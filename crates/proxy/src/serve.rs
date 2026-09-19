@@ -37,7 +37,7 @@ use tokio::net::TcpListener;
 
 /// How long accepting pauses after an error that is not about one connection — out of
 /// file descriptors, say — instead of failing again at once, over and over.
-const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
+pub(crate) const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 
 /// What is answered: the upstream's body as it arrives, or nothing.
 type Body = Either<Incoming, Empty<Bytes>>;
@@ -364,7 +364,7 @@ fn at_endpoint(target: &Uri, endpoint: &Authority) -> Option<Uri> {
 
 /// Whether a failure to accept is the failure of the one connection that was next in line,
 /// so that the one after it can be accepted at once.
-fn is_about_one_connection(error: &io::Error) -> bool {
+pub(crate) fn is_about_one_connection(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::ConnectionRefused

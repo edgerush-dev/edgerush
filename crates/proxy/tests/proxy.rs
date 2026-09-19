@@ -852,3 +852,37 @@ async fn what_happens_is_counted_and_a_reload_resets_nothing() {
     assert_eq!(sample(&scrape, "edgerush_config_reloads_total"), 1);
     assert!(sample(&scrape, "edgerush_config_last_reload_timestamp_seconds") > 1_700_000_000);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_scrape_endpoint_serves_what_was_counted_and_nothing_else() {
+    let up = upstream("up").await;
+    let (proxy, addresses) = reloadable_proxy(&everything_to(&[("web", up)], "0")).await;
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let scrape = socket.local_addr().unwrap();
+    tokio::spawn(Arc::clone(&proxy).serve_metrics(socket));
+    assert_eq!(send(get(addresses["web"], "/")).await.0, 200);
+
+    let (status, headers, body) = send(get(scrape, "/metrics")).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers["content-type"],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let web_2xx = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"}";
+    assert_eq!(sample(&body, web_2xx), 1);
+
+    // A query is the scraper's business; any other path or method is not served.
+    assert_eq!(send(get(scrape, "/metrics?name=x")).await.0, 200);
+    let head = request(Method::HEAD, scrape, "/metrics");
+    let (status, _, body) = send(head.body(Empty::new().boxed()).unwrap()).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, ""));
+    assert_eq!(send(get(scrape, "/")).await.0, 404);
+    assert_eq!(send(get(scrape, "/metrics/")).await.0, 404);
+    let post = request(Method::POST, scrape, "/metrics");
+    let (status, headers, _) = send(post.body(Empty::new().boxed()).unwrap()).await;
+    assert_eq!(status, 405);
+    assert_eq!(headers["allow"], "GET, HEAD");
+
+    // Scrapes are not traffic: no listener counts them.
+    assert_eq!(sample(&proxy.metrics(), web_2xx), 1);
+}
