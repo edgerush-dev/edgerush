@@ -64,7 +64,8 @@ on its own: `cargo fmt --manifest-path fuzz/Cargo.toml`.
 crates/edgerush    the binary (operator, control plane and data plane will be subcommands)
 crates/config      the config model and its compilation (`edgerush-config`): pure, format-free
 crates/filters     built-in filters (`edgerush-filters`): pure, on plain `http` types
-crates/proxy       the data plane (`edgerush-proxy`): the request core so far, on plain `http` types
+crates/proxy       the data plane (`edgerush-proxy`): the request core on plain `http` types, and the
+                   serving and forwarding around it, the only code that touches hyper
 crates/router      request matching (`edgerush-router`): pure logic, no I/O
 fuzz               fuzz targets (cargo-fuzz; not part of the workspace)
 ```

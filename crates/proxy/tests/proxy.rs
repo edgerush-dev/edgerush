@@ -1,0 +1,507 @@
+//! The proxy over real sockets: a client, the proxy and upstreams, all on the loopback
+//! interface and on ports the operating system hands out.
+//!
+//! The upstream answers every request with a description of what it saw, which is how the
+//! tests look at the upstream's side; requests to `/echo` get their own body back, frame by
+//! frame as it arrives.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test set-up: the helpers around the tests fail them the way the tests would"
+)]
+
+use edgerush_config::{Config, compile};
+use edgerush_proxy::Proxy;
+use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Either, Empty, Full};
+use hyper::body::{Body, Bytes, Frame, Incoming};
+use hyper::service::service_fn;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+
+type ClientBody = BoxBody<Bytes, Infallible>;
+
+/// Starts an upstream that says `name` in an `x-upstream` field of every answer.
+async fn upstream(name: &'static str) -> SocketAddr {
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = socket.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(move |request| async move {
+                    Ok::<_, Infallible>(upstream_answer(name, request))
+                });
+                let _closed = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    address
+}
+
+fn upstream_answer(
+    name: &'static str,
+    request: Request<Incoming>,
+) -> Response<Either<Incoming, Full<Bytes>>> {
+    let (head, body) = request.into_parts();
+    let body = if head.uri.path() == "/echo" {
+        Either::Left(body)
+    } else {
+        let mut seen = format!("{} {} {:?}\n", head.method, head.uri, head.version);
+        for (name, value) in &head.headers {
+            seen.push_str(&format!("{name}: {}\n", value.to_str().unwrap()));
+        }
+        Either::Right(Full::new(Bytes::from(seen)))
+    };
+    let mut response = Response::builder()
+        .header("x-upstream", name)
+        .header("x-powered-by", "upstream");
+    if head.uri.path() == "/hop" {
+        // An upstream that talks about its connection to the proxy.
+        response = response
+            .header("connection", "x-upstream-hop")
+            .header("x-upstream-hop", "1")
+            .header("keep-alive", "timeout=5");
+    }
+    response.body(body).unwrap()
+}
+
+/// An address nothing listens on: one that was just given to a socket that is gone again.
+async fn dead_endpoint() -> SocketAddr {
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    socket.local_addr().unwrap()
+}
+
+/// Starts a proxy for the config, with every listener on a port of its own choosing; the
+/// addresses by the listeners' names.
+async fn proxy(yaml: &str) -> BTreeMap<String, SocketAddr> {
+    let config: Config = serde_saphyr::from_str(yaml).unwrap();
+    let proxy = Arc::new(Proxy::new(compile(&config).unwrap()).unwrap());
+    let mut addresses = BTreeMap::new();
+    for (position, listener) in proxy.snapshot().listeners.iter().enumerate() {
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addresses.insert(listener.name.clone(), socket.local_addr().unwrap());
+        tokio::spawn(Arc::clone(&proxy).serve(position, socket));
+    }
+    addresses
+}
+
+/// A shop with a cart, as far as the tests share a config.
+async fn shop() -> SocketAddr {
+    let cart = upstream("cart").await;
+    let pages = upstream("pages").await;
+    let dead = dead_endpoint().await;
+    let yaml = format!(
+        r#"
+listeners:
+  web: {{ address: "127.0.0.1:0", protocol: http }}
+routes:
+  - name: shop
+    listeners: [web]
+    hostnames:
+      - {{ name: shop.example.com, falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: /cart }}
+        filters:
+          - type: request_header_modifier
+            set: [{{ name: X-Gateway, value: edgerush }}]
+            remove: [x-debug]
+          - type: response_header_modifier
+            add: [{{ name: X-Served-By, value: edgerush }}]
+            remove: [x-powered-by]
+        backends:
+          - {{ upstream: cart, weight: 1 }}
+      - matches:
+          - path: {{ exact: /closed }}
+        backends:
+          - {{ upstream: cart, weight: 0 }}
+      - matches:
+          - path: {{ exact: /empty }}
+        backends:
+          - {{ upstream: empty, weight: 1 }}
+      - matches:
+          - path: {{ exact: /dead }}
+        backends:
+          - {{ upstream: dead, weight: 1 }}
+      - matches:
+          - path: {{ prefix: / }}
+        backends:
+          - {{ upstream: pages, weight: 1 }}
+upstreams:
+  cart: {{ endpoints: ["{cart}"] }}
+  dead: {{ endpoints: ["{dead}"] }}
+  empty: {{ endpoints: [] }}
+  pages: {{ endpoints: ["{pages}"] }}
+"#
+    );
+    proxy(&yaml).await["web"]
+}
+
+fn client(http2: bool) -> Client<HttpConnector, ClientBody> {
+    let mut builder = Client::builder(TokioExecutor::new());
+    builder.http2_only(http2);
+    builder.build(HttpConnector::new())
+}
+
+fn request(method: Method, proxy: SocketAddr, target: &str) -> http::request::Builder {
+    Request::builder()
+        .method(method)
+        .uri(format!("http://{proxy}{target}"))
+        .header("host", "shop.example.com")
+}
+
+fn get(proxy: SocketAddr, target: &str) -> Request<ClientBody> {
+    request(Method::GET, proxy, target)
+        .body(Empty::new().boxed())
+        .unwrap()
+}
+
+/// Sends the request and reads the whole answer: status, headers and body as text.
+async fn send(request: Request<ClientBody>) -> (StatusCode, HeaderMap, String) {
+    let http2 = request.version() == Version::HTTP_2;
+    let response = within(client(http2).request(request)).await.unwrap();
+    let (head, body) = response.into_parts();
+    let body = within(body.collect()).await.unwrap().to_bytes();
+    (
+        head.status,
+        head.headers,
+        String::from_utf8(body.to_vec()).unwrap(),
+    )
+}
+
+/// A test that waits for what never comes should fail, not hang.
+async fn within<T>(future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(10), future)
+        .await
+        .expect("timed out")
+}
+
+/// Writes raw bytes to the proxy and reads until it closes the connection.
+async fn raw(proxy: SocketAddr, bytes: &str) -> String {
+    let mut stream = TcpStream::connect(proxy).await.unwrap();
+    stream.write_all(bytes.as_bytes()).await.unwrap();
+    let mut answer = String::new();
+    within(stream.read_to_string(&mut answer)).await.unwrap();
+    answer
+}
+
+/// A request body that is written to from the test, a frame at a time.
+struct ChannelBody(mpsc::Receiver<Bytes>);
+
+impl Body for ChannelBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        self.0
+            .poll_recv(context)
+            .map(|data| data.map(|data| Ok(Frame::data(data))))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_goes_to_its_upstream_and_the_answer_comes_back() {
+    let proxy = shop().await;
+    let (status, headers, seen) = send(get(proxy, "/about?lang=en")).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["x-upstream"], "pages");
+    assert!(seen.starts_with("GET /about?lang=en HTTP/1.1\n"), "{seen}");
+    assert!(seen.contains("host: shop.example.com\n"), "{seen}");
+
+    let (status, headers, _) = send(get(proxy, "/cart/items")).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["x-upstream"], "cart");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_upstream_sees_the_normal_form_of_the_path() {
+    let proxy = shop().await;
+    let (status, headers, seen) = send(get(proxy, "/pages/../cart//items/%7e?next=/a/../b")).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["x-upstream"], "cart");
+    assert!(
+        seen.starts_with("GET /cart/items/~?next=/a/../b "),
+        "{seen}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_rule_changes_the_headers_of_request_and_response() {
+    let proxy = shop().await;
+    let request = request(Method::GET, proxy, "/cart")
+        .header("x-debug", "1")
+        .header("x-gateway", "spoofed")
+        .header("x-other", "kept")
+        .body(Empty::new().boxed())
+        .unwrap();
+    let (status, headers, seen) = send(request).await;
+    assert_eq!(status, 200);
+    assert!(seen.contains("x-gateway: edgerush\n"), "{seen}");
+    assert!(seen.contains("x-other: kept\n"), "{seen}");
+    assert!(!seen.contains("x-debug"), "{seen}");
+    assert!(!seen.contains("spoofed"), "{seen}");
+    assert_eq!(headers["x-served-by"], "edgerush");
+    assert!(!headers.contains_key("x-powered-by"));
+
+    // A rule without changes leaves both as they are.
+    let (_, headers, _) = send(get(proxy, "/about")).await;
+    assert_eq!(headers["x-powered-by"], "upstream");
+    assert!(!headers.contains_key("x-served-by"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bodies_stream_in_both_directions() {
+    let proxy = shop().await;
+    let (frames, body) = mpsc::channel(1);
+    let request = request(Method::POST, proxy, "/echo")
+        .body(ChannelBody(body).boxed())
+        .unwrap();
+    let response = within(client(false).request(request)).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut echo = response.into_body();
+
+    // Every frame comes back before the next is sent: nothing waits for the whole body.
+    for text in ["one", "two", "three"] {
+        frames.send(Bytes::from(text)).await.unwrap();
+        let frame = within(echo.frame()).await.unwrap().unwrap();
+        assert_eq!(frame.into_data().unwrap(), text);
+    }
+    drop(frames);
+    assert!(within(echo.frame()).await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_body_comes_through_whole() {
+    let proxy = shop().await;
+    let sent: Vec<u8> = (0..4_000_000_u32).map(|at| at.to_le_bytes()[0]).collect();
+    let request = request(Method::POST, proxy, "/echo")
+        .body(Full::new(Bytes::from(sent.clone())).boxed())
+        .unwrap();
+    let response = within(client(false).request(request)).await.unwrap();
+    let echoed = within(response.into_body().collect()).await.unwrap();
+    assert!(echoed.to_bytes() == sent);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_cannot_be_placed_is_answered_here() {
+    let proxy = shop().await;
+    for (target, status) in [
+        ("/cart/..%2Fadmin", StatusCode::BAD_REQUEST),
+        ("/closed", StatusCode::INTERNAL_SERVER_ERROR),
+        ("/empty", StatusCode::SERVICE_UNAVAILABLE),
+        ("/dead", StatusCode::BAD_GATEWAY),
+    ] {
+        let (answered, headers, body) = send(get(proxy, target)).await;
+        assert_eq!(answered, status, "{target}");
+        assert!(!headers.contains_key("x-upstream"), "{target}");
+        assert_eq!(body, "", "{target}");
+    }
+
+    let mut elsewhere = get(proxy, "/about");
+    elsewhere
+        .headers_mut()
+        .insert("host", "other.example.org".parse().unwrap());
+    assert_eq!(send(elsewhere).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_that_names_no_host_is_rejected() {
+    let proxy = shop().await;
+    let answer = raw(proxy, "GET /about HTTP/1.1\r\nConnection: close\r\n\r\n").await;
+    assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+    let twice = "GET /about HTTP/1.1\r\nHost: shop.example.com\r\nHost: shop.example.com\r\n\
+                 Connection: close\r\n\r\n";
+    let answer = raw(proxy, twice).await;
+    assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_serves_one_request_after_another() {
+    let proxy = shop().await;
+    let requests = "GET /about HTTP/1.1\r\nHost: shop.example.com\r\n\r\n\
+                    GET /cart HTTP/1.1\r\nHost: shop.example.com\r\n\r\n\
+                    GET /nowhere HTTP/1.1\r\nHost: other.example.org\r\nConnection: close\r\n\r\n";
+    let answers = raw(proxy, requests).await;
+    let statuses: Vec<&str> = answers
+        .lines()
+        .filter(|line| line.starts_with("HTTP/1.1 "))
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            "HTTP/1.1 200 OK",
+            "HTTP/1.1 200 OK",
+            "HTTP/1.1 404 Not Found"
+        ]
+    );
+    assert!(answers.contains("x-upstream: pages"), "{answers}");
+    assert!(answers.contains("x-upstream: cart"), "{answers}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http2_comes_in_and_http1_goes_out() {
+    let proxy = shop().await;
+    let request = Request::builder()
+        .version(Version::HTTP_2)
+        .uri(format!("http://{proxy}/cart/items?page=3"))
+        .body(Empty::new().boxed())
+        .unwrap();
+    // The authority is the proxy's address, which no route is for.
+    assert_eq!(send(request).await.0, StatusCode::NOT_FOUND);
+
+    let any_host = upstream("any").await;
+    let yaml = format!(
+        r#"
+listeners:
+  web: {{ address: "127.0.0.1:0", protocol: http }}
+routes:
+  - name: everything
+    listeners: [web]
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: / }}
+        backends:
+          - {{ upstream: any, weight: 1 }}
+upstreams:
+  any: {{ endpoints: ["{any_host}"] }}
+"#
+    );
+    let proxy = self::proxy(&yaml).await["web"];
+    let request = Request::builder()
+        .version(Version::HTTP_2)
+        .uri(format!("http://{proxy}/cart/./items?page=3"))
+        .body(Empty::new().boxed())
+        .unwrap();
+    let (status, headers, seen) = send(request).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["x-upstream"], "any");
+    assert!(
+        seen.starts_with("GET /cart/items?page=3 HTTP/1.1\n"),
+        "{seen}"
+    );
+    // The host that was routed on is the host the upstream is told.
+    assert!(seen.contains(&format!("host: {proxy}\n")), "{seen}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_listener_serves_its_own_routes_and_every_endpoint_gets_requests() {
+    let (one, two, admin) = (
+        upstream("one").await,
+        upstream("two").await,
+        upstream("admin").await,
+    );
+    let yaml = format!(
+        r#"
+listeners:
+  admin: {{ address: "127.0.0.1:0", protocol: http }}
+  web: {{ address: "127.0.0.1:1", protocol: http }}
+routes:
+  - name: web
+    listeners: [web]
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: / }}
+        backends:
+          - {{ upstream: web, weight: 1 }}
+  - name: admin
+    listeners: [admin]
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: /status }}
+        backends:
+          - {{ upstream: admin, weight: 1 }}
+upstreams:
+  admin: {{ endpoints: ["{admin}"] }}
+  web: {{ endpoints: ["{one}", "{two}"] }}
+"#
+    );
+    let listeners = proxy(&yaml).await;
+
+    let (status, headers, _) = send(get(listeners["admin"], "/status")).await;
+    assert_eq!(
+        (status, &headers["x-upstream"]),
+        (StatusCode::OK, &"admin".parse().unwrap())
+    );
+    assert_eq!(
+        send(get(listeners["admin"], "/")).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    // Forty requests that all go to one of two endpoints: once in 2³⁹ runs.
+    let mut served = BTreeMap::new();
+    for _ in 0..40 {
+        let (status, headers, _) = send(get(listeners["web"], "/status")).await;
+        assert_eq!(status, 200);
+        *served
+            .entry(headers["x-upstream"].to_str().unwrap().to_owned())
+            .or_insert(0) += 1;
+    }
+    assert_eq!(
+        served.keys().collect::<Vec<_>>(),
+        ["one", "two"],
+        "{served:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_is_said_about_one_connection_does_not_reach_the_next() {
+    let proxy = shop().await;
+    let request = "GET /hop HTTP/1.1\r\nHost: shop.example.com\r\nConnection: close, x-hop\r\n\
+                   X-Hop: 1\r\nKeep-Alive: timeout=5\r\nTE: trailers, gzip\r\nX-Kept: 1\r\n\r\n";
+    let answer = raw(proxy, request).await;
+    assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+    let (head, seen) = answer.split_once("\r\n\r\n").unwrap();
+
+    // What the upstream saw of the request.
+    assert!(seen.contains("x-kept: 1\n"), "{seen}");
+    assert!(seen.contains("te: trailers\n"), "{seen}");
+    for gone in ["x-hop", "keep-alive", "connection", "gzip"] {
+        assert!(!seen.contains(gone), "{gone} in {seen}");
+    }
+    // What the client sees of the response; its own connection is closed as it asked.
+    assert!(head.contains("x-upstream: pages"), "{head}");
+    assert!(head.contains("connection: close"), "{head}");
+    for gone in ["x-upstream-hop", "keep-alive"] {
+        assert!(!head.contains(gone), "{gone} in {head}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_header_that_would_take_the_host_away_is_rejected() {
+    let proxy = shop().await;
+    let request =
+        "GET /about HTTP/1.1\r\nHost: shop.example.com\r\nConnection: close, host\r\n\r\n";
+    let answer = raw(proxy, request).await;
+    assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+
+    // The same request without that option is served: it was the option that was refused.
+    let request = "GET /about HTTP/1.1\r\nHost: shop.example.com\r\nConnection: close\r\n\r\n";
+    let answer = raw(proxy, request).await;
+    assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+}

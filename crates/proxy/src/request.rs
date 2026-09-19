@@ -5,10 +5,13 @@
 //! The host is the one the request target names (HTTP/2's `:authority`, HTTP/1.1's
 //! absolute form) and only without one the `Host` field, as RFC 9112 §3.2.2 has it. The
 //! path is normalised once, and the same normal form is matched and forwarded. Whatever is
-//! routed on is what the upstream gets to see: the head is rewritten to say it.
+//! routed on is what the upstream gets to see: the head is rewritten to say it. What the
+//! request said about the connection it came in on is taken off ([`crate::hop_by_hop`])
+//! before the rule's own changes to the headers.
 
+use crate::hop_by_hop::{self, ConnectionError, check_connection, strip_request};
 use crate::host::{HostError, bare_host, host_field};
-use edgerush_config::{Compiled, CompiledListener, CompiledRule, CompiledUpstream};
+use edgerush_config::{Compiled, CompiledListener, CompiledRule, UpstreamId};
 use edgerush_router::{NormaliseError, RequestParts, normalise_path};
 use http::header::{HOST, HeaderValue};
 use http::request::Parts;
@@ -21,8 +24,8 @@ use std::borrow::Cow;
 pub struct Forward<'a> {
     /// The rule the request belongs to, for what is still to be done to its response.
     pub rule: &'a CompiledRule,
-    /// The upstream chosen among the rule's backends.
-    pub upstream: &'a CompiledUpstream,
+    /// The upstream chosen among the rule's backends: its position in the snapshot's list.
+    pub upstream: UpstreamId,
 }
 
 /// Why a request goes nowhere, and is answered here.
@@ -34,6 +37,9 @@ pub enum Rejection {
     /// The path has no normal form.
     #[error(transparent)]
     Path(#[from] NormaliseError),
+    /// The `Connection` header is not one to act on.
+    #[error(transparent)]
+    Connection(#[from] ConnectionError),
     /// The normalised target is not one the `http` crate takes. Not known to happen.
     #[error("request target cannot be rewritten")]
     Target,
@@ -52,7 +58,9 @@ impl Rejection {
     #[must_use]
     pub fn status(&self) -> StatusCode {
         match self {
-            Self::Host(_) | Self::Path(_) | Self::Target => StatusCode::BAD_REQUEST,
+            Self::Host(_) | Self::Path(_) | Self::Connection(_) | Self::Target => {
+                StatusCode::BAD_REQUEST
+            }
             Self::NoRoute => StatusCode::NOT_FOUND,
             Self::NoBackend => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -61,7 +69,7 @@ impl Rejection {
 
 /// Decides where a request that came in on `listener` goes, and makes its head what the
 /// upstream is to see: the normalised path, a `Host` field that names the host that was
-/// routed on, and the rule's changes to the headers.
+/// routed on, no hop-by-hop headers, and the rule's changes to the headers.
 ///
 /// `random` chooses among weighted backends and should be uniform over `u64`; passing it
 /// in keeps the core deterministic. A request in the usual form — origin-form target, a
@@ -82,6 +90,10 @@ pub fn decide<'a>(
         None => bare_host(host_field(&head.headers)?)?,
     };
     let path = normalise_path(head.uri.path())?;
+    let says_hop_by_hop = hop_by_hop::is_present(&head.headers);
+    if says_hop_by_hop {
+        check_connection(&head.headers)?;
+    }
     let request = RequestParts {
         host,
         path: &path,
@@ -92,11 +104,7 @@ pub fn decide<'a>(
     let id = *listener.router.route(&request).ok_or(Rejection::NoRoute)?;
     // A router only ever yields rules of the snapshot it was compiled into.
     let rule = snapshot.rule(id).ok_or(Rejection::NoBackend)?;
-    let upstream = rule
-        .backends
-        .pick(random)
-        .and_then(|id| snapshot.upstream(id))
-        .ok_or(Rejection::NoBackend)?;
+    let upstream = rule.backends.pick(random).ok_or(Rejection::NoBackend)?;
 
     // Everything that can fail comes before the first change to the head.
     let target = match path {
@@ -115,6 +123,9 @@ pub fn decide<'a>(
     }
     if let Some(host_field) = host_field {
         head.headers.insert(HOST, host_field);
+    }
+    if says_hop_by_hop {
+        strip_request(&mut head.headers);
     }
     if let Some(changes) = &rule.request_headers {
         changes.apply(&mut head.headers);
@@ -218,7 +229,8 @@ upstreams:
     fn decide_on(listener: &str, head: &mut Parts, random: u64) -> Result<String, Rejection> {
         let shop = shop();
         let listener = shop.listeners.iter().find(|l| l.name == listener).unwrap();
-        decide(&shop, listener, head, random).map(|forward| forward.upstream.name.clone())
+        decide(&shop, listener, head, random)
+            .map(|forward| shop.upstream(forward.upstream).unwrap().name.clone())
     }
 
     fn upstream_for(target: &str, fields: &[(&str, &str)]) -> Result<String, Rejection> {
@@ -271,10 +283,7 @@ upstreams:
         let mut head = head("/cart", &[("host", "shop.example.com")]);
         let forward = decide(&shop, web, &mut head, 0).unwrap();
         assert!(forward.rule.request_headers.is_some());
-        assert_eq!(
-            forward.upstream.endpoints,
-            ["127.0.0.1:9002".parse().unwrap()]
-        );
+        assert_eq!(shop.upstream(forward.upstream).unwrap().name, "cart");
     }
 
     #[test]
@@ -422,6 +431,40 @@ upstreams:
     }
 
     #[test]
+    fn what_the_request_says_about_its_connection_stays_behind() {
+        let mut request = head(
+            "/cart",
+            &[
+                ("host", "shop.example.com"),
+                ("connection", "keep-alive, x-hop"),
+                ("keep-alive", "timeout=5"),
+                ("x-hop", "1"),
+                ("te", "trailers, gzip"),
+                ("accept", "*/*"),
+            ],
+        );
+        assert_eq!(decide_on("web", &mut request, 0).as_deref(), Ok("cart"));
+        let mut names: Vec<&str> = request.headers.keys().map(|name| name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["accept", "host", "te", "x-gateway"]);
+        assert_eq!(request.headers.get("te").unwrap(), "trailers");
+    }
+
+    #[test]
+    fn a_connection_header_that_would_take_the_host_away_is_rejected() {
+        let fields = [("host", "shop.example.com"), ("connection", "close, host")];
+        assert_eq!(
+            upstream_for("/cart", &fields),
+            Err(Rejection::Connection(ConnectionError::Protected))
+        );
+        let fields = [("host", "shop.example.com"), ("connection", "x y")];
+        assert_eq!(
+            upstream_for("/cart", &fields),
+            Err(Rejection::Connection(ConnectionError::Malformed))
+        );
+    }
+
+    #[test]
     fn a_rule_with_nowhere_to_go_is_rejected() {
         let upstream = upstream_for("/closed", &[("host", "shop.example.com")]);
         assert_eq!(upstream, Err(Rejection::NoBackend));
@@ -442,6 +485,10 @@ upstreams:
     fn every_rejection_has_its_status() {
         assert_eq!(Rejection::Host(HostError::Missing).status(), 400);
         assert_eq!(Rejection::Path(NormaliseError::Backslash).status(), 400);
+        assert_eq!(
+            Rejection::Connection(ConnectionError::Malformed).status(),
+            400
+        );
         assert_eq!(Rejection::Target.status(), 400);
         assert_eq!(Rejection::NoRoute.status(), 404);
         assert_eq!(Rejection::NoBackend.status(), 500);

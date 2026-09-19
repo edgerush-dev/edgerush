@@ -1,5 +1,6 @@
 //! Instruction counts for the request core: everything between a request's head and the
-//! choice of its upstream — host, path normalisation, routing, header changes, backend.
+//! choice of its upstream — host, path normalisation, routing, hop-by-hop headers, header
+//! changes, backend.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-proxy`, see the repository README.
 
@@ -54,6 +55,10 @@ fn shop() -> Compiled {
 
 /// A request with a browser's worth of headers.
 fn head(target: &str, host: Option<&str>) -> Parts {
+    head_with(target, host, &[])
+}
+
+fn head_with(target: &str, host: Option<&str>, more: &[(&'static str, &'static str)]) -> Parts {
     let fields = [
         (
             "user-agent",
@@ -71,6 +76,7 @@ fn head(target: &str, host: Option<&str>) -> Parts {
         ),
     ];
     let mut request = Request::builder().uri(target);
+    let fields = fields.into_iter().chain(more.iter().copied());
     for (name, value) in host.map(|host| ("host", host)).into_iter().chain(fields) {
         request = request.header(name, value);
     }
@@ -83,6 +89,14 @@ fn head(target: &str, host: Option<&str>) -> Parts {
 #[bench::with_header_changes(shop(), head("/cart/items?page=3", Some("shop.example.com")))]
 #[bench::path_to_normalise(shop(), head("/pages/./a/../about?lang=en", Some("shop.example.com")))]
 #[bench::host_in_the_target(shop(), head("http://shop.example.com/pages/about?lang=en", None))]
+#[bench::connection_header(
+    shop(),
+    head_with(
+        "/pages/about?lang=en",
+        Some("shop.example.com"),
+        &[("connection", "keep-alive"), ("keep-alive", "timeout=5"), ("te", "trailers")]
+    )
+)]
 #[bench::no_route(shop(), head("/pages/about", Some("other.example.org")))]
 fn request_core(snapshot: Compiled, mut head: Parts) -> (Compiled, Parts, bool) {
     let forwarded = match snapshot.listeners.first() {

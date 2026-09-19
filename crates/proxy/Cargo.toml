@@ -11,13 +11,18 @@ publish.workspace = true
 edgerush-config.workspace = true
 edgerush-router.workspace = true
 http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 iai-callgrind.workspace = true
 proptest.workspace = true
 # Fixtures are written the way harness files are.
 serde-saphyr.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "sync"] }
 
 [[bench]]
 name = "decide"
