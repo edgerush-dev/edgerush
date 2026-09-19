@@ -6,9 +6,9 @@
 //!
 //! So far: the host stage (hostname patterns and the index that finds the candidates for a
 //! request's host), the path stage (exact, prefix and regex patterns and their index), the
-//! normaliser that request paths go through before they are matched, and header
-//! predicates. Query and method predicates, the rest of Gateway API precedence and the
-//! router that joins the stages build on them.
+//! normaliser that request paths go through before they are matched, and header and query
+//! parameter predicates. The rest of Gateway API precedence and the router that joins the
+//! stages build on them.
 
 mod hash;
 pub mod header;
@@ -17,6 +17,7 @@ pub mod host_index;
 pub mod normalise;
 pub mod path;
 pub mod path_index;
+pub mod query;
 #[cfg(any(test, feature = "reference"))]
 pub mod reference;
 #[cfg(test)]
@@ -29,4 +30,5 @@ pub use host_index::{HostClaim, HostIndex};
 pub use normalise::{NormaliseError, normalise_path};
 pub use path::{PathPattern, PathPatternError};
 pub use path_index::{PathCandidates, PathIndex};
+pub use query::{QueryPredicate, QueryPredicateError, QueryPredicates};
 pub use whole_regex::RegexError;

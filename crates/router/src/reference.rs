@@ -212,3 +212,59 @@ pub fn exact_headers_match(rule: &[(String, String)], request: &[(String, String
         !values.is_empty() && values.join(",") == *expected
     })
 }
+
+/// The parameters of a query string (without its `?`), in order and decoded: split on `&`
+/// skipping empty pieces, split each pair at its first `=`, read `+` as a space and decode
+/// percent-encoding. A pair whose name cannot be decoded is left out; a value that cannot
+/// be decoded is `None`.
+#[must_use]
+pub fn query_parameters(query: &str) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter_map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            Some((form_decode(name)?, form_decode(value)))
+        })
+        .collect()
+}
+
+fn form_decode(text: &str) -> Option<Vec<u8>> {
+    let mut decoded = Vec::new();
+    let mut rest = text.as_bytes();
+    while let Some((&first, tail)) = rest.split_first() {
+        rest = tail;
+        decoded.push(match first {
+            b'+' => b' ',
+            b'%' => {
+                let (digits, tail) = rest.split_at_checked(2)?;
+                rest = tail;
+                if !digits.iter().all(u8::is_ascii_hexdigit) {
+                    return None;
+                }
+                u8::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()?
+            }
+            byte => byte,
+        });
+    }
+    Some(decoded)
+}
+
+/// Whether a query string satisfies a rule's exact query parameter matches, given as
+/// (name, value) in order: only the first match for a name counts, and a parameter is
+/// matched by its first occurrence in the query, which must decode to exactly the value.
+#[must_use]
+pub fn exact_query_matches(rule: &[(String, String)], query: &str) -> bool {
+    let parameters = query_parameters(query);
+    let mut seen: Vec<&str> = Vec::new();
+    rule.iter().all(|(name, expected)| {
+        if seen.contains(&name.as_str()) {
+            return true;
+        }
+        seen.push(name);
+        parameters
+            .iter()
+            .find(|(parameter, _)| parameter == name.as_bytes())
+            .is_some_and(|(_, value)| value.as_deref() == Some(expected.as_bytes()))
+    })
+}

@@ -38,3 +38,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "query"
+harness = false

@@ -114,7 +114,8 @@ fn write_segment(segment: &str, normal: &mut String) -> Result<bool, NormaliseEr
     Ok(encoded_dot)
 }
 
-fn hex_value(digit: u8) -> Option<u8> {
+/// The value of one hex digit of a percent-encoding.
+pub(crate) fn hex_value(digit: u8) -> Option<u8> {
     char::from(digit)
         .to_digit(16)
         .and_then(|value| u8::try_from(value).ok())
