@@ -167,6 +167,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-telemetry"
+version = "0.0.0"
+dependencies = [
+ "iai-callgrind",
+ "proptest",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"

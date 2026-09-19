@@ -1,0 +1,19 @@
+[package]
+name = "edgerush-telemetry"
+description = "EdgeRush metrics: counters sharded by thread and their exposition, no I/O and no clock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dev-dependencies]
+iai-callgrind.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "counting"
+harness = false
+
+[lints]
+workspace = true

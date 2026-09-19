@@ -67,6 +67,7 @@ crates/filters     built-in filters (`edgerush-filters`): pure, on plain `http` 
 crates/proxy       the data plane (`edgerush-proxy`): the request core on plain `http` types, and the
                    serving and forwarding around it, the only code that touches hyper
 crates/router      request matching (`edgerush-router`): pure logic, no I/O
+crates/telemetry   metrics (`edgerush-telemetry`): counters sharded by thread, the Prometheus text format
 fuzz               fuzz targets (cargo-fuzz; not part of the workspace)
 ```
 
