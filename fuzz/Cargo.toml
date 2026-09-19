@@ -1,0 +1,26 @@
+# Fuzz targets, run with cargo-fuzz on a nightly toolchain (see the repository README).
+# A package of its own, outside the workspace: nothing in EdgeRush depends on it, and the
+# workspace's checks on the stable toolchain never build it.
+[package]
+name = "edgerush-fuzz"
+description = "EdgeRush fuzz targets"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+edgerush-router = { path = "../crates/router", features = ["reference"] }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "normalise"
+path = "fuzz_targets/normalise.rs"
+test = false
+doc = false
+bench = false

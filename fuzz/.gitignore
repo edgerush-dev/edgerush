@@ -1,0 +1,5 @@
+# What the fuzzer builds and collects. A crashing input worth keeping becomes a test.
+target/
+corpus/
+artifacts/
+coverage/

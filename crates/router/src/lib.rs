@@ -16,6 +16,8 @@ pub mod host_index;
 pub mod normalise;
 pub mod path;
 pub mod path_index;
+#[cfg(any(test, feature = "reference"))]
+pub mod reference;
 #[cfg(test)]
 mod strategies;
 

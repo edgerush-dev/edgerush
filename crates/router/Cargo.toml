@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# The slow reference implementations, for the fuzz targets. Never for the binary.
+reference = []
+
 [dependencies]
 regex.workspace = true
 thiserror.workspace = true

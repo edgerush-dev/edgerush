@@ -34,11 +34,31 @@ Valgrind must be recent: 3.18 (Ubuntu 22.04) runs but reports zero instructions 
 current Rust; 3.27 works. Each run is compared with the previous one kept in `target/iai`.
 From a checkout on a Windows drive, point `CARGO_TARGET_DIR` at the Linux filesystem.
 
+## Fuzzing
+
+Code that reads untrusted input has a fuzz target in `fuzz/`, a package of its own outside
+the workspace. Fuzzing needs a nightly compiler (for the instrumentation only; EdgeRush
+itself builds on the pinned stable toolchain) and Linux; WSL2 is enough.
+
+```sh
+rustup toolchain install nightly --profile minimal
+cargo install cargo-fuzz
+cargo +nightly fuzz list
+cargo +nightly fuzz run normalise -- -max_total_time=600
+```
+
+Targets compare the real code with the slow reference implementations in the router's
+`reference` module, the same ones the property tests use. An input that fails is saved
+under `fuzz/artifacts/`; fix the bug and add the input to the unit tests. Run a target
+after changing the code it covers. Being outside the workspace, the package is formatted
+on its own: `cargo fmt --manifest-path fuzz/Cargo.toml`.
+
 ## Layout
 
 ```
 crates/edgerush    the binary (operator, control plane and data plane will be subcommands)
 crates/router      request matching (`edgerush-router`): pure logic, no I/O
+fuzz               fuzz targets (cargo-fuzz; not part of the workspace)
 ```
 
 Crates are internal to this workspace and are not published.

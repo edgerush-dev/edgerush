@@ -208,6 +208,7 @@ pub enum NormaliseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reference;
     use crate::strategies::nasty_path;
     use proptest::prelude::*;
 
@@ -384,74 +385,11 @@ mod tests {
             && well_formed(last)
     }
 
-    /// The specification, written in separate steps with no regard for cost: decode every
-    /// segment into a list, then resolve the list with a stack.
-    fn reference(path: &str) -> Option<String> {
-        let segments: Vec<(String, bool)> = path
-            .strip_prefix('/')?
-            .split('/')
-            .map(reference_segment)
-            .collect::<Option<_>>()?;
-
-        let mut stack: Vec<&str> = Vec::new();
-        let mut trailing_slash = false;
-        for (segment, encoded_dot) in &segments {
-            let name = segment.split(';').next().unwrap();
-            let is_dots = name == "." || name == "..";
-            if is_dots && (*encoded_dot || name != segment) {
-                return None;
-            }
-            trailing_slash = is_dots || segment.is_empty();
-            if name == ".." {
-                stack.pop()?;
-            } else if !trailing_slash {
-                stack.push(segment);
-            }
-        }
-        let mut normal: String = stack.iter().flat_map(|segment| ["/", segment]).collect();
-        if trailing_slash || normal.is_empty() {
-            normal.push('/');
-        }
-        Some(normal)
-    }
-
-    fn reference_segment(segment: &str) -> Option<(String, bool)> {
-        let bytes = segment.as_bytes();
-        let mut canonical = String::new();
-        let mut encoded_dot = false;
-        let mut at = 0;
-        while at < bytes.len() {
-            let (byte, encoded) = if bytes[at] == b'%' {
-                let digits = bytes.get(at + 1..at + 3)?;
-                if !digits.iter().all(u8::is_ascii_hexdigit) {
-                    return None;
-                }
-                at += 3;
-                let digits = std::str::from_utf8(digits).unwrap();
-                (u8::from_str_radix(digits, 16).unwrap(), true)
-            } else {
-                at += 1;
-                (bytes[at - 1], false)
-            };
-            if byte.is_ascii_control() || byte == b'\\' || (encoded && byte == b'/') {
-                return None;
-            }
-            let keep_raw = is_unreserved(byte) || (!encoded && b"!$&'()*+,;=:@".contains(&byte));
-            if keep_raw {
-                canonical.push(char::from(byte));
-                encoded_dot |= encoded && byte == b'.';
-            } else {
-                canonical.push_str(&format!("%{byte:02X}"));
-            }
-        }
-        Some((canonical, encoded_dot))
-    }
-
     proptest! {
         #[test]
         fn normalising_agrees_with_the_step_by_step_reference(path in nasty_path()) {
             let normal = normalise_path(&path).ok().map(Cow::into_owned);
-            prop_assert_eq!(normal, reference(&path));
+            prop_assert_eq!(normal, reference::normalise_path(&path));
         }
 
         #[test]
