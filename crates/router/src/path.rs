@@ -8,21 +8,13 @@
 //! with `//` or dot segments, which says something other than what it would match, is
 //! rejected rather than quietly rewritten.
 //!
-//! Regular expressions are RE2-style and matched in linear time, whatever the pattern and
-//! the path. That is the contract; the engine behind it is a detail of this module and
-//! appears nowhere in the crate's interface.
+//! Regular expressions are RE2-style, held to the whole path and matched in linear time,
+//! whatever the pattern and the path ([`RegexError`] says what is refused).
 
-use crate::{NormaliseError, normalise_path};
-use regex::bytes::{Regex, RegexBuilder};
+use crate::whole_regex::WholeRegex;
+use crate::{NormaliseError, RegexError, normalise_path};
 use std::hash::{Hash, Hasher};
 use std::mem::discriminant;
-
-/// The most memory one compiled regex may take. Far more than any sane path pattern needs;
-/// a pattern that repeats large groups a large number of times is refused.
-const REGEX_SIZE_LIMIT: usize = 256 * 1024;
-/// The most memory the engine may use to speed up matching one regex, per thread that
-/// matches it. Going without only makes matching slower, never wrong.
-const REGEX_CACHE_LIMIT: usize = 512 * 1024;
 
 /// A validated path pattern.
 #[derive(Debug, Clone)]
@@ -39,7 +31,7 @@ pub(crate) enum Kind {
     Exact,
     Prefix,
     /// Compiled to match the whole path.
-    Regex(Regex),
+    Regex(WholeRegex),
 }
 
 /// Patterns are what their kind and text say; a compiled regex adds nothing to that.
@@ -101,14 +93,8 @@ impl PathPattern {
     /// Returns a [`PathPatternError`] if `pattern` is not ASCII, not valid syntax, or
     /// compiles to something unreasonably large.
     pub fn regex(pattern: &str) -> Result<Self, PathPatternError> {
-        if !pattern.is_ascii() {
-            return Err(PathPatternError::RegexNotAscii);
-        }
-        // On its own first: a pattern such as `a)|(b` must not be able to close the group
-        // that holds it to the whole path, and syntax errors should quote the user's text.
-        compile(pattern)?;
         Ok(Self {
-            kind: Kind::Regex(compile(&format!("^(?:{pattern})$"))?),
+            kind: Kind::Regex(WholeRegex::new(pattern)?),
             path: pattern.into(),
         })
     }
@@ -133,20 +119,6 @@ impl PathPattern {
             Kind::Regex(regex) => path.starts_with('/') && regex.is_match(path.as_bytes()),
         }
     }
-}
-
-/// Compiles with the limits and the dialect of the contract. Unicode support is off, as in
-/// RE2's defaults: `\d` and `\w` are the ASCII classes, and normalised paths are ASCII.
-fn compile(pattern: &str) -> Result<Regex, PathPatternError> {
-    RegexBuilder::new(pattern)
-        .unicode(false)
-        .size_limit(REGEX_SIZE_LIMIT)
-        .dfa_size_limit(REGEX_CACHE_LIMIT)
-        .build()
-        .map_err(|error| match error {
-            regex::Error::CompiledTooBig(_) => PathPatternError::RegexTooLarge,
-            other => PathPatternError::RegexSyntax(other.to_string()),
-        })
 }
 
 /// The pattern text in the normal form request paths have: structure checked, not changed;
@@ -189,16 +161,9 @@ pub enum PathPatternError {
     /// The path is one that a request would be rejected for, so nothing could match it.
     #[error(transparent)]
     Ambiguous(#[from] NormaliseError),
-    /// The regular expression is not valid RE2-style syntax; the text says what is wrong.
-    #[error("invalid regular expression: {0}")]
-    RegexSyntax(String),
-    /// The regular expression contains something other than ASCII, which no normalised
-    /// path does.
-    #[error("regular expression is not ASCII; write other characters percent-encoded")]
-    RegexNotAscii,
-    /// The regular expression compiles to more than the size allowed for one pattern.
-    #[error("regular expression is too large once compiled")]
-    RegexTooLarge,
+    /// The regular expression is outside the contract.
+    #[error(transparent)]
+    Regex(#[from] RegexError),
 }
 
 #[cfg(test)]
@@ -364,30 +329,6 @@ mod tests {
     }
 
     #[test]
-    fn anchors_the_user_writes_change_nothing() {
-        let user = regex(r"^/users/\d+$");
-        assert!(user.matches("/users/42"));
-        assert!(!user.matches("/users/42/edit"));
-        assert!(!user.matches("/x/users/42"));
-    }
-
-    #[test]
-    fn every_branch_of_an_alternation_is_held_to_the_whole_path() {
-        let either = regex("/a|/ab");
-        assert!(either.matches("/a"));
-        assert!(either.matches("/ab"));
-        assert!(!either.matches("/abc"));
-        assert!(!either.matches("/x/a"));
-    }
-
-    #[test]
-    fn regex_pattern_is_case_sensitive_unless_it_says_otherwise() {
-        assert!(regex("/shop").matches("/shop"));
-        assert!(!regex("/shop").matches("/Shop"));
-        assert!(regex("(?i)/shop").matches("/SHOP"));
-    }
-
-    #[test]
     fn regex_pattern_sees_the_normalised_path() {
         assert!(regex(r"/caf%C3%A9/\d+").matches("/caf%C3%A9/7"));
         assert!(regex("/[^/]+/menu").matches("/caf%C3%A9/menu"));
@@ -413,34 +354,15 @@ mod tests {
     }
 
     #[test]
-    fn regex_patterns_outside_the_contract_are_rejected() {
-        // Broken syntax, an attempt to break out of the anchoring, and the two features
-        // that cannot be matched in linear time: look-around and backreferences.
-        for pattern in ["/a(", "/a)|(/b", "/a(?=b)", r"/(a)\1"] {
-            assert!(
-                matches!(
-                    PathPattern::regex(pattern),
-                    Err(PathPatternError::RegexSyntax(_))
-                ),
-                "{pattern:?}"
-            );
-        }
+    fn regex_patterns_outside_the_contract_are_rejected_with_the_reason() {
         assert_eq!(
             PathPattern::regex("/café"),
-            Err(PathPatternError::RegexNotAscii)
+            Err(PathPatternError::Regex(RegexError::NotAscii))
         );
-        assert_eq!(
-            PathPattern::regex("(?:/[a-z]{1,500}){1,500}"),
-            Err(PathPatternError::RegexTooLarge)
-        );
-    }
-
-    #[test]
-    fn hostile_pattern_and_path_are_matched_in_linear_time() {
-        // Catastrophic for a backtracking engine; a test that finishes is the assertion.
-        let pattern = regex("/(a+)+b");
-        let path = format!("/{}", "a".repeat(100_000));
-        assert!(!pattern.matches(&path));
+        assert!(matches!(
+            PathPattern::regex("/a)|(/b"),
+            Err(PathPatternError::Regex(RegexError::Syntax(_)))
+        ));
     }
 
     #[test]

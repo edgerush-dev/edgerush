@@ -20,9 +20,11 @@ pub mod path_index;
 pub mod reference;
 #[cfg(test)]
 mod strategies;
+mod whole_regex;
 
 pub use host::{HostPattern, HostPatternError, WildcardLabels};
 pub use host_index::{HostClaim, HostIndex};
 pub use normalise::{NormaliseError, normalise_path};
 pub use path::{PathPattern, PathPatternError};
 pub use path_index::{PathCandidates, PathIndex};
+pub use whole_regex::RegexError;
