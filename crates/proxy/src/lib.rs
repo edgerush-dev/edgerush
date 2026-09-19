@@ -4,8 +4,8 @@
 //! goes, on plain `http` types, whatever protocol the request came in by. Around it — and
 //! nowhere else in EdgeRush — is the code that touches the HTTP engine.
 //!
-//! So far: the request core, and [`Proxy`], which serves listeners and forwards to
-//! upstreams over HTTP/1.1.
+//! So far: the request core, and [`Proxy`], which serves listeners, forwards to upstreams
+//! over HTTP/1.1 and takes a new config while it runs without dropping a request.
 
 mod hop_by_hop;
 pub mod host;

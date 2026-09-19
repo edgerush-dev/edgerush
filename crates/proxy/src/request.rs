@@ -18,12 +18,15 @@ use http::request::Parts;
 use http::uri::PathAndQuery;
 use http::{StatusCode, Uri};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 /// Where a request goes.
 #[derive(Debug, Clone, Copy)]
 pub struct Forward<'a> {
-    /// The rule the request belongs to, for what is still to be done to its response.
-    pub rule: &'a CompiledRule,
+    /// The rule the request belongs to, for what is still to be done to its response. A
+    /// request that is still under way when the config changes keeps its rule, and only
+    /// its rule, alive.
+    pub rule: &'a Arc<CompiledRule>,
     /// The upstream chosen among the rule's backends: its position in the snapshot's list.
     pub upstream: UpstreamId,
 }

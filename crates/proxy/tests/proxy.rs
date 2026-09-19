@@ -11,7 +11,7 @@
     reason = "test set-up: the helpers around the tests fail them the way the tests would"
 )]
 
-use edgerush_config::{Config, compile};
+use edgerush_config::{Compiled, Config, compile};
 use edgerush_proxy::Proxy;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
@@ -22,11 +22,12 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -91,15 +92,56 @@ async fn dead_endpoint() -> SocketAddr {
 /// Starts a proxy for the config, with every listener on a port of its own choosing; the
 /// addresses by the listeners' names.
 async fn proxy(yaml: &str) -> BTreeMap<String, SocketAddr> {
-    let config: Config = serde_saphyr::from_str(yaml).unwrap();
-    let proxy = Arc::new(Proxy::new(compile(&config).unwrap()).unwrap());
+    reloadable_proxy(yaml).await.1
+}
+
+/// The same, with the proxy itself for reloading it.
+async fn reloadable_proxy(yaml: &str) -> (Arc<Proxy>, BTreeMap<String, SocketAddr>) {
+    let proxy = Arc::new(Proxy::new(compiled(yaml)).unwrap());
     let mut addresses = BTreeMap::new();
-    for (position, listener) in proxy.snapshot().listeners.iter().enumerate() {
+    for (position, listener) in proxy.listeners().iter().enumerate() {
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        addresses.insert(listener.name.clone(), socket.local_addr().unwrap());
+        addresses.insert(listener.clone(), socket.local_addr().unwrap());
         tokio::spawn(Arc::clone(&proxy).serve(position, socket));
     }
-    addresses
+    (proxy, addresses)
+}
+
+fn compiled(yaml: &str) -> Compiled {
+    let config: Config = serde_saphyr::from_str(yaml).unwrap();
+    compile(&config).unwrap()
+}
+
+/// A config with the named listeners, each sending every request to the upstream it is
+/// paired with and saying which config it is in an `x-config` field of the response.
+fn everything_to(listeners: &[(&str, SocketAddr)], config: &str) -> String {
+    let mut yaml = String::from("listeners:\n");
+    for (at, (listener, _)) in listeners.iter().enumerate() {
+        yaml += &format!("  {listener}: {{ address: \"127.0.0.1:{at}\", protocol: http }}\n");
+    }
+    yaml += "routes:\n";
+    for (listener, _) in listeners {
+        yaml += &format!(
+            r#"  - name: {listener}
+    listeners: [{listener}]
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: / }}
+        filters:
+          - type: response_header_modifier
+            set: [{{ name: x-config, value: "{config}" }}]
+        backends:
+          - {{ upstream: {listener}, weight: 1 }}
+"#
+        );
+    }
+    yaml += "upstreams:\n";
+    for (listener, upstream) in listeners {
+        yaml += &format!("  {listener}: {{ endpoints: [\"{upstream}\"] }}\n");
+    }
+    yaml
 }
 
 /// A shop with a cart, as far as the tests share a config.
@@ -176,7 +218,15 @@ fn get(proxy: SocketAddr, target: &str) -> Request<ClientBody> {
 /// Sends the request and reads the whole answer: status, headers and body as text.
 async fn send(request: Request<ClientBody>) -> (StatusCode, HeaderMap, String) {
     let http2 = request.version() == Version::HTTP_2;
-    let response = within(client(http2).request(request)).await.unwrap();
+    send_with(&client(http2), request).await
+}
+
+/// The same with a client of the caller's, whose connections are kept between requests.
+async fn send_with(
+    client: &Client<HttpConnector, ClientBody>,
+    request: Request<ClientBody>,
+) -> (StatusCode, HeaderMap, String) {
+    let response = within(client.request(request)).await.unwrap();
     let (head, body) = response.into_parts();
     let body = within(body.collect()).await.unwrap().to_bytes();
     (
@@ -504,4 +554,81 @@ async fn a_connection_header_that_would_take_the_host_away_is_rejected() {
     let request = "GET /about HTTP/1.1\r\nHost: shop.example.com\r\nConnection: close\r\n\r\n";
     let answer = raw(proxy, request).await;
     assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_under_load_drops_nothing() {
+    let (old, new) = (upstream("old").await, upstream("new").await);
+    let (proxy, addresses) = reloadable_proxy(&everything_to(&[("web", old)], "0")).await;
+    let web = addresses["web"];
+
+    // Clients that ask as fast as they are answered, each on a connection it keeps.
+    let stop = Arc::new(AtomicBool::new(false));
+    let clients: Vec<_> = (0..8)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let client = client(false);
+                let (mut answered, mut upstreams) = (0_u32, BTreeSet::new());
+                while !stop.load(Ordering::Relaxed) {
+                    let (status, headers, _) = send_with(&client, get(web, "/")).await;
+                    assert_eq!(status, 200, "after {answered} requests");
+                    assert!(headers.contains_key("x-config"));
+                    upstreams.insert(headers["x-upstream"].to_str().unwrap().to_owned());
+                    answered += 1;
+                }
+                (answered, upstreams)
+            })
+        })
+        .collect();
+
+    // Meanwhile the config changes back and forth, and ends at the new upstream.
+    for round in 1..=51 {
+        let upstream = if round % 2 == 1 { new } else { old };
+        let config = everything_to(&[("web", upstream)], &round.to_string());
+        proxy.reload(compiled(&config)).unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // A reload is whole at once: the first request after it is served by the new config.
+    let (status, headers, _) = send(get(web, "/")).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["x-upstream"], "new");
+    assert_eq!(headers["x-config"], "51");
+
+    stop.store(true, Ordering::Relaxed);
+    let mut seen = BTreeSet::new();
+    for client in clients {
+        let (answered, upstreams) = within(client).await.unwrap();
+        assert!(answered > 0);
+        seen.extend(upstreams);
+    }
+    assert_eq!(seen.into_iter().collect::<Vec<_>>(), ["new", "old"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listener_keeps_its_socket_whatever_happens_to_the_listeners_around_it() {
+    let (first, second, admin) = (
+        upstream("first").await,
+        upstream("second").await,
+        upstream("admin").await,
+    );
+    let (proxy, addresses) = reloadable_proxy(&everything_to(&[("web", first)], "0")).await;
+    let web = addresses["web"];
+    assert_eq!(send(get(web, "/")).await.1["x-upstream"], "first");
+
+    // A listener that sorts before it moves it down the list; its socket stays its own.
+    let with_admin = everything_to(&[("admin", admin), ("web", second)], "1");
+    proxy.reload(compiled(&with_admin)).unwrap();
+    assert_eq!(send(get(web, "/")).await.1["x-upstream"], "second");
+
+    // Without the listener in the config there is no route for what comes in on its socket.
+    proxy
+        .reload(compiled(&everything_to(&[("admin", admin)], "2")))
+        .unwrap();
+    assert_eq!(send(get(web, "/")).await.0, StatusCode::NOT_FOUND);
+
+    proxy
+        .reload(compiled(&everything_to(&[("web", first)], "3")))
+        .unwrap();
+    assert_eq!(send(get(web, "/")).await.1["x-upstream"], "first");
 }

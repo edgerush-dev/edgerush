@@ -17,6 +17,7 @@ use http::Method;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 /// Which rule a request was routed to: positions in the list of routes and in the route's
 /// list of rules.
@@ -35,14 +36,15 @@ pub struct Compiled {
     pub listeners: Vec<CompiledListener>,
     /// The upstreams, in the order of their names; an [`UpstreamId`] is a position here.
     pub upstreams: Vec<CompiledUpstream>,
-    /// By position of the route, then of the rule.
-    rules: Vec<Vec<CompiledRule>>,
+    /// By position of the route, then of the rule. Each is shared on its own, so that a
+    /// request can hold on to its rule without holding on to the whole config.
+    rules: Vec<Vec<Arc<CompiledRule>>>,
 }
 
 impl Compiled {
     /// What to do with a request that was routed to `id`.
     #[must_use]
-    pub fn rule(&self, id: RuleId) -> Option<&CompiledRule> {
+    pub fn rule(&self, id: RuleId) -> Option<&Arc<CompiledRule>> {
         self.rules.get(id.route)?.get(id.rule)
     }
 
@@ -173,11 +175,11 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                 }
             }
             let (request_headers, response_headers) = filters(rule, &place, &mut errors);
-            compiled_rules.push(CompiledRule {
+            compiled_rules.push(Arc::new(CompiledRule {
                 request_headers,
                 response_headers,
                 backends: backends(rule, &upstream_ids, &place, &mut errors),
-            });
+            }));
         }
         rules.push(compiled_rules);
     }

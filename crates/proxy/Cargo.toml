@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+arc-swap.workspace = true
 edgerush-config.workspace = true
 edgerush-router.workspace = true
 http.workspace = true

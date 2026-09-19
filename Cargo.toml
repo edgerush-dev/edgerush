@@ -10,6 +10,8 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+# Publishing a config to the request path without a lock: readers never wait.
+arc-swap = "1.9"
 edgerush-config = { path = "crates/config" }
 edgerush-filters = { path = "crates/filters" }
 edgerush-router = { path = "crates/router" }
