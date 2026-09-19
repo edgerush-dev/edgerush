@@ -8,4 +8,4 @@
 
 mod header_modifier;
 
-pub use header_modifier::{HeaderModifier, HeaderModifierError};
+pub use header_modifier::{HeaderModifier, HeaderModifierError, RESERVED};

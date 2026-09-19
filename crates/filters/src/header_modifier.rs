@@ -4,8 +4,27 @@
 //! had; `remove` takes the header away. Names are case-insensitive. The spec does not say
 //! what a header named in more than one of the three, or twice in one, should come to — so
 //! that is not accepted, and the order in which the three are carried out can never matter.
+//!
+//! Some headers are the gateway's own and no modifier may name them ([`RESERVED`]). `Host`
+//! says where a request was routed; a rule that wants another host for the upstream needs a
+//! rewrite of the host, which changes the target with it. The others describe the connection
+//! and the framing of the message on it, which the gateway makes anew on either side: a
+//! `Transfer-Encoding` or `Content-Length` out of step with the body that is really sent is
+//! how requests are smuggled. The spec is silent on all of this.
 
-use http::header::{HeaderMap, HeaderName, HeaderValue};
+use http::header::{self, HeaderMap, HeaderName, HeaderValue};
+
+/// The headers no modifier may set, add or remove.
+pub const RESERVED: [HeaderName; 8] = [
+    header::HOST,
+    header::CONNECTION,
+    HeaderName::from_static("keep-alive"),
+    HeaderName::from_static("proxy-connection"),
+    header::TE,
+    header::TRANSFER_ENCODING,
+    header::UPGRADE,
+    header::CONTENT_LENGTH,
+];
 
 /// A validated set of changes to a header map.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -20,9 +39,9 @@ impl HeaderModifier {
     ///
     /// # Errors
     ///
-    /// Returns a [`HeaderModifierError`] for a name that is not a header name, a value that
-    /// no header could have (empty, white space at either end, control characters), or a
-    /// header that is named more than once.
+    /// Returns a [`HeaderModifierError`] for a name that is not a header name or is
+    /// [`RESERVED`], a value that no header could have (empty, white space at either end,
+    /// control characters), or a header that is named more than once.
     pub fn new<'a>(
         set: impl IntoIterator<Item = (&'a str, &'a str)>,
         add: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -67,6 +86,9 @@ impl Named {
     fn once(&mut self, name: &str) -> Result<HeaderName, HeaderModifierError> {
         let parsed = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| HeaderModifierError::InvalidName(name.to_owned()))?;
+        if RESERVED.contains(&parsed) {
+            return Err(HeaderModifierError::Reserved(parsed.to_string()));
+        }
         if self.0.contains(&parsed) {
             return Err(HeaderModifierError::NamedTwice(parsed.to_string()));
         }
@@ -99,6 +121,9 @@ pub enum HeaderModifierError {
     /// Not a valid header name.
     #[error("`{0}` is not a header name")]
     InvalidName(String),
+    /// One of the gateway's own headers ([`RESERVED`]).
+    #[error("header `{0}` is the gateway's own and cannot be modified")]
+    Reserved(String),
     /// Not something a header could have as its value.
     #[error("the value for header `{0}` is not a header value")]
     InvalidValue(String),
@@ -246,6 +271,54 @@ mod tests {
         );
         assert_eq!(HeaderModifier::new([("x-a", "1")], [], ["x-a"]), twice);
         assert_eq!(HeaderModifier::new([], [("x-a", "1")], ["x-a"]), twice);
+    }
+
+    #[test]
+    fn headers_that_are_the_gateways_own_are_rejected() {
+        for name in [
+            "host",
+            "Host",
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "te",
+            "Transfer-Encoding",
+            "upgrade",
+            "content-length",
+        ] {
+            let reserved = Err(HeaderModifierError::Reserved(name.to_ascii_lowercase()));
+            assert_eq!(
+                HeaderModifier::new([(name, "1")], [], []),
+                reserved,
+                "{name}"
+            );
+            assert_eq!(
+                HeaderModifier::new([], [(name, "1")], []),
+                reserved,
+                "{name}"
+            );
+            assert_eq!(HeaderModifier::new([], [], [name]), reserved, "{name}");
+        }
+        // HTTP/2's pseudo-headers are no header names at all, to remove as little as to set.
+        for name in [":authority", ":path"] {
+            let invalid = Err(HeaderModifierError::InvalidName(name.to_owned()));
+            assert_eq!(HeaderModifier::new([], [], [name]), invalid, "{name}");
+        }
+    }
+
+    #[test]
+    fn headers_about_forwarding_and_content_are_not_reserved() {
+        let names = [
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "content-type",
+            "trailer",
+            "authorization",
+        ];
+        for name in names {
+            assert!(HeaderModifier::new([(name, "1")], [], []).is_ok(), "{name}");
+            assert!(HeaderModifier::new([], [], [name]).is_ok(), "{name}");
+        }
     }
 
     #[test]

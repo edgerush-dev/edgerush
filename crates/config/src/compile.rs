@@ -775,6 +775,29 @@ upstreams:
     }
 
     #[test]
+    fn a_modifier_may_not_name_the_gateways_own_headers() {
+        let reserved = SHOP.replace("remove: [x-debug]", "remove: [Host]").replace(
+            "add: [{ name: cache-control, value: no-store }]",
+            "add: [{ name: Transfer-Encoding, value: chunked }]",
+        );
+        let errors: Vec<String> = compile(&config(&reserved))
+            .err()
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                "route `shop`, rules[1], filters[0]: header `host` is the gateway's own and \
+                 cannot be modified",
+                "route `shop`, rules[1], filters[1]: header `transfer-encoding` is the \
+                 gateway's own and cannot be modified",
+            ]
+        );
+    }
+
+    #[test]
     fn the_order_of_routes_is_the_last_tie_breaker() {
         let twins = r#"
 listeners: { web: { address: "[::]:8080", protocol: http } }
