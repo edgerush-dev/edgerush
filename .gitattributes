@@ -1,0 +1,3 @@
+# Store and check out text files with LF on every platform, so files are byte-identical
+# on Windows, Linux and CI.
+* text=auto eol=lf
