@@ -43,12 +43,26 @@ pub enum Wildcard {
     AnyLabels,
 }
 
-/// A rule: the requests it is for. What it does with them (filters, backends) is to come.
+/// A rule: the requests it is for and where they go. What is done to them on the way
+/// (filters) is to come.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     /// The rule is for a request that satisfies any one of these. At least one.
     pub matches: Vec<Match>,
+    /// Where requests go, in proportion to the weights. At least one.
+    pub backends: Vec<Backend>,
+}
+
+/// One destination of a rule.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Backend {
+    /// The name of an upstream in the same config.
+    pub upstream: String,
+    /// This backend's share of the rule's requests, relative to the other weights. Zero
+    /// is no share; if all are zero the rule has nowhere to send a request.
+    pub weight: u32,
 }
 
 /// One way for a request to belong to a rule: all of what is stated here must hold.

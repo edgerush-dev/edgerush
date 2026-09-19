@@ -104,6 +104,8 @@ version = "0.0.0"
 dependencies = [
  "edgerush-router",
  "http",
+ "iai-callgrind",
+ "proptest",
  "serde",
  "serde-saphyr",
  "thiserror",

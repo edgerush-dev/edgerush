@@ -14,8 +14,14 @@ serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+iai-callgrind.workspace = true
+proptest.workspace = true
 # Fixtures are written the way harness files are. The crate itself knows no format.
 serde-saphyr.workspace = true
+
+[[bench]]
+name = "backends"
+harness = false
 
 [lints]
 workspace = true

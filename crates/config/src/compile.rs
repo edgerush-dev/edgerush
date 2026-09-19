@@ -1,101 +1,165 @@
-//! From routes as the model states them to a router: everything is checked, and every
-//! problem is reported with its place, not only the first.
+//! From a config as the model states it to what a data plane runs: everything is checked,
+//! names are resolved to positions, and every problem is reported with its place, not only
+//! the first.
 
+use crate::backends::{UpstreamId, WeightedBackends};
 use crate::route::{Hostname, Match, PathMatch, Route, ValueMatch, ValuePredicate, Wildcard};
+use crate::{Config, Rule};
 use edgerush_router::{
     HeaderPredicate, HeaderPredicateError, HeaderPredicates, HostClaim, HostPattern,
     HostPatternError, PathPattern, PathPatternError, QueryPredicate, QueryPredicateError,
     QueryPredicates, RouteMatch, Router, WildcardLabels,
 };
 use http::Method;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::net::SocketAddr;
 
 /// Which rule a request was routed to: positions in the list of routes and in the route's
 /// list of rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RuleId {
-    /// The route's position in the list given to [`compile_routes`].
+    /// The route's position in [`Config::routes`].
     pub route: usize,
     /// The rule's position in the route.
     pub rule: usize,
 }
 
-/// Compiles routes into a router that yields the rule a request belongs to. The order of
-/// the routes, then of the rules, then of a rule's matches is the last tie-breaker of
-/// precedence.
+/// A config compiled: fully resolved and immutable, what a snapshot is made of.
+#[derive(Debug)]
+pub struct Compiled {
+    /// Finds the rule a request belongs to.
+    pub router: Router<RuleId>,
+    /// The upstreams, in the order of their names; an [`UpstreamId`] is a position here.
+    pub upstreams: Vec<CompiledUpstream>,
+    /// By position of the route, then of the rule.
+    rules: Vec<Vec<CompiledRule>>,
+}
+
+impl Compiled {
+    /// What to do with a request that was routed to `id`.
+    #[must_use]
+    pub fn rule(&self, id: RuleId) -> Option<&CompiledRule> {
+        self.rules.get(id.route)?.get(id.rule)
+    }
+
+    /// The upstream a rule's backend stands for.
+    #[must_use]
+    pub fn upstream(&self, id: UpstreamId) -> Option<&CompiledUpstream> {
+        self.upstreams.get(id.0)
+    }
+}
+
+/// What a rule does with its requests.
+#[derive(Debug)]
+pub struct CompiledRule {
+    /// Where they go.
+    pub backends: WeightedBackends,
+}
+
+/// An upstream, with the name it had in the config for logs and metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledUpstream {
+    /// Its name in the config.
+    pub name: String,
+    /// Where to connect.
+    pub endpoints: Vec<SocketAddr>,
+}
+
+/// Compiles a config. The order of the routes, then of the rules, then of a rule's matches
+/// is the last tie-breaker of precedence.
 ///
 /// # Errors
 ///
 /// Returns every problem found, each with its place. Nothing is compiled if there is any:
 /// a data plane keeps running what it has, and a harness does not start.
-pub fn compile_routes(routes: &[Route]) -> Result<Router<RuleId>, Vec<RouteError>> {
+pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
     let mut errors = Vec::new();
+
+    // A `BTreeMap` hands out its names in order, so positions are the same on every pod.
+    let upstream_ids: BTreeMap<&str, UpstreamId> = config
+        .upstreams
+        .keys()
+        .enumerate()
+        .map(|(position, name)| (name.as_str(), UpstreamId(position)))
+        .collect();
+    let upstreams = config
+        .upstreams
+        .iter()
+        .map(|(name, upstream)| CompiledUpstream {
+            name: name.clone(),
+            endpoints: upstream.endpoints.clone(),
+        })
+        .collect();
+
     let mut matches = Vec::new();
+    let mut rules = Vec::new();
     let mut names = HashSet::new();
-
-    for (route_at, route) in routes.iter().enumerate() {
-        let place = Place {
-            route: route.name.clone(),
-            rule: None,
-            matching: None,
-        };
-        let mut report = |place: &Place, problem| {
-            errors.push(RouteError {
-                place: place.clone(),
-                problem,
-            });
-        };
-
+    for (route_at, route) in config.routes.iter().enumerate() {
+        let place = Place::route(&route.name);
         if !names.insert(route.name.as_str()) {
-            report(&place, Problem::DuplicateName);
+            errors.push(place.problem(Problem::DuplicateName));
         }
-        if route.hostnames.is_empty() {
-            report(&place, Problem::NoHostnames);
-        }
-        if route.rules.is_empty() {
-            report(&place, Problem::NoRules);
-        }
-        let mut hosts = Vec::new();
-        for hostname in &route.hostnames {
-            match host_claim(hostname) {
-                Ok(claim) => hosts.push(claim),
-                Err(problem) => report(&place, problem),
-            }
-        }
+        let hosts = host_claims(route, &place, &mut errors);
 
+        let mut compiled_rules = Vec::new();
         for (rule_at, rule) in route.rules.iter().enumerate() {
             let place = Place {
                 rule: Some(rule_at),
                 ..place.clone()
             };
+            let id = RuleId {
+                route: route_at,
+                rule: rule_at,
+            };
             if rule.matches.is_empty() {
-                report(&place, Problem::NoMatches);
+                errors.push(place.problem(Problem::NoMatches));
             }
             for (match_at, matching) in rule.matches.iter().enumerate() {
                 let place = Place {
                     matching: Some(match_at),
                     ..place.clone()
                 };
-                let value = RuleId {
-                    route: route_at,
-                    rule: rule_at,
-                };
-                match route_match(matching, &hosts, value) {
+                match route_match(matching, &hosts, id) {
                     Ok(route_match) => matches.push(route_match),
-                    Err(problems) => problems
-                        .into_iter()
-                        .for_each(|problem| report(&place, problem)),
+                    Err(problems) => {
+                        errors.extend(problems.into_iter().map(|problem| place.problem(problem)));
+                    }
                 }
             }
+            compiled_rules.push(CompiledRule {
+                backends: backends(rule, &upstream_ids, &place, &mut errors),
+            });
         }
+        rules.push(compiled_rules);
     }
 
     if errors.is_empty() {
-        Ok(Router::new(matches))
+        Ok(Compiled {
+            router: Router::new(matches),
+            upstreams,
+            rules,
+        })
     } else {
         Err(errors)
     }
+}
+
+fn host_claims(route: &Route, place: &Place, errors: &mut Vec<ConfigError>) -> Vec<HostClaim<()>> {
+    if route.hostnames.is_empty() {
+        errors.push(place.problem(Problem::NoHostnames));
+    }
+    if route.rules.is_empty() {
+        errors.push(place.problem(Problem::NoRules));
+    }
+    let mut hosts = Vec::new();
+    for hostname in &route.hostnames {
+        match host_claim(hostname) {
+            Ok(claim) => hosts.push(claim),
+            Err(problem) => errors.push(place.problem(problem)),
+        }
+    }
+    hosts
 }
 
 fn host_claim(hostname: &Hostname) -> Result<HostClaim<()>, Problem> {
@@ -140,7 +204,7 @@ fn route_match(
         PathMatch::Prefix(path) => PathPattern::prefix(path),
         PathMatch::Regex(pattern) => PathPattern::regex(pattern),
     }
-    .map_err(|source| problems.push(Problem::Path(source)))
+    .map_err(|reason| problems.push(Problem::Path(reason)))
     .ok();
 
     // Any token is a method to the `http` crate; one in lower case would be a method of its
@@ -198,18 +262,45 @@ fn route_match(
     }
 }
 
-/// A problem in the routes, and where it is.
+fn backends(
+    rule: &Rule,
+    upstream_ids: &BTreeMap<&str, UpstreamId>,
+    place: &Place,
+    errors: &mut Vec<ConfigError>,
+) -> WeightedBackends {
+    if rule.backends.is_empty() {
+        errors.push(place.problem(Problem::NoBackends));
+    }
+    let resolved = rule
+        .backends
+        .iter()
+        .enumerate()
+        .filter_map(|(at, backend)| {
+            let id = upstream_ids.get(backend.upstream.as_str()).copied();
+            if id.is_none() {
+                let place = Place {
+                    backend: Some(at),
+                    ..place.clone()
+                };
+                errors.push(place.problem(Problem::UnknownUpstream(backend.upstream.clone())));
+            }
+            Some((id?, backend.weight))
+        });
+    WeightedBackends::new(resolved.collect::<Vec<_>>())
+}
+
+/// A problem in a config, and where it is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{place}: {problem}")]
-pub struct RouteError {
+pub struct ConfigError {
     /// Where the problem is.
     pub place: Place,
     /// What it is.
     pub problem: Problem,
 }
 
-/// A place in the routes: a route, a rule in it, a match in the rule. Positions count from
-/// zero, as the lists in a file do.
+/// A place in a config: a route, a rule in it, a match or a backend in the rule. Positions
+/// count from zero, as the lists in a file do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Place {
     /// The route's name.
@@ -218,6 +309,26 @@ pub struct Place {
     pub rule: Option<usize>,
     /// The match's position in the rule, if the problem is in a match.
     pub matching: Option<usize>,
+    /// The backend's position in the rule, if the problem is in a backend.
+    pub backend: Option<usize>,
+}
+
+impl Place {
+    fn route(name: &str) -> Self {
+        Self {
+            route: name.to_owned(),
+            rule: None,
+            matching: None,
+            backend: None,
+        }
+    }
+
+    fn problem(&self, problem: Problem) -> ConfigError {
+        ConfigError {
+            place: self.clone(),
+            problem,
+        }
+    }
 }
 
 impl fmt::Display for Place {
@@ -229,11 +340,14 @@ impl fmt::Display for Place {
         if let Some(matching) = self.matching {
             write!(f, ", matches[{matching}]")?;
         }
+        if let Some(backend) = self.backend {
+            write!(f, ", backends[{backend}]")?;
+        }
         Ok(())
     }
 }
 
-/// What is wrong with a route.
+/// What is wrong.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Problem {
     /// Another route has the same name.
@@ -248,6 +362,12 @@ pub enum Problem {
     /// The rule is for no request.
     #[error("no matches; any path is `{{ prefix: / }}`")]
     NoMatches,
+    /// The rule sends its requests nowhere.
+    #[error("no backends")]
+    NoBackends,
+    /// The backend names an upstream the config does not have.
+    #[error("there is no upstream `{0}`")]
+    UnknownUpstream(String),
     /// The hostname is not valid.
     #[error("hostname `{name}`: {reason}")]
     Hostname {
@@ -292,16 +412,16 @@ mod tests {
     use edgerush_router::RequestParts;
     use http::HeaderMap;
 
-    fn routes(yaml: &str) -> Vec<Route> {
+    fn config(yaml: &str) -> Config {
         serde_saphyr::from_str(yaml).unwrap()
     }
 
-    fn route(router: &Router<RuleId>, host: &str, target: &str) -> Option<(usize, usize)> {
-        route_with(router, "GET", host, target, &[])
+    fn route(compiled: &Compiled, host: &str, target: &str) -> Option<(usize, usize)> {
+        route_with(compiled, "GET", host, target, &[])
     }
 
     fn route_with(
-        router: &Router<RuleId>,
+        compiled: &Compiled,
         method: &str,
         host: &str,
         target: &str,
@@ -312,7 +432,8 @@ mod tests {
         for (name, value) in fields {
             headers.append(*name, value.parse().unwrap());
         }
-        router
+        compiled
+            .router
             .route(&RequestParts {
                 host,
                 path,
@@ -324,38 +445,48 @@ mod tests {
     }
 
     const SHOP: &str = r#"
-- name: shop
-  hostnames:
-    - { name: shop.example.com, falls_through: true }
-    - { name: "*.shop.example.com", wildcard: any_labels, falls_through: true }
-  rules:
-    - matches:
-        - path: { exact: /checkout }
-          method: POST
-        - path: { prefix: /cart }
-          headers: [{ name: X-Beta, value: { exact: "on" } }]
-          query: [{ name: tenant, value: { regex: "[a-z]+" } }]
-    - matches:
-        - path: { regex: "/orders/[0-9]+" }
-        - path: { prefix: / }
-- name: everything-else
-  hostnames: [{ name: "*", falls_through: true }]
-  rules:
-    - matches: [{ path: { prefix: / } }]
+routes:
+  - name: shop
+    hostnames:
+      - { name: shop.example.com, falls_through: true }
+      - { name: "*.shop.example.com", wildcard: any_labels, falls_through: true }
+    rules:
+      - matches:
+          - path: { exact: /checkout }
+            method: POST
+          - path: { prefix: /cart }
+            headers: [{ name: X-Beta, value: { exact: "on" } }]
+            query: [{ name: tenant, value: { regex: "[a-z]+" } }]
+        backends:
+          - { upstream: checkout, weight: 9 }
+          - { upstream: checkout-canary, weight: 1 }
+      - matches:
+          - path: { regex: "/orders/[0-9]+" }
+          - path: { prefix: / }
+        backends: [{ upstream: web, weight: 1 }]
+  - name: everything-else
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        backends: [{ upstream: web, weight: 1 }]
+upstreams:
+  web: { endpoints: ["127.0.0.1:9000"] }
+  checkout: { endpoints: ["127.0.0.1:9001", "[::1]:9001"] }
+  checkout-canary: { endpoints: [] }
 "#;
 
     #[test]
-    fn routes_compile_into_a_router_that_finds_the_rule() {
-        let router = compile_routes(&routes(SHOP)).unwrap();
+    fn a_config_compiles_into_a_router_that_finds_the_rule() {
+        let compiled = compile(&config(SHOP)).unwrap();
         let shop = "shop.example.com";
         assert_eq!(
-            route_with(&router, "POST", shop, "/checkout", &[]),
+            route_with(&compiled, "POST", shop, "/checkout", &[]),
             Some((0, 0))
         );
-        assert_eq!(route(&router, shop, "/checkout"), Some((0, 1)));
+        assert_eq!(route(&compiled, shop, "/checkout"), Some((0, 1)));
         assert_eq!(
             route_with(
-                &router,
+                &compiled,
                 "GET",
                 shop,
                 "/cart/1?tenant=acme",
@@ -363,73 +494,116 @@ mod tests {
             ),
             Some((0, 0))
         );
-        assert_eq!(route(&router, shop, "/cart/1?tenant=acme"), Some((0, 1)));
-        assert_eq!(route(&router, shop, "/orders/42"), Some((0, 1)));
+        assert_eq!(route(&compiled, shop, "/cart/1?tenant=acme"), Some((0, 1)));
+        assert_eq!(route(&compiled, shop, "/orders/42"), Some((0, 1)));
         assert_eq!(
-            route(&router, "eu.west.shop.example.com", "/x"),
+            route(&compiled, "eu.west.shop.example.com", "/x"),
             Some((0, 1))
         );
-        assert_eq!(route(&router, "example.org", "/x"), Some((1, 0)));
+        assert_eq!(route(&compiled, "example.org", "/x"), Some((1, 0)));
+    }
+
+    #[test]
+    fn a_rule_leads_to_its_upstreams_in_proportion_to_the_weights() {
+        let compiled = compile(&config(SHOP)).unwrap();
+        let rule = compiled.rule(RuleId { route: 0, rule: 0 }).unwrap();
+        let picked: Vec<&str> = (0..10)
+            .map(|point| {
+                let upstream = rule.backends.pick(point).unwrap();
+                compiled.upstream(upstream).unwrap().name.as_str()
+            })
+            .collect();
+        assert_eq!(picked[..9], ["checkout"; 9]);
+        assert_eq!(picked[9], "checkout-canary");
+
+        let checkout = compiled
+            .upstreams
+            .iter()
+            .find(|u| u.name == "checkout")
+            .unwrap();
+        let endpoints: Vec<String> = checkout.endpoints.iter().map(ToString::to_string).collect();
+        assert_eq!(endpoints, ["127.0.0.1:9001", "[::1]:9001"]);
+        // An upstream may have nowhere to connect: that is a state, not a mistake.
+        let canary = compiled
+            .upstreams
+            .iter()
+            .find(|u| u.name == "checkout-canary")
+            .unwrap();
+        assert!(canary.endpoints.is_empty());
+
+        assert!(compiled.rule(RuleId { route: 0, rule: 2 }).is_none());
+        assert!(compiled.rule(RuleId { route: 2, rule: 0 }).is_none());
     }
 
     #[test]
     fn the_order_of_routes_is_the_last_tie_breaker() {
         let twins = r#"
-- name: older
-  hostnames: [{ name: a.example.com, falls_through: true }]
-  rules: [{ matches: [{ path: { prefix: /api } }] }]
-- name: younger
-  hostnames: [{ name: a.example.com, falls_through: true }]
-  rules: [{ matches: [{ path: { prefix: /api } }] }]
+routes:
+  - name: older
+    hostnames: [{ name: a.example.com, falls_through: true }]
+    rules: [{ matches: [{ path: { prefix: /api } }], backends: [{ upstream: u, weight: 1 }] }]
+  - name: younger
+    hostnames: [{ name: a.example.com, falls_through: true }]
+    rules: [{ matches: [{ path: { prefix: /api } }], backends: [{ upstream: u, weight: 1 }] }]
+upstreams: { u: { endpoints: [] } }
 "#;
-        let router = compile_routes(&routes(twins)).unwrap();
-        assert_eq!(route(&router, "a.example.com", "/api/x"), Some((0, 0)));
+        let compiled = compile(&config(twins)).unwrap();
+        assert_eq!(route(&compiled, "a.example.com", "/api/x"), Some((0, 0)));
     }
 
     #[test]
     fn wildcard_kind_and_fall_through_are_what_the_hostname_says() {
         let ingress_style = r#"
-- name: wildcard
-  hostnames: [{ name: "*.example.com", wildcard: one_label, falls_through: false }]
-  rules: [{ matches: [{ path: { prefix: /shared } }] }]
-- name: exact
-  hostnames: [{ name: a.example.com, wildcard: any_labels, falls_through: false }]
-  rules: [{ matches: [{ path: { prefix: /own } }] }]
+routes:
+  - name: wildcard
+    hostnames: [{ name: "*.example.com", wildcard: one_label, falls_through: false }]
+    rules: [{ matches: [{ path: { prefix: /shared } }], backends: [{ upstream: u, weight: 1 }] }]
+  - name: exact
+    hostnames: [{ name: a.example.com, wildcard: any_labels, falls_through: false }]
+    rules: [{ matches: [{ path: { prefix: /own } }], backends: [{ upstream: u, weight: 1 }] }]
+upstreams: { u: { endpoints: [] } }
 "#;
-        let router = compile_routes(&routes(ingress_style)).unwrap();
-        assert_eq!(route(&router, "b.example.com", "/shared"), Some((0, 0)));
-        assert_eq!(route(&router, "x.b.example.com", "/shared"), None);
-        assert_eq!(route(&router, "a.example.com", "/own"), Some((1, 0)));
-        assert_eq!(route(&router, "a.example.com", "/shared"), None);
+        let compiled = compile(&config(ingress_style)).unwrap();
+        assert_eq!(route(&compiled, "b.example.com", "/shared"), Some((0, 0)));
+        assert_eq!(route(&compiled, "x.b.example.com", "/shared"), None);
+        assert_eq!(route(&compiled, "a.example.com", "/own"), Some((1, 0)));
+        assert_eq!(route(&compiled, "a.example.com", "/shared"), None);
 
         let gateway_style = ingress_style
             .replace("one_label", "any_labels")
             .replace("falls_through: false", "falls_through: true");
-        let router = compile_routes(&routes(&gateway_style)).unwrap();
-        assert_eq!(route(&router, "x.b.example.com", "/shared"), Some((0, 0)));
-        assert_eq!(route(&router, "a.example.com", "/shared"), Some((0, 0)));
+        let compiled = compile(&config(&gateway_style)).unwrap();
+        assert_eq!(route(&compiled, "x.b.example.com", "/shared"), Some((0, 0)));
+        assert_eq!(route(&compiled, "a.example.com", "/shared"), Some((0, 0)));
     }
 
     #[test]
     fn every_problem_is_reported_with_its_place() {
         let broken = r#"
-- name: a
-  hostnames: []
-  rules: []
-- name: a
-  hostnames:
-    - { name: "*.example.com", falls_through: true }
-    - { name: "exa mple.com", falls_through: true }
-  rules:
-    - matches: []
-    - matches:
-        - path: { prefix: /ok }
-        - path: { exact: no-slash }
-          method: get
-          headers: [{ name: "x y", value: { exact: "1" } }]
-          query: [{ name: "", value: { regex: "(" } }]
+routes:
+  - name: a
+    hostnames: []
+    rules: []
+  - name: a
+    hostnames:
+      - { name: "*.example.com", falls_through: true }
+      - { name: "exa mple.com", falls_through: true }
+    rules:
+      - matches: []
+        backends: []
+      - matches:
+          - path: { prefix: /ok }
+          - path: { exact: no-slash }
+            method: get
+            headers: [{ name: "x y", value: { exact: "1" } }]
+            query: [{ name: "", value: { regex: "(" } }]
+        backends:
+          - { upstream: web, weight: 1 }
+          - { upstream: wbe, weight: 1 }
+upstreams:
+  web: { endpoints: [] }
 "#;
-        let errors: Vec<String> = compile_routes(&routes(broken))
+        let errors: Vec<String> = compile(&config(broken))
             .err()
             .unwrap()
             .iter()
@@ -445,35 +619,46 @@ mod tests {
                  `one_label` or `any_labels`",
                 "route `a`: hostname `exa mple.com`: hostname contains invalid character ' '",
                 "route `a`, rules[0]: no matches; any path is `{ prefix: / }`",
+                "route `a`, rules[0]: no backends",
                 "route `a`, rules[1], matches[1]: path: path does not start with `/`",
                 "route `a`, rules[1], matches[1]: method `get` is not an HTTP method in upper \
                  case",
                 "route `a`, rules[1], matches[1]: header `x y`: invalid header name",
                 "route `a`, rules[1], matches[1]: query parameter ``: query parameter name is \
                  empty",
+                "route `a`, rules[1], backends[1]: there is no upstream `wbe`",
             ]
         );
     }
 
     #[test]
     fn there_is_no_shorthand_and_nothing_unknown_is_let_through() {
-        let parse = |yaml: &str| serde_saphyr::from_str::<Vec<Route>>(yaml).map(|_| ());
+        let parse = |routes: &str| {
+            let yaml = format!("routes: {routes}\nupstreams: {{}}\n");
+            serde_saphyr::from_str::<Config>(&yaml).map(|_| ())
+        };
+        assert!(parse("[{ name: a, hostnames: [], rules: [] }]").is_ok());
         // A hostname is always the full statement.
-        assert!(parse("- { name: a, hostnames: [a.example.com], rules: [] }").is_err());
-        assert!(parse("- { name: a, hostnames: [{ name: a.example.com }], rules: [] }").is_err());
-        // A match always states its path.
-        assert!(
-            parse("- { name: a, hostnames: [], rules: [{ matches: [{ method: GET }] }] }").is_err()
-        );
+        assert!(parse("[{ name: a, hostnames: [a.example.com], rules: [] }]").is_err());
+        assert!(parse("[{ name: a, hostnames: [{ name: a.example.com }], rules: [] }]").is_err());
+        // A match always states its path, a backend its weight.
+        let rule = |rule: &str| format!("[{{ name: a, hostnames: [], rules: [{rule}] }}]");
+        assert!(parse(&rule("{ matches: [], backends: [] }")).is_ok());
+        assert!(parse(&rule("{ matches: [{ method: GET }], backends: [] }")).is_err());
+        assert!(parse(&rule("{ matches: [], backends: [{ upstream: u }] }")).is_err());
+        assert!(parse(&rule("{ matches: [] }")).is_err());
         // Misspelt keys are errors, not silence.
-        assert!(parse("- { name: a, hostnames: [], rules: [], rulez: [] }").is_err());
-        assert!(
-            parse("- { name: a, hostnames: [], rules: [{ matches: [], filter: [] }] }").is_err()
-        );
-        assert!(
-            parse("- { name: a, hostnames: [], rules: [{ matches: [{ path: { glob: /a } }] }] }")
-                .is_err()
-        );
-        assert!(parse("- { name: a, hostnames: [], rules: [] }").is_ok());
+        assert!(parse("[{ name: a, hostnames: [], rules: [], rulez: [] }]").is_err());
+        assert!(parse(&rule("{ matches: [], backends: [], filter: [] }")).is_err());
+        assert!(parse(&rule("{ matches: [{ path: { glob: /a } }], backends: [] }")).is_err());
+        // An endpoint is an address, not a name.
+        let upstream = |endpoint: &str| {
+            let yaml =
+                format!("routes: []\nupstreams: {{ u: {{ endpoints: [\"{endpoint}\"] }} }}\n");
+            serde_saphyr::from_str::<Config>(&yaml).map(|_| ())
+        };
+        assert!(upstream("10.0.0.1:80").is_ok());
+        assert!(upstream("localhost:80").is_err());
+        assert!(upstream("10.0.0.1").is_err());
     }
 }
