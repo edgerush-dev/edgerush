@@ -1,0 +1,27 @@
+[package]
+name = "edgerush-proxy"
+description = "EdgeRush data plane: the request core, and around it the only code that touches the HTTP engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+edgerush-config.workspace = true
+edgerush-router.workspace = true
+http.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+iai-callgrind.workspace = true
+proptest.workspace = true
+# Fixtures are written the way harness files are.
+serde-saphyr.workspace = true
+
+[[bench]]
+name = "decide"
+harness = false
+
+[lints]
+workspace = true

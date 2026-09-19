@@ -10,6 +10,7 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+edgerush-config = { path = "crates/config" }
 edgerush-filters = { path = "crates/filters" }
 edgerush-router = { path = "crates/router" }
 # Types only (header map, method): the request core works on these, never on an engine's.

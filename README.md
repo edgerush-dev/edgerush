@@ -52,7 +52,8 @@ The first directory is the corpus the fuzzer grows (not kept in git); `fuzz/seed
 few hand-written inputs per target that show it the input format.
 
 Targets compare the real code with the slow reference implementations in the router's
-`reference` module, the same ones the property tests use. An input that fails is saved
+`reference` module, the same ones the property tests use; `request_host` compares with the
+`http` crate's reading instead. An input that fails is saved
 under `fuzz/artifacts/`; fix the bug and add the input to the unit tests. Run a target
 after changing the code it covers. Being outside the workspace, the package is formatted
 on its own: `cargo fmt --manifest-path fuzz/Cargo.toml`.
@@ -63,6 +64,7 @@ on its own: `cargo fmt --manifest-path fuzz/Cargo.toml`.
 crates/edgerush    the binary (operator, control plane and data plane will be subcommands)
 crates/config      the config model and its compilation (`edgerush-config`): pure, format-free
 crates/filters     built-in filters (`edgerush-filters`): pure, on plain `http` types
+crates/proxy       the data plane (`edgerush-proxy`): the request core so far, on plain `http` types
 crates/router      request matching (`edgerush-router`): pure logic, no I/O
 fuzz               fuzz targets (cargo-fuzz; not part of the workspace)
 ```

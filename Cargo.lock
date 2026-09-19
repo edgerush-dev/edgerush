@@ -123,6 +123,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-proxy"
+version = "0.0.0"
+dependencies = [
+ "edgerush-config",
+ "edgerush-router",
+ "http",
+ "iai-callgrind",
+ "proptest",
+ "serde-saphyr",
+ "thiserror",
+]
+
+[[package]]
 name = "edgerush-router"
 version = "0.0.0"
 dependencies = [
