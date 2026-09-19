@@ -112,6 +112,14 @@ dependencies = [
 [[package]]
 name = "edgerush"
 version = "0.0.0"
+dependencies = [
+ "edgerush-config",
+ "edgerush-proxy",
+ "serde-saphyr",
+ "socket2",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "edgerush-config"

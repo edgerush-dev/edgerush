@@ -1,8 +1,12 @@
 //! The EdgeRush binary.
 //!
 //! One executable will carry every role (operator, control plane, data plane) as
-//! subcommands. None of them exist yet: for now the binary only reports its version and
-//! usage, which is enough to prove the workspace, lints, tests and CI end to end.
+//! subcommands. So far there is one: `proxy`, a data plane run from a config file — the
+//! development harness.
+
+mod bind;
+mod config_file;
+mod harness;
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -11,7 +15,10 @@ use std::process::ExitCode;
 const VERSION: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"));
 
 const USAGE: &str = "\
-Usage: edgerush [OPTIONS]
+Usage: edgerush [OPTIONS] [COMMAND]
+
+Commands:
+  proxy  Run a data plane from a config file, without Kubernetes (development harness)
 
 Options:
   -V, --version  Print version
@@ -39,6 +46,7 @@ fn run(
     let written = match args.next().as_deref() {
         None | Some("-h" | "--help") => write!(stdout, "{USAGE}").map(|()| 0),
         Some("-V" | "--version") => writeln!(stdout, "{VERSION}").map(|()| 0),
+        Some("proxy") => return harness::command(args, stdout, stderr),
         Some(other) => {
             write!(stderr, "error: unexpected argument '{other}'\n\n{USAGE}").map(|()| EXIT_USAGE)
         }
