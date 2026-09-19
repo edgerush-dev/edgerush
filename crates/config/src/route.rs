@@ -12,6 +12,8 @@ use serde::Deserialize;
 pub struct Route {
     /// Unique among the routes; what errors, status and metrics refer to.
     pub name: String,
+    /// The names of the listeners whose requests this route is for. At least one.
+    pub listeners: Vec<String>,
     /// The hosts served. At least one: every host has to be asked for by the name `*`.
     pub hostnames: Vec<Hostname>,
     /// The rules, in order. At least one.

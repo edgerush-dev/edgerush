@@ -4,7 +4,7 @@
 
 use crate::backends::{UpstreamId, WeightedBackends};
 use crate::route::{Hostname, Match, PathMatch, Route, ValueMatch, ValuePredicate, Wildcard};
-use crate::{Config, Rule};
+use crate::{Config, Protocol, Rule};
 use edgerush_router::{
     HeaderPredicate, HeaderPredicateError, HeaderPredicates, HostClaim, HostPattern,
     HostPatternError, PathPattern, PathPatternError, QueryPredicate, QueryPredicateError,
@@ -28,8 +28,8 @@ pub struct RuleId {
 /// A config compiled: fully resolved and immutable, what a snapshot is made of.
 #[derive(Debug)]
 pub struct Compiled {
-    /// Finds the rule a request belongs to.
-    pub router: Router<RuleId>,
+    /// The listeners, in the order of their names, each with the routes that are for it.
+    pub listeners: Vec<CompiledListener>,
     /// The upstreams, in the order of their names; an [`UpstreamId`] is a position here.
     pub upstreams: Vec<CompiledUpstream>,
     /// By position of the route, then of the rule.
@@ -48,6 +48,19 @@ impl Compiled {
     pub fn upstream(&self, id: UpstreamId) -> Option<&CompiledUpstream> {
         self.upstreams.get(id.0)
     }
+}
+
+/// A listener and the router for the requests that come in there.
+#[derive(Debug)]
+pub struct CompiledListener {
+    /// Its name in the config.
+    pub name: String,
+    /// The address to listen on.
+    pub address: SocketAddr,
+    /// What is spoken there.
+    pub protocol: Protocol,
+    /// Finds the rule a request belongs to, among the routes that are for this listener.
+    pub router: Router<RuleId>,
 }
 
 /// What a rule does with its requests.
@@ -92,7 +105,24 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
         })
         .collect();
 
-    let mut matches = Vec::new();
+    // Until listeners can share a socket, two on one address cannot both be served.
+    let mut addresses: BTreeMap<SocketAddr, &str> = BTreeMap::new();
+    for (name, listener) in &config.listeners {
+        if let Some(other) = addresses.insert(listener.address, name) {
+            let problem = Problem::AddressTaken {
+                address: listener.address,
+                other: other.to_owned(),
+            };
+            errors.push(Place::listener(name).problem(problem));
+        }
+    }
+
+    // The matches of every listener, by the listener's name.
+    let mut matches: BTreeMap<&str, Vec<RouteMatch<RuleId>>> = config
+        .listeners
+        .keys()
+        .map(|name| (name.as_str(), Vec::new()))
+        .collect();
     let mut rules = Vec::new();
     let mut names = HashSet::new();
     for (route_at, route) in config.routes.iter().enumerate() {
@@ -100,6 +130,7 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
         if !names.insert(route.name.as_str()) {
             errors.push(place.problem(Problem::DuplicateName));
         }
+        let listeners = listeners_of(route, &matches, &place, &mut errors);
         let hosts = host_claims(route, &place, &mut errors);
 
         let mut compiled_rules = Vec::new();
@@ -121,7 +152,13 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                     ..place.clone()
                 };
                 match route_match(matching, &hosts, id) {
-                    Ok(route_match) => matches.push(route_match),
+                    Ok(route_match) => {
+                        for listener in &listeners {
+                            if let Some(matches) = matches.get_mut(listener) {
+                                matches.push(route_match.clone());
+                            }
+                        }
+                    }
                     Err(problems) => {
                         errors.extend(problems.into_iter().map(|problem| place.problem(problem)));
                     }
@@ -135,14 +172,47 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
     }
 
     if errors.is_empty() {
+        let listeners = config
+            .listeners
+            .iter()
+            .map(|(name, listener)| CompiledListener {
+                name: name.clone(),
+                address: listener.address,
+                protocol: listener.protocol,
+                router: Router::new(matches.remove(name.as_str()).unwrap_or_default()),
+            })
+            .collect();
         Ok(Compiled {
-            router: Router::new(matches),
+            listeners,
             upstreams,
             rules,
         })
     } else {
         Err(errors)
     }
+}
+
+/// The listeners a route is for, each once, as far as they exist.
+fn listeners_of<'a>(
+    route: &'a Route,
+    known: &BTreeMap<&str, Vec<RouteMatch<RuleId>>>,
+    place: &Place,
+    errors: &mut Vec<ConfigError>,
+) -> Vec<&'a str> {
+    if route.listeners.is_empty() {
+        errors.push(place.problem(Problem::NoListeners));
+    }
+    let mut listeners: Vec<&str> = Vec::new();
+    for name in &route.listeners {
+        if !known.contains_key(name.as_str()) {
+            errors.push(place.problem(Problem::UnknownListener(name.clone())));
+        } else if listeners.contains(&name.as_str()) {
+            errors.push(place.problem(Problem::ListenerTwice(name.clone())));
+        } else {
+            listeners.push(name);
+        }
+    }
+    listeners
 }
 
 fn host_claims(route: &Route, place: &Place, errors: &mut Vec<ConfigError>) -> Vec<HostClaim<()>> {
@@ -299,12 +369,21 @@ pub struct ConfigError {
     pub problem: Problem,
 }
 
-/// A place in a config: a route, a rule in it, a match or a backend in the rule. Positions
-/// count from zero, as the lists in a file do.
+/// A named thing in a config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Object {
+    /// The listener of this name.
+    Listener(String),
+    /// The route of this name.
+    Route(String),
+}
+
+/// A place in a config: a listener, or a route, a rule in it, a match or a backend in the
+/// rule. Positions count from zero, as the lists in a file do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Place {
-    /// The route's name.
-    pub route: String,
+    /// The listener or route.
+    pub object: Object,
     /// The rule's position in the route, if the problem is in a rule.
     pub rule: Option<usize>,
     /// The match's position in the rule, if the problem is in a match.
@@ -315,8 +394,16 @@ pub struct Place {
 
 impl Place {
     fn route(name: &str) -> Self {
+        Self::of(Object::Route(name.to_owned()))
+    }
+
+    fn listener(name: &str) -> Self {
+        Self::of(Object::Listener(name.to_owned()))
+    }
+
+    fn of(object: Object) -> Self {
         Self {
-            route: name.to_owned(),
+            object,
             rule: None,
             matching: None,
             backend: None,
@@ -333,7 +420,10 @@ impl Place {
 
 impl fmt::Display for Place {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "route `{}`", self.route)?;
+        match &self.object {
+            Object::Listener(name) => write!(f, "listener `{name}`")?,
+            Object::Route(name) => write!(f, "route `{name}`")?,
+        }
         if let Some(rule) = self.rule {
             write!(f, ", rules[{rule}]")?;
         }
@@ -350,9 +440,26 @@ impl fmt::Display for Place {
 /// What is wrong.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Problem {
+    /// Another listener has the same address.
+    #[error("address {address} is already taken by listener `{other}`")]
+    AddressTaken {
+        /// The address both want.
+        address: SocketAddr,
+        /// The listener that has it.
+        other: String,
+    },
     /// Another route has the same name.
     #[error("another route has the same name")]
     DuplicateName,
+    /// The route is for no listener.
+    #[error("no listeners")]
+    NoListeners,
+    /// The route names a listener the config does not have.
+    #[error("there is no listener `{0}`")]
+    UnknownListener(String),
+    /// The route names a listener twice.
+    #[error("listener `{0}` is listed twice")]
+    ListenerTwice(String),
     /// The route serves no host.
     #[error("no hostnames; every host is the name `*`")]
     NoHostnames,
@@ -420,6 +527,24 @@ mod tests {
         route_with(compiled, "GET", host, target, &[])
     }
 
+    fn route_on(compiled: &Compiled, listener: &str, host: &str) -> Option<(usize, usize)> {
+        let listener = compiled
+            .listeners
+            .iter()
+            .find(|l| l.name == listener)
+            .unwrap();
+        listener
+            .router
+            .route(&RequestParts {
+                host,
+                path: "/",
+                query: "",
+                method: &Method::GET,
+                headers: &HeaderMap::new(),
+            })
+            .map(|id| (id.route, id.rule))
+    }
+
     fn route_with(
         compiled: &Compiled,
         method: &str,
@@ -432,8 +557,8 @@ mod tests {
         for (name, value) in fields {
             headers.append(*name, value.parse().unwrap());
         }
-        compiled
-            .router
+        let web = compiled.listeners.iter().find(|l| l.name == "web").unwrap();
+        web.router
             .route(&RequestParts {
                 host,
                 path,
@@ -445,8 +570,11 @@ mod tests {
     }
 
     const SHOP: &str = r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http }
 routes:
   - name: shop
+    listeners: [web]
     hostnames:
       - { name: shop.example.com, falls_through: true }
       - { name: "*.shop.example.com", wildcard: any_labels, falls_through: true }
@@ -465,6 +593,7 @@ routes:
           - path: { prefix: / }
         backends: [{ upstream: web, weight: 1 }]
   - name: everything-else
+    listeners: [web]
     hostnames: [{ name: "*", falls_through: true }]
     rules:
       - matches: [{ path: { prefix: / } }]
@@ -538,11 +667,14 @@ upstreams:
     #[test]
     fn the_order_of_routes_is_the_last_tie_breaker() {
         let twins = r#"
+listeners: { web: { address: "[::]:8080", protocol: http } }
 routes:
   - name: older
+    listeners: [web]
     hostnames: [{ name: a.example.com, falls_through: true }]
     rules: [{ matches: [{ path: { prefix: /api } }], backends: [{ upstream: u, weight: 1 }] }]
   - name: younger
+    listeners: [web]
     hostnames: [{ name: a.example.com, falls_through: true }]
     rules: [{ matches: [{ path: { prefix: /api } }], backends: [{ upstream: u, weight: 1 }] }]
 upstreams: { u: { endpoints: [] } }
@@ -554,11 +686,14 @@ upstreams: { u: { endpoints: [] } }
     #[test]
     fn wildcard_kind_and_fall_through_are_what_the_hostname_says() {
         let ingress_style = r#"
+listeners: { web: { address: "[::]:8080", protocol: http } }
 routes:
   - name: wildcard
+    listeners: [web]
     hostnames: [{ name: "*.example.com", wildcard: one_label, falls_through: false }]
     rules: [{ matches: [{ path: { prefix: /shared } }], backends: [{ upstream: u, weight: 1 }] }]
   - name: exact
+    listeners: [web]
     hostnames: [{ name: a.example.com, wildcard: any_labels, falls_through: false }]
     rules: [{ matches: [{ path: { prefix: /own } }], backends: [{ upstream: u, weight: 1 }] }]
 upstreams: { u: { endpoints: [] } }
@@ -580,11 +715,16 @@ upstreams: { u: { endpoints: [] } }
     #[test]
     fn every_problem_is_reported_with_its_place() {
         let broken = r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http }
+  web-again: { address: "[::]:8080", protocol: http }
 routes:
   - name: a
+    listeners: []
     hostnames: []
     rules: []
   - name: a
+    listeners: [web, wbe, web]
     hostnames:
       - { name: "*.example.com", falls_through: true }
       - { name: "exa mple.com", falls_through: true }
@@ -612,9 +752,13 @@ upstreams:
         assert_eq!(
             errors,
             [
+                "listener `web-again`: address [::]:8080 is already taken by listener `web`",
+                "route `a`: no listeners",
                 "route `a`: no hostnames; every host is the name `*`",
                 "route `a`: no rules",
                 "route `a`: another route has the same name",
+                "route `a`: there is no listener `wbe`",
+                "route `a`: listener `web` is listed twice",
                 "route `a`: hostname `*.example.com` is a wildcard; `wildcard` must say \
                  `one_label` or `any_labels`",
                 "route `a`: hostname `exa mple.com`: hostname contains invalid character ' '",
@@ -634,31 +778,88 @@ upstreams:
     #[test]
     fn there_is_no_shorthand_and_nothing_unknown_is_let_through() {
         let parse = |routes: &str| {
-            let yaml = format!("routes: {routes}\nupstreams: {{}}\n");
+            let yaml = format!("listeners: {{}}\nroutes: {routes}\nupstreams: {{}}\n");
             serde_saphyr::from_str::<Config>(&yaml).map(|_| ())
         };
-        assert!(parse("[{ name: a, hostnames: [], rules: [] }]").is_ok());
+        assert!(parse("[{ name: a, listeners: [], hostnames: [], rules: [] }]").is_ok());
         // A hostname is always the full statement.
-        assert!(parse("[{ name: a, hostnames: [a.example.com], rules: [] }]").is_err());
-        assert!(parse("[{ name: a, hostnames: [{ name: a.example.com }], rules: [] }]").is_err());
+        assert!(
+            parse("[{ name: a, listeners: [], hostnames: [a.example.com], rules: [] }]").is_err()
+        );
+        assert!(
+            parse("[{ name: a, listeners: [], hostnames: [{ name: a.example.com }], rules: [] }]")
+                .is_err()
+        );
         // A match always states its path, a backend its weight.
-        let rule = |rule: &str| format!("[{{ name: a, hostnames: [], rules: [{rule}] }}]");
+        let rule =
+            |rule: &str| format!("[{{ name: a, listeners: [], hostnames: [], rules: [{rule}] }}]");
         assert!(parse(&rule("{ matches: [], backends: [] }")).is_ok());
         assert!(parse(&rule("{ matches: [{ method: GET }], backends: [] }")).is_err());
         assert!(parse(&rule("{ matches: [], backends: [{ upstream: u }] }")).is_err());
         assert!(parse(&rule("{ matches: [] }")).is_err());
         // Misspelt keys are errors, not silence.
-        assert!(parse("[{ name: a, hostnames: [], rules: [], rulez: [] }]").is_err());
+        assert!(
+            parse("[{ name: a, listeners: [], hostnames: [], rules: [], rulez: [] }]").is_err()
+        );
         assert!(parse(&rule("{ matches: [], backends: [], filter: [] }")).is_err());
         assert!(parse(&rule("{ matches: [{ path: { glob: /a } }], backends: [] }")).is_err());
         // An endpoint is an address, not a name.
         let upstream = |endpoint: &str| {
-            let yaml =
-                format!("routes: []\nupstreams: {{ u: {{ endpoints: [\"{endpoint}\"] }} }}\n");
+            let yaml = format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ endpoints: [\"{endpoint}\"] }} }}\n"
+            );
             serde_saphyr::from_str::<Config>(&yaml).map(|_| ())
         };
         assert!(upstream("10.0.0.1:80").is_ok());
         assert!(upstream("localhost:80").is_err());
         assert!(upstream("10.0.0.1").is_err());
+
+        // A listener speaks a protocol the model knows, on an address.
+        let listener = |listener: &str| {
+            let yaml = format!("listeners: {{ l: {listener} }}\nroutes: []\nupstreams: {{}}\n");
+            serde_saphyr::from_str::<Config>(&yaml).map(|_| ())
+        };
+        assert!(listener(r#"{ address: "[::]:80", protocol: http }"#).is_ok());
+        assert!(listener(r#"{ address: "[::]:80", protocol: gopher }"#).is_err());
+        assert!(listener(r#"{ address: "[::]:80" }"#).is_err());
+        assert!(listener(r#"{ address: ":80", protocol: http }"#).is_err());
+    }
+
+    #[test]
+    fn every_listener_has_a_router_of_the_routes_that_are_for_it() {
+        let two = r#"
+listeners:
+  public: { address: "[::]:8080", protocol: http }
+  internal: { address: "127.0.0.1:9090", protocol: http }
+  idle: { address: "127.0.0.1:9091", protocol: http }
+routes:
+  - name: site
+    listeners: [public]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules: [{ matches: [{ path: { prefix: / } }], backends: [{ upstream: u, weight: 1 }] }]
+  - name: metrics
+    listeners: [internal, public]
+    hostnames: [{ name: metrics.internal, falls_through: true }]
+    rules: [{ matches: [{ path: { prefix: / } }], backends: [{ upstream: u, weight: 1 }] }]
+upstreams: { u: { endpoints: [] } }
+"#;
+        let compiled = compile(&config(two)).unwrap();
+        let names: Vec<&str> = compiled.listeners.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["idle", "internal", "public"]);
+        assert_eq!(compiled.listeners[2].address.to_string(), "[::]:8080");
+        assert_eq!(compiled.listeners[2].protocol, Protocol::Http);
+
+        assert_eq!(route_on(&compiled, "public", "example.com"), Some((0, 0)));
+        assert_eq!(
+            route_on(&compiled, "public", "metrics.internal"),
+            Some((1, 0))
+        );
+        assert_eq!(
+            route_on(&compiled, "internal", "metrics.internal"),
+            Some((1, 0))
+        );
+        assert_eq!(route_on(&compiled, "internal", "example.com"), None);
+        // A listener no route is for answers nothing, which is valid.
+        assert_eq!(route_on(&compiled, "idle", "example.com"), None);
     }
 }
