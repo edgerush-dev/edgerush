@@ -9,14 +9,14 @@
 /// A validated path pattern.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PathPattern {
-    kind: Kind,
+    pub(crate) kind: Kind,
     /// For a prefix, without its trailing slash (the root prefix is the empty string), so
     /// that `/shop` and `/shop/` are one pattern and the boundary check is uniform.
-    path: Box<str>,
+    pub(crate) path: Box<str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Kind {
+pub(crate) enum Kind {
     Exact,
     Prefix,
 }

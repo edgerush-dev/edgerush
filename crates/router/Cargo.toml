@@ -18,5 +18,9 @@ proptest.workspace = true
 name = "host_index"
 harness = false
 
+[[bench]]
+name = "path_index"
+harness = false
+
 [lints]
 workspace = true

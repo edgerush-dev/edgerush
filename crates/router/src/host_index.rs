@@ -11,15 +11,9 @@
 //! request pays for one lookup and gets one list.
 
 use crate::WildcardLabels;
+use crate::hash::Map;
 use crate::host::{HostPattern, Kind, MAX_NAME_LEN};
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, DefaultHasher};
-
-/// A fixed-key hasher instead of the randomly seeded default: a pure crate takes no
-/// randomness, and benchmarks that count instructions need identical runs. Random seeding
-/// defends against chosen colliding keys, but the keys stored here come from
-/// configuration, not from requests.
-type Map<V> = HashMap<Box<[u8]>, V, BuildHasherDefault<DefaultHasher>>;
 
 /// One claim on a set of hosts, carrying whatever the caller wants to find again.
 #[derive(Debug, Clone)]
