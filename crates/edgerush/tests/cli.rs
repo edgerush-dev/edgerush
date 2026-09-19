@@ -91,9 +91,17 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
     let (one, two) = (upstream("one")?, upstream("two")?);
     let file = scratch("followed.yaml");
     std::fs::write(&file, config("127.0.0.1:0", "up", Some(one)))?;
-    let mut harness = Harness::start(&["--config", &file, "--metrics", "127.0.0.1:0"])?;
+    let mut harness = Harness::start(&[
+        "--config",
+        &file,
+        "--metrics",
+        "127.0.0.1:0",
+        "--workers",
+        "2",
+    ])?;
     let web = harness.address_after("listener \"web\" is on ");
     let metrics = harness.address_after("metrics are on ");
+    harness.wait_for("2 workers, work-stealing");
     assert!(get(web, "/")?.contains("x-upstream: one"));
 
     // Another config: it takes over without a restart.
@@ -124,6 +132,43 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
     );
     let served = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"} 4\n";
     assert!(scrape.contains(served), "{scrape}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn every_worker_of_thread_per_core_serves_the_file_and_follows_it() -> io::Result<()> {
+    let (one, two) = (upstream("one")?, upstream("two")?);
+    let file = scratch("per-core.yaml");
+    std::fs::write(&file, config("127.0.0.1:0", "up", Some(one)))?;
+    let model = ["--threading", "thread-per-core", "--workers", "3"];
+    let mut harness = Harness::start(&[&["--config", &file][..], &model[..]].concat())?;
+    // One port for the sockets of all three, though the config left it open.
+    let web = harness.address_after("listener \"web\" is on ");
+    harness.wait_for("3 workers, thread-per-core");
+
+    // The kernel picks a worker for every connection: enough of them meet all three.
+    for _ in 0..24 {
+        assert!(get(web, "/")?.contains("x-upstream: one"));
+    }
+    std::fs::write(&file, config("127.0.0.1:0", "up", Some(two)))?;
+    harness.wait_for("config reloaded");
+    for _ in 0..24 {
+        assert!(get(web, "/")?.contains("x-upstream: two"));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[test]
+fn thread_per_core_does_not_start_where_a_port_cannot_be_shared() -> io::Result<()> {
+    let file = scratch("per-core.yaml");
+    std::fs::write(&file, config("127.0.0.1:0", "up", None))?;
+    let output = edgerush(&["proxy", "--config", &file, "--threading", "thread-per-core"])?;
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("error: cannot listen on "), "{stderr}");
+    assert!(stderr.contains("SO_REUSEPORT"), "{stderr}");
     Ok(())
 }
 

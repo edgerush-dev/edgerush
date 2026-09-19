@@ -32,8 +32,9 @@ serde = { version = "1.0", features = ["derive"] }
 # optional extras; pure Rust with budgets against hostile input.
 serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
 # Socket options that neither std nor tokio can set before a socket is bound. Only the
-# binary binds sockets; tokio and hyper-util bring the crate in anyway.
-socket2 = "0.6.5"
+# binary binds sockets; tokio and hyper-util bring the crate in anyway. "all" is where
+# SO_REUSEPORT is.
+socket2 = { version = "0.6.5", features = ["all"] }
 regex = { version = "1.13", default-features = false, features = ["std", "perf"] }
 thiserror = "2.0"
 # Only what is used; tests add the multi-thread runtime and the macros for themselves.

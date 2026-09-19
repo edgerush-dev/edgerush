@@ -5,6 +5,7 @@
 
 use edgerush_config::{Compiled, Config, ConfigError, compile};
 use std::fmt::{self, Display, Formatter};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::{fs, io};
 
@@ -12,23 +13,30 @@ use std::{fs, io};
 #[derive(Debug)]
 pub(crate) struct ConfigFile {
     path: PathBuf,
+    /// How many times a config is compiled: once for every data plane that runs it. A
+    /// compiled config cannot be copied, as nothing else ever needs a second one.
+    copies: NonZeroUsize,
     /// The bytes, or why there were none.
     seen: Result<Vec<u8>, io::ErrorKind>,
 }
 
 impl ConfigFile {
     /// Reads the file for the first time.
-    pub(crate) fn open(path: PathBuf) -> Result<(Self, Compiled), Rejected> {
+    pub(crate) fn open(
+        path: PathBuf,
+        copies: NonZeroUsize,
+    ) -> Result<(Self, Vec<Compiled>), Rejected> {
         let bytes = fs::read(&path).map_err(Rejected::Read)?;
-        let compiled = compiled(&bytes)?;
+        let compiled = compiled(&bytes, copies)?;
         let seen = Ok(bytes);
-        Ok((Self { path, seen }, compiled))
+        let file = Self { path, copies, seen };
+        Ok((file, compiled))
     }
 
     /// Reads the file again. `None` while it is as it was the last time — whether that was
     /// a config, one that was rejected or no file at all, so that nothing is said twice.
     /// A file caught half written is rejected, and read again when it is whole.
-    pub(crate) fn changed(&mut self) -> Option<Result<Compiled, Rejected>> {
+    pub(crate) fn changed(&mut self) -> Option<Result<Vec<Compiled>, Rejected>> {
         let read = fs::read(&self.path);
         let as_it_was = match (&read, &self.seen) {
             (Ok(now), Ok(before)) => now == before,
@@ -40,7 +48,7 @@ impl ConfigFile {
         }
         let (seen, outcome) = match read {
             Ok(bytes) => {
-                let outcome = compiled(&bytes);
+                let outcome = compiled(&bytes, self.copies);
                 (Ok(bytes), outcome)
             }
             Err(error) => (Err(error.kind()), Err(Rejected::Read(error))),
@@ -50,10 +58,12 @@ impl ConfigFile {
     }
 }
 
-fn compiled(yaml: &[u8]) -> Result<Compiled, Rejected> {
+fn compiled(yaml: &[u8], copies: NonZeroUsize) -> Result<Vec<Compiled>, Rejected> {
     let config: Config =
         serde_saphyr::from_slice(yaml).map_err(|error| Rejected::Parse(Box::new(error)))?;
-    compile(&config).map_err(|problems| Rejected::Invalid(Problems(problems)))
+    (0..copies.get())
+        .map(|_| compile(&config).map_err(|problems| Rejected::Invalid(Problems(problems))))
+        .collect()
 }
 
 /// Why a config file cannot be run.
@@ -105,8 +115,8 @@ mod tests {
             Self(path)
         }
 
-        fn open(&self) -> Result<(ConfigFile, Compiled), Rejected> {
-            ConfigFile::open(self.0.clone())
+        fn open(&self) -> Result<(ConfigFile, Vec<Compiled>), Rejected> {
+            ConfigFile::open(self.0.clone(), NonZeroUsize::MIN)
         }
 
         fn write(&self, content: &str) {
@@ -123,7 +133,20 @@ mod tests {
     #[test]
     fn a_file_is_compiled_when_it_is_opened() {
         let (_, compiled) = Scratch::new("opened", ONE_UPSTREAM).open().unwrap();
-        assert_eq!(compiled.upstreams.len(), 1);
+        assert_eq!(compiled.len(), 1);
+        assert_eq!(compiled[0].upstreams.len(), 1);
+    }
+
+    #[test]
+    fn a_config_is_compiled_once_for_every_data_plane_that_runs_it() {
+        let scratch = Scratch::new("copies", NOTHING);
+        let copies = NonZeroUsize::new(3).unwrap();
+        let (mut file, compiled) = ConfigFile::open(scratch.0.clone(), copies).unwrap();
+        assert_eq!(compiled.len(), 3);
+        scratch.write(ONE_UPSTREAM);
+        let compiled = file.changed().unwrap().unwrap();
+        assert_eq!(compiled.len(), 3);
+        assert!(compiled.iter().all(|copy| copy.upstreams.len() == 1));
     }
 
     #[test]
@@ -182,7 +205,8 @@ upstreams: {}
         let (mut file, _) = scratch.open().unwrap();
         scratch.write(ONE_UPSTREAM);
         let compiled = file.changed().unwrap().unwrap();
-        assert_eq!(compiled.upstreams.len(), 1);
+        assert_eq!(compiled.len(), 1);
+        assert_eq!(compiled[0].upstreams.len(), 1);
         assert!(file.changed().is_none());
     }
 

@@ -6,23 +6,29 @@
 //! once, at the start. After that the file is read again every [`POLL`] and a config that
 //! has changed takes over without dropping a request, while one that cannot be run is
 //! told and changes nothing.
+//!
+//! Both candidates for the threading model can be run, so that they can be measured
+//! ([`Threading`]). Thread-per-core is an experiment made of what there is: a whole data
+//! plane for every worker, which is what gives each its own upstream connections.
 
-use crate::bind::listen;
+use crate::bind::{Port, listen};
 use crate::config_file::{ConfigFile, Rejected};
 use edgerush_config::Compiled;
 use edgerush_proxy::{Proxy, ProxyError};
 use std::convert::Infallible;
+use std::future::pending;
 use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Builder, Runtime};
 
 pub(crate) const USAGE: &str = "\
-Usage: edgerush proxy --config <FILE> [--metrics <ADDRESS>]
+Usage: edgerush proxy --config <FILE> [OPTIONS]
 
 Runs a data plane from a config file, without Kubernetes: a harness for development.
 The file is read again every second, and a changed config takes over without dropping a
@@ -31,6 +37,11 @@ request. Listeners are bound once: one that is new or has moved takes a restart.
 Options:
       --config <FILE>      The config, in YAML
       --metrics <ADDRESS>  Serve /metrics there, as in 127.0.0.1:9090 [default: nowhere]
+      --threading <MODEL>  work-stealing: one runtime whose workers share everything;
+                           thread-per-core: for every worker a runtime, sockets on shared
+                           ports (SO_REUSEPORT) and upstream connections of its own, and
+                           no /metrics [default: work-stealing]
+      --workers <N>        How many threads serve requests [default: one for every CPU]
   -h, --help               Print help
 ";
 
@@ -65,6 +76,21 @@ enum Parsed {
 struct Options {
     config: PathBuf,
     metrics: Option<SocketAddr>,
+    threading: Threading,
+    /// `None` is one for every CPU the process may use.
+    workers: Option<NonZeroUsize>,
+}
+
+/// How the threads that serve requests share the work ([03 §2] in the docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Threading {
+    /// One runtime: connections are accepted in one place and their tasks move to
+    /// whichever worker has time. One data plane, one pool of upstream connections.
+    WorkStealing,
+    /// A single-threaded runtime for every worker, each with a socket of its own on
+    /// every listener's port and a data plane of its own: a connection stays with the
+    /// worker the kernel gave it to, and so do the upstream connections it uses.
+    ThreadPerCore,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -79,11 +105,19 @@ enum UsageError {
     NoConfig,
     #[error("'{0}' is not an address to listen on, such as 127.0.0.1:9090")]
     Address(String),
+    #[error("'{0}' is not a threading model: work-stealing or thread-per-core")]
+    Threading(String),
+    #[error("'{0}' is not a number of workers: 1 or more")]
+    Workers(String),
+    #[error("'--metrics' is not served with thread-per-core, where every worker counts alone")]
+    MetricsPerCore,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut config = None;
     let mut metrics = None;
+    let mut threading = None;
+    let mut workers = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
@@ -100,11 +134,38 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                     return Err(UsageError::Twice("--metrics"));
                 }
             }
+            "--threading" => {
+                let model = args.next().ok_or(UsageError::NoValue("--threading"))?;
+                let model = match model.as_str() {
+                    "work-stealing" => Threading::WorkStealing,
+                    "thread-per-core" => Threading::ThreadPerCore,
+                    _ => return Err(UsageError::Threading(model)),
+                };
+                if threading.replace(model).is_some() {
+                    return Err(UsageError::Twice("--threading"));
+                }
+            }
+            "--workers" => {
+                let count = args.next().ok_or(UsageError::NoValue("--workers"))?;
+                let count = count.parse().map_err(|_| UsageError::Workers(count))?;
+                if workers.replace(count).is_some() {
+                    return Err(UsageError::Twice("--workers"));
+                }
+            }
             _ => return Err(UsageError::Unexpected(arg)),
         }
     }
     let config = config.ok_or(UsageError::NoConfig)?;
-    Ok(Parsed::Run(Options { config, metrics }))
+    let threading = threading.unwrap_or(Threading::WorkStealing);
+    if threading == Threading::ThreadPerCore && metrics.is_some() {
+        return Err(UsageError::MetricsPerCore);
+    }
+    Ok(Parsed::Run(Options {
+        config,
+        metrics,
+        threading,
+        workers,
+    }))
 }
 
 /// Why there is no data plane to run.
@@ -128,51 +189,114 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
     let Options {
         config: path,
         metrics,
+        threading,
+        workers,
     } = options;
-    let (mut file, config) = match ConfigFile::open(path.clone()) {
+    let workers = workers
+        .or_else(|| thread::available_parallelism().ok())
+        .unwrap_or(NonZeroUsize::MIN);
+    let (data_planes, port) = match threading {
+        Threading::WorkStealing => (NonZeroUsize::MIN, Port::Own),
+        Threading::ThreadPerCore => (workers, Port::Shared),
+    };
+
+    let (mut file, configs) = match ConfigFile::open(path.clone(), data_planes) {
         Ok(opened) => opened,
         Err(rejected) => return Err(Failure::Config { path, rejected }),
     };
-    let bound: Vec<Bound> = config.listeners.iter().map(Bound::from).collect();
-    let proxy = Proxy::new(config).map_err(|error| Failure::Proxy { path, error })?;
-    let proxy = Arc::new(proxy);
+    let mut bound: Vec<Bound> = configs
+        .first()
+        .map(|config| config.listeners.iter().map(Bound::from).collect())
+        .unwrap_or_default();
+    let proxies = configs
+        .into_iter()
+        .map(|config| Proxy::new(config).map(Arc::new))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| Failure::Proxy { path, error })?;
 
     // Every socket is open before a request is served on any, so that a port that is
     // taken stops a harness that has done nothing yet.
-    let mut sockets = Vec::with_capacity(bound.len());
-    for listener in &bound {
-        let what = format!("listener \"{}\"", listener.name);
-        sockets.push(open(what, listener.address)?);
+    let mut sockets = Vec::with_capacity(proxies.len());
+    for _ in &proxies {
+        let mut of_this_one = Vec::with_capacity(bound.len());
+        for listener in &mut bound {
+            let what = format!("listener \"{}\"", listener.name);
+            let socket = open(what, listener.listens_on, port)?;
+            // A port that the operating system chose for the first data plane is the
+            // port of those after it.
+            listener.listens_on = socket.local_addr().unwrap_or(listener.listens_on);
+            of_this_one.push(socket);
+        }
+        sockets.push(of_this_one);
     }
     let metrics = metrics
-        .map(|address| open("metrics".to_owned(), address).map(|socket| (socket, address)))
+        .map(|address| open("metrics".to_owned(), address, Port::Own).map(|s| (s, address)))
         .transpose()?;
 
-    let runtime = Runtime::new().map_err(Failure::Runtime)?;
-    // Sockets are handed to the runtime that is entered.
-    let entered = runtime.enter();
-    for (position, (listener, socket)) in bound.iter().zip(sockets).enumerate() {
-        let (socket, address) = registered(socket, listener.address)?;
+    let mut runtimes = Vec::with_capacity(proxies.len());
+    for (proxy, sockets) in proxies.iter().zip(sockets) {
+        let runtime = match threading {
+            Threading::WorkStealing => Builder::new_multi_thread()
+                .worker_threads(workers.get())
+                .enable_all()
+                .build(),
+            Threading::ThreadPerCore => Builder::new_current_thread().enable_all().build(),
+        };
+        let runtime = runtime.map_err(Failure::Runtime)?;
+        // Sockets are handed to the runtime that is entered.
+        let entered = runtime.enter();
+        for (position, socket) in sockets.into_iter().enumerate() {
+            let socket = TcpListener::from_std(socket).map_err(Failure::Runtime)?;
+            runtime.spawn(Arc::clone(proxy).serve(position, socket));
+        }
+        drop(entered);
+        runtimes.push(runtime);
+    }
+    for listener in &bound {
         say(
             stderr,
-            format_args!("listener \"{}\" is on {address}", listener.name),
+            format_args!(
+                "listener \"{}\" is on {}",
+                listener.name, listener.listens_on
+            ),
         );
-        runtime.spawn(Arc::clone(&proxy).serve(position, socket));
     }
-    if let Some((socket, address)) = metrics {
-        let (socket, address) = registered(socket, address)?;
+    if let (Some((socket, address)), Some(runtime), Some(proxy)) =
+        (metrics, runtimes.first(), proxies.first())
+    {
+        let address = socket.local_addr().unwrap_or(address);
+        let entered = runtime.enter();
+        let socket = TcpListener::from_std(socket).map_err(Failure::Runtime)?;
+        runtime.spawn(Arc::clone(proxy).serve_metrics(socket));
+        drop(entered);
         say(stderr, format_args!("metrics are on {address}"));
-        runtime.spawn(Arc::clone(&proxy).serve_metrics(socket));
     }
-    drop(entered);
+    // A runtime with workers of its own runs by being there; one without runs on the
+    // thread that waits on it.
+    let _running: Vec<Runtime> = match threading {
+        Threading::WorkStealing => runtimes,
+        Threading::ThreadPerCore => {
+            for (worker, runtime) in runtimes.into_iter().enumerate() {
+                thread::Builder::new()
+                    .name(format!("worker-{worker}"))
+                    .spawn(move || runtime.block_on(pending::<()>()))
+                    .map_err(Failure::Runtime)?;
+            }
+            Vec::new()
+        }
+    };
+    say(
+        stderr,
+        format_args!("{} workers, {}", workers, threading.name()),
+    );
 
     loop {
         thread::sleep(POLL);
         let Some(changed) = file.changed() else {
             continue;
         };
-        let config = match changed {
-            Ok(config) => config,
+        let configs = match changed {
+            Ok(configs) => configs,
             Err(rejected) => {
                 say(
                     stderr,
@@ -181,8 +305,16 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
                 continue;
             }
         };
-        let warnings = restart_needed(&bound, &config);
-        match proxy.reload(config) {
+        let warnings = configs
+            .first()
+            .map(|config| restart_needed(&bound, config))
+            .unwrap_or_default();
+        // What a data plane refuses is in the config, so the first refuses what any would.
+        let reloaded = proxies
+            .iter()
+            .zip(configs)
+            .try_for_each(|(proxy, config)| proxy.reload(config));
+        match reloaded {
             Ok(()) => say(stderr, format_args!("config reloaded")),
             Err(error) => {
                 say(
@@ -198,11 +330,24 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
     }
 }
 
-/// A listener that has a socket: its name and the address the config gave it then.
+impl Threading {
+    fn name(self) -> &'static str {
+        match self {
+            Self::WorkStealing => "work-stealing",
+            Self::ThreadPerCore => "thread-per-core",
+        }
+    }
+}
+
+/// A listener that has a socket.
 #[derive(Debug, PartialEq, Eq)]
 struct Bound {
     name: String,
+    /// The address the config gave it then: what a later config's is compared with.
     address: SocketAddr,
+    /// The address its socket has, which is another when the config left the port to the
+    /// operating system.
+    listens_on: SocketAddr,
 }
 
 impl From<&edgerush_config::CompiledListener> for Bound {
@@ -210,27 +355,17 @@ impl From<&edgerush_config::CompiledListener> for Bound {
         Self {
             name: listener.name.clone(),
             address: listener.address,
+            listens_on: listener.address,
         }
     }
 }
 
-fn open(what: String, address: SocketAddr) -> Result<std::net::TcpListener, Failure> {
-    listen(address).map_err(|error| Failure::Listen {
+fn open(what: String, address: SocketAddr, port: Port) -> Result<std::net::TcpListener, Failure> {
+    listen(address, port).map_err(|error| Failure::Listen {
         what,
         address,
         error,
     })
-}
-
-/// The socket in the runtime's hands, and the address it really has: the config may have
-/// left the port to the operating system.
-fn registered(
-    socket: std::net::TcpListener,
-    asked_for: SocketAddr,
-) -> Result<(TcpListener, SocketAddr), Failure> {
-    let address = socket.local_addr().unwrap_or(asked_for);
-    let socket = TcpListener::from_std(socket).map_err(Failure::Runtime)?;
-    Ok((socket, address))
 }
 
 /// What a config asks of the listeners that only a restart can give: sockets are opened
@@ -280,6 +415,8 @@ mod tests {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
             metrics: None,
+            threading: Threading::WorkStealing,
+            workers: None,
         };
         assert_eq!(parsed(&["--config", "dev.yaml"]), Ok(Parsed::Run(options)));
     }
@@ -289,11 +426,34 @@ mod tests {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
             metrics: Some("[::]:9090".parse().unwrap()),
+            threading: Threading::WorkStealing,
+            workers: None,
         };
         assert_eq!(
             parsed(&["--metrics", "[::]:9090", "--config", "dev.yaml"]),
             Ok(Parsed::Run(options))
         );
+    }
+
+    #[test]
+    fn the_threading_model_and_the_workers_are_as_the_command_line_says() {
+        let options = Options {
+            config: PathBuf::from("dev.yaml"),
+            metrics: None,
+            threading: Threading::ThreadPerCore,
+            workers: NonZeroUsize::new(4),
+        };
+        let args = ["--config", "dev.yaml", "--workers", "4"];
+        assert_eq!(
+            parsed(&[&args[..], &["--threading", "thread-per-core"]].concat()),
+            Ok(Parsed::Run(options))
+        );
+        let Ok(Parsed::Run(options)) =
+            parsed(&[&args[..], &["--threading", "work-stealing"]].concat())
+        else {
+            panic!("a command line that can be run");
+        };
+        assert_eq!(options.threading, Threading::WorkStealing);
     }
 
     #[test]
@@ -325,6 +485,27 @@ mod tests {
         assert_eq!(
             parsed(&["a.yaml"]),
             Err(UsageError::Unexpected("a.yaml".to_owned()))
+        );
+        assert_eq!(
+            parsed(&["--config", "a.yaml", "--threading", "fibers"]),
+            Err(UsageError::Threading("fibers".to_owned()))
+        );
+        for workers in ["0", "-1", "many"] {
+            assert_eq!(
+                parsed(&["--config", "a.yaml", "--workers", workers]),
+                Err(UsageError::Workers(workers.to_owned()))
+            );
+        }
+        assert_eq!(
+            parsed(&[
+                "--config",
+                "a.yaml",
+                "--threading",
+                "thread-per-core",
+                "--metrics",
+                "[::]:9090"
+            ]),
+            Err(UsageError::MetricsPerCore)
         );
     }
 
