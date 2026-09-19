@@ -42,3 +42,7 @@ workspace = true
 [[bench]]
 name = "query"
 harness = false
+
+[[bench]]
+name = "router"
+harness = false

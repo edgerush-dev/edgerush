@@ -269,3 +269,104 @@ pub fn exact_query_matches(rule: &[(String, String)], query: &str) -> bool {
             .is_some_and(|(_, value)| value.as_deref() == Some(expected.as_bytes()))
     })
 }
+
+/// One way to reach a route rule, as text: host claims, a path pattern in canonical form,
+/// and exact predicates.
+#[derive(Debug, Clone)]
+pub struct RouteSpec {
+    /// The hosts served, as for [`host_candidates`].
+    pub hosts: Vec<HostClaimSpec>,
+    /// The path pattern.
+    pub path: PathSpec,
+    /// The method the request must have, if it matters.
+    pub method: Option<String>,
+    /// Exact header matches, as for [`exact_headers_match`].
+    pub headers: Vec<(String, String)>,
+    /// Exact query parameter matches, as for [`exact_query_matches`].
+    pub query: Vec<(String, String)>,
+}
+
+/// A request, as text.
+#[derive(Debug, Clone)]
+pub struct RequestSpec {
+    /// The bare hostname.
+    pub host: String,
+    /// The normalised path.
+    pub path: String,
+    /// The query string without its `?`.
+    pub query: String,
+    /// The method.
+    pub method: String,
+    /// The header fields in order.
+    pub headers: Vec<(String, String)>,
+}
+
+/// The position of the route that [`Router::route`](crate::Router::route) must find: go
+/// through the groups of equally specific host claims, most specific first; in each, sort
+/// the routes whose path matches by the whole list of precedence — path, a method predicate
+/// before none, the number of header predicates that count, the number of query predicates
+/// that count, the order given — and take the first the request satisfies in full. Whether
+/// route `n`'s path matches is for `path_matches` to say.
+#[must_use]
+pub fn route(
+    routes: &[RouteSpec],
+    request: &RequestSpec,
+    path_matches: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let distinct = |names: Vec<String>| {
+        let mut names = names;
+        names.sort();
+        names.dedup();
+        names.len()
+    };
+    let precedence = |position: usize| {
+        let route = &routes[position];
+        let (path, kind) = &route.path;
+        let prefix_length = match kind {
+            PathKind::Prefix => path.strip_suffix('/').unwrap_or(path).len(),
+            PathKind::Exact | PathKind::Regex => 0,
+        };
+        let headers = route
+            .headers
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase());
+        let query = route.query.iter().map(|(name, _)| name.clone());
+        (
+            *kind,
+            Reverse(prefix_length),
+            Reverse(route.method.is_some()),
+            Reverse(distinct(headers.collect())),
+            Reverse(distinct(query.collect())),
+            position,
+        )
+    };
+    let serves = |position: usize| {
+        let route = &routes[position];
+        route
+            .method
+            .as_ref()
+            .is_none_or(|method| *method == request.method)
+            && exact_headers_match(&route.headers, &request.headers)
+            && exact_query_matches(&route.query, &request.query)
+    };
+
+    // Every host claim of every route, and whose it is.
+    let (owners, claims): (Vec<usize>, Vec<HostClaimSpec>) = routes
+        .iter()
+        .enumerate()
+        .flat_map(|(position, route)| {
+            route
+                .hosts
+                .iter()
+                .map(move |claim| (position, claim.clone()))
+        })
+        .unzip();
+    host_candidates(&claims, &request.host)
+        .into_iter()
+        .find_map(|group| {
+            let mut members: Vec<usize> = group.into_iter().map(|claim| owners[claim]).collect();
+            members.retain(|&position| path_matches(position));
+            members.sort_by_key(|&position| precedence(position));
+            members.into_iter().find(|&position| serves(position))
+        })
+}
