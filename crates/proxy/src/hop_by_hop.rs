@@ -355,6 +355,43 @@ mod tests {
     }
 
     #[test]
+    fn options_that_name_no_header_of_the_message_change_nothing() {
+        let stripped = request_without_hop_by_hop(&[
+            ("connection", "close, x-absent, Keep-Alive"),
+            ("accept", "*/*"),
+            ("x-kept", "1"),
+        ]);
+        assert_eq!(left(&stripped), [("accept", "*/*"), ("x-kept", "1")]);
+    }
+
+    #[test]
+    fn an_option_names_its_header_whatever_the_case_and_however_often_it_is_said() {
+        let stripped = request_without_hop_by_hop(&[
+            ("connection", "X-HOP, x-hop, x-Other"),
+            ("x-hop", "1"),
+            ("x-other", "2"),
+            ("x-hopper", "kept"),
+            ("x-ho", "kept"),
+        ]);
+        assert_eq!(left(&stripped), [("x-ho", "kept"), ("x-hopper", "kept")]);
+    }
+
+    #[test]
+    fn more_options_than_anyone_sends_are_all_honoured() {
+        // Beyond what is kept track of in one pass, headers are looked up one by one.
+        let options: Vec<String> = (0..100).map(|at| format!("x-hop-{at}")).collect();
+        let connection = options.join(", ");
+        let mut fields = vec![("connection", connection.as_str()), ("x-kept", "1")];
+        for at in [0, 63, 64, 99] {
+            fields.push((options[at].as_str(), "gone"));
+        }
+        assert_eq!(
+            left(&request_without_hop_by_hop(&fields)),
+            [("x-kept", "1")]
+        );
+    }
+
+    #[test]
     fn options_that_are_no_header_names_name_nothing() {
         let mut response = headers(&[("connection", "x y, \"quoted\", caf\u{e9}"), ("x", "1")]);
         strip_response(&mut response);

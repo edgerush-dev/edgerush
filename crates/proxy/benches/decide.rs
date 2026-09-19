@@ -97,6 +97,14 @@ fn head_with(target: &str, host: Option<&str>, more: &[(&'static str, &'static s
         &[("connection", "keep-alive"), ("keep-alive", "timeout=5"), ("te", "trailers")]
     )
 )]
+#[bench::grpc_says_te_trailers(
+    shop(),
+    head_with(
+        "http://shop.example.com/pages.Pages/About",
+        None,
+        &[("te", "trailers"), ("content-type", "application/grpc")]
+    )
+)]
 #[bench::no_route(shop(), head("/pages/about", Some("other.example.org")))]
 fn request_core(snapshot: Compiled, mut head: Parts) -> (Compiled, Parts, bool) {
     let forwarded = match snapshot.listeners.first() {

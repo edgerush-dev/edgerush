@@ -17,7 +17,7 @@ use crate::hop_by_hop::{ConnectionError, check_connection, is_hop_by_hop, strip_
 use crate::host::{HostError, bare_host, host_field};
 use edgerush_config::{Compiled, CompiledListener, CompiledRule, UpstreamId};
 use edgerush_router::{NormaliseError, RequestParts, normalise_path};
-use http::header::{COOKIE, HOST, HeaderMap, HeaderValue};
+use http::header::{COOKIE, HOST, HeaderMap, HeaderValue, TE};
 use http::request::Parts;
 use http::uri::PathAndQuery;
 use http::{StatusCode, Uri};
@@ -152,6 +152,7 @@ pub fn decide<'a>(
 /// requests have none of them and pay for the pass alone: looking every name up would cost
 /// several times as much.
 struct Survey {
+    /// Whether there are hop-by-hop headers to check and to take off.
     hop_by_hop: bool,
     cookie_fields: usize,
 }
@@ -161,14 +162,20 @@ fn survey(headers: &HeaderMap) -> Survey {
         hop_by_hop: false,
         cookie_fields: 0,
     };
+    let mut plain_te_fields = 0;
     // A header that is repeated comes up once for each of its fields.
-    for (name, _) in headers {
+    for (name, value) in headers {
         if *name == COOKIE {
             found.cookie_fields += 1;
+        } else if *name == TE && value == "trailers" {
+            // What every gRPC client says, and already the one form in which `TE` is
+            // forwarded: on its own there is nothing to take off only to put it back.
+            plain_te_fields += 1;
         } else if is_hop_by_hop(name) {
             found.hop_by_hop = true;
         }
     }
+    found.hop_by_hop |= plain_te_fields > 1;
     found
 }
 
@@ -570,6 +577,51 @@ upstreams:
             .iter()
             .collect();
         assert_eq!(credentials, ["Basic Z2F0ZXdheQ=="]);
+    }
+
+    #[test]
+    fn a_request_that_says_te_trailers_and_nothing_more_goes_on_saying_it() {
+        // What every gRPC client sends. It is already what would be forwarded, so there is
+        // nothing to take off and put back.
+        let mut grpc = head(
+            "http://shop.example.com/cart",
+            &[("te", "trailers"), ("content-type", "application/grpc")],
+        );
+        assert_eq!(decide_on("web", &mut grpc, 0).as_deref(), Ok("cart"));
+        let te: Vec<_> = grpc.headers.get_all("te").iter().collect();
+        assert_eq!(te, ["trailers"]);
+        assert!(!hop_by_hop_to_take_off(&grpc.headers));
+
+        // Said in any other way, it is still brought to that one form.
+        for said in [
+            &[("te", "Trailers")][..],
+            &[("te", "trailers, gzip")],
+            &[("te", "trailers;q=1")],
+            &[("te", "trailers"), ("te", "trailers")],
+            &[("te", "trailers"), ("connection", "te")],
+            &[("te", "trailers"), ("keep-alive", "timeout=5")],
+        ] {
+            let mut fields = vec![("host", "shop.example.com")];
+            fields.extend_from_slice(said);
+            let mut request = head("/cart", &fields);
+            assert!(hop_by_hop_to_take_off(&request.headers), "{said:?}");
+            assert_eq!(decide_on("web", &mut request, 0).as_deref(), Ok("cart"));
+            let te: Vec<_> = request.headers.get_all("te").iter().collect();
+            assert_eq!(te, ["trailers"], "{said:?}");
+            assert!(!request.headers.contains_key("connection"), "{said:?}");
+            assert!(!request.headers.contains_key("keep-alive"), "{said:?}");
+        }
+
+        // And a `TE` that does not accept trailers goes.
+        let mut request = head("/cart", &[("host", "shop.example.com"), ("te", "gzip")]);
+        assert!(hop_by_hop_to_take_off(&request.headers));
+        assert_eq!(decide_on("web", &mut request, 0).as_deref(), Ok("cart"));
+        assert!(!request.headers.contains_key("te"));
+    }
+
+    /// Whether the pass over the headers finds hop-by-hop headers that need work.
+    fn hop_by_hop_to_take_off(headers: &HeaderMap) -> bool {
+        survey(headers).hop_by_hop
     }
 
     #[test]
