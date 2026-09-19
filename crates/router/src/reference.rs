@@ -40,11 +40,12 @@ pub fn host_matches(pattern: &str, wildcard: WildcardLabels, host: &str) -> bool
 /// wildcard, and whether the claim falls through onto more specific hosts.
 pub type HostClaimSpec = (Option<(String, WildcardLabels)>, bool);
 
-/// The positions of the claims that are candidates for `host`, in the order
-/// [`HostIndex::lookup`](crate::HostIndex::lookup) must give them: scan every claim, keep
-/// the most specific matches plus whatever falls through, most specific first.
+/// The positions of the claims that are candidates for `host`, as
+/// [`HostIndex::lookup`](crate::HostIndex::lookup) must group and order them: scan every
+/// claim, keep the most specific matches plus whatever falls through, put equally specific
+/// claims in one group in the order given, most specific group first.
 #[must_use]
-pub fn host_candidates(claims: &[HostClaimSpec], host: &str) -> Vec<usize> {
+pub fn host_candidates(claims: &[HostClaimSpec], host: &str) -> Vec<Vec<usize>> {
     let specificity = |claim: &HostClaimSpec| match &claim.0 {
         None => (false, 0),
         Some((text, _)) => (!text.starts_with('*'), text.len()),
@@ -66,8 +67,8 @@ pub fn host_candidates(claims: &[HostClaimSpec], host: &str) -> Vec<usize> {
         .collect();
     candidates.sort_by_key(|(position, claim)| (Reverse(specificity(claim)), *position));
     candidates
-        .into_iter()
-        .map(|(position, _)| position)
+        .chunk_by(|(_, one), (_, other)| specificity(one) == specificity(other))
+        .map(|group| group.iter().map(|(position, _)| *position).collect())
         .collect()
 }
 

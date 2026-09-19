@@ -1,6 +1,6 @@
 //! Fuzzes the host stage against its reference: every pattern must agree with the
 //! label-by-label matcher, and the index with the scan of every claim — which claims are
-//! candidates for a host, and in what order.
+//! candidates for a host, in which groups, and in what order.
 //!
 //! Input: the request host on the first line, then one claim per line. The first character
 //! of a claim line gives its flags (bit 0: falls through; bit 1: the wildcard stands for
@@ -56,9 +56,11 @@ fuzz_target!(|input: &str| {
         });
     }
 
-    let index = HostIndex::new(claims);
+    // Groups that are simply the positions of their members.
+    let index = HostIndex::new(claims, |members: Vec<usize>| members);
+    let groups: Vec<Vec<usize>> = index.lookup(host).cloned().collect();
     assert_eq!(
-        index.lookup(host),
+        groups,
         reference::host_candidates(&specs, host),
         "{specs:?} on {host:?}"
     );
