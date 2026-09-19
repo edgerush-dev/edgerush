@@ -1,0 +1,11 @@
+[package]
+name = "edgerush"
+description = "EdgeRush: a Kubernetes-native API gateway (operator, control plane and data plane in one binary)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
