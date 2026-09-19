@@ -3,8 +3,11 @@
 //! the first.
 
 use crate::backends::{UpstreamId, WeightedBackends};
-use crate::route::{Hostname, Match, PathMatch, Route, ValueMatch, ValuePredicate, Wildcard};
+use crate::route::{
+    Filter, HeaderChanges, Hostname, Match, PathMatch, Route, ValueMatch, ValuePredicate, Wildcard,
+};
 use crate::{Config, Protocol, Rule};
+use edgerush_filters::{HeaderModifier, HeaderModifierError};
 use edgerush_router::{
     HeaderPredicate, HeaderPredicateError, HeaderPredicates, HostClaim, HostPattern,
     HostPatternError, PathPattern, PathPatternError, QueryPredicate, QueryPredicateError,
@@ -66,6 +69,11 @@ pub struct CompiledListener {
 /// What a rule does with its requests.
 #[derive(Debug)]
 pub struct CompiledRule {
+    /// Changes to the request's headers before it goes to the upstream, if there are any:
+    /// a rule that asks for none carries nothing to skip over.
+    pub request_headers: Option<HeaderModifier>,
+    /// Changes to the response's headers before it goes to the client, if there are any.
+    pub response_headers: Option<HeaderModifier>,
     /// Where they go.
     pub backends: WeightedBackends,
 }
@@ -164,7 +172,10 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                     }
                 }
             }
+            let (request_headers, response_headers) = filters(rule, &place, &mut errors);
             compiled_rules.push(CompiledRule {
+                request_headers,
+                response_headers,
                 backends: backends(rule, &upstream_ids, &place, &mut errors),
             });
         }
@@ -332,6 +343,52 @@ fn route_match(
     }
 }
 
+/// The rule's header modifiers, for the request and for the response.
+fn filters(
+    rule: &Rule,
+    place: &Place,
+    errors: &mut Vec<ConfigError>,
+) -> (Option<HeaderModifier>, Option<HeaderModifier>) {
+    let mut request = None;
+    let mut response = None;
+    for (at, filter) in rule.filters.iter().enumerate() {
+        let place = Place {
+            filter: Some(at),
+            ..place.clone()
+        };
+        let (slot, changes, kind) = match filter {
+            Filter::RequestHeaderModifier(changes) => {
+                (&mut request, changes, "request_header_modifier")
+            }
+            Filter::ResponseHeaderModifier(changes) => {
+                (&mut response, changes, "response_header_modifier")
+            }
+        };
+        if slot.is_some() {
+            errors.push(place.problem(Problem::FilterTwice(kind)));
+        }
+        match header_modifier(changes) {
+            Ok(modifier) => *slot = Some(modifier),
+            Err(reason) => errors.push(place.problem(Problem::HeaderModifier(reason))),
+        }
+    }
+    let kept = |modifier: Option<HeaderModifier>| modifier.filter(|modifier| !modifier.is_empty());
+    (kept(request), kept(response))
+}
+
+fn header_modifier(changes: &HeaderChanges) -> Result<HeaderModifier, HeaderModifierError> {
+    fn pairs(headers: &[crate::Header]) -> impl Iterator<Item = (&str, &str)> {
+        headers
+            .iter()
+            .map(|header| (header.name.as_str(), header.value.as_str()))
+    }
+    HeaderModifier::new(
+        pairs(&changes.set),
+        pairs(&changes.add),
+        changes.remove.iter().map(String::as_str),
+    )
+}
+
 fn backends(
     rule: &Rule,
     upstream_ids: &BTreeMap<&str, UpstreamId>,
@@ -388,6 +445,8 @@ pub struct Place {
     pub rule: Option<usize>,
     /// The match's position in the rule, if the problem is in a match.
     pub matching: Option<usize>,
+    /// The filter's position in the rule, if the problem is in a filter.
+    pub filter: Option<usize>,
     /// The backend's position in the rule, if the problem is in a backend.
     pub backend: Option<usize>,
 }
@@ -406,6 +465,7 @@ impl Place {
             object,
             rule: None,
             matching: None,
+            filter: None,
             backend: None,
         }
     }
@@ -429,6 +489,9 @@ impl fmt::Display for Place {
         }
         if let Some(matching) = self.matching {
             write!(f, ", matches[{matching}]")?;
+        }
+        if let Some(filter) = self.filter {
+            write!(f, ", filters[{filter}]")?;
         }
         if let Some(backend) = self.backend {
             write!(f, ", backends[{backend}]")?;
@@ -469,6 +532,12 @@ pub enum Problem {
     /// The rule is for no request.
     #[error("no matches; any path is `{{ prefix: / }}`")]
     NoMatches,
+    /// The rule has two filters of a kind that it may have once.
+    #[error("a rule may have one `{0}`")]
+    FilterTwice(&'static str),
+    /// The header modifier is not valid.
+    #[error("{0}")]
+    HeaderModifier(HeaderModifierError),
     /// The rule sends its requests nowhere.
     #[error("no backends")]
     NoBackends,
@@ -591,6 +660,12 @@ routes:
       - matches:
           - path: { regex: "/orders/[0-9]+" }
           - path: { prefix: / }
+        filters:
+          - type: request_header_modifier
+            set: [{ name: X-Gateway, value: edgerush }]
+            remove: [x-debug]
+          - type: response_header_modifier
+            add: [{ name: cache-control, value: no-store }]
         backends: [{ upstream: web, weight: 1 }]
   - name: everything-else
     listeners: [web]
@@ -665,6 +740,41 @@ upstreams:
     }
 
     #[test]
+    fn a_rule_carries_its_header_modifiers_and_nothing_for_none() {
+        let compiled = compile(&config(SHOP)).unwrap();
+        let plain = compiled.rule(RuleId { route: 0, rule: 0 }).unwrap();
+        assert!(plain.request_headers.is_none());
+        assert!(plain.response_headers.is_none());
+
+        let filtered = compiled.rule(RuleId { route: 0, rule: 1 }).unwrap();
+        let mut request = HeaderMap::new();
+        request.insert("x-debug", "1".parse().unwrap());
+        request.insert("x-gateway", "spoofed".parse().unwrap());
+        filtered
+            .request_headers
+            .as_ref()
+            .unwrap()
+            .apply(&mut request);
+        assert_eq!(request.get("x-gateway").unwrap(), "edgerush");
+        assert!(!request.contains_key("x-debug"));
+
+        let mut response = HeaderMap::new();
+        filtered
+            .response_headers
+            .as_ref()
+            .unwrap()
+            .apply(&mut response);
+        assert_eq!(response.get("cache-control").unwrap(), "no-store");
+
+        // A modifier with nothing in it is not kept.
+        let empty = SHOP.replace("add: [{ name: cache-control, value: no-store }]", "add: []");
+        let compiled = compile(&config(&empty)).unwrap();
+        let filtered = compiled.rule(RuleId { route: 0, rule: 1 }).unwrap();
+        assert!(filtered.request_headers.is_some());
+        assert!(filtered.response_headers.is_none());
+    }
+
+    #[test]
     fn the_order_of_routes_is_the_last_tie_breaker() {
         let twins = r#"
 listeners: { web: { address: "[::]:8080", protocol: http } }
@@ -730,6 +840,10 @@ routes:
       - { name: "exa mple.com", falls_through: true }
     rules:
       - matches: []
+        filters:
+          - { type: request_header_modifier, set: [{ name: x-a, value: "1" }] }
+          - { type: response_header_modifier, set: [{ name: x-a, value: "1" }], remove: [X-A] }
+          - { type: request_header_modifier, add: [{ name: "x y", value: "1" }] }
         backends: []
       - matches:
           - path: { prefix: /ok }
@@ -763,6 +877,9 @@ upstreams:
                  `one_label` or `any_labels`",
                 "route `a`: hostname `exa mple.com`: hostname contains invalid character ' '",
                 "route `a`, rules[0]: no matches; any path is `{ prefix: / }`",
+                "route `a`, rules[0], filters[1]: header `x-a` is named more than once",
+                "route `a`, rules[0], filters[2]: a rule may have one `request_header_modifier`",
+                "route `a`, rules[0], filters[2]: `x y` is not a header name",
                 "route `a`, rules[0]: no backends",
                 "route `a`, rules[1], matches[1]: path: path does not start with `/`",
                 "route `a`, rules[1], matches[1]: method `get` is not an HTTP method in upper \
@@ -802,6 +919,23 @@ upstreams:
             parse("[{ name: a, listeners: [], hostnames: [], rules: [], rulez: [] }]").is_err()
         );
         assert!(parse(&rule("{ matches: [], backends: [], filter: [] }")).is_err());
+        // A filter is of a kind the model knows and has no keys it does not.
+        let filter = |filter: &str| {
+            rule(&format!(
+                "{{ matches: [], filters: [{filter}], backends: [] }}"
+            ))
+        };
+        assert!(parse(&filter("{ type: request_header_modifier }")).is_ok());
+        assert!(parse(&filter("{ type: request_header_modifier, remove: [x] }")).is_ok());
+        assert!(parse(&filter("{ type: request_header_modifier, removes: [x] }")).is_err());
+        assert!(parse(&filter("{ type: header_modifier }")).is_err());
+        assert!(parse(&filter("{ set: [] }")).is_err());
+        assert!(
+            parse(&filter(
+                "{ type: request_header_modifier, set: [{ name: x }] }"
+            ))
+            .is_err()
+        );
         assert!(parse(&rule("{ matches: [{ path: { glob: /a } }], backends: [] }")).is_err());
         // An endpoint is an address, not a name.
         let upstream = |endpoint: &str| {

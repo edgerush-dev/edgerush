@@ -9,9 +9,9 @@
 //! canonical form — no shorthand, and no defaults that choose behaviour. What is missing is
 //! an error, not "everything".
 //!
-//! So far: listeners, routes with their rules and weighted backends, and upstreams
-//! ([`Config`]), and their compilation ([`compile`]) into a router per listener and what
-//! each rule leads to ([`Compiled`]). Filters build on them.
+//! So far: listeners, routes with their rules, header filters and weighted backends, and
+//! upstreams ([`Config`]), and their compilation ([`compile`]) into a router per listener
+//! and what each rule does and leads to ([`Compiled`]).
 
 mod backends;
 mod compile;
@@ -25,5 +25,6 @@ pub use compile::{
 };
 pub use config::{Config, Listener, Protocol, Upstream};
 pub use route::{
-    Backend, Hostname, Match, PathMatch, Route, Rule, ValueMatch, ValuePredicate, Wildcard,
+    Backend, Filter, Header, HeaderChanges, Hostname, Match, PathMatch, Route, Rule, ValueMatch,
+    ValuePredicate, Wildcard,
 };

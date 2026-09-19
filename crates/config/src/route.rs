@@ -45,15 +45,52 @@ pub enum Wildcard {
     AnyLabels,
 }
 
-/// A rule: the requests it is for and where they go. What is done to them on the way
-/// (filters) is to come.
+/// A rule: the requests it is for, what is done to them on the way, and where they go.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     /// The rule is for a request that satisfies any one of these. At least one.
     pub matches: Vec<Match>,
+    /// What is done to a request and its response. Each kind of filter at most once.
+    #[serde(default)]
+    pub filters: Vec<Filter>,
     /// Where requests go, in proportion to the weights. At least one.
     pub backends: Vec<Backend>,
+}
+
+/// Something done to a request or its response.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Filter {
+    /// Changes the headers of the request before it goes to the upstream.
+    RequestHeaderModifier(HeaderChanges),
+    /// Changes the headers of the response before it goes to the client.
+    ResponseHeaderModifier(HeaderChanges),
+}
+
+/// Changes to headers. A header may be named once, in one of the three.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderChanges {
+    /// Headers to give one value, whatever they had.
+    #[serde(default)]
+    pub set: Vec<Header>,
+    /// Values to append to whatever the headers had.
+    #[serde(default)]
+    pub add: Vec<Header>,
+    /// Headers to take away.
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// A header with a value.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Header {
+    /// The header name; case does not matter.
+    pub name: String,
+    /// The value.
+    pub value: String,
 }
 
 /// One destination of a rule.
