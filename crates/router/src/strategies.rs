@@ -81,3 +81,36 @@ pub(crate) fn host_near(pattern: &str) -> impl Strategy<Value = String> + use<> 
     );
     prop_oneof![arbitrary, nearby]
 }
+
+/// Paths over an alphabet chosen to hit every rule often: separators, dots, the
+/// encodings of dots, slashes, backslashes, letters and controls, path parameters, and
+/// raw bytes that need encoding.
+pub(crate) fn nasty_path() -> impl Strategy<Value = String> {
+    let piece = prop_oneof![
+        4 => Just("/"),
+        3 => Just("."),
+        2 => Just("a"),
+        1 => Just("B"),
+        1 => Just("%2e"),
+        1 => Just("%2E"),
+        1 => Just("%2f"),
+        1 => Just("%5C"),
+        1 => Just("%61"),
+        1 => Just("%20"),
+        1 => Just("%c3"),
+        1 => Just("%0a"),
+        1 => Just("%"),
+        1 => Just("%4"),
+        1 => Just(";"),
+        1 => Just(";x"),
+        1 => Just("\\"),
+        1 => Just(" "),
+        1 => Just("é"),
+        1 => Just("\u{1}"),
+        1 => Just("+"),
+    ];
+    (any::<bool>(), prop::collection::vec(piece, 0..10)).prop_map(|(absolute, pieces)| {
+        let path = pieces.concat();
+        if absolute { format!("/{path}") } else { path }
+    })
+}

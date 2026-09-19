@@ -2,9 +2,13 @@
 //! define them.
 //!
 //! Patterns are compared byte for byte, case-sensitively, with the *normalised* request
-//! path (dot segments resolved, duplicate slashes merged). Normalising is not done here:
-//! the caller does it once per request. A pattern that is not itself in normal form could
-//! never match, so it is rejected instead.
+//! path ([`normalise_path`]). Normalising the request path is not done here: the caller
+//! does it once per request. Patterns get the same canonical percent-encoding when they
+//! are built, so `/café`, `/caf%c3%a9` and `/caf%C3%A9` are one pattern; but a pattern
+//! with `//` or dot segments, which says something other than what it would match, is
+//! rejected rather than quietly rewritten.
+
+use crate::{NormaliseError, normalise_path};
 
 /// A validated path pattern.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -26,12 +30,12 @@ impl PathPattern {
     ///
     /// # Errors
     ///
-    /// Returns a [`PathPatternError`] if `path` is not an absolute path in normal form.
+    /// Returns a [`PathPatternError`] if `path` is not absolute, has empty or dot segments, or is
+    /// a path that requests are rejected for.
     pub fn exact(path: &str) -> Result<Self, PathPatternError> {
-        validate(path)?;
         Ok(Self {
             kind: Kind::Exact,
-            path: path.into(),
+            path: canonical(path)?.into(),
         })
     }
 
@@ -41,12 +45,13 @@ impl PathPattern {
     ///
     /// # Errors
     ///
-    /// Returns a [`PathPatternError`] if `prefix` is not an absolute path in normal form.
+    /// Returns a [`PathPatternError`] if `prefix` is not absolute, has empty or dot segments, or
+    /// is a path that requests are rejected for.
     pub fn prefix(prefix: &str) -> Result<Self, PathPatternError> {
-        validate(prefix)?;
+        let prefix = canonical(prefix)?;
         Ok(Self {
             kind: Kind::Prefix,
-            path: prefix.strip_suffix('/').unwrap_or(prefix).into(),
+            path: prefix.strip_suffix('/').unwrap_or(&prefix).into(),
         })
     }
 
@@ -71,7 +76,14 @@ impl PathPattern {
     }
 }
 
-/// Checks that `path` is absolute and already in the form the normaliser produces.
+/// The pattern text in the normal form request paths have: structure checked, not changed;
+/// percent-encoding made canonical.
+fn canonical(path: &str) -> Result<std::borrow::Cow<'_, str>, PathPatternError> {
+    validate(path)?;
+    Ok(normalise_path(path)?)
+}
+
+/// Checks that `path` is absolute and has the structure the normaliser produces.
 fn validate(path: &str) -> Result<(), PathPatternError> {
     let segments = path
         .strip_prefix('/')
@@ -101,12 +113,15 @@ pub enum PathPatternError {
     /// The path contains a `.` or `..` segment, which normalised request paths never do.
     #[error("path contains a `.` or `..` segment")]
     DotSegment,
+    /// The path is one that a request would be rejected for, so nothing could match it.
+    #[error(transparent)]
+    Ambiguous(#[from] NormaliseError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::strategies::{path_near, path_pattern_text};
+    use crate::strategies::{nasty_path, path_near, path_pattern_text};
     use proptest::prelude::*;
 
     fn exact(path: &str) -> PathPattern {
@@ -175,8 +190,44 @@ mod tests {
     fn paths_that_are_not_ascii_are_compared_without_panicking() {
         assert!(prefix("/caf").matches("/caf/é"));
         assert!(!prefix("/caf").matches("/café"));
-        assert!(prefix("/café").matches("/café/au-lait"));
         assert!(!exact("/café").matches("/cafe"));
+    }
+
+    #[test]
+    fn every_spelling_of_a_pattern_is_the_same_pattern() {
+        for spelling in ["/café", "/caf%c3%a9", "/caf%C3%A9", "/c%61f%C3%A9"] {
+            assert_eq!(exact(spelling), exact("/caf%C3%A9"), "{spelling:?}");
+            assert_eq!(prefix(spelling), prefix("/caf%C3%A9"), "{spelling:?}");
+        }
+        assert_eq!(prefix("/%61dmin/"), prefix("/admin"));
+    }
+
+    #[test]
+    fn patterns_match_the_normal_form_of_request_paths() {
+        // The request path arrives normalised; however the pattern was spelt, it matches.
+        assert!(exact("/café").matches("/caf%C3%A9"));
+        assert!(prefix("/my files").matches("/my%20files/report.pdf"));
+        assert!(prefix("/%61dmin").matches("/admin/users"));
+        // A request path that skipped normalisation is not what patterns are written for.
+        assert!(!exact("/café").matches("/café"));
+    }
+
+    #[test]
+    fn patterns_no_request_path_could_be_normalised_to_are_rejected() {
+        use crate::NormaliseError;
+        let cases = [
+            ("/a%2Fb", NormaliseError::EncodedSeparator),
+            ("/a\\b", NormaliseError::Backslash),
+            ("/a%zz", NormaliseError::InvalidPercentEncoding),
+            ("/a%00", NormaliseError::ControlCharacter),
+            ("/a/%2e%2e/b", NormaliseError::AmbiguousDotSegment),
+            ("/a/..;x/b", NormaliseError::AmbiguousDotSegment),
+        ];
+        for (path, reason) in cases {
+            let reason = Err(PathPatternError::Ambiguous(reason));
+            assert_eq!(PathPattern::exact(path), reason, "exact {path:?}");
+            assert_eq!(PathPattern::prefix(path), reason, "prefix {path:?}");
+        }
     }
 
     #[test]
@@ -240,6 +291,20 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn pattern_made_from_any_path_matches_the_normal_form_of_that_path(
+            path in nasty_path()
+        ) {
+            if let (Ok(normal), Ok(exact), Ok(prefix)) = (
+                normalise_path(&path),
+                PathPattern::exact(&path),
+                PathPattern::prefix(&path),
+            ) {
+                prop_assert!(exact.matches(&normal), "exact {normal:?}");
+                prop_assert!(prefix.matches(&normal), "prefix {normal:?}");
+            }
+        }
+
         #[test]
         fn matching_agrees_with_the_segment_by_segment_reference(
             (text, is_prefix, path) in case()
