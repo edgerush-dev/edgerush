@@ -19,6 +19,10 @@ name = "host_index"
 harness = false
 
 [[bench]]
+name = "normalise"
+harness = false
+
+[[bench]]
 name = "path_index"
 harness = false
 
