@@ -10,9 +10,16 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+edgerush-router = { path = "crates/router" }
 # Types only (header map, method): the request core works on these, never on an engine's.
 http = "1.5"
 # Unicode tables are left out: regex paths are matched against normalised, ASCII-only paths.
+# The config model derives these traits and knows no format; formats belong to whoever
+# reads or writes a file or a stream.
+serde = { version = "1.0", features = ["derive"] }
+# YAML for the development harness and the command-line tools only. Reading only, no
+# optional extras; pure Rust with budgets against hostile input.
+serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
 regex = { version = "1.13", default-features = false, features = ["std", "perf"] }
 thiserror = "2.0"
 # Benchmark-only: instruction counts under valgrind, so Linux (WSL2) only. The installed

@@ -1,0 +1,21 @@
+[package]
+name = "edgerush-config"
+description = "EdgeRush config model: what a data plane runs, and its compilation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+edgerush-router.workspace = true
+http.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Fixtures are written the way harness files are. The crate itself knows no format.
+serde-saphyr.workspace = true
+
+[lints]
+workspace = true
