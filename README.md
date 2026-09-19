@@ -17,7 +17,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-All three must pass before every commit. They run in CI on Linux and Windows.
+All three must pass before every commit, on Windows and on Linux. There is no CI yet: the
+workflow in `.github/workflows/ci.yml` is kept ready for when the repository is published.
 
 ## Layout
 
