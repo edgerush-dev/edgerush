@@ -1,5 +1,11 @@
 //! Path normalisation: the one form of a request path that is both matched and forwarded,
-//! so that the gateway and the upstream can never read a path differently.
+//! so that the gateway and the upstream read the same path — as far as that can be had
+//! without knowing the upstream's parser. What is assumed of it is written down in the
+//! architecture docs (data plane, protocol correctness): it decodes a path at most once,
+//! splits it at `/` only, and may or may not know path parameters, decode before it looks
+//! for them, or decode unreserved characters. What would be read differently within those
+//! bounds is rejected; what lies outside them (decoding twice, Unicode look-alikes,
+//! file-system rules for case and trailing dots) is not something a normal form can settle.
 //!
 //! A path in normal form starts with `/`; has no empty, `.` or `..` segments (a trailing
 //! slash is allowed); and consists of plain path characters and percent-encodings in
@@ -35,7 +41,8 @@ pub fn normalise_path(path: &str) -> Result<Cow<'_, str>, NormaliseError> {
         let written = normal.get(start + 1..).unwrap_or_default();
 
         let dots = dot_segment(written.as_bytes());
-        if dots.is_some() && (encoded_dot || written.contains(';')) {
+        // Only `.` and `..` spelt plainly are dot segments to everybody.
+        if dots.is_some() && (encoded_dot || !matches!(written, "." | "..")) {
             return Err(NormaliseError::AmbiguousDotSegment);
         }
         // Empty and dot segments leave no trace of their own, except that one at the very
@@ -169,11 +176,15 @@ enum Dots {
 }
 
 /// Whether the segment is `.` or `..` once path parameters (`;…`) are set aside, the way
-/// servers that know path parameters read it.
+/// servers that know path parameters read it — including those that decode the path
+/// first, to which an encoded `;` is a `;`. The segment has canonical encoding by now, so
+/// that is `%3B` and nothing else.
 fn dot_segment(segment: &[u8]) -> Option<Dots> {
     match segment {
-        [b'.'] | [b'.', b';', ..] => Some(Dots::Current),
-        [b'.', b'.'] | [b'.', b'.', b';', ..] => Some(Dots::Parent),
+        [b'.'] | [b'.', b';', ..] | [b'.', b'%', b'3', b'B', ..] => Some(Dots::Current),
+        [b'.', b'.'] | [b'.', b'.', b';', ..] | [b'.', b'.', b'%', b'3', b'B', ..] => {
+            Some(Dots::Parent)
+        }
         _ => None,
     }
 }
@@ -197,8 +208,9 @@ pub enum NormaliseError {
     /// A control character, raw or encoded.
     #[error("path contains a control character")]
     ControlCharacter,
-    /// A `.` or `..` segment spelt with an encoded dot or carrying path parameters
-    /// (`%2e%2e`, `..;x`): a dot segment to some servers, an ordinary name to others.
+    /// A `.` or `..` segment spelt with an encoded dot or carrying path parameters, their
+    /// `;` encoded or not (`%2e%2e`, `..;x`, `..%3Bx`): a dot segment to some servers, an
+    /// ordinary name to others.
     #[error("path contains a disguised `.` or `..` segment")]
     AmbiguousDotSegment,
     /// `..` segments that climb above the root.
@@ -272,6 +284,12 @@ mod tests {
         assert_eq!(normalised("/100%25"), "/100%25");
         // Reserved characters mean something else when encoded, so they stay as they came.
         assert_eq!(normalised("/a%3Bb;c/%40@/%2b+"), "/a%3Bb;c/%40@/%2B+");
+        // An encoded `;` is only a disguise right after the dots of a dot segment: names
+        // that merely have dots and an encoded `;` in them are names.
+        assert_eq!(
+            normalised("/...%3bx/..a%3Bb/x..%3B"),
+            "/...%3Bx/..a%3Bb/x..%3B"
+        );
     }
 
     #[test]
@@ -329,6 +347,12 @@ mod tests {
             ("/a/..;x=y/b", NormaliseError::AmbiguousDotSegment),
             ("/a/.;x", NormaliseError::AmbiguousDotSegment),
             ("/a/%2e%2e;x/b", NormaliseError::AmbiguousDotSegment),
+            // The same with the `;` encoded: a server that decodes before it sets path
+            // parameters aside reads `..;x`, and then `..`.
+            ("/public/..%3Bx/admin", NormaliseError::AmbiguousDotSegment),
+            ("/a/..%3b/b", NormaliseError::AmbiguousDotSegment),
+            ("/a/.%3Bx", NormaliseError::AmbiguousDotSegment),
+            ("/a/%2e%2e%3Bx/b", NormaliseError::AmbiguousDotSegment),
             ("/..", NormaliseError::AboveRoot),
             ("/../a", NormaliseError::AboveRoot),
             ("/a/../../b", NormaliseError::AboveRoot),
@@ -355,7 +379,9 @@ mod tests {
         let segments: Vec<&str> = rest.split('/').collect();
         let (last, others) = segments.split_last().unwrap();
         let well_formed = |segment: &str| {
+            // Up to the first `;`, however it is written.
             let name = segment.split(';').next().unwrap();
+            let name = name.split("%3B").next().unwrap();
             let mut rest = segment.as_bytes();
             let mut encodings_are_canonical = true;
             while let Some((&byte, tail)) = rest.split_first() {

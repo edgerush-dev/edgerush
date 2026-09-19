@@ -141,7 +141,10 @@ pub fn normalise_path(path: &str) -> Option<String> {
     let mut stack: Vec<&str> = Vec::new();
     let mut trailing_slash = false;
     for (segment, encoded_dot) in &segments {
-        let name = segment.split_once(';').map_or(&**segment, |(name, _)| name);
+        // What a server that knows path parameters takes for the name: up to the first
+        // `;`, which to a server that decodes first may have been written `%3B`.
+        let decoded = segment.replace("%3B", ";");
+        let name = decoded.split_once(';').map_or(&*decoded, |(name, _)| name);
         let is_dots = name == "." || name == "..";
         if is_dots && (*encoded_dot || name != segment) {
             return None;

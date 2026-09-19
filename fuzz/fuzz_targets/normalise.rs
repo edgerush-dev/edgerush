@@ -40,7 +40,9 @@ fn check(path: &str) {
     while let Some(segment) = segments.next() {
         let last = segments.peek().is_none();
         assert!(last || !segment.is_empty(), "{path:?} -> {normal:?}");
+        // Up to the first `;`, however it is written: no server may find a dot segment.
         let name = segment.split(';').next().unwrap_or(segment);
+        let name = name.split("%3B").next().unwrap_or(name);
         assert!(name != "." && name != "..", "{path:?} -> {normal:?}");
     }
     for encoded in ["%2F", "%2f", "%5C", "%5c", "%2E", "%2e", "%41", "%61"] {
