@@ -193,13 +193,12 @@ fn shorter_suffixes(name: &str) -> impl Iterator<Item = (&str, &str)> {
 mod tests {
     use super::*;
     use crate::WildcardLabels::{One, OneOrMore};
+    use crate::reference;
     use crate::strategies::{host_near, pattern_text, wildcard_labels};
     use proptest::prelude::*;
-    use std::cmp::Reverse;
 
-    /// A claim as the tests write it: pattern text (`None` for every host), how to read a
-    /// wildcard, and whether it falls through. Its value is its position in the list.
-    type Spec = (Option<(String, WildcardLabels)>, bool);
+    /// A claim as the tests write it; its value is its position in the list.
+    type Spec = reference::HostClaimSpec;
 
     const FALLS_THROUGH: bool = true;
     const STAYS_PUT: bool = false;
@@ -333,30 +332,6 @@ mod tests {
         assert!(index.lookup("...").is_empty());
     }
 
-    /// The specification, written the slow and obvious way: scan every claim, keep the
-    /// most specific matches plus whatever falls through, most specific first.
-    fn reference(specs: &[Spec], host: &str) -> Vec<usize> {
-        let specificity = |spec: &Spec| match &spec.0 {
-            None => (false, 0),
-            Some((text, _)) => (!text.starts_with('*'), text.len()),
-        };
-        let matching: Vec<(usize, &Spec)> = specs
-            .iter()
-            .enumerate()
-            .filter(|(_, spec)| compile(spec).is_none_or(|pattern| pattern.matches(host)))
-            .collect();
-        let most_specific = matching.iter().map(|(_, spec)| specificity(spec)).max();
-        let mut candidates: Vec<(usize, &Spec)> = matching
-            .into_iter()
-            .filter(|(_, spec)| spec.1 || Some(specificity(spec)) == most_specific)
-            .collect();
-        candidates.sort_by_key(|(position, spec)| (Reverse(specificity(spec)), *position));
-        candidates
-            .into_iter()
-            .map(|(position, _)| position)
-            .collect()
-    }
-
     fn spec() -> impl Strategy<Value = Spec> {
         let pattern = prop_oneof![
             1 => Just(None),
@@ -391,7 +366,7 @@ mod tests {
         #[test]
         fn lookup_agrees_with_the_scan_everything_reference((specs, host) in case()) {
             let index = index(&specs);
-            prop_assert_eq!(index.lookup(&host), reference(&specs, &host));
+            prop_assert_eq!(index.lookup(&host), reference::host_candidates(&specs, &host));
         }
     }
 }

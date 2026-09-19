@@ -171,20 +171,12 @@ impl<'a, T> Iterator for PathCandidates<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reference::{self, PathKind as SpecKind};
     use crate::strategies::{path_near, path_pattern_text};
     use proptest::prelude::*;
-    use std::cmp::Reverse;
 
-    /// An entry as the tests write it: pattern text and its kind, in order of precedence.
-    /// Its value is its position in the list.
-    type Spec = (String, SpecKind);
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    enum SpecKind {
-        Exact,
-        Regex,
-        Prefix,
-    }
+    /// An entry as the tests write it; its value is its position in the list.
+    type Spec = reference::PathSpec;
 
     fn exact(path: &str) -> Spec {
         (path.to_owned(), SpecKind::Exact)
@@ -308,27 +300,6 @@ mod tests {
         assert_eq!(lookup(&index, "//a"), [0]);
     }
 
-    /// The specification, written the slow and obvious way: scan every entry, keep those
-    /// whose pattern matches; exact ones first, then regexes, then the longest prefix first.
-    fn reference(specs: &[Spec], path: &str) -> Vec<usize> {
-        let mut candidates: Vec<(usize, &Spec)> = specs
-            .iter()
-            .enumerate()
-            .filter(|(_, spec)| compile(spec).matches(path))
-            .collect();
-        candidates.sort_by_key(|(position, (text, kind))| {
-            let length = match kind {
-                SpecKind::Prefix => text.strip_suffix('/').unwrap_or(text).len(),
-                SpecKind::Exact | SpecKind::Regex => 0,
-            };
-            (*kind, Reverse(length), *position)
-        });
-        candidates
-            .into_iter()
-            .map(|(position, _)| position)
-            .collect()
-    }
-
     /// Exact and prefix patterns, and regexes that say the same as one of those or match
     /// one segment of anything — so that all three kinds keep matching the same paths.
     fn spec() -> impl Strategy<Value = (Spec, String)> {
@@ -366,7 +337,9 @@ mod tests {
     proptest! {
         #[test]
         fn lookup_agrees_with_the_scan_everything_reference((specs, path) in case()) {
-            prop_assert_eq!(lookup(&index(&specs), &path), reference(&specs, &path));
+            let patterns: Vec<PathPattern> = specs.iter().map(compile).collect();
+            let expected = reference::path_candidates(&specs, |n| patterns[n].matches(&path));
+            prop_assert_eq!(lookup(&index(&specs), &path), expected);
         }
     }
 }

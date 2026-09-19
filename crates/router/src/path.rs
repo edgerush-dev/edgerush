@@ -204,6 +204,7 @@ pub enum PathPatternError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reference;
     use crate::strategies::{nasty_path, path_near, path_pattern_text};
     use proptest::prelude::*;
 
@@ -450,22 +451,6 @@ mod tests {
         );
     }
 
-    /// The obvious way to match a prefix: split both into segments and compare them one by
-    /// one, as the Gateway API text describes it.
-    fn reference_matches(pattern: &str, is_prefix: bool, path: &str) -> bool {
-        if !is_prefix {
-            return pattern == path;
-        }
-        let mut wanted: Vec<&str> = pattern.split('/').collect();
-        if wanted.last() == Some(&"") {
-            wanted.pop();
-        }
-        let given: Vec<&str> = path.split('/').collect();
-        path.starts_with('/')
-            && given.len() >= wanted.len()
-            && wanted.iter().zip(&given).all(|(a, b)| a == b)
-    }
-
     fn case() -> impl Strategy<Value = (String, bool, String)> {
         (path_pattern_text(), any::<bool>()).prop_flat_map(|(pattern, is_prefix)| {
             let path = path_near(&pattern);
@@ -507,7 +492,7 @@ mod tests {
             let pattern = if is_prefix { prefix(&text) } else { exact(&text) };
             prop_assert_eq!(
                 pattern.matches(&path),
-                reference_matches(&text, is_prefix, &path)
+                reference::path_matches(&text, is_prefix, &path)
             );
         }
     }

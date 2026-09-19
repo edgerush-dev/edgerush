@@ -164,6 +164,7 @@ pub enum HostPatternError {
 mod tests {
     use super::WildcardLabels::{One, OneOrMore};
     use super::*;
+    use crate::reference;
     use crate::strategies::{host_near, pattern_text, wildcard_labels};
     use proptest::prelude::*;
 
@@ -295,28 +296,6 @@ mod tests {
         );
     }
 
-    /// The obvious way to match, label by label with allocation everywhere — what
-    /// [`HostPattern::matches`] must agree with.
-    fn reference_matches(pattern: &str, wildcard: WildcardLabels, host: &str) -> bool {
-        let labels =
-            |name: &str| -> Vec<String> { name.split('.').map(str::to_ascii_lowercase).collect() };
-        let (pattern, host) = (labels(pattern), labels(host));
-        if pattern.first().map(String::as_str) != Some("*") {
-            return host == pattern;
-        }
-        let suffix = &pattern[1..];
-        if host.len() <= suffix.len() {
-            return false;
-        }
-        let (leading, trailing) = host.split_at(host.len() - suffix.len());
-        trailing == suffix
-            && !leading.join(".").is_empty()
-            && match wildcard {
-                One => leading.len() == 1,
-                OneOrMore => true,
-            }
-    }
-
     fn case() -> impl Strategy<Value = (String, WildcardLabels, String)> {
         (pattern_text(), wildcard_labels()).prop_flat_map(|(pattern, wildcard)| {
             let host = host_near(&pattern);
@@ -332,7 +311,7 @@ mod tests {
             let compiled = pattern(&text, wildcard);
             prop_assert_eq!(
                 compiled.matches(&host),
-                reference_matches(&text, wildcard, &host)
+                reference::host_matches(&text, wildcard, &host)
             );
         }
     }

@@ -44,8 +44,12 @@ itself builds on the pinned stable toolchain) and Linux; WSL2 is enough.
 rustup toolchain install nightly --profile minimal
 cargo install cargo-fuzz
 cargo +nightly fuzz list
-cargo +nightly fuzz run normalise -- -max_total_time=600
+mkdir -p fuzz/corpus/normalise
+cargo +nightly fuzz run normalise fuzz/corpus/normalise fuzz/seeds/normalise -- -max_total_time=600
 ```
+
+The first directory is the corpus the fuzzer grows (not kept in git); `fuzz/seeds/` holds a
+few hand-written inputs per target that show it the input format.
 
 Targets compare the real code with the slow reference implementations in the router's
 `reference` module, the same ones the property tests use. An input that fails is saved

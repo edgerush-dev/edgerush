@@ -1,0 +1,6 @@
+/api/v1/users/42
+e/api/v1/users/42
+p/api
+p/
+r/api/v1/users/[0-9]+
+r/api/.*

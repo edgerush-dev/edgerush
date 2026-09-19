@@ -19,8 +19,22 @@ edgerush-router = { path = "../crates/router", features = ["reference"] }
 libfuzzer-sys = "0.4"
 
 [[bin]]
+name = "host_index"
+path = "fuzz_targets/host_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "normalise"
 path = "fuzz_targets/normalise.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_index"
+path = "fuzz_targets/path_index.rs"
 test = false
 doc = false
 bench = false
