@@ -5,12 +5,13 @@
 //! keeps it deterministic and easy to test, fuzz and benchmark.
 //!
 //! So far: the host stage (hostname patterns and the index that finds the candidates for a
-//! request's host), the path stage for exact and prefix patterns, and the normaliser that
-//! request paths go through before they are matched. Regex paths,
-//! predicates, the rest of Gateway API precedence and the router that joins the stages
-//! build on them.
+//! request's host), the path stage (exact, prefix and regex patterns and their index), the
+//! normaliser that request paths go through before they are matched, and header
+//! predicates. Query and method predicates, the rest of Gateway API precedence and the
+//! router that joins the stages build on them.
 
 mod hash;
+pub mod header;
 pub mod host;
 pub mod host_index;
 pub mod normalise;
@@ -22,6 +23,7 @@ pub mod reference;
 mod strategies;
 mod whole_regex;
 
+pub use header::{HeaderPredicate, HeaderPredicateError, HeaderPredicates};
 pub use host::{HostPattern, HostPatternError, WildcardLabels};
 pub use host_index::{HostClaim, HostIndex};
 pub use normalise::{NormaliseError, normalise_path};

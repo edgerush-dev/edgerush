@@ -10,6 +10,8 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+# Types only (header map, method): the request core works on these, never on an engine's.
+http = "1.5"
 # Unicode tables are left out: regex paths are matched against normalised, ASCII-only paths.
 regex = { version = "1.13", default-features = false, features = ["std", "perf"] }
 thiserror = "2.0"

@@ -12,12 +12,17 @@ publish.workspace = true
 reference = []
 
 [dependencies]
+http.workspace = true
 regex.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 iai-callgrind.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "header"
+harness = false
 
 [[bench]]
 name = "host_index"

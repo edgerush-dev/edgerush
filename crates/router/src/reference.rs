@@ -190,3 +190,25 @@ fn canonical_segment(segment: &str) -> Option<(String, bool)> {
     }
     Some((canonical, encoded_dot))
 }
+
+/// Whether a request's header fields satisfy a rule's exact header matches, both given as
+/// (name, value) in order: only the first match for a name counts, names are compared
+/// without regard to case, and a header the request repeats has the one value that joining
+/// its fields with commas gives.
+#[must_use]
+pub fn exact_headers_match(rule: &[(String, String)], request: &[(String, String)]) -> bool {
+    let mut seen: Vec<String> = Vec::new();
+    rule.iter().all(|(name, expected)| {
+        let name = name.to_ascii_lowercase();
+        if seen.contains(&name) {
+            return true;
+        }
+        seen.push(name.clone());
+        let values: Vec<&str> = request
+            .iter()
+            .filter(|(field, _)| field.to_ascii_lowercase() == name)
+            .map(|(_, value)| value.as_str())
+            .collect();
+        !values.is_empty() && values.join(",") == *expected
+    })
+}
