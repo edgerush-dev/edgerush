@@ -1,28 +1,61 @@
-//! Path patterns: exact paths and segment-wise prefixes, as Gateway API and Ingress both
-//! define them.
+//! Path patterns: exact paths, segment-wise prefixes and regular expressions, the three
+//! kinds of Gateway API (Ingress has the first two).
 //!
-//! Patterns are compared byte for byte, case-sensitively, with the *normalised* request
-//! path ([`normalise_path`]). Normalising the request path is not done here: the caller
-//! does it once per request. Patterns get the same canonical percent-encoding when they
-//! are built, so `/café`, `/caf%c3%a9` and `/caf%C3%A9` are one pattern; but a pattern
+//! Patterns are compared case-sensitively with the *normalised* request path
+//! ([`normalise_path`]). Normalising the request path is not done here: the caller does it
+//! once per request. Exact and prefix patterns get the same canonical percent-encoding when
+//! they are built, so `/café`, `/caf%c3%a9` and `/caf%C3%A9` are one pattern; but a pattern
 //! with `//` or dot segments, which says something other than what it would match, is
 //! rejected rather than quietly rewritten.
+//!
+//! Regular expressions are RE2-style and matched in linear time, whatever the pattern and
+//! the path. That is the contract; the engine behind it is a detail of this module and
+//! appears nowhere in the crate's interface.
 
 use crate::{NormaliseError, normalise_path};
+use regex::bytes::{Regex, RegexBuilder};
+use std::hash::{Hash, Hasher};
+use std::mem::discriminant;
+
+/// The most memory one compiled regex may take. Far more than any sane path pattern needs;
+/// a pattern that repeats large groups a large number of times is refused.
+const REGEX_SIZE_LIMIT: usize = 256 * 1024;
+/// The most memory the engine may use to speed up matching one regex, per thread that
+/// matches it. Going without only makes matching slower, never wrong.
+const REGEX_CACHE_LIMIT: usize = 512 * 1024;
 
 /// A validated path pattern.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct PathPattern {
     pub(crate) kind: Kind,
-    /// For a prefix, without its trailing slash (the root prefix is the empty string), so
-    /// that `/shop` and `/shop/` are one pattern and the boundary check is uniform.
+    /// The pattern text. For a prefix, without its trailing slash (the root prefix is the
+    /// empty string), so that `/shop` and `/shop/` are one pattern and the boundary check
+    /// is uniform. For a regex, as the user wrote it.
     pub(crate) path: Box<str>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub(crate) enum Kind {
     Exact,
     Prefix,
+    /// Compiled to match the whole path.
+    Regex(Regex),
+}
+
+/// Patterns are what their kind and text say; a compiled regex adds nothing to that.
+impl PartialEq for PathPattern {
+    fn eq(&self, other: &Self) -> bool {
+        discriminant(&self.kind) == discriminant(&other.kind) && self.path == other.path
+    }
+}
+
+impl Eq for PathPattern {}
+
+impl Hash for PathPattern {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        discriminant(&self.kind).hash(state);
+        self.path.hash(state);
+    }
 }
 
 impl PathPattern {
@@ -55,6 +88,31 @@ impl PathPattern {
         })
     }
 
+    /// A pattern that matches the paths a regular expression describes: the **whole** path,
+    /// so `/users/\d+` matches `/users/42` but not `/users/42/edit`; whoever wants less
+    /// writes `.*`. Case-sensitive unless the pattern says otherwise (`(?i)`).
+    ///
+    /// The syntax is RE2-style: no look-around and no backreferences, which is what makes
+    /// linear-time matching possible. The regex sees the normalised path, in which anything
+    /// but ASCII is percent-encoded, so the pattern has to be ASCII too.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PathPatternError`] if `pattern` is not ASCII, not valid syntax, or
+    /// compiles to something unreasonably large.
+    pub fn regex(pattern: &str) -> Result<Self, PathPatternError> {
+        if !pattern.is_ascii() {
+            return Err(PathPatternError::RegexNotAscii);
+        }
+        // On its own first: a pattern such as `a)|(b` must not be able to close the group
+        // that holds it to the whole path, and syntax errors should quote the user's text.
+        compile(pattern)?;
+        Ok(Self {
+            kind: Kind::Regex(compile(&format!("^(?:{pattern})$"))?),
+            path: pattern.into(),
+        })
+    }
+
     /// Whether the request path falls under this pattern.
     ///
     /// `path` is the normalised path alone, without the query string. Anything that does
@@ -62,7 +120,7 @@ impl PathPattern {
     /// allocates.
     #[must_use]
     pub fn matches(&self, path: &str) -> bool {
-        match self.kind {
+        match &self.kind {
             Kind::Exact => path == &*self.path,
             // What follows the prefix must be nothing or start a new segment. The check for
             // a leading slash only matters to the root prefix, stored as the empty string.
@@ -72,8 +130,23 @@ impl PathPattern {
                         .strip_prefix(&*self.path)
                         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
             }
+            Kind::Regex(regex) => path.starts_with('/') && regex.is_match(path.as_bytes()),
         }
     }
+}
+
+/// Compiles with the limits and the dialect of the contract. Unicode support is off, as in
+/// RE2's defaults: `\d` and `\w` are the ASCII classes, and normalised paths are ASCII.
+fn compile(pattern: &str) -> Result<Regex, PathPatternError> {
+    RegexBuilder::new(pattern)
+        .unicode(false)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_CACHE_LIMIT)
+        .build()
+        .map_err(|error| match error {
+            regex::Error::CompiledTooBig(_) => PathPatternError::RegexTooLarge,
+            other => PathPatternError::RegexSyntax(other.to_string()),
+        })
 }
 
 /// The pattern text in the normal form request paths have: structure checked, not changed;
@@ -102,7 +175,7 @@ fn validate(path: &str) -> Result<(), PathPatternError> {
 }
 
 /// Why a path pattern was rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PathPatternError {
     /// The path does not start with `/` (or is empty).
     #[error("path does not start with `/`")]
@@ -116,6 +189,16 @@ pub enum PathPatternError {
     /// The path is one that a request would be rejected for, so nothing could match it.
     #[error(transparent)]
     Ambiguous(#[from] NormaliseError),
+    /// The regular expression is not valid RE2-style syntax; the text says what is wrong.
+    #[error("invalid regular expression: {0}")]
+    RegexSyntax(String),
+    /// The regular expression contains something other than ASCII, which no normalised
+    /// path does.
+    #[error("regular expression is not ASCII; write other characters percent-encoded")]
+    RegexNotAscii,
+    /// The regular expression compiles to more than the size allowed for one pattern.
+    #[error("regular expression is too large once compiled")]
+    RegexTooLarge,
 }
 
 #[cfg(test)]
@@ -130,6 +213,10 @@ mod tests {
 
     fn prefix(path: &str) -> PathPattern {
         PathPattern::prefix(path).unwrap()
+    }
+
+    fn regex(pattern: &str) -> PathPattern {
+        PathPattern::regex(pattern).unwrap()
     }
 
     #[test]
@@ -248,7 +335,11 @@ mod tests {
             ("/shop/../", PathPatternError::DotSegment),
         ];
         for (path, reason) in cases {
-            assert_eq!(PathPattern::exact(path), Err(reason), "exact {path:?}");
+            assert_eq!(
+                PathPattern::exact(path),
+                Err(reason.clone()),
+                "exact {path:?}"
+            );
             assert_eq!(PathPattern::prefix(path), Err(reason), "prefix {path:?}");
         }
     }
@@ -257,6 +348,98 @@ mod tests {
     fn dots_inside_a_segment_are_ordinary_characters() {
         assert!(exact("/.well-known/acme").matches("/.well-known/acme"));
         assert!(prefix("/v1.2/...").matches("/v1.2/.../x"));
+    }
+
+    #[test]
+    fn regex_pattern_must_match_the_whole_path() {
+        let user = regex(r"/users/\d+");
+        assert!(user.matches("/users/42"));
+        assert!(!user.matches("/users/42/edit"));
+        assert!(!user.matches("/x/users/42"));
+        assert!(!user.matches("/users/"));
+        // Whoever wants less says so.
+        assert!(regex(r"/users/\d+(/.*)?").matches("/users/42/edit"));
+        assert!(regex(r".*/users/\d+").matches("/x/users/42"));
+    }
+
+    #[test]
+    fn anchors_the_user_writes_change_nothing() {
+        let user = regex(r"^/users/\d+$");
+        assert!(user.matches("/users/42"));
+        assert!(!user.matches("/users/42/edit"));
+        assert!(!user.matches("/x/users/42"));
+    }
+
+    #[test]
+    fn every_branch_of_an_alternation_is_held_to_the_whole_path() {
+        let either = regex("/a|/ab");
+        assert!(either.matches("/a"));
+        assert!(either.matches("/ab"));
+        assert!(!either.matches("/abc"));
+        assert!(!either.matches("/x/a"));
+    }
+
+    #[test]
+    fn regex_pattern_is_case_sensitive_unless_it_says_otherwise() {
+        assert!(regex("/shop").matches("/shop"));
+        assert!(!regex("/shop").matches("/Shop"));
+        assert!(regex("(?i)/shop").matches("/SHOP"));
+    }
+
+    #[test]
+    fn regex_pattern_sees_the_normalised_path() {
+        assert!(regex(r"/caf%C3%A9/\d+").matches("/caf%C3%A9/7"));
+        assert!(regex("/[^/]+/menu").matches("/caf%C3%A9/menu"));
+        assert!(!regex("/[^/]+/menu").matches("/a/b/menu"));
+    }
+
+    #[test]
+    fn regex_pattern_matches_nothing_that_is_not_an_absolute_path() {
+        let anything = regex(".*");
+        assert!(anything.matches("/"));
+        assert!(anything.matches("/shop"));
+        assert!(!anything.matches(""));
+        assert!(!anything.matches("*"));
+        assert!(!anything.matches("shop"));
+    }
+
+    #[test]
+    fn regex_patterns_are_compared_by_their_text() {
+        assert_eq!(regex("/a+"), regex("/a+"));
+        assert_ne!(regex("/a+"), regex("/a*"));
+        assert_ne!(regex("/a"), exact("/a"));
+        assert_ne!(regex("/a"), prefix("/a"));
+    }
+
+    #[test]
+    fn regex_patterns_outside_the_contract_are_rejected() {
+        // Broken syntax, an attempt to break out of the anchoring, and the two features
+        // that cannot be matched in linear time: look-around and backreferences.
+        for pattern in ["/a(", "/a)|(/b", "/a(?=b)", r"/(a)\1"] {
+            assert!(
+                matches!(
+                    PathPattern::regex(pattern),
+                    Err(PathPatternError::RegexSyntax(_))
+                ),
+                "{pattern:?}"
+            );
+        }
+        assert_eq!(
+            PathPattern::regex("/café"),
+            Err(PathPatternError::RegexNotAscii)
+        );
+        assert_eq!(
+            PathPattern::regex("(?:/[a-z]{1,500}){1,500}"),
+            Err(PathPatternError::RegexTooLarge)
+        );
+    }
+
+    #[test]
+    fn hostile_pattern_and_path_are_matched_in_linear_time() {
+        // Catastrophic for a backtracking engine; a test that finishes is the assertion.
+        let pattern = regex("/(a+)+b");
+        let path = format!("/{}", "a".repeat(100_000));
+        assert!(!pattern.matches(&path));
     }
 
     #[test]
@@ -303,6 +486,18 @@ mod tests {
                 prop_assert!(exact.matches(&normal), "exact {normal:?}");
                 prop_assert!(prefix.matches(&normal), "prefix {normal:?}");
             }
+        }
+
+        #[test]
+        fn regex_of_a_literal_path_is_the_exact_pattern_and_with_a_tail_the_prefix(
+            (text, _, path) in case()
+        ) {
+            // Whole-path matching, checked against the two kinds that define it by hand.
+            let literal = ::regex::escape(text.strip_suffix('/').unwrap_or(&text));
+            let as_exact = regex(&::regex::escape(&text));
+            let as_prefix = regex(&format!("{literal}(?:/.*)?"));
+            prop_assert_eq!(as_exact.matches(&path), exact(&text).matches(&path));
+            prop_assert_eq!(as_prefix.matches(&path), prefix(&text).matches(&path));
         }
 
         #[test]

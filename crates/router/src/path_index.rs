@@ -1,6 +1,11 @@
 //! The path stage of routing: from a normalised request path to the candidates whose path
-//! pattern it satisfies, in Gateway API precedence — exact matches first, then prefixes
-//! from the longest to the shortest.
+//! pattern it satisfies, in precedence order — exact matches first, then regular
+//! expressions, then prefixes from the longest to the shortest.
+//!
+//! Gateway API fixes the order of exact and prefix matches and leaves regular expressions
+//! to the implementation. They come before prefixes because a regex is usually the more
+//! specific statement, and a catch-all `/` prefix would otherwise shadow every regex beside
+//! it. They have no specificity among themselves and are tried in the order given.
 
 use crate::hash::Map;
 use crate::path::{Kind, PathPattern};
@@ -9,6 +14,9 @@ use crate::path::{Kind, PathPattern};
 #[derive(Debug)]
 pub struct PathIndex<T> {
     exact: Map<Box<[T]>>,
+    /// Tried one after the other, and only as far as the caller asks for candidates. An
+    /// index without regexes pays nothing for them.
+    regexes: Vec<(PathPattern, T)>,
     /// A trie over path segments. The root, always present at position 0, is the prefix
     /// `/`. Children are created after their parents, so they sit at higher positions.
     prefixes: Vec<PrefixNode<T>>,
@@ -37,9 +45,11 @@ impl<T> PathIndex<T> {
     /// Builds the index. Values with the same pattern keep the order they were given in.
     pub fn new(entries: impl IntoIterator<Item = (PathPattern, T)>) -> Self {
         let mut exact: Map<Vec<T>> = Map::default();
+        let mut regexes = Vec::new();
         let mut prefixes = vec![PrefixNode::new(None)];
         for (pattern, value) in entries {
-            match pattern.kind {
+            match &pattern.kind {
+                Kind::Regex(_) => regexes.push((pattern, value)),
                 Kind::Exact => exact
                     .entry(pattern.path.as_bytes().into())
                     .or_default()
@@ -72,17 +82,20 @@ impl<T> PathIndex<T> {
                 .into_iter()
                 .map(|(path, values)| (path, values.into_boxed_slice()))
                 .collect(),
+            regexes,
             prefixes,
         }
     }
 
     /// The candidates for a request path, best match first: those with exactly this path,
-    /// then those with a prefix of it, longest prefix first.
+    /// then those with a regex that matches it, then those with a prefix of it, longest
+    /// prefix first.
     ///
     /// `path` is the normalised path alone, as for [`PathPattern::matches`], and the two
-    /// always agree on what matches. Never allocates.
+    /// always agree on what matches. Never allocates. Regexes are only run as the
+    /// candidates before them are used up.
     #[must_use]
-    pub fn lookup(&self, path: &str) -> PathCandidates<'_, T> {
+    pub fn lookup<'a>(&'a self, path: &'a str) -> PathCandidates<'a, T> {
         let exact = self
             .exact
             .get(path.as_bytes())
@@ -105,6 +118,8 @@ impl<T> PathIndex<T> {
             at
         });
         PathCandidates {
+            path,
+            regexes: self.regexes.iter(),
             prefixes: &self.prefixes,
             current: exact.iter(),
             next: deepest,
@@ -124,6 +139,10 @@ fn segments(path: &str) -> impl Iterator<Item = &str> {
 /// Candidates for one request path, best match first; see [`PathIndex::lookup`].
 #[derive(Debug)]
 pub struct PathCandidates<'a, T> {
+    path: &'a str,
+    /// The regexes not tried yet; their turn comes when the exact matches in `current`
+    /// run dry, before the first trie node is handed out.
+    regexes: std::slice::Iter<'a, (PathPattern, T)>,
     prefixes: &'a [PrefixNode<T>],
     current: std::slice::Iter<'a, T>,
     /// The trie node to hand out once `current` runs dry.
@@ -136,6 +155,10 @@ impl<'a, T> Iterator for PathCandidates<'a, T> {
     fn next(&mut self) -> Option<&'a T> {
         loop {
             if let Some(value) = self.current.next() {
+                return Some(value);
+            }
+            let path = self.path;
+            if let Some((_, value)) = self.regexes.find(|(regex, _)| regex.matches(path)) {
                 return Some(value);
             }
             let node = self.prefixes.get(self.next.take()?)?;
@@ -152,24 +175,36 @@ mod tests {
     use proptest::prelude::*;
     use std::cmp::Reverse;
 
-    /// An entry as the tests write it: pattern text and whether it is a prefix. Its value
-    /// is its position in the list.
-    type Spec = (String, bool);
+    /// An entry as the tests write it: pattern text and its kind, in order of precedence.
+    /// Its value is its position in the list.
+    type Spec = (String, SpecKind);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum SpecKind {
+        Exact,
+        Regex,
+        Prefix,
+    }
 
     fn exact(path: &str) -> Spec {
-        (path.to_owned(), false)
+        (path.to_owned(), SpecKind::Exact)
+    }
+
+    fn regex(pattern: &str) -> Spec {
+        (pattern.to_owned(), SpecKind::Regex)
     }
 
     fn prefix(path: &str) -> Spec {
-        (path.to_owned(), true)
+        (path.to_owned(), SpecKind::Prefix)
     }
 
-    fn compile((text, is_prefix): &Spec) -> PathPattern {
-        if *is_prefix {
-            PathPattern::prefix(text).unwrap()
-        } else {
-            PathPattern::exact(text).unwrap()
+    fn compile((text, kind): &Spec) -> PathPattern {
+        match kind {
+            SpecKind::Exact => PathPattern::exact(text),
+            SpecKind::Regex => PathPattern::regex(text),
+            SpecKind::Prefix => PathPattern::prefix(text),
         }
+        .unwrap()
     }
 
     fn index(specs: &[Spec]) -> PathIndex<usize> {
@@ -195,6 +230,33 @@ mod tests {
         let index = index(&[prefix("/"), prefix("/shop"), exact("/shop")]);
         assert_eq!(lookup(&index, "/shop"), [2, 1, 0]);
         assert_eq!(lookup(&index, "/shop/"), [1, 0]);
+    }
+
+    #[test]
+    fn regex_match_comes_after_exact_and_before_any_prefix() {
+        let index = index(&[
+            prefix("/"),
+            prefix("/users/42"),
+            regex(r"/users/\d+"),
+            exact("/users/42"),
+        ]);
+        assert_eq!(lookup(&index, "/users/42"), [3, 2, 1, 0]);
+        assert_eq!(lookup(&index, "/users/7"), [2, 0]);
+        assert_eq!(lookup(&index, "/users/42/edit"), [1, 0]);
+    }
+
+    #[test]
+    fn regexes_that_match_keep_the_order_they_were_given_in() {
+        let index = index(&[
+            regex("/a.*"),
+            regex("/b.*"),
+            regex("/ab?c"),
+            regex(".*c"),
+            regex("/a.*"),
+        ]);
+        assert_eq!(lookup(&index, "/abc"), [0, 2, 3, 4]);
+        assert_eq!(lookup(&index, "/bc"), [1, 3]);
+        assert!(lookup(&index, "/x").is_empty());
     }
 
     #[test]
@@ -233,7 +295,7 @@ mod tests {
 
     #[test]
     fn paths_that_are_not_absolute_have_no_candidates() {
-        let index = index(&[prefix("/"), prefix("/a")]);
+        let index = index(&[prefix("/"), prefix("/a"), regex(".*")]);
         assert!(lookup(&index, "").is_empty());
         assert!(lookup(&index, "*").is_empty());
         assert!(lookup(&index, "a").is_empty());
@@ -247,16 +309,19 @@ mod tests {
     }
 
     /// The specification, written the slow and obvious way: scan every entry, keep those
-    /// whose pattern matches, exact ones first and then the longest prefix first.
+    /// whose pattern matches; exact ones first, then regexes, then the longest prefix first.
     fn reference(specs: &[Spec], path: &str) -> Vec<usize> {
         let mut candidates: Vec<(usize, &Spec)> = specs
             .iter()
             .enumerate()
             .filter(|(_, spec)| compile(spec).matches(path))
             .collect();
-        candidates.sort_by_key(|(position, (text, is_prefix))| {
-            let length = text.strip_suffix('/').unwrap_or(text).len();
-            (*is_prefix, Reverse(length), *position)
+        candidates.sort_by_key(|(position, (text, kind))| {
+            let length = match kind {
+                SpecKind::Prefix => text.strip_suffix('/').unwrap_or(text).len(),
+                SpecKind::Exact | SpecKind::Regex => 0,
+            };
+            (*kind, Reverse(length), *position)
         });
         candidates
             .into_iter()
@@ -264,20 +329,36 @@ mod tests {
             .collect()
     }
 
+    /// Exact and prefix patterns, and regexes that say the same as one of those or match
+    /// one segment of anything — so that all three kinds keep matching the same paths.
+    fn spec() -> impl Strategy<Value = (Spec, String)> {
+        (path_pattern_text(), 0..5).prop_map(|(path, shape)| {
+            let literal = ::regex::escape(path.strip_suffix('/').unwrap_or(&path));
+            let spec = match shape {
+                0 => exact(&path),
+                1 => prefix(&path),
+                2 => regex(&::regex::escape(&path)),
+                3 => regex(&format!("{literal}(?:/.*)?")),
+                _ => regex(&format!("{literal}/[^/]+")),
+            };
+            (spec, path)
+        })
+    }
+
     /// A handful of entries and a path near one of them (or near nothing at all).
     fn case() -> impl Strategy<Value = (Vec<Spec>, String)> {
-        let spec = (path_pattern_text(), any::<bool>());
         (
-            prop::collection::vec(spec, 0..8),
+            prop::collection::vec(spec(), 0..8),
             any::<prop::sample::Index>(),
         )
             .prop_flat_map(|(specs, pick)| {
                 let near = if specs.is_empty() {
-                    "/a/b"
+                    "/a/b".to_owned()
                 } else {
-                    pick.get(&specs).0.as_str()
+                    pick.get(&specs).1.clone()
                 };
-                let path = path_near(near);
+                let path = path_near(&near);
+                let specs = specs.into_iter().map(|(spec, _)| spec).collect();
                 (Just(specs), path)
             })
     }

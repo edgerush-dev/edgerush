@@ -10,6 +10,8 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+# Unicode tables are left out: regex paths are matched against normalised, ASCII-only paths.
+regex = { version = "1.13", default-features = false, features = ["std", "perf"] }
 thiserror = "2.0"
 # Benchmark-only: instruction counts under valgrind, so Linux (WSL2) only. The installed
 # `iai-callgrind-runner` must be exactly this version.
