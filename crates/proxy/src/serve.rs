@@ -11,13 +11,14 @@
 //! connections belong to the data plane, not to a snapshot, and outlive every reload.
 
 use crate::hop_by_hop::strip_response;
+use crate::metrics::{Answer, Metrics};
 use crate::random::random;
 use crate::request::decide;
 use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRule};
 use http::request::Parts;
 use http::uri::{Authority, Scheme};
-use http::{Request, Response, StatusCode, Uri, Version};
+use http::{Request, Response, Uri, Version};
 use http_body_util::{Either, Empty};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -28,8 +29,10 @@ use hyper_util::server::conn::auto;
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 
 /// How long accepting pauses after an error that is not about one connection — out of
@@ -47,6 +50,8 @@ pub struct Proxy {
     /// served as the listener at its position here, whatever configs come later.
     listeners: Vec<String>,
     current: ArcSwap<Snapshot>,
+    /// Outside the snapshot, so that a reload resets no counter.
+    metrics: Metrics,
     /// One for the life of the data plane: a reload does not throw warm connections away.
     /// Those to an endpoint that is no longer used grow idle and are closed.
     client: Client<HttpConnector, Incoming>,
@@ -62,10 +67,12 @@ struct Snapshot {
     /// By position of the upstream, then of the endpoint: where to connect, in the form a
     /// request target takes, made once so that no request formats an address.
     endpoints: Vec<Vec<Authority>>,
+    /// By position of the upstream: the slot of its counters.
+    upstream_slots: Vec<usize>,
 }
 
 impl Snapshot {
-    fn new(config: Compiled, listeners: &[String]) -> Result<Self, ProxyError> {
+    fn new(config: Compiled, listeners: &[String], metrics: &Metrics) -> Result<Self, ProxyError> {
         let endpoints = config
             .upstreams
             .iter()
@@ -75,10 +82,16 @@ impl Snapshot {
             .iter()
             .map(|name| config.listeners.iter().position(|l| l.name == *name))
             .collect();
+        let upstream_slots = config
+            .upstreams
+            .iter()
+            .map(|upstream| metrics.upstream_slot(&upstream.name))
+            .collect();
         Ok(Self {
             config,
             listeners,
             endpoints,
+            upstream_slots,
         })
     }
 }
@@ -96,7 +109,10 @@ impl Proxy {
             .iter()
             .map(|listener| listener.name.clone())
             .collect();
-        let current = ArcSwap::from_pointee(Snapshot::new(config, &listeners)?);
+        // A shard for every thread that may serve requests at the same time.
+        let shards = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
+        let metrics = Metrics::new(shards, listeners.len());
+        let current = ArcSwap::from_pointee(Snapshot::new(config, &listeners, &metrics)?);
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
         let client = Client::builder(TokioExecutor::new())
@@ -105,6 +121,7 @@ impl Proxy {
         Ok(Self {
             listeners,
             current,
+            metrics,
             client,
         })
     }
@@ -130,9 +147,29 @@ impl Proxy {
     /// Returns a [`ProxyError`] as [`Proxy::new`] does; the data plane then runs on as it
     /// was.
     pub fn reload(&self, config: Compiled) -> Result<(), ProxyError> {
-        let snapshot = Snapshot::new(config, &self.listeners)?;
+        let snapshot = Snapshot::new(config, &self.listeners, &self.metrics)?;
         self.current.store(Arc::new(snapshot));
+        self.metrics.reloads.inc();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH);
+        let now = now.map_or(0, |since_epoch| since_epoch.as_secs());
+        self.metrics.last_reload.store(now, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// What has been counted, in the Prometheus text format: per listener and per upstream
+    /// of the current config. Counters are kept outside the config, so a reload resets
+    /// none of them. For scrapes: it adds up the shards of every series and allocates.
+    #[must_use]
+    pub fn metrics(&self) -> String {
+        let snapshot = self.current.load();
+        let upstreams: Vec<(&str, usize)> = snapshot
+            .config
+            .upstreams
+            .iter()
+            .zip(&snapshot.upstream_slots)
+            .map(|(upstream, slot)| (upstream.name.as_str(), *slot))
+            .collect();
+        self.metrics.render(&self.listeners, &upstreams)
     }
 
     /// Serves the connections that come in on `socket` as those of the listener at
@@ -145,6 +182,9 @@ impl Proxy {
             let stream = match socket.accept().await {
                 Ok((stream, _)) => stream,
                 Err(error) => {
+                    if let Some(counters) = self.metrics.listener(listener) {
+                        counters.accept_errors.inc();
+                    }
                     if !is_about_one_connection(&error) {
                         tokio::time::sleep(ACCEPT_PAUSE).await;
                     }
@@ -154,15 +194,18 @@ impl Proxy {
             // Worth having, not worth refusing a connection over.
             let _unset = stream.set_nodelay(true);
 
-            // Every request clones a handle, as the engine wants futures that own what they
-            // use. A handle of the connection's own keeps that count off a line of cache
-            // that all the workers would otherwise write to.
-            let connection = Arc::new(Arc::clone(&self));
+            let connection = Arc::new(Connection::open(Arc::clone(&self), listener));
             let server = server.clone();
             tokio::spawn(async move {
+                // Every request clones a handle, as the engine wants futures that own what
+                // they use. A handle of the connection's own keeps that count off a line
+                // of cache that all the workers would otherwise write to.
                 let service = service_fn(move |request| {
                     let connection = Arc::clone(&connection);
-                    async move { Ok::<_, Infallible>(connection.handle(listener, request).await) }
+                    async move {
+                        let response = connection.proxy.handle(listener, request).await;
+                        Ok::<_, Infallible>(response)
+                    }
                 });
                 // An error here is the end of one connection: the peer went away or spoke
                 // nonsense. There is nobody to tell.
@@ -172,18 +215,37 @@ impl Proxy {
     }
 
     async fn handle(&self, listener: usize, request: Request<Incoming>) -> Response<Body> {
+        let came_in = Instant::now();
+        let response = self.respond(listener, request).await;
+        if let Some(counters) = self.metrics.listener(listener) {
+            let took = u64::try_from(came_in.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            counters.responded(response.status(), took);
+        }
+        response
+    }
+
+    async fn respond(&self, listener: usize, request: Request<Incoming>) -> Response<Body> {
         let (mut head, body) = request.into_parts();
-        let rule = match self.direct(listener, &mut head) {
-            Ok(rule) => rule,
-            Err(status) => return answer(status),
+        let directed = match self.direct(listener, &mut head) {
+            Ok(directed) => directed,
+            Err(answer) => return self.answer(listener, answer),
         };
-        let response = match self.client.request(Request::from_parts(head, body)).await {
-            Ok(response) => response,
-            Err(_) => return answer(StatusCode::BAD_GATEWAY),
+        let response = self.client.request(Request::from_parts(head, body)).await;
+        // Counted where the request is now: it may have changed threads while it waited.
+        let upstream = self.metrics.upstream(directed.upstream_slot);
+        let Ok(response) = response else {
+            if let Some(upstream) = upstream {
+                upstream.failures.inc();
+            }
+            return self.answer(listener, Answer::UpstreamFailed);
         };
+        if let Some(upstream) = upstream {
+            upstream.responded(response.status());
+        }
         let (mut head, body) = response.into_parts();
         strip_response(&mut head.headers);
-        if let Some(changes) = rule
+        if let Some(changes) = directed
+            .rule
             .as_ref()
             .and_then(|rule| rule.response_headers.as_ref())
         {
@@ -192,15 +254,22 @@ impl Proxy {
         Response::from_parts(head, Either::Left(body))
     }
 
+    /// An answer of the data plane's own, counted by its reason.
+    fn answer(&self, listener: usize, answer: Answer) -> Response<Body> {
+        if let Some(counters) = self.metrics.listener(listener) {
+            counters.answered(answer);
+        }
+        let mut response = Response::new(Either::Right(Empty::new()));
+        *response.status_mut() = answer.status();
+        response
+    }
+
     /// Makes the head of a request that came in on a listener's socket the head of the
     /// request to send, target included, or says what to answer instead. All of it is done
     /// on one snapshot, which is let go of before anything is waited for; what is kept for
-    /// the response is the rule, and only if it has something to do to the response.
-    fn direct(
-        &self,
-        listener: usize,
-        head: &mut Parts,
-    ) -> Result<Option<Arc<CompiledRule>>, StatusCode> {
+    /// the response is the rule, and only if it has something to do to the response, and
+    /// the slot of the upstream's counters.
+    fn direct(&self, listener: usize, head: &mut Parts) -> Result<Directed, Answer> {
         let snapshot = self.current.load();
         let listener = snapshot
             .listeners
@@ -208,22 +277,60 @@ impl Proxy {
             .copied()
             .flatten()
             .and_then(|position| snapshot.config.listeners.get(position))
-            .ok_or(StatusCode::NOT_FOUND)?;
-        let forward = decide(&snapshot.config, listener, head, random())
-            .map_err(|rejection| rejection.status())?;
+            .ok_or(Answer::NoRoute)?;
+        let forward = decide(&snapshot.config, listener, head, random())?;
         // An upstream the snapshot does not have is not known to happen.
-        let endpoints = snapshot
-            .endpoints
-            .get(forward.upstream.0)
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-        let endpoint = pick(endpoints, random()).ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        let upstream = forward.upstream.0;
+        let endpoints = snapshot.endpoints.get(upstream).ok_or(Answer::NoBackend)?;
+        let upstream_slot = *snapshot
+            .upstream_slots
+            .get(upstream)
+            .ok_or(Answer::NoBackend)?;
+        let endpoint = pick(endpoints, random()).ok_or(Answer::NoEndpoints)?;
 
-        head.uri = at_endpoint(&head.uri, endpoint).ok_or(StatusCode::BAD_REQUEST)?;
+        head.uri = at_endpoint(&head.uri, endpoint).ok_or(Answer::BadTarget)?;
         head.version = Version::HTTP_11;
         // What the engine attached to the request is about the connection it came in on.
         head.extensions.clear();
+        if let Some(counters) = self.metrics.upstream(upstream_slot) {
+            counters.requests.inc();
+        }
         let has_changes = forward.rule.response_headers.is_some();
-        Ok(has_changes.then(|| Arc::clone(forward.rule)))
+        Ok(Directed {
+            rule: has_changes.then(|| Arc::clone(forward.rule)),
+            upstream_slot,
+        })
+    }
+}
+
+/// What a request keeps of the snapshot it was directed on.
+struct Directed {
+    rule: Option<Arc<CompiledRule>>,
+    upstream_slot: usize,
+}
+
+/// A connection that came in on a listener's socket: what its requests share, and what
+/// counts it as open until the last of them is done, wherever that happens.
+struct Connection {
+    proxy: Arc<Proxy>,
+    listener: usize,
+}
+
+impl Connection {
+    fn open(proxy: Arc<Proxy>, listener: usize) -> Self {
+        if let Some(counters) = proxy.metrics.listener(listener) {
+            counters.accepted.inc();
+            counters.active.inc();
+        }
+        Self { proxy, listener }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let Some(counters) = self.proxy.metrics.listener(self.listener) {
+            counters.active.dec();
+        }
     }
 }
 
@@ -253,13 +360,6 @@ fn at_endpoint(target: &Uri, endpoint: &Authority) -> Option<Uri> {
     parts.scheme = Some(Scheme::HTTP);
     parts.authority = Some(endpoint.clone());
     Uri::from_parts(parts).ok()
-}
-
-/// An answer of our own: a status and nothing else.
-fn answer(status: StatusCode) -> Response<Body> {
-    let mut response = Response::new(Either::Right(Empty::new()));
-    *response.status_mut() = status;
-    response
 }
 
 /// Whether a failure to accept is the failure of the one connection that was next in line,
@@ -298,8 +398,9 @@ mod tests {
     #[test]
     fn a_snapshot_knows_where_it_has_the_listeners_that_have_sockets() {
         let sockets = ["admin".to_owned(), "web".to_owned()];
+        let metrics = Metrics::new(NonZeroUsize::MIN, sockets.len());
         let listeners = |names: &[&str]| {
-            Snapshot::new(config_with(names), &sockets)
+            Snapshot::new(config_with(names), &sockets, &metrics)
                 .unwrap()
                 .listeners
         };
@@ -362,9 +463,52 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_of_our_own_is_a_status_and_nothing_else() {
-        let answer = answer(StatusCode::NOT_FOUND);
+    fn an_answer_of_our_own_is_a_status_and_nothing_else_and_is_counted() {
+        let proxy = Proxy::new(config_with(&["web"])).unwrap();
+        let answer = proxy.answer(0, Answer::NoRoute);
         assert_eq!(answer.status(), 404);
         assert!(answer.headers().is_empty());
+        let counted =
+            "edgerush_listener_local_answers_total{listener=\"web\",reason=\"no_route\"} 1
+";
+        assert!(proxy.metrics().contains(counted));
+    }
+
+    #[test]
+    fn a_reload_is_counted_and_resets_nothing() {
+        let proxy = Proxy::new(config_with(&["web"])).unwrap();
+        let _counted = proxy.answer(0, Answer::NoRoute);
+        assert!(proxy.metrics().contains(
+            "edgerush_config_reloads_total 0
+"
+        ));
+        assert!(proxy.metrics().contains(
+            "edgerush_config_last_reload_timestamp_seconds 0
+"
+        ));
+
+        proxy.reload(config_with(&["web"])).unwrap();
+        let scrape = proxy.metrics();
+        assert!(
+            scrape.contains(
+                "edgerush_config_reloads_total 1
+"
+            ),
+            "{scrape}"
+        );
+        assert!(
+            !scrape.contains(
+                "edgerush_config_last_reload_timestamp_seconds 0
+"
+            ),
+            "{scrape}"
+        );
+        assert!(
+            scrape.contains(
+                "reason=\"no_route\"} 1
+"
+            ),
+            "{scrape}"
+        );
     }
 }

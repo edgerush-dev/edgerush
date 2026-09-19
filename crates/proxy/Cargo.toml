@@ -11,6 +11,7 @@ publish.workspace = true
 arc-swap.workspace = true
 edgerush-config.workspace = true
 edgerush-router.workspace = true
+edgerush-telemetry.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true

@@ -144,6 +144,7 @@ dependencies = [
  "arc-swap",
  "edgerush-config",
  "edgerush-router",
+ "edgerush-telemetry",
  "http",
  "http-body-util",
  "hyper",

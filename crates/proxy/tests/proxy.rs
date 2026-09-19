@@ -8,6 +8,7 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::panic,
     reason = "test set-up: the helpers around the tests fail them the way the tests would"
 )]
 
@@ -631,4 +632,123 @@ async fn a_listener_keeps_its_socket_whatever_happens_to_the_listeners_around_it
         .reload(compiled(&everything_to(&[("web", first)], "3")))
         .unwrap();
     assert_eq!(send(get(web, "/")).await.1["x-upstream"], "first");
+}
+
+/// The value of the sample that begins with `series`, which is its name and labels.
+fn sample(scrape: &str, series: &str) -> u64 {
+    let line = scrape
+        .lines()
+        .find(|line| line.starts_with(series))
+        .unwrap_or_else(|| panic!("{series} is not in\n{scrape}"));
+    line.rsplit(' ').next().unwrap().parse().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_happens_is_counted_and_a_reload_resets_nothing() {
+    let (up, nowhere) = (upstream("up").await, dead_endpoint().await);
+    let config = everything_to(&[("dead", nowhere), ("web", up)], "0");
+    let (proxy, addresses) = reloadable_proxy(&config).await;
+    let (web, dead) = (addresses["web"], addresses["dead"]);
+
+    for _ in 0..3 {
+        assert_eq!(send(get(web, "/")).await.0, 200);
+    }
+    assert_eq!(send(get(web, "/..%2f")).await.0, 400);
+    assert_eq!(send(get(dead, "/")).await.0, 502);
+
+    let scrape = proxy.metrics();
+    let web_responses = "edgerush_listener_responses_total{listener=\"web\",class=";
+    assert_eq!(sample(&scrape, &format!("{web_responses}\"2xx\"}}")), 3);
+    assert_eq!(sample(&scrape, &format!("{web_responses}\"4xx\"}}")), 1);
+    assert_eq!(sample(&scrape, &format!("{web_responses}\"5xx\"}}")), 0);
+    let answers = "edgerush_listener_local_answers_total{listener=";
+    assert_eq!(
+        sample(&scrape, &format!("{answers}\"web\",reason=\"bad_path\"}}")),
+        1
+    );
+    assert_eq!(
+        sample(
+            &scrape,
+            &format!("{answers}\"dead\",reason=\"upstream_failed\"}}")
+        ),
+        1
+    );
+    let head_time = "edgerush_listener_time_to_response_head_seconds";
+    assert_eq!(
+        sample(&scrape, &format!("{head_time}_count{{listener=\"web\"}}")),
+        4
+    );
+    assert_eq!(
+        sample(
+            &scrape,
+            &format!("{head_time}_bucket{{listener=\"web\",le=\"+Inf\"}}")
+        ),
+        4
+    );
+    assert_eq!(
+        sample(
+            &scrape,
+            "edgerush_upstream_requests_total{upstream=\"web\"}"
+        ),
+        3
+    );
+    assert_eq!(
+        sample(
+            &scrape,
+            "edgerush_upstream_responses_total{upstream=\"web\",class=\"2xx\"}"
+        ),
+        3
+    );
+    assert_eq!(
+        sample(
+            &scrape,
+            "edgerush_upstream_failures_total{upstream=\"web\"}"
+        ),
+        0
+    );
+    assert_eq!(
+        sample(
+            &scrape,
+            "edgerush_upstream_requests_total{upstream=\"dead\"}"
+        ),
+        1
+    );
+    assert_eq!(
+        sample(
+            &scrape,
+            "edgerush_upstream_failures_total{upstream=\"dead\"}"
+        ),
+        1
+    );
+    // Every request came on a connection of its own, and the clients are gone again.
+    assert_eq!(
+        sample(
+            &scrape,
+            "edgerush_listener_connections_accepted_total{listener=\"web\"}"
+        ),
+        4
+    );
+    let active = "edgerush_listener_connections_active{listener=\"web\"}";
+    within(async {
+        while sample(&proxy.metrics(), active) != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    // Another config, with the same names: counting goes on from where it was.
+    let reloaded = everything_to(&[("dead", nowhere), ("web", up)], "1");
+    proxy.reload(compiled(&reloaded)).unwrap();
+    assert_eq!(send(get(web, "/")).await.0, 200);
+    let scrape = proxy.metrics();
+    assert_eq!(sample(&scrape, &format!("{web_responses}\"2xx\"}}")), 4);
+    assert_eq!(
+        sample(
+            &scrape,
+            "edgerush_upstream_requests_total{upstream=\"web\"}"
+        ),
+        4
+    );
+    assert_eq!(sample(&scrape, "edgerush_config_reloads_total"), 1);
+    assert!(sample(&scrape, "edgerush_config_last_reload_timestamp_seconds") > 1_700_000_000);
 }

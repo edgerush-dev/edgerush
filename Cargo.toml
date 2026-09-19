@@ -15,6 +15,7 @@ arc-swap = "1.9"
 edgerush-config = { path = "crates/config" }
 edgerush-filters = { path = "crates/filters" }
 edgerush-router = { path = "crates/router" }
+edgerush-telemetry = { path = "crates/telemetry" }
 # Types only (header map, method): the request core works on these, never on an engine's.
 http = "1.5"
 # Body helpers (an empty body, either of two bodies) for the proxy crate's answers.
