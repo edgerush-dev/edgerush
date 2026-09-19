@@ -23,6 +23,7 @@ All three must pass before every commit. They run in CI on Linux and Windows.
 
 ```
 crates/edgerush    the binary (operator, control plane and data plane will be subcommands)
+crates/router      request matching (`edgerush-router`): pure logic, no I/O
 ```
 
 Crates are internal to this workspace and are not published.

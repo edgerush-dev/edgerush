@@ -9,6 +9,11 @@ rust-version = "1.98"
 license = "Apache-2.0"
 publish = false
 
+[workspace.dependencies]
+thiserror = "2.0"
+# Test-only. Forking and timeouts are left out: they pull in extra crates we do not need.
+proptest = { version = "1.11", default-features = false, features = ["std"] }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
