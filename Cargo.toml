@@ -11,8 +11,15 @@ publish = false
 
 [workspace.dependencies]
 thiserror = "2.0"
+# Benchmark-only: instruction counts under valgrind, so Linux (WSL2) only. The installed
+# `iai-callgrind-runner` must be exactly this version.
+iai-callgrind = "=0.16.1"
 # Test-only. Forking and timeouts are left out: they pull in extra crates we do not need.
 proptest = { version = "1.11", default-features = false, features = ["std"] }
+
+# Callgrind attributes costs to functions by their symbols.
+[profile.bench]
+debug = true
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

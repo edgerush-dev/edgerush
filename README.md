@@ -20,6 +20,20 @@ cargo test --workspace
 All three must pass before every commit, on Windows and on Linux. There is no CI yet: the
 workflow in `.github/workflows/ci.yml` is kept ready for when the repository is published.
 
+## Benchmarks
+
+Micro benchmarks count instructions under valgrind (`iai-callgrind`), so results do not
+depend on how busy the machine is. They need Linux; WSL2 is enough.
+
+```sh
+cargo install iai-callgrind-runner --version 0.16.1   # must match Cargo.toml exactly
+cargo bench -p edgerush-router
+```
+
+Valgrind must be recent: 3.18 (Ubuntu 22.04) runs but reports zero instructions for
+current Rust; 3.27 works. Each run is compared with the previous one kept in `target/iai`.
+From a checkout on a Windows drive, point `CARGO_TARGET_DIR` at the Linux filesystem.
+
 ## Layout
 
 ```

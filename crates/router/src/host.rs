@@ -7,7 +7,7 @@
 //! by whoever translates the source object.
 
 /// Longest hostname DNS allows, in bytes.
-const MAX_NAME_LEN: usize = 253;
+pub(crate) const MAX_NAME_LEN: usize = 253;
 /// Longest single label DNS allows, in bytes.
 const MAX_LABEL_LEN: usize = 63;
 
@@ -28,14 +28,14 @@ pub enum WildcardLabels {
 /// equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HostPattern {
-    kind: Kind,
+    pub(crate) kind: Kind,
     /// Lower case. For a wildcard this is the part after the `*`, leading dot included
     /// (`.example.com`), so a suffix comparison also checks the label boundary.
-    name: Box<str>,
+    pub(crate) name: Box<str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Kind {
+pub(crate) enum Kind {
     Exact,
     Wildcard(WildcardLabels),
 }
@@ -83,9 +83,13 @@ impl HostPattern {
     /// `host` is the bare hostname of the request: no port and no trailing dot — the
     /// caller strips those once per request. The comparison is ASCII case-insensitive and
     /// purely textual: `host` is not validated, and anything that is not a hostname simply
-    /// matches by the same byte rules. Never allocates.
+    /// matches by the same byte rules — except that a host longer than any DNS name (253
+    /// bytes) matches nothing. Never allocates.
     #[must_use]
     pub fn matches(&self, host: &str) -> bool {
+        if host.len() > MAX_NAME_LEN {
+            return false;
+        }
         let host = host.as_bytes();
         let name = self.name.as_bytes();
         match self.kind {
@@ -160,6 +164,7 @@ pub enum HostPatternError {
 mod tests {
     use super::WildcardLabels::{One, OneOrMore};
     use super::*;
+    use crate::strategies::{host_near, pattern_text, wildcard_labels};
     use proptest::prelude::*;
 
     fn pattern(text: &str, wildcard: WildcardLabels) -> HostPattern {
@@ -227,6 +232,15 @@ mod tests {
         assert!(!pattern("*.example.com", One).matches("ä.example.org"));
         // Textual matching: the wildcard part is not validated.
         assert!(pattern("*.example.com", One).matches("ä.example.com"));
+    }
+
+    #[test]
+    fn hosts_longer_than_any_dns_name_match_nothing() {
+        let wildcard = pattern("*.example.com", OneOrMore);
+        let longest = format!("{}.example.com", "a".repeat(253 - ".example.com".len()));
+        assert_eq!(longest.len(), 253);
+        assert!(wildcard.matches(&longest));
+        assert!(!wildcard.matches(&format!("a{longest}")));
     }
 
     #[test]
@@ -303,51 +317,11 @@ mod tests {
             }
     }
 
-    /// A tiny alphabet, so that unrelated patterns and hosts still collide often.
-    fn valid_label() -> impl Strategy<Value = String> {
-        "[ab]{1,2}"
-    }
-
-    /// Host labels may be empty or upper case: hosts are not validated.
-    fn host_label() -> impl Strategy<Value = String> {
-        "[abAB]{0,2}"
-    }
-
-    fn pattern_text() -> impl Strategy<Value = String> {
-        (any::<bool>(), prop::collection::vec(valid_label(), 1..4)).prop_map(
-            |(wildcard, labels)| {
-                let name = labels.join(".");
-                if wildcard { format!("*.{name}") } else { name }
-            },
-        )
-    }
-
-    /// Either an arbitrary host, or the pattern's own name under zero to two extra labels
-    /// — the interesting neighbourhood of every pattern.
-    fn host_near(pattern: &str) -> impl Strategy<Value = String> + use<> {
-        let name = pattern.strip_prefix("*.").unwrap_or(pattern).to_owned();
-        let arbitrary = prop::collection::vec(host_label(), 1..5).prop_map(|l| l.join("."));
-        let nearby = (prop::collection::vec(host_label(), 0..3), any::<bool>()).prop_map(
-            move |(mut labels, upper_case)| {
-                labels.push(name.clone());
-                let host = labels.join(".");
-                if upper_case {
-                    host.to_ascii_uppercase()
-                } else {
-                    host
-                }
-            },
-        );
-        prop_oneof![arbitrary, nearby]
-    }
-
     fn case() -> impl Strategy<Value = (String, WildcardLabels, String)> {
-        (pattern_text(), prop_oneof![Just(One), Just(OneOrMore)]).prop_flat_map(
-            |(pattern, wildcard)| {
-                let host = host_near(&pattern);
-                (Just(pattern), Just(wildcard), host)
-            },
-        )
+        (pattern_text(), wildcard_labels()).prop_flat_map(|(pattern, wildcard)| {
+            let host = host_near(&pattern);
+            (Just(pattern), Just(wildcard), host)
+        })
     }
 
     proptest! {
