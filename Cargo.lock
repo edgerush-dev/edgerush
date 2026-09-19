@@ -112,6 +112,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-filters"
+version = "0.0.0"
+dependencies = [
+ "http",
+ "iai-callgrind",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "edgerush-router"
 version = "0.0.0"
 dependencies = [
