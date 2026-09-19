@@ -4,17 +4,21 @@
 //! When a rule names a header twice, only the first entry counts, as the spec requires. A
 //! header that the request repeats is read as the RFC says such headers are to be read —
 //! as one value, the fields joined by commas — so `x: a` plus `x: b` is `a,b`, which an
-//! exact match on `a` does not accept.
+//! exact match on `a` does not accept. `Cookie` is the exception the RFCs make: HTTP/2 lets
+//! a client split its cookie string into fields, and what puts it together again is `"; "`
+//! (RFC 9113 §8.2.3) — a comma would make a different cookie string of it.
 
 use crate::RegexError;
 use crate::whole_regex::WholeRegex;
-use http::header::{HeaderMap, HeaderName, HeaderValue};
+use http::header::{COOKIE, HeaderMap, HeaderName, HeaderValue};
 
 /// A validated condition on one request header.
 #[derive(Debug, Clone)]
 pub struct HeaderPredicate {
     name: HeaderName,
     value: ValueMatch,
+    /// What joins the fields of this header when the request repeats it.
+    between: &'static [u8],
 }
 
 #[derive(Debug, Clone)]
@@ -37,10 +41,7 @@ impl HeaderPredicate {
             .ok()
             .filter(|_| !value.is_empty() && trimmed.len() == value.len())
             .ok_or(HeaderPredicateError::InvalidValue)?;
-        Ok(Self {
-            name: parse_name(name)?,
-            value: ValueMatch::Exact(value),
-        })
+        Self::new(name, ValueMatch::Exact(value))
     }
 
     /// The header must be present with a value that, as a whole, matches the regular
@@ -51,9 +52,17 @@ impl HeaderPredicate {
     /// Returns a [`HeaderPredicateError`] if `name` is not a header name or `pattern` is
     /// outside the contract for regular expressions.
     pub fn regex(name: &str, pattern: &str) -> Result<Self, HeaderPredicateError> {
+        Self::new(name, ValueMatch::Regex(WholeRegex::new(pattern)?))
+    }
+
+    fn new(name: &str, value: ValueMatch) -> Result<Self, HeaderPredicateError> {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| HeaderPredicateError::InvalidName)?;
+        let between: &[u8] = if name == COOKIE { b"; " } else { b"," };
         Ok(Self {
-            name: parse_name(name)?,
-            value: ValueMatch::Regex(WholeRegex::new(pattern)?),
+            name,
+            value,
+            between,
         })
     }
 
@@ -75,7 +84,7 @@ impl HeaderPredicate {
                 let mut expected = expected.as_bytes().strip_prefix(first.as_bytes());
                 for value in rest {
                     expected = expected
-                        .and_then(|expected| expected.strip_prefix(b","))
+                        .and_then(|expected| expected.strip_prefix(self.between))
                         .and_then(|expected| expected.strip_prefix(value.as_bytes()));
                 }
                 expected.is_some_and(<[u8]>::is_empty)
@@ -83,17 +92,13 @@ impl HeaderPredicate {
             ValueMatch::Regex(regex) => {
                 let mut joined = first.as_bytes().to_vec();
                 for value in rest {
-                    joined.push(b',');
+                    joined.extend_from_slice(self.between);
                     joined.extend_from_slice(value.as_bytes());
                 }
                 regex.is_match(&joined)
             }
         }
     }
-}
-
-fn parse_name(name: &str) -> Result<HeaderName, HeaderPredicateError> {
-    HeaderName::from_bytes(name.as_bytes()).map_err(|_| HeaderPredicateError::InvalidName)
 }
 
 /// The header predicates of one rule: all of them must hold.
@@ -212,6 +217,24 @@ mod tests {
     }
 
     #[test]
+    fn repeated_cookie_is_read_as_one_cookie_string() {
+        // HTTP/2 may split the cookie string into fields; "; " puts it together again
+        // (RFC 9113 §8.2.3), and a comma would make another cookie string of it.
+        let split = headers(&[("cookie", "a=1"), ("accept", "*/*"), ("Cookie", "b=2")]);
+        assert!(exact("cookie", "a=1; b=2").matches(&split));
+        assert!(exact("Cookie", "a=1; b=2").matches(&split));
+        assert!(!exact("cookie", "a=1,b=2").matches(&split));
+        assert!(!exact("cookie", "a=1").matches(&split));
+        assert!(!exact("cookie", "a=1; b=2; c=3").matches(&split));
+        assert!(regex("cookie", "(.*; )?b=2(; .*)?").matches(&split));
+        assert!(!regex("cookie", "a=1,b=2").matches(&split));
+
+        let whole = headers(&[("cookie", "a=1; b=2")]);
+        assert!(exact("cookie", "a=1; b=2").matches(&whole));
+        assert!(regex("cookie", "(.*; )?b=2(; .*)?").matches(&whole));
+    }
+
+    #[test]
     fn header_sent_once_with_commas_equals_the_same_header_repeated() {
         let once = headers(&[("x-tag", "a,b")]);
         assert!(exact("x-tag", "a,b").matches(&once));
@@ -286,11 +309,14 @@ mod tests {
     }
 
     /// Few names, in both cases, and values that are each other's pieces and joins, so that
-    /// repeated headers and near misses come up all the time.
+    /// repeated headers and near misses come up all the time — for cookies too, which are
+    /// joined in a way of their own.
     fn field() -> impl Strategy<Value = (String, String)> {
         (
-            prop::sample::select(vec!["x-a", "X-A", "x-b", "X-b", "x-c"]),
-            prop::sample::select(vec!["1", "2", "1,2", "1,1", "12", ",", "1,"]),
+            prop::sample::select(vec!["x-a", "X-A", "x-b", "X-b", "x-c", "cookie", "Cookie"]),
+            prop::sample::select(vec![
+                "1", "2", "1,2", "1,1", "12", ",", "1,", "1; 2", "1;2", "1; 1", ";",
+            ]),
         )
             .prop_map(|(name, value)| (name.to_owned(), value.to_owned()))
     }

@@ -35,7 +35,7 @@ pub(crate) fn is_present(headers: &HeaderMap) -> bool {
 
 /// Whether the header is one of [`HOP_BY_HOP`]. Header names are held in lower case, and
 /// matching their text (the length first) is cheaper than comparing names one by one.
-fn is_hop_by_hop(name: &HeaderName) -> bool {
+pub(crate) fn is_hop_by_hop(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
         "connection" | "keep-alive" | "proxy-connection" | "te" | "transfer-encoding" | "upgrade"

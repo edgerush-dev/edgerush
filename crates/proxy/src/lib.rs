@@ -8,6 +8,7 @@
 //! over HTTP/1.1, takes a new config while it runs without dropping a request, and counts
 //! what it does.
 
+mod cookies;
 mod hop_by_hop;
 pub mod host;
 mod metrics;

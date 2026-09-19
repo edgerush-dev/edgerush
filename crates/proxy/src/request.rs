@@ -7,13 +7,15 @@
 //! path is normalised once, and the same normal form is matched and forwarded. Whatever is
 //! routed on is what the upstream gets to see: the head is rewritten to say it. What the
 //! request said about the connection it came in on is taken off ([`crate::hop_by_hop`])
-//! before the rule's own changes to the headers.
+//! before the rule's own changes to the headers. A cookie string that came in pieces, as
+//! HTTP/2 allows, is put together before anything looks at it ([`crate::cookies`]).
 
-use crate::hop_by_hop::{self, ConnectionError, check_connection, strip_request};
+use crate::cookies;
+use crate::hop_by_hop::{ConnectionError, check_connection, is_hop_by_hop, strip_request};
 use crate::host::{HostError, bare_host, host_field};
 use edgerush_config::{Compiled, CompiledListener, CompiledRule, UpstreamId};
 use edgerush_router::{NormaliseError, RequestParts, normalise_path};
-use http::header::{HOST, HeaderValue};
+use http::header::{COOKIE, HOST, HeaderMap, HeaderValue};
 use http::request::Parts;
 use http::uri::PathAndQuery;
 use http::{StatusCode, Uri};
@@ -72,7 +74,8 @@ impl Rejection {
 
 /// Decides where a request that came in on `listener` goes, and makes its head what the
 /// upstream is to see: the normalised path, a `Host` field that names the host that was
-/// routed on, no hop-by-hop headers, and the rule's changes to the headers.
+/// routed on, the cookie string in one piece, no hop-by-hop headers, and the rule's changes
+/// to the headers.
 ///
 /// `random` chooses among weighted backends and should be uniform over `u64`; passing it
 /// in keeps the core deterministic. A request in the usual form — origin-form target, a
@@ -81,20 +84,25 @@ impl Rejection {
 ///
 /// # Errors
 ///
-/// Returns a [`Rejection`] for a request to answer locally; the head is then unchanged.
+/// Returns a [`Rejection`] for a request to answer locally. The head is then as it came,
+/// but for a cookie string that came in pieces and is whole now, which says the same.
 pub fn decide<'a>(
     snapshot: &'a Compiled,
     listener: &CompiledListener,
     head: &mut Parts,
     random: u64,
 ) -> Result<Forward<'a>, Rejection> {
+    let found = survey(&head.headers);
+    if found.cookie_fields > 1 {
+        // Before routing, so that rules and the upstream read the same cookie string.
+        cookies::join(&mut head.headers);
+    }
     let host = match head.uri.authority() {
         Some(authority) => bare_host(authority.as_str())?,
         None => bare_host(host_field(&head.headers)?)?,
     };
     let path = normalise_path(head.uri.path())?;
-    let says_hop_by_hop = hop_by_hop::is_present(&head.headers);
-    if says_hop_by_hop {
+    if found.hop_by_hop {
         check_connection(&head.headers)?;
     }
     let request = RequestParts {
@@ -127,13 +135,37 @@ pub fn decide<'a>(
     if let Some(host_field) = host_field {
         head.headers.insert(HOST, host_field);
     }
-    if says_hop_by_hop {
+    if found.hop_by_hop {
         strip_request(&mut head.headers);
     }
     if let Some(changes) = &rule.request_headers {
         changes.apply(&mut head.headers);
     }
     Ok(Forward { rule, upstream })
+}
+
+/// What one pass over the header fields finds of the rare things that need work. Most
+/// requests have none of them and pay for the pass alone: looking every name up would cost
+/// several times as much.
+struct Survey {
+    hop_by_hop: bool,
+    cookie_fields: usize,
+}
+
+fn survey(headers: &HeaderMap) -> Survey {
+    let mut found = Survey {
+        hop_by_hop: false,
+        cookie_fields: 0,
+    };
+    // A header that is repeated comes up once for each of its fields.
+    for (name, _) in headers {
+        if *name == COOKIE {
+            found.cookie_fields += 1;
+        } else if is_hop_by_hop(name) {
+            found.hop_by_hop = true;
+        }
+    }
+    found
 }
 
 /// Whether the `Host` field already says what the target's authority says.
@@ -187,6 +219,11 @@ routes:
       - matches:
           - path: { prefix: /search }
             query: [{ name: q, value: { exact: "a b" } }]
+        backends:
+          - { upstream: search, weight: 1 }
+      - matches:
+          - path: { prefix: /account }
+            headers: [{ name: Cookie, value: { exact: "a=1; b=2" } }]
         backends:
           - { upstream: search, weight: 1 }
   - name: everything-else
@@ -405,6 +442,65 @@ upstreams:
             upstream_for("/search?q=ab", &host).as_deref(),
             Ok("fallback")
         );
+    }
+
+    #[test]
+    fn a_cookie_string_that_came_in_pieces_is_routed_on_and_forwarded_whole() {
+        // HTTP/2 lets a client split its cookie string into fields (RFC 9113 §8.2.3).
+        let mut request = head(
+            "/account",
+            &[
+                ("host", "shop.example.com"),
+                ("cookie", "a=1"),
+                ("accept", "*/*"),
+                ("cookie", "b=2"),
+            ],
+        );
+        assert_eq!(decide_on("web", &mut request, 0).as_deref(), Ok("search"));
+        let cookies: Vec<_> = request.headers.get_all("cookie").iter().collect();
+        assert_eq!(cookies, ["a=1; b=2"]);
+        assert_eq!(request.headers.get("accept").unwrap(), "*/*");
+
+        // Whole already: left as it is, and routed on the same.
+        let mut whole = head(
+            "/account",
+            &[("host", "shop.example.com"), ("cookie", "a=1; b=2")],
+        );
+        assert_eq!(decide_on("web", &mut whole, 0).as_deref(), Ok("search"));
+        assert_eq!(whole.headers.get("cookie").unwrap(), "a=1; b=2");
+
+        // Other cookies do not match, in pieces or whole.
+        let mut other = head(
+            "/account",
+            &[
+                ("host", "shop.example.com"),
+                ("cookie", "a=1"),
+                ("cookie", "c=3"),
+            ],
+        );
+        assert_eq!(decide_on("web", &mut other, 0).as_deref(), Ok("fallback"));
+        let cookies: Vec<_> = other.headers.get_all("cookie").iter().collect();
+        assert_eq!(cookies, ["a=1; c=3"]);
+    }
+
+    #[test]
+    fn three_pieces_and_a_sensitive_one_make_one_sensitive_cookie_string() {
+        let mut request = head(
+            "/cart",
+            &[
+                ("host", "shop.example.com"),
+                ("cookie", "a=1"),
+                ("cookie", "b=2"),
+                ("cookie", "c=3"),
+            ],
+        );
+        let mut secret = HeaderValue::from_static("session=s3cr3t");
+        secret.set_sensitive(true);
+        request.headers.append("cookie", secret);
+        assert_eq!(decide_on("web", &mut request, 0).as_deref(), Ok("cart"));
+        let cookies: Vec<_> = request.headers.get_all("cookie").iter().collect();
+        assert_eq!(cookies, ["a=1; b=2; c=3; session=s3cr3t"]);
+        assert!(cookies[0].is_sensitive());
     }
 
     #[test]

@@ -410,6 +410,26 @@ async fn a_connection_serves_one_request_after_another() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_cookie_string_split_by_http2_leaves_whole_over_http1() {
+    let any = upstream("any").await;
+    let proxy = proxy(&everything_to(&[("web", any)], "0")).await["web"];
+    // Two cookie fields, which HTTP/2 allows and HTTP/1.1 does not: RFC 9113 §8.2.3.
+    let request = Request::builder()
+        .version(Version::HTTP_2)
+        .uri(format!("http://{proxy}/account"))
+        .header("cookie", "a=1")
+        .header("x-between", "1")
+        .header("cookie", "b=2")
+        .body(Empty::new().boxed())
+        .unwrap();
+    let (status, _, seen) = send(request).await;
+    assert_eq!(status, 200);
+    assert!(seen.contains("cookie: a=1; b=2\n"), "{seen}");
+    assert_eq!(seen.matches("cookie:").count(), 1, "{seen}");
+    assert!(seen.contains("x-between: 1\n"), "{seen}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn http2_comes_in_and_http1_goes_out() {
     let proxy = shop().await;
     let request = Request::builder()
