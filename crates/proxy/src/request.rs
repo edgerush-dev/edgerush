@@ -539,6 +539,40 @@ upstreams:
     }
 
     #[test]
+    fn a_clients_proxy_credentials_stay_behind_and_a_rules_own_go_out() {
+        let fields = [
+            ("host", "shop.example.com"),
+            ("proxy-authorization", "Basic Y2xpZW50"),
+            ("authorization", "Bearer for-the-origin"),
+        ];
+        let mut request = head("/cart", &fields);
+        assert_eq!(decide_on("web", &mut request, 0).as_deref(), Ok("cart"));
+        assert!(!request.headers.contains_key("proxy-authorization"));
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            "Bearer for-the-origin"
+        );
+
+        // An upstream that is itself a proxy wanting credentials is said so in the config:
+        // the rule's changes come after the client's have been taken off.
+        let chained = SHOP.replace(
+            "set: [{ name: X-Gateway, value: edgerush }]",
+            "set: [{ name: Proxy-Authorization, value: Basic Z2F0ZXdheQ== }]",
+        );
+        let config: Config = serde_saphyr::from_str(&chained).unwrap();
+        let chained = compile(&config).unwrap();
+        let web = chained.listeners.iter().find(|l| l.name == "web").unwrap();
+        let mut request = head("/cart", &fields);
+        decide(&chained, web, &mut request, 0).unwrap();
+        let credentials: Vec<_> = request
+            .headers
+            .get_all("proxy-authorization")
+            .iter()
+            .collect();
+        assert_eq!(credentials, ["Basic Z2F0ZXdheQ=="]);
+    }
+
+    #[test]
     fn what_the_request_says_about_its_connection_stays_behind() {
         let mut request = head(
             "/cart",

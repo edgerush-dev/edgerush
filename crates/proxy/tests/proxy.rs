@@ -75,11 +75,15 @@ fn upstream_answer(
         .header("x-upstream", name)
         .header("x-powered-by", "upstream");
     if head.uri.path() == "/hop" {
-        // An upstream that talks about its connection to the proxy.
+        // An upstream that talks about its connection to the proxy, and as if it were a
+        // proxy that the gateway has to authenticate to.
         response = response
             .header("connection", "x-upstream-hop")
             .header("x-upstream-hop", "1")
-            .header("keep-alive", "timeout=5");
+            .header("keep-alive", "timeout=5")
+            .header("proxy-authenticate", "Basic realm=\"upstream\"")
+            .header("proxy-authentication-info", "nextnonce=\"abc\"")
+            .header("www-authenticate", "Basic realm=\"origin\"");
     }
     response.body(body).unwrap()
 }
@@ -611,6 +615,32 @@ async fn what_is_said_about_one_connection_does_not_reach_the_next() {
     for gone in ["x-upstream-hop", "keep-alive"] {
         assert!(!head.contains(gone), "{gone} in {head}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_authentication_is_between_the_client_and_the_gateway_only() {
+    let proxy = shop().await;
+    let request = "GET /hop HTTP/1.1\r\nHost: shop.example.com\r\nConnection: close\r\n\
+                   Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\
+                   Authorization: Bearer for-the-origin\r\n\r\n";
+    let answer = raw(proxy, request).await;
+    assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+    let (head, seen) = answer.split_once("\r\n\r\n").unwrap();
+
+    // The application behind the gateway is not the proxy those credentials are for.
+    assert!(
+        seen.contains("authorization: Bearer for-the-origin\n"),
+        "{seen}"
+    );
+    assert!(!seen.contains("proxy-authorization"), "{seen}");
+    assert!(!seen.contains("dXNlcjpwYXNz"), "{seen}");
+    // And what it says about proxy authentication is not for the gateway's client.
+    assert!(
+        head.contains("www-authenticate: Basic realm=\"origin\""),
+        "{head}"
+    );
+    assert!(!head.contains("proxy-authenticate"), "{head}");
+    assert!(!head.contains("proxy-authentication-info"), "{head}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

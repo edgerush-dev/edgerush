@@ -7,19 +7,34 @@
 //! `TE` is between this hop and the next as well, but a request that accepted trailers
 //! goes on saying so — `TE: trailers` and nothing else — as it does with Envoy, HAProxy and
 //! Go's proxy: trailers are passed through here, and gRPC servers insist on being told.
-//! `Trailer` and the `Proxy-Auth*` headers stay; RFC 9110 no longer counts them.
+//! `Trailer` stays: it says what the message ends with, which is passed through too.
+//!
+//! Proxy authentication is between a client and the proxy that asked for it, and goes no
+//! further (RFC 9110 §11.7): `Proxy-Authorization` is not for the application behind the
+//! gateway, and an upstream's `Proxy-Authenticate` and `Proxy-Authentication-Info` are not
+//! for the gateway's client. That RFC 9110 no longer lists them with the hop-by-hop
+//! headers does not make them end-to-end; passing credentials on is for proxies that
+//! authenticate as a chain, and a gateway in front of origins is the end of any chain. An
+//! upstream that is itself a proxy wanting credentials gets them from the rule's header
+//! changes, which come after all this: said in the config, not taken from a client.
 //!
 //! A client must not be able to have the gateway take away what the upstream relies on. A
 //! request whose `Connection` names `Host` or an `X-Forwarded-*` header is rejected, as
 //! Envoy and Pingora do, and so is one whose `Connection` is not a list of tokens.
 
 use http::HeaderMap;
-use http::header::{CONNECTION, HeaderName, HeaderValue, TE, TRANSFER_ENCODING, UPGRADE};
+use http::header::{
+    CONNECTION, HeaderName, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE,
+    TRANSFER_ENCODING, UPGRADE,
+};
 
 /// The headers that go whether `Connection` names them or not.
-const HOP_BY_HOP: [HeaderName; 6] = [
+const HOP_BY_HOP: [HeaderName; 9] = [
     CONNECTION,
     HeaderName::from_static("keep-alive"),
+    PROXY_AUTHENTICATE,
+    HeaderName::from_static("proxy-authentication-info"),
+    PROXY_AUTHORIZATION,
     HeaderName::from_static("proxy-connection"),
     TE,
     TRANSFER_ENCODING,
@@ -38,7 +53,15 @@ pub(crate) fn is_present(headers: &HeaderMap) -> bool {
 pub(crate) fn is_hop_by_hop(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
-        "connection" | "keep-alive" | "proxy-connection" | "te" | "transfer-encoding" | "upgrade"
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authentication-info"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "transfer-encoding"
+            | "upgrade"
     )
 }
 
@@ -202,6 +225,9 @@ mod tests {
         for name in [
             "connection",
             "Keep-Alive",
+            "proxy-authenticate",
+            "Proxy-Authentication-Info",
+            "proxy-authorization",
             "proxy-connection",
             "te",
             "transfer-encoding",
@@ -225,8 +251,19 @@ mod tests {
         for name in HOP_BY_HOP {
             assert!(is_hop_by_hop(&name), "{name}");
         }
-        assert_eq!(HOP_BY_HOP.len(), 6);
-        for name in ["host", "trailer", "tea", "connections", "x-upgrade"] {
+        assert_eq!(HOP_BY_HOP.len(), 9);
+        let others = [
+            "host",
+            "trailer",
+            "tea",
+            "connections",
+            "x-upgrade",
+            "authorization",
+            "www-authenticate",
+            "authentication-info",
+            "proxy-status",
+        ];
+        for name in others {
             assert!(!is_hop_by_hop(&HeaderName::from_static(name)), "{name}");
         }
     }
@@ -238,11 +275,44 @@ mod tests {
             ("content-length", "12"),
             ("content-type", "text/plain"),
             ("host", "example.com"),
-            ("proxy-authorization", "Basic x"),
             ("trailer", "x-checksum"),
+            ("www-authenticate", "Basic realm=\"origin\""),
             ("x-forwarded-for", "192.0.2.1"),
         ];
         assert_eq!(left(&request_without_hop_by_hop(&end_to_end)), end_to_end);
+    }
+
+    #[test]
+    fn credentials_for_a_proxy_go_no_further_than_this_one() {
+        // They are between a client and the proxy that asked for them (RFC 9110 §11.7):
+        // the application behind the gateway is not that proxy.
+        let stripped = request_without_hop_by_hop(&[
+            ("proxy-authorization", "Basic dXNlcjpwYXNz"),
+            ("Proxy-Authorization", "Bearer second"),
+            ("authorization", "Bearer for-the-origin"),
+        ]);
+        assert_eq!(
+            left(&stripped),
+            [("authorization", "Bearer for-the-origin")]
+        );
+    }
+
+    #[test]
+    fn what_an_upstream_says_about_proxy_authentication_does_not_reach_the_client() {
+        let mut response = headers(&[
+            ("proxy-authenticate", "Basic realm=\"upstream\""),
+            ("proxy-authentication-info", "nextnonce=\"abc\""),
+            ("www-authenticate", "Basic realm=\"origin\""),
+            ("authentication-info", "nextnonce=\"def\""),
+        ]);
+        strip_response(&mut response);
+        assert_eq!(
+            left(&response),
+            [
+                ("authentication-info", "nextnonce=\"def\""),
+                ("www-authenticate", "Basic realm=\"origin\""),
+            ]
+        );
     }
 
     #[test]
