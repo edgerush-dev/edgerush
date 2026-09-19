@@ -376,6 +376,56 @@ async fn what_cannot_be_placed_is_answered_here() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_request_has_one_host_for_everything_that_looks_at_it() {
+    let (evil, rest) = (upstream("evil").await, upstream("rest").await);
+    let yaml = format!(
+        r#"
+listeners:
+  web: {{ address: "127.0.0.1:0", protocol: http }}
+routes:
+  - name: by-host-header
+    listeners: [web]
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: / }}
+            headers: [{{ name: Host, value: {{ exact: evil.example }} }}]
+        backends:
+          - {{ upstream: evil, weight: 1 }}
+      - matches:
+          - path: {{ prefix: / }}
+        backends:
+          - {{ upstream: rest, weight: 1 }}
+upstreams:
+  evil: {{ endpoints: ["{evil}"] }}
+  rest: {{ endpoints: ["{rest}"] }}
+"#
+    );
+    let proxy = proxy(&yaml).await["web"];
+
+    // The target says one host and the `Host` field another: the target's is the host,
+    // for the rule that looks at the `Host` header as for the upstream (RFC 9112 §3.2.2).
+    let spoofed = "GET http://good.example/about HTTP/1.1\r\nHost: evil.example\r\n\
+                   Connection: close\r\n\r\n";
+    let answer = raw(proxy, spoofed).await;
+    assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+    assert!(answer.contains("x-upstream: rest"), "{answer}");
+    assert!(answer.contains("host: good.example\n"), "{answer}");
+    assert!(!answer.contains("evil.example"), "{answer}");
+
+    // A request that is for that host reaches the rule, by either way of saying so.
+    let by_target = "GET http://evil.example/about HTTP/1.1\r\nHost: good.example\r\n\
+                     Connection: close\r\n\r\n";
+    let by_field = "GET /about HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n";
+    for request in [by_target, by_field] {
+        let answer = raw(proxy, request).await;
+        assert!(answer.contains("x-upstream: evil"), "{answer}");
+        assert!(answer.contains("host: evil.example\n"), "{answer}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_request_that_names_no_host_is_rejected() {
     let proxy = shop().await;
     let answer = raw(proxy, "GET /about HTTP/1.1\r\nConnection: close\r\n\r\n").await;

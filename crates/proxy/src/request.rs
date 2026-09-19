@@ -3,7 +3,9 @@
 //! HTTP/1.1, HTTP/2 and later HTTP/3 are adapters around it.
 //!
 //! The host is the one the request target names (HTTP/2's `:authority`, HTTP/1.1's
-//! absolute form) and only without one the `Host` field, as RFC 9112 §3.2.2 has it. The
+//! absolute form) and only without one the `Host` field, as RFC 9112 §3.2.2 has it; when
+//! the target names it, the `Host` field is made to say the same before anything is
+//! matched, so that a request has one host for every predicate and for the upstream. The
 //! path is normalised once, and the same normal form is matched and forwarded. Whatever is
 //! routed on is what the upstream gets to see: the head is rewritten to say it. What the
 //! request said about the connection it came in on is taken off ([`crate::hop_by_hop`])
@@ -84,8 +86,9 @@ impl Rejection {
 ///
 /// # Errors
 ///
-/// Returns a [`Rejection`] for a request to answer locally. The head is then as it came,
-/// but for a cookie string that came in pieces and is whole now, which says the same.
+/// Returns a [`Rejection`] for a request to answer locally. Its target is then as it came;
+/// of its headers, a cookie string that came in pieces may be whole and the `Host` field
+/// may have been made to agree with the target, as both are before anything is matched.
 pub fn decide<'a>(
     snapshot: &'a Compiled,
     listener: &CompiledListener,
@@ -97,9 +100,19 @@ pub fn decide<'a>(
         // Before routing, so that rules and the upstream read the same cookie string.
         cookies::join(&mut head.headers);
     }
-    let host = match head.uri.authority() {
-        Some(authority) => bare_host(authority.as_str())?,
-        None => bare_host(host_field(&head.headers)?)?,
+    // A request has one host, for everything that looks at it: the router's hostnames, a
+    // rule's predicate on the `Host` header, and the upstream. When the target names it,
+    // the `Host` field is made to say the same before anything is matched.
+    let host = if let Some(authority) = head.uri.authority() {
+        let host = bare_host(authority.as_str())?;
+        if !names_host(&head.headers, authority.as_str()) {
+            let named =
+                HeaderValue::from_str(authority.as_str()).map_err(|_| HostError::Invalid)?;
+            head.headers.insert(HOST, named);
+        }
+        host
+    } else {
+        bare_host(host_field(&head.headers)?)?
     };
     let path = normalise_path(head.uri.path())?;
     if found.hop_by_hop {
@@ -117,23 +130,14 @@ pub fn decide<'a>(
     let rule = snapshot.rule(id).ok_or(Rejection::NoBackend)?;
     let upstream = rule.backends.pick(random).ok_or(Rejection::NoBackend)?;
 
-    // Everything that can fail comes before the first change to the head.
+    // Whatever can still fail comes before the target and the rest of the headers change.
     let target = match path {
         Cow::Borrowed(_) => None,
         Cow::Owned(path) => Some(with_path(&head.uri, path)?),
     };
-    let host_field = match head.uri.authority() {
-        Some(authority) if !names_host(head, authority.as_str()) => {
-            Some(HeaderValue::from_str(authority.as_str()).map_err(|_| HostError::Invalid)?)
-        }
-        _ => None,
-    };
 
     if let Some(target) = target {
         head.uri = target;
-    }
-    if let Some(host_field) = host_field {
-        head.headers.insert(HOST, host_field);
     }
     if found.hop_by_hop {
         strip_request(&mut head.headers);
@@ -169,8 +173,8 @@ fn survey(headers: &HeaderMap) -> Survey {
 }
 
 /// Whether the `Host` field already says what the target's authority says.
-fn names_host(head: &Parts, authority: &str) -> bool {
-    let mut fields = head.headers.get_all(HOST).iter();
+fn names_host(headers: &HeaderMap, authority: &str) -> bool {
+    let mut fields = headers.get_all(HOST).iter();
     fields.next().is_some_and(|field| field == authority) && fields.next().is_none()
 }
 
@@ -231,6 +235,11 @@ routes:
     hostnames:
       - { name: "*", falls_through: true }
     rules:
+      - matches:
+          - path: { prefix: /tenant }
+            headers: [{ name: Host, value: { exact: tenant.example.net } }]
+        backends:
+          - { upstream: search, weight: 1 }
       - matches:
           - path: { prefix: / }
         backends:
@@ -570,14 +579,58 @@ upstreams:
     }
 
     #[test]
-    fn a_rejected_request_keeps_its_head() {
+    fn a_rule_that_looks_at_the_host_header_sees_the_host_that_is_routed_on() {
+        // The target names one host and the `Host` field another: the target's counts
+        // (RFC 9112 §3.2.2), for every predicate, not only for the hostname.
+        let mut spoofed = head(
+            "http://shop.example.com/tenant",
+            &[("host", "tenant.example.net")],
+        );
+        assert_eq!(decide_on("web", &mut spoofed, 0).as_deref(), Ok("fallback"));
+        assert_eq!(spoofed.headers.get(HOST).unwrap(), "shop.example.com");
+
+        // The other way round, the rule is for the request, whatever its `Host` field says.
+        let mut tenant = head(
+            "http://tenant.example.net/tenant",
+            &[("host", "shop.example.com")],
+        );
+        assert_eq!(decide_on("web", &mut tenant, 0).as_deref(), Ok("search"));
+        assert_eq!(tenant.headers.get(HOST).unwrap(), "tenant.example.net");
+
+        // HTTP/2 has `:authority` and no `Host` field at all.
+        let mut h2 = head("http://tenant.example.net/tenant", &[]);
+        assert_eq!(decide_on("web", &mut h2, 0).as_deref(), Ok("search"));
+
+        // Without a host in the target, the `Host` field is the host.
+        let mut origin_form = head("/tenant", &[("host", "tenant.example.net")]);
+        assert_eq!(
+            decide_on("web", &mut origin_form, 0).as_deref(),
+            Ok("search")
+        );
+        let mut origin_form = head("/tenant", &[("host", "shop.example.com")]);
+        assert_eq!(
+            decide_on("web", &mut origin_form, 0).as_deref(),
+            Ok("fallback")
+        );
+    }
+
+    #[test]
+    fn a_rejected_request_keeps_its_target_and_the_headers_nothing_was_matched_on() {
         let mut head = head(
             "http://shop.example.com/./closed",
-            &[("host", "other.example.org")],
+            &[
+                ("host", "other.example.org"),
+                ("connection", "x-hop"),
+                ("x-hop", "1"),
+                ("x-debug", "1"),
+            ],
         );
         assert_eq!(decide_on("web", &mut head, 0), Err(Rejection::NoBackend));
         assert_eq!(head.uri, "http://shop.example.com/./closed");
-        assert_eq!(head.headers.get(HOST).unwrap(), "other.example.org");
+        assert_eq!(head.headers.get("x-hop").unwrap(), "1");
+        assert_eq!(head.headers.get("x-debug").unwrap(), "1");
+        // The host is settled before anything is matched, so it is settled here too.
+        assert_eq!(head.headers.get(HOST).unwrap(), "shop.example.com");
     }
 
     #[test]
