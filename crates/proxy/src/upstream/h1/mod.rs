@@ -8,6 +8,7 @@
 
 pub mod codec;
 pub mod exchange;
+pub mod pool;
 
 use std::time::Duration;
 
@@ -55,6 +56,19 @@ pub struct H1Limits {
     /// the expectation is one that means to read the body anyway, and the client is
     /// waiting on both of them meanwhile.
     pub continue_wait: Duration,
+    /// How many idle connections a worker keeps to any one destination.
+    pub idle_per_destination: usize,
+    /// How many it keeps in all. Workers do not share, so a pod's total is this times
+    /// the number of them.
+    pub idle_total: usize,
+    /// How long a connection may sit unused before it is dropped rather than trusted.
+    pub idle_timeout: Duration,
+    /// How long a connection may be reused at all, counted from when it was opened, and
+    /// whatever it has been doing meanwhile. An old connection has had more chances to
+    /// have quietly stopped working.
+    pub max_age: Duration,
+    /// How often a worker looks over what it is keeping.
+    pub sweep: Duration,
 }
 
 impl Default for H1Limits {
@@ -70,6 +84,11 @@ impl Default for H1Limits {
             final_head: Duration::from_secs(60),
             idle: Duration::from_secs(30),
             continue_wait: Duration::from_secs(1),
+            idle_per_destination: 8,
+            idle_total: 256,
+            idle_timeout: Duration::from_secs(30),
+            max_age: Duration::from_secs(5 * 60),
+            sweep: Duration::from_secs(1),
         }
     }
 }

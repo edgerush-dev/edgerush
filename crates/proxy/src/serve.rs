@@ -322,7 +322,8 @@ impl Worker {
     ///
     /// # Panics
     ///
-    /// Runs inside the worker's `LocalSet` ([`OnThisWorker`]). An HTTP/2 connection
+    /// Runs inside the worker's `LocalSet`, where the engine's own futures go. An
+    /// HTTP/2 connection
     /// panics without one, as the engine spawns a future for every stream.
     pub async fn serve_connection(self: Rc<Self>, listener: usize, stream: TcpStream) {
         // Worth having, not worth refusing a connection over.
