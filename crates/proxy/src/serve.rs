@@ -9,6 +9,11 @@
 //! current snapshot without waiting for anybody, works with that one snapshot until it has
 //! been directed, and from then on holds on to its rule at most. Sockets and upstream
 //! connections belong to the data plane, not to a snapshot, and outlive every reload.
+//!
+//! A connection is served on the worker that took it, and stays there: everything it
+//! spawns goes into that worker's `LocalSet` ([`OnThisWorker`]), so nothing a request
+//! touches need be `Send`. That is what lets a worker own things a thread cannot share —
+//! the pool of upstream connections to come, above all.
 
 use crate::hop_by_hop::strip_response;
 use crate::metrics::{Answer, Metrics};
@@ -21,12 +26,14 @@ use http::uri::{Authority, Scheme};
 use http::{Request, Response, Uri, Version};
 use http_body_util::{Either, Empty};
 use hyper::body::{Bytes, Incoming};
+use hyper::rt::Executor;
 use hyper::service::service_fn;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use std::convert::Infallible;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -38,6 +45,21 @@ use tokio::net::{TcpListener, TcpStream};
 /// How long accepting pauses after an error that is not about one connection, instead of
 /// failing again at once, over and over.
 pub(crate) const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
+
+/// Where the futures the engine spawns of its own accord go: the worker that is serving
+/// the connection they belong to, never a thread pool. A worker is a single-threaded
+/// runtime and a `LocalSet`, so a request and everything it holds stay on one core and
+/// need not be `Send`.
+#[derive(Debug, Clone, Copy, Default)]
+struct OnThisWorker;
+
+impl<F: Future<Output = ()> + 'static> Executor<F> for OnThisWorker {
+    fn execute(&self, future: F) {
+        // The engine only spawns while serving a connection, and a connection is only
+        // ever served inside a worker's LocalSet, which is the one this goes into.
+        let _detached = tokio::task::spawn_local(future);
+    }
+}
 
 /// What is answered: the upstream's body as it arrives, or nothing.
 type Body = Either<Incoming, Empty<Bytes>>;
@@ -176,11 +198,17 @@ impl Proxy {
     /// position `listener` of [`Proxy::listeners`], HTTP/1.1 and HTTP/2 alike. Never
     /// returns; dropping the future stops accepting, and connections already accepted
     /// carry on.
+    ///
+    /// # Panics
+    ///
+    /// Runs inside a worker's `LocalSet`, where the connections it accepts are served;
+    /// without one there is nowhere to put them and the first connection panics.
     pub async fn serve(self: Arc<Self>, listener: usize, socket: TcpListener) {
         loop {
             match socket.accept().await {
                 Ok((stream, _)) => {
-                    tokio::spawn(Arc::clone(&self).serve_connection(listener, stream));
+                    let connection = Arc::clone(&self).serve_connection(listener, stream);
+                    let _detached = tokio::task::spawn_local(connection);
                 }
                 Err(error) => {
                     if let Some(pause) = self.accept_failed(listener, &error) {
@@ -207,6 +235,11 @@ impl Proxy {
     /// of [`Proxy::listeners`]. It may have been accepted anywhere — by another thread,
     /// which then hands it over as a socket of the standard library — as long as `stream`
     /// was made on the runtime that runs this.
+    ///
+    /// # Panics
+    ///
+    /// Runs inside the worker's `LocalSet` ([`OnThisWorker`]). An HTTP/2 connection
+    /// panics without one, as the engine spawns a future for every stream.
     pub async fn serve_connection(self: Arc<Self>, listener: usize, stream: TcpStream) {
         // Worth having, not worth refusing a connection over.
         let _unset = stream.set_nodelay(true);
@@ -223,7 +256,7 @@ impl Proxy {
         });
         // An error here is the end of one connection: the peer went away or spoke
         // nonsense. There is nobody to tell.
-        let _closed = auto::Builder::new(TokioExecutor::new())
+        let _closed = auto::Builder::new(OnThisWorker)
             .serve_connection(TokioIo::new(stream), service)
             .await;
     }
@@ -391,6 +424,84 @@ pub(crate) fn is_about_one_connection(error: &io::Error) -> bool {
 mod tests {
     use super::*;
     use edgerush_config::{Config, compile};
+    use http_body_util::{BodyExt, Full};
+    use std::rc::Rc;
+
+    /// The engine must take a service, and a body, that cannot leave the thread they were
+    /// made on: a worker's own things — the pool of upstream connections above all — will
+    /// be exactly that, and an executor that wanted `Send` would refuse them. HTTP/2 is
+    /// where it would refuse, because the engine spawns a future for every stream, so both
+    /// protocols are asked here.
+    #[test]
+    fn the_engine_serves_what_cannot_leave_the_worker() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = socket.local_addr().unwrap();
+            tokio::task::spawn_local(async move {
+                loop {
+                    let (stream, _) = socket.accept().await.unwrap();
+                    let _detached = tokio::task::spawn_local(async move {
+                        // An Rc is held for the life of the connection and cloned into
+                        // every request: nothing here could be sent to another thread.
+                        let answer = Rc::new(Bytes::from_static(b"on this worker"));
+                        let service = service_fn(move |_| {
+                            let answer = Rc::clone(&answer);
+                            async move {
+                                let body = Full::new(Bytes::clone(&answer));
+                                Ok::<_, Infallible>(Response::new(body))
+                            }
+                        });
+                        let _closed = auto::Builder::new(OnThisWorker)
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            });
+
+            assert_eq!(asked_over_http1(address).await, "on this worker");
+            assert_eq!(asked_over_http2(address).await, "on this worker");
+        }));
+    }
+
+    /// What one HTTP/1.1 request to `address` answers, as text.
+    async fn asked_over_http1(address: SocketAddr) -> String {
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        let _detached = tokio::task::spawn_local(async move {
+            let _closed = connection.await;
+        });
+        let request = Request::new(Empty::<Bytes>::new());
+        collected(sender.send_request(request).await.unwrap()).await
+    }
+
+    /// The same over HTTP/2, which the engine tells apart by the preface the client sends.
+    async fn asked_over_http2(address: SocketAddr) -> String {
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) =
+            hyper::client::conn::http2::handshake(OnThisWorker, TokioIo::new(stream))
+                .await
+                .unwrap();
+        let _detached = tokio::task::spawn_local(async move {
+            let _closed = connection.await;
+        });
+        let mut request = Request::new(Empty::<Bytes>::new());
+        *request.version_mut() = Version::HTTP_2;
+        *request.uri_mut() = format!("http://{address}/").parse().unwrap();
+        collected(sender.send_request(request).await.unwrap()).await
+    }
+
+    async fn collected(response: Response<Incoming>) -> String {
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
 
     fn authorities(addresses: &[&str]) -> Vec<Authority> {
         addresses

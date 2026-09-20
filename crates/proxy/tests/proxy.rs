@@ -104,12 +104,38 @@ async fn proxy(yaml: &str) -> BTreeMap<String, SocketAddr> {
 async fn reloadable_proxy(yaml: &str) -> (Arc<Proxy>, BTreeMap<String, SocketAddr>) {
     let proxy = Arc::new(Proxy::new(compiled(yaml)).unwrap());
     let mut addresses = BTreeMap::new();
+    let mut sockets = Vec::new();
     for (position, listener) in proxy.listeners().iter().enumerate() {
-        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Of the standard library's kind, to be handed to the worker's runtime and to no
+        // other, exactly as the harness hands its listeners over.
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
         addresses.insert(listener.clone(), socket.local_addr().unwrap());
-        tokio::spawn(Arc::clone(&proxy).serve(position, socket));
+        sockets.push((position, socket));
     }
+    on_a_worker(Arc::clone(&proxy), sockets);
     (proxy, addresses)
+}
+
+/// Serves the listeners the way a data plane does: a thread of its own, a single-threaded
+/// runtime and a `LocalSet`, so that the tests exercise the shape the proxy really runs
+/// in and not one where a connection may wander between threads.
+fn on_a_worker(proxy: Arc<Proxy>, sockets: Vec<(usize, std::net::TcpListener)>) {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let entered = runtime.enter();
+        for (position, socket) in sockets {
+            let socket = TcpListener::from_std(socket).unwrap();
+            local.spawn_local(Arc::clone(&proxy).serve(position, socket));
+        }
+        drop(entered);
+        // Accepting never ends, so neither does this: the thread goes with the process.
+        runtime.block_on(local);
+    });
 }
 
 fn compiled(yaml: &str) -> Compiled {
@@ -904,13 +930,14 @@ async fn a_connection_accepted_on_one_thread_is_served_on_another() {
             .enable_all()
             .build()
             .unwrap();
-        runtime.block_on(async move {
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async move {
             while let Some(stream) = handed.recv().await {
                 let stream = TcpStream::from_std(stream).unwrap();
                 Arc::clone(&worker).serve_connection(0, stream).await;
                 served.send(std::thread::current().id()).unwrap();
             }
-        });
+        }));
     });
 
     // Accepted here, on the test's runtime, and handed over as a socket of the standard

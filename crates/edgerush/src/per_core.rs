@@ -5,16 +5,19 @@
 //! is ([`crate::balance`]). One that is another worker's is handed over as a socket that no
 //! runtime knows yet, so that it is the other worker's runtime that watches it from its
 //! first byte on: once for a connection, and nothing crosses threads for a request.
+//!
+//! Everything a worker runs lives in a `LocalSet` of its own, so that a connection and all
+//! the engine spawns for it stay on the one thread and need not be `Send`.
 
 use crate::balance::{Held, Loads};
 use edgerush_proxy::Proxy;
-use std::future::pending;
 use std::io;
 use std::sync::Arc;
 use std::thread;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
+use tokio::task::LocalSet;
 
 /// How many connections can be on their way to a worker that is busy with something else.
 /// With more than that, a connection stays with the worker that accepted it.
@@ -81,18 +84,29 @@ pub(crate) fn start(
             accept,
         };
         let runtime = Builder::new_current_thread().enable_all().build()?;
-        // Sockets are handed to the runtime that is entered.
+        // Sockets are handed to the runtime that is entered. Here, and not on the worker's
+        // thread, so that a socket the runtime will not take stops the harness starting.
         let entered = runtime.enter();
-        for (listener, socket) in sockets.into_iter().enumerate() {
-            let socket = TcpListener::from_std(socket)?;
-            runtime.spawn(worker.clone().accept(listener, socket));
-        }
-        runtime.spawn(worker.receive(handed_over));
+        let sockets = sockets
+            .into_iter()
+            .map(TcpListener::from_std)
+            .collect::<io::Result<Vec<_>>>()?;
         drop(entered);
-        // A runtime without threads of its own runs on the thread that waits on it.
+        // A runtime without threads of its own runs on the thread that waits on it, and a
+        // LocalSet belongs to one thread, so it is made on that one.
         thread::Builder::new()
             .name(format!("worker-{position}"))
-            .spawn(move || runtime.block_on(pending::<()>()))?;
+            .spawn(move || {
+                let local = LocalSet::new();
+                let entered = runtime.enter();
+                for (listener, socket) in sockets.into_iter().enumerate() {
+                    local.spawn_local(worker.clone().accept(listener, socket));
+                }
+                local.spawn_local(worker.receive(handed_over));
+                drop(entered);
+                // Accepting has no end, so neither has the LocalSet that waits on it.
+                runtime.block_on(local);
+            })?;
     }
     Ok(loads)
 }
@@ -164,7 +178,7 @@ impl Worker {
     /// as the worker's to its end.
     fn serve(&self, listener: usize, stream: TcpStream, held: Held) {
         let proxy = Arc::clone(&self.proxy);
-        tokio::spawn(async move {
+        let _detached = tokio::task::spawn_local(async move {
             proxy.serve_connection(listener, stream).await;
             drop(held);
         });
