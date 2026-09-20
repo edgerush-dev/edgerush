@@ -46,6 +46,26 @@ pub(crate) enum CodecError {
     /// leading sign and HTTP does not.
     #[error("the response has a content-length that is not a plain number")]
     BadLength,
+    /// A transfer coding that is not a lone `chunked`: a chain, a repeat, or one this
+    /// does not speak.
+    #[error("the response has a transfer-encoding that is not a single chunked")]
+    Coding,
+    /// Both ways of saying how long a body is. Which one a reader believes is what
+    /// request smuggling turns on.
+    #[error("the response has both a content-length and a transfer-encoding")]
+    LengthAndCoding,
+    /// Chunked came with HTTP/1.1, so a 1.0 response claiming it is not to be believed.
+    #[error("the response is HTTP/1.0 and claims a transfer-encoding")]
+    CodingOnHttp10,
+    /// A body described where none may be sent.
+    #[error("the response cannot have a body and says how long one would be")]
+    BodyForbidden,
+    /// 101, which hands the connection to a protocol this does not speak.
+    #[error("the response switches to another protocol, which is not supported")]
+    Upgrade,
+    /// A `Connection` holding something that is not a list of tokens.
+    #[error("the response has a connection field that is not a list of tokens")]
+    BadConnection,
 }
 
 /// A response head, once it has been read and found sound.
@@ -238,6 +258,136 @@ fn reason(error: httparse::Error) -> &'static str {
         httparse::Error::TooManyHeaders => "it has too many fields",
         httparse::Error::Version => "its version is not one",
     }
+}
+
+/// How the body of a response is delimited — the one question every other part of reading
+/// one turns on, and the one that request smuggling is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Framing {
+    /// None at all. What a head says a body would have been is not read as one.
+    None,
+    /// Chunk by chunk, to the zero chunk and the trailer section that follows it.
+    Chunked,
+    /// Exactly this many bytes.
+    Length(u64),
+    /// Everything until the connection closes, which is the only thing that ends it.
+    UntilClose,
+}
+
+/// What a head says about the body after it and the connection it came on.
+///
+/// Of a *final* head: an interim one is followed by more of the same exchange, and what
+/// is said here about carrying another exchange does not apply until the final one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Delivery {
+    pub(crate) framing: Framing,
+    /// Whether this connection may carry another exchange once this one is done. Worked
+    /// out here, while `Connection` is still on the head: by the time the hop-by-hop
+    /// fields have been taken off there is nothing left to work it out from.
+    pub(crate) persistent: bool,
+}
+
+/// What was asked, as far as the answer's framing turns on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Asked {
+    /// Anything but HEAD: a body is whatever the head says it is.
+    Anything,
+    /// HEAD: the head describes a body that is not sent.
+    Head,
+}
+
+/// What follows a head, and whether anything may follow that.
+///
+/// # Errors
+///
+/// A transfer coding this does not speak, a length and a coding together, a coding on
+/// HTTP/1.0, a body described where none may be, an upgrade, or a `Connection` that is
+/// not a list of tokens.
+pub(crate) fn delivery(head: &ResponseHead, asked: Asked) -> Result<Delivery, CodecError> {
+    let chunked = is_chunked(&head.headers)?;
+    // Two ways of saying how long a body is, and no way to know which the sender meant or
+    // which the next reader will believe. This is the shape request smuggling is built on.
+    if chunked && head.content_length.is_some() {
+        return Err(CodecError::LengthAndCoding);
+    }
+    // Chunked came with HTTP/1.1. A 1.0 sender that claims it is not one to go along with.
+    if chunked && head.version == Version::HTTP_10 {
+        return Err(CodecError::CodingOnHttp10);
+    }
+    let closing = says_close(&head.headers)?;
+    // A connection that is to close, one that speaks 1.0, or one whose body only the
+    // close ends, carries nothing after this.
+    let persists =
+        |framing| !closing && head.version == Version::HTTP_11 && framing != Framing::UntilClose;
+
+    let status = head.status.as_u16();
+    // 101 hands the connection to another protocol, and this speaks none.
+    if status == 101 {
+        return Err(CodecError::Upgrade);
+    }
+    // Nothing follows these, and nothing may claim to: a length or a coding here is a
+    // sender describing a body it may not send, which the next reader may go looking for.
+    if head.status.is_informational() || status == 204 {
+        if chunked || head.content_length.is_some() {
+            return Err(CodecError::BodyForbidden);
+        }
+        return Ok(Delivery {
+            framing: Framing::None,
+            persistent: persists(Framing::None),
+        });
+    }
+    // These describe a body that is not sent. What they say of it has been checked above
+    // and is now simply not acted on — 205 is not among them, though it is next to 204.
+    if status == 304 || asked == Asked::Head {
+        return Ok(Delivery {
+            framing: Framing::None,
+            persistent: persists(Framing::None),
+        });
+    }
+
+    let framing = if chunked {
+        Framing::Chunked
+    } else if let Some(length) = head.content_length {
+        Framing::Length(length)
+    } else {
+        Framing::UntilClose
+    };
+    Ok(Delivery {
+        framing,
+        persistent: persists(framing),
+    })
+}
+
+/// Whether the body is chunked. One `chunked` and nothing besides: a chain of codings, a
+/// coding that is not the last, and a `chunked` said twice are all refused, because each
+/// is a place where what this reads and what the next reader reads could differ.
+fn is_chunked(headers: &HeaderMap) -> Result<bool, CodecError> {
+    let mut codings = headers
+        .get_all(http::header::TRANSFER_ENCODING)
+        .iter()
+        .flat_map(crate::hop_by_hop::options);
+    let Some(only) = codings.next() else {
+        return Ok(false);
+    };
+    if codings.next().is_some() || !only.eq_ignore_ascii_case(b"chunked") {
+        return Err(CodecError::Coding);
+    }
+    Ok(true)
+}
+
+/// Whether `Connection` asks for the connection to close, having first checked that what
+/// it holds is a list of tokens at all: a value that is not is not something to act on.
+fn says_close(headers: &HeaderMap) -> Result<bool, CodecError> {
+    let mut closing = false;
+    for value in headers.get_all(http::header::CONNECTION) {
+        for option in crate::hop_by_hop::options(value) {
+            if !option.iter().copied().all(crate::hop_by_hop::is_token_byte) {
+                return Err(CodecError::BadConnection);
+            }
+            closing |= option.eq_ignore_ascii_case(b"close");
+        }
+    }
+    Ok(closing)
 }
 
 #[cfg(test)]
@@ -509,6 +659,253 @@ mod tests {
                     Ok(Head::Read { .. })
                 ),
                 "cut {cut}"
+            );
+        }
+    }
+
+    /// What a head of these fields says about its body, or why it cannot be believed.
+    fn delivery_of(fields: &str, asked: Asked) -> Result<Delivery, CodecError> {
+        let bytes = format!("HTTP/1.1 200 OK\r\n{fields}\r\n").into_bytes();
+        delivery(&head_of(&bytes), asked)
+    }
+
+    /// The same, for a head whose status and version are the test's own.
+    fn delivery_with(start: &str, fields: &str) -> Result<Delivery, CodecError> {
+        let bytes = format!("{start}\r\n{fields}\r\n").into_bytes();
+        delivery(&head_of(&bytes), Asked::Anything)
+    }
+
+    #[test]
+    fn a_coding_wins_over_a_length_being_absent_and_a_length_over_the_close() {
+        assert_eq!(
+            delivery_of("transfer-encoding: chunked\r\n", Asked::Anything),
+            Ok(Delivery {
+                framing: Framing::Chunked,
+                persistent: true
+            })
+        );
+        assert_eq!(
+            delivery_of("content-length: 12\r\n", Asked::Anything),
+            Ok(Delivery {
+                framing: Framing::Length(12),
+                persistent: true
+            })
+        );
+        // Nothing said: the close is what ends it, so there is no next exchange.
+        assert_eq!(
+            delivery_of("", Asked::Anything),
+            Ok(Delivery {
+                framing: Framing::UntilClose,
+                persistent: false
+            })
+        );
+    }
+
+    #[test]
+    fn a_length_and_a_coding_together_are_refused() {
+        assert_eq!(
+            delivery_of(
+                "content-length: 12\r\ntransfer-encoding: chunked\r\n",
+                Asked::Anything
+            ),
+            Err(CodecError::LengthAndCoding)
+        );
+    }
+
+    /// One `chunked`, and nothing else at all. Each of these is a place where this reader
+    /// and the next could part company over where the body ends.
+    #[test]
+    fn only_a_lone_chunked_coding_is_read() {
+        for coding in [
+            "gzip",
+            "chunked, chunked",
+            "chunked, gzip",
+            "gzip, chunked",
+            "identity",
+            "chunked, identity",
+            "Chunked, Chunked",
+        ] {
+            let fields = format!("transfer-encoding: {coding}\r\n");
+            assert_eq!(
+                delivery_of(&fields, Asked::Anything),
+                Err(CodecError::Coding),
+                "{coding}"
+            );
+        }
+        // Said over two fields, which is the same list and is refused the same way.
+        assert_eq!(
+            delivery_of(
+                "transfer-encoding: gzip\r\ntransfer-encoding: chunked\r\n",
+                Asked::Anything
+            ),
+            Err(CodecError::Coding)
+        );
+        // The name's case is nothing to do with it.
+        assert!(matches!(
+            delivery_of("Transfer-Encoding: CHUNKED\r\n", Asked::Anything),
+            Ok(Delivery {
+                framing: Framing::Chunked,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_coding_on_http_1_0_is_refused() {
+        assert_eq!(
+            delivery_with("HTTP/1.0 200 OK", "transfer-encoding: chunked\r\n"),
+            Err(CodecError::CodingOnHttp10)
+        );
+    }
+
+    /// HTTP/1.0 is read, and never kept: this slice pools no connection that speaks it,
+    /// whatever it says about keeping alive.
+    #[test]
+    fn an_http_1_0_response_is_never_kept() {
+        assert_eq!(
+            delivery_with("HTTP/1.0 200 OK", "content-length: 3\r\n"),
+            Ok(Delivery {
+                framing: Framing::Length(3),
+                persistent: false
+            })
+        );
+        assert_eq!(
+            delivery_with(
+                "HTTP/1.0 200 OK",
+                "content-length: 3\r\nconnection: keep-alive\r\n"
+            ),
+            Ok(Delivery {
+                framing: Framing::Length(3),
+                persistent: false
+            })
+        );
+    }
+
+    /// The statuses that carry no body, and the ones that only look as though they do.
+    #[test]
+    fn the_statuses_that_carry_no_body() {
+        for status in ["100 Continue", "103 Early Hints", "204 No Content"] {
+            let start = format!("HTTP/1.1 {status}");
+            assert_eq!(
+                delivery_with(&start, ""),
+                Ok(Delivery {
+                    framing: Framing::None,
+                    persistent: true
+                }),
+                "{status}"
+            );
+            // And they may not even describe one.
+            for said in ["content-length: 0\r\n", "transfer-encoding: chunked\r\n"] {
+                assert_eq!(
+                    delivery_with(&start, said),
+                    Err(CodecError::BodyForbidden),
+                    "{status} with {said}"
+                );
+            }
+        }
+    }
+
+    /// 304 says what a body would have been; the answer to a HEAD does the same. What
+    /// they say is checked, and then not read as a body.
+    #[test]
+    fn a_body_that_is_described_and_not_sent() {
+        assert_eq!(
+            delivery_with("HTTP/1.1 304 Not Modified", "content-length: 99\r\n"),
+            Ok(Delivery {
+                framing: Framing::None,
+                persistent: true
+            })
+        );
+        assert_eq!(
+            delivery_of("content-length: 99\r\n", Asked::Head),
+            Ok(Delivery {
+                framing: Framing::None,
+                persistent: true
+            })
+        );
+        // Checked all the same: a coding it cannot read is refused before it is ignored.
+        assert_eq!(
+            delivery_with("HTTP/1.1 304 Not Modified", "transfer-encoding: gzip\r\n"),
+            Err(CodecError::Coding)
+        );
+        assert_eq!(
+            delivery_of("transfer-encoding: gzip\r\n", Asked::Head),
+            Err(CodecError::Coding)
+        );
+    }
+
+    /// 205 sits next to 204 and is not one of the bodiless statuses: read as anything
+    /// else is, so a body it sends is not left on the connection for the next request.
+    #[test]
+    fn a_205_is_not_a_204() {
+        assert_eq!(
+            delivery_with("HTTP/1.1 205 Reset Content", "content-length: 0\r\n"),
+            Ok(Delivery {
+                framing: Framing::Length(0),
+                persistent: true
+            })
+        );
+        assert_eq!(
+            delivery_with("HTTP/1.1 205 Reset Content", ""),
+            Ok(Delivery {
+                framing: Framing::UntilClose,
+                persistent: false
+            })
+        );
+    }
+
+    #[test]
+    fn an_upgrade_is_refused_because_none_is_spoken() {
+        assert_eq!(
+            delivery_with("HTTP/1.1 101 Switching Protocols", "upgrade: websocket\r\n"),
+            Err(CodecError::Upgrade)
+        );
+    }
+
+    #[test]
+    fn a_connection_that_asks_to_close_is_not_kept() {
+        assert_eq!(
+            delivery_of(
+                "content-length: 0\r\nconnection: close\r\n",
+                Asked::Anything
+            ),
+            Ok(Delivery {
+                framing: Framing::Length(0),
+                persistent: false
+            })
+        );
+        // Among other options, and whatever its case.
+        assert_eq!(
+            delivery_of(
+                "content-length: 0\r\nconnection: x-a, CLOSE\r\n",
+                Asked::Anything
+            ),
+            Ok(Delivery {
+                framing: Framing::Length(0),
+                persistent: false
+            })
+        );
+        // Something else entirely leaves the connection as it was.
+        assert_eq!(
+            delivery_of(
+                "content-length: 0\r\nconnection: keep-alive\r\n",
+                Asked::Anything
+            ),
+            Ok(Delivery {
+                framing: Framing::Length(0),
+                persistent: true
+            })
+        );
+    }
+
+    #[test]
+    fn a_connection_that_is_not_a_list_of_tokens_is_not_acted_on() {
+        for value in ["clo se", "\"close\"", "close/1"] {
+            let fields = format!("content-length: 0\r\nconnection: {value}\r\n");
+            assert_eq!(
+                delivery_of(&fields, Asked::Anything),
+                Err(CodecError::BadConnection),
+                "{value}"
             );
         }
     }

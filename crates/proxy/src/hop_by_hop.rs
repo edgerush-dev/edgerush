@@ -124,7 +124,7 @@ fn strip(headers: &mut HeaderMap) {
 
 /// The members of a comma-separated list, without the white space around them and without
 /// the empty ones that the list syntax allows.
-fn options(value: &HeaderValue) -> impl Iterator<Item = &[u8]> {
+pub(crate) fn options(value: &HeaderValue) -> impl Iterator<Item = &[u8]> {
     value
         .as_bytes()
         .split(|byte| *byte == b',')
@@ -133,7 +133,7 @@ fn options(value: &HeaderValue) -> impl Iterator<Item = &[u8]> {
 }
 
 /// RFC 9110's `tchar`: what connection options and header names are made of.
-fn is_token_byte(byte: u8) -> bool {
+pub(crate) fn is_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
