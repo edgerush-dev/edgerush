@@ -23,7 +23,7 @@ repo=$(dirname "$here")
 : "${BACKEND_CPUS:=3,7}"
 : "${DURATION:=30}"          # seconds of every measurement
 : "${REPS:=3}"
-: "${VARIANTS:=work-stealing thread-per-core}" # and: nginx haproxy envoy kong
+: "${VARIANTS:=work-stealing thread-per-core}" # and: thread-per-core-kernel nginx haproxy envoy kong
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
 
 # Hundreds of connections on either side of the proxy, and more when they churn.
@@ -78,6 +78,12 @@ start_proxy() { # variant
     haproxy)
         # A thread for every CPU it may run on: WORKERS of them, if PROXY_CPUS is as many.
         taskset -c "$PROXY_CPUS" haproxy -db -f "$here/haproxy.cfg" 2>>"$OUT/proxy.log" &
+        ;;
+    thread-per-core-kernel)
+        # Connections left where the kernel put them: what balancing is measured against.
+        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$here/proxy.yaml" \
+            --threading thread-per-core --accept kernel --workers "$WORKERS" \
+            2>>"$OUT/proxy.log" &
         ;;
     *)
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$here/proxy.yaml" \

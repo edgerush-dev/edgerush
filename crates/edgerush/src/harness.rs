@@ -7,16 +7,17 @@
 //! has changed takes over without dropping a request, while one that cannot be run is
 //! told and changes nothing.
 //!
-//! Both candidates for the threading model can be run, so that they can be measured
-//! ([`Threading`]). Thread-per-core is an experiment made of what there is: a whole data
-//! plane for every worker, which is what gives each its own upstream connections.
+//! Both threading models that were measured against each other can be run
+//! ([`Threading`]). Thread-per-core is the one that was chosen, here still as the
+//! experiment made of what there was ([`crate::per_core`]): a whole data plane for every
+//! worker, which is what gives each its own upstream connections.
 
 use crate::bind::{Port, listen};
 use crate::config_file::{ConfigFile, Rejected};
+use crate::per_core::{self, Accept};
 use edgerush_config::Compiled;
 use edgerush_proxy::{Proxy, ProxyError};
 use std::convert::Infallible;
-use std::future::pending;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -25,7 +26,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Builder;
 
 pub(crate) const USAGE: &str = "\
 Usage: edgerush proxy --config <FILE> [OPTIONS]
@@ -41,6 +42,9 @@ Options:
                            thread-per-core: for every worker a runtime, sockets on shared
                            ports (SO_REUSEPORT) and upstream connections of its own, and
                            no /metrics [default: work-stealing]
+      --accept <BY>        With thread-per-core, whose a new connection is. balanced: the
+                           worker that holds the fewest; kernel: the one the kernel gave
+                           it to, by its hash of the addresses [default: balanced]
       --workers <N>        How many threads serve requests [default: one for every CPU]
   -h, --help               Print help
 ";
@@ -79,6 +83,7 @@ struct Options {
     threading: Threading,
     /// `None` is one for every CPU the process may use.
     workers: Option<NonZeroUsize>,
+    accept: Accept,
 }
 
 /// How the threads that serve requests share the work ([03 §2] in the docs).
@@ -111,6 +116,10 @@ enum UsageError {
     Workers(String),
     #[error("'--metrics' is not served with thread-per-core, where every worker counts alone")]
     MetricsPerCore,
+    #[error("'{0}' is not a way to place connections: balanced or kernel")]
+    Accept(String),
+    #[error("'--accept' is for thread-per-core: work-stealing has all connections in one place")]
+    AcceptPerCore,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
@@ -118,6 +127,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut metrics = None;
     let mut threading = None;
     let mut workers = None;
+    let mut accept = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
@@ -152,6 +162,17 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                     return Err(UsageError::Twice("--workers"));
                 }
             }
+            "--accept" => {
+                let by = args.next().ok_or(UsageError::NoValue("--accept"))?;
+                let by = match by.as_str() {
+                    "balanced" => Accept::Balanced,
+                    "kernel" => Accept::Kernel,
+                    _ => return Err(UsageError::Accept(by)),
+                };
+                if accept.replace(by).is_some() {
+                    return Err(UsageError::Twice("--accept"));
+                }
+            }
             _ => return Err(UsageError::Unexpected(arg)),
         }
     }
@@ -160,11 +181,15 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     if threading == Threading::ThreadPerCore && metrics.is_some() {
         return Err(UsageError::MetricsPerCore);
     }
+    if threading == Threading::WorkStealing && accept.is_some() {
+        return Err(UsageError::AcceptPerCore);
+    }
     Ok(Parsed::Run(Options {
         config,
         metrics,
         threading,
         workers,
+        accept: accept.unwrap_or(Accept::Balanced),
     }))
 }
 
@@ -191,6 +216,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
         metrics,
         threading,
         workers,
+        accept,
     } = options;
     let workers = workers
         .or_else(|| thread::available_parallelism().ok())
@@ -233,25 +259,6 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
         .map(|address| open("metrics".to_owned(), address, Port::Own).map(|s| (s, address)))
         .transpose()?;
 
-    let mut runtimes = Vec::with_capacity(proxies.len());
-    for (proxy, sockets) in proxies.iter().zip(sockets) {
-        let runtime = match threading {
-            Threading::WorkStealing => Builder::new_multi_thread()
-                .worker_threads(workers.get())
-                .enable_all()
-                .build(),
-            Threading::ThreadPerCore => Builder::new_current_thread().enable_all().build(),
-        };
-        let runtime = runtime.map_err(Failure::Runtime)?;
-        // Sockets are handed to the runtime that is entered.
-        let entered = runtime.enter();
-        for (position, socket) in sockets.into_iter().enumerate() {
-            let socket = TcpListener::from_std(socket).map_err(Failure::Runtime)?;
-            runtime.spawn(Arc::clone(proxy).serve(position, socket));
-        }
-        drop(entered);
-        runtimes.push(runtime);
-    }
     for listener in &bound {
         say(
             stderr,
@@ -261,28 +268,34 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
             ),
         );
     }
-    if let (Some((socket, address)), Some(runtime), Some(proxy)) =
-        (metrics, runtimes.first(), proxies.first())
-    {
-        let address = socket.local_addr().unwrap_or(address);
-        let entered = runtime.enter();
-        let socket = TcpListener::from_std(socket).map_err(Failure::Runtime)?;
-        runtime.spawn(Arc::clone(proxy).serve_metrics(socket));
-        drop(entered);
-        say(stderr, format_args!("metrics are on {address}"));
-    }
-    // A runtime with workers of its own runs by being there; one without runs on the
-    // thread that waits on it.
-    let _running: Vec<Runtime> = match threading {
-        Threading::WorkStealing => runtimes,
-        Threading::ThreadPerCore => {
-            for (worker, runtime) in runtimes.into_iter().enumerate() {
-                thread::Builder::new()
-                    .name(format!("worker-{worker}"))
-                    .spawn(move || runtime.block_on(pending::<()>()))
-                    .map_err(Failure::Runtime)?;
+    // A runtime with workers of its own runs by being there, for as long as it is there.
+    let _running = match threading {
+        Threading::WorkStealing => {
+            let runtime = Builder::new_multi_thread()
+                .worker_threads(workers.get())
+                .enable_all()
+                .build()
+                .map_err(Failure::Runtime)?;
+            // Sockets are handed to the runtime that is entered.
+            let entered = runtime.enter();
+            for (proxy, sockets) in proxies.iter().zip(sockets) {
+                for (position, socket) in sockets.into_iter().enumerate() {
+                    let socket = TcpListener::from_std(socket).map_err(Failure::Runtime)?;
+                    runtime.spawn(Arc::clone(proxy).serve(position, socket));
+                }
             }
-            Vec::new()
+            if let (Some((socket, address)), Some(proxy)) = (metrics, proxies.first()) {
+                let address = socket.local_addr().unwrap_or(address);
+                let socket = TcpListener::from_std(socket).map_err(Failure::Runtime)?;
+                runtime.spawn(Arc::clone(proxy).serve_metrics(socket));
+                say(stderr, format_args!("metrics are on {address}"));
+            }
+            drop(entered);
+            Some(runtime)
+        }
+        Threading::ThreadPerCore => {
+            per_core::start(&proxies, sockets, accept).map_err(Failure::Runtime)?;
+            None
         }
     };
     say(
@@ -417,6 +430,7 @@ mod tests {
             metrics: None,
             threading: Threading::WorkStealing,
             workers: None,
+            accept: Accept::Balanced,
         };
         assert_eq!(parsed(&["--config", "dev.yaml"]), Ok(Parsed::Run(options)));
     }
@@ -428,6 +442,7 @@ mod tests {
             metrics: Some("[::]:9090".parse().unwrap()),
             threading: Threading::WorkStealing,
             workers: None,
+            accept: Accept::Balanced,
         };
         assert_eq!(
             parsed(&["--metrics", "[::]:9090", "--config", "dev.yaml"]),
@@ -442,6 +457,7 @@ mod tests {
             metrics: None,
             threading: Threading::ThreadPerCore,
             workers: NonZeroUsize::new(4),
+            accept: Accept::Balanced,
         };
         let args = ["--config", "dev.yaml", "--workers", "4"];
         assert_eq!(
@@ -454,6 +470,24 @@ mod tests {
             panic!("a command line that can be run");
         };
         assert_eq!(options.threading, Threading::WorkStealing);
+    }
+
+    #[test]
+    fn connections_are_balanced_unless_they_are_left_to_the_kernel() {
+        let per_core = ["--config", "dev.yaml", "--threading", "thread-per-core"];
+        let Ok(Parsed::Run(options)) = parsed(&[&per_core[..], &["--accept", "kernel"]].concat())
+        else {
+            panic!("a command line that can be run");
+        };
+        assert_eq!(options.accept, Accept::Kernel);
+        assert_eq!(
+            parsed(&[&per_core[..], &["--accept", "luck"]].concat()),
+            Err(UsageError::Accept("luck".to_owned()))
+        );
+        assert_eq!(
+            parsed(&["--config", "dev.yaml", "--accept", "balanced"]),
+            Err(UsageError::AcceptPerCore)
+        );
     }
 
     #[test]
