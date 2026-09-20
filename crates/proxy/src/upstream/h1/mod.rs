@@ -48,6 +48,13 @@ pub struct H1Limits {
     /// Where a peer is waiting on something legitimate — a client that has not asked for
     /// the next frame yet — no round is outstanding and nothing is counted against it.
     pub idle: Duration,
+    /// How long a request that said `Expect: 100-continue` holds its body back, waiting
+    /// to be asked for it.
+    ///
+    /// Short, because it is a wait for nothing useful: an upstream that does not answer
+    /// the expectation is one that means to read the body anyway, and the client is
+    /// waiting on both of them meanwhile.
+    pub continue_wait: Duration,
 }
 
 impl Default for H1Limits {
@@ -62,6 +69,7 @@ impl Default for H1Limits {
             interim_bytes: 128 * 1024,
             final_head: Duration::from_secs(60),
             idle: Duration::from_secs(30),
+            continue_wait: Duration::from_secs(1),
         }
     }
 }

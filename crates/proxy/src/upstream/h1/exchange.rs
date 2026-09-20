@@ -16,7 +16,7 @@ use super::codec::{
     Asked, BodyReader, BodyWriter, CodecError, Delivery, Framing, Head, HeadReader, Piece,
     ResponseHead, Sending, Trailers, delivery, write_head,
 };
-use http::{HeaderMap, Method, Uri};
+use http::{HeaderMap, Method, StatusCode, Uri};
 use hyper::body::{Body, Bytes, Frame, SizeHint};
 use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
@@ -25,7 +25,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::{Sleep, timeout};
+use tokio::time::{Instant, Sleep, timeout, timeout_at};
 
 /// How much of a request waits in memory to be written. One frame at a time is staged;
 /// the body is not asked for more until what it gave has gone.
@@ -170,6 +170,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
         write_head(&mut self.outgoing, method, uri, headers, sending, limits)?;
+        // A request that asks to be told before it sends its body has its head go out
+        // alone; what follows waits for the upstream to answer, or for the wait to end.
+        let mut may_send = !expects_continue(headers);
+        let ask_by = Instant::now() + limits.continue_wait;
         let mut writer = BodyWriter::new(sending);
         let mut body = std::pin::pin!(body);
         let mut trailers: Option<HeaderMap> = None;
@@ -183,8 +187,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             // looking at it is how an upstream that answers and closes at once has its
             // answer thrown away for a close that had already been overtaken.
             let Head::Read { head, consumed } = reader.read(&self.incoming, limits)? else {
-                let round = poll_fn(|cx| self.round(cx, &mut body, &mut writer, &mut trailers));
-                match timeout(limits.idle, round).await {
+                let round =
+                    poll_fn(|cx| self.round(cx, &mut body, &mut writer, &mut trailers, may_send));
+                // While the body is held back, the wait for permission is the shorter of
+                // the two and is counted from when the head went, not from this round.
+                let until = if may_send {
+                    Instant::now() + limits.idle
+                } else {
+                    ask_by.min(Instant::now() + limits.idle)
+                };
+                match timeout_at(until, round).await {
+                    Err(_) if !may_send && Instant::now() >= ask_by => {
+                        // Long enough. An upstream that will not say whether it wants the
+                        // body is one that will be sent it.
+                        may_send = true;
+                        continue;
+                    }
                     Err(_) => return Err(ExchangeError::Idle { after: limits.idle }),
                     Ok(Err(error)) => return Err(error),
                     Ok(Ok(Moved::Read | Moved::Wrote)) => continue,
@@ -192,6 +210,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                 }
             };
             if head.status.is_informational() {
+                // Only a 100 says to send the body. Another interim answer says something
+                // else entirely, and saying something else is not saying yes.
+                if head.status == StatusCode::CONTINUE {
+                    may_send = true;
+                }
                 // Consumed and not passed on. The exchange goes on to the final head.
                 interim += 1;
                 interim_bytes += consumed;
@@ -230,6 +253,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         body: &mut Pin<&mut B>,
         writer: &mut BodyWriter,
         trailers: &mut Option<HeaderMap>,
+        may_send: bool,
     ) -> Poll<Result<Moved, ExchangeError>>
     where
         B: Body<Data = Bytes>,
@@ -237,8 +261,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
     {
         let mut wrote = false;
 
-        // Take another frame of the request, unless what has been taken is still waiting.
-        if !writer.is_done() && self.outgoing.len() - self.written < STAGING {
+        // Take another frame of the request, unless what has been taken is still waiting
+        // or the body is being held back until the upstream asks for it. The body is not
+        // polled at all in that case: asking a client for bytes it was told to hold is
+        // how both ends come to be waiting for each other.
+        if may_send && !writer.is_done() && self.outgoing.len() - self.written < STAGING {
             match body.as_mut().poll_frame(cx) {
                 Poll::Pending => {}
                 Poll::Ready(Some(Err(error))) => {
@@ -492,6 +519,18 @@ impl<S: AsyncRead + Unpin> Body for H1Body<S> {
     }
 }
 
+/// Whether a request asked to be told before it sends its body.
+///
+/// Only `100-continue` is waited on. An expectation this does not know is passed on as it
+/// came and waited on by nobody, which is what the engine's own client does with one.
+fn expects_continue(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(http::header::EXPECT)
+        .iter()
+        .flat_map(crate::hop_by_hop::options)
+        .any(|option| option.eq_ignore_ascii_case(b"100-continue"))
+}
+
 /// What a round of an exchange managed to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Moved {
@@ -517,6 +556,9 @@ impl From<&Method> for Asked {
 mod tests {
     use super::*;
     use http_body_util::{Empty, Full};
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     /// A body that gives a frame and then fails, as a client's does when it goes away
@@ -1160,5 +1202,254 @@ mod tests {
         let (data, _) = collected(&mut body).await.unwrap();
         assert_eq!(data, b"hello th");
         assert!(body.is_complete());
+    }
+
+    /// A body that says whether anybody has asked it for anything. Holding a body back
+    /// means not asking it, not asking and discarding, so what is watched is the asking.
+    struct Watched {
+        asked: Arc<AtomicBool>,
+        data: Option<Bytes>,
+    }
+
+    impl Watched {
+        fn new(data: &'static [u8]) -> (Self, Arc<AtomicBool>) {
+            let asked = Arc::new(AtomicBool::new(false));
+            let body = Self {
+                asked: Arc::clone(&asked),
+                data: Some(Bytes::from_static(data)),
+            };
+            (body, asked)
+        }
+    }
+
+    impl Body for Watched {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+            self.asked.store(true, Ordering::SeqCst);
+            Poll::Ready(
+                self.data
+                    .take()
+                    .map(|data| Ok(hyper::body::Frame::data(data))),
+            )
+        }
+    }
+
+    fn expecting() -> HeaderMap {
+        headers(&[("host", "up.test"), ("expect", "100-continue")])
+    }
+
+    /// The head goes out alone and the body waits to be asked for. Only when the upstream
+    /// says 100 is the client's body touched at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_that_was_told_to_wait_waits_for_the_upstreams_word() {
+        let (mut exchange, mut peer) = connected(4096);
+        let (body, asked) = Watched::new(b"hello");
+        let watching = Arc::clone(&asked);
+        let peering = tokio::spawn(async move {
+            let head = peer.until(b"\r\n\r\n").await;
+            // Long enough that a body which was going to be sent would have been.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let asked_too_soon = watching.load(Ordering::SeqCst);
+            peer.say("HTTP/1.1 100 Continue\r\n\r\n").await;
+            let body = peer.until(b"0\r\n\r\n").await;
+            peer.say("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            (head, asked_too_soon, body)
+        });
+
+        // A wait long enough that only the 100 can end it.
+        let limits = H1Limits {
+            continue_wait: Duration::from_secs(60),
+            ..H1Limits::default()
+        };
+        let answer = exchange
+            .send(
+                &Method::POST,
+                &"/x".parse().unwrap(),
+                &expecting(),
+                Sending::Chunked,
+                body,
+                &limits,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(answer.head.status, 200);
+        let (head, asked_too_soon, body) = peering.await.unwrap();
+        assert!(
+            String::from_utf8(head)
+                .unwrap()
+                .contains("expect: 100-continue\r\n"),
+            "the expectation goes to the upstream, which is who can answer it"
+        );
+        assert!(
+            !asked_too_soon,
+            "the body was asked for before it was wanted"
+        );
+        assert!(asked.load(Ordering::SeqCst), "and then never asked for");
+        assert_eq!(body, b"5\r\nhello\r\n0\r\n\r\n");
+    }
+
+    /// An upstream that will not say either way does not hold the body forever: after the
+    /// wait it is sent anyway, because the client is waiting on both of them meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_held_back_goes_anyway_once_the_wait_is_up() {
+        let (mut exchange, mut peer) = connected(4096);
+        let (body, asked) = Watched::new(b"hello");
+        let peering = tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            // It says nothing at all about the expectation.
+            let body = peer.until(b"0\r\n\r\n").await;
+            peer.say("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            body
+        });
+
+        let answer = exchange
+            .send(
+                &Method::POST,
+                &"/x".parse().unwrap(),
+                &expecting(),
+                Sending::Chunked,
+                body,
+                &H1Limits::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(answer.head.status, 200);
+        assert!(asked.load(Ordering::SeqCst));
+        assert_eq!(peering.await.unwrap(), b"5\r\nhello\r\n0\r\n\r\n");
+    }
+
+    /// Another interim answer says something else, and saying something else is not
+    /// saying yes: the body keeps waiting.
+    #[tokio::test(start_paused = true)]
+    async fn an_interim_answer_that_is_not_a_100_does_not_release_the_body() {
+        let (mut exchange, mut peer) = connected(4096);
+        let (body, asked) = Watched::new(b"hello");
+        let watching = Arc::clone(&asked);
+        let peering = tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            peer.say("HTTP/1.1 103 Early Hints\r\nlink: </a>\r\n\r\n")
+                .await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let asked_on_a_103 = watching.load(Ordering::SeqCst);
+            peer.say("HTTP/1.1 100 Continue\r\n\r\n").await;
+            let body = peer.until(b"0\r\n\r\n").await;
+            peer.say("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            (asked_on_a_103, body)
+        });
+
+        let limits = H1Limits {
+            continue_wait: Duration::from_secs(60),
+            ..H1Limits::default()
+        };
+        let answer = exchange
+            .send(
+                &Method::POST,
+                &"/x".parse().unwrap(),
+                &expecting(),
+                Sending::Chunked,
+                body,
+                &limits,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(answer.head.status, 200);
+        let (asked_on_a_103, body) = peering.await.unwrap();
+        assert!(
+            !asked_on_a_103,
+            "a 103 released a body it does not speak for"
+        );
+        assert_eq!(body, b"5\r\nhello\r\n0\r\n\r\n");
+    }
+
+    /// An upstream that refuses outright is answered at once, and the body it refused is
+    /// never asked for: this is what asking first was for.
+    #[tokio::test(start_paused = true)]
+    async fn an_upstream_that_refuses_is_never_sent_the_body() {
+        let (mut exchange, mut peer) = connected(4096);
+        let (body, asked) = Watched::new(b"hello");
+        tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            peer.say(
+                "HTTP/1.1 417 Expectation Failed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .await;
+            peer
+        });
+
+        let limits = H1Limits {
+            continue_wait: Duration::from_secs(60),
+            ..H1Limits::default()
+        };
+        let answer = exchange
+            .send(
+                &Method::POST,
+                &"/x".parse().unwrap(),
+                &expecting(),
+                Sending::Chunked,
+                body,
+                &limits,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(answer.head.status, 417);
+        assert!(
+            !asked.load(Ordering::SeqCst),
+            "the refused body was sent anyway"
+        );
+        assert!(answer.cut_short_the_request);
+        assert!(!answer.delivery.persistent);
+    }
+
+    /// An expectation nobody here knows is passed on and waited on by no one, which is
+    /// what the engine's own client does with one.
+    #[tokio::test(start_paused = true)]
+    async fn an_expectation_that_is_not_a_continue_holds_nothing_back() {
+        let (mut exchange, mut peer) = connected(4096);
+        let (body, asked) = Watched::new(b"hello");
+        let peering = tokio::spawn(async move {
+            let head = peer.until(b"\r\n\r\n").await;
+            let body = peer.until(b"0\r\n\r\n").await;
+            peer.say("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            (head, body)
+        });
+
+        let limits = H1Limits {
+            // Long enough that anything which waited would be caught waiting.
+            continue_wait: Duration::from_secs(600),
+            ..H1Limits::default()
+        };
+        exchange
+            .send(
+                &Method::POST,
+                &"/x".parse().unwrap(),
+                &headers(&[("host", "up.test"), ("expect", "the-moon-on-a-stick")]),
+                Sending::Chunked,
+                body,
+                &limits,
+            )
+            .await
+            .unwrap();
+
+        assert!(asked.load(Ordering::SeqCst));
+        let (head, body) = peering.await.unwrap();
+        assert!(
+            String::from_utf8(head)
+                .unwrap()
+                .contains("expect: the-moon-on-a-stick\r\n")
+        );
+        assert_eq!(body, b"5\r\nhello\r\n0\r\n\r\n");
     }
 }
