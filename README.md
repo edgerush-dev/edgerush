@@ -69,6 +69,8 @@ crates/proxy       the data plane (`edgerush-proxy`): the request core on plain 
                    serving and forwarding around it, the only code that touches hyper
 crates/router      request matching (`edgerush-router`): pure logic, no I/O
 crates/telemetry   metrics (`edgerush-telemetry`): counters sharded by thread, the Prometheus text format
+bench              the macro benchmark: load generator, proxy and backend on one Linux machine
+                   (bench/README.md)
 fuzz               fuzz targets (cargo-fuzz; not part of the workspace)
 ```
 

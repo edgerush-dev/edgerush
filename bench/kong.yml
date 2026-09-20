@@ -1,0 +1,43 @@
+# Kong (without a database) as the proxy under test, doing what proxy.yaml asks of
+# EdgeRush: the same routes, the same header changes — through its two transformer plugins,
+# which is how Kong changes headers — and keep-alive connections to the same backend. Run
+# by bench/run.sh, which sets the rest through KONG_* variables: WORKERS worker processes,
+# no access logs, none of Kong's own headers, no admin API.
+#
+# Not the same to the letter: Kong always writes `x-forwarded-*` headers of its own.
+_format_version: "3.0"
+
+services:
+  - name: backend
+    url: http://127.0.0.1:9000
+    routes:
+      - name: bench
+        hosts: [bench.example.com]
+        paths: [/]
+        strip_path: false
+        preserve_host: true
+        plugins:
+          - name: request-transformer
+            config:
+              append: { headers: ["x-request-source:edge"] }
+              remove: { headers: [x-internal-debug] }
+          - name: response-transformer
+            config:
+              add: { headers: ["x-served-by:edgerush"] }
+              remove: { headers: [server] }
+  - name: nowhere
+    url: http://127.0.0.1:9
+    plugins:
+      - name: request-termination
+        config: { status_code: 503 }
+    routes:
+      - name: bench-unavailable
+        hosts: [bench.example.com]
+        paths: ["/health", "/static"]
+      - name: bench-api-post
+        hosts: [bench.example.com]
+        paths: [/api/v1]
+        methods: [POST]
+      - name: others
+        hosts: ["*.example.org", www.example.net]
+        paths: [/]

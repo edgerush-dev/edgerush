@@ -1,0 +1,76 @@
+# Envoy as the proxy under test, doing what proxy.yaml asks of EdgeRush: the same routes,
+# the same header changes, keep-alive connections to the same backend. Run by bench/run.sh
+# with `--concurrency WORKERS`.
+#
+# What a benchmark of Envoy usually turns off is off: no access log, no tracing, no
+# request ids, none of its own `x-envoy-*` headers. Its statistics cannot be turned off.
+static_resources:
+  listeners:
+    - name: web
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: web
+                # HTTP/1.1 and cleartext HTTP/2 on the one port, told apart by the preface.
+                codec_type: AUTO
+                generate_request_id: false
+                server_header_transformation: PASS_THROUGH
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      suppress_envoy_headers: true
+                route_config:
+                  name: routes
+                  virtual_hosts:
+                    - name: bench
+                      domains: ["bench.example.com", "bench.example.com:*"]
+                      routes:
+                        - match: { path: /health }
+                          direct_response: { status: 503 }
+                        - match: { prefix: /static }
+                          direct_response: { status: 503 }
+                        - match:
+                            prefix: /api/v1
+                            headers:
+                              - name: ":method"
+                                string_match: { exact: POST }
+                          direct_response: { status: 503 }
+                        - match: { prefix: / }
+                          route: { cluster: backend, timeout: 0s }
+                          request_headers_to_add:
+                            - header: { key: x-forwarded-proto, value: http }
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                            - header: { key: x-request-source, value: edge }
+                              append_action: APPEND_IF_EXISTS_OR_ADD
+                          request_headers_to_remove: [x-internal-debug]
+                          response_headers_to_add:
+                            - header: { key: x-served-by, value: edgerush }
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                          response_headers_to_remove: [server]
+                    - name: others
+                      domains: ["*.example.org", "*.example.org:*", "www.example.net", "www.example.net:*"]
+                      routes:
+                        - match: { prefix: / }
+                          direct_response: { status: 503 }
+  clusters:
+    - name: backend
+      type: STATIC
+      connect_timeout: 5s
+      # Its defaults stop at 1024 connections and 1024 requests under way.
+      circuit_breakers:
+        thresholds:
+          - max_connections: 100000
+            max_pending_requests: 100000
+            max_requests: 100000
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 9000 }
