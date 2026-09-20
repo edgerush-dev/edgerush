@@ -19,13 +19,13 @@ use super::codec::{
 use http::{HeaderMap, Method, Uri};
 use hyper::body::{Body, Bytes, Frame, SizeHint};
 use std::error::Error as StdError;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::timeout;
+use tokio::time::{Sleep, timeout};
 
 /// How much of a request waits in memory to be written. One frame at a time is staged;
 /// the body is not asked for more until what it gave has gone.
@@ -331,6 +331,10 @@ pub struct H1Body<S> {
     trailers: Option<HeaderMap>,
     /// How many trailer fields were dropped on the way, for a counter to add up.
     discarded: usize,
+    /// Armed only while a read is outstanding, and thrown away the moment anything
+    /// arrives. A client that has not asked for the next frame is not an upstream being
+    /// slow, so while nobody is waiting on the socket nothing is counted against it.
+    waiting: Option<Pin<Box<Sleep>>>,
 }
 
 impl<S> H1Body<S> {
@@ -349,6 +353,7 @@ impl<S> H1Body<S> {
             complete,
             trailers: None,
             discarded: 0,
+            waiting: None,
         }
     }
 
@@ -446,12 +451,25 @@ impl<S: AsyncRead + Unpin> Body for H1Body<S> {
             let filled = read.filled().len();
             this.buffered.truncate(was + filled);
             match outcome {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    let idle = this.limits.idle;
+                    let waiting = this
+                        .waiting
+                        .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+                    if waiting.as_mut().poll(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                    // Long enough with a read outstanding and nothing to show for it.
+                    this.socket = None;
+                    return Poll::Ready(Some(Err(ExchangeError::Idle { after: idle })));
+                }
                 Poll::Ready(Err(error)) => {
                     this.socket = None;
                     return Poll::Ready(Some(Err(error.into())));
                 }
                 Poll::Ready(Ok(())) => {
+                    // Something happened, so the waiting starts again from here.
+                    this.waiting = None;
                     if filled == 0 {
                         // The reader is told; it alone knows whether a close ends this
                         // body or loses it.
@@ -1089,5 +1107,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(answer.head.status, 200);
+    }
+
+    /// An upstream that stops part way through a body it promised, while the client is
+    /// waiting for the rest, is given up on rather than waited for forever.
+    #[tokio::test(start_paused = true)]
+    async fn an_upstream_that_stops_mid_body_is_given_up_on() {
+        let (mut body, _peer) = body_on(Framing::Length(8), b"hel");
+        let failed = collected(&mut body).await.unwrap_err();
+        assert!(matches!(failed, ExchangeError::Idle { .. }), "{failed}");
+        assert!(!body.is_complete());
+    }
+
+    /// **Only while somebody is waiting.** A client that takes its time between frames is
+    /// not an upstream being slow, and the upstream is not punished for it: no read is
+    /// outstanding, so nothing is counted. Here the clock moves far past the bound
+    /// between one frame and the next, and the body comes through all the same.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_is_slow_to_ask_does_not_time_the_upstream_out() {
+        let (mut body, mut peer) = body_on(Framing::Length(8), b"hel");
+        peer.say("lo th").await;
+
+        let mut pinned = Pin::new(&mut body);
+        let first = poll_fn(|cx| pinned.as_mut().poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.into_data().unwrap(), Bytes::from_static(b"hel"));
+
+        // The client goes away and thinks about it for twice as long as the bound.
+        tokio::time::sleep(H1Limits::default().idle * 2).await;
+
+        let (rest, _) = collected(&mut body).await.unwrap();
+        assert_eq!(rest, b"lo th");
+        assert!(body.is_complete());
+    }
+
+    /// And an upstream that is slow but not stopped keeps its connection: the bound is
+    /// about nothing arriving, not about taking a while.
+    #[tokio::test(start_paused = true)]
+    async fn an_upstream_that_is_merely_slow_is_not_given_up_on() {
+        let (mut body, peer) = body_on(Framing::Length(8), b"");
+        tokio::spawn(async move {
+            let mut peer = peer;
+            for piece in ["he", "ll", "o ", "th"] {
+                tokio::time::sleep(H1Limits::default().idle / 2).await;
+                peer.say(piece).await;
+            }
+            peer
+        });
+
+        let (data, _) = collected(&mut body).await.unwrap();
+        assert_eq!(data, b"hello th");
+        assert!(body.is_complete());
     }
 }
