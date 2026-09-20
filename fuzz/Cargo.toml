@@ -15,7 +15,7 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
-edgerush-proxy = { path = "../crates/proxy" }
+edgerush-proxy = { path = "../crates/proxy", features = ["fuzzing"] }
 edgerush-router = { path = "../crates/router", features = ["reference"] }
 # The reading of a request's host is compared with this crate's own.
 http = "1.5"
@@ -52,6 +52,20 @@ bench = false
 [[bin]]
 name = "request_host"
 path = "fuzz_targets/request_host.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h1_response"
+path = "fuzz_targets/h1_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h1_roundtrip"
+path = "fuzz_targets/h1_roundtrip.rs"
 test = false
 doc = false
 bench = false

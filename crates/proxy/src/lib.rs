@@ -18,6 +18,11 @@ mod random;
 mod request;
 mod scrape;
 mod serve;
+// Private, save when the fuzz targets are being built: they are a crate of their own and
+// cannot otherwise reach what they drive.
+#[cfg(feature = "fuzzing")]
+pub mod upstream;
+#[cfg(not(feature = "fuzzing"))]
 mod upstream;
 
 pub use hop_by_hop::ConnectionError;

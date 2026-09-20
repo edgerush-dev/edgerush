@@ -21,17 +21,23 @@ const END: &[u8; 4] = b"\r\n\r\n";
 
 /// The most fields any head is read into. A limit may ask for fewer, never for more: the
 /// room is taken once, on the stack, so that reading a head allocates nothing.
-pub(crate) const MOST_FIELDS: usize = 128;
+pub const MOST_FIELDS: usize = 128;
 
 /// Why what an upstream sent cannot be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum CodecError {
+pub enum CodecError {
     /// The head went past what a head may be without ending.
     #[error("the response head is longer than {limit} bytes")]
-    HeadTooLong { limit: usize },
+    HeadTooLong {
+        /// What a head may come to.
+        limit: usize,
+    },
     /// More fields than a head may carry.
     #[error("the response head has more than {limit} fields")]
-    TooManyFields { limit: usize },
+    TooManyFields {
+        /// How many fields a head or a trailer section may carry.
+        limit: usize,
+    },
     /// Not a version this speaks. HTTP/0.9 has no head at all, and HTTP/2 does not begin
     /// like this.
     #[error("the response is not HTTP/1.0 or HTTP/1.1")]
@@ -77,10 +83,16 @@ pub(crate) enum CodecError {
     Chunk,
     /// A chunk's size line went past what such a line may be.
     #[error("a chunk size line is longer than {limit} bytes")]
-    ChunkLineTooLong { limit: usize },
+    ChunkLineTooLong {
+        /// What such a line may come to.
+        limit: usize,
+    },
     /// The trailer section went past what one may be.
     #[error("the trailer section is longer than {limit} bytes")]
-    TrailersTooLong { limit: usize },
+    TrailersTooLong {
+        /// What a trailer section may come to.
+        limit: usize,
+    },
     /// More body arrived than a counted body said it would carry.
     #[error("the request body is longer than its content-length")]
     BodyOverran,
@@ -98,23 +110,31 @@ pub(crate) enum CodecError {
 
 /// A response head, once it has been read and found sound.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResponseHead {
-    pub(crate) status: StatusCode,
-    pub(crate) version: Version,
-    pub(crate) headers: HeaderMap,
+pub struct ResponseHead {
+    /// What the upstream answered.
+    pub status: StatusCode,
+    /// The version it answered in, which is HTTP/1.0 or HTTP/1.1 and nothing else.
+    pub version: Version,
+    /// Its fields, in the order they came, repeats and all.
+    pub headers: HeaderMap,
     /// The one `Content-Length`, already checked, because a [`HeaderMap`] cannot be asked
     /// afterwards whether there had been two of them.
-    pub(crate) content_length: Option<u64>,
+    pub content_length: Option<u64>,
 }
 
 /// How far reading a head has got.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Head {
+pub enum Head {
     /// Not all of it has arrived. Nothing was consumed; ask again with more.
     More,
     /// A head, and how many bytes of what was given it took. What follows those bytes is
     /// the body, or the next head.
-    Read { head: ResponseHead, consumed: usize },
+    Read {
+        /// The head that was read.
+        head: ResponseHead,
+        /// How many bytes of what was given it took.
+        consumed: usize,
+    },
 }
 
 /// Reads response heads from bytes as they come.
@@ -123,7 +143,7 @@ pub(crate) enum Head {
 /// bytes included. What has already been looked at is not looked at again, so a head that
 /// arrives one byte at a time costs no more than one that arrives whole.
 #[derive(Debug, Default)]
-pub(crate) struct HeadReader {
+pub struct HeadReader {
     /// How much of the bytes has been searched for the empty line that ends a head.
     searched: usize,
 }
@@ -135,7 +155,7 @@ impl HeadReader {
     ///
     /// A head that goes past `limits`, is not HTTP/1.0 or HTTP/1.1, does not parse, or
     /// says its length in a way that cannot be trusted.
-    pub(crate) fn read(&mut self, bytes: &[u8], limits: &H1Limits) -> Result<Head, CodecError> {
+    pub fn read(&mut self, bytes: &[u8], limits: &H1Limits) -> Result<Head, CodecError> {
         let Some(end) = self.end_of_head(bytes)? else {
             // Nothing yet, and it may never come: a head that has grown past its bound
             // without ending is not going to end well.
@@ -291,7 +311,7 @@ fn reason(error: httparse::Error) -> &'static str {
 /// How the body of a response is delimited — the one question every other part of reading
 /// one turns on, and the one that request smuggling is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Framing {
+pub enum Framing {
     /// None at all. What a head says a body would have been is not read as one.
     None,
     /// Chunk by chunk, to the zero chunk and the trailer section that follows it.
@@ -307,17 +327,18 @@ pub(crate) enum Framing {
 /// Of a *final* head: an interim one is followed by more of the same exchange, and what
 /// is said here about carrying another exchange does not apply until the final one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Delivery {
-    pub(crate) framing: Framing,
+pub struct Delivery {
+    /// What delimits the body that follows.
+    pub framing: Framing,
     /// Whether this connection may carry another exchange once this one is done. Worked
     /// out here, while `Connection` is still on the head: by the time the hop-by-hop
     /// fields have been taken off there is nothing left to work it out from.
-    pub(crate) persistent: bool,
+    pub persistent: bool,
 }
 
 /// What was asked, as far as the answer's framing turns on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Asked {
+pub enum Asked {
     /// Anything but HEAD: a body is whatever the head says it is.
     Anything,
     /// HEAD: the head describes a body that is not sent.
@@ -331,7 +352,7 @@ pub(crate) enum Asked {
 /// A transfer coding this does not speak, a length and a coding together, a coding on
 /// HTTP/1.0, a body described where none may be, an upgrade, or a `Connection` that is
 /// not a list of tokens.
-pub(crate) fn delivery(head: &ResponseHead, asked: Asked) -> Result<Delivery, CodecError> {
+pub fn delivery(head: &ResponseHead, asked: Asked) -> Result<Delivery, CodecError> {
     let chunked = is_chunked(&head.headers)?;
     // Two ways of saying how long a body is, and no way to know which the sender meant or
     // which the next reader will believe. This is the shape request smuggling is built on.
@@ -479,12 +500,12 @@ const DENIED_TRAILERS: &[&str] = &[
 
 /// What a trailer section came to.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct Trailers {
+pub struct Trailers {
     /// The ones that travel on, their values as they came.
-    pub(crate) fields: HeaderMap,
+    pub fields: HeaderMap,
     /// How many were dropped, for a counter to add up. A number and never a name: a
     /// series labelled with what a backend sent is a series a backend can invent.
-    pub(crate) discarded: usize,
+    pub discarded: usize,
 }
 
 /// Whether a field may not travel on as a trailer: one of the named set, or one this
@@ -498,7 +519,7 @@ fn is_denied(name: &HeaderName, nominated: &[HeaderName]) -> bool {
 ///
 /// Doing this to the declaration is not doing it to the trailers: both are filtered, and
 /// a permitted trailer that was never declared is still passed on.
-pub(crate) fn filter_declaration(headers: &mut HeaderMap, nominated: &[HeaderName]) {
+pub fn filter_declaration(headers: &mut HeaderMap, nominated: &[HeaderName]) {
     let declared: Vec<HeaderValue> = headers
         .get_all(http::header::TRAILER)
         .iter()
@@ -530,16 +551,23 @@ pub(crate) fn filter_declaration(headers: &mut HeaderMap, nominated: &[HeaderNam
 
 /// A piece of a body, as it is read.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Piece {
+pub enum Piece {
     /// Nothing can be said until more bytes arrive.
     More,
     /// Body data: `bytes[data]` of what was given, with `consumed` taken off the front.
     /// The two differ where framing bytes sit around the data, as chunking's do.
-    Data { data: Range<usize>, consumed: usize },
+    Data {
+        /// Where the body data sits in what was given.
+        data: Range<usize>,
+        /// How many bytes of the front of it are finished with.
+        consumed: usize,
+    },
     /// The body is whole. `trailers` is `Some` only for a chunked body, which may carry
     /// them; they are frames of their own and are never folded into the head's fields.
     End {
+        /// What came after the last chunk, for a body that was chunked.
         trailers: Option<Trailers>,
+        /// How many bytes of the front of what was given are finished with.
         consumed: usize,
     },
 }
@@ -566,7 +594,7 @@ enum State {
 /// of the connection; it never decides that for itself, because no bytes having arrived is
 /// not the same as no bytes ever arriving.
 #[derive(Debug)]
-pub(crate) struct BodyReader {
+pub struct BodyReader {
     framing: Framing,
     state: State,
     /// The names this message's `Connection` nominated. Taken from the head before it was
@@ -576,7 +604,7 @@ pub(crate) struct BodyReader {
 
 impl BodyReader {
     /// A reader for a body delimited as `framing` says.
-    pub(crate) fn new(framing: Framing) -> Self {
+    pub fn new(framing: Framing) -> Self {
         let state = match framing {
             Framing::None => State::Done,
             Framing::Chunked => State::Size,
@@ -592,7 +620,7 @@ impl BodyReader {
 
     /// The same, for a message whose `Connection` nominated these names: they are
     /// hop-by-hop for this hop and do not travel on among its trailers either.
-    pub(crate) fn nominating(framing: Framing, nominated: Vec<HeaderName>) -> Self {
+    pub fn nominating(framing: Framing, nominated: Vec<HeaderName>) -> Self {
         Self {
             nominated,
             ..Self::new(framing)
@@ -600,7 +628,7 @@ impl BodyReader {
     }
 
     /// Whether the whole body has been read. Only then may the connection be kept.
-    pub(crate) fn is_done(&self) -> bool {
+    pub fn is_done(&self) -> bool {
         self.state == State::Done
     }
 
@@ -611,7 +639,7 @@ impl BodyReader {
     ///
     /// A chunk that is not one, a body that ends before it has been delivered in full, or
     /// anything past the bounds in `limits`.
-    pub(crate) fn read(
+    pub fn read(
         &mut self,
         bytes: &[u8],
         ended: bool,
@@ -911,7 +939,7 @@ fn fields(
 /// cannot manufacture framing, and whatever the head happens to say about it is left out
 /// in favour of this ([13 §1](../../../docs/13-http1-upstream.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Sending {
+pub enum Sending {
     /// No body. Not the same as a body of nothing: nothing is said about a length at all.
     None,
     /// This many bytes, and exactly this many.
@@ -931,7 +959,7 @@ pub(crate) enum Sending {
 ///
 /// A head that would come to more than `limits` allows, or a target that cannot be written
 /// in origin form.
-pub(crate) fn write_head(
+pub fn write_head(
     out: &mut Vec<u8>,
     method: &Method,
     uri: &Uri,
@@ -1002,7 +1030,7 @@ fn itoa(mut number: u64) -> Vec<u8> {
 /// caller's to remember, so a write that went only part way is picked up where it stopped
 /// and no byte is written twice.
 #[derive(Debug)]
-pub(crate) struct BodyWriter {
+pub struct BodyWriter {
     sending: Sending,
     /// For a counted body: how many bytes are still owed.
     left: u64,
@@ -1011,7 +1039,7 @@ pub(crate) struct BodyWriter {
 
 impl BodyWriter {
     /// A writer for a body sent as `sending` says.
-    pub(crate) fn new(sending: Sending) -> Self {
+    pub fn new(sending: Sending) -> Self {
         Self {
             sending,
             left: match sending {
@@ -1028,7 +1056,7 @@ impl BodyWriter {
     ///
     /// More bytes than a counted body said it would have, or anything at all after the
     /// body was finished.
-    pub(crate) fn data(&mut self, out: &mut Vec<u8>, data: &[u8]) -> Result<(), CodecError> {
+    pub fn data(&mut self, out: &mut Vec<u8>, data: &[u8]) -> Result<(), CodecError> {
         if self.done {
             return Err(CodecError::BodyAfterEnd);
         }
@@ -1065,7 +1093,7 @@ impl BodyWriter {
     ///
     /// A counted body that fell short of what it said, trailers on a body that cannot
     /// carry them, or a second ending.
-    pub(crate) fn finish(
+    pub fn finish(
         &mut self,
         out: &mut Vec<u8>,
         trailers: Option<&HeaderMap>,
@@ -1108,7 +1136,7 @@ impl BodyWriter {
     }
 
     /// Whether the body has been ended.
-    pub(crate) fn is_done(&self) -> bool {
+    pub fn is_done(&self) -> bool {
         self.done
     }
 }
@@ -2388,5 +2416,34 @@ mod tests {
         let (read, back) = body_of(Framing::Chunked, written.as_bytes(), false).unwrap();
         assert_eq!(read, frames.concat());
         assert_eq!(back.unwrap().fields["grpc-status"], "0");
+    }
+
+    /// Found by the fuzzer, and kept: which bound a bad head trips depends on how much of
+    /// it has arrived. A reader given everything at once meets the bare newline; one given
+    /// a byte at a time runs out of room before it reaches it. Both refuse the head, which
+    /// is the part that has to be the same — the complaint is not.
+    #[test]
+    fn which_bound_a_bad_head_trips_depends_on_what_has_arrived() {
+        let limits = H1Limits {
+            head: 8,
+            ..H1Limits::default()
+        };
+        // No empty line anywhere, longer than a head may be, and a bare newline past that.
+        let bytes = b"aaaaaaaaaa\n";
+
+        assert_eq!(
+            HeadReader::default().read(bytes, &limits),
+            Err(CodecError::Malformed("a line ends with a bare newline"))
+        );
+
+        let mut reader = HeadReader::default();
+        let mut refused = None;
+        for upto in 0..=bytes.len() {
+            if let Err(error) = reader.read(&bytes[..upto], &limits) {
+                refused = Some(error);
+                break;
+            }
+        }
+        assert_eq!(refused, Some(CodecError::HeadTooLong { limit: 8 }));
     }
 }

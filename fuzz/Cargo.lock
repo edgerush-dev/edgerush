@@ -95,6 +95,7 @@ dependencies = [
  "edgerush-telemetry",
  "http",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-util",
  "thiserror",

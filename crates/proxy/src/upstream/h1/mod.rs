@@ -5,7 +5,7 @@
 //! is what lets every one of its answers be checked against a table and every split of its
 //! input be tried. The code that does hold a socket comes later, and keeps that separation.
 
-pub(crate) mod codec;
+pub mod codec;
 
 /// What a worker will not go beyond, whatever an upstream sends. Conservative numbers for
 /// development, not settings anybody configures and not the pool's policy, which waits for
@@ -14,18 +14,18 @@ pub(crate) mod codec;
 /// A gain that came of loosening these is not a gain, so a benchmark that changes them
 /// says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct H1Limits {
+pub struct H1Limits {
     /// The most a response head may come to, status line and fields together.
-    pub(crate) head: usize,
+    pub head: usize,
     /// The most fields a head may carry. No more than [`codec::MOST_FIELDS`] is read,
     /// whatever this says.
-    pub(crate) fields: usize,
+    pub fields: usize,
     /// The most a chunk's size line may come to, its extensions included.
-    pub(crate) chunk_line: usize,
+    pub chunk_line: usize,
     /// The most the fields after the last chunk may come to.
-    pub(crate) trailers: usize,
+    pub trailers: usize,
     /// The most fields there may be among them.
-    pub(crate) trailer_fields: usize,
+    pub trailer_fields: usize,
 }
 
 impl Default for H1Limits {

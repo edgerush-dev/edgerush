@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Opens the upstream codec to the fuzz targets, which are a package of their own. Nothing
+# in EdgeRush turns this on, and the workspace's checks never build with it.
+fuzzing = []
+
 [dependencies]
 arc-swap.workspace = true
 edgerush-config.workspace = true
