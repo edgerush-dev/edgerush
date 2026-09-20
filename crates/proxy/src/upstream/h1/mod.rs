@@ -6,6 +6,7 @@
 //! input be tried. The code that does hold a socket comes later, and keeps that separation.
 
 pub mod codec;
+pub mod exchange;
 
 /// What a worker will not go beyond, whatever an upstream sends. Conservative numbers for
 /// development, not settings anybody configures and not the pool's policy, which waits for
@@ -26,6 +27,10 @@ pub struct H1Limits {
     pub trailers: usize,
     /// The most fields there may be among them.
     pub trailer_fields: usize,
+    /// How many interim answers one exchange will wait through.
+    pub interim_heads: usize,
+    /// What those interim answers may come to together.
+    pub interim_bytes: usize,
 }
 
 impl Default for H1Limits {
@@ -36,6 +41,8 @@ impl Default for H1Limits {
             chunk_line: 4 * 1024,
             trailers: 16 * 1024,
             trailer_fields: 64,
+            interim_heads: 16,
+            interim_bytes: 128 * 1024,
         }
     }
 }
