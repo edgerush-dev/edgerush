@@ -22,4 +22,5 @@
 // here and nowhere else.
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
 
+pub mod destination;
 pub mod h1;
