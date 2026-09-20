@@ -488,3 +488,33 @@ async fn equal_repeated_request_lengths_are_made_one_by_the_engine() {
     assert_eq!(sent.matches("content-length:").count(), 1, "{sent}");
     assert!(sent.ends_with("content-length: 5\r\n\r\nhello"), "{sent}");
 }
+
+/// What the engine puts on the wire follows what the answer's body says is left of it,
+/// so the framing is where that shows: a length the upstream gave is kept and not turned
+/// into chunks, and an answer of the data plane's own says it has no body at all rather
+/// than leaving the client to wait for one.
+#[tokio::test]
+async fn an_answers_framing_follows_what_its_body_has_left() {
+    let upstream = raw_upstream(move |mut wire| async move {
+        let _head = wire.head().await;
+        wire.write("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+            .await;
+    });
+    let proxy = proxy_to(upstream).await;
+
+    let mut client = Wire::to(proxy).await;
+    client
+        .write("GET /up HTTP/1.1\r\nhost: a.test\r\n\r\n")
+        .await;
+    let head = client.head().await;
+    assert!(head.contains("content-length: 2\r\n"), "{head}");
+    assert!(!head.contains("transfer-encoding"), "{head}");
+    assert_eq!(client.body(2).await, "ok");
+
+    // An answer of ours, which no upstream was asked for: a request with no host.
+    let mut bare = Wire::to(proxy).await;
+    bare.write("GET /up HTTP/1.1\r\n\r\n").await;
+    let head = bare.head().await;
+    assert!(head.starts_with("HTTP/1.1 400 "), "{head}");
+    assert!(head.contains("content-length: 0\r\n"), "{head}");
+}

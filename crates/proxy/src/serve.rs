@@ -24,8 +24,7 @@ use edgerush_config::{Compiled, CompiledRule};
 use http::request::Parts;
 use http::uri::{Authority, Scheme};
 use http::{Request, Response, Uri, Version};
-use http_body_util::{Either, Empty};
-use hyper::body::{Bytes, Incoming};
+use hyper::body::{Body as HttpBody, Bytes, Frame, Incoming, SizeHint};
 use hyper::rt::Executor;
 use hyper::service::service_fn;
 use hyper_util::client::legacy::Client;
@@ -37,9 +36,11 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -62,8 +63,58 @@ impl<F: Future<Output = ()> + 'static> Executor<F> for OnThisWorker {
     }
 }
 
-/// What is answered: the upstream's body as it arrives, or nothing.
-type Body = Either<Incoming, Empty<Bytes>>;
+/// What is answered: the upstream's body as it arrives, or nothing at all.
+///
+/// Named, and not a box or a trait object, because every request would pay for that and
+/// because the engine can see through this to what is really left to send — a body whose
+/// length is known keeps it, and an answer of ours is end-of-stream from the start.
+/// A second kind, read by EdgeRush's own upstream path, goes beside [`Self::Upstream`]
+/// when there is one ([13 §1](../../../docs/13-http1-upstream.md)).
+enum Body {
+    /// The upstream's answer, as the engine's client reads it.
+    Upstream(Incoming),
+    /// An answer of the data plane's own. It has no body, and never will have one.
+    Empty,
+}
+
+/// Why an answer's body stopped. One kind for whichever way it was being read, so that
+/// what carries it does not change when a second way arrives.
+#[derive(Debug, thiserror::Error)]
+enum BodyError {
+    #[error("the upstream's answer could not be read: {0}")]
+    Upstream(#[from] hyper::Error),
+}
+
+impl HttpBody for Body {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        match self.get_mut() {
+            Self::Upstream(incoming) => Pin::new(incoming)
+                .poll_frame(context)
+                .map(|frame| frame.map(|frame| frame.map_err(BodyError::Upstream))),
+            Self::Empty => Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            Self::Upstream(incoming) => incoming.is_end_stream(),
+            Self::Empty => true,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match self {
+            Self::Upstream(incoming) => incoming.size_hint(),
+            Self::Empty => SizeHint::with_exact(0),
+        }
+    }
+}
 
 /// A data plane: one for the whole process, whatever its workers. It holds what must be
 /// one — the config every worker serves, and the counters they all add to — and takes a
@@ -330,7 +381,7 @@ impl Worker {
         {
             changes.apply(&mut head.headers);
         }
-        Response::from_parts(head, Either::Left(body))
+        Response::from_parts(head, Body::Upstream(body))
     }
 }
 
@@ -340,7 +391,7 @@ impl Proxy {
         if let Some(counters) = self.metrics.listener(listener) {
             counters.answered(answer);
         }
-        let mut response = Response::new(Either::Right(Empty::new()));
+        let mut response = Response::new(Body::Empty);
         *response.status_mut() = answer.status();
         response
     }
@@ -458,7 +509,7 @@ pub(crate) fn is_about_one_connection(error: &io::Error) -> bool {
 mod tests {
     use super::*;
     use edgerush_config::{Config, compile};
-    use http_body_util::{BodyExt, Full};
+    use http_body_util::{BodyExt, Empty, Full};
     use std::rc::Rc;
 
     /// The engine must take a service, and a body, that cannot leave the thread they were
