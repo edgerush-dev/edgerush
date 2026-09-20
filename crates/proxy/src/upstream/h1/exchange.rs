@@ -22,7 +22,7 @@ use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Instant, Sleep, timeout, timeout_at};
@@ -362,11 +362,24 @@ pub struct H1Body<S> {
     /// arrives. A client that has not asked for the next frame is not an upstream being
     /// slow, so while nobody is waiting on the socket nothing is counted against it.
     waiting: Option<Pin<Box<Sleep>>>,
+    /// What the head said about carrying another exchange, and whether the request it
+    /// answered went out whole. Both are settled before a byte of this body is read.
+    may_reuse: bool,
 }
 
 impl<S> H1Body<S> {
     /// A body of `framing`, on `socket`, with `buffered` already read from it.
-    pub fn new(socket: S, buffered: Vec<u8>, framing: Framing, limits: H1Limits) -> Self {
+    ///
+    /// `may_reuse` is what the answer's head said about keeping the connection, and
+    /// whether the request it answered finished going out: both are known before this
+    /// body is read and neither can be worked out from it afterwards.
+    pub fn new(
+        socket: S,
+        buffered: Vec<u8>,
+        framing: Framing,
+        may_reuse: bool,
+        limits: H1Limits,
+    ) -> Self {
         let reader = BodyReader::new(framing);
         // A body that was never going to carry anything is finished before it starts. Said
         // now and not at the first poll, because nothing need ever poll an empty body.
@@ -381,6 +394,7 @@ impl<S> H1Body<S> {
             trailers: None,
             discarded: 0,
             waiting: None,
+            may_reuse,
         }
     }
 
@@ -394,8 +408,52 @@ impl<S> H1Body<S> {
         self.discarded
     }
 
-    /// What is left of the connection, for whoever may reuse it. `None` once the body has
-    /// failed, and never to be taken while the body is unfinished.
+    /// The connection, if it has earned its way back.
+    ///
+    /// Every one of these holds, and none of them is inferred from another
+    /// ([13 §6](../../../docs/13-http1-upstream.md)):
+    ///
+    /// - the answer's head allowed the connection to carry another exchange, and the
+    ///   request it answered went out whole;
+    /// - exactly one answer was read through to its end, chunk terminator and trailers
+    ///   included, and everything of it has been handed on;
+    /// - nothing went wrong along the way — an error leaves no socket here to give;
+    /// - nothing is left over in hand, and nothing is readable on the socket now, and the
+    ///   upstream has not closed.
+    ///
+    /// **It is not a promise that the peer will behave.** TCP carries no mark that tells
+    /// a delayed answer to the last request from an answer to the next, so nothing here
+    /// can show that an upstream will not send something unasked-for a moment from now.
+    /// What it shows is that the upstream has not done so *yet* and that this end is in a
+    /// state it can account for. Keeping each destination's connections to itself limits
+    /// who could be affected by a peer that misbehaves; it cannot stop one.
+    pub fn into_reusable(mut self) -> Option<Kept<S>>
+    where
+        S: AsyncRead + Unpin,
+    {
+        // What the head allowed, and a request that finished going out.
+        if !self.may_reuse {
+            return None;
+        }
+        // One answer, read to its end, with everything of it passed on.
+        if !self.is_complete() {
+            return None;
+        }
+        // Bytes in hand after a message that is over are a peer saying something nobody
+        // asked for, and the upstream having closed is the end of the connection anyway.
+        if !self.buffered.is_empty() || self.ended {
+            return None;
+        }
+        // An error took the socket, so there may be nothing here at all.
+        let mut socket = self.socket.take()?;
+        if !nothing_to_say(&mut socket) {
+            return None;
+        }
+        Some(Kept { socket })
+    }
+
+    /// What is left of the connection whatever state it is in, for a caller that means to
+    /// close it. Never a way back into a pool: that is [`H1Body::into_reusable`] alone.
     pub fn into_connection(self) -> Option<(S, Vec<u8>)> {
         self.socket.map(|socket| (socket, self.buffered))
     }
@@ -517,6 +575,39 @@ impl<S: AsyncRead + Unpin> Body for H1Body<S> {
         }
         SizeHint::default()
     }
+}
+
+/// A connection that finished an exchange with nothing owing, which is the only kind that
+/// may be kept. Made by [`H1Body::into_reusable`] and nowhere else, so that keeping one
+/// cannot be arranged by anybody who has merely got hold of a socket.
+#[derive(Debug)]
+pub struct Kept<S> {
+    socket: S,
+}
+
+impl<S> Kept<S> {
+    /// The connection itself, to be handed to a pool.
+    pub fn into_socket(self) -> S {
+        self.socket
+    }
+}
+
+/// Whether the upstream is saying nothing at this moment: no bytes waiting to be read,
+/// and no close.
+///
+/// Asked with a waker that wakes nobody, because this is a question about now and not a
+/// wait for an answer. Anything readable here is a peer out of step with us, and the
+/// connection is dropped rather than read — what is found is never taken for the start of
+/// whatever the next request would have got.
+fn nothing_to_say<S: AsyncRead + Unpin>(socket: &mut S) -> bool {
+    let mut byte = [0; 1];
+    let mut read = ReadBuf::new(&mut byte);
+    let nobody = Waker::noop();
+    // Pending is nothing to be read, which is what a connection between exchanges looks
+    // like. Ready is a close, or something nobody asked for; either way it does not stay.
+    Pin::new(socket)
+        .poll_read(&mut Context::from_waker(nobody), &mut read)
+        .is_pending()
 }
 
 /// Whether a request asked to be told before it sends its body.
@@ -898,10 +989,26 @@ mod tests {
         Ok((data, trailers))
     }
 
-    /// A body on a connection whose other end is the test's to write on.
+    /// A body on a connection whose other end is the test's to write on, on a head that
+    /// allowed the connection to be kept.
     fn body_on(framing: Framing, buffered: &[u8]) -> (H1Body<DuplexStream>, Peer) {
+        keepable_body_on(framing, buffered, true)
+    }
+
+    /// The same, saying whether the head and the request allowed it to be kept at all.
+    fn keepable_body_on(
+        framing: Framing,
+        buffered: &[u8],
+        may_reuse: bool,
+    ) -> (H1Body<DuplexStream>, Peer) {
         let (ours, theirs) = tokio::io::duplex(4096);
-        let body = H1Body::new(ours, buffered.to_vec(), framing, H1Limits::default());
+        let body = H1Body::new(
+            ours,
+            buffered.to_vec(),
+            framing,
+            may_reuse,
+            H1Limits::default(),
+        );
         (body, Peer(theirs))
     }
 
@@ -1451,5 +1558,99 @@ mod tests {
                 .contains("expect: the-moon-on-a-stick\r\n")
         );
         assert_eq!(body, b"5\r\nhello\r\n0\r\n\r\n");
+    }
+
+    /// A body read cleanly to its end, on a head that allowed it, gives its connection
+    /// back. Every test below takes one condition away from this and gets nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_exchange_gives_its_connection_back() {
+        let (mut body, _peer) = body_on(Framing::Length(5), b"hello");
+        let (data, _) = collected(&mut body).await.unwrap();
+        assert_eq!(data, b"hello");
+        assert!(body.into_reusable().is_some());
+    }
+
+    /// What the head said comes first. A connection the answer said to close is not kept,
+    /// however cleanly the body read.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_the_answer_closed_is_not_kept() {
+        let (mut body, _peer) = keepable_body_on(Framing::Length(5), b"hello", false);
+        let (data, _) = collected(&mut body).await.unwrap();
+        assert_eq!(data, b"hello");
+        assert!(body.into_reusable().is_none());
+    }
+
+    /// A body nobody finished reading is a connection in the middle of a message.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_that_was_never_read_to_its_end_is_not_kept() {
+        let (body, _peer) = body_on(Framing::Length(5), b"hello");
+        // Not a frame taken.
+        assert!(body.into_reusable().is_none());
+    }
+
+    /// A chunked body has no way of knowing it is over until it has read the chunk that
+    /// says so, so one left after its data is one whose end was never checked — and an
+    /// end that was never checked is a connection nobody can account for.
+    #[tokio::test(start_paused = true)]
+    async fn a_chunked_body_stopped_before_its_end_is_not_kept() {
+        let (mut body, _peer) = body_on(
+            Framing::Chunked,
+            b"5\r\nhello\r\n0\r\ngrpc-status: 0\r\n\r\n",
+        );
+        let mut pinned = Pin::new(&mut body);
+        let frame = poll_fn(|cx| pinned.as_mut().poll_frame(cx)).await.unwrap();
+        assert_eq!(
+            frame.unwrap().into_data().unwrap(),
+            Bytes::from_static(b"hello")
+        );
+        // The zero chunk and the trailers are still on the wire.
+        assert!(body.into_reusable().is_none());
+    }
+
+    /// A body that stopped making sense took its connection with it: there is nothing
+    /// left here to give back.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_that_failed_has_no_connection_to_give() {
+        let (mut body, _peer) = body_on(Framing::Chunked, b"zz\r\nhello\r\n");
+        assert!(collected(&mut body).await.is_err());
+        assert!(body.into_reusable().is_none());
+    }
+
+    /// **Bytes after the end are a peer that is out of step.** Whatever they are, they
+    /// are not the beginning of whatever the next request would have been given, and the
+    /// connection goes rather than being read to find out.
+    #[tokio::test(start_paused = true)]
+    async fn bytes_arriving_after_the_answer_stop_it_being_kept() {
+        let (mut body, mut peer) = body_on(Framing::Length(5), b"hello");
+        let (data, _) = collected(&mut body).await.unwrap();
+        assert_eq!(data, b"hello");
+
+        // Said after the answer was whole, and asked for by nobody.
+        peer.say("HTTP/1.1 200 OK\r\n\r\n").await;
+        tokio::task::yield_now().await;
+        assert!(body.into_reusable().is_none());
+    }
+
+    /// The same for a close: an upstream that has gone is not a connection to keep.
+    #[tokio::test(start_paused = true)]
+    async fn an_upstream_that_closed_after_answering_is_not_kept() {
+        let (mut body, peer) = body_on(Framing::Length(5), b"hello");
+        let (data, _) = collected(&mut body).await.unwrap();
+        assert_eq!(data, b"hello");
+
+        drop(peer);
+        tokio::task::yield_now().await;
+        assert!(body.into_reusable().is_none());
+    }
+
+    /// A body the close delimits has had its connection ended by definition; nothing that
+    /// arrived that way can be kept, and the head says so before the body is read.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_the_close_delimited_is_never_kept() {
+        let (mut body, peer) = keepable_body_on(Framing::UntilClose, b"some", false);
+        drop(peer);
+        let (data, _) = collected(&mut body).await.unwrap();
+        assert_eq!(data, b"some");
+        assert!(body.into_reusable().is_none());
     }
 }
