@@ -93,8 +93,17 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
     std::fs::write(&file, config("127.0.0.1:0", "up", Some(one)))?;
     // One worker, so that this runs wherever EdgeRush is developed: it is from the second
     // on that the workers share a port, and only Unix deals connections out among them.
-    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
+    let args = [
+        "--config",
+        &file,
+        "--workers",
+        "1",
+        "--metrics",
+        "127.0.0.1:0",
+    ];
+    let mut harness = Harness::start(&args)?;
     let web = harness.address_after("listener \"web\" is on ");
+    let metrics = harness.address_after("metrics are on ");
     harness.wait_for("1 worker, thread-per-core");
     assert!(get(web, "/")?.contains("x-upstream: one"));
 
@@ -118,22 +127,14 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
     harness.wait_for("warning: listener \"api\" is new");
     assert!(get(web, "/")?.contains("x-upstream: one"));
 
-    Ok(())
-}
-
-/// `/metrics` is not served while every worker counts alone, and the flag says so rather
-/// than serving one worker's numbers as if they were the pod's.
-#[test]
-fn metrics_are_refused_with_the_reason() -> io::Result<()> {
-    let file = scratch("no-metrics.yaml");
-    std::fs::write(&file, config("127.0.0.1:0", "up", None))?;
-    let output = edgerush(&["proxy", "--config", &file, "--metrics", "127.0.0.1:0"])?;
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let scrape = get(metrics, "/metrics")?;
+    assert!(scrape.starts_with("HTTP/1.1 200 OK\r\n"), "{scrape}");
     assert!(
-        stderr.starts_with("error: '--metrics' is not served yet"),
-        "{stderr}"
+        scrape.contains("edgerush_config_reloads_total 2\n"),
+        "{scrape}"
     );
+    let served = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"} 4\n";
+    assert!(scrape.contains(served), "{scrape}");
     Ok(())
 }
 
@@ -157,6 +158,52 @@ fn every_worker_serves_the_file_and_follows_it() -> io::Result<()> {
     for _ in 0..24 {
         assert!(get(web, "/")?.contains("x-upstream: two"));
     }
+    Ok(())
+}
+
+/// The workers count into one set of numbers, not one each: every request is in the
+/// scrape, wherever it was served, and one reload is one reload however many workers saw
+/// it. Connections are left to the kernel so that they really do land on several workers.
+#[cfg(unix)]
+#[test]
+fn what_every_worker_counts_is_added_up_in_one_scrape() -> io::Result<()> {
+    const REQUESTS: usize = 24;
+    let (one, two) = (upstream("one")?, upstream("two")?);
+    let file = scratch("shared-counters.yaml");
+    std::fs::write(&file, config("127.0.0.1:0", "up", Some(one)))?;
+    let args = [
+        "--config",
+        &file,
+        "--workers",
+        "3",
+        "--accept",
+        "kernel",
+        "--metrics",
+        "127.0.0.1:0",
+    ];
+    let mut harness = Harness::start(&args)?;
+    let web = harness.address_after("listener \"web\" is on ");
+    let metrics = harness.address_after("metrics are on ");
+    harness.wait_for("3 workers, thread-per-core");
+
+    // A connection of its own for every request, so the kernel spreads them out.
+    for _ in 0..REQUESTS {
+        assert!(get(web, "/")?.contains("x-upstream: one"));
+    }
+    std::fs::write(&file, config("127.0.0.1:0", "up", Some(two)))?;
+    harness.wait_for("config reloaded");
+
+    let scrape = get(metrics, "/metrics")?;
+    let served =
+        format!("edgerush_listener_responses_total{{listener=\"web\",class=\"2xx\"}} {REQUESTS}\n");
+    assert!(scrape.contains(&served), "{scrape}");
+    let accepted =
+        format!("edgerush_listener_connections_accepted_total{{listener=\"web\"}} {REQUESTS}\n");
+    assert!(scrape.contains(&accepted), "{scrape}");
+    assert!(
+        scrape.contains("edgerush_config_reloads_total 1\n"),
+        "{scrape}"
+    );
     Ok(())
 }
 

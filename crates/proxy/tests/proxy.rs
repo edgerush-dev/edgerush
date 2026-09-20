@@ -13,7 +13,7 @@
 )]
 
 use edgerush_config::{Compiled, Config, compile};
-use edgerush_proxy::Proxy;
+use edgerush_proxy::{Proxy, Worker};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Either, Empty, Full};
@@ -26,7 +26,9 @@ use hyper_util::server::conn::auto;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
@@ -102,7 +104,7 @@ async fn proxy(yaml: &str) -> BTreeMap<String, SocketAddr> {
 
 /// The same, with the proxy itself for reloading it.
 async fn reloadable_proxy(yaml: &str) -> (Arc<Proxy>, BTreeMap<String, SocketAddr>) {
-    let proxy = Arc::new(Proxy::new(compiled(yaml)).unwrap());
+    let proxy = Arc::new(Proxy::new(compiled(yaml), NonZeroUsize::MIN).unwrap());
     let mut addresses = BTreeMap::new();
     let mut sockets = Vec::new();
     for (position, listener) in proxy.listeners().iter().enumerate() {
@@ -118,8 +120,9 @@ async fn reloadable_proxy(yaml: &str) -> (Arc<Proxy>, BTreeMap<String, SocketAdd
 }
 
 /// Serves the listeners the way a data plane does: a thread of its own, a single-threaded
-/// runtime and a `LocalSet`, so that the tests exercise the shape the proxy really runs
-/// in and not one where a connection may wander between threads.
+/// runtime and a `LocalSet`, with the worker's share of the data plane made on that
+/// thread — the shape the proxy really runs in, and not one where a connection may wander
+/// between threads.
 fn on_a_worker(proxy: Arc<Proxy>, sockets: Vec<(usize, std::net::TcpListener)>) {
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -128,9 +131,10 @@ fn on_a_worker(proxy: Arc<Proxy>, sockets: Vec<(usize, std::net::TcpListener)>) 
             .unwrap();
         let local = tokio::task::LocalSet::new();
         let entered = runtime.enter();
+        let worker = Worker::new(proxy);
         for (position, socket) in sockets {
             let socket = TcpListener::from_std(socket).unwrap();
-            local.spawn_local(Arc::clone(&proxy).serve(position, socket));
+            local.spawn_local(Rc::clone(&worker).serve(position, socket));
         }
         drop(entered);
         // Accepting never ends, so neither does this: the thread goes with the process.
@@ -916,7 +920,8 @@ async fn the_scrape_endpoint_serves_what_was_counted_and_nothing_else() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connection_accepted_on_one_thread_is_served_on_another() {
     let up = upstream("up").await;
-    let proxy = Arc::new(Proxy::new(compiled(&everything_to(&[("web", up)], "0"))).unwrap());
+    let config = compiled(&everything_to(&[("web", up)], "0"));
+    let proxy = Arc::new(Proxy::new(config, NonZeroUsize::MIN).unwrap());
     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = socket.local_addr().unwrap();
 
@@ -924,7 +929,7 @@ async fn a_connection_accepted_on_one_thread_is_served_on_another() {
     // each to its end.
     let (hand_over, mut handed) = mpsc::channel::<std::net::TcpStream>(4);
     let (served, was_served) = std::sync::mpsc::channel();
-    let worker = Arc::clone(&proxy);
+    let shared = Arc::clone(&proxy);
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -932,9 +937,10 @@ async fn a_connection_accepted_on_one_thread_is_served_on_another() {
             .unwrap();
         let local = tokio::task::LocalSet::new();
         runtime.block_on(local.run_until(async move {
+            let worker = Worker::new(shared);
             while let Some(stream) = handed.recv().await {
                 let stream = TcpStream::from_std(stream).unwrap();
-                Arc::clone(&worker).serve_connection(0, stream).await;
+                Rc::clone(&worker).serve_connection(0, stream).await;
                 served.send(std::thread::current().id()).unwrap();
             }
         }));
@@ -961,11 +967,11 @@ async fn a_connection_accepted_on_one_thread_is_served_on_another() {
 
 #[test]
 fn a_failure_to_accept_is_counted_and_only_some_are_waited_after() {
-    let proxy = Proxy::new(compiled(&everything_to(
+    let config = compiled(&everything_to(
         &[("web", "127.0.0.1:1".parse().unwrap())],
         "0",
-    )))
-    .unwrap();
+    ));
+    let proxy = Proxy::new(config, NonZeroUsize::MIN).unwrap();
     let gone = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
     assert_eq!(proxy.accept_failed(0, &gone), None);
     // Out of file descriptors: accepting again at once would fail again at once.

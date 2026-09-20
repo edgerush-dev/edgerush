@@ -1,5 +1,7 @@
-//! Thread-per-core as the harness has it: for every worker a thread with a single-threaded
-//! runtime, a data plane of its own and a socket of its own on every listener's port.
+//! Thread-per-core: for every worker a thread with a single-threaded runtime, a socket of
+//! its own on every listener's port, and upstream connections of its own. One data plane
+//! is shared by all of them — the config they serve and the counters they add to are the
+//! process's, not a worker's.
 //!
 //! A worker accepts what the kernel gives its sockets and then decides whose connection it
 //! is ([`crate::balance`]). One that is another worker's is handed over as a socket that no
@@ -12,6 +14,7 @@
 use crate::balance::{Held, Loads};
 use edgerush_proxy::Proxy;
 use std::io;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
 use tokio::net::{TcpListener, TcpStream};
@@ -43,46 +46,39 @@ struct HandedOver {
     held: Held,
 }
 
-/// What a worker works with.
+/// What a worker works with. Its share of the data plane is an `Rc` and goes no further
+/// than the thread it was made on, which is why this is put together there and not here.
 #[derive(Debug, Clone)]
 struct Worker {
     position: usize,
-    proxy: Arc<Proxy>,
+    plane: Rc<edgerush_proxy::Worker>,
     loads: Arc<Loads>,
     /// Where to hand a connection over to each worker, by position.
     workers: Arc<[Sender<HandedOver>]>,
     accept: Accept,
 }
 
-/// Starts a worker for each of `proxies`, on a thread of its own, with the sockets at the
-/// same position of `sockets` — one for every listener, in the order of the listeners.
-/// Returns what the workers hold, for whoever wants to look.
+/// Starts a worker on a thread of its own for every entry of `sockets` — one socket for
+/// every listener, in the order of the listeners — all serving the one `proxy`. Returns
+/// what the workers hold, for whoever wants to look.
 ///
 /// # Errors
 ///
 /// A runtime or a thread that cannot be started, or a socket that a runtime does not take.
 /// Workers that were started before it stay.
 pub(crate) fn start(
-    proxies: &[Arc<Proxy>],
+    proxy: &Arc<Proxy>,
     sockets: Vec<Vec<std::net::TcpListener>>,
     accept: Accept,
 ) -> io::Result<Arc<Loads>> {
-    let loads = Loads::new(proxies.len());
-    let (workers, handed_over): (Vec<_>, Vec<_>) = proxies
+    let loads = Loads::new(sockets.len());
+    let (workers, handed_over): (Vec<_>, Vec<_>) = sockets
         .iter()
         .map(|_| mpsc::channel::<HandedOver>(ON_THEIR_WAY))
         .unzip();
     let workers: Arc<[Sender<HandedOver>]> = workers.into();
 
-    let each = proxies.iter().zip(sockets).zip(handed_over).enumerate();
-    for (position, ((proxy, sockets), handed_over)) in each {
-        let worker = Worker {
-            position,
-            proxy: Arc::clone(proxy),
-            loads: Arc::clone(&loads),
-            workers: Arc::clone(&workers),
-            accept,
-        };
+    for (position, (sockets, handed_over)) in sockets.into_iter().zip(handed_over).enumerate() {
         let runtime = Builder::new_current_thread().enable_all().build()?;
         // Sockets are handed to the runtime that is entered. Here, and not on the worker's
         // thread, so that a socket the runtime will not take stops the harness starting.
@@ -92,6 +88,7 @@ pub(crate) fn start(
             .map(TcpListener::from_std)
             .collect::<io::Result<Vec<_>>>()?;
         drop(entered);
+        let (proxy, loads, senders) = (Arc::clone(proxy), Arc::clone(&loads), Arc::clone(&workers));
         // A runtime without threads of its own runs on the thread that waits on it, and a
         // LocalSet belongs to one thread, so it is made on that one.
         thread::Builder::new()
@@ -99,6 +96,15 @@ pub(crate) fn start(
             .spawn(move || {
                 let local = LocalSet::new();
                 let entered = runtime.enter();
+                let worker = Worker {
+                    position,
+                    // The upstream connections of this worker and of no other, made where
+                    // they are used: nothing about them can leave this thread.
+                    plane: edgerush_proxy::Worker::new(proxy),
+                    loads,
+                    workers: senders,
+                    accept,
+                };
                 for (listener, socket) in sockets.into_iter().enumerate() {
                     local.spawn_local(worker.clone().accept(listener, socket));
                 }
@@ -117,7 +123,7 @@ impl Worker {
             match socket.accept().await {
                 Ok((stream, _)) => self.place(listener, stream),
                 Err(error) => {
-                    if let Some(pause) = self.proxy.accept_failed(listener, &error) {
+                    if let Some(pause) = self.plane.proxy().accept_failed(listener, &error) {
                         tokio::time::sleep(pause).await;
                     }
                 }
@@ -177,9 +183,9 @@ impl Worker {
     /// Serves the connection on this worker's runtime, which the caller is on. It counts
     /// as the worker's to its end.
     fn serve(&self, listener: usize, stream: TcpStream, held: Held) {
-        let proxy = Arc::clone(&self.proxy);
+        let plane = Rc::clone(&self.plane);
         let _detached = tokio::task::spawn_local(async move {
-            proxy.serve_connection(listener, stream).await;
+            plane.serve_connection(listener, stream).await;
             drop(held);
         });
     }
@@ -193,6 +199,7 @@ mod tests {
     use edgerush_config::{Config, compile};
     use std::io::{Read, Write};
     use std::net::SocketAddr;
+    use std::num::NonZeroUsize;
     use std::time::{Duration, Instant};
 
     /// Workers whose one listener `web` has nowhere to send a request: every request is
@@ -214,16 +221,16 @@ upstreams:
   nowhere: { endpoints: [] }
 "#;
         let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let workers = NonZeroUsize::new(count).unwrap();
+        let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), workers).unwrap());
         let mut address: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let mut proxies = Vec::new();
         let mut sockets = Vec::new();
         for _ in 0..count {
-            proxies.push(Arc::new(Proxy::new(compile(&config).unwrap()).unwrap()));
             let socket = listen(address, Port::Shared).unwrap();
             address = socket.local_addr().unwrap();
             sockets.push(vec![socket]);
         }
-        (address, start(&proxies, sockets, accept).unwrap())
+        (address, start(&proxy, sockets, accept).unwrap())
     }
 
     fn eventually(loads: &Loads, what: impl Fn(&[usize]) -> bool) -> Vec<usize> {

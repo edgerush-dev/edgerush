@@ -37,6 +37,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -64,8 +65,11 @@ impl<F: Future<Output = ()> + 'static> Executor<F> for OnThisWorker {
 /// What is answered: the upstream's body as it arrives, or nothing.
 type Body = Either<Incoming, Empty<Bytes>>;
 
-/// A data plane: serves the listeners of a compiled config, forwards to its upstreams, and
-/// takes a new config while it runs.
+/// A data plane: one for the whole process, whatever its workers. It holds what must be
+/// one — the config every worker serves, and the counters they all add to — and takes a
+/// new config while they run.
+///
+/// What a worker keeps to itself is in [`Worker`].
 #[derive(Debug)]
 pub struct Proxy {
     /// The names of the listeners of the config the data plane was made with. A socket is
@@ -74,7 +78,18 @@ pub struct Proxy {
     current: ArcSwap<Snapshot>,
     /// Outside the snapshot, so that a reload resets no counter.
     metrics: Metrics,
-    /// One for the life of the data plane: a reload does not throw warm connections away.
+}
+
+/// One worker's share of the data plane: the connections it holds to the upstreams, which
+/// are its own and no other worker's, and a handle on what they all share.
+///
+/// It is made on the worker's own thread, in its `LocalSet`, and never leaves it: it is
+/// counted with an [`Rc`] and holds what cannot be sent anywhere. This is the place the
+/// pool of upstream connections will go.
+#[derive(Debug)]
+pub struct Worker {
+    proxy: Arc<Proxy>,
+    /// One for the life of the worker: a reload does not throw warm connections away.
     /// Those to an endpoint that is no longer used grow idle and are closed.
     client: Client<HttpConnector, Incoming>,
 }
@@ -119,32 +134,30 @@ impl Snapshot {
 }
 
 impl Proxy {
-    /// A data plane that runs `config`. Nothing is listened on or connected to yet.
+    /// A data plane that runs `config` on `workers` of them. Nothing is listened on or
+    /// connected to yet, and no worker exists until [`Worker::new`] makes one.
+    ///
+    /// The worker count is told, not guessed: it is what the counters are sharded by, and
+    /// a process left to work it out for itself reads the machine rather than what it was
+    /// given ([03 §2] in the docs).
     ///
     /// # Errors
     ///
     /// Returns a [`ProxyError`] for an endpoint address that cannot be part of a request
     /// target (one with an IPv6 zone).
-    pub fn new(config: Compiled) -> Result<Self, ProxyError> {
+    pub fn new(config: Compiled, workers: NonZeroUsize) -> Result<Self, ProxyError> {
         let listeners: Vec<String> = config
             .listeners
             .iter()
             .map(|listener| listener.name.clone())
             .collect();
-        // A shard for every thread that may serve requests at the same time.
-        let shards = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
-        let metrics = Metrics::new(shards, listeners.len());
+        // A shard for every worker, so that no two write to one line of cache.
+        let metrics = Metrics::new(workers, listeners.len());
         let current = ArcSwap::from_pointee(Snapshot::new(config, &listeners, &metrics)?);
-        let mut connector = HttpConnector::new();
-        connector.set_nodelay(true);
-        let client = Client::builder(TokioExecutor::new())
-            .pool_timer(TokioTimer::new())
-            .build(connector);
         Ok(Self {
             listeners,
             current,
             metrics,
-            client,
         })
     }
 
@@ -194,6 +207,38 @@ impl Proxy {
         self.metrics.render(&self.listeners, &upstreams)
     }
 
+    /// Counts a failure to accept on the socket of the listener at position `listener`,
+    /// and says how long to wait before accepting again: not at all after the failure of
+    /// the one connection that was next in line, a moment after one that is not about a
+    /// connection — out of file descriptors, say — and would only happen again at once.
+    /// For whoever accepts by themselves and serves with [`Worker::serve_connection`].
+    pub fn accept_failed(&self, listener: usize, error: &io::Error) -> Option<Duration> {
+        if let Some(counters) = self.metrics.listener(listener) {
+            counters.accept_errors.inc();
+        }
+        (!is_about_one_connection(error)).then_some(ACCEPT_PAUSE)
+    }
+}
+
+impl Worker {
+    /// A worker of `proxy`, with upstream connections of its own. Made on the thread that
+    /// serves with it, inside that thread's `LocalSet`, and never moved off it.
+    #[must_use]
+    pub fn new(proxy: Arc<Proxy>) -> Rc<Self> {
+        let mut connector = HttpConnector::new();
+        connector.set_nodelay(true);
+        let client = Client::builder(TokioExecutor::new())
+            .pool_timer(TokioTimer::new())
+            .build(connector);
+        Rc::new(Self { proxy, client })
+    }
+
+    /// What this worker serves: the data plane the whole process shares.
+    #[must_use]
+    pub fn proxy(&self) -> &Arc<Proxy> {
+        &self.proxy
+    }
+
     /// Serves the connections that come in on `socket` as those of the listener at
     /// position `listener` of [`Proxy::listeners`], HTTP/1.1 and HTTP/2 alike. Never
     /// returns; dropping the future stops accepting, and connections already accepted
@@ -201,34 +246,22 @@ impl Proxy {
     ///
     /// # Panics
     ///
-    /// Runs inside a worker's `LocalSet`, where the connections it accepts are served;
+    /// Runs inside the worker's `LocalSet`, where the connections it accepts are served;
     /// without one there is nowhere to put them and the first connection panics.
-    pub async fn serve(self: Arc<Self>, listener: usize, socket: TcpListener) {
+    pub async fn serve(self: Rc<Self>, listener: usize, socket: TcpListener) {
         loop {
             match socket.accept().await {
                 Ok((stream, _)) => {
-                    let connection = Arc::clone(&self).serve_connection(listener, stream);
+                    let connection = Rc::clone(&self).serve_connection(listener, stream);
                     let _detached = tokio::task::spawn_local(connection);
                 }
                 Err(error) => {
-                    if let Some(pause) = self.accept_failed(listener, &error) {
+                    if let Some(pause) = self.proxy.accept_failed(listener, &error) {
                         tokio::time::sleep(pause).await;
                     }
                 }
             }
         }
-    }
-
-    /// Counts a failure to accept on the socket of the listener at position `listener`,
-    /// and says how long to wait before accepting again: not at all after the failure of
-    /// the one connection that was next in line, a moment after one that is not about a
-    /// connection — out of file descriptors, say — and would only happen again at once.
-    /// For whoever accepts by themselves and serves with [`Proxy::serve_connection`].
-    pub fn accept_failed(&self, listener: usize, error: &io::Error) -> Option<Duration> {
-        if let Some(counters) = self.metrics.listener(listener) {
-            counters.accept_errors.inc();
-        }
-        (!is_about_one_connection(error)).then_some(ACCEPT_PAUSE)
     }
 
     /// Serves one connection, to its end, as one of the listener at position `listener`
@@ -240,17 +273,17 @@ impl Proxy {
     ///
     /// Runs inside the worker's `LocalSet` ([`OnThisWorker`]). An HTTP/2 connection
     /// panics without one, as the engine spawns a future for every stream.
-    pub async fn serve_connection(self: Arc<Self>, listener: usize, stream: TcpStream) {
+    pub async fn serve_connection(self: Rc<Self>, listener: usize, stream: TcpStream) {
         // Worth having, not worth refusing a connection over.
         let _unset = stream.set_nodelay(true);
-        let connection = Arc::new(Connection::open(self, listener));
+        let connection = Rc::new(Connection::open(self, listener));
         // Every request clones a handle, as the engine wants futures that own what they
         // use. A handle of the connection's own keeps that count off a line of cache that
         // all the workers would otherwise write to.
         let service = service_fn(move |request| {
-            let connection = Arc::clone(&connection);
+            let connection = Rc::clone(&connection);
             async move {
-                let response = connection.proxy.handle(listener, request).await;
+                let response = connection.worker.handle(listener, request).await;
                 Ok::<_, Infallible>(response)
             }
         });
@@ -264,7 +297,7 @@ impl Proxy {
     async fn handle(&self, listener: usize, request: Request<Incoming>) -> Response<Body> {
         let came_in = Instant::now();
         let response = self.respond(listener, request).await;
-        if let Some(counters) = self.metrics.listener(listener) {
+        if let Some(counters) = self.proxy.metrics.listener(listener) {
             let took = u64::try_from(came_in.elapsed().as_nanos()).unwrap_or(u64::MAX);
             counters.responded(response.status(), took);
         }
@@ -273,18 +306,17 @@ impl Proxy {
 
     async fn respond(&self, listener: usize, request: Request<Incoming>) -> Response<Body> {
         let (mut head, body) = request.into_parts();
-        let directed = match self.direct(listener, &mut head) {
+        let directed = match self.proxy.direct(listener, &mut head) {
             Ok(directed) => directed,
-            Err(answer) => return self.answer(listener, answer),
+            Err(answer) => return self.proxy.answer(listener, answer),
         };
         let response = self.client.request(Request::from_parts(head, body)).await;
-        // Counted where the request is now: it may have changed threads while it waited.
-        let upstream = self.metrics.upstream(directed.upstream_slot);
+        let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
         let Ok(response) = response else {
             if let Some(upstream) = upstream {
                 upstream.failures.inc();
             }
-            return self.answer(listener, Answer::UpstreamFailed);
+            return self.proxy.answer(listener, Answer::UpstreamFailed);
         };
         if let Some(upstream) = upstream {
             upstream.responded(response.status());
@@ -300,7 +332,9 @@ impl Proxy {
         }
         Response::from_parts(head, Either::Left(body))
     }
+}
 
+impl Proxy {
     /// An answer of the data plane's own, counted by its reason.
     fn answer(&self, listener: usize, answer: Answer) -> Response<Body> {
         if let Some(counters) = self.metrics.listener(listener) {
@@ -359,23 +393,23 @@ struct Directed {
 /// A connection that came in on a listener's socket: what its requests share, and what
 /// counts it as open until the last of them is done, wherever that happens.
 struct Connection {
-    proxy: Arc<Proxy>,
+    worker: Rc<Worker>,
     listener: usize,
 }
 
 impl Connection {
-    fn open(proxy: Arc<Proxy>, listener: usize) -> Self {
-        if let Some(counters) = proxy.metrics.listener(listener) {
+    fn open(worker: Rc<Worker>, listener: usize) -> Self {
+        if let Some(counters) = worker.proxy.metrics.listener(listener) {
             counters.accepted.inc();
             counters.active.inc();
         }
-        Self { proxy, listener }
+        Self { worker, listener }
     }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        if let Some(counters) = self.proxy.metrics.listener(self.listener) {
+        if let Some(counters) = self.worker.proxy.metrics.listener(self.listener) {
             counters.active.dec();
         }
     }
@@ -542,7 +576,7 @@ mod tests {
 
     #[test]
     fn a_data_plane_serves_the_listeners_it_was_made_with() {
-        let proxy = Proxy::new(config_with(&["web", "admin"])).unwrap();
+        let proxy = Proxy::new(config_with(&["web", "admin"]), NonZeroUsize::MIN).unwrap();
         assert_eq!(proxy.listeners(), ["admin", "web"]);
         proxy.reload(config_with(&["later"])).unwrap();
         assert_eq!(proxy.listeners(), ["admin", "web"]);
@@ -589,7 +623,7 @@ mod tests {
 
     #[test]
     fn an_answer_of_our_own_is_a_status_and_nothing_else_and_is_counted() {
-        let proxy = Proxy::new(config_with(&["web"])).unwrap();
+        let proxy = Proxy::new(config_with(&["web"]), NonZeroUsize::MIN).unwrap();
         let answer = proxy.answer(0, Answer::NoRoute);
         assert_eq!(answer.status(), 404);
         assert!(answer.headers().is_empty());
@@ -601,7 +635,7 @@ mod tests {
 
     #[test]
     fn a_reload_is_counted_and_resets_nothing() {
-        let proxy = Proxy::new(config_with(&["web"])).unwrap();
+        let proxy = Proxy::new(config_with(&["web"]), NonZeroUsize::MIN).unwrap();
         let _counted = proxy.answer(0, Answer::NoRoute);
         assert!(proxy.metrics().contains(
             "edgerush_config_reloads_total 0

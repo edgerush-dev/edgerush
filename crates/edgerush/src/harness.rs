@@ -2,15 +2,15 @@
 //! development and tests — in a cluster the config comes from the control plane.
 //!
 //! The file is the config model as it is, nothing added; what is about the process and not
-//! about routing (how many workers there are, whose a connection is) is on the command
-//! line. Listeners are bound once, at the start. After that the file is read again every
-//! [`POLL`] and a config that has changed takes over without dropping a request, while one
-//! that cannot be run is told and changes nothing.
+//! about routing (where `/metrics` is served, how many workers there are, whose a new
+//! connection is) is on the command line. Listeners are bound once, at the start. After
+//! that the file is read again every [`POLL`] and a config that has changed takes over
+//! without dropping a request, while one that cannot be run is told and changes nothing.
 //!
 //! Requests are served thread-per-core ([`crate::per_core`]), the model that was chosen
-//! from the benchmark ([03 §2] in the docs). What is here of it is still the experiment
-//! made of what there was: a whole data plane for every worker, which is what gives each
-//! its own upstream connections, and why `/metrics` is not served yet.
+//! from the benchmark ([03 §2] in the docs): one data plane for the process, whose config
+//! and counters every worker shares, and upstream connections that belong to a worker
+//! alone. Scrapes are answered away from the workers, on a runtime of their own.
 //!
 //! Workers past the first share the port of every listener (`SO_REUSEPORT`), which only
 //! Unix has; a single worker has the port to itself and needs nothing of the kind, so
@@ -29,6 +29,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::runtime::Builder;
 
 pub(crate) const USAGE: &str = "\
 Usage: edgerush proxy --config <FILE> [OPTIONS]
@@ -39,7 +41,7 @@ request. Listeners are bound once: one that is new or has moved takes a restart.
 
 Options:
       --config <FILE>      The config, in YAML
-      --metrics <ADDRESS>  Not served yet: every worker still counts alone
+      --metrics <ADDRESS>  Serve /metrics there, as in 127.0.0.1:9090 [default: nowhere]
       --accept <BY>        Whose a new connection is. balanced: the worker that holds the
                            fewest; kernel: the one the kernel gave it to, by its hash of
                            the addresses [default: balanced]
@@ -79,6 +81,7 @@ enum Parsed {
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
     config: PathBuf,
+    metrics: Option<SocketAddr>,
     /// `None` is one for every CPU the process may use.
     workers: Option<NonZeroUsize>,
     accept: Accept,
@@ -98,10 +101,6 @@ enum UsageError {
     Address(String),
     #[error("'{0}' is not a number of workers: 1 or more")]
     Workers(String),
-    #[error(
-        "'--metrics' is not served yet: every worker counts alone, so no one number is the pod's"
-    )]
-    MetricsNotYet,
     #[error("'{0}' is not a way to place connections: balanced or kernel")]
     Accept(String),
 }
@@ -149,13 +148,9 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         }
     }
     let config = config.ok_or(UsageError::NoConfig)?;
-    // Parsed, so that a misspelt address is still told apart from a missing one, and then
-    // refused: there is no one set of counters to serve while every worker keeps its own.
-    if metrics.is_some() {
-        return Err(UsageError::MetricsNotYet);
-    }
     Ok(Parsed::Run(Options {
         config,
+        metrics,
         workers,
         accept: accept.unwrap_or(Accept::Balanced),
     }))
@@ -181,6 +176,7 @@ enum Failure {
 fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure> {
     let Options {
         config: path,
+        metrics,
         workers,
         accept,
     } = options;
@@ -195,35 +191,33 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
         Port::Shared
     };
 
-    let (mut file, configs) = match ConfigFile::open(path.clone(), workers) {
+    let (mut file, config) = match ConfigFile::open(path.clone()) {
         Ok(opened) => opened,
         Err(rejected) => return Err(Failure::Config { path, rejected }),
     };
-    let mut bound: Vec<Bound> = configs
-        .first()
-        .map(|config| config.listeners.iter().map(Bound::from).collect())
-        .unwrap_or_default();
-    let proxies = configs
-        .into_iter()
-        .map(|config| Proxy::new(config).map(Arc::new))
-        .collect::<Result<Vec<_>, _>>()
+    let mut bound: Vec<Bound> = config.listeners.iter().map(Bound::from).collect();
+    let proxy = Proxy::new(config, workers)
+        .map(Arc::new)
         .map_err(|error| Failure::Proxy { path, error })?;
 
     // Every socket is open before a request is served on any, so that a port that is
     // taken stops a harness that has done nothing yet.
-    let mut sockets = Vec::with_capacity(proxies.len());
-    for _ in &proxies {
+    let mut sockets = Vec::with_capacity(workers.get());
+    for _ in 0..workers.get() {
         let mut of_this_one = Vec::with_capacity(bound.len());
         for listener in &mut bound {
             let what = format!("listener \"{}\"", listener.name);
             let socket = open(what, listener.listens_on, port)?;
-            // A port that the operating system chose for the first data plane is the
-            // port of those after it.
+            // A port that the operating system chose for the first worker is the port of
+            // those after it.
             listener.listens_on = socket.local_addr().unwrap_or(listener.listens_on);
             of_this_one.push(socket);
         }
         sockets.push(of_this_one);
     }
+    let metrics = metrics
+        .map(|address| open("metrics".to_owned(), address, Port::Own))
+        .transpose()?;
 
     for listener in &bound {
         say(
@@ -235,7 +229,12 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
         );
     }
     // Every worker runs on a thread of its own, which stays for as long as the process.
-    per_core::start(&proxies, sockets, accept).map_err(Failure::Runtime)?;
+    per_core::start(&proxy, sockets, accept).map_err(Failure::Runtime)?;
+    if let Some(socket) = metrics {
+        let address = socket.local_addr().map_err(Failure::Runtime)?;
+        scrapes(Arc::clone(&proxy), socket).map_err(Failure::Runtime)?;
+        say(stderr, format_args!("metrics are on {address}"));
+    }
     let plural = if workers == NonZeroUsize::MIN {
         ""
     } else {
@@ -251,8 +250,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
         let Some(changed) = file.changed() else {
             continue;
         };
-        let configs = match changed {
-            Ok(configs) => configs,
+        let config = match changed {
+            Ok(config) => config,
             Err(rejected) => {
                 say(
                     stderr,
@@ -261,16 +260,10 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
                 continue;
             }
         };
-        let warnings = configs
-            .first()
-            .map(|config| restart_needed(&bound, config))
-            .unwrap_or_default();
-        // What a data plane refuses is in the config, so the first refuses what any would.
-        let reloaded = proxies
-            .iter()
-            .zip(configs)
-            .try_for_each(|(proxy, config)| proxy.reload(config));
-        match reloaded {
+        let warnings = restart_needed(&bound, &config);
+        // Published once, for every worker at once: none of them sees the old config after
+        // another has seen the new one.
+        match proxy.reload(config) {
             Ok(()) => say(stderr, format_args!("config reloaded")),
             Err(error) => {
                 say(
@@ -284,6 +277,21 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
             say(stderr, format_args!("warning: {warning}"));
         }
     }
+}
+
+/// Answers scrapes on `socket`, on a small runtime and a thread of their own: what a
+/// scraper asks for is added up over every worker's shard, and no worker's time goes on
+/// it ([03 §2] in the docs).
+fn scrapes(proxy: Arc<Proxy>, socket: std::net::TcpListener) -> io::Result<()> {
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    // The socket is handed to the runtime that is entered, as a worker's are.
+    let entered = runtime.enter();
+    let socket = TcpListener::from_std(socket)?;
+    drop(entered);
+    thread::Builder::new()
+        .name("metrics".to_owned())
+        .spawn(move || runtime.block_on(proxy.serve_metrics(socket)))?;
+    Ok(())
 }
 
 /// A listener that has a socket.
@@ -361,6 +369,7 @@ mod tests {
     fn a_config_is_all_that_is_needed() {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
+            metrics: None,
             workers: None,
             accept: Accept::Balanced,
         };
@@ -371,11 +380,26 @@ mod tests {
     fn the_workers_are_as_the_command_line_says() {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
+            metrics: None,
             workers: NonZeroUsize::new(4),
             accept: Accept::Balanced,
         };
         assert_eq!(
             parsed(&["--config", "dev.yaml", "--workers", "4"]),
+            Ok(Parsed::Run(options))
+        );
+    }
+
+    #[test]
+    fn metrics_are_served_where_the_command_line_says() {
+        let options = Options {
+            config: PathBuf::from("dev.yaml"),
+            metrics: Some("[::]:9090".parse().unwrap()),
+            workers: None,
+            accept: Accept::Balanced,
+        };
+        assert_eq!(
+            parsed(&["--metrics", "[::]:9090", "--config", "dev.yaml"]),
             Ok(Parsed::Run(options))
         );
     }
@@ -400,13 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn metrics_are_refused_while_every_worker_counts_alone() {
-        // The address is still read, so that a misspelt one is told apart from the flag
-        // itself not being served yet.
-        assert_eq!(
-            parsed(&["--config", "dev.yaml", "--metrics", "[::]:9090"]),
-            Err(UsageError::MetricsNotYet)
-        );
+    fn an_address_that_cannot_be_listened_on_is_refused() {
         assert_eq!(
             parsed(&["--config", "dev.yaml", "--metrics", "localhost:9090"]),
             Err(UsageError::Address("localhost:9090".to_owned()))
