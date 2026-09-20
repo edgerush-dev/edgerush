@@ -13,7 +13,9 @@
 
 use super::H1Limits;
 use crate::upstream::destination::ReuseIdentity;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use tokio::time::Instant;
 
@@ -21,6 +23,9 @@ use tokio::time::Instant;
 #[derive(Debug)]
 struct Idle<S> {
     socket: S,
+    /// The destination it was opened to. Held here so that a sweep can see for itself
+    /// that the destination is gone, rather than being told.
+    identity: Arc<ReuseIdentity>,
     /// When it was opened, which bounds how long it may go on being reused however busy
     /// it is: an old connection has had more chances to have quietly stopped working.
     opened: Instant,
@@ -100,6 +105,7 @@ impl<S> Pool<S> {
         }
         held.push(Idle {
             socket,
+            identity: Arc::clone(identity),
             opened,
             since: now,
         });
@@ -112,11 +118,16 @@ impl<S> Pool<S> {
     ///
     /// One sweep for the whole worker rather than a timer per connection, and it is what
     /// clears out a destination that stopped receiving traffic the moment it went.
-    pub fn sweep(&mut self, retired: impl Fn(u64) -> bool, limits: &H1Limits) -> usize {
+    pub fn sweep(&mut self, limits: &H1Limits) -> usize {
         let now = Instant::now();
         let before = self.total;
-        self.idle.retain(|key, held| {
-            if retired(*key) {
+        self.idle.retain(|_, held| {
+            // Every connection in a bucket is for the one destination, so one of them
+            // answers for all of them.
+            if held
+                .first()
+                .is_some_and(|first| first.identity.is_retired())
+            {
                 return false;
             }
             held.retain(|connection| is_fit(connection, now, limits));
@@ -142,6 +153,72 @@ impl<S> Pool<S> {
         if let Some(held) = self.idle.remove(&key) {
             self.total -= held.len();
         }
+    }
+}
+
+/// A connection taken out of a pool, or newly opened, for the length of one exchange.
+///
+/// While this holds it the pool does not, so no arrangement gives two exchanges the same
+/// socket. Dropping it closes the connection: a lease let go of rather than finished is
+/// one whose connection is in a state nobody knows, and the only way back is
+/// [`Lease::keep`], which wants the proof that an exchange finished.
+///
+/// The handle on the pool is a weak one, so a lease outliving the worker it came from
+/// does not keep that worker's pool alive; it simply has nowhere to put its connection
+/// back, and closes it.
+#[derive(Debug)]
+pub struct Lease<S> {
+    socket: Option<S>,
+    identity: Arc<ReuseIdentity>,
+    opened: Instant,
+    pool: Weak<RefCell<Pool<S>>>,
+}
+
+impl<S> Lease<S> {
+    /// A lease on `socket`, which was opened to `identity` at `opened`.
+    pub fn new(
+        socket: S,
+        identity: Arc<ReuseIdentity>,
+        opened: Instant,
+        pool: &Rc<RefCell<Pool<S>>>,
+    ) -> Self {
+        Self {
+            socket: Some(socket),
+            identity,
+            opened,
+            pool: Rc::downgrade(pool),
+        }
+    }
+
+    /// The destination this was opened to.
+    pub fn identity(&self) -> &Arc<ReuseIdentity> {
+        &self.identity
+    }
+
+    /// When it was opened, which bounds how long it may go on being used.
+    pub fn opened(&self) -> Instant {
+        self.opened
+    }
+
+    /// The connection, taken out of the lease for the length of an exchange. Whatever
+    /// becomes of it, only [`Lease::keep`] puts one back.
+    pub fn into_socket(mut self) -> Option<S> {
+        self.socket.take()
+    }
+
+    /// Puts a connection back, given the proof that an exchange finished with nothing
+    /// owing. The pool may still refuse it — for being one too many, or too old — and
+    /// then it is closed here, which is what refusing it means.
+    pub fn keep(self, socket: S, limits: &H1Limits) {
+        let Some(pool) = self.pool.upgrade() else {
+            // The worker has gone. There is nowhere to put this, and holding it would
+            // only keep a socket open that nobody will ever come for.
+            return;
+        };
+        let refused = pool
+            .borrow_mut()
+            .put(&self.identity, socket, self.opened, limits);
+        drop(refused);
     }
 }
 
@@ -321,7 +398,8 @@ mod tests {
     }
 
     /// A destination that stops receiving traffic has nobody to notice it went, so the
-    /// sweep is what clears it out.
+    /// sweep is what clears it out. The destination is really retired here, by a config
+    /// that no longer has it, rather than the test saying so.
     #[tokio::test(start_paused = true)]
     async fn the_sweep_clears_out_what_nobody_will_come_back_for() {
         let keys = Keys::default();
@@ -335,8 +413,22 @@ mod tests {
         pool.put(&staying, 1, Instant::now(), &limits);
         pool.put(&going, 2, Instant::now(), &limits);
 
-        let gone = going.key();
-        assert_eq!(pool.sweep(|key| key == gone, &limits), 1);
+        // A config with only `a` in it, which retires `b`.
+        let _after = Destinations::reconcile(
+            &compile(
+                &serde_saphyr::from_str::<Config>(
+                    "listeners: {}\nroutes: []\nupstreams:\n  a: { endpoints: [\"127.0.0.1:1\"] }\n",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            &held,
+            &keys,
+        );
+        assert!(going.is_retired());
+        assert!(!staying.is_retired());
+
+        assert_eq!(pool.sweep(&limits), 1);
         assert_eq!(pool.idle(), 1);
         assert_eq!(pool.take(&staying, &limits), Some(1));
     }
@@ -350,7 +442,7 @@ mod tests {
 
         pool.put(&identity, 1, Instant::now(), &limits);
         tokio::time::sleep(limits.idle_timeout * 2).await;
-        assert_eq!(pool.sweep(|_| false, &limits), 1);
+        assert_eq!(pool.sweep(&limits), 1);
         assert_eq!(pool.idle(), 0);
     }
 
@@ -372,7 +464,7 @@ mod tests {
 
             let identity = Arc::clone(previous.at(0, 0).unwrap());
             pool.put(&identity, round, Instant::now(), &limits);
-            pool.sweep(|key| key != identity.key(), &limits);
+            pool.sweep(&limits);
         }
         assert_eq!(pool.idle(), 1);
         assert_eq!(
@@ -380,5 +472,92 @@ mod tests {
             1,
             "a bucket was left behind for every reload"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_that_is_kept_puts_its_connection_back() {
+        let keys = Keys::default();
+        let (_held, identity) = one(&keys);
+        let limits = H1Limits::default();
+        let pool = Rc::new(RefCell::new(Pool::default()));
+
+        let lease = Lease::new(9, Arc::clone(&identity), Instant::now(), &pool);
+        let socket = lease_socket(&lease);
+        lease.keep(socket, &limits);
+
+        assert_eq!(pool.borrow().idle(), 1);
+        assert_eq!(pool.borrow_mut().take(&identity, &limits), Some(9));
+    }
+
+    /// A lease let go of rather than finished takes its connection with it. There is no
+    /// way to put one back by accident, and none to leave one half used in the pool.
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_that_is_dropped_keeps_nothing() {
+        let keys = Keys::default();
+        let (_held, identity) = one(&keys);
+        let limits = H1Limits::default();
+        let pool = Rc::new(RefCell::new(Pool::default()));
+
+        drop(Lease::new(9, Arc::clone(&identity), Instant::now(), &pool));
+
+        assert_eq!(pool.borrow().idle(), 0);
+        assert_eq!(pool.borrow_mut().take(&identity, &limits), None);
+    }
+
+    /// A lease that outlives its worker has nowhere to put anything, and does not keep
+    /// the worker's pool alive by holding on to it.
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_whose_worker_has_gone_closes_what_it_holds() {
+        let keys = Keys::default();
+        let (_held, identity) = one(&keys);
+        let limits = H1Limits::default();
+        let pool = Rc::new(RefCell::new(Pool::<i32>::default()));
+        let watching = Rc::downgrade(&pool);
+
+        let lease = Lease::new(9, Arc::clone(&identity), Instant::now(), &pool);
+        drop(pool);
+        assert!(
+            watching.upgrade().is_none(),
+            "the lease kept the pool alive"
+        );
+
+        // Nothing to put it back into, and nothing that panics for the want of one.
+        lease.keep(9, &limits);
+    }
+
+    /// What the pool will not hold, the lease does not hold either: refusing a connection
+    /// is how it comes to be closed rather than kept somewhere nobody looks.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_the_pool_refuses_is_not_kept_anywhere() {
+        let keys = Keys::default();
+        let (_held, identity) = one(&keys);
+        let limits = H1Limits {
+            idle_per_destination: 1,
+            ..H1Limits::default()
+        };
+        let pool = Rc::new(RefCell::new(Pool::default()));
+
+        Lease::new(1, Arc::clone(&identity), Instant::now(), &pool).keep(1, &limits);
+        Lease::new(2, Arc::clone(&identity), Instant::now(), &pool).keep(2, &limits);
+
+        assert_eq!(pool.borrow().idle(), 1, "the second was kept as well");
+    }
+
+    /// Taking the socket out is not putting it back: a lease unwrapped for an exchange
+    /// that then went wrong leaves the pool with nothing.
+    #[tokio::test(start_paused = true)]
+    async fn taking_a_socket_out_of_a_lease_is_not_returning_it() {
+        let keys = Keys::default();
+        let (_held, identity) = one(&keys);
+        let pool = Rc::new(RefCell::new(Pool::default()));
+
+        let lease = Lease::new(9, Arc::clone(&identity), Instant::now(), &pool);
+        assert_eq!(lease.into_socket(), Some(9));
+        assert_eq!(pool.borrow().idle(), 0);
+    }
+
+    /// The socket a lease is holding, for a test that means to hand it straight back.
+    fn lease_socket(lease: &Lease<i32>) -> i32 {
+        lease.socket.expect("a lease that still holds one")
     }
 }
