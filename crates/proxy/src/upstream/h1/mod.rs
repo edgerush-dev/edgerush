@@ -20,6 +20,12 @@ pub(crate) struct H1Limits {
     /// The most fields a head may carry. No more than [`codec::MOST_FIELDS`] is read,
     /// whatever this says.
     pub(crate) fields: usize,
+    /// The most a chunk's size line may come to, its extensions included.
+    pub(crate) chunk_line: usize,
+    /// The most the fields after the last chunk may come to.
+    pub(crate) trailers: usize,
+    /// The most fields there may be among them.
+    pub(crate) trailer_fields: usize,
 }
 
 impl Default for H1Limits {
@@ -27,6 +33,9 @@ impl Default for H1Limits {
         Self {
             head: 64 * 1024,
             fields: codec::MOST_FIELDS,
+            chunk_line: 4 * 1024,
+            trailers: 16 * 1024,
+            trailer_fields: 64,
         }
     }
 }

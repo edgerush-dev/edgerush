@@ -14,6 +14,7 @@
 
 use super::H1Limits;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Version};
+use std::ops::Range;
 
 /// The end of a head, and of a trailer section: an empty line.
 const END: &[u8; 4] = b"\r\n\r\n";
@@ -66,6 +67,20 @@ pub(crate) enum CodecError {
     /// A `Connection` holding something that is not a list of tokens.
     #[error("the response has a connection field that is not a list of tokens")]
     BadConnection,
+    /// The connection ended part way through a body that said how long it would be. What
+    /// arrived is not the answer, and saying it is would be inventing one.
+    #[error("the response body ended before all of it had arrived")]
+    Truncated,
+    /// A chunk that is not one: no size, a size too large to hold, an extension that does
+    /// not parse, or something other than CRLF where a chunk ends.
+    #[error("the response has a chunk that cannot be read")]
+    Chunk,
+    /// A chunk's size line went past what such a line may be.
+    #[error("a chunk size line is longer than {limit} bytes")]
+    ChunkLineTooLong { limit: usize },
+    /// The trailer section went past what one may be.
+    #[error("the trailer section is longer than {limit} bytes")]
+    TrailersTooLong { limit: usize },
 }
 
 /// A response head, once it has been read and found sound.
@@ -388,6 +403,351 @@ fn says_close(headers: &HeaderMap) -> Result<bool, CodecError> {
         }
     }
     Ok(closing)
+}
+
+/// A piece of a body, as it is read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Piece {
+    /// Nothing can be said until more bytes arrive.
+    More,
+    /// Body data: `bytes[data]` of what was given, with `consumed` taken off the front.
+    /// The two differ where framing bytes sit around the data, as chunking's do.
+    Data { data: Range<usize>, consumed: usize },
+    /// The body is whole. `trailers` is `Some` only for a chunked body, which may carry
+    /// them; they are frames of their own and are never folded into the head's fields.
+    End {
+        trailers: Option<HeaderMap>,
+        consumed: usize,
+    },
+}
+
+/// Where the reading of a body has got to.
+#[derive(Debug, PartialEq, Eq)]
+enum State {
+    /// Waiting for a chunk's size line.
+    Size,
+    /// Inside a chunk or a counted body, with this many bytes of it still to come.
+    Data { left: u64 },
+    /// After a chunk's data, where its own CRLF is.
+    AfterChunk,
+    /// After the zero chunk, reading fields until an empty line ends them.
+    Trailers,
+    /// Nothing more is coming.
+    Done,
+}
+
+/// Reads the body of one response, however that body is delimited.
+///
+/// Given the bytes that have arrived and whether the connection has ended, it says what it
+/// can and how much of the front of the buffer it has finished with. It is told of the end
+/// of the connection; it never decides that for itself, because no bytes having arrived is
+/// not the same as no bytes ever arriving.
+#[derive(Debug)]
+pub(crate) struct BodyReader {
+    framing: Framing,
+    state: State,
+}
+
+impl BodyReader {
+    /// A reader for a body delimited as `framing` says.
+    pub(crate) fn new(framing: Framing) -> Self {
+        let state = match framing {
+            Framing::None => State::Done,
+            Framing::Chunked => State::Size,
+            Framing::Length(left) => State::Data { left },
+            Framing::UntilClose => State::Data { left: u64::MAX },
+        };
+        Self { framing, state }
+    }
+
+    /// Whether the whole body has been read. Only then may the connection be kept.
+    pub(crate) fn is_done(&self) -> bool {
+        self.state == State::Done
+    }
+
+    /// Reads what it can from the front of `bytes`. `ended` says the connection has
+    /// closed, which only the caller can know.
+    ///
+    /// # Errors
+    ///
+    /// A chunk that is not one, a body that ends before it has been delivered in full, or
+    /// anything past the bounds in `limits`.
+    pub(crate) fn read(
+        &mut self,
+        bytes: &[u8],
+        ended: bool,
+        limits: &H1Limits,
+    ) -> Result<Piece, CodecError> {
+        loop {
+            return match self.state {
+                State::Done => Ok(Piece::End {
+                    trailers: None,
+                    consumed: 0,
+                }),
+                // The end of a chunk's data, or of a counted body: a step of its own,
+                // which wants no bytes and gives the caller nothing to do.
+                State::Data { left: 0 } => match self.framing {
+                    Framing::Chunked => {
+                        self.state = State::AfterChunk;
+                        continue;
+                    }
+                    _ => {
+                        self.state = State::Done;
+                        Ok(Piece::End {
+                            trailers: None,
+                            consumed: 0,
+                        })
+                    }
+                },
+                State::Data { left } => self.data(bytes, left, ended),
+                State::Size => self.size(bytes, ended, limits),
+                State::AfterChunk => self.after_chunk(bytes, ended),
+                State::Trailers => self.trailers(bytes, ended, limits),
+            };
+        }
+    }
+
+    /// Body bytes, of a counted body or of one chunk.
+    fn data(&mut self, bytes: &[u8], left: u64, ended: bool) -> Result<Piece, CodecError> {
+        if bytes.is_empty() {
+            if !ended {
+                return Ok(Piece::More);
+            }
+            // The close ends a body that nothing else delimits, and only that one.
+            return match self.framing {
+                Framing::UntilClose => {
+                    self.state = State::Done;
+                    Ok(Piece::End {
+                        trailers: None,
+                        consumed: 0,
+                    })
+                }
+                _ => Err(CodecError::Truncated),
+            };
+        }
+        let take = usize::try_from(left).unwrap_or(usize::MAX).min(bytes.len());
+        self.state = State::Data {
+            // `take` is no more than `left`, so this cannot go below zero.
+            left: left - u64::try_from(take).unwrap_or(u64::MAX),
+        };
+        Ok(Piece::Data {
+            data: 0..take,
+            consumed: take,
+        })
+    }
+
+    /// A chunk's size line: hexadecimal, any extensions, then CRLF.
+    fn size(&mut self, bytes: &[u8], ended: bool, limits: &H1Limits) -> Result<Piece, CodecError> {
+        let Some(line) = line(bytes, limits.chunk_line)? else {
+            return if ended {
+                Err(CodecError::Truncated)
+            } else {
+                Ok(Piece::More)
+            };
+        };
+        let (size, rest) = hex(&bytes[..line.text])?;
+        extensions(rest)?;
+        if size == 0 {
+            self.state = State::Trailers;
+            return Ok(Piece::Data {
+                data: 0..0,
+                consumed: line.whole,
+            });
+        }
+        self.state = State::Data { left: size };
+        Ok(Piece::Data {
+            data: 0..0,
+            consumed: line.whole,
+        })
+    }
+
+    /// The CRLF that follows a chunk's data, and nothing else.
+    fn after_chunk(&mut self, bytes: &[u8], ended: bool) -> Result<Piece, CodecError> {
+        match bytes {
+            [b'\r', b'\n', ..] => {
+                self.state = State::Size;
+                Ok(Piece::Data {
+                    data: 0..0,
+                    consumed: 2,
+                })
+            }
+            // Still could become one.
+            [] | [b'\r'] if !ended => Ok(Piece::More),
+            [] | [b'\r'] => Err(CodecError::Truncated),
+            _ => Err(CodecError::Chunk),
+        }
+    }
+
+    /// The fields after the zero chunk, ending at an empty line. There may be none, which
+    /// is an empty line and nothing before it.
+    fn trailers(
+        &mut self,
+        bytes: &[u8],
+        ended: bool,
+        limits: &H1Limits,
+    ) -> Result<Piece, CodecError> {
+        let Some(end) = section(bytes, limits.trailers)? else {
+            return if ended {
+                Err(CodecError::Truncated)
+            } else {
+                Ok(Piece::More)
+            };
+        };
+        let trailers = fields(&bytes[..end], limits)?;
+        self.state = State::Done;
+        Ok(Piece::End {
+            trailers: Some(trailers),
+            consumed: end,
+        })
+    }
+}
+
+/// A line of the buffer, if a whole one is there: where its text ends and where the line
+/// itself does, the CRLF included.
+struct Line {
+    text: usize,
+    whole: usize,
+}
+
+/// The first line of `bytes`, or `None` while it has not ended.
+fn line(bytes: &[u8], bound: usize) -> Result<Option<Line>, CodecError> {
+    for (at, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        if at == 0 || bytes[at - 1] != b'\r' {
+            return Err(CodecError::Chunk);
+        }
+        if at + 1 > bound {
+            return Err(CodecError::ChunkLineTooLong { limit: bound });
+        }
+        return Ok(Some(Line {
+            text: at - 1,
+            whole: at + 1,
+        }));
+    }
+    if bytes.len() > bound {
+        return Err(CodecError::ChunkLineTooLong { limit: bound });
+    }
+    Ok(None)
+}
+
+/// A chunk's size, and whatever follows it on the line. Hexadecimal, at least one digit,
+/// and no more than a count of bytes can hold.
+fn hex(line: &[u8]) -> Result<(u64, &[u8]), CodecError> {
+    let digits = line
+        .iter()
+        .position(|byte| !byte.is_ascii_hexdigit())
+        .unwrap_or(line.len());
+    if digits == 0 {
+        return Err(CodecError::Chunk);
+    }
+    let mut size: u64 = 0;
+    for byte in &line[..digits] {
+        let digit = char::from(*byte).to_digit(16).ok_or(CodecError::Chunk)?;
+        size = size
+            .checked_mul(16)
+            .and_then(|so_far| so_far.checked_add(u64::from(digit)))
+            .ok_or(CodecError::Chunk)?;
+    }
+    Ok((size, &line[digits..]))
+}
+
+/// What may follow a chunk's size: `;name` or `;name=value`, over and over, where a value
+/// is a token or a quoted string. None of it is acted on. It is checked because a line
+/// that is not read the same way twice is a line two readers can end in two places.
+fn extensions(mut rest: &[u8]) -> Result<(), CodecError> {
+    while !rest.is_empty() {
+        let after = rest.strip_prefix(b";").ok_or(CodecError::Chunk)?;
+        let (_name, after) = token(after)?;
+        rest = match after.strip_prefix(b"=") {
+            None => after,
+            Some(value) if value.first() == Some(&b'"') => quoted(value)?,
+            Some(value) => token(value)?.1,
+        };
+    }
+    Ok(())
+}
+
+/// One token, which is one or more `tchar`, and what follows it.
+fn token(bytes: &[u8]) -> Result<(&[u8], &[u8]), CodecError> {
+    let end = bytes
+        .iter()
+        .position(|byte| !crate::hop_by_hop::is_token_byte(*byte))
+        .unwrap_or(bytes.len());
+    if end == 0 {
+        return Err(CodecError::Chunk);
+    }
+    Ok(bytes.split_at(end))
+}
+
+/// What follows a quoted string, the closing quote included. A backslash makes the next
+/// byte part of the string, the closing quote included, which is the point of checking.
+fn quoted(bytes: &[u8]) -> Result<&[u8], CodecError> {
+    let mut at = 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => return Ok(&bytes[at + 1..]),
+            b'\\' => at += 2,
+            b'\r' | b'\n' => return Err(CodecError::Chunk),
+            _ => at += 1,
+        }
+    }
+    Err(CodecError::Chunk)
+}
+
+/// Where a section of fields ends, an empty line included, or `None` while it has not.
+fn section(bytes: &[u8], bound: usize) -> Result<Option<usize>, CodecError> {
+    // No fields at all: the empty line comes first.
+    if bytes.starts_with(b"\r\n") {
+        return Ok(Some(2));
+    }
+    if bytes.len() < 2 {
+        return Ok(None);
+    }
+    for at in 0..bytes.len() {
+        if bytes[at] != b'\n' {
+            continue;
+        }
+        if at == 0 || bytes[at - 1] != b'\r' {
+            return Err(CodecError::Malformed("a line ends with a bare newline"));
+        }
+        if at >= 3 && bytes[at - 2] == b'\n' {
+            if at + 1 > bound {
+                return Err(CodecError::TrailersTooLong { limit: bound });
+            }
+            return Ok(Some(at + 1));
+        }
+    }
+    if bytes.len() > bound {
+        return Err(CodecError::TrailersTooLong { limit: bound });
+    }
+    Ok(None)
+}
+
+/// The fields of a trailer section, which is a head's fields without a status line.
+fn fields(section: &[u8], limits: &H1Limits) -> Result<HeaderMap, CodecError> {
+    let mut room = [httparse::EMPTY_HEADER; MOST_FIELDS];
+    let room = &mut room[..limits.trailer_fields.min(MOST_FIELDS)];
+    let parsed = match httparse::parse_headers(section, room) {
+        Ok(httparse::Status::Complete((_, parsed))) => parsed,
+        Ok(httparse::Status::Partial) => {
+            return Err(CodecError::Malformed("trailers are cut short"));
+        }
+        Err(httparse::Error::TooManyHeaders) => {
+            return Err(CodecError::TooManyFields { limit: room.len() });
+        }
+        Err(error) => return Err(CodecError::Malformed(reason(error))),
+    };
+    let mut trailers = HeaderMap::with_capacity(parsed.len());
+    for field in parsed {
+        let name = HeaderName::from_bytes(field.name.as_bytes())
+            .map_err(|_| CodecError::Malformed("a trailer name is not one"))?;
+        let value = HeaderValue::from_bytes(field.value)
+            .map_err(|_| CodecError::Malformed("a trailer value is not one"))?;
+        trailers.append(name, value);
+    }
+    Ok(trailers)
 }
 
 #[cfg(test)]
@@ -908,5 +1268,293 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// Reads a whole body from `bytes`, a piece at a time, as the exchange would: what it
+    /// delivered, and the trailers if there were any.
+    fn body_of(
+        framing: Framing,
+        bytes: &[u8],
+        ended: bool,
+    ) -> Result<(Vec<u8>, Option<HeaderMap>), CodecError> {
+        read_in_pieces(framing, bytes, ended, &H1Limits::default())
+    }
+
+    /// The same, with bounds of the caller's.
+    fn read_in_pieces(
+        framing: Framing,
+        bytes: &[u8],
+        ended: bool,
+        limits: &H1Limits,
+    ) -> Result<(Vec<u8>, Option<HeaderMap>), CodecError> {
+        let mut reader = BodyReader::new(framing);
+        let mut left = bytes;
+        let mut delivered = Vec::new();
+        loop {
+            match reader.read(left, ended, limits)? {
+                Piece::More => panic!("more was wanted than {bytes:?} holds"),
+                Piece::Data { data, consumed } => {
+                    delivered.extend_from_slice(&left[data]);
+                    left = &left[consumed..];
+                }
+                Piece::End { trailers, consumed } => {
+                    assert!(reader.is_done());
+                    left = &left[consumed..];
+                    assert!(left.is_empty(), "{left:?} was left over");
+                    return Ok((delivered, trailers));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_counted_body_is_delivered_and_no_more() {
+        let (body, trailers) = body_of(Framing::Length(5), b"hello", false).unwrap();
+        assert_eq!(body, b"hello");
+        assert_eq!(trailers, None);
+        // And a counted body of nothing is over before it starts.
+        assert_eq!(body_of(Framing::Length(0), b"", false).unwrap().0, b"");
+    }
+
+    #[test]
+    fn a_body_with_no_framing_at_all_is_over_at_once() {
+        assert_eq!(body_of(Framing::None, b"", false).unwrap().0, b"");
+    }
+
+    #[test]
+    fn a_body_the_close_ends_is_whatever_came_before_it() {
+        let mut reader = BodyReader::new(Framing::UntilClose);
+        let limits = H1Limits::default();
+        let Ok(Piece::Data { data, consumed }) = reader.read(b"some bytes", false, &limits) else {
+            panic!("the bytes");
+        };
+        assert_eq!(&b"some bytes"[data], b"some bytes");
+        assert_eq!(consumed, 10);
+        // Nothing more has come, and nothing says it will not.
+        assert_eq!(reader.read(b"", false, &limits), Ok(Piece::More));
+        // Now the connection has closed, and that is the end of the body.
+        assert_eq!(
+            reader.read(b"", true, &limits),
+            Ok(Piece::End {
+                trailers: None,
+                consumed: 0
+            })
+        );
+    }
+
+    /// A close is the end of a body only where nothing else says where the end is. Where
+    /// something does, a close part way through is an answer that never arrived, and
+    /// handing on what did arrive would be inventing one.
+    #[test]
+    fn a_close_part_way_through_a_counted_body_is_a_failure() {
+        assert_eq!(
+            body_of(Framing::Length(5), b"hel", true),
+            Err(CodecError::Truncated)
+        );
+        assert_eq!(
+            body_of(Framing::Chunked, b"5\r\nhel", true),
+            Err(CodecError::Truncated)
+        );
+        assert_eq!(
+            body_of(Framing::Chunked, b"5\r\nhello\r\n", true),
+            Err(CodecError::Truncated)
+        );
+        // Even where every byte of the body arrived: the zero chunk did not.
+        assert_eq!(
+            body_of(Framing::Chunked, b"5\r\nhello\r\n0\r\n", true),
+            Err(CodecError::Truncated)
+        );
+    }
+
+    #[test]
+    fn a_chunked_body_is_delivered_without_its_framing() {
+        let (body, trailers) = body_of(
+            Framing::Chunked,
+            b"5\r\nhello\r\n3\r\n th\r\n0\r\n\r\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(body, b"hello th");
+        assert_eq!(trailers, Some(HeaderMap::new()));
+    }
+
+    #[test]
+    fn a_chunked_body_of_nothing_is_the_zero_chunk_alone() {
+        let (body, trailers) = body_of(Framing::Chunked, b"0\r\n\r\n", false).unwrap();
+        assert!(body.is_empty());
+        assert_eq!(trailers, Some(HeaderMap::new()));
+    }
+
+    #[test]
+    fn the_trailers_after_the_last_chunk_are_read_and_kept_apart() {
+        let bytes = b"0\r\ngrpc-status: 0\r\ngrpc-message: ok\r\n\r\n";
+        let (body, trailers) = body_of(Framing::Chunked, bytes, false).unwrap();
+        assert!(body.is_empty());
+        let trailers = trailers.unwrap();
+        assert_eq!(trailers["grpc-status"], "0");
+        assert_eq!(trailers["grpc-message"], "ok");
+    }
+
+    /// However the bytes are cut up, the body that comes out is the same one.
+    #[test]
+    fn a_body_arriving_a_byte_at_a_time_is_the_same_body() {
+        let cases: &[(Framing, &[u8], &[u8])] = &[
+            (Framing::Length(5), b"hello", b"hello"),
+            (
+                Framing::Chunked,
+                b"5\r\nhello\r\n3\r\n th\r\n0\r\n\r\n",
+                b"hello th",
+            ),
+            (Framing::Chunked, b"0\r\nx-a: 1\r\n\r\n", b""),
+        ];
+        for (framing, whole, expected) in cases {
+            let mut reader = BodyReader::new(*framing);
+            let limits = H1Limits::default();
+            let mut delivered = Vec::new();
+            let mut taken = 0;
+            for upto in 1..=whole.len() {
+                loop {
+                    let left = &whole[taken..upto];
+                    match reader.read(left, false, &limits).unwrap() {
+                        Piece::More => break,
+                        Piece::Data { data, consumed } => {
+                            delivered.extend_from_slice(&left[data]);
+                            taken += consumed;
+                            if consumed == 0 {
+                                break;
+                            }
+                        }
+                        Piece::End { consumed, .. } => {
+                            taken += consumed;
+                            assert_eq!(taken, whole.len(), "{whole:?}");
+                            break;
+                        }
+                    }
+                }
+            }
+            assert_eq!(delivered, *expected, "{whole:?}");
+            assert!(reader.is_done(), "{whole:?}");
+        }
+    }
+
+    /// The table of chunk size lines. A size that is not hexadecimal, or is more than a
+    /// count of bytes can hold, is not a size.
+    #[test]
+    fn a_chunk_size_is_hexadecimal_and_fits() {
+        let good: &[(&[u8], usize)] = &[
+            (b"5\r\nhello\r\n0\r\n\r\n", 5),
+            (b"A\r\n0123456789\r\n0\r\n\r\n", 10),
+            (b"a\r\n0123456789\r\n0\r\n\r\n", 10),
+            (b"00000005\r\nhello\r\n0\r\n\r\n", 5),
+        ];
+        for (bytes, length) in good {
+            let (body, _) = body_of(Framing::Chunked, bytes, false).unwrap();
+            assert_eq!(body.len(), *length, "{bytes:?}");
+        }
+
+        let bad: &[&[u8]] = &[
+            b"\r\nhello\r\n",         // No size at all.
+            b"-5\r\nhello\r\n",       // Not a hexadecimal digit.
+            b"0x5\r\nhello\r\n",      // Nor is this how one is written.
+            b" 5\r\nhello\r\n",       // Nor a space before it.
+            b"5 \r\nhello\r\n",       // Nor one after it.
+            b"10000000000000000\r\n", // One past what a length can be.
+            b"5\nhello\n0\n\n",       // Bare newlines.
+        ];
+        for bytes in bad {
+            assert_eq!(
+                body_of(Framing::Chunked, bytes, false),
+                Err(CodecError::Chunk),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    /// What may follow a size on its line. None of it is acted on; all of it is checked,
+    /// because a line read two ways is a body that ends in two places.
+    #[test]
+    fn a_chunk_extension_is_checked_and_then_ignored() {
+        let good: &[&[u8]] = &[
+            b"5;a\r\nhello\r\n0\r\n\r\n",
+            b"5;a=b\r\nhello\r\n0\r\n\r\n",
+            b"5;a=\"b\"\r\nhello\r\n0\r\n\r\n",
+            b"5;a=\"b;c\"\r\nhello\r\n0\r\n\r\n",
+            b"5;a=\"b\\\"c\"\r\nhello\r\n0\r\n\r\n",
+            b"5;a;b=c\r\nhello\r\n0\r\n\r\n",
+        ];
+        for bytes in good {
+            let (body, _) = body_of(Framing::Chunked, bytes, false).unwrap();
+            assert_eq!(body, b"hello", "{bytes:?}");
+        }
+
+        let bad: &[&[u8]] = &[
+            b"5;\r\nhello\r\n",      // A semicolon naming nothing.
+            b"5;a=\r\nhello\r\n",    // A name with nothing after the equals.
+            b"5;a=\"b\r\nhello\r\n", // A quoted string that never closes.
+            b"5 ;a\r\nhello\r\n",    // Space where none may be.
+            b"5;a b\r\nhello\r\n",
+            b"5x;a\r\nhello\r\n",
+        ];
+        for bytes in bad {
+            assert_eq!(
+                body_of(Framing::Chunked, bytes, false),
+                Err(CodecError::Chunk),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chunk_that_does_not_end_in_crlf_is_refused() {
+        for bytes in [
+            &b"5\r\nhelloX\r\n0\r\n\r\n"[..], // Something else after the data.
+            &b"5\r\nhello\n0\r\n\r\n"[..],    // A bare newline after it.
+            &b"5\r\nhello0\r\n\r\n"[..],      // Nothing at all after it.
+        ] {
+            assert_eq!(
+                body_of(Framing::Chunked, bytes, false),
+                Err(CodecError::Chunk),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chunk_size_line_past_its_bound_is_refused() {
+        let limits = H1Limits {
+            chunk_line: 16,
+            ..H1Limits::default()
+        };
+        let padded = [b"5;", &b"a".repeat(32)[..], b"\r\nhello\r\n0\r\n\r\n"].concat();
+        assert_eq!(
+            read_in_pieces(Framing::Chunked, &padded, false, &limits),
+            Err(CodecError::ChunkLineTooLong { limit: 16 })
+        );
+    }
+
+    #[test]
+    fn a_trailer_section_past_its_bound_is_refused() {
+        let limits = H1Limits {
+            trailers: 16,
+            ..H1Limits::default()
+        };
+        let padded = [b"0\r\nx-a: ", &b"1".repeat(32)[..], b"\r\n\r\n"].concat();
+        assert_eq!(
+            read_in_pieces(Framing::Chunked, &padded, false, &limits),
+            Err(CodecError::TrailersTooLong { limit: 16 })
+        );
+    }
+
+    #[test]
+    fn more_trailers_than_are_allowed_is_refused() {
+        let limits = H1Limits {
+            trailer_fields: 1,
+            ..H1Limits::default()
+        };
+        let bytes = b"0\r\nx-a: 1\r\nx-b: 2\r\n\r\n";
+        assert_eq!(
+            read_in_pieces(Framing::Chunked, bytes, false, &limits),
+            Err(CodecError::TooManyFields { limit: 1 })
+        );
     }
 }
