@@ -18,6 +18,7 @@ mod random;
 mod request;
 mod scrape;
 mod serve;
+mod upstream;
 
 pub use hop_by_hop::ConnectionError;
 pub use host::HostError;

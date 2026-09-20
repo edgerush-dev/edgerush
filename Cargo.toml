@@ -21,6 +21,10 @@ edgerush-telemetry = { path = "crates/telemetry" }
 http = "1.5"
 # Body helpers (an empty body, either of two bodies) for the proxy crate's answers.
 http-body-util = "0.1.5"
+# Tokenises the head of an upstream's response. It is already under hyper, and is what
+# hyper, actix and Pingora all parse heads with; what it allows is not what EdgeRush
+# allows, so every head it returns is checked again here.
+httparse = "1.10"
 # The HTTP engine. Only the proxy crate may depend on these two.
 hyper = { version = "1.11", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "client-legacy", "http1", "http2"] }
