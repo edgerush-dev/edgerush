@@ -22,13 +22,17 @@ use edgerush_proxy::upstream::h1::codec::{
 use libfuzzer_sys::fuzz_target;
 
 /// Small bounds, so that a target really reaches them on inputs a fuzzer will produce.
-const fn limits() -> H1Limits {
+/// The rest stay as they are: a bound this target has no way of reaching is one it has
+/// nothing to say about, and naming every one of them here only breaks this file when a
+/// new bound is added.
+fn limits() -> H1Limits {
     H1Limits {
         head: 1024,
         fields: 16,
         chunk_line: 64,
         trailers: 256,
         trailer_fields: 8,
+        ..H1Limits::default()
     }
 }
 
