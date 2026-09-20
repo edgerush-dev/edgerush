@@ -33,10 +33,10 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
-/// How long accepting pauses after an error that is not about one connection — out of
-/// file descriptors, say — instead of failing again at once, over and over.
+/// How long accepting pauses after an error that is not about one connection, instead of
+/// failing again at once, over and over.
 pub(crate) const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 
 /// What is answered: the upstream's body as it arrives, or nothing.
@@ -177,41 +177,55 @@ impl Proxy {
     /// returns; dropping the future stops accepting, and connections already accepted
     /// carry on.
     pub async fn serve(self: Arc<Self>, listener: usize, socket: TcpListener) {
-        let server = auto::Builder::new(TokioExecutor::new());
         loop {
-            let stream = match socket.accept().await {
-                Ok((stream, _)) => stream,
-                Err(error) => {
-                    if let Some(counters) = self.metrics.listener(listener) {
-                        counters.accept_errors.inc();
-                    }
-                    if !is_about_one_connection(&error) {
-                        tokio::time::sleep(ACCEPT_PAUSE).await;
-                    }
-                    continue;
+            match socket.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(Arc::clone(&self).serve_connection(listener, stream));
                 }
-            };
-            // Worth having, not worth refusing a connection over.
-            let _unset = stream.set_nodelay(true);
-
-            let connection = Arc::new(Connection::open(Arc::clone(&self), listener));
-            let server = server.clone();
-            tokio::spawn(async move {
-                // Every request clones a handle, as the engine wants futures that own what
-                // they use. A handle of the connection's own keeps that count off a line
-                // of cache that all the workers would otherwise write to.
-                let service = service_fn(move |request| {
-                    let connection = Arc::clone(&connection);
-                    async move {
-                        let response = connection.proxy.handle(listener, request).await;
-                        Ok::<_, Infallible>(response)
+                Err(error) => {
+                    if let Some(pause) = self.accept_failed(listener, &error) {
+                        tokio::time::sleep(pause).await;
                     }
-                });
-                // An error here is the end of one connection: the peer went away or spoke
-                // nonsense. There is nobody to tell.
-                let _closed = server.serve_connection(TokioIo::new(stream), service).await;
-            });
+                }
+            }
         }
+    }
+
+    /// Counts a failure to accept on the socket of the listener at position `listener`,
+    /// and says how long to wait before accepting again: not at all after the failure of
+    /// the one connection that was next in line, a moment after one that is not about a
+    /// connection — out of file descriptors, say — and would only happen again at once.
+    /// For whoever accepts by themselves and serves with [`Proxy::serve_connection`].
+    pub fn accept_failed(&self, listener: usize, error: &io::Error) -> Option<Duration> {
+        if let Some(counters) = self.metrics.listener(listener) {
+            counters.accept_errors.inc();
+        }
+        (!is_about_one_connection(error)).then_some(ACCEPT_PAUSE)
+    }
+
+    /// Serves one connection, to its end, as one of the listener at position `listener`
+    /// of [`Proxy::listeners`]. It may have been accepted anywhere — by another thread,
+    /// which then hands it over as a socket of the standard library — as long as `stream`
+    /// was made on the runtime that runs this.
+    pub async fn serve_connection(self: Arc<Self>, listener: usize, stream: TcpStream) {
+        // Worth having, not worth refusing a connection over.
+        let _unset = stream.set_nodelay(true);
+        let connection = Arc::new(Connection::open(self, listener));
+        // Every request clones a handle, as the engine wants futures that own what they
+        // use. A handle of the connection's own keeps that count off a line of cache that
+        // all the workers would otherwise write to.
+        let service = service_fn(move |request| {
+            let connection = Arc::clone(&connection);
+            async move {
+                let response = connection.proxy.handle(listener, request).await;
+                Ok::<_, Infallible>(response)
+            }
+        });
+        // An error here is the end of one connection: the peer went away or spoke
+        // nonsense. There is nobody to tell.
+        let _closed = auto::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(stream), service)
+            .await;
     }
 
     async fn handle(&self, listener: usize, request: Request<Incoming>) -> Response<Body> {

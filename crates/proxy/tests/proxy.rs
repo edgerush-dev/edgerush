@@ -886,3 +886,64 @@ async fn the_scrape_endpoint_serves_what_was_counted_and_nothing_else() {
     // Scrapes are not traffic: no listener counts them.
     assert_eq!(sample(&proxy.metrics(), web_2xx), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_accepted_on_one_thread_is_served_on_another() {
+    let up = upstream("up").await;
+    let proxy = Arc::new(Proxy::new(compiled(&everything_to(&[("web", up)], "0"))).unwrap());
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+
+    // A worker of its own: a thread with a runtime that is given connections, and serves
+    // each to its end.
+    let (hand_over, mut handed) = mpsc::channel::<std::net::TcpStream>(4);
+    let (served, was_served) = std::sync::mpsc::channel();
+    let worker = Arc::clone(&proxy);
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            while let Some(stream) = handed.recv().await {
+                let stream = TcpStream::from_std(stream).unwrap();
+                Arc::clone(&worker).serve_connection(0, stream).await;
+                served.send(std::thread::current().id()).unwrap();
+            }
+        });
+    });
+
+    // Accepted here, on the test's runtime, and handed over as a socket of the standard
+    // library's, which belongs to no runtime.
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = socket.accept().await.unwrap();
+            hand_over.send(stream.into_std().unwrap()).await.unwrap();
+        }
+    });
+
+    let (status, headers, _) = send(get(address, "/")).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["x-upstream"], "up");
+    // The client is gone, so the connection came to its end, where it was served.
+    let served_by = was_served.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_ne!(served_by, std::thread::current().id());
+    let accepted = "edgerush_listener_connections_accepted_total{listener=\"web\"}";
+    assert_eq!(sample(&proxy.metrics(), accepted), 1);
+}
+
+#[test]
+fn a_failure_to_accept_is_counted_and_only_some_are_waited_after() {
+    let proxy = Proxy::new(compiled(&everything_to(
+        &[("web", "127.0.0.1:1".parse().unwrap())],
+        "0",
+    )))
+    .unwrap();
+    let gone = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+    assert_eq!(proxy.accept_failed(0, &gone), None);
+    // Out of file descriptors: accepting again at once would fail again at once.
+    let exhausted = std::io::Error::other("too many open files");
+    assert!(proxy.accept_failed(0, &exhausted).is_some());
+    let errors = "edgerush_listener_accept_errors_total{listener=\"web\"}";
+    assert_eq!(sample(&proxy.metrics(), errors), 2);
+}
