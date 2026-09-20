@@ -91,17 +91,11 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
     let (one, two) = (upstream("one")?, upstream("two")?);
     let file = scratch("followed.yaml");
     std::fs::write(&file, config("127.0.0.1:0", "up", Some(one)))?;
-    let mut harness = Harness::start(&[
-        "--config",
-        &file,
-        "--metrics",
-        "127.0.0.1:0",
-        "--workers",
-        "2",
-    ])?;
+    // One worker, so that this runs wherever EdgeRush is developed: it is from the second
+    // on that the workers share a port, and only Unix deals connections out among them.
+    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
     let web = harness.address_after("listener \"web\" is on ");
-    let metrics = harness.address_after("metrics are on ");
-    harness.wait_for("2 workers, work-stealing");
+    harness.wait_for("1 worker, thread-per-core");
     assert!(get(web, "/")?.contains("x-upstream: one"));
 
     // Another config: it takes over without a restart.
@@ -124,25 +118,32 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
     harness.wait_for("warning: listener \"api\" is new");
     assert!(get(web, "/")?.contains("x-upstream: one"));
 
-    let scrape = get(metrics, "/metrics")?;
-    assert!(scrape.starts_with("HTTP/1.1 200 OK\r\n"), "{scrape}");
+    Ok(())
+}
+
+/// `/metrics` is not served while every worker counts alone, and the flag says so rather
+/// than serving one worker's numbers as if they were the pod's.
+#[test]
+fn metrics_are_refused_with_the_reason() -> io::Result<()> {
+    let file = scratch("no-metrics.yaml");
+    std::fs::write(&file, config("127.0.0.1:0", "up", None))?;
+    let output = edgerush(&["proxy", "--config", &file, "--metrics", "127.0.0.1:0"])?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        scrape.contains("edgerush_config_reloads_total 2\n"),
-        "{scrape}"
+        stderr.starts_with("error: '--metrics' is not served yet"),
+        "{stderr}"
     );
-    let served = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"} 4\n";
-    assert!(scrape.contains(served), "{scrape}");
     Ok(())
 }
 
 #[cfg(unix)]
 #[test]
-fn every_worker_of_thread_per_core_serves_the_file_and_follows_it() -> io::Result<()> {
+fn every_worker_serves_the_file_and_follows_it() -> io::Result<()> {
     let (one, two) = (upstream("one")?, upstream("two")?);
     let file = scratch("per-core.yaml");
     std::fs::write(&file, config("127.0.0.1:0", "up", Some(one)))?;
-    let model = ["--threading", "thread-per-core", "--workers", "3"];
-    let mut harness = Harness::start(&[&["--config", &file][..], &model[..]].concat())?;
+    let mut harness = Harness::start(&["--config", &file, "--workers", "3"])?;
     // One port for the sockets of all three, though the config left it open.
     let web = harness.address_after("listener \"web\" is on ");
     harness.wait_for("3 workers, thread-per-core");
@@ -159,12 +160,14 @@ fn every_worker_of_thread_per_core_serves_the_file_and_follows_it() -> io::Resul
     Ok(())
 }
 
+/// A second worker wants a second socket on the one port, which is `SO_REUSEPORT` and is
+/// not everywhere. One worker asks nothing of the kernel and runs anywhere.
 #[cfg(not(unix))]
 #[test]
-fn thread_per_core_does_not_start_where_a_port_cannot_be_shared() -> io::Result<()> {
+fn more_than_one_worker_does_not_start_where_a_port_cannot_be_shared() -> io::Result<()> {
     let file = scratch("per-core.yaml");
     std::fs::write(&file, config("127.0.0.1:0", "up", None))?;
-    let output = edgerush(&["proxy", "--config", &file, "--threading", "thread-per-core"])?;
+    let output = edgerush(&["proxy", "--config", &file, "--workers", "2"])?;
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.starts_with("error: cannot listen on "), "{stderr}");

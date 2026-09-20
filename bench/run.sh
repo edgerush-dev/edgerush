@@ -9,8 +9,8 @@
 #   bench/run.sh latency H1 H2 CHURN          open loop: latency at these request rates
 #   bench/run.sh summary DIR                  the table of a finished run
 #
-# The variants — EdgeRush in either threading model, and NGINX, HAProxy, Envoy and Kong set
-# up to do the same — are run in turns, REPS times, so that whatever drifts, heat above all, drifts
+# The variants — EdgeRush, and NGINX, HAProxy, Envoy and Kong set up to do the same
+# — are run in turns, REPS times, so that whatever drifts, heat above all, drifts
 # for all of them.
 set -euo pipefail
 
@@ -23,7 +23,7 @@ repo=$(dirname "$here")
 : "${BACKEND_CPUS:=3,7}"
 : "${DURATION:=30}"          # seconds of every measurement
 : "${REPS:=3}"
-: "${VARIANTS:=work-stealing thread-per-core}" # and: thread-per-core-kernel nginx haproxy envoy kong
+: "${VARIANTS:=thread-per-core}" # and: thread-per-core-kernel nginx haproxy envoy kong
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
 
 # Hundreds of connections on either side of the proxy, and more when they churn.
@@ -82,12 +82,12 @@ start_proxy() { # variant
     thread-per-core-kernel)
         # Connections left where the kernel put them: what balancing is measured against.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$here/proxy.yaml" \
-            --threading thread-per-core --accept kernel --workers "$WORKERS" \
+            --accept kernel --workers "$WORKERS" \
             2>>"$OUT/proxy.log" &
         ;;
     *)
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$here/proxy.yaml" \
-            --threading "$1" --workers "$WORKERS" 2>>"$OUT/proxy.log" &
+            --workers "$WORKERS" 2>>"$OUT/proxy.log" &
         ;;
     esac
     proxy_pid=${daemon:-$!}

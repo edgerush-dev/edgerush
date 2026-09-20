@@ -13,8 +13,9 @@ edgerush-proxy.workspace = true
 serde-saphyr.workspace = true
 socket2.workspace = true
 thiserror.workspace = true
-# "sync": the channels by which a worker is handed a connection.
-tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+# "sync": the channels by which a worker is handed a connection. Every worker runs a
+# single-threaded runtime, so the multi-thread one is not built.
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 proptest.workspace = true

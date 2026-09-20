@@ -37,7 +37,7 @@ machine with 4 cores and 8 threads where CPUs *n* and *n+4* are one core.
 
 ## The variants
 
-`VARIANTS` names what is run, in turns: `work-stealing`, `thread-per-core` and
+`VARIANTS` names what is run, in turns: `thread-per-core` and
 `thread-per-core-kernel` — the same without balancing connections at accept — (EdgeRush,
 `proxy.yaml`), `nginx` (`nginx-proxy.conf`), `haproxy` (`haproxy.cfg`), `envoy`
 (`envoy.yaml`) and `kong` (`kong.yml`, without a database). The configs ask for the same

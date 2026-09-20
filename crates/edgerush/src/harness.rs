@@ -2,15 +2,19 @@
 //! development and tests — in a cluster the config comes from the control plane.
 //!
 //! The file is the config model as it is, nothing added; what is about the process and not
-//! about routing (where `/metrics` is served) is on the command line. Listeners are bound
-//! once, at the start. After that the file is read again every [`POLL`] and a config that
-//! has changed takes over without dropping a request, while one that cannot be run is
-//! told and changes nothing.
+//! about routing (how many workers there are, whose a connection is) is on the command
+//! line. Listeners are bound once, at the start. After that the file is read again every
+//! [`POLL`] and a config that has changed takes over without dropping a request, while one
+//! that cannot be run is told and changes nothing.
 //!
-//! Both threading models that were measured against each other can be run
-//! ([`Threading`]). Thread-per-core is the one that was chosen, here still as the
-//! experiment made of what there was ([`crate::per_core`]): a whole data plane for every
-//! worker, which is what gives each its own upstream connections.
+//! Requests are served thread-per-core ([`crate::per_core`]), the model that was chosen
+//! from the benchmark ([03 §2] in the docs). What is here of it is still the experiment
+//! made of what there was: a whole data plane for every worker, which is what gives each
+//! its own upstream connections, and why `/metrics` is not served yet.
+//!
+//! Workers past the first share the port of every listener (`SO_REUSEPORT`), which only
+//! Unix has; a single worker has the port to itself and needs nothing of the kind, so
+//! that is the shape the harness runs in on Windows.
 
 use crate::bind::{Port, listen};
 use crate::config_file::{ConfigFile, Rejected};
@@ -25,8 +29,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tokio::net::TcpListener;
-use tokio::runtime::Builder;
 
 pub(crate) const USAGE: &str = "\
 Usage: edgerush proxy --config <FILE> [OPTIONS]
@@ -37,15 +39,13 @@ request. Listeners are bound once: one that is new or has moved takes a restart.
 
 Options:
       --config <FILE>      The config, in YAML
-      --metrics <ADDRESS>  Serve /metrics there, as in 127.0.0.1:9090 [default: nowhere]
-      --threading <MODEL>  work-stealing: one runtime whose workers share everything;
-                           thread-per-core: for every worker a runtime, sockets on shared
-                           ports (SO_REUSEPORT) and upstream connections of its own, and
-                           no /metrics [default: work-stealing]
-      --accept <BY>        With thread-per-core, whose a new connection is. balanced: the
-                           worker that holds the fewest; kernel: the one the kernel gave
-                           it to, by its hash of the addresses [default: balanced]
-      --workers <N>        How many threads serve requests [default: one for every CPU]
+      --metrics <ADDRESS>  Not served yet: every worker still counts alone
+      --accept <BY>        Whose a new connection is. balanced: the worker that holds the
+                           fewest; kernel: the one the kernel gave it to, by its hash of
+                           the addresses [default: balanced]
+      --workers <N>        How many threads serve requests. More than one shares every
+                           listener's port, which needs SO_REUSEPORT (Unix)
+                           [default: one for every CPU]
   -h, --help               Print help
 ";
 
@@ -79,23 +79,9 @@ enum Parsed {
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
     config: PathBuf,
-    metrics: Option<SocketAddr>,
-    threading: Threading,
     /// `None` is one for every CPU the process may use.
     workers: Option<NonZeroUsize>,
     accept: Accept,
-}
-
-/// How the threads that serve requests share the work ([03 §2] in the docs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Threading {
-    /// One runtime: connections are accepted in one place and their tasks move to
-    /// whichever worker has time. One data plane, one pool of upstream connections.
-    WorkStealing,
-    /// A single-threaded runtime for every worker, each with a socket of its own on
-    /// every listener's port and a data plane of its own: a connection stays with the
-    /// worker the kernel gave it to, and so do the upstream connections it uses.
-    ThreadPerCore,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -110,22 +96,19 @@ enum UsageError {
     NoConfig,
     #[error("'{0}' is not an address to listen on, such as 127.0.0.1:9090")]
     Address(String),
-    #[error("'{0}' is not a threading model: work-stealing or thread-per-core")]
-    Threading(String),
     #[error("'{0}' is not a number of workers: 1 or more")]
     Workers(String),
-    #[error("'--metrics' is not served with thread-per-core, where every worker counts alone")]
-    MetricsPerCore,
+    #[error(
+        "'--metrics' is not served yet: every worker counts alone, so no one number is the pod's"
+    )]
+    MetricsNotYet,
     #[error("'{0}' is not a way to place connections: balanced or kernel")]
     Accept(String),
-    #[error("'--accept' is for thread-per-core: work-stealing has all connections in one place")]
-    AcceptPerCore,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut config = None;
-    let mut metrics = None;
-    let mut threading = None;
+    let mut metrics: Option<SocketAddr> = None;
     let mut workers = None;
     let mut accept = None;
     while let Some(arg) = args.next() {
@@ -142,17 +125,6 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                 let address = address.parse().map_err(|_| UsageError::Address(address))?;
                 if metrics.replace(address).is_some() {
                     return Err(UsageError::Twice("--metrics"));
-                }
-            }
-            "--threading" => {
-                let model = args.next().ok_or(UsageError::NoValue("--threading"))?;
-                let model = match model.as_str() {
-                    "work-stealing" => Threading::WorkStealing,
-                    "thread-per-core" => Threading::ThreadPerCore,
-                    _ => return Err(UsageError::Threading(model)),
-                };
-                if threading.replace(model).is_some() {
-                    return Err(UsageError::Twice("--threading"));
                 }
             }
             "--workers" => {
@@ -177,17 +149,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         }
     }
     let config = config.ok_or(UsageError::NoConfig)?;
-    let threading = threading.unwrap_or(Threading::WorkStealing);
-    if threading == Threading::ThreadPerCore && metrics.is_some() {
-        return Err(UsageError::MetricsPerCore);
-    }
-    if threading == Threading::WorkStealing && accept.is_some() {
-        return Err(UsageError::AcceptPerCore);
+    // Parsed, so that a misspelt address is still told apart from a missing one, and then
+    // refused: there is no one set of counters to serve while every worker keeps its own.
+    if metrics.is_some() {
+        return Err(UsageError::MetricsNotYet);
     }
     Ok(Parsed::Run(Options {
         config,
-        metrics,
-        threading,
         workers,
         accept: accept.unwrap_or(Accept::Balanced),
     }))
@@ -213,20 +181,21 @@ enum Failure {
 fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure> {
     let Options {
         config: path,
-        metrics,
-        threading,
         workers,
         accept,
     } = options;
     let workers = workers
         .or_else(|| thread::available_parallelism().ok())
         .unwrap_or(NonZeroUsize::MIN);
-    let (data_planes, port) = match threading {
-        Threading::WorkStealing => (NonZeroUsize::MIN, Port::Own),
-        Threading::ThreadPerCore => (workers, Port::Shared),
+    // One worker is alone on every listener's port and needs nothing of the kernel; it is
+    // from the second on that they share one, which is what SO_REUSEPORT is for.
+    let port = if workers == NonZeroUsize::MIN {
+        Port::Own
+    } else {
+        Port::Shared
     };
 
-    let (mut file, configs) = match ConfigFile::open(path.clone(), data_planes) {
+    let (mut file, configs) = match ConfigFile::open(path.clone(), workers) {
         Ok(opened) => opened,
         Err(rejected) => return Err(Failure::Config { path, rejected }),
     };
@@ -255,9 +224,6 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
         }
         sockets.push(of_this_one);
     }
-    let metrics = metrics
-        .map(|address| open("metrics".to_owned(), address, Port::Own).map(|s| (s, address)))
-        .transpose()?;
 
     for listener in &bound {
         say(
@@ -268,39 +234,16 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
             ),
         );
     }
-    // A runtime with workers of its own runs by being there, for as long as it is there.
-    let _running = match threading {
-        Threading::WorkStealing => {
-            let runtime = Builder::new_multi_thread()
-                .worker_threads(workers.get())
-                .enable_all()
-                .build()
-                .map_err(Failure::Runtime)?;
-            // Sockets are handed to the runtime that is entered.
-            let entered = runtime.enter();
-            for (proxy, sockets) in proxies.iter().zip(sockets) {
-                for (position, socket) in sockets.into_iter().enumerate() {
-                    let socket = TcpListener::from_std(socket).map_err(Failure::Runtime)?;
-                    runtime.spawn(Arc::clone(proxy).serve(position, socket));
-                }
-            }
-            if let (Some((socket, address)), Some(proxy)) = (metrics, proxies.first()) {
-                let address = socket.local_addr().unwrap_or(address);
-                let socket = TcpListener::from_std(socket).map_err(Failure::Runtime)?;
-                runtime.spawn(Arc::clone(proxy).serve_metrics(socket));
-                say(stderr, format_args!("metrics are on {address}"));
-            }
-            drop(entered);
-            Some(runtime)
-        }
-        Threading::ThreadPerCore => {
-            per_core::start(&proxies, sockets, accept).map_err(Failure::Runtime)?;
-            None
-        }
+    // Every worker runs on a thread of its own, which stays for as long as the process.
+    per_core::start(&proxies, sockets, accept).map_err(Failure::Runtime)?;
+    let plural = if workers == NonZeroUsize::MIN {
+        ""
+    } else {
+        "s"
     };
     say(
         stderr,
-        format_args!("{} workers, {}", workers, threading.name()),
+        format_args!("{workers} worker{plural}, thread-per-core"),
     );
 
     loop {
@@ -339,15 +282,6 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
         }
         for warning in warnings {
             say(stderr, format_args!("warning: {warning}"));
-        }
-    }
-}
-
-impl Threading {
-    fn name(self) -> &'static str {
-        match self {
-            Self::WorkStealing => "work-stealing",
-            Self::ThreadPerCore => "thread-per-core",
         }
     }
 }
@@ -427,8 +361,6 @@ mod tests {
     fn a_config_is_all_that_is_needed() {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
-            metrics: None,
-            threading: Threading::WorkStealing,
             workers: None,
             accept: Accept::Balanced,
         };
@@ -436,57 +368,48 @@ mod tests {
     }
 
     #[test]
-    fn metrics_are_served_where_the_command_line_says() {
+    fn the_workers_are_as_the_command_line_says() {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
-            metrics: Some("[::]:9090".parse().unwrap()),
-            threading: Threading::WorkStealing,
-            workers: None,
-            accept: Accept::Balanced,
-        };
-        assert_eq!(
-            parsed(&["--metrics", "[::]:9090", "--config", "dev.yaml"]),
-            Ok(Parsed::Run(options))
-        );
-    }
-
-    #[test]
-    fn the_threading_model_and_the_workers_are_as_the_command_line_says() {
-        let options = Options {
-            config: PathBuf::from("dev.yaml"),
-            metrics: None,
-            threading: Threading::ThreadPerCore,
             workers: NonZeroUsize::new(4),
             accept: Accept::Balanced,
         };
-        let args = ["--config", "dev.yaml", "--workers", "4"];
         assert_eq!(
-            parsed(&[&args[..], &["--threading", "thread-per-core"]].concat()),
+            parsed(&["--config", "dev.yaml", "--workers", "4"]),
             Ok(Parsed::Run(options))
         );
-        let Ok(Parsed::Run(options)) =
-            parsed(&[&args[..], &["--threading", "work-stealing"]].concat())
-        else {
-            panic!("a command line that can be run");
-        };
-        assert_eq!(options.threading, Threading::WorkStealing);
     }
 
     #[test]
     fn connections_are_balanced_unless_they_are_left_to_the_kernel() {
-        let per_core = ["--config", "dev.yaml", "--threading", "thread-per-core"];
-        let Ok(Parsed::Run(options)) = parsed(&[&per_core[..], &["--accept", "kernel"]].concat())
+        let config = ["--config", "dev.yaml"];
+        let Ok(Parsed::Run(options)) = parsed(&[&config[..], &["--accept", "kernel"]].concat())
         else {
             panic!("a command line that can be run");
         };
         assert_eq!(options.accept, Accept::Kernel);
+        let Ok(Parsed::Run(options)) = parsed(&[&config[..], &["--accept", "balanced"]].concat())
+        else {
+            panic!("a command line that can be run");
+        };
+        assert_eq!(options.accept, Accept::Balanced);
         assert_eq!(
-            parsed(&[&per_core[..], &["--accept", "luck"]].concat()),
+            parsed(&[&config[..], &["--accept", "luck"]].concat()),
             Err(UsageError::Accept("luck".to_owned()))
         );
+    }
+
+    #[test]
+    fn metrics_are_refused_while_every_worker_counts_alone() {
+        // The address is still read, so that a misspelt one is told apart from the flag
+        // itself not being served yet.
         assert_eq!(
-            parsed(&["--config", "dev.yaml", "--accept", "balanced"]),
-            Err(UsageError::AcceptPerCore)
+            parsed(&["--config", "dev.yaml", "--metrics", "[::]:9090"]),
+            Err(UsageError::MetricsNotYet)
+        );
+        assert_eq!(
+            parsed(&["--config", "dev.yaml", "--metrics", "localhost:9090"]),
+            Err(UsageError::Address("localhost:9090".to_owned()))
         );
     }
 
@@ -513,16 +436,16 @@ mod tests {
             Err(UsageError::Twice("--config"))
         );
         assert_eq!(
-            parsed(&["--config", "a.yaml", "--metrics", "localhost:9090"]),
-            Err(UsageError::Address("localhost:9090".to_owned()))
-        );
-        assert_eq!(
             parsed(&["a.yaml"]),
             Err(UsageError::Unexpected("a.yaml".to_owned()))
         );
         assert_eq!(
-            parsed(&["--config", "a.yaml", "--threading", "fibers"]),
-            Err(UsageError::Threading("fibers".to_owned()))
+            parsed(&["--config", "a.yaml", "--accept"]),
+            Err(UsageError::NoValue("--accept"))
+        );
+        assert_eq!(
+            parsed(&["--config", "a.yaml", "--workers", "1", "--workers", "2"]),
+            Err(UsageError::Twice("--workers"))
         );
         for workers in ["0", "-1", "many"] {
             assert_eq!(
@@ -530,17 +453,6 @@ mod tests {
                 Err(UsageError::Workers(workers.to_owned()))
             );
         }
-        assert_eq!(
-            parsed(&[
-                "--config",
-                "a.yaml",
-                "--threading",
-                "thread-per-core",
-                "--metrics",
-                "[::]:9090"
-            ]),
-            Err(UsageError::MetricsPerCore)
-        );
     }
 
     #[test]
