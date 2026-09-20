@@ -16,6 +16,7 @@ use super::codec::{
     Asked, BodyReader, BodyWriter, CodecError, Delivery, Framing, Head, HeadReader, Piece,
     ResponseHead, Sending, Trailers, delivery, write_head,
 };
+use super::pool::Lease;
 use http::{HeaderMap, Method, StatusCode, Uri};
 use hyper::body::{Body, Bytes, Frame, SizeHint};
 use std::error::Error as StdError;
@@ -365,6 +366,9 @@ pub struct H1Body<S> {
     /// What the head said about carrying another exchange, and whether the request it
     /// answered went out whole. Both are settled before a byte of this body is read.
     may_reuse: bool,
+    /// Where this connection came from, and where it may go back to. Absent for a body
+    /// on a connection that was never leased from anywhere.
+    returner: Option<Lease<S>>,
 }
 
 impl<S> H1Body<S> {
@@ -395,7 +399,15 @@ impl<S> H1Body<S> {
             discarded: 0,
             waiting: None,
             may_reuse,
+            returner: None,
         }
+    }
+
+    /// The same, on a connection that came out of a pool and may go back to it.
+    #[must_use]
+    pub fn returning_to(mut self, lease: Lease<S>) -> Self {
+        self.returner = Some(lease);
+        self
     }
 
     /// Whether the whole body arrived and every check on it passed.
@@ -449,7 +461,10 @@ impl<S> H1Body<S> {
         if !nothing_to_say(&mut socket) {
             return None;
         }
-        Some(Kept { socket })
+        Some(Kept {
+            socket,
+            returner: self.returner.take(),
+        })
     }
 
     /// What is left of the connection whatever state it is in, for a caller that means to
@@ -583,10 +598,20 @@ impl<S: AsyncRead + Unpin> Body for H1Body<S> {
 #[derive(Debug)]
 pub struct Kept<S> {
     socket: S,
+    returner: Option<Lease<S>>,
 }
 
 impl<S> Kept<S> {
-    /// The connection itself, to be handed to a pool.
+    /// Puts the connection back where it came from. A connection that came from nowhere
+    /// goes nowhere: it is closed here, which is the only other thing to do with one.
+    pub fn put_back(self, limits: &H1Limits) {
+        match self.returner {
+            Some(lease) => lease.keep(self.socket, limits),
+            None => drop(self.socket),
+        }
+    }
+
+    /// The connection itself, for a caller that means to do something else with it.
     pub fn into_socket(self) -> S {
         self.socket
     }

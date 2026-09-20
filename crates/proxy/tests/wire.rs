@@ -73,7 +73,9 @@ upstreams:
         let local = tokio::task::LocalSet::new();
         let entered = runtime.enter();
         let socket = TcpListener::from_std(socket).unwrap();
-        local.spawn_local(Worker::new(proxy).serve(0, socket));
+        let worker = Worker::new(proxy);
+        local.spawn_local(std::rc::Rc::clone(&worker).maintain());
+        local.spawn_local(worker.serve(0, socket));
         drop(entered);
         runtime.block_on(local);
     });

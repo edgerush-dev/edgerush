@@ -69,6 +69,8 @@ pub struct H1Limits {
     pub max_age: Duration,
     /// How often a worker looks over what it is keeping.
     pub sweep: Duration,
+    /// How long opening a connection to an upstream may take before it is given up on.
+    pub connect: Duration,
 }
 
 impl Default for H1Limits {
@@ -89,6 +91,7 @@ impl Default for H1Limits {
             idle_timeout: Duration::from_secs(30),
             max_age: Duration::from_secs(5 * 60),
             sweep: Duration::from_secs(1),
+            connect: Duration::from_secs(5),
         }
     }
 }

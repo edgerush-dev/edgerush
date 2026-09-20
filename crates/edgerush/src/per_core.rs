@@ -96,11 +96,14 @@ pub(crate) fn start(
             .spawn(move || {
                 let local = LocalSet::new();
                 let entered = runtime.enter();
+                // The upstream connections of this worker and of no other, made where
+                // they are used: nothing about them can leave this thread.
+                let plane = edgerush_proxy::Worker::new(proxy);
+                // One sweep for the worker, beside its listeners, for as long as it runs.
+                local.spawn_local(Rc::clone(&plane).maintain());
                 let worker = Worker {
                     position,
-                    // The upstream connections of this worker and of no other, made where
-                    // they are used: nothing about them can leave this thread.
-                    plane: edgerush_proxy::Worker::new(proxy),
+                    plane,
                     loads,
                     workers: senders,
                     accept,

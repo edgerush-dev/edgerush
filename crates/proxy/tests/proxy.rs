@@ -132,6 +132,7 @@ fn on_a_worker(proxy: Arc<Proxy>, sockets: Vec<(usize, std::net::TcpListener)>) 
         let local = tokio::task::LocalSet::new();
         let entered = runtime.enter();
         let worker = Worker::new(proxy);
+        local.spawn_local(Rc::clone(&worker).maintain());
         for (position, socket) in sockets {
             let socket = TcpListener::from_std(socket).unwrap();
             local.spawn_local(Rc::clone(&worker).serve(position, socket));

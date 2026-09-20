@@ -178,6 +178,22 @@ pub struct Lease<S> {
 }
 
 impl<S> Lease<S> {
+    /// A lease on a connection that is in use elsewhere — inside an exchange, or inside
+    /// the body of the answer it is reading. It holds no connection itself; what it holds
+    /// is where the one being used came from and where it may go back to.
+    pub fn in_use(
+        identity: Arc<ReuseIdentity>,
+        opened: Instant,
+        pool: &Rc<RefCell<Pool<S>>>,
+    ) -> Self {
+        Self {
+            socket: None,
+            identity,
+            opened,
+            pool: Rc::downgrade(pool),
+        }
+    }
+
     /// A lease on `socket`, which was opened to `identity` at `opened`.
     pub fn new(
         socket: S,

@@ -19,12 +19,16 @@ use crate::hop_by_hop::strip_response;
 use crate::metrics::{Answer, Metrics};
 use crate::random::random;
 use crate::request::decide;
-use crate::upstream::destination::{Destinations, Keys};
+use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
+use crate::upstream::h1::H1Limits;
+use crate::upstream::h1::codec::{ResponseHead, Sending};
+use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body};
+use crate::upstream::h1::pool::{Lease, Pool};
 use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRule};
 use http::request::Parts;
 use http::uri::{Authority, Scheme};
-use http::{Request, Response, Uri, Version};
+use http::{HeaderMap, Method, Request, Response, Uri, Version};
 use hyper::body::{Body as HttpBody, Bytes, Frame, Incoming, SizeHint};
 use hyper::rt::Executor;
 use hyper::service::service_fn;
@@ -32,6 +36,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
+use std::cell::RefCell;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
@@ -42,8 +47,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::Instant;
 
 /// How long accepting pauses after an error that is not about one connection, instead of
 /// failing again at once, over and over.
@@ -147,6 +153,10 @@ pub struct Worker {
     /// One for the life of the worker: a reload does not throw warm connections away.
     /// Those to an endpoint that is no longer used grow idle and are closed.
     client: Client<HttpConnector, Incoming>,
+    /// The connections this worker keeps by EdgeRush's own path, which is a candidate
+    /// beside the engine's client and carries nothing yet.
+    pool: Rc<RefCell<Pool<TcpStream>>>,
+    limits: H1Limits,
 }
 
 /// A compiled config and what the data plane works out from it, once, when it arrives.
@@ -310,7 +320,105 @@ impl Worker {
         let client = Client::builder(TokioExecutor::new())
             .pool_timer(TokioTimer::new())
             .build(connector);
-        Rc::new(Self { proxy, client })
+        Rc::new(Self {
+            proxy,
+            client,
+            pool: Rc::new(RefCell::new(Pool::default())),
+            limits: H1Limits::default(),
+        })
+    }
+
+    /// Looks over the connections this worker is keeping, for as long as it runs.
+    ///
+    /// One sweep for the worker rather than a timer for every connection, and it is what
+    /// clears out a destination that a reload took away and that nothing will ask for
+    /// again ([13 §3](../../docs/13-http1-upstream.md)). Spawned into the worker's
+    /// `LocalSet` beside its listeners; a worker without it keeps what it should drop.
+    pub async fn maintain(self: Rc<Self>) {
+        let every = self.limits.sweep;
+        loop {
+            tokio::time::sleep(every).await;
+            // Borrowed for the sweep and let go of before anything is waited on again.
+            let swept = self.pool.borrow_mut().sweep(&self.limits);
+            let _counted_when_there_are_counters = swept;
+        }
+    }
+
+    /// How many connections this worker is keeping. For tests and, later, a gauge.
+    #[must_use]
+    pub fn idle_connections(&self) -> usize {
+        self.pool.borrow().idle()
+    }
+
+    /// Sends a request by EdgeRush's own path and returns the answer's head and body.
+    ///
+    /// A connection comes out of the pool where there is one to use, and is opened where
+    /// there is not; either way the answer's body carries the way back, and the
+    /// connection returns only if the body earns it ([13 §6](../../docs/13-http1-upstream.md)).
+    ///
+    /// # Errors
+    ///
+    /// Anything the upstream said that cannot be read, or a connection that could not be
+    /// opened, failed or closed without answering.
+    // Its own tests reach it; nothing else does until a request can be told to take this
+    // path. Said only of the build where that is true, so the day it gains a caller the
+    // compiler says this line has served its purpose.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no request takes this path until it can be selected"
+        )
+    )]
+    async fn through_h1<B>(
+        &self,
+        identity: &Arc<ReuseIdentity>,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        sending: Sending,
+        body: B,
+    ) -> Result<(ResponseHead, H1Body<TcpStream>), ExchangeError>
+    where
+        B: HttpBody<Data = Bytes>,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        // Bound in its own statement, so the pool is not still borrowed when the connect
+        // below is waited on.
+        let found = self.pool.borrow_mut().take(identity, &self.limits);
+        let (socket, opened) = match found {
+            Some(reused) => reused,
+            None => {
+                let opening = TcpStream::connect(identity.address());
+                let socket = match tokio::time::timeout(self.limits.connect, opening).await {
+                    Ok(socket) => socket?,
+                    Err(_) => return Err(ExchangeError::Io(io::ErrorKind::TimedOut.into())),
+                };
+                // Worth having, not worth refusing an upstream over.
+                let _unset = socket.set_nodelay(true);
+                (socket, Instant::now())
+            }
+        };
+
+        let mut exchange = Exchange::new(socket);
+        let answer = exchange
+            .send(method, uri, headers, sending, body, &self.limits)
+            .await?;
+        let (socket, buffered) = exchange.into_body_parts();
+
+        // What the head allowed, and a request that finished going out. Settled here
+        // because neither can be worked out from the body afterwards.
+        let may_reuse = answer.delivery.persistent && !answer.cut_short_the_request;
+        let lease = Lease::in_use(Arc::clone(identity), opened, &self.pool);
+        let body = H1Body::new(
+            socket,
+            buffered,
+            answer.delivery.framing,
+            may_reuse,
+            self.limits,
+        )
+        .returning_to(lease);
+        Ok((answer.head, body))
     }
 
     /// What this worker serves: the data plane the whole process shares.
@@ -659,6 +767,105 @@ mod tests {
         assert_eq!(filed_under(&proxy, 1), web, "web changed hands on a reload");
         assert_ne!(filed_under(&proxy, 0), web, "the newcomer took web's place");
         assert!(zed.is_retired(), "an upstream that is gone was left live");
+    }
+
+    /// An upstream that answers every request on whatever connection it arrives on, and
+    /// counts how many connections it was given. Its answers are bytes, so that what is
+    /// read back is what really went over the wire.
+    async fn counting_upstream() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = Arc::clone(&opened);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = socket.accept().await.unwrap();
+                counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    // One request after another on the one connection.
+                    let mut seen = Vec::new();
+                    let mut byte = [0; 1];
+                    loop {
+                        match stream.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => seen.push(byte[0]),
+                        }
+                        if seen.ends_with(b"\r\n\r\n") {
+                            seen.clear();
+                            let answer = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+                            if stream.write_all(answer.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (address, opened)
+    }
+
+    /// Reads a body to its end and says whether its connection went back.
+    async fn drain(mut body: H1Body<TcpStream>, limits: &H1Limits) -> (Vec<u8>, bool) {
+        use http_body_util::BodyExt;
+
+        let mut data = Vec::new();
+        while let Some(frame) = body.frame().await {
+            if let Ok(bytes) = frame.unwrap().into_data() {
+                data.extend_from_slice(&bytes);
+            }
+        }
+        match body.into_reusable() {
+            Some(kept) => {
+                kept.put_back(limits);
+                (data, true)
+            }
+            None => (data, false),
+        }
+    }
+
+    /// **The whole path.** A request goes out on a connection opened for it, the answer
+    /// is read to its end, the connection goes back, and the next request is given the
+    /// same one — which the upstream can see, because it was only ever accepted once.
+    #[tokio::test]
+    async fn a_connection_that_finished_carries_the_next_request_too() {
+        let (upstream, opened) = counting_upstream().await;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let config = upstreams(&[("web", &upstream.to_string())]);
+                let proxy = Arc::new(Proxy::new(config, NonZeroUsize::MIN).unwrap());
+                let worker = Worker::new(Arc::clone(&proxy));
+                let identity = Arc::clone(proxy.current.load().destinations.at(0, 0).unwrap());
+
+                for round in 0..3 {
+                    let (head, body) = worker
+                        .through_h1(
+                            &identity,
+                            &Method::GET,
+                            &"/x".parse().unwrap(),
+                            &HeaderMap::new(),
+                            Sending::None,
+                            http_body_util::Empty::<Bytes>::new(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(head.status, 200, "round {round}");
+
+                    let (data, went_back) = drain(body, &worker.limits).await;
+                    assert_eq!(data, b"ok", "round {round}");
+                    assert!(went_back, "round {round} did not put its connection back");
+                    assert_eq!(worker.idle_connections(), 1, "round {round}");
+                }
+
+                assert_eq!(
+                    opened.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "the upstream was given a new connection for a later request"
+                );
+            })
+            .await;
     }
 
     fn authorities(addresses: &[&str]) -> Vec<Authority> {
