@@ -405,6 +405,116 @@ fn says_close(headers: &HeaderMap) -> Result<bool, CodecError> {
     Ok(closing)
 }
 
+/// The names that do not travel on as trailers.
+///
+/// This is the gateway's forwarding policy, not a register of every field whose own
+/// specification forbids it in a trailer section. What is not named here and parses is
+/// passed on untouched and uninterpreted — `grpc-status` and the digest fields among
+/// them — because a gateway that drops what it does not recognise is a gateway nobody can
+/// build on. Nor is the whole of a family denied: `Authentication-Info` is end-to-end and
+/// may be a trailer where its scheme allows one.
+///
+/// Grouped by why each is denied rather than by alphabet, because the reason is the part
+/// worth reading. Walked through rather than searched: it is short, and it is only ever
+/// consulted for a chunked answer that really carries trailers. The names are lower case,
+/// as a parsed field name always is.
+const DENIED_TRAILERS: &[&str] = &[
+    // Framing and routing. A trailer cannot reach back and change how the message it
+    // belongs to was delimited, so these are dropped without their values being read.
+    "content-length",
+    "host",
+    "trailer",
+    "transfer-encoding",
+    // About the connection this arrived on, which is not the connection it goes out on.
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "upgrade",
+    // Credentials and challenges, which belong to a head where they can be acted on.
+    "authorization",
+    "cookie",
+    "proxy-authenticate",
+    "proxy-authentication-info",
+    "proxy-authorization",
+    "set-cookie",
+    "www-authenticate",
+    // About the content, which a recipient has already begun to act on by now.
+    "content-encoding",
+    "content-range",
+    "content-type",
+    // Control of the response, which is likewise decided by the time these could arrive.
+    "age",
+    "cache-control",
+    "date",
+    "expires",
+    "location",
+    "pragma",
+    "retry-after",
+    "vary",
+    "warning",
+    // Conditions and expectations, which are a request's business and already settled.
+    "expect",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-range",
+    "if-unmodified-since",
+    "max-forwards",
+    "range",
+];
+
+/// What a trailer section came to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct Trailers {
+    /// The ones that travel on, their values as they came.
+    pub(crate) fields: HeaderMap,
+    /// How many were dropped, for a counter to add up. A number and never a name: a
+    /// series labelled with what a backend sent is a series a backend can invent.
+    pub(crate) discarded: usize,
+}
+
+/// Whether a field may not travel on as a trailer: one of the named set, or one this
+/// message's own `Connection` nominated, which makes it hop-by-hop for this hop alone.
+fn is_denied(name: &HeaderName, nominated: &[HeaderName]) -> bool {
+    DENIED_TRAILERS.contains(&name.as_str()) || nominated.contains(name)
+}
+
+/// Takes the denied names out of a `Trailer` declaration, leaving one that says only what
+/// will really arrive, and takes the declaration away altogether when nothing will.
+///
+/// Doing this to the declaration is not doing it to the trailers: both are filtered, and
+/// a permitted trailer that was never declared is still passed on.
+pub(crate) fn filter_declaration(headers: &mut HeaderMap, nominated: &[HeaderName]) {
+    let declared: Vec<HeaderValue> = headers
+        .get_all(http::header::TRAILER)
+        .iter()
+        .cloned()
+        .collect();
+    if declared.is_empty() {
+        return;
+    }
+    let mut kept: Vec<String> = Vec::new();
+    for value in &declared {
+        for name in crate::hop_by_hop::options(value) {
+            // A name that is no name declares nothing, and goes the way of the rest.
+            let Ok(name) = HeaderName::from_bytes(name) else {
+                continue;
+            };
+            if !is_denied(&name, nominated) {
+                kept.push(name.as_str().to_owned());
+            }
+        }
+    }
+    headers.remove(http::header::TRAILER);
+    if kept.is_empty() {
+        return;
+    }
+    if let Ok(value) = HeaderValue::from_str(&kept.join(", ")) {
+        headers.insert(http::header::TRAILER, value);
+    }
+}
+
 /// A piece of a body, as it is read.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Piece {
@@ -416,7 +526,7 @@ pub(crate) enum Piece {
     /// The body is whole. `trailers` is `Some` only for a chunked body, which may carry
     /// them; they are frames of their own and are never folded into the head's fields.
     End {
-        trailers: Option<HeaderMap>,
+        trailers: Option<Trailers>,
         consumed: usize,
     },
 }
@@ -446,6 +556,9 @@ enum State {
 pub(crate) struct BodyReader {
     framing: Framing,
     state: State,
+    /// The names this message's `Connection` nominated. Taken from the head before it was
+    /// stripped, because afterwards there is nothing left to take them from.
+    nominated: Vec<HeaderName>,
 }
 
 impl BodyReader {
@@ -457,7 +570,20 @@ impl BodyReader {
             Framing::Length(left) => State::Data { left },
             Framing::UntilClose => State::Data { left: u64::MAX },
         };
-        Self { framing, state }
+        Self {
+            framing,
+            state,
+            nominated: Vec::new(),
+        }
+    }
+
+    /// The same, for a message whose `Connection` nominated these names: they are
+    /// hop-by-hop for this hop and do not travel on among its trailers either.
+    pub(crate) fn nominating(framing: Framing, nominated: Vec<HeaderName>) -> Self {
+        Self {
+            nominated,
+            ..Self::new(framing)
+        }
     }
 
     /// Whether the whole body has been read. Only then may the connection be kept.
@@ -593,7 +719,7 @@ impl BodyReader {
                 Ok(Piece::More)
             };
         };
-        let trailers = fields(&bytes[..end], limits)?;
+        let trailers = fields(&bytes[..end], &self.nominated, limits)?;
         self.state = State::Done;
         Ok(Piece::End {
             trailers: Some(trailers),
@@ -726,7 +852,16 @@ fn section(bytes: &[u8], bound: usize) -> Result<Option<usize>, CodecError> {
 }
 
 /// The fields of a trailer section, which is a head's fields without a status line.
-fn fields(section: &[u8], limits: &H1Limits) -> Result<HeaderMap, CodecError> {
+///
+/// Every one of them is parsed and counted before any is dropped, so that a section that
+/// is malformed or past its bounds is caught whether or not its fields would have been
+/// kept. Only then is the deny set applied, and applying it fails nothing: a message that
+/// was framed correctly is not thrown away over a footer that may not travel.
+fn fields(
+    section: &[u8],
+    nominated: &[HeaderName],
+    limits: &H1Limits,
+) -> Result<Trailers, CodecError> {
     let mut room = [httparse::EMPTY_HEADER; MOST_FIELDS];
     let room = &mut room[..limits.trailer_fields.min(MOST_FIELDS)];
     let parsed = match httparse::parse_headers(section, room) {
@@ -739,13 +874,22 @@ fn fields(section: &[u8], limits: &H1Limits) -> Result<HeaderMap, CodecError> {
         }
         Err(error) => return Err(CodecError::Malformed(reason(error))),
     };
-    let mut trailers = HeaderMap::with_capacity(parsed.len());
+    let mut trailers = Trailers {
+        fields: HeaderMap::with_capacity(parsed.len()),
+        discarded: 0,
+    };
     for field in parsed {
         let name = HeaderName::from_bytes(field.name.as_bytes())
             .map_err(|_| CodecError::Malformed("a trailer name is not one"))?;
         let value = HeaderValue::from_bytes(field.value)
             .map_err(|_| CodecError::Malformed("a trailer value is not one"))?;
-        trailers.append(name, value);
+        if is_denied(&name, nominated) {
+            // Dropped without its value being looked at: a length here says nothing about
+            // a body whose end has already been found.
+            trailers.discarded += 1;
+            continue;
+        }
+        trailers.fields.append(name, value);
     }
     Ok(trailers)
 }
@@ -1276,7 +1420,7 @@ mod tests {
         framing: Framing,
         bytes: &[u8],
         ended: bool,
-    ) -> Result<(Vec<u8>, Option<HeaderMap>), CodecError> {
+    ) -> Result<(Vec<u8>, Option<Trailers>), CodecError> {
         read_in_pieces(framing, bytes, ended, &H1Limits::default())
     }
 
@@ -1286,8 +1430,24 @@ mod tests {
         bytes: &[u8],
         ended: bool,
         limits: &H1Limits,
-    ) -> Result<(Vec<u8>, Option<HeaderMap>), CodecError> {
-        let mut reader = BodyReader::new(framing);
+    ) -> Result<(Vec<u8>, Option<Trailers>), CodecError> {
+        drive(&mut BodyReader::new(framing), bytes, ended, limits)
+    }
+
+    /// Drives a reader the caller made to the end of its body.
+    fn to_the_end(
+        reader: &mut BodyReader,
+        bytes: &[u8],
+    ) -> Result<(Vec<u8>, Option<Trailers>), CodecError> {
+        drive(reader, bytes, false, &H1Limits::default())
+    }
+
+    fn drive(
+        reader: &mut BodyReader,
+        bytes: &[u8],
+        ended: bool,
+        limits: &H1Limits,
+    ) -> Result<(Vec<u8>, Option<Trailers>), CodecError> {
         let mut left = bytes;
         let mut delivered = Vec::new();
         loop {
@@ -1375,14 +1535,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body, b"hello th");
-        assert_eq!(trailers, Some(HeaderMap::new()));
+        assert_eq!(trailers, Some(Trailers::default()));
     }
 
     #[test]
     fn a_chunked_body_of_nothing_is_the_zero_chunk_alone() {
         let (body, trailers) = body_of(Framing::Chunked, b"0\r\n\r\n", false).unwrap();
         assert!(body.is_empty());
-        assert_eq!(trailers, Some(HeaderMap::new()));
+        assert_eq!(trailers, Some(Trailers::default()));
     }
 
     #[test]
@@ -1391,8 +1551,9 @@ mod tests {
         let (body, trailers) = body_of(Framing::Chunked, bytes, false).unwrap();
         assert!(body.is_empty());
         let trailers = trailers.unwrap();
-        assert_eq!(trailers["grpc-status"], "0");
-        assert_eq!(trailers["grpc-message"], "ok");
+        assert_eq!(trailers.fields["grpc-status"], "0");
+        assert_eq!(trailers.fields["grpc-message"], "ok");
+        assert_eq!(trailers.discarded, 0);
     }
 
     /// However the bytes are cut up, the body that comes out is the same one.
@@ -1556,5 +1717,198 @@ mod tests {
             read_in_pieces(Framing::Chunked, bytes, false, &limits),
             Err(CodecError::TooManyFields { limit: 1 })
         );
+    }
+
+    /// What a trailer section came to, once what may not travel has been left behind.
+    fn trailers_of(section: &str) -> Trailers {
+        let bytes = format!("0\r\n{section}\r\n").into_bytes();
+        body_of(Framing::Chunked, &bytes, false).unwrap().1.unwrap()
+    }
+
+    /// The named set never travels on. None of it fails the message: the body was framed
+    /// from the head and read to its end, and a footer that may not be passed on is no
+    /// reason to throw away an answer that was correct.
+    #[test]
+    fn a_denied_trailer_is_dropped_and_the_message_is_not() {
+        for denied in [
+            "content-length: 5",
+            "transfer-encoding: chunked",
+            "host: elsewhere.test",
+            "trailer: x-a",
+            "connection: close",
+            "keep-alive: timeout=5",
+            "proxy-connection: keep-alive",
+            "te: trailers",
+            "upgrade: websocket",
+            "authorization: Basic abc",
+            "proxy-authorization: Basic abc",
+            "www-authenticate: Basic realm=x",
+            "proxy-authenticate: Basic realm=x",
+            "proxy-authentication-info: nextnonce=abc",
+            "cookie: a=1",
+            "set-cookie: a=1",
+            "content-type: text/plain",
+            "content-encoding: gzip",
+            "content-range: bytes 0-1/2",
+            "cache-control: no-store",
+            "pragma: no-cache",
+            "age: 1",
+            "expires: 0",
+            "date: Sun, 20 Sep 2026 00:00:00 GMT",
+            "location: /elsewhere",
+            "retry-after: 1",
+            "vary: accept",
+            "warning: 199 - x",
+            "expect: 100-continue",
+            "max-forwards: 1",
+            "range: bytes=0-1",
+            "if-match: x",
+            "if-none-match: x",
+            "if-modified-since: Sun, 20 Sep 2026 00:00:00 GMT",
+            "if-unmodified-since: Sun, 20 Sep 2026 00:00:00 GMT",
+            "if-range: x",
+        ] {
+            let trailers = trailers_of(&format!("{denied}\r\n"));
+            assert!(trailers.fields.is_empty(), "{denied} travelled on");
+            assert_eq!(trailers.discarded, 1, "{denied}");
+        }
+    }
+
+    /// Whatever case it is written in.
+    #[test]
+    fn a_denied_trailer_is_denied_however_it_is_spelt() {
+        let trailers = trailers_of("Content-Length: 5\r\nTRANSFER-ENCODING: chunked\r\n");
+        assert!(trailers.fields.is_empty());
+        assert_eq!(trailers.discarded, 2);
+    }
+
+    /// What is not named travels on untouched, and is not read for meaning on the way.
+    #[test]
+    fn an_application_trailer_travels_on_as_it_came() {
+        let trailers = trailers_of("grpc-status: 0\r\nx-checksum: abc\r\n");
+        assert_eq!(trailers.fields["grpc-status"], "0");
+        assert_eq!(trailers.fields["x-checksum"], "abc");
+        assert_eq!(trailers.discarded, 0);
+    }
+
+    /// A family is not denied wholesale: `Authentication-Info` is end-to-end and may be a
+    /// trailer, though the fields around it in the set are not.
+    #[test]
+    fn authentication_info_is_not_denied_with_the_rest_of_its_family() {
+        let trailers = trailers_of("authentication-info: nextnonce=abc\r\n");
+        assert_eq!(trailers.fields["authentication-info"], "nextnonce=abc");
+        assert_eq!(trailers.discarded, 0);
+    }
+
+    #[test]
+    fn some_denied_and_some_not_keeps_only_the_ones_that_may_travel() {
+        let trailers = trailers_of("grpc-status: 0\r\ncontent-length: 5\r\nx-a: 1\r\n");
+        assert_eq!(trailers.fields.len(), 2);
+        assert_eq!(trailers.fields["grpc-status"], "0");
+        assert_eq!(trailers.fields["x-a"], "1");
+        assert_eq!(trailers.discarded, 1);
+    }
+
+    /// What the head's `Connection` named is hop-by-hop for this hop, among the trailers
+    /// as much as among the fields.
+    #[test]
+    fn what_the_head_nominated_does_not_travel_on_either() {
+        let nominated = vec![HeaderName::from_static("x-hop")];
+        let mut reader = BodyReader::nominating(Framing::Chunked, nominated);
+        let bytes = b"0\r\nx-hop: 1\r\nx-a: 1\r\n\r\n";
+        let trailers = to_the_end(&mut reader, bytes).unwrap().1.unwrap();
+        assert_eq!(trailers.fields.len(), 1);
+        assert_eq!(trailers.fields["x-a"], "1");
+        assert_eq!(trailers.discarded, 1);
+    }
+
+    /// A length among the trailers is dropped without being read. It says nothing about a
+    /// body whose end was found from the head, and reading it would be inviting it to.
+    #[test]
+    fn a_length_among_the_trailers_does_not_touch_the_framing() {
+        let bytes = b"5\r\nhello\r\n0\r\ncontent-length: 99999\r\n\r\n";
+        let (body, trailers) = body_of(Framing::Chunked, bytes, false).unwrap();
+        assert_eq!(body, b"hello");
+        let trailers = trailers.unwrap();
+        assert!(trailers.fields.is_empty());
+        assert_eq!(trailers.discarded, 1);
+    }
+
+    /// A section that is malformed or past its bounds still fails, whether or not what it
+    /// held would have been kept: everything is counted before anything is dropped.
+    #[test]
+    fn a_denied_field_is_still_counted_against_the_bounds() {
+        let limits = H1Limits {
+            trailer_fields: 1,
+            ..H1Limits::default()
+        };
+        // Both would have been dropped; there are still two of them.
+        let bytes = b"0\r\ncontent-length: 5\r\ncontent-type: text/plain\r\n\r\n";
+        assert_eq!(
+            read_in_pieces(Framing::Chunked, bytes, false, &limits),
+            Err(CodecError::TooManyFields { limit: 1 })
+        );
+    }
+
+    #[test]
+    fn a_declaration_says_only_what_will_really_arrive() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::TRAILER,
+            HeaderValue::from_static("grpc-status, content-length, x-a"),
+        );
+        filter_declaration(&mut headers, &[]);
+        assert_eq!(headers[http::header::TRAILER], "grpc-status, x-a");
+    }
+
+    #[test]
+    fn a_declaration_with_nothing_left_to_say_is_taken_away() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::TRAILER,
+            HeaderValue::from_static("content-length, host"),
+        );
+        filter_declaration(&mut headers, &[]);
+        assert!(!headers.contains_key(http::header::TRAILER));
+    }
+
+    #[test]
+    fn a_declaration_is_filtered_by_what_the_head_nominated_too() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::TRAILER,
+            HeaderValue::from_static("x-hop, x-a"),
+        );
+        filter_declaration(&mut headers, &[HeaderName::from_static("x-hop")]);
+        assert_eq!(headers[http::header::TRAILER], "x-a");
+    }
+
+    /// Filtering the declaration is not filtering the trailers: one that was never
+    /// declared and may travel is passed on all the same.
+    #[test]
+    fn a_trailer_that_was_never_declared_is_not_refused_for_that() {
+        let trailers = trailers_of("x-undeclared: 1\r\n");
+        assert_eq!(trailers.fields["x-undeclared"], "1");
+        assert_eq!(trailers.discarded, 0);
+    }
+
+    /// A parsed field name is lower case, so the set it is compared against must be, and
+    /// a name that appears twice is a name whose reason for being denied was unclear.
+    #[test]
+    fn the_denied_names_are_lower_case_and_said_once() {
+        assert!(
+            DENIED_TRAILERS
+                .iter()
+                .all(|name| name.to_lowercase() == *name),
+            "{DENIED_TRAILERS:?}"
+        );
+        let mut once = DENIED_TRAILERS.to_vec();
+        once.sort_unstable();
+        once.dedup();
+        assert_eq!(once.len(), DENIED_TRAILERS.len());
+        // Every one of them is a field name the http crate will parse back.
+        for name in DENIED_TRAILERS {
+            assert!(HeaderName::from_bytes(name.as_bytes()).is_ok(), "{name}");
+        }
     }
 }
