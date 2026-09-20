@@ -13,11 +13,11 @@
 
 use super::H1Limits;
 use super::codec::{
-    Asked, BodyWriter, CodecError, Delivery, Head, HeadReader, ResponseHead, Sending, delivery,
-    write_head,
+    Asked, BodyReader, BodyWriter, CodecError, Delivery, Framing, Head, HeadReader, Piece,
+    ResponseHead, Sending, Trailers, delivery, write_head,
 };
 use http::{HeaderMap, Method, Uri};
-use hyper::body::{Body, Bytes};
+use hyper::body::{Body, Bytes, Frame, SizeHint};
 use std::error::Error as StdError;
 use std::future::poll_fn;
 use std::io;
@@ -256,6 +256,178 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
     /// the start of the answer's body.
     pub fn into_body_parts(self) -> (S, Vec<u8>) {
         (self.socket, self.incoming)
+    }
+}
+
+/// The body of an upstream's answer, read as the client asks for it.
+///
+/// It holds the socket, what was already read from it, and where the reading of the body
+/// had got to. Nothing is read until somebody asks for a frame, so a client that is slow
+/// to take the answer is an upstream that is slow to be read: the backpressure goes all
+/// the way through rather than piling up here.
+///
+/// Whether the body finished — every framing check passed, every byte accounted for — is
+/// [`H1Body::is_complete`]. It is the first of the things a connection must satisfy before
+/// it could ever be used again ([13 §6](../../../docs/13-http1-upstream.md)); the rest
+/// come with the pool, and until then this connection is closed when the body is dropped.
+#[derive(Debug)]
+pub struct H1Body<S> {
+    /// Gone once the body has failed: there is nothing to be done with a socket whose
+    /// message stopped making sense.
+    socket: Option<S>,
+    /// Read from the socket and not yet handed on.
+    buffered: Vec<u8>,
+    reader: BodyReader,
+    limits: H1Limits,
+    /// The upstream closed its end. Told to the reader, which alone knows whether that is
+    /// the end of this body or the loss of it.
+    ended: bool,
+    /// Every check passed and every byte accounted for.
+    complete: bool,
+    /// Came with the end and has not been handed on yet.
+    trailers: Option<HeaderMap>,
+    /// How many trailer fields were dropped on the way, for a counter to add up.
+    discarded: usize,
+}
+
+impl<S> H1Body<S> {
+    /// A body of `framing`, on `socket`, with `buffered` already read from it.
+    pub fn new(socket: S, buffered: Vec<u8>, framing: Framing, limits: H1Limits) -> Self {
+        let reader = BodyReader::new(framing);
+        // A body that was never going to carry anything is finished before it starts. Said
+        // now and not at the first poll, because nothing need ever poll an empty body.
+        let complete = reader.is_done();
+        Self {
+            socket: Some(socket),
+            buffered,
+            reader,
+            limits,
+            ended: false,
+            complete,
+            trailers: None,
+            discarded: 0,
+        }
+    }
+
+    /// Whether the whole body arrived and every check on it passed.
+    pub fn is_complete(&self) -> bool {
+        self.complete && self.trailers.is_none()
+    }
+
+    /// How many trailer fields were dropped as fields that may not travel on.
+    pub fn discarded_trailers(&self) -> usize {
+        self.discarded
+    }
+
+    /// What is left of the connection, for whoever may reuse it. `None` once the body has
+    /// failed, and never to be taken while the body is unfinished.
+    pub fn into_connection(self) -> Option<(S, Vec<u8>)> {
+        self.socket.map(|socket| (socket, self.buffered))
+    }
+
+    /// Takes the end apart: what the reader said, kept for the frame after this one.
+    fn ended_with(&mut self, trailers: Option<Trailers>) {
+        self.complete = true;
+        if let Some(trailers) = trailers {
+            self.discarded = trailers.discarded;
+            if !trailers.fields.is_empty() {
+                self.trailers = Some(trailers.fields);
+            }
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> Body for H1Body<S> {
+    type Data = Bytes;
+    type Error = ExchangeError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, ExchangeError>>> {
+        let this = self.get_mut();
+        loop {
+            if this.complete {
+                // The trailers are a frame of their own, never folded into the head.
+                return match this.trailers.take() {
+                    Some(fields) => Poll::Ready(Some(Ok(Frame::trailers(fields)))),
+                    None => Poll::Ready(None),
+                };
+            }
+            let Some(socket) = this.socket.as_mut() else {
+                return Poll::Ready(None);
+            };
+
+            match this.reader.read(&this.buffered, this.ended, &this.limits) {
+                Err(error) => {
+                    // A body that stopped making sense is not an end; saying so would be
+                    // handing the client half an answer as though it were the whole one.
+                    this.socket = None;
+                    return Poll::Ready(Some(Err(error.into())));
+                }
+                Ok(Piece::End { trailers, consumed }) => {
+                    this.buffered.drain(..consumed);
+                    this.ended_with(trailers);
+                    continue;
+                }
+                Ok(Piece::Data { data, consumed }) => {
+                    let frame =
+                        (!data.is_empty()).then(|| Bytes::copy_from_slice(&this.buffered[data]));
+                    this.buffered.drain(..consumed);
+                    let Some(frame) = frame else {
+                        // Framing bytes and nothing else; keep going.
+                        continue;
+                    };
+                    // Whether that was the last of it is worth knowing now: a client
+                    // told how long a body is need never poll it again, and a body whose
+                    // end was never checked is one whose connection cannot be trusted.
+                    // Asked only where the answer is already certain — reading to find
+                    // out would move the reader past bytes still sitting in the buffer.
+                    if this.reader.is_spent()
+                        && let Ok(Piece::End { trailers, consumed }) =
+                            this.reader.read(&this.buffered, this.ended, &this.limits)
+                    {
+                        this.buffered.drain(..consumed);
+                        this.ended_with(trailers);
+                    }
+                    return Poll::Ready(Some(Ok(Frame::data(frame))));
+                }
+                Ok(Piece::More) => {}
+            }
+
+            // Only now, and only because somebody asked for a frame.
+            let was = this.buffered.len();
+            this.buffered.resize(was + READING, 0);
+            let mut read = ReadBuf::new(&mut this.buffered[was..]);
+            let outcome = Pin::new(socket).poll_read(cx, &mut read);
+            let filled = read.filled().len();
+            this.buffered.truncate(was + filled);
+            match outcome {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => {
+                    this.socket = None;
+                    return Poll::Ready(Some(Err(error.into())));
+                }
+                Poll::Ready(Ok(())) => {
+                    if filled == 0 {
+                        // The reader is told; it alone knows whether a close ends this
+                        // body or loses it.
+                        this.ended = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.complete && self.trailers.is_none()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        if self.complete && self.trailers.is_none() {
+            return SizeHint::with_exact(0);
+        }
+        SizeHint::default()
     }
 }
 
@@ -601,5 +773,154 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(failed, ExchangeError::RequestBody(_)), "{failed}");
+    }
+
+    /// Reads a whole body, as a client taking the answer would.
+    async fn collected<S: AsyncRead + Unpin>(
+        body: &mut H1Body<S>,
+    ) -> Result<(Vec<u8>, Option<HeaderMap>), ExchangeError> {
+        let mut data = Vec::new();
+        let mut trailers = None;
+        let mut body = Pin::new(body);
+        while let Some(frame) = poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
+            let frame = frame?;
+            match frame.into_data() {
+                Ok(bytes) => data.extend_from_slice(&bytes),
+                Err(frame) => {
+                    if let Ok(fields) = frame.into_trailers() {
+                        trailers = Some(fields);
+                    }
+                }
+            }
+        }
+        Ok((data, trailers))
+    }
+
+    /// A body on a connection whose other end is the test's to write on.
+    fn body_on(framing: Framing, buffered: &[u8]) -> (H1Body<DuplexStream>, Peer) {
+        let (ours, theirs) = tokio::io::duplex(4096);
+        let body = H1Body::new(ours, buffered.to_vec(), framing, H1Limits::default());
+        (body, Peer(theirs))
+    }
+
+    /// A body that carries nothing is over before anybody asks, because nothing need ever
+    /// ask an empty body anything.
+    #[tokio::test]
+    async fn a_body_of_nothing_is_finished_before_it_is_polled() {
+        let (body, _peer) = body_on(Framing::None, b"");
+        assert!(body.is_complete());
+        assert!(body.is_end_stream());
+        assert_eq!(body.size_hint().exact(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_counted_body_comes_from_what_was_already_read() {
+        let (mut body, _peer) = body_on(Framing::Length(5), b"hello");
+        let (data, trailers) = collected(&mut body).await.unwrap();
+        assert_eq!(data, b"hello");
+        assert_eq!(trailers, None);
+        assert!(body.is_complete());
+    }
+
+    /// And the rest of it from the socket, a piece at a time, only when asked.
+    #[tokio::test]
+    async fn a_counted_body_is_read_on_as_it_is_wanted() {
+        let (mut body, mut peer) = body_on(Framing::Length(8), b"hel");
+        tokio::spawn(async move {
+            peer.say("lo").await;
+            tokio::task::yield_now().await;
+            peer.say(" th").await;
+            peer
+        });
+        let (data, _) = collected(&mut body).await.unwrap();
+        assert_eq!(data, b"hello th");
+        assert!(body.is_complete());
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_comes_back_with_its_trailers() {
+        let (mut body, _peer) = body_on(
+            Framing::Chunked,
+            b"5\r\nhello\r\n0\r\ngrpc-status: 0\r\ncontent-length: 9\r\n\r\n",
+        );
+        let (data, trailers) = collected(&mut body).await.unwrap();
+        assert_eq!(data, b"hello");
+        let trailers = trailers.unwrap();
+        assert_eq!(trailers["grpc-status"], "0");
+        // The one that may not travel was dropped, and counted.
+        assert!(!trailers.contains_key("content-length"));
+        assert_eq!(body.discarded_trailers(), 1);
+        assert!(body.is_complete());
+    }
+
+    #[tokio::test]
+    async fn a_body_the_close_ends_is_what_came_before_it() {
+        let (mut body, peer) = body_on(Framing::UntilClose, b"some");
+        tokio::spawn(async move {
+            let mut peer = peer;
+            peer.say(" bytes").await;
+            drop(peer);
+        });
+        let (data, _) = collected(&mut body).await.unwrap();
+        assert_eq!(data, b"some bytes");
+        assert!(body.is_complete());
+    }
+
+    /// A close part way through a body that said how long it would be is a lost answer,
+    /// and it is told as one: handing on what arrived would be passing off half an answer
+    /// as the whole of it.
+    #[tokio::test]
+    async fn a_body_cut_short_is_an_error_and_not_a_clean_end() {
+        let (mut body, peer) = body_on(Framing::Length(8), b"hel");
+        drop(peer);
+        let failed = collected(&mut body).await.unwrap_err();
+        assert!(
+            matches!(failed, ExchangeError::Codec(CodecError::Truncated)),
+            "{failed}"
+        );
+        assert!(!body.is_complete());
+        // And the connection is gone: there is nothing to be done with it.
+        assert!(body.into_connection().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_body_that_stops_making_sense_is_an_error() {
+        let (mut body, _peer) = body_on(Framing::Chunked, b"zz\r\nhello\r\n");
+        let failed = collected(&mut body).await.unwrap_err();
+        assert!(
+            matches!(failed, ExchangeError::Codec(CodecError::Chunk)),
+            "{failed}"
+        );
+        assert!(!body.is_complete());
+    }
+
+    /// A client told how long a body is need never ask again, so the last frame of one
+    /// must already have been checked to its end — otherwise a connection whose framing
+    /// was never finished could look finished.
+    #[tokio::test]
+    async fn a_counted_body_is_finished_by_its_last_frame() {
+        let (mut body, _peer) = body_on(Framing::Length(5), b"hello");
+        let mut pinned = Pin::new(&mut body);
+        let frame = poll_fn(|cx| pinned.as_mut().poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"hello"));
+        // Without a second poll.
+        assert!(body.is_complete());
+        assert!(body.is_end_stream());
+    }
+
+    /// Nothing is read until a frame is wanted: what an upstream sends sits in its own
+    /// socket until the client is ready for it.
+    #[tokio::test]
+    async fn nothing_is_read_before_a_frame_is_asked_for() {
+        let (mut body, mut peer) = body_on(Framing::Length(4), b"");
+        peer.say("abcd").await;
+        // The bytes are there for the taking and have not been taken.
+        assert!(!body.is_complete());
+
+        let (data, _) = collected(&mut body).await.unwrap();
+        assert_eq!(data, b"abcd");
     }
 }

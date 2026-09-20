@@ -632,6 +632,16 @@ impl BodyReader {
         self.state == State::Done
     }
 
+    /// Whether every byte of the body has been delivered and only its end is left, with
+    /// nothing more wanted from the peer to be sure of it.
+    ///
+    /// True of a counted body that has had its count. A chunked one is never sure until
+    /// it has seen the chunk that says so, and a body the close ends never until it
+    /// closes — for those this says no, and the end is found by reading on.
+    pub fn is_spent(&self) -> bool {
+        matches!(self.framing, Framing::Length(_)) && self.state == State::Data { left: 0 }
+    }
+
     /// Reads what it can from the front of `bytes`. `ended` says the connection has
     /// closed, which only the caller can know.
     ///
