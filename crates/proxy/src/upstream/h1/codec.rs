@@ -13,7 +13,7 @@
 //! allowed here ([13 §4](../../../docs/13-http1-upstream.md)).
 
 use super::H1Limits;
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Version};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
 use std::ops::Range;
 
 /// The end of a head, and of a trailer section: an empty line.
@@ -81,6 +81,19 @@ pub(crate) enum CodecError {
     /// The trailer section went past what one may be.
     #[error("the trailer section is longer than {limit} bytes")]
     TrailersTooLong { limit: usize },
+    /// More body arrived than a counted body said it would carry.
+    #[error("the request body is longer than its content-length")]
+    BodyOverran,
+    /// A counted body ended before it had sent what it said it would. Sending it as it
+    /// stands would be telling the upstream a length that is not the one it will get.
+    #[error("the request body is shorter than its content-length")]
+    BodyShort,
+    /// Something after a body was finished, or a body on a request that has none.
+    #[error("there is more of a request body after its end")]
+    BodyAfterEnd,
+    /// Trailers for a body that has no place to put them.
+    #[error("the request body cannot carry trailers")]
+    UnexpectedTrailers,
 }
 
 /// A response head, once it has been read and found sound.
@@ -892,6 +905,229 @@ fn fields(
         trailers.fields.append(name, value);
     }
     Ok(trailers)
+}
+
+/// How a request's body is to be sent. One choice, made once, and made here: a filter
+/// cannot manufacture framing, and whatever the head happens to say about it is left out
+/// in favour of this ([13 §1](../../../docs/13-http1-upstream.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sending {
+    /// No body. Not the same as a body of nothing: nothing is said about a length at all.
+    None,
+    /// This many bytes, and exactly this many.
+    Length(u64),
+    /// Chunked, because how much there is is not known, or because trailers may follow.
+    Chunked,
+}
+
+/// Writes the head of a request as an upstream is to receive it, appending to `out`.
+///
+/// `Content-Length` and `Transfer-Encoding` on the head are left out and `sending` is
+/// written instead. The config already refuses a filter that sets either
+/// (`edgerush_filters::RESERVED`); this is the backstop, so that what is sent is what was
+/// decided and not what something along the way added.
+///
+/// # Errors
+///
+/// A head that would come to more than `limits` allows, or a target that cannot be written
+/// in origin form.
+pub(crate) fn write_head(
+    out: &mut Vec<u8>,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    sending: Sending,
+    limits: &H1Limits,
+) -> Result<(), CodecError> {
+    let began = out.len();
+    // Origin form: the path and query alone. The endpoint is who we are speaking to, not
+    // what we are asking for, and a proxy that sends the whole URI is asking for the
+    // upstream to treat it as a forward proxy request.
+    let target = uri
+        .path_and_query()
+        .map_or("/", http::uri::PathAndQuery::as_str);
+    out.extend_from_slice(method.as_str().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(target.as_bytes());
+    out.extend_from_slice(b" HTTP/1.1\r\n");
+
+    for (name, value) in headers {
+        if name == http::header::CONTENT_LENGTH || name == http::header::TRANSFER_ENCODING {
+            continue;
+        }
+        out.extend_from_slice(name.as_str().as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    match sending {
+        Sending::None => {}
+        Sending::Length(length) => {
+            out.extend_from_slice(b"content-length: ");
+            let mut digits = itoa(length);
+            out.append(&mut digits);
+            out.extend_from_slice(b"\r\n");
+        }
+        Sending::Chunked => out.extend_from_slice(b"transfer-encoding: chunked\r\n"),
+    }
+    out.extend_from_slice(b"\r\n");
+
+    if out.len() - began > limits.head {
+        out.truncate(began);
+        return Err(CodecError::HeadTooLong { limit: limits.head });
+    }
+    Ok(())
+}
+
+/// A number as its decimal digits. Small enough to build backwards on the stack, which
+/// keeps formatting off the path a request takes.
+fn itoa(mut number: u64) -> Vec<u8> {
+    // The largest u64 is twenty digits.
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + u8::try_from(number % 10).unwrap_or(0);
+        number /= 10;
+        if number == 0 {
+            break;
+        }
+    }
+    digits[at..].to_vec()
+}
+
+/// Frames the body of a request as it is sent.
+///
+/// It only ever appends to a buffer; how much of that buffer has reached the socket is the
+/// caller's to remember, so a write that went only part way is picked up where it stopped
+/// and no byte is written twice.
+#[derive(Debug)]
+pub(crate) struct BodyWriter {
+    sending: Sending,
+    /// For a counted body: how many bytes are still owed.
+    left: u64,
+    done: bool,
+}
+
+impl BodyWriter {
+    /// A writer for a body sent as `sending` says.
+    pub(crate) fn new(sending: Sending) -> Self {
+        Self {
+            sending,
+            left: match sending {
+                Sending::Length(length) => length,
+                _ => 0,
+            },
+            done: false,
+        }
+    }
+
+    /// Writes one frame of body data.
+    ///
+    /// # Errors
+    ///
+    /// More bytes than a counted body said it would have, or anything at all after the
+    /// body was finished.
+    pub(crate) fn data(&mut self, out: &mut Vec<u8>, data: &[u8]) -> Result<(), CodecError> {
+        if self.done {
+            return Err(CodecError::BodyAfterEnd);
+        }
+        if data.is_empty() {
+            // Nothing to say, and saying it in chunked would say the opposite: a chunk of
+            // no bytes is how a chunked body ends.
+            return Ok(());
+        }
+        match self.sending {
+            Sending::None => Err(CodecError::BodyAfterEnd),
+            Sending::Length(_) => {
+                let length = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                self.left = self
+                    .left
+                    .checked_sub(length)
+                    .ok_or(CodecError::BodyOverran)?;
+                out.extend_from_slice(data);
+                Ok(())
+            }
+            Sending::Chunked => {
+                out.append(&mut hex_digits(data.len()));
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(data);
+                out.extend_from_slice(b"\r\n");
+                Ok(())
+            }
+        }
+    }
+
+    /// Ends the body: nothing for one that was counted, beyond making sure every byte it
+    /// promised was sent, and the last chunk with any trailers for one that was chunked.
+    ///
+    /// # Errors
+    ///
+    /// A counted body that fell short of what it said, trailers on a body that cannot
+    /// carry them, or a second ending.
+    pub(crate) fn finish(
+        &mut self,
+        out: &mut Vec<u8>,
+        trailers: Option<&HeaderMap>,
+        nominated: &[HeaderName],
+    ) -> Result<(), CodecError> {
+        if self.done {
+            return Err(CodecError::BodyAfterEnd);
+        }
+        self.done = true;
+        match self.sending {
+            // A body that cannot carry trailers is not given any, and a trailer that
+            // arrives for one is a frame with nowhere to go.
+            Sending::None | Sending::Length(_) if trailers.is_some_and(|t| !t.is_empty()) => {
+                Err(CodecError::UnexpectedTrailers)
+            }
+            Sending::None => Ok(()),
+            Sending::Length(_) => {
+                if self.left != 0 {
+                    return Err(CodecError::BodyShort);
+                }
+                Ok(())
+            }
+            Sending::Chunked => {
+                out.extend_from_slice(b"0\r\n");
+                for (name, value) in trailers.into_iter().flatten() {
+                    // The same set as on the way back: what may not travel as a trailer
+                    // may not travel in either direction.
+                    if is_denied(name, nominated) {
+                        continue;
+                    }
+                    out.extend_from_slice(name.as_str().as_bytes());
+                    out.extend_from_slice(b": ");
+                    out.extend_from_slice(value.as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                }
+                out.extend_from_slice(b"\r\n");
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether the body has been ended.
+    pub(crate) fn is_done(&self) -> bool {
+        self.done
+    }
+}
+
+/// A chunk's size, in the hexadecimal a chunked body writes it in.
+fn hex_digits(mut size: usize) -> Vec<u8> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    // The largest usize is sixteen hexadecimal digits.
+    let mut digits = [0u8; 16];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = DIGITS[size % 16];
+        size /= 16;
+        if size == 0 {
+            break;
+        }
+    }
+    digits[at..].to_vec()
 }
 
 #[cfg(test)]
@@ -1910,5 +2146,247 @@ mod tests {
         for name in DENIED_TRAILERS {
             assert!(HeaderName::from_bytes(name.as_bytes()).is_ok(), "{name}");
         }
+    }
+
+    /// A head written for an upstream, as text.
+    fn written(method: &str, target: &str, fields: &[(&str, &str)], sending: Sending) -> String {
+        let mut headers = HeaderMap::new();
+        for (name, value) in fields {
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        let mut out = Vec::new();
+        write_head(
+            &mut out,
+            &Method::from_bytes(method.as_bytes()).unwrap(),
+            &target.parse::<Uri>().unwrap(),
+            &headers,
+            sending,
+            &H1Limits::default(),
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// The target is the path and query alone. Sending the whole URI is how a request is
+    /// addressed to a forward proxy, which an upstream is not.
+    #[test]
+    fn a_request_is_written_in_origin_form() {
+        let head = written("GET", "http://up.test:8080/a/b?c=1", &[], Sending::None);
+        assert!(head.starts_with("GET /a/b?c=1 HTTP/1.1\r\n"), "{head}");
+        // A target with nothing to it is still a path.
+        let head = written("GET", "http://up.test", &[], Sending::None);
+        assert!(head.starts_with("GET / HTTP/1.1\r\n"), "{head}");
+    }
+
+    #[test]
+    fn the_fields_of_the_head_are_written_as_they_are() {
+        let head = written(
+            "POST",
+            "/x",
+            &[("host", "shop.test"), ("x-a", "1"), ("x-a", "2")],
+            Sending::None,
+        );
+        assert!(head.contains("host: shop.test\r\n"), "{head}");
+        // A field said twice is written twice, in the order it was said.
+        assert!(head.contains("x-a: 1\r\nx-a: 2\r\n"), "{head}");
+    }
+
+    /// The writer owns the framing. Whatever the head carries about it is left out, so
+    /// that what goes on the wire is the one choice that was made.
+    #[test]
+    fn the_framing_on_the_head_is_replaced_by_the_one_that_was_chosen() {
+        let carried = &[
+            ("host", "shop.test"),
+            ("content-length", "99"),
+            ("transfer-encoding", "chunked"),
+        ];
+        let head = written("POST", "/x", carried, Sending::Length(5));
+        assert!(head.contains("content-length: 5\r\n"), "{head}");
+        assert!(!head.contains("99"), "{head}");
+        assert!(!head.contains("transfer-encoding"), "{head}");
+
+        let head = written("POST", "/x", carried, Sending::Chunked);
+        assert!(head.contains("transfer-encoding: chunked\r\n"), "{head}");
+        assert!(!head.contains("content-length"), "{head}");
+
+        // No body at all says nothing about a length, which is not the same as saying nil.
+        let head = written("GET", "/x", carried, Sending::None);
+        assert!(!head.contains("content-length"), "{head}");
+        assert!(!head.contains("transfer-encoding"), "{head}");
+    }
+
+    #[test]
+    fn a_length_of_nothing_is_still_a_length() {
+        let head = written("POST", "/x", &[], Sending::Length(0));
+        assert!(head.contains("content-length: 0\r\n"), "{head}");
+    }
+
+    #[test]
+    fn a_head_past_its_bound_is_refused_and_leaves_nothing_behind() {
+        let mut out = b"already here".to_vec();
+        let limits = H1Limits {
+            head: 16,
+            ..H1Limits::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-long", HeaderValue::from_static("0123456789abcdef"));
+        let written = write_head(
+            &mut out,
+            &Method::GET,
+            &"/x".parse().unwrap(),
+            &headers,
+            Sending::None,
+            &limits,
+        );
+        assert_eq!(written, Err(CodecError::HeadTooLong { limit: 16 }));
+        assert_eq!(out, b"already here");
+    }
+
+    /// What a written body comes to, given the frames it was made of.
+    fn sent(sending: Sending, frames: &[&[u8]], trailers: Option<&HeaderMap>) -> String {
+        let mut writer = BodyWriter::new(sending);
+        let mut out = Vec::new();
+        for frame in frames {
+            writer.data(&mut out, frame).unwrap();
+        }
+        writer.finish(&mut out, trailers, &[]).unwrap();
+        assert!(writer.is_done());
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn a_counted_body_is_its_bytes_and_nothing_around_them() {
+        assert_eq!(
+            sent(Sending::Length(8), &[b"hello", b" th"], None),
+            "hello th"
+        );
+        assert_eq!(sent(Sending::Length(0), &[], None), "");
+    }
+
+    #[test]
+    fn a_chunked_body_is_written_with_framing_of_our_own() {
+        assert_eq!(
+            sent(Sending::Chunked, &[b"hello", b" th"], None),
+            "5\r\nhello\r\n3\r\n th\r\n0\r\n\r\n"
+        );
+        // A chunk's size is hexadecimal, so sixteen bytes is `10`.
+        assert_eq!(
+            sent(Sending::Chunked, &[&[b'x'; 16]], None),
+            format!("10\r\n{}\r\n0\r\n\r\n", "x".repeat(16))
+        );
+    }
+
+    #[test]
+    fn a_chunked_body_of_nothing_is_the_last_chunk_alone() {
+        assert_eq!(sent(Sending::Chunked, &[], None), "0\r\n\r\n");
+    }
+
+    /// A frame of no bytes says nothing, and in a chunked body saying it would say the
+    /// opposite: a chunk of nothing is how such a body ends.
+    #[test]
+    fn a_frame_of_no_bytes_ends_nothing() {
+        assert_eq!(
+            sent(Sending::Chunked, &[b"a", b"", b"b"], None),
+            "1\r\na\r\n1\r\nb\r\n0\r\n\r\n"
+        );
+        assert_eq!(sent(Sending::Length(1), &[b"", b"a", b""], None), "a");
+    }
+
+    #[test]
+    fn trailers_are_written_after_the_last_chunk() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        assert_eq!(
+            sent(Sending::Chunked, &[b"a"], Some(&trailers)),
+            "1\r\na\r\n0\r\ngrpc-status: 0\r\n\r\n"
+        );
+    }
+
+    /// The same set applies on the way out: what may not travel as a trailer may not
+    /// travel in either direction.
+    #[test]
+    fn a_denied_trailer_is_not_written_either() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("content-length", HeaderValue::from_static("5"));
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        assert_eq!(
+            sent(Sending::Chunked, &[b"a"], Some(&trailers)),
+            "1\r\na\r\n0\r\ngrpc-status: 0\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn more_than_a_counted_body_promised_is_refused() {
+        let mut writer = BodyWriter::new(Sending::Length(3));
+        let mut out = Vec::new();
+        assert_eq!(writer.data(&mut out, b"ab"), Ok(()));
+        assert_eq!(writer.data(&mut out, b"cd"), Err(CodecError::BodyOverran));
+    }
+
+    #[test]
+    fn less_than_a_counted_body_promised_is_refused() {
+        let mut writer = BodyWriter::new(Sending::Length(3));
+        let mut out = Vec::new();
+        assert_eq!(writer.data(&mut out, b"ab"), Ok(()));
+        assert_eq!(
+            writer.finish(&mut out, None, &[]),
+            Err(CodecError::BodyShort)
+        );
+    }
+
+    #[test]
+    fn nothing_may_follow_the_end_of_a_body() {
+        let mut writer = BodyWriter::new(Sending::Chunked);
+        let mut out = Vec::new();
+        assert_eq!(writer.finish(&mut out, None, &[]), Ok(()));
+        assert_eq!(writer.data(&mut out, b"a"), Err(CodecError::BodyAfterEnd));
+        assert_eq!(
+            writer.finish(&mut out, None, &[]),
+            Err(CodecError::BodyAfterEnd)
+        );
+    }
+
+    #[test]
+    fn a_body_that_was_to_be_absent_carries_nothing() {
+        let mut writer = BodyWriter::new(Sending::None);
+        let mut out = Vec::new();
+        assert_eq!(writer.data(&mut out, b"a"), Err(CodecError::BodyAfterEnd));
+        // A frame of no bytes is still nothing, and is let by.
+        let mut writer = BodyWriter::new(Sending::None);
+        assert_eq!(writer.data(&mut out, b""), Ok(()));
+        assert_eq!(writer.finish(&mut out, None, &[]), Ok(()));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn trailers_on_a_body_that_cannot_carry_them_are_refused() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        for sending in [Sending::None, Sending::Length(0)] {
+            let mut writer = BodyWriter::new(sending);
+            let mut out = Vec::new();
+            assert_eq!(
+                writer.finish(&mut out, Some(&trailers), &[]),
+                Err(CodecError::UnexpectedTrailers),
+                "{sending:?}"
+            );
+        }
+    }
+
+    /// What is written for a chunked body is read back as the same body, which is the
+    /// only check that really matters of a framing this writes and something else reads.
+    #[test]
+    fn what_is_written_chunked_reads_back_as_what_went_in() {
+        let frames: &[&[u8]] = &[b"hello", b" ", b"there", &[b'x'; 300]];
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        let written = sent(Sending::Chunked, frames, Some(&trailers));
+
+        let (read, back) = body_of(Framing::Chunked, written.as_bytes(), false).unwrap();
+        assert_eq!(read, frames.concat());
+        assert_eq!(back.unwrap().fields["grpc-status"], "0");
     }
 }
