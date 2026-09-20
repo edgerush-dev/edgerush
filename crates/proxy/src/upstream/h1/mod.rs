@@ -3,10 +3,13 @@
 //! The protocol engine ([`codec`]) is by itself: it is given bytes and told of events, and
 //! says what it made of them. It opens no socket, reads no clock and spawns nothing, which
 //! is what lets every one of its answers be checked against a table and every split of its
-//! input be tried. The code that does hold a socket comes later, and keeps that separation.
+//! input be tried. The code that does hold a socket ([`exchange`]) keeps that separation,
+//! and is where the clock lives: the engine is told what happened, never when.
 
 pub mod codec;
 pub mod exchange;
+
+use std::time::Duration;
 
 /// What a worker will not go beyond, whatever an upstream sends. Conservative numbers for
 /// development, not settings anybody configures and not the pool's policy, which waits for
@@ -31,6 +34,20 @@ pub struct H1Limits {
     pub interim_heads: usize,
     /// What those interim answers may come to together.
     pub interim_bytes: usize,
+    /// How long an exchange has to reach a final head, counted from when it begins.
+    ///
+    /// Absolute on purpose: an upload arriving a byte at a time must not be able to hold
+    /// an exchange open for as long as it keeps trickling, and an upstream that keeps
+    /// sending interim answers does not buy itself more time by doing so. A very long
+    /// upload needs a profile of its own, which this stage does not have.
+    pub final_head: Duration,
+    /// How long nothing at all may happen before an exchange is given up on.
+    ///
+    /// About progress, not about time passing: a round of an exchange waits only when
+    /// neither direction can move, so a round that does not finish is nothing moving.
+    /// Where a peer is waiting on something legitimate — a client that has not asked for
+    /// the next frame yet — no round is outstanding and nothing is counted against it.
+    pub idle: Duration,
 }
 
 impl Default for H1Limits {
@@ -43,6 +60,8 @@ impl Default for H1Limits {
             trailer_fields: 64,
             interim_heads: 16,
             interim_bytes: 128 * 1024,
+            final_head: Duration::from_secs(60),
+            idle: Duration::from_secs(30),
         }
     }
 }

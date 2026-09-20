@@ -23,7 +23,9 @@ use std::future::poll_fn;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::timeout;
 
 /// How much of a request waits in memory to be written. One frame at a time is staged;
 /// the body is not asked for more until what it gave has gone.
@@ -60,6 +62,18 @@ pub enum ExchangeError {
     InterimTooLong {
         /// What they may come to together.
         limit: usize,
+    },
+    /// No final head within the time an exchange has for one, however busy it was.
+    #[error("the upstream did not answer within {after:?}")]
+    TooSlow {
+        /// The time an exchange has to reach a final head.
+        after: Duration,
+    },
+    /// Neither direction moved for long enough that neither is going to.
+    #[error("nothing moved on the connection for {after:?}")]
+    Idle {
+        /// How long nothing may happen.
+        after: Duration,
     },
 }
 
@@ -129,6 +143,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         B: Body<Data = Bytes>,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
+        let by = limits.final_head;
+        match timeout(
+            by,
+            self.exchange(method, uri, headers, sending, body, limits),
+        )
+        .await
+        {
+            Ok(answer) => answer,
+            Err(_) => Err(ExchangeError::TooSlow { after: by }),
+        }
+    }
+
+    /// The exchange itself, with the clock kept outside it.
+    async fn exchange<B>(
+        &mut self,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        sending: Sending,
+        body: B,
+        limits: &H1Limits,
+    ) -> Result<Answer, ExchangeError>
+    where
+        B: Body<Data = Bytes>,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
         write_head(&mut self.outgoing, method, uri, headers, sending, limits)?;
         let mut writer = BodyWriter::new(sending);
         let mut body = std::pin::pin!(body);
@@ -143,9 +183,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             // looking at it is how an upstream that answers and closes at once has its
             // answer thrown away for a close that had already been overtaken.
             let Head::Read { head, consumed } = reader.read(&self.incoming, limits)? else {
-                match poll_fn(|cx| self.round(cx, &mut body, &mut writer, &mut trailers)).await? {
-                    Moved::Read | Moved::Wrote => continue,
-                    Moved::Closed => return Err(ExchangeError::Closed),
+                let round = poll_fn(|cx| self.round(cx, &mut body, &mut writer, &mut trailers));
+                match timeout(limits.idle, round).await {
+                    Err(_) => return Err(ExchangeError::Idle { after: limits.idle }),
+                    Ok(Err(error)) => return Err(error),
+                    Ok(Ok(Moved::Read | Moved::Wrote)) => continue,
+                    Ok(Ok(Moved::Closed)) => return Err(ExchangeError::Closed),
                 }
             };
             if head.status.is_informational() {
@@ -456,7 +499,6 @@ impl From<&Method> for Asked {
 mod tests {
     use super::*;
     use http_body_util::{Empty, Full};
-    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     /// A body that gives a frame and then fails, as a client's does when it goes away
@@ -922,5 +964,130 @@ mod tests {
 
         let (data, _) = collected(&mut body).await.unwrap();
         assert_eq!(data, b"abcd");
+    }
+
+    /// An upstream that takes the request, says nothing, and stays. Time is the test's to
+    /// move, so nothing here really waits a minute.
+    #[tokio::test(start_paused = true)]
+    async fn an_upstream_that_never_answers_is_given_up_on() {
+        let (mut exchange, mut peer) = connected(4096);
+        tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            // It holds the connection open and says nothing at all.
+            std::future::pending::<()>().await;
+            drop(peer);
+        });
+
+        let limits = H1Limits::default();
+        let failed = exchange
+            .send(
+                &Method::GET,
+                &"/x".parse().unwrap(),
+                &headers(&[("host", "up.test")]),
+                Sending::None,
+                Empty::<Bytes>::new(),
+                &limits,
+            )
+            .await
+            .unwrap_err();
+        // The idle bound is the shorter of the two, so it is the one that speaks.
+        assert!(
+            matches!(failed, ExchangeError::Idle { after } if after == limits.idle),
+            "{failed}"
+        );
+    }
+
+    /// An upstream that keeps something happening never goes idle, and is still given up
+    /// on: the time an exchange has for a final head is counted from its start and is not
+    /// extended by an upstream that stays busy.
+    #[tokio::test(start_paused = true)]
+    async fn an_upstream_that_dribbles_does_not_buy_itself_more_time() {
+        let (mut exchange, mut peer) = connected(4096);
+        tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            // A byte of a head that never ends, often enough never to be idle.
+            loop {
+                peer.say("x").await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        let limits = H1Limits::default();
+        let failed = exchange
+            .send(
+                &Method::GET,
+                &"/x".parse().unwrap(),
+                &headers(&[("host", "up.test")]),
+                Sending::None,
+                Empty::<Bytes>::new(),
+                &limits,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(failed, ExchangeError::TooSlow { after } if after == limits.final_head),
+            "{failed}"
+        );
+    }
+
+    /// Nor do interim answers, which is the same rule said of the other way an upstream
+    /// can look busy without getting anywhere.
+    #[tokio::test(start_paused = true)]
+    async fn interim_answers_do_not_buy_more_time_either() {
+        let (mut exchange, mut peer) = connected(4096);
+        tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            loop {
+                peer.say("HTTP/1.1 100 Continue\r\n\r\n").await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        // Room for more interim answers than the clock will allow through.
+        let limits = H1Limits {
+            interim_heads: 1024,
+            ..H1Limits::default()
+        };
+        let failed = exchange
+            .send(
+                &Method::GET,
+                &"/x".parse().unwrap(),
+                &headers(&[("host", "up.test")]),
+                Sending::None,
+                Empty::<Bytes>::new(),
+                &limits,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(failed, ExchangeError::TooSlow { after } if after == limits.final_head),
+            "{failed}"
+        );
+    }
+
+    /// An upstream that answers in good time is not hurried by any of this.
+    #[tokio::test(start_paused = true)]
+    async fn an_upstream_that_answers_in_time_is_left_alone() {
+        let (mut exchange, mut peer) = connected(4096);
+        tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            peer.say("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            peer
+        });
+
+        let answer = exchange
+            .send(
+                &Method::GET,
+                &"/x".parse().unwrap(),
+                &headers(&[("host", "up.test")]),
+                Sending::None,
+                Empty::<Bytes>::new(),
+                &H1Limits::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer.head.status, 200);
     }
 }
