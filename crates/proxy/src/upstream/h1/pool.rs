@@ -54,12 +54,16 @@ impl<S> Default for Pool<S> {
 }
 
 impl<S> Pool<S> {
-    /// A connection for `identity` that is fit to be used again, if there is one.
+    /// A connection for `identity` that is fit to be used again, and when it was opened.
+    ///
+    /// The time it was opened travels with it, because a connection that started its age
+    /// again on every reuse would have no age at all: one in steady use would go on being
+    /// trusted for ever, which is the one case the bound is there for.
     ///
     /// Anything found to be too old or too long idle is dropped rather than handed out,
     /// and so is everything held for a destination that is gone: a config can change
     /// while a connection sits here.
-    pub fn take(&mut self, identity: &ReuseIdentity, limits: &H1Limits) -> Option<S> {
+    pub fn take(&mut self, identity: &ReuseIdentity, limits: &H1Limits) -> Option<(S, Instant)> {
         if identity.is_retired() {
             self.forget(identity.key());
             return None;
@@ -70,11 +74,10 @@ impl<S> Pool<S> {
         while let Some(connection) = held.pop() {
             self.total -= 1;
             if is_fit(&connection, now, limits) {
-                let socket = connection.socket;
                 if held.is_empty() {
                     self.idle.remove(&identity.key());
                 }
-                return Some(socket);
+                return Some((connection.socket, connection.opened));
             }
         }
         self.idle.remove(&identity.key());
@@ -200,9 +203,10 @@ impl<S> Lease<S> {
         self.opened
     }
 
-    /// The connection, taken out of the lease for the length of an exchange. Whatever
-    /// becomes of it, only [`Lease::keep`] puts one back.
-    pub fn into_socket(mut self) -> Option<S> {
+    /// The connection, taken out for the length of an exchange. The lease stays behind
+    /// to say where it came from and where it may go back to; whatever becomes of it in
+    /// the meantime, only [`Lease::keep`] puts one back.
+    pub fn take_socket(&mut self) -> Option<S> {
         self.socket.take()
     }
 
@@ -234,6 +238,7 @@ mod tests {
     use super::*;
     use crate::upstream::destination::{Destinations, Keys};
     use edgerush_config::{Config, compile};
+    use std::time::Duration;
 
     /// Destinations for the named upstreams, each with the addresses given.
     fn destinations(upstreams: &[(&str, &[&str])], keys: &Keys) -> Destinations {
@@ -262,7 +267,7 @@ mod tests {
 
         assert!(pool.put(&identity, 7, Instant::now(), &limits).is_none());
         assert_eq!(pool.idle(), 1);
-        assert_eq!(pool.take(&identity, &limits), Some(7));
+        assert_eq!(pool.take(&identity, &limits).map(|(s, _)| s), Some(7));
         assert_eq!(pool.idle(), 0, "it was left in as well as handed out");
     }
 
@@ -276,8 +281,8 @@ mod tests {
         let mut pool = Pool::default();
 
         pool.put(&identity, 1, Instant::now(), &limits);
-        assert_eq!(pool.take(&identity, &limits), Some(1));
-        assert_eq!(pool.take(&identity, &limits), None);
+        assert_eq!(pool.take(&identity, &limits).map(|(s, _)| s), Some(1));
+        assert!(pool.take(&identity, &limits).is_none());
     }
 
     /// The destination is the key, and nothing else is. Two upstreams at one address do
@@ -298,8 +303,8 @@ mod tests {
 
         pool.put(&first, 1, Instant::now(), &limits);
         assert_eq!(first.address(), second.address());
-        assert_eq!(pool.take(&second, &limits), None, "one's went to two");
-        assert_eq!(pool.take(&first, &limits), Some(1));
+        assert!(pool.take(&second, &limits).is_none(), "one's went to two");
+        assert_eq!(pool.take(&first, &limits).map(|(s, _)| s), Some(1));
     }
 
     #[tokio::test(start_paused = true)]
@@ -348,7 +353,7 @@ mod tests {
 
         pool.put(&identity, 1, Instant::now(), &limits);
         tokio::time::sleep(limits.idle_timeout * 2).await;
-        assert_eq!(pool.take(&identity, &limits), None);
+        assert!(pool.take(&identity, &limits).is_none());
         assert_eq!(
             pool.idle(),
             0,
@@ -392,7 +397,7 @@ mod tests {
         );
         assert!(identity.is_retired());
 
-        assert_eq!(pool.take(&identity, &limits), None);
+        assert!(pool.take(&identity, &limits).is_none());
         assert_eq!(pool.idle(), 0, "a retired destination kept its connections");
         assert_eq!(pool.put(&identity, 2, Instant::now(), &limits), Some(2));
     }
@@ -430,7 +435,7 @@ mod tests {
 
         assert_eq!(pool.sweep(&limits), 1);
         assert_eq!(pool.idle(), 1);
-        assert_eq!(pool.take(&staying, &limits), Some(1));
+        assert_eq!(pool.take(&staying, &limits).map(|(s, _)| s), Some(1));
     }
 
     #[tokio::test(start_paused = true)]
@@ -474,6 +479,38 @@ mod tests {
         );
     }
 
+    /// A connection keeps the time it was opened through every reuse, so one in steady
+    /// use is still bounded by its age. Were the clock to start again each time it went
+    /// back, a busy connection would go on being trusted for ever.
+    #[tokio::test(start_paused = true)]
+    async fn reuse_does_not_make_a_connection_young_again() {
+        let keys = Keys::default();
+        let (_held, identity) = one(&keys);
+        // Gaps short enough that it is never idle too long, and an age it can reach.
+        let limits = H1Limits {
+            idle_timeout: Duration::from_secs(30),
+            max_age: Duration::from_secs(100),
+            ..H1Limits::default()
+        };
+        let mut pool = Pool::default();
+        let opened = Instant::now();
+
+        // Used over and over, never idle for long, always put straight back.
+        for round in 0..4 {
+            assert!(pool.put(&identity, 1, opened, &limits).is_none(), "{round}");
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            let (socket, was_opened) = pool.take(&identity, &limits).expect("still fit");
+            assert_eq!(socket, 1);
+            assert_eq!(was_opened, opened, "it forgot when it was opened");
+        }
+
+        // Eighty seconds of use so far, and none of it spent idle for long. A little
+        // more and it is past its age, however lately it was used.
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        assert_eq!(pool.put(&identity, 1, opened, &limits), Some(1));
+        assert_eq!(pool.idle(), 0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_lease_that_is_kept_puts_its_connection_back() {
         let keys = Keys::default();
@@ -486,7 +523,10 @@ mod tests {
         lease.keep(socket, &limits);
 
         assert_eq!(pool.borrow().idle(), 1);
-        assert_eq!(pool.borrow_mut().take(&identity, &limits), Some(9));
+        assert_eq!(
+            pool.borrow_mut().take(&identity, &limits).map(|(s, _)| s),
+            Some(9)
+        );
     }
 
     /// A lease let go of rather than finished takes its connection with it. There is no
@@ -501,7 +541,7 @@ mod tests {
         drop(Lease::new(9, Arc::clone(&identity), Instant::now(), &pool));
 
         assert_eq!(pool.borrow().idle(), 0);
-        assert_eq!(pool.borrow_mut().take(&identity, &limits), None);
+        assert!(pool.borrow_mut().take(&identity, &limits).is_none());
     }
 
     /// A lease that outlives its worker has nowhere to put anything, and does not keep
@@ -551,8 +591,8 @@ mod tests {
         let (_held, identity) = one(&keys);
         let pool = Rc::new(RefCell::new(Pool::default()));
 
-        let lease = Lease::new(9, Arc::clone(&identity), Instant::now(), &pool);
-        assert_eq!(lease.into_socket(), Some(9));
+        let mut lease = Lease::new(9, Arc::clone(&identity), Instant::now(), &pool);
+        assert_eq!(lease.take_socket(), Some(9));
         assert_eq!(pool.borrow().idle(), 0);
     }
 
