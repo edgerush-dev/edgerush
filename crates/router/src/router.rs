@@ -4,9 +4,9 @@
 //! route's hostnames — is a [`RouteMatch`]. For a request, the one that serves is the first
 //! in this order that the request satisfies in full:
 //!
-//! 1. the most specific host ([`HostIndex`](crate::HostIndex): groups of equally specific
+//! 1. the most specific host ([`HostIndex`]: groups of equally specific
 //!    claims, the next group only when no match of the one before serves);
-//! 2. the best path ([`PathIndex`](crate::PathIndex): exact, then regex, then the longest
+//! 2. the best path ([`PathIndex`]: exact, then regex, then the longest
 //!    prefix);
 //! 3. a method predicate before none;
 //! 4. the most header predicates;
