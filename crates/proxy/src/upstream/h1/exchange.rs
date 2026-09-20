@@ -78,6 +78,49 @@ pub enum ExchangeError {
     },
 }
 
+/// The request, as far as it has been sent.
+///
+/// It outlives the final head: an upstream may answer before it has taken all of a body,
+/// and stopping there would leave an echo server waiting for bytes that were never going
+/// to come while the client waited for an answer that was never going to finish.
+#[derive(Debug)]
+pub struct Upload<B> {
+    body: B,
+    writer: BodyWriter,
+    trailers: Option<HeaderMap>,
+    /// Nothing more of the request will be sent, whether because it was all sent or
+    /// because there is no longer anywhere for it to go.
+    stopped: bool,
+}
+
+impl<S, B> Rest<S, B> {
+    /// Whether every byte of the request went out.
+    pub fn upload_finished(&self) -> bool {
+        self.upload.finished()
+    }
+}
+
+impl<B> Upload<B> {
+    /// Whether every byte of the request went out.
+    fn finished(&self) -> bool {
+        self.writer.is_done()
+    }
+
+    /// Gives up on the rest of the request. What has not gone will never go, so the
+    /// connection is out of step and is not to be used again.
+    fn abandon(&mut self) {
+        self.stopped = true;
+    }
+}
+
+/// What is left of an exchange once its final head has been read: the connection, what was
+/// read past the head, and a request that may still be going out.
+#[derive(Debug)]
+pub struct Rest<S, B> {
+    exchange: Exchange<S>,
+    upload: Upload<B>,
+}
+
 /// An upstream's answer, once its head has been read.
 #[derive(Debug)]
 pub struct Answer {
@@ -88,10 +131,13 @@ pub struct Answer {
     /// How many interim heads came before it. They are consumed and not passed on; the
     /// engine that serves the client has no way to send one ([13 §5]).
     pub interim: usize,
-    /// True where the answer arrived before the request had finished going out. What was
-    /// left of the request was abandoned, so the connection is out of step and must not be
-    /// kept, whatever else says otherwise.
-    pub cut_short_the_request: bool,
+    /// Whether this answer is one that says to stop sending the request: a refusal that
+    /// also closes the connection.
+    ///
+    /// A head arriving early says nothing by itself — an echo answers at once — and
+    /// neither does a status alone, nor a `Connection: close` on an answer that is going
+    /// well ([13 §5](../../../docs/13-http1-upstream.md)).
+    pub stop_uploading: bool,
 }
 
 /// One exchange on one connection.
@@ -132,28 +178,44 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
     /// Anything the upstream said that cannot be read, a connection that failed or closed
     /// without answering, or a request body that could not be read.
     pub async fn send<B>(
-        &mut self,
+        mut self,
         method: &Method,
         uri: &Uri,
         headers: &HeaderMap,
         sending: Sending,
         body: B,
         limits: &H1Limits,
-    ) -> Result<Answer, ExchangeError>
+    ) -> Result<(Answer, Rest<S, B>), ExchangeError>
     where
-        B: Body<Data = Bytes>,
+        B: Body<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
         let by = limits.final_head;
-        match timeout(
+        let mut upload = Upload {
+            body,
+            writer: BodyWriter::new(sending),
+            trailers: None,
+            stopped: false,
+        };
+        let asked = timeout(
             by,
-            self.exchange(method, uri, headers, sending, body, limits),
+            self.exchange(method, uri, headers, sending, &mut upload, limits),
         )
-        .await
-        {
-            Ok(answer) => answer,
-            Err(_) => Err(ExchangeError::TooSlow { after: by }),
+        .await;
+        let answer = match asked {
+            Ok(answer) => answer?,
+            Err(_) => return Err(ExchangeError::TooSlow { after: by }),
+        };
+        if answer.stop_uploading {
+            upload.abandon();
         }
+        Ok((
+            answer,
+            Rest {
+                exchange: self,
+                upload,
+            },
+        ))
     }
 
     /// The exchange itself, with the clock kept outside it.
@@ -163,21 +225,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         uri: &Uri,
         headers: &HeaderMap,
         sending: Sending,
-        body: B,
+        upload: &mut Upload<B>,
         limits: &H1Limits,
     ) -> Result<Answer, ExchangeError>
     where
-        B: Body<Data = Bytes>,
+        B: Body<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
         write_head(&mut self.outgoing, method, uri, headers, sending, limits)?;
         // A request that asks to be told before it sends its body has its head go out
         // alone; what follows waits for the upstream to answer, or for the wait to end.
         let mut may_send = !expects_continue(headers);
+        let withheld = !may_send;
         let ask_by = Instant::now() + limits.continue_wait;
-        let mut writer = BodyWriter::new(sending);
-        let mut body = std::pin::pin!(body);
-        let mut trailers: Option<HeaderMap> = None;
 
         let mut reader = HeadReader::default();
         let mut interim = 0;
@@ -188,8 +248,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             // looking at it is how an upstream that answers and closes at once has its
             // answer thrown away for a close that had already been overtaken.
             let Head::Read { head, consumed } = reader.read(&self.incoming, limits)? else {
-                let round =
-                    poll_fn(|cx| self.round(cx, &mut body, &mut writer, &mut trailers, may_send));
+                let round = poll_fn(|cx| self.round(cx, upload, may_send));
                 // While the body is held back, the wait for permission is the shorter of
                 // the two and is counted from when the head went, not from this round.
                 let until = if may_send {
@@ -235,14 +294,92 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             }
             self.incoming.drain(..consumed);
             let delivery = delivery(&head, Asked::from(method))?;
+            // A refusal that also closes the connection says to stop; an answer that came
+            // early says nothing at all, because an echo answers early by nature. A
+            // request still being withheld for a 100 is never started now.
+            let refused = head.status.is_client_error() || head.status.is_server_error();
+            // A request still being withheld for a 100 is never started by an answer:
+            // the upstream answered instead of asking, so it is not waiting for a body.
+            let never_asked_for = withheld && !may_send;
+            let stop_uploading = never_asked_for || (refused && !delivery.persistent);
             return Ok(Answer {
                 head,
                 delivery,
                 interim,
-                // The answer came first, so what is left of the request will never go.
-                cut_short_the_request: !writer.is_done() || self.written < self.outgoing.len(),
+                stop_uploading,
             });
         }
+    }
+
+    /// Pushes the request along as far as it will go without waiting: another frame of it
+    /// if there is room to stage one, and whatever is staged out onto the socket.
+    ///
+    /// Says whether anything moved. Never waits on the request: a body that has nothing
+    /// ready is not a reason to stop reading, which is the whole point of doing both.
+    fn push<B>(
+        &mut self,
+        cx: &mut Context<'_>,
+        upload: &mut Upload<B>,
+        may_send: bool,
+    ) -> Result<bool, ExchangeError>
+    where
+        B: Body<Data = Bytes> + Unpin,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let mut moved = false;
+        // Nothing more will be sent, so there is nothing to take and nothing to write.
+        if upload.stopped {
+            return Ok(false);
+        }
+
+        // Take another frame, unless what was taken is still waiting to go out, or the
+        // body is being held back until the upstream asks for it. Held back means not
+        // polled at all: asking a client for bytes it was told to keep is how both ends
+        // come to be waiting for each other.
+        if may_send && !upload.writer.is_done() && self.outgoing.len() - self.written < STAGING {
+            match Pin::new(&mut upload.body).poll_frame(cx) {
+                Poll::Pending => {}
+                Poll::Ready(Some(Err(error))) => {
+                    return Err(ExchangeError::RequestBody(error.into()));
+                }
+                Poll::Ready(Some(Ok(frame))) => {
+                    match frame.into_data() {
+                        Ok(data) => upload.writer.data(&mut self.outgoing, &data)?,
+                        // Trailers come last, and go out with the body's end.
+                        Err(frame) => {
+                            if let Ok(fields) = frame.into_trailers() {
+                                upload.trailers = Some(fields);
+                            }
+                        }
+                    }
+                    moved = true;
+                }
+                Poll::Ready(None) => {
+                    upload
+                        .writer
+                        .finish(&mut self.outgoing, upload.trailers.as_ref(), &[])?;
+                    moved = true;
+                }
+            }
+        }
+
+        // And out onto the socket, as far as it will take.
+        while self.written < self.outgoing.len() {
+            match Pin::new(&mut self.socket).poll_write(cx, &self.outgoing[self.written..]) {
+                Poll::Pending => break,
+                Poll::Ready(Err(error)) => return Err(error.into()),
+                Poll::Ready(Ok(0)) => break,
+                Poll::Ready(Ok(gone)) => {
+                    self.written += gone;
+                    moved = true;
+                }
+            }
+        }
+        if self.written == self.outgoing.len() && self.written > 0 {
+            self.outgoing.clear();
+            self.written = 0;
+        }
+        Ok(moved)
     }
 
     /// One round of whatever can be done: writing what is waiting, taking another frame of
@@ -251,61 +388,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
     fn round<B>(
         &mut self,
         cx: &mut Context<'_>,
-        body: &mut Pin<&mut B>,
-        writer: &mut BodyWriter,
-        trailers: &mut Option<HeaderMap>,
+        upload: &mut Upload<B>,
         may_send: bool,
     ) -> Poll<Result<Moved, ExchangeError>>
     where
-        B: Body<Data = Bytes>,
+        B: Body<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
-        let mut wrote = false;
-
-        // Take another frame of the request, unless what has been taken is still waiting
-        // or the body is being held back until the upstream asks for it. The body is not
-        // polled at all in that case: asking a client for bytes it was told to hold is
-        // how both ends come to be waiting for each other.
-        if may_send && !writer.is_done() && self.outgoing.len() - self.written < STAGING {
-            match body.as_mut().poll_frame(cx) {
-                Poll::Pending => {}
-                Poll::Ready(Some(Err(error))) => {
-                    return Poll::Ready(Err(ExchangeError::RequestBody(error.into())));
-                }
-                Poll::Ready(Some(Ok(frame))) => {
-                    match frame.into_data() {
-                        Ok(data) => writer.data(&mut self.outgoing, &data)?,
-                        // Trailers come last and are written with the body's end.
-                        Err(frame) => {
-                            if let Ok(fields) = frame.into_trailers() {
-                                *trailers = Some(fields);
-                            }
-                        }
-                    }
-                    wrote = true;
-                }
-                Poll::Ready(None) => {
-                    writer.finish(&mut self.outgoing, trailers.as_ref(), &[])?;
-                    wrote = true;
-                }
-            }
-        }
-        // Write whatever is waiting.
-        while self.written < self.outgoing.len() {
-            match Pin::new(&mut self.socket).poll_write(cx, &self.outgoing[self.written..]) {
-                Poll::Pending => break,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
-                Poll::Ready(Ok(0)) => break,
-                Poll::Ready(Ok(gone)) => {
-                    self.written += gone;
-                    wrote = true;
-                }
-            }
-        }
-        if self.written == self.outgoing.len() && self.written > 0 {
-            self.outgoing.clear();
-            self.written = 0;
-        }
+        let wrote = match self.push(cx, upload, may_send) {
+            Ok(wrote) => wrote,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
 
         // And read, whatever the writing did. This is the part that must not be skipped.
         let was = self.incoming.len();
@@ -342,12 +435,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
 /// it could ever be used again ([13 §6](../../../docs/13-http1-upstream.md)); the rest
 /// come with the pool, and until then this connection is closed when the body is dropped.
 #[derive(Debug)]
-pub struct H1Body<S> {
-    /// Gone once the body has failed: there is nothing to be done with a socket whose
+pub struct H1Body<S, B> {
+    /// The connection, what was read past the head, and the request still going out.
+    /// Gone once the body has failed: there is nothing to be done with a connection whose
     /// message stopped making sense.
-    socket: Option<S>,
-    /// Read from the socket and not yet handed on.
-    buffered: Vec<u8>,
+    rest: Option<Rest<S, B>>,
     reader: BodyReader,
     limits: H1Limits,
     /// The upstream closed its end. Told to the reader, which alone knows whether that is
@@ -359,38 +451,31 @@ pub struct H1Body<S> {
     trailers: Option<HeaderMap>,
     /// How many trailer fields were dropped on the way, for a counter to add up.
     discarded: usize,
-    /// Armed only while a read is outstanding, and thrown away the moment anything
-    /// arrives. A client that has not asked for the next frame is not an upstream being
-    /// slow, so while nobody is waiting on the socket nothing is counted against it.
+    /// Armed only while a poll is outstanding, and thrown away the moment anything moves
+    /// in either direction. A client that has not asked for the next frame is not an
+    /// upstream being slow, so while nobody is waiting nothing is counted against it.
     waiting: Option<Pin<Box<Sleep>>>,
-    /// What the head said about carrying another exchange, and whether the request it
-    /// answered went out whole. Both are settled before a byte of this body is read.
-    may_reuse: bool,
-    /// Where this connection came from, and where it may go back to. Absent for a body
-    /// on a connection that was never leased from anywhere.
+    /// What the answer's head said about the connection carrying another exchange. Not by
+    /// itself enough to keep it: the request has to have finished going out too.
+    persistent: bool,
+    /// Where this connection came from, and where it may go back to. Absent for a body on
+    /// a connection that was never leased from anywhere.
     returner: Option<Lease<S>>,
 }
 
-impl<S> H1Body<S> {
-    /// A body of `framing`, on `socket`, with `buffered` already read from it.
+impl<S, B> H1Body<S, B> {
+    /// A body of `framing` on what is left of an exchange.
     ///
-    /// `may_reuse` is what the answer's head said about keeping the connection, and
-    /// whether the request it answered finished going out: both are known before this
-    /// body is read and neither can be worked out from it afterwards.
-    pub fn new(
-        socket: S,
-        buffered: Vec<u8>,
-        framing: Framing,
-        may_reuse: bool,
-        limits: H1Limits,
-    ) -> Self {
+    /// `persistent` is what the answer's head said about keeping the connection. Whether
+    /// the request finished is not asked yet: an upstream may answer before it has taken
+    /// all of one, and the rest of it goes out while this body is read.
+    pub fn new(rest: Rest<S, B>, framing: Framing, persistent: bool, limits: H1Limits) -> Self {
         let reader = BodyReader::new(framing);
         // A body that was never going to carry anything is finished before it starts. Said
         // now and not at the first poll, because nothing need ever poll an empty body.
         let complete = reader.is_done();
         Self {
-            socket: Some(socket),
-            buffered,
+            rest: Some(rest),
             reader,
             limits,
             ended: false,
@@ -398,7 +483,7 @@ impl<S> H1Body<S> {
             trailers: None,
             discarded: 0,
             waiting: None,
-            may_reuse,
+            persistent,
             returner: None,
         }
     }
@@ -425,11 +510,12 @@ impl<S> H1Body<S> {
     /// Every one of these holds, and none of them is inferred from another
     /// ([13 §6](../../../docs/13-http1-upstream.md)):
     ///
-    /// - the answer's head allowed the connection to carry another exchange, and the
-    ///   request it answered went out whole;
+    /// - the answer's head allowed the connection to carry another exchange;
+    /// - the request went out whole — which may have happened after the head arrived, and
+    ///   is no worse for that;
     /// - exactly one answer was read through to its end, chunk terminator and trailers
     ///   included, and everything of it has been handed on;
-    /// - nothing went wrong along the way — an error leaves no socket here to give;
+    /// - nothing went wrong along the way — an error leaves no connection here to give;
     /// - nothing is left over in hand, and nothing is readable on the socket now, and the
     ///   upstream has not closed.
     ///
@@ -443,21 +529,23 @@ impl<S> H1Body<S> {
     where
         S: AsyncRead + Unpin,
     {
-        // What the head allowed, and a request that finished going out.
-        if !self.may_reuse {
+        // What the head allowed, and one answer read to its end with everything passed on.
+        if !self.persistent || !self.is_complete() {
             return None;
         }
-        // One answer, read to its end, with everything of it passed on.
-        if !self.is_complete() {
+        let rest = self.rest.as_ref()?;
+        // A request that never finished leaves the connection out of step, whenever the
+        // answer happened to arrive.
+        if rest.upload.stopped || !rest.upload.finished() {
             return None;
         }
         // Bytes in hand after a message that is over are a peer saying something nobody
         // asked for, and the upstream having closed is the end of the connection anyway.
-        if !self.buffered.is_empty() || self.ended {
+        if !rest.exchange.incoming.is_empty() || self.ended {
             return None;
         }
-        // An error took the socket, so there may be nothing here at all.
-        let mut socket = self.socket.take()?;
+        let rest = self.rest.take()?;
+        let mut socket = rest.exchange.socket;
         if !nothing_to_say(&mut socket) {
             return None;
         }
@@ -485,7 +573,8 @@ impl<S> H1Body<S> {
     /// What is left of the connection whatever state it is in, for a caller that means to
     /// close it. Never a way back into a pool: that is [`H1Body::take_if_reusable`] alone.
     pub fn into_connection(self) -> Option<(S, Vec<u8>)> {
-        self.socket.map(|socket| (socket, self.buffered))
+        self.rest
+            .map(|rest| (rest.exchange.socket, rest.exchange.incoming))
     }
 
     /// Takes the end apart: what the reader said, kept for the frame after this one.
@@ -497,10 +586,22 @@ impl<S> H1Body<S> {
                 self.trailers = Some(trailers.fields);
             }
         }
+        // The answer is over. Anything of the request that has not gone is not going now:
+        // nobody is left to read it, and the connection cannot be handed on.
+        if let Some(rest) = self.rest.as_mut()
+            && !rest.upload.finished()
+        {
+            rest.upload.abandon();
+        }
     }
 }
 
-impl<S: AsyncRead + Unpin> Body for H1Body<S> {
+impl<S, B> Body for H1Body<S, B>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
     type Data = Bytes;
     type Error = ExchangeError;
 
@@ -517,26 +618,42 @@ impl<S: AsyncRead + Unpin> Body for H1Body<S> {
                     None => Poll::Ready(None),
                 };
             }
-            let Some(socket) = this.socket.as_mut() else {
+            let Some(rest) = this.rest.as_mut() else {
                 return Poll::Ready(None);
             };
 
-            match this.reader.read(&this.buffered, this.ended, &this.limits) {
+            // The rest of the request goes out while the answer is read. An upstream that
+            // answers early may still be reading, and one that has stopped reading is not
+            // a reason to stop delivering what it has already said.
+            let mut moved = match rest.exchange.push(cx, &mut rest.upload, true) {
+                Ok(moved) => moved,
+                Err(_) => {
+                    // The request will not finish, so the connection cannot be kept. The
+                    // answer is another matter and goes on being read.
+                    rest.upload.abandon();
+                    false
+                }
+            };
+
+            match this
+                .reader
+                .read(&rest.exchange.incoming, this.ended, &this.limits)
+            {
                 Err(error) => {
                     // A body that stopped making sense is not an end; saying so would be
                     // handing the client half an answer as though it were the whole one.
-                    this.socket = None;
+                    this.rest = None;
                     return Poll::Ready(Some(Err(error.into())));
                 }
                 Ok(Piece::End { trailers, consumed }) => {
-                    this.buffered.drain(..consumed);
+                    rest.exchange.incoming.drain(..consumed);
                     this.ended_with(trailers);
                     continue;
                 }
                 Ok(Piece::Data { data, consumed }) => {
-                    let frame =
-                        (!data.is_empty()).then(|| Bytes::copy_from_slice(&this.buffered[data]));
-                    this.buffered.drain(..consumed);
+                    let frame = (!data.is_empty())
+                        .then(|| Bytes::copy_from_slice(&rest.exchange.incoming[data]));
+                    rest.exchange.incoming.drain(..consumed);
                     let Some(frame) = frame else {
                         // Framing bytes and nothing else; keep going.
                         continue;
@@ -546,27 +663,37 @@ impl<S: AsyncRead + Unpin> Body for H1Body<S> {
                     // end was never checked is one whose connection cannot be trusted.
                     // Asked only where the answer is already certain — reading to find
                     // out would move the reader past bytes still sitting in the buffer.
-                    if this.reader.is_spent()
-                        && let Ok(Piece::End { trailers, consumed }) =
-                            this.reader.read(&this.buffered, this.ended, &this.limits)
-                    {
-                        this.buffered.drain(..consumed);
-                        this.ended_with(trailers);
+                    if this.reader.is_spent() {
+                        let settled =
+                            this.reader
+                                .read(&rest.exchange.incoming, this.ended, &this.limits);
+                        if let Ok(Piece::End { trailers, consumed }) = settled {
+                            rest.exchange.incoming.drain(..consumed);
+                            this.ended_with(trailers);
+                        }
                     }
+                    this.waiting = None;
                     return Poll::Ready(Some(Ok(Frame::data(frame))));
                 }
                 Ok(Piece::More) => {}
             }
 
             // Only now, and only because somebody asked for a frame.
-            let was = this.buffered.len();
-            this.buffered.resize(was + READING, 0);
-            let mut read = ReadBuf::new(&mut this.buffered[was..]);
-            let outcome = Pin::new(socket).poll_read(cx, &mut read);
+            let was = rest.exchange.incoming.len();
+            rest.exchange.incoming.resize(was + READING, 0);
+            let mut read = ReadBuf::new(&mut rest.exchange.incoming[was..]);
+            let outcome = Pin::new(&mut rest.exchange.socket).poll_read(cx, &mut read);
             let filled = read.filled().len();
-            this.buffered.truncate(was + filled);
+            rest.exchange.incoming.truncate(was + filled);
             match outcome {
                 Poll::Pending => {
+                    if moved {
+                        // Something went out even though nothing came in; go round again
+                        // rather than sleep on a socket that may now be writable.
+                        moved = false;
+                        let _went_out = moved;
+                        continue;
+                    }
                     let idle = this.limits.idle;
                     let waiting = this
                         .waiting
@@ -574,12 +701,12 @@ impl<S: AsyncRead + Unpin> Body for H1Body<S> {
                     if waiting.as_mut().poll(cx).is_pending() {
                         return Poll::Pending;
                     }
-                    // Long enough with a read outstanding and nothing to show for it.
-                    this.socket = None;
+                    // Long enough with a poll outstanding and nothing to show for it.
+                    this.rest = None;
                     return Poll::Ready(Some(Err(ExchangeError::Idle { after: idle })));
                 }
                 Poll::Ready(Err(error)) => {
-                    this.socket = None;
+                    this.rest = None;
                     return Poll::Ready(Some(Err(error.into())));
                 }
                 Poll::Ready(Ok(())) => {
@@ -694,6 +821,7 @@ mod tests {
 
     /// A body that gives a frame and then fails, as a client's does when it goes away
     /// part way through sending one.
+    #[derive(Debug)]
     struct Failing(bool);
 
     impl Body for Failing {
@@ -753,13 +881,13 @@ mod tests {
     }
 
     /// Everything of the answer's body that was already in hand when the head was read.
-    fn left_over(exchange: Exchange<DuplexStream>) -> Vec<u8> {
-        exchange.into_body_parts().1
+    fn left_over<B>(rest: Rest<DuplexStream, B>) -> Vec<u8> {
+        rest.exchange.incoming
     }
 
     #[tokio::test]
     async fn a_request_goes_out_and_its_answer_comes_back() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         let limits = H1Limits::default();
         let sent = tokio::spawn(async move {
             let head = peer.until(b"\r\n\r\n").await;
@@ -767,7 +895,7 @@ mod tests {
             (head, peer)
         });
 
-        let answer = exchange
+        let (answer, rest) = exchange
             .send(
                 &Method::GET,
                 &"/a?b=1".parse().unwrap(),
@@ -781,7 +909,7 @@ mod tests {
 
         assert_eq!(answer.head.status, 204);
         assert_eq!(answer.interim, 0);
-        assert!(!answer.cut_short_the_request);
+        assert!(rest.upload_finished(), "the request did not all go");
         let (head, _peer) = sent.await.unwrap();
         let head = String::from_utf8(head).unwrap();
         assert!(head.starts_with("GET /a?b=1 HTTP/1.1\r\n"), "{head}");
@@ -790,7 +918,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_counted_body_goes_out_with_the_head() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         let sent = tokio::spawn(async move {
             let head = peer.until(b"\r\n\r\n").await;
             let mut body = vec![0; 5];
@@ -800,7 +928,7 @@ mod tests {
             (head, body)
         });
 
-        let answer = exchange
+        let (answer, rest) = exchange
             .send(
                 &Method::POST,
                 &"/x".parse().unwrap(),
@@ -813,7 +941,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(answer.head.status, 200);
-        assert!(!answer.cut_short_the_request);
+        assert!(rest.upload_finished(), "the request did not all go");
         let (head, body) = sent.await.unwrap();
         assert!(
             String::from_utf8(head)
@@ -822,12 +950,12 @@ mod tests {
         );
         assert_eq!(body, b"hello");
         // The two bytes of the answer's body were read along with its head.
-        assert_eq!(left_over(exchange), b"ok");
+        assert_eq!(left_over(rest), b"ok");
     }
 
     #[tokio::test]
     async fn a_body_of_unknown_length_goes_out_chunked() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         let sent = tokio::spawn(async move {
             let head = peer.until(b"\r\n\r\n").await;
             let body = peer.until(b"0\r\n\r\n").await;
@@ -865,7 +993,7 @@ mod tests {
     #[tokio::test]
     async fn an_answer_arrives_though_the_upload_cannot_go() {
         // Room for the head and little else; the body has nowhere to go.
-        let (mut exchange, mut peer) = connected(64);
+        let (exchange, mut peer) = connected(64);
         let upstream = tokio::spawn(async move {
             // It reads the head and then stops reading altogether.
             peer.until(b"\r\n\r\n").await;
@@ -877,7 +1005,7 @@ mod tests {
         });
 
         let huge = Bytes::from(vec![b'x'; 512 * 1024]);
-        let answer = tokio::time::timeout(
+        let (answer, rest) = tokio::time::timeout(
             Duration::from_secs(10),
             exchange.send(
                 &Method::POST,
@@ -893,15 +1021,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(answer.head.status, 413);
-        // The request never finished going out, so this connection is out of step.
-        assert!(answer.cut_short_the_request);
+        // The upload is still unfinished; it is not abandoned for the head alone, and
+        // the answer that closes the connection is what ends it.
+        assert!(!rest.upload_finished());
         assert!(!answer.delivery.persistent);
         drop(upstream);
     }
 
     #[tokio::test]
     async fn interim_answers_are_consumed_and_counted() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         tokio::spawn(async move {
             peer.until(b"\r\n\r\n").await;
             peer.say("HTTP/1.1 100 Continue\r\n\r\n").await;
@@ -912,7 +1041,7 @@ mod tests {
             peer
         });
 
-        let answer = exchange
+        let (answer, _rest) = exchange
             .send(
                 &Method::GET,
                 &"/x".parse().unwrap(),
@@ -932,7 +1061,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_upstream_that_never_stops_being_interim_is_given_up_on() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         tokio::spawn(async move {
             peer.until(b"\r\n\r\n").await;
             for _ in 0..100 {
@@ -964,7 +1093,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_upstream_that_closes_without_answering_is_not_asked_again() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         tokio::spawn(async move {
             // It takes the request, says nothing, and goes.
             peer.until(b"\r\n\r\n").await;
@@ -986,7 +1115,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_body_that_fails_stops_the_exchange() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         tokio::spawn(async move {
             peer.until(b"\r\n\r\n").await;
             peer
@@ -1009,8 +1138,8 @@ mod tests {
     }
 
     /// Reads a whole body, as a client taking the answer would.
-    async fn collected<S: AsyncRead + Unpin>(
-        body: &mut H1Body<S>,
+    async fn collected(
+        body: &mut SpentBody,
     ) -> Result<(Vec<u8>, Option<HeaderMap>), ExchangeError> {
         let mut data = Vec::new();
         let mut trailers = None;
@@ -1030,27 +1159,32 @@ mod tests {
     }
 
     /// A body on a connection whose other end is the test's to write on, on a head that
-    /// allowed the connection to be kept.
-    fn body_on(framing: Framing, buffered: &[u8]) -> (H1Body<DuplexStream>, Peer) {
+    /// allowed the connection to be kept and a request that all went out.
+    fn body_on(framing: Framing, buffered: &[u8]) -> (SpentBody, Peer) {
         keepable_body_on(framing, buffered, true)
     }
 
-    /// The same, saying whether the head and the request allowed it to be kept at all.
-    fn keepable_body_on(
-        framing: Framing,
-        buffered: &[u8],
-        may_reuse: bool,
-    ) -> (H1Body<DuplexStream>, Peer) {
+    /// The same, saying whether the head allowed it to be kept at all.
+    fn keepable_body_on(framing: Framing, buffered: &[u8], persistent: bool) -> (SpentBody, Peer) {
         let (ours, theirs) = tokio::io::duplex(4096);
-        let body = H1Body::new(
-            ours,
-            buffered.to_vec(),
-            framing,
-            may_reuse,
-            H1Limits::default(),
-        );
+        let mut exchange = Exchange::new(ours);
+        exchange.incoming = buffered.to_vec();
+        // A request with nothing in it, already all sent.
+        let mut upload = Upload {
+            body: Empty::<Bytes>::new(),
+            writer: BodyWriter::new(Sending::None),
+            trailers: None,
+            stopped: false,
+        };
+        let mut nothing = Vec::new();
+        upload.writer.finish(&mut nothing, None, &[]).unwrap();
+        let rest = Rest { exchange, upload };
+        let body = H1Body::new(rest, framing, persistent, H1Limits::default());
         (body, Peer(theirs))
     }
+
+    /// A body whose request is behind it, which is every body these tests make.
+    type SpentBody = H1Body<DuplexStream, Empty<Bytes>>;
 
     /// A body that carries nothing is over before anybody asks, because nothing need ever
     /// ask an empty body anything.
@@ -1177,7 +1311,7 @@ mod tests {
     /// move, so nothing here really waits a minute.
     #[tokio::test(start_paused = true)]
     async fn an_upstream_that_never_answers_is_given_up_on() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         tokio::spawn(async move {
             peer.until(b"\r\n\r\n").await;
             // It holds the connection open and says nothing at all.
@@ -1209,7 +1343,7 @@ mod tests {
     /// extended by an upstream that stays busy.
     #[tokio::test(start_paused = true)]
     async fn an_upstream_that_dribbles_does_not_buy_itself_more_time() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         tokio::spawn(async move {
             peer.until(b"\r\n\r\n").await;
             // A byte of a head that never ends, often enough never to be idle.
@@ -1241,7 +1375,7 @@ mod tests {
     /// can look busy without getting anywhere.
     #[tokio::test(start_paused = true)]
     async fn interim_answers_do_not_buy_more_time_either() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         tokio::spawn(async move {
             peer.until(b"\r\n\r\n").await;
             loop {
@@ -1275,7 +1409,7 @@ mod tests {
     /// An upstream that answers in good time is not hurried by any of this.
     #[tokio::test(start_paused = true)]
     async fn an_upstream_that_answers_in_time_is_left_alone() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         tokio::spawn(async move {
             peer.until(b"\r\n\r\n").await;
             tokio::time::sleep(Duration::from_secs(20)).await;
@@ -1284,7 +1418,7 @@ mod tests {
             peer
         });
 
-        let answer = exchange
+        let (answer, _rest) = exchange
             .send(
                 &Method::GET,
                 &"/x".parse().unwrap(),
@@ -1394,7 +1528,7 @@ mod tests {
     /// says 100 is the client's body touched at all.
     #[tokio::test(start_paused = true)]
     async fn a_body_that_was_told_to_wait_waits_for_the_upstreams_word() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         let (body, asked) = Watched::new(b"hello");
         let watching = Arc::clone(&asked);
         let peering = tokio::spawn(async move {
@@ -1414,7 +1548,7 @@ mod tests {
             continue_wait: Duration::from_secs(60),
             ..H1Limits::default()
         };
-        let answer = exchange
+        let (answer, _rest) = exchange
             .send(
                 &Method::POST,
                 &"/x".parse().unwrap(),
@@ -1446,7 +1580,7 @@ mod tests {
     /// wait it is sent anyway, because the client is waiting on both of them meanwhile.
     #[tokio::test(start_paused = true)]
     async fn a_body_held_back_goes_anyway_once_the_wait_is_up() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         let (body, asked) = Watched::new(b"hello");
         let peering = tokio::spawn(async move {
             peer.until(b"\r\n\r\n").await;
@@ -1457,7 +1591,7 @@ mod tests {
             body
         });
 
-        let answer = exchange
+        let (answer, _rest) = exchange
             .send(
                 &Method::POST,
                 &"/x".parse().unwrap(),
@@ -1478,7 +1612,7 @@ mod tests {
     /// saying yes: the body keeps waiting.
     #[tokio::test(start_paused = true)]
     async fn an_interim_answer_that_is_not_a_100_does_not_release_the_body() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         let (body, asked) = Watched::new(b"hello");
         let watching = Arc::clone(&asked);
         let peering = tokio::spawn(async move {
@@ -1498,7 +1632,7 @@ mod tests {
             continue_wait: Duration::from_secs(60),
             ..H1Limits::default()
         };
-        let answer = exchange
+        let (answer, _rest) = exchange
             .send(
                 &Method::POST,
                 &"/x".parse().unwrap(),
@@ -1523,7 +1657,7 @@ mod tests {
     /// never asked for: this is what asking first was for.
     #[tokio::test(start_paused = true)]
     async fn an_upstream_that_refuses_is_never_sent_the_body() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         let (body, asked) = Watched::new(b"hello");
         tokio::spawn(async move {
             peer.until(b"\r\n\r\n").await;
@@ -1538,7 +1672,7 @@ mod tests {
             continue_wait: Duration::from_secs(60),
             ..H1Limits::default()
         };
-        let answer = exchange
+        let (answer, _rest) = exchange
             .send(
                 &Method::POST,
                 &"/x".parse().unwrap(),
@@ -1555,7 +1689,10 @@ mod tests {
             !asked.load(Ordering::SeqCst),
             "the refused body was sent anyway"
         );
-        assert!(answer.cut_short_the_request);
+        assert!(
+            answer.stop_uploading,
+            "a refusal that closes did not stop the upload"
+        );
         assert!(!answer.delivery.persistent);
     }
 
@@ -1563,7 +1700,7 @@ mod tests {
     /// what the engine's own client does with one.
     #[tokio::test(start_paused = true)]
     async fn an_expectation_that_is_not_a_continue_holds_nothing_back() {
-        let (mut exchange, mut peer) = connected(4096);
+        let (exchange, mut peer) = connected(4096);
         let (body, asked) = Watched::new(b"hello");
         let peering = tokio::spawn(async move {
             let head = peer.until(b"\r\n\r\n").await;

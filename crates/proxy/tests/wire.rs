@@ -247,13 +247,17 @@ async fn a_body_of_unknown_length_is_chunked_in_both_directions() {
     assert_eq!(client.chunked_body().await, "2\r\nhi\r\n0\r\n\r\n");
 }
 
-/// **A gap, not a promise.** The client's trailers reach the service — hyper's server
-/// parses them, which [`hypers_server_gives_a_service_the_requests_trailers`] shows — and
-/// then go no further: hyper's client puts none on the wire. The half that loses them is
-/// the half [13](../../../docs/13-http1-upstream.md) replaces, so an own upstream path
-/// could close this; until one is adopted, a request's trailers are dropped.
+/// **Where the two paths differ, on purpose.** A client's trailers reach the service
+/// either way — hyper's server parses them, which
+/// [`hypers_server_gives_a_service_the_requests_trailers`] shows. What becomes of them
+/// next is the difference: hyper's client puts none on the wire, and EdgeRush's own puts
+/// them there.
+///
+/// This is the one place the candidate is meant to disagree with the baseline, and it
+/// disagrees by being right ([13 §5](../../../docs/13-http1-upstream.md)). A differential
+/// test that expected these to match would be asking the new path to lose them too.
 #[tokio::test]
-async fn a_requests_trailers_do_not_reach_the_upstream() {
+async fn a_requests_trailers_reach_the_upstream_only_by_our_own_path() {
     let (saw, mut seen) = reporter();
     let upstream = raw_upstream(move |mut wire| {
         let saw = saw.clone();
@@ -274,11 +278,11 @@ async fn a_requests_trailers_do_not_reach_the_upstream() {
         .await;
 
     let body = seen.recv().await.unwrap();
-    assert_eq!(
-        body, "5\r\nhello\r\n0\r\n\r\n",
-        "a trailer would follow the 0"
-    );
-    assert!(!body.contains("x-sent"), "{body}");
+    match upstream_under_test() {
+        // Lost between the service and the wire, which is the half being replaced.
+        Upstream::Hyper => assert_eq!(body, "5\r\nhello\r\n0\r\n\r\n"),
+        Upstream::Ours => assert_eq!(body, "5\r\nhello\r\n0\r\nx-sent: yes\r\n\r\n"),
+    }
 }
 
 /// Hyper's server does hand the trailers to the service, so what the test above measures

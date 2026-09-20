@@ -83,7 +83,7 @@ enum Body {
     Upstream(Incoming),
     /// The upstream's answer, as EdgeRush's own path reads it. In a box because it is
     /// much the larger of the two, and every answer would otherwise carry room for it.
-    Ours(Box<H1Body<TcpStream>>),
+    Ours(Box<H1Body<TcpStream, Incoming>>),
     /// An answer of the data plane's own. It has no body, and never will have one.
     Empty,
 }
@@ -407,9 +407,9 @@ impl Worker {
         headers: &HeaderMap,
         sending: Sending,
         body: B,
-    ) -> Result<(ResponseHead, H1Body<TcpStream>), ExchangeError>
+    ) -> Result<(ResponseHead, H1Body<TcpStream, B>), ExchangeError>
     where
-        B: HttpBody<Data = Bytes>,
+        B: HttpBody<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         // Bound in its own statement, so the pool is not still borrowed when the connect
@@ -429,21 +429,18 @@ impl Worker {
             }
         };
 
-        let mut exchange = Exchange::new(socket);
-        let answer = exchange
+        let exchange = Exchange::new(socket);
+        let (answer, rest) = exchange
             .send(method, uri, headers, sending, body, &self.limits)
             .await?;
-        let (socket, buffered) = exchange.into_body_parts();
 
-        // What the head allowed, and a request that finished going out. Settled here
-        // because neither can be worked out from the body afterwards.
-        let may_reuse = answer.delivery.persistent && !answer.cut_short_the_request;
+        // The request may still be going out; what is left of it goes with the body,
+        // which drives it while the client reads the answer.
         let lease = Lease::in_use(Arc::clone(identity), opened, &self.pool);
         let body = H1Body::new(
-            socket,
-            buffered,
+            rest,
             answer.delivery.framing,
-            may_reuse,
+            answer.delivery.persistent,
             self.limits,
         )
         .returning_to(lease);
@@ -932,13 +929,16 @@ mod tests {
     }
 
     /// Reads a body to its end and says whether its connection went back.
-    async fn drain(mut body: H1Body<TcpStream>, limits: &H1Limits) -> (Vec<u8>, bool) {
+    async fn drain(
+        mut body: H1Body<TcpStream, http_body_util::Empty<Bytes>>,
+        limits: &H1Limits,
+    ) -> (Vec<u8>, bool) {
         use http_body_util::BodyExt;
 
         let mut data = Vec::new();
         while let Some(frame) = body.frame().await {
             if let Ok(bytes) = frame.unwrap().into_data() {
-                data.extend_from_slice(&bytes);
+                data.extend_from_slice(bytes.as_ref());
             }
         }
         match body.take_if_reusable() {
