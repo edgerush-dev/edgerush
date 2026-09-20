@@ -439,7 +439,7 @@ impl<S> H1Body<S> {
     /// What it shows is that the upstream has not done so *yet* and that this end is in a
     /// state it can account for. Keeping each destination's connections to itself limits
     /// who could be affected by a peer that misbehaves; it cannot stop one.
-    pub fn into_reusable(mut self) -> Option<Kept<S>>
+    pub fn take_if_reusable(&mut self) -> Option<Kept<S>>
     where
         S: AsyncRead + Unpin,
     {
@@ -467,8 +467,23 @@ impl<S> H1Body<S> {
         })
     }
 
+    /// Puts the connection back if it has earned its way, now that the body is over.
+    ///
+    /// Done when the body ends rather than when whoever holds it lets go: a body that is
+    /// finished with has nothing more to say, and a connection that could be carrying the
+    /// next request should not wait on a client to drop an object.
+    pub fn settle(&mut self)
+    where
+        S: AsyncRead + Unpin,
+    {
+        let limits = self.limits;
+        if let Some(kept) = self.take_if_reusable() {
+            kept.put_back(&limits);
+        }
+    }
+
     /// What is left of the connection whatever state it is in, for a caller that means to
-    /// close it. Never a way back into a pool: that is [`H1Body::into_reusable`] alone.
+    /// close it. Never a way back into a pool: that is [`H1Body::take_if_reusable`] alone.
     pub fn into_connection(self) -> Option<(S, Vec<u8>)> {
         self.socket.map(|socket| (socket, self.buffered))
     }
@@ -593,7 +608,7 @@ impl<S: AsyncRead + Unpin> Body for H1Body<S> {
 }
 
 /// A connection that finished an exchange with nothing owing, which is the only kind that
-/// may be kept. Made by [`H1Body::into_reusable`] and nowhere else, so that keeping one
+/// may be kept. Made by [`H1Body::take_if_reusable`] and nowhere else, so that keeping one
 /// cannot be arranged by anybody who has merely got hold of a socket.
 #[derive(Debug)]
 pub struct Kept<S> {
@@ -1592,7 +1607,7 @@ mod tests {
         let (mut body, _peer) = body_on(Framing::Length(5), b"hello");
         let (data, _) = collected(&mut body).await.unwrap();
         assert_eq!(data, b"hello");
-        assert!(body.into_reusable().is_some());
+        assert!(body.take_if_reusable().is_some());
     }
 
     /// What the head said comes first. A connection the answer said to close is not kept,
@@ -1602,15 +1617,15 @@ mod tests {
         let (mut body, _peer) = keepable_body_on(Framing::Length(5), b"hello", false);
         let (data, _) = collected(&mut body).await.unwrap();
         assert_eq!(data, b"hello");
-        assert!(body.into_reusable().is_none());
+        assert!(body.take_if_reusable().is_none());
     }
 
     /// A body nobody finished reading is a connection in the middle of a message.
     #[tokio::test(start_paused = true)]
     async fn a_body_that_was_never_read_to_its_end_is_not_kept() {
-        let (body, _peer) = body_on(Framing::Length(5), b"hello");
+        let (mut body, _peer) = body_on(Framing::Length(5), b"hello");
         // Not a frame taken.
-        assert!(body.into_reusable().is_none());
+        assert!(body.take_if_reusable().is_none());
     }
 
     /// A chunked body has no way of knowing it is over until it has read the chunk that
@@ -1629,7 +1644,7 @@ mod tests {
             Bytes::from_static(b"hello")
         );
         // The zero chunk and the trailers are still on the wire.
-        assert!(body.into_reusable().is_none());
+        assert!(body.take_if_reusable().is_none());
     }
 
     /// A body that stopped making sense took its connection with it: there is nothing
@@ -1638,7 +1653,7 @@ mod tests {
     async fn a_body_that_failed_has_no_connection_to_give() {
         let (mut body, _peer) = body_on(Framing::Chunked, b"zz\r\nhello\r\n");
         assert!(collected(&mut body).await.is_err());
-        assert!(body.into_reusable().is_none());
+        assert!(body.take_if_reusable().is_none());
     }
 
     /// **Bytes after the end are a peer that is out of step.** Whatever they are, they
@@ -1653,7 +1668,7 @@ mod tests {
         // Said after the answer was whole, and asked for by nobody.
         peer.say("HTTP/1.1 200 OK\r\n\r\n").await;
         tokio::task::yield_now().await;
-        assert!(body.into_reusable().is_none());
+        assert!(body.take_if_reusable().is_none());
     }
 
     /// The same for a close: an upstream that has gone is not a connection to keep.
@@ -1665,7 +1680,7 @@ mod tests {
 
         drop(peer);
         tokio::task::yield_now().await;
-        assert!(body.into_reusable().is_none());
+        assert!(body.take_if_reusable().is_none());
     }
 
     /// A body the close delimits has had its connection ended by definition; nothing that
@@ -1676,6 +1691,6 @@ mod tests {
         drop(peer);
         let (data, _) = collected(&mut body).await.unwrap();
         assert_eq!(data, b"some");
-        assert!(body.into_reusable().is_none());
+        assert!(body.take_if_reusable().is_none());
     }
 }

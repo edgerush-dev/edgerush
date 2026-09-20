@@ -18,7 +18,7 @@
 )]
 
 use edgerush_config::{Config, compile};
-use edgerush_proxy::{Proxy, Worker};
+use edgerush_proxy::{Proxy, Upstream, Worker};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -61,7 +61,14 @@ upstreams:
 "#
     );
     let config: Config = serde_saphyr::from_str(&yaml).unwrap();
-    let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+    let proxy = Arc::new(
+        Proxy::new(
+            compile(&config).unwrap(),
+            NonZeroUsize::MIN,
+            upstream_under_test(),
+        )
+        .unwrap(),
+    );
     let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     socket.set_nonblocking(true).unwrap();
     let address = socket.local_addr().unwrap();
@@ -80,6 +87,20 @@ upstreams:
         runtime.block_on(local);
     });
     address
+}
+
+/// Which way these tests reach an upstream. The suite is the same either way — that is
+/// the point of it — so it is told rather than written twice:
+///
+/// ```text
+/// cargo test                                  the engine's client
+/// EDGERUSH_TEST_UPSTREAM=ours cargo test      EdgeRush's own
+/// ```
+fn upstream_under_test() -> Upstream {
+    match std::env::var("EDGERUSH_TEST_UPSTREAM").as_deref() {
+        Ok("ours") => Upstream::Ours,
+        _ => Upstream::Hyper,
+    }
 }
 
 /// An upstream that is a socket and nothing more: every connection it accepts is handed to

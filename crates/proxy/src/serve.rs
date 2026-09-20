@@ -27,6 +27,7 @@ use crate::upstream::h1::pool::{Lease, Pool};
 use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRule};
 use http::request::Parts;
+use http::response;
 use http::uri::{Authority, Scheme};
 use http::{HeaderMap, Method, Request, Response, Uri, Version};
 use hyper::body::{Body as HttpBody, Bytes, Frame, Incoming, SizeHint};
@@ -80,6 +81,9 @@ impl<F: Future<Output = ()> + 'static> Executor<F> for OnThisWorker {
 enum Body {
     /// The upstream's answer, as the engine's client reads it.
     Upstream(Incoming),
+    /// The upstream's answer, as EdgeRush's own path reads it. In a box because it is
+    /// much the larger of the two, and every answer would otherwise carry room for it.
+    Ours(Box<H1Body<TcpStream>>),
     /// An answer of the data plane's own. It has no body, and never will have one.
     Empty,
 }
@@ -90,6 +94,8 @@ enum Body {
 enum BodyError {
     #[error("the upstream's answer could not be read: {0}")]
     Upstream(#[from] hyper::Error),
+    #[error("the upstream's answer could not be read: {0}")]
+    Ours(#[from] ExchangeError),
 }
 
 impl HttpBody for Body {
@@ -104,6 +110,15 @@ impl HttpBody for Body {
             Self::Upstream(incoming) => Pin::new(incoming)
                 .poll_frame(context)
                 .map(|frame| frame.map(|frame| frame.map_err(BodyError::Upstream))),
+            Self::Ours(ours) => {
+                let frame = Pin::new(&mut *ours).poll_frame(context);
+                if matches!(frame, Poll::Ready(None)) {
+                    // The end of the answer, which is the moment the connection can go
+                    // back — not whenever whoever is reading it happens to let go.
+                    ours.settle();
+                }
+                frame.map(|frame| frame.map(|frame| frame.map_err(BodyError::Ours)))
+            }
             Self::Empty => Poll::Ready(None),
         }
     }
@@ -111,6 +126,7 @@ impl HttpBody for Body {
     fn is_end_stream(&self) -> bool {
         match self {
             Self::Upstream(incoming) => incoming.is_end_stream(),
+            Self::Ours(ours) => ours.is_end_stream(),
             Self::Empty => true,
         }
     }
@@ -118,9 +134,25 @@ impl HttpBody for Body {
     fn size_hint(&self) -> SizeHint {
         match self {
             Self::Upstream(incoming) => incoming.size_hint(),
+            Self::Ours(ours) => ours.size_hint(),
             Self::Empty => SizeHint::with_exact(0),
         }
     }
+}
+
+/// Which way a request reaches its upstream.
+///
+/// One choice for the process, made on the command line and never changed while it runs
+/// — and never changed part way through a request. A path that failed is not a reason to
+/// try the other: by then the request may already have reached the upstream, and sending
+/// it again would be sending it twice ([13 §1](../../docs/13-http1-upstream.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Upstream {
+    /// The engine's client, which is what has always carried these requests.
+    #[default]
+    Hyper,
+    /// EdgeRush's own, which is the candidate this slice is about.
+    Ours,
 }
 
 /// A data plane: one for the whole process, whatever its workers. It holds what must be
@@ -139,6 +171,8 @@ pub struct Proxy {
     /// Outside it for a different reason: a key must not come round again when a config
     /// does, so what hands them out lives as long as the process.
     keys: Keys,
+    /// Which way its workers reach an upstream.
+    upstream: Upstream,
 }
 
 /// One worker's share of the data plane: the connections it holds to the upstreams, which
@@ -222,7 +256,11 @@ impl Proxy {
     ///
     /// Returns a [`ProxyError`] for an endpoint address that cannot be part of a request
     /// target (one with an IPv6 zone).
-    pub fn new(config: Compiled, workers: NonZeroUsize) -> Result<Self, ProxyError> {
+    pub fn new(
+        config: Compiled,
+        workers: NonZeroUsize,
+        upstream: Upstream,
+    ) -> Result<Self, ProxyError> {
         let listeners: Vec<String> = config
             .listeners
             .iter()
@@ -238,6 +276,7 @@ impl Proxy {
             current: ArcSwap::from_pointee(snapshot),
             metrics,
             keys,
+            upstream,
         })
     }
 
@@ -360,16 +399,6 @@ impl Worker {
     ///
     /// Anything the upstream said that cannot be read, or a connection that could not be
     /// opened, failed or closed without answering.
-    // Its own tests reach it; nothing else does until a request can be told to take this
-    // path. Said only of the build where that is true, so the day it gains a caller the
-    // compiler says this line has served its purpose.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no request takes this path until it can be selected"
-        )
-    )]
     async fn through_h1<B>(
         &self,
         identity: &Arc<ReuseIdentity>,
@@ -495,22 +524,30 @@ impl Worker {
 
     async fn respond(&self, listener: usize, request: Request<Incoming>) -> Response<Body> {
         let (mut head, body) = request.into_parts();
+        // How the body is to be sent on, worked out from what arrived and before `direct`
+        // takes the hop-by-hop fields off it — and before the body itself is touched,
+        // because the path is chosen while there is still nothing to undo.
+        let sending = sending_for(&head, &body);
         let directed = match self.proxy.direct(listener, &mut head) {
             Ok(directed) => directed,
             Err(answer) => return self.proxy.answer(listener, answer),
         };
-        let response = self.client.request(Request::from_parts(head, body)).await;
+
+        let answered = match self.proxy.upstream {
+            Upstream::Hyper => self.by_hyper(head, body).await,
+            Upstream::Ours => self.by_ours(&directed, &head, sending, body).await,
+        };
+
         let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
-        let Ok(response) = response else {
+        let Some((mut head, body)) = answered else {
             if let Some(upstream) = upstream {
                 upstream.failures.inc();
             }
             return self.proxy.answer(listener, Answer::UpstreamFailed);
         };
         if let Some(upstream) = upstream {
-            upstream.responded(response.status());
+            upstream.responded(head.status);
         }
-        let (mut head, body) = response.into_parts();
         strip_response(&mut head.headers);
         if let Some(changes) = directed
             .rule
@@ -519,7 +556,47 @@ impl Worker {
         {
             changes.apply(&mut head.headers);
         }
-        Response::from_parts(head, Body::Upstream(body))
+        Response::from_parts(head, body)
+    }
+
+    /// By the engine's client, which is what has always carried these requests.
+    async fn by_hyper(&self, head: Parts, body: Incoming) -> Option<(response::Parts, Body)> {
+        let response = self
+            .client
+            .request(Request::from_parts(head, body))
+            .await
+            .ok()?;
+        let (head, body) = response.into_parts();
+        Some((head, Body::Upstream(body)))
+    }
+
+    /// By EdgeRush's own path. Never after the other has been tried: by the time one has
+    /// failed the request may already have reached the upstream, and a second attempt
+    /// would be a second request.
+    async fn by_ours(
+        &self,
+        directed: &Directed,
+        head: &Parts,
+        sending: Sending,
+        body: Incoming,
+    ) -> Option<(response::Parts, Body)> {
+        let answer = self
+            .through_h1(
+                &directed.endpoint,
+                &head.method,
+                &head.uri,
+                &head.headers,
+                sending,
+                body,
+            )
+            .await
+            .ok()?;
+        let (read, body) = answer;
+        let mut parts = Response::new(()).into_parts().0;
+        parts.status = read.status;
+        parts.version = read.version;
+        parts.headers = read.headers;
+        Some((parts, Body::Ours(Box::new(body))))
     }
 }
 
@@ -556,7 +633,12 @@ impl Proxy {
             .upstream_slots
             .get(upstream)
             .ok_or(Answer::NoBackend)?;
-        let endpoint = pick(endpoints, random()).ok_or(Answer::NoEndpoints)?;
+        let at = pick_at(endpoints.len(), random()).ok_or(Answer::NoEndpoints)?;
+        let endpoint = endpoints.get(at).ok_or(Answer::NoEndpoints)?;
+        let identity = snapshot
+            .destinations
+            .at(upstream, at)
+            .ok_or(Answer::NoEndpoints)?;
 
         head.uri = at_endpoint(&head.uri, endpoint).ok_or(Answer::BadTarget)?;
         head.version = Version::HTTP_11;
@@ -569,6 +651,7 @@ impl Proxy {
         Ok(Directed {
             rule: has_changes.then(|| Arc::clone(forward.rule)),
             upstream_slot,
+            endpoint: Arc::clone(identity),
         })
     }
 }
@@ -577,6 +660,48 @@ impl Proxy {
 struct Directed {
     rule: Option<Arc<CompiledRule>>,
     upstream_slot: usize,
+    /// The endpoint this request was directed to, taken from the same snapshot as the
+    /// route so that no reload can come between the two.
+    endpoint: Arc<ReuseIdentity>,
+}
+
+/// How a request's body is to be sent on.
+///
+/// Read from the request as it arrived rather than from the body's own account of itself:
+/// a body that says how long it is may still end with trailers, and over HTTP/2 it always
+/// may. What is certain is what the client framed it as
+/// ([13 §4](../../docs/13-http1-upstream.md)).
+fn sending_for(head: &Parts, body: &Incoming) -> Sending {
+    // The engine says outright when there is no body, and that is the one thing a length
+    // alone would not settle.
+    if body.is_end_stream() {
+        return Sending::None;
+    }
+    if head.version == Version::HTTP_2 {
+        // Framed as frames, with trailers allowed after any of them. There is no length
+        // here that would still be true by the end.
+        return Sending::Chunked;
+    }
+    if crate::hop_by_hop::is_chunked_request(&head.headers) {
+        return Sending::Chunked;
+    }
+    match request_length(&head.headers) {
+        Some(length) => Sending::Length(length),
+        // No length and no coding, over HTTP/1.1, is no body at all.
+        None => Sending::None,
+    }
+}
+
+/// A request's `Content-Length`, where it has exactly one that is a plain number. Hyper
+/// has already refused what it will refuse; anything left that does not read as a length
+/// is treated as no length, and the body is framed by this end instead.
+fn request_length(headers: &HeaderMap) -> Option<u64> {
+    let mut lengths = headers.get_all(http::header::CONTENT_LENGTH).iter();
+    let only = lengths.next()?;
+    if lengths.next().is_some() {
+        return None;
+    }
+    only.to_str().ok()?.trim().parse().ok()
 }
 
 /// A connection that came in on a listener's socket: what its requests share, and what
@@ -617,10 +742,9 @@ fn authority(endpoint: &SocketAddr) -> Result<Authority, ProxyError> {
 }
 
 /// One of the endpoints, each as likely as any other; `None` if there are none.
-fn pick(endpoints: &[Authority], random: u64) -> Option<&Authority> {
-    let count = u64::try_from(endpoints.len()).ok()?;
-    let position = usize::try_from(random.checked_rem(count)?).ok()?;
-    endpoints.get(position)
+fn pick_at(endpoints: usize, random: u64) -> Option<usize> {
+    let count = u64::try_from(endpoints).ok()?;
+    usize::try_from(random.checked_rem(count)?).ok()
 }
 
 /// The same path and query, at the endpoint: the form in which the client is told where to
@@ -754,6 +878,7 @@ mod tests {
         let proxy = Proxy::new(
             upstreams(&[("web", "127.0.0.1:1"), ("zed", "127.0.0.1:2")]),
             NonZeroUsize::MIN,
+            Upstream::Ours,
         )
         .unwrap();
         let web = filed_under(&proxy, 0);
@@ -816,7 +941,7 @@ mod tests {
                 data.extend_from_slice(&bytes);
             }
         }
-        match body.into_reusable() {
+        match body.take_if_reusable() {
             Some(kept) => {
                 kept.put_back(limits);
                 (data, true)
@@ -835,7 +960,8 @@ mod tests {
         local
             .run_until(async move {
                 let config = upstreams(&[("web", &upstream.to_string())]);
-                let proxy = Arc::new(Proxy::new(config, NonZeroUsize::MIN).unwrap());
+                let proxy =
+                    Arc::new(Proxy::new(config, NonZeroUsize::MIN, Upstream::Ours).unwrap());
                 let worker = Worker::new(Arc::clone(&proxy));
                 let identity = Arc::clone(proxy.current.load().destinations.at(0, 0).unwrap());
 
@@ -913,7 +1039,12 @@ mod tests {
 
     #[test]
     fn a_data_plane_serves_the_listeners_it_was_made_with() {
-        let proxy = Proxy::new(config_with(&["web", "admin"]), NonZeroUsize::MIN).unwrap();
+        let proxy = Proxy::new(
+            config_with(&["web", "admin"]),
+            NonZeroUsize::MIN,
+            Upstream::Hyper,
+        )
+        .unwrap();
         assert_eq!(proxy.listeners(), ["admin", "web"]);
         proxy.reload(config_with(&["later"])).unwrap();
         assert_eq!(proxy.listeners(), ["admin", "web"]);
@@ -927,20 +1058,14 @@ mod tests {
 
     #[test]
     fn every_endpoint_gets_its_turn() {
-        let endpoints = authorities(&["127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3"]);
-        let picked: Vec<&str> = (0..4)
-            .map(|random| pick(&endpoints, random).unwrap().as_str())
-            .collect();
-        assert_eq!(
-            picked,
-            ["127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3", "127.0.0.1:1"]
-        );
-        assert_eq!(pick(&endpoints, u64::MAX).unwrap(), "127.0.0.1:1");
+        let picked: Vec<usize> = (0..4).map(|random| pick_at(3, random).unwrap()).collect();
+        assert_eq!(picked, [0, 1, 2, 0]);
+        assert_eq!(pick_at(3, u64::MAX).unwrap(), 0);
     }
 
     #[test]
     fn no_endpoints_is_nowhere_to_connect() {
-        assert_eq!(pick(&[], 7), None);
+        assert_eq!(pick_at(0, 7), None);
     }
 
     #[test]
@@ -960,7 +1085,7 @@ mod tests {
 
     #[test]
     fn an_answer_of_our_own_is_a_status_and_nothing_else_and_is_counted() {
-        let proxy = Proxy::new(config_with(&["web"]), NonZeroUsize::MIN).unwrap();
+        let proxy = Proxy::new(config_with(&["web"]), NonZeroUsize::MIN, Upstream::Hyper).unwrap();
         let answer = proxy.answer(0, Answer::NoRoute);
         assert_eq!(answer.status(), 404);
         assert!(answer.headers().is_empty());
@@ -972,7 +1097,7 @@ mod tests {
 
     #[test]
     fn a_reload_is_counted_and_resets_nothing() {
-        let proxy = Proxy::new(config_with(&["web"]), NonZeroUsize::MIN).unwrap();
+        let proxy = Proxy::new(config_with(&["web"]), NonZeroUsize::MIN, Upstream::Hyper).unwrap();
         let _counted = proxy.answer(0, Answer::NoRoute);
         assert!(proxy.metrics().contains(
             "edgerush_config_reloads_total 0

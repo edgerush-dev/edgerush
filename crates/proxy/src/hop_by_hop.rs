@@ -80,6 +80,16 @@ pub(crate) fn check_connection(headers: &HeaderMap) -> Result<(), ConnectionErro
     Ok(())
 }
 
+/// Whether a request said its body is chunked. Asked before the hop-by-hop fields come
+/// off, because afterwards there is nothing left to ask.
+pub(crate) fn is_chunked_request(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(TRANSFER_ENCODING)
+        .iter()
+        .flat_map(options)
+        .any(|coding| coding.eq_ignore_ascii_case(b"chunked"))
+}
+
 /// Takes the hop-by-hop headers off a request; `TE: trailers` stays if it was said.
 /// Allocates only for a request with more than one `Connection` field.
 pub(crate) fn strip_request(headers: &mut HeaderMap) {

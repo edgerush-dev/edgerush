@@ -28,4 +28,4 @@ mod upstream;
 pub use hop_by_hop::ConnectionError;
 pub use host::HostError;
 pub use request::{Forward, Rejection, decide};
-pub use serve::{Proxy, ProxyError, Worker};
+pub use serve::{Proxy, ProxyError, Upstream, Worker};

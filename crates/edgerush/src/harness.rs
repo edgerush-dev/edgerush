@@ -20,7 +20,7 @@ use crate::bind::{Port, listen};
 use crate::config_file::{ConfigFile, Rejected};
 use crate::per_core::{self, Accept};
 use edgerush_config::Compiled;
-use edgerush_proxy::{Proxy, ProxyError};
+use edgerush_proxy::{Proxy, ProxyError, Upstream};
 use std::convert::Infallible;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -48,6 +48,9 @@ Options:
       --workers <N>        How many threads serve requests. More than one shares every
                            listener's port, which needs SO_REUSEPORT (Unix)
                            [default: one for every CPU]
+      --upstream <BY>      How a request reaches its upstream. hyper: the engine's
+                           client; ours: EdgeRush's own, which is a candidate and not
+                           yet measured in place [default: hyper]
   -h, --help               Print help
 ";
 
@@ -81,6 +84,7 @@ enum Parsed {
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
     config: PathBuf,
+    upstream: Upstream,
     metrics: Option<SocketAddr>,
     /// `None` is one for every CPU the process may use.
     workers: Option<NonZeroUsize>,
@@ -103,6 +107,8 @@ enum UsageError {
     Workers(String),
     #[error("'{0}' is not a way to place connections: balanced or kernel")]
     Accept(String),
+    #[error("'{0}' is not a way to reach an upstream: hyper or ours")]
+    Upstream(String),
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
@@ -110,6 +116,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut metrics: Option<SocketAddr> = None;
     let mut workers = None;
     let mut accept = None;
+    let mut upstream = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
@@ -133,6 +140,17 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                     return Err(UsageError::Twice("--workers"));
                 }
             }
+            "--upstream" => {
+                let by = args.next().ok_or(UsageError::NoValue("--upstream"))?;
+                let by = match by.as_str() {
+                    "hyper" => Upstream::Hyper,
+                    "ours" => Upstream::Ours,
+                    _ => return Err(UsageError::Upstream(by)),
+                };
+                if upstream.replace(by).is_some() {
+                    return Err(UsageError::Twice("--upstream"));
+                }
+            }
             "--accept" => {
                 let by = args.next().ok_or(UsageError::NoValue("--accept"))?;
                 let by = match by.as_str() {
@@ -150,6 +168,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let config = config.ok_or(UsageError::NoConfig)?;
     Ok(Parsed::Run(Options {
         config,
+        upstream: upstream.unwrap_or_default(),
         metrics,
         workers,
         accept: accept.unwrap_or(Accept::Balanced),
@@ -176,6 +195,7 @@ enum Failure {
 fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure> {
     let Options {
         config: path,
+        upstream,
         metrics,
         workers,
         accept,
@@ -196,7 +216,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
         Err(rejected) => return Err(Failure::Config { path, rejected }),
     };
     let mut bound: Vec<Bound> = config.listeners.iter().map(Bound::from).collect();
-    let proxy = Proxy::new(config, workers)
+    let proxy = Proxy::new(config, workers, upstream)
         .map(Arc::new)
         .map_err(|error| Failure::Proxy { path, error })?;
 
@@ -240,9 +260,13 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
     } else {
         "s"
     };
+    let by = match upstream {
+        Upstream::Hyper => "hyper's client",
+        Upstream::Ours => "our own upstream path",
+    };
     say(
         stderr,
-        format_args!("{workers} worker{plural}, thread-per-core"),
+        format_args!("{workers} worker{plural}, thread-per-core, upstreams by {by}"),
     );
 
     loop {
@@ -369,6 +393,7 @@ mod tests {
     fn a_config_is_all_that_is_needed() {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
+            upstream: Upstream::Hyper,
             metrics: None,
             workers: None,
             accept: Accept::Balanced,
@@ -380,6 +405,7 @@ mod tests {
     fn the_workers_are_as_the_command_line_says() {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
+            upstream: Upstream::Hyper,
             metrics: None,
             workers: NonZeroUsize::new(4),
             accept: Accept::Balanced,
@@ -394,6 +420,7 @@ mod tests {
     fn metrics_are_served_where_the_command_line_says() {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
+            upstream: Upstream::Hyper,
             metrics: Some("[::]:9090".parse().unwrap()),
             workers: None,
             accept: Accept::Balanced,
