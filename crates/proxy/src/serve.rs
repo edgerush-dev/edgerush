@@ -19,6 +19,7 @@ use crate::hop_by_hop::strip_response;
 use crate::metrics::{Answer, Metrics};
 use crate::random::random;
 use crate::request::decide;
+use crate::upstream::destination::{Destinations, Keys};
 use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRule};
 use http::request::Parts;
@@ -129,6 +130,9 @@ pub struct Proxy {
     current: ArcSwap<Snapshot>,
     /// Outside the snapshot, so that a reload resets no counter.
     metrics: Metrics,
+    /// Outside it for a different reason: a key must not come round again when a config
+    /// does, so what hands them out lives as long as the process.
+    keys: Keys,
 }
 
 /// One worker's share of the data plane: the connections it holds to the upstreams, which
@@ -157,10 +161,20 @@ struct Snapshot {
     endpoints: Vec<Vec<Authority>>,
     /// By position of the upstream: the slot of its counters.
     upstream_slots: Vec<usize>,
+    /// By position of the upstream, then of the endpoint: what a kept connection to it is
+    /// filed under. Worked out against the config this one replaces, because that is the
+    /// only moment both are in hand ([13 §3](../../docs/13-http1-upstream.md)).
+    destinations: Destinations,
 }
 
 impl Snapshot {
-    fn new(config: Compiled, listeners: &[String], metrics: &Metrics) -> Result<Self, ProxyError> {
+    fn new(
+        config: Compiled,
+        listeners: &[String],
+        metrics: &Metrics,
+        previous: &Destinations,
+        keys: &Keys,
+    ) -> Result<Self, ProxyError> {
         let endpoints = config
             .upstreams
             .iter()
@@ -175,11 +189,13 @@ impl Snapshot {
             .iter()
             .map(|upstream| metrics.upstream_slot(&upstream.name))
             .collect();
+        let destinations = Destinations::reconcile(&config, previous, keys);
         Ok(Self {
             config,
             listeners,
             endpoints,
             upstream_slots,
+            destinations,
         })
     }
 }
@@ -204,11 +220,14 @@ impl Proxy {
             .collect();
         // A shard for every worker, so that no two write to one line of cache.
         let metrics = Metrics::new(workers, listeners.len());
-        let current = ArcSwap::from_pointee(Snapshot::new(config, &listeners, &metrics)?);
+        let keys = Keys::default();
+        let nothing_yet = Destinations::default();
+        let snapshot = Snapshot::new(config, &listeners, &metrics, &nothing_yet, &keys)?;
         Ok(Self {
             listeners,
-            current,
+            current: ArcSwap::from_pointee(snapshot),
             metrics,
+            keys,
         })
     }
 
@@ -233,7 +252,17 @@ impl Proxy {
     /// Returns a [`ProxyError`] as [`Proxy::new`] does; the data plane then runs on as it
     /// was.
     pub fn reload(&self, config: Compiled) -> Result<(), ProxyError> {
-        let snapshot = Snapshot::new(config, &self.listeners, &self.metrics)?;
+        // Against the config on its way out, so that a destination which has not changed
+        // keeps what its connections are filed under and one that has gone is retired.
+        let previous = self.current.load();
+        let snapshot = Snapshot::new(
+            config,
+            &self.listeners,
+            &self.metrics,
+            &previous.destinations,
+            &self.keys,
+        )?;
+        drop(previous);
         self.current.store(Arc::new(snapshot));
         self.metrics.reloads.inc();
         let now = SystemTime::now().duration_since(UNIX_EPOCH);
@@ -589,6 +618,49 @@ mod tests {
         String::from_utf8(body.to_vec()).unwrap()
     }
 
+    /// A config with the named upstreams, each at the address given.
+    fn upstreams(named: &[(&str, &str)]) -> Compiled {
+        let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
+        for (name, address) in named {
+            yaml += &format!("  {name}: {{ endpoints: [\"{address}\"] }}\n");
+        }
+        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+        compile(&config).unwrap()
+    }
+
+    /// What a destination of the running config is filed under.
+    fn filed_under(proxy: &Proxy, upstream: usize) -> u64 {
+        proxy
+            .current
+            .load()
+            .destinations
+            .at(upstream, 0)
+            .expect("a destination")
+            .key()
+    }
+
+    /// Reconciling happens where a config is published, so a real reload keeps what has
+    /// not changed and retires what has gone — not only the reconciler asked on its own.
+    #[test]
+    fn a_reload_keeps_what_has_not_changed_and_retires_what_has() {
+        let proxy = Proxy::new(
+            upstreams(&[("web", "127.0.0.1:1"), ("zed", "127.0.0.1:2")]),
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let web = filed_under(&proxy, 0);
+        let zed = Arc::clone(proxy.current.load().destinations.at(1, 0).unwrap());
+
+        // `aaa` sorts first, so every upstream after it moves along one, and `zed` goes.
+        proxy
+            .reload(upstreams(&[("aaa", "127.0.0.1:3"), ("web", "127.0.0.1:1")]))
+            .unwrap();
+
+        assert_eq!(filed_under(&proxy, 1), web, "web changed hands on a reload");
+        assert_ne!(filed_under(&proxy, 0), web, "the newcomer took web's place");
+        assert!(zed.is_retired(), "an upstream that is gone was left live");
+    }
+
     fn authorities(addresses: &[&str]) -> Vec<Authority> {
         addresses
             .iter()
@@ -611,9 +683,15 @@ mod tests {
         let sockets = ["admin".to_owned(), "web".to_owned()];
         let metrics = Metrics::new(NonZeroUsize::MIN, sockets.len());
         let listeners = |names: &[&str]| {
-            Snapshot::new(config_with(names), &sockets, &metrics)
-                .unwrap()
-                .listeners
+            Snapshot::new(
+                config_with(names),
+                &sockets,
+                &metrics,
+                &Destinations::default(),
+                &Keys::default(),
+            )
+            .unwrap()
+            .listeners
         };
 
         assert_eq!(listeners(&["admin", "web"]), [Some(0), Some(1)]);
