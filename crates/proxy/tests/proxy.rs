@@ -30,7 +30,7 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,11 +41,23 @@ type ClientBody = BoxBody<Bytes, Infallible>;
 
 /// Starts an upstream that says `name` in an `x-upstream` field of every answer.
 async fn upstream(name: &'static str) -> SocketAddr {
+    counted_upstream(name).await.0
+}
+
+/// The same, with a count of the connections it has accepted.
+///
+/// Which backend answered is in the answer; which socket carried the question is not, and
+/// a reload that moved an upstream along would be invisible without this
+/// ([13 §3](../../../docs/13-http1-upstream.md)).
+async fn counted_upstream(name: &'static str) -> (SocketAddr, Arc<AtomicUsize>) {
     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = socket.local_addr().unwrap();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&accepts);
     tokio::spawn(async move {
         loop {
             let (stream, _) = socket.accept().await.unwrap();
+            counting.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
                 let service = service_fn(move |request| async move {
                     Ok::<_, Infallible>(upstream_answer(name, request))
@@ -56,7 +68,7 @@ async fn upstream(name: &'static str) -> SocketAddr {
             });
         }
     });
-    address
+    (address, accepts)
 }
 
 fn upstream_answer(
@@ -1017,4 +1029,274 @@ fn a_failure_to_accept_is_counted_and_only_some_are_waited_after() {
     assert!(proxy.accept_failed(0, &exhausted).is_some());
     let errors = "edgerush_listener_accept_errors_total{listener=\"web\"}";
     assert_eq!(sample(&proxy.metrics(), errors), 2);
+}
+
+// ---- what a reload does to the connections a worker is keeping ----
+
+/// One listener, and a rule per upstream chosen by the first segment of the path, so that
+/// several upstreams are reachable through one proxy and told apart by the answer.
+fn routed_to(upstreams: &[(&str, SocketAddr)]) -> String {
+    let mut yaml = String::from(
+        "listeners:\n  web: { address: \"127.0.0.1:0\", protocol: http }\nroutes:\n  \
+         - name: everything\n    listeners: [web]\n    hostnames:\n      \
+         - { name: \"*\", falls_through: true }\n    rules:\n",
+    );
+    for (name, _) in upstreams {
+        yaml += &format!(
+            "      - matches:\n          - path: {{ prefix: /{name} }}\n        \
+             backends: [{{ upstream: {name}, weight: 1 }}]\n"
+        );
+    }
+    yaml += "upstreams:\n";
+    for (name, address) in upstreams {
+        yaml += &format!("  {name}: {{ endpoints: [\"{address}\"] }}\n");
+    }
+    yaml
+}
+
+/// Asks through `client` and gives back which upstream answered.
+async fn answered_by(
+    client: &Client<HttpConnector, ClientBody>,
+    web: SocketAddr,
+    path: &str,
+) -> String {
+    let (status, headers, _) = send_with(client, get(web, path)).await;
+    assert_eq!(status, StatusCode::OK, "asking for {path}");
+    headers["x-upstream"].to_str().unwrap().to_owned()
+}
+
+/// A compiled config orders upstreams by name, so one called `aaa` moves every other
+/// upstream along by one. Connections are kept for the destination and not for where it
+/// sat, so they stay with the upstream they were opened for
+/// ([13 §3](../../../docs/13-http1-upstream.md)).
+///
+/// **The answer alone would not show this.** A worker that handed `alpha`'s request the
+/// socket it had opened for `beta` would deliver an answer from the wrong backend and say
+/// nothing about it, which is why the backend is named in the answer and the connections
+/// are counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_that_moves_an_upstream_along_leaves_its_connections_where_they_were() {
+    let (alpha, alpha_opened) = counted_upstream("alpha").await;
+    let (beta, beta_opened) = counted_upstream("beta").await;
+    let (shifter, _) = counted_upstream("shifter").await;
+    let (proxy, addresses) =
+        reloadable_proxy(&routed_to(&[("alpha", alpha), ("beta", beta)])).await;
+    let web = addresses["web"];
+    let client = client(false);
+
+    assert_eq!(answered_by(&client, web, "/alpha").await, "alpha");
+    assert_eq!(answered_by(&client, web, "/beta").await, "beta");
+    assert_eq!(alpha_opened.load(Ordering::SeqCst), 1);
+    assert_eq!(beta_opened.load(Ordering::SeqCst), 1);
+
+    // `aaa` sorts before both, so both move along by one.
+    let moved = routed_to(&[("aaa", shifter), ("alpha", alpha), ("beta", beta)]);
+    proxy.reload(compiled(&moved)).unwrap();
+
+    assert_eq!(answered_by(&client, web, "/alpha").await, "alpha");
+    assert_eq!(answered_by(&client, web, "/beta").await, "beta");
+    assert_eq!(answered_by(&client, web, "/aaa").await, "shifter");
+    // On the very sockets opened before the reload: neither destination changed, so what
+    // was kept for each is still theirs to use.
+    assert_eq!(
+        alpha_opened.load(Ordering::SeqCst),
+        1,
+        "alpha opened another"
+    );
+    assert_eq!(beta_opened.load(Ordering::SeqCst), 1, "beta opened another");
+}
+
+/// A destination taken out of a config and put back is a new destination, whatever it is
+/// called and wherever it points. Nothing here can tell whether what answers at that
+/// address is what answered before, so nothing kept for the old one is used for the new.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_that_goes_and_comes_back_is_not_the_one_that_left() {
+    let (alpha, opened) = counted_upstream("alpha").await;
+    let (beta, _) = counted_upstream("beta").await;
+    let (proxy, addresses) =
+        reloadable_proxy(&routed_to(&[("alpha", alpha), ("beta", beta)])).await;
+    let web = addresses["web"];
+    let client = client(false);
+
+    assert_eq!(answered_by(&client, web, "/alpha").await, "alpha");
+    assert_eq!(opened.load(Ordering::SeqCst), 1);
+
+    // Gone. What was kept for it is kept for nothing now.
+    proxy
+        .reload(compiled(&routed_to(&[("beta", beta)])))
+        .unwrap();
+    let (status, _, _) = send_with(&client, get(web, "/alpha")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // And back, at the address it had before.
+    let back = routed_to(&[("alpha", alpha), ("beta", beta)]);
+    proxy.reload(compiled(&back)).unwrap();
+    assert_eq!(answered_by(&client, web, "/alpha").await, "alpha");
+
+    match upstream_under_test() {
+        // **Where the two paths differ, by design rather than by rule.** Ours gives the
+        // recreated destination a key of its own, so the connection retired with the old
+        // one is not used for it ([13 §3](../../../docs/13-http1-upstream.md)).
+        Upstream::Ours => assert_eq!(
+            opened.load(Ordering::SeqCst),
+            2,
+            "a retired connection was used again"
+        ),
+        // The engine's client keeps its connections by authority, which has not changed,
+        // so the same socket carries on. Nothing in HTTP says otherwise; it simply has no
+        // notion of a destination that was taken away.
+        Upstream::Hyper => assert_eq!(opened.load(Ordering::SeqCst), 1),
+    }
+}
+
+/// Two upstreams that point at one address are two destinations. What they are for
+/// differs, whatever they currently resolve to, and a socket opened for one is never lent
+/// to the other ([13 §3](../../../docs/13-http1-upstream.md)).
+#[tokio::test(flavor = "multi_thread")]
+async fn two_upstreams_at_one_address_do_not_share_a_connection() {
+    let (backend, opened) = counted_upstream("shared").await;
+    let (_proxy, addresses) =
+        reloadable_proxy(&routed_to(&[("alpha", backend), ("beta", backend)])).await;
+    let web = addresses["web"];
+    let client = client(false);
+
+    assert_eq!(answered_by(&client, web, "/alpha").await, "shared");
+    assert_eq!(answered_by(&client, web, "/beta").await, "shared");
+    // Asked again, so that what is counted is two destinations and not two first requests.
+    assert_eq!(answered_by(&client, web, "/alpha").await, "shared");
+    assert_eq!(answered_by(&client, web, "/beta").await, "shared");
+
+    match upstream_under_test() {
+        // One connection each, kept and reused: separate, and separately reused.
+        Upstream::Ours => assert_eq!(
+            opened.load(Ordering::SeqCst),
+            2,
+            "two upstreams shared a connection"
+        ),
+        // The engine's client keys on the authority alone, so one address is one pool
+        // however many upstreams point at it. That is the isolation §3 asks for and the
+        // candidate adds; it is not a rule hyper's client is breaking.
+        Upstream::Hyper => assert_eq!(opened.load(Ordering::SeqCst), 1),
+    }
+}
+
+// ---- an HTTP/2 client in front of it ----
+
+/// Says so when it is dropped, which is how a test sees a request being let go of.
+struct Tells(mpsc::UnboundedSender<()>);
+
+impl Drop for Tells {
+    fn drop(&mut self) {
+        let _told = self.0.send(());
+    }
+}
+
+/// An upstream that answers `/quick` at once and never answers `/hang`.
+///
+/// It says when it has been asked to hang and again when that request is let go of, so
+/// that a test waits for what it means rather than sleeping and hoping.
+struct Hanging {
+    address: SocketAddr,
+    asked: mpsc::UnboundedReceiver<()>,
+    released: mpsc::UnboundedReceiver<()>,
+}
+
+async fn hanging_upstream() -> Hanging {
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    let (saw, asked) = mpsc::unbounded_channel();
+    let (gone, released) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = socket.accept().await.unwrap();
+            let (saw, gone) = (saw.clone(), gone.clone());
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let (saw, gone) = (saw.clone(), gone.clone());
+                    async move {
+                        if request.uri().path() == "/hang" {
+                            let _told = saw.send(());
+                            // Dropped when this request is dropped, which happens when the
+                            // connection carrying it goes.
+                            let _releases = Tells(gone);
+                            // Never answered, so the exchange in front of it stays open
+                            // until something cancels it.
+                            std::future::pending::<()>().await;
+                        }
+                        Ok::<_, Infallible>(upstream_answer("quick", request))
+                    }
+                });
+                let _closed = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    Hanging {
+        address,
+        asked,
+        released,
+    }
+}
+
+/// A stream cancelled takes nothing with it but itself: another stream on the same
+/// connection is answered while it is still waiting, and the connection goes on carrying
+/// streams after it is gone.
+///
+/// **The connection is made here rather than taken from a client's pool.** A pooled client
+/// that quietly opened a second connection would make a test of "the same connection" pass
+/// without one, so there is one here and every stream is on it
+/// ([13 §5](../../../docs/13-http1-upstream.md)).
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_one_http2_stream_leaves_the_rest_of_its_connection_alone() {
+    let mut upstream = hanging_upstream().await;
+    let backend = upstream.address;
+    let (_proxy, addresses) = reloadable_proxy(&everything_to(&[("web", backend)], "0")).await;
+    let web = addresses["web"];
+
+    let stream = TcpStream::connect(web).await.unwrap();
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .unwrap();
+    let _pumping = tokio::spawn(connection);
+
+    // A stream that will never be answered, left in flight.
+    let hanging = {
+        let mut sender = sender.clone();
+        tokio::spawn(async move { sender.send_request(get(web, "/hang")).await })
+    };
+    // Waited for rather than slept on: the upstream says when it has the request.
+    within(upstream.asked.recv()).await.unwrap();
+
+    // Another stream on that same connection, answered while the first still waits.
+    let answered = within(sender.send_request(get(web, "/quick")))
+        .await
+        .unwrap();
+    assert_eq!(answered.status(), StatusCode::OK);
+    assert_eq!(answered.headers()["x-upstream"], "quick");
+    let body = within(answered.into_body().collect()).await.unwrap();
+    assert!(!body.to_bytes().is_empty());
+
+    // And now the first is cancelled.
+    hanging.abort();
+    let _ended = hanging.await;
+
+    // The cancel reaches the upstream: the request it was still holding is let go of.
+    // Without this the test would pass on a proxy that quietly kept the exchange alive
+    // for as long as the upstream cared to hold it.
+    within(upstream.released.recv()).await.unwrap();
+
+    // And the connection is still the connection.
+    let answered = within(sender.send_request(get(web, "/quick")))
+        .await
+        .unwrap();
+    assert_eq!(
+        answered.status(),
+        StatusCode::OK,
+        "the cancel took the connection with it"
+    );
+    assert_eq!(answered.headers()["x-upstream"], "quick");
+    let body = within(answered.into_body().collect()).await.unwrap();
+    assert!(!body.to_bytes().is_empty());
 }
