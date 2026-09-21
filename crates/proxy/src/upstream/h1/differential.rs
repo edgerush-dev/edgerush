@@ -20,15 +20,18 @@
 //! hyper's client reads ahead, which is its own business; whether a boundary was read
 //! correctly shows in the exchange that follows, not in a byte count.
 
+use super::blocks::{Blocks, SMALL, Sizes};
 use super::exchange::{Exchange, H1Body, Kept};
 use super::script::{self, Budget, Script, Scripted, Tape};
 use super::{H1Limits, lifecycle, reference};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
 use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time::Sleep;
@@ -595,10 +598,39 @@ pub fn twice(path: Path, script: &Script, ask: &Asking, budget: Budget, limits: 
     }
 }
 
+/// Blocks that have all been used before, and hold what an upstream might have said.
+///
+/// A block is lent without being cleared, so what the last exchange read is still in it,
+/// out of reach only because the cursors say so. Fresh blocks would hide a cursor that is
+/// out by one: what it let through would be zeros, which the parser throws away as
+/// nonsense. Blocks full of a plausible answer make the same mistake an answer that is
+/// wrong, which is what both oracles are there to see.
+fn used_blocks(limits: &H1Limits) -> Rc<RefCell<Blocks>> {
+    const STALE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 6\r\n\r\nSTALE!";
+    let mut blocks = Blocks::new(Sizes::within(limits, SMALL));
+    // As many of each size as one exchange could want at once, and then some.
+    let mut lent: Vec<_> = (0..4).map(|_| blocks.take()).collect();
+    for _ in 0..4 {
+        let small = blocks.take();
+        lent.push(blocks.grow(small));
+    }
+    for mut block in lent {
+        let room = block.room();
+        for (at, byte) in room.iter_mut().enumerate() {
+            *byte = STALE[at % STALE.len()];
+        }
+        let filled = room.len();
+        block.arrived(filled);
+        block.consume(filled);
+        blocks.give(block);
+    }
+    Rc::new(RefCell::new(blocks))
+}
+
 /// One exchange by EdgeRush's own path, and the connection back if it kept it.
 async fn one_ours(socket: Scripted, ask: &Asking, limits: H1Limits) -> (Got, Option<Scripted>) {
     let uri: Uri = TARGET.parse().unwrap_or_default();
-    let sent = Exchange::new(socket)
+    let sent = Exchange::new(socket, used_blocks(&limits))
         .send(
             &ask.method(),
             &uri,

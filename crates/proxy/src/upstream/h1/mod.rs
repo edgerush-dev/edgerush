@@ -6,6 +6,7 @@
 //! input be tried. The code that does hold a socket ([`exchange`]) keeps that separation,
 //! and is where the clock lives: the engine is told what happened, never when.
 
+pub mod blocks;
 pub mod codec;
 pub mod exchange;
 pub mod pool;

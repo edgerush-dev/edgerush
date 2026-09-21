@@ -21,6 +21,7 @@ use crate::random::random;
 use crate::request::decide;
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
+use crate::upstream::h1::blocks::{Blocks, SMALL, Sizes};
 use crate::upstream::h1::codec::{ResponseHead, Sending, filter_declaration, filter_trailers};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, nothing_to_say};
 use crate::upstream::h1::pool::{Lease, Pool};
@@ -266,6 +267,9 @@ pub struct Worker {
     /// The connections this worker keeps by EdgeRush's own path, which is a candidate
     /// beside the engine's client and carries nothing yet.
     pool: Rc<RefCell<Pool<TcpStream>>>,
+    /// What its exchanges read into, lent and taken back rather than made each time
+    /// ([13 §7](../../docs/13-http1-upstream.md)).
+    blocks: Rc<RefCell<Blocks>>,
     /// How many exchanges this worker has in hand. Its own, like everything else here:
     /// no worker waits on another to find out whether it may take a request.
     in_flight: Rc<Cell<usize>>,
@@ -472,6 +476,7 @@ impl Worker {
             proxy,
             client,
             pool: Rc::new(RefCell::new(Pool::default())),
+            blocks: Rc::new(RefCell::new(Blocks::new(Sizes::within(&limits, SMALL)))),
             in_flight: Rc::new(Cell::new(0)),
             limits,
         })
@@ -587,7 +592,7 @@ impl Worker {
             }
         };
 
-        let exchange = Exchange::new(socket);
+        let exchange = Exchange::new(socket, Rc::clone(&self.blocks));
         let (answer, rest) = exchange
             .send(method, uri, headers, nominated, sending, body, &self.limits)
             .await?;

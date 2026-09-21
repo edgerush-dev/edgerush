@@ -12,6 +12,7 @@
 //! here sends a request twice.
 
 use super::H1Limits;
+use super::blocks::{Block, Blocks};
 use super::codec::{
     Asked, BodyReader, BodyWriter, CodecError, Delivery, Framing, Head, HeadReader, Piece,
     ResponseHead, Sending, Trailers, delivery, write_head,
@@ -19,10 +20,12 @@ use super::codec::{
 use super::pool::Lease;
 use http::{HeaderMap, HeaderName, Method, StatusCode, Uri};
 use hyper::body::{Body, Bytes, Frame, SizeHint};
+use std::cell::RefCell;
 use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -31,9 +34,6 @@ use tokio::time::{Instant, Sleep, timeout, timeout_at};
 /// How much of a request waits in memory to be written. One frame at a time is staged;
 /// the body is not asked for more until what it gave has gone.
 const STAGING: usize = 16 * 1024;
-
-/// How much is read from the socket at once.
-const READING: usize = 16 * 1024;
 
 /// How many turns of staging one push may take before it gives the socket a chance.
 const ROUNDS: usize = 8;
@@ -190,8 +190,16 @@ pub struct Exchange<S> {
     socket: S,
     /// Read from the socket and not yet used. What is left when the head has been read is
     /// the beginning of the body.
-    incoming: Vec<u8>,
+    ///
+    /// Lent from the worker's blocks while there is anything in it and given back the
+    /// moment there is not: an exchange waiting on a quiet upstream holds none, and a
+    /// connection goes back to its pool holding none either.
+    incoming: Option<Block>,
+    blocks: Rc<RefCell<Blocks>>,
     /// Waiting to be written, and how much of it has gone.
+    ///
+    /// Lent from the worker's blocks with its room already made, and given back once
+    /// everything in it has gone; empty and unallocated in between.
     outgoing: Vec<u8>,
     written: usize,
 }
@@ -201,14 +209,89 @@ impl<S> Exchange<S> {
     fn nothing_queued(&self) -> bool {
         self.written >= self.outgoing.len()
     }
+
+    /// What has been read and not yet used.
+    fn unread(&self) -> &[u8] {
+        self.incoming.as_ref().map_or(&[][..], Block::data)
+    }
+
+    /// Says the first `count` of [`Exchange::unread`] have been used.
+    fn used(&mut self, count: usize) {
+        if let Some(block) = self.incoming.as_mut() {
+            block.consume(count);
+        }
+        self.give_back_if_empty();
+    }
+
+    /// Gives the block back if nothing in it is waiting to be used, which is the moment
+    /// holding it stops being worth anything.
+    fn give_back_if_empty(&mut self) {
+        if let Some(block) = self.incoming.take_if(|block| block.is_empty()) {
+            self.blocks.borrow_mut().give(block);
+        }
+    }
+
+    /// Makes sure there is a staging buffer with its room made, lent from the worker's
+    /// blocks if none is held.
+    fn lend_staging(&mut self) {
+        if self.outgoing.capacity() < STAGING {
+            let mut lent = self.blocks.borrow_mut().take_staging(STAGING);
+            lent.extend_from_slice(&self.outgoing);
+            self.outgoing = lent;
+        }
+    }
+
+    /// Gives the staging buffer back if everything staged in it has gone, rather than
+    /// hold it empty until there is more.
+    fn give_back_staging_if_empty(&mut self) {
+        if self.outgoing.is_empty() && self.outgoing.capacity() > 0 {
+            let spent = std::mem::take(&mut self.outgoing);
+            self.blocks.borrow_mut().give_staging(spent);
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> Exchange<S> {
+    /// Reads what the socket has, into a block borrowed for it if none is held.
+    ///
+    /// Says how the read went and how many bytes it brought, which are what both of its
+    /// callers decide on. A full block is grown first, because a read into no room comes
+    /// back with nothing, and nothing is what a close looks like.
+    fn poll_fill(&mut self, cx: &mut Context<'_>) -> (Poll<io::Result<()>>, usize) {
+        let mut block = match self.incoming.take() {
+            Some(block) => block,
+            None => self.blocks.borrow_mut().take(),
+        };
+        if block.room().is_empty() {
+            block = self.blocks.borrow_mut().grow(block);
+        }
+        if block.room().is_empty() {
+            // Not reached while the blocks are sized by `Sizes::within`: a grown block has
+            // room for anything the codec assembles whole, and the codec refuses anything
+            // bigger first. Failed all the same rather than read, because a read of nothing
+            // would be taken for the upstream closing.
+            self.incoming = Some(block);
+            let outgrown = io::Error::other("an answer outgrew the most a block holds");
+            return (Poll::Ready(Err(outgrown)), 0);
+        }
+        let mut read = ReadBuf::new(block.room());
+        let outcome = Pin::new(&mut self.socket).poll_read(cx, &mut read);
+        let filled = read.filled().len();
+        block.arrived(filled);
+        self.incoming = Some(block);
+        self.give_back_if_empty();
+        (outcome, filled)
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
-    /// An exchange on `socket`, which nothing has been said on yet.
-    pub fn new(socket: S) -> Self {
+    /// An exchange on `socket`, which nothing has been said on yet, reading into blocks
+    /// lent from `blocks`.
+    pub fn new(socket: S, blocks: Rc<RefCell<Blocks>>) -> Self {
         Self {
             socket,
-            incoming: Vec::new(),
+            incoming: None,
+            blocks,
             outgoing: Vec::new(),
             written: 0,
         }
@@ -299,6 +382,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         B: Body<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
+        self.lend_staging();
         write_head(&mut self.outgoing, method, uri, headers, sending, limits)?;
         // A request that asks to be told before it sends its body has its head go out
         // alone; what follows waits for the upstream to answer, or for the wait to end.
@@ -315,7 +399,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             // What is already in hand comes first. Going back to the socket before
             // looking at it is how an upstream that answers and closes at once has its
             // answer thrown away for a close that had already been overtaken.
-            let Head::Read { head, consumed } = reader.read(&self.incoming, limits)? else {
+            let Head::Read { head, consumed } = reader.read(self.unread(), limits)? else {
                 let round = poll_fn(|cx| self.round(cx, upload, may_send, &mut clocks, limits));
                 // The clocks inside the round are the exchange's own. This one is the wait
                 // for permission, which is not an exchange gone quiet but a question gone
@@ -367,11 +451,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                         limit: limits.interim_bytes,
                     });
                 }
-                self.incoming.drain(..consumed);
+                self.used(consumed);
                 reader = HeadReader::default();
                 continue;
             }
-            self.incoming.drain(..consumed);
+            self.used(consumed);
             // A refusal that also closes the connection says to stop; an answer that came
             // early says nothing at all, because an echo answers early by nature. A
             // request still being withheld for a 100 is never started now.
@@ -413,15 +497,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         if upload.stopped {
             return Ok(pushed);
         }
-        // The staging buffer is given its bound once and exactly, the first time anything
-        // is staged. Grown a piece at a time it lands wherever the doubling takes it —
-        // past the bound, by however much the last step overshot — and what is measured
-        // is what a buffer holds, not what is in it
-        // ([13 §7](../../../docs/13-http1-upstream.md)). The read buffer is already its
-        // own size for the same reason.
-        if self.outgoing.capacity() < STAGING {
-            self.outgoing.reserve_exact(STAGING - self.outgoing.len());
-        }
+        // The staging buffer is lent with its bound already made, never grown to it a
+        // piece at a time: grown, it lands wherever the doubling takes it — past the
+        // bound, by however much the last step overshot — and what is measured is what a
+        // buffer holds, not what is in it ([13 §7](../../../docs/13-http1-upstream.md)).
+        self.lend_staging();
 
         // Bounded work per turn: a body that keeps handing over frames must not be able
         // to hold this loop for as long as it cares to.
@@ -518,6 +598,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             self.outgoing.drain(..self.written);
             self.written = 0;
         }
+        self.give_back_staging_if_empty();
         // Anything still staged is the upstream's to take, and until it does the wait is
         // the upstream's. A client asked for more while the socket is backed up is not a
         // client that is being slow, so its clock does not run while this one does.
@@ -563,12 +644,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         }
 
         // And read, whatever the writing did. This is the part that must not be skipped.
-        let was = self.incoming.len();
-        self.incoming.resize(was + READING, 0);
-        let mut read = ReadBuf::new(&mut self.incoming[was..]);
-        let outcome = Pin::new(&mut self.socket).poll_read(cx, &mut read);
-        let filled = read.filled().len();
-        self.incoming.truncate(was + filled);
+        let (outcome, filled) = self.poll_fill(cx);
         match outcome {
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
             Poll::Ready(Ok(())) if filled == 0 => return Poll::Ready(Ok(Moved::Closed)),
@@ -614,7 +690,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
     /// The bytes that came after the head, and the socket they came on. What is left is
     /// the start of the answer's body.
     pub fn into_body_parts(self) -> (S, Vec<u8>) {
-        (self.socket, self.incoming)
+        let unread = self.unread().to_vec();
+        (self.socket, unread)
     }
 }
 
@@ -742,7 +819,7 @@ impl<S, B> H1Body<S, B> {
         }
         // Bytes in hand after a message that is over are a peer saying something nobody
         // asked for, and the upstream having closed is the end of the connection anyway.
-        if !rest.exchange.incoming.is_empty() || self.ended {
+        if !rest.exchange.unread().is_empty() || self.ended {
             return None;
         }
         let rest = self.rest.take()?;
@@ -774,8 +851,10 @@ impl<S, B> H1Body<S, B> {
     /// What is left of the connection whatever state it is in, for a caller that means to
     /// close it. Never a way back into a pool: that is [`H1Body::take_if_reusable`] alone.
     pub fn into_connection(self) -> Option<(S, Vec<u8>)> {
-        self.rest
-            .map(|rest| (rest.exchange.socket, rest.exchange.incoming))
+        self.rest.map(|rest| {
+            let unread = rest.exchange.unread().to_vec();
+            (rest.exchange.socket, unread)
+        })
     }
 
     /// Takes the end apart: what the reader said, kept for the frame after this one.
@@ -856,7 +935,7 @@ where
 
             match this
                 .reader
-                .read(&rest.exchange.incoming, this.ended, &this.limits)
+                .read(rest.exchange.unread(), this.ended, &this.limits)
             {
                 Err(error) => {
                     // A body that stopped making sense is not an end; saying so would be
@@ -865,14 +944,14 @@ where
                     return Poll::Ready(Some(Err(error.into())));
                 }
                 Ok(Piece::End { trailers, consumed }) => {
-                    rest.exchange.incoming.drain(..consumed);
+                    rest.exchange.used(consumed);
                     this.ended_with(trailers);
                     continue;
                 }
                 Ok(Piece::Data { data, consumed }) => {
                     let frame = (!data.is_empty())
-                        .then(|| Bytes::copy_from_slice(&rest.exchange.incoming[data]));
-                    rest.exchange.incoming.drain(..consumed);
+                        .then(|| Bytes::copy_from_slice(&rest.exchange.unread()[data]));
+                    rest.exchange.used(consumed);
                     let Some(frame) = frame else {
                         // Framing bytes and nothing else; keep going.
                         continue;
@@ -896,9 +975,9 @@ where
                     if this.reader.is_spent() {
                         let settled =
                             this.reader
-                                .read(&rest.exchange.incoming, this.ended, &this.limits);
+                                .read(rest.exchange.unread(), this.ended, &this.limits);
                         if let Ok(Piece::End { trailers, consumed }) = settled {
-                            rest.exchange.incoming.drain(..consumed);
+                            rest.exchange.used(consumed);
                             this.ended_with(trailers);
                         }
                     }
@@ -917,12 +996,7 @@ where
             }
 
             // Only now, and only because somebody asked for a frame.
-            let was = rest.exchange.incoming.len();
-            rest.exchange.incoming.resize(was + READING, 0);
-            let mut read = ReadBuf::new(&mut rest.exchange.incoming[was..]);
-            let outcome = Pin::new(&mut rest.exchange.socket).poll_read(cx, &mut read);
-            let filled = read.filled().len();
-            rest.exchange.incoming.truncate(was + filled);
+            let (outcome, filled) = rest.exchange.poll_fill(cx);
             match outcome {
                 Poll::Pending => {
                     if moved {
@@ -1187,10 +1261,38 @@ struct Held {
     frames: usize,
 }
 
+/// Blocks of their own, for a test that is not a worker.
+#[cfg(test)]
+fn test_blocks() -> Rc<RefCell<Blocks>> {
+    Rc::new(RefCell::new(Blocks::new(super::blocks::Sizes::default())))
+}
+
+#[cfg(test)]
+impl<S> Exchange<S> {
+    /// Puts `bytes` where a read would have, for a test that starts part way through.
+    fn holding(&mut self, bytes: &[u8]) {
+        let mut blocks = self.blocks.borrow_mut();
+        let mut block = blocks.take();
+        if bytes.len() > block.capacity() {
+            block = blocks.grow(block);
+        }
+        block.room()[..bytes.len()].copy_from_slice(bytes);
+        block.arrived(bytes.len());
+        drop(blocks);
+        self.incoming = Some(block);
+    }
+}
+
 #[cfg(test)]
 impl Held {
     fn total(self) -> usize {
         self.staged + self.buffered + self.frame
+    }
+
+    /// The staging buffer and the read block: what this code holds, without the frame
+    /// whose size is the client's choice.
+    fn buffers(self) -> (usize, usize) {
+        (self.staged, self.buffered)
     }
 }
 
@@ -1207,7 +1309,7 @@ impl<S, B> H1Body<S, B> {
         };
         Held {
             staged: rest.exchange.outgoing.capacity(),
-            buffered: rest.exchange.incoming.capacity(),
+            buffered: rest.exchange.incoming.as_ref().map_or(0, Block::capacity),
             frame,
             frames,
         }
@@ -1217,6 +1319,7 @@ impl<S, B> H1Body<S, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upstream::h1::blocks::{SMALL, Sizes};
     use http::HeaderValue;
     use http_body_util::{Empty, Full};
     use std::convert::Infallible;
@@ -1288,7 +1391,7 @@ mod tests {
     /// before a write has to wait.
     fn connected(room: usize) -> (Exchange<DuplexStream>, Peer) {
         let (ours, theirs) = tokio::io::duplex(room);
-        (Exchange::new(ours), Peer(theirs))
+        (Exchange::new(ours, test_blocks()), Peer(theirs))
     }
 
     fn headers(fields: &[(&str, &str)]) -> HeaderMap {
@@ -1304,7 +1407,7 @@ mod tests {
 
     /// Everything of the answer's body that was already in hand when the head was read.
     fn left_over<B>(rest: Rest<DuplexStream, B>) -> Vec<u8> {
-        rest.exchange.incoming
+        rest.exchange.unread().to_vec()
     }
 
     #[tokio::test]
@@ -1337,6 +1440,138 @@ mod tests {
         let head = String::from_utf8(head).unwrap();
         assert!(head.starts_with("GET /a?b=1 HTTP/1.1\r\n"), "{head}");
         assert!(head.contains("host: up.test\r\n"), "{head}");
+    }
+
+    /// **A finished exchange gives back what it was lent.** The block it read the answer
+    /// into and the buffer it staged the request in are both the worker's; either one
+    /// going with the exchange instead would be memory made again for the next request,
+    /// which is the whole of what lending them saves, and nothing else would notice.
+    #[tokio::test]
+    async fn a_finished_exchange_gives_back_what_it_was_lent() {
+        let blocks = test_blocks();
+        let (ours, theirs) = tokio::io::duplex(4096);
+        let mut peer = Peer(theirs);
+        let limits = H1Limits::default();
+        let answered = tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            peer.say("HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello")
+                .await;
+            peer
+        });
+
+        let (answer, rest) = Exchange::new(ours, Rc::clone(&blocks))
+            .send(
+                &Method::GET,
+                &"/".parse().unwrap(),
+                &headers(&[("host", "up.test")]),
+                &[],
+                Sending::None,
+                Empty::<Bytes>::new(),
+                &limits,
+            )
+            .await
+            .unwrap();
+        let _peer = answered.await.unwrap();
+        let mut body = H1Body::new(
+            rest,
+            answer.delivery.framing,
+            answer.delivery.persistent,
+            answer.nominated,
+            limits,
+        );
+        let (data, _trailers) = collected(&mut body).await.unwrap();
+        assert_eq!(data, b"hello");
+
+        // Both lent while they were wanted and back now: one block and one staging
+        // buffer, however many times either was given back empty and lent again in
+        // between, because neither is taken while one is held.
+        assert_eq!(
+            blocks.borrow().parked(),
+            2,
+            "the block or the staging buffer went with the exchange"
+        );
+        assert!(
+            body.take_if_reusable().is_some(),
+            "a clean exchange was not kept"
+        );
+    }
+
+    /// **A head bigger than a block is read whole.** A block starts at the read bound and
+    /// a head may be four times that ([13 §7](../../../docs/13-http1-upstream.md)): the
+    /// block it outgrows is grown, and the head is none the wiser.
+    #[tokio::test]
+    async fn a_head_bigger_than_a_block_is_read_whole() {
+        let (exchange, mut peer) = connected(4096);
+        let limits = H1Limits::default();
+        // One field long enough to fill the first block by itself, and well inside the
+        // head bound.
+        let length = SMALL + SMALL / 4;
+        let answered = tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            let long = "a".repeat(length);
+            peer.say(&format!(
+                "HTTP/1.1 200 OK\r\nx-long: {long}\r\ncontent-length: 0\r\n\r\n"
+            ))
+            .await;
+            peer
+        });
+
+        let (answer, _rest) = exchange
+            .send(
+                &Method::GET,
+                &"/".parse().unwrap(),
+                &headers(&[("host", "up.test")]),
+                &[],
+                Sending::None,
+                Empty::<Bytes>::new(),
+                &limits,
+            )
+            .await
+            .unwrap();
+        let _peer = answered.await.unwrap();
+
+        assert_eq!(answer.head.status, 200);
+        assert_eq!(answer.head.headers["x-long"].len(), length);
+    }
+
+    /// **And an answer no block can hold is a failure, not a close.** Not reached with
+    /// blocks sized from the limits, which is what makes it worth a test of its own: a
+    /// read into no room at all comes back with nothing, and nothing is what a close looks
+    /// like. Blocks made too small for the limits show which of the two it is taken for.
+    #[tokio::test]
+    async fn an_answer_no_block_can_hold_is_a_failure_and_not_a_close() {
+        let tiny = Sizes {
+            small: 8,
+            large: 16,
+            parked: 1,
+        };
+        let (ours, theirs) = tokio::io::duplex(4096);
+        let mut peer = Peer(theirs);
+        let limits = H1Limits::default();
+        let answered = tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            // Longer than the largest block, far short of the head bound, and not over:
+            // the upstream is still there and has more to say.
+            peer.say("HTTP/1.1 200 OK\r\nx-long: aaaaaaaaaaaaaaaa")
+                .await;
+            peer
+        });
+
+        let error = Exchange::new(ours, Rc::new(RefCell::new(Blocks::new(tiny))))
+            .send(
+                &Method::GET,
+                &"/".parse().unwrap(),
+                &headers(&[("host", "up.test")]),
+                &[],
+                Sending::None,
+                Empty::<Bytes>::new(),
+                &limits,
+            )
+            .await
+            .unwrap_err();
+        let _peer = answered.await.unwrap();
+
+        assert!(matches!(error, ExchangeError::Io(_)), "{error}");
     }
 
     #[tokio::test]
@@ -1634,8 +1869,8 @@ mod tests {
     /// The same, saying whether the head allowed it to be kept at all.
     fn keepable_body_on(framing: Framing, buffered: &[u8], persistent: bool) -> (SpentBody, Peer) {
         let (ours, theirs) = tokio::io::duplex(4096);
-        let mut exchange = Exchange::new(ours);
-        exchange.incoming = buffered.to_vec();
+        let mut exchange = Exchange::new(ours, test_blocks());
+        exchange.holding(buffered);
         // A request with nothing in it, already all sent.
         let mut upload = Upload::new(Empty::<Bytes>::new(), Sending::None, Vec::new());
         let mut nothing = Vec::new();
@@ -1660,9 +1895,9 @@ mod tests {
     #[tokio::test]
     async fn a_request_body_that_fails_after_the_head_fails_the_answer() {
         let (ours, theirs) = tokio::io::duplex(4096);
-        let mut exchange = Exchange::new(ours);
+        let mut exchange = Exchange::new(ours, test_blocks());
         // The whole answer is already in hand, so nothing about the upstream is at fault.
-        exchange.incoming = b"ok".to_vec();
+        exchange.holding(b"ok");
         let upload = Upload::new(Failing(true), Sending::Chunked, Vec::new());
         let rest = Rest { exchange, upload };
         let mut body = H1Body::new(
@@ -1693,10 +1928,10 @@ mod tests {
     async fn an_answer_that_keeps_coming_does_not_hide_a_stalled_request() {
         let limits = H1Limits::default();
         let (ours, theirs) = tokio::io::duplex(4096);
-        let mut exchange = Exchange::new(ours);
+        let mut exchange = Exchange::new(ours, test_blocks());
         // Chunk after chunk, all of it already in hand, so every ask has a frame
         // ready without the socket being touched.
-        exchange.incoming = "4\r\nabcd\r\n".repeat(64).into_bytes();
+        exchange.holding("4\r\nabcd\r\n".repeat(64).as_bytes());
         // And a client that has handed over nothing, and will not.
         let upload = Upload::new(Silent, Sending::Chunked, Vec::new());
         let rest = Rest { exchange, upload };
@@ -1731,7 +1966,7 @@ mod tests {
     async fn staging_keeps_room_for_the_framing_it_adds() {
         // A socket that takes almost nothing, so what is staged stays staged.
         let (ours, _theirs) = tokio::io::duplex(1);
-        let mut exchange = Exchange::new(ours);
+        let mut exchange = Exchange::new(ours, test_blocks());
         let mut upload = Upload::new(
             Full::new(Bytes::from(vec![b'x'; STAGING * 2])),
             Sending::Chunked,
@@ -1803,7 +2038,7 @@ mod tests {
             Vec::new(),
         );
         let rest = Rest {
-            exchange: Exchange::new(ours),
+            exchange: Exchange::new(ours, test_blocks()),
             upload,
         };
         let mut body = H1Body::new(
@@ -2137,7 +2372,7 @@ mod tests {
         let idle = H1Limits::default().idle;
         let (ours, theirs) = tokio::io::duplex(4096);
         let rest = Rest {
-            exchange: Exchange::new(ours),
+            exchange: Exchange::new(ours, test_blocks()),
             upload: Upload::new(
                 Stops(Some(Bytes::from_static(b"half"))),
                 Sending::Chunked,
@@ -2201,7 +2436,7 @@ mod tests {
         // Room for a little of the request and no more, so the rest stays staged.
         let (ours, theirs) = tokio::io::duplex(64);
         let rest = Rest {
-            exchange: Exchange::new(ours),
+            exchange: Exchange::new(ours, test_blocks()),
             upload: Upload::new(
                 Full::new(Bytes::from(vec![b'x'; 64 * 1024])),
                 Sending::Length(64 * 1024),
@@ -2260,7 +2495,7 @@ mod tests {
         // client is asked for nothing while it waits.
         let (ours, theirs) = tokio::io::duplex(64);
         let rest = Rest {
-            exchange: Exchange::new(ours),
+            exchange: Exchange::new(ours, test_blocks()),
             upload: Upload::new(
                 // More than the sips below will ever take, so the socket stays backed up
                 // throughout and the client is never asked for a second frame.
@@ -2374,7 +2609,7 @@ mod tests {
         };
         let (ours, theirs) = tokio::io::duplex(4096);
         let rest = Rest {
-            exchange: Exchange::new(ours),
+            exchange: Exchange::new(ours, test_blocks()),
             upload: Upload::new(
                 Frames {
                     left: frames,
@@ -2425,8 +2660,16 @@ mod tests {
         };
         watch(body.held());
         loop {
-            let polled = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
-            watch(body.held());
+            // After every poll, including the ones with nothing to show for it. A buffer
+            // is held while something is in it and given back when not, so the moments it
+            // is held are the ones spent waiting -- which are the polls that come back
+            // with nothing, and the only ones that would see the upload at work.
+            let polled = poll_fn(|cx| {
+                let polled = Pin::new(&mut body).poll_frame(cx);
+                watch(body.held());
+                polled
+            })
+            .await;
             match polled {
                 None => break,
                 Some(frame) => {
@@ -2442,9 +2685,10 @@ mod tests {
     /// exchange or sixteen mebibytes, at frames from 4 KiB to 256 KiB: the same two
     /// buffers, the same size, every time.
     ///
-    /// The bound is exactly the buffers this code owns -- one for staging the request and
-    /// one for reading the answer -- and it is asserted as an equality rather than a
-    /// ceiling, because a ceiling would not notice a buffer that had begun to creep.
+    /// The bound is exactly the buffers this code holds at its most -- one for staging the
+    /// request and one block, lent, for reading the answer -- and it is asserted as an
+    /// equality rather than a ceiling, because a ceiling would not notice a buffer that
+    /// had begun to creep.
     #[tokio::test]
     async fn what_is_held_does_not_move_with_what_is_moved() {
         let smallest = holding(4, 4, 4 * 1024).await;
@@ -2458,12 +2702,18 @@ mod tests {
             (64, 256 * 1024),
         ] {
             let most = holding(frames, frames, size).await;
-            assert_eq!(most, smallest, "{frames} frames of {size}");
+            assert_eq!(
+                most.buffers(),
+                smallest.buffers(),
+                "{frames} frames of {size}: {most:?}"
+            );
+            // The frame in hand is the client's size, and there is one at most.
+            assert!(most.frames <= 1, "frames queued up: {most:?}");
         }
-        // And what that unmoving amount is: the two buffers this code owns, and nothing
-        // else. Said in terms of the bounds themselves, so that raising one is a decision
-        // taken here rather than a number that drifted.
-        assert_eq!(smallest.total(), STAGING + READING, "{smallest:?}");
+        // And what that unmoving amount is: each of the two buffers at exactly its own
+        // bound, and nothing else. Said in terms of the bounds themselves, so that raising
+        // one is a decision taken here rather than a number that drifted.
+        assert_eq!(smallest.buffers(), (STAGING, SMALL), "{smallest:?}");
     }
 
     /// **And a chunked request holds no more than a counted one.** A chunk carries a size
@@ -2477,14 +2727,18 @@ mod tests {
     async fn a_chunked_request_holds_what_a_counted_one_holds() {
         let counted = holding_sent(16, 16, 4 * 1024, Sent::Counted).await;
         let chunked = holding_sent(16, 16, 4 * 1024, Sent::Chunked).await;
-        assert_eq!(chunked, counted, "chunked held more than counted");
-        assert_eq!(chunked.total(), STAGING + READING, "{chunked:?}");
+        assert_eq!(
+            chunked.buffers(),
+            counted.buffers(),
+            "chunked held more than counted: {chunked:?}"
+        );
+        assert_eq!(chunked.buffers(), (STAGING, SMALL), "{chunked:?}");
 
         // With trailers on the end, what is staged may reach the section's own bound
         // besides -- and no further.
         let trailing = holding_sent(16, 16, 4 * 1024, Sent::WithTrailers).await;
         assert!(
-            trailing.total() <= STAGING + READING + H1Limits::default().trailers,
+            trailing.staged + trailing.buffered <= STAGING + SMALL + H1Limits::default().trailers,
             "{trailing:?} is past the staging and trailer bounds together"
         );
     }
@@ -2501,15 +2755,23 @@ mod tests {
             holding(4, 4, 4 * 1024),
         );
         for (which, most) in [first, second, third, fourth].into_iter().enumerate() {
-            assert_eq!(most, alone, "exchange {which}");
+            assert_eq!(
+                most.buffers(),
+                alone.buffers(),
+                "exchange {which}: {most:?}"
+            );
         }
     }
 
     /// **One frame in hand, never a queue of them.** A client with sixty-four frames to
     /// give and an upstream that will take almost none of them is a client that is not
-    /// asked for the next one: what is held is the frame being forwarded and the two
-    /// buffers, however much more is offered
+    /// asked for the next one: what is held is the frame being forwarded and the staging
+    /// buffer, however much more is offered
     /// ([13 §7](../../../docs/13-http1-upstream.md)).
+    ///
+    /// And no block to read into, because the upstream has said nothing: a block is lent
+    /// while there is something in it and given back the moment there is not, so an
+    /// exchange waiting on a silent upstream is not holding a buffer against the chance.
     ///
     /// The frame counts at its own size, which is the client's choice and not this end's.
     /// What this end promises is that there is one.
@@ -2519,7 +2781,7 @@ mod tests {
         // Room for a little of the request and no more, so the frames have to wait.
         let (ours, _theirs) = tokio::io::duplex(64);
         let rest = Rest {
-            exchange: Exchange::new(ours),
+            exchange: Exchange::new(ours, test_blocks()),
             upload: Upload::new(
                 Frames {
                     left: 64,
@@ -2551,7 +2813,11 @@ mod tests {
 
         let held = body.held();
         assert_eq!(held.frame, size, "{held:?}");
-        assert_eq!(held.total(), STAGING + READING + size, "{held:?}");
+        assert_eq!(
+            held.buffered, 0,
+            "a block held for an answer nobody sent: {held:?}"
+        );
+        assert_eq!(held.total(), STAGING + size, "{held:?}");
     }
 
     /// A body that says whether anybody has asked it for anything. Holding a body back
@@ -2930,7 +3196,7 @@ mod lifecycle {
     async fn staging_does_not_keep_what_it_has_already_sent() {
         use tokio::io::AsyncReadExt;
         let (socket, mut peer) = tokio::io::duplex(1024);
-        let mut exchange = Exchange::new(socket);
+        let mut exchange = Exchange::new(socket, test_blocks());
         let mut upload = Upload::new(Frames, Sending::Chunked, Vec::new());
         let mut drain = [0; 1024];
         for _ in 0..100 {
@@ -2955,7 +3221,7 @@ mod lifecycle {
     #[tokio::test]
     async fn a_request_still_queued_is_not_a_request_that_went() {
         let (socket, _peer) = tokio::io::duplex(64);
-        let mut exchange = Exchange::new(socket);
+        let mut exchange = Exchange::new(socket, test_blocks());
         exchange.outgoing.extend_from_slice(b"0\r\n\r\n");
         let mut upload = Upload::new(
             http_body_util::Empty::<Bytes>::new(),

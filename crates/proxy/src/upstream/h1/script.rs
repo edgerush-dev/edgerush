@@ -635,6 +635,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upstream::h1::blocks::{Blocks, Sizes};
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Reads everything the upstream says, until the end or an error. The error is kept
@@ -1013,7 +1016,8 @@ mod tests {
 
         let (outcome, tape) = run(script, Budget::default(), move |socket| async move {
             let limits = H1Limits::default();
-            let (answer, rest) = Exchange::new(socket)
+            let blocks = Rc::new(RefCell::new(Blocks::new(Sizes::default())));
+            let (answer, rest) = Exchange::new(socket, blocks)
                 .send(
                     &Method::GET,
                     &uri,
