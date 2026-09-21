@@ -2287,10 +2287,15 @@ mod tests {
     }
 
     /// A body nobody finished reading is a connection in the middle of a message.
+    ///
+    /// Nothing is buffered on purpose. Bytes in hand would refuse this connection for
+    /// being bytes in hand, and the test would pass without the answer's end ever having
+    /// been the reason — which is what bytes waiting to be read cost a test here.
     #[tokio::test(start_paused = true)]
     async fn a_body_that_was_never_read_to_its_end_is_not_kept() {
-        let (mut body, _peer) = body_on(Framing::Length(5), b"hello");
-        // Not a frame taken.
+        let (mut body, _peer) = body_on(Framing::Length(5), b"");
+        // Not a frame taken, and none waiting to be.
+        assert!(!body.is_complete());
         assert!(body.take_if_reusable().is_none());
     }
 

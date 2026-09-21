@@ -28,6 +28,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -190,6 +191,20 @@ impl Wire {
                 return None;
             }
         }
+    }
+
+    /// Everything that arrives from here until the connection ends, however it ends.
+    /// A body cut short may be followed by a close or by a reset, and which of the two
+    /// arrives is the operating system's business rather than the proxy's.
+    async fn rest(&mut self) -> Vec<u8> {
+        let mut bytes = [0; 4096];
+        loop {
+            match within(self.stream.read(&mut bytes)).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => self.buffered.extend_from_slice(&bytes[..read]),
+            }
+        }
+        std::mem::take(&mut self.buffered)
     }
 
     /// Reads whatever has arrived. False when the peer has closed.
@@ -551,7 +566,6 @@ async fn an_answers_framing_follows_what_its_body_has_left() {
 /// back correctly says nothing about whether anything was reused.
 #[tokio::test]
 async fn a_finished_answer_leaves_its_connection_for_the_next_request() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     let accepts = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&accepts);
     let backend = raw_upstream(move |mut wire| {
@@ -662,4 +676,412 @@ async fn what_an_idle_connection_was_told_is_never_the_next_answer() {
             "unsolicited idle bytes became next response"
         );
     }
+}
+
+// ---- reuse, and the ends of connections ----
+//
+// Whether a connection was kept is invisible from either end of the proxy: the client
+// sees an answer and the upstream sees a request, and a correct body says nothing about
+// which socket carried it ([13 §6](../../../docs/13-http1-upstream.md)). So every test
+// below counts the connections the upstream accepted, and every one of them sends a
+// second request: reuse that is never used again is reuse that was never proved.
+
+/// The plain answer, which only a connection of its own ever gives.
+const FRESH: &str = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh";
+
+/// Answers every request on this connection the same plain way, until it ends.
+async fn plainly(mut wire: Wire) {
+    while wire.until(b"\r\n\r\n").await.is_some() {
+        wire.write(FRESH).await;
+    }
+}
+
+/// An upstream whose **first** connection does something hostile and whose later ones
+/// answer plainly, with a count of how many it has accepted.
+///
+/// That split is what makes the assertions say something. A second answer of `fresh`
+/// could not have come from the hostile connection, and an accept count of one could not
+/// have served two requests on two sockets: together they say which socket was used,
+/// which no amount of reading the answer can.
+fn hostile_first<F, Fut>(hostile: F) -> (SocketAddr, Arc<AtomicUsize>)
+where
+    F: Fn(Wire) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&accepts);
+    let hostile = Arc::new(hostile);
+    let address = raw_upstream(move |wire| {
+        let first = counting.fetch_add(1, Ordering::SeqCst) == 0;
+        let hostile = Arc::clone(&hostile);
+        async move {
+            if first {
+                hostile(wire).await;
+            } else {
+                plainly(wire).await;
+            }
+        }
+    });
+    (address, accepts)
+}
+
+/// Whatever followed the first head in `bytes`, or `None` if no whole head arrived.
+///
+/// **A failure part way through a body has two shapes, and which one arrives is not the
+/// proxy's to decide.** The head reaches the downstream server before the body is polled,
+/// but whether that server had flushed it to the socket before the body failed is its own
+/// buffering. So a client may be left with a head and a body that stops, or with nothing
+/// at all. Neither is a message that finished, and that is the whole of what is promised
+/// ([13 §7](../../../docs/13-http1-upstream.md)).
+fn after_head(bytes: &[u8]) -> Option<&[u8]> {
+    find(bytes, b"\r\n\r\n").map(|at| &bytes[at + 4..])
+}
+
+/// Sends a request and returns the answer's head.
+async fn asks(client: &mut Wire, path: &str) -> String {
+    client
+        .write(&format!(
+            "GET {path} HTTP/1.1\r\nHost: example.test\r\n\r\n"
+        ))
+        .await;
+    within(client.head()).await
+}
+
+/// Bytes arriving with the answer are a peer saying something nobody asked for. The
+/// answer itself is still the answer, but the connection has said a thing this end
+/// cannot account for, and a connection like that is not lent out again.
+#[tokio::test]
+async fn surplus_bytes_behind_an_answer_stop_the_connection_being_kept() {
+    let (backend, accepts) = hostile_first(|mut wire| async move {
+        if wire.until(b"\r\n\r\n").await.is_some() {
+            // The answer, and hard behind it a whole answer nobody asked for.
+            wire.write(concat!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nsurplus",
+            ))
+            .await;
+        }
+        // Still there, so that a connection wrongly kept would have something to give.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+
+    assert!(
+        asks(&mut client, "/first")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert_eq!(within(client.body(2)).await, "ok");
+
+    assert!(
+        asks(&mut client, "/second")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert_eq!(
+        within(client.body(5)).await,
+        "fresh",
+        "the surplus became the next answer"
+    );
+    assert_eq!(accepts.load(Ordering::SeqCst), 2, "a kept connection");
+}
+
+/// An upstream that closes a connection it is not using has closed it, whatever this end
+/// thought it was keeping. The next request opens one of its own and is answered; a
+/// connection found to be gone is not the request's failure.
+#[tokio::test]
+async fn a_connection_closed_while_idle_is_not_handed_to_the_next_request() {
+    let (backend, accepts) = hostile_first(|mut wire| async move {
+        if wire.until(b"\r\n\r\n").await.is_some() {
+            wire.write(FRESH).await;
+        }
+        // And gone: the handler returns, which closes it.
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+
+    assert!(
+        asks(&mut client, "/first")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert_eq!(within(client.body(5)).await, "fresh");
+    // Long enough for the close to have arrived before the next request wants a socket.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let head = asks(&mut client, "/second").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(within(client.body(5)).await, "fresh");
+    assert_eq!(accepts.load(Ordering::SeqCst), 2, "a closed connection");
+}
+
+/// A connection that closes before it has answered at all fails the request it was
+/// carrying. It is not sent again down another socket: a request that has been dispatched
+/// has been dispatched, and this end cannot know what the other made of it
+/// ([13 §5](../../../docs/13-http1-upstream.md)).
+#[tokio::test]
+async fn a_connection_that_closes_before_answering_fails_and_is_not_replayed() {
+    let (backend, accepts) = hostile_first(|mut wire| async move {
+        let _request = wire.until(b"\r\n\r\n").await;
+        // Nothing said, and gone.
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+
+    let head = asks(&mut client, "/first").await;
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "the request was sent a second time"
+    );
+}
+
+/// The same part way through a head: nothing has been promised to the client yet, so the
+/// failure is the proxy's own answer rather than a half-read one passed on.
+#[tokio::test]
+async fn a_connection_that_closes_inside_a_head_fails_the_request() {
+    let (backend, accepts) = hostile_first(|mut wire| async move {
+        if wire.until(b"\r\n\r\n").await.is_some() {
+            wire.write("HTTP/1.1 200 OK\r\nContent-Len").await;
+        }
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+
+    let head = asks(&mut client, "/first").await;
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "the request was replayed"
+    );
+}
+
+/// A close while the request is still going out is the same failure at a different
+/// moment: the upload had nowhere left to go and no answer ever came. Nothing had been
+/// promised to the client, so it is told, and the request is not sent anywhere else.
+#[tokio::test]
+async fn a_connection_that_closes_during_an_upload_fails_the_request() {
+    let (backend, accepts) = hostile_first(|mut wire| async move {
+        // The head and not a byte of the body, and then gone.
+        let _head = wire.until(b"\r\n\r\n").await;
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+
+    // Two bytes of a body that says it is ten, so the upload is still in the air when
+    // the upstream goes.
+    client
+        .write("POST /first HTTP/1.1\r\nHost: example.test\r\nContent-Length: 10\r\n\r\nab")
+        .await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "the request was sent a second time"
+    );
+}
+
+/// An interim answer is not an answer. A connection that says one and then closes has
+/// left the exchange where it was: still waiting for the head that never came.
+#[tokio::test]
+async fn a_connection_that_closes_after_an_interim_answer_fails_the_request() {
+    let (backend, accepts) = hostile_first(|mut wire| async move {
+        if wire.until(b"\r\n\r\n").await.is_some() {
+            wire.write("HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n")
+                .await;
+        }
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+
+    let head = asks(&mut client, "/first").await;
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "the request was replayed"
+    );
+}
+
+/// **A body that stops early is lost, not finished.** The head has gone to the client
+/// already, so there is no status left to change; what must not happen is the client
+/// being handed five bytes of a ten-byte body as though that were all of it.
+#[tokio::test]
+async fn a_length_delimited_body_cut_short_never_looks_complete() {
+    let (backend, _accepts) = hostile_first(|mut wire| async move {
+        if wire.until(b"\r\n\r\n").await.is_some() {
+            wire.write("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort")
+                .await;
+        }
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+
+    client
+        .write("GET /first HTTP/1.1\r\nHost: example.test\r\n\r\n")
+        .await;
+    let all = within(client.rest()).await;
+    assert!(
+        after_head(&all).is_none_or(|body| body.len() < 10),
+        "a cut-short body was completed: {all:?}"
+    );
+}
+
+/// And chunked: the client is never given the terminating chunk, because there was none.
+#[tokio::test]
+async fn a_chunked_body_cut_short_never_reaches_its_terminator() {
+    let (backend, _accepts) = hostile_first(|mut wire| async move {
+        if wire.until(b"\r\n\r\n").await.is_some() {
+            wire.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nshort\r\n")
+                .await;
+        }
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+
+    client
+        .write("GET /first HTTP/1.1\r\nHost: example.test\r\n\r\n")
+        .await;
+    let all = within(client.rest()).await;
+    assert!(
+        after_head(&all).is_none_or(|body| find(body, b"0\r\n\r\n").is_none()),
+        "a cut-short body was terminated: {all:?}"
+    );
+}
+
+/// A last chunk with no trailer section behind it is a message that stopped inside its
+/// framing, however complete the data looks. The bytes are all there; the message is not.
+#[tokio::test]
+async fn a_body_that_stops_inside_its_trailer_section_is_not_an_end() {
+    let (backend, _accepts) = hostile_first(|mut wire| async move {
+        if wire.until(b"\r\n\r\n").await.is_some() {
+            // Every byte of data, the zero chunk, and then nothing: the empty line that
+            // ends the trailer section never comes.
+            wire.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n")
+                .await;
+        }
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+
+    client
+        .write("GET /first HTTP/1.1\r\nHost: example.test\r\n\r\n")
+        .await;
+    let all = within(client.rest()).await;
+    assert!(
+        after_head(&all).is_none_or(|body| find(body, b"0\r\n\r\n").is_none()),
+        "an unterminated message was terminated: {all:?}"
+    );
+}
+
+/// A body the close of the connection delimits ends with that close, which is the one
+/// place EOF is an ending rather than a loss.
+///
+/// The count here is not evidence of a decision: a connection that has closed could not
+/// have been kept whatever this end thought. What it shows is that the next request got
+/// a connection of its own and was answered, rather than failing on the remains of one.
+/// That such an answer is refused on its own terms is
+/// `a_body_the_close_delimited_is_never_kept`, which asks the exchange directly.
+#[tokio::test]
+async fn a_close_delimited_answer_arrives_whole_and_the_next_request_is_served() {
+    let (backend, accepts) = hostile_first(|mut wire| async move {
+        if wire.until(b"\r\n\r\n").await.is_some() {
+            wire.write("HTTP/1.1 200 OK\r\n\r\nall of it").await;
+        }
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+
+    assert!(
+        asks(&mut client, "/first")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert!(
+        within(client.chunked_body()).await.contains("all of it"),
+        "a close-delimited body was not delivered whole"
+    );
+
+    assert!(
+        asks(&mut client, "/second")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert_eq!(within(client.body(5)).await, "fresh");
+    assert_eq!(accepts.load(Ordering::SeqCst), 2, "a spent connection");
+}
+
+/// **A refused exchange's socket is never lent again.** The framing stopped making sense
+/// part way through, so what state the connection is in is exactly what this end does not
+/// know — and a connection nobody can account for is worth less than the one it saves.
+#[tokio::test]
+async fn a_connection_whose_framing_failed_is_never_lent_again() {
+    let (backend, accepts) = hostile_first(|mut wire| async move {
+        if wire.until(b"\r\n\r\n").await.is_some() {
+            // A chunk size that is not a number, behind a head that was fine.
+            wire.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")
+                .await;
+        }
+        // Willing to answer anything else that arrives here, so that a connection wrongly
+        // kept would be answered rather than simply hang.
+        plainly(wire).await;
+    });
+    let proxy = proxy_to(backend).await;
+    let mut client = Wire::to(proxy).await;
+
+    client
+        .write("GET /first HTTP/1.1\r\nHost: example.test\r\n\r\n")
+        .await;
+    let lost = within(client.rest()).await;
+    assert!(
+        after_head(&lost).is_none_or(|body| find(body, b"0\r\n\r\n").is_none()),
+        "a message that stopped making sense was finished off: {lost:?}"
+    );
+
+    // The client's connection went with the body, so the second request needs one of its
+    // own downstream; what is being counted is the upstream's.
+    let mut second = Wire::to(proxy).await;
+    let head = asks(&mut second, "/second").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(within(second.body(5)).await, "fresh");
+    assert_eq!(accepts.load(Ordering::SeqCst), 2, "a broken connection");
+}
+
+/// Trailers that the gateway does not forward are dropped from the message, not held
+/// against the connection. Every byte of the trailer section was still read and accounted
+/// for, so the connection has finished cleanly and carries the next request
+/// ([13 §4](../../../docs/13-http1-upstream.md)).
+#[tokio::test]
+async fn an_answer_whose_trailers_were_filtered_still_leaves_its_connection() {
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&accepts);
+    let backend = raw_upstream(move |mut wire| {
+        counting.fetch_add(1, Ordering::SeqCst);
+        async move {
+            while wire.until(b"\r\n\r\n").await.is_some() {
+                wire.write(concat!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n",
+                    "Trailer: x-note, content-length\r\n\r\n",
+                    "5\r\nfresh\r\n0\r\nx-note: kept\r\ncontent-length: 9\r\n\r\n",
+                ))
+                .await;
+            }
+        }
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+
+    for path in ["/first", "/second"] {
+        client
+            .write(&format!(
+                "GET {path} HTTP/1.1\r\nHost: example.test\r\nTE: trailers\r\n\r\n"
+            ))
+            .await;
+        let head = within(client.head()).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let body = within(client.chunked_body()).await;
+        assert!(body.contains("fresh"), "{body}");
+        assert!(
+            !body.to_ascii_lowercase().contains("content-length: 9"),
+            "a denied trailer was forwarded: {body}"
+        );
+    }
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "filtering a trailer cost the connection"
+    );
 }
