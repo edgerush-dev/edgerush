@@ -132,6 +132,21 @@ fn strip(headers: &mut HeaderMap) {
     }
 }
 
+/// The field names a message's `Connection` names as its own.
+///
+/// Read before anything is stripped, because afterwards there is nothing left to read:
+/// these are hop-by-hop for this hop and do not travel on, among the trailers no more
+/// than among the fields ([13 §4](../../docs/13-http1-upstream.md)). Which client read
+/// the message does not come into it: this is what being an intermediary requires.
+pub(crate) fn nominated(headers: &HeaderMap) -> Vec<HeaderName> {
+    headers
+        .get_all(CONNECTION)
+        .iter()
+        .flat_map(options)
+        .filter_map(|option| HeaderName::from_bytes(option).ok())
+        .collect()
+}
+
 /// The members of a comma-separated list, without the white space around them and without
 /// the empty ones that the list syntax allows.
 pub(crate) fn options(value: &HeaderValue) -> impl Iterator<Item = &[u8]> {

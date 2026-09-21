@@ -73,11 +73,15 @@ pub enum ExchangeError {
         /// The time an exchange has to reach a final head.
         after: Duration,
     },
-    /// Neither direction moved for long enough that neither is going to.
-    #[error("nothing moved on the connection for {after:?}")]
+    /// What the exchange was waiting for did not happen for long enough that it is not
+    /// going to.
+    #[error("{waiting} for {after:?}")]
     Idle {
-        /// How long nothing may happen.
+        /// How long the thing being waited for may not happen.
         after: Duration,
+        /// Which of the three it was, so that a counter can say where exchanges die
+        /// without a label a backend could invent.
+        waiting: Stalled,
     },
 }
 
@@ -231,7 +235,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
         let by = limits.final_head;
-        let mut upload = Upload::new(body, sending, nominations(headers));
+        let mut upload = Upload::new(body, sending, crate::hop_by_hop::nominated(headers));
         let asked = timeout(
             by,
             self.exchange(method, uri, headers, sending, &mut upload, limits),
@@ -277,31 +281,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         let mut reader = HeadReader::default();
         let mut interim = 0;
         let mut interim_bytes = 0;
+        let mut clocks = Clocks::default();
 
         loop {
             // What is already in hand comes first. Going back to the socket before
             // looking at it is how an upstream that answers and closes at once has its
             // answer thrown away for a close that had already been overtaken.
             let Head::Read { head, consumed } = reader.read(&self.incoming, limits)? else {
-                let round = poll_fn(|cx| self.round(cx, upload, may_send));
-                // While the body is held back, the wait for permission is the shorter of
-                // the two and is counted from when the head went, not from this round.
-                let until = if may_send {
-                    Instant::now() + limits.idle
+                let round =
+                    poll_fn(|cx| self.round(cx, upload, may_send, &mut clocks, limits.idle));
+                // The clocks inside the round are the exchange's own. This one is the wait
+                // for permission, which is not an exchange gone quiet but a question gone
+                // unanswered, and is counted from when the head went.
+                let outcome = if may_send {
+                    round.await
                 } else {
-                    ask_by.min(Instant::now() + limits.idle)
-                };
-                match timeout_at(until, round).await {
-                    Err(_) if !may_send && Instant::now() >= ask_by => {
-                        // Long enough. An upstream that will not say whether it wants the
-                        // body is one that will be sent it.
-                        may_send = true;
-                        continue;
+                    match timeout_at(ask_by, round).await {
+                        Ok(outcome) => outcome,
+                        Err(_) => {
+                            // Long enough. An upstream that will not say whether it wants
+                            // the body is one that will be sent it. What was being waited
+                            // for was this, so the next wait is a new one.
+                            may_send = true;
+                            clocks = Clocks::default();
+                            continue;
+                        }
                     }
-                    Err(_) => return Err(ExchangeError::Idle { after: limits.idle }),
-                    Ok(Err(error)) => return Err(error),
-                    Ok(Ok(Moved::Read | Moved::Wrote)) => continue,
-                    Ok(Ok(Moved::Closed)) => return Err(ExchangeError::Closed),
+                };
+                match outcome {
+                    Err(error) => return Err(error),
+                    Ok(Moved::Read | Moved::Wrote) => continue,
+                    Ok(Moved::Closed) => return Err(ExchangeError::Closed),
                 }
             };
             // Checked before it is believed, interim or final alike. An interim head
@@ -344,7 +354,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             let never_asked_for = withheld && !may_send;
             let stop_uploading = never_asked_for || (refused && !delivery.persistent);
             return Ok(Answer {
-                nominated: nominations(&head.headers),
+                nominated: crate::hop_by_hop::nominated(&head.headers),
                 head,
                 delivery,
                 interim,
@@ -356,22 +366,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
     /// Pushes the request along as far as it will go without waiting: another frame of it
     /// if there is room to stage one, and whatever is staged out onto the socket.
     ///
-    /// Says whether anything moved. Never waits on the request: a body that has nothing
-    /// ready is not a reason to stop reading, which is the whole point of doing both.
+    /// Says what moved and what it is now waiting for. Never waits on the request: a
+    /// body that has nothing ready is not a reason to stop reading, which is the whole
+    /// point of doing both.
     fn push<B>(
         &mut self,
         cx: &mut Context<'_>,
         upload: &mut Upload<B>,
         may_send: bool,
-    ) -> Result<bool, ExchangeError>
+    ) -> Result<Pushed, ExchangeError>
     where
         B: Body<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
-        let mut moved = false;
-        // Nothing more will be sent, so there is nothing to take and nothing to write.
+        let mut pushed = Pushed::default();
+        // Nothing more will be sent, so there is nothing to take, nothing to write and
+        // nothing to wait for.
         if upload.stopped {
-            return Ok(false);
+            return Ok(pushed);
         }
 
         // Bounded work per turn: a body that keeps handing over frames must not be able
@@ -392,7 +404,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                 if *at == frame.len() {
                     upload.pending = None;
                 }
-                moved = true;
                 continue;
             }
             // Held back means not polled at all: asking a client for bytes it was told
@@ -401,7 +412,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                 break;
             }
             match Pin::new(&mut upload.body).poll_frame(cx) {
-                Poll::Pending => break,
+                Poll::Pending => {
+                    // Asked, with room for what it gives, and it had nothing. From here
+                    // the wait is the client's.
+                    pushed.wants_client = true;
+                    break;
+                }
                 Poll::Ready(Some(Err(error))) => {
                     return Err(ExchangeError::RequestBody(error.into()));
                 }
@@ -413,13 +429,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                         Ok(data) if data.is_empty() => {}
                         Ok(data) => {
                             upload.pending = Some((data, 0));
-                            moved = true;
+                            pushed.took = true;
                         }
                         // Trailers come last, and go out with the body's end.
                         Err(frame) => {
                             if let Ok(fields) = frame.into_trailers() {
                                 upload.trailers = Some(fields);
-                                moved = true;
+                                pushed.took = true;
                             }
                         }
                     }
@@ -430,7 +446,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                         upload.trailers.as_ref(),
                         &upload.nominated,
                     )?;
-                    moved = true;
+                    // The end of the request is the client's last word and its best:
+                    // there is nothing more to wait on it for.
+                    pushed.took = true;
                     break;
                 }
             }
@@ -444,7 +462,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                 Poll::Ready(Ok(0)) => break,
                 Poll::Ready(Ok(gone)) => {
                     self.written += gone;
-                    moved = true;
+                    pushed.wrote = true;
                 }
             }
         }
@@ -455,26 +473,48 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             self.outgoing.drain(..self.written);
             self.written = 0;
         }
-        Ok(moved)
+        // Anything still staged is the upstream's to take, and until it does the wait is
+        // the upstream's. A client asked for more while the socket is backed up is not a
+        // client that is being slow, so its clock does not run while this one does.
+        pushed.wants_upstream = !self.outgoing.is_empty();
+        if pushed.wants_upstream {
+            pushed.wants_client = false;
+        }
+        Ok(pushed)
+    }
+
+    /// Whether the request is behind the exchange: encoded to its last byte and gone, or
+    /// given up on. It is what makes the answer the only thing left to wait for.
+    fn upload_is_behind<B>(&self, upload: &Upload<B>) -> bool {
+        upload.stopped || (upload.finished() && self.nothing_queued())
     }
 
     /// One round of whatever can be done: writing what is waiting, taking another frame of
     /// the request, and reading whatever has arrived. Pending only when none of the three
-    /// can move, so a blocked write never holds the reading up.
+    /// can move and no clock that was running has run out, so a blocked write never holds
+    /// the reading up and no one wait is counted against another.
     fn round<B>(
         &mut self,
         cx: &mut Context<'_>,
         upload: &mut Upload<B>,
         may_send: bool,
+        clocks: &mut Clocks,
+        idle: Duration,
     ) -> Poll<Result<Moved, ExchangeError>>
     where
         B: Body<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
-        let wrote = match self.push(cx, upload, may_send) {
-            Ok(wrote) => wrote,
+        let pushed = match self.push(cx, upload, may_send) {
+            Ok(pushed) => pushed,
             Err(error) => return Poll::Ready(Err(error)),
         };
+        if pushed.took {
+            clocks.client_moved();
+        }
+        if pushed.wrote {
+            clocks.upstream_moved();
+        }
 
         // And read, whatever the writing did. This is the part that must not be skipped.
         let was = self.incoming.len();
@@ -484,11 +524,44 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         let filled = read.filled().len();
         self.incoming.truncate(was + filled);
         match outcome {
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
-            Poll::Ready(Ok(())) if filled == 0 => Poll::Ready(Ok(Moved::Closed)),
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(Moved::Read)),
-            Poll::Pending if wrote => Poll::Ready(Ok(Moved::Wrote)),
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+            Poll::Ready(Ok(())) if filled == 0 => return Poll::Ready(Ok(Moved::Closed)),
+            Poll::Ready(Ok(())) => {
+                clocks.answer_moved();
+                return Poll::Ready(Ok(Moved::Read));
+            }
+            Poll::Pending if pushed.wrote || pushed.took => {
+                return Poll::Ready(Ok(Moved::Wrote));
+            }
+            Poll::Pending => {}
+        }
+
+        // Nothing moved, so what is left is to say what is being waited for and see
+        // whether that wait has gone on too long.
+        let waiting = self.waiting_on(upload, pushed);
+        if let Some(stalled) = clocks.expired(cx, waiting, idle) {
+            return Poll::Ready(Err(ExchangeError::Idle {
+                after: idle,
+                waiting: stalled,
+            }));
+        }
+        Poll::Pending
+    }
+
+    /// Which clocks are running, given what the last push did.
+    ///
+    /// The answer's clock does not run while the request is still going out: an upstream
+    /// that has not been given the whole request has every reason to say nothing, and a
+    /// backend that answers a head and then reads a long upload before it says more is
+    /// doing nothing wrong. It starts fresh when the request gets behind the exchange.
+    fn waiting_on<B>(&self, upload: &Upload<B>, pushed: Pushed) -> Waiting {
+        let behind = self.upload_is_behind(upload);
+        Waiting {
+            client: pushed.wants_client && !behind,
+            upstream: pushed.wants_upstream,
+            // The thing waited for when nothing else is: an exchange that is waiting must
+            // be waiting for something, or it waits for ever.
+            answer: behind || !(pushed.wants_client || pushed.wants_upstream),
         }
     }
 
@@ -530,7 +603,7 @@ pub struct H1Body<S, B> {
     /// Armed only while a poll is outstanding, and thrown away the moment anything moves
     /// in either direction. A client that has not asked for the next frame is not an
     /// upstream being slow, so while nobody is waiting nothing is counted against it.
-    waiting: Option<Pin<Box<Sleep>>>,
+    clocks: Clocks,
     /// What the answer's head said about the connection carrying another exchange. Not by
     /// itself enough to keep it: the request has to have finished going out too.
     persistent: bool,
@@ -564,7 +637,7 @@ impl<S, B> H1Body<S, B> {
             complete,
             trailers: None,
             discarded: 0,
-            waiting: None,
+            clocks: Clocks::default(),
             persistent,
             returner: None,
         }
@@ -707,22 +780,22 @@ where
             // The rest of the request goes out while the answer is read. An upstream that
             // answers early may still be reading, and one that has stopped reading is not
             // a reason to stop delivering what it has already said.
-            let mut moved = match rest.exchange.push(cx, &mut rest.upload, true) {
-                Ok(moved) => moved,
+            let pushed = match rest.exchange.push(cx, &mut rest.upload, true) {
+                Ok(pushed) => pushed,
                 Err(_) => {
                     // The request will not finish, so the connection cannot be kept. The
                     // answer is another matter and goes on being read.
                     rest.upload.abandon();
-                    false
+                    Pushed::default()
                 }
             };
-            if moved {
-                // An upstream taking the request in is an upstream that is there. The
-                // bound is for one that has gone quiet altogether, and a backend reading
-                // a long upload before it has anything to say has not
-                // ([13 §5](../../../docs/13-http1-upstream.md)).
-                this.waiting = None;
+            if pushed.took {
+                this.clocks.client_moved();
             }
+            if pushed.wrote {
+                this.clocks.upstream_moved();
+            }
+            let mut moved = pushed.took || pushed.wrote;
 
             match this
                 .reader
@@ -761,7 +834,7 @@ where
                             this.ended_with(trailers);
                         }
                     }
-                    this.waiting = None;
+                    this.clocks.answer_moved();
                     return Poll::Ready(Some(Ok(Frame::data(frame))));
                 }
                 Ok(Piece::More) => {}
@@ -784,23 +857,26 @@ where
                         continue;
                     }
                     let idle = this.limits.idle;
-                    let waiting = this
-                        .waiting
-                        .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
-                    if waiting.as_mut().poll(cx).is_pending() {
+                    let waiting = rest.exchange.waiting_on(&rest.upload, pushed);
+                    let Some(stalled) = this.clocks.expired(cx, waiting, idle) else {
                         return Poll::Pending;
-                    }
-                    // Long enough with a poll outstanding and nothing to show for it.
+                    };
+                    // Long enough waiting for one thing, with a poll outstanding and
+                    // nothing to show for it. The connection goes with the exchange: an
+                    // upstream part way through a message is not one to lend out again.
                     this.rest = None;
-                    return Poll::Ready(Some(Err(ExchangeError::Idle { after: idle })));
+                    return Poll::Ready(Some(Err(ExchangeError::Idle {
+                        after: idle,
+                        waiting: stalled,
+                    })));
                 }
                 Poll::Ready(Err(error)) => {
                     this.rest = None;
                     return Poll::Ready(Some(Err(error.into())));
                 }
                 Poll::Ready(Ok(())) => {
-                    // Something happened, so the waiting starts again from here.
-                    this.waiting = None;
+                    // The upstream said something, so its clock starts again from here.
+                    this.clocks.answer_moved();
                     if filled == 0 {
                         // The reader is told; it alone knows whether a close ends this
                         // body or loses it.
@@ -870,20 +946,6 @@ pub fn nothing_to_say<S: AsyncRead + Unpin>(socket: &mut S) -> bool {
         .is_pending()
 }
 
-/// The field names a message's `Connection` names as its own.
-///
-/// Read before anything is stripped, because afterwards there is nothing left to read:
-/// these are hop-by-hop for this hop and do not travel on, among the trailers no more
-/// than among the fields ([13 §4](../../../docs/13-http1-upstream.md)).
-fn nominations(headers: &HeaderMap) -> Vec<HeaderName> {
-    headers
-        .get_all(http::header::CONNECTION)
-        .iter()
-        .flat_map(crate::hop_by_hop::options)
-        .filter_map(|option| HeaderName::from_bytes(option).ok())
-        .collect()
-}
-
 /// Whether a request asked to be told before it sends its body.
 ///
 /// Only `100-continue` is waited on. An expectation this does not know is passed on as it
@@ -897,6 +959,113 @@ fn expects_continue(headers: &HeaderMap) -> bool {
 }
 
 /// What a round of an exchange managed to do.
+/// Which way an exchange stopped moving.
+///
+/// An exchange has three things it can be waiting for and they fail for different
+/// reasons: the client that is sending the request, the upstream that is taking it, and
+/// the upstream that is answering. Only one of them is ever at fault, and saying which is
+/// what keeps a slow client from being read as a slow backend
+/// ([13 §7](../../../docs/13-http1-upstream.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stalled {
+    /// The client stopped handing over the request while there was room to forward it.
+    Client,
+    /// The upstream stopped taking the request that was waiting to go to it.
+    Upstream,
+    /// The upstream stopped answering, with the request behind it already sent.
+    Answer,
+}
+
+impl std::fmt::Display for Stalled {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let said = match self {
+            Self::Client => "the client sent nothing more of the request",
+            Self::Upstream => "the upstream took nothing more of the request",
+            Self::Answer => "the upstream said nothing more of the answer",
+        };
+        out.write_str(said)
+    }
+}
+
+/// Which of an exchange's three clocks are running.
+///
+/// At most one of the request's two: an upstream that will not take what is staged is not
+/// a client that is being slow, and the client is not asked to answer for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Waiting {
+    client: bool,
+    upstream: bool,
+    answer: bool,
+}
+
+/// The clocks themselves, one per thing that can be waited for.
+///
+/// A clock exists only while its own thing is being waited for: it is made when that
+/// starts and dropped when it stops, so time spent waiting for something else is not
+/// counted against it. Progress in one direction never touches another's
+/// ([13 §7](../../../docs/13-http1-upstream.md)).
+#[derive(Debug, Default)]
+struct Clocks {
+    client: Option<Pin<Box<Sleep>>>,
+    upstream: Option<Pin<Box<Sleep>>>,
+    answer: Option<Pin<Box<Sleep>>>,
+}
+
+impl Clocks {
+    /// Sets the clocks to `on`, and says which has run out.
+    ///
+    /// One that is not running is dropped rather than paused, which is what makes the
+    /// next wait a fresh one. A clock that is already running keeps running: the same
+    /// wait going on is not a new wait.
+    fn expired(&mut self, cx: &mut Context<'_>, on: Waiting, idle: Duration) -> Option<Stalled> {
+        let each = [
+            (&mut self.upstream, on.upstream, Stalled::Upstream),
+            (&mut self.client, on.client, Stalled::Client),
+            (&mut self.answer, on.answer, Stalled::Answer),
+        ];
+        let mut ran_out = None;
+        for (clock, running, which) in each {
+            if !running {
+                *clock = None;
+                continue;
+            }
+            let ticking = clock.get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+            if ticking.as_mut().poll(cx).is_ready() && ran_out.is_none() {
+                ran_out = Some(which);
+            }
+        }
+        ran_out
+    }
+
+    /// Something of the request went out, so the upstream is taking it.
+    fn upstream_moved(&mut self) {
+        self.upstream = None;
+    }
+
+    /// The client handed something over, so it has not stopped.
+    fn client_moved(&mut self) {
+        self.client = None;
+    }
+
+    /// The upstream said something, so it has not stopped either.
+    fn answer_moved(&mut self) {
+        self.answer = None;
+    }
+}
+
+/// What one push of the request did, and what it left the exchange waiting for.
+#[derive(Debug, Clone, Copy, Default)]
+struct Pushed {
+    /// The client handed over data, trailers or its end.
+    took: bool,
+    /// Bytes of the request went out onto the socket.
+    wrote: bool,
+    /// There was room to forward and the client had nothing ready.
+    wants_client: bool,
+    /// Bytes are encoded and the socket would not take them.
+    wants_upstream: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Moved {
     /// Bytes arrived, which may have finished a head.
@@ -1484,9 +1653,13 @@ mod tests {
             )
             .await
             .unwrap_err();
-        // The idle bound is the shorter of the two, so it is the one that speaks.
+        // The idle bound is the shorter of the two, so it is the one that speaks, and
+        // what it was waiting for was the answer: the request was sent long ago.
         assert!(
-            matches!(failed, ExchangeError::Idle { after } if after == limits.idle),
+            matches!(
+                failed,
+                ExchangeError::Idle { after, waiting: Stalled::Answer } if after == limits.idle
+            ),
             "{failed}"
         );
     }
@@ -1636,6 +1809,175 @@ mod tests {
         let (data, _) = collected(&mut body).await.unwrap();
         assert_eq!(data, b"hello th");
         assert!(body.is_complete());
+    }
+
+    /// A body that hands over one frame and then nothing, as a client does when it stops
+    /// uploading part way through and does not close.
+    #[derive(Debug)]
+    struct Stops(Option<Bytes>);
+
+    impl Body for Stops {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+            match self.0.take() {
+                Some(data) => Poll::Ready(Some(Ok(Frame::data(data)))),
+                // Never woken: the client has gone quiet, not gone away.
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    /// An answer whose request has stopped coming, with the answer itself still arriving.
+    ///
+    /// **An answer cannot vouch for a request.** The two clocks are separate, so bytes
+    /// coming back say nothing about a client that has stopped sending, and the exchange
+    /// is given up on for the reason it really stopped
+    /// ([13 §7](../../../docs/13-http1-upstream.md)).
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_still_arriving_does_not_vouch_for_a_client_that_stopped() {
+        let idle = H1Limits::default().idle;
+        let (ours, theirs) = tokio::io::duplex(4096);
+        let rest = Rest {
+            exchange: Exchange::new(ours),
+            upload: Upload::new(
+                Stops(Some(Bytes::from_static(b"half"))),
+                Sending::Chunked,
+                Vec::new(),
+            ),
+        };
+        let mut body = H1Body::new(
+            rest,
+            Framing::Chunked,
+            true,
+            Vec::new(),
+            H1Limits::default(),
+        );
+
+        let _answering = tokio::spawn(async move {
+            let mut peer = Peer(theirs);
+            // Answering all the while and reading what did arrive, so that neither of the
+            // other two waits is what ends this. It runs for eight times the bound: one shared clock would
+            // be reset by every one of these and the exchange would never end at all.
+            let mut sink = [0; 256];
+            for _ in 0..64 {
+                tokio::time::sleep(idle / 8).await;
+                peer.say("1\r\na\r\n").await;
+                let _taken = peer.0.read(&mut sink).await;
+            }
+            peer
+        });
+
+        let began = tokio::time::Instant::now();
+        let failed = collected(&mut body).await.unwrap_err();
+        assert!(
+            matches!(
+                failed,
+                ExchangeError::Idle {
+                    waiting: Stalled::Client,
+                    ..
+                }
+            ),
+            "{failed}"
+        );
+        // A bound after the client went quiet, not a bound after anything else did.
+        assert!(began.elapsed() < idle * 2, "{:?}", began.elapsed());
+    }
+
+    /// And the other way round: an upstream that answers but stops taking the request is
+    /// given up on for that, not excused by the answer it is still sending.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_still_arriving_does_not_excuse_an_upstream_that_stopped_reading() {
+        let idle = H1Limits::default().idle;
+        // Room for a little of the request and no more, so the rest stays staged.
+        let (ours, theirs) = tokio::io::duplex(64);
+        let rest = Rest {
+            exchange: Exchange::new(ours),
+            upload: Upload::new(
+                Full::new(Bytes::from(vec![b'x'; 64 * 1024])),
+                Sending::Length(64 * 1024),
+                Vec::new(),
+            ),
+        };
+        let mut body = H1Body::new(
+            rest,
+            Framing::Chunked,
+            true,
+            Vec::new(),
+            H1Limits::default(),
+        );
+
+        let _answering = tokio::spawn(async move {
+            let mut peer = Peer(theirs);
+            // Talking, never listening, for eight times the bound: only a clock of its
+            // own for the request going out can end this.
+            for _ in 0..64 {
+                tokio::time::sleep(idle / 8).await;
+                peer.say("1\r\na\r\n").await;
+            }
+            peer
+        });
+
+        let began = tokio::time::Instant::now();
+        let failed = collected(&mut body).await.unwrap_err();
+        assert!(
+            matches!(
+                failed,
+                ExchangeError::Idle {
+                    waiting: Stalled::Upstream,
+                    ..
+                }
+            ),
+            "{failed}"
+        );
+        // A bound after the socket stopped taking bytes, not after anything else.
+        assert!(began.elapsed() < idle * 2, "{:?}", began.elapsed());
+    }
+
+    /// An upstream that will not take the request is not a client that is being slow.
+    /// While the socket is backed up the client is not asked for anything, so nothing it
+    /// does or fails to do is counted: the blame follows the block.
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_upstream_is_not_counted_against_the_client() {
+        let idle = H1Limits::default().idle;
+        let (ours, theirs) = tokio::io::duplex(64);
+        let rest = Rest {
+            exchange: Exchange::new(ours),
+            upload: Upload::new(
+                Stops(Some(Bytes::from(vec![b'x'; 64 * 1024]))),
+                Sending::Length(64 * 1024),
+                Vec::new(),
+            ),
+        };
+        let mut body = H1Body::new(
+            rest,
+            Framing::Chunked,
+            true,
+            Vec::new(),
+            H1Limits::default(),
+        );
+
+        let _silent = tokio::spawn(async move {
+            let peer = theirs;
+            tokio::time::sleep(idle * 4).await;
+            peer
+        });
+
+        let failed = collected(&mut body).await.unwrap_err();
+        assert!(
+            matches!(
+                failed,
+                ExchangeError::Idle {
+                    waiting: Stalled::Upstream,
+                    ..
+                }
+            ),
+            "{failed}"
+        );
     }
 
     /// A body that says whether anybody has asked it for anything. Holding a body back

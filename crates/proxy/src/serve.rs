@@ -21,7 +21,7 @@ use crate::random::random;
 use crate::request::decide;
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
-use crate::upstream::h1::codec::{ResponseHead, Sending};
+use crate::upstream::h1::codec::{ResponseHead, Sending, filter_trailers};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, nothing_to_say};
 use crate::upstream::h1::pool::{Lease, Pool};
 use arc_swap::ArcSwap;
@@ -29,7 +29,7 @@ use edgerush_config::{Compiled, CompiledRule};
 use http::request::Parts;
 use http::response;
 use http::uri::{Authority, Scheme};
-use http::{HeaderMap, Method, Request, Response, Uri, Version};
+use http::{HeaderMap, HeaderName, Method, Request, Response, Uri, Version};
 use hyper::body::{Body as HttpBody, Bytes, Frame, Incoming, SizeHint};
 use hyper::rt::Executor;
 use hyper::service::service_fn;
@@ -79,14 +79,32 @@ impl<F: Future<Output = ()> + 'static> Executor<F> for OnThisWorker {
 /// A second kind, read by EdgeRush's own upstream path, goes beside [`Self::Upstream`]
 /// when there is one ([13 §1](../../../docs/13-http1-upstream.md)).
 enum Body {
-    /// The upstream's answer, as the engine's client reads it.
-    Upstream(Incoming),
+    /// The upstream's answer, as the engine's client reads it, and what that answer's
+    /// own `Connection` named. The names are kept because the trailers have not arrived
+    /// yet and the head they were read from will be gone by the time they do.
+    Upstream(Incoming, Vec<HeaderName>),
     /// The upstream's answer, as EdgeRush's own path reads it. In a box because it is
     /// much the larger of the two, and every answer would otherwise carry room for it.
     /// It carries its exchange's place with it: the exchange is over when this is.
     Ours(Box<H1Body<TcpStream, Incoming>>, Admitted),
     /// An answer of the data plane's own. It has no body, and never will have one.
     Empty,
+}
+
+/// A frame on its way to the client, with what may not travel on taken out of it.
+///
+/// Only a trailer section is touched, and only by name: a field the answer's own
+/// `Connection` named is hop-by-hop for that hop, and forwarding it is a thing an
+/// intermediary may not do whichever client read it
+/// ([13 §4](../../docs/13-http1-upstream.md)).
+fn filtered(frame: Frame<Bytes>, nominated: &[HeaderName]) -> Frame<Bytes> {
+    match frame.into_trailers() {
+        Ok(mut fields) => {
+            let _discarded = filter_trailers(&mut fields, nominated);
+            Frame::trailers(fields)
+        }
+        Err(frame) => frame,
+    }
 }
 
 /// Why an answer's body stopped. One kind for whichever way it was being read, so that
@@ -108,9 +126,15 @@ impl HttpBody for Body {
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         match self.get_mut() {
-            Self::Upstream(incoming) => Pin::new(incoming)
-                .poll_frame(context)
-                .map(|frame| frame.map(|frame| frame.map_err(BodyError::Upstream))),
+            Self::Upstream(incoming, nominated) => {
+                Pin::new(incoming).poll_frame(context).map(|frame| {
+                    frame.map(|frame| {
+                        frame
+                            .map(|frame| filtered(frame, nominated))
+                            .map_err(BodyError::Upstream)
+                    })
+                })
+            }
             Self::Ours(ours, _place) => {
                 let frame = Pin::new(&mut *ours).poll_frame(context);
                 // The moment the answer is known to be over, which for a body of known
@@ -128,7 +152,7 @@ impl HttpBody for Body {
 
     fn is_end_stream(&self) -> bool {
         match self {
-            Self::Upstream(incoming) => incoming.is_end_stream(),
+            Self::Upstream(incoming, _nominated) => incoming.is_end_stream(),
             Self::Ours(ours, _place) => ours.is_end_stream(),
             Self::Empty => true,
         }
@@ -136,7 +160,7 @@ impl HttpBody for Body {
 
     fn size_hint(&self) -> SizeHint {
         match self {
-            Self::Upstream(incoming) => incoming.size_hint(),
+            Self::Upstream(incoming, _nominated) => incoming.size_hint(),
             Self::Ours(ours, _place) => ours.size_hint(),
             Self::Empty => SizeHint::with_exact(0),
         }
@@ -630,7 +654,10 @@ impl Worker {
             .await
             .ok()?;
         let (head, body) = response.into_parts();
-        Some((head, Body::Upstream(body)))
+        // Read here, because `respond` takes the hop-by-hop fields off this head before
+        // the trailers behind it arrive.
+        let nominated = crate::hop_by_hop::nominated(&head.headers);
+        Some((head, Body::Upstream(body, nominated)))
     }
 
     /// By EdgeRush's own path. Never after the other has been tried: by the time one has

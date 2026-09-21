@@ -514,6 +514,27 @@ fn is_denied(name: &HeaderName, nominated: &[HeaderName]) -> bool {
     DENIED_TRAILERS.contains(&name.as_str()) || nominated.contains(name)
 }
 
+/// Takes out of a trailer section what may not travel on, and says how many went.
+///
+/// For a body somebody else parsed. What may not be a trailer follows from being an
+/// intermediary, not from how the answer was read, so a body the engine's client read is
+/// filtered by this same set ([13 §4](../../../docs/13-http1-upstream.md)).
+pub fn filter_trailers(fields: &mut HeaderMap, nominated: &[HeaderName]) -> usize {
+    // Named first and removed after: the map cannot be read while it is changed, and a
+    // name may carry more than one value.
+    let denied: Vec<HeaderName> = fields
+        .keys()
+        .filter(|name| is_denied(name, nominated))
+        .cloned()
+        .collect();
+    let mut discarded = 0;
+    for name in denied {
+        discarded += fields.get_all(&name).iter().count();
+        fields.remove(&name);
+    }
+    discarded
+}
+
 /// Takes the denied names out of a `Trailer` declaration, leaving one that says only what
 /// will really arrive, and takes the declaration away altogether when nothing will.
 ///
@@ -2046,6 +2067,36 @@ mod tests {
             assert!(trailers.fields.is_empty(), "{denied} travelled on");
             assert_eq!(trailers.discarded, 1, "{denied}");
         }
+    }
+
+    /// A section somebody else parsed is filtered by the same set, every value of a
+    /// repeated name with it.
+    #[test]
+    fn a_section_read_elsewhere_loses_what_may_not_travel_on() {
+        let mut fields = HeaderMap::new();
+        fields.append(
+            HeaderName::from_static("x-secret"),
+            HeaderValue::from_static("a"),
+        );
+        fields.append(
+            HeaderName::from_static("x-secret"),
+            HeaderValue::from_static("b"),
+        );
+        fields.append(
+            HeaderName::from_static("content-length"),
+            HeaderValue::from_static("7"),
+        );
+        fields.append(
+            HeaderName::from_static("x-kept"),
+            HeaderValue::from_static("here"),
+        );
+
+        let nominated = vec![HeaderName::from_static("x-secret")];
+        assert_eq!(filter_trailers(&mut fields, &nominated), 3);
+
+        assert!(fields.get("x-secret").is_none());
+        assert!(fields.get("content-length").is_none());
+        assert_eq!(fields.get("x-kept").unwrap(), "here");
     }
 
     /// Whatever case it is written in.

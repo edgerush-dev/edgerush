@@ -603,11 +603,11 @@ async fn an_interim_answer_claiming_a_body_is_refused_by_our_own_path() {
     }
 }
 
-/// **Where the two paths differ, on purpose.** A field an answer's own `Connection`
-/// names is that hop's business and no further. Ours drops it; the engine's client
-/// passes it to the client.
+/// A field an answer's own `Connection` names is that hop's business and no further.
+/// Forwarding it is something an intermediary may not do (RFC 9110 §7.6.1), and which
+/// client read the body has nothing to do with it: the same set is taken off both.
 #[tokio::test]
-async fn a_trailer_the_answer_nominated_is_dropped_by_our_own_path() {
+async fn a_trailer_the_answer_nominated_reaches_no_client() {
     let backend = raw_upstream(|mut wire| async move {
         wire.head().await;
         wire.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: x-secret\r\nTrailer: x-secret\r\n\r\n1\r\na\r\n0\r\nx-secret: hidden\r\n\r\n").await;
@@ -619,12 +619,7 @@ async fn a_trailer_the_answer_nominated_is_dropped_by_our_own_path() {
         .await;
     within(client.head()).await;
     let body = within(client.chunked_body()).await;
-    match upstream_under_test() {
-        // Passed on: what the answer's own `Connection` named is hop-by-hop for that hop
-        // and the engine's client hands it to the client all the same.
-        Upstream::Hyper => assert!(body.contains("hidden"), "{body}"),
-        Upstream::Ours => assert!(!body.contains("hidden"), "{body}"),
-    }
+    assert!(!body.contains("hidden"), "{body}");
 }
 
 /// An upstream that says something into a connection nobody is using has said it to
