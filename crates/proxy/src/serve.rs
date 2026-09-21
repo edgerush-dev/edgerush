@@ -604,10 +604,12 @@ impl Worker {
         // The same for the answer: a name its `Connection` gave does not travel on, and
         // is not declared onwards either.
         filter_declaration(&mut head.headers, &answer.nominated);
+        let persistent = answer.delivery.persistent
+            && !crate::upstream::auth::challenges(head.status, &head.headers);
         let body = H1Body::new(
             rest,
             answer.delivery.framing,
-            answer.delivery.persistent,
+            persistent,
             answer.nominated,
             self.limits,
         )
@@ -705,6 +707,16 @@ impl Worker {
         // A name it gave is not declared onwards either: the declaration says what the
         // trailers will hold, and it will not hold that.
         filter_declaration(&mut head.headers, &nominated);
+
+        // Credentials can bind the upstream socket to this client, even when the
+        // response is successful. Decide after rule filters and before either client
+        // dispatches: hyper can return a socket to its pool before we see the response.
+        if crate::upstream::auth::carries_credentials(&head.headers) {
+            head.headers.insert(
+                http::header::CONNECTION,
+                http::HeaderValue::from_static("close"),
+            );
+        }
 
         let answered = match self.proxy.upstream {
             Upstream::Hyper => {

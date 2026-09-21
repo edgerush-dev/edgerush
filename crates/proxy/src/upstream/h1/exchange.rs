@@ -353,12 +353,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             return Err(ExchangeError::Unsolicited);
         }
         let mut upload = Upload::new(body, sending, nominated.to_vec());
-        let answer = self
+        let mut answer = self
             .exchange(method, uri, headers, sending, &mut upload, limits)
             .await?;
         if answer.stop_uploading {
             upload.abandon();
         }
+        // A request-side close forbids reuse even if the peer ignores it. This is
+        // separate from upload refusal: closing after an authenticated request must
+        // not stop its body from reaching the backend or replace the backend's answer.
+        let request_closes = headers
+            .get_all(http::header::CONNECTION)
+            .iter()
+            .flat_map(crate::hop_by_hop::options)
+            .any(|option| option.eq_ignore_ascii_case(b"close"));
+        answer.delivery.persistent &= !request_closes;
         Ok((
             answer,
             Rest {

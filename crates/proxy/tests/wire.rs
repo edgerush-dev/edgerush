@@ -44,6 +44,10 @@ async fn within<T>(future: impl Future<Output = T>) -> T {
 /// Starts a proxy whose one listener sends everything to `upstream`, and says where it
 /// listens. It is served the way a data plane serves: a worker on a thread of its own.
 async fn proxy_to(upstream: SocketAddr) -> SocketAddr {
+    proxy_to_with_filters(upstream, "").await
+}
+
+async fn proxy_to_with_filters(upstream: SocketAddr, filters: &str) -> SocketAddr {
     let yaml = format!(
         r#"
 listeners:
@@ -57,6 +61,7 @@ routes:
       - matches:
           - path: {{ prefix: / }}
         backends: [{{ upstream: up, weight: 1 }}]
+{filters}
 upstreams:
   up: {{ endpoints: ["{upstream}"] }}
 "#
@@ -734,6 +739,249 @@ async fn what_an_idle_connection_was_told_is_never_the_next_answer() {
 
 /// The plain answer, which only a connection of its own ever gives.
 const FRESH: &str = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh";
+
+/// The peer deliberately ignores the request's close option. The clients themselves
+/// must prevent another downstream client from borrowing a credential-bearing socket.
+#[tokio::test]
+async fn connection_bound_credentials_are_never_pooled() {
+    for (credentials, status, length) in [
+        ("Authorization: NTLM token\r\n", 200, 0),
+        ("Authorization: nEgOtIaTe ticket\r\n", 200, 2),
+        ("Authorization: NTLM token\r\n", 401, 2),
+        (
+            "Authorization: Basic token\r\nAuthorization: Negotiate ticket\r\n",
+            200,
+            2,
+        ),
+    ] {
+        let (report, mut reports) = reporter();
+        let (backend, accepts) = counted(move |mut wire| {
+            let report = report.clone();
+            async move {
+                while let Some(head) = wire.until(b"\r\n\r\n").await {
+                    report.send(String::from_utf8(head).unwrap()).unwrap();
+                    let body = if length == 0 { "" } else { "ok" };
+                    wire.write(&format!(
+                        "HTTP/1.1 {status} Backend Answer\r\nContent-Length: {length}\r\n\r\n{body}"
+                    ))
+                    .await;
+                }
+            }
+        });
+        let front = proxy_to(backend).await;
+        let mut first = Wire::to(front).await;
+        first
+            .write(&format!(
+                "GET /first HTTP/1.1\r\nHost: example.test\r\n{credentials}\r\n"
+            ))
+            .await;
+        assert!(
+            within(first.head())
+                .await
+                .starts_with(&format!("HTTP/1.1 {status}"))
+        );
+        if length > 0 {
+            assert_eq!(within(first.body(length)).await, "ok");
+        }
+        let sent = within(reports.recv()).await.unwrap().to_ascii_lowercase();
+        assert!(sent.contains("connection: close\r\n"), "{sent}");
+
+        let mut second = Wire::to(front).await;
+        assert!(
+            asks(&mut second, "/second")
+                .await
+                .starts_with(&format!("HTTP/1.1 {status}"))
+        );
+        if length > 0 {
+            assert_eq!(within(second.body(length)).await, "ok");
+        }
+        let sent = within(reports.recv()).await.unwrap().to_ascii_lowercase();
+        assert!(!sent.contains("authorization:"), "{sent}");
+        assert_eq!(accepts.load(Ordering::SeqCst), 2, "{credentials}");
+    }
+}
+
+#[tokio::test]
+async fn connection_bound_credentials_added_by_a_rule_are_never_pooled() {
+    for name in ["Authorization", "Proxy-Authorization"] {
+        let (report, mut reports) = reporter();
+        let (backend, accepts) = counted(move |mut wire| {
+            let report = report.clone();
+            async move {
+                while let Some(head) = wire.until(b"\r\n\r\n").await {
+                    report.send(String::from_utf8(head).unwrap()).unwrap();
+                    wire.write(FRESH).await;
+                }
+            }
+        });
+        let filters = format!(
+            "        filters:\n          - type: request_header_modifier\n            set: [{{ name: {name}, value: 'Negotiate ticket' }}]"
+        );
+        let front = proxy_to_with_filters(backend, &filters).await;
+        for _ in 0..2 {
+            let mut client = Wire::to(front).await;
+            assert!(asks(&mut client, "/").await.starts_with("HTTP/1.1 200"));
+            assert_eq!(within(client.body(5)).await, "fresh");
+            let sent = within(reports.recv()).await.unwrap().to_ascii_lowercase();
+            assert!(
+                sent.contains(&format!(
+                    "{}: negotiate ticket\r\n",
+                    name.to_ascii_lowercase()
+                )),
+                "{sent}"
+            );
+            assert!(sent.contains("connection: close\r\n"), "{sent}");
+        }
+        assert_eq!(accepts.load(Ordering::SeqCst), 2, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn connection_bound_challenges_prevent_reuse_on_the_custom_path() {
+    for (status, field, challenge) in [
+        (401, "WWW-Authenticate", "NTLM"),
+        (401, "WWW-Authenticate", "Digest realm=\"a,b\", Negotiate"),
+        (407, "Proxy-Authenticate", "Negotiate"),
+    ] {
+        let (backend, accepts) = counted(move |mut wire| async move {
+            while wire.until(b"\r\n\r\n").await.is_some() {
+                wire.write(&format!(
+                    "HTTP/1.1 {status} Challenge\r\n{field}: {challenge}\r\nContent-Length: 2\r\n\r\nok"
+                )).await;
+            }
+        });
+        let front = proxy_to(backend).await;
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let mut client = Wire::to(front).await;
+            assert!(
+                asks(&mut client, "/")
+                    .await
+                    .starts_with(&format!("HTTP/1.1 {status}"))
+            );
+            assert_eq!(within(client.body(2)).await, "ok");
+            clients.push(client);
+        }
+        let expected = match upstream_under_test() {
+            Upstream::Hyper => 1,
+            Upstream::Ours => 2,
+        };
+        assert_eq!(accepts.load(Ordering::SeqCst), expected, "{challenge}");
+    }
+}
+
+#[tokio::test]
+async fn connection_bound_guard_uses_only_credentials_that_go_upstream() {
+    for (credentials, filters) in [
+        ("Authorization: Basic token\r\n", ""),
+        ("Authorization: Bearer NTLM\r\n", ""),
+        ("Proxy-Authorization: NTLM token\r\n", ""),
+        (
+            "Authorization: Negotiate ticket\r\n",
+            "        filters:\n          - type: request_header_modifier\n            remove: [authorization]",
+        ),
+    ] {
+        let (report, mut reports) = reporter();
+        let (backend, accepts) = counted(move |mut wire| {
+            let report = report.clone();
+            async move {
+                while let Some(head) = wire.until(b"\r\n\r\n").await {
+                    report.send(String::from_utf8(head).unwrap()).unwrap();
+                    wire.write(FRESH).await;
+                }
+            }
+        });
+        let front = proxy_to_with_filters(backend, filters).await;
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let mut client = Wire::to(front).await;
+            client
+                .write(&format!(
+                    "GET / HTTP/1.1\r\nHost: example.test\r\n{credentials}\r\n"
+                ))
+                .await;
+            assert!(within(client.head()).await.starts_with("HTTP/1.1 200"));
+            assert_eq!(within(client.body(5)).await, "fresh");
+            let sent = within(reports.recv()).await.unwrap().to_ascii_lowercase();
+            assert!(!sent.contains("connection: close"), "{sent}");
+            assert!(!sent.contains("proxy-authorization:"), "{sent}");
+            if !filters.is_empty() {
+                assert!(!sent.contains("authorization:"), "{sent}");
+            }
+            clients.push(client);
+        }
+        assert_eq!(accepts.load(Ordering::SeqCst), 1, "{credentials}");
+    }
+}
+
+/// Closing the credential-bearing upstream hop must leave the downstream H2 connection
+/// usable, with the backend's response delivered on each stream.
+#[tokio::test]
+async fn connection_bound_credentials_from_http2_close_only_the_upstream_hop() {
+    use http_body_util::BodyExt;
+
+    let (report, mut reports) = reporter();
+    let (backend, accepts) = counted(move |mut wire| {
+        let report = report.clone();
+        async move {
+            while let Some(head) = wire.until(b"\r\n\r\n").await {
+                report.send(String::from_utf8(head).unwrap()).unwrap();
+                wire.write(FRESH).await;
+            }
+        }
+    });
+    let front = proxy_to(backend).await;
+    let mut sender = h2_to(front).await;
+    for credential in [true, false, false] {
+        let mut request = http::Request::get(format!("http://{front}/"));
+        if credential {
+            request = request.header("authorization", "Negotiate ticket");
+        }
+        let response = within(sender.send_request(request.body(Upload::None).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(!response.headers().contains_key("connection"));
+        assert_eq!(
+            within(response.into_body().collect())
+                .await
+                .unwrap()
+                .to_bytes(),
+            "fresh"
+        );
+        let sent = within(reports.recv()).await.unwrap().to_ascii_lowercase();
+        assert_eq!(sent.contains("connection: close\r\n"), credential, "{sent}");
+    }
+    assert_eq!(accepts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn connection_bound_credentials_do_not_make_an_early_answer_stop_the_upload() {
+    let (report, mut reports) = reporter();
+    let backend = raw_upstream(move |mut wire| {
+        let report = report.clone();
+        async move {
+            let head = wire.head().await;
+            report.send(head).unwrap();
+            // A refusal alone does not stop the upload. Only the request said close;
+            // this response still depends on receiving the whole request body.
+            wire.write("HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n")
+                .await;
+            let body = wire.body(5).await;
+            report.send(body).unwrap();
+            wire.write("ok").await;
+        }
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+    client.write("POST / HTTP/1.1\r\nHost: example.test\r\nAuthorization: NTLM token\r\nContent-Length: 5\r\n\r\n").await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 401"), "{head}");
+    client.write("hello").await;
+    assert_eq!(within(client.body(2)).await, "ok");
+    let sent = within(reports.recv()).await.unwrap().to_ascii_lowercase();
+    assert!(sent.contains("connection: close\r\n"), "{sent}");
+    assert_eq!(within(reports.recv()).await.unwrap(), "hello");
+}
 
 /// Answers every request on this connection the same plain way, until it ends.
 async fn plainly(mut wire: Wire) {
