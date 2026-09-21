@@ -1451,6 +1451,14 @@ mod tests {
             &b"HTTP/1.2 200 OK\r\n\r\n"[..],
             &b"HTTP/0.9 200 OK\r\n\r\n"[..],
             &b"ICY 200 OK\r\n\r\n"[..],
+            // A version is spelt one way, and a reader that takes near misses for it
+            // (as Envoy's balsa takes `HTTP/9.1` for 1.0) is reading something else.
+            &b"http/1.1 200 OK\r\n\r\n"[..],
+            &b"HTTP/1.10 200 OK\r\n\r\n"[..],
+            &b"HTTP/9.1 200 OK\r\n\r\n"[..],
+            &b"HTTP/A.0 200 OK\r\n\r\n"[..],
+            &b"HTTPS/1.1 200 OK\r\n\r\n"[..],
+            &b"aHTTP/1.1 200 OK\r\n\r\n"[..],
         ] {
             assert!(read(other).is_err(), "{other:?} was read");
         }
@@ -1487,6 +1495,9 @@ mod tests {
             b"5\xa0",
             b"18446744073709551616", // One past what a length can be.
             b"99999999999999999999999999",
+            b"5,", // Lists with an empty member, which is still a list.
+            b",5",
+            b"5,5",
         ];
         for value in bad {
             let bytes = [b"HTTP/1.1 200 OK\r\ncontent-length:", *value, b"\r\n\r\n"].concat();
@@ -1528,10 +1539,87 @@ mod tests {
             b"HTTP/1.1 999999 OK\r\n\r\n",         // Not a status.
             b"HTTP/1.1 OK\r\n\r\n",                // No status at all.
             b"HTTP/1.1 200 OK\nx-a: 1\n\n",        // Bare newlines.
+            // The status line has one space between its parts. HAProxy and nginx take
+            // runs of whitespace; RFC 9112 §4 lets a reader, and this one does not.
+            b"HTTP/1.1  200 OK\r\n\r\n",
+            b"HTTP/1.1\t200 OK\r\n\r\n",
+            b"HTTP/1.1 200OK\r\n\r\n",
+            b"HTTP/1.1 200\rOK\r\n\r\n", // A carriage return standing for a space.
+            b"HTTP/1.1 403.1 Forbidden\r\n\r\n", // IIS's substatus, which nginx takes.
+            b"HTTP/1.1 200 \x00\r\n\r\n", // Control bytes in the reason.
+            b"HTTP/1.1 200 O\x7fK\r\n\r\n",
+            // A status line where a field should be, which nginx reads past.
+            b"HTTP/1.1 200 OK\r\nHTTP/1.1 200 OK\r\n\r\n",
+            // Field names that are not tokens, and a line that is no field at all.
+            b"HTTP/1.1 200 OK\r\n: v\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nx-foo\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\n;\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\ncred\x00entials: x\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nx\xff: 1\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nf\xc3\xb6\xc3\xb6: bar\r\n\r\n",
+            // Values with control bytes in them.
+            b"HTTP/1.1 200 OK\r\nx-a: 1\x002\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nx-a: 1\r2\r\n\r\n",
         ];
         for bytes in bad {
             assert!(read(bytes).is_err(), "{bytes:?} was read");
         }
+        // Each separator RFC 9110 §5.6.2 keeps out of a token, in a name.
+        for separator in b"\"(),/;<=>?@[\\]{}\x7f\x80" {
+            let bytes = [b"HTTP/1.1 200 OK\r\nx", &[*separator][..], b"a: 1\r\n\r\n"].concat();
+            assert!(read(&bytes).is_err(), "{bytes:?} was read");
+        }
+    }
+
+    /// The other side of the table above: what the grammar allows is read, however
+    /// unusual it looks.
+    #[test]
+    fn what_the_grammar_allows_is_read() {
+        let good: &[&[u8]] = &[
+            b"HTTP/1.1 103 \r\n\r\n", // An empty reason, which is how 103 is usually sent.
+            b"HTTP/1.1 200 O\tK\r\n\r\n",
+            b"HTTP/1.1 200 X\xffZ\r\n\r\n", // obs-text is part of a reason.
+            b"HTTP/1.1 200 OK\r\nx_foo: 1\r\n\r\n", // An underscore is a tchar.
+            b"HTTP/1.1 200 OK\r\n!#$%&'*+-.^_`|~09az: 1\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nserver: hello\tworld\r\n\r\n",
+        ];
+        for bytes in good {
+            assert!(
+                matches!(read(bytes), Ok(Head::Read { .. })),
+                "{bytes:?} was not read"
+            );
+        }
+        // A value of nothing but whitespace is an empty value.
+        assert_eq!(
+            head_of(b"HTTP/1.1 200 OK\r\nx-a:   \r\n\r\n").headers["x-a"],
+            ""
+        );
+        assert_eq!(
+            head_of(b"HTTP/1.1 200 OK\r\nx-a: \thello\t \r\n\r\n").headers["x-a"],
+            "hello"
+        );
+    }
+
+    /// A value padded far beyond any line a reader might buffer, arriving a byte at a
+    /// time, is still one value (from Envoy's protocol integration tests).
+    #[test]
+    fn a_long_padded_value_arriving_a_byte_at_a_time_is_one_value() {
+        let padding = " ".repeat(32 * 1024);
+        let whole = format!("HTTP/1.1 200 OK\r\nx-a: v{padding}v\r\n\r\n").into_bytes();
+        let mut reader = HeadReader::default();
+        let mut head = None;
+        for upto in 0..=whole.len() {
+            match reader.read(&whole[..upto], &H1Limits::default()) {
+                Ok(Head::More) => {}
+                Ok(Head::Read { head: read, .. }) => {
+                    head = Some(read);
+                    break;
+                }
+                Err(error) => panic!("refused at {upto}: {error:?}"),
+            }
+        }
+        let head = head.expect("a head");
+        assert_eq!(head.headers["x-a"], format!("v{padding}v"));
     }
 
     #[test]
@@ -1630,6 +1718,8 @@ mod tests {
             "identity",
             "chunked, identity",
             "Chunked, Chunked",
+            "chunked, gzip, chunked",
+            "chunked;q=1", // `chunked` takes no parameters.
         ] {
             let fields = format!("transfer-encoding: {coding}\r\n");
             assert_eq!(
@@ -1654,6 +1744,31 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A `Transfer-Encoding` that is there and names nothing is still there. RFC 9112 §6.3
+    /// frames by the field's presence — a coding present outranks a length, and one whose
+    /// last member is not `chunked` runs to the close — and hyper's client reads these to
+    /// the close. Taking it as absent frames the body by the length instead, which is two
+    /// readers ending one body in two places (found by Envoy, HAProxy and Pingora).
+    #[test]
+    #[ignore = "defect: an empty Transfer-Encoding is taken for no coding at all"]
+    fn a_coding_that_names_nothing_is_still_a_coding() {
+        for value in ["", " ", "\t", ","] {
+            let alone = format!("transfer-encoding: {value}\r\n");
+            let with_length = format!("{alone}content-length: 5\r\n");
+            for (start, fields) in [
+                ("HTTP/1.1 200 OK", &alone),
+                ("HTTP/1.1 200 OK", &with_length),
+                ("HTTP/1.1 204 No Content", &alone),
+                ("HTTP/1.0 200 OK", &with_length),
+            ] {
+                assert!(
+                    delivery_with(start, fields).is_err(),
+                    "{start} with {fields:?} was framed"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1690,7 +1805,14 @@ mod tests {
     /// The statuses that carry no body, and the ones that only look as though they do.
     #[test]
     fn the_statuses_that_carry_no_body() {
-        for status in ["100 Continue", "103 Early Hints", "204 No Content"] {
+        for status in [
+            "100 Continue",
+            "102 Processing",
+            "103 Early Hints",
+            "104 Upload Resumption Supported",
+            "199 Unknown",
+            "204 No Content",
+        ] {
             let start = format!("HTTP/1.1 {status}");
             assert_eq!(
                 delivery_with(&start, ""),
@@ -1738,6 +1860,23 @@ mod tests {
             delivery_of("transfer-encoding: gzip\r\n", Asked::Head),
             Err(CodecError::Coding)
         );
+        // A coding it can read is ignored like a length: nothing is waited for, and the
+        // connection is kept (the case behind a fix in Pingora, and in nginx's tests).
+        let described = Ok(Delivery {
+            framing: Framing::None,
+            persistent: true,
+        });
+        assert_eq!(
+            delivery_with(
+                "HTTP/1.1 304 Not Modified",
+                "transfer-encoding: chunked\r\n"
+            ),
+            described
+        );
+        assert_eq!(
+            delivery_of("transfer-encoding: chunked\r\n", Asked::Head),
+            described
+        );
     }
 
     /// 205 sits next to 204 and is not one of the bodiless statuses: read as anything
@@ -1766,6 +1905,13 @@ mod tests {
             delivery_with("HTTP/1.1 101 Switching Protocols", "upgrade: websocket\r\n"),
             Err(CodecError::Upgrade)
         );
+        // Nor does leaving out what it would switch to make it anything else.
+        assert_eq!(
+            delivery_with("HTTP/1.1 101 Switching Protocols", ""),
+            Err(CodecError::Upgrade)
+        );
+        let head = head_of(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
+        assert_eq!(delivery(&head, Asked::Head), Err(CodecError::Upgrade));
     }
 
     #[test]
@@ -1961,6 +2107,9 @@ mod tests {
     /// However the bytes are cut up, the body that comes out is the same one.
     #[test]
     fn a_body_arriving_a_byte_at_a_time_is_the_same_body() {
+        // A hundred small chunks, as nginx's keepalive tests send them.
+        let tiny = [&b"a\r\n0123456789\r\n".repeat(100)[..], b"0\r\n\r\n"].concat();
+        let tiny_body = b"0123456789".repeat(100);
         let cases: &[(Framing, &[u8], &[u8])] = &[
             (Framing::Length(5), b"hello", b"hello"),
             (
@@ -1969,6 +2118,8 @@ mod tests {
                 b"hello th",
             ),
             (Framing::Chunked, b"0\r\nx-a: 1\r\n\r\n", b""),
+            (Framing::Chunked, &tiny, &tiny_body),
+            (Framing::Chunked, b"5\r\nhello\r\n0;a=b\r\n\r\n", b"hello"),
         ];
         for (framing, whole, expected) in cases {
             let mut reader = BodyReader::new(*framing);
@@ -2023,6 +2174,11 @@ mod tests {
             b"5 \r\nhello\r\n",       // Nor one after it.
             b"10000000000000000\r\n", // One past what a length can be.
             b"5\nhello\n0\n\n",       // Bare newlines.
+            // From hyper's decoder tests.
+            b"1;reject\nnewlines\r\n",
+            b"F\rF\r\n",
+            b"1 A\r\n",
+            b"1\r\nZ\r\n\r\n\r\n", // The zero chunk's digit missing.
         ];
         for bytes in bad {
             assert_eq!(
@@ -2031,6 +2187,18 @@ mod tests {
                 "{bytes:?}"
             );
         }
+
+        // The largest size there is is a size, and a body that then stops short of it is
+        // cut short rather than malformed (from Pingora's body tests).
+        assert_eq!(
+            body_of(Framing::Chunked, b"ffffffffffffffff\r\nAAAA", true),
+            Err(CodecError::Truncated)
+        );
+        // As is a size line the close cuts in half.
+        assert_eq!(
+            body_of(Framing::Chunked, b"1\r", true),
+            Err(CodecError::Truncated)
+        );
     }
 
     /// What may follow a size on its line. None of it is acted on; all of it is checked,
@@ -2140,6 +2308,13 @@ mod tests {
             b"5;a =b\r\nhello\r\n0\r\n\r\n",
             b"5;a= b\r\nhello\r\n0\r\n\r\n",
             b"5 ; a = \"b\" ;c\r\nhello\r\n0\r\n\r\n",
+            // A quoted string may hold HTAB and obs-text, bare or escaped.
+            b"5;a=\"b\tc\"\r\nhello\r\n0\r\n\r\n",
+            b"5;a=\"\x80\"\r\nhello\r\n0\r\n\r\n",
+            b"5;a=\"\\\x80\"\r\nhello\r\n0\r\n\r\n",
+            // The last chunk may carry extensions too, checked the same way.
+            b"5\r\nhello\r\n0;a=b\r\n\r\n",
+            b"5\r\nhello\r\n000;x\r\n\r\n",
         ];
         for bytes in good {
             let (body, _) = body_of(Framing::Chunked, bytes, false).unwrap();
@@ -2153,8 +2328,32 @@ mod tests {
             b"5;a \r\nhello\r\n",    // Whitespace the grammar ends without.
             b"5;a b\r\nhello\r\n",
             b"5x;a\r\nhello\r\n",
+            b"5\r\nhello\r\n0;=v\r\n\r\n", // On the last chunk as on any other.
+            b"5\r\nhello\r\n0;\"x\"\r\n\r\n",
         ];
         for bytes in bad {
+            assert_eq!(
+                body_of(Framing::Chunked, bytes, false),
+                Err(CodecError::Chunk),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    /// A quoted string is `qdtext` and `quoted-pair` (RFC 9110 §5.6.4): no control byte
+    /// but HTAB in either, and an escape takes only HTAB, SP, VCHAR or obs-text. A bare
+    /// carriage return is what one reader takes for the end of a line and the next does
+    /// not, which is the chunk-extension smuggling shape (found by Envoy and HAProxy).
+    #[test]
+    #[ignore = "defect: a quoted chunk extension lets control bytes through"]
+    fn a_quoted_extension_holds_no_control_bytes() {
+        for bytes in [
+            &b"5;a=\"\x00\"\r\nhello\r\n0\r\n\r\n"[..],
+            &b"5;a=\"\x01\"\r\nhello\r\n0\r\n\r\n"[..],
+            &b"5;a=\"b\x7f\"\r\nhello\r\n0\r\n\r\n"[..],
+            &b"5;a=\"\\\x00\"\r\nhello\r\n0\r\n\r\n"[..],
+            &b"5;a=\"\\\r\"\r\nhello\r\n0\r\n\r\n"[..],
+        ] {
             assert_eq!(
                 body_of(Framing::Chunked, bytes, false),
                 Err(CodecError::Chunk),
@@ -2169,6 +2368,7 @@ mod tests {
             &b"5\r\nhelloX\r\n0\r\n\r\n"[..], // Something else after the data.
             &b"5\r\nhello\n0\r\n\r\n"[..],    // A bare newline after it.
             &b"5\r\nhello0\r\n\r\n"[..],      // Nothing at all after it.
+            &b"1\r\na\rn0\r\n\r\n"[..],       // A carriage return and something else.
         ] {
             assert_eq!(
                 body_of(Framing::Chunked, bytes, false),
@@ -2187,6 +2387,12 @@ mod tests {
         let padded = [b"5;", &b"a".repeat(32)[..], b"\r\nhello\r\n0\r\n\r\n"].concat();
         assert_eq!(
             read_in_pieces(Framing::Chunked, &padded, false, &limits),
+            Err(CodecError::ChunkLineTooLong { limit: 16 })
+        );
+        // Leading zeros count against it too: a size is not exempt for being small.
+        let zeros = [&b"0".repeat(32)[..], b"5\r\nhello\r\n0\r\n\r\n"].concat();
+        assert_eq!(
+            read_in_pieces(Framing::Chunked, &zeros, false, &limits),
             Err(CodecError::ChunkLineTooLong { limit: 16 })
         );
     }
@@ -2215,6 +2421,171 @@ mod tests {
             read_in_pieces(Framing::Chunked, bytes, false, &limits),
             Err(CodecError::TooManyFields { limit: 1 })
         );
+    }
+
+    /// Right up to the trailer bounds is not past them.
+    #[test]
+    fn a_trailer_section_right_at_its_bounds_is_read() {
+        let limits = H1Limits::default();
+        let many = |count: usize| {
+            let fields: String = (0..count).map(|at| format!("x-{at}: 1\r\n")).collect();
+            format!("0\r\n{fields}\r\n").into_bytes()
+        };
+        let (_, trailers) = body_of(Framing::Chunked, &many(limits.trailer_fields), false).unwrap();
+        assert_eq!(trailers.unwrap().fields.len(), limits.trailer_fields);
+        assert_eq!(
+            body_of(Framing::Chunked, &many(limits.trailer_fields + 1), false),
+            Err(CodecError::TooManyFields {
+                limit: limits.trailer_fields
+            })
+        );
+
+        // A section of exactly the bound, its empty line included, and one byte more.
+        let sized = |length: usize| {
+            let value = "v".repeat(length - "x-a: \r\n\r\n".len());
+            format!("0\r\nx-a: {value}\r\n\r\n").into_bytes()
+        };
+        assert!(body_of(Framing::Chunked, &sized(limits.trailers), false).is_ok());
+        assert_eq!(
+            body_of(Framing::Chunked, &sized(limits.trailers + 1), false),
+            Err(CodecError::TrailersTooLong {
+                limit: limits.trailers
+            })
+        );
+    }
+
+    /// Trailer lines that are not fields. Each fails the body, and with it the connection
+    /// (from HAProxy's `http_transfer_encoding.vtc`, Envoy's and hyper's decoder tests).
+    #[test]
+    fn a_trailer_section_that_is_not_fields_is_refused() {
+        for bytes in [
+            &b"0\r\nno-colon\r\n\r\n"[..],
+            &b"0\r\nx tlr: value\r\n\r\n"[..],
+            &b"0\r\n:status: 200\r\n\r\n"[..],
+            &b"0\r\n: value\r\n\r\n"[..],
+            &b"0\r\nf\xc3\xb6\xc3\xb6: bar\r\n\r\n"[..],
+            &b"0\r\nx-a: val\rue\r\n\r\n"[..],
+            &b"0\r\nx-a: \x00\r\n\r\n"[..],
+            &b"0\r\nx-a: 1\r\n folded\r\n\r\n"[..],
+            &b"0\r\nbad\r\r\n\r\n"[..],
+            &b"0\r\nr\n"[..],
+            &b"0\r\nabc: hi\r\nr\n"[..],
+        ] {
+            assert!(
+                body_of(Framing::Chunked, bytes, false).is_err(),
+                "{bytes:?} was read"
+            );
+        }
+    }
+
+    /// Drives a reader a byte at a time to its end or its first refusal: the refusal, or
+    /// `None` if the body was read whole.
+    fn refused_a_byte_at_a_time(framing: Framing, whole: &[u8]) -> Option<CodecError> {
+        let mut reader = BodyReader::new(framing);
+        let limits = H1Limits::default();
+        let mut taken = 0;
+        for upto in 1..=whole.len() {
+            loop {
+                match reader.read(&whole[taken..upto], false, &limits) {
+                    Err(error) => return Some(error),
+                    Ok(Piece::More) => break,
+                    Ok(Piece::Data { consumed, .. }) => {
+                        taken += consumed;
+                        if consumed == 0 {
+                            break;
+                        }
+                    }
+                    Ok(Piece::End { .. }) => return None,
+                }
+            }
+        }
+        panic!("{whole:?} neither ended nor was refused");
+    }
+
+    /// A refusal is the same whatever pieces the bytes arrive in: a body refused whole and
+    /// read when it trickles in is a body two readers end in two places (§4).
+    #[test]
+    fn a_refused_body_is_refused_however_it_arrives() {
+        for bytes in [
+            &b"5\r\nhelloX\r\n0\r\n\r\n"[..],
+            &b"5;a=\r\nhello\r\n0\r\n\r\n"[..],
+            &b"5\nhello\r\n0\r\n\r\n"[..],
+            &b"0\r\nx-a : 1\r\n\r\n"[..],
+            &b"0\r\nx-a: 1\n\r\n"[..],
+            &b"0\r\nr\n"[..],
+            &b"0\r\nx-a: 1\r\n\n"[..],
+        ] {
+            assert!(
+                body_of(Framing::Chunked, bytes, false).is_err(),
+                "{bytes:?} was read whole"
+            );
+            assert!(
+                refused_a_byte_at_a_time(Framing::Chunked, bytes).is_some(),
+                "{bytes:?} was read a byte at a time"
+            );
+        }
+    }
+
+    /// A trailer section whose first byte is a bare newline is refused when it arrives
+    /// whole, and read as no trailers at all when that newline arrives on its own. The
+    /// second of these swallows a whole response as its "trailers" (found through hyper's
+    /// decoder tests and httparse, which ends a section at a leading newline).
+    #[test]
+    #[ignore = "defect: a trailer section's leading bare newline is missed when it arrives alone"]
+    fn a_bare_newline_opening_a_trailer_section_is_refused_however_it_arrives() {
+        for bytes in [
+            &b"0\r\n\nx-a: 1\r\n\r\n"[..],
+            &b"0\r\n\nHTTP/1.1 200 OK\r\n\r\n"[..],
+        ] {
+            assert!(
+                body_of(Framing::Chunked, bytes, false).is_err(),
+                "{bytes:?}"
+            );
+            assert!(
+                refused_a_byte_at_a_time(Framing::Chunked, bytes).is_some(),
+                "{bytes:?} was read a byte at a time"
+            );
+        }
+    }
+
+    /// A field said twice among the trailers is kept twice, in order.
+    #[test]
+    fn a_trailer_said_twice_keeps_both_in_order() {
+        let trailers = trailers_of("x-trace: first\r\nx-trace: second\r\n");
+        let values: Vec<_> = trailers.fields.get_all("x-trace").iter().collect();
+        assert_eq!(values, ["first", "second"]);
+    }
+
+    /// The whitespace around a trailer's value is not part of it (HAProxy c12).
+    #[test]
+    fn a_trailer_value_is_read_without_the_whitespace_around_it() {
+        let trailers = trailers_of("x-tlr1: value1\r\nX-Tlr2: \tvalue2\t \r\n");
+        assert_eq!(trailers.fields["x-tlr1"], "value1");
+        assert_eq!(trailers.fields["x-tlr2"], "value2");
+    }
+
+    /// A reader that has finished takes nothing more: what follows the body belongs to
+    /// whatever comes next, or to nobody (from hyper's decoder tests).
+    #[test]
+    fn a_finished_body_takes_no_more_bytes() {
+        let limits = H1Limits::default();
+        for (framing, bytes) in [
+            (Framing::Length(5), &b"hello"[..]),
+            (Framing::Chunked, &b"5\r\nhello\r\n0\r\n\r\n"[..]),
+        ] {
+            let mut reader = BodyReader::new(framing);
+            drive(&mut reader, bytes, false, &limits).unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    reader.read(b"HTTP/1.1 200 OK\r\n", false, &limits),
+                    Ok(Piece::End {
+                        trailers: None,
+                        consumed: 0
+                    }),
+                    "{framing:?}"
+                );
+            }
+        }
     }
 
     /// What a trailer section came to, once what may not travel has been left behind.
@@ -2596,6 +2967,18 @@ mod tests {
         assert_eq!(
             sent(Sending::Chunked, &[b"a"], Some(&trailers)),
             "1\r\na\r\n0\r\ngrpc-status: 0\r\n\r\n"
+        );
+    }
+
+    /// A trailer said twice goes out twice, in order (hyper's encoder tests).
+    #[test]
+    fn a_trailer_said_twice_is_written_twice_in_order() {
+        let mut trailers = HeaderMap::new();
+        trailers.append("x-trace", HeaderValue::from_static("first"));
+        trailers.append("x-trace", HeaderValue::from_static("second"));
+        assert_eq!(
+            sent(Sending::Chunked, &[b"a"], Some(&trailers)),
+            "1\r\na\r\n0\r\nx-trace: first\r\nx-trace: second\r\n\r\n"
         );
     }
 
