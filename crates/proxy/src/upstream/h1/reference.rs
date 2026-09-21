@@ -98,7 +98,7 @@ pub enum Notable {
     Upgrade,
     /// A `Connection` field whose value is not what the field's grammar has.
     /// [RFC 9110 §7.6.1](https://www.rfc-editor.org/rfc/rfc9110.html#section-7.6.1)
-    /// gives `Connection = 1#connection-option` with `connection-option = token`, and
+    /// gives `Connection = #connection-option` with `connection-option = token`, and
     /// §5.5 gives a recipient no rule for a value that fails its field's grammar. So
     /// what the peer meant by it cannot be worked out, and both refusing the message and
     /// disregarding the field are open; §4 refuses.
@@ -563,12 +563,12 @@ fn framing(head: &Head, asked: Asked, notable: &mut Vec<Notable>) -> Result<Fram
     })
 }
 
-/// Whether every `Connection` field is a list of tokens with something in it. Empty
-/// elements are not the question: a list rule lets a recipient disregard those.
+/// Whether every `Connection` field is a list of tokens. The `#connection-option`
+/// grammar allows an empty list; empty members are ignored under RFC 9110 §5.6.1.2.
 fn connection_is_tokens(head: &Head) -> bool {
     named(&head.fields, "connection").all(|value| {
         let options = list(value);
-        !options.is_empty() && options.iter().all(|option| option.bytes().all(is_token))
+        options.iter().all(|option| option.bytes().all(is_token))
     })
 }
 
@@ -1322,15 +1322,26 @@ mod tests {
     fn a_connection_field_that_is_not_a_list_of_tokens_is_not_one_to_act_on() {
         let malformed = whole(b"HTTP/1.1 200 OK\r\nconnection: 00 =K\r\ncontent-length: 0\r\n\r\n");
         assert_eq!(malformed.notable, [Notable::ConnectionNotTokens]);
-        // An empty one is not a list of one either: the field's grammar wants at
-        // least one option in it.
-        let empty = whole(b"HTTP/1.1 200 OK\r\nconnection:\r\ncontent-length: 0\r\n\r\n");
-        assert_eq!(empty.notable, [Notable::ConnectionNotTokens]);
-        // Empty elements among real ones are not the question; a list rule lets a
-        // recipient disregard those.
+        // Empty members do not make the nonempty options invalid.
         let padded =
             whole(b"HTTP/1.1 200 OK\r\nconnection: keep-alive,,\r\ncontent-length: 0\r\n\r\n");
         assert!(padded.notable.is_empty());
+    }
+
+    #[test]
+    fn empty_connection_lists_have_no_options() {
+        for value in ["", " \t", ",", " , ,\t", ", keep-alive, ,"] {
+            let bytes =
+                format!("HTTP/1.1 200 OK\r\nconnection: {value}\r\ncontent-length: 0\r\n\r\n");
+            let answer = whole(bytes.as_bytes());
+            assert!(answer.notable.is_empty(), "{value:?}: {:?}", answer.notable);
+            assert!(answer.persistent, "{value:?}");
+        }
+        let answer = whole(
+            b"HTTP/1.1 200 OK\r\nconnection: ,\r\nconnection: , CLOSE,\r\ncontent-length: 0\r\n\r\n",
+        );
+        assert!(answer.notable.is_empty());
+        assert!(!answer.persistent);
     }
 
     #[test]

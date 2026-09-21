@@ -1334,8 +1334,28 @@ mod tests {
     }
 
     #[test]
+    fn empty_connection_lists_are_shared_by_both_paths() {
+        for fields in [
+            "connection:\r\n",
+            "connection: \t\r\n",
+            "connection: , ,\t\r\n",
+            "connection: ,\r\nconnection: keep-alive,,\r\n",
+            "connection: ,\r\nconnection: , CLOSE,\r\n",
+        ] {
+            let script = says(&format!(
+                "HTTP/1.1 200 OK\r\n{fields}content-length: 2\r\n\r\nok"
+            ));
+            for path in [Path::Ours, Path::Theirs] {
+                let checked = checked(path, &script, &Asking::Nothing);
+                assert_eq!(checked.verdict, Verdict::Agrees, "{fields:?}: {checked:?}");
+                assert_eq!(seen(&checked).body, b"ok", "{path:?}: {fields:?}");
+            }
+        }
+    }
+
+    #[test]
     fn a_connection_field_that_is_not_a_list_of_tokens_is_refused_by_one_path() {
-        // RFC 9110 section 7.6.1 gives `Connection = 1#connection-option` with
+        // RFC 9110 section 7.6.1 gives `Connection = #connection-option` with
         // `connection-option = token`, and section 5.5 gives a recipient no rule for
         // a value that fails its field's grammar. What the peer meant by this one
         // cannot be worked out, so 13 section 4 validates it and refuses; hyper's
