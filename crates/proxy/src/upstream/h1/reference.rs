@@ -1325,6 +1325,21 @@ mod tests {
         assert!(whole(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").persistent);
     }
 
+    /// A `Transfer-Encoding` present with no coding in it is still present: its final
+    /// coding is not `chunked`, so RFC 9112 §6.3 rule 4 has the close end the body, and
+    /// rule 3 has it outrank the length. The oracle has the same blind spot as the codec.
+    #[test]
+    #[ignore = "defect: an empty Transfer-Encoding is taken for no coding at all"]
+    fn a_coding_that_names_nothing_is_still_a_coding() {
+        let answer = whole(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: \r\ncontent-length: 5\r\n\r\nhello world",
+        );
+        assert_eq!(answer.framing, Framing::ToClose);
+        assert_eq!(answer.body, b"hello world");
+        assert!(answer.notable.contains(&Notable::LengthWithCoding));
+        assert!(!answer.shared());
+    }
+
     #[test]
     fn a_coding_that_is_not_one_chunked_is_outside_this_slice() {
         // Chunked last is still chunked, and a chain of them is still noted.

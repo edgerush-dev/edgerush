@@ -1668,6 +1668,537 @@ mod tests {
         assert!(matches!(theirs.verdict, Verdict::Outside(_)));
     }
 
+    /// The upstream answers, waits for the next request to have gone out, and answers
+    /// that too.
+    fn answers_twice(first: &str, second: &str) -> Script {
+        Script::new(vec![
+            Step::Wait(Wait::Written(BEGUN)),
+            Step::Say(first.as_bytes().to_vec()),
+            Step::Wait(Wait::Time(Duration::from_secs(1))),
+            Step::Say(second.as_bytes().to_vec()),
+            Step::Wait(Wait::Forever),
+        ])
+    }
+
+    /// A second answer with no body, so that it answers a `HEAD` as well as a `GET`.
+    const NEXT: &str = "HTTP/1.1 201 Created\r\ncontent-length: 0\r\n\r\n";
+
+    /// Both paths read a first answer, keep the connection, and read `NEXT` on it.
+    fn both_carry_a_second_exchange(script: &Script, ask: &Asking) -> [Seen; 2] {
+        [Path::Ours, Path::Theirs].map(|path| {
+            let ran = twice(path, script, ask, Budget::default(), H1Limits::default());
+            let Got::Answer(one) = ran.first else {
+                panic!(
+                    "{path:?} {ask:?} did not read the first answer: {:?}",
+                    ran.first
+                );
+            };
+            assert!(
+                one.kept,
+                "{path:?} {ask:?} would not carry a second exchange"
+            );
+            let Some(Got::Answer(two)) = &ran.second else {
+                panic!("{path:?} {ask:?} had no second exchange: {:?}", ran.second);
+            };
+            assert_eq!(two.status, 201, "{path:?} {ask:?}");
+            one
+        })
+    }
+
+    /// A head that describes a body it does not send leaves nothing to wait for, and the
+    /// connection for the next exchange. Every project surveyed tests this one.
+    #[test]
+    fn a_body_described_and_not_sent_leaves_the_connection_for_the_next_answer() {
+        for (first, ask) in [
+            (
+                "HTTP/1.1 200 OK\r\ncontent-length: 26\r\n\r\n",
+                Asking::Head,
+            ),
+            (
+                "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n",
+                Asking::Head,
+            ),
+            (
+                "HTTP/1.1 304 Not Modified\r\ncontent-length: 100\r\n\r\n",
+                Asking::Nothing,
+            ),
+            (
+                "HTTP/1.1 304 Not Modified\r\ntransfer-encoding: chunked\r\n\r\n",
+                Asking::Nothing,
+            ),
+            ("HTTP/1.1 304 Not Modified\r\n\r\n", Asking::Nothing),
+            ("HTTP/1.1 204 No Content\r\n\r\n", Asking::Nothing),
+            // After interim answers too, which Pingora once got wrong for HEAD.
+            (
+                "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n",
+                Asking::Head,
+            ),
+            (
+                "HTTP/1.1 103 Early Hints\r\nlink: </s.css>\r\n\r\n\
+                 HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n",
+                Asking::Head,
+            ),
+        ] {
+            for one in both_carry_a_second_exchange(&answers_twice(first, NEXT), &ask) {
+                assert!(one.body.is_empty(), "{first:?}: {:?}", one.body);
+            }
+        }
+    }
+
+    /// A body sent where none may be, or bytes after the end of one, is not delivered as
+    /// anything, and the connection it arrived on is not trusted again (nginx's
+    /// `proxy_extra_data.t`, HAProxy's `http_bodyless_response.vtc`, hyper's client tests).
+    #[test]
+    fn a_body_sent_where_none_may_be_is_not_delivered_and_costs_the_connection() {
+        for (answer, ask, body) in [
+            (
+                "HTTP/1.1 200 OK\r\ncontent-length: 12\r\n\r\nskipped data",
+                Asking::Head,
+                "",
+            ),
+            (
+                "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n",
+                Asking::Head,
+                "",
+            ),
+            (
+                "HTTP/1.1 304 Not Modified\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n",
+                Asking::Nothing,
+                "",
+            ),
+            (
+                "HTTP/1.1 304 Not Modified\r\ncontent-length: 8\r\n\r\nSEE-THIS",
+                Asking::Nothing,
+                "",
+            ),
+            (
+                "HTTP/1.1 204 No Content\r\n\r\nNOT-THIS",
+                Asking::Nothing,
+                "",
+            ),
+            (
+                "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\nNOT-THIS",
+                Asking::Nothing,
+                "",
+            ),
+            // A stray CRLF after a counted body, which real servers send.
+            (
+                "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello\r\n",
+                Asking::Nothing,
+                "hello",
+            ),
+        ] {
+            let ours = checked(Path::Ours, &says(answer), &ask);
+            assert!(
+                !matches!(ours.verdict, Verdict::Disagrees(_)),
+                "{answer:?} {ours:?}"
+            );
+            let seen = seen(&ours);
+            assert_eq!(seen.body, body.as_bytes(), "{answer:?}");
+            assert!(
+                !seen.kept,
+                "{answer:?} left a connection that was not finished"
+            );
+        }
+    }
+
+    /// The end of a chunked body arriving in two pieces: nothing is finished until the
+    /// empty line is, and the connection is good afterwards (nginx's `proxy_keepalive.t`).
+    #[test]
+    fn a_last_chunk_whose_empty_line_comes_later_still_leaves_a_good_connection() {
+        let script = Script::new(vec![
+            Step::Wait(Wait::Written(BEGUN)),
+            Step::Say(
+                b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n\
+                  1a\r\nabcdefghijklmnopqrstuvwxyz\r\n0\r\n"
+                    .to_vec(),
+            ),
+            Step::Wait(Wait::Time(Duration::from_millis(50))),
+            Step::Say(b"\r\n".to_vec()),
+            Step::Wait(Wait::Time(Duration::from_secs(1))),
+            Step::Say(NEXT.as_bytes().to_vec()),
+            Step::Wait(Wait::Forever),
+        ]);
+        for one in both_carry_a_second_exchange(&script, &Asking::Nothing) {
+            assert_eq!(one.body, b"abcdefghijklmnopqrstuvwxyz");
+        }
+    }
+
+    /// An interim answer and the final one, cut at every byte between them: a reader
+    /// that starts afresh after an interim head must keep what it already has of the next
+    /// (Pingora's client tests; a stall it fixed).
+    #[test]
+    fn an_interim_answer_and_the_final_one_cut_anywhere_are_the_same_answer() {
+        let bytes = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+        for cut in 1..bytes.len() {
+            let script = Script::new(vec![
+                Step::Wait(Wait::Written(BEGUN)),
+                Step::Say(bytes[..cut].to_vec()),
+                Step::Say(bytes[cut..].to_vec()),
+                Step::Wait(Wait::Forever),
+            ]);
+            for path in [Path::Ours, Path::Theirs] {
+                let checked = checked(path, &script, &Asking::Nothing);
+                assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} at {cut}");
+                assert_eq!(seen(&checked).body, b"ok", "{path:?} at {cut}");
+            }
+        }
+    }
+
+    /// What follows an interim head is a head, and one that is not is a failure to read
+    /// an answer rather than another interim one (Pingora's client tests).
+    #[test]
+    fn what_follows_an_interim_answer_has_to_be_an_answer() {
+        let script = says("HTTP/1.1 100 Continue\r\n\r\nHTP/1.1 200 OK\r\n\r\n");
+        let ours = checked(Path::Ours, &script, &Asking::Nothing);
+        assert!(matches!(ours.got, Got::Refused(_)), "{:?}", ours.got);
+        assert_eq!(ours.verdict, Verdict::Agrees, "{ours:?}");
+    }
+
+    /// The first read fills the reading buffer exactly, and the rest comes after a pause:
+    /// a full buffer with nothing more in it yet is not the end of anything (nginx's
+    /// `proxy_available.t`, ticket #2367).
+    #[test]
+    fn a_first_read_that_fills_the_buffer_exactly_is_not_the_end() {
+        const FILLED: usize = 16 * 1024;
+        let budget = Budget {
+            said: 4 * FILLED,
+            ..Budget::default()
+        };
+        // Delimited by the close, and counted. The count is five digits either way, so
+        // the head is the same length whatever it says.
+        const COUNTED: &str = "HTTP/1.1 200 OK\r\ncontent-length: 00000\r\n\r\n";
+        for close in [true, false] {
+            let head = if close {
+                "HTTP/1.1 200 OK\r\n\r\n".to_owned()
+            } else {
+                let body = FILLED - COUNTED.len() + b"AND-THIS".len();
+                format!("HTTP/1.1 200 OK\r\ncontent-length: {body:05}\r\n\r\n")
+            };
+            let filler = vec![b'f'; FILLED - head.len()];
+            let mut first = head.into_bytes();
+            first.extend(&filler);
+            assert_eq!(first.len(), FILLED);
+            let script = Script::new(vec![
+                Step::Wait(Wait::Written(BEGUN)),
+                Step::Say(first),
+                Step::Wait(Wait::Time(Duration::from_millis(1100))),
+                Step::Say(b"AND-THIS".to_vec()),
+                if close {
+                    Step::Close
+                } else {
+                    Step::Wait(Wait::Forever)
+                },
+            ]);
+            for path in [Path::Ours, Path::Theirs] {
+                let checked = check(path, &script, &Asking::Nothing, budget, H1Limits::default());
+                assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {close}");
+                let body = &seen(&checked).body;
+                assert_eq!(body.len(), filler.len() + 8, "{path:?} {close}");
+                assert!(body.ends_with(b"AND-THIS"), "{path:?} {close}");
+            }
+        }
+    }
+
+    /// A length, and then the close before a byte of the body: no answer at all, not an
+    /// empty one (nginx's `proxy_extra_data.t`).
+    #[test]
+    fn a_close_before_any_of_a_counted_body_is_no_answer() {
+        let script = says_and_closes("HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n");
+        for path in [Path::Ours, Path::Theirs] {
+            let checked = checked(path, &script, &Asking::Nothing);
+            assert!(
+                matches!(checked.got, Got::Refused(_)),
+                "{path:?} {:?}",
+                checked.got
+            );
+        }
+        let ours = checked(Path::Ours, &script, &Asking::Nothing);
+        assert_eq!(ours.verdict, Verdict::Agrees, "{ours:?}");
+    }
+
+    /// A body the close delimits is whatever it holds, even when that looks like framing
+    /// (from Envoy's codec tests).
+    #[test]
+    fn a_body_the_close_delimits_is_read_as_bytes_however_it_looks() {
+        let script = says_and_closes(
+            "HTTP/1.1 200 OK\r\n\r\ntransfer-encoding: chunked\r\n\r\nb\r\nhello world\r\n0\r\n\r\n",
+        );
+        for path in [Path::Ours, Path::Theirs] {
+            let checked = checked(path, &script, &Asking::Nothing);
+            assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {checked:?}");
+            assert_eq!(
+                seen(&checked).body,
+                b"transfer-encoding: chunked\r\n\r\nb\r\nhello world\r\n0\r\n\r\n"
+            );
+        }
+    }
+
+    /// Bytes after a chunked body's end in the same read are not part of it, trailers or
+    /// no trailers (nginx's `proxy_chunked_extra.t`).
+    #[test]
+    fn bytes_after_the_end_of_a_chunked_body_are_not_part_of_it() {
+        for tail in ["0\r\n\r\n75\r\nzzz\r\n0\r\n\r\n", "0\r\nx-a: 1\r\n\r\nJUNK"] {
+            let answer = format!(
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n2\r\nyy\r\n{tail}"
+            );
+            let ours = checked(Path::Ours, &says(&answer), &Asking::Nothing);
+            assert!(!matches!(ours.verdict, Verdict::Disagrees(_)), "{ours:?}");
+            assert_eq!(seen(&ours).body, b"yy", "{tail:?}");
+            assert!(!seen(&ours).kept, "{tail:?}");
+        }
+    }
+
+    /// An HTTP/1.0 answer is read by its own framing and never kept, and a length on it
+    /// is not a reason to wait for the close (Pingora's client tests).
+    #[test]
+    fn an_http_1_0_answer_is_read_and_its_connection_let_go() {
+        for script in [
+            says("HTTP/1.0 200 OK\r\ncontent-length: 3\r\n\r\nabc"),
+            says_and_closes("HTTP/1.0 200 OK\r\n\r\nabc"),
+        ] {
+            let ours = checked(Path::Ours, &script, &Asking::Nothing);
+            // HTTP/1.0 is outside the subset both clients undertake to share, so a
+            // classified outcome is what is owed, and it has to be a right one.
+            assert_eq!(
+                ours.verdict,
+                Verdict::Outside(vec!["Http10".to_owned()]),
+                "{ours:?}"
+            );
+            assert_eq!(seen(&ours).body, b"abc");
+            assert!(!seen(&ours).kept, "{ours:?}");
+            assert!(ours.tape.elapsed < H1Limits::default().idle, "{ours:?}");
+        }
+    }
+
+    /// An HTTP/1.0 answer that asks to be kept alive is not kept, because 13 §4 pools no
+    /// connection that speaks 1.0 — a policy of this project's, which the verdict has to
+    /// leave room for. It calls not keeping it a disagreement, so the hostile arm fails on
+    /// any input that reaches this shape.
+    #[test]
+    #[ignore = "defect in the harness: the verdict blames ours for not keeping an HTTP/1.0 connection"]
+    fn an_http_1_0_answer_that_asks_to_be_kept_is_let_go_without_blame() {
+        let script =
+            says("HTTP/1.0 200 OK\r\nconnection: keep-alive\r\ncontent-length: 3\r\n\r\nabc");
+        let ours = checked(Path::Ours, &script, &Asking::Nothing);
+        assert_eq!(seen(&ours).body, b"abc");
+        assert!(!seen(&ours).kept, "{ours:?}");
+        assert_eq!(
+            ours.verdict,
+            Verdict::Outside(vec!["Http10".to_owned()]),
+            "{ours:?}"
+        );
+    }
+
+    /// An answer that says it closes is delivered at its length without waiting for the
+    /// close, and not kept (nginx's `proxy_noclose.t`, Envoy's pool tests).
+    #[test]
+    fn an_answer_that_says_close_is_delivered_without_waiting_for_it() {
+        let script = says(
+            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 12\r\n\r\n0123456789\r\n",
+        );
+        for path in [Path::Ours, Path::Theirs] {
+            let checked = checked(path, &script, &Asking::Nothing);
+            assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {checked:?}");
+            assert_eq!(seen(&checked).body, b"0123456789\r\n", "{path:?}");
+            assert!(!seen(&checked).kept, "{path:?}");
+            assert!(checked.tape.elapsed < H1Limits::default().idle, "{path:?}");
+        }
+    }
+
+    /// Three answers in one write while the upload is still going: the first is the
+    /// answer, the rest are surplus, and the connection goes (Envoy's integration tests).
+    #[test]
+    fn answers_piled_up_behind_an_unfinished_upload_cost_the_connection() {
+        let one = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n";
+        let script = says(&one.repeat(3));
+        let ours = checked(Path::Ours, &script, &Asking::Endless(vec![b"ab".to_vec()]));
+        assert_eq!(ours.verdict, Verdict::Agrees, "{ours:?}");
+        assert_eq!(seen(&ours).status, 200);
+        assert!(seen(&ours).body.is_empty());
+        assert!(!seen(&ours).kept);
+    }
+
+    /// An upstream that closes its sending side while the client's body is waiting on
+    /// nothing: the exchange ends promptly as a close without an answer, rather than
+    /// going round (hyper #4085) or waiting out a deadline.
+    #[test]
+    fn an_upstream_that_stops_sending_mid_upload_ends_the_exchange_promptly() {
+        let script = Script::new(vec![Step::Wait(Wait::Written(BEGUN)), Step::Close]);
+        let ours = checked(Path::Ours, &script, &Asking::Endless(vec![b"ab".to_vec()]));
+        assert!(matches!(ours.got, Got::Refused(_)), "{:?}", ours.got);
+        assert!(
+            ours.tape.elapsed < H1Limits::default().idle,
+            "waited {:?}",
+            ours.tape.elapsed
+        );
+    }
+
+    /// A refusal that arrives, and then the connection fails while the upload is blocked,
+    /// after the head was read: the answer already given stands (13 §5; nginx's lingering
+    /// close tests).
+    #[test]
+    fn a_refusal_read_before_the_upload_failed_is_still_delivered() {
+        let script = Script::with_room(
+            vec![
+                Step::Wait(Wait::Written(BEGUN)),
+                Step::Say(b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 7\r\n\r\n".to_vec()),
+                Step::Wait(Wait::Time(Duration::from_secs(1))),
+                Step::Say(b"refused".to_vec()),
+                Step::Fail,
+            ],
+            64,
+        );
+        let ours = checked(Path::Ours, &script, &Asking::Counted(vec![b'x'; 4096]));
+        let seen = seen(&ours);
+        assert_eq!((seen.status, seen.body.as_slice()), (413, &b"refused"[..]));
+        assert!(!seen.kept);
+    }
+
+    /// The same, with the failure arriving before the head has been read: the answer is
+    /// on the socket all the same, and a write that fails is no reason not to read it
+    /// (Pingora: "flush already received data if upstream write errors").
+    #[test]
+    #[ignore = "defect: a failed write before the head is read loses an answer already sent"]
+    fn a_refusal_already_sent_when_the_upload_fails_is_still_delivered() {
+        let script = Script::with_room(
+            vec![
+                Step::Wait(Wait::Written(BEGUN)),
+                Step::Say(
+                    b"HTTP/1.1 413 Payload Too Large\r\nconnection: close\r\ncontent-length: 7\r\n\r\nrefused"
+                        .to_vec(),
+                ),
+                Step::Fail,
+            ],
+            64,
+        );
+        let ours = checked(Path::Ours, &script, &Asking::Counted(vec![b'x'; 4096]));
+        let seen = seen(&ours);
+        assert_eq!((seen.status, seen.body.as_slice()), (413, &b"refused"[..]));
+        assert!(!seen.kept);
+    }
+
+    /// A head that arrives in two pieces with a stretch of upload between them is one
+    /// head (Pingora's client tests).
+    #[test]
+    fn a_head_split_by_a_stretch_of_upload_is_one_head() {
+        const TAKEN: usize = 16 * 1024;
+        let script = Script::with_room(
+            vec![
+                Step::Wait(Wait::Written(BEGUN)),
+                Step::Say(b"HTTP/1.1 200 OK\r\nconte".to_vec()),
+                Step::Take(TAKEN),
+                Step::Wait(Wait::Written(1024 + TAKEN)),
+                Step::Say(b"nt-length: 2\r\n\r\nok".to_vec()),
+                Step::Wait(Wait::Forever),
+            ],
+            1024,
+        );
+        let ours = checked(Path::Ours, &script, &Asking::Counted(vec![b'x'; 64 * 1024]));
+        assert!(!matches!(ours.verdict, Verdict::Disagrees(_)), "{ours:?}");
+        assert_eq!(ours.tape.written.len(), 1024 + TAKEN);
+        let seen = seen(&ours);
+        assert_eq!((seen.status, seen.body.as_slice()), (200, &b"ok"[..]));
+        // The upload did not finish, so the connection cannot be kept.
+        assert!(!seen.kept);
+    }
+
+    /// A `Transfer-Encoding` that names nothing, with a length: hyper's client reads to
+    /// the close as RFC 9112 §6.3 says, and ours frames by the length, so the two end the
+    /// body in different places.
+    #[test]
+    #[ignore = "defect: an empty Transfer-Encoding is taken for no coding at all"]
+    fn a_coding_that_names_nothing_does_not_leave_the_length_in_charge() {
+        let script = says_and_closes(
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: \r\ncontent-length: 5\r\n\r\nhello world",
+        );
+        let theirs = checked(Path::Theirs, &script, &Asking::Nothing);
+        assert_eq!(seen(&theirs).body, b"hello world");
+        let ours = checked(Path::Ours, &script, &Asking::Nothing);
+        assert!(matches!(ours.got, Got::Refused(_)), "{:?}", ours.got);
+    }
+
+    /// Framing hyper's client reads and ours refuses, by §4's rules, that §5's list of
+    /// differences does not name yet. Measured here so that none is lost.
+    #[test]
+    fn framing_hyper_reads_and_ours_refuses() {
+        let zeros = format!(
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n{}5\r\nhello\r\n0\r\n\r\n",
+            "0".repeat(5000)
+        );
+        for (script, ask, body) in [
+            (
+                says(
+                    "HTTP/1.1 200 OK\r\ntransfer-encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+                ),
+                Asking::Nothing,
+                "hello",
+            ),
+            (
+                says_and_closes("HTTP/1.1 200 OK\r\ntransfer-encoding: yolo\r\n\r\nhello"),
+                Asking::Nothing,
+                "hello",
+            ),
+            (
+                says("HTTP/1.1 200 OK\r\ncontent-length: 5,5\r\n\r\nhello"),
+                Asking::Nothing,
+                "hello",
+            ),
+            (
+                says("HTTP/1.1 200 OK\r\ntransfer-encoding: gzip\r\n\r\n"),
+                Asking::Head,
+                "",
+            ),
+            (
+                says(
+                    "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5 \r\nhello\r\n0\r\n\r\n",
+                ),
+                Asking::Nothing,
+                "hello",
+            ),
+            (says(&zeros), Asking::Nothing, "hello"),
+        ] {
+            let theirs = checked(Path::Theirs, &script, &ask);
+            assert_eq!(seen(&theirs).body, body.as_bytes(), "{:?}", script.steps());
+            let ours = checked(Path::Ours, &script, &ask);
+            assert!(matches!(ours.got, Got::Refused(_)), "{:?}", script.steps());
+            assert!(!matches!(ours.verdict, Verdict::Disagrees(_)), "{ours:?}");
+        }
+    }
+
+    /// And the other way about: hyper's client bounds the extension bytes of a whole body
+    /// at 16 KiB, where ours bounds each line and not their sum.
+    #[test]
+    fn many_long_extensions_are_refused_by_hyper_and_read_by_ours() {
+        let chunk = format!("1;{}\r\nA\r\n", "x".repeat(4000));
+        let answer = format!(
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n{}0\r\n\r\n",
+            chunk.repeat(5)
+        );
+        let budget = Budget {
+            said: 64 * 1024,
+            ..Budget::default()
+        };
+        let script = says(&answer);
+        let ours = check(
+            Path::Ours,
+            &script,
+            &Asking::Nothing,
+            budget,
+            H1Limits::default(),
+        );
+        assert_eq!(ours.verdict, Verdict::Agrees, "{ours:?}");
+        assert_eq!(seen(&ours).body, b"AAAAA");
+        let theirs = check(
+            Path::Theirs,
+            &script,
+            &Asking::Nothing,
+            budget,
+            H1Limits::default(),
+        );
+        assert!(matches!(theirs.got, Got::Refused(_)), "{:?}", theirs.got);
+    }
+
     #[test]
     fn a_cancelled_exchange_is_the_run_ending_and_not_a_disagreement() {
         let script = Script::new(vec![
