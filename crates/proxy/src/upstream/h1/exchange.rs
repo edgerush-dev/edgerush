@@ -29,7 +29,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::{Instant, Sleep, timeout, timeout_at};
+use tokio::time::{Instant, Sleep};
 
 /// How much of a request waits in memory to be written. One frame at a time is staged;
 /// the body is not asked for more until what it gave has gone.
@@ -202,6 +202,11 @@ pub struct Exchange<S> {
     /// everything in it has gone; empty and unallocated in between.
     outgoing: Vec<u8>,
     written: usize,
+    /// Head bytes still queued, separately from body bytes staged behind them. Response
+    /// deadlines start at the write that takes the last head byte, even if it also
+    /// takes body bytes; neither encoding the head nor starting its write is enough.
+    head_left: usize,
+    head_sent: Option<Instant>,
 }
 
 impl<S> Exchange<S> {
@@ -294,6 +299,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             blocks,
             outgoing: Vec::new(),
             written: 0,
+            head_left: 0,
+            head_sent: None,
         }
     }
 
@@ -345,17 +352,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         if !nothing_to_say(&mut self.socket) {
             return Err(ExchangeError::Unsolicited);
         }
-        let by = limits.final_head;
         let mut upload = Upload::new(body, sending, nominated.to_vec());
-        let asked = timeout(
-            by,
-            self.exchange(method, uri, headers, sending, &mut upload, limits),
-        )
-        .await;
-        let answer = match asked {
-            Ok(answer) => answer?,
-            Err(_) => return Err(ExchangeError::TooSlow { after: by }),
-        };
+        let answer = self
+            .exchange(method, uri, headers, sending, &mut upload, limits)
+            .await?;
         if answer.stop_uploading {
             upload.abandon();
         }
@@ -368,7 +368,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         ))
     }
 
-    /// The exchange itself, with the clock kept outside it.
+    /// The exchange itself, with deadlines anchored to transmission of the request head.
     async fn exchange<B>(
         &mut self,
         method: &Method,
@@ -384,6 +384,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
     {
         self.lend_staging();
         write_head(&mut self.outgoing, method, uri, headers, sending, limits)?;
+        self.head_left = self.outgoing.len();
         // A request that asks to be told before it sends its body has its head go out
         // alone; what follows waits for the upstream to answer, or for the wait to end.
         //
@@ -394,7 +395,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         let nothing_to_send = matches!(sending, Sending::None | Sending::Length(0));
         let mut may_send = nothing_to_send || !expects_continue(headers);
         let withheld = !may_send;
-        let ask_by = Instant::now() + limits.continue_wait;
+        let mut final_wait = std::pin::pin!(None::<Sleep>);
+        let mut continue_wait = std::pin::pin!(None::<Sleep>);
 
         let mut reader = HeadReader::default();
         let mut interim = 0;
@@ -406,25 +408,44 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             // looking at it is how an upstream that answers and closes at once has its
             // answer thrown away for a close that had already been overtaken.
             let Head::Read { head, consumed } = reader.read(self.unread(), limits)? else {
-                let round = poll_fn(|cx| self.round(cx, upload, may_send, &mut clocks, limits));
-                // The clocks inside the round are the exchange's own. This one is the wait
-                // for permission, which is not an exchange gone quiet but a question gone
-                // unanswered, and is counted from when the head went.
-                let outcome = if may_send {
-                    round.await
-                } else {
-                    match timeout_at(ask_by, round).await {
-                        Ok(outcome) => outcome,
-                        Err(_) => {
-                            // Long enough. An upstream that will not say whether it wants
-                            // the body is one that will be sent it. What was being waited
-                            // for was this, so the next wait is a new one.
-                            may_send = true;
-                            clocks = Clocks::default();
-                            continue;
+                let outcome = poll_fn(|cx| {
+                    // The write-idle clock covers the head while it is queued. These
+                    // two waits begin only once the complete head has reached the socket.
+                    // They are polled even when I/O is ready: a busy peer cannot extend
+                    // an absolute deadline by supplying progress or interim heads.
+                    if let Some(sent) = self.head_sent {
+                        if final_wait.is_none() {
+                            final_wait
+                                .set(Some(tokio::time::sleep_until(sent + limits.final_head)));
+                        }
+                        if final_wait
+                            .as_mut()
+                            .as_pin_mut()
+                            .is_some_and(|deadline| deadline.poll(cx).is_ready())
+                        {
+                            return Poll::Ready(Err(ExchangeError::TooSlow {
+                                after: limits.final_head,
+                            }));
+                        }
+                        if !may_send {
+                            if continue_wait.is_none() {
+                                continue_wait.set(Some(tokio::time::sleep_until(
+                                    sent + limits.continue_wait,
+                                )));
+                            }
+                            if continue_wait
+                                .as_mut()
+                                .as_pin_mut()
+                                .is_some_and(|deadline| deadline.poll(cx).is_ready())
+                            {
+                                may_send = true;
+                                clocks = Clocks::default();
+                            }
                         }
                     }
-                };
+                    self.round(cx, upload, may_send, &mut clocks, limits)
+                })
+                .await;
                 match outcome {
                     Err(error) => return Err(error),
                     Ok(Moved::Read | Moved::Wrote) => continue,
@@ -592,6 +613,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                 Poll::Ready(Err(error)) => return Err(error.into()),
                 Poll::Ready(Ok(0)) => break,
                 Poll::Ready(Ok(gone)) => {
+                    if self.head_left > 0 {
+                        self.head_left = self.head_left.saturating_sub(gone);
+                        if self.head_left == 0 {
+                            self.head_sent = Some(Instant::now());
+                        }
+                    }
                     self.written += gone;
                     pushed.wrote = true;
                 }
@@ -2169,6 +2196,72 @@ mod tests {
         assert_eq!(data, b"abcd");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn final_head_deadline_starts_after_the_request_head_is_written() {
+        let (exchange, mut peer) = connected(1);
+        let limits = H1Limits {
+            final_head: Duration::from_secs(5),
+            idle: Duration::from_secs(30),
+            ..H1Limits::default()
+        };
+        let holding = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            peer.until(b"\r\n\r\n").await;
+            std::future::pending::<()>().await;
+            drop(peer);
+        });
+        let began = Instant::now();
+        let failed = exchange
+            .send(
+                &Method::GET,
+                &"/x".parse().unwrap(),
+                &headers(&[("host", "up.test")]),
+                &[],
+                Sending::None,
+                Empty::<Bytes>::new(),
+                &limits,
+            )
+            .await
+            .unwrap_err();
+        holding.abort();
+        assert!(matches!(failed, ExchangeError::TooSlow { .. }), "{failed}");
+        assert_eq!(began.elapsed(), Duration::from_secs(15));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_request_head_uses_upload_write_idle() {
+        let (exchange, _peer) = connected(1);
+        let limits = H1Limits {
+            final_head: Duration::from_secs(5),
+            idle: Duration::from_secs(10),
+            ..H1Limits::default()
+        };
+        let began = Instant::now();
+        let failed = exchange
+            .send(
+                &Method::GET,
+                &"/x".parse().unwrap(),
+                &headers(&[("host", "up.test")]),
+                &[],
+                Sending::None,
+                Empty::<Bytes>::new(),
+                &limits,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                failed,
+                ExchangeError::Idle {
+                    waiting: Stalled::Upstream,
+                    ..
+                }
+            ),
+            "{failed}"
+        );
+        assert_eq!(began.elapsed(), limits.idle);
+    }
+
     /// An upstream that takes the request, says nothing, and stays. Time is the test's to
     /// move, so nothing here really waits a minute.
     #[tokio::test(start_paused = true)]
@@ -2206,8 +2299,8 @@ mod tests {
     }
 
     /// An upstream that keeps something happening never goes idle, and is still given up
-    /// on: the time an exchange has for a final head is counted from its start and is not
-    /// extended by an upstream that stays busy.
+    /// on: the time for a final head is counted from transmission of the request head
+    /// and is not extended by an upstream that stays busy.
     #[tokio::test(start_paused = true)]
     async fn an_upstream_that_dribbles_does_not_buy_itself_more_time() {
         let (exchange, mut peer) = connected(4096);
@@ -2872,6 +2965,44 @@ mod tests {
 
     fn expecting() -> HeaderMap {
         headers(&[("host", "up.test"), ("expect", "100-continue")])
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continue_wait_starts_after_the_request_head_is_written() {
+        let (exchange, mut peer) = connected(1);
+        let (body, asked) = Watched::new(b"hello");
+        let peering = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let asked_before_head = asked.load(Ordering::SeqCst);
+            peer.until(b"\r\n\r\n").await;
+            let sent = Instant::now();
+            let body = peer.until(b"0\r\n\r\n").await;
+            let waited = sent.elapsed();
+            peer.say("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            (asked_before_head, waited, body)
+        });
+        let limits = H1Limits::default();
+        let (answer, _rest) = exchange
+            .send(
+                &Method::POST,
+                &"/x".parse().unwrap(),
+                &expecting(),
+                &[],
+                Sending::Chunked,
+                body,
+                &limits,
+            )
+            .await
+            .unwrap();
+        let (asked_before_head, waited, body) = peering.await.unwrap();
+        assert!(
+            !asked_before_head,
+            "the continue timer ran during the head write"
+        );
+        assert_eq!(waited, limits.continue_wait);
+        assert_eq!(body, b"5\r\nhello\r\n0\r\n\r\n");
+        assert_eq!(answer.head.status, 200);
     }
 
     /// The head goes out alone and the body waits to be asked for. Only when the upstream

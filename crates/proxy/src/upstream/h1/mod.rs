@@ -51,7 +51,8 @@ pub struct H1Limits {
     pub interim_heads: usize,
     /// What those interim answers may come to together.
     pub interim_bytes: usize,
-    /// How long an exchange has to reach a final head, counted from when it begins.
+    /// How long an exchange has to reach a final head, counted from when its complete
+    /// request head has been written to the upstream socket.
     ///
     /// Absolute on purpose: an upload arriving a byte at a time must not be able to hold
     /// an exchange open for as long as it keeps trickling, and an upstream that keeps
@@ -66,7 +67,7 @@ pub struct H1Limits {
     /// the next frame yet — no round is outstanding and nothing is counted against it.
     pub idle: Duration,
     /// How long a request that said `Expect: 100-continue` holds its body back, waiting
-    /// to be asked for it.
+    /// to be asked for it, counted from when its complete head has been written.
     ///
     /// Short, because it is a wait for nothing useful: an upstream that does not answer
     /// the expectation is one that means to read the body anyway, and the client is
