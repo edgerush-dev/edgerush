@@ -34,14 +34,20 @@ def oha(text):
     # Requests that were under way when the time was up: the end of the run, not a failure.
     errors.pop("aborted due to deadline", None)
     bad = sum(codes.values()) - good + sum(errors.values())
+    # A run where nothing finished has no latency to report, and one is meant to: every
+    # request of the cancelled scenario is given up on.
     percentiles = result["latencyPercentiles"]
+
+    def took(name):
+        return percentiles[name] * 1000 if percentiles.get(name) is not None else None
+
     return {
         "requests": good + bad,
         "rate": result["summary"]["requestsPerSec"],
         "bad": bad,
-        "p50": percentiles["p50"] * 1000,
-        "p99": percentiles["p99"] * 1000,
-        "p99.9": percentiles["p99.9"] * 1000,
+        "p50": took("p50"),
+        "p99": took("p99"),
+        "p99.9": took("p99.9"),
     }
 
 
@@ -117,7 +123,11 @@ def main(directory):
     for (scenario, model), results in sorted(runs.items()):
         cells = []
         for column in columns:
-            values = [result[column] for result in results if column in result]
+            values = [
+                result[column]
+                for result in results
+                if result.get(column) is not None
+            ]
             if not values:
                 cells.append("")
                 continue

@@ -59,6 +59,9 @@ start_backend() {
     mkdir -p "$run/tmp"
     # What the streamed scenarios ask for, and what the trickling one trickles.
     [ -s "$run/big.bin" ] || head -c "$STREAMED" /dev/zero >"$run/big.bin"
+    # What the trickling one trickles: small enough that a request finishes in a few
+    # seconds at the rate that location is held to.
+    [ -s "$run/slow.bin" ] || head -c $((STREAMED / 8)) /dev/zero >"$run/slow.bin"
     cp "$here/proxy.yaml" "$config"
     taskset -c "$BACKEND_CPUS" nginx -p "$run/" -c "$here/nginx.conf" -e "$run/error.log"
     await "$backend"
