@@ -12,7 +12,7 @@
 //! the engine spawns for it stay on the one thread and need not be `Send`.
 
 use crate::balance::{Held, Loads};
-use edgerush_proxy::Proxy;
+use edgerush_proxy::{H1Limits, Proxy};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -70,6 +70,7 @@ pub(crate) fn start(
     proxy: &Arc<Proxy>,
     sockets: Vec<Vec<std::net::TcpListener>>,
     accept: Accept,
+    limits: H1Limits,
 ) -> io::Result<Arc<Loads>> {
     let loads = Loads::new(sockets.len());
     let (workers, handed_over): (Vec<_>, Vec<_>) = sockets
@@ -98,7 +99,7 @@ pub(crate) fn start(
                 let entered = runtime.enter();
                 // The upstream connections of this worker and of no other, made where
                 // they are used: nothing about them can leave this thread.
-                let plane = edgerush_proxy::Worker::new(proxy);
+                let plane = edgerush_proxy::Worker::with_limits(proxy, limits);
                 // One sweep for the worker, beside its listeners, for as long as it runs.
                 local.spawn_local(Rc::clone(&plane).maintain());
                 let worker = Worker {
@@ -235,7 +236,10 @@ upstreams:
             address = socket.local_addr().unwrap();
             sockets.push(vec![socket]);
         }
-        (address, start(&proxy, sockets, accept).unwrap())
+        (
+            address,
+            start(&proxy, sockets, accept, H1Limits::default()).unwrap(),
+        )
     }
 
     fn eventually(loads: &Loads, what: impl Fn(&[usize]) -> bool) -> Vec<usize> {

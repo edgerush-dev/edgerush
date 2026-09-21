@@ -32,8 +32,15 @@ bench/run.sh summary bench/results/<run>
 Results go to `bench/results/<time>/` (not committed): the raw output of every
 measurement, the proxy's CPU time around it, `environment.txt`, and the table that
 `summary` prints. Settings are environment variables — `PROXY_CPUS`, `WORKERS`,
-`GEN_CPUS`, `BACKEND_CPUS`, `DURATION`, `REPS`, `VARIANTS`, `OUT`; the defaults are for a
-machine with 4 cores and 8 threads where CPUs *n* and *n+4* are one core.
+`GEN_CPUS`, `BACKEND_CPUS`, `DURATION`, `REPS`, `VARIANTS`, `IDLE_PER_DESTINATION`,
+`IDLE_TOTAL`, `OUT`; the defaults are for a machine with 4 cores and 8 threads where CPUs
+*n* and *n+4* are one core.
+
+`IDLE_PER_DESTINATION` and `IDLE_TOTAL` are the bounds of
+[13 §7](../../docs/13-http1-upstream.md) on how many idle upstream connections a worker
+keeps — 8 and 256. Whichever client carries a request is held to them, so comparing the
+two is comparing them at the same bounds; every run writes what they were into
+`environment.txt`, because a gain that came of loosening a bound is not a gain.
 
 ## The variants
 

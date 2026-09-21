@@ -37,8 +37,8 @@ use std::time::Duration;
 pub struct H1Limits {
     /// The most a response head may come to, status line and fields together.
     pub head: usize,
-    /// The most fields a head may carry. No more than [`codec::MOST_FIELDS`] is read,
-    /// whatever this says.
+    /// The most fields a head may carry. The head parser has a maximum of its own
+    /// and no more than that is read, whatever this says.
     pub fields: usize,
     /// The most a chunk's size line may come to, its extensions included.
     pub chunk_line: usize,

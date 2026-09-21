@@ -405,12 +405,19 @@ impl Worker {
 
     /// The same, on bounds of the caller's choosing. The stage has no configuration for
     /// these; what it has is one value per worker
-    /// ([13 §7](../../docs/13-http1-upstream.md)).
-    fn with_limits(proxy: Arc<Proxy>, limits: H1Limits) -> Rc<Self> {
+    /// ([13 §7](../../docs/13-http1-upstream.md)), which a benchmark may override and
+    /// then say that it did.
+    #[must_use]
+    pub fn with_limits(proxy: Arc<Proxy>, limits: H1Limits) -> Rc<Self> {
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
         let client = Client::builder(TokioExecutor::new())
             .pool_timer(TokioTimer::new())
+            // How many idle connections a worker keeps to one destination is the data
+            // plane's bound and not one client's, so the engine's pool is held to it too
+            // ([13 §7](../../docs/13-http1-upstream.md)). Left alone it keeps as many as
+            // it likes, which is a different proxy from the one that document describes.
+            .pool_max_idle_per_host(limits.idle_per_destination)
             .build(connector);
         Rc::new(Self {
             proxy,
@@ -985,6 +992,70 @@ mod tests {
             held.borrow_mut().clear();
             until(|| worker.in_flight.get() == 0).await;
             assert_eq!(status_over_http1(front).await, StatusCode::BAD_GATEWAY);
+        }));
+    }
+
+    /// The same, by whichever client is named: how many idle connections a worker keeps
+    /// is the data plane's bound, so it has to hold for both of them.
+    fn sending_to_by(upstream: SocketAddr, by: Upstream) -> Arc<Proxy> {
+        let yaml = format!(
+            r#"
+listeners:
+  web: {{ address: "127.0.0.1:0", protocol: http }}
+routes:
+  - name: everything
+    listeners: [web]
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: / }}
+        backends: [{{ upstream: up, weight: 1 }}]
+upstreams:
+  up: {{ endpoints: ["{upstream}"] }}
+"#
+        );
+        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+        let compiled = compile(&config).unwrap();
+        Arc::new(Proxy::new(compiled, NonZeroUsize::MIN, by).unwrap())
+    }
+
+    /// How many connections a worker opens for `requests` sent one after another, when it
+    /// may keep `idle_per_destination` of them.
+    async fn connections_for(by: Upstream, keeping: usize, requests: usize) -> usize {
+        let (upstream, opened) = counting_upstream().await;
+        let limits = H1Limits {
+            idle_per_destination: keeping,
+            ..H1Limits::default()
+        };
+        let worker = Worker::with_limits(sending_to_by(upstream, by), limits);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        for _ in 0..requests {
+            assert_eq!(status_over_http1(front).await, StatusCode::OK);
+        }
+        opened.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many idle connections a worker keeps to one destination is the data plane's
+    /// bound and not one client's, so it holds whichever client carries the request.
+    /// Left to itself the engine's pool keeps as many as it likes, which is a different
+    /// proxy from the one [13 §7](../../docs/13-http1-upstream.md) describes.
+    #[test]
+    fn the_bound_on_idle_connections_holds_for_both_clients() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            for by in [Upstream::Hyper, Upstream::Ours] {
+                // Keeping none: every request after the first opens its own connection.
+                assert_eq!(connections_for(by, 0, 3).await, 3, "{by:?} keeping none");
+                // Keeping one: the first connection carries all three.
+                assert_eq!(connections_for(by, 1, 3).await, 1, "{by:?} keeping one");
+            }
         }));
     }
 

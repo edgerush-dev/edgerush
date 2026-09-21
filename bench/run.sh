@@ -23,6 +23,13 @@ repo=$(dirname "$here")
 : "${BACKEND_CPUS:=3,7}"
 : "${DURATION:=30}"          # seconds of every measurement
 : "${REPS:=3}"
+# How many idle upstream connections a worker keeps, which 13 §7 puts at 8 per
+# destination and 256 in all. Whichever client carries the request is held to them,
+# so a comparison of the two is a comparison at the same bounds — and a run that
+# moves them says so in environment.txt, because a gain that came of loosening a
+# bound is not a gain.
+: "${IDLE_PER_DESTINATION:=8}"
+: "${IDLE_TOTAL:=256}"
 : "${VARIANTS:=thread-per-core}" # and: ours thread-per-core-kernel nginx haproxy envoy kong
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
 
@@ -51,6 +58,9 @@ stop_backend() {
 
 start_proxy() { # variant
     local daemon=
+    # Given unquoted below, so that it is two flags and their values rather than one
+    # long argument. Only the variants that are EdgeRush are given it.
+    local idle="--idle-per-destination $IDLE_PER_DESTINATION --idle-total $IDLE_TOTAL"
     case "$1" in
     envoy)
         taskset -c "$PROXY_CPUS" envoy -c "$here/envoy.yaml" --concurrency "$WORKERS" \
@@ -82,7 +92,7 @@ start_proxy() { # variant
     thread-per-core-kernel)
         # Connections left where the kernel put them: what balancing is measured against.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$here/proxy.yaml" \
-            --accept kernel --workers "$WORKERS" \
+            --accept kernel --workers "$WORKERS" $idle \
             2>>"$OUT/proxy.log" &
         ;;
     ours)
@@ -90,12 +100,12 @@ start_proxy() { # variant
         # client, which is the candidate of 13 section 8 step 6. Nothing else about
         # it changes, which is what makes the pair of them the measurement.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$here/proxy.yaml" \
-            --upstream ours --workers "$WORKERS" \
+            --upstream ours --workers "$WORKERS" $idle \
             2>>"$OUT/proxy.log" &
         ;;
     *)
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$here/proxy.yaml" \
-            --workers "$WORKERS" 2>>"$OUT/proxy.log" &
+            --workers "$WORKERS" $idle 2>>"$OUT/proxy.log" &
         ;;
     esac
     proxy_pid=${daemon:-$!}
@@ -210,6 +220,8 @@ environment() {
             "no_turbo $(cat /sys/devices/system/cpu/intel_pstate/no_turbo)"
         echo "proxy on $PROXY_CPUS ($WORKERS workers), generator on $GEN_CPUS," \
             "backend on $BACKEND_CPUS, ${DURATION}s, $REPS repetitions"
+        echo "idle upstream connections: $IDLE_PER_DESTINATION per destination," \
+            "$IDLE_TOTAL in all"
         h2load --version
         oha --version
         nginx -v 2>&1

@@ -20,7 +20,7 @@ use crate::bind::{Port, listen};
 use crate::config_file::{ConfigFile, Rejected};
 use crate::per_core::{self, Accept};
 use edgerush_config::Compiled;
-use edgerush_proxy::{Proxy, ProxyError, Upstream};
+use edgerush_proxy::{H1Limits, Proxy, ProxyError, Upstream};
 use std::convert::Infallible;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -51,6 +51,11 @@ Options:
       --upstream <BY>      How a request reaches its upstream. hyper: the engine's
                            client; ours: EdgeRush's own, which is a candidate and not
                            yet measured in place [default: hyper]
+      --idle-per-destination <N>
+                           How many idle connections a worker keeps to one destination,
+                           whichever client carries the request. For comparing the two at
+                           matched bounds; there is no configuration for these [default: 8]
+      --idle-total <N>     How many it keeps in all, the same way [default: 256]
   -h, --help               Print help
 ";
 
@@ -67,7 +72,7 @@ pub(crate) fn command(
 ) -> u8 {
     let written = match parse(args) {
         Ok(Parsed::Help) => write!(stdout, "{USAGE}").map(|()| 0),
-        Ok(Parsed::Run(options)) => match run(options, stderr) {
+        Ok(Parsed::Run(options)) => match run(*options, stderr) {
             Err(failure) => writeln!(stderr, "error: {failure}").map(|()| 1),
         },
         Err(error) => write!(stderr, "error: {error}\n\n{USAGE}").map(|()| crate::EXIT_USAGE),
@@ -78,7 +83,9 @@ pub(crate) fn command(
 #[derive(Debug, PartialEq, Eq)]
 enum Parsed {
     Help,
-    Run(Options),
+    /// Boxed because it is much the larger of the two and a `Parsed` is passed by
+    /// value; the bounds a worker runs under are most of its size.
+    Run(Box<Options>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -89,6 +96,10 @@ struct Options {
     /// `None` is one for every CPU the process may use.
     workers: Option<NonZeroUsize>,
     accept: Accept,
+    /// What a worker will not go beyond. There is no configuration for these; what a
+    /// benchmark needs is a way to hold both clients to the same ones, and to say which
+    /// ([13 §7](../../../docs/13-http1-upstream.md)).
+    limits: H1Limits,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -109,6 +120,8 @@ enum UsageError {
     Accept(String),
     #[error("'{0}' is not a way to reach an upstream: hyper or ours")]
     Upstream(String),
+    #[error("'{1}' is not a number of idle connections for '{0}': 0 or more")]
+    Idle(&'static str, String),
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
@@ -116,6 +129,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut metrics: Option<SocketAddr> = None;
     let mut workers = None;
     let mut accept = None;
+    let mut limits = H1Limits::default();
+    let (mut per_destination, mut total) = (false, false);
     let mut upstream = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -151,6 +166,26 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                     return Err(UsageError::Twice("--upstream"));
                 }
             }
+            "--idle-per-destination" => {
+                let many = args
+                    .next()
+                    .ok_or(UsageError::NoValue("--idle-per-destination"))?;
+                limits.idle_per_destination = many
+                    .parse()
+                    .map_err(|_| UsageError::Idle("--idle-per-destination", many))?;
+                if std::mem::replace(&mut per_destination, true) {
+                    return Err(UsageError::Twice("--idle-per-destination"));
+                }
+            }
+            "--idle-total" => {
+                let many = args.next().ok_or(UsageError::NoValue("--idle-total"))?;
+                limits.idle_total = many
+                    .parse()
+                    .map_err(|_| UsageError::Idle("--idle-total", many))?;
+                if std::mem::replace(&mut total, true) {
+                    return Err(UsageError::Twice("--idle-total"));
+                }
+            }
             "--accept" => {
                 let by = args.next().ok_or(UsageError::NoValue("--accept"))?;
                 let by = match by.as_str() {
@@ -166,13 +201,14 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         }
     }
     let config = config.ok_or(UsageError::NoConfig)?;
-    Ok(Parsed::Run(Options {
+    Ok(Parsed::Run(Box::new(Options {
         config,
         upstream: upstream.unwrap_or_default(),
         metrics,
         workers,
         accept: accept.unwrap_or(Accept::Balanced),
-    }))
+        limits,
+    })))
 }
 
 /// Why there is no data plane to run.
@@ -199,6 +235,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
         metrics,
         workers,
         accept,
+        limits,
     } = options;
     let workers = workers
         .or_else(|| thread::available_parallelism().ok())
@@ -249,7 +286,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
         );
     }
     // Every worker runs on a thread of its own, which stays for as long as the process.
-    per_core::start(&proxy, sockets, accept).map_err(Failure::Runtime)?;
+    per_core::start(&proxy, sockets, accept, limits).map_err(Failure::Runtime)?;
     if let Some(socket) = metrics {
         let address = socket.local_addr().map_err(Failure::Runtime)?;
         scrapes(Arc::clone(&proxy), socket).map_err(Failure::Runtime)?;
@@ -397,8 +434,61 @@ mod tests {
             metrics: None,
             workers: None,
             accept: Accept::Balanced,
+            limits: H1Limits::default(),
         };
-        assert_eq!(parsed(&["--config", "dev.yaml"]), Ok(Parsed::Run(options)));
+        assert_eq!(
+            parsed(&["--config", "dev.yaml"]),
+            Ok(Parsed::Run(Box::new(options)))
+        );
+    }
+
+    #[test]
+    fn the_bounds_on_idle_connections_are_as_the_command_line_says() {
+        // There is no configuration for these; what a benchmark needs is to hold both
+        // clients to the same ones, and to be able to say which they were.
+        let options = Options {
+            config: PathBuf::from("dev.yaml"),
+            upstream: Upstream::Hyper,
+            metrics: None,
+            workers: None,
+            accept: Accept::Balanced,
+            limits: H1Limits {
+                idle_per_destination: 64,
+                idle_total: 512,
+                ..H1Limits::default()
+            },
+        };
+        assert_eq!(
+            parsed(&[
+                "--config",
+                "dev.yaml",
+                "--idle-per-destination",
+                "64",
+                "--idle-total",
+                "512",
+            ]),
+            Ok(Parsed::Run(Box::new(options)))
+        );
+        // Keeping none is a number like any other; a number it is not, is not.
+        assert!(matches!(
+            parsed(&["--config", "dev.yaml", "--idle-per-destination", "0"]),
+            Ok(Parsed::Run(_))
+        ));
+        assert_eq!(
+            parsed(&["--config", "dev.yaml", "--idle-total", "many"]),
+            Err(UsageError::Idle("--idle-total", "many".to_owned()))
+        );
+        assert_eq!(
+            parsed(&[
+                "--config",
+                "dev.yaml",
+                "--idle-total",
+                "1",
+                "--idle-total",
+                "2"
+            ]),
+            Err(UsageError::Twice("--idle-total"))
+        );
     }
 
     #[test]
@@ -409,10 +499,11 @@ mod tests {
             metrics: None,
             workers: NonZeroUsize::new(4),
             accept: Accept::Balanced,
+            limits: H1Limits::default(),
         };
         assert_eq!(
             parsed(&["--config", "dev.yaml", "--workers", "4"]),
-            Ok(Parsed::Run(options))
+            Ok(Parsed::Run(Box::new(options)))
         );
     }
 
@@ -424,10 +515,11 @@ mod tests {
             metrics: Some("[::]:9090".parse().unwrap()),
             workers: None,
             accept: Accept::Balanced,
+            limits: H1Limits::default(),
         };
         assert_eq!(
             parsed(&["--metrics", "[::]:9090", "--config", "dev.yaml"]),
-            Ok(Parsed::Run(options))
+            Ok(Parsed::Run(Box::new(options)))
         );
     }
 
