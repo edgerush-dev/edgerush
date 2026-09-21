@@ -810,11 +810,22 @@ where
             // a reason to stop delivering what it has already said.
             let pushed = match rest.exchange.push(cx, &mut rest.upload, true) {
                 Ok(pushed) => pushed,
-                Err(_) => {
-                    // The request will not finish, so the connection cannot be kept. The
-                    // answer is another matter and goes on being read.
+                // A write the upstream will not take is an upstream that has stopped
+                // reading, which §5 says to go on reading the answer through: the answer
+                // it already gave stands, and what is let go of is the request. The
+                // connection cannot be kept either way.
+                Err(ExchangeError::Io(_)) => {
                     rest.upload.abandon();
                     Pushed::default()
+                }
+                // The client's own body failing, or framing that does not add up, is not
+                // that. Nothing here can say the request went, so nothing here may hand
+                // on an answer that finished cleanly: a client told that would believe
+                // the upstream had the whole of what it sent
+                // ([13 §7](../../../docs/13-http1-upstream.md)).
+                Err(error) => {
+                    this.rest = None;
+                    return Poll::Ready(Some(Err(error)));
                 }
             };
             if pushed.took {
@@ -1581,6 +1592,39 @@ mod tests {
 
     /// A body whose request is behind it, which is every body these tests make.
     type SpentBody = H1Body<DuplexStream, Empty<Bytes>>;
+
+    /// A request body that fails after the answer's head has arrived is not the
+    /// abandonment §5 allows. That is for an upstream that has stopped reading — the
+    /// answer stands and the request is let go of. This is the client's own body failing,
+    /// or the framing of it not adding up, and an answer that finished cleanly would tell
+    /// a client its request went when it did not
+    /// ([13 §7](../../../docs/13-http1-upstream.md)).
+    #[tokio::test]
+    async fn a_request_body_that_fails_after_the_head_fails_the_answer() {
+        let (ours, theirs) = tokio::io::duplex(4096);
+        let mut exchange = Exchange::new(ours);
+        // The whole answer is already in hand, so nothing about the upstream is at fault.
+        exchange.incoming = b"ok".to_vec();
+        let upload = Upload::new(Failing(true), Sending::Chunked, Vec::new());
+        let rest = Rest { exchange, upload };
+        let mut body = H1Body::new(
+            rest,
+            Framing::Length(2),
+            true,
+            Vec::new(),
+            H1Limits::default(),
+        );
+        let _peer = Peer(theirs);
+
+        let error = collected(&mut body).await.unwrap_err();
+        assert!(
+            matches!(error, ExchangeError::RequestBody(_)),
+            "the client's body failed and the answer was called finished: {error}"
+        );
+        // And the connection goes with it: a request that was cut off leaves the upstream
+        // waiting for bytes that are never coming.
+        assert!(body.take_if_reusable().is_none());
+    }
 
     /// A body that carries nothing is over before anybody asks, because nothing need ever
     /// ask an empty body anything.
