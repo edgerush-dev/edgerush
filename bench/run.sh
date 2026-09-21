@@ -9,6 +9,7 @@
 #   bench/run.sh latency H1 H2 CHURN          open loop: latency at these request rates
 #   bench/run.sh carrying [STREAMED SLOW]     streamed bodies, a slow upstream,
 #                                             cancellation, reload under load, idle memory
+#   bench/run.sh instructions                 where a worker's instructions go, by part
 #   bench/run.sh summary DIR                  the table of a finished run
 #
 # The variants — EdgeRush, and NGINX, HAProxy, Envoy and Kong set up to do the same
@@ -42,7 +43,8 @@ repo=$(dirname "$here")
 # Hundreds of connections on either side of the proxy, and more when they churn.
 ulimit -n 65536
 
-edgerush=$repo/target/release/edgerush
+# The binary under test. `instructions` points this at a build with symbols in it.
+edgerush=${EDGERUSH:-$repo/target/release/edgerush}
 run=/tmp/edgerush-bench
 # The proxy is given a copy rather than the file in the repository: one scenario
 # rewrites it while the load is on, and the repository is not the place for that.
@@ -330,7 +332,7 @@ prepare)
 summary)
     exec python3 "$here/summary.py" "$2"
     ;;
-ceiling | saturation | latency | carrying) ;;
+ceiling | saturation | latency | carrying | instructions) ;;
 *)
     sed -n '2,15p' "$0" >&2
     exit 2
@@ -369,6 +371,28 @@ saturation)
 latency)
     h1_rate=${2:?rate for h1} h2_rate=${3:?rate for h2} churn_rate=${4:?rate for churn}
     each_variant latency_runs
+    ;;
+instructions)
+    # What a worker's instructions go on, and how many of them one request takes. Sampled
+    # on `instructions:u` rather than on time, so a share here is a share of the work
+    # rather than of the wait; `perf stat` beside it gives the total to divide by the
+    # requests that were served.
+    for variant in $VARIANTS; do
+        start_proxy "$variant"
+        sudo -n perf record -q -e instructions:u -F 3999 -p "$proxy_pid"             -o "$OUT/$variant.perf.data" -- sleep "$DURATION" &
+        recorder=$!
+        sudo -n perf stat -e instructions:u,instructions:k,cycles -x, -p "$proxy_pid"             -o "$OUT/$variant.stat" -- sleep "$DURATION" &
+        counter=$!
+        saturation_h1 "$variant.instructions" "$proxy" --connect-to="$proxy_at"
+        wait "$recorder" "$counter" 2>/dev/null || true
+        sudo -n chown "$(id -u)" "$OUT/$variant.perf.data" 2>/dev/null || true
+        perf report -i "$OUT/$variant.perf.data" --stdio --no-children -s sym             --percent-limit 0 2>/dev/null | python3 "$here/buckets.py"             >"$OUT/$variant.parts" || true
+        stop_proxy
+        echo "== $variant =="
+        cat "$OUT/$variant.parts"
+        sleep 5
+    done
+    exit
     ;;
 carrying)
     # Low rates: every one of these is about what an exchange holds and for how long

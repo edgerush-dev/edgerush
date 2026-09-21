@@ -53,6 +53,13 @@ proptest = { version = "1.11", default-features = false, features = ["std"] }
 [profile.bench]
 debug = true
 
+# The same for perf, which reads them out of the binary. A release build in every
+# other way: debug information changes no code, so what is measured under this is
+# what runs without it.
+[profile.profiling]
+inherits = "release"
+debug = true
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
