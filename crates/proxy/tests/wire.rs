@@ -708,19 +708,34 @@ where
     F: Fn(Wire) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    let accepts = Arc::new(AtomicUsize::new(0));
-    let counting = Arc::clone(&accepts);
     let hostile = Arc::new(hostile);
-    let address = raw_upstream(move |wire| {
-        let first = counting.fetch_add(1, Ordering::SeqCst) == 0;
+    let first = AtomicUsize::new(0);
+    counted(move |wire| {
         let hostile = Arc::clone(&hostile);
+        let hostile_now = first.fetch_add(1, Ordering::SeqCst) == 0;
         async move {
-            if first {
+            if hostile_now {
                 hostile(wire).await;
             } else {
                 plainly(wire).await;
             }
         }
+    })
+}
+
+/// An upstream that treats every connection alike, with a count of how many it accepted.
+fn counted<F, Fut>(answer: F) -> (SocketAddr, Arc<AtomicUsize>)
+where
+    F: Fn(Wire) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&accepts);
+    let answer = Arc::new(answer);
+    let address = raw_upstream(move |wire| {
+        counting.fetch_add(1, Ordering::SeqCst);
+        let answer = Arc::clone(&answer);
+        async move { answer(wire).await }
     });
     (address, accepts)
 }
@@ -1041,6 +1056,132 @@ async fn a_connection_whose_framing_failed_is_never_lent_again() {
     assert_eq!(accepts.load(Ordering::SeqCst), 2, "a broken connection");
 }
 
+// ---- peers that send what this end will not take ----
+//
+// Most of these are decided by the codec and have a table entry of their own there. What
+// they are here for is the path: a bound is reached in a different order when the bytes
+// arrive in pieces, and an answer refused must leave the next request able to be served.
+//
+// **Not all of them are refused for the same kind of reason**, and the tests say which.
+// Some are messages that do not parse. Some are shapes the specification names and leaves
+// to the recipient, where refusing is this project's choice and reading on is equally
+// correct. Some are limits this project sets for itself, one of them against a MUST.
+// Where a test differs from the engine's client it says which of the three it is, because
+// differing from hyper is not by itself being right
+// ([13 §5](../../../docs/13-http1-upstream.md)).
+
+/// Answers the first request with `answer`, then asks a second on a connection of its
+/// own, and says what the client was told each time and how many connections it took.
+async fn facing(answer: String) -> (SocketAddr, Arc<AtomicUsize>) {
+    let answer = Arc::new(answer);
+    let (backend, accepts) = hostile_first(move |mut wire| {
+        let answer = Arc::clone(&answer);
+        async move {
+            // Answering every request on this connection the same way, so that a
+            // connection wrongly kept shows as an answer from it and not as a hang.
+            while wire.until(b"\r\n\r\n").await.is_some() {
+                wire.write(&answer).await;
+            }
+        }
+    });
+    (proxy_to(backend).await, accepts)
+}
+
+/// Answers the first request with `answer`, then asks a second on a connection of its
+/// own, and says what the client was told each time and how many connections it took.
+async fn told_when_answered(answer: String) -> (String, String, usize) {
+    let (proxy, accepts) = facing(answer).await;
+
+    let mut client = Wire::to(proxy).await;
+    let first = asks(&mut client, "/first").await;
+    let mut again = Wire::to(proxy).await;
+    let second = asks(&mut again, "/second").await;
+    let served = within(again.body(5)).await;
+    (
+        first,
+        format!("{second}{served}"),
+        accepts.load(Ordering::SeqCst),
+    )
+}
+
+/// A head refused is a request failed and a connection gone, and the next request is
+/// served all the same. Every case below is one head away from a head that works.
+async fn is_refused(answer: String) {
+    let (first, second, accepts) = told_when_answered(answer).await;
+    assert!(first.starts_with("HTTP/1.1 502"), "{first}");
+    assert!(second.ends_with("fresh"), "{second}");
+    assert_eq!(accepts, 2, "a refused answer kept its connection");
+}
+
+/// Two lengths that disagree are two framings, and choosing between them is how the same
+/// bytes come to be one message here and two somewhere else.
+#[tokio::test]
+async fn an_answer_with_two_lengths_that_disagree_is_refused() {
+    is_refused("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello".into())
+        .await;
+}
+
+/// **A choice the specification leaves open, and the two paths take different ones.**
+/// [RFC 9110 §8.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6) says a
+/// recipient "MAY either reject the message as invalid or replace that invalid field
+/// value with a single instance of the decimal value". Both are named in the one
+/// sentence: ours rejects, the engine's client replaces and keeps the connection, and
+/// neither is more correct than the other. Ours rejects because a duplicate means some
+/// processor upstream has already rewritten this message, and what it meant is not this
+/// end's to guess.
+///
+/// Lengths that *disagree* are an unrecoverable error either way, which is the test
+/// above. The request direction is hyper's server and not this rule at all, which
+/// `equal_repeated_request_lengths_are_made_one_by_the_engine` measures.
+#[tokio::test]
+async fn an_answer_with_two_equal_lengths_is_refused_by_our_own_path() {
+    let answer = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+    match upstream_under_test() {
+        Upstream::Ours => is_refused(answer.into()).await,
+        Upstream::Hyper => {
+            let (first, _second, accepts) = told_when_answered(answer.into()).await;
+            assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+            assert_eq!(accepts, 1, "the engine's client kept it");
+        }
+    }
+}
+
+/// A sign is not a digit. `+5` is a length only to a parser that was being helpful.
+#[tokio::test]
+async fn an_answer_with_a_signed_length_is_refused() {
+    is_refused("HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\nhello".into()).await;
+}
+
+/// And a length no counter can hold is not a length; it is checked, not wrapped.
+#[tokio::test]
+async fn an_answer_with_a_length_too_big_to_count_is_refused() {
+    is_refused("HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999999\r\n\r\nhello".into())
+        .await;
+}
+
+/// **Another choice left open, and neither path forwards the ambiguity.**
+/// [RFC 9112 §6.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3) rule 3 says a
+/// message with both "ought to be handled as an error", and that an intermediary which
+/// chooses to forward it "MUST first remove the received Content-Length field and process
+/// the Transfer-Encoding". Ours takes the error route. The engine's client takes the
+/// other one and does remove the length, which is what that rule asks of a forwarder.
+///
+/// So this is not a hole ours closes; it is the same rule answered two permitted ways.
+/// What ours buys is that nothing downstream is asked to trust a head this end could not
+/// make sense of ([13 §5](../../../docs/13-http1-upstream.md)).
+#[tokio::test]
+async fn an_answer_with_both_a_length_and_chunking_is_refused_by_our_own_path() {
+    let answer = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    match upstream_under_test() {
+        Upstream::Ours => is_refused(answer.into()).await,
+        Upstream::Hyper => {
+            let (first, _second, accepts) = told_when_answered(answer.into()).await;
+            assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+            assert_eq!(accepts, 1, "the engine's client kept it");
+        }
+    }
+}
+
 /// Trailers that the gateway does not forward are dropped from the message, not held
 /// against the connection. Every byte of the trailer section was still read and accounted
 /// for, so the connection has finished cleanly and carries the next request
@@ -1083,5 +1224,338 @@ async fn an_answer_whose_trailers_were_filtered_still_leaves_its_connection() {
         accepts.load(Ordering::SeqCst),
         1,
         "filtering a trailer cost the connection"
+    );
+}
+
+/// Answers the first request with `answer`, which stops making sense somewhere after its
+/// head, and asks a second afterwards.
+///
+/// The head has gone to the downstream server by then, so what the client is left with is
+/// its buffering and not a promise; what is asserted is that no message was ever finished
+/// off, and that the connection this happened on was not kept.
+async fn never_finished(answer: String) {
+    let (proxy, accepts) = facing(answer).await;
+
+    let mut client = Wire::to(proxy).await;
+    client
+        .write("GET /first HTTP/1.1\r\nHost: example.test\r\n\r\n")
+        .await;
+    let all = within(client.rest()).await;
+    assert!(
+        after_head(&all).is_none_or(|body| find(body, b"0\r\n\r\n").is_none()),
+        "a message that stopped making sense was finished off: {all:?}"
+    );
+
+    let mut again = Wire::to(proxy).await;
+    let second = asks(&mut again, "/second").await;
+    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+    assert_eq!(within(again.body(5)).await, "fresh");
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        2,
+        "a broken connection was kept"
+    );
+}
+
+/// **A limit of this project's, not a rule.** The line here is valid syntax; it is only
+/// long. Nothing in HTTP sets a length for it --
+/// [RFC 9112 §7.1.1](https://www.rfc-editor.org/rfc/rfc9112.html#section-7.1.1) says only
+/// that a *server* ought to limit chunk extensions in a *request* -- so reading it however
+/// long it is, as the engine's client does, is correct. Ours refuses at 4 KiB so that a
+/// peer cannot choose how much a worker holds for it
+/// ([13 §7](../../../docs/13-http1-upstream.md)).
+#[tokio::test]
+async fn a_chunk_size_line_past_its_bound_is_refused_by_our_own_path() {
+    let padding = ";x=".to_owned() + &"a".repeat(8 * 1024);
+    let answer = format!(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5{padding}\r\nhello\r\n0\r\n\r\n"
+    );
+    match upstream_under_test() {
+        Upstream::Ours => never_finished(answer).await,
+        Upstream::Hyper => delivered_whole(answer).await,
+    }
+}
+
+/// **A different kind of refusal from the one above: this one does not parse.**
+/// [RFC 9112 §7.1.1](https://www.rfc-editor.org/rfc/rfc9112.html#section-7.1.1) needs a
+/// `chunk-ext-name` before any `=`, so `;=novalue` is not an extension at all. Its "a
+/// recipient MUST ignore unrecognized chunk extensions" is about names nobody knows, not
+/// about input that does not parse, which is why framing bytes are validated here even
+/// where their meaning is ignored: what is waved through is parsed by whatever reads
+/// these bytes next. The engine's client skips to the CRLF without looking, which
+/// nothing forbids.
+#[tokio::test]
+async fn a_chunk_extension_without_a_name_is_refused_by_our_own_path() {
+    let answer =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;=novalue\r\nhello\r\n0\r\n\r\n"
+            .to_owned();
+    match upstream_under_test() {
+        Upstream::Ours => never_finished(answer).await,
+        Upstream::Hyper => delivered_whole(answer).await,
+    }
+}
+
+/// A chunk that does not end where it said it would is a length that meant nothing.
+#[tokio::test]
+async fn a_chunk_that_does_not_end_where_it_said_is_refused() {
+    never_finished(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n".to_owned(),
+    )
+    .await;
+}
+
+/// Whitespace before a field line's colon is what
+/// [RFC 9112 §5.1](https://www.rfc-editor.org/rfc/rfc9112.html#section-5.1) singles out,
+/// and a trailer is a field line like any other. That section tells a proxy to remove such
+/// whitespace from a *response* before forwarding rather than to reject the message;
+/// [RFC 9112 §7.1.2](https://www.rfc-editor.org/rfc/rfc9112.html#section-7.1.2) would also
+/// allow the field simply to be discarded. Failing the exchange is stricter than either,
+/// and is this project's choice: a trailer section that does not parse is a message whose
+/// end was never accounted for ([13 §4](../../../docs/13-http1-upstream.md)). Both paths
+/// do it, so it is not one of the differences.
+#[tokio::test]
+async fn a_trailer_with_space_before_its_colon_is_refused() {
+    never_finished(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nx-note : v\r\n\r\n"
+            .to_owned(),
+    )
+    .await;
+}
+
+/// And a trailer section past its bound, which is the same bound argument as the head's:
+/// the end of a message is not somewhere a peer may put as much as it likes.
+#[tokio::test]
+async fn a_trailer_section_past_its_bound_is_refused() {
+    let fields = "x-note: ".to_owned() + &"a".repeat(32 * 1024) + "\r\n";
+    never_finished(format!(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n{fields}\r\n"
+    ))
+    .await;
+}
+
+/// **A limit of this project's, and the one that sits against a MUST.**
+/// [RFC 9110 §15.2](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.2) says a client
+/// "MUST be able to parse one or more 1xx responses received prior to a final response",
+/// and names no limit; the engine's client consumes as many as arrive and answers with
+/// the final head behind them, which is what the specification asks for.
+///
+/// Ours stops at sixteen, because without a limit one upstream holds a worker for as long
+/// as it cares to keep sending interim heads, and that is judged the worse failure. It is
+/// a deliberate deviation and is recorded as one
+/// ([13 §5](../../../docs/13-http1-upstream.md)); the test is here so that changing it
+/// is a decision and not a drift.
+#[tokio::test]
+async fn an_upstream_that_floods_interim_heads_is_given_up_on_by_our_own_path() {
+    let flood = "HTTP/1.1 103 Early Hints\r\n\r\n".repeat(20);
+    let answer = format!("{flood}HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    match upstream_under_test() {
+        Upstream::Ours => is_refused(answer).await,
+        Upstream::Hyper => answered_anyway(answer).await,
+    }
+}
+
+/// And the same deviation by the other measure: counting heads alone would let a peer
+/// hold as much as it liked in sixteen of them, so there is a bound on what they come to
+/// as well. Both are ours; the engine's client has neither.
+#[tokio::test]
+async fn an_upstream_whose_interim_heads_are_too_long_is_given_up_on_by_our_own_path() {
+    let one = "HTTP/1.1 103 Early Hints\r\nLink: ".to_owned() + &"a".repeat(16 * 1024) + "\r\n\r\n";
+    let answer = format!(
+        "{}HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        one.repeat(12)
+    );
+    match upstream_under_test() {
+        Upstream::Ours => is_refused(answer).await,
+        Upstream::Hyper => answered_anyway(answer).await,
+    }
+}
+
+/// What the engine's client does with the four above: reads past what the candidate would
+/// have stopped at, and delivers the message whole. Recorded so that the difference is a
+/// measured thing rather than an assumption; in three of the four it is doing nothing
+/// wrong ([13 §5](../../../docs/13-http1-upstream.md)).
+async fn delivered_whole(answer: String) {
+    let (proxy, accepts) = facing(answer).await;
+    let mut client = Wire::to(proxy).await;
+    let head = asks(&mut client, "/first").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let body = within(client.chunked_body()).await;
+    assert!(body.contains("hello"), "{body}");
+    assert_eq!(accepts.load(Ordering::SeqCst), 1, "and kept the connection");
+}
+
+/// The same for the interim floods, where what arrives is the final head behind them.
+async fn answered_anyway(answer: String) {
+    let (proxy, accepts) = facing(answer).await;
+    let mut client = Wire::to(proxy).await;
+    let head = asks(&mut client, "/first").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(within(client.body(2)).await, "ok");
+    assert_eq!(accepts.load(Ordering::SeqCst), 1, "and kept the connection");
+}
+
+// ---- peers that stop part way, on either side ----
+
+/// An upstream that refuses an upload it has not read, and says so while the bytes are
+/// still arriving. The answer must reach the client rather than wait behind a socket
+/// that will never drain ([13 §5](../../../docs/13-http1-upstream.md), RFC 9112 §9.5).
+///
+/// The upload runs in a task of its own, because a client whose upload is not being read
+/// blocks, and a test that blocked with it would be waiting for its own answer.
+#[tokio::test]
+async fn a_refusal_reaches_the_client_though_the_upload_cannot_go() {
+    let (backend, _accepts) = counted(|mut wire| async move {
+        // The head, and then not another byte read: the upload backs up behind this.
+        if wire.until(b"\r\n\r\n").await.is_some() {
+            wire.write("HTTP/1.1 413 Payload Too Large\r\nConnection: close\r\nContent-Length: 7\r\n\r\nrefused").await;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let stream = TcpStream::connect(proxy_to(backend).await).await.unwrap();
+    let (mut reading, mut writing) = tokio::io::split(stream);
+
+    let _uploading = tokio::spawn(async move {
+        let head = "POST /first HTTP/1.1\r\nHost: example.test\r\nContent-Length: 4194304\r\n\r\n";
+        if writing.write_all(head.as_bytes()).await.is_err() {
+            return;
+        }
+        // Enough to fill the socket and the staging behind it several times over, and
+        // no more: what is being shown is a write that cannot go, not a large one.
+        let block = vec![b'x'; 64 * 1024];
+        for _ in 0..8 {
+            if writing.write_all(&block).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let mut seen = Vec::new();
+    let mut bytes = [0; 4096];
+    while find(&seen, b"\r\n\r\n").is_none() {
+        let read = within(reading.read(&mut bytes)).await.unwrap();
+        assert!(read > 0, "the connection ended before the refusal");
+        seen.extend_from_slice(&bytes[..read]);
+    }
+    let seen = String::from_utf8_lossy(&seen).into_owned();
+    assert!(seen.starts_with("HTTP/1.1 413"), "{seen}");
+}
+
+/// An upstream that is asked whether to send a body and says nothing is not waited on for
+/// ever: the wait is short, and what follows it is the body, because an upstream that
+/// does not answer the question is one that means to read it anyway.
+#[tokio::test]
+async fn a_withheld_body_goes_when_the_continue_wait_runs_out() {
+    let (told, mut hears) = reporter();
+    let (backend, _accepts) = counted(move |mut wire| {
+        let told = told.clone();
+        async move {
+            // The head is read and nothing is said about it. No 100, no refusal.
+            if wire.until(b"\r\n\r\n").await.is_some() {
+                let body = wire.body(5).await;
+                let _sent = told.send(body);
+                wire.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+    let began = std::time::Instant::now();
+    client
+        .write("POST /first HTTP/1.1\r\nHost: example.test\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello")
+        .await;
+
+    // The downstream server answers the expectation itself, so the client may see a 100
+    // of its own before the answer; the upstream's silence is what is being measured.
+    let mut head = within(client.head()).await;
+    while head.starts_with("HTTP/1.1 1") {
+        head = within(client.head()).await;
+    }
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(within(client.body(2)).await, "ok");
+    assert_eq!(hears.recv().await.unwrap(), "hello", "the body never went");
+
+    // **Where the two paths differ, on purpose.** Ours holds the body back for the wait
+    // in [13 §7](../../../docs/13-http1-upstream.md) and sends it when that runs out,
+    // so this cannot finish sooner. The engine's client does not hold it back at all,
+    // which is why the same test finishes at once there; the body arriving is what both
+    // are held to, and the waiting is only ours.
+    let waited = began.elapsed();
+    match upstream_under_test() {
+        Upstream::Ours => assert!(
+            waited >= Duration::from_secs(1),
+            "the body went without the wait: {waited:?}"
+        ),
+        Upstream::Hyper => assert!(
+            waited < Duration::from_secs(1),
+            "the engine's client waited after all: {waited:?}"
+        ),
+    }
+}
+
+/// A client that goes away part way through its upload leaves an upstream part way
+/// through a request. Whatever the upstream does about that, the connection is not one
+/// this end can account for, so the next request is given one of its own.
+#[tokio::test]
+async fn a_client_that_abandons_its_upload_costs_the_connection() {
+    let (backend, accepts) = counted(|mut wire| async move {
+        while wire.until(b"\r\n\r\n").await.is_some() {
+            wire.write(FRESH).await;
+        }
+    });
+    let proxy = proxy_to(backend).await;
+
+    let gone = Wire::to(proxy).await;
+    let mut gone = gone;
+    gone.write("POST /first HTTP/1.1\r\nHost: example.test\r\nContent-Length: 100\r\n\r\nab")
+        .await;
+    // Two bytes of a hundred, and then the client is gone.
+    drop(gone);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = Wire::to(proxy).await;
+    let head = asks(&mut client, "/second").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(within(client.body(5)).await, "fresh");
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        2,
+        "an abandoned upload's connection"
+    );
+}
+
+/// And a client that goes away part way through the answer. The upstream is left with a
+/// message half delivered and nobody to deliver it to, which is the same connection in
+/// the same unaccountable state.
+#[tokio::test]
+async fn a_client_that_abandons_the_answer_costs_the_connection() {
+    let (backend, accepts) = counted(|mut wire| async move {
+        while wire.until(b"\r\n\r\n").await.is_some() {
+            wire.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await;
+            // Bounded: a peer that talks for ever is a test run that never ends.
+            for _ in 0..200 {
+                wire.write("8\r\nxxxxxxxx\r\n").await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            wire.write("0\r\n\r\n").await;
+        }
+    });
+    let proxy = proxy_to(backend).await;
+
+    let mut gone = Wire::to(proxy).await;
+    let head = asks(&mut gone, "/first").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    // The head and nothing more: the client leaves the answer where it is.
+    drop(gone);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = Wire::to(proxy).await;
+    let head = asks(&mut client, "/second").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        2,
+        "an abandoned answer's connection"
     );
 }
