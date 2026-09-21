@@ -545,3 +545,126 @@ async fn an_answers_framing_follows_what_its_body_has_left() {
     assert!(head.starts_with("HTTP/1.1 400 "), "{head}");
     assert!(head.contains("content-length: 0\r\n"), "{head}");
 }
+
+/// A connection whose answer finished carries the next request too, which only the
+/// upstream can see: it is given one connection for two requests. A body that came
+/// back correctly says nothing about whether anything was reused.
+#[tokio::test]
+async fn a_finished_answer_leaves_its_connection_for_the_next_request() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&accepts);
+    let backend = raw_upstream(move |mut wire| {
+        count.fetch_add(1, Ordering::SeqCst);
+        async move {
+            while wire.until(b"\r\n\r\n").await.is_some() {
+                wire.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            }
+        }
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+    for _ in 0..2 {
+        client
+            .write("GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            .await;
+        within(client.head()).await;
+        assert_eq!(within(client.body(2)).await, "ok");
+    }
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "upstream connection not reused"
+    );
+}
+
+/// **Where the two paths differ, on purpose.** An interim head that claims a body
+/// describes bytes that nothing here will read as one and that the next reader may.
+/// Ours refuses the exchange; the engine's client waves it through.
+#[tokio::test]
+async fn an_interim_answer_claiming_a_body_is_refused_by_our_own_path() {
+    let backend = raw_upstream(|mut wire| async move {
+        wire.head().await;
+        wire.write("HTTP/1.1 100 Continue\r\nContent-Length: 7\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+    client
+        .write("GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+        .await;
+    let head = within(client.head()).await;
+    match upstream_under_test() {
+        // Waved through: the engine's client consumes the interim head without asking
+        // what it claimed, and answers with the 200 behind it.
+        Upstream::Hyper => assert!(head.starts_with("HTTP/1.1 200"), "{head}"),
+        // An interim head that claims a body is a body nobody here will read and
+        // something else may: the exchange fails rather than pass it on.
+        Upstream::Ours => assert!(head.starts_with("HTTP/1.1 502"), "{head}"),
+    }
+}
+
+/// **Where the two paths differ, on purpose.** A field an answer's own `Connection`
+/// names is that hop's business and no further. Ours drops it; the engine's client
+/// passes it to the client.
+#[tokio::test]
+async fn a_trailer_the_answer_nominated_is_dropped_by_our_own_path() {
+    let backend = raw_upstream(|mut wire| async move {
+        wire.head().await;
+        wire.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: x-secret\r\nTrailer: x-secret\r\n\r\n1\r\na\r\n0\r\nx-secret: hidden\r\n\r\n").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+    client
+        .write("GET / HTTP/1.1\r\nHost: example.test\r\nTE: trailers\r\n\r\n")
+        .await;
+    within(client.head()).await;
+    let body = within(client.chunked_body()).await;
+    match upstream_under_test() {
+        // Passed on: what the answer's own `Connection` named is hop-by-hop for that hop
+        // and the engine's client hands it to the client all the same.
+        Upstream::Hyper => assert!(body.contains("hidden"), "{body}"),
+        Upstream::Ours => assert!(!body.contains("hidden"), "{body}"),
+    }
+}
+
+/// An upstream that says something into a connection nobody is using has said it to
+/// nobody. Handing that to whoever comes next would be answering one request with
+/// what was meant for another, which is worth more than the connection it saves.
+#[tokio::test]
+async fn what_an_idle_connection_was_told_is_never_the_next_answer() {
+    let backend = raw_upstream(|mut wire| async move {
+        wire.head().await;
+        wire.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n")
+            .await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        wire.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nzz")
+            .await;
+        if wire.until(b"\r\n\r\n").await.is_some() {
+            wire.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+    client
+        .write("GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+        .await;
+    within(client.head()).await;
+    within(client.chunked_body()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client
+        .write("GET /second HTTP/1.1\r\nHost: example.test\r\n\r\n")
+        .await;
+    let head = within(client.head()).await;
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        assert!(within(client.chunked_body()).await.contains("ok"));
+    } else {
+        assert_eq!(
+            within(client.body(2)).await,
+            "ok",
+            "unsolicited idle bytes became next response"
+        );
+    }
+}

@@ -17,7 +17,7 @@ use super::codec::{
     ResponseHead, Sending, Trailers, delivery, write_head,
 };
 use super::pool::Lease;
-use http::{HeaderMap, Method, StatusCode, Uri};
+use http::{HeaderMap, HeaderName, Method, StatusCode, Uri};
 use hyper::body::{Body, Bytes, Frame, SizeHint};
 use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
@@ -34,6 +34,9 @@ const STAGING: usize = 16 * 1024;
 
 /// How much is read from the socket at once.
 const READING: usize = 16 * 1024;
+
+/// How many turns of staging one push may take before it gives the socket a chance.
+const ROUNDS: usize = 8;
 
 /// Why an exchange could not be carried through.
 #[derive(Debug, thiserror::Error)]
@@ -88,22 +91,49 @@ pub struct Upload<B> {
     body: B,
     writer: BodyWriter,
     trailers: Option<HeaderMap>,
+    /// The one frame being forwarded, and how much of it has been staged. One at a time
+    /// and never a queue of them: a client that is faster than the upstream would
+    /// otherwise be held in this buffer rather than slowed down by it.
+    pending: Option<(Bytes, usize)>,
+    /// What the request's own `Connection` nominated, which does not travel on as a
+    /// trailer either. Kept from before the head was stripped.
+    nominated: Vec<HeaderName>,
     /// Nothing more of the request will be sent, whether because it was all sent or
     /// because there is no longer anywhere for it to go.
     stopped: bool,
 }
 
+impl<B> Upload<B> {
+    /// A request to be sent as `sending` says, whose `Connection` named these fields.
+    pub fn new(body: B, sending: Sending, nominated: Vec<HeaderName>) -> Self {
+        Self {
+            body,
+            writer: BodyWriter::new(sending),
+            trailers: None,
+            pending: None,
+            nominated,
+            stopped: false,
+        }
+    }
+}
+
 impl<S, B> Rest<S, B> {
-    /// Whether every byte of the request went out.
+    /// Whether every byte of the request went out: encoded to the last byte **and**
+    /// written to the socket.
+    ///
+    /// An encoder that has finished is not a request that has arrived. A connection with
+    /// bytes still queued is one whose upstream is part way through reading a request,
+    /// and writing the next one into it would join the two together.
     pub fn upload_finished(&self) -> bool {
-        self.upload.finished()
+        self.upload.finished() && self.exchange.nothing_queued()
     }
 }
 
 impl<B> Upload<B> {
-    /// Whether every byte of the request went out.
+    /// Whether the request has been encoded to its last byte. Not the same as its
+    /// having gone: what is queued is [`Exchange::nothing_queued`]'s business.
     fn finished(&self) -> bool {
-        self.writer.is_done()
+        self.writer.is_done() && self.pending.is_none()
     }
 
     /// Gives up on the rest of the request. What has not gone will never go, so the
@@ -131,6 +161,9 @@ pub struct Answer {
     /// How many interim heads came before it. They are consumed and not passed on; the
     /// engine that serves the client has no way to send one ([13 §5]).
     pub interim: usize,
+    /// What this answer's own `Connection` named as its own. Read here, because by the
+    /// time the hop-by-hop fields have been taken off there is nothing left to read.
+    pub nominated: Vec<HeaderName>,
     /// Whether this answer is one that says to stop sending the request: a refusal that
     /// also closes the connection.
     ///
@@ -154,6 +187,13 @@ pub struct Exchange<S> {
     /// Waiting to be written, and how much of it has gone.
     outgoing: Vec<u8>,
     written: usize,
+}
+
+impl<S> Exchange<S> {
+    /// Whether everything encoded has left for the socket.
+    fn nothing_queued(&self) -> bool {
+        self.written >= self.outgoing.len()
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
@@ -191,12 +231,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
         let by = limits.final_head;
-        let mut upload = Upload {
-            body,
-            writer: BodyWriter::new(sending),
-            trailers: None,
-            stopped: false,
-        };
+        let mut upload = Upload::new(body, sending, nominations(headers));
         let asked = timeout(
             by,
             self.exchange(method, uri, headers, sending, &mut upload, limits),
@@ -269,6 +304,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                     Ok(Ok(Moved::Closed)) => return Err(ExchangeError::Closed),
                 }
             };
+            // Checked before it is believed, interim or final alike. An interim head
+            // that claims a body is a sender describing bytes that nobody will read as
+            // one here and something else may read as one next; a 101 is a protocol this
+            // does not speak. Neither may be waved through for being on the way to
+            // something else ([13 §4](../../../docs/13-http1-upstream.md)).
+            let delivery = delivery(&head, Asked::from(method))?;
+
             if head.status.is_informational() {
                 // Only a 100 says to send the body. Another interim answer says something
                 // else entirely, and saying something else is not saying yes.
@@ -293,7 +335,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                 continue;
             }
             self.incoming.drain(..consumed);
-            let delivery = delivery(&head, Asked::from(method))?;
             // A refusal that also closes the connection says to stop; an answer that came
             // early says nothing at all, because an echo answers early by nature. A
             // request still being withheld for a 100 is never started now.
@@ -303,6 +344,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             let never_asked_for = withheld && !may_send;
             let stop_uploading = never_asked_for || (refused && !delivery.persistent);
             return Ok(Answer {
+                nominated: nominations(&head.headers),
                 head,
                 delivery,
                 interim,
@@ -332,33 +374,64 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             return Ok(false);
         }
 
-        // Take another frame, unless what was taken is still waiting to go out, or the
-        // body is being held back until the upstream asks for it. Held back means not
-        // polled at all: asking a client for bytes it was told to keep is how both ends
-        // come to be waiting for each other.
-        if may_send && !upload.writer.is_done() && self.outgoing.len() - self.written < STAGING {
+        // Bounded work per turn: a body that keeps handing over frames must not be able
+        // to hold this loop for as long as it cares to.
+        for _ in 0..ROUNDS {
+            let staged = self.outgoing.len();
+            if staged >= STAGING {
+                break;
+            }
+            // What is in hand goes first, a bounded slice at a time. The frame itself is
+            // not copied in whole: that would be the client's pace, not the upstream's.
+            if let Some((frame, at)) = upload.pending.as_mut() {
+                let take = (STAGING - staged).min(frame.len() - *at);
+                upload
+                    .writer
+                    .data(&mut self.outgoing, &frame[*at..*at + take])?;
+                *at += take;
+                if *at == frame.len() {
+                    upload.pending = None;
+                }
+                moved = true;
+                continue;
+            }
+            // Held back means not polled at all: asking a client for bytes it was told
+            // to keep is how both ends come to be waiting for each other.
+            if !may_send || upload.writer.is_done() {
+                break;
+            }
             match Pin::new(&mut upload.body).poll_frame(cx) {
-                Poll::Pending => {}
+                Poll::Pending => break,
                 Poll::Ready(Some(Err(error))) => {
                     return Err(ExchangeError::RequestBody(error.into()));
                 }
                 Poll::Ready(Some(Ok(frame))) => {
                     match frame.into_data() {
-                        Ok(data) => upload.writer.data(&mut self.outgoing, &data)?,
+                        // A frame of nothing is not progress and is not counted as any:
+                        // a body that hands over nothing for ever would otherwise keep
+                        // this loop turning for ever with it.
+                        Ok(data) if data.is_empty() => {}
+                        Ok(data) => {
+                            upload.pending = Some((data, 0));
+                            moved = true;
+                        }
                         // Trailers come last, and go out with the body's end.
                         Err(frame) => {
                             if let Ok(fields) = frame.into_trailers() {
                                 upload.trailers = Some(fields);
+                                moved = true;
                             }
                         }
                     }
-                    moved = true;
                 }
                 Poll::Ready(None) => {
-                    upload
-                        .writer
-                        .finish(&mut self.outgoing, upload.trailers.as_ref(), &[])?;
+                    upload.writer.finish(
+                        &mut self.outgoing,
+                        upload.trailers.as_ref(),
+                        &upload.nominated,
+                    )?;
                     moved = true;
+                    break;
                 }
             }
         }
@@ -375,8 +448,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                 }
             }
         }
-        if self.written == self.outgoing.len() && self.written > 0 {
-            self.outgoing.clear();
+        // What has gone is let go of, whether or not all of it went. Keeping a sent
+        // prefix in front of the next frame is how a buffer comes to hold the whole of
+        // an upload rather than the part of it that is waiting.
+        if self.written > 0 {
+            self.outgoing.drain(..self.written);
             self.written = 0;
         }
         Ok(moved)
@@ -469,8 +545,14 @@ impl<S, B> H1Body<S, B> {
     /// `persistent` is what the answer's head said about keeping the connection. Whether
     /// the request finished is not asked yet: an upstream may answer before it has taken
     /// all of one, and the rest of it goes out while this body is read.
-    pub fn new(rest: Rest<S, B>, framing: Framing, persistent: bool, limits: H1Limits) -> Self {
-        let reader = BodyReader::new(framing);
+    pub fn new(
+        rest: Rest<S, B>,
+        framing: Framing,
+        persistent: bool,
+        nominated: Vec<HeaderName>,
+        limits: H1Limits,
+    ) -> Self {
+        let reader = BodyReader::nominating(framing, nominated);
         // A body that was never going to carry anything is finished before it starts. Said
         // now and not at the first poll, because nothing need ever poll an empty body.
         let complete = reader.is_done();
@@ -536,7 +618,7 @@ impl<S, B> H1Body<S, B> {
         let rest = self.rest.as_ref()?;
         // A request that never finished leaves the connection out of step, whenever the
         // answer happened to arrive.
-        if rest.upload.stopped || !rest.upload.finished() {
+        if rest.upload.stopped || !rest.upload_finished() {
             return None;
         }
         // Bytes in hand after a message that is over are a peer saying something nobody
@@ -589,7 +671,7 @@ impl<S, B> H1Body<S, B> {
         // The answer is over. Anything of the request that has not gone is not going now:
         // nobody is left to read it, and the connection cannot be handed on.
         if let Some(rest) = self.rest.as_mut()
-            && !rest.upload.finished()
+            && !rest.upload_finished()
         {
             rest.upload.abandon();
         }
@@ -634,6 +716,13 @@ where
                     false
                 }
             };
+            if moved {
+                // An upstream taking the request in is an upstream that is there. The
+                // bound is for one that has gone quiet altogether, and a backend reading
+                // a long upload before it has anything to say has not
+                // ([13 §5](../../../docs/13-http1-upstream.md)).
+                this.waiting = None;
+            }
 
             match this
                 .reader
@@ -762,11 +851,15 @@ impl<S> Kept<S> {
 /// Whether the upstream is saying nothing at this moment: no bytes waiting to be read,
 /// and no close.
 ///
+/// Asked when a connection is put back, and again when one is taken out: what was quiet
+/// then may not be quiet now, and a socket that has been sitting in a pool has had every
+/// chance to hear something nobody asked for.
+///
 /// Asked with a waker that wakes nobody, because this is a question about now and not a
 /// wait for an answer. Anything readable here is a peer out of step with us, and the
 /// connection is dropped rather than read — what is found is never taken for the start of
 /// whatever the next request would have got.
-fn nothing_to_say<S: AsyncRead + Unpin>(socket: &mut S) -> bool {
+pub fn nothing_to_say<S: AsyncRead + Unpin>(socket: &mut S) -> bool {
     let mut byte = [0; 1];
     let mut read = ReadBuf::new(&mut byte);
     let nobody = Waker::noop();
@@ -775,6 +868,20 @@ fn nothing_to_say<S: AsyncRead + Unpin>(socket: &mut S) -> bool {
     Pin::new(socket)
         .poll_read(&mut Context::from_waker(nobody), &mut read)
         .is_pending()
+}
+
+/// The field names a message's `Connection` names as its own.
+///
+/// Read before anything is stripped, because afterwards there is nothing left to read:
+/// these are hop-by-hop for this hop and do not travel on, among the trailers no more
+/// than among the fields ([13 §4](../../../docs/13-http1-upstream.md)).
+fn nominations(headers: &HeaderMap) -> Vec<HeaderName> {
+    headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .flat_map(crate::hop_by_hop::options)
+        .filter_map(|option| HeaderName::from_bytes(option).ok())
+        .collect()
 }
 
 /// Whether a request asked to be told before it sends its body.
@@ -1137,10 +1244,15 @@ mod tests {
         assert!(matches!(failed, ExchangeError::RequestBody(_)), "{failed}");
     }
 
-    /// Reads a whole body, as a client taking the answer would.
-    async fn collected(
-        body: &mut SpentBody,
-    ) -> Result<(Vec<u8>, Option<HeaderMap>), ExchangeError> {
+    /// Reads a whole body, as a client taking the answer would. Whatever is behind it
+    /// is still going out meanwhile, which for most of these tests is nothing.
+    async fn collected<B>(
+        body: &mut H1Body<DuplexStream, B>,
+    ) -> Result<(Vec<u8>, Option<HeaderMap>), ExchangeError>
+    where
+        B: Body<Data = Bytes> + Unpin,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let mut data = Vec::new();
         let mut trailers = None;
         let mut body = Pin::new(body);
@@ -1170,16 +1282,11 @@ mod tests {
         let mut exchange = Exchange::new(ours);
         exchange.incoming = buffered.to_vec();
         // A request with nothing in it, already all sent.
-        let mut upload = Upload {
-            body: Empty::<Bytes>::new(),
-            writer: BodyWriter::new(Sending::None),
-            trailers: None,
-            stopped: false,
-        };
+        let mut upload = Upload::new(Empty::<Bytes>::new(), Sending::None, Vec::new());
         let mut nothing = Vec::new();
         upload.writer.finish(&mut nothing, None, &[]).unwrap();
         let rest = Rest { exchange, upload };
-        let body = H1Body::new(rest, framing, persistent, H1Limits::default());
+        let body = H1Body::new(rest, framing, persistent, Vec::new(), H1Limits::default());
         (body, Peer(theirs))
     }
 
@@ -1218,6 +1325,52 @@ mod tests {
         let (data, _) = collected(&mut body).await.unwrap();
         assert_eq!(data, b"hello th");
         assert!(body.is_complete());
+    }
+
+    /// And an upstream still taking the request in is an upstream that is still there.
+    /// The bound is for hearing nothing at all from it; a backend draining a long upload
+    /// before it has anything to say is saying plenty, only in the other direction.
+    ///
+    /// Here it reads on for three times the bound and answers at the end of it.
+    #[tokio::test(start_paused = true)]
+    async fn an_upstream_still_taking_the_request_in_is_not_given_up_on() {
+        let idle = H1Limits::default().idle;
+        // Room for far less than the request, so that the upload only goes as fast as the
+        // upstream reads it and every byte of progress is the upstream's doing.
+        let (ours, theirs) = tokio::io::duplex(1024);
+        let upload = Upload::new(
+            Full::new(Bytes::from(vec![b'x'; 64 * 1024])),
+            Sending::Length(64 * 1024),
+            Vec::new(),
+        );
+        let rest = Rest {
+            exchange: Exchange::new(ours),
+            upload,
+        };
+        let mut body = H1Body::new(
+            rest,
+            Framing::Length(2),
+            true,
+            Vec::new(),
+            H1Limits::default(),
+        );
+
+        tokio::spawn(async move {
+            let mut peer = theirs;
+            let mut sink = [0; 1024];
+            // Never at the bound itself, so that what is being tested is the rearming and
+            // not which of two deadlines a tie goes to.
+            for _ in 0..4 {
+                tokio::time::sleep(idle * 3 / 4).await;
+                let taken = peer.read(&mut sink).await.unwrap();
+                assert!(taken > 0, "the upload stopped before the test did");
+            }
+            peer.write_all(b"ok").await.unwrap();
+            peer
+        });
+
+        let (data, _) = collected(&mut body).await.unwrap();
+        assert_eq!(data, b"ok");
     }
 
     #[tokio::test]
@@ -1829,5 +1982,66 @@ mod tests {
         let (data, _) = collected(&mut body).await.unwrap();
         assert_eq!(data, b"some");
         assert!(body.take_if_reusable().is_none());
+    }
+}
+
+#[cfg(test)]
+mod lifecycle {
+    use super::*;
+    #[derive(Debug)]
+    struct Frames;
+    impl Body for Frames {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(&[b'x'; 4096])))))
+        }
+    }
+    #[tokio::test]
+    async fn staging_does_not_keep_what_it_has_already_sent() {
+        use tokio::io::AsyncReadExt;
+        let (socket, mut peer) = tokio::io::duplex(1024);
+        let mut exchange = Exchange::new(socket);
+        let mut upload = Upload::new(Frames, Sending::Chunked, Vec::new());
+        let mut drain = [0; 1024];
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            exchange
+                .push(&mut Context::from_waker(Waker::noop()), &mut upload, true)
+                .unwrap();
+            peer.read_exact(&mut drain).await.unwrap();
+        }
+        assert!(
+            exchange.outgoing.len() <= STAGING + 4096,
+            "retained {} bytes for {} unsent",
+            exchange.outgoing.len(),
+            exchange.outgoing.len() - exchange.written
+        );
+    }
+    #[tokio::test]
+    async fn a_request_still_queued_is_not_a_request_that_went() {
+        let (socket, _peer) = tokio::io::duplex(64);
+        let mut exchange = Exchange::new(socket);
+        exchange.outgoing.extend_from_slice(b"0\r\n\r\n");
+        let mut upload = Upload::new(
+            http_body_util::Empty::<Bytes>::new(),
+            Sending::Length(0),
+            Vec::new(),
+        );
+        upload.writer.finish(&mut Vec::new(), None, &[]).unwrap();
+        let mut body = H1Body::new(
+            Rest { exchange, upload },
+            Framing::None,
+            true,
+            Vec::new(),
+            H1Limits::default(),
+        );
+        assert!(
+            body.take_if_reusable().is_none(),
+            "returned socket with request bytes still unsent"
+        );
     }
 }

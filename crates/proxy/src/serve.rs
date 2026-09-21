@@ -22,7 +22,7 @@ use crate::request::decide;
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::codec::{ResponseHead, Sending};
-use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body};
+use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, nothing_to_say};
 use crate::upstream::h1::pool::{Lease, Pool};
 use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRule};
@@ -37,7 +37,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
@@ -83,7 +83,8 @@ enum Body {
     Upstream(Incoming),
     /// The upstream's answer, as EdgeRush's own path reads it. In a box because it is
     /// much the larger of the two, and every answer would otherwise carry room for it.
-    Ours(Box<H1Body<TcpStream, Incoming>>),
+    /// It carries its exchange's place with it: the exchange is over when this is.
+    Ours(Box<H1Body<TcpStream, Incoming>>, Admitted),
     /// An answer of the data plane's own. It has no body, and never will have one.
     Empty,
 }
@@ -110,11 +111,13 @@ impl HttpBody for Body {
             Self::Upstream(incoming) => Pin::new(incoming)
                 .poll_frame(context)
                 .map(|frame| frame.map(|frame| frame.map_err(BodyError::Upstream))),
-            Self::Ours(ours) => {
+            Self::Ours(ours, _place) => {
                 let frame = Pin::new(&mut *ours).poll_frame(context);
-                if matches!(frame, Poll::Ready(None)) {
-                    // The end of the answer, which is the moment the connection can go
-                    // back — not whenever whoever is reading it happens to let go.
+                // The moment the answer is known to be over, which for a body of known
+                // length is its last frame and not some later poll: a client told how
+                // long a body is has no reason to ask again, and a connection waiting on
+                // a poll that never comes is a connection nobody gets to use.
+                if ours.is_end_stream() {
                     ours.settle();
                 }
                 frame.map(|frame| frame.map(|frame| frame.map_err(BodyError::Ours)))
@@ -126,7 +129,7 @@ impl HttpBody for Body {
     fn is_end_stream(&self) -> bool {
         match self {
             Self::Upstream(incoming) => incoming.is_end_stream(),
-            Self::Ours(ours) => ours.is_end_stream(),
+            Self::Ours(ours, _place) => ours.is_end_stream(),
             Self::Empty => true,
         }
     }
@@ -134,7 +137,7 @@ impl HttpBody for Body {
     fn size_hint(&self) -> SizeHint {
         match self {
             Self::Upstream(incoming) => incoming.size_hint(),
-            Self::Ours(ours) => ours.size_hint(),
+            Self::Ours(ours, _place) => ours.size_hint(),
             Self::Empty => SizeHint::with_exact(0),
         }
     }
@@ -190,7 +193,26 @@ pub struct Worker {
     /// The connections this worker keeps by EdgeRush's own path, which is a candidate
     /// beside the engine's client and carries nothing yet.
     pool: Rc<RefCell<Pool<TcpStream>>>,
+    /// How many exchanges this worker has in hand. Its own, like everything else here:
+    /// no worker waits on another to find out whether it may take a request.
+    in_flight: Rc<Cell<usize>>,
     limits: H1Limits,
+}
+
+/// One exchange's place among those a worker has in hand, given back when it is dropped.
+///
+/// Taken before a connection is looked for and held until the answer's body is let go of,
+/// so that what is counted is work in hand rather than requests begun. Dropping is the
+/// only way to give it back, which is what makes every way out of an exchange — answered,
+/// failed, or a client that stopped reading — release it without being told to
+/// ([13 §7](../../docs/13-http1-upstream.md)).
+#[derive(Debug)]
+struct Admitted(Rc<Cell<usize>>);
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
 }
 
 /// A compiled config and what the data plane works out from it, once, when it arrives.
@@ -354,6 +376,13 @@ impl Worker {
     /// serves with it, inside that thread's `LocalSet`, and never moved off it.
     #[must_use]
     pub fn new(proxy: Arc<Proxy>) -> Rc<Self> {
+        Self::with_limits(proxy, H1Limits::default())
+    }
+
+    /// The same, on bounds of the caller's choosing. The stage has no configuration for
+    /// these; what it has is one value per worker
+    /// ([13 §7](../../docs/13-http1-upstream.md)).
+    fn with_limits(proxy: Arc<Proxy>, limits: H1Limits) -> Rc<Self> {
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
         let client = Client::builder(TokioExecutor::new())
@@ -363,7 +392,8 @@ impl Worker {
             proxy,
             client,
             pool: Rc::new(RefCell::new(Pool::default())),
-            limits: H1Limits::default(),
+            in_flight: Rc::new(Cell::new(0)),
+            limits,
         })
     }
 
@@ -387,6 +417,19 @@ impl Worker {
     #[must_use]
     pub fn idle_connections(&self) -> usize {
         self.pool.borrow().idle()
+    }
+
+    /// Takes a place among the exchanges this worker has in hand, if one is going.
+    ///
+    /// Nothing waits here. A request arriving at a worker that is already full is
+    /// answered, because holding it would cost the very memory the bound is for.
+    fn admit(&self) -> Option<Admitted> {
+        let in_hand = self.in_flight.get();
+        if in_hand >= self.limits.exchanges {
+            return None;
+        }
+        self.in_flight.set(in_hand + 1);
+        Some(Admitted(Rc::clone(&self.in_flight)))
     }
 
     /// Sends a request by EdgeRush's own path and returns the answer's head and body.
@@ -414,8 +457,22 @@ impl Worker {
     {
         // Bound in its own statement, so the pool is not still borrowed when the connect
         // below is waited on.
-        let found = self.pool.borrow_mut().take(identity, &self.limits);
-        let (socket, opened) = match found {
+        let mut kept = None;
+        loop {
+            let found = self.pool.borrow_mut().take(identity, &self.limits);
+            let Some((mut socket, opened)) = found else {
+                break;
+            };
+            // Quiet when it was put back is not quiet now. Anything readable is an
+            // upstream that has said something nobody asked for, and an answer to the
+            // last request must never be handed to the next one; the connection goes
+            // and another is tried.
+            if nothing_to_say(&mut socket) {
+                kept = Some((socket, opened));
+                break;
+            }
+        }
+        let (socket, opened) = match kept {
             Some(reused) => reused,
             None => {
                 let opening = TcpStream::connect(identity.address());
@@ -441,6 +498,7 @@ impl Worker {
             rest,
             answer.delivery.framing,
             answer.delivery.persistent,
+            answer.nominated,
             self.limits,
         )
         .returning_to(lease);
@@ -532,7 +590,15 @@ impl Worker {
 
         let answered = match self.proxy.upstream {
             Upstream::Hyper => self.by_hyper(head, body).await,
-            Upstream::Ours => self.by_ours(&directed, &head, sending, body).await,
+            Upstream::Ours => {
+                // Before anything is looked for or opened: a place is what entitles a
+                // request to a connection, so it is taken before one is sought.
+                let Some(admitted) = self.admit() else {
+                    return self.proxy.answer(listener, Answer::TooBusy);
+                };
+                self.by_ours(&directed, &head, sending, body, admitted)
+                    .await
+            }
         };
 
         let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
@@ -576,6 +642,7 @@ impl Worker {
         head: &Parts,
         sending: Sending,
         body: Incoming,
+        admitted: Admitted,
     ) -> Option<(response::Parts, Body)> {
         let answer = self
             .through_h1(
@@ -588,12 +655,19 @@ impl Worker {
             )
             .await
             .ok()?;
-        let (read, body) = answer;
+        let (read, mut body) = answer;
+        // Nothing need ever poll an empty body, so its connection would otherwise sit
+        // until the body object was dropped.
+        if body.is_end_stream() {
+            body.settle();
+        }
         let mut parts = Response::new(()).into_parts().0;
         parts.status = read.status;
         parts.version = read.version;
         parts.headers = read.headers;
-        Some((parts, Body::Ours(Box::new(body))))
+        // The place goes with the body, which is what is still being worked on. Every
+        // other way out of here has dropped it already.
+        Some((parts, Body::Ours(Box::new(body), admitted)))
     }
 }
 
@@ -768,8 +842,11 @@ pub(crate) fn is_about_one_connection(error: &io::Error) -> bool {
 mod tests {
     use super::*;
     use edgerush_config::{Config, compile};
+    use http::StatusCode;
     use http_body_util::{BodyExt, Empty, Full};
+    use std::num::NonZeroUsize;
     use std::rc::Rc;
+    use std::time::Duration;
 
     /// The engine must take a service, and a body, that cannot leave the thread they were
     /// made on: a worker's own things — the pool of upstream connections above all — will
@@ -810,6 +887,122 @@ mod tests {
             assert_eq!(asked_over_http1(address).await, "on this worker");
             assert_eq!(asked_over_http2(address).await, "on this worker");
         }));
+    }
+
+    /// A worker takes on only so many exchanges at once, and answers the rest rather
+    /// than opening another connection for them. The place is given back by every way out
+    /// of an exchange, a failed one included, so a worker that has been full is not full
+    /// for ever ([13 §7](../../docs/13-http1-upstream.md)).
+    #[test]
+    fn a_worker_full_of_exchanges_answers_rather_than_take_another() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            // An upstream that accepts and says nothing: every request sent to it stays
+            // in hand, which is the only way to have a worker hold several at once.
+            let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = backend.local_addr().unwrap();
+            let held = Rc::new(RefCell::new(Vec::new()));
+            let holding = Rc::clone(&held);
+            let _accepting = tokio::task::spawn_local(async move {
+                loop {
+                    let (stream, _) = backend.accept().await.unwrap();
+                    holding.borrow_mut().push(stream);
+                }
+            });
+
+            // Short bounds so that the exchange which is meant to fail fails in a
+            // second or two rather than in the default half-minute. Long enough that
+            // nothing parked here is given up on before the test has looked at it.
+            let limits = H1Limits {
+                exchanges: 2,
+                idle: Duration::from_secs(2),
+                final_head: Duration::from_secs(2),
+                ..H1Limits::default()
+            };
+            let worker = Worker::with_limits(sending_to(upstream), limits);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+
+            // Two that will not come back, waited for where the worker has committed to
+            // them rather than where they were sent.
+            for _ in 0..2 {
+                let _parked = tokio::task::spawn_local(async move {
+                    let _never = status_over_http1(front).await;
+                });
+            }
+            until(|| held.borrow().len() == 2).await;
+
+            assert_eq!(
+                status_over_http1(front).await,
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+
+            // The upstream goes away, so both exchanges fail; a failure gives its place
+            // back like any other ending, and the worker takes requests again.
+            held.borrow_mut().clear();
+            until(|| worker.in_flight.get() == 0).await;
+            assert_eq!(status_over_http1(front).await, StatusCode::BAD_GATEWAY);
+        }));
+    }
+
+    /// A proxy of one listener that sends everything to `upstream`, by EdgeRush's own
+    /// path because that is the path with a bound on it.
+    fn sending_to(upstream: SocketAddr) -> Arc<Proxy> {
+        let yaml = format!(
+            r#"
+listeners:
+  web: {{ address: "127.0.0.1:0", protocol: http }}
+routes:
+  - name: everything
+    listeners: [web]
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: / }}
+        backends: [{{ upstream: up, weight: 1 }}]
+upstreams:
+  up: {{ endpoints: ["{upstream}"] }}
+"#
+        );
+        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+        let compiled = compile(&config).unwrap();
+        Arc::new(Proxy::new(compiled, NonZeroUsize::MIN, Upstream::Ours).unwrap())
+    }
+
+    /// Waits for something the test is about to depend on, and fails rather than hangs
+    /// if it never happens.
+    async fn until(mut settled: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !settled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waited for something that never happened");
+    }
+
+    /// What one HTTP/1.1 request to `address` is answered with.
+    async fn status_over_http1(address: SocketAddr) -> StatusCode {
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        let _detached = tokio::task::spawn_local(async move {
+            let _closed = connection.await;
+        });
+        // Routed like any other request, so it needs a host to be routed by.
+        let request = Request::builder()
+            .uri("/")
+            .header("host", "example.test")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        sender.send_request(request).await.unwrap().status()
     }
 
     /// What one HTTP/1.1 request to `address` answers, as text.

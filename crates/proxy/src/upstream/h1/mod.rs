@@ -71,6 +71,14 @@ pub struct H1Limits {
     pub sweep: Duration,
     /// How long opening a connection to an upstream may take before it is given up on.
     pub connect: Duration,
+    /// How many exchanges a worker will have in hand at once, counted from before a
+    /// connection is looked for until the answer's body has been let go of.
+    ///
+    /// Without it a worker holds as many sockets, buffers and timers as happen to
+    /// arrive. The excess is answered rather than queued: a queue would only move the
+    /// same unboundedness somewhere quieter
+    /// ([13 §7](../../../../docs/13-http1-upstream.md)).
+    pub exchanges: usize,
 }
 
 impl Default for H1Limits {
@@ -92,6 +100,7 @@ impl Default for H1Limits {
             max_age: Duration::from_secs(5 * 60),
             sweep: Duration::from_secs(1),
             connect: Duration::from_secs(5),
+            exchanges: 1024,
         }
     }
 }

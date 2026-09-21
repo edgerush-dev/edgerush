@@ -57,10 +57,12 @@ pub(crate) enum Answer {
     NoBackend,
     NoEndpoints,
     UpstreamFailed,
+    /// This worker already has as many exchanges in hand as it will take.
+    TooBusy,
 }
 
 impl Answer {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -69,6 +71,7 @@ impl Answer {
         Self::NoBackend,
         Self::NoEndpoints,
         Self::UpstreamFailed,
+        Self::TooBusy,
     ];
 
     /// The status that is answered with.
@@ -79,7 +82,7 @@ impl Answer {
             }
             Self::NoRoute => StatusCode::NOT_FOUND,
             Self::NoBackend => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::NoEndpoints => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NoEndpoints | Self::TooBusy => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamFailed => StatusCode::BAD_GATEWAY,
         }
     }
@@ -94,6 +97,7 @@ impl Answer {
             Self::NoBackend => "no_backend",
             Self::NoEndpoints => "no_endpoints",
             Self::UpstreamFailed => "upstream_failed",
+            Self::TooBusy => "too_busy",
         }
     }
 }
