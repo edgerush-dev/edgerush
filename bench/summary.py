@@ -45,6 +45,16 @@ def oha(text):
     }
 
 
+def memory(text):
+    """What idle connections cost: the lines bench/run.sh's idle_memory writes."""
+    read = dict(
+        line.split(maxsplit=1) for line in text.splitlines() if " " in line
+    )
+    if "per_connection_bytes" not in read:
+        return None
+    return {key: int(value) for key, value in read.items()}
+
+
 def cpu(before, after):
     """How many CPUs the proxy kept busy between the two snapshots, and each thread's part
     of that in percent, the busiest first. The snapshots are around the warm-up too, which
@@ -73,10 +83,14 @@ def middle(values):
 
 def main(directory):
     runs = defaultdict(list)
+    held = {}
     for out in sorted(directory.glob("*.out")):
         subject, _, scenario = out.name[: -len(".out")].rpartition(".")
         model = subject.rsplit(".", 1)[0] if subject.rsplit(".", 1)[-1].isdigit() else subject
         text = out.read_text()
+        if text.startswith("connections "):
+            held[(scenario, model)] = memory(text)
+            continue
         try:
             result = oha(text) if text.lstrip().startswith("{") else h2load(text)
         except (ValueError, KeyError):
@@ -115,6 +129,21 @@ def main(directory):
             cells.append(cell)
         threads = "; ".join(result.get("threads", "") for result in results)
         print(f"| {scenario} | {model} | {len(results)} | " + " | ".join(cells) + f" | {threads} |")
+
+    if held:
+        # Not a row of the table: what a connection costs while nothing happens on it is
+        # not a rate and has no latency.
+        print()
+        print("| scenario | variant | connections | RSS quiet | RSS held | bytes each |")
+        print("|---|---|---|---|---|---|")
+        for (scenario, model), read in sorted(held.items()):
+            if not read:
+                continue
+            print(
+                f"| {scenario} | {model} | {read['connections']:,} |"
+                f" {read['rss_quiet_kb']:,} KiB | {read['rss_held_kb']:,} KiB |"
+                f" {read['per_connection_bytes']:,} |"
+            )
 
 
 if __name__ == "__main__":

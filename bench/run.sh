@@ -7,6 +7,8 @@
 #                                             and their latency at these rates
 #   bench/run.sh saturation                   closed loop: the most each variant serves
 #   bench/run.sh latency H1 H2 CHURN          open loop: latency at these request rates
+#   bench/run.sh carrying [STREAMED SLOW]     streamed bodies, a slow upstream,
+#                                             cancellation, reload under load, idle memory
 #   bench/run.sh summary DIR                  the table of a finished run
 #
 # The variants — EdgeRush, and NGINX, HAProxy, Envoy and Kong set up to do the same
@@ -30,6 +32,10 @@ repo=$(dirname "$here")
 # bound is not a gain.
 : "${IDLE_PER_DESTINATION:=8}"
 : "${IDLE_TOTAL:=256}"
+# A body big enough that neither end holds it whole, for the streamed scenarios,
+# and how many connections are left idle for the one that weighs them.
+: "${STREAMED:=8388608}"
+: "${IDLE_CONNECTIONS:=2000}"
 : "${VARIANTS:=thread-per-core}" # and: ours thread-per-core-kernel nginx haproxy envoy kong
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
 
@@ -38,6 +44,9 @@ ulimit -n 65536
 
 edgerush=$repo/target/release/edgerush
 run=/tmp/edgerush-bench
+# The proxy is given a copy rather than the file in the repository: one scenario
+# rewrites it while the load is on, and the repository is not the place for that.
+config=$run-config.yaml
 backend=http://127.0.0.1:9000/
 # The proxy is asked for by the name its routes are for, and the generators are told where
 # that is: a `host` header would not do, as HTTP/2 names the host in the target.
@@ -48,6 +57,9 @@ proxy_pid=
 
 start_backend() {
     mkdir -p "$run/tmp"
+    # What the streamed scenarios ask for, and what the trickling one trickles.
+    [ -s "$run/big.bin" ] || head -c "$STREAMED" /dev/zero >"$run/big.bin"
+    cp "$here/proxy.yaml" "$config"
     taskset -c "$BACKEND_CPUS" nginx -p "$run/" -c "$here/nginx.conf" -e "$run/error.log"
     await "$backend"
 }
@@ -91,7 +103,7 @@ start_proxy() { # variant
         ;;
     thread-per-core-kernel)
         # Connections left where the kernel put them: what balancing is measured against.
-        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$here/proxy.yaml" \
+        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
             --accept kernel --workers "$WORKERS" $idle \
             2>>"$OUT/proxy.log" &
         ;;
@@ -99,12 +111,12 @@ start_proxy() { # variant
         # The same proxy by EdgeRush's own upstream path rather than the engine's
         # client, which is the candidate of 13 section 8 step 6. Nothing else about
         # it changes, which is what makes the pair of them the measurement.
-        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$here/proxy.yaml" \
+        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
             --upstream ours --workers "$WORKERS" $idle \
             2>>"$OUT/proxy.log" &
         ;;
     *)
-        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$here/proxy.yaml" \
+        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
             --workers "$WORKERS" $idle 2>>"$OUT/proxy.log" &
         ;;
     esac
@@ -188,6 +200,64 @@ latency_h1() { oha_at "$1" "$2" "$3" -c 256; }
 latency_h2() { oha_at "$1" "$2" "$3" --http2 -c 4 -p 100; }
 churn() { oha_at "$1" "$2" "$3" -c 64 --disable-keepalive; }
 
+# A body neither end holds whole, in each direction: what the paths cost when they
+# are carrying something rather than passing a few bytes along.
+streamed_answer() { oha_at "$1" "$2" "$proxy/big" -c 32; }
+streamed_request() { oha_at "$1" "$2" "$proxy/sink" -c 32 -m POST -D "$run/big.bin"; }
+
+# An upstream that trickles: the answer is read over as long as it takes, and the
+# exchange is held open the whole time.
+slow_upstream() { oha_at "$1" "$2" "$proxy/slow" -c 32; }
+
+# Clients that give up part way through an answer, which is where an exchange has to
+# let go of everything it is holding rather than wait to be asked again.
+cancelled() { oha_at "$1" "$2" "$proxy/slow" -c 32 -t 200ms; }
+
+# A config taken over again and again while the load is on. Only EdgeRush is asked
+# for this: the others would need their own reload, which is a different thing to
+# measure. What it is for is the one in 10 §1 — no failed request while it happens.
+reload_under_load() { # name, rate
+    (
+        for turn in $(seq "$DURATION"); do
+            sed "s/x-served-by, value: edgerush/x-served-by, value: edgerush-$turn/" \
+                "$here/proxy.yaml" >"$config.next"
+            mv "$config.next" "$config"
+            sleep 1
+        done
+    ) &
+    local rewriting=$!
+    oha_at "$1" "$2" "$proxy" -c 64
+    kill "$rewriting" 2>/dev/null || true
+    wait "$rewriting" 2>/dev/null || true
+    cp "$here/proxy.yaml" "$config"
+}
+
+# What connections cost while nothing is happening on them: the proxy's own memory
+# with a few thousand open and answered, against the same proxy with none.
+idle_memory() { # name
+    local name=$1
+    local quiet=$(grep VmRSS "/proc/$proxy_pid/status" | awk "{print \$2}")
+    taskset -c "$GEN_CPUS" python3 "$here/idle.py" "$proxy_at" "$host" \
+        "$IDLE_CONNECTIONS" >"$OUT/$name.ready" 2>"$OUT/$name.err" &
+    local holding=$!
+    for _ in $(seq 600); do
+        grep -q ready "$OUT/$name.ready" 2>/dev/null && break
+        sleep 0.1
+    done
+    # A sweep runs once a second; give it one so that what is held is settled.
+    sleep 2
+    local held=$(grep VmRSS "/proc/$proxy_pid/status" | awk "{print \$2}")
+    {
+        echo "connections $IDLE_CONNECTIONS"
+        echo "rss_quiet_kb $quiet"
+        echo "rss_held_kb $held"
+        echo "per_connection_bytes $(( (held - quiet) * 1024 / IDLE_CONNECTIONS ))"
+    } >"$OUT/$name.out"
+    kill "$holding" 2>/dev/null || true
+    wait "$holding" 2>/dev/null || true
+    echo "done: $name"
+}
+
 each_variant() { # function, that is given: prefix of the names
     for rep in $(seq "$REPS"); do
         for variant in $VARIANTS; do
@@ -208,6 +278,20 @@ latency_runs() {
     latency_h1 "$1.latency-h1" "$h1_rate" "$proxy"
     latency_h2 "$1.latency-h2" "$h2_rate" "$proxy"
     churn "$1.churn" "$churn_rate" "$proxy"
+}
+
+# The rest of what 13 §8 step 6 asks a series to cover.
+carrying_runs() {
+    streamed_answer "$1.streamed-answer" "$streamed_rate"
+    streamed_request "$1.streamed-request" "$streamed_rate"
+    slow_upstream "$1.slow-upstream" "$slow_rate"
+    cancelled "$1.cancelled" "$slow_rate"
+    idle_memory "$1.idle-memory"
+    case "$1" in
+    # Only EdgeRush is asked to take a config over while it serves.
+    nginx.* | haproxy.* | envoy.* | kong.*) ;;
+    *) reload_under_load "$1.reload" "$h1_rate" ;;
+    esac
 }
 
 environment() {
@@ -243,9 +327,9 @@ prepare)
 summary)
     exec python3 "$here/summary.py" "$2"
     ;;
-ceiling | saturation | latency) ;;
+ceiling | saturation | latency | carrying) ;;
 *)
-    sed -n '2,14p' "$0" >&2
+    sed -n '2,15p' "$0" >&2
     exit 2
     ;;
 esac
@@ -282,6 +366,13 @@ saturation)
 latency)
     h1_rate=${2:?rate for h1} h2_rate=${3:?rate for h2} churn_rate=${4:?rate for churn}
     each_variant latency_runs
+    ;;
+carrying)
+    # Low rates: every one of these is about what an exchange holds and for how long
+    # rather than how many of them a worker gets through, and a body of megabytes at a
+    # thousand a second is the generator's measurement rather than the proxy's.
+    streamed_rate=${2:-20} slow_rate=${3:-100} h1_rate=${4:-10000}
+    each_variant carrying_runs
     ;;
 esac
 python3 "$here/summary.py" "$OUT"

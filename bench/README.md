@@ -26,6 +26,8 @@ bench/run.sh prepare                # performance governor, turbo off (sudo; unt
 bench/run.sh ceiling [H1 H2 CHURN]  # generators against the backend, no proxy
 bench/run.sh saturation             # closed loop: the most each model serves
 bench/run.sh latency 25000 25000 2000   # open loop at these rates: h1, h2, churn
+bench/run.sh carrying               # streamed bodies, a slow upstream, cancellation,
+                                    # reload under load, and what idle connections cost
 bench/run.sh summary bench/results/<run>
 ```
 
@@ -67,6 +69,12 @@ worth as much as the care that went into the other side.
 | `latency-h1` | oha, 256 connections, a fixed request rate | Latency (p50, p99, p99.9) at a load below the knee |
 | `latency-h2` | oha, 4 connections × 100 streams, a fixed rate | Latency on a few hot connections |
 | `churn` | oha, a new connection for every request, a fixed rate | The cost of accepting, and of a connection's first request |
+| `streamed-answer` | oha, a body of `STREAMED` bytes coming back | What the answer's path costs when it is carrying something rather than passing a few bytes along |
+| `streamed-request` | oha, the same body going out | The same for the request's path, where the body is read from the client and framed again |
+| `slow-upstream` | oha against a backend that trickles at 256 KiB/s | An exchange held open for as long as an upstream takes, and the clocks that decide it is still alive |
+| `cancelled` | the same, with a 200 ms timeout on every request | Clients that go away part way through an answer: everything the exchange holds has to go with them |
+| `reload` | oha at a steady rate while the config is taken over once a second | The one in [10 §1](../../docs/10-testing.md): no failed request while a config changes. EdgeRush only — the others would need their own reload, which is a different thing to measure |
+| `idle-memory` | `IDLE_CONNECTIONS` connections, answered and then left quiet | What a connection costs while nothing is happening on it, as the proxy's own resident memory |
 
 Every request goes through routing on a config with several hosts and rules and through a
 small filter chain (request and response header changes): `proxy.yaml`.
