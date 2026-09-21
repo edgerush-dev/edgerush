@@ -1473,7 +1473,7 @@ mod tests {
         let theirs = checked(Path::Theirs, &script, &ask);
         let ours_wire = String::from_utf8_lossy(&ours.tape.written).into_owned();
         let theirs_wire = String::from_utf8_lossy(&theirs.tape.written).into_owned();
-        // The second of the eleven differences, in the request direction and at the
+        // One of 13 section 5's differences, in the request direction and at the
         // client layer: RFC 9110 section 6.5 lets a recipient retain or discard
         // trailers, hyper's client puts none of them on the wire, and ours forwards
         // them so that end-to-end fields survive the hop.
@@ -1495,7 +1495,7 @@ mod tests {
         let ours = checked(Path::Ours, &script, &ask);
         let theirs = checked(Path::Theirs, &script, &ask);
 
-        // **A difference that is not one of the eleven in 13 section 5.** Ours stops
+        // One of the choices 13 section 5 lists as left open. Ours stops
         // uploading a body the answer has finished without, which is 13 section 5's
         // rule, and the connection goes with it. hyper's client sends the rest of the
         // request and keeps the connection. Neither is a violation: RFC 9112 section 9.5
@@ -1626,7 +1626,7 @@ mod tests {
             says("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2;=v\r\nhi\r\n0\r\n\r\n");
         let ours = checked(Path::Ours, &script, &Asking::Nothing);
         let theirs = checked(Path::Theirs, &script, &Asking::Nothing);
-        // The first of the eleven differences, and the one kind where a difference is a
+        // One of 13 section 5's differences, of the one kind where a difference is a
         // fault: RFC 9112 section 7.1.1 wants a name before any `=`, so this is not an
         // extension to be ignored but bytes that do not parse. Ours refuses; hyper's
         // client does not look, and presents a message the grammar does not have.
@@ -2118,8 +2118,8 @@ mod tests {
         assert!(matches!(ours.got, Got::Refused(_)), "{:?}", ours.got);
     }
 
-    /// Framing hyper's client reads and ours refuses, by §4's rules, that §5's list of
-    /// differences does not name yet. Measured here so that none is lost.
+    /// Framing hyper's client reads and ours refuses, by §4's rules. Each row is one of
+    /// 13 §5's differences, measured here so that none is lost.
     #[test]
     fn framing_hyper_reads_and_ours_refuses() {
         let zeros = format!(

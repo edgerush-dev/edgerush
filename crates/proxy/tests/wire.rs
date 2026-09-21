@@ -1709,8 +1709,8 @@ async fn a_body_sent_to_a_head_request_is_never_the_next_answer() {
 #[tokio::test]
 async fn an_answer_that_says_close_is_not_reused_though_the_socket_stays_open() {
     // An HTTP/1.0 answer that asks to be kept alive is kept by the engine's client, which
-    // RFC 9112 §9.3 allows; ours never pools a connection that speaks 1.0 (13 §4). A
-    // difference 13 §5 does not list yet.
+    // RFC 9112 §9.3 allows; ours never pools a connection that speaks 1.0 (13 §4), one
+    // of 13 §5's open choices.
     let kept_alive = match upstream_under_test() {
         Upstream::Ours => 2,
         Upstream::Hyper => 1,
