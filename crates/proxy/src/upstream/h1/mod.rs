@@ -12,6 +12,9 @@ pub mod pool;
 // The scripted peer the differential harness is driven from, and the bounded run it
 // happens under: for this crate's own tests and for the fuzz targets, which are a crate
 // of their own ([13 §8](../../../../docs/13-http1-upstream.md)).
+// The specification as code, for the harness to compare both clients against.
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod reference;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod script;
 
