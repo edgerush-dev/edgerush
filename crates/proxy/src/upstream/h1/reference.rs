@@ -627,11 +627,14 @@ fn read_chunked(bytes: &[u8], measured: &mut Measured) -> Result<Option<Chunked>
 ///
 /// A recipient must ignore an extension it does not recognise, which is about names
 /// nobody knows and not about bytes that are not an extension at all: there is no name
-/// in `;=v`, so it does not match the grammar and there is nothing there to ignore.
+/// in `;=v`, so it does not match the grammar and there is nothing there to ignore. The
+/// bad whitespace between the parts is in the grammar; whitespace after the last of them
+/// is not, so it is only consumed when a mark follows it.
 fn read_extensions(mut rest: &[u8]) -> Result<(), Invalid> {
     while !rest.is_empty() {
-        rest = skip_space(rest);
-        rest = rest.strip_prefix(b";").ok_or(Invalid::ChunkExtension)?;
+        rest = skip_space(rest)
+            .strip_prefix(b";")
+            .ok_or(Invalid::ChunkExtension)?;
         rest = skip_space(rest);
         let name = rest
             .iter()
@@ -640,11 +643,14 @@ fn read_extensions(mut rest: &[u8]) -> Result<(), Invalid> {
         if name == 0 {
             return Err(Invalid::ChunkExtension);
         }
-        rest = skip_space(&rest[name..]);
-        let Some(after) = rest.strip_prefix(b"=") else {
+        let after = &rest[name..];
+        let Some(value) = skip_space(after).strip_prefix(b"=") else {
+            // Whatever follows the name unskipped, so that trailing whitespace is left
+            // for the next turn of this loop to refuse.
+            rest = after;
             continue;
         };
-        rest = skip_space(after);
+        rest = skip_space(value);
         rest = match rest.first() {
             Some(b'"') => quoted(rest)?,
             _ => {
@@ -966,6 +972,11 @@ mod tests {
         let nameless =
             b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2;=v\r\nhi\r\n0\r\n\r\n";
         assert_eq!(refused(nameless), Invalid::ChunkExtension);
+        // Whitespace after the last extension is not in the grammar: every BWS it
+        // has comes before a mark, so there is none to end a line with.
+        let trailing =
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2;a \r\nhi\r\n0\r\n\r\n";
+        assert_eq!(refused(trailing), Invalid::ChunkExtension);
         // And a quoted value that never ends is not one.
         let unended =
             b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2;a=\"b\r\nhi\r\n0\r\n\r\n";

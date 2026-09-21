@@ -965,32 +965,33 @@ mod tests {
     }
 
     #[test]
-    fn bad_whitespace_in_a_chunk_extension_is_refused_by_ours_and_the_grammar_allows_it() {
+    fn bad_whitespace_in_a_chunk_extension_belongs_to_the_grammar() {
+        // RFC 9112 section 7.1.1 is
+        // `chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`,
+        // so the whitespace around the marks is part of the message. Refusing it cost a
+        // connection for a message that was not wrong, which is what this found.
         let script = says(
             "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2 ; a = \"b\"\r\nhi\r\n0\r\n\r\n",
         );
-        let ours = checked(Path::Ours, &script, &Asking::Nothing);
-        let theirs = checked(Path::Theirs, &script, &Asking::Nothing);
+        for path in [Path::Ours, Path::Theirs] {
+            let checked = checked(path, &script, &Asking::Nothing);
+            assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {checked:?}");
+            assert_eq!(seen(&checked).body, b"hi");
+            assert!(seen(&checked).kept, "{path:?} gave up a good connection");
+        }
 
-        // **A third difference that is not one of the eleven, and this one is a defect
-        // in ours.** RFC 9112 section 7.1.1 gives
-        // `chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`,
-        // so the whitespace around the `;` and the `=` is part of the grammar. Ours
-        // requires the `;` immediately and refuses the exchange; hyper's client does not
-        // look at extensions at all and reads the message.
-        //
-        // This test records what happens today rather than what should: the harness
-        // reporting ours as disagreeing with the specification is the finding, and it
-        // becomes the regression test for the fix by having its verdict flipped.
-        assert!(matches!(ours.expected.reading, reference::Reading::Read(_)));
-        assert!(
-            matches!(ours.verdict, Verdict::Disagrees(_)),
-            "the grammar's whitespace is accepted now, so this finding is fixed: {:?}",
-            ours.verdict
-        );
+        // Whitespace with no mark after it is not in the grammar, and ours refuses it
+        // still: what was fixed is the grammar, not a licence to skip whitespace
+        // wherever it turns up.
+        let trailing =
+            says("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2;a \r\nhi\r\n0\r\n\r\n");
+        let ours = checked(Path::Ours, &trailing, &Asking::Nothing);
+        assert!(matches!(
+            ours.expected.reading,
+            reference::Reading::Invalid(reference::Invalid::ChunkExtension)
+        ));
         assert!(matches!(ours.got, Got::Refused(_)), "{:?}", ours.got);
-        assert_eq!(theirs.verdict, Verdict::Agrees, "{theirs:?}");
-        assert_eq!(seen(&theirs).body, b"hi");
+        assert_eq!(ours.verdict, Verdict::Agrees, "{ours:?}");
     }
 
     #[test]

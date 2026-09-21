@@ -851,20 +851,47 @@ fn hex(line: &[u8]) -> Result<(u64, &[u8]), CodecError> {
     Ok((size, &line[digits..]))
 }
 
-/// What may follow a chunk's size: `;name` or `;name=value`, over and over, where a value
-/// is a token or a quoted string. None of it is acted on. It is checked because a line
-/// that is not read the same way twice is a line two readers can end in two places.
+/// What may follow a chunk's size, which
+/// [RFC 9112 §7.1.1](https://www.rfc-editor.org/rfc/rfc9112.html#section-7.1.1) gives as
+/// `chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`: `;name`
+/// or `;name=value`, over and over, where a value is a token or a quoted string and the
+/// bad whitespace between the parts belongs to the grammar.
+///
+/// None of it is acted on. It is checked because a line that is not read the same way
+/// twice is a line two readers can end in two places — and checked against the grammar
+/// and nothing stricter, because refusing a line the grammar allows costs a connection
+/// for a message that is not wrong.
 fn extensions(mut rest: &[u8]) -> Result<(), CodecError> {
     while !rest.is_empty() {
-        let after = rest.strip_prefix(b";").ok_or(CodecError::Chunk)?;
-        let (_name, after) = token(after)?;
-        rest = match after.strip_prefix(b"=") {
+        rest = bad_space(rest)
+            .strip_prefix(b";")
+            .ok_or(CodecError::Chunk)?;
+        let (_name, after) = token(bad_space(rest))?;
+        rest = match bad_space(after).strip_prefix(b"=") {
+            // No value, so nothing past the name is consumed: whitespace with no mark
+            // after it is whitespace the grammar ends without, and the next turn of this
+            // loop is what refuses it.
             None => after,
-            Some(value) if value.first() == Some(&b'"') => quoted(value)?,
-            Some(value) => token(value)?.1,
+            Some(value) => {
+                let value = bad_space(value);
+                if value.first() == Some(&b'"') {
+                    quoted(value)?
+                } else {
+                    token(value)?.1
+                }
+            }
         };
     }
     Ok(())
+}
+
+/// Past the bad whitespace an extension's grammar allows between its parts.
+fn bad_space(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t'))
+        .unwrap_or(bytes.len());
+    &bytes[start..]
 }
 
 /// One token, which is one or more `tchar`, and what follows it.
@@ -1937,6 +1964,13 @@ mod tests {
             b"5;a=\"b;c\"\r\nhello\r\n0\r\n\r\n",
             b"5;a=\"b\\\"c\"\r\nhello\r\n0\r\n\r\n",
             b"5;a;b=c\r\nhello\r\n0\r\n\r\n",
+            // Bad whitespace is part of the grammar: RFC 9112 7.1.1 is
+            // `chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`.
+            b"5 ;a\r\nhello\r\n0\r\n\r\n",
+            b"5; a\r\nhello\r\n0\r\n\r\n",
+            b"5;a =b\r\nhello\r\n0\r\n\r\n",
+            b"5;a= b\r\nhello\r\n0\r\n\r\n",
+            b"5 ; a = \"b\" ;c\r\nhello\r\n0\r\n\r\n",
         ];
         for bytes in good {
             let (body, _) = body_of(Framing::Chunked, bytes, false).unwrap();
@@ -1947,7 +1981,7 @@ mod tests {
             b"5;\r\nhello\r\n",      // A semicolon naming nothing.
             b"5;a=\r\nhello\r\n",    // A name with nothing after the equals.
             b"5;a=\"b\r\nhello\r\n", // A quoted string that never closes.
-            b"5 ;a\r\nhello\r\n",    // Space where none may be.
+            b"5;a \r\nhello\r\n",    // Whitespace the grammar ends without.
             b"5;a b\r\nhello\r\n",
             b"5x;a\r\nhello\r\n",
         ];
