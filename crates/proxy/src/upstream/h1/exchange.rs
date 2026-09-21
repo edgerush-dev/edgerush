@@ -55,6 +55,9 @@ pub enum ExchangeError {
     /// there is nothing to do but say so: it is never sent a second time.
     #[error("the upstream closed the connection without answering")]
     Closed,
+    /// The upstream had said something before it was asked anything.
+    #[error("the upstream said something before it was asked")]
+    Unsolicited,
     /// More interim answers than an exchange will wait through.
     #[error("the upstream sent more than {limit} interim answers")]
     TooManyInterim {
@@ -234,6 +237,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         B: Body<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
+        // Nothing may be waiting here before a byte of the request has gone. HTTP/1.1
+        // pairs an answer with the request that was outstanding when it arrived
+        // ([RFC 9112 §9.2](https://www.rfc-editor.org/rfc/rfc9112.html#section-9.2)), so
+        // bytes already on the socket answer no request of this end's, and sending the
+        // request now would pair them with a question nobody asked.
+        //
+        // An immediate look, and nothing more: it cannot catch bytes that race the first
+        // write, and it says nothing about bytes arriving later while an upload is still
+        // going out — an upstream answering early is doing exactly that and is allowed
+        // to ([13 §5](../../../docs/13-http1-upstream.md)).
+        if !nothing_to_say(&mut self.socket) {
+            return Err(ExchangeError::Unsolicited);
+        }
         let by = limits.final_head;
         let mut upload = Upload::new(body, sending, crate::hop_by_hop::nominated(headers));
         let asked = timeout(
@@ -1242,6 +1258,37 @@ mod tests {
         let head = String::from_utf8(head).unwrap();
         assert!(head.starts_with("GET /a?b=1 HTTP/1.1\r\n"), "{head}");
         assert!(head.contains("host: up.test\r\n"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_speaks_before_it_is_asked_is_refused() {
+        let (exchange, mut peer) = connected(4096);
+        // On the socket before a byte of the request has gone: said here, and not
+        // left to which end happens to be polled first.
+        peer.say("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+            .await;
+
+        let limits = H1Limits::default();
+        let error = exchange
+            .send(
+                &Method::GET,
+                &"/a".parse().unwrap(),
+                &headers(&[("host", "up.test")]),
+                Sending::None,
+                Empty::<Bytes>::new(),
+                &limits,
+            )
+            .await
+            .unwrap_err();
+
+        // An answer pairs with the request outstanding when it arrives, so bytes
+        // waiting here answer nothing this end sent.
+        assert!(matches!(error, ExchangeError::Unsolicited), "{error}");
+        // And the request never went out: the look comes before the write, which is
+        // what makes it a check on the connection rather than a race with one.
+        let mut sent = Vec::new();
+        peer.0.read_to_end(&mut sent).await.unwrap();
+        assert!(sent.is_empty(), "the request went out anyway: {sent:?}");
     }
 
     #[tokio::test]

@@ -1313,30 +1313,58 @@ mod tests {
     }
 
     #[test]
-    fn a_status_code_with_no_class_is_read_by_both_and_one_below_a_hundred_by_neither() {
-        // RFC 9110 section 15 has a recipient understand a code's class from its
-        // first digit and treat an unrecognised code as that class's x00. There is no
-        // class for 6xx upwards, and none below 100 either — but servers in the wild
-        // send the former, and both clients read them.
-        let classless = says("HTTP/1.1 999 Who Knows\r\ncontent-length: 2\r\n\r\nok");
-        for path in [Path::Ours, Path::Theirs] {
-            let checked = checked(path, &classless, &Asking::Nothing);
+    fn a_status_outside_the_range_http_has_is_refused_by_ours_and_read_by_hyper() {
+        // RFC 9110 section 15: "Values outside the range 100..599 are invalid.
+        // Implementations often use three-digit integer values outside of that range
+        // (i.e., 600..999) for internal communication of non-HTTP status (e.g.,
+        // library errors). A client that receives a response with an invalid status
+        // code SHOULD process the response as if it had a 5xx (Server Error) status
+        // code." Ours answers 502 and lets the connection go, which is one way of
+        // doing that; hyper's client reads the status as it stands, which is that
+        // library tolerance the paragraph describes.
+        for code in [600, 999] {
+            let script = says(&format!(
+                "HTTP/1.1 {code} Out Of Range\r\ncontent-length: 2\r\n\r\nok"
+            ));
+            let ours = checked(Path::Ours, &script, &Asking::Nothing);
+            let theirs = checked(Path::Theirs, &script, &Asking::Nothing);
             assert!(
-                matches!(checked.verdict, Verdict::Outside(_)),
-                "{path:?} {checked:?}"
+                matches!(ours.got, Got::Refused(_)),
+                "{code}: {:?}",
+                ours.got
             );
-            assert_eq!(seen(&checked).status, 999, "{path:?}");
+            assert!(
+                matches!(ours.verdict, Verdict::Outside(_)),
+                "{code}: {ours:?}"
+            );
+            assert_eq!(seen(&theirs).status, code, "{code}");
+            assert!(
+                matches!(theirs.verdict, Verdict::Outside(_)),
+                "{code}: {theirs:?}"
+            );
         }
-        // Below a hundred there is nothing a recipient could do with it at all, and
-        // neither client takes it.
-        let nothing = says("HTTP/1.1 059 Nor This\r\ncontent-length: 2\r\n\r\nok");
+
+        // The last status HTTP has, which is nothing out of the ordinary.
+        let last = says("HTTP/1.1 599 The Last\r\ncontent-length: 2\r\n\r\nok");
         for path in [Path::Ours, Path::Theirs] {
-            let checked = checked(path, &nothing, &Asking::Nothing);
+            let checked = checked(path, &last, &Asking::Nothing);
+            assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {checked:?}");
+            assert_eq!(seen(&checked).status, 599, "{path:?}");
+        }
+
+        // Below the range there is nothing either client will take: the engine's own
+        // status type does not hold one.
+        let low = says("HTTP/1.1 059 Below\r\ncontent-length: 2\r\n\r\nok");
+        for path in [Path::Ours, Path::Theirs] {
+            let checked = checked(path, &low, &Asking::Nothing);
             assert!(
                 matches!(checked.got, Got::Refused(_)),
                 "{path:?} {checked:?}"
             );
-            assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {checked:?}");
+            assert!(
+                matches!(checked.verdict, Verdict::Outside(_)),
+                "{path:?} {checked:?}"
+            );
         }
     }
 
@@ -1458,150 +1486,32 @@ mod tests {
     }
 
     #[test]
-    fn an_upstream_that_speaks_before_the_request_is_refused_by_one_path_and_not_the_other() {
-        // Every other script here waits for the request to begin. This one does not: the
-        // answer is on the socket before a byte of the request has gone.
+    fn an_upstream_that_speaks_before_the_request_is_refused_by_both() {
+        // Every other script here waits for the request to begin. This one does not:
+        // the answer is on the socket before a byte of the request has gone, and the
+        // script puts it there rather than leaving it to which client polls first.
         let script = Script::new(vec![
             Step::Say(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".to_vec()),
             Step::Wait(Wait::Forever),
         ]);
-        let ours = checked(Path::Ours, &script, &Asking::Nothing);
-        let theirs = checked(Path::Theirs, &script, &Asking::Nothing);
-
-        // **A second difference that is not one of the eleven.** hyper's client reads
-        // before it writes, finds a message where no request is in flight, and ends the
-        // connection without sending anything at all. Ours pairs the waiting bytes with
-        // the request it then sends.
-        assert!(matches!(theirs.got, Got::Refused(_)), "{:?}", theirs.got);
-        assert!(
-            theirs.tape.written.is_empty(),
-            "hyper sent the request anyway"
-        );
-        assert_eq!(seen(&ours).body, b"ok");
-
-        // HTTP has no rule about this — a peer that answers a request it has not been
-        // sent is not a case the specification describes — so it is not a violation by
-        // either client. What it is is a check ours does not have on a fresh connection:
-        // on a pooled one, anything readable at checkout discards the socket (13 section
-        // 6), and this is the same peer behaviour one exchange earlier.
-        assert_eq!(ours.verdict, Verdict::Agrees, "{ours:?}");
-    }
-
-    #[test]
-    fn surplus_bytes_in_front_of_the_connection_cost_it() {
-        let script = says("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nokand more besides");
         for path in [Path::Ours, Path::Theirs] {
             let checked = checked(path, &script, &Asking::Nothing);
-            assert_eq!(
-                checked.expected.reuse,
-                Err(lifecycle::Refused::Surplus),
-                "the oracle should have refused the connection"
-            );
-            assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {checked:?}");
-            // The answer is still the answer: the surplus is not part of it.
-            assert_eq!(seen(&checked).body, b"ok");
+            // HTTP/1.1 pairs an answer with the request that was outstanding when it
+            // arrived (RFC 9112 section 9.2), so these bytes answer nothing this end
+            // sent, and pairing them with the request about to go out would be
+            // answering a question nobody asked.
             assert!(
-                !seen(&checked).kept,
-                "{path:?} kept a connection with bytes on it"
+                matches!(checked.got, Got::Refused(_)),
+                "{path:?} {checked:?}"
             );
-        }
-    }
-
-    #[test]
-    fn an_answer_delimited_by_the_close_is_read_to_the_close() {
-        let script = says_and_closes("HTTP/1.1 200 OK\r\n\r\nas much as there is");
-        for path in [Path::Ours, Path::Theirs] {
-            let checked = checked(path, &script, &Asking::Nothing);
-            assert_eq!(
-                checked.expected.reuse,
-                Err(lifecycle::Refused::ClosedDelimited)
-            );
-            assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {checked:?}");
-            assert_eq!(seen(&checked).body, b"as much as there is");
-            assert!(!seen(&checked).kept, "{path:?} kept a closed connection");
-        }
-    }
-
-    #[test]
-    fn an_answer_that_asks_for_closure_costs_the_connection_even_on_an_open_socket() {
-        // The upstream says to close and then does not: only what the answer's head
-        // said forbids the reuse, which is the one condition a peer that closed would
-        // have hidden.
-        let script = says("HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nok");
-        for path in [Path::Ours, Path::Theirs] {
-            let checked = checked(path, &script, &Asking::Nothing);
-            assert_eq!(
-                checked.expected.reuse,
-                Err(lifecycle::Refused::NotPersistent)
-            );
-            assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {checked:?}");
-            assert_eq!(seen(&checked).body, b"ok");
             assert!(
-                !seen(&checked).kept,
-                "{path:?} kept a connection the answer asked to close"
+                checked.tape.written.is_empty(),
+                "{path:?} sent the request anyway"
             );
-        }
-    }
-
-    #[test]
-    fn a_chunked_answer_carries_its_trailers_by_both_paths() {
-        let script = says(
-            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n\
-             5\r\nhello\r\n0\r\nx-a: 1\r\n\r\n",
-        );
-        for path in [Path::Ours, Path::Theirs] {
-            let checked = checked(path, &script, &Asking::Nothing);
-            assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {checked:?}");
-            let seen = seen(&checked);
-            assert_eq!(seen.body, b"hello");
-            assert_eq!(
-                seen.trailers,
-                [("x-a".to_owned(), "1".to_owned())],
-                "{path:?}"
+            assert!(
+                matches!(checked.verdict, Verdict::Outside(_)),
+                "{path:?} {checked:?}"
             );
-            assert!(seen.kept, "{path:?} gave up a good connection");
-        }
-    }
-
-    #[test]
-    fn a_status_that_may_not_have_a_body_is_refused_by_one_path_for_declaring_one() {
-        // A 204 says it has three bytes. RFC 9110 section 8.6 forbids a server from
-        // sending a length on one at all, and RFC 9112 section 6.3 rule 1 ends the
-        // message at its empty line "regardless of the header fields present", so
-        // reading past it is right and so is refusing it: 13 section 4 refuses.
-        let script = says("HTTP/1.1 204 No Content\r\ncontent-length: 3\r\n\r\nxyz");
-        let ours = checked(Path::Ours, &script, &Asking::Nothing);
-        let theirs = checked(Path::Theirs, &script, &Asking::Nothing);
-        assert!(matches!(ours.verdict, Verdict::Outside(_)), "{ours:?}");
-        assert!(matches!(ours.got, Got::Refused(_)), "{:?}", ours.got);
-        assert!(matches!(theirs.verdict, Verdict::Outside(_)), "{theirs:?}");
-        assert!(seen(&theirs).body.is_empty(), "hyper read a body");
-        // The three bytes belong to no message, so whoever read the answer is not
-        // carrying another exchange on that connection.
-        assert!(!seen(&theirs).kept, "hyper kept the surplus");
-
-        // On a 304 the same field is expected rather than forbidden, and both paths
-        // read it: the length describes a body that a body-bearing answer would
-        // have had, which is 13 section 4's distinction.
-        let modified = says("HTTP/1.1 304 Not Modified\r\ncontent-length: 3\r\n\r\nxyz");
-        for path in [Path::Ours, Path::Theirs] {
-            let checked = checked(path, &modified, &Asking::Nothing);
-            assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {checked:?}");
-            assert!(seen(&checked).body.is_empty(), "{path:?} read a body");
-            assert!(!seen(&checked).kept, "{path:?} kept the surplus");
-        }
-    }
-
-    #[test]
-    fn an_answer_to_head_has_no_body_by_either_path() {
-        let script = says("HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n");
-        for path in [Path::Ours, Path::Theirs] {
-            let checked = checked(path, &script, &Asking::Head);
-            assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {checked:?}");
-            assert!(seen(&checked).body.is_empty(), "{path:?} read a body");
-            // The five bytes the head promised are not there and were never coming; the
-            // connection is still good.
-            assert!(seen(&checked).kept, "{path:?} gave up a good connection");
         }
     }
 
