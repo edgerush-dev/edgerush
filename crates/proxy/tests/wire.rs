@@ -1617,3 +1617,444 @@ async fn a_client_that_abandons_the_answer_costs_the_connection() {
         "an abandoned answer's connection"
     );
 }
+
+// ---- cases taken from other implementations' suites ----
+//
+// HAProxy's reg-tests, nginx's test suite, Envoy's, hyper's and Pingora's were read for
+// cases this suite lacked. The inputs are theirs; the tests are written for this path.
+
+/// A head that describes a body it does not send leaves nothing to wait for, and the
+/// connection for the next request. Every one of those suites tests this.
+#[tokio::test]
+async fn a_body_described_and_not_sent_leaves_the_connection_for_the_next_request() {
+    for (method, answer) in [
+        ("HEAD", "HTTP/1.1 200 OK\r\nContent-Length: 26\r\n\r\n"),
+        (
+            "HEAD",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ),
+        (
+            "GET",
+            "HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n",
+        ),
+        (
+            "GET",
+            "HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ),
+    ] {
+        let (backend, accepts) = counted(move |mut wire| async move {
+            if wire.until(b"\r\n\r\n").await.is_some() {
+                wire.write(answer).await;
+            }
+            plainly(wire).await;
+        });
+        let mut client = Wire::to(proxy_to(backend).await).await;
+        client
+            .write(&format!(
+                "{method} /first HTTP/1.1\r\nHost: example.test\r\n\r\n"
+            ))
+            .await;
+        let head = within(client.head()).await;
+        assert!(head.starts_with(&answer[..12]), "{answer:?}: {head}");
+
+        let head = asks(&mut client, "/second").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{answer:?}: {head}");
+        assert_eq!(within(client.body(5)).await, "fresh", "{answer:?}");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "{answer:?}: a finished answer's connection was not kept"
+        );
+    }
+}
+
+/// A body sent to a `HEAD` anyway is not the next answer, and the connection it came on
+/// is not lent again (HAProxy's `http_bodyless_response.vtc`, nginx's
+/// `proxy_extra_data.t`).
+#[tokio::test]
+async fn a_body_sent_to_a_head_request_is_never_the_next_answer() {
+    for answer in [
+        "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nskipped data",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    ] {
+        let (backend, accepts) = hostile_first(move |mut wire| async move {
+            if wire.until(b"\r\n\r\n").await.is_some() {
+                wire.write(answer).await;
+            }
+            // Still there, so that a connection wrongly kept would have something to give.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let mut client = Wire::to(proxy_to(backend).await).await;
+        client
+            .write("HEAD /first HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            .await;
+        let head = within(client.head()).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{answer:?}: {head}");
+
+        let head = asks(&mut client, "/second").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{answer:?}: {head}");
+        assert_eq!(within(client.body(5)).await, "fresh", "{answer:?}");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "{answer:?}: a kept connection"
+        );
+    }
+}
+
+/// An answer that says it closes is delivered at its length, without waiting for a close
+/// that may be slow to come, and its connection is not used again (nginx's
+/// `proxy_noclose.t` and `proxy_keepalive.t`). The upstream here keeps the socket open and
+/// goes on answering, so only the count of connections can tell.
+#[tokio::test]
+async fn an_answer_that_says_close_is_not_reused_though_the_socket_stays_open() {
+    // An HTTP/1.0 answer that asks to be kept alive is kept by the engine's client, which
+    // RFC 9112 §9.3 allows; ours never pools a connection that speaks 1.0 (13 §4). A
+    // difference 13 §5 does not list yet.
+    let kept_alive = match upstream_under_test() {
+        Upstream::Ours => 2,
+        Upstream::Hyper => 1,
+    };
+    for (answer, connections) in [
+        (
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nfresh",
+            2,
+        ),
+        ("HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nfresh", 2),
+        (
+            "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\nfresh",
+            kept_alive,
+        ),
+    ] {
+        let (backend, accepts) = counted(move |mut wire| async move {
+            while wire.until(b"\r\n\r\n").await.is_some() {
+                wire.write(answer).await;
+            }
+        });
+        let proxy = proxy_to(backend).await;
+        for path in ["/first", "/second"] {
+            // A client connection each: which version the answer is passed on in is the
+            // test below, and not this one's business.
+            let mut client = Wire::to(proxy).await;
+            let head = asks(&mut client, path).await;
+            assert!(head.contains(" 200 OK\r\n"), "{answer:?}: {head}");
+            assert_eq!(within(client.body(5)).await, "fresh", "{answer:?}");
+        }
+        assert_eq!(accepts.load(Ordering::SeqCst), connections, "{answer:?}");
+    }
+}
+
+/// An intermediary speaks its own version: "Intermediaries that process HTTP messages ...
+/// MUST send their own HTTP-version in forwarded messages" (RFC 9110 §6.2). An upstream
+/// that answers in HTTP/1.0 is answered on to an HTTP/1.1 client in HTTP/1.1. Found while
+/// writing the test above; both paths copy the upstream's version onto the answer.
+#[tokio::test]
+#[ignore = "defect on both paths: an upstream's HTTP/1.0 is passed on as the answer's version"]
+async fn an_answer_in_http_1_0_is_passed_on_in_the_proxys_own_version() {
+    let (backend, _accepts) = counted(|mut wire| async move {
+        while wire.until(b"\r\n\r\n").await.is_some() {
+            wire.write("HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nfresh")
+                .await;
+        }
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+    let head = asks(&mut client, "/first").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+}
+
+/// An idle connection the upstream resets, rather than closes, is as gone as one it
+/// closed, and the next request is answered on a connection of its own (Pingora's pool
+/// tests).
+#[tokio::test]
+async fn a_connection_reset_while_idle_is_not_handed_to_the_next_request() {
+    let (backend, accepts) = hostile_first(|mut wire| async move {
+        if wire.until(b"\r\n\r\n").await.is_some() {
+            wire.write(FRESH).await;
+        }
+        // Not before the answer has been read: a reset throws away what the other end has
+        // not read yet, on Windows at least, and the answer would go with it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // A linger of nothing makes the close a reset. It cannot block, which is what the
+        // deprecation is about.
+        #[expect(deprecated, reason = "a zero linger is how a test sends a reset")]
+        wire.stream.set_linger(Some(Duration::ZERO)).unwrap();
+    });
+    let mut client = Wire::to(proxy_to(backend).await).await;
+
+    assert!(
+        asks(&mut client, "/first")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert_eq!(within(client.body(5)).await, "fresh");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let head = asks(&mut client, "/second").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(within(client.body(5)).await, "fresh");
+    assert_eq!(accepts.load(Ordering::SeqCst), 2, "a reset connection");
+}
+
+/// A request whose `Connection` names its own framing field still goes upstream with
+/// exactly one framing and the whole body: the field is hop-by-hop, but the framing is
+/// the serialiser's to choose, not the headers' (Pingora's `test_upstream.rs`).
+#[tokio::test]
+async fn a_request_that_nominates_its_own_framing_still_arrives_whole() {
+    for (named, framing, body) in [
+        ("Content-Length", "Content-Length: 5\r\n", "hello"),
+        (
+            "Transfer-Encoding",
+            "Transfer-Encoding: chunked\r\n",
+            "5\r\nhello\r\n0\r\n\r\n",
+        ),
+    ] {
+        let (saw, mut seen) = reporter();
+        let upstream = raw_upstream(move |mut wire| {
+            let saw = saw.clone();
+            async move {
+                let head = wire.head().await;
+                let lower = head.to_ascii_lowercase();
+                let body = if lower.contains("transfer-encoding: chunked") {
+                    wire.chunked_body().await
+                } else if lower.contains("content-length: 5") {
+                    wire.body(5).await
+                } else {
+                    String::new()
+                };
+                saw.send(format!("{head}{body}")).unwrap();
+                wire.write(FRESH).await;
+            }
+        });
+        let mut client = Wire::to(proxy_to(upstream).await).await;
+        client
+            .write(&format!(
+                "POST / HTTP/1.1\r\nHost: example.test\r\nConnection: {named}\r\n{framing}\r\n{body}"
+            ))
+            .await;
+        let head = within(client.head()).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{named}: {head}");
+
+        let seen = within(seen.recv()).await.unwrap().to_ascii_lowercase();
+        let framings =
+            seen.matches("content-length:").count() + seen.matches("transfer-encoding:").count();
+        assert_eq!(framings, 1, "{named}: {seen}");
+        assert!(!seen.contains("\r\nconnection:"), "{named}: {seen}");
+        assert!(seen.contains("hello"), "{named}: {seen}");
+    }
+}
+
+/// Trailer sections that are not fields fail the exchange, on the wire as in the codec
+/// (HAProxy's `http_transfer_encoding.vtc`).
+#[tokio::test]
+async fn a_trailer_section_that_is_not_fields_is_refused() {
+    for trailer in [
+        "x tlr: value\r\n",
+        ":status: 200\r\n",
+        "x-a: val\rue\r\n",
+        "x-a: 1\r\n folded\r\n",
+        "x-a: \x00\r\n",
+    ] {
+        never_finished(format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n{trailer}\r\n"
+        ))
+        .await;
+    }
+}
+
+/// A `POST` that says it carries nothing still says so upstream. RFC 9110 §8.6 has a user
+/// agent send a length for a method that defines a meaning for content, some servers
+/// answer 411 without one, and the message that arrived had it (HAProxy's
+/// `h1_to_h1.vtc`). The engine's client keeps it.
+#[tokio::test]
+#[ignore = "defect on our own path: a request's length of zero is dropped"]
+async fn a_post_of_nothing_still_says_its_length() {
+    let (saw, mut seen) = reporter();
+    let upstream = raw_upstream(move |mut wire| {
+        let saw = saw.clone();
+        async move {
+            saw.send(wire.head().await).unwrap();
+            wire.write(FRESH).await;
+        }
+    });
+    let mut client = Wire::to(proxy_to(upstream).await).await;
+    client
+        .write("POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: 0\r\n\r\n")
+        .await;
+    within(client.head()).await;
+    let seen = within(seen.recv()).await.unwrap().to_ascii_lowercase();
+    assert!(seen.contains("content-length: 0\r\n"), "{seen}");
+}
+
+// ---- HTTP/2 in, HTTP/1.1 out ----
+
+/// A request body for an HTTP/2 client: nothing at all, or nothing after a pause, which
+/// is a HEADERS frame without END_STREAM followed by an empty DATA frame that has it.
+#[derive(Debug)]
+enum Upload {
+    None,
+    EmptyLater(std::pin::Pin<Box<tokio::time::Sleep>>),
+}
+
+impl hyper::body::Body for Upload {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+        match &mut *self {
+            Self::None => std::task::Poll::Ready(None),
+            Self::EmptyLater(sleep) => sleep.as_mut().poll(cx).map(|()| None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// An HTTP/2 connection to the proxy, made here rather than taken from a pool.
+async fn h2_to(proxy: SocketAddr) -> hyper::client::conn::http2::SendRequest<Upload> {
+    let stream = TcpStream::connect(proxy).await.unwrap();
+    let (sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .unwrap();
+    tokio::spawn(connection);
+    sender
+}
+
+/// An upstream that reports each request's head, and whatever chunked body followed it
+/// within a second, and answers plainly.
+fn reporting_upstream() -> (SocketAddr, mpsc::UnboundedReceiver<String>) {
+    let (saw, seen) = reporter();
+    let upstream = raw_upstream(move |mut wire| {
+        let saw = saw.clone();
+        async move {
+            while let Some(head) = wire.until(b"\r\n\r\n").await {
+                let head = String::from_utf8(head).unwrap();
+                let chunked = head
+                    .to_ascii_lowercase()
+                    .contains("transfer-encoding: chunked");
+                let body = if chunked {
+                    tokio::time::timeout(Duration::from_secs(1), wire.until(b"0\r\n\r\n"))
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|body| String::from_utf8(body).unwrap())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                saw.send(format!("{head}{body}")).unwrap();
+                wire.write(FRESH).await;
+            }
+        }
+    });
+    (upstream, seen)
+}
+
+/// A request whose HEADERS frame ends the stream has no body, and goes upstream with no
+/// framing at all (nginx's `h2_request_body.t`).
+#[tokio::test]
+async fn an_http2_request_that_ends_with_its_headers_goes_up_with_no_framing() {
+    let (upstream, mut seen) = reporting_upstream();
+    let proxy = proxy_to(upstream).await;
+    let mut sender = h2_to(proxy).await;
+    let request = http::Request::post(format!("http://{proxy}/x"))
+        .body(Upload::None)
+        .unwrap();
+    let answer = within(sender.send_request(request)).await.unwrap();
+    assert_eq!(answer.status(), 200);
+    let seen = within(seen.recv()).await.unwrap().to_ascii_lowercase();
+    assert!(!seen.contains("content-length"), "{seen}");
+    assert!(!seen.contains("transfer-encoding"), "{seen}");
+}
+
+/// A request whose body turns out to be empty only when its stream ends: no length was
+/// ever said, so it is framed in chunks and ended by one (13 §4: "do not infer absence
+/// merely from a missing CL on H2"; nginx's `h2_proxy_request_buffering.t`). The engine's
+/// client takes a body already over as an absent one, which is one of 13 §5's differences.
+#[tokio::test]
+async fn an_http2_request_that_ends_with_an_empty_frame_is_ended_in_chunks() {
+    let (upstream, mut seen) = reporting_upstream();
+    let proxy = proxy_to(upstream).await;
+    let mut sender = h2_to(proxy).await;
+    let later = Upload::EmptyLater(Box::pin(tokio::time::sleep(Duration::from_millis(200))));
+    let request = http::Request::post(format!("http://{proxy}/x"))
+        .body(later)
+        .unwrap();
+    let answer = within(sender.send_request(request)).await.unwrap();
+    assert_eq!(answer.status(), 200);
+    let seen = within(seen.recv()).await.unwrap().to_ascii_lowercase();
+    assert!(!seen.contains("content-length"), "{seen}");
+    match upstream_under_test() {
+        Upstream::Ours => {
+            assert!(seen.contains("transfer-encoding: chunked\r\n"), "{seen}");
+            assert!(seen.ends_with("\r\n\r\n0\r\n\r\n"), "{seen}");
+        }
+        Upstream::Hyper => assert!(seen.ends_with("\r\n\r\n"), "{seen}"),
+    }
+}
+
+/// An answer of trailers and no data reaches an HTTP/2 client as HEADERS and trailers,
+/// with no DATA frame between them (nginx's `h2_trailers.t`).
+#[tokio::test]
+async fn an_answer_of_trailers_alone_reaches_an_http2_client_as_trailers() {
+    let upstream = raw_upstream(|mut wire| async move {
+        wire.head().await;
+        wire.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nx-var: v\r\n\r\n")
+            .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+    let proxy = proxy_to(upstream).await;
+    let mut sender = h2_to(proxy).await;
+    let request = http::Request::get(format!("http://{proxy}/x"))
+        .header("te", "trailers")
+        .body(Upload::None)
+        .unwrap();
+    let answer = within(sender.send_request(request)).await.unwrap();
+    assert_eq!(answer.status(), 200);
+    let mut body = answer.into_body();
+    let mut data = 0;
+    let mut trailers = None;
+    while let Some(frame) = within(http_body_util::BodyExt::frame(&mut body)).await {
+        match frame.unwrap().into_data() {
+            Ok(bytes) => data += bytes.len(),
+            Err(frame) => trailers = frame.into_trailers().ok(),
+        }
+    }
+    assert_eq!(data, 0);
+    assert_eq!(trailers.expect("trailers")["x-var"], "v");
+}
+
+/// A chunked answer that says it closes, sent a piece at a time and closed straight
+/// after its last chunk, reaches an HTTP/2 client whole and ended cleanly (HAProxy's
+/// `truncated.vtc`).
+#[tokio::test]
+async fn a_chunked_answer_closed_right_after_its_end_reaches_an_http2_client_whole() {
+    let upstream = raw_upstream(|mut wire| async move {
+        wire.head().await;
+        wire.write("HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await;
+        let chunk = format!("32f\r\n{}\r\n", "x".repeat(815));
+        for _ in 0..20 {
+            wire.write(&chunk).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        wire.write("0\r\n\r\n").await;
+        // And closed, which the return does.
+    });
+    let proxy = proxy_to(upstream).await;
+    let mut sender = h2_to(proxy).await;
+    let request = http::Request::get(format!("http://{proxy}/x"))
+        .body(Upload::None)
+        .unwrap();
+    let answer = within(sender.send_request(request)).await.unwrap();
+    assert_eq!(answer.status(), 200);
+    let body = within(http_body_util::BodyExt::collect(answer.into_body()))
+        .await
+        .expect("a body that ended cleanly");
+    assert_eq!(body.to_bytes().len(), 20 * 815);
+}
