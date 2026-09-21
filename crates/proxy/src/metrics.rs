@@ -46,6 +46,83 @@ const HEAD_TIME_BOUNDS: [u64; 14] = [
 
 const CLASSES: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
 
+/// Why an exchange by EdgeRush's own path ended without an answer.
+///
+/// A fixed list, and what a counter is labelled with is a name from it: an upstream
+/// cannot invent a new series by failing in a new way, and no error text or address ever
+/// reaches a label ([13 §7](../../docs/13-http1-upstream.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stopped {
+    /// What the upstream said could not be read.
+    Codec,
+    /// The connection itself failed.
+    Io,
+    /// The request's own body could not be read.
+    RequestBody,
+    /// The upstream went away without answering.
+    Closed,
+    /// The upstream said something before it was asked anything.
+    Unsolicited,
+    /// More interim answers, or longer ones, than an exchange will wait through.
+    Interim,
+    /// No final head within the time an exchange has for one.
+    TooSlow,
+    /// Whatever was being waited for stopped happening for long enough.
+    Idle,
+}
+
+impl Stopped {
+    /// The name this reason is counted under.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Codec => "codec",
+            Self::Io => "io",
+            Self::RequestBody => "request_body",
+            Self::Closed => "closed",
+            Self::Unsolicited => "unsolicited",
+            Self::Interim => "interim",
+            Self::TooSlow => "too_slow",
+            Self::Idle => "idle",
+        }
+    }
+
+    /// Every one of them, for a scrape that shows a series whether it has happened or not.
+    const ALL: [Self; 8] = [
+        Self::Codec,
+        Self::Io,
+        Self::RequestBody,
+        Self::Closed,
+        Self::Unsolicited,
+        Self::Interim,
+        Self::TooSlow,
+        Self::Idle,
+    ];
+}
+
+/// What became of a connection to an upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Socket {
+    /// Opened for this exchange, there being none to take.
+    Opened,
+    /// Taken from what the worker was keeping.
+    Reused,
+    /// Dropped rather than used or kept: it had something to say at checkout, or its age
+    /// or idleness had run out.
+    Discarded,
+}
+
+impl Socket {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Opened => "opened",
+            Self::Reused => "reused",
+            Self::Discarded => "discarded",
+        }
+    }
+
+    const ALL: [Self; 3] = [Self::Opened, Self::Reused, Self::Discarded];
+}
+
 /// Why the data plane answered a request itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Answer {
@@ -150,6 +227,11 @@ pub(crate) struct UpstreamCounters {
     pub(crate) requests: Counter,
     responses: [Counter; 5],
     pub(crate) failures: Counter,
+    /// Answers whose head was handed on and whose body then failed. Counted apart from
+    /// `failures`, which is answers that never arrived: by the time one of these happens
+    /// the status has been counted and the client has been told
+    /// ([13 §7](../../docs/13-http1-upstream.md)).
+    pub(crate) body_failures: Counter,
 }
 
 impl UpstreamCounters {
@@ -179,6 +261,47 @@ pub(crate) struct Metrics {
     pub(crate) reloads: Counter,
     /// Seconds since the Unix epoch; zero before the first reload.
     pub(crate) last_reload: AtomicU64,
+    /// Exchanges of EdgeRush's own that ended without an answer, by reason.
+    stopped: Sharded<[Counter; 8]>,
+    /// What became of the connections a worker used, by which of the three it was.
+    connections: Sharded<[Counter; 3]>,
+    /// What each worker has in hand, sampled by the worker itself as it sweeps.
+    workers: Sharded<WorkerGauges>,
+}
+
+/// What one worker holds at the moment it last looked. Sampled rather than kept up to
+/// date on the request path: a gauge is for how much there is now, and a sweep already
+/// walks everything this asks about.
+#[derive(Debug, Default)]
+pub(crate) struct WorkerGauges {
+    /// Exchanges in hand, from before a connection is looked for until the answer's body
+    /// has been let go of.
+    exchanges: Gauge,
+    /// Connections the worker is keeping for an upstream to be asked again.
+    idle: Gauge,
+}
+
+impl WorkerGauges {
+    /// What this worker holds now. A gauge counts up and down rather than being told a
+    /// number, so what it is given is the difference from what it last said.
+    pub(crate) fn holding(&self, exchanges: usize, idle: usize) {
+        move_to(&self.exchanges, exchanges);
+        move_to(&self.idle, idle);
+    }
+}
+
+/// Moves a gauge to `now`, a step at a time in whichever direction.
+fn move_to(gauge: &Gauge, now: usize) {
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
+    let mut was = gauge.get();
+    while was < now {
+        gauge.inc();
+        was += 1;
+    }
+    while was > now {
+        gauge.dec();
+        was -= 1;
+    }
 }
 
 impl Metrics {
@@ -190,7 +313,29 @@ impl Metrics {
             slots: Mutex::default(),
             reloads: Counter::default(),
             last_reload: AtomicU64::new(0),
+            stopped: Sharded::new(shards),
+            connections: Sharded::new(shards),
+            workers: Sharded::new(shards),
         }
+    }
+
+    /// Counts an exchange of our own that ended without an answer.
+    pub(crate) fn stopped(&self, why: Stopped) {
+        if let Some(counter) = self.stopped.local().get(why as usize) {
+            counter.inc();
+        }
+    }
+
+    /// Counts what became of a connection.
+    pub(crate) fn socket(&self, what: Socket) {
+        if let Some(counter) = self.connections.local().get(what as usize) {
+            counter.inc();
+        }
+    }
+
+    /// This worker's gauges, for it to say what it is holding.
+    pub(crate) fn worker(&self) -> &WorkerGauges {
+        self.workers.local()
     }
 
     /// This thread's shard of a listener's counters.
@@ -343,6 +488,51 @@ impl Metrics {
             let labels = [("upstream", upstream)];
             scrape.sample(name, &labels, series.sum(|shard| shard.failures.get()));
         }
+
+        let name = "edgerush_upstream_body_failures_total";
+        let help = "Answers whose head was handed on and whose body then failed.";
+        scrape.family(name, Kind::Counter, help);
+        for (upstream, series) in upstreams() {
+            let labels = [("upstream", upstream)];
+            scrape.sample(name, &labels, series.sum(|shard| shard.body_failures.get()));
+        }
+
+        let name = "edgerush_upstream_exchanges_stopped_total";
+        let help = "Exchanges by EdgeRush's own path that ended without an answer.";
+        scrape.family(name, Kind::Counter, help);
+        for why in Stopped::ALL {
+            let labels = [("reason", why.name())];
+            let count = |shard: &[Counter; 8]| shard[why as usize].get();
+            scrape.sample(name, &labels, self.stopped.sum(count));
+        }
+
+        let name = "edgerush_upstream_connections_total";
+        let help = "Connections to upstreams, by what became of each.";
+        scrape.family(name, Kind::Counter, help);
+        for what in Socket::ALL {
+            let labels = [("state", what.name())];
+            let count = |shard: &[Counter; 3]| shard[what as usize].get();
+            scrape.sample(name, &labels, self.connections.sum(count));
+        }
+
+        let name = "edgerush_upstream_exchanges_active";
+        let help = "Exchanges a worker has in hand, as its last sweep found them.";
+        scrape.family(name, Kind::Gauge, help);
+        scrape.sample(
+            name,
+            &[],
+            self.workers
+                .sum(|shard| shard.exchanges.get().max(0).cast_unsigned()),
+        );
+        let name = "edgerush_upstream_connections_idle";
+        let help = "Connections a worker is keeping, as its last sweep found them.";
+        scrape.family(name, Kind::Gauge, help);
+        scrape.sample(
+            name,
+            &[],
+            self.workers
+                .sum(|shard| shard.idle.get().max(0).cast_unsigned()),
+        );
 
         let name = "edgerush_config_reloads_total";
         scrape.family(name, Kind::Counter, "Configs taken over while running.");

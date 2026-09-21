@@ -16,7 +16,7 @@
 //! the pool of upstream connections to come, above all.
 
 use crate::hop_by_hop::strip_response;
-use crate::metrics::{Answer, Metrics};
+use crate::metrics::{Answer, Metrics, Socket, Stopped};
 use crate::random::random;
 use crate::request::decide;
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
@@ -82,11 +82,11 @@ enum Body {
     /// The upstream's answer, as the engine's client reads it, and what that answer's
     /// own `Connection` named. The names are kept because the trailers have not arrived
     /// yet and the head they were read from will be gone by the time they do.
-    Upstream(Incoming, Vec<HeaderName>),
+    Upstream(Incoming, Vec<HeaderName>, Watch),
     /// The upstream's answer, as EdgeRush's own path reads it. In a box because it is
     /// much the larger of the two, and every answer would otherwise carry room for it.
     /// It carries its exchange's place with it: the exchange is over when this is.
-    Ours(Box<H1Body<TcpStream, Incoming>>, Admitted),
+    Ours(Box<H1Body<TcpStream, Incoming>>, Admitted, Watch),
     /// An answer of the data plane's own. It has no body, and never will have one.
     Empty,
 }
@@ -104,6 +104,45 @@ fn filtered(frame: Frame<Bytes>, nominated: &[HeaderName]) -> Frame<Bytes> {
             Frame::trailers(fields)
         }
         Err(frame) => frame,
+    }
+}
+
+/// Which of the named reasons an exchange stopped for.
+///
+/// A fixed list on purpose: an upstream that fails in a new way must not be able to make
+/// a new series, and no error text reaches a label
+/// ([13 §7](../../docs/13-http1-upstream.md)).
+fn why_stopped(error: &ExchangeError) -> Stopped {
+    match error {
+        ExchangeError::Codec(_) => Stopped::Codec,
+        ExchangeError::Io(_) => Stopped::Io,
+        ExchangeError::RequestBody(_) => Stopped::RequestBody,
+        ExchangeError::Closed => Stopped::Closed,
+        ExchangeError::Unsolicited => Stopped::Unsolicited,
+        ExchangeError::TooManyInterim { .. } | ExchangeError::InterimTooLong { .. } => {
+            Stopped::Interim
+        }
+        ExchangeError::TooSlow { .. } => Stopped::TooSlow,
+        ExchangeError::Idle { .. } => Stopped::Idle,
+    }
+}
+
+/// Where a body says that it failed.
+///
+/// Carried by the body because that is where a failure after the head happens: by then
+/// the status has been counted and the client has been told, so nothing else is left to
+/// notice ([13 §7](../../docs/13-http1-upstream.md)).
+#[derive(Debug, Clone)]
+struct Watch {
+    proxy: Arc<Proxy>,
+    upstream: usize,
+}
+
+impl Watch {
+    fn body_failed(&self) {
+        if let Some(counters) = self.proxy.metrics.upstream(self.upstream) {
+            counters.body_failures.inc();
+        }
     }
 }
 
@@ -126,16 +165,19 @@ impl HttpBody for Body {
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         match self.get_mut() {
-            Self::Upstream(incoming, nominated) => {
+            Self::Upstream(incoming, nominated, watch) => {
                 Pin::new(incoming).poll_frame(context).map(|frame| {
                     frame.map(|frame| {
                         frame
                             .map(|frame| filtered(frame, nominated))
-                            .map_err(BodyError::Upstream)
+                            .map_err(|error| {
+                                watch.body_failed();
+                                BodyError::Upstream(error)
+                            })
                     })
                 })
             }
-            Self::Ours(ours, _place) => {
+            Self::Ours(ours, _place, watch) => {
                 let frame = Pin::new(&mut *ours).poll_frame(context);
                 // The moment the answer is known to be over, which for a body of known
                 // length is its last frame and not some later poll: a client told how
@@ -144,7 +186,14 @@ impl HttpBody for Body {
                 if ours.is_end_stream() {
                     ours.settle();
                 }
-                frame.map(|frame| frame.map(|frame| frame.map_err(BodyError::Ours)))
+                frame.map(|frame| {
+                    frame.map(|frame| {
+                        frame.map_err(|error| {
+                            watch.body_failed();
+                            BodyError::Ours(error)
+                        })
+                    })
+                })
             }
             Self::Empty => Poll::Ready(None),
         }
@@ -152,16 +201,16 @@ impl HttpBody for Body {
 
     fn is_end_stream(&self) -> bool {
         match self {
-            Self::Upstream(incoming, _nominated) => incoming.is_end_stream(),
-            Self::Ours(ours, _place) => ours.is_end_stream(),
+            Self::Upstream(incoming, ..) => incoming.is_end_stream(),
+            Self::Ours(ours, ..) => ours.is_end_stream(),
             Self::Empty => true,
         }
     }
 
     fn size_hint(&self) -> SizeHint {
         match self {
-            Self::Upstream(incoming, _nominated) => incoming.size_hint(),
-            Self::Ours(ours, _place) => ours.size_hint(),
+            Self::Upstream(incoming, ..) => incoming.size_hint(),
+            Self::Ours(ours, ..) => ours.size_hint(),
             Self::Empty => SizeHint::with_exact(0),
         }
     }
@@ -440,7 +489,16 @@ impl Worker {
             tokio::time::sleep(every).await;
             // Borrowed for the sweep and let go of before anything is waited on again.
             let swept = self.pool.borrow_mut().sweep(&self.limits);
-            let _counted_when_there_are_counters = swept;
+            let metrics = &self.proxy.metrics;
+            for _discarded in 0..swept {
+                metrics.socket(Socket::Discarded);
+            }
+            // What this worker holds at the moment it last looked. A sweep already walks
+            // everything these ask about, so nothing is counted on the request path for
+            // them ([13 §7](../../docs/13-http1-upstream.md)).
+            metrics
+                .worker()
+                .holding(self.in_flight.get(), self.idle_connections());
         }
     }
 
@@ -507,10 +565,17 @@ impl Worker {
                 kept = Some((socket, opened));
                 break;
             }
+            // Anything readable is an upstream saying something nobody asked for, and the
+            // socket goes rather than being lent again.
+            self.proxy.metrics.socket(Socket::Discarded);
         }
         let (socket, opened) = match kept {
-            Some(reused) => reused,
+            Some(reused) => {
+                self.proxy.metrics.socket(Socket::Reused);
+                reused
+            }
             None => {
+                self.proxy.metrics.socket(Socket::Opened);
                 let opening = TcpStream::connect(identity.address());
                 let socket = match tokio::time::timeout(self.limits.connect, opening).await {
                     Ok(socket) => socket?,
@@ -637,7 +702,13 @@ impl Worker {
         filter_declaration(&mut head.headers, &nominated);
 
         let answered = match self.proxy.upstream {
-            Upstream::Hyper => self.by_hyper(head, body).await,
+            Upstream::Hyper => {
+                let watch = Watch {
+                    proxy: Arc::clone(&self.proxy),
+                    upstream: directed.upstream_slot,
+                };
+                self.by_hyper(head, body, watch).await
+            }
             Upstream::Ours => {
                 // Before anything is looked for or opened: a place is what entitles a
                 // request to a connection, so it is taken before one is sought.
@@ -671,7 +742,12 @@ impl Worker {
     }
 
     /// By the engine's client, which is what has always carried these requests.
-    async fn by_hyper(&self, head: Parts, body: Incoming) -> Option<(response::Parts, Body)> {
+    async fn by_hyper(
+        &self,
+        head: Parts,
+        body: Incoming,
+        watch: Watch,
+    ) -> Option<(response::Parts, Body)> {
         let response = self
             .client
             .request(Request::from_parts(head, body))
@@ -694,7 +770,7 @@ impl Worker {
         let nominated = crate::hop_by_hop::nominated(&head.headers);
         // What may not travel on is not declared onwards either.
         filter_declaration(&mut head.headers, &nominated);
-        Some((head, Body::Upstream(body, nominated)))
+        Some((head, Body::Upstream(body, nominated, watch)))
     }
 
     /// By EdgeRush's own path. Never after the other has been tried: by the time one has
@@ -709,7 +785,7 @@ impl Worker {
         body: Incoming,
         admitted: Admitted,
     ) -> Option<(response::Parts, Body)> {
-        let answer = self
+        let answer = match self
             .through_h1(
                 &directed.endpoint,
                 &head.method,
@@ -720,7 +796,13 @@ impl Worker {
                 body,
             )
             .await
-            .ok()?;
+        {
+            Ok(answer) => answer,
+            Err(error) => {
+                self.proxy.metrics.stopped(why_stopped(&error));
+                return None;
+            }
+        };
         let (read, mut body) = answer;
         // Nothing need ever poll an empty body, so its connection would otherwise sit
         // until the body object was dropped.
@@ -733,7 +815,11 @@ impl Worker {
         parts.headers = read.headers;
         // The place goes with the body, which is what is still being worked on. Every
         // other way out of here has dropped it already.
-        Some((parts, Body::Ours(Box::new(body), admitted)))
+        let watch = Watch {
+            proxy: Arc::clone(&self.proxy),
+            upstream: directed.upstream_slot,
+        };
+        Some((parts, Body::Ours(Box::new(body), admitted, watch)))
     }
 }
 
@@ -1078,6 +1164,189 @@ upstreams:
                 assert_eq!(connections_for(by, 1, 3).await, 1, "{by:?} keeping one");
             }
         }));
+    }
+
+    /// What became of every connection is counted, and so is a worker's own holding.
+    /// A benchmark that cannot tell a reused connection from a fresh one is measuring
+    /// the wrong thing ([13 §7](../../docs/13-http1-upstream.md)).
+    #[test]
+    fn what_became_of_a_connection_is_counted() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let (upstream, _opened) = counting_upstream().await;
+            let proxy = sending_to_by(upstream, Upstream::Ours);
+            let worker = Worker::with_limits(Arc::clone(&proxy), H1Limits::default());
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+
+            for _ in 0..3 {
+                assert_eq!(status_over_http1(front).await, StatusCode::OK);
+            }
+            // One connection opened for the first request, and taken again for the rest.
+            let scrape = proxy.metrics.render(&["web".to_owned()], &[]);
+            assert!(
+                scrape.contains(
+                    "edgerush_upstream_connections_total{state=\"opened\"} 1
+"
+                ),
+                "{scrape}"
+            );
+            assert!(
+                scrape.contains(
+                    "edgerush_upstream_connections_total{state=\"reused\"} 2
+"
+                ),
+                "{scrape}"
+            );
+            // And what the worker holds, which it says as it sweeps.
+            proxy
+                .metrics
+                .worker()
+                .holding(worker.in_flight.get(), worker.idle_connections());
+            let scrape = proxy.metrics.render(&["web".to_owned()], &[]);
+            assert!(
+                scrape.contains(
+                    "edgerush_upstream_connections_idle 1
+"
+                ),
+                "{scrape}"
+            );
+        }));
+    }
+
+    /// An exchange that ends without an answer says which of the named reasons it
+    /// was. The names are a fixed list: an upstream that fails in a new way does not
+    /// get to make a new series, and no error text reaches a label.
+    #[test]
+    fn why_an_exchange_stopped_is_counted_by_a_name_of_ours() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            // An upstream that waits to be asked and then says something that is not
+            // an answer.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut asked = [0; 1024];
+                        let _read = stream.read(&mut asked).await;
+                        let _said = stream.write_all(b"nonsense\r\n\r\n").await;
+                    });
+                }
+            });
+
+            let proxy = sending_to_by(upstream, Upstream::Ours);
+            let worker = Worker::with_limits(Arc::clone(&proxy), H1Limits::default());
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+
+            assert_eq!(status_over_http1(front).await, StatusCode::BAD_GATEWAY);
+            let up = proxy.metrics.upstream_slot("up");
+            let scrape = proxy.metrics.render(&["web".to_owned()], &[("up", up)]);
+            assert!(
+                scrape.contains("edgerush_upstream_exchanges_stopped_total{reason=\"codec\"} 1\n"),
+                "{scrape}"
+            );
+            // And the answer never arrived, so nothing counted it as a body that
+            // failed part way: the two are different things.
+            assert!(
+                scrape.contains("edgerush_upstream_body_failures_total{upstream=\"up\"} 0\n"),
+                "{scrape}"
+            );
+        }));
+    }
+
+    /// A body that fails after its head has gone is counted where nothing else
+    /// would notice it: the status was counted as a success and the client was told
+    /// so, and only the body knew otherwise
+    /// ([13 §7](../../docs/13-http1-upstream.md)). Both paths count it.
+    #[test]
+    fn a_body_that_fails_after_its_head_is_counted() {
+        for by in [Upstream::Hyper, Upstream::Ours] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            runtime.block_on(local.run_until(async move {
+                // A head that promises ten bytes, five bytes, and then the end.
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upstream = listener.local_addr().unwrap();
+                tokio::spawn(async move {
+                    loop {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        tokio::spawn(async move {
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            let mut asked = [0; 1024];
+                            let _read = stream.read(&mut asked).await;
+                            let _said = stream
+                                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nshort")
+                                .await;
+                            // Long enough for the head to reach the client before
+                            // the body stops. Which of the two a client sees when a
+                            // body fails is the downstream server's buffering rather
+                            // than anything decided here, and this test is about the
+                            // counter rather than about that.
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        });
+                    }
+                });
+
+                let proxy = sending_to_by(upstream, by);
+                let worker = Worker::with_limits(Arc::clone(&proxy), H1Limits::default());
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+
+                // The head arrives and says the answer succeeded; the body does not.
+                let stream = TcpStream::connect(front).await.unwrap();
+                let (mut sender, connection) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                        .await
+                        .unwrap();
+                let _driving = tokio::task::spawn_local(async move {
+                    let _closed = connection.await;
+                });
+                let request = Request::builder()
+                    .uri("/")
+                    .header("host", "example.test")
+                    .body(Empty::<Bytes>::new())
+                    .unwrap();
+                let answer = sender.send_request(request).await.unwrap();
+                assert_eq!(answer.status(), StatusCode::OK, "{by:?}");
+                assert!(
+                    answer.into_body().collect().await.is_err(),
+                    "{by:?} made a truncated body look whole"
+                );
+
+                let up = proxy.metrics.upstream_slot("up");
+                let scrape = proxy.metrics.render(&["web".to_owned()], &[("up", up)]);
+                assert!(
+                    scrape.contains("edgerush_upstream_body_failures_total{upstream=\"up\"} 1\n"),
+                    "{by:?}: {scrape}"
+                );
+                // And the answer was counted a success, which is why the body needed
+                // a counter of its own.
+                assert!(
+                    scrape.contains(
+                        "edgerush_upstream_responses_total{upstream=\"up\",class=\"2xx\"} 1\n"
+                    ),
+                    "{by:?}: {scrape}"
+                );
+            }));
+        }
     }
 
     /// A proxy of one listener that sends everything to `upstream`, by EdgeRush's own
