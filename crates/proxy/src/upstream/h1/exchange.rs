@@ -1086,6 +1086,58 @@ impl From<&Method> for Asked {
     }
 }
 
+/// What this end is holding for one exchange.
+///
+/// **Capacity, not length.** A buffer that grew and was drained is still holding what it
+/// grew to, and a bound measured on lengths would be a bound on nothing.
+///
+/// **What it does not measure.** Only the buffers this code owns, and of the request frame
+/// in hand only the slice that is visible here. A `Bytes` is a view into an allocation
+/// somebody else made, and a short view can hold a long allocation open, so the frame is
+/// counted at what can be seen and no claim is made about what stands behind it. Neither
+/// hyper's own buffers, its parsed maps, nor the process's memory are in here; those
+/// belong to the measurement in [10 §3](../../../docs/10-testing.md), not to this
+/// ([13 §7](../../../docs/13-http1-upstream.md)).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Held {
+    /// Room the outgoing buffer has taken, encoded request and framing alike.
+    staged: usize,
+    /// Room the incoming buffer has taken, which is where the answer arrives.
+    buffered: usize,
+    /// The frame of the request in hand, whole, however much of it has gone.
+    frame: usize,
+    /// How many frames are in hand. One is the most there is ever meant to be.
+    frames: usize,
+}
+
+#[cfg(test)]
+impl Held {
+    fn total(self) -> usize {
+        self.staged + self.buffered + self.frame
+    }
+}
+
+#[cfg(test)]
+impl<S, B> H1Body<S, B> {
+    /// What this end is holding right now.
+    fn held(&self) -> Held {
+        let Some(rest) = self.rest.as_ref() else {
+            return Held::default();
+        };
+        let (frame, frames) = match rest.upload.pending.as_ref() {
+            Some((bytes, _gone)) => (bytes.len(), 1),
+            None => (0, 0),
+        };
+        Held {
+            staged: rest.exchange.outgoing.capacity(),
+            buffered: rest.exchange.incoming.capacity(),
+            frame,
+            frames,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2012,6 +2064,187 @@ mod tests {
         // Long past the bound a client that had said nothing all this time would have
         // broken, had anybody been counting its silence.
         assert!(began.elapsed() > idle * 8, "{:?}", began.elapsed());
+    }
+
+    // ---- what one exchange holds ----
+
+    /// A request body of `left` frames of `size` bytes, handed over as fast as asked for.
+    #[derive(Debug)]
+    struct Frames {
+        left: usize,
+        size: usize,
+    }
+
+    impl Body for Frames {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+            if self.left == 0 {
+                return Poll::Ready(None);
+            }
+            self.left -= 1;
+            let size = self.size;
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![b'x'; size])))))
+        }
+    }
+
+    /// Sends `frames` frames of `size` upstream and reads `chunks` chunks of `size` back,
+    /// and says the most this end was holding at any point along the way.
+    async fn holding(frames: usize, chunks: usize, size: usize) -> Held {
+        let total = frames * size;
+        let (ours, theirs) = tokio::io::duplex(4096);
+        let rest = Rest {
+            exchange: Exchange::new(ours),
+            upload: Upload::new(
+                Frames { left: frames, size },
+                Sending::Length(total as u64),
+                Vec::new(),
+            ),
+        };
+        let mut body = H1Body::new(
+            rest,
+            Framing::Chunked,
+            true,
+            Vec::new(),
+            H1Limits::default(),
+        );
+
+        let _peer = tokio::spawn(async move {
+            let mut peer = Peer(theirs);
+            let mut sink = vec![0; 4096];
+            let mut taken = 0;
+            // Bounded: room for the whole request and a little over, never an open loop.
+            for _ in 0..(total / 1024 + 64) {
+                if taken >= total {
+                    break;
+                }
+                match peer.0.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => taken += read,
+                }
+            }
+            for _ in 0..chunks {
+                peer.say(&format!("{size:x}\r\n")).await;
+                peer.0.write_all(&vec![b'y'; size]).await.unwrap();
+                peer.say("\r\n").await;
+            }
+            peer.say("0\r\n\r\n").await;
+            peer
+        });
+
+        let mut most = Held::default();
+        let mut watch = |held: Held| {
+            most.staged = most.staged.max(held.staged);
+            most.buffered = most.buffered.max(held.buffered);
+            most.frame = most.frame.max(held.frame);
+            most.frames = most.frames.max(held.frames);
+        };
+        watch(body.held());
+        loop {
+            let polled = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+            watch(body.held());
+            match polled {
+                None => break,
+                Some(frame) => {
+                    frame.unwrap();
+                }
+            }
+        }
+        assert!(body.is_complete());
+        most
+    }
+
+    /// **What is held does not move with what is moved.** Sixteen kibibytes through the
+    /// exchange or sixteen mebibytes, at frames from 4 KiB to 256 KiB: the same two
+    /// buffers, the same size, every time.
+    ///
+    /// The bound is exactly the buffers this code owns -- one for staging the request and
+    /// one for reading the answer -- and it is asserted as an equality rather than a
+    /// ceiling, because a ceiling would not notice a buffer that had begun to creep.
+    #[tokio::test]
+    async fn what_is_held_does_not_move_with_what_is_moved() {
+        let smallest = holding(4, 4, 4 * 1024).await;
+        for (frames, size) in [
+            (16, 4 * 1024),
+            (64, 4 * 1024),
+            (16, 16 * 1024),
+            (64, 16 * 1024),
+            (16, 64 * 1024),
+            (64, 64 * 1024),
+            (64, 256 * 1024),
+        ] {
+            let most = holding(frames, frames, size).await;
+            assert_eq!(most, smallest, "{frames} frames of {size}");
+        }
+        // And what that unmoving amount is: the two buffers this code owns, and nothing
+        // else. Said in terms of the bounds themselves, so that raising one is a decision
+        // taken here rather than a number that drifted.
+        assert_eq!(smallest.total(), STAGING + READING, "{smallest:?}");
+    }
+
+    /// And exchanges beside one another are still an exchange each: nothing here is
+    /// shared, so nothing here adds up differently for being one of several.
+    #[tokio::test]
+    async fn exchanges_beside_one_another_hold_what_one_holds() {
+        let alone = holding(4, 4, 4 * 1024).await;
+        let (first, second, third, fourth) = tokio::join!(
+            holding(64, 64, 64 * 1024),
+            holding(64, 64, 64 * 1024),
+            holding(16, 16, 256 * 1024),
+            holding(4, 4, 4 * 1024),
+        );
+        for (which, most) in [first, second, third, fourth].into_iter().enumerate() {
+            assert_eq!(most, alone, "exchange {which}");
+        }
+    }
+
+    /// **One frame in hand, never a queue of them.** A client with sixty-four frames to
+    /// give and an upstream that will take almost none of them is a client that is not
+    /// asked for the next one: what is held is the frame being forwarded and the two
+    /// buffers, however much more is offered
+    /// ([13 §7](../../../docs/13-http1-upstream.md)).
+    ///
+    /// The frame counts at its own size, which is the client's choice and not this end's.
+    /// What this end promises is that there is one.
+    #[tokio::test]
+    async fn only_one_frame_of_the_request_is_ever_in_hand() {
+        let size = 64 * 1024;
+        // Room for a little of the request and no more, so the frames have to wait.
+        let (ours, _theirs) = tokio::io::duplex(64);
+        let rest = Rest {
+            exchange: Exchange::new(ours),
+            upload: Upload::new(
+                Frames { left: 64, size },
+                Sending::Length((64 * size) as u64),
+                Vec::new(),
+            ),
+        };
+        let mut body = H1Body::new(
+            rest,
+            Framing::Chunked,
+            true,
+            Vec::new(),
+            H1Limits::default(),
+        );
+
+        let mut context = Context::from_waker(Waker::noop());
+        let mut ever = false;
+        for _ in 0..16 {
+            let _polled = Pin::new(&mut body).poll_frame(&mut context);
+            let held = body.held();
+            assert!(held.frames <= 1, "frames queued up: {held:?}");
+            assert!(held.staged <= STAGING, "staging grew: {held:?}");
+            ever |= held.frames == 1;
+        }
+        assert!(ever, "no frame was ever in hand, so nothing was measured");
+
+        let held = body.held();
+        assert_eq!(held.frame, size, "{held:?}");
+        assert_eq!(held.total(), STAGING + READING + size, "{held:?}");
     }
 
     /// A body that says whether anybody has asked it for anything. Holding a body back
