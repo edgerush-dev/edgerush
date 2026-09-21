@@ -90,10 +90,32 @@ fn upstream_answer(
     response.body(body).unwrap()
 }
 
-/// An address nothing listens on: one that was just given to a socket that is gone again.
+/// An endpoint that takes a connection and closes it at once, so nothing asked of it is
+/// ever answered, and that holds its port for as long as the run lasts.
+///
+/// **Not a port that was just given up.** Reading a port from a socket and then dropping
+/// the socket hands the port back for the operating system to give to whatever asks next,
+/// and on Linux it does: an upstream started later took the port this had called dead,
+/// answered a request meant for nowhere, and failed both the test that expected 502 and
+/// the test whose connections it had quietly added to.
+///
+/// Holding the port costs the one thing the dropped socket gave, which was a connection
+/// *refused* rather than a connection closed. Nothing available here refuses on both
+/// Windows and WSL: a port low enough to sit outside the ephemeral range is filtered and
+/// not refused under WSL, and a second loopback address is unanswered on Windows. So what
+/// these tests place a request on is an upstream that answers nothing, which reaches a
+/// client as the same 502.
 async fn dead_endpoint() -> SocketAddr {
     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    socket.local_addr().unwrap()
+    let address = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (taken, _) = socket.accept().await.unwrap();
+            // Closed without a word, which is all this endpoint ever does.
+            drop(taken);
+        }
+    });
+    address
 }
 
 /// Starts a proxy for the config, with every listener on a port of its own choosing; the
