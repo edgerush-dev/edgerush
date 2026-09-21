@@ -1866,7 +1866,6 @@ async fn a_trailer_section_that_is_not_fields_is_refused() {
 /// answer 411 without one, and the message that arrived had it (HAProxy's
 /// `h1_to_h1.vtc`). The engine's client keeps it.
 #[tokio::test]
-#[ignore = "defect on our own path: a request's length of zero is dropped"]
 async fn a_post_of_nothing_still_says_its_length() {
     let (saw, mut seen) = reporter();
     let upstream = raw_upstream(move |mut wire| {

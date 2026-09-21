@@ -901,9 +901,15 @@ struct Directed {
 /// ([13 §4](../../docs/13-http1-upstream.md)).
 fn sending_for(head: &Parts, body: &Incoming) -> Sending {
     // The engine says outright when there is no body, and that is the one thing a length
-    // alone would not settle.
+    // alone would not settle. A client that said its body is a length of nothing goes on
+    // saying so: RFC 9110 §8.6 has a sender state a length for a method whose content
+    // means something, and a server may answer 411 without one. One that said nothing,
+    // as an HTTP/2 request ended by its headers does, is sent no framing either.
     if body.is_end_stream() {
-        return Sending::None;
+        return match request_length(&head.headers) {
+            Some(0) => Sending::Length(0),
+            _ => Sending::None,
+        };
     }
     if head.version == Version::HTTP_2 {
         // Framed as frames, with trailers allowed after any of them. There is no length
