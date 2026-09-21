@@ -15,9 +15,12 @@ import sys
 from collections import defaultdict
 
 PARTS = {
-    "the HTTP engine": {
-        "hyper", "hyper_util", "h2", "http", "httparse", "http_body", "http_body_util",
-    },
+    # The engine proper: what serves the client and what carried a request upstream
+    # before EdgeRush's own path did.
+    "the HTTP engine": {"hyper", "hyper_util", "h2", "http_body", "http_body_util"},
+    # Header types and head parsing, kept apart because both paths call them directly:
+    # counting them with the engine would flatter whichever path is not hyper's.
+    "headers and parsing": {"http", "httparse"},
     "the runtime": {
         "tokio", "mio", "futures_util", "futures_core", "futures_task", "socket2", "slab",
     },
