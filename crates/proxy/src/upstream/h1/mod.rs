@@ -9,6 +9,11 @@
 pub mod codec;
 pub mod exchange;
 pub mod pool;
+// The scripted peer the differential harness is driven from, and the bounded run it
+// happens under: for this crate's own tests and for the fuzz targets, which are a crate
+// of their own ([13 §8](../../../../docs/13-http1-upstream.md)).
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod script;
 
 use std::time::Duration;
 

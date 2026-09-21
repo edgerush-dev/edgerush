@@ -10,7 +10,9 @@ publish.workspace = true
 [features]
 # Opens the upstream codec to the fuzz targets, which are a package of their own. Nothing
 # in EdgeRush turns this on, and the workspace's checks never build with it.
-fuzzing = []
+# A stopped clock is what makes a scripted run deterministic, and it is `test-util`
+# that lets anything but a test stop one.
+fuzzing = ["tokio/test-util"]
 
 [dependencies]
 arc-swap.workspace = true
