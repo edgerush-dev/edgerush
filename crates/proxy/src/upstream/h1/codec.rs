@@ -974,9 +974,8 @@ fn section(bytes: &[u8], from: usize, bound: usize) -> Result<Option<usize>, Cod
     if bytes.starts_with(b"\r\n") {
         return Ok(Some(2));
     }
-    if bytes.len() < 2 {
-        return Ok(None);
-    }
+    // Everything else goes through the search, however little of it there is: a byte
+    // passed over here would be counted as searched, and never looked at again.
     examining(bytes.len().saturating_sub(from));
     for at in from..bytes.len() {
         if bytes[at] != b'\n' {
@@ -2530,12 +2529,12 @@ mod tests {
         }
     }
 
-    /// A trailer section whose first byte is a bare newline is refused when it arrives
-    /// whole, and read as no trailers at all when that newline arrives on its own. The
-    /// second of these swallows a whole response as its "trailers" (found through hyper's
-    /// decoder tests and httparse, which ends a section at a leading newline).
+    /// A trailer section whose first byte is a bare newline is refused, whether it arrives
+    /// whole or that newline arrives on its own. A newline passed over as too little to
+    /// search reaches httparse, which ends a section at a leading newline and reads the
+    /// rest as nothing — the second of these would be a whole answer swallowed as
+    /// "trailers" (found through hyper's decoder tests).
     #[test]
-    #[ignore = "defect: a trailer section's leading bare newline is missed when it arrives alone"]
     fn a_bare_newline_opening_a_trailer_section_is_refused_however_it_arrives() {
         for bytes in [
             &b"0\r\n\nx-a: 1\r\n\r\n"[..],
