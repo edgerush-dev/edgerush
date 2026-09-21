@@ -2059,7 +2059,6 @@ mod tests {
     /// on the socket all the same, and a write that fails is no reason not to read it
     /// (Pingora: "flush already received data if upstream write errors").
     #[test]
-    #[ignore = "defect: a failed write before the head is read loses an answer already sent"]
     fn a_refusal_already_sent_when_the_upload_fails_is_still_delivered() {
         let script = Script::with_room(
             vec![

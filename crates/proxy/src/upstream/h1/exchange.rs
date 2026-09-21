@@ -634,6 +634,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         let idle = limits.idle;
         let pushed = match self.push(cx, upload, may_send, limits) {
             Ok(pushed) => pushed,
+            // A write the upstream will not take is an upstream that has stopped reading,
+            // not one that has stopped talking: what it already said may be a refusal
+            // sitting in the socket, which §5 says to deliver. The upload goes, and the
+            // connection with it; the read below finds the answer, or the close or the
+            // failure that there really was.
+            Err(ExchangeError::Io(_)) => {
+                upload.abandon();
+                Pushed::default()
+            }
             Err(error) => return Poll::Ready(Err(error)),
         };
         if pushed.took {
