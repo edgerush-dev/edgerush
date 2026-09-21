@@ -1069,6 +1069,22 @@ mod tests {
         let unended =
             b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2;a=\"b\r\nhi\r\n0\r\n\r\n";
         assert_eq!(refused(unended), Invalid::ChunkExtension);
+        // Nor is one holding a control byte, bare or escaped (RFC 9110 §5.6.4).
+        for inside in [&b"\x00"[..], b"\\\r", b"b\x7f"] {
+            let bytes = [
+                &b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2;a=\""[..],
+                inside,
+                b"\"\r\nhi\r\n0\r\n\r\n",
+            ]
+            .concat();
+            // Refused, by whichever rule meets it first: an escaped carriage return is
+            // a bare one before it is anything else.
+            let why = refused(&bytes);
+            assert!(
+                matches!(why, Invalid::ChunkExtension | Invalid::BareCarriageReturn),
+                "{inside:?}: {why:?}"
+            );
+        }
     }
 
     #[test]

@@ -955,14 +955,25 @@ fn token(bytes: &[u8]) -> Result<(&[u8], &[u8]), CodecError> {
 
 /// What follows a quoted string, the closing quote included. A backslash makes the next
 /// byte part of the string, the closing quote included, which is the point of checking.
+///
+/// [RFC 9110 §5.6.4](https://www.rfc-editor.org/rfc/rfc9110.html#section-5.6.4) keeps
+/// control bytes other than HTAB out of both halves of a quoted string, escaped or not.
+/// A carriage return that one reader takes for the end of the line and the next does not
+/// is exactly what an extension that nobody acts on can still be used to smuggle.
 fn quoted(bytes: &[u8]) -> Result<&[u8], CodecError> {
     let mut at = 1;
-    while at < bytes.len() {
-        match bytes[at] {
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
             b'"' => return Ok(&bytes[at + 1..]),
-            b'\\' => at += 2,
-            b'\r' | b'\n' => return Err(CodecError::Chunk),
-            _ => at += 1,
+            // quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )
+            b'\\' => match bytes.get(at + 1) {
+                Some(b'\t' | b' '..=b'~' | 0x80..=0xff) => at += 2,
+                _ => return Err(CodecError::Chunk),
+            },
+            // qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text, the quote and the
+            // backslash having been dealt with above.
+            b'\t' | b' '..=b'~' | 0x80..=0xff => at += 1,
+            _ => return Err(CodecError::Chunk),
         }
     }
     Err(CodecError::Chunk)
@@ -2348,7 +2359,6 @@ mod tests {
     /// carriage return is what one reader takes for the end of a line and the next does
     /// not, which is the chunk-extension smuggling shape (found by Envoy and HAProxy).
     #[test]
-    #[ignore = "defect: a quoted chunk extension lets control bytes through"]
     fn a_quoted_extension_holds_no_control_bytes() {
         for bytes in [
             &b"5;a=\"\x00\"\r\nhello\r\n0\r\n\r\n"[..],
