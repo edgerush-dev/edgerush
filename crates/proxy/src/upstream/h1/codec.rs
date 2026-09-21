@@ -1199,6 +1199,7 @@ impl BodyWriter {
         out: &mut Vec<u8>,
         trailers: Option<&HeaderMap>,
         nominated: &[HeaderName],
+        limits: &H1Limits,
     ) -> Result<(), CodecError> {
         if self.done {
             return Err(CodecError::BodyAfterEnd);
@@ -1218,6 +1219,27 @@ impl BodyWriter {
                 Ok(())
             }
             Sending::Chunked => {
+                // Counted before any of it is filtered, denied names included: a bound
+                // that only counted what survived filtering would be no bound on what
+                // arrives ([13 §4](../../../docs/13-http1-upstream.md)). The same
+                // numbers as a trailer section that comes the other way.
+                let fields = trailers.map_or(0, HeaderMap::len);
+                if fields > limits.trailer_fields {
+                    return Err(CodecError::TooManyFields {
+                        limit: limits.trailer_fields,
+                    });
+                }
+                let section: usize = trailers
+                    .into_iter()
+                    .flatten()
+                    .map(|(name, value)| name.as_str().len() + 2 + value.as_bytes().len() + 2)
+                    .sum();
+                // The empty line that ends the section is part of it.
+                if section + 2 > limits.trailers {
+                    return Err(CodecError::TrailersTooLong {
+                        limit: limits.trailers,
+                    });
+                }
                 out.extend_from_slice(b"0\r\n");
                 for (name, value) in trailers.into_iter().flatten() {
                     // The same set as on the way back: what may not travel as a trailer
@@ -1233,6 +1255,21 @@ impl BodyWriter {
                 out.extend_from_slice(b"\r\n");
                 Ok(())
             }
+        }
+    }
+
+    /// How much room a chunked body needs beside its bytes: a size line and the line
+    /// ending around them, and the chunk that says the body is over. Kept back from the
+    /// staging buffer, because filling that to the brim with payload and then adding
+    /// these is how its bound is quietly gone past
+    /// ([13 §7](../../../docs/13-http1-upstream.md)).
+    ///
+    /// Enough for a size line of sixteen hexadecimal digits, which is more than any
+    /// staging buffer could ask for, and for the five bytes that end the body.
+    pub fn framing_room(&self) -> usize {
+        match self.sending {
+            Sending::Chunked => 20 + 5,
+            Sending::None | Sending::Length(_) => 0,
         }
     }
 
@@ -2048,6 +2085,45 @@ mod tests {
         );
     }
 
+    /// A trailer section a request sends is bounded before any of it is filtered: a
+    /// bound that counted only what survived filtering would be no bound at all on
+    /// what a client can make a worker hold
+    /// ([13 §4](../../../docs/13-http1-upstream.md)).
+    #[test]
+    fn a_request_trailer_section_is_bounded_before_it_is_filtered() {
+        let limits = H1Limits {
+            trailers: 48,
+            trailer_fields: 2,
+            ..H1Limits::default()
+        };
+        // A name that may not travel at all, so filtering would leave nothing of it.
+        let long = "x".repeat(64);
+        let mut fields = HeaderMap::new();
+        fields.insert(
+            HeaderName::from_static("content-length"),
+            HeaderValue::from_str(&long).unwrap(),
+        );
+        let mut writer = BodyWriter::new(Sending::Chunked);
+        assert_eq!(
+            writer.finish(&mut Vec::new(), Some(&fields), &[], &limits),
+            Err(CodecError::TrailersTooLong { limit: 48 })
+        );
+
+        // And how many there are, counted the same way.
+        let mut many = HeaderMap::new();
+        for name in ["x-a", "x-b", "x-c"] {
+            many.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_static("1"),
+            );
+        }
+        let mut writer = BodyWriter::new(Sending::Chunked);
+        assert_eq!(
+            writer.finish(&mut Vec::new(), Some(&many), &[], &limits),
+            Err(CodecError::TooManyFields { limit: 2 })
+        );
+    }
+
     #[test]
     fn a_chunk_extension_is_checked_and_then_ignored() {
         let good: &[&[u8]] = &[
@@ -2468,7 +2544,9 @@ mod tests {
         for frame in frames {
             writer.data(&mut out, frame).unwrap();
         }
-        writer.finish(&mut out, trailers, &[]).unwrap();
+        writer
+            .finish(&mut out, trailers, &[], &H1Limits::default())
+            .unwrap();
         assert!(writer.is_done());
         String::from_utf8(out).unwrap()
     }
@@ -2548,7 +2626,7 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(writer.data(&mut out, b"ab"), Ok(()));
         assert_eq!(
-            writer.finish(&mut out, None, &[]),
+            writer.finish(&mut out, None, &[], &H1Limits::default()),
             Err(CodecError::BodyShort)
         );
     }
@@ -2557,10 +2635,13 @@ mod tests {
     fn nothing_may_follow_the_end_of_a_body() {
         let mut writer = BodyWriter::new(Sending::Chunked);
         let mut out = Vec::new();
-        assert_eq!(writer.finish(&mut out, None, &[]), Ok(()));
+        assert_eq!(
+            writer.finish(&mut out, None, &[], &H1Limits::default()),
+            Ok(())
+        );
         assert_eq!(writer.data(&mut out, b"a"), Err(CodecError::BodyAfterEnd));
         assert_eq!(
-            writer.finish(&mut out, None, &[]),
+            writer.finish(&mut out, None, &[], &H1Limits::default()),
             Err(CodecError::BodyAfterEnd)
         );
     }
@@ -2573,7 +2654,10 @@ mod tests {
         // A frame of no bytes is still nothing, and is let by.
         let mut writer = BodyWriter::new(Sending::None);
         assert_eq!(writer.data(&mut out, b""), Ok(()));
-        assert_eq!(writer.finish(&mut out, None, &[]), Ok(()));
+        assert_eq!(
+            writer.finish(&mut out, None, &[], &H1Limits::default()),
+            Ok(())
+        );
         assert!(out.is_empty());
     }
 
@@ -2585,7 +2669,7 @@ mod tests {
             let mut writer = BodyWriter::new(sending);
             let mut out = Vec::new();
             assert_eq!(
-                writer.finish(&mut out, Some(&trailers), &[]),
+                writer.finish(&mut out, Some(&trailers), &[], &H1Limits::default()),
                 Err(CodecError::UnexpectedTrailers),
                 "{sending:?}"
             );

@@ -316,8 +316,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             // looking at it is how an upstream that answers and closes at once has its
             // answer thrown away for a close that had already been overtaken.
             let Head::Read { head, consumed } = reader.read(&self.incoming, limits)? else {
-                let round =
-                    poll_fn(|cx| self.round(cx, upload, may_send, &mut clocks, limits.idle));
+                let round = poll_fn(|cx| self.round(cx, upload, may_send, &mut clocks, limits));
                 // The clocks inside the round are the exchange's own. This one is the wait
                 // for permission, which is not an exchange gone quiet but a question gone
                 // unanswered, and is counted from when the head went.
@@ -402,6 +401,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         cx: &mut Context<'_>,
         upload: &mut Upload<B>,
         may_send: bool,
+        limits: &H1Limits,
     ) -> Result<Pushed, ExchangeError>
     where
         B: Body<Data = Bytes> + Unpin,
@@ -412,6 +412,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         // nothing to wait for.
         if upload.stopped {
             return Ok(pushed);
+        }
+        // The staging buffer is given its bound once and exactly, the first time anything
+        // is staged. Grown a piece at a time it lands wherever the doubling takes it —
+        // past the bound, by however much the last step overshot — and what is measured
+        // is what a buffer holds, not what is in it
+        // ([13 §7](../../../docs/13-http1-upstream.md)). The read buffer is already its
+        // own size for the same reason.
+        if self.outgoing.capacity() < STAGING {
+            self.outgoing.reserve_exact(STAGING - self.outgoing.len());
         }
 
         // Bounded work per turn: a body that keeps handing over frames must not be able
@@ -424,7 +433,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             // What is in hand goes first, a bounded slice at a time. The frame itself is
             // not copied in whole: that would be the client's pace, not the upstream's.
             if let Some((frame, at)) = upload.pending.as_mut() {
-                let take = (STAGING - staged).min(frame.len() - *at);
+                // Room for the framing as well as the bytes: a chunk carries a size line
+                // and a line ending of its own, and payload written to the brim leaves
+                // nowhere but past the bound for them to go.
+                let room = (STAGING - staged).saturating_sub(upload.writer.framing_room());
+                let take = room.min(frame.len() - *at);
+                if take == 0 {
+                    break;
+                }
                 upload
                     .writer
                     .data(&mut self.outgoing, &frame[*at..*at + take])?;
@@ -473,6 +489,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                         &mut self.outgoing,
                         upload.trailers.as_ref(),
                         &upload.nominated,
+                        limits,
                     )?;
                     // The end of the request is the client's last word and its best:
                     // there is nothing more to wait on it for.
@@ -527,13 +544,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         upload: &mut Upload<B>,
         may_send: bool,
         clocks: &mut Clocks,
-        idle: Duration,
+        limits: &H1Limits,
     ) -> Poll<Result<Moved, ExchangeError>>
     where
         B: Body<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
-        let pushed = match self.push(cx, upload, may_send) {
+        let idle = limits.idle;
+        let pushed = match self.push(cx, upload, may_send, limits) {
             Ok(pushed) => pushed,
             Err(error) => return Poll::Ready(Err(error)),
         };
@@ -808,7 +826,7 @@ where
             // The rest of the request goes out while the answer is read. An upstream that
             // answers early may still be reading, and one that has stopped reading is not
             // a reason to stop delivering what it has already said.
-            let pushed = match rest.exchange.push(cx, &mut rest.upload, true) {
+            let pushed = match rest.exchange.push(cx, &mut rest.upload, true, &this.limits) {
                 Ok(pushed) => pushed,
                 // A write the upstream will not take is an upstream that has stopped
                 // reading, which §5 says to go on reading the answer through: the answer
@@ -1199,6 +1217,7 @@ impl<S, B> H1Body<S, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::HeaderValue;
     use http_body_util::{Empty, Full};
     use std::convert::Infallible;
     use std::sync::Arc;
@@ -1620,7 +1639,10 @@ mod tests {
         // A request with nothing in it, already all sent.
         let mut upload = Upload::new(Empty::<Bytes>::new(), Sending::None, Vec::new());
         let mut nothing = Vec::new();
-        upload.writer.finish(&mut nothing, None, &[]).unwrap();
+        upload
+            .writer
+            .finish(&mut nothing, None, &[], &H1Limits::default())
+            .unwrap();
         let rest = Rest { exchange, upload };
         let body = H1Body::new(rest, framing, persistent, Vec::new(), H1Limits::default());
         (body, Peer(theirs))
@@ -1699,6 +1721,34 @@ mod tests {
                 }
             ),
             "the request stopped and the answer went on covering for it: {error}"
+        );
+    }
+
+    /// What is staged stays inside its bound, the framing it adds included. Payload
+    /// written to the brim and a size line put after it is how a bound is quietly
+    /// gone past ([13 §7](../../../docs/13-http1-upstream.md)).
+    #[tokio::test]
+    async fn staging_keeps_room_for_the_framing_it_adds() {
+        // A socket that takes almost nothing, so what is staged stays staged.
+        let (ours, _theirs) = tokio::io::duplex(1);
+        let mut exchange = Exchange::new(ours);
+        let mut upload = Upload::new(
+            Full::new(Bytes::from(vec![b'x'; STAGING * 2])),
+            Sending::Chunked,
+            Vec::new(),
+        );
+        let _pushed = exchange
+            .push(
+                &mut Context::from_waker(Waker::noop()),
+                &mut upload,
+                true,
+                &H1Limits::default(),
+            )
+            .unwrap();
+        assert!(
+            exchange.outgoing.len() <= STAGING,
+            "{} bytes staged where the bound is {STAGING}",
+            exchange.outgoing.len()
         );
     }
 
@@ -2265,6 +2315,8 @@ mod tests {
     struct Frames {
         left: usize,
         size: usize,
+        /// Sent after the last of them, where a body carries any.
+        trailers: Option<HeaderMap>,
     }
 
     impl Body for Frames {
@@ -2276,7 +2328,11 @@ mod tests {
             _cx: &mut Context<'_>,
         ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
             if self.left == 0 {
-                return Poll::Ready(None);
+                return Poll::Ready(
+                    self.trailers
+                        .take()
+                        .map(|fields| Ok(Frame::trailers(fields))),
+                );
             }
             self.left -= 1;
             let size = self.size;
@@ -2287,13 +2343,45 @@ mod tests {
     /// Sends `frames` frames of `size` upstream and reads `chunks` chunks of `size` back,
     /// and says the most this end was holding at any point along the way.
     async fn holding(frames: usize, chunks: usize, size: usize) -> Held {
+        holding_sent(frames, chunks, size, Sent::Counted).await
+    }
+
+    /// How a request's body is framed on its way out, which is what the staging buffer
+    /// has to hold besides the bytes themselves.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Sent {
+        /// A length known in advance: the bytes and nothing else.
+        Counted,
+        /// In chunks: a size line before every frame, and the chunk that ends them.
+        Chunked,
+        /// The same, with fields after the last chunk.
+        WithTrailers,
+    }
+
+    async fn holding_sent(frames: usize, chunks: usize, size: usize, sent: Sent) -> Held {
         let total = frames * size;
+        let trailers = (sent == Sent::WithTrailers).then(|| {
+            let mut fields = HeaderMap::new();
+            fields.insert(
+                HeaderName::from_static("x-done"),
+                HeaderValue::from_static("yes"),
+            );
+            fields
+        });
+        let sending = match sent {
+            Sent::Counted => Sending::Length(total as u64),
+            Sent::Chunked | Sent::WithTrailers => Sending::Chunked,
+        };
         let (ours, theirs) = tokio::io::duplex(4096);
         let rest = Rest {
             exchange: Exchange::new(ours),
             upload: Upload::new(
-                Frames { left: frames, size },
-                Sending::Length(total as u64),
+                Frames {
+                    left: frames,
+                    size,
+                    trailers,
+                },
+                sending,
                 Vec::new(),
             ),
         };
@@ -2378,6 +2466,29 @@ mod tests {
         assert_eq!(smallest.total(), STAGING + READING, "{smallest:?}");
     }
 
+    /// **And a chunked request holds no more than a counted one.** A chunk carries a size
+    /// line of its own and the chunk that ends the body, and room is kept back for both,
+    /// so the staging buffer is the same buffer whichever way the request is framed.
+    ///
+    /// A request that carries trailers is the one exception, and it is bounded rather
+    /// than free: the section is staged in one piece, and what it may come to is the
+    /// trailer bound of [13 §7](../../../docs/13-http1-upstream.md).
+    #[tokio::test]
+    async fn a_chunked_request_holds_what_a_counted_one_holds() {
+        let counted = holding_sent(16, 16, 4 * 1024, Sent::Counted).await;
+        let chunked = holding_sent(16, 16, 4 * 1024, Sent::Chunked).await;
+        assert_eq!(chunked, counted, "chunked held more than counted");
+        assert_eq!(chunked.total(), STAGING + READING, "{chunked:?}");
+
+        // With trailers on the end, what is staged may reach the section's own bound
+        // besides -- and no further.
+        let trailing = holding_sent(16, 16, 4 * 1024, Sent::WithTrailers).await;
+        assert!(
+            trailing.total() <= STAGING + READING + H1Limits::default().trailers,
+            "{trailing:?} is past the staging and trailer bounds together"
+        );
+    }
+
     /// And exchanges beside one another are still an exchange each: nothing here is
     /// shared, so nothing here adds up differently for being one of several.
     #[tokio::test]
@@ -2410,7 +2521,11 @@ mod tests {
         let rest = Rest {
             exchange: Exchange::new(ours),
             upload: Upload::new(
-                Frames { left: 64, size },
+                Frames {
+                    left: 64,
+                    size,
+                    trailers: None,
+                },
                 Sending::Length((64 * size) as u64),
                 Vec::new(),
             ),
@@ -2821,7 +2936,12 @@ mod lifecycle {
         for _ in 0..100 {
             tokio::task::yield_now().await;
             exchange
-                .push(&mut Context::from_waker(Waker::noop()), &mut upload, true)
+                .push(
+                    &mut Context::from_waker(Waker::noop()),
+                    &mut upload,
+                    true,
+                    &H1Limits::default(),
+                )
                 .unwrap();
             peer.read_exact(&mut drain).await.unwrap();
         }
@@ -2842,7 +2962,10 @@ mod lifecycle {
             Sending::Length(0),
             Vec::new(),
         );
-        upload.writer.finish(&mut Vec::new(), None, &[]).unwrap();
+        upload
+            .writer
+            .finish(&mut Vec::new(), None, &[], &H1Limits::default())
+            .unwrap();
         let mut body = H1Body::new(
             Rest { exchange, upload },
             Framing::None,

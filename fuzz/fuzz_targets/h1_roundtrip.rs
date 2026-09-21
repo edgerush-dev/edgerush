@@ -43,7 +43,7 @@ fuzz_target!(|bytes: &[u8]| {
                 .unwrap_or_else(|error| panic!("{frames:?} could not be written: {error}"));
         }
         writer
-            .finish(&mut written, None, &[])
+            .finish(&mut written, None, &[], &limits)
             .unwrap_or_else(|error| panic!("{frames:?} could not be finished: {error}"));
 
         let framing = match sending {
