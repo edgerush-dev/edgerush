@@ -654,6 +654,17 @@ impl Worker {
             .await
             .ok()?;
         let (head, body) = response.into_parts();
+        // HTTP has only the statuses from 100 to 599, and
+        // [RFC 9110 §15](https://www.rfc-editor.org/rfc/rfc9110.html#section-15) says
+        // "Values outside the range 100..599 are invalid"; the engine's client allows the
+        // range above, which libraries use for errors of their own. An invalid status is
+        // answered 502, which is the "process the response as if it had a 5xx" that §15
+        // asks for, and the body goes unread so that the engine does not hand the
+        // connection on. Only unread is in this end's gift here: a body already complete
+        // leaves the connection in the engine's pool whatever this does with it.
+        if !(100..=599).contains(&head.status.as_u16()) {
+            return None;
+        }
         // Read here, because `respond` takes the hop-by-hop fields off this head before
         // the trailers behind it arrive.
         let nominated = crate::hop_by_hop::nominated(&head.headers);

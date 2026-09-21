@@ -235,6 +235,17 @@ fn parse(head: &[u8], limits: &H1Limits) -> Result<ResponseHead, CodecError> {
     let code = response
         .code
         .ok_or(CodecError::Malformed("it has no status"))?;
+    // `StatusCode` allows 100 to 999, because libraries use the range above HTTP's for
+    // errors of their own; HTTP has only 100 to 599, and
+    // [RFC 9110 §15](https://www.rfc-editor.org/rfc/rfc9110.html#section-15) says
+    // "Values outside the range 100..599 are invalid". A client "SHOULD process the
+    // response as if it had a 5xx (Server Error) status code", which is what answering
+    // 502 and letting the connection go is.
+    if !(100..=599).contains(&code) {
+        return Err(CodecError::Malformed(
+            "its status is outside the range HTTP has",
+        ));
+    }
     let status =
         StatusCode::from_u16(code).map_err(|_| CodecError::Malformed("its status is not one"))?;
 

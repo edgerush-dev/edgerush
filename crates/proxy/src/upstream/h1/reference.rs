@@ -103,15 +103,20 @@ pub enum Notable {
     /// what the peer meant by it cannot be worked out, and both refusing the message and
     /// disregarding the field are open; §4 refuses.
     ConnectionNotTokens,
-    /// A status code with no class: 6xx to 9xx.
-    /// [RFC 9110 §15](https://www.rfc-editor.org/rfc/rfc9110.html#section-15) says a
-    /// recipient "MUST understand the class of any status code, as indicated by the
-    /// first digit, and treat an unrecognized status code as being equivalent to the x00
-    /// status code of that class", and there is no such class for these. Read all the
-    /// same, because both clients read them and because servers in the wild send them;
-    /// a code below 100 has no class either and is refused outright, there being nothing
-    /// at all that could be done with one.
-    StatusWithoutClass,
+    /// A status outside the range HTTP has.
+    /// [RFC 9110 §15](https://www.rfc-editor.org/rfc/rfc9110.html#section-15): "Values
+    /// outside the range 100..599 are invalid. Implementations often use three-digit
+    /// integer values outside of that range (i.e., 600..999) for internal communication
+    /// of non-HTTP status (e.g., library errors). A client that receives a response with
+    /// an invalid status code SHOULD process the response as if it had a 5xx (Server
+    /// Error) status code."
+    ///
+    /// The message is read, because its framing is not in doubt and the status is the
+    /// only thing wrong with it. What to do about the status is left open by that
+    /// SHOULD: answering 502 and letting the connection go is one way of processing it
+    /// as a 5xx, and reading it as the status it claims to be is a library's tolerance
+    /// of input HTTP calls invalid.
+    StatusOutsideTheRange,
     /// A status line that stops after the code.
     /// [RFC 9112 §4](https://www.rfc-editor.org/rfc/rfc9112.html#section-4) requires a
     /// sender to send the space before the reason phrase "even when the reason-phrase is
@@ -322,8 +327,8 @@ fn reading(bytes: &[u8], asked: Asked, ended: bool) -> Result<Option<Answer>, In
     if head.no_space {
         note(&mut notable, Notable::NoSpaceAfterStatus);
     }
-    if head.status >= 600 {
-        note(&mut notable, Notable::StatusWithoutClass);
+    if !(100..=599).contains(&head.status) {
+        note(&mut notable, Notable::StatusOutsideTheRange);
     }
     if !connection_is_tokens(&head) {
         note(&mut notable, Notable::ConnectionNotTokens);
@@ -489,9 +494,6 @@ fn read_status(line: &[u8]) -> Result<(Version, u16, String, bool), Invalid> {
     let status = code
         .iter()
         .fold(0u16, |status, digit| status * 10 + u16::from(digit - b'0'));
-    if status < 100 {
-        return Err(Invalid::StatusCode);
-    }
     Ok((version, status, text(reason), no_space))
 }
 
@@ -1259,14 +1261,19 @@ mod tests {
         assert_eq!(refused(b"HTTP/1.1 20 OK\r\n\r\n"), Invalid::StatusCode);
         assert_eq!(refused(b"HTTP/1.1 2000 OK\r\n\r\n"), Invalid::StatusLine);
         assert_eq!(refused(b"HTTP/1.1 2x0 OK\r\n\r\n"), Invalid::StatusCode);
-        // Three digits below a hundred are no status: there is no class for a
-        // recipient to understand and nothing to treat them as. Above five
-        // hundred and ninety-nine there is no class either, but both clients read
-        // those, so they are noted rather than refused.
-        assert_eq!(refused(b"HTTP/1.1 059 OK\r\n\r\n"), Invalid::StatusCode);
+        // Three digits outside 100..599 are a status HTTP calls invalid, at either
+        // end of the range. The message is still read — the framing is not in doubt —
+        // and what to do about the status is what the specification leaves open.
         let classless = whole(b"HTTP/1.1 999 Who Knows\r\ncontent-length: 0\r\n\r\n");
         assert_eq!(classless.status, 999);
-        assert_eq!(classless.notable, [Notable::StatusWithoutClass]);
+        assert_eq!(classless.notable, [Notable::StatusOutsideTheRange]);
+        // And at the other end of the range, where a message is read the same way.
+        let low = whole(b"HTTP/1.1 059 Nor This\r\ncontent-length: 0\r\n\r\n");
+        assert_eq!(low.status, 59);
+        assert_eq!(low.notable, [Notable::StatusOutsideTheRange]);
+        // The last status HTTP has is read with nothing notable about it.
+        let last = whole(b"HTTP/1.1 599 The Last\r\ncontent-length: 0\r\n\r\n");
+        assert!(last.notable.is_empty());
         // The space before the reason phrase is required of a sender even when the
         // phrase is absent — but a recipient is given no rule, and the code is not in
         // doubt without it, so a line that stops after the code is read and noted.
