@@ -28,7 +28,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1414,16 +1414,24 @@ async fn a_refusal_reaches_the_client_though_the_upload_cannot_go() {
     let stream = TcpStream::connect(proxy_to(backend).await).await.unwrap();
     let (mut reading, mut writing) = tokio::io::split(stream);
 
+    // Set the moment anything comes back, which is what stops the upload.
+    let answered = Arc::new(AtomicBool::new(false));
+    let stop = Arc::clone(&answered);
     let _uploading = tokio::spawn(async move {
         let head = "POST /first HTTP/1.1\r\nHost: example.test\r\nContent-Length: 4194304\r\n\r\n";
         if writing.write_all(head.as_bytes()).await.is_err() {
             return;
         }
-        // Enough to fill the socket and the staging behind it several times over, and
-        // no more: what is being shown is a write that cannot go, not a large one.
-        let block = vec![b'x'; 64 * 1024];
-        for _ in 0..8 {
-            if writing.write_all(&block).await.is_err() {
+        // **Bounded from both sides.** Enough to fill the staging and the socket behind
+        // it, or nothing would be blocked and there would be no test here. Little enough
+        // that the proxy has taken it all in by the time it answers: a connection closed
+        // while unread bytes are still sitting in its receive buffer is reset rather than
+        // closed, and a reset takes the answer that had already arrived with it. That is
+        // TCP rather than anything this proxy decides, and half a megabyte here failed
+        // about one run in two on Windows.
+        let block = vec![b'x'; 16 * 1024];
+        for _ in 0..10 {
+            if stop.load(Ordering::SeqCst) || writing.write_all(&block).await.is_err() {
                 return;
             }
         }
@@ -1435,6 +1443,10 @@ async fn a_refusal_reaches_the_client_though_the_upload_cannot_go() {
         let read = within(reading.read(&mut bytes)).await.unwrap();
         assert!(read > 0, "the connection ended before the refusal");
         seen.extend_from_slice(&bytes[..read]);
+        // Answered, so there is nothing to be gained by sending the rest -- and a client
+        // that writes on into a connection the other end has closed has its own receive
+        // buffer reset out from under it, answer and all.
+        answered.store(true, Ordering::SeqCst);
     }
     let seen = String::from_utf8_lossy(&seen).into_owned();
     assert!(seen.starts_with("HTTP/1.1 413"), "{seen}");
