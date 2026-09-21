@@ -526,8 +526,12 @@ fn judge(path: Path, got: &Got, expected: &Expected, limits: &H1Limits, started:
     for past in &bounds {
         faults.push(format!("read past a bound of its own — {past}"));
     }
+    // An HTTP/1.0 connection is one 13 §4 has ours never pool, whatever it says about
+    // keeping alive. That is a policy of the path's, like a bound: ours answers for it,
+    // and giving the connection up is keeping to it rather than a fault.
+    let never_pooled = path == Path::Ours && answer.version == reference::Version::Ten;
     match expected.reuse {
-        Ok(()) if !seen.kept => faults.push(format!(
+        Ok(()) if !seen.kept && !never_pooled => faults.push(format!(
             "gave up a connection the trace says survived: {:?}",
             expected.trace
         )),
@@ -1972,11 +1976,10 @@ mod tests {
     }
 
     /// An HTTP/1.0 answer that asks to be kept alive is not kept, because 13 §4 pools no
-    /// connection that speaks 1.0 — a policy of this project's, which the verdict has to
-    /// leave room for. It calls not keeping it a disagreement, so the hostile arm fails on
-    /// any input that reaches this shape.
+    /// connection that speaks 1.0 — a policy of this project's, which the verdict leaves
+    /// room for. Called a disagreement, it would fail the hostile arm on any input that
+    /// reached this shape.
     #[test]
-    #[ignore = "defect in the harness: the verdict blames ours for not keeping an HTTP/1.0 connection"]
     fn an_http_1_0_answer_that_asks_to_be_kept_is_let_go_without_blame() {
         let script =
             says("HTTP/1.0 200 OK\r\nconnection: keep-alive\r\ncontent-length: 3\r\n\r\nabc");
