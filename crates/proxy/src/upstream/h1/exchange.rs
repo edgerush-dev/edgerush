@@ -859,6 +859,17 @@ where
                         // Framing bytes and nothing else; keep going.
                         continue;
                     };
+                    // What the request is waiting for, read while the request is still in
+                    // hand. Its clocks run on whether the request is moving and never on
+                    // whether the answer is: an upstream with plenty to say must not be
+                    // able to cover for a client that has stopped. Without this the only
+                    // place they are looked at is a socket read that had nothing, and an
+                    // answer that always has a frame ready never reaches one
+                    // ([13 §7](../../../docs/13-http1-upstream.md)).
+                    let waiting = Waiting {
+                        answer: false,
+                        ..rest.exchange.waiting_on(&rest.upload, pushed)
+                    };
                     // Whether that was the last of it is worth knowing now: a client
                     // told how long a body is need never poll it again, and a body whose
                     // end was never checked is one whose connection cannot be trusted.
@@ -872,6 +883,14 @@ where
                             rest.exchange.incoming.drain(..consumed);
                             this.ended_with(trailers);
                         }
+                    }
+                    let idle = this.limits.idle;
+                    if let Some(stalled) = this.clocks.expired(cx, waiting, idle) {
+                        this.rest = None;
+                        return Poll::Ready(Some(Err(ExchangeError::Idle {
+                            after: idle,
+                            waiting: stalled,
+                        })));
                     }
                     this.clocks.answer_moved();
                     return Poll::Ready(Some(Ok(Frame::data(frame))));
@@ -1185,6 +1204,23 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    /// A body that never gives anything and never ends: a client that has stopped
+    /// sending without saying so.
+    #[derive(Debug)]
+    struct Silent;
+
+    impl Body for Silent {
+        type Data = Bytes;
+        type Error = &'static str;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, &'static str>>> {
+            Poll::Pending
+        }
+    }
 
     /// A body that gives a frame and then fails, as a client's does when it goes away
     /// part way through sending one.
@@ -1624,6 +1660,46 @@ mod tests {
         // And the connection goes with it: a request that was cut off leaves the upstream
         // waiting for bytes that are never coming.
         assert!(body.take_if_reusable().is_none());
+    }
+
+    /// An upstream with plenty to say must not be able to hide a request that has
+    /// stopped. The clocks for the request run on whether the request is moving, and
+    /// an answer with a frame ready is not that: a client that went quiet mid-upload
+    /// would otherwise hold the exchange for as long as the upstream kept talking
+    /// ([13 §7](../../../docs/13-http1-upstream.md)).
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_that_keeps_coming_does_not_hide_a_stalled_request() {
+        let limits = H1Limits::default();
+        let (ours, theirs) = tokio::io::duplex(4096);
+        let mut exchange = Exchange::new(ours);
+        // Chunk after chunk, all of it already in hand, so every ask has a frame
+        // ready without the socket being touched.
+        exchange.incoming = "4\r\nabcd\r\n".repeat(64).into_bytes();
+        // And a client that has handed over nothing, and will not.
+        let upload = Upload::new(Silent, Sending::Chunked, Vec::new());
+        let rest = Rest { exchange, upload };
+        let mut body = H1Body::new(rest, Framing::Chunked, true, Vec::new(), limits);
+        let _peer = Peer(theirs);
+
+        let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+        assert!(matches!(frame, Some(Ok(_))), "{frame:?}");
+        // Time passes with the request still going nowhere.
+        tokio::time::advance(limits.idle + Duration::from_secs(1)).await;
+
+        let error = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+            .await
+            .expect("the answer ended rather than the request being noticed")
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ExchangeError::Idle {
+                    waiting: Stalled::Client,
+                    ..
+                }
+            ),
+            "the request stopped and the answer went on covering for it: {error}"
+        );
     }
 
     /// A body that carries nothing is over before anybody asks, because nothing need ever
