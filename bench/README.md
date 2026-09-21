@@ -37,10 +37,13 @@ machine with 4 cores and 8 threads where CPUs *n* and *n+4* are one core.
 
 ## The variants
 
-`VARIANTS` names what is run, in turns: `thread-per-core` and
-`thread-per-core-kernel` — the same without balancing connections at accept — (EdgeRush,
-`proxy.yaml`), `nginx` (`nginx-proxy.conf`), `haproxy` (`haproxy.cfg`), `envoy`
-(`envoy.yaml`) and `kong` (`kong.yml`, without a database). The configs ask for the same
+`VARIANTS` names what is run, in turns: `thread-per-core`,
+`thread-per-core-kernel` — the same without balancing connections at accept — and `ours`,
+the same again by EdgeRush's own upstream path instead of the engine's client (EdgeRush,
+`proxy.yaml`); then `nginx` (`nginx-proxy.conf`), `haproxy` (`haproxy.cfg`), `envoy`
+(`envoy.yaml`) and `kong` (`kong.yml`, without a database). `thread-per-core` and `ours`
+differ in nothing but that client, which is what makes the pair of them a measurement of
+it ([13 §8](../../docs/13-http1-upstream.md) step 6). The configs ask for the same
 thing — the same hosts and rules, the same header changes on
 request and response, HTTP/1.1 and cleartext HTTP/2 on one port, keep-alive connections to
 the backend that any client's request may use, no access log — and each proxy gets

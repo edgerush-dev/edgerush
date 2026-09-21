@@ -23,7 +23,7 @@ repo=$(dirname "$here")
 : "${BACKEND_CPUS:=3,7}"
 : "${DURATION:=30}"          # seconds of every measurement
 : "${REPS:=3}"
-: "${VARIANTS:=thread-per-core}" # and: thread-per-core-kernel nginx haproxy envoy kong
+: "${VARIANTS:=thread-per-core}" # and: ours thread-per-core-kernel nginx haproxy envoy kong
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
 
 # Hundreds of connections on either side of the proxy, and more when they churn.
@@ -83,6 +83,14 @@ start_proxy() { # variant
         # Connections left where the kernel put them: what balancing is measured against.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$here/proxy.yaml" \
             --accept kernel --workers "$WORKERS" \
+            2>>"$OUT/proxy.log" &
+        ;;
+    ours)
+        # The same proxy by EdgeRush's own upstream path rather than the engine's
+        # client, which is the candidate of 13 section 8 step 6. Nothing else about
+        # it changes, which is what makes the pair of them the measurement.
+        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$here/proxy.yaml" \
+            --upstream ours --workers "$WORKERS" \
             2>>"$OUT/proxy.log" &
         ;;
     *)
