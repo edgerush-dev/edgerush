@@ -300,6 +300,52 @@ async fn a_requests_trailers_reach_the_upstream_only_by_our_own_path() {
     }
 }
 
+/// A field the request's own `Connection` named is hop-by-hop for that hop, so it may not
+/// travel on — as a trailer no more than as a header, and no more as a name declared in
+/// `Trailer` than as the field itself ([13 §4](../../../docs/13-http1-upstream.md)).
+///
+/// The names have to be read before routing strips the `Connection` that held them:
+/// afterwards there is nothing left to read them from, and everything it named looks like
+/// an ordinary field.
+#[tokio::test]
+async fn a_trailer_the_requests_connection_named_does_not_travel_on() {
+    let (saw, mut seen) = reporter();
+    let upstream = raw_upstream(move |mut wire| {
+        let saw = saw.clone();
+        async move {
+            let head = wire.head().await;
+            let body = wire.chunked_body().await;
+            saw.send(format!("{head}{body}")).unwrap();
+            wire.write("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    let mut client = Wire::to(proxy_to(upstream).await).await;
+    client
+        .write(concat!(
+            "POST /up HTTP/1.1\r\nhost: a.test\r\ntransfer-encoding: chunked\r\n",
+            "connection: x-secret\r\ntrailer: x-secret, x-keep\r\nte: trailers\r\n",
+            "\r\n5\r\nhello\r\n0\r\nx-secret: leaked\r\nx-keep: fine\r\n\r\n"
+        ))
+        .await;
+
+    let sent = seen.recv().await.unwrap();
+    // Neither as a trailer nor as a name the head declared it would send.
+    assert!(
+        !sent.to_ascii_lowercase().contains("x-secret"),
+        "a field the request's own Connection named crossed the hop:\n{sent}"
+    );
+    // What the `Connection` did not name is untouched: by our own path the trailer
+    // travels and the declaration still names it.
+    if matches!(upstream_under_test(), Upstream::Ours) {
+        assert!(sent.contains("x-keep: fine"), "{sent}");
+        assert!(
+            sent.to_ascii_lowercase().contains("trailer: x-keep"),
+            "{sent}"
+        );
+    }
+}
+
 /// Hyper's server does hand the trailers to the service, so what the test above measures
 /// is the upstream half losing them and not the downstream half never seeing them. This
 /// asks hyper alone, with no proxy in the way, so that the two halves cannot be confused.

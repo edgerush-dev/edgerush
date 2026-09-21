@@ -1018,6 +1018,7 @@ mod tests {
                     &Method::GET,
                     &uri,
                     &headers,
+                    &[],
                     Sending::None,
                     Empty::<Bytes>::new(),
                     &limits,

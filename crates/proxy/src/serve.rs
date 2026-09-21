@@ -21,7 +21,7 @@ use crate::random::random;
 use crate::request::decide;
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
-use crate::upstream::h1::codec::{ResponseHead, Sending, filter_trailers};
+use crate::upstream::h1::codec::{ResponseHead, Sending, filter_declaration, filter_trailers};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, nothing_to_say};
 use crate::upstream::h1::pool::{Lease, Pool};
 use arc_swap::ArcSwap;
@@ -473,12 +473,17 @@ impl Worker {
     ///
     /// Anything the upstream said that cannot be read, or a connection that could not be
     /// opened, failed or closed without answering.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each of them is a different thing an exchange needs, and a struct \n                  to hold them would be indirection for a lint rather than for a reader"
+    )]
     async fn through_h1<B>(
         &self,
         identity: &Arc<ReuseIdentity>,
         method: &Method,
         uri: &Uri,
         headers: &HeaderMap,
+        nominated: &[HeaderName],
         sending: Sending,
         body: B,
     ) -> Result<(ResponseHead, H1Body<TcpStream, B>), ExchangeError>
@@ -519,12 +524,16 @@ impl Worker {
 
         let exchange = Exchange::new(socket);
         let (answer, rest) = exchange
-            .send(method, uri, headers, sending, body, &self.limits)
+            .send(method, uri, headers, nominated, sending, body, &self.limits)
             .await?;
 
         // The request may still be going out; what is left of it goes with the body,
         // which drives it while the client reads the answer.
         let lease = Lease::in_use(Arc::clone(identity), opened, &self.pool);
+        let mut head = answer.head;
+        // The same for the answer: a name its `Connection` gave does not travel on, and
+        // is not declared onwards either.
+        filter_declaration(&mut head.headers, &answer.nominated);
         let body = H1Body::new(
             rest,
             answer.delivery.framing,
@@ -533,7 +542,7 @@ impl Worker {
             self.limits,
         )
         .returning_to(lease);
-        Ok((answer.head, body))
+        Ok((head, body))
     }
 
     /// What this worker serves: the data plane the whole process shares.
@@ -614,10 +623,18 @@ impl Worker {
         // takes the hop-by-hop fields off it — and before the body itself is touched,
         // because the path is chosen while there is still nothing to undo.
         let sending = sending_for(&head, &body);
+        // What this request's own `Connection` named, read before routing takes the
+        // hop-by-hop fields off the head. Afterwards there is nothing left to read them
+        // from and everything it named looks like an ordinary field, so a trailer of that
+        // name would travel on ([13 §4](../../docs/13-http1-upstream.md)).
+        let nominated = crate::hop_by_hop::nominated(&head.headers);
         let directed = match self.proxy.direct(listener, &mut head) {
             Ok(directed) => directed,
             Err(answer) => return self.proxy.answer(listener, answer),
         };
+        // A name it gave is not declared onwards either: the declaration says what the
+        // trailers will hold, and it will not hold that.
+        filter_declaration(&mut head.headers, &nominated);
 
         let answered = match self.proxy.upstream {
             Upstream::Hyper => self.by_hyper(head, body).await,
@@ -627,7 +644,7 @@ impl Worker {
                 let Some(admitted) = self.admit() else {
                     return self.proxy.answer(listener, Answer::TooBusy);
                 };
-                self.by_ours(&directed, &head, sending, body, admitted)
+                self.by_ours(&directed, &head, &nominated, sending, body, admitted)
                     .await
             }
         };
@@ -660,7 +677,7 @@ impl Worker {
             .request(Request::from_parts(head, body))
             .await
             .ok()?;
-        let (head, body) = response.into_parts();
+        let (mut head, body) = response.into_parts();
         // HTTP has only the statuses from 100 to 599, and
         // [RFC 9110 §15](https://www.rfc-editor.org/rfc/rfc9110.html#section-15) says
         // "Values outside the range 100..599 are invalid"; the engine's client allows the
@@ -675,6 +692,8 @@ impl Worker {
         // Read here, because `respond` takes the hop-by-hop fields off this head before
         // the trailers behind it arrive.
         let nominated = crate::hop_by_hop::nominated(&head.headers);
+        // What may not travel on is not declared onwards either.
+        filter_declaration(&mut head.headers, &nominated);
         Some((head, Body::Upstream(body, nominated)))
     }
 
@@ -685,6 +704,7 @@ impl Worker {
         &self,
         directed: &Directed,
         head: &Parts,
+        nominated: &[HeaderName],
         sending: Sending,
         body: Incoming,
         admitted: Admitted,
@@ -695,6 +715,7 @@ impl Worker {
                 &head.method,
                 &head.uri,
                 &head.headers,
+                nominated,
                 sending,
                 body,
             )
@@ -1274,6 +1295,7 @@ upstreams:
                             &Method::GET,
                             &"/x".parse().unwrap(),
                             &HeaderMap::new(),
+                            &[],
                             Sending::None,
                             http_body_util::Empty::<Bytes>::new(),
                         )

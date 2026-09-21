@@ -220,15 +220,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
     /// going out. What is left of the answer is its body, which is read from the socket
     /// and the bytes already in hand.
     ///
+    /// `nominated` is what this request's own `Connection` named, read from the head
+    /// before routing took the hop-by-hop fields off it. Those names are hop-by-hop for
+    /// this hop, so they do not travel on among the request's trailers either; by the
+    /// time a head reaches here there is nothing left to read them from, which is why
+    /// they are handed over rather than worked out
+    /// ([13 §4](../../../docs/13-http1-upstream.md)).
+    ///
     /// # Errors
     ///
     /// Anything the upstream said that cannot be read, a connection that failed or closed
     /// without answering, or a request body that could not be read.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each of them is a different thing an exchange needs, and a struct \n                  to hold them would be indirection for a lint rather than for a reader"
+    )]
     pub async fn send<B>(
         mut self,
         method: &Method,
         uri: &Uri,
         headers: &HeaderMap,
+        nominated: &[HeaderName],
         sending: Sending,
         body: B,
         limits: &H1Limits,
@@ -251,7 +263,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             return Err(ExchangeError::Unsolicited);
         }
         let by = limits.final_head;
-        let mut upload = Upload::new(body, sending, crate::hop_by_hop::nominated(headers));
+        let mut upload = Upload::new(body, sending, nominated.to_vec());
         let asked = timeout(
             by,
             self.exchange(method, uri, headers, sending, &mut upload, limits),
@@ -1244,6 +1256,7 @@ mod tests {
                 &Method::GET,
                 &"/a?b=1".parse().unwrap(),
                 &headers(&[("host", "up.test")]),
+                &[],
                 Sending::None,
                 Empty::<Bytes>::new(),
                 &limits,
@@ -1274,6 +1287,7 @@ mod tests {
                 &Method::GET,
                 &"/a".parse().unwrap(),
                 &headers(&[("host", "up.test")]),
+                &[],
                 Sending::None,
                 Empty::<Bytes>::new(),
                 &limits,
@@ -1308,6 +1322,7 @@ mod tests {
                 &Method::POST,
                 &"/x".parse().unwrap(),
                 &headers(&[("host", "up.test")]),
+                &[],
                 Sending::Length(5),
                 Full::new(Bytes::from_static(b"hello")),
                 &H1Limits::default(),
@@ -1344,6 +1359,7 @@ mod tests {
                 &Method::POST,
                 &"/x".parse().unwrap(),
                 &headers(&[("host", "up.test")]),
+                &[],
                 Sending::Chunked,
                 Full::new(Bytes::from_static(b"hello")),
                 &H1Limits::default(),
@@ -1386,6 +1402,7 @@ mod tests {
                 &Method::POST,
                 &"/x".parse().unwrap(),
                 &headers(&[("host", "up.test")]),
+                &[],
                 Sending::Length(huge.len() as u64),
                 Full::new(huge),
                 &H1Limits::default(),
@@ -1421,6 +1438,7 @@ mod tests {
                 &Method::GET,
                 &"/x".parse().unwrap(),
                 &headers(&[("host", "up.test")]),
+                &[],
                 Sending::None,
                 Empty::<Bytes>::new(),
                 &H1Limits::default(),
@@ -1454,6 +1472,7 @@ mod tests {
                 &Method::GET,
                 &"/x".parse().unwrap(),
                 &headers(&[("host", "up.test")]),
+                &[],
                 Sending::None,
                 Empty::<Bytes>::new(),
                 &limits,
@@ -1479,6 +1498,7 @@ mod tests {
                 &Method::GET,
                 &"/x".parse().unwrap(),
                 &headers(&[("host", "up.test")]),
+                &[],
                 Sending::None,
                 Empty::<Bytes>::new(),
                 &H1Limits::default(),
@@ -1503,6 +1523,7 @@ mod tests {
                 &Method::POST,
                 &"/x".parse().unwrap(),
                 &headers(&[("host", "up.test")]),
+                &[],
                 Sending::Chunked,
                 body,
                 &H1Limits::default(),
@@ -1746,6 +1767,7 @@ mod tests {
                 &Method::GET,
                 &"/x".parse().unwrap(),
                 &headers(&[("host", "up.test")]),
+                &[],
                 Sending::None,
                 Empty::<Bytes>::new(),
                 &limits,
@@ -1784,6 +1806,7 @@ mod tests {
                 &Method::GET,
                 &"/x".parse().unwrap(),
                 &headers(&[("host", "up.test")]),
+                &[],
                 Sending::None,
                 Empty::<Bytes>::new(),
                 &limits,
@@ -1819,6 +1842,7 @@ mod tests {
                 &Method::GET,
                 &"/x".parse().unwrap(),
                 &headers(&[("host", "up.test")]),
+                &[],
                 Sending::None,
                 Empty::<Bytes>::new(),
                 &limits,
@@ -1848,6 +1872,7 @@ mod tests {
                 &Method::GET,
                 &"/x".parse().unwrap(),
                 &headers(&[("host", "up.test")]),
+                &[],
                 Sending::None,
                 Empty::<Bytes>::new(),
                 &H1Limits::default(),
@@ -2362,6 +2387,7 @@ mod tests {
                 &Method::POST,
                 &"/x".parse().unwrap(),
                 &expecting(),
+                &[],
                 Sending::Chunked,
                 body,
                 &limits,
@@ -2405,6 +2431,7 @@ mod tests {
                 &Method::POST,
                 &"/x".parse().unwrap(),
                 &expecting(),
+                &[],
                 Sending::Chunked,
                 body,
                 &H1Limits::default(),
@@ -2446,6 +2473,7 @@ mod tests {
                 &Method::POST,
                 &"/x".parse().unwrap(),
                 &expecting(),
+                &[],
                 Sending::Chunked,
                 body,
                 &limits,
@@ -2486,6 +2514,7 @@ mod tests {
                 &Method::POST,
                 &"/x".parse().unwrap(),
                 &expecting(),
+                &[],
                 Sending::Chunked,
                 body,
                 &limits,
@@ -2529,6 +2558,7 @@ mod tests {
                 &Method::POST,
                 &"/x".parse().unwrap(),
                 &headers(&[("host", "up.test"), ("expect", "the-moon-on-a-stick")]),
+                &[],
                 Sending::Chunked,
                 body,
                 &limits,
