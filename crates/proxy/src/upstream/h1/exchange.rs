@@ -3077,6 +3077,181 @@ mod tests {
         assert_eq!(body, b"5\r\nhello\r\n0\r\n\r\n");
     }
 
+    /// Reads an answer's body to its end, and says whether the connection was kept.
+    async fn finished<B>(answer: Answer, rest: Rest<DuplexStream, B>) -> (Vec<u8>, bool)
+    where
+        B: Body<Data = Bytes> + Unpin,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let mut body = H1Body::new(
+            rest,
+            answer.delivery.framing,
+            answer.delivery.persistent,
+            answer.nominated,
+            H1Limits::default(),
+        );
+        let (data, _) = collected(&mut body).await.unwrap();
+        (data, body.take_if_reusable().is_some())
+    }
+
+    /// Asking to be told before sending a body that has nothing in it holds nothing back,
+    /// so an answer that never said 100 abandons nothing, and the connection is as good as
+    /// any other (from Pingora, where the expectation has no bearing on keeping one).
+    #[tokio::test(start_paused = true)]
+    #[ignore = "defect: an expectation with no body to hold back costs the connection"]
+    async fn an_expectation_with_nothing_to_hold_back_costs_nothing() {
+        let (exchange, mut peer) = connected(4096);
+        let _peering = tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            peer.say("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await;
+            peer
+        });
+        let (answer, rest) = exchange
+            .send(
+                &Method::POST,
+                &"/x".parse().unwrap(),
+                &expecting(),
+                &[],
+                Sending::Length(0),
+                Empty::<Bytes>::new(),
+                &H1Limits::default(),
+            )
+            .await
+            .unwrap();
+        let (data, kept) = finished(answer, rest).await;
+        assert_eq!(data, b"ok");
+        assert!(
+            kept,
+            "a connection was given up for a body that had nothing in it"
+        );
+    }
+
+    /// A refusal while a body is held back, that does not close: the body — here a whole
+    /// second request, the shape a smuggling attempt takes — never reaches the upstream,
+    /// and the connection is not lent to anyone else, because what it carried is not
+    /// finished (Envoy's `NonWebsocketUpgradeWithPrePayloadDoesNotPoisonConnection`).
+    #[tokio::test(start_paused = true)]
+    async fn a_body_held_back_from_a_refusal_never_arrives_and_the_connection_goes() {
+        const SMUGGLED: &[u8] = b"GET /smuggled HTTP/1.1\r\nhost: up.test\r\n\r\n";
+        for refusal in [
+            "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+        ] {
+            let (exchange, mut peer) = connected(4096);
+            let (body, asked) = Watched::new(SMUGGLED);
+            let peering = tokio::spawn(async move {
+                peer.until(b"\r\n\r\n").await;
+                peer.say(refusal).await;
+                // Everything else the connection ever carries, until it closes.
+                let mut rest = Vec::new();
+                peer.0.read_to_end(&mut rest).await.unwrap();
+                rest
+            });
+            let limits = H1Limits {
+                continue_wait: Duration::from_secs(60),
+                ..H1Limits::default()
+            };
+            let (answer, rest) = exchange
+                .send(
+                    &Method::POST,
+                    &"/x".parse().unwrap(),
+                    &expecting(),
+                    &[],
+                    Sending::Length(SMUGGLED.len() as u64),
+                    body,
+                    &limits,
+                )
+                .await
+                .unwrap();
+            assert!(answer.delivery.persistent, "{refusal}");
+            let (_, kept) = finished(answer, rest).await;
+            assert!(!kept, "{refusal}: a connection owed a body was lent on");
+            assert!(
+                !asked.load(Ordering::SeqCst),
+                "{refusal}: the body was asked for"
+            );
+            let after = peering.await.unwrap();
+            assert!(
+                after.is_empty(),
+                "{refusal}: {:?}",
+                String::from_utf8_lossy(&after)
+            );
+        }
+    }
+
+    /// A body that gives a frame, waits a while, and then fails: long enough for what it
+    /// gave to have gone out before it does.
+    #[derive(Debug)]
+    struct FailingLater {
+        gave: bool,
+        waiting: Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl FailingLater {
+        fn new() -> Self {
+            Self {
+                gave: false,
+                waiting: Box::pin(tokio::time::sleep(Duration::from_secs(1))),
+            }
+        }
+    }
+
+    impl Body for FailingLater {
+        type Data = Bytes;
+        type Error = &'static str;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, &'static str>>> {
+            if !self.gave {
+                self.gave = true;
+                let frame = hyper::body::Frame::data(Bytes::from_static(b"ab"));
+                return Poll::Ready(Some(Ok(frame)));
+            }
+            match self.waiting.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => Poll::Ready(Some(Err("the client went away"))),
+            }
+        }
+    }
+
+    /// A request body that fails part way leaves the upstream with a request that is
+    /// visibly unfinished: no zero chunk to end it, no padding to make up a length
+    /// (hyper's client tests).
+    #[tokio::test(start_paused = true)]
+    async fn a_request_body_that_fails_is_never_made_to_look_finished() {
+        for (sending, expected) in [
+            (Sending::Chunked, &b"2\r\nab\r\n"[..]),
+            (Sending::Length(10), &b"ab"[..]),
+        ] {
+            let (exchange, mut peer) = connected(4096);
+            // Everything after the head, until the connection closes.
+            let peering = tokio::spawn(async move {
+                peer.until(b"\r\n\r\n").await;
+                let mut rest = Vec::new();
+                peer.0.read_to_end(&mut rest).await.unwrap();
+                rest
+            });
+            let failed = exchange
+                .send(
+                    &Method::POST,
+                    &"/x".parse().unwrap(),
+                    &headers(&[("host", "up.test")]),
+                    &[],
+                    sending,
+                    FailingLater::new(),
+                    &H1Limits::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(failed, ExchangeError::RequestBody(_)), "{failed}");
+            // What the client gave, and nothing that would end it.
+            assert_eq!(peering.await.unwrap(), expected, "{sending:?}");
+        }
+    }
+
     /// A body read cleanly to its end, on a head that allowed it, gives its connection
     /// back. Every test below takes one condition away from this and gets nothing.
     #[tokio::test(start_paused = true)]
