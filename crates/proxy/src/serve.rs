@@ -736,6 +736,10 @@ impl Worker {
             upstream.responded(head.status);
         }
         strip_response(&mut head.headers);
+        // The version is this hop's and not the upstream's: "Intermediaries that process
+        // HTTP messages ... MUST send their own HTTP-version in forwarded messages" (RFC
+        // 9110 §6.2). The engine's server still answers a client that spoke 1.0 in 1.0.
+        head.version = Version::HTTP_11;
         if let Some(changes) = directed
             .rule
             .as_ref()

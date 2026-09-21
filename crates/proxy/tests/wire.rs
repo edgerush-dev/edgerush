@@ -1746,20 +1746,31 @@ async fn an_answer_that_says_close_is_not_reused_though_the_socket_stays_open() 
 
 /// An intermediary speaks its own version: "Intermediaries that process HTTP messages ...
 /// MUST send their own HTTP-version in forwarded messages" (RFC 9110 §6.2). An upstream
-/// that answers in HTTP/1.0 is answered on to an HTTP/1.1 client in HTTP/1.1. Found while
-/// writing the test above; both paths copy the upstream's version onto the answer.
+/// that answers in HTTP/1.0 is answered on to an HTTP/1.1 client in HTTP/1.1, and one that
+/// answers in HTTP/1.1 is answered on to an HTTP/1.0 client in 1.0, which is all that
+/// client can be sent. Found while writing the test above.
 #[tokio::test]
-#[ignore = "defect on both paths: an upstream's HTTP/1.0 is passed on as the answer's version"]
-async fn an_answer_in_http_1_0_is_passed_on_in_the_proxys_own_version() {
-    let (backend, _accepts) = counted(|mut wire| async move {
-        while wire.until(b"\r\n\r\n").await.is_some() {
-            wire.write("HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nfresh")
-                .await;
-        }
-    });
-    let mut client = Wire::to(proxy_to(backend).await).await;
+async fn an_answer_is_passed_on_in_the_proxys_own_version() {
+    let proxy = proxy_to(
+        counted(|mut wire| async move {
+            while wire.until(b"\r\n\r\n").await.is_some() {
+                wire.write("HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nfresh")
+                    .await;
+            }
+        })
+        .0,
+    )
+    .await;
+    let mut client = Wire::to(proxy).await;
     let head = asks(&mut client, "/first").await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let proxy = proxy_to(counted(plainly).0).await;
+    let mut old = Wire::to(proxy).await;
+    old.write("GET /first HTTP/1.0\r\nHost: example.test\r\n\r\n")
+        .await;
+    let head = within(old.head()).await;
+    assert!(head.starts_with("HTTP/1.0 200"), "{head}");
 }
 
 /// An idle connection the upstream resets, rather than closes, is as gone as one it
