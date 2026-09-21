@@ -96,6 +96,29 @@ pub enum Notable {
     /// A 101. The connection would become something that is not HTTP/1.1, which this
     /// slice does not support.
     Upgrade,
+    /// A `Connection` field whose value is not what the field's grammar has.
+    /// [RFC 9110 §7.6.1](https://www.rfc-editor.org/rfc/rfc9110.html#section-7.6.1)
+    /// gives `Connection = 1#connection-option` with `connection-option = token`, and
+    /// §5.5 gives a recipient no rule for a value that fails its field's grammar. So
+    /// what the peer meant by it cannot be worked out, and both refusing the message and
+    /// disregarding the field are open; §4 refuses.
+    ConnectionNotTokens,
+    /// A status code with no class: 6xx to 9xx.
+    /// [RFC 9110 §15](https://www.rfc-editor.org/rfc/rfc9110.html#section-15) says a
+    /// recipient "MUST understand the class of any status code, as indicated by the
+    /// first digit, and treat an unrecognized status code as being equivalent to the x00
+    /// status code of that class", and there is no such class for these. Read all the
+    /// same, because both clients read them and because servers in the wild send them;
+    /// a code below 100 has no class either and is refused outright, there being nothing
+    /// at all that could be done with one.
+    StatusWithoutClass,
+    /// A status line that stops after the code.
+    /// [RFC 9112 §4](https://www.rfc-editor.org/rfc/rfc9112.html#section-4) requires a
+    /// sender to send the space before the reason phrase "even when the reason-phrase is
+    /// absent"; it gives a recipient no rule, and the code itself is not in doubt. So
+    /// this reads the line and leaves the choice where the specification left it: both
+    /// refusing it and reading it are allowed.
+    NoSpaceAfterStatus,
 }
 
 /// What the bytes came to, measured rather than judged.
@@ -206,7 +229,8 @@ pub enum Invalid {
     StatusLine,
     /// Not `HTTP/1.0` or `HTTP/1.1`.
     Version,
-    /// Not three digits.
+    /// Not three digits, or three digits below 100 — which is no status at all: there
+    /// is no class for a recipient to understand and nothing to treat it as.
     StatusCode,
     /// A field name that is not a token, or is empty.
     FieldName,
@@ -242,9 +266,13 @@ pub enum Reading {
     Unfinished,
 }
 
-/// Reads `bytes` as an answer to `asked`, where `ended` says whether the upstream has
-/// finished talking — which is the only thing that ends a body delimited by the
+/// Reads `bytes` as an answer to `asked`, where `ended` says whether the upstream
+/// closed its end cleanly — which is the only thing that ends a body delimited by the
 /// connection closing.
+///
+/// A connection that *failed* has not ended such a message, it has cut one off, so
+/// `ended` is false for one: the bytes that arrived are all there were, and there is no
+/// saying whether they were all there was going to be.
 #[must_use]
 pub fn read(bytes: &[u8], asked: Asked, ended: bool) -> Reading {
     match reading(bytes, asked, ended) {
@@ -271,6 +299,9 @@ fn reading(bytes: &[u8], asked: Asked, ended: bool) -> Result<Option<Answer>, In
         if !(100..200).contains(&head.status) {
             break head;
         }
+        if head.no_space {
+            note(&mut notable, Notable::NoSpaceAfterStatus);
+        }
         if head.status == 101 {
             note(&mut notable, Notable::Upgrade);
             break head;
@@ -288,6 +319,15 @@ fn reading(bytes: &[u8], asked: Asked, ended: bool) -> Result<Option<Answer>, In
 
     measured.head = head.bytes;
     measured.fields = head.fields.len();
+    if head.no_space {
+        note(&mut notable, Notable::NoSpaceAfterStatus);
+    }
+    if head.status >= 600 {
+        note(&mut notable, Notable::StatusWithoutClass);
+    }
+    if !connection_is_tokens(&head) {
+        note(&mut notable, Notable::ConnectionNotTokens);
+    }
     if head.version == Version::Ten {
         note(&mut notable, Notable::Http10);
     }
@@ -355,6 +395,8 @@ struct Head {
     version: Version,
     status: u16,
     reason: String,
+    /// Its status line stopped after the code.
+    no_space: bool,
     fields: Vec<(String, String)>,
     /// What it came to, its terminator included.
     bytes: usize,
@@ -382,7 +424,7 @@ fn read_head(bytes: &[u8]) -> Result<Option<Head>, Invalid> {
     let Some(status) = lines.next() else {
         return Err(Invalid::StatusLine);
     };
-    let (version, status, reason) = read_status(status)?;
+    let (version, status, reason, no_space) = read_status(status)?;
 
     let mut fields = Vec::new();
     for line in lines {
@@ -393,6 +435,7 @@ fn read_head(bytes: &[u8]) -> Result<Option<Head>, Invalid> {
         version,
         status,
         reason,
+        no_space,
         fields,
         bytes: end + 4,
     }))
@@ -420,7 +463,7 @@ fn strip_return(line: &[u8]) -> &[u8] {
 }
 
 /// `HTTP-version SP status-code SP [ reason-phrase ]`, and nothing looser.
-fn read_status(line: &[u8]) -> Result<(Version, u16, String), Invalid> {
+fn read_status(line: &[u8]) -> Result<(Version, u16, String, bool), Invalid> {
     let rest = line.strip_prefix(b"HTTP/1.").ok_or(Invalid::Version)?;
     let (version, rest) = rest.split_first().ok_or(Invalid::Version)?;
     let version = match version {
@@ -433,14 +476,23 @@ fn read_status(line: &[u8]) -> Result<(Version, u16, String), Invalid> {
     if !code.iter().all(u8::is_ascii_digit) {
         return Err(Invalid::StatusCode);
     }
-    let reason = reason.strip_prefix(b" ").ok_or(Invalid::StatusLine)?;
+    let (reason, no_space) = match reason.strip_prefix(b" ") {
+        Some(reason) => (reason, false),
+        // Nothing at all after the code: the space is required of a sender, and what the
+        // status is is not in doubt without it. Read, and noted.
+        None if reason.is_empty() => (reason, true),
+        None => return Err(Invalid::StatusLine),
+    };
     if !reason.iter().copied().all(is_text) {
         return Err(Invalid::StatusLine);
     }
     let status = code
         .iter()
         .fold(0u16, |status, digit| status * 10 + u16::from(digit - b'0'));
-    Ok((version, status, text(reason)))
+    if status < 100 {
+        return Err(Invalid::StatusCode);
+    }
+    Ok((version, status, text(reason), no_space))
 }
 
 /// `field-name ":" OWS field-value OWS`, with the name lowered so that a comparison is
@@ -506,6 +558,15 @@ fn framing(head: &Head, asked: Asked, notable: &mut Vec<Notable>) -> Result<Fram
     Ok(match length {
         Some(length) => Framing::Length(length),
         None => Framing::ToClose,
+    })
+}
+
+/// Whether every `Connection` field is a list of tokens with something in it. Empty
+/// elements are not the question: a list rule lets a recipient disregard those.
+fn connection_is_tokens(head: &Head) -> bool {
+    named(&head.fields, "connection").all(|value| {
+        let options = list(value);
+        !options.is_empty() && options.iter().all(|option| option.bytes().all(is_token))
     })
 }
 
@@ -1198,9 +1259,20 @@ mod tests {
         assert_eq!(refused(b"HTTP/1.1 20 OK\r\n\r\n"), Invalid::StatusCode);
         assert_eq!(refused(b"HTTP/1.1 2000 OK\r\n\r\n"), Invalid::StatusLine);
         assert_eq!(refused(b"HTTP/1.1 2x0 OK\r\n\r\n"), Invalid::StatusCode);
+        // Three digits below a hundred are no status: there is no class for a
+        // recipient to understand and nothing to treat them as. Above five
+        // hundred and ninety-nine there is no class either, but both clients read
+        // those, so they are noted rather than refused.
+        assert_eq!(refused(b"HTTP/1.1 059 OK\r\n\r\n"), Invalid::StatusCode);
+        let classless = whole(b"HTTP/1.1 999 Who Knows\r\ncontent-length: 0\r\n\r\n");
+        assert_eq!(classless.status, 999);
+        assert_eq!(classless.notable, [Notable::StatusWithoutClass]);
         // The space before the reason phrase is required of a sender even when the
-        // phrase is absent, so a line that stops after the code is malformed.
-        assert_eq!(refused(b"HTTP/1.1 200\r\n\r\n"), Invalid::StatusLine);
+        // phrase is absent — but a recipient is given no rule, and the code is not in
+        // doubt without it, so a line that stops after the code is read and noted.
+        let stopped = whole(b"HTTP/1.1 200\r\n\r\n");
+        assert_eq!(stopped.status, 200);
+        assert_eq!(stopped.notable, [Notable::NoSpaceAfterStatus]);
         // An empty reason phrase, with its space, is a status line.
         let answer = whole(b"HTTP/1.1 200 \r\ncontent-length: 0\r\n\r\n");
         assert_eq!((answer.status, answer.reason.as_str()), (200, ""));
@@ -1220,6 +1292,21 @@ mod tests {
             whole(b"HTTP/1.0 200 OK\r\nconnection: keep-alive\r\ncontent-length: 0\r\n\r\n");
         assert!(asked.persistent);
         assert_eq!(asked.notable, [Notable::Http10]);
+    }
+
+    #[test]
+    fn a_connection_field_that_is_not_a_list_of_tokens_is_not_one_to_act_on() {
+        let malformed = whole(b"HTTP/1.1 200 OK\r\nconnection: 00 =K\r\ncontent-length: 0\r\n\r\n");
+        assert_eq!(malformed.notable, [Notable::ConnectionNotTokens]);
+        // An empty one is not a list of one either: the field's grammar wants at
+        // least one option in it.
+        let empty = whole(b"HTTP/1.1 200 OK\r\nconnection:\r\ncontent-length: 0\r\n\r\n");
+        assert_eq!(empty.notable, [Notable::ConnectionNotTokens]);
+        // Empty elements among real ones are not the question; a list rule lets a
+        // recipient disregard those.
+        let padded =
+            whole(b"HTTP/1.1 200 OK\r\nconnection: keep-alive,,\r\ncontent-length: 0\r\n\r\n");
+        assert!(padded.notable.is_empty());
     }
 
     #[test]

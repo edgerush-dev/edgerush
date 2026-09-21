@@ -78,7 +78,8 @@ impl Asking {
     }
 
     /// What the answer's framing turns on.
-    fn asked(&self) -> reference::Asked {
+    #[must_use]
+    pub fn asked(&self) -> reference::Asked {
         match self {
             Self::Head => reference::Asked::Head,
             _ => reference::Asked::Anything,
@@ -354,8 +355,11 @@ pub fn check(
     limits: H1Limits,
 ) -> Checked {
     let (got, _again, tape) = drive(path, script, ask, budget, limits, false);
-    let expected = expected(script, ask, &tape);
-    let verdict = judge(path, &got, &expected, &limits);
+    let expected = expected(script, ask, &tape, &got);
+    // Whether the request ever reached the socket at all. Nothing that arrived on a
+    // connection the request never went out on is an answer to anything.
+    let started = !tape.written.is_empty();
+    let verdict = judge(path, &got, &expected, &limits, started);
     Checked {
         got,
         tape,
@@ -364,12 +368,24 @@ pub fn check(
     }
 }
 
-/// What the oracles make of the script, the request, and what the socket recorded.
+/// What the oracles make of the script, the request, what the socket recorded, and how
+/// the run ended.
+///
+/// `got` is consulted for one fact only: whether the exchange was cancelled. That is the
+/// run's own doing rather than a client's opinion — a `Cancel` step the script reached
+/// after the exchange had already finished cancelled nothing at all, and an oracle that
+/// read it off the steps would blame a connection kept by an exchange that went through.
 #[must_use]
-pub fn expected(script: &Script, ask: &Asking, tape: &Tape) -> Expected {
-    let said = script.said();
-    let ended = script.ends();
-    let reading = reference::read(&said, ask.asked(), ended);
+pub fn expected(script: &Script, ask: &Asking, tape: &Tape, got: &Got) -> Expected {
+    // What the upstream said over the steps the run reached, which is not the whole
+    // script: a `Say` behind a wait that never released never reached the wire, and an
+    // oracle handed those bytes would hold a client to a message nobody sent.
+    let spoken = script.within(tape.reached);
+    // Only a clean close ends a body the close delimits. A connection that failed
+    // did not end such a message, it cut one off, and a client that presented it as
+    // whole would be handing on a truncation.
+    let closed = spoken.ended && !spoken.failed;
+    let reading = reference::read(&spoken.bytes, ask.asked(), closed);
     let answer = match &reading {
         reference::Reading::Read(answer) => Some(answer),
         _ => None,
@@ -385,10 +401,10 @@ pub fn expected(script: &Script, ask: &Asking, tape: &Tape) -> Expected {
         tunnel: answer.is_some_and(|answer| answer.notable.contains(&reference::Notable::Upgrade)),
         // Nothing here ever asks for the connection to close.
         asked_to_close: false,
-        failed: script.fails() || answer.is_none(),
-        cancelled: script.cancels(),
-        surplus: answer.is_some_and(|answer| answer.boundary < said.len()),
-        peer_closed: ended,
+        failed: spoken.failed || answer.is_none(),
+        cancelled: matches!(got, Got::Cancelled),
+        surplus: answer.is_some_and(|answer| answer.boundary < spoken.bytes.len()),
+        peer_closed: spoken.ended,
     };
     Expected {
         reading,
@@ -440,7 +456,7 @@ fn past_bounds(measured: &reference::Measured, limits: &H1Limits) -> Vec<String>
 /// is asked of every answer a path presents, inside the shared subset or not: reading a
 /// message nobody has to accept is no licence to keep a connection that cannot carry
 /// another exchange.
-fn judge(path: Path, got: &Got, expected: &Expected, limits: &H1Limits) -> Verdict {
+fn judge(path: Path, got: &Got, expected: &Expected, limits: &H1Limits, started: bool) -> Verdict {
     let answer = match &expected.reading {
         reference::Reading::Read(answer) => answer,
         // Not a message. Nothing may present one; a refusal is the only thing that is
@@ -477,7 +493,12 @@ fn judge(path: Path, got: &Got, expected: &Expected, limits: &H1Limits) -> Verdi
     let seen = match got {
         Got::Answer(seen) => seen,
         Got::Refused(why) => {
-            return if bounds.is_empty() && choices.is_empty() {
+            return if !started {
+                // No byte of the request went out, so there is no exchange for these
+                // bytes to be an answer to: a refusal is the only outcome there could be,
+                // whatever they would otherwise have been read as.
+                Verdict::Outside(vec!["the request never went out".to_owned()])
+            } else if bounds.is_empty() && choices.is_empty() {
                 Verdict::Disagrees(vec![format!(
                     "refused a message the specification reads: {why}"
                 )])
@@ -1036,8 +1057,9 @@ mod tests {
             let script = Script::new(steps);
 
             // What the oracle reads: the first message, and the second from where the
-            // first one ended.
-            let said = script.said();
+            // first one ended. Every step of this script is reached, so what it says and
+            // what it hoped to say are the same thing.
+            let said = script.within(usize::MAX).bytes;
             let reference::Reading::Read(one) =
                 reference::read(&said, reference::Asked::Anything, false)
             else {
@@ -1137,7 +1159,7 @@ mod tests {
 
         // The oracle finds the second message where the first one ended, which is what
         // the boundary is for.
-        let said = script.said();
+        let said = script.within(usize::MAX).bytes;
         let reference::Reading::Read(one) =
             reference::read(&said, reference::Asked::Anything, false)
         else {
@@ -1172,6 +1194,149 @@ mod tests {
             assert_eq!(got_two.status, two.status, "{path:?}");
             assert_eq!(got_two.body, two.body, "{path:?}");
             assert!(got_two.kept, "{path:?} gave up a good connection");
+        }
+    }
+
+    #[test]
+    fn an_answer_behind_a_wait_that_never_released_was_never_said() {
+        // The upstream waits for more of the request than a request of this shape
+        // has in it, so it never speaks. What the oracle is given has to be what was
+        // said and not what the script hoped to say: handed those bytes it would hold
+        // ours to a message nobody sent, and then blame it for meeting the deadline
+        // it was left with instead. Found by the fuzz target.
+        let script = Script::new(vec![
+            Step::Wait(Wait::Written(150)),
+            Step::Say(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n".to_vec()),
+        ]);
+        let checked = checked(Path::Ours, &script, &Asking::Head);
+        assert_eq!(checked.tape.delivered, 0, "{checked:?}");
+        assert_eq!(checked.expected.reading, reference::Reading::Unfinished);
+        assert!(matches!(checked.got, Got::Refused(_)), "{:?}", checked.got);
+        assert_eq!(checked.verdict, Verdict::Agrees, "{checked:?}");
+    }
+
+    #[test]
+    fn a_body_the_close_delimits_is_cut_off_by_a_failure_rather_than_ended_by_it() {
+        // No length and no coding, so only the close ends this body — and what comes
+        // is not a close but a connection that failed. The bytes that arrived are all
+        // there were, and there is no saying whether they were all there was going to
+        // be, so nothing may present them as a whole message. Found by the fuzz
+        // target, which had the oracle calling it one.
+        let script = Script::new(vec![
+            Step::Wait(Wait::Written(BEGUN)),
+            Step::Say(b"HTTP/1.1 200 OK\r\n\r\nas much as arrived".to_vec()),
+            Step::Fail,
+        ]);
+        let cut_off = checked(Path::Ours, &script, &Asking::Nothing);
+        assert_eq!(cut_off.expected.reading, reference::Reading::Unfinished);
+        assert!(matches!(cut_off.got, Got::Refused(_)), "{:?}", cut_off.got);
+        assert_eq!(cut_off.verdict, Verdict::Agrees, "{cut_off:?}");
+
+        // The same bytes, ended by a close instead, are a whole message.
+        let closed = says_and_closes("HTTP/1.1 200 OK\r\n\r\nas much as arrived");
+        let ended = checked(Path::Ours, &closed, &Asking::Nothing);
+        assert_eq!(ended.verdict, Verdict::Agrees, "{ended:?}");
+        assert_eq!(seen(&ended).body, b"as much as arrived");
+    }
+
+    #[test]
+    fn a_status_line_that_stops_after_the_code_is_read_by_both() {
+        // RFC 9112 section 4 requires a sender to send the space before the reason
+        // phrase even when the phrase is absent. A recipient is given no rule and the
+        // code is not in doubt without it, so refusing it and reading it are both
+        // allowed; both clients read it. Found by the fuzz target, which had the
+        // oracle calling it no message at all.
+        let script = says_and_closes("HTTP/1.1 200\r\n\r\n");
+        for path in [Path::Ours, Path::Theirs] {
+            let checked = checked(path, &script, &Asking::Nothing);
+            assert!(
+                matches!(checked.verdict, Verdict::Outside(_)),
+                "{path:?} {checked:?}"
+            );
+            assert_eq!(seen(&checked).status, 200, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn a_cancellation_the_exchange_finished_before_cancelled_nothing() {
+        // The script says to take the client away, and gets there only once the
+        // answer has been read — by which time the exchange is over and the
+        // connection kept. A step being reached is not the same as its having had an
+        // effect. Found by the fuzz target, which had the oracle blaming a connection
+        // that an exchange which went through had every right to keep.
+        let script = Script::new(vec![
+            Step::Wait(Wait::Written(BEGUN)),
+            Step::Say(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n".to_vec()),
+            Step::Cancel,
+        ]);
+        let checked = checked(Path::Ours, &script, &Asking::Nothing);
+        assert!(matches!(checked.got, Got::Answer(_)), "{:?}", checked.got);
+        assert!(!checked.expected.trace.cancelled, "{checked:?}");
+        assert_eq!(checked.expected.reuse, Ok(()));
+        assert_eq!(checked.verdict, Verdict::Agrees, "{checked:?}");
+        assert!(seen(&checked).kept);
+    }
+
+    #[test]
+    fn a_connection_that_failed_before_the_request_went_out_answers_nothing() {
+        // The upstream says an answer and the connection fails in the same breath,
+        // before a byte of the request has gone. There is no exchange for those bytes
+        // to be an answer to, so a refusal is the only outcome there could be —
+        // whatever they would otherwise have been read as. Found by the fuzz target.
+        let script = Script::new(vec![
+            Step::Say(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n".to_vec()),
+            Step::Fail,
+        ]);
+        let checked = checked(Path::Ours, &script, &Asking::Head);
+        assert!(checked.tape.written.is_empty(), "{:?}", checked.tape);
+        assert!(matches!(checked.got, Got::Refused(_)), "{:?}", checked.got);
+        assert!(
+            matches!(checked.verdict, Verdict::Outside(_)),
+            "{checked:?}"
+        );
+    }
+
+    #[test]
+    fn a_connection_field_that_is_not_a_list_of_tokens_is_refused_by_one_path() {
+        // RFC 9110 section 7.6.1 gives `Connection = 1#connection-option` with
+        // `connection-option = token`, and section 5.5 gives a recipient no rule for
+        // a value that fails its field's grammar. What the peer meant by this one
+        // cannot be worked out, so 13 section 4 validates it and refuses; hyper's
+        // client reads on. Found by the fuzz target.
+        let script = says("HTTP/1.1 200 OK\r\nconnection: 00 =K\r\ncontent-length: 2\r\n\r\nok");
+        let ours = checked(Path::Ours, &script, &Asking::Nothing);
+        let theirs = checked(Path::Theirs, &script, &Asking::Nothing);
+        assert!(matches!(ours.verdict, Verdict::Outside(_)), "{ours:?}");
+        assert!(matches!(ours.got, Got::Refused(_)), "{:?}", ours.got);
+        assert!(matches!(theirs.verdict, Verdict::Outside(_)), "{theirs:?}");
+        assert_eq!(seen(&theirs).body, b"ok");
+    }
+
+    #[test]
+    fn a_status_code_with_no_class_is_read_by_both_and_one_below_a_hundred_by_neither() {
+        // RFC 9110 section 15 has a recipient understand a code's class from its
+        // first digit and treat an unrecognised code as that class's x00. There is no
+        // class for 6xx upwards, and none below 100 either — but servers in the wild
+        // send the former, and both clients read them.
+        let classless = says("HTTP/1.1 999 Who Knows\r\ncontent-length: 2\r\n\r\nok");
+        for path in [Path::Ours, Path::Theirs] {
+            let checked = checked(path, &classless, &Asking::Nothing);
+            assert!(
+                matches!(checked.verdict, Verdict::Outside(_)),
+                "{path:?} {checked:?}"
+            );
+            assert_eq!(seen(&checked).status, 999, "{path:?}");
+        }
+        // Below a hundred there is nothing a recipient could do with it at all, and
+        // neither client takes it.
+        let nothing = says("HTTP/1.1 059 Nor This\r\ncontent-length: 2\r\n\r\nok");
+        for path in [Path::Ours, Path::Theirs] {
+            let checked = checked(path, &nothing, &Asking::Nothing);
+            assert!(
+                matches!(checked.got, Got::Refused(_)),
+                "{path:?} {checked:?}"
+            );
+            assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {checked:?}");
         }
     }
 

@@ -96,48 +96,41 @@ impl Script {
         &self.steps
     }
 
-    /// Everything the upstream says, all together: the bytes an oracle reads. Anything
-    /// after a close or a failure is left out, because it never reaches a client.
+    /// What the upstream said over the first `steps` steps of this script, and how it
+    /// stopped talking if it did.
+    ///
+    /// **Not what the script hoped to say.** A `Say` behind a wait that never released is
+    /// something the upstream never said, and an oracle handed those bytes would be
+    /// holding a client to a message that was never on the wire. `steps` is what the run
+    /// actually reached, which is [`Tape::reached`].
     #[must_use]
-    pub fn said(&self) -> Vec<u8> {
-        let mut said = Vec::new();
-        for step in &self.steps {
+    pub fn within(&self, steps: usize) -> Spoken {
+        let mut spoken = Spoken {
+            bytes: Vec::new(),
+            ended: false,
+            failed: false,
+            cancelled: false,
+        };
+        for step in self.steps.iter().take(steps) {
             match step {
-                Step::Say(bytes) => said.extend_from_slice(bytes),
-                Step::Close | Step::Fail | Step::Cancel => break,
-                _ => {}
+                Step::Say(bytes) => spoken.bytes.extend_from_slice(bytes),
+                Step::Close => {
+                    spoken.ended = true;
+                    break;
+                }
+                Step::Fail => {
+                    spoken.ended = true;
+                    spoken.failed = true;
+                    break;
+                }
+                Step::Cancel => {
+                    spoken.cancelled = true;
+                    break;
+                }
+                Step::Block | Step::Take(_) | Step::Wait(_) => {}
             }
         }
-        said
-    }
-
-    /// What stops the script, if anything does. The steps after it are never reached,
-    /// so every question about how a run ended is a question about this one step.
-    fn stops(&self) -> Option<&Step> {
-        self.steps
-            .iter()
-            .find(|step| matches!(step, Step::Close | Step::Fail | Step::Cancel))
-    }
-
-    /// Whether the upstream's last word is a failure rather than a close or a silence.
-    /// The bytes are the same either way; what differs is whether the stream ended or
-    /// broke, which is not something a framer can tell from the bytes.
-    #[must_use]
-    pub fn fails(&self) -> bool {
-        self.stops() == Some(&Step::Fail)
-    }
-
-    /// Whether the upstream finishes talking. What ends a body that only the close
-    /// delimits, and what leaves nothing for another exchange to be carried on.
-    #[must_use]
-    pub fn ends(&self) -> bool {
-        matches!(self.stops(), Some(Step::Close | Step::Fail))
-    }
-
-    /// Whether the script takes the client away before the upstream has finished.
-    #[must_use]
-    pub fn cancels(&self) -> bool {
-        self.stops() == Some(&Step::Cancel)
+        spoken
     }
 
     /// Reads one input as a script, within `budget`.
@@ -187,6 +180,20 @@ impl Script {
         }
         Self::new(steps)
     }
+}
+
+/// What an upstream said, and how it stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spoken {
+    /// Every byte of it.
+    pub bytes: Vec<u8>,
+    /// It will say nothing more: it closed its end, or the connection failed.
+    pub ended: bool,
+    /// What ended it was a failure rather than an orderly close. The bytes are the
+    /// same either way; what differs is whether the stream ended or broke.
+    pub failed: bool,
+    /// The script took the client away before the upstream had finished.
+    pub cancelled: bool,
 }
 
 /// What a run may spend, and what an input may come to. Every one of these is a bound
@@ -947,12 +954,21 @@ mod tests {
         ]);
         // Waits and room are not bytes, and nothing after the connection ended ever
         // reaches a client, so neither belongs in what an oracle is given.
-        assert_eq!(script.said(), b"onetwo");
-        assert!(!script.fails());
-        assert!(Script::new(vec![Step::Say(b"x".to_vec()), Step::Fail]).fails());
+        let all = usize::MAX;
+        assert_eq!(script.within(all).bytes, b"onetwo");
+        assert!(!script.within(all).failed);
+        assert!(
+            Script::new(vec![Step::Say(b"x".to_vec()), Step::Fail])
+                .within(all)
+                .failed
+        );
+        // Only as far as the run got: a step the script never reached said nothing, and
+        // an oracle told otherwise would be holding a client to bytes nobody sent.
+        assert_eq!(script.within(1).bytes, b"one");
+        assert_eq!(script.within(0).bytes, b"");
         // A script that never ends its connection has not failed it either.
-        let silence = Script::new(vec![Step::Wait(Wait::Forever)]);
-        assert!(!silence.fails() && !silence.ends() && !silence.cancels());
+        let silence = Script::new(vec![Step::Wait(Wait::Forever)]).within(all);
+        assert!(!silence.failed && !silence.ended && !silence.cancelled);
         // And whatever stops the script is the end of it: a failure written after the
         // client has been taken away is a step nothing ever reaches, so a script that
         // cancels does not also fail, and says nothing after the cancellation.
@@ -962,10 +978,11 @@ mod tests {
             Step::Say(b"after".to_vec()),
             Step::Fail,
         ]);
-        assert!(taken.cancels() && !taken.fails() && !taken.ends());
-        assert_eq!(taken.said(), b"before");
-        let closed = Script::new(vec![Step::Close]);
-        assert!(closed.ends() && !closed.fails() && !closed.cancels());
+        let taken = taken.within(all);
+        assert!(taken.cancelled && !taken.failed && !taken.ended);
+        assert_eq!(taken.bytes, b"before");
+        let closed = Script::new(vec![Step::Close]).within(all);
+        assert!(closed.ended && !closed.failed && !closed.cancelled);
     }
 
     /// The thing the harness is for, driven over the scripted socket: a script fits the
@@ -1028,7 +1045,10 @@ mod tests {
             let bytes: Vec<u8> = (0..40).map(|index| seed.wrapping_mul(index + 1)).collect();
             let script = Script::decode(&bytes, &budget);
             assert!(script.steps().len() <= budget.steps, "{seed}");
-            assert!(script.said().len() <= budget.said, "{seed}");
+            assert!(
+                script.within(usize::MAX).bytes.len() <= budget.said,
+                "{seed}"
+            );
         }
     }
 
