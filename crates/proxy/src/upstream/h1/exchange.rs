@@ -386,7 +386,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         write_head(&mut self.outgoing, method, uri, headers, sending, limits)?;
         // A request that asks to be told before it sends its body has its head go out
         // alone; what follows waits for the upstream to answer, or for the wait to end.
-        let mut may_send = !expects_continue(headers);
+        //
+        // A body framed as nothing has nothing to hold back: waiting would ask the
+        // upstream's leave to send no bytes, and an answer given instead of a 100 would
+        // then abandon an upload that was never there, and the connection with it. One of
+        // unknown length is another matter: nobody knows it is empty until it is asked.
+        let nothing_to_send = matches!(sending, Sending::None | Sending::Length(0));
+        let mut may_send = nothing_to_send || !expects_continue(headers);
         let withheld = !may_send;
         let ask_by = Instant::now() + limits.continue_wait;
 
@@ -3107,7 +3113,6 @@ mod tests {
     /// so an answer that never said 100 abandons nothing, and the connection is as good as
     /// any other (from Pingora, where the expectation has no bearing on keeping one).
     #[tokio::test(start_paused = true)]
-    #[ignore = "defect: an expectation with no body to hold back costs the connection"]
     async fn an_expectation_with_nothing_to_hold_back_costs_nothing() {
         let (exchange, mut peer) = connected(4096);
         let _peering = tokio::spawn(async move {
