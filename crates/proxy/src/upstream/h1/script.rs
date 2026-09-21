@@ -104,11 +104,19 @@ impl Script {
         for step in &self.steps {
             match step {
                 Step::Say(bytes) => said.extend_from_slice(bytes),
-                Step::Close | Step::Fail => break,
+                Step::Close | Step::Fail | Step::Cancel => break,
                 _ => {}
             }
         }
         said
+    }
+
+    /// What stops the script, if anything does. The steps after it are never reached,
+    /// so every question about how a run ended is a question about this one step.
+    fn stops(&self) -> Option<&Step> {
+        self.steps
+            .iter()
+            .find(|step| matches!(step, Step::Close | Step::Fail | Step::Cancel))
     }
 
     /// Whether the upstream's last word is a failure rather than a close or a silence.
@@ -116,10 +124,20 @@ impl Script {
     /// broke, which is not something a framer can tell from the bytes.
     #[must_use]
     pub fn fails(&self) -> bool {
-        self.steps
-            .iter()
-            .find(|step| matches!(step, Step::Close | Step::Fail))
-            .is_some_and(|step| *step == Step::Fail)
+        self.stops() == Some(&Step::Fail)
+    }
+
+    /// Whether the upstream finishes talking. What ends a body that only the close
+    /// delimits, and what leaves nothing for another exchange to be carried on.
+    #[must_use]
+    pub fn ends(&self) -> bool {
+        matches!(self.stops(), Some(Step::Close | Step::Fail))
+    }
+
+    /// Whether the script takes the client away before the upstream has finished.
+    #[must_use]
+    pub fn cancels(&self) -> bool {
+        self.stops() == Some(&Step::Cancel)
     }
 
     /// Reads one input as a script, within `budget`.
@@ -391,6 +409,12 @@ impl Shared {
                     wake(&mut self.writer);
                 }
                 Some(Step::Cancel) => {
+                    // Once what came before it has been read: "say this and then go
+                    // away" means the client saw it and then went, not that it went
+                    // while the bytes were still in the socket.
+                    if !self.pending.is_empty() {
+                        break;
+                    }
                     self.cancel = true;
                     self.next();
                 }
@@ -927,7 +951,21 @@ mod tests {
         assert!(!script.fails());
         assert!(Script::new(vec![Step::Say(b"x".to_vec()), Step::Fail]).fails());
         // A script that never ends its connection has not failed it either.
-        assert!(!Script::new(vec![Step::Wait(Wait::Forever)]).fails());
+        let silence = Script::new(vec![Step::Wait(Wait::Forever)]);
+        assert!(!silence.fails() && !silence.ends() && !silence.cancels());
+        // And whatever stops the script is the end of it: a failure written after the
+        // client has been taken away is a step nothing ever reaches, so a script that
+        // cancels does not also fail, and says nothing after the cancellation.
+        let taken = Script::new(vec![
+            Step::Say(b"before".to_vec()),
+            Step::Cancel,
+            Step::Say(b"after".to_vec()),
+            Step::Fail,
+        ]);
+        assert!(taken.cancels() && !taken.fails() && !taken.ends());
+        assert_eq!(taken.said(), b"before");
+        let closed = Script::new(vec![Step::Close]);
+        assert!(closed.ends() && !closed.fails() && !closed.cancels());
     }
 
     /// The thing the harness is for, driven over the scripted socket: a script fits the
