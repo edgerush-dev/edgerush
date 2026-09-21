@@ -80,11 +80,19 @@ pub enum Notable {
     /// A transfer coding this slice does not support: a chain of them, `chunked`
     /// anywhere but last, or any at all on an HTTP/1.0 message.
     UnsupportedCoding,
-    /// An interim answer that claimed a body. A 1xx ends at its empty line whatever its
-    /// fields say ([RFC 9110 §15.2](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.2)),
-    /// so the framing is not in doubt; the claim is only evidence that something upstream
-    /// is confused about this message.
-    InterimClaimsBody,
+    /// A head that may not have a body, carrying `Content-Length` or
+    /// `Transfer-Encoding` — a 1xx, interim or final, or a 204.
+    /// [RFC 9110 §8.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6) forbids a
+    /// server from sending a length on either, and
+    /// [RFC 9112 §6.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3) rule 1
+    /// ends such a message at its empty line "regardless of the header fields present",
+    /// so the framing is never in doubt. The claim is only evidence that something
+    /// upstream is confused about this message.
+    ///
+    /// A `HEAD` answer and a 304 are not this: there the metadata describes the body that
+    /// a body-bearing answer would have had, and is expected
+    /// ([13 §4](../../../../docs/13-http1-upstream.md)).
+    ForbiddenFraming,
     /// A 101. The connection would become something that is not HTTP/1.1, which this
     /// slice does not support.
     Upgrade,
@@ -267,10 +275,8 @@ fn reading(bytes: &[u8], asked: Asked, ended: bool) -> Result<Option<Answer>, In
             note(&mut notable, Notable::Upgrade);
             break head;
         }
-        if named(&head.fields, "content-length").next().is_some()
-            || named(&head.fields, "transfer-encoding").next().is_some()
-        {
-            note(&mut notable, Notable::InterimClaimsBody);
+        if claims_a_body(&head) {
+            note(&mut notable, Notable::ForbiddenFraming);
         }
         measured.interim_heads += 1;
         measured.interim_bytes += head.bytes;
@@ -476,6 +482,11 @@ fn framing(head: &Head, asked: Asked, notable: &mut Vec<Notable>) -> Result<Fram
         || head.status == 204
         || head.status == 304
     {
+        // A 1xx or a 204 may not carry framing metadata at all; on a `HEAD` answer or a
+        // 304 it describes the body that would have been there and is expected.
+        if ((100..200).contains(&head.status) || head.status == 204) && claims_a_body(head) {
+            note(notable, Notable::ForbiddenFraming);
+        }
         return Ok(Framing::None);
     }
     // Rule 3, ahead of the length: a transfer coding overrides one.
@@ -496,6 +507,12 @@ fn framing(head: &Head, asked: Asked, notable: &mut Vec<Notable>) -> Result<Fram
         Some(length) => Framing::Length(length),
         None => Framing::ToClose,
     })
+}
+
+/// Whether a head carries framing metadata: a length, or a transfer coding.
+fn claims_a_body(head: &Head) -> bool {
+    named(&head.fields, "content-length").next().is_some()
+        || named(&head.fields, "transfer-encoding").next().is_some()
 }
 
 /// Whether the answer has a transfer coding, and whether `chunked` is the last of them.
@@ -922,6 +939,13 @@ mod tests {
         let not_modified = whole(b"HTTP/1.1 304 Not Modified\r\ncontent-length: 5\r\n\r\nhello");
         assert_eq!(not_modified.framing, Framing::None);
         assert!(not_modified.body.is_empty());
+        // A 204 may not carry framing metadata at all, so a length on one is worth
+        // noting; on a 304 the same field describes the body a body-bearing answer
+        // would have had, and is expected.
+        let no_content = whole(b"HTTP/1.1 204 No Content\r\ncontent-length: 3\r\n\r\nxyz");
+        assert_eq!(no_content.framing, Framing::None);
+        assert_eq!(no_content.notable, [Notable::ForbiddenFraming]);
+        assert!(not_modified.notable.is_empty());
         // 205 is neither 204 nor 304, and its body is its body.
         let reset = whole(b"HTTP/1.1 205 Reset Content\r\ncontent-length: 2\r\n\r\nok");
         assert_eq!(reset.framing, Framing::Length(2));
@@ -1067,7 +1091,7 @@ mod tests {
         // answer is where it always was.
         assert_eq!(answer.status, 200);
         assert_eq!(answer.body, b"ok");
-        assert_eq!(answer.notable, [Notable::InterimClaimsBody]);
+        assert_eq!(answer.notable, [Notable::ForbiddenFraming]);
         assert!(!answer.shared());
     }
 

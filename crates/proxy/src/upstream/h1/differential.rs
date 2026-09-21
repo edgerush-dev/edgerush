@@ -20,8 +20,8 @@
 //! hyper's client reads ahead, which is its own business; whether a boundary was read
 //! correctly shows in the exchange that follows, not in a byte count.
 
-use super::exchange::{Exchange, H1Body};
-use super::script::{self, Budget, Script, Tape};
+use super::exchange::{Exchange, H1Body, Kept};
+use super::script::{self, Budget, Script, Scripted, Tape};
 use super::{H1Limits, lifecycle, reference};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
 use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
@@ -165,9 +165,15 @@ impl Asking {
             Self::Nothing | Self::Head => head_ended(written),
             Self::Counted(bytes) if bytes.is_empty() => head_ended(written),
             Self::Counted(bytes) => written.ends_with(bytes),
-            // The zero chunk, and then the end of the trailer section — which is the
-            // same empty line whether any trailers were sent or not.
-            Self::Chunked(_) | Self::Slow(..) | Self::Trailing(..) => {
+            Self::Chunked(frames) | Self::Slow(frames, _) | Self::Trailing(frames, _) => {
+                // A body with no bytes in it at all is one a client may frame as
+                // absent, which the engine's client does and ours does not: with
+                // nothing to send, the head having gone is the whole request going.
+                if frames.iter().all(Vec::is_empty) {
+                    return head_ended(written);
+                }
+                // Otherwise the zero chunk, and then the end of the trailer section,
+                // which is the same empty line whether trailers were sent or not.
                 written.windows(5).any(|window| window == b"\r\n0\r\n") && head_ended(written)
             }
             Self::Endless(_) => false,
@@ -347,12 +353,9 @@ pub fn check(
     budget: Budget,
     limits: H1Limits,
 ) -> Checked {
-    let (got, tape) = match path {
-        Path::Ours => ours(script.clone(), ask, budget, limits),
-        Path::Theirs => theirs(script.clone(), ask, budget),
-    };
+    let (got, _again, tape) = drive(path, script, ask, budget, limits, false);
     let expected = expected(script, ask, &tape);
-    let verdict = judge(&got, &expected, &limits);
+    let verdict = judge(path, &got, &expected, &limits);
     Checked {
         got,
         tape,
@@ -428,7 +431,16 @@ fn past_bounds(measured: &reference::Measured, limits: &H1Limits) -> Vec<String>
 }
 
 /// Holds what a client did against what the oracles say.
-fn judge(got: &Got, expected: &Expected, limits: &H1Limits) -> Verdict {
+///
+/// Three questions, and they are not the same question. Whether the bytes are a message
+/// at all is the specification's. Whether this path was entitled to refuse one is partly
+/// the specification's — where it names a choice — and partly this project's, where a
+/// bound of its own says no; a bound belongs to the path that set it, so hyper's client
+/// is never held to one. Whether the connection survived is the lifecycle model's, and it
+/// is asked of every answer a path presents, inside the shared subset or not: reading a
+/// message nobody has to accept is no licence to keep a connection that cannot carry
+/// another exchange.
+fn judge(path: Path, got: &Got, expected: &Expected, limits: &H1Limits) -> Verdict {
     let answer = match &expected.reading {
         reference::Reading::Read(answer) => answer,
         // Not a message. Nothing may present one; a refusal is the only thing that is
@@ -450,27 +462,33 @@ fn judge(got: &Got, expected: &Expected, limits: &H1Limits) -> Verdict {
         }
     };
 
-    // Outside the shared subset, or outside this project's bounds: a classified outcome
-    // is all that is asked for, and every arm of `Got` is one.
-    let mut outside: Vec<String> = answer
+    // Bounds are the path's own, so only the path that set them answers for them.
+    let bounds = match path {
+        Path::Ours => past_bounds(&answer.measured, limits),
+        Path::Theirs => Vec::new(),
+    };
+    // Choices the specification names and leaves open belong to neither path.
+    let choices: Vec<String> = answer
         .notable
         .iter()
         .map(|notable| format!("{notable:?}"))
         .collect();
-    outside.extend(past_bounds(&answer.measured, limits));
-    if !outside.is_empty() {
-        return Verdict::Outside(outside);
-    }
 
     let seen = match got {
         Got::Answer(seen) => seen,
         Got::Refused(why) => {
-            return Verdict::Disagrees(vec![format!(
-                "refused a message the specification reads: {why}"
-            )]);
+            return if bounds.is_empty() && choices.is_empty() {
+                Verdict::Disagrees(vec![format!(
+                    "refused a message the specification reads: {why}"
+                )])
+            } else {
+                // Entitled to refuse it: a bound of its own, or a choice the
+                // specification left to it.
+                Verdict::Outside([bounds, choices].concat())
+            };
         }
         // A budget or a cancellation is the run ending. There is nothing to compare,
-        // which is not the same as agreement and is not a fault either.
+        // which is not agreement and is not a fault either.
         Got::Spent(spent) => {
             return Verdict::Outside(vec![format!("the run's budget ran out: {spent:?}")]);
         }
@@ -480,23 +498,9 @@ fn judge(got: &Got, expected: &Expected, limits: &H1Limits) -> Verdict {
     };
 
     let mut faults = Vec::new();
-    if seen.status != answer.status {
-        faults.push(format!(
-            "the status is {} and the message says {}",
-            seen.status, answer.status
-        ));
-    }
-    if seen.body != answer.body {
-        faults.push(format!(
-            "the body is {} bytes and the message says {}",
-            seen.body.len(),
-            answer.body.len()
-        ));
-    }
-    let wanted = Seen::bag(&answer.fields);
-    let got_fields = Seen::bag(&seen.fields);
-    if got_fields != wanted {
-        faults.push(format!("the fields are {got_fields:?} and not {wanted:?}"));
+    // A bound is a promise not to read past it.
+    for past in &bounds {
+        faults.push(format!("read past a bound of its own — {past}"));
     }
     match expected.reuse {
         Ok(()) if !seen.kept => faults.push(format!(
@@ -508,127 +512,230 @@ fn judge(got: &Got, expected: &Expected, limits: &H1Limits) -> Verdict {
         }
         _ => {}
     }
-    if faults.is_empty() {
-        Verdict::Agrees
-    } else {
+    // What the message means is only compared where both clients undertake to read it.
+    if bounds.is_empty() && choices.is_empty() {
+        if seen.status != answer.status {
+            faults.push(format!(
+                "the status is {} and the message says {}",
+                seen.status, answer.status
+            ));
+        }
+        if seen.body != answer.body {
+            faults.push(format!(
+                "the body is {} bytes and the message says {}",
+                seen.body.len(),
+                answer.body.len()
+            ));
+        }
+        let wanted = Seen::bag(&answer.fields);
+        let got_fields = Seen::bag(&seen.fields);
+        if got_fields != wanted {
+            faults.push(format!("the fields are {got_fields:?} and not {wanted:?}"));
+        }
+    }
+
+    if !faults.is_empty() {
         Verdict::Disagrees(faults)
+    } else if !choices.is_empty() {
+        Verdict::Outside(choices)
+    } else {
+        Verdict::Agrees
     }
 }
 
-/// EdgeRush's own path, over the scripted socket.
-fn ours(script: Script, ask: &Asking, budget: Budget, limits: H1Limits) -> (Got, Tape) {
-    let method = ask.method();
-    let headers = ask.headers();
-    let sending = ask.sending();
-    let upload = ask.upload();
-    let uri: Uri = TARGET.parse().unwrap_or_default();
-
-    let (outcome, tape) = script::run(script, budget, move |socket| async move {
-        let sent = Exchange::new(socket)
-            .send(&method, &uri, &headers, sending, upload, &limits)
-            .await;
-        let (answer, rest) = match sent {
-            Ok(pair) => pair,
-            Err(error) => return Got::Refused(error.to_string()),
-        };
-        let mut body = H1Body::new(
-            rest,
-            answer.delivery.framing,
-            answer.delivery.persistent,
-            answer.nominated,
-            limits,
-        );
-        let mut data = Vec::new();
-        let mut trailers = Vec::new();
-        loop {
-            match poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
-                None => break,
-                Some(Err(error)) => return Got::Refused(error.to_string()),
-                Some(Ok(frame)) => match frame.into_data() {
-                    Ok(bytes) => data.extend_from_slice(&bytes),
-                    Err(frame) => {
-                        if let Ok(fields) = frame.into_trailers() {
-                            trailers.extend(fields_of(&fields));
-                        }
-                    }
-                },
-            }
-        }
-        let kept = body.take_if_reusable().is_some();
-        Got::Answer(Seen {
-            status: answer.head.status.as_u16(),
-            fields: fields_of(&answer.head.headers),
-            body: data,
-            trailers,
-            kept,
-        })
-    });
-    (settled(outcome), tape)
+/// Two exchanges on one connection, where the first kept it.
+///
+/// The only place a boundary that was read wrongly shows. A client that took a byte too
+/// few leaves it sitting in front of the next answer; one that took a byte too many has
+/// eaten the next answer's first byte. Neither shows in the first answer, and neither can
+/// be found by counting what a client read, because reading ahead of a boundary is that
+/// client's own business ([13 §8](../../../../docs/13-http1-upstream.md)).
+#[derive(Debug)]
+pub struct Twice {
+    /// What the first exchange came to.
+    pub first: Got,
+    /// What a second exchange on the connection came to, where the first kept it. `None`
+    /// where it did not, which is no fault by itself: whether it should have is what
+    /// [`Expected::reuse`] answers.
+    pub second: Option<Got>,
+    /// What the socket recorded across both of them.
+    pub tape: Tape,
 }
 
-/// The engine's client, over the same scripted socket.
-fn theirs(script: Script, ask: &Asking, budget: Budget) -> (Got, Tape) {
-    let method = ask.method();
-    let headers = ask.headers();
-    let upload = ask.upload();
-    let uri: Uri = TARGET.parse().unwrap_or_default();
+/// Drives `path` twice on one connection, the second exchange only if the first left a
+/// connection to carry it.
+#[must_use]
+pub fn twice(path: Path, script: &Script, ask: &Asking, budget: Budget, limits: H1Limits) -> Twice {
+    let (first, second, tape) = drive(path, script, ask, budget, limits, true);
+    Twice {
+        first,
+        second,
+        tape,
+    }
+}
 
+/// One exchange by EdgeRush's own path, and the connection back if it kept it.
+async fn one_ours(socket: Scripted, ask: &Asking, limits: H1Limits) -> (Got, Option<Scripted>) {
+    let uri: Uri = TARGET.parse().unwrap_or_default();
+    let sent = Exchange::new(socket)
+        .send(
+            &ask.method(),
+            &uri,
+            &ask.headers(),
+            ask.sending(),
+            ask.upload(),
+            &limits,
+        )
+        .await;
+    let (answer, rest) = match sent {
+        Ok(pair) => pair,
+        Err(error) => return (Got::Refused(error.to_string()), None),
+    };
+    let mut body = H1Body::new(
+        rest,
+        answer.delivery.framing,
+        answer.delivery.persistent,
+        answer.nominated,
+        limits,
+    );
+    let mut data = Vec::new();
+    let mut trailers = Vec::new();
+    loop {
+        match poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
+            None => break,
+            Some(Err(error)) => return (Got::Refused(error.to_string()), None),
+            Some(Ok(frame)) => match frame.into_data() {
+                Ok(bytes) => data.extend_from_slice(&bytes),
+                Err(frame) => {
+                    if let Ok(fields) = frame.into_trailers() {
+                        trailers.extend(fields_of(&fields));
+                    }
+                }
+            },
+        }
+    }
+    let kept = body.take_if_reusable();
+    let seen = Seen {
+        status: answer.head.status.as_u16(),
+        fields: fields_of(&answer.head.headers),
+        body: data,
+        trailers,
+        kept: kept.is_some(),
+    };
+    (Got::Answer(seen), kept.map(Kept::into_socket))
+}
+
+/// EdgeRush's own path, over the scripted socket, once or twice.
+fn ours(
+    script: Script,
+    ask: &Asking,
+    budget: Budget,
+    limits: H1Limits,
+    twice: bool,
+) -> (Got, Option<Got>, Tape) {
+    let ask = ask.clone();
+    let (outcome, tape) = script::run(script, budget, move |socket| async move {
+        let (first, kept) = one_ours(socket, &ask, limits).await;
+        let second = match kept {
+            Some(socket) if twice => Some(one_ours(socket, &ask, limits).await.0),
+            _ => None,
+        };
+        (first, second)
+    });
+    let (first, second) = settled(outcome);
+    (first, second, tape)
+}
+
+/// One exchange by the engine's client on a sender that is already connected.
+async fn one_theirs(
+    sender: &mut hyper::client::conn::http1::SendRequest<Upload>,
+    ask: &Asking,
+) -> Got {
+    let uri: Uri = TARGET.parse().unwrap_or_default();
+    let mut request = http::Request::new(ask.upload());
+    *request.method_mut() = ask.method();
+    *request.uri_mut() = uri;
+    *request.headers_mut() = ask.headers();
+    let response = match sender.send_request(request).await {
+        Ok(response) => response,
+        Err(error) => return Got::Refused(error.to_string()),
+    };
+    let (head, mut body) = response.into_parts();
+    let mut data = Vec::new();
+    let mut trailers = Vec::new();
+    loop {
+        match poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
+            None => break,
+            Some(Err(error)) => return Got::Refused(error.to_string()),
+            Some(Ok(frame)) => match frame.into_data() {
+                Ok(bytes) => data.extend_from_slice(&bytes),
+                Err(frame) => {
+                    if let Ok(fields) = frame.into_trailers() {
+                        trailers.extend(fields_of(&fields));
+                    }
+                }
+            },
+        }
+    }
+    // Whether this client would carry another exchange on the connection. Asked of the
+    // sender rather than read out of hyper's own buffers: what it did with the bytes it
+    // read ahead is its business, and the question here is only whether it would use the
+    // connection again.
+    let kept = sender.ready().await.is_ok();
+    Got::Answer(Seen {
+        status: head.status.as_u16(),
+        fields: fields_of(&head.headers),
+        body: data,
+        trailers,
+        kept,
+    })
+}
+
+/// The engine's client, over the same scripted socket, once or twice.
+fn theirs(script: Script, ask: &Asking, budget: Budget, twice: bool) -> (Got, Option<Got>, Tape) {
+    let ask = ask.clone();
     let (outcome, tape) = script::run(script, budget, move |socket| async move {
         let io = hyper_util::rt::TokioIo::new(socket);
         let (mut sender, connection) = match hyper::client::conn::http1::handshake(io).await {
             Ok(pair) => pair,
-            Err(error) => return Got::Refused(error.to_string()),
+            Err(error) => return (Got::Refused(error.to_string()), None),
         };
         // The connection is what drives the socket; without it nothing moves.
         let _driving = tokio::spawn(connection);
 
-        let mut request = http::Request::new(upload);
-        *request.method_mut() = method;
-        *request.uri_mut() = uri;
-        *request.headers_mut() = headers;
-        let response = match sender.send_request(request).await {
-            Ok(response) => response,
-            Err(error) => return Got::Refused(error.to_string()),
+        let first = one_theirs(&mut sender, &ask).await;
+        let kept = matches!(&first, Got::Answer(seen) if seen.kept);
+        let second = match twice && kept {
+            true => Some(one_theirs(&mut sender, &ask).await),
+            false => None,
         };
-        let (head, mut body) = response.into_parts();
-        let mut data = Vec::new();
-        let mut trailers = Vec::new();
-        loop {
-            match poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
-                None => break,
-                Some(Err(error)) => return Got::Refused(error.to_string()),
-                Some(Ok(frame)) => match frame.into_data() {
-                    Ok(bytes) => data.extend_from_slice(&bytes),
-                    Err(frame) => {
-                        if let Ok(fields) = frame.into_trailers() {
-                            trailers.extend(fields_of(&fields));
-                        }
-                    }
-                },
-            }
-        }
-        // Whether this client would carry another exchange on the connection. Asked of
-        // the sender rather than read out of hyper's own buffers: what it did with the
-        // bytes it read ahead is its business, and the question here is only whether it
-        // would use the connection again.
-        let kept = sender.ready().await.is_ok();
-        Got::Answer(Seen {
-            status: head.status.as_u16(),
-            fields: fields_of(&head.headers),
-            body: data,
-            trailers,
-            kept,
-        })
+        (first, second)
     });
-    (settled(outcome), tape)
+    let (first, second) = settled(outcome);
+    (first, second, tape)
+}
+
+/// Drives `path` once, or twice on the connection the first exchange kept.
+fn drive(
+    path: Path,
+    script: &Script,
+    ask: &Asking,
+    budget: Budget,
+    limits: H1Limits,
+    twice: bool,
+) -> (Got, Option<Got>, Tape) {
+    match path {
+        Path::Ours => ours(script.clone(), ask, budget, limits, twice),
+        Path::Theirs => theirs(script.clone(), ask, budget, twice),
+    }
 }
 
 /// The run's own ends, which are not either client's doing.
-fn settled(outcome: script::Outcome<Got>) -> Got {
+fn settled(outcome: script::Outcome<(Got, Option<Got>)>) -> (Got, Option<Got>) {
     match outcome {
         script::Outcome::Done(got) => got,
-        script::Outcome::Cancelled => Got::Cancelled,
-        script::Outcome::Spent(spent) => Got::Spent(spent),
+        script::Outcome::Cancelled => (Got::Cancelled, None),
+        script::Outcome::Spent(spent) => (Got::Spent(spent), None),
     }
 }
 
@@ -683,6 +790,388 @@ mod tests {
         match &checked.got {
             Got::Answer(seen) => seen,
             other => panic!("{other:?} is not an answer: {:?}", checked.verdict),
+        }
+    }
+
+    use proptest::prelude::*;
+
+    /// Small bounds, so that a generated message can reach them at all. The rest stay as
+    /// they are: a bound nothing here can reach is one these properties have nothing to
+    /// say about.
+    fn small() -> H1Limits {
+        H1Limits {
+            head: 256,
+            fields: 8,
+            chunk_line: 32,
+            trailers: 128,
+            trailer_fields: 4,
+            interim_heads: 2,
+            interim_bytes: 256,
+            ..H1Limits::default()
+        }
+    }
+
+    /// What a generated answer's body is.
+    #[derive(Debug, Clone)]
+    enum Made {
+        /// None at all, and nothing said about one.
+        Nothing,
+        /// This much, counted.
+        Counted(Vec<u8>),
+        /// These frames, in chunks, with these trailers after them.
+        Chunked(Vec<Vec<u8>>, Vec<(String, String)>),
+        /// This much, ending only with the connection.
+        ToClose(Vec<u8>),
+    }
+
+    /// A field name this generator will make up, and a value for it.
+    ///
+    /// Every name that means something to the framing or to the trailer policy is left
+    /// out on purpose: what those do is asserted by name elsewhere, and a generator that
+    /// stumbled on one would be comparing two clients' policies rather than their
+    /// reading of a message.
+    fn made_field() -> impl Strategy<Value = (String, String)> {
+        (
+            prop::sample::select(vec!["x-a", "x-b", "x-c"]),
+            prop::sample::select(vec!["1", "two", "a b", ""]),
+        )
+            .prop_map(|(name, value)| (name.to_owned(), value.to_owned()))
+    }
+
+    /// `closing` says whether a body that only the close delimits is one of the choices.
+    /// On a connection that has to carry a second answer it is not, and it is left out
+    /// of the strategy rather than filtered out of it: a choice that is always rejected
+    /// is a generator that makes no progress.
+    fn made_body(closing: bool) -> BoxedStrategy<Made> {
+        let keeping = prop_oneof![
+            Just(Made::Nothing),
+            prop::collection::vec(any::<u8>(), 0..6).prop_map(Made::Counted),
+            (
+                prop::collection::vec(prop::collection::vec(any::<u8>(), 0..4), 0..3),
+                prop::collection::vec(made_field(), 0..2),
+            )
+                .prop_map(|(frames, trailers)| Made::Chunked(frames, trailers)),
+        ];
+        if !closing {
+            return keeping.boxed();
+        }
+        prop_oneof![
+            keeping,
+            prop::collection::vec(any::<u8>(), 0..6).prop_map(Made::ToClose),
+        ]
+        .boxed()
+    }
+
+    /// A whole answer: its status paired with a body that status may carry, the fields it
+    /// carries, and the interim answers that come before it.
+    fn made_answer(
+        closing: bool,
+    ) -> impl Strategy<Value = (u16, Vec<(String, String)>, Made, Vec<u16>)> {
+        made_body(closing).prop_flat_map(|body| {
+            let statuses = match body {
+                // Nothing said about a body and nothing there: only the statuses that
+                // have no body have that shape. On any other status a head with no
+                // framing in it is a body the close delimits, which is `ToClose`.
+                Made::Nothing => vec![204u16, 304],
+                _ => vec![200u16, 201, 202, 205, 404, 500],
+            };
+            (
+                prop::sample::select(statuses),
+                prop::collection::vec(made_field(), 0..3),
+                Just(body),
+                prop::collection::vec(prop::sample::select(vec![100u16, 103]), 0..2),
+            )
+        })
+    }
+
+    /// The answer as bytes on the wire.
+    fn render(status: u16, fields: &[(String, String)], body: &Made, interim: &[u16]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for code in interim {
+            out.extend(format!("HTTP/1.1 {code} Interim\r\nx-i: 1\r\n\r\n").as_bytes());
+        }
+        out.extend(format!("HTTP/1.1 {status} Made\r\n").as_bytes());
+        for (name, value) in fields {
+            out.extend(format!("{name}: {value}\r\n").as_bytes());
+        }
+        match body {
+            Made::Nothing | Made::ToClose(_) => {}
+            Made::Counted(bytes) => {
+                out.extend(format!("content-length: {}\r\n", bytes.len()).as_bytes());
+            }
+            Made::Chunked(..) => out.extend(b"transfer-encoding: chunked\r\n"),
+        }
+        out.extend(b"\r\n");
+        match body {
+            Made::Nothing => {}
+            Made::Counted(bytes) | Made::ToClose(bytes) => out.extend(bytes),
+            Made::Chunked(frames, trailers) => {
+                for frame in frames {
+                    // A chunk of nothing is the chunk that ends the body, so a frame
+                    // with nothing in it is not one.
+                    if frame.is_empty() {
+                        continue;
+                    }
+                    out.extend(format!("{:x}\r\n", frame.len()).as_bytes());
+                    out.extend(frame);
+                    out.extend(b"\r\n");
+                }
+                out.extend(b"0\r\n");
+                for (name, value) in trailers {
+                    out.extend(format!("{name}: {value}\r\n").as_bytes());
+                }
+                out.extend(b"\r\n");
+            }
+        }
+        out
+    }
+
+    /// The bytes in the pieces the generator chose, so that the same answer is delivered
+    /// in different reads from one case to the next. Where a message is split is the
+    /// seam a reader that keeps state between arrivals can be read two ways at.
+    fn cut_into(bytes: &[u8], cuts: &[u8]) -> Vec<Vec<u8>> {
+        let mut offsets: Vec<usize> = cuts
+            .iter()
+            .map(|cut| usize::from(*cut) * bytes.len() / 256)
+            .filter(|offset| *offset > 0)
+            .collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        offsets.push(bytes.len());
+        let mut pieces = Vec::new();
+        let mut at = 0;
+        for offset in offsets {
+            pieces.push(bytes[at..offset].to_vec());
+            at = offset;
+        }
+        pieces
+    }
+
+    /// The script that delivers `bytes`, in pieces, once the request has begun.
+    fn delivering(bytes: &[u8], cuts: &[u8], close: bool) -> Script {
+        let mut steps = vec![Step::Wait(Wait::Written(BEGUN))];
+        for piece in cut_into(bytes, cuts) {
+            steps.push(Step::Say(piece));
+        }
+        steps.push(if close {
+            Step::Close
+        } else {
+            Step::Wait(Wait::Forever)
+        });
+        Script::new(steps)
+    }
+
+    /// A request whose body finishes, so that reuse turns on the answer and not on the
+    /// upload. What an unfinished upload costs is asserted by name elsewhere.
+    fn finishing_ask() -> impl Strategy<Value = Asking> {
+        prop_oneof![
+            Just(Asking::Nothing),
+            Just(Asking::Head),
+            prop::collection::vec(any::<u8>(), 0..4).prop_map(Asking::Counted),
+            prop::collection::vec(prop::collection::vec(any::<u8>(), 0..3), 0..2)
+                .prop_map(Asking::Chunked),
+        ]
+    }
+
+    proptest::proptest! {
+        // Sixty-four cases: every one of them builds a runtime and drives two clients,
+        // so this is where the ordinary suite's runtime would go if it went anywhere.
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// **The strict arm.** A well-formed answer inside the subset both clients
+        /// undertake to support, delivered in pieces: both paths agree with the oracles,
+        /// and both read the same message out of it.
+        #[test]
+        fn a_shared_answer_is_read_the_same_way_by_both(
+            (status, fields, body, interim) in made_answer(true),
+            ask in finishing_ask(),
+            cuts in prop::collection::vec(any::<u8>(), 0..3),
+        ) {
+            let bytes = render(status, &fields, &body, &interim);
+            // A body that only the close ends needs the close to end it.
+            let close = matches!(body, Made::ToClose(_));
+            let script = delivering(&bytes, &cuts, close);
+
+            let ours = check(Path::Ours, &script, &ask, Budget::default(), small());
+            let theirs = check(Path::Theirs, &script, &ask, Budget::default(), small());
+            prop_assert_eq!(&ours.verdict, &Verdict::Agrees, "ours: {:?}", ours);
+            prop_assert_eq!(&theirs.verdict, &Verdict::Agrees, "theirs: {:?}", theirs);
+
+            // And the same message by both, which is the arm's own claim: the oracles
+            // could both be satisfied by two clients reading two different things only
+            // if the oracle were the weaker of the two, and it is not.
+            let (Got::Answer(one), Got::Answer(two)) = (&ours.got, &theirs.got) else {
+                return Err(TestCaseError::fail(format!(
+                    "a shared answer was not read by both: {:?} and {:?}",
+                    ours.got, theirs.got
+                )));
+            };
+            prop_assert_eq!(one.status, two.status);
+            prop_assert_eq!(&one.body, &two.body);
+            prop_assert_eq!(Seen::bag(&one.fields), Seen::bag(&two.fields));
+            prop_assert_eq!(Seen::bag(&one.trailers), Seen::bag(&two.trailers));
+            prop_assert_eq!(one.kept, two.kept);
+        }
+
+        /// **A boundary shows in the next exchange.** Two answers on one connection: both
+        /// paths read the first, keep the connection, and get the second — which they
+        /// could not if either had taken a byte too many or too few from the first.
+        #[test]
+        fn a_second_answer_is_found_where_the_first_one_ended(
+            (status, fields, body, interim) in made_answer(false),
+            (next_status, next_fields, next_body, next_interim) in made_answer(false),
+            cuts in prop::collection::vec(any::<u8>(), 0..3),
+        ) {
+            let first = render(status, &fields, &body, &interim);
+            let second = render(next_status, &next_fields, &next_body, &next_interim);
+            let mut steps = vec![Step::Wait(Wait::Written(BEGUN))];
+            for piece in cut_into(&first, &cuts) {
+                steps.push(Step::Say(piece));
+            }
+            // Not before the second request has had time to go out: two answers said
+            // together would be one of them arriving unasked-for.
+            steps.push(Step::Wait(Wait::Time(Duration::from_secs(1))));
+            steps.push(Step::Say(second.clone()));
+            steps.push(Step::Wait(Wait::Forever));
+            let script = Script::new(steps);
+
+            // What the oracle reads: the first message, and the second from where the
+            // first one ended.
+            let said = script.said();
+            let reference::Reading::Read(one) =
+                reference::read(&said, reference::Asked::Anything, false)
+            else {
+                return Ok(());
+            };
+            prop_assume!(one.shared() && one.boundary == first.len());
+            let reference::Reading::Read(two) =
+                reference::read(&said[one.boundary..], reference::Asked::Anything, false)
+            else {
+                return Ok(());
+            };
+            prop_assume!(two.shared());
+            // Only where the first answer leaves a connection to carry the second.
+            prop_assume!(one.persistent && one.framing != reference::Framing::ToClose);
+
+            for path in [Path::Ours, Path::Theirs] {
+                let ran = twice(
+                    path,
+                    &script,
+                    &Asking::Nothing,
+                    Budget::default(),
+                    small(),
+                );
+                let Got::Answer(got_one) = &ran.first else {
+                    return Err(TestCaseError::fail(format!(
+                        "{path:?} did not read the first answer: {:?}",
+                        ran.first
+                    )));
+                };
+                prop_assert_eq!(got_one.status, one.status, "{:?}", path);
+                prop_assert_eq!(&got_one.body, &one.body, "{:?}", path);
+                prop_assert!(got_one.kept, "{:?} would not carry a second exchange", path);
+                let Some(Got::Answer(got_two)) = &ran.second else {
+                    return Err(TestCaseError::fail(format!(
+                        "{path:?} had no second exchange: {:?}",
+                        ran.second
+                    )));
+                };
+                prop_assert_eq!(got_two.status, two.status, "{:?}", path);
+                prop_assert_eq!(&got_two.body, &two.body, "{:?}", path);
+            }
+        }
+
+        /// **The hostile arm.** Any bytes at all, as a script: ours may refuse whatever
+        /// it likes, and may meet a bound or a deadline, but it may never present a
+        /// message the specification does not read there, never read past a bound of its
+        /// own, and never keep a connection the trace says is finished.
+        ///
+        /// Nothing is asserted of hyper's client here beyond its not panicking: reading
+        /// something the grammar does not have is a difference of the first kind, not a
+        /// promise this project can make on its behalf.
+        #[test]
+        fn nothing_hostile_gets_a_message_past_ours(bytes: Vec<u8>) {
+            let budget = Budget {
+                steps: 8,
+                said: 512,
+                ops: 512,
+                time: Duration::from_secs(120),
+            };
+            let script = Script::decode(&bytes, &budget);
+            for ask in [Asking::Nothing, Asking::Counted(b"ab".to_vec())] {
+                let ours = check(Path::Ours, &script, &ask, budget, small());
+                prop_assert!(
+                    !matches!(ours.verdict, Verdict::Disagrees(_)),
+                    "{:?} against {:?}",
+                    ours,
+                    script.steps()
+                );
+                let theirs = check(Path::Theirs, &script, &ask, budget, small());
+                // Every outcome is classified; a run that hangs never gets here at all.
+                prop_assert!(
+                    matches!(
+                        theirs.got,
+                        Got::Answer(_) | Got::Refused(_) | Got::Spent(_) | Got::Cancelled
+                    ),
+                    "{:?}",
+                    theirs
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_second_exchange_on_one_connection_gets_the_second_answer() {
+        let first = "HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\none";
+        let second = "HTTP/1.1 201 Created\r\ncontent-length: 3\r\n\r\ntwo";
+        let script = Script::new(vec![
+            Step::Wait(Wait::Written(BEGUN)),
+            Step::Say(first.as_bytes().to_vec()),
+            // Not until the second request has had time to go out: two answers said
+            // together would be one of them arriving unasked-for, which is the surplus
+            // case and costs the connection.
+            Step::Wait(Wait::Time(Duration::from_secs(1))),
+            Step::Say(second.as_bytes().to_vec()),
+            Step::Wait(Wait::Forever),
+        ]);
+
+        // The oracle finds the second message where the first one ended, which is what
+        // the boundary is for.
+        let said = script.said();
+        let reference::Reading::Read(one) =
+            reference::read(&said, reference::Asked::Anything, false)
+        else {
+            panic!("the first answer is not a message");
+        };
+        let reference::Reading::Read(two) =
+            reference::read(&said[one.boundary..], reference::Asked::Anything, false)
+        else {
+            panic!("the second answer is not a message");
+        };
+        assert_eq!((one.status, two.status), (200, 201));
+
+        for path in [Path::Ours, Path::Theirs] {
+            let ran = twice(
+                path,
+                &script,
+                &Asking::Nothing,
+                Budget::default(),
+                H1Limits::default(),
+            );
+            let Got::Answer(got_one) = &ran.first else {
+                panic!("{path:?} did not read the first answer: {:?}", ran.first);
+            };
+            assert_eq!(got_one.status, one.status, "{path:?}");
+            assert_eq!(got_one.body, one.body, "{path:?}");
+            assert!(got_one.kept, "{path:?} would not carry a second exchange");
+            let Some(Got::Answer(got_two)) = &ran.second else {
+                panic!("{path:?} had no second exchange: {:?}", ran.second);
+            };
+            // The second answer, whole and its own: a client that had taken a byte too
+            // many or too few from the first would be reading something else here.
+            assert_eq!(got_two.status, two.status, "{path:?}");
+            assert_eq!(got_two.body, two.body, "{path:?}");
+            assert!(got_two.kept, "{path:?} gave up a good connection");
         }
     }
 
@@ -906,6 +1395,35 @@ mod tests {
                 "{path:?}"
             );
             assert!(seen.kept, "{path:?} gave up a good connection");
+        }
+    }
+
+    #[test]
+    fn a_status_that_may_not_have_a_body_is_refused_by_one_path_for_declaring_one() {
+        // A 204 says it has three bytes. RFC 9110 section 8.6 forbids a server from
+        // sending a length on one at all, and RFC 9112 section 6.3 rule 1 ends the
+        // message at its empty line "regardless of the header fields present", so
+        // reading past it is right and so is refusing it: 13 section 4 refuses.
+        let script = says("HTTP/1.1 204 No Content\r\ncontent-length: 3\r\n\r\nxyz");
+        let ours = checked(Path::Ours, &script, &Asking::Nothing);
+        let theirs = checked(Path::Theirs, &script, &Asking::Nothing);
+        assert!(matches!(ours.verdict, Verdict::Outside(_)), "{ours:?}");
+        assert!(matches!(ours.got, Got::Refused(_)), "{:?}", ours.got);
+        assert!(matches!(theirs.verdict, Verdict::Outside(_)), "{theirs:?}");
+        assert!(seen(&theirs).body.is_empty(), "hyper read a body");
+        // The three bytes belong to no message, so whoever read the answer is not
+        // carrying another exchange on that connection.
+        assert!(!seen(&theirs).kept, "hyper kept the surplus");
+
+        // On a 304 the same field is expected rather than forbidden, and both paths
+        // read it: the length describes a body that a body-bearing answer would
+        // have had, which is 13 section 4's distinction.
+        let modified = says("HTTP/1.1 304 Not Modified\r\ncontent-length: 3\r\n\r\nxyz");
+        for path in [Path::Ours, Path::Theirs] {
+            let checked = checked(path, &modified, &Asking::Nothing);
+            assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {checked:?}");
+            assert!(seen(&checked).body.is_empty(), "{path:?} read a body");
+            assert!(!seen(&checked).kept, "{path:?} kept the surplus");
         }
     }
 
