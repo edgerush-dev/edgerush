@@ -1858,18 +1858,29 @@ mod tests {
             H1Limits::default(),
         );
 
-        let _answering = tokio::spawn(async move {
-            let mut peer = Peer(theirs);
-            // Answering all the while and reading what did arrive, so that neither of the
-            // other two waits is what ends this. It runs for eight times the bound: one shared clock would
-            // be reset by every one of these and the exchange would never end at all.
+        let (mut reading, mut writing) = tokio::io::split(theirs);
+        // Taking in what arrived, so that a socket backed up is not what ends this. It
+        // reads in a task of its own because an upstream that waited here for a client
+        // that has stopped would stop answering too, and an answer that stops is exactly
+        // what this test must not rely on.
+        let _taking = tokio::spawn(async move {
             let mut sink = [0; 256];
             for _ in 0..64 {
-                tokio::time::sleep(idle / 8).await;
-                peer.say("1\r\na\r\n").await;
-                let _taken = peer.0.read(&mut sink).await;
+                match reading.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
             }
-            peer
+        });
+        let _answering = tokio::spawn(async move {
+            // Answering all the while, for eight times the bound: one shared clock would
+            // be reset by every one of these and the exchange would never end at all.
+            for _ in 0..64 {
+                tokio::time::sleep(idle / 8).await;
+                if writing.write_all(b"1\r\na\r\n").await.is_err() {
+                    break;
+                }
+            }
         });
 
         let began = tokio::time::Instant::now();
@@ -1941,15 +1952,26 @@ mod tests {
     /// An upstream that will not take the request is not a client that is being slow.
     /// While the socket is backed up the client is not asked for anything, so nothing it
     /// does or fails to do is counted: the blame follows the block.
+    ///
+    /// The client here hands over one frame and then never speaks again, while the
+    /// upstream takes a little of it every half-bound. Only the upstream's clock runs,
+    /// and every one of those sips rearms it, so the exchange outlives the bound many
+    /// times over. A client's clock running alongside would have gone off at the first
+    /// one and blamed a client that was never asked for anything
+    /// ([13 §7](../../../docs/13-http1-upstream.md)).
     #[tokio::test(start_paused = true)]
     async fn a_blocked_upstream_is_not_counted_against_the_client() {
         let idle = H1Limits::default().idle;
+        // Room for a little of the request and no more, so the rest stays staged and the
+        // client is asked for nothing while it waits.
         let (ours, theirs) = tokio::io::duplex(64);
         let rest = Rest {
             exchange: Exchange::new(ours),
             upload: Upload::new(
-                Stops(Some(Bytes::from(vec![b'x'; 64 * 1024]))),
-                Sending::Length(64 * 1024),
+                // More than the sips below will ever take, so the socket stays backed up
+                // throughout and the client is never asked for a second frame.
+                Stops(Some(Bytes::from(vec![b'x'; 8 * 1024]))),
+                Sending::Chunked,
                 Vec::new(),
             ),
         };
@@ -1961,12 +1983,21 @@ mod tests {
             H1Limits::default(),
         );
 
-        let _silent = tokio::spawn(async move {
-            let peer = theirs;
-            tokio::time::sleep(idle * 4).await;
+        let _sipping = tokio::spawn(async move {
+            let mut peer = Peer(theirs);
+            let mut sink = [0; 64];
+            // A sip every half-bound for eight times the bound, and never a word said.
+            // Each rearms the upstream's clock; none of them is the client doing anything.
+            for _ in 0..16 {
+                tokio::time::sleep(idle / 2).await;
+                if peer.0.read(&mut sink).await.is_err() {
+                    break;
+                }
+            }
             peer
         });
 
+        let began = tokio::time::Instant::now();
         let failed = collected(&mut body).await.unwrap_err();
         assert!(
             matches!(
@@ -1978,6 +2009,9 @@ mod tests {
             ),
             "{failed}"
         );
+        // Long past the bound a client that had said nothing all this time would have
+        // broken, had anybody been counting its silence.
+        assert!(began.elapsed() > idle * 8, "{:?}", began.elapsed());
     }
 
     /// A body that says whether anybody has asked it for anything. Holding a body back
