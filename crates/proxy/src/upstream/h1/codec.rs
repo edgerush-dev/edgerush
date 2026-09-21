@@ -421,18 +421,23 @@ pub fn delivery(head: &ResponseHead, asked: Asked) -> Result<Delivery, CodecErro
 /// Whether the body is chunked. One `chunked` and nothing besides: a chain of codings, a
 /// coding that is not the last, and a `chunked` said twice are all refused, because each
 /// is a place where what this reads and what the next reader reads could differ.
+///
+/// Decided by whether the field is there, not by what it lists. RFC 9112 §6.3 frames by
+/// its presence: one that names no coding at all has no `chunked` last, so the close
+/// would end the body and a length beside it would be overruled. Taking it for absent
+/// would frame by that length instead, which is the two readers again.
 fn is_chunked(headers: &HeaderMap) -> Result<bool, CodecError> {
-    let mut codings = headers
-        .get_all(http::header::TRANSFER_ENCODING)
-        .iter()
-        .flat_map(crate::hop_by_hop::options);
-    let Some(only) = codings.next() else {
+    let mut fields = headers.get_all(http::header::TRANSFER_ENCODING).iter();
+    let Some(first) = fields.next() else {
         return Ok(false);
     };
-    if codings.next().is_some() || !only.eq_ignore_ascii_case(b"chunked") {
-        return Err(CodecError::Coding);
+    let mut codings = std::iter::once(first)
+        .chain(fields)
+        .flat_map(crate::hop_by_hop::options);
+    match (codings.next(), codings.next()) {
+        (Some(only), None) if only.eq_ignore_ascii_case(b"chunked") => Ok(true),
+        _ => Err(CodecError::Coding),
     }
-    Ok(true)
 }
 
 /// Whether `Connection` asks for the connection to close, having first checked that what
@@ -1749,10 +1754,9 @@ mod tests {
     /// A `Transfer-Encoding` that is there and names nothing is still there. RFC 9112 §6.3
     /// frames by the field's presence — a coding present outranks a length, and one whose
     /// last member is not `chunked` runs to the close — and hyper's client reads these to
-    /// the close. Taking it as absent frames the body by the length instead, which is two
+    /// the close. Taken for absent, it would frame the body by the length instead, which is two
     /// readers ending one body in two places (found by Envoy, HAProxy and Pingora).
     #[test]
-    #[ignore = "defect: an empty Transfer-Encoding is taken for no coding at all"]
     fn a_coding_that_names_nothing_is_still_a_coding() {
         for value in ["", " ", "\t", ","] {
             let alone = format!("transfer-encoding: {value}\r\n");

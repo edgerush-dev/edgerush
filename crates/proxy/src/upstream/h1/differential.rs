@@ -2104,10 +2104,9 @@ mod tests {
     }
 
     /// A `Transfer-Encoding` that names nothing, with a length: hyper's client reads to
-    /// the close as RFC 9112 §6.3 says, and ours frames by the length, so the two end the
-    /// body in different places.
+    /// the close as RFC 9112 §6.3 says, and ours refuses it rather than frame it by the
+    /// length, which would end the body somewhere else.
     #[test]
-    #[ignore = "defect: an empty Transfer-Encoding is taken for no coding at all"]
     fn a_coding_that_names_nothing_does_not_leave_the_length_in_charge() {
         let script = says_and_closes(
             "HTTP/1.1 200 OK\r\ntransfer-encoding: \r\ncontent-length: 5\r\n\r\nhello world",

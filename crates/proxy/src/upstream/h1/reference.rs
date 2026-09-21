@@ -580,13 +580,14 @@ fn claims_a_body(head: &Head) -> bool {
 
 /// Whether the answer has a transfer coding, and whether `chunked` is the last of them.
 /// Anything but a single `chunked` is noted as outside this slice.
+///
+/// A field that is there and lists nothing is still there: no coding is last, so it is not
+/// `chunked`, and rules 3 and 4 of RFC 9112 §6.3 apply as they would to any other.
 fn coding(head: &Head, notable: &mut Vec<Notable>) -> Option<bool> {
+    named(&head.fields, "transfer-encoding").next()?;
     let codings: Vec<String> = named(&head.fields, "transfer-encoding")
         .flat_map(list)
         .collect();
-    if codings.is_empty() {
-        return None;
-    }
     // A coding on an HTTP/1.0 message: the peer cannot have been told that this hop
     // speaks 1.1, so there is no saying what it meant by one.
     if head.version == Version::Ten {
@@ -1327,9 +1328,8 @@ mod tests {
 
     /// A `Transfer-Encoding` present with no coding in it is still present: its final
     /// coding is not `chunked`, so RFC 9112 §6.3 rule 4 has the close end the body, and
-    /// rule 3 has it outrank the length. The oracle has the same blind spot as the codec.
+    /// rule 3 has it outrank the length.
     #[test]
-    #[ignore = "defect: an empty Transfer-Encoding is taken for no coding at all"]
     fn a_coding_that_names_nothing_is_still_a_coding() {
         let answer = whole(
             b"HTTP/1.1 200 OK\r\ntransfer-encoding: \r\ncontent-length: 5\r\n\r\nhello world",
