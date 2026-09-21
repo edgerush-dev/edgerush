@@ -629,6 +629,11 @@ enum State {
 pub struct BodyReader {
     framing: Framing,
     state: State,
+    /// How much of what is in hand has been searched for the end of the line or section
+    /// being read. Without it a peer sending a byte at a time makes every arrival rescan
+    /// everything before it, which is quadratic work for linear input and is what §4
+    /// means by bounded work per new byte.
+    searched: usize,
     /// The names this message's `Connection` nominated. Taken from the head before it was
     /// stripped, because afterwards there is nothing left to take them from.
     nominated: Vec<HeaderName>,
@@ -646,6 +651,7 @@ impl BodyReader {
         Self {
             framing,
             state,
+            searched: 0,
             nominated: Vec::new(),
         }
     }
@@ -747,13 +753,17 @@ impl BodyReader {
 
     /// A chunk's size line: hexadecimal, any extensions, then CRLF.
     fn size(&mut self, bytes: &[u8], ended: bool, limits: &H1Limits) -> Result<Piece, CodecError> {
-        let Some(line) = line(bytes, limits.chunk_line)? else {
+        let Some(line) = line(bytes, self.searched, limits.chunk_line)? else {
+            // Nothing found, so all of it has been looked at; the next arrival starts
+            // from here rather than from the beginning.
+            self.searched = bytes.len();
             return if ended {
                 Err(CodecError::Truncated)
             } else {
                 Ok(Piece::More)
             };
         };
+        self.searched = 0;
         let (size, rest) = hex(&bytes[..line.text])?;
         extensions(rest)?;
         if size == 0 {
@@ -795,7 +805,10 @@ impl BodyReader {
         ended: bool,
         limits: &H1Limits,
     ) -> Result<Piece, CodecError> {
-        let Some(end) = section(bytes, limits.trailers)? else {
+        let Some(end) = section(bytes, self.searched, limits.trailers)? else {
+            // Nothing found, so all of it has been looked at; the next arrival starts
+            // from here rather than from the beginning.
+            self.searched = bytes.len();
             return if ended {
                 Err(CodecError::Truncated)
             } else {
@@ -818,9 +831,27 @@ struct Line {
     whole: usize,
 }
 
+// How many bytes the searches below have looked at. A cursor changes no answer, only how
+// much is looked at to reach one, so the test for it counts this rather than any result.
+// Test-only: the reader keeps no such number, and nothing outside a test adds to it.
+#[cfg(test)]
+thread_local! {
+    static EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Adds what a search is about to look over.
+#[cfg(test)]
+fn examining(many: usize) {
+    EXAMINED.with(|examined| examined.set(examined.get() + many));
+}
+
+#[cfg(not(test))]
+fn examining(_many: usize) {}
+
 /// The first line of `bytes`, or `None` while it has not ended.
-fn line(bytes: &[u8], bound: usize) -> Result<Option<Line>, CodecError> {
-    for (at, byte) in bytes.iter().enumerate() {
+fn line(bytes: &[u8], from: usize, bound: usize) -> Result<Option<Line>, CodecError> {
+    examining(bytes.len().saturating_sub(from));
+    for (at, byte) in bytes.iter().enumerate().skip(from) {
         if *byte != b'\n' {
             continue;
         }
@@ -933,7 +964,7 @@ fn quoted(bytes: &[u8]) -> Result<&[u8], CodecError> {
 }
 
 /// Where a section of fields ends, an empty line included, or `None` while it has not.
-fn section(bytes: &[u8], bound: usize) -> Result<Option<usize>, CodecError> {
+fn section(bytes: &[u8], from: usize, bound: usize) -> Result<Option<usize>, CodecError> {
     // No fields at all: the empty line comes first.
     if bytes.starts_with(b"\r\n") {
         return Ok(Some(2));
@@ -941,7 +972,8 @@ fn section(bytes: &[u8], bound: usize) -> Result<Option<usize>, CodecError> {
     if bytes.len() < 2 {
         return Ok(None);
     }
-    for at in 0..bytes.len() {
+    examining(bytes.len().saturating_sub(from));
+    for at in from..bytes.len() {
         if bytes[at] != b'\n' {
             continue;
         }
@@ -1966,6 +1998,56 @@ mod tests {
 
     /// What may follow a size on its line. None of it is acted on; all of it is checked,
     /// because a line read two ways is a body that ends in two places.
+    /// A line that arrives a byte at a time is looked over once, not once for every
+    /// byte that follows it. Without a cursor every arrival searches everything in
+    /// hand, which is quadratic work for linear input and is what §4 means by
+    /// bounded work per new byte.
+    #[test]
+    fn a_chunk_size_line_is_looked_over_once_however_it_arrives() {
+        let limits = H1Limits::default();
+        let mut reader = BodyReader::new(Framing::Chunked);
+        let line = b"40;padding=xxxxxxxxxxxxxxxxxxxx\r\n";
+        EXAMINED.with(|examined| examined.set(0));
+        // Everything but the line ending, a byte at a time.
+        for at in 1..line.len() {
+            assert!(matches!(
+                reader.read(&line[..at], false, &limits),
+                Ok(Piece::More)
+            ));
+        }
+        let examined = EXAMINED.with(std::cell::Cell::get);
+        assert!(
+            examined <= line.len(),
+            "{examined} bytes looked over for a line of {}: the search starts over",
+            line.len()
+        );
+    }
+
+    /// The same for the fields after the last chunk.
+    #[test]
+    fn a_trailer_section_is_looked_over_once_however_it_arrives() {
+        let limits = H1Limits::default();
+        let mut reader = BodyReader::new(Framing::Chunked);
+        assert!(matches!(
+            reader.read(b"0\r\n", false, &limits),
+            Ok(Piece::Data { .. })
+        ));
+        let section = b"x-a: 1\r\nx-b: 2\r\n\r\n";
+        EXAMINED.with(|examined| examined.set(0));
+        for at in 1..section.len() {
+            assert!(matches!(
+                reader.read(&section[..at], false, &limits),
+                Ok(Piece::More)
+            ));
+        }
+        let examined = EXAMINED.with(std::cell::Cell::get);
+        assert!(
+            examined <= section.len(),
+            "{examined} bytes looked over for a section of {}: the search starts over",
+            section.len()
+        );
+    }
+
     #[test]
     fn a_chunk_extension_is_checked_and_then_ignored() {
         let good: &[&[u8]] = &[
