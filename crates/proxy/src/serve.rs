@@ -786,6 +786,14 @@ impl Worker {
         if !(100..=599).contains(&head.status.as_u16()) {
             return None;
         }
+        // The engine's client consumes every other interim answer, so only a 101 arrives
+        // here. No request asked for one — `Upgrade` is taken off every request — and this
+        // proxy tunnels nothing, so passing it on would hand the client a switch it never
+        // asked for. Dropping the answer unread drops the connection the engine set aside
+        // for the switch ([13 §1](../../../docs/13-http1-upstream.md)).
+        if head.status.is_informational() {
+            return None;
+        }
         // Read here, because `respond` takes the hop-by-hop fields off this head before
         // the trailers behind it arrive.
         let nominated = crate::hop_by_hop::nominated(&head.headers);

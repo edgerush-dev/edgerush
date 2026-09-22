@@ -531,24 +531,21 @@ async fn a_426_is_forwarded_without_its_upgrade() {
 /// which this slice does not do ([13 §1](../../../docs/13-http1-upstream.md);
 /// linkerd2-proxy's `http1_upgrade_not_requested` tests the same).
 #[tokio::test]
-#[ignore = "defect: the engine's path passes a bare 101 on to the client"]
 async fn a_101_nobody_asked_for_is_answered_502() {
-    let upstream = raw_upstream(move |mut wire| async move {
-        let _head = wire.head().await;
-        wire.write(concat!(
-            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n",
-            "connection: upgrade\r\n\r\nTUNNELLED"
-        ))
-        .await;
-        // Held open, as a tunnel would be.
-        tokio::time::sleep(Duration::from_secs(5)).await;
+    let (upstream, accepts) = hostile_first(|mut wire| async move {
+        if wire.until(b"\r\n\r\n").await.is_some() {
+            wire.write(concat!(
+                "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n",
+                "connection: upgrade\r\n\r\nTUNNELLED"
+            ))
+            .await;
+            // Held open, as a tunnel would be.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
     });
     let mut client = Wire::to(proxy_to(upstream).await).await;
-    client
-        .write("GET /up HTTP/1.1\r\nhost: a.test\r\n\r\n")
-        .await;
 
-    let head = client.head().await;
+    let head = asks(&mut client, "/first").await;
     assert!(head.starts_with("HTTP/1.1 502"), "{head}");
     let lower = head.to_ascii_lowercase();
     assert!(!lower.contains("upgrade"), "{head}");
@@ -558,6 +555,17 @@ async fn a_101_nobody_asked_for_is_answered_502() {
         .find_map(|line| line.strip_prefix("content-length: "))
         .map_or(0, |length| length.trim().parse::<usize>().unwrap());
     assert!(!client.body(length).await.contains("TUNNELLED"));
+
+    // The client's connection still carries requests, and the next one goes to a fresh
+    // upstream connection rather than into the one that offered to switch.
+    let head = asks(&mut client, "/second").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(within(client.body(5)).await, "fresh");
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        2,
+        "the switched connection was reused"
+    );
 }
 
 /// An upstream that answers before it has read the body is not waited for: the answer
