@@ -108,6 +108,21 @@ fn filtered(frame: Frame<Bytes>, nominated: &[HeaderName]) -> Frame<Bytes> {
     }
 }
 
+/// Waits for `opening` to connect, and gives up after `limit`: a destination that never
+/// answers a connect must not hold a request, or the place it was admitted to, for as long
+/// as the operating system cares to retry ([13 §7](../../docs/13-http1-upstream.md)).
+/// Given the connect rather than an address, so that one which never completes can be
+/// put to it.
+async fn connect_within<S>(
+    limit: Duration,
+    opening: impl Future<Output = io::Result<S>>,
+) -> Result<S, ExchangeError> {
+    match tokio::time::timeout(limit, opening).await {
+        Ok(socket) => Ok(socket?),
+        Err(_) => Err(ExchangeError::Io(io::ErrorKind::TimedOut.into())),
+    }
+}
+
 /// Which of the named reasons an exchange stopped for.
 ///
 /// A fixed list on purpose: an upstream that fails in a new way must not be able to make
@@ -582,10 +597,7 @@ impl Worker {
             None => {
                 self.proxy.metrics.socket(Socket::Opened);
                 let opening = TcpStream::connect(identity.address());
-                let socket = match tokio::time::timeout(self.limits.connect, opening).await {
-                    Ok(socket) => socket?,
-                    Err(_) => return Err(ExchangeError::Io(io::ErrorKind::TimedOut.into())),
-                };
+                let socket = connect_within(self.limits.connect, opening).await?;
                 // Worth having, not worth refusing an upstream over.
                 let _unset = socket.set_nodelay(true);
                 (socket, Instant::now())
@@ -1074,6 +1086,36 @@ mod tests {
             assert_eq!(asked_over_http1(address).await, "on this worker");
             assert_eq!(asked_over_http2(address).await, "on this worker");
         }));
+    }
+
+    /// A connect that never completes is given up on at the limit and not before, and one
+    /// that completes inside it is kept (linkerd2-proxy tests its connect timeout the same
+    /// way, with a connector that never finishes).
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_never_completes_is_given_up_on_at_its_limit() {
+        let limit = Duration::from_secs(5);
+        let started = tokio::time::Instant::now();
+        let failed = connect_within(limit, std::future::pending::<io::Result<()>>())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&failed, ExchangeError::Io(error) if error.kind() == io::ErrorKind::TimedOut),
+            "{failed}"
+        );
+        assert_eq!(started.elapsed(), limit);
+
+        let slow = async {
+            tokio::time::sleep(limit - Duration::from_millis(1)).await;
+            Ok::<_, io::Error>("connected")
+        };
+        assert_eq!(connect_within(limit, slow).await.unwrap(), "connected");
+
+        let refused = async { Err::<(), _>(io::Error::from(io::ErrorKind::ConnectionRefused)) };
+        let failed = connect_within(limit, refused).await.unwrap_err();
+        assert!(
+            matches!(&failed, ExchangeError::Io(error) if error.kind() == io::ErrorKind::ConnectionRefused),
+            "{failed}"
+        );
     }
 
     /// A worker takes on only so many exchanges at once, and answers the rest rather
