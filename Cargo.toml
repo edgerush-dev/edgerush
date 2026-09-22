@@ -22,6 +22,9 @@ edgerush-router = { path = "crates/router" }
 edgerush-telemetry = { path = "crates/telemetry" }
 # Types only (header map, method): the request core works on these, never on an engine's.
 http = "1.5"
+# The body trait the request core and the upstream exchange work on, whichever engine read
+# the body. Already in the tree through hyper, at the same version.
+http-body = "1.1"
 # Body helpers (an empty body, either of two bodies) for the proxy crate's answers.
 http-body-util = "0.1.5"
 # Tokenises the head of an upstream's response. It is already under hyper, and is what

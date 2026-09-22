@@ -21,6 +21,7 @@ use crate::linger::{self, Lent, linger};
 use crate::metrics::{Answer, Metrics, Socket, Stopped};
 use crate::random::random;
 use crate::request::decide;
+use crate::request_body::RequestBody;
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Blocks, SMALL, Sizes};
@@ -116,7 +117,7 @@ enum Body {
     Upstream(Incoming, Vec<HeaderName>, Admitted, Watch),
     /// The upstream's answer, as EdgeRush's own path reads it. In a box because it is
     /// much the larger of the two, and every answer would otherwise carry room for it.
-    Ours(Box<H1Body<TcpStream, Incoming>>, Admitted, Watch),
+    Ours(Box<H1Body<TcpStream, RequestBody>>, Admitted, Watch),
     /// An answer of the data plane's own. It has no body, and never will have one.
     Empty,
 }
@@ -308,7 +309,7 @@ pub struct Worker {
     proxy: Arc<Proxy>,
     /// One for the life of the worker: a reload does not throw warm connections away.
     /// Those to an endpoint that is no longer used grow idle and are closed.
-    client: Client<HttpConnector, Incoming>,
+    client: Client<HttpConnector, RequestBody>,
     /// The connections this worker keeps by EdgeRush's own path.
     pool: Rc<RefCell<Pool<TcpStream>>>,
     /// What its exchanges read into, lent and taken back rather than made each time
@@ -724,6 +725,9 @@ impl Worker {
             asking.set(true);
             let connection = Rc::clone(&connection);
             async move {
+                // Where the engine's body stops: from here on the request's body is one
+                // any engine could have read.
+                let request = request.map(RequestBody::Hyper);
                 let response = connection.worker.handle(listener, request).await;
                 Ok::<_, Infallible>(response)
             }
@@ -774,7 +778,7 @@ impl Worker {
         }
     }
 
-    async fn handle(&self, listener: usize, request: Request<Incoming>) -> Response<Body> {
+    async fn handle(&self, listener: usize, request: Request<RequestBody>) -> Response<Body> {
         let came_in = Instant::now();
         let response = self.respond(listener, request).await;
         if let Some(counters) = self.proxy.metrics.listener(listener) {
@@ -784,7 +788,7 @@ impl Worker {
         response
     }
 
-    async fn respond(&self, listener: usize, request: Request<Incoming>) -> Response<Body> {
+    async fn respond(&self, listener: usize, request: Request<RequestBody>) -> Response<Body> {
         let (mut head, body) = request.into_parts();
         // How the body is to be sent on, worked out from what arrived and before `direct`
         // takes the hop-by-hop fields off it — and before the body itself is touched,
@@ -863,7 +867,7 @@ impl Worker {
     async fn by_hyper(
         &self,
         head: Parts,
-        body: Incoming,
+        body: RequestBody,
         admitted: Admitted,
         watch: Watch,
     ) -> Option<(response::Parts, Body)> {
@@ -910,7 +914,7 @@ impl Worker {
         head: &Parts,
         nominated: &[HeaderName],
         sending: Sending,
-        body: Incoming,
+        body: RequestBody,
         admitted: Admitted,
     ) -> Option<(response::Parts, Body)> {
         let answer = match self
@@ -1022,7 +1026,7 @@ struct Directed {
 /// a body that says how long it is may still end with trailers, and over HTTP/2 it always
 /// may. What is certain is what the client framed it as
 /// ([13 §4](../../docs/13-http1-upstream.md)).
-fn sending_for(head: &Parts, body: &Incoming) -> Sending {
+fn sending_for(head: &Parts, body: &RequestBody) -> Sending {
     // The engine says outright when there is no body, and that is the one thing a length
     // alone would not settle. A client that said its body is a length of nothing goes on
     // saying so: RFC 9110 §8.6 has a sender state a length for a method whose content

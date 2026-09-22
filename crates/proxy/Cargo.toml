@@ -21,6 +21,7 @@ edgerush-config.workspace = true
 edgerush-router.workspace = true
 edgerush-telemetry.workspace = true
 http.workspace = true
+http-body.workspace = true
 http-body-util.workspace = true
 httparse.workspace = true
 hyper.workspace = true

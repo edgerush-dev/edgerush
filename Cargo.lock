@@ -156,6 +156,7 @@ dependencies = [
  "edgerush-router",
  "edgerush-telemetry",
  "http",
+ "http-body",
  "http-body-util",
  "httparse",
  "hyper",

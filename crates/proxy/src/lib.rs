@@ -17,6 +17,7 @@ mod linger;
 mod metrics;
 mod random;
 mod request;
+mod request_body;
 mod scrape;
 mod serve;
 // Private, save when the fuzz targets are being built: they are a crate of their own and
