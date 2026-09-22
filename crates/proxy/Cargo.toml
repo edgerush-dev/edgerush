@@ -46,5 +46,10 @@ tokio = { workspace = true, features = [
 name = "decide"
 harness = false
 
+[[bench]]
+name = "h1_codec"
+harness = false
+required-features = ["fuzzing"]
+
 [lints]
 workspace = true

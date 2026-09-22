@@ -8,3 +8,4 @@ cc 90344417e11733ecd429c7ba3d6bf423a212056f59dfc3ef929b8acbd8468888 # shrinks to
 cc a192108510b41181a1734d8a850e8be394ae9177fee8d6df0526daf5927b2562 # shrinks to (status, fields, body, interim) = (204, [], Nothing, []), ask = Nothing, cuts = []
 cc a207eb0e8a687eae612153363908179891e3a69edcf68d3f2306e1e5c99c475a # shrinks to bytes = [60, 0, 0]
 cc 696b300cf0ec63a22b6045ff45a8d7ba7668aa7d68bb791927c6f517219c9666 # shrinks to (status, fields, body, interim) = (200, [], Counted([0]), []), ask = Head, cuts = []
+cc a635962405a25734a51aac6b0ff002697d24c2c33e4867542868e1225bf57efb # shrinks to (status, fields, body, interim) = (204, [], Nothing, []), ask = Counted([0]), cuts = []

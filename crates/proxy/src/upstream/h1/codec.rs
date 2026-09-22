@@ -150,6 +150,8 @@ pub enum Head {
 pub struct HeadReader {
     /// How much of the bytes has been searched for the empty line that ends a head.
     searched: usize,
+    /// Completed nonempty lines, including the status line.
+    lines: usize,
 }
 
 impl HeadReader {
@@ -175,7 +177,7 @@ impl HeadReader {
         if end > limits.head {
             return Err(CodecError::HeadTooLong { limit: limits.head });
         }
-        let head = parse(&bytes[..end], limits)?;
+        let head = parse(&bytes[..end], self.lines.saturating_sub(1), limits)?;
         Ok(Head::Read {
             head,
             consumed: end,
@@ -184,9 +186,8 @@ impl HeadReader {
 
     /// Where the empty line that ends a head finishes, or `None` while there is none.
     ///
-    /// Only what has not been searched before is searched, save for the last three bytes
-    /// of it: an empty line can be split across two arrivals, and those three are where
-    /// the halves of one would meet. Looking at those three again changes nothing.
+    /// Each new LF is checked against its preceding bytes, including bytes from the
+    /// previous arrival. Earlier bytes need not be searched again.
     ///
     /// # Errors
     ///
@@ -195,7 +196,7 @@ impl HeadReader {
     /// where a line ends — so it is refused here and now, rather than waited on until the
     /// head outgrows its bound.
     fn end_of_head(&mut self, bytes: &[u8]) -> Result<Option<usize>, CodecError> {
-        let from = self.searched.saturating_sub(END.len() - 1);
+        let from = self.searched;
         let mut end = None;
         for at in from..bytes.len() {
             if bytes[at] != b'\n' {
@@ -209,6 +210,7 @@ impl HeadReader {
                 end = Some(at + 1);
                 break;
             }
+            self.lines += 1;
         }
         self.searched = bytes.len();
         Ok(end)
@@ -253,9 +255,19 @@ fn status_start(bytes: &[u8]) -> Result<(), CodecError> {
 }
 
 /// Makes a head of the bytes of one, which are known to end with an empty line.
-fn parse(head: &[u8], limits: &H1Limits) -> Result<ResponseHead, CodecError> {
-    let mut fields = [httparse::EMPTY_HEADER; MOST_FIELDS];
-    let room = limits.fields.min(MOST_FIELDS);
+fn parse(head: &[u8], fields: usize, limits: &H1Limits) -> Result<ResponseHead, CodecError> {
+    // Most answers have only a few fields. Do not initialise 128 header slots (4 KiB)
+    // on every request; the full bound is still available to larger heads.
+    if fields <= 16 {
+        parse_with::<16>(head, limits)
+    } else {
+        parse_with::<MOST_FIELDS>(head, limits)
+    }
+}
+
+fn parse_with<const N: usize>(head: &[u8], limits: &H1Limits) -> Result<ResponseHead, CodecError> {
+    let mut fields = [httparse::EMPTY_HEADER; N];
+    let room = limits.fields.min(N);
     let mut response = httparse::Response::new(&mut fields[..room]);
     // The parser's own settings say no to obsolete line folding, to space before a colon
     // and to the other shapes a lenient reader would take. They are its defaults; they
@@ -1228,31 +1240,42 @@ impl BodyWriter {
     /// More bytes than a counted body said it would have, or anything at all after the
     /// body was finished.
     pub fn data(&mut self, out: &mut Vec<u8>, data: &[u8]) -> Result<(), CodecError> {
+        let chunked = self.data_prefix(out, data.len())?;
+        out.extend_from_slice(data);
+        if chunked {
+            out.extend_from_slice(b"\r\n");
+        }
+        Ok(())
+    }
+
+    /// Accounts for payload without copying it. Returns whether a trailing CRLF is owed.
+    pub(super) fn data_prefix(
+        &mut self,
+        out: &mut Vec<u8>,
+        size: usize,
+    ) -> Result<bool, CodecError> {
         if self.done {
             return Err(CodecError::BodyAfterEnd);
         }
-        if data.is_empty() {
+        if size == 0 {
             // Nothing to say, and saying it in chunked would say the opposite: a chunk of
             // no bytes is how a chunked body ends.
-            return Ok(());
+            return Ok(false);
         }
         match self.sending {
             Sending::None => Err(CodecError::BodyAfterEnd),
             Sending::Length(_) => {
-                let length = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                let length = u64::try_from(size).unwrap_or(u64::MAX);
                 self.left = self
                     .left
                     .checked_sub(length)
                     .ok_or(CodecError::BodyOverran)?;
-                out.extend_from_slice(data);
-                Ok(())
+                Ok(false)
             }
             Sending::Chunked => {
-                out.append(&mut hex_digits(data.len()));
+                out.append(&mut hex_digits(size));
                 out.extend_from_slice(b"\r\n");
-                out.extend_from_slice(data);
-                out.extend_from_slice(b"\r\n");
-                Ok(())
+                Ok(true)
             }
         }
     }
@@ -1451,8 +1474,7 @@ mod tests {
         let mut reader = HeadReader::default();
         for upto in 0..whole.len() {
             let _waiting = reader.read(&whole[..upto], &H1Limits::default());
-            // Everything given has been looked at, so the next call starts at its end
-            // (less the three bytes an empty line could be split across).
+            // Everything given has been looked at, so the next call starts at its end.
             assert_eq!(reader.searched, upto);
         }
     }
@@ -1532,6 +1554,28 @@ mod tests {
             HeadReader::default().read(bytes, &limits),
             Err(CodecError::HeadTooLong { limit: 32 })
         );
+    }
+
+    #[test]
+    fn small_and_large_header_arrays_obey_the_same_field_limit() {
+        for count in [16, 17, MOST_FIELDS, MOST_FIELDS + 1] {
+            let head = format!("HTTP/1.1 200 OK\r\n{}\r\n", "x-a: 1\r\n".repeat(count));
+            for limit in [15, 16, 17, MOST_FIELDS] {
+                let limits = H1Limits {
+                    fields: limit,
+                    ..H1Limits::default()
+                };
+                let got = HeadReader::default().read(head.as_bytes(), &limits);
+                if count > limit {
+                    assert_eq!(got, Err(CodecError::TooManyFields { limit }));
+                } else {
+                    let Head::Read { head, .. } = got.unwrap() else {
+                        panic!("incomplete head")
+                    };
+                    assert_eq!(head.headers.len(), count);
+                }
+            }
+        }
     }
 
     #[test]

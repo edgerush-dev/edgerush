@@ -35,7 +35,7 @@ use tokio::time::{Instant, Sleep};
 /// the body is not asked for more until what it gave has gone.
 const STAGING: usize = 16 * 1024;
 
-/// How many turns of staging one push may take before it gives the socket a chance.
+/// Maximum write batches per push, and body polls within each batch.
 const ROUNDS: usize = 8;
 
 /// Why an exchange could not be carried through.
@@ -203,6 +203,9 @@ pub struct Exchange<S> {
     /// everything in it has gone; empty and unallocated in between.
     outgoing: Vec<u8>,
     written: usize,
+    /// A shared slice of the upload frame, between its encoded prefix and suffix.
+    payload: Bytes,
+    chunk_tail: usize,
     /// Head bytes still queued, separately from body bytes staged behind them. Response
     /// deadlines start at the write that takes the last head byte, even if it also
     /// takes body bytes; neither encoding the head nor starting its write is enough.
@@ -213,7 +216,7 @@ pub struct Exchange<S> {
 impl<S> Exchange<S> {
     /// Whether everything encoded has left for the socket.
     fn nothing_queued(&self) -> bool {
-        self.written >= self.outgoing.len()
+        self.written >= self.outgoing.len() && self.payload.is_empty() && self.chunk_tail == 0
     }
 
     /// What has been read and not yet used.
@@ -300,6 +303,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             blocks,
             outgoing: Vec::new(),
             written: 0,
+            payload: Bytes::new(),
+            chunk_tail: 0,
             head_left: 0,
             head_sent: None,
         }
@@ -553,116 +558,151 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         // piece at a time: grown, it lands wherever the doubling takes it — past the
         // bound, by however much the last step overshot — and what is measured is what a
         // buffer holds, not what is in it ([13 §7](../../../docs/13-http1-upstream.md)).
-        self.lend_staging();
+        // The final batch may observe EOF and write terminal framing, but cannot start
+        // another payload. Otherwise a bodyless answer arriving exactly at the work
+        // budget could hide request completion and unnecessarily discard the socket.
+        for batch in 0..=ROUNDS {
+            self.lend_staging();
 
-        // Bounded work per turn: a body that keeps handing over frames must not be able
-        // to hold this loop for as long as it cares to.
-        for _ in 0..ROUNDS {
-            let staged = self.outgoing.len();
-            if staged >= STAGING {
-                break;
-            }
-            // What is in hand goes first, a bounded slice at a time. The frame itself is
-            // not copied in whole: that would be the client's pace, not the upstream's.
-            if let Some((frame, at)) = upload.pending.as_mut() {
-                // Room for the framing as well as the bytes: a chunk carries a size line
-                // and a line ending of its own, and payload written to the brim leaves
-                // nowhere but past the bound for them to go.
-                let room = (STAGING - staged).saturating_sub(upload.writer.framing_room());
-                let take = room.min(frame.len() - *at);
-                if take == 0 {
+            // Bounded work per turn: a body that keeps handing over frames must not be able
+            // to hold this loop for as long as it cares to.
+            for _ in 0..ROUNDS {
+                if !self.payload.is_empty() || self.chunk_tail != 0 {
                     break;
                 }
-                upload
-                    .writer
-                    .data(&mut self.outgoing, &frame[*at..*at + take])?;
-                *at += take;
-                if *at == frame.len() {
-                    upload.pending = None;
-                }
-                continue;
-            }
-            // Held back means not polled at all: asking a client for bytes it was told
-            // to keep is how both ends come to be waiting for each other.
-            if !may_send || upload.writer.is_done() {
-                break;
-            }
-            match Pin::new(&mut upload.body).poll_frame(cx) {
-                Poll::Pending => {
-                    // Asked, with room for what it gives, and it had nothing. From here
-                    // the wait is the client's.
-                    pushed.wants_client = true;
+                let staged = self.outgoing.len();
+                if staged >= STAGING {
                     break;
                 }
-                Poll::Ready(Some(Err(error))) => {
-                    return Err(ExchangeError::RequestBody(error.into()));
+                // What is in hand goes first, a bounded slice at a time. The frame itself is
+                // not copied in whole: that would be the client's pace, not the upstream's.
+                if let Some((frame, at)) = upload.pending.as_mut() {
+                    if *at == frame.len() {
+                        upload.pending = None;
+                        continue;
+                    }
+                    if batch == ROUNDS {
+                        break;
+                    }
+                    // Room for the framing as well as the bytes: a chunk carries a size line
+                    // and a line ending of its own, and payload written to the brim leaves
+                    // nowhere but past the bound for them to go.
+                    let room = (STAGING - staged).saturating_sub(upload.writer.framing_room());
+                    let take = room.min(frame.len() - *at);
+                    if take == 0 {
+                        break;
+                    }
+                    let chunked = upload.writer.data_prefix(&mut self.outgoing, take)?;
+                    self.payload = frame.slice(*at..*at + take);
+                    self.chunk_tail = if chunked { 2 } else { 0 };
+                    *at += take;
+                    continue;
                 }
-                Poll::Ready(Some(Ok(frame))) => {
-                    match frame.into_data() {
-                        // A frame of nothing is not progress and is not counted as any:
-                        // a body that hands over nothing for ever would otherwise keep
-                        // this loop turning for ever with it.
-                        Ok(data) if data.is_empty() => {}
-                        Ok(data) => {
-                            upload.pending = Some((data, 0));
-                            pushed.took = true;
-                        }
-                        // Trailers come last, and go out with the body's end.
-                        Err(frame) => {
-                            if let Ok(fields) = frame.into_trailers() {
-                                upload.trailers = Some(fields);
+                // Held back means not polled at all: asking a client for bytes it was told
+                // to keep is how both ends come to be waiting for each other.
+                if !may_send || upload.writer.is_done() {
+                    break;
+                }
+                match Pin::new(&mut upload.body).poll_frame(cx) {
+                    Poll::Pending => {
+                        // Asked, with room for what it gives, and it had nothing. From here
+                        // the wait is the client's.
+                        pushed.wants_client = true;
+                        break;
+                    }
+                    Poll::Ready(Some(Err(error))) => {
+                        return Err(ExchangeError::RequestBody(error.into()));
+                    }
+                    Poll::Ready(Some(Ok(frame))) => {
+                        match frame.into_data() {
+                            // A frame of nothing is not progress and is not counted as any:
+                            // a body that hands over nothing for ever would otherwise keep
+                            // this loop turning for ever with it.
+                            Ok(data) if data.is_empty() => {}
+                            Ok(data) => {
+                                upload.pending = Some((data, 0));
                                 pushed.took = true;
+                            }
+                            // Trailers come last, and go out with the body's end.
+                            Err(frame) => {
+                                if let Ok(fields) = frame.into_trailers() {
+                                    upload.trailers = Some(fields);
+                                    pushed.took = true;
+                                }
                             }
                         }
                     }
-                }
-                Poll::Ready(None) => {
-                    upload.writer.finish(
-                        &mut self.outgoing,
-                        upload.trailers.as_ref(),
-                        &upload.nominated,
-                        limits,
-                    )?;
-                    // The end of the request is the client's last word and its best:
-                    // there is nothing more to wait on it for.
-                    pushed.took = true;
-                    break;
-                }
-            }
-        }
-
-        // And out onto the socket, as far as it will take.
-        while self.written < self.outgoing.len() {
-            match Pin::new(&mut self.socket).poll_write(cx, &self.outgoing[self.written..]) {
-                Poll::Pending => break,
-                Poll::Ready(Err(error)) => return Err(error.into()),
-                Poll::Ready(Ok(0)) => break,
-                Poll::Ready(Ok(gone)) => {
-                    if self.head_left > 0 {
-                        self.head_left = self.head_left.saturating_sub(gone);
-                        if self.head_left == 0 {
-                            self.head_sent = Some(Instant::now());
-                        }
+                    Poll::Ready(None) => {
+                        upload.writer.finish(
+                            &mut self.outgoing,
+                            upload.trailers.as_ref(),
+                            &upload.nominated,
+                            limits,
+                        )?;
+                        // The end of the request is the client's last word and its best:
+                        // there is nothing more to wait on it for.
+                        pushed.took = true;
+                        break;
                     }
-                    self.written += gone;
-                    pushed.wrote = true;
                 }
             }
-        }
-        // What has gone is let go of, whether or not all of it went. Keeping a sent
-        // prefix in front of the next frame is how a buffer comes to hold the whole of
-        // an upload rather than the part of it that is waiting.
-        if self.written > 0 {
-            self.outgoing.drain(..self.written);
-            self.written = 0;
-        }
-        self.give_back_staging_if_empty();
-        // Anything still staged is the upstream's to take, and until it does the wait is
-        // the upstream's. A client asked for more while the socket is backed up is not a
-        // client that is being slow, so its clock does not run while this one does.
-        pushed.wants_upstream = !self.outgoing.is_empty();
-        if pushed.wants_upstream {
-            pushed.wants_client = false;
+
+            // And out onto the socket, as far as it will take.
+            while !self.nothing_queued() {
+                // Vectored writes keep the head/chunk prefix, shared payload and suffix in
+                // order without assembling a second copy of the payload. The default
+                // AsyncWrite implementation also works, taking only the first slice.
+                let result = if self.payload.is_empty() && self.chunk_tail == 0 {
+                    // Head-only requests retain their single-buffer write path.
+                    Pin::new(&mut self.socket).poll_write(cx, &self.outgoing[self.written..])
+                } else {
+                    let slices = [
+                        io::IoSlice::new(&self.outgoing[self.written..]),
+                        io::IoSlice::new(&self.payload),
+                        io::IoSlice::new(&b"\r\n"[2 - self.chunk_tail..]),
+                    ];
+                    Pin::new(&mut self.socket).poll_write_vectored(cx, &slices)
+                };
+                match result {
+                    Poll::Pending => break,
+                    Poll::Ready(Err(error)) => return Err(error.into()),
+                    Poll::Ready(Ok(0)) => {
+                        return Err(io::Error::from(io::ErrorKind::WriteZero).into());
+                    }
+                    Poll::Ready(Ok(gone)) => {
+                        if self.head_left > 0 {
+                            self.head_left = self.head_left.saturating_sub(gone);
+                            if self.head_left == 0 {
+                                self.head_sent = Some(Instant::now());
+                            }
+                        }
+                        let prefix = gone.min(self.outgoing.len() - self.written);
+                        self.written += prefix;
+                        let payload = (gone - prefix).min(self.payload.len());
+                        self.payload = self.payload.slice(payload..);
+                        self.chunk_tail -= gone - prefix - payload;
+                        pushed.wrote = true;
+                    }
+                }
+            }
+            // What has gone is let go of, whether or not all of it went. Keeping a sent
+            // prefix in front of the next frame is how a buffer comes to hold the whole of
+            // an upload rather than the part of it that is waiting.
+            if self.written > 0 {
+                self.outgoing.drain(..self.written);
+                self.written = 0;
+            }
+            self.give_back_staging_if_empty();
+            // Anything still staged is the upstream's to take, and until it does the wait is
+            // the upstream's. A client asked for more while the socket is backed up is not a
+            // client that is being slow, so its clock does not run while this one does.
+            pushed.wants_upstream = !self.nothing_queued();
+            if pushed.wants_upstream {
+                pushed.wants_client = false;
+            }
+            if pushed.wants_upstream || pushed.wants_client || upload.writer.is_done() {
+                break;
+            }
         }
         Ok(pushed)
     }
@@ -2846,10 +2886,9 @@ mod tests {
             // The frame in hand is the client's size, and there is one at most.
             assert!(most.frames <= 1, "frames queued up: {most:?}");
         }
-        // And what that unmoving amount is: each of the two buffers at exactly its own
-        // bound, and nothing else. Said in terms of the bounds themselves, so that raising
-        // one is a decision taken here rather than a number that drifted.
-        assert_eq!(smallest.buffers(), (STAGING, SMALL), "{smallest:?}");
+        // Payload is shared with the held frame, so no staging allocation survives a
+        // push in this fixture; the response still holds one read block.
+        assert_eq!(smallest.buffers(), (0, SMALL), "{smallest:?}");
     }
 
     /// **And a chunked request holds no more than a counted one.** A chunk carries a size
@@ -2868,7 +2907,7 @@ mod tests {
             counted.buffers(),
             "chunked held more than counted: {chunked:?}"
         );
-        assert_eq!(chunked.buffers(), (STAGING, SMALL), "{chunked:?}");
+        assert_eq!(chunked.buffers(), (0, SMALL), "{chunked:?}");
 
         // With trailers on the end, what is staged may reach the section's own bound
         // besides -- and no further.
@@ -2953,7 +2992,7 @@ mod tests {
             held.buffered, 0,
             "a block held for an answer nobody sent: {held:?}"
         );
-        assert_eq!(held.total(), STAGING + size, "{held:?}");
+        assert_eq!(held.total(), size, "{held:?}");
     }
 
     /// A body that says whether anybody has asked it for anything. Holding a body back
@@ -3576,6 +3615,90 @@ mod tests {
 #[cfg(test)]
 mod lifecycle {
     use super::*;
+
+    #[tokio::test]
+    async fn the_last_write_batch_observes_eof_without_starting_another_payload() {
+        use http_body_util::Full;
+        for chunked in [false, true] {
+            let framing = if chunked { 25 } else { 0 };
+            let budget = ROUNDS * (STAGING - framing);
+            for extra in [0, 1] {
+                let size = budget + extra;
+                let sending = if chunked {
+                    Sending::Chunked
+                } else {
+                    Sending::Length(size as u64)
+                };
+                let (socket, _peer) = tokio::io::duplex(size + STAGING);
+                let mut exchange = Exchange::new(socket, test_blocks());
+                let mut upload = Upload::new(
+                    Full::new(Bytes::from(vec![b'x'; size])),
+                    sending,
+                    Vec::new(),
+                );
+                exchange
+                    .push(
+                        &mut Context::from_waker(Waker::noop()),
+                        &mut upload,
+                        true,
+                        &H1Limits::default(),
+                    )
+                    .unwrap();
+                assert!(exchange.nothing_queued());
+                assert_eq!(upload.finished(), extra == 0);
+                if extra != 0 {
+                    assert_eq!(upload.pending.as_ref().unwrap().1, budget);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_uploads_share_the_original_frame_until_the_wire_is_complete() {
+        use http_body_util::Full;
+        use tokio::io::AsyncReadExt;
+
+        for sending in [Sending::Length(100), Sending::Chunked] {
+            // Split the prefix, payload and suffix at every byte boundary, including
+            // the scalar fallback for transports without vectored writes.
+            let (socket, mut peer) = tokio::io::duplex(1);
+            let mut exchange = Exchange::new(socket, test_blocks());
+            let original = Bytes::from(vec![b'x'; 100]);
+            let mut upload = Upload::new(Full::new(original.clone()), sending, Vec::new());
+            let mut wire = Vec::new();
+            let mut shared = false;
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+                let pushed = exchange
+                    .push(
+                        &mut Context::from_waker(Waker::noop()),
+                        &mut upload,
+                        true,
+                        &H1Limits::default(),
+                    )
+                    .unwrap();
+                if !exchange.payload.is_empty() {
+                    let offset = original.len() - exchange.payload.len();
+                    assert_eq!(exchange.payload.as_ptr(), original[offset..].as_ptr());
+                    assert!(!exchange.nothing_queued());
+                    shared = true;
+                }
+                if pushed.wrote {
+                    wire.push(peer.read_u8().await.unwrap());
+                }
+                if upload.finished() && exchange.nothing_queued() {
+                    break;
+                }
+            }
+            assert!(shared);
+            assert!(upload.finished() && exchange.nothing_queued());
+            let expected = match sending {
+                Sending::Chunked => [b"64\r\n".as_slice(), &original, b"\r\n0\r\n\r\n"].concat(),
+                _ => original.to_vec(),
+            };
+            assert_eq!(wire, expected);
+        }
+    }
     #[derive(Debug)]
     struct Frames;
     impl Body for Frames {
