@@ -418,9 +418,14 @@ pub fn delivery(head: &ResponseHead, asked: Asked) -> Result<Delivery, CodecErro
     })
 }
 
-/// Whether the body is chunked. One `chunked` and nothing besides: a chain of codings, a
+/// Whether the body is chunked. One `chunked` and no other coding: a chain of codings, a
 /// coding that is not the last, and a `chunked` said twice are all refused, because each
 /// is a place where what this reads and what the next reader reads could differ.
+///
+/// Empty list members are not codings. `chunked,` and `, chunked` are one `chunked`,
+/// because [RFC 9110 §5.6.1.2](https://www.rfc-editor.org/rfc/rfc9110.html#section-5.6.1.2)
+/// says a recipient MUST accept and ignore a reasonable number of them; every reader that
+/// follows it ends the body where this does.
 ///
 /// Decided by whether the field is there, not by what it lists. RFC 9112 §6.3 frames by
 /// its presence: one that names no coding at all has no `chunked` last, so the close
@@ -1754,6 +1759,36 @@ mod tests {
         // The name's case is nothing to do with it.
         assert!(matches!(
             delivery_of("Transfer-Encoding: CHUNKED\r\n", Asked::Anything),
+            Ok(Delivery {
+                framing: Framing::Chunked,
+                ..
+            })
+        ));
+    }
+
+    /// Empty members of the list are ignored, as RFC 9110 §5.6.1.2 requires of a recipient,
+    /// so each of these is a lone `chunked`.
+    #[test]
+    fn empty_members_beside_a_lone_chunked_are_ignored() {
+        for coding in ["chunked,", ", chunked", " , chunked , ,", "chunked,,"] {
+            let fields = format!("transfer-encoding: {coding}\r\n");
+            assert!(
+                matches!(
+                    delivery_of(&fields, Asked::Anything),
+                    Ok(Delivery {
+                        framing: Framing::Chunked,
+                        ..
+                    })
+                ),
+                "{coding:?}"
+            );
+        }
+        // The same list over two fields, one of which names nothing.
+        assert!(matches!(
+            delivery_of(
+                "transfer-encoding: chunked\r\ntransfer-encoding: ,\r\n",
+                Asked::Anything
+            ),
             Ok(Delivery {
                 framing: Framing::Chunked,
                 ..
