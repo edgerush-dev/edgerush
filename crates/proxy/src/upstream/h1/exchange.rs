@@ -172,7 +172,8 @@ pub struct Answer {
     /// time the hop-by-hop fields have been taken off there is nothing left to read.
     pub nominated: Vec<HeaderName>,
     /// Whether this answer is one that says to stop sending the request: a refusal that
-    /// also closes the connection.
+    /// says `Connection: close`, on its own head or on an interim one before it. A
+    /// connection that merely will not persist has not said the body is unwanted.
     ///
     /// A head arriving early says nothing by itself — an echo answers at once — and
     /// neither does a status alone, nor a `Connection: close` on an answer that is going
@@ -499,15 +500,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                 continue;
             }
             self.used(consumed);
+            close_said |= head
+                .headers
+                .get_all(http::header::CONNECTION)
+                .iter()
+                .flat_map(crate::hop_by_hop::options)
+                .any(|option| option.eq_ignore_ascii_case(b"close"));
             delivery.persistent &= !close_said;
-            // A refusal that also closes the connection says to stop; an answer that came
-            // early says nothing at all, because an echo answers early by nature. A
-            // request still being withheld for a 100 is never started now.
+            // A refusal that says close is what says to stop (RFC 9112 §9.5). A connection
+            // that merely will not persist — HTTP/1.0, a body the close delimits — has not
+            // said the body is unwanted, and an answer that came early says nothing at all,
+            // because an echo answers early by nature.
             let refused = head.status.is_client_error() || head.status.is_server_error();
             // A request still being withheld for a 100 is never started by an answer:
             // the upstream answered instead of asking, so it is not waiting for a body.
             let never_asked_for = withheld && !may_send;
-            let stop_uploading = never_asked_for || (refused && !delivery.persistent);
+            let stop_uploading = never_asked_for || (refused && close_said);
             return Ok(Answer {
                 nominated: crate::hop_by_hop::nominated(&head.headers),
                 head,
@@ -3198,6 +3206,54 @@ mod tests {
             "a refusal that closes did not stop the upload"
         );
         assert!(!answer.delivery.persistent);
+    }
+
+    /// Only a refusal that says `close` stops an upload: RFC 9112 §9.5 asks a client to
+    /// stop where the server "does not wish to receive the message body and is closing
+    /// the connection". A refusal on a connection that merely will not persist — HTTP/1.0,
+    /// or a body the close delimits — has said neither, and a close said on this exchange's
+    /// interim head is said all the same.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_refusal_that_says_close_stops_the_upload() {
+        for (answer, stops) in [
+            (
+                "HTTP/1.1 413 Too Large\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+                true,
+            ),
+            (
+                "HTTP/1.1 100 Continue\r\nconnection: close\r\n\r\n\
+                 HTTP/1.1 413 Too Large\r\ncontent-length: 0\r\n\r\n",
+                true,
+            ),
+            ("HTTP/1.1 413 Too Large\r\ncontent-length: 0\r\n\r\n", false),
+            ("HTTP/1.0 413 Too Large\r\ncontent-length: 0\r\n\r\n", false),
+            ("HTTP/1.1 413 Too Large\r\n\r\n", false),
+            (
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+                false,
+            ),
+        ] {
+            let (exchange, mut peer) = connected(4096);
+            tokio::spawn(async move {
+                peer.until(b"\r\n\r\n").await;
+                peer.say(answer).await;
+                peer
+            });
+            let (body, _asked) = Watched::new(b"hello");
+            let (got, _rest) = exchange
+                .send(
+                    &Method::POST,
+                    &"/x".parse().unwrap(),
+                    &headers(&[("host", "up.test")]),
+                    &[],
+                    Sending::Chunked,
+                    body,
+                    &H1Limits::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(got.stop_uploading, stops, "{answer:?}");
+        }
     }
 
     /// An expectation nobody here knows is passed on and waited on by no one, which is
