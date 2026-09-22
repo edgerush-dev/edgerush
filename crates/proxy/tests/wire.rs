@@ -2432,6 +2432,66 @@ async fn an_answer_of_trailers_alone_reaches_an_http2_client_as_trailers() {
     assert_eq!(trailers.expect("trailers")["x-var"], "v");
 }
 
+/// A HEAD answer and a 304 describe a body that is not sent, and may say how long it
+/// would have been. An HTTP/2 client is given that length and a stream that ends with
+/// the head, not a stream error for a length the data never matched (RFC 9113 §8.1.1
+/// exempts both), and the connection goes on carrying streams (linkerd2-proxy's tests
+/// of HEAD over HTTP/2).
+#[tokio::test]
+async fn a_bodyless_answer_with_a_length_reaches_an_http2_client_whole() {
+    let upstream = raw_upstream(|mut wire| async move {
+        while let Some(head) = wire.until(b"\r\n\r\n").await {
+            let head = String::from_utf8(head).unwrap();
+            let answer = if head.starts_with("HEAD ") {
+                "HTTP/1.1 200 OK\r\ncontent-length: 42\r\n\r\n"
+            } else if head.starts_with("GET /not-modified ") {
+                "HTTP/1.1 304 Not Modified\r\ncontent-length: 42\r\n\r\n"
+            } else {
+                FRESH
+            };
+            wire.write(answer).await;
+        }
+    });
+    let proxy = proxy_to(upstream).await;
+    let mut sender = h2_to(proxy).await;
+    for (method, path, status) in [
+        (http::Method::HEAD, "/x", 200),
+        (http::Method::GET, "/not-modified", 304),
+        (http::Method::HEAD, "/x", 200),
+    ] {
+        let request = http::Request::builder()
+            .method(method.clone())
+            .uri(format!("http://{proxy}{path}"))
+            .body(Upload::None)
+            .unwrap();
+        let answer = within(sender.send_request(request)).await.unwrap();
+        assert_eq!(answer.status(), status, "{method} {path}");
+        assert_eq!(
+            answer
+                .headers()
+                .get("content-length")
+                .map(|value| value.as_bytes()),
+            Some(&b"42"[..]),
+            "{method} {path}: {:?}",
+            answer.headers()
+        );
+        let body = within(http_body_util::BodyExt::collect(answer.into_body()))
+            .await
+            .expect("a stream that ended cleanly");
+        assert!(body.to_bytes().is_empty(), "{method} {path}");
+    }
+    // And the connection still carries an ordinary stream.
+    let request = http::Request::get(format!("http://{proxy}/after"))
+        .body(Upload::None)
+        .unwrap();
+    let answer = within(sender.send_request(request)).await.unwrap();
+    assert_eq!(answer.status(), 200);
+    let body = within(http_body_util::BodyExt::collect(answer.into_body()))
+        .await
+        .unwrap();
+    assert_eq!(body.to_bytes(), "fresh");
+}
+
 /// A chunked answer that says it closes, sent a piece at a time and closed straight
 /// after its last chunk, reaches an HTTP/2 client whole and ended cleanly (HAProxy's
 /// `truncated.vtc`).
