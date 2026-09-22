@@ -2496,6 +2496,52 @@ async fn a_bodyless_answer_with_a_length_reaches_an_http2_client_whole() {
     assert_eq!(body.to_bytes(), "fresh");
 }
 
+/// What a bodyless answer tells an HTTP/1.1 client about the body it describes. A HEAD
+/// answer's framing fields say what a GET would have been sent (RFC 9110 §9.3.2), so a
+/// length is passed on as it came and none is made up — a `content-length: 0` for a GET
+/// that would have been chunked is a claim about a body nobody measured. A 204 is told
+/// nothing about a length at all (RFC 9110 §8.6). A 304's length is dropped on both paths
+/// by the engine's server, which §8.6 allows ("A server MAY send a Content-Length header
+/// field in a 304 response"); this says so if that ever changes.
+#[tokio::test]
+async fn a_bodyless_answer_tells_an_http1_client_no_length_it_did_not_have() {
+    let upstream = raw_upstream(|mut wire| async move {
+        while let Some(head) = wire.until(b"\r\n\r\n").await {
+            let head = String::from_utf8(head).unwrap();
+            let path = head.split(' ').nth(1).unwrap_or_default().to_owned();
+            let answer = match path.as_str() {
+                "/counted" => "HTTP/1.1 200 OK\r\ncontent-length: 42\r\n\r\n",
+                "/chunked" => "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n",
+                "/not-modified" => "HTTP/1.1 304 Not Modified\r\ncontent-length: 42\r\n\r\n",
+                "/no-content" => "HTTP/1.1 204 No Content\r\n\r\n",
+                _ => FRESH,
+            };
+            wire.write(answer).await;
+        }
+    });
+    let mut client = Wire::to(proxy_to(upstream).await).await;
+    for (method, path, length) in [
+        ("HEAD", "/counted", Some("42")),
+        ("HEAD", "/chunked", None),
+        ("GET", "/not-modified", None),
+        ("GET", "/no-content", None),
+    ] {
+        client
+            .write(&format!("{method} {path} HTTP/1.1\r\nhost: a.test\r\n\r\n"))
+            .await;
+        let head = within(client.head()).await;
+        let said = head
+            .to_ascii_lowercase()
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("content-length: ").map(str::to_owned));
+        assert_eq!(said.as_deref(), length, "{method} {path}: {head}");
+    }
+    // Every one of them ended at its head: the next answer is where it should be.
+    let head = asks(&mut client, "/after").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(within(client.body(5)).await, "fresh");
+}
+
 /// A chunked answer that says it closes, sent a piece at a time and closed straight
 /// after its last chunk, reaches an HTTP/2 client whole and ended cleanly (HAProxy's
 /// `truncated.vtc`).
