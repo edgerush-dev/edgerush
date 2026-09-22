@@ -568,6 +568,36 @@ async fn a_101_nobody_asked_for_is_answered_502() {
     );
 }
 
+/// An HTTP/1.0 client cannot read chunks, so a chunked answer with trailers reaches it as
+/// the bytes alone, ended by the close: no chunk framing, and no trailer section, which
+/// HTTP/1.0 has nowhere to put (RFC 9112 §7.1; linkerd2-proxy's HTTP/1.0 tests).
+#[tokio::test]
+async fn an_http_1_0_client_is_sent_a_chunked_answer_without_its_chunks() {
+    let upstream = raw_upstream(move |mut wire| async move {
+        let _head = wire.head().await;
+        wire.write(concat!(
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ntrailer: x-t\r\n\r\n",
+            "5\r\nhello\r\n6\r\n there\r\n0\r\nx-t: 1\r\n\r\n"
+        ))
+        .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+    let mut client = Wire::to(proxy_to(upstream).await).await;
+    client
+        .write("GET /up HTTP/1.0\r\nhost: a.test\r\n\r\n")
+        .await;
+
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1."), "{head}");
+    assert!(head.contains(" 200 "), "{head}");
+    assert!(
+        !head.to_ascii_lowercase().contains("transfer-encoding"),
+        "{head}"
+    );
+    let rest = String::from_utf8(within(client.rest()).await).unwrap();
+    assert_eq!(rest, "hello there", "{head}");
+}
+
 /// An upstream that answers before it has read the body is not waited for: the answer
 /// goes to the client while the upload is still in the air.
 #[tokio::test]
