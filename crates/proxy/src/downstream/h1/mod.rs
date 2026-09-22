@@ -5,3 +5,6 @@
 //! can be checked against a table and every split of its input tried.
 
 pub mod codec;
+// Where the codec and hyper's server answer the same bytes differently.
+#[cfg(test)]
+mod differences;
