@@ -92,9 +92,11 @@ That is a hypothesis to isolate, not an explanation established by the macro rer
 
 `VARIANTS` names what is run, in turns: `thread-per-core` — EdgeRush by the engine's
 upstream client, named with `--upstream hyper` since it is not the default —,
-`thread-per-core-kernel` — the same without balancing connections at accept — and `ours`,
-the same again by EdgeRush's own upstream client, the default (EdgeRush,
-`proxy.yaml`); then `nginx` (`nginx-proxy.conf`), `haproxy` (`haproxy.cfg`), `envoy`
+`thread-per-core-kernel` — the same without balancing connections at accept —, `ours`,
+the same again by EdgeRush's own upstream client, the default, and `hyper-conn`, by the
+engine's client a connection at a time over EdgeRush's own pool, which is what `ours` is
+compared with from the downstream work on (EdgeRush, `proxy.yaml`,
+[14 §2](../../docs/14-downstream-server.md)); then `nginx` (`nginx-proxy.conf`), `haproxy` (`haproxy.cfg`), `envoy`
 (`envoy.yaml`) and `kong` (`kong.yml`, without a database). `thread-per-core` and `ours`
 differ in nothing but that client, which is what makes the pair of them a measurement of
 it ([13 §8](../../docs/13-http1-upstream.md) step 6). The configs ask for the same

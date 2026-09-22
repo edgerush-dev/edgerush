@@ -110,17 +110,19 @@ impl<B> HyperConnection<B> {
 #[derive(Debug)]
 pub struct HyperBody<B> {
     incoming: Incoming,
-    returning: Option<Returning<B>>,
+    /// In a box because it is much the larger part, and a body of the pooled client, which
+    /// has none, would otherwise carry room for it.
+    returning: Option<Box<Returning<B>>>,
     /// The whole answer has been handed on.
     ended: bool,
 }
 
-/// A connection in use by an answer's body, and where it goes when the answer is over.
+/// A connection in use by an answer's body, and where it goes when the answer is over:
+/// nowhere, for one that is to be closed whatever the answer says.
 #[derive(Debug)]
 struct Returning<B> {
     connection: HyperConnection<B>,
-    lease: Lease<HyperConnection<B>>,
-    limits: H1Limits,
+    back: Option<(Lease<HyperConnection<B>>, H1Limits)>,
 }
 
 impl<B> HyperBody<B> {
@@ -143,11 +145,10 @@ impl<B> HyperBody<B> {
     ) -> Self {
         let mut body = Self {
             incoming,
-            returning: Some(Returning {
+            returning: Some(Box::new(Returning {
                 connection,
-                lease,
-                limits,
-            }),
+                back: Some((lease, limits)),
+            })),
             ended: false,
         };
         // Nothing need ever poll a body with nothing in it, so its connection would
@@ -159,17 +160,27 @@ impl<B> HyperBody<B> {
         body
     }
 
+    /// A body on `connection`, which is closed once the body is over or let go of: one an
+    /// answer has bound to its client, say, whose next request must not be sent on it.
+    pub fn closing(incoming: Incoming, connection: HyperConnection<B>) -> Self {
+        Self {
+            incoming,
+            returning: Some(Box::new(Returning {
+                connection,
+                back: None,
+            })),
+            ended: false,
+        }
+    }
+
     /// Puts the connection back if hyper will take another request on it, and closes it
     /// otherwise.
     fn give_back(&mut self) {
-        if let Some(Returning {
-            connection,
-            lease,
-            limits,
-        }) = self.returning.take()
-            && connection.is_ready()
+        if let Some(returning) = self.returning.take()
+            && let Some((lease, limits)) = returning.back
+            && returning.connection.is_ready()
         {
-            lease.keep(connection, &limits);
+            lease.keep(returning.connection, &limits);
         }
     }
 }

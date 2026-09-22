@@ -3,7 +3,7 @@
 //! between the HTTP engine (hyper) and the core, and the only place that knows both.
 //!
 //! Bodies stream in both directions and are never held here. Upstream connections are
-//! HTTP/1.1, by EdgeRush's own client and pool unless the engine's is asked for
+//! HTTP/1.1, by EdgeRush's own client and pool unless one of the engine's is asked for
 //! ([`Upstream`]).
 //!
 //! The config is published whole and at once ([`Proxy::reload`]): a request reads the
@@ -28,13 +28,14 @@ use crate::upstream::h1::blocks::{Blocks, SMALL, Sizes};
 use crate::upstream::h1::codec::{ResponseHead, Sending, filter_declaration, filter_trailers};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, nothing_to_say};
 use crate::upstream::h1::pool::{Lease, Pool};
+use crate::upstream::hyper_conn::{HyperBody, HyperConnection};
 use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRule};
 use http::request::Parts;
 use http::response;
 use http::uri::{Authority, Scheme};
 use http::{HeaderMap, HeaderName, Method, Request, Response, Uri, Version};
-use hyper::body::{Body as HttpBody, Bytes, Frame, Incoming, SizeHint};
+use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
 use hyper::rt::Executor;
 use hyper::service::service_fn;
 use hyper_util::client::legacy::Client;
@@ -111,10 +112,10 @@ impl<F: Future<Output = ()> + 'static> Executor<F> for OnThisWorker {
 /// An upstream's answer carries its exchange's place with it, whichever client read it:
 /// the exchange is over when the body is.
 enum Body {
-    /// The upstream's answer, as the engine's client reads it, and what that answer's
-    /// own `Connection` named. The names are kept because the trailers have not arrived
-    /// yet and the head they were read from will be gone by the time they do.
-    Upstream(Incoming, Vec<HeaderName>, Admitted, Watch),
+    /// The upstream's answer, as one of the engine's clients reads it, and what that
+    /// answer's own `Connection` named. The names are kept because the trailers have not
+    /// arrived yet and the head they were read from will be gone by the time they do.
+    Upstream(HyperBody<RequestBody>, Vec<HeaderName>, Admitted, Watch),
     /// The upstream's answer, as EdgeRush's own path reads it. In a box because it is
     /// much the larger of the two, and every answer would otherwise carry room for it.
     Ours(Box<H1Body<TcpStream, RequestBody>>, Admitted, Watch),
@@ -270,8 +271,15 @@ impl HttpBody for Body {
 /// it again would be sending it twice ([13 §1](../../docs/13-http1-upstream.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Upstream {
-    /// The engine's client, kept to compare EdgeRush's own against.
+    /// The engine's pooled client (hyper-util's), which carried every request before
+    /// EdgeRush's own did. Kept unchanged as the fixed point earlier measurements were made
+    /// against ([14 §2](../../docs/14-downstream-server.md)).
     Hyper,
+    /// The engine's client a connection at a time, over this worker's own pool and its
+    /// policy: what EdgeRush's own is compared with. It takes a request body that cannot
+    /// leave the worker, which the pooled one cannot
+    /// ([14 §2](../../docs/14-downstream-server.md)).
+    HyperConn,
     /// EdgeRush's own, measured against the engine's and chosen over it
     /// ([13 §8](../../docs/13-http1-upstream.md)).
     #[default]
@@ -312,6 +320,9 @@ pub struct Worker {
     client: Client<HttpConnector, RequestBody>,
     /// The connections this worker keeps by EdgeRush's own path.
     pool: Rc<RefCell<Pool<TcpStream>>>,
+    /// The connections it keeps by the engine's client a connection at a time, under the
+    /// same policy.
+    hyper_pool: Rc<RefCell<Pool<HyperConnection<RequestBody>>>>,
     /// What its exchanges read into, lent and taken back rather than made each time
     /// ([13 §7](../../docs/13-http1-upstream.md)).
     blocks: Rc<RefCell<Blocks>>,
@@ -527,6 +538,7 @@ impl Worker {
             proxy,
             client,
             pool: Rc::new(RefCell::new(Pool::default())),
+            hyper_pool: Rc::new(RefCell::new(Pool::default())),
             blocks: Rc::new(RefCell::new(Blocks::new(Sizes::within(&limits, SMALL)))),
             in_flight: Rc::new(Cell::new(0)),
             limits,
@@ -545,7 +557,8 @@ impl Worker {
         loop {
             tokio::time::sleep(every).await;
             // Borrowed for the sweep and let go of before anything is waited on again.
-            let swept = self.pool.borrow_mut().sweep(&self.limits);
+            let swept = self.pool.borrow_mut().sweep(&self.limits)
+                + self.hyper_pool.borrow_mut().sweep(&self.limits);
             // And what a burst left parked of the blocks, down to what a quiet worker keeps.
             self.blocks.borrow_mut().sweep();
             let metrics = &self.proxy.metrics;
@@ -564,7 +577,7 @@ impl Worker {
     /// How many connections this worker is keeping. For tests and, later, a gauge.
     #[must_use]
     pub fn idle_connections(&self) -> usize {
-        self.pool.borrow().idle()
+        self.pool.borrow().idle() + self.hyper_pool.borrow().idle()
     }
 
     /// Takes a place among the exchanges this worker has in hand, if one is going.
@@ -825,12 +838,13 @@ impl Worker {
             return self.proxy.answer(listener, Answer::TooBusy);
         };
         let answered = match self.proxy.upstream {
-            Upstream::Hyper => {
+            Upstream::Hyper | Upstream::HyperConn => {
                 let watch = Watch {
                     proxy: Arc::clone(&self.proxy),
                     upstream: directed.upstream_slot,
                 };
-                self.by_hyper(head, body, admitted, watch).await
+                self.by_hyper(&directed.endpoint, head, body, admitted, watch)
+                    .await
             }
             Upstream::Ours => {
                 self.by_ours(&directed, &head, &nominated, sending, body, admitted)
@@ -863,28 +877,37 @@ impl Worker {
         Response::from_parts(head, body)
     }
 
-    /// By the engine's client, which is what has always carried these requests.
+    /// By one of the engine's clients.
     async fn by_hyper(
         &self,
+        identity: &Arc<ReuseIdentity>,
         head: Parts,
         body: RequestBody,
         admitted: Admitted,
         watch: Watch,
     ) -> Option<(response::Parts, Body)> {
-        let response = self
-            .client
-            .request(Request::from_parts(head, body))
-            .await
-            .ok()?;
-        let (mut head, body) = response.into_parts();
+        let (mut head, incoming, connection) = if self.proxy.upstream == Upstream::HyperConn {
+            let (response, connection) = self.through_hyper_conn(identity, head, body).await?;
+            let (head, incoming) = response.into_parts();
+            (head, incoming, Some(connection))
+        } else {
+            let response = self
+                .client
+                .request(Request::from_parts(head, body))
+                .await
+                .ok()?;
+            let (head, incoming) = response.into_parts();
+            (head, incoming, None)
+        };
         // HTTP has only the statuses from 100 to 599, and
         // [RFC 9110 §15](https://www.rfc-editor.org/rfc/rfc9110.html#section-15) says
         // "Values outside the range 100..599 are invalid"; the engine's client allows the
         // range above, which libraries use for errors of their own. An invalid status is
         // answered 502, which is the "process the response as if it had a 5xx" that §15
         // asks for, and the body goes unread so that the engine does not hand the
-        // connection on. Only unread is in this end's gift here: a body already complete
-        // leaves the connection in the engine's pool whatever this does with it.
+        // connection on. The pooled client's connection may be back in its pool already if
+        // its body is complete, which this end cannot prevent; a connection of our pool's
+        // goes back only through the body, which has not been made yet, so it is closed.
         if !(100..=599).contains(&head.status.as_u16()) {
             return None;
         }
@@ -901,8 +924,78 @@ impl Worker {
         let nominated = crate::hop_by_hop::nominated(&head.headers);
         // What may not travel on is not declared onwards either.
         filter_declaration(&mut head.headers, &nominated);
+        let body = match connection {
+            None => HyperBody::unpooled(incoming),
+            // An answer that binds its connection to this client's credentials closes it,
+            // as on EdgeRush's own path.
+            Some((connection, _))
+                if crate::upstream::auth::challenges(head.status, &head.headers) =>
+            {
+                HyperBody::closing(incoming, connection)
+            }
+            Some((connection, opened)) => {
+                let lease = Lease::in_use(Arc::clone(identity), opened, &self.hyper_pool);
+                HyperBody::returning(incoming, connection, lease, self.limits)
+            }
+        };
         // The place goes with the body, as it does on the other path.
         Some((head, Body::Upstream(body, nominated, admitted, watch)))
+    }
+
+    /// Sends a request by the engine's client on a connection of this worker's pool, or
+    /// on one opened for it, and returns the answer with the connection it came on.
+    ///
+    /// A connection is taken only if hyper says it will take a request now, which it says
+    /// only while the connection is open and the last exchange on it is over: one the
+    /// upstream closed, or that it said something unasked on, is not ready and goes.
+    async fn through_hyper_conn(
+        &self,
+        identity: &Arc<ReuseIdentity>,
+        mut head: Parts,
+        body: RequestBody,
+    ) -> Option<(
+        Response<hyper::body::Incoming>,
+        (HyperConnection<RequestBody>, Instant),
+    )> {
+        let mut kept = None;
+        loop {
+            // Bound in its own statement, so the pool is not still borrowed below.
+            let found = self.hyper_pool.borrow_mut().take(identity, &self.limits);
+            let Some((connection, opened)) = found else {
+                break;
+            };
+            if connection.is_ready() {
+                kept = Some((connection, opened));
+                break;
+            }
+            self.proxy.metrics.socket(Socket::Discarded);
+        }
+        let (mut connection, opened) = match kept {
+            Some(reused) => {
+                self.proxy.metrics.socket(Socket::Reused);
+                reused
+            }
+            None => {
+                self.proxy.metrics.socket(Socket::Opened);
+                let opening = TcpStream::connect(identity.address());
+                let socket = connect_within(self.limits.connect, opening).await.ok()?;
+                // Worth having, not worth refusing an upstream over.
+                let _unset = socket.set_nodelay(true);
+                (HyperConnection::open(socket).await.ok()?, Instant::now())
+            }
+        };
+        // Sent as the target is written, so in origin form as every client here sends it;
+        // the pooled client makes the same change for itself.
+        head.uri = head
+            .uri
+            .path_and_query()
+            .cloned()
+            .map_or_else(Uri::default, Uri::from);
+        let response = connection
+            .send(Request::from_parts(head, body))
+            .await
+            .ok()?;
+        Some((response, (connection, opened)))
     }
 
     /// By EdgeRush's own path. Never after the other has been tried: by the time one has
@@ -1375,7 +1468,7 @@ mod tests {
     /// has been full is not full for ever ([13 §7](../../docs/13-http1-upstream.md)).
     #[test]
     fn a_worker_full_of_exchanges_answers_rather_than_take_another() {
-        for by in [Upstream::Hyper, Upstream::Ours] {
+        for by in [Upstream::Hyper, Upstream::HyperConn, Upstream::Ours] {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1426,7 +1519,7 @@ mod tests {
     #[test]
     fn every_way_out_of_an_exchange_gives_its_place_back() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for by in [Upstream::Hyper, Upstream::Ours] {
+        for by in [Upstream::Hyper, Upstream::HyperConn, Upstream::Ours] {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1638,14 +1731,14 @@ upstreams:
     /// Left to itself the engine's pool keeps as many as it likes, which is a different
     /// proxy from the one [13 §7](../../docs/13-http1-upstream.md) describes.
     #[test]
-    fn the_bound_on_idle_connections_holds_for_both_clients() {
+    fn the_bound_on_idle_connections_holds_for_every_client() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let local = tokio::task::LocalSet::new();
         runtime.block_on(local.run_until(async {
-            for by in [Upstream::Hyper, Upstream::Ours] {
+            for by in [Upstream::Hyper, Upstream::HyperConn, Upstream::Ours] {
                 // Keeping none: every request after the first opens its own connection.
                 assert_eq!(connections_for(by, 0, 3).await, 3, "{by:?} keeping none");
                 // Keeping one: the first connection carries all three.
@@ -1654,57 +1747,97 @@ upstreams:
         }));
     }
 
-    /// What became of every connection is counted, and so is a worker's own holding.
-    /// A benchmark that cannot tell a reused connection from a fresh one is measuring
-    /// the wrong thing ([13 §7](../../docs/13-http1-upstream.md)).
+    /// The worker's sweep reaches every pool it keeps: a connection left idle past its
+    /// time is closed by the sweep, whichever client's it is, with nothing asking for it
+    /// again ([13 §3](../../docs/13-http1-upstream.md)).
+    #[test]
+    fn the_sweep_closes_what_every_pool_left_idle_too_long() {
+        for by in [Upstream::HyperConn, Upstream::Ours] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            runtime.block_on(local.run_until(async {
+                let (upstream, _opened) = counting_upstream().await;
+                let limits = H1Limits {
+                    idle_timeout: Duration::from_millis(100),
+                    sweep: Duration::from_millis(50),
+                    ..H1Limits::default()
+                };
+                let worker = Worker::with_limits(sending_to_by(upstream, by), limits);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+                assert_eq!(status_over_http1(front).await, StatusCode::OK);
+                until(|| worker.idle_connections() == 1).await;
+
+                let _maintaining = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while worker.idle_connections() != 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{by:?}: an idle connection outlived the sweep"));
+            }));
+        }
+    }
+
+    /// What became of every connection is counted, and so is a worker's own holding, for
+    /// every client over this worker's pool. A benchmark that cannot tell a reused
+    /// connection from a fresh one is measuring the wrong thing
+    /// ([13 §7](../../docs/13-http1-upstream.md)).
     #[test]
     fn what_became_of_a_connection_is_counted() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let local = tokio::task::LocalSet::new();
-        runtime.block_on(local.run_until(async {
-            let (upstream, _opened) = counting_upstream().await;
-            let proxy = sending_to_by(upstream, Upstream::Ours);
-            let worker = Worker::with_limits(Arc::clone(&proxy), H1Limits::default());
-            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let front = socket.local_addr().unwrap();
-            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        for by in [Upstream::HyperConn, Upstream::Ours] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            runtime.block_on(local.run_until(async {
+                let (upstream, _opened) = counting_upstream().await;
+                let proxy = sending_to_by(upstream, by);
+                let worker = Worker::with_limits(Arc::clone(&proxy), H1Limits::default());
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
 
-            for _ in 0..3 {
-                assert_eq!(status_over_http1(front).await, StatusCode::OK);
-            }
-            // One connection opened for the first request, and taken again for the rest.
-            let scrape = proxy.metrics.render(&["web".to_owned()], &[]);
-            assert!(
-                scrape.contains(
-                    "edgerush_upstream_connections_total{state=\"opened\"} 1
+                for _ in 0..3 {
+                    assert_eq!(status_over_http1(front).await, StatusCode::OK);
+                }
+                // One connection opened for the first request, and taken again for the rest.
+                let scrape = proxy.metrics.render(&["web".to_owned()], &[]);
+                assert!(
+                    scrape.contains(
+                        "edgerush_upstream_connections_total{state=\"opened\"} 1
 "
-                ),
-                "{scrape}"
-            );
-            assert!(
-                scrape.contains(
-                    "edgerush_upstream_connections_total{state=\"reused\"} 2
+                    ),
+                    "{scrape}"
+                );
+                assert!(
+                    scrape.contains(
+                        "edgerush_upstream_connections_total{state=\"reused\"} 2
 "
-                ),
-                "{scrape}"
-            );
-            // And what the worker holds, which it says as it sweeps.
-            proxy
-                .metrics
-                .worker()
-                .holding(worker.in_flight.get(), worker.idle_connections());
-            let scrape = proxy.metrics.render(&["web".to_owned()], &[]);
-            assert!(
-                scrape.contains(
-                    "edgerush_upstream_connections_idle 1
+                    ),
+                    "{scrape}"
+                );
+                // And what the worker holds, which it says as it sweeps.
+                proxy
+                    .metrics
+                    .worker()
+                    .holding(worker.in_flight.get(), worker.idle_connections());
+                let scrape = proxy.metrics.render(&["web".to_owned()], &[]);
+                assert!(
+                    scrape.contains(
+                        "edgerush_upstream_connections_idle 1
 "
-                ),
-                "{scrape}"
-            );
-        }));
+                    ),
+                    "{scrape}"
+                );
+            }));
+        }
     }
 
     /// An exchange that ends without an answer says which of the named reasons it
@@ -1762,7 +1895,7 @@ upstreams:
     /// ([13 §7](../../docs/13-http1-upstream.md)). Both paths count it.
     #[test]
     fn a_body_that_fails_after_its_head_is_counted() {
-        for by in [Upstream::Hyper, Upstream::Ours] {
+        for by in [Upstream::Hyper, Upstream::HyperConn, Upstream::Ours] {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1926,7 +2059,7 @@ upstreams:
         collected(sender.send_request(request).await.unwrap()).await
     }
 
-    async fn collected(response: Response<Incoming>) -> String {
+    async fn collected(response: Response<hyper::body::Incoming>) -> String {
         assert_eq!(response.status(), 200);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8(body.to_vec()).unwrap()

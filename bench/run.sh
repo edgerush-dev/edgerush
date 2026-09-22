@@ -38,7 +38,7 @@ repo=$(dirname "$here")
 # and how many connections are left idle for the one that weighs them.
 : "${STREAMED:=8388608}"
 : "${IDLE_CONNECTIONS:=2000}"
-: "${VARIANTS:=thread-per-core}" # and: ours thread-per-core-kernel nginx haproxy envoy kong
+: "${VARIANTS:=thread-per-core}" # and: ours hyper-conn thread-per-core-kernel nginx haproxy envoy kong
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
 
 # Hundreds of connections on either side of the proxy, and more when they churn.
@@ -134,6 +134,14 @@ start_proxy() { # variant
         # what makes the pair of them the measurement.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
             --upstream ours --workers "$WORKERS" $idle \
+            2>>"$OUT/proxy.log" &
+        ;;
+    hyper-conn)
+        # The engine's client a connection at a time over EdgeRush's own pool: what ours is
+        # compared with from the downstream work on (14 section 2). Against thread-per-core
+        # it measures the pool and the adapter; against ours, the client itself.
+        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
+            --upstream hyper-conn --workers "$WORKERS" $idle \
             2>>"$OUT/proxy.log" &
         ;;
     *)

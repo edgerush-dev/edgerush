@@ -140,12 +140,14 @@ async fn proxy(yaml: &str) -> BTreeMap<String, SocketAddr> {
 /// the point of it — so it is told rather than written twice:
 ///
 /// ```text
-/// cargo test                                  EdgeRush's own, the default
-/// EDGERUSH_TEST_UPSTREAM=hyper cargo test     the engine's client
+/// cargo test                                       EdgeRush's own, the default
+/// EDGERUSH_TEST_UPSTREAM=hyper cargo test          the engine's pooled client
+/// EDGERUSH_TEST_UPSTREAM=hyper-conn cargo test     the engine's, over our pool
 /// ```
 fn upstream_under_test() -> Upstream {
     match std::env::var("EDGERUSH_TEST_UPSTREAM").as_deref() {
         Ok("hyper") => Upstream::Hyper,
+        Ok("hyper-conn") => Upstream::HyperConn,
         _ => Upstream::Ours,
     }
 }
@@ -1134,15 +1136,16 @@ async fn an_upstream_that_goes_and_comes_back_is_not_the_one_that_left() {
     assert_eq!(answered_by(&client, web, "/alpha").await, "alpha");
 
     match upstream_under_test() {
-        // **Where the two paths differ, by design rather than by rule.** Ours gives the
+        // **Where the pools differ, by design rather than by rule.** Ours gives the
         // recreated destination a key of its own, so the connection retired with the old
-        // one is not used for it ([13 §3](../../../docs/13-http1-upstream.md)).
-        Upstream::Ours => assert_eq!(
+        // one is not used for it ([13 §3](../../../docs/13-http1-upstream.md)), whichever
+        // client's connection it is.
+        Upstream::Ours | Upstream::HyperConn => assert_eq!(
             opened.load(Ordering::SeqCst),
             2,
             "a retired connection was used again"
         ),
-        // The engine's client keeps its connections by authority, which has not changed,
+        // The engine's pooled client keeps its connections by authority, which has not changed,
         // so the same socket carries on. Nothing in HTTP says otherwise; it simply has no
         // notion of a destination that was taken away.
         Upstream::Hyper => assert_eq!(opened.load(Ordering::SeqCst), 1),
@@ -1168,12 +1171,12 @@ async fn two_upstreams_at_one_address_do_not_share_a_connection() {
 
     match upstream_under_test() {
         // One connection each, kept and reused: separate, and separately reused.
-        Upstream::Ours => assert_eq!(
+        Upstream::Ours | Upstream::HyperConn => assert_eq!(
             opened.load(Ordering::SeqCst),
             2,
             "two upstreams shared a connection"
         ),
-        // The engine's client keys on the authority alone, so one address is one pool
+        // The engine's pooled client keys on the authority alone, so one address is one pool
         // however many upstreams point at it. That is the isolation §3 asks for and the
         // candidate adds; it is not a rule hyper's client is breaking.
         Upstream::Hyper => assert_eq!(opened.load(Ordering::SeqCst), 1),

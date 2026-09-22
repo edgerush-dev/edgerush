@@ -49,7 +49,9 @@ Options:
                            listener's port, which needs SO_REUSEPORT (Unix)
                            [default: one for every CPU]
       --upstream <BY>      How a request reaches its upstream. ours: EdgeRush's own
-                           client; hyper: the engine's, kept for comparison
+                           client; hyper-conn: the engine's, a connection at a time
+                           over our pool, which ours is compared with; hyper: the
+                           engine's pooled client, kept as a fixed point
                            [default: ours]
       --idle-per-destination <N>
                            How many idle connections a worker keeps to one destination,
@@ -118,7 +120,7 @@ enum UsageError {
     Workers(String),
     #[error("'{0}' is not a way to place connections: balanced or kernel")]
     Accept(String),
-    #[error("'{0}' is not a way to reach an upstream: hyper or ours")]
+    #[error("'{0}' is not a way to reach an upstream: ours, hyper-conn or hyper")]
     Upstream(String),
     #[error("'{1}' is not a number of idle connections for '{0}': 0 or more")]
     Idle(&'static str, String),
@@ -159,6 +161,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                 let by = args.next().ok_or(UsageError::NoValue("--upstream"))?;
                 let by = match by.as_str() {
                     "hyper" => Upstream::Hyper,
+                    "hyper-conn" => Upstream::HyperConn,
                     "ours" => Upstream::Ours,
                     _ => return Err(UsageError::Upstream(by)),
                 };
@@ -298,7 +301,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
         "s"
     };
     let by = match upstream {
-        Upstream::Hyper => "hyper's client",
+        Upstream::Hyper => "hyper's pooled client",
+        Upstream::HyperConn => "hyper's client over our pool",
         Upstream::Ours => "our own upstream path",
     };
     say(
@@ -493,7 +497,11 @@ mod tests {
 
     #[test]
     fn the_upstream_client_is_as_the_command_line_says() {
-        for (by, upstream) in [("ours", Upstream::Ours), ("hyper", Upstream::Hyper)] {
+        for (by, upstream) in [
+            ("ours", Upstream::Ours),
+            ("hyper-conn", Upstream::HyperConn),
+            ("hyper", Upstream::Hyper),
+        ] {
             let options = Options {
                 config: PathBuf::from("dev.yaml"),
                 upstream,
