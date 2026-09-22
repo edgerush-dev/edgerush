@@ -631,6 +631,25 @@ async fn two_hosts_share_an_upstream_connection_and_keep_their_own_host() {
     assert_eq!(accepts.load(Ordering::SeqCst), 1, "a connection each");
 }
 
+/// A request whose target has no path — `CONNECT`'s authority form and `OPTIONS *` — is
+/// answered 400 here and never reaches an upstream: this gateway tunnels nothing, and an
+/// asterisk names no route (13 §1; linkerd2-proxy's tests).
+#[tokio::test]
+async fn a_request_with_no_path_is_answered_400_and_sent_nowhere() {
+    let (upstream, accepts) = counted(plainly);
+    let proxy = proxy_to(upstream).await;
+    for request in [
+        "CONNECT shop.test:443 HTTP/1.1\r\nhost: shop.test:443\r\n\r\n",
+        "OPTIONS * HTTP/1.1\r\nhost: shop.test\r\n\r\n",
+    ] {
+        let mut client = Wire::to(proxy).await;
+        client.write(request).await;
+        let head = within(client.head()).await;
+        assert!(head.starts_with("HTTP/1.1 400"), "{request:?}: {head}");
+    }
+    assert_eq!(accepts.load(Ordering::SeqCst), 0, "an upstream was asked");
+}
+
 /// An upstream that answers before it has read the body is not waited for: the answer
 /// goes to the client while the upload is still in the air.
 #[tokio::test]
