@@ -25,3 +25,4 @@
 pub(crate) mod auth;
 pub mod destination;
 pub mod h1;
+pub mod hyper_conn;
