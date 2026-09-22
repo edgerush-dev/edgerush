@@ -16,6 +16,7 @@
 //! the pool of upstream connections to come, above all.
 
 use crate::hop_by_hop::strip_response;
+use crate::linger::{self, Lent, linger};
 use crate::metrics::{Answer, Metrics, Socket, Stopped};
 use crate::random::random;
 use crate::request::decide;
@@ -684,11 +685,19 @@ impl Worker {
                 Ok::<_, Infallible>(response)
             }
         });
+        // Lent rather than given, so that it comes back once the engine is done with it.
+        let (lent, back) = Lent::new(stream);
         // An error here is the end of one connection: the peer went away or spoke
         // nonsense. There is nobody to tell.
         let _closed = auto::Builder::new(OnThisWorker)
-            .serve_connection(TokioIo::new(stream), service)
+            .serve_connection(TokioIo::new(lent), service)
             .await;
+        // Dropped with bytes the client sent still unread — the rest of an upload the
+        // engine never read — the connection would be reset, and the reset can take the
+        // answer the client has not read yet with it. So it lingers instead.
+        if let Some(stream) = back.take() {
+            linger(stream, linger::QUIET, linger::MOST).await;
+        }
     }
 
     async fn handle(&self, listener: usize, request: Request<Incoming>) -> Response<Body> {

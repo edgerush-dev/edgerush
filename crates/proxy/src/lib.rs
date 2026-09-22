@@ -13,6 +13,7 @@
 mod cookies;
 mod hop_by_hop;
 pub mod host;
+mod linger;
 mod metrics;
 mod random;
 mod request;

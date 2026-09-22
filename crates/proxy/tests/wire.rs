@@ -2006,15 +2006,15 @@ async fn a_refusal_reaches_the_client_though_the_upload_cannot_go() {
         if writing.write_all(head.as_bytes()).await.is_err() {
             return;
         }
-        // **Bounded from both sides.** Enough to fill the staging and the socket behind
-        // it, or nothing would be blocked and there would be no test here. Little enough
-        // that the proxy has taken it all in by the time it answers: a connection closed
-        // while unread bytes are still sitting in its receive buffer is reset rather than
-        // closed, and a reset takes the answer that had already arrived with it. That is
-        // TCP rather than anything this proxy decides, and half a megabyte here failed
-        // about one run in two on Windows.
+        // Enough to fill the staging and the socket behind it, or nothing would be
+        // blocked and there would be no test here — and far more than the proxy has read
+        // by the time it answers. A connection closed with unread bytes waiting is reset,
+        // and a reset takes an answer the client has not read yet with it; the proxy
+        // lingers over its closes so that it is not (`linger.rs`). Before it did, half a
+        // megabyte here failed about one run in two on Windows, and a tenth of that one in
+        // three on Linux.
         let block = vec![b'x'; 16 * 1024];
-        for _ in 0..10 {
+        for _ in 0..64 {
             if stop.load(Ordering::SeqCst) || writing.write_all(&block).await.is_err() {
                 return;
             }
