@@ -410,6 +410,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         let mut reader = HeadReader::default();
         let mut interim = 0;
         let mut interim_bytes = 0;
+        // A close said on an interim head holds for the rest of the exchange: RFC 9112
+        // §9.6 has a client that receives one cease sending requests on the connection,
+        // and the final head saying nothing does not take it back.
+        let mut close_said = false;
         let mut clocks = Clocks::default();
 
         loop {
@@ -466,7 +470,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             // one here and something else may read as one next; a 101 is a protocol this
             // does not speak. Neither may be waved through for being on the way to
             // something else ([13 §4](../../../docs/13-http1-upstream.md)).
-            let delivery = delivery(&head, Asked::from(method))?;
+            let mut delivery = delivery(&head, Asked::from(method))?;
 
             if head.status.is_informational() {
                 // Only a 100 says to send the body. Another interim answer says something
@@ -475,6 +479,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                     may_send = true;
                 }
                 // Consumed and not passed on. The exchange goes on to the final head.
+                // A 1.1 interim head is persistent unless it says close; 1.0 ones are
+                // refused before this.
+                close_said |= !delivery.persistent;
                 interim += 1;
                 interim_bytes += consumed;
                 if interim > limits.interim_heads {
@@ -492,6 +499,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                 continue;
             }
             self.used(consumed);
+            delivery.persistent &= !close_said;
             // A refusal that also closes the connection says to stop; an answer that came
             // early says nothing at all, because an echo answers early by nature. A
             // request still being withheld for a 100 is never started now.

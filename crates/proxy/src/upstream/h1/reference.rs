@@ -184,8 +184,8 @@ pub struct Answer {
     pub interim: Vec<Interim>,
     /// How its body was delimited.
     pub framing: Framing,
-    /// Whether HTTP leaves the connection usable, from the version and the head's own
-    /// `Connection` options. The first of the conditions in
+    /// Whether HTTP leaves the connection usable, from the version and the `Connection`
+    /// options of this head and of the interim heads before it. The first of the conditions in
     /// [13 §6](../../../../docs/13-http1-upstream.md) and by itself no kind of proof:
     /// a body delimited by the close cannot be followed by another exchange whatever
     /// this says, and the rest of the conditions are the lifecycle model's.
@@ -295,6 +295,9 @@ fn reading(bytes: &[u8], asked: Asked, ended: bool) -> Result<Option<Answer>, In
     let mut interim = Vec::new();
     let mut notable = Vec::new();
     let mut at = 0;
+    // RFC 9112 §9.6: a client that receives a `close` "MUST cease sending requests on
+    // that connection", and one received on an interim answer is received all the same.
+    let mut close_said = false;
 
     // The interim answers, and then the final one. A 1xx ends at its empty line whatever
     // its fields claim, so each one is read and set aside.
@@ -319,6 +322,7 @@ fn reading(bytes: &[u8], asked: Asked, ended: bool) -> Result<Option<Answer>, In
         if claims_a_body(&head) {
             note(&mut notable, Notable::ForbiddenFraming);
         }
+        close_said |= says_close(&head);
         measured.interim_heads += 1;
         measured.interim_bytes += head.bytes;
         interim.push(Interim {
@@ -343,7 +347,7 @@ fn reading(bytes: &[u8], asked: Asked, ended: bool) -> Result<Option<Answer>, In
     }
 
     let framing = framing(&head, asked, &mut notable)?;
-    let persistent = persistent(&head);
+    let persistent = !close_said && persistent(&head);
 
     let (body, trailers, boundary) = match framing {
         Framing::None => (Vec::new(), Vec::new(), at),
@@ -633,14 +637,22 @@ fn length(head: &Head, notable: &mut Vec<Notable>) -> Result<Option<u64>, Invali
 /// Whether HTTP leaves the connection usable, worked out before anything is stripped
 /// from the head: `close` ends it either way, and an HTTP/1.0 answer has to ask.
 fn persistent(head: &Head) -> bool {
-    let options: Vec<String> = named(&head.fields, "connection").flat_map(list).collect();
-    if options.iter().any(|option| option == "close") {
+    if says_close(head) {
         return false;
     }
     match head.version {
         Version::Eleven => true,
-        Version::Ten => options.iter().any(|option| option == "keep-alive"),
+        Version::Ten => named(&head.fields, "connection")
+            .flat_map(list)
+            .any(|option| option == "keep-alive"),
     }
+}
+
+/// Whether a head's `Connection` options include `close`.
+fn says_close(head: &Head) -> bool {
+    named(&head.fields, "connection")
+        .flat_map(list)
+        .any(|option| option == "close")
 }
 
 /// A chunked body, read whole.

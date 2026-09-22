@@ -1869,6 +1869,33 @@ mod tests {
         }
     }
 
+    /// A `Connection: close` on an interim head holds for the whole exchange. RFC 9112 §9.6
+    /// says a client that receives one "MUST cease sending requests on that connection",
+    /// and a final head that says nothing about it does not take it back. One of 13 §5's
+    /// differences.
+    #[test]
+    fn a_close_said_on_an_interim_answer_is_not_forgotten_by_the_final_one() {
+        for interim in ["connection: close\r\n", "connection: x-a, Close\r\n"] {
+            let script = says(&format!(
+                "HTTP/1.1 100 Continue\r\n{interim}\r\n\
+                 HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"
+            ));
+            let ours = checked(Path::Ours, &script, &Asking::Nothing);
+            assert_eq!(ours.verdict, Verdict::Agrees, "{interim:?}: {ours:?}");
+            assert_eq!(seen(&ours).body, b"ok", "{interim:?}");
+            assert!(!seen(&ours).kept, "{interim:?}: ours kept it");
+            // hyper's client forgets it and keeps the connection, which the oracle calls
+            // the defect it is. Listed in 13 §5; this says so if hyper ever changes.
+            let theirs = checked(Path::Theirs, &script, &Asking::Nothing);
+            assert_eq!(seen(&theirs).body, b"ok", "{interim:?}");
+            assert!(seen(&theirs).kept, "{interim:?}: hyper let it go");
+            assert!(
+                matches!(theirs.verdict, Verdict::Disagrees(_)),
+                "{interim:?}: {theirs:?}"
+            );
+        }
+    }
+
     /// What follows an interim head is a head, and one that is not is a failure to read
     /// an answer rather than another interim one (Pingora's client tests).
     #[test]
