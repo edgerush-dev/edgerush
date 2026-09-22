@@ -1146,9 +1146,13 @@ async fn the_rest_of_a_refused_upload_is_never_served_as_a_request() {
     ] {
         let (upstream, accepts) = hostile_first(move |mut wire| async move {
             if wire.until(b"\r\n\r\n").await.is_some() {
-                // Not a byte of the body is read, and then the connection goes.
+                // Not a byte of the body is read before the answer. What arrives after it
+                // is read and thrown away until the proxy lets go, so that closing with
+                // bytes unread does not reset the connection and take the answer with it:
+                // that race is a different question from this test's.
                 if let Some(answer) = answer {
                     wire.write(answer).await;
+                    let _ = wire.rest().await;
                 }
             }
         });
