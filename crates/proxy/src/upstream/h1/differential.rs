@@ -1869,6 +1869,27 @@ mod tests {
         }
     }
 
+    /// `close` in a second `Connection` field is as much said as in the first: the fields
+    /// are one list (RFC 9110 §5.3), and a reader that looks at the first alone keeps a
+    /// connection the upstream is about to close (linkerd2-proxy's tests).
+    #[test]
+    fn a_close_in_a_second_connection_field_is_heard() {
+        for fields in [
+            "connection: keep-alive\r\nconnection: close\r\n",
+            "connection: x-a\r\nx-a: 1\r\nconnection: Close\r\n",
+        ] {
+            let script = says(&format!(
+                "HTTP/1.1 200 OK\r\n{fields}content-length: 2\r\n\r\nok"
+            ));
+            for path in [Path::Ours, Path::Theirs] {
+                let checked = checked(path, &script, &Asking::Nothing);
+                assert_eq!(checked.verdict, Verdict::Agrees, "{path:?} {fields:?}");
+                assert_eq!(seen(&checked).body, b"ok", "{path:?} {fields:?}");
+                assert!(!seen(&checked).kept, "{path:?} {fields:?}: kept");
+            }
+        }
+    }
+
     /// A `Connection: close` on an interim head holds for the whole exchange. RFC 9112 §9.6
     /// says a client that receives one "MUST cease sending requests on that connection",
     /// and a final head that says nothing about it does not take it back. One of 13 §5's
