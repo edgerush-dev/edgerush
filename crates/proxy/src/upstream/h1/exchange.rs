@@ -18,8 +18,9 @@ use super::codec::{
     ResponseHead, Sending, Trailers, delivery, write_head,
 };
 use super::pool::Lease;
+use bytes::Bytes;
 use http::{HeaderMap, HeaderName, Method, StatusCode, Uri};
-use hyper::body::{Body, Bytes, Frame, SizeHint};
+use http_body::{Body, Frame, SizeHint};
 use std::cell::RefCell;
 use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
@@ -1464,7 +1465,7 @@ mod tests {
         fn poll_frame(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, &'static str>>> {
+        ) -> Poll<Option<Result<Frame<Bytes>, &'static str>>> {
             Poll::Pending
         }
     }
@@ -1481,12 +1482,12 @@ mod tests {
         fn poll_frame(
             mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, &'static str>>> {
+        ) -> Poll<Option<Result<Frame<Bytes>, &'static str>>> {
             if self.0 {
                 return Poll::Ready(Some(Err("the client went away")));
             }
             self.0 = true;
-            let frame = hyper::body::Frame::data(Bytes::from_static(b"ab"));
+            let frame = Frame::data(Bytes::from_static(b"ab"));
             Poll::Ready(Some(Ok(frame)))
         }
     }
@@ -3039,13 +3040,9 @@ mod tests {
         fn poll_frame(
             mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
             self.asked.store(true, Ordering::SeqCst);
-            Poll::Ready(
-                self.data
-                    .take()
-                    .map(|data| Ok(hyper::body::Frame::data(data))),
-            )
+            Poll::Ready(self.data.take().map(|data| Ok(Frame::data(data))))
         }
     }
 
@@ -3483,10 +3480,10 @@ mod tests {
         fn poll_frame(
             mut self: Pin<&mut Self>,
             cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, &'static str>>> {
+        ) -> Poll<Option<Result<Frame<Bytes>, &'static str>>> {
             if !self.gave {
                 self.gave = true;
-                let frame = hyper::body::Frame::data(Bytes::from_static(b"ab"));
+                let frame = Frame::data(Bytes::from_static(b"ab"));
                 return Poll::Ready(Some(Ok(frame)));
             }
             match self.waiting.as_mut().poll(cx) {
