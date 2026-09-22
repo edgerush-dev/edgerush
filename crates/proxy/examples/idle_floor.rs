@@ -84,10 +84,7 @@ async fn connection(stream: TcpStream, blocks: Blocks) {
         if stream.readable().await.is_err() {
             return;
         }
-        let mut block = blocks
-            .borrow_mut()
-            .pop()
-            .unwrap_or_else(|| vec![0; BLOCK]);
+        let mut block = blocks.borrow_mut().pop().unwrap_or_else(|| vec![0; BLOCK]);
         let answered = head_and_answer(&stream, &mut block).await;
         blocks.borrow_mut().push(block);
         match answered {
