@@ -3,7 +3,8 @@
 //! between the HTTP engine (hyper) and the core, and the only place that knows both.
 //!
 //! Bodies stream in both directions and are never held here. Upstream connections are
-//! HTTP/1.1 from hyper-util's pool for now.
+//! HTTP/1.1, by EdgeRush's own client and pool unless the engine's is asked for
+//! ([`Upstream`]).
 //!
 //! The config is published whole and at once ([`Proxy::reload`]): a request reads the
 //! current snapshot without waiting for anybody, works with that one snapshot until it has
@@ -241,10 +242,11 @@ impl HttpBody for Body {
 /// it again would be sending it twice ([13 §1](../../docs/13-http1-upstream.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Upstream {
-    /// The engine's client, which is what has always carried these requests.
-    #[default]
+    /// The engine's client, kept to compare EdgeRush's own against.
     Hyper,
-    /// EdgeRush's own, which is the candidate this slice is about.
+    /// EdgeRush's own, measured against the engine's and chosen over it
+    /// ([13 §8](../../docs/13-http1-upstream.md)).
+    #[default]
     Ours,
 }
 
@@ -280,8 +282,7 @@ pub struct Worker {
     /// One for the life of the worker: a reload does not throw warm connections away.
     /// Those to an endpoint that is no longer used grow idle and are closed.
     client: Client<HttpConnector, Incoming>,
-    /// The connections this worker keeps by EdgeRush's own path, which is a candidate
-    /// beside the engine's client and carries nothing yet.
+    /// The connections this worker keeps by EdgeRush's own path.
     pool: Rc<RefCell<Pool<TcpStream>>>,
     /// What its exchanges read into, lent and taken back rather than made each time
     /// ([13 §7](../../docs/13-http1-upstream.md)).

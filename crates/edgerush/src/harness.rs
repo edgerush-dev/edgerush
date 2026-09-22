@@ -48,9 +48,9 @@ Options:
       --workers <N>        How many threads serve requests. More than one shares every
                            listener's port, which needs SO_REUSEPORT (Unix)
                            [default: one for every CPU]
-      --upstream <BY>      How a request reaches its upstream. hyper: the engine's
-                           client; ours: EdgeRush's own, which is a candidate and not
-                           yet measured in place [default: hyper]
+      --upstream <BY>      How a request reaches its upstream. ours: EdgeRush's own
+                           client; hyper: the engine's, kept for comparison
+                           [default: ours]
       --idle-per-destination <N>
                            How many idle connections a worker keeps to one destination,
                            whichever client carries the request. For comparing the two at
@@ -430,7 +430,7 @@ mod tests {
     fn a_config_is_all_that_is_needed() {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
-            upstream: Upstream::Hyper,
+            upstream: Upstream::Ours,
             metrics: None,
             workers: None,
             accept: Accept::Balanced,
@@ -448,7 +448,7 @@ mod tests {
         // clients to the same ones, and to be able to say which they were.
         let options = Options {
             config: PathBuf::from("dev.yaml"),
-            upstream: Upstream::Hyper,
+            upstream: Upstream::Ours,
             metrics: None,
             workers: None,
             accept: Accept::Balanced,
@@ -492,10 +492,44 @@ mod tests {
     }
 
     #[test]
+    fn the_upstream_client_is_as_the_command_line_says() {
+        for (by, upstream) in [("ours", Upstream::Ours), ("hyper", Upstream::Hyper)] {
+            let options = Options {
+                config: PathBuf::from("dev.yaml"),
+                upstream,
+                metrics: None,
+                workers: None,
+                accept: Accept::Balanced,
+                limits: H1Limits::default(),
+            };
+            assert_eq!(
+                parsed(&["--config", "dev.yaml", "--upstream", by]),
+                Ok(Parsed::Run(Box::new(options))),
+                "{by}"
+            );
+        }
+        assert_eq!(
+            parsed(&["--config", "dev.yaml", "--upstream", "curl"]),
+            Err(UsageError::Upstream("curl".to_owned()))
+        );
+        assert_eq!(
+            parsed(&[
+                "--config",
+                "dev.yaml",
+                "--upstream",
+                "hyper",
+                "--upstream",
+                "ours"
+            ]),
+            Err(UsageError::Twice("--upstream"))
+        );
+    }
+
+    #[test]
     fn the_workers_are_as_the_command_line_says() {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
-            upstream: Upstream::Hyper,
+            upstream: Upstream::Ours,
             metrics: None,
             workers: NonZeroUsize::new(4),
             accept: Accept::Balanced,
@@ -511,7 +545,7 @@ mod tests {
     fn metrics_are_served_where_the_command_line_says() {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
-            upstream: Upstream::Hyper,
+            upstream: Upstream::Ours,
             metrics: Some("[::]:9090".parse().unwrap()),
             workers: None,
             accept: Accept::Balanced,

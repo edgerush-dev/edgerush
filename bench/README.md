@@ -89,9 +89,10 @@ polling calls the upload driver on every frame, even after the request has finis
 the upload-loop change can affect answers without changing the response-copy code.
 That is a hypothesis to isolate, not an explanation established by the macro rerun.
 
-`VARIANTS` names what is run, in turns: `thread-per-core`,
+`VARIANTS` names what is run, in turns: `thread-per-core` — EdgeRush by the engine's
+upstream client, named with `--upstream hyper` since it is not the default —,
 `thread-per-core-kernel` — the same without balancing connections at accept — and `ours`,
-the same again by EdgeRush's own upstream path instead of the engine's client (EdgeRush,
+the same again by EdgeRush's own upstream client, the default (EdgeRush,
 `proxy.yaml`); then `nginx` (`nginx-proxy.conf`), `haproxy` (`haproxy.cfg`), `envoy`
 (`envoy.yaml`) and `kong` (`kong.yml`, without a database). `thread-per-core` and `ours`
 differ in nothing but that client, which is what makes the pair of them a measurement of

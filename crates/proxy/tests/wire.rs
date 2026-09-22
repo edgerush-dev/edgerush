@@ -99,13 +99,13 @@ upstreams:
 /// the point of it — so it is told rather than written twice:
 ///
 /// ```text
-/// cargo test                                  the engine's client
-/// EDGERUSH_TEST_UPSTREAM=ours cargo test      EdgeRush's own
+/// cargo test                                  EdgeRush's own, the default
+/// EDGERUSH_TEST_UPSTREAM=hyper cargo test     the engine's client
 /// ```
 fn upstream_under_test() -> Upstream {
     match std::env::var("EDGERUSH_TEST_UPSTREAM").as_deref() {
-        Ok("ours") => Upstream::Ours,
-        _ => Upstream::Hyper,
+        Ok("hyper") => Upstream::Hyper,
+        _ => Upstream::Ours,
     }
 }
 

@@ -109,21 +109,24 @@ start_proxy() { # variant
         ;;
     thread-per-core-kernel)
         # Connections left where the kernel put them: what balancing is measured against.
+        # By the engine's client, as the variant it is compared with is.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
-            --accept kernel --workers "$WORKERS" $idle \
+            --upstream hyper --accept kernel --workers "$WORKERS" $idle \
             2>>"$OUT/proxy.log" &
         ;;
     ours)
-        # The same proxy by EdgeRush's own upstream path rather than the engine's
-        # client, which is the candidate of 13 section 8 step 6. Nothing else about
-        # it changes, which is what makes the pair of them the measurement.
+        # The same proxy by EdgeRush's own upstream client, the default, rather than
+        # the engine's (13 section 8 step 6). Nothing else about it changes, which is
+        # what makes the pair of them the measurement.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
             --upstream ours --workers "$WORKERS" $idle \
             2>>"$OUT/proxy.log" &
         ;;
     *)
+        # The engine's upstream client, named: it is not the default, and this is the
+        # variant EdgeRush's own is held against.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
-            --workers "$WORKERS" $idle 2>>"$OUT/proxy.log" &
+            --upstream hyper --workers "$WORKERS" $idle 2>>"$OUT/proxy.log" &
         ;;
     esac
     proxy_pid=${daemon:-$!}
