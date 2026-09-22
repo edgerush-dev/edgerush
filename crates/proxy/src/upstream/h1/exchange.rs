@@ -1611,6 +1611,7 @@ mod tests {
             small: 8,
             large: 16,
             parked: 1,
+            kept: 1,
         };
         let (ours, theirs) = tokio::io::duplex(4096);
         let mut peer = Peer(theirs);

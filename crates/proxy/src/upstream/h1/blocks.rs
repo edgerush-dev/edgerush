@@ -49,6 +49,12 @@ pub struct Sizes {
     /// How many free blocks of each size a worker keeps. Beyond this a returned block is
     /// dropped: a burst should not leave its memory parked here for ever.
     pub parked: usize,
+    /// How many of each kind a quiet worker keeps: what [`Blocks::sweep`] trims down to,
+    /// and all of the grown blocks that are ever parked. A grown block is several times
+    /// the size of the others and needed only by the odd large head, so a burst of those
+    /// is not kept at all — nginx keeps four of its large header buffers for the same
+    /// reason.
+    pub kept: usize,
 }
 
 impl Sizes {
@@ -65,6 +71,7 @@ impl Sizes {
             small,
             large: whole + small,
             parked: 64,
+            kept: 4,
         }
     }
 }
@@ -230,12 +237,12 @@ impl Blocks {
     /// Dropped rather than kept when there are already enough of its size: memory parked
     /// here is memory a worker is holding for work it is not doing.
     pub fn give(&mut self, block: Block) {
-        let free = if block.capacity() >= self.sizes.large {
-            &mut self.large
+        let (free, most) = if block.capacity() >= self.sizes.large {
+            (&mut self.large, self.sizes.kept)
         } else {
-            &mut self.small
+            (&mut self.small, self.sizes.parked)
         };
-        if free.len() < self.sizes.parked {
+        if free.len() < most {
             free.push(block.bytes);
         }
     }
@@ -273,6 +280,15 @@ impl Blocks {
         self.staging.truncate(keep);
     }
 
+    /// Trims down to what a quiet worker keeps, for the worker's once-a-second sweep.
+    ///
+    /// Under load the blocks trimmed are made again within the second, which is a few
+    /// allocations a second rather than one a request; once the load has gone, they are
+    /// not.
+    pub fn sweep(&mut self) {
+        self.trim(self.sizes.kept);
+    }
+
     /// A free block if there is one, and a new one if there is not.
     ///
     /// The one place a block's bytes are ever set to anything: made once, at full length,
@@ -297,6 +313,7 @@ mod tests {
             small: 16,
             large: 64,
             parked: 2,
+            kept: 1,
         }
     }
 
@@ -532,6 +549,50 @@ mod tests {
             blocks.give(block);
         }
         assert_eq!(blocks.parked(), 2, "a burst left its memory parked");
+    }
+
+    /// Grown blocks are five times the size of the others and seldom needed, so fewer of
+    /// them are parked: one given back beyond `kept` is freed.
+    #[test]
+    fn only_so_many_grown_blocks_are_kept() {
+        let mut blocks = Blocks::new(sizes());
+        let grown: Vec<Block> = (0..3)
+            .map(|_| {
+                let block = blocks.take();
+                blocks.grow(block)
+            })
+            .collect();
+        for block in grown {
+            blocks.give(block);
+        }
+        // The one small block that every growing handed back and the next took again, and
+        // one grown one. Held to `parked` alone, two grown ones would be here.
+        assert_eq!(
+            blocks.parked(),
+            2,
+            "grown blocks were parked past what is kept"
+        );
+    }
+
+    /// A sweep lets go of what a burst left parked, down to what a quiet worker keeps of
+    /// each kind.
+    #[test]
+    fn a_sweep_keeps_what_a_quiet_worker_keeps() {
+        let mut blocks = Blocks::new(sizes());
+        let small: Vec<Block> = (0..2).map(|_| blocks.take()).collect();
+        let staging: Vec<Vec<u8>> = (0..2).map(|_| blocks.take_staging(8)).collect();
+        let block = blocks.take();
+        let grown = blocks.grow(block);
+        for block in small {
+            blocks.give(block);
+        }
+        for buffer in staging {
+            blocks.give_staging(buffer);
+        }
+        blocks.give(grown);
+        assert_eq!(blocks.parked(), 5);
+        blocks.sweep();
+        assert_eq!(blocks.parked(), 3, "a sweep left a burst's memory parked");
     }
 
     #[test]

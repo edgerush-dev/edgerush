@@ -510,6 +510,8 @@ impl Worker {
             tokio::time::sleep(every).await;
             // Borrowed for the sweep and let go of before anything is waited on again.
             let swept = self.pool.borrow_mut().sweep(&self.limits);
+            // And what a burst left parked of the blocks, down to what a quiet worker keeps.
+            self.blocks.borrow_mut().sweep();
             let metrics = &self.proxy.metrics;
             for _discarded in 0..swept {
                 metrics.socket(Socket::Discarded);
@@ -1125,6 +1127,36 @@ mod tests {
             matches!(&failed, ExchangeError::Io(error) if error.kind() == io::ErrorKind::ConnectionRefused),
             "{failed}"
         );
+    }
+
+    /// The worker's sweep lets go of the blocks a burst left parked, so that a worker that
+    /// has gone quiet holds only what a quiet worker keeps ([13 §7](../../docs/13-http1-upstream.md)).
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_lets_go_of_what_a_burst_left_parked() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let limits = H1Limits::default();
+                let worker =
+                    Worker::with_limits(sending_to("127.0.0.1:9".parse().unwrap()), limits);
+                {
+                    let mut blocks = worker.blocks.borrow_mut();
+                    let burst: Vec<_> = (0..20).map(|_| blocks.take()).collect();
+                    for block in burst {
+                        blocks.give(block);
+                    }
+                    assert_eq!(blocks.parked(), 20);
+                }
+                let _maintaining = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+                tokio::time::sleep(limits.sweep + Duration::from_millis(1)).await;
+                let blocks = worker.blocks.borrow();
+                assert_eq!(
+                    blocks.parked(),
+                    blocks.sizes().kept,
+                    "the burst is still parked"
+                );
+            })
+            .await;
     }
 
     /// A worker takes on only so many exchanges at once, and answers the rest rather
