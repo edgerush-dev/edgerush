@@ -1128,6 +1128,79 @@ async fn asks(client: &mut Wire, path: &str) -> String {
     within(client.head()).await
 }
 
+/// What is left of an upload the upstream refused, or never took, is the body of the
+/// request it belonged to and never a request of its own — even when it looks exactly like
+/// one. Whether the client's connection is drained or closed after the answer, nothing in
+/// it is served ([13 §5](../../../docs/13-http1-upstream.md); linkerd2-proxy's tests of
+/// an early answer to a request with a body).
+#[tokio::test]
+async fn the_rest_of_a_refused_upload_is_never_served_as_a_request() {
+    const SMUGGLED: &str = "GET /smuggled HTTP/1.1\r\nhost: a.test\r\n\r\n";
+    let refused =
+        "HTTP/1.1 413 Payload Too Large\r\ncontent-length: 3\r\nconnection: close\r\n\r\ntoo";
+    for (framing, answer) in [
+        ("counted", Some(refused)),
+        ("chunked", Some(refused)),
+        ("counted", None),
+        ("chunked", None),
+    ] {
+        let (upstream, accepts) = hostile_first(move |mut wire| async move {
+            if wire.until(b"\r\n\r\n").await.is_some() {
+                // Not a byte of the body is read, and then the connection goes.
+                if let Some(answer) = answer {
+                    wire.write(answer).await;
+                }
+            }
+        });
+        let mut client = Wire::to(proxy_to(upstream).await).await;
+        let request = match framing {
+            "counted" => format!(
+                "POST /up HTTP/1.1\r\nhost: a.test\r\ncontent-length: {}\r\n\r\n{SMUGGLED}",
+                SMUGGLED.len()
+            ),
+            _ => format!(
+                "POST /up HTTP/1.1\r\nhost: a.test\r\ntransfer-encoding: chunked\r\n\r\n\
+                 {:x}\r\n{SMUGGLED}\r\n0\r\n\r\n",
+                SMUGGLED.len()
+            ),
+        };
+        client.write(&request).await;
+
+        let head = within(client.head()).await;
+        let expected = if answer.is_some() {
+            "HTTP/1.1 413"
+        } else {
+            "HTTP/1.1 502"
+        };
+        assert!(head.starts_with(expected), "{framing} {answer:?}: {head}");
+
+        // Whatever else the client is sent, for a while, holds no second answer.
+        let mut after = Vec::new();
+        let mut bytes = [0; 4096];
+        let listening = tokio::time::sleep(Duration::from_millis(500));
+        tokio::pin!(listening);
+        loop {
+            tokio::select! {
+                () = &mut listening => break,
+                read = client.stream.read(&mut bytes) => match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => after.extend_from_slice(&bytes[..read]),
+                },
+            }
+        }
+        let after = String::from_utf8_lossy(&after);
+        assert!(
+            !after.contains("HTTP/1.1") && !after.contains("fresh"),
+            "{framing} {answer:?}: {after}"
+        );
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "{framing} {answer:?}: the rest of the upload reached the upstream as a request"
+        );
+    }
+}
+
 /// Bytes arriving with the answer are a peer saying something nobody asked for. The
 /// answer itself is still the answer, but the connection has said a thing this end
 /// cannot account for, and a connection like that is not lent out again.
