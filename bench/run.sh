@@ -289,6 +289,13 @@ reload_under_load() { # name, rate
 # with a few thousand open and answered, against the same proxy with none.
 idle_memory() { # name
     local name=$1
+    # On a proxy started afresh. One that has just carried large bodies holds memory it
+    # has freed and not handed back, and a small cost per connection disappears into it:
+    # measured after the other scenarios, NGINX read as 0 bytes a connection, where a
+    # fresh one shows 600-900.
+    stop_proxy
+    start_proxy "${name%%.*}"
+    sleep 1
     local quiet
     quiet=$(python3 "$here/rss.py" "$proxy_pid")
     taskset -c "$GEN_CPUS" python3 "$here/idle.py" "$proxy_at" "$host" \
