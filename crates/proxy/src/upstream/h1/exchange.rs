@@ -24,6 +24,7 @@ use std::cell::RefCell;
 use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
 use std::io;
+use std::ops::Range;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
@@ -232,6 +233,17 @@ impl<S> Exchange<S> {
         self.give_back_if_empty();
     }
 
+    /// Cuts `data` of [`Exchange::unread`] out as a frame, sharing the block's memory
+    /// rather than copying it, and says the first `through` bytes have been used.
+    fn take_frame(&mut self, data: Range<usize>, through: usize) -> Bytes {
+        let frame = self
+            .incoming
+            .as_mut()
+            .map_or_else(Bytes::new, |block| block.take_frame(data, through));
+        self.give_back_if_empty();
+        frame
+    }
+
     /// Gives the block back if nothing in it is waiting to be used, which is the moment
     /// holding it stops being worth anything.
     fn give_back_if_empty(&mut self) {
@@ -264,15 +276,16 @@ impl<S: AsyncRead + Unpin> Exchange<S> {
     /// Reads what the socket has, into a block borrowed for it if none is held.
     ///
     /// Says how the read went and how many bytes it brought, which are what both of its
-    /// callers decide on. A full block is grown first, because a read into no room comes
-    /// back with nothing, and nothing is what a close looks like.
+    /// callers decide on. A block with no room is refilled first — its memory taken back
+    /// from frames that have gone, or grown for a head that does not fit — because a read
+    /// into no room comes back with nothing, and nothing is what a close looks like.
     fn poll_fill(&mut self, cx: &mut Context<'_>) -> (Poll<io::Result<()>>, usize) {
         let mut block = match self.incoming.take() {
             Some(block) => block,
             None => self.blocks.borrow_mut().take(),
         };
         if block.room().is_empty() {
-            block = self.blocks.borrow_mut().grow(block);
+            block = self.blocks.borrow_mut().refill(block);
         }
         if block.room().is_empty() {
             // Not reached while the blocks are sized by `Sizes::within`: a grown block has
@@ -1058,13 +1071,16 @@ where
                     continue;
                 }
                 Ok(Piece::Data { data, consumed }) => {
-                    let frame = (!data.is_empty())
-                        .then(|| Bytes::copy_from_slice(&rest.exchange.unread()[data]));
-                    rest.exchange.used(consumed);
-                    let Some(frame) = frame else {
+                    if data.is_empty() {
                         // Framing bytes and nothing else; keep going.
+                        rest.exchange.used(consumed);
                         continue;
-                    };
+                    }
+                    // Cut from the block rather than copied out of it: a copy is an
+                    // allocation a piece, and the allocator handing that memory back to
+                    // the kernel and faulting it in again was a tenth of what a large
+                    // answer cost ([13 §7](../../../docs/13-http1-upstream.md)).
+                    let frame = rest.exchange.take_frame(data, consumed);
                     // What the request is waiting for, read while the request is still in
                     // hand. Its clocks run on whether the request is moving and never on
                     // whether the answer is: an upstream with plenty to say must not be

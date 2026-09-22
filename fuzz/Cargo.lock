@@ -90,6 +90,7 @@ name = "edgerush-proxy"
 version = "0.0.0"
 dependencies = [
  "arc-swap",
+ "bytes",
  "edgerush-config",
  "edgerush-router",
  "edgerush-telemetry",

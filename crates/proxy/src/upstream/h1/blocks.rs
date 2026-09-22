@@ -8,7 +8,7 @@
 //! buffers it has already made, haproxy from a pool it returns each buffer to the moment
 //! that buffer is empty.
 //!
-//! So this holds blocks, hands them out on demand and takes them back. Two things follow
+//! So this holds blocks, hands them out on demand and takes them back. Three things follow
 //! from that and are the point of the whole module:
 //!
 //! - **A block is lent, not made.** The same few blocks go round, so they stay in cache
@@ -17,7 +17,11 @@
 //! - **A returned block keeps its bytes.** They are nobody's bytes — [`Block::data`] shows
 //!   only what has been put in since, and the cursors say where that is — so a block that
 //!   comes back is not cleared, and one that goes out again is not cleared either. The
-//!   zeroing happens once, when a block is first made, and never again.
+//!   zeroing happens when a block is first made, and again only when memory is taken back
+//!   from frames that have gone.
+//! - **Frames are cut from a block, not copied out of it.** An answer's data reaches the
+//!   engine as a piece of the block's own memory, which the block gives up and takes back
+//!   only once the engine has let go of it ([`Block::take_frame`], [`Blocks::refill`]).
 //!
 //! **A block is taken out, not borrowed**, in the sense [`super::pool`] means it: what
 //! [`Blocks::take`] hands over is gone from the store until somebody gives it back, and a
@@ -29,6 +33,8 @@
 //! Nothing here does I/O or reads a clock ([13 §7](../../../docs/13-http1-upstream.md)).
 
 use super::H1Limits;
+use bytes::{Buf, Bytes, BytesMut};
+use std::ops::Range;
 
 /// What a block holds when it is first lent: the read bound of
 /// [13 §7](../../../docs/13-http1-upstream.md).
@@ -89,13 +95,24 @@ impl Default for Sizes {
 /// The bytes are held at their full length throughout, which is what lets the same block
 /// be used again without being cleared: length is not what says how much is in it.
 /// [`Block::data`] does.
+///
+/// **Frames are cut from it, not copied out of it** ([`Block::take_frame`]). A frame is a
+/// piece of the block's own memory, and from then on the engine's until it lets go: the
+/// block keeps only what lies after it. So a block that has had frames cut from it can come
+/// to the end of its memory without being full, and [`Blocks::refill`] takes the memory
+/// back once every frame cut from it is gone — never before, which is what keeps a frame
+/// the engine still holds from being written over.
 #[derive(Debug)]
 pub struct Block {
-    bytes: Vec<u8>,
+    /// What is left of the block's memory, initialised throughout. Frames cut from the
+    /// front of it no longer belong to it.
+    bytes: BytesMut,
     /// How much of `bytes` holds anything.
     filled: usize,
     /// How much of what it holds has been dealt with. Never past `filled`.
     taken: usize,
+    /// What it was made at, whatever is left of it now.
+    size: usize,
 }
 
 impl Block {
@@ -115,9 +132,10 @@ impl Block {
         self.filled == self.taken
     }
 
-    /// The whole of it, whether or not anything is in it.
+    /// What it was made at, whether or not anything is in it and however much of it has
+    /// gone into frames.
     pub fn capacity(&self) -> usize {
-        self.bytes.len()
+        self.size
     }
 
     /// Says that the first `count` of [`Block::data`] have been dealt with.
@@ -142,10 +160,38 @@ impl Block {
         }
     }
 
+    /// Cuts `range` of [`Block::data`] out as a frame of its own, sharing the block's
+    /// memory rather than copying it, and says everything up to `through` has been dealt
+    /// with. What came before the frame goes with it; what comes after it stays.
+    ///
+    /// # Panics
+    ///
+    /// In a debug build, if `range` does not lie within the first `through` bytes of
+    /// [`Block::data`], for the reason [`Block::consume`] gives. A release build holds
+    /// both inside what is there instead.
+    pub fn take_frame(&mut self, range: Range<usize>, through: usize) -> Bytes {
+        debug_assert!(
+            range.start <= range.end && range.end <= through && through <= self.len(),
+            "a frame of {range:?} through {through} of {}",
+            self.len()
+        );
+        let start = self.taken.saturating_add(range.start).min(self.filled);
+        let count = range.len().min(self.filled - start);
+        // The frame has to be at the front to be cut off, so what lies before it goes
+        // first: bytes already dealt with, and whatever framing preceded it.
+        self.bytes.advance(start);
+        self.filled -= start;
+        self.taken = 0;
+        let frame = self.bytes.split_to(count).freeze();
+        self.filled -= count;
+        self.consume(through.saturating_sub(range.end).min(self.filled));
+        frame
+    }
+
     /// Where the next bytes read may go, which is whatever is left after what is in it.
     ///
-    /// Empty when the block is full. A caller that is given nothing here has a block that
-    /// needs [`Blocks::grow`], not a smaller read.
+    /// Empty when the block has no memory left after what is in it. A caller that is given
+    /// nothing here needs [`Blocks::refill`], not a smaller read.
     pub fn room(&mut self) -> &mut [u8] {
         // Bytes already dealt with are in the way of nothing until the block is full, and
         // then they are in the way of everything: move what is left down over them, which
@@ -169,6 +215,25 @@ impl Block {
         debug_assert!(count <= room, "arrived {count} where {room} would fit");
         self.filled = self.filled.saturating_add(count).min(self.bytes.len());
     }
+
+    /// Takes the block's memory back, at its full size, with what it holds moved to the
+    /// front — if nothing else holds any of it. Says whether it could; where a frame cut
+    /// from it is still held, the memory is not the block's to take, and it keeps only
+    /// what it holds, with no room after it.
+    fn reclaim(&mut self) -> bool {
+        let held = self.len();
+        self.bytes.advance(self.taken);
+        self.bytes.truncate(held);
+        self.filled = held;
+        self.taken = 0;
+        if !self.bytes.try_reclaim(self.size - held) {
+            return false;
+        }
+        // The one place memory taken back is set to anything. What was there is bytes of
+        // frames that have gone, and a read is given initialised room to put its bytes in.
+        self.bytes.resize(self.size, 0);
+        true
+    }
 }
 
 /// The blocks one worker has, lent out and taken back.
@@ -177,9 +242,10 @@ impl Block {
 /// shared between threads is what two requests can be half way through at once.
 #[derive(Debug)]
 pub struct Blocks {
-    /// Free blocks, by the size they were made at.
-    small: Vec<Vec<u8>>,
-    large: Vec<Vec<u8>>,
+    /// Free blocks, by the size they were made at. Some may still have frames cut from
+    /// them in the engine's hands, and are lent only once those have gone.
+    small: Vec<BytesMut>,
+    large: Vec<BytesMut>,
     /// Free buffers for what is waiting to be written, empty and with their room made.
     staging: Vec<Vec<u8>>,
     sizes: Sizes,
@@ -212,6 +278,40 @@ impl Blocks {
     /// it holds nothing as far as its reader is concerned.
     pub fn take(&mut self) -> Block {
         Self::lend(&mut self.small, self.sizes.small)
+    }
+
+    /// The same block with room to read into, what it held kept at the front.
+    ///
+    /// A block that has come to the end of its memory because frames were cut from it
+    /// takes the memory back if they have all gone; if one is still held, what it holds
+    /// moves into a free block and it is given back, to be taken back into use once they
+    /// have. A block that is simply full of one thing — a head that does not fit — is
+    /// grown ([`Blocks::grow`]).
+    pub fn refill(&mut self, mut block: Block) -> Block {
+        if !block.room().is_empty() {
+            return block;
+        }
+        if block.bytes.len() < block.size {
+            if block.reclaim() {
+                return block;
+            }
+            let free = if block.size >= self.sizes.large {
+                &mut self.large
+            } else {
+                &mut self.small
+            };
+            let mut fresh = Self::lend(free, block.size);
+            let held = block.len();
+            fresh.room()[..held].copy_from_slice(block.data());
+            fresh.arrived(held);
+            block.consume(held);
+            self.give(block);
+            block = fresh;
+            if !block.room().is_empty() {
+                return block;
+            }
+        }
+        self.grow(block)
     }
 
     /// The same block with room for a head that would not fit in it.
@@ -289,16 +389,34 @@ impl Blocks {
         self.trim(self.sizes.kept);
     }
 
-    /// A free block if there is one, and a new one if there is not.
+    /// A free block that is whole, or can be made whole, if there is one, and a new one
+    /// if there is not.
     ///
-    /// The one place a block's bytes are ever set to anything: made once, at full length,
-    /// and from then on reused as they are.
-    fn lend(free: &mut Vec<Vec<u8>>, size: usize) -> Block {
-        let bytes = free.pop().unwrap_or_else(|| vec![0; size]);
+    /// A free block whose frames the engine still holds is passed over and left where it
+    /// is, to be taken back once they have gone. A new block is set to zeros once, at its
+    /// full length; one lent again is not set to anything.
+    fn lend(free: &mut Vec<BytesMut>, size: usize) -> Block {
+        let found = free.iter_mut().rposition(|bytes| {
+            if bytes.len() == size {
+                return true;
+            }
+            // Holds nothing any reader will look at: it came back empty.
+            bytes.clear();
+            if bytes.try_reclaim(size) {
+                bytes.resize(size, 0);
+                return true;
+            }
+            false
+        });
+        let bytes = match found {
+            Some(at) => free.swap_remove(at),
+            None => BytesMut::zeroed(size),
+        };
         Block {
             bytes,
             filled: 0,
             taken: 0,
+            size,
         }
     }
 }
@@ -609,6 +727,99 @@ mod tests {
         assert_eq!(blocks.parked(), 0);
     }
 
+    /// A frame is a piece of the block's own memory, not a copy of it: the copy, and the
+    /// allocation behind it, is what a large answer spent its time on.
+    #[test]
+    fn a_frame_is_cut_from_the_block_rather_than_copied() {
+        let mut blocks = Blocks::new(sizes());
+        let mut block = blocks.take();
+        put(&mut block, b"5\r\nhello\r\n");
+        let at = block.data()[3..].as_ptr();
+        let frame = block.take_frame(3..8, 10);
+        assert_eq!(&frame[..], b"hello");
+        assert_eq!(frame.as_ptr(), at, "the frame was copied");
+        assert!(block.is_empty());
+    }
+
+    #[test]
+    fn what_follows_a_frame_stays_in_the_block() {
+        let mut blocks = Blocks::new(sizes());
+        let mut block = blocks.take();
+        put(&mut block, b"5\r\nhello\r\n3\r\nab");
+        let frame = block.take_frame(3..8, 10);
+        assert_eq!(&frame[..], b"hello");
+        assert_eq!(block.data(), b"3\r\nab");
+    }
+
+    /// **The one thing a shared block must never do.** A frame the engine still holds is
+    /// memory the block no longer owns, and nothing read after it may land there.
+    #[test]
+    fn a_frame_still_held_is_never_written_over() {
+        let mut blocks = Blocks::new(sizes());
+        let mut block = blocks.take();
+        put(&mut block, &[b'a'; 16]);
+        let held = block.take_frame(0..16, 16);
+        // Nothing of its own is left, and what it had is held: refilling it cannot take
+        // that memory back.
+        let mut block = blocks.refill(block);
+        assert!(!block.room().is_empty(), "refilled with no room");
+        assert_eq!(put(&mut block, &[b'b'; 16]), 16);
+        assert_eq!(&held[..], &[b'a'; 16], "a held frame was written over");
+        assert_eq!(block.data(), &[b'b'; 16]);
+    }
+
+    /// Once the frames cut from it are gone, the block's memory is its own again, and a
+    /// refill takes it back rather than making more; what had not been dealt with comes
+    /// along to the front.
+    #[test]
+    fn a_block_whose_frames_are_gone_is_its_own_again() {
+        let mut blocks = Blocks::new(sizes());
+        let mut block = blocks.take();
+        put(&mut block, &[b'a'; 16]);
+        let base = block.data().as_ptr();
+        drop(block.take_frame(0..10, 10));
+        let mut block = blocks.refill(block);
+        assert_eq!(block.data(), &[b'a'; 6], "unread bytes were lost");
+        assert_eq!(block.data().as_ptr(), base, "the memory was not taken back");
+        assert_eq!(block.room().len(), 10);
+        assert_eq!(blocks.parked(), 0);
+    }
+
+    /// Where a frame still holds the memory, the refill is a free block instead, and
+    /// what had not been dealt with moves into it.
+    #[test]
+    fn a_block_whose_frames_are_held_is_refilled_elsewhere_with_what_it_had() {
+        let mut blocks = Blocks::new(sizes());
+        let mut block = blocks.take();
+        put(&mut block, b"0123456789abcdef");
+        let held = block.take_frame(0..10, 10);
+        let mut block = blocks.refill(block);
+        assert_eq!(block.data(), b"abcdef");
+        assert_eq!(block.room().len(), 10);
+        assert_eq!(&held[..], b"0123456789");
+    }
+
+    /// A block given back while a frame still holds part of it is taken back into use
+    /// once the frame has gone, rather than being made again.
+    #[test]
+    fn a_block_given_back_while_a_frame_holds_it_is_lent_again_once_it_has_gone() {
+        let mut blocks = Blocks::new(sizes());
+        let mut block = blocks.take();
+        put(&mut block, &[b'a'; 16]);
+        let base = block.data().as_ptr();
+        let frame = block.take_frame(0..16, 16);
+        blocks.give(block);
+        drop(frame);
+        let mut again = blocks.take();
+        assert!(again.is_empty());
+        assert_eq!(again.room().len(), 16);
+        assert_eq!(
+            again.room().as_ptr(),
+            base.cast_mut(),
+            "the block was made again"
+        );
+    }
+
     #[test]
     #[should_panic(expected = "consumed")]
     fn dealing_with_more_than_is_there_is_a_bug() {
@@ -633,6 +844,12 @@ mod tests {
         Put(usize),
         Consume(usize),
         Recycle,
+        /// Cut a frame of up to this many bytes off the front, and hold on to it or not.
+        Frame(usize, bool),
+        /// Make room, as a read that found none does.
+        Refill,
+        /// Let go of the oldest frame still held, as the engine does once it is written.
+        Release,
     }
 
     fn doings() -> impl Strategy<Value = Vec<Doing>> {
@@ -641,6 +858,9 @@ mod tests {
                 (1usize..24).prop_map(Doing::Put),
                 (0usize..24).prop_map(Doing::Consume),
                 Just(Doing::Recycle),
+                (0usize..24, any::<bool>()).prop_map(|(most, keep)| Doing::Frame(most, keep)),
+                Just(Doing::Refill),
+                Just(Doing::Release),
             ],
             0..60,
         )
@@ -648,11 +868,14 @@ mod tests {
 
     proptest! {
         /// A block loses no byte, invents none and reorders none, however it is filled,
-        /// consumed and lent again.
+        /// consumed, cut into frames, refilled and lent again — and no frame still held
+        /// is ever written over, whatever is read after it.
         #[test]
         fn a_block_is_a_queue_of_bytes(doings in doings()) {
             let mut blocks = Blocks::new(sizes());
             let mut block = blocks.take();
+            // Frames still held, with what each was when it was cut.
+            let mut held: std::collections::VecDeque<(Bytes, Vec<u8>)> = Default::default();
             // What the block should be holding, and what to put in next: every byte put in
             // is different from the last, so an off-by-one would show as a wrong byte and
             // not merely a wrong count.
@@ -687,6 +910,26 @@ mod tests {
                             expected.clear();
                         }
                     }
+                    Doing::Frame(most, keep) => {
+                        let count = most.min(block.len());
+                        let frame = block.take_frame(0..count, count);
+                        let was: Vec<u8> = expected.drain(..count).collect();
+                        prop_assert_eq!(&frame[..], &was[..]);
+                        if keep {
+                            held.push_back((frame, was));
+                        }
+                    }
+                    Doing::Refill => {
+                        if block.room().is_empty() {
+                            block = blocks.refill(block);
+                        }
+                    }
+                    Doing::Release => {
+                        held.pop_front();
+                    }
+                }
+                for (frame, was) in &held {
+                    prop_assert_eq!(&frame[..], &was[..], "a held frame was written over");
                 }
                 prop_assert_eq!(block.data(), &expected[..]);
                 prop_assert_eq!(block.len(), expected.len());

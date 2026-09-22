@@ -12,6 +12,9 @@ publish = false
 [workspace.dependencies]
 # Publishing a config to the request path without a lock: readers never wait.
 arc-swap = "1.9"
+# The buffers an answer is read into, and the frames cut from them without a copy. Already
+# in the tree through hyper and http, at the same version.
+bytes = "1.12"
 edgerush-config = { path = "crates/config" }
 edgerush-filters = { path = "crates/filters" }
 edgerush-proxy = { path = "crates/proxy" }
