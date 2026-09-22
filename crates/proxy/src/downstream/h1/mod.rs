@@ -6,6 +6,7 @@
 
 pub mod codec;
 pub mod date;
+pub mod writer;
 // Where the codec and hyper's server answer the same bytes differently.
 #[cfg(test)]
 mod differences;
