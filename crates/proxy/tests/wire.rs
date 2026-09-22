@@ -598,6 +598,39 @@ async fn an_http_1_0_client_is_sent_a_chunked_answer_without_its_chunks() {
     assert_eq!(rest, "hello there", "{head}");
 }
 
+/// Requests for two Hosts routed to one upstream share its connection, because reuse is
+/// keyed by the endpoint and never by the incoming Host (13 §3), and each carries its own
+/// Host and not the one the connection first carried (linkerd2-proxy's tests).
+#[tokio::test]
+async fn two_hosts_share_an_upstream_connection_and_keep_their_own_host() {
+    let (saw, mut seen) = reporter();
+    let (upstream, accepts) = counted(move |mut wire| {
+        let saw = saw.clone();
+        async move {
+            while let Some(head) = wire.until(b"\r\n\r\n").await {
+                saw.send(String::from_utf8(head).unwrap()).unwrap();
+                wire.write(FRESH).await;
+            }
+        }
+    });
+    let mut client = Wire::to(proxy_to(upstream).await).await;
+    for host in ["a.test", "b.test", "a.test"] {
+        client
+            .write(&format!("GET /up HTTP/1.1\r\nhost: {host}\r\n\r\n"))
+            .await;
+        let head = within(client.head()).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(within(client.body(5)).await, "fresh");
+        let sent = within(seen.recv()).await.unwrap().to_ascii_lowercase();
+        let hosts: Vec<&str> = sent
+            .split("\r\n")
+            .filter_map(|line| line.strip_prefix("host: "))
+            .collect();
+        assert_eq!(hosts, [host], "{sent}");
+    }
+    assert_eq!(accepts.load(Ordering::SeqCst), 1, "a connection each");
+}
+
 /// An upstream that answers before it has read the body is not waited for: the answer
 /// goes to the client while the upload is still in the air.
 #[tokio::test]
