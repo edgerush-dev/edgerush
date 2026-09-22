@@ -7,6 +7,7 @@
 pub mod codec;
 pub mod continuing;
 pub mod date;
+pub mod outbound;
 pub mod writer;
 // Where the codec and hyper's server answer the same bytes differently.
 #[cfg(test)]
