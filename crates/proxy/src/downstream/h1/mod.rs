@@ -9,6 +9,10 @@ pub mod continuing;
 pub mod date;
 pub mod deadlines;
 pub mod outbound;
+// What a connection's life must have been, given what its client sent: the harness's
+// second oracle.
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod lifecycle;
 // The specification as code, for the harness to judge the reader and the driver against.
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod reference;
