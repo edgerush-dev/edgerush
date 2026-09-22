@@ -17,6 +17,9 @@ pub mod lifecycle;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod reference;
 pub mod writer;
+// The coordinator, writer and commitment tracker composed against a scripted socket.
+#[cfg(test)]
+mod races;
 // Where the codec and hyper's server answer the same bytes differently.
 #[cfg(test)]
 mod differences;
