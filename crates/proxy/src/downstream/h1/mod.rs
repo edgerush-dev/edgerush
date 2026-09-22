@@ -9,6 +9,9 @@ pub mod continuing;
 pub mod date;
 pub mod deadlines;
 pub mod outbound;
+// The specification as code, for the harness to judge the reader and the driver against.
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod reference;
 pub mod writer;
 // Where the codec and hyper's server answer the same bytes differently.
 #[cfg(test)]
