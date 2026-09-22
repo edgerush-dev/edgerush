@@ -525,6 +525,41 @@ async fn a_426_is_forwarded_without_its_upgrade() {
     assert_eq!(client.body(4).await, "plea");
 }
 
+/// A 101 to a request that did not ask to switch — none can have asked, since `Upgrade`
+/// is taken off every request — is answered 502 on both paths. Passing it on would hand
+/// the client a switch it never asked for and tunnel whatever the upstream said next,
+/// which this slice does not do ([13 §1](../../../docs/13-http1-upstream.md);
+/// linkerd2-proxy's `http1_upgrade_not_requested` tests the same).
+#[tokio::test]
+#[ignore = "defect: the engine's path passes a bare 101 on to the client"]
+async fn a_101_nobody_asked_for_is_answered_502() {
+    let upstream = raw_upstream(move |mut wire| async move {
+        let _head = wire.head().await;
+        wire.write(concat!(
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n",
+            "connection: upgrade\r\n\r\nTUNNELLED"
+        ))
+        .await;
+        // Held open, as a tunnel would be.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let mut client = Wire::to(proxy_to(upstream).await).await;
+    client
+        .write("GET /up HTTP/1.1\r\nhost: a.test\r\n\r\n")
+        .await;
+
+    let head = client.head().await;
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    let lower = head.to_ascii_lowercase();
+    assert!(!lower.contains("upgrade"), "{head}");
+    // Nothing the upstream said after its head reaches the client.
+    let length = lower
+        .split("\r\n")
+        .find_map(|line| line.strip_prefix("content-length: "))
+        .map_or(0, |length| length.trim().parse::<usize>().unwrap());
+    assert!(!client.body(length).await.contains("TUNNELLED"));
+}
+
 /// An upstream that answers before it has read the body is not waited for: the answer
 /// goes to the client while the upload is still in the air.
 #[tokio::test]
