@@ -2325,11 +2325,13 @@ async fn a_post_of_nothing_still_says_its_length() {
 // ---- HTTP/2 in, HTTP/1.1 out ----
 
 /// A request body for an HTTP/2 client: nothing at all, or nothing after a pause, which
-/// is a HEADERS frame without END_STREAM followed by an empty DATA frame that has it.
+/// is a HEADERS frame without END_STREAM followed by an empty DATA frame that has it, or
+/// some data and then trailers.
 #[derive(Debug)]
 enum Upload {
     None,
     EmptyLater(std::pin::Pin<Box<tokio::time::Sleep>>),
+    Trailed(Option<Bytes>, Option<http::HeaderMap>),
 }
 
 impl hyper::body::Body for Upload {
@@ -2343,6 +2345,12 @@ impl hyper::body::Body for Upload {
         match &mut *self {
             Self::None => std::task::Poll::Ready(None),
             Self::EmptyLater(sleep) => sleep.as_mut().poll(cx).map(|()| None),
+            Self::Trailed(data, trailers) => std::task::Poll::Ready(
+                data.take()
+                    .map(hyper::body::Frame::data)
+                    .or_else(|| trailers.take().map(hyper::body::Frame::trailers))
+                    .map(Ok),
+            ),
         }
     }
 
@@ -2432,6 +2440,72 @@ async fn an_http2_request_that_ends_with_an_empty_frame_is_ended_in_chunks() {
             assert!(seen.ends_with("\r\n\r\n0\r\n\r\n"), "{seen}");
         }
         Upstream::Hyper => assert!(seen.ends_with("\r\n\r\n"), "{seen}"),
+    }
+}
+
+/// An HTTP/2 request that says its length and then sends trailers is carried whole and
+/// answered (linkerd2-proxy #15414, where one hung). A length cannot carry trailers on
+/// HTTP/1.1, so EdgeRush's own path frames it in chunks with the length removed and the
+/// trailers after the last chunk (13 §4); the engine's client keeps the length and drops
+/// the trailers, which is the request-trailer difference in 13 §5.
+#[tokio::test]
+async fn an_http2_request_with_a_length_and_trailers_is_carried() {
+    let (saw, mut seen) = reporter();
+    let upstream = raw_upstream(move |mut wire| {
+        let saw = saw.clone();
+        async move {
+            let Some(head) = wire.until(b"\r\n\r\n").await else {
+                return;
+            };
+            // Whatever follows the head, for a moment: enough for a body of five bytes
+            // and a trailer section however it is framed.
+            let mut bytes = [0; 4096];
+            while let Ok(Ok(read)) =
+                tokio::time::timeout(Duration::from_millis(300), wire.stream.read(&mut bytes)).await
+            {
+                if read == 0 {
+                    break;
+                }
+                wire.buffered.extend_from_slice(&bytes[..read]);
+            }
+            let body = std::mem::take(&mut wire.buffered);
+            saw.send(format!(
+                "{}{}",
+                String::from_utf8(head).unwrap(),
+                String::from_utf8(body).unwrap()
+            ))
+            .unwrap();
+            wire.write(FRESH).await;
+        }
+    });
+    let proxy = proxy_to(upstream).await;
+    let mut sender = h2_to(proxy).await;
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("x-t", http::HeaderValue::from_static("1"));
+    let request = http::Request::post(format!("http://{proxy}/x"))
+        .header("content-length", "5")
+        .body(Upload::Trailed(
+            Some(Bytes::from_static(b"hello")),
+            Some(trailers),
+        ))
+        .unwrap();
+    let answer = within(sender.send_request(request)).await.unwrap();
+    assert_eq!(answer.status(), 200);
+
+    let seen = within(seen.recv()).await.unwrap().to_ascii_lowercase();
+    match upstream_under_test() {
+        Upstream::Ours => {
+            assert!(!seen.contains("content-length"), "{seen}");
+            assert!(seen.contains("transfer-encoding: chunked\r\n"), "{seen}");
+            assert!(
+                seen.ends_with("\r\n\r\n5\r\nhello\r\n0\r\nx-t: 1\r\n\r\n"),
+                "{seen}"
+            );
+        }
+        Upstream::Hyper => {
+            assert!(seen.contains("content-length: 5\r\n"), "{seen}");
+            assert!(seen.ends_with("\r\n\r\nhello"), "{seen}");
+        }
     }
 }
 
