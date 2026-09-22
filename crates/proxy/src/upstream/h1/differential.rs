@@ -1995,6 +1995,24 @@ mod tests {
         }
     }
 
+    /// HTTP/1.0 has no interim answers. Ours refuses one written in it, by 13 §4; hyper's
+    /// client consumes it and reads the final answer. One of 13 §5's differences.
+    #[test]
+    fn an_interim_answer_in_http_1_0_is_refused_by_ours_and_consumed_by_hyper() {
+        let script =
+            says("HTTP/1.0 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+        let ours = checked(Path::Ours, &script, &Asking::Nothing);
+        assert!(matches!(ours.got, Got::Refused(_)), "{:?}", ours.got);
+        assert_eq!(
+            ours.verdict,
+            Verdict::Outside(vec!["Http10".to_owned()]),
+            "{ours:?}"
+        );
+        let theirs = checked(Path::Theirs, &script, &Asking::Nothing);
+        assert_eq!(seen(&theirs).body, b"ok", "{theirs:?}");
+        assert!(matches!(theirs.verdict, Verdict::Outside(_)), "{theirs:?}");
+    }
+
     /// An HTTP/1.0 answer that asks to be kept alive is not kept, because 13 §4 pools no
     /// connection that speaks 1.0 — a policy of this project's, which the verdict leaves
     /// room for. Called a disagreement, it would fail the hostile arm on any input that

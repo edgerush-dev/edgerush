@@ -64,6 +64,10 @@ pub enum CodecError {
     /// Chunked came with HTTP/1.1, so a 1.0 response claiming it is not to be believed.
     #[error("the response is HTTP/1.0 and claims a transfer-encoding")]
     CodingOnHttp10,
+    /// An interim answer in HTTP/1.0, which defines none: a peer that writes one is
+    /// contradicting itself about which HTTP it speaks.
+    #[error("the response is an interim answer in HTTP/1.0, which has none")]
+    InterimOnHttp10,
     /// A body described where none may be sent.
     #[error("the response cannot have a body and says how long one would be")]
     BodyForbidden,
@@ -360,9 +364,9 @@ pub enum Asked {
 ///
 /// # Errors
 ///
-/// A transfer coding this does not speak, a length and a coding together, a coding on
-/// HTTP/1.0, a body described where none may be, an upgrade, or a `Connection` that is
-/// not a list of tokens.
+/// A transfer coding this does not speak, a length and a coding together, a coding or an
+/// interim answer on HTTP/1.0, a body described where none may be, an upgrade, or a
+/// `Connection` that is not a list of tokens.
 pub fn delivery(head: &ResponseHead, asked: Asked) -> Result<Delivery, CodecError> {
     let chunked = is_chunked(&head.headers)?;
     // Two ways of saying how long a body is, and no way to know which the sender meant or
@@ -373,6 +377,11 @@ pub fn delivery(head: &ResponseHead, asked: Asked) -> Result<Delivery, CodecErro
     // Chunked came with HTTP/1.1. A 1.0 sender that claims it is not one to go along with.
     if chunked && head.version == Version::HTTP_10 {
         return Err(CodecError::CodingOnHttp10);
+    }
+    // HTTP/1.0 defines no 1xx. What such a head means, and which version the rest of the
+    // exchange is in, is not something to guess at, so it is refused as policy.
+    if head.status.is_informational() && head.version == Version::HTTP_10 {
+        return Err(CodecError::InterimOnHttp10);
     }
     let closing = says_close(&head.headers)?;
     // A connection that is to close, one that speaks 1.0, or one whose body only the
@@ -1826,6 +1835,27 @@ mod tests {
             delivery_with("HTTP/1.0 200 OK", "transfer-encoding: chunked\r\n"),
             Err(CodecError::CodingOnHttp10)
         );
+    }
+
+    /// HTTP/1.0 has no interim answers, so a peer that writes one in it is contradicting
+    /// itself. Refused as policy; the same statuses in 1.1 are read.
+    #[test]
+    fn an_interim_answer_in_http_1_0_is_refused() {
+        for start in [
+            "HTTP/1.0 100 Continue",
+            "HTTP/1.0 103 Early Hints",
+            "HTTP/1.0 199 Whatever",
+            "HTTP/1.0 101 Switching Protocols",
+        ] {
+            assert_eq!(
+                delivery_with(start, ""),
+                Err(CodecError::InterimOnHttp10),
+                "{start}"
+            );
+        }
+        for start in ["HTTP/1.1 100 Continue", "HTTP/1.1 103 Early Hints"] {
+            assert!(delivery_with(start, "").is_ok(), "{start}");
+        }
     }
 
     /// HTTP/1.0 is read, and never kept: this slice pools no connection that speaks it,

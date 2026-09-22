@@ -64,7 +64,9 @@ pub enum Framing {
 /// is not required of it — a classified outcome on each path is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Notable {
-    /// `HTTP/1.0`. Framed by its own rules, and never kept for reuse in this slice.
+    /// `HTTP/1.0`. Framed by its own rules, and never kept for reuse in this slice. Also
+    /// raised by an interim answer written in it: HTTP/1.0 defines no 1xx, and the
+    /// specification gives a recipient no rule for one.
     Http10,
     /// The same `Content-Length` more than once.
     /// [RFC 9110 §8.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6) lets a
@@ -306,6 +308,9 @@ fn reading(bytes: &[u8], asked: Asked, ended: bool) -> Result<Option<Answer>, In
         }
         if head.no_space {
             note(&mut notable, Notable::NoSpaceAfterStatus);
+        }
+        if head.version == Version::Ten {
+            note(&mut notable, Notable::Http10);
         }
         if head.status == 101 {
             note(&mut notable, Notable::Upgrade);
