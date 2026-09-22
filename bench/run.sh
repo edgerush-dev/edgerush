@@ -46,6 +46,8 @@ ulimit -n 65536
 
 # The binary under test. `instructions` points this at a build with symbols in it.
 edgerush=${EDGERUSH:-$repo/target/release/edgerush}
+# The engine alone, for the `frontend` scenarios: cargo build --release -p edgerush-proxy --example bare_hyper
+bare_hyper=${BARE_HYPER:-$repo/target/release/examples/bare_hyper}
 run=/tmp/edgerush-bench
 # The proxy is given a copy rather than the file in the repository: one scenario
 # rewrites it while the load is on, and the repository is not the place for that.
@@ -96,6 +98,18 @@ start_proxy() { # variant
             taskset -c "$PROXY_CPUS" kong start
         ) >>"$OUT/proxy.log" 2>&1
         daemon=$(cat "$run-kong/pids/nginx.pid")
+        ;;
+    bare-hyper)
+        # The engine alone, answering every request itself (crates/proxy/examples).
+        taskset -c "$PROXY_CPUS" "$bare_hyper" "$proxy_at" "$WORKERS" \
+            2>>"$OUT/proxy.log" &
+        ;;
+    nginx-direct)
+        # NGINX answering every request itself: the counterpart of bare-hyper.
+        mkdir -p "$run-direct/tmp"
+        sed "s/WORKERS/$WORKERS/" "$here/nginx-direct.conf" >"$run-direct/nginx.conf"
+        taskset -c "$PROXY_CPUS" nginx -p "$run-direct/" -c "$run-direct/nginx.conf" \
+            -e "$run-direct/error.log" 2>>"$OUT/proxy.log" &
         ;;
     nginx)
         mkdir -p "$run-proxy/tmp"
@@ -410,7 +424,7 @@ profile-body)
         exit 2
     }
     ;;
-ceiling | saturation | latency | carrying | hotpaths | instructions) ;;
+ceiling | saturation | latency | carrying | hotpaths | frontend | instructions) ;;
 *)
     sed -n '2,15p' "$0" >&2
     exit 2
@@ -476,6 +490,37 @@ profile-body)
     sha256sum "$edgerush" >"$OUT/binary.sha256"
     git -C "$repo" diff --binary HEAD >"$OUT/source.patch"
     each_variant profile_body_runs
+    ;;
+frontend)
+    # What the engine costs by itself against NGINX, and what the request core and the
+    # upstream add: every variant at saturation for the benchmark's host (the bare engine
+    # and NGINX answer it themselves; EdgeRush forwards it) and for a host no route is
+    # for (answered by each itself: EdgeRush's 404 is the engine and the request core).
+    # Counted over every process of the variant, so NGINX's workers are included.
+    [ -x "$bare_hyper" ] || {
+        echo "build first: cargo build --release -p edgerush-proxy --example bare_hyper" >&2
+        exit 2
+    }
+    frontend_runs() {
+        local host_as
+        for host_as in "bench.example.com:served" "nowhere.example.com:unrouted"; do
+            local url="http://${host_as%%:*}:8080/" as=${host_as##*:}
+            local pids
+            pids=$(echo "$proxy_pid" $(pgrep -P "$proxy_pid") | tr ' ' ',')
+            sudo -n perf stat -x, -p "$pids" -o "$OUT/$1.$as-h1.stat" \
+                -e instructions:u,instructions:k,cycles -- sleep "$((DURATION - 2))" &
+            local counter=$!
+            saturation_h1 "$1.$as-h1" "$url" --connect-to="$proxy_at"
+            wait "$counter" || true
+            pids=$(echo "$proxy_pid" $(pgrep -P "$proxy_pid") | tr ' ' ',')
+            sudo -n perf stat -x, -p "$pids" -o "$OUT/$1.$as-h2.stat" \
+                -e instructions:u,instructions:k,cycles -- sleep "$((DURATION - 2))" &
+            counter=$!
+            saturation_h2 "$1.$as-h2" "$url" --connect-to="$proxy_at"
+            wait "$counter" || true
+        done
+    }
+    each_variant frontend_runs
     ;;
 hotpaths)
     streamed_rate=${2:-20}
