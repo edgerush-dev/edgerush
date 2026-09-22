@@ -10,6 +10,7 @@
 #   bench/run.sh carrying [STREAMED SLOW]     streamed bodies, a slow upstream,
 #                                             cancellation, reload under load, idle memory
 #   bench/run.sh instructions                 where a worker's instructions go, by part
+#   bench/run.sh profile-body upload|answer [RATE]  CPU stacks during streamed bodies
 #   bench/run.sh summary DIR                  the table of a finished run
 #
 # The variants — EdgeRush, and NGINX, HAProxy, Envoy and Kong set up to do the same
@@ -173,9 +174,15 @@ measured() { # name, command...
         cat $(printf "/sys/devices/system/cpu/cpu%s/cpufreq/scaling_cur_freq " ${0//,/ })
     done' "$PROXY_CPUS" >"$OUT/$name.freq" 2>/dev/null &
     local sampler=$!
-    taskset -c "$GEN_CPUS" "$@" >"$OUT/$name.out" 2>"$OUT/$name.err" || echo "failed: $name" >&2
+    local status=0
+    taskset -c "$GEN_CPUS" "$@" >"$OUT/$name.out" 2>"$OUT/$name.err" || status=$?
     kill "$sampler" 2>/dev/null || true
+    wait "$sampler" 2>/dev/null || true
     cpu "$OUT/$name.cpu-after"
+    if [ "$status" -ne 0 ]; then
+        echo "failed: $name" >&2
+        return "$status"
+    fi
     echo "done: $name"
 }
 
@@ -210,6 +217,44 @@ churn() { oha_at "$1" "$2" "$3" -c 64 --disable-keepalive; }
 streamed_answer() { oha_at "$1" "$2" "$proxy/big" -c 32; }
 streamed_request() { oha_at "$1" "$2" "$proxy/sink" -c 32 -m POST -D "$run/big.bin"; }
 
+# Sample the middle of a sustained body workload. Startup and draining requests are
+# outside the perf window; CPU/request still comes from the ordinary measured snapshots,
+# not from dividing these shorter-window counters by the whole run's request count.
+profile_body_runs() (
+    local name="$1.streamed-$body_direction" loader= counter= status=0
+    # All background work is reaped, including when perf cannot access an event.
+    trap 'for job in "$loader" "$counter"; do
+        [ -z "$job" ] || kill "$job" 2>/dev/null || true
+    done
+    wait 2>/dev/null || true' EXIT
+    if [ "$body_direction" = upload ]; then
+        streamed_request "$name" "$streamed_rate" &
+    else
+        streamed_answer "$name" "$streamed_rate" &
+    fi
+    loader=$!
+    sleep 2
+    sudo -n perf stat -x, -p "$proxy_pid" \
+        -e task-clock,cycles:u,cycles:k,instructions:u,instructions:k,context-switches,cpu-migrations,page-faults \
+        -o "$OUT/$name.stat" -- sleep "$((DURATION - 4))" &
+    counter=$!
+    sudo -n perf record -q -e cycles -F 499 --call-graph dwarf,16384 \
+        -p "$proxy_pid" -o "$OUT/$name.perf.data" -- sleep "$((DURATION - 4))" || status=$?
+    wait "$counter" || status=$?
+    counter=
+    wait "$loader" || status=$?
+    loader=
+    [ "$status" -eq 0 ] || return "$status"
+    sudo -n chown "$(id -u):$(id -g)" "$OUT/$name.perf.data" "$OUT/$name.stat"
+    perf report -i "$OUT/$name.perf.data" --stdio --no-children \
+        -s dso,symbol --percent-limit 0 >"$OUT/$name.self.txt" || return $?
+    perf report -i "$OUT/$name.perf.data" --stdio --children \
+        -g graph,0.5,caller >"$OUT/$name.stacks.txt" || return $?
+    printf '%s\n' "cycles sampled across user and kernel; window $((DURATION - 4))s" \
+        "Profiling overhead affects these runs; use hotpaths for adoption numbers." \
+        >"$OUT/$name.profile-notes.txt"
+)
+
 # An upstream that trickles: the answer is read over as long as it takes, and the
 # exchange is held open the whole time.
 slow_upstream() { oha_at "$1" "$2" "$proxy/slow" -c 32; }
@@ -241,7 +286,8 @@ reload_under_load() { # name, rate
 # with a few thousand open and answered, against the same proxy with none.
 idle_memory() { # name
     local name=$1
-    local quiet=$(grep VmRSS "/proc/$proxy_pid/status" | awk "{print \$2}")
+    local quiet
+    quiet=$(python3 "$here/rss.py" "$proxy_pid")
     taskset -c "$GEN_CPUS" python3 "$here/idle.py" "$proxy_at" "$host" \
         "$IDLE_CONNECTIONS" >"$OUT/$name.ready" 2>"$OUT/$name.err" &
     local holding=$!
@@ -251,7 +297,8 @@ idle_memory() { # name
     done
     # A sweep runs once a second; give it one so that what is held is settled.
     sleep 2
-    local held=$(grep VmRSS "/proc/$proxy_pid/status" | awk "{print \$2}")
+    local held
+    held=$(python3 "$here/rss.py" "$proxy_pid")
     {
         echo "connections $IDLE_CONNECTIONS"
         echo "rss_quiet_kb $quiet"
@@ -332,7 +379,28 @@ prepare)
 summary)
     exec python3 "$here/summary.py" "$2"
     ;;
-ceiling | saturation | latency | carrying | instructions) ;;
+profile-body)
+    body_direction=${2:?choose upload or answer}
+    case "$body_direction" in upload | answer) ;; *) exit 2 ;; esac
+    streamed_rate=${3:-20}
+    [[ "$DURATION" =~ ^[0-9]+$ ]] && [ "$DURATION" -ge 10 ] || {
+        echo "profile-body needs an integer DURATION of at least 10 seconds" >&2
+        exit 2
+    }
+    # -p attaches to every thread in EdgeRush, but not workers of a separate process.
+    for variant in $VARIANTS; do
+        case "$variant" in thread-per-core | thread-per-core-kernel | ours) ;;
+        *) echo "profile-body supports EdgeRush client variants only" >&2; exit 2 ;;
+        esac
+    done
+    command -v perf >/dev/null || { echo "perf is required" >&2; exit 2; }
+    edgerush=${EDGERUSH:-$repo/target/profiling/edgerush}
+    [ -x "$edgerush" ] || {
+        echo "build first: cargo build --profile profiling -p edgerush" >&2
+        exit 2
+    }
+    ;;
+ceiling | saturation | latency | carrying | hotpaths | instructions) ;;
 *)
     sed -n '2,15p' "$0" >&2
     exit 2
@@ -393,6 +461,20 @@ instructions)
         sleep 5
     done
     exit
+    ;;
+profile-body)
+    sha256sum "$edgerush" >"$OUT/binary.sha256"
+    git -C "$repo" diff --binary HEAD >"$OUT/source.patch"
+    each_variant profile_body_runs
+    ;;
+hotpaths)
+    streamed_rate=${2:-20}
+    hotpath_runs() {
+        saturation_h1 "$1.saturation-h1" "$proxy" --connect-to="$proxy_at"
+        streamed_answer "$1.streamed-answer" "$streamed_rate"
+        streamed_request "$1.streamed-request" "$streamed_rate"
+    }
+    each_variant hotpath_runs
     ;;
 carrying)
     # Low rates: every one of these is about what an exchange holds and for how long

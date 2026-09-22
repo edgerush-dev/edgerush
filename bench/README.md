@@ -28,6 +28,7 @@ bench/run.sh saturation             # closed loop: the most each model serves
 bench/run.sh latency 25000 25000 2000   # open loop at these rates: h1, h2, churn
 bench/run.sh carrying               # streamed bodies, a slow upstream, cancellation,
                                     # reload under load, and what idle connections cost
+bench/run.sh hotpaths [RATE]        # H1 saturation and both streamed bodies (default 20/s)
 bench/run.sh summary bench/results/<run>
 ```
 
@@ -45,6 +46,48 @@ two is comparing them at the same bounds; every run writes what they were into
 `environment.txt`, because a gain that came of loosening a bound is not a gain.
 
 ## The variants
+
+For the client optimisation rerun, use the original machine and fixed frequency with
+`WORKERS=2 REPS=3 VARIANTS="thread-per-core ours nginx" IDLE_PER_DESTINATION=1024
+IDLE_TOTAL=1024 STREAMED=8388608 bench/run.sh hotpaths`. Preserve the original CPU
+affinity settings and verify the backend/generator ceiling first. This command keeps the
+anchors interleaved and runs only H1 saturation, large responses and large uploads.
+Idle memory now sums RSS over the proxy process tree, including nginx workers. Shared
+pages may be counted more than once; this is not unique physical memory.
+
+The focused parser instruction benchmark is
+`cargo bench -p edgerush-proxy --features fuzzing --bench h1_codec` (Linux/Callgrind).
+It covers 8, 16, 17 and 128 fields, plus a head arriving one byte at a time.
+
+To locate the remaining upload CPU cost, build with symbols and profile only that
+scenario on the benchmark machine (retain its CPU affinity and frequency settings):
+
+```sh
+cargo build --profile profiling -p edgerush
+sudo -v
+WORKERS=2 REPS=3 VARIANTS="thread-per-core ours" \
+IDLE_PER_DESTINATION=1024 IDLE_TOTAL=1024 STREAMED=8388608 \
+bench/run.sh profile-body upload 20
+```
+
+Use `profile-body answer 20` for the unexplained response gain. Each repetition captures
+cycles with DWARF call stacks, including kernel work, plus separate user/kernel
+instructions and cycles, task-clock, context switches and faults. `*.self.txt` gives
+exclusive symbol costs and `*.stacks.txt` their callers. Inspect the raw `.stat` files
+for unavailable or multiplexed events. This mode supports EdgeRush client variants only;
+attaching to nginx's master would miss the worker processes.
+
+Sampling covers the middle `DURATION - 4` seconds (minimum duration 10 seconds).
+Do not divide those counters by the whole run's request count, or feed cycle profiles to
+`buckets.py`, whose headings assume user instruction samples. Profiled latency and CPU
+include profiler overhead; keep adoption measurements on unprofiled `hotpaths` runs.
+The binary hash and tracked-source patch accompany each profile directory.
+
+For causal attribution, compare the original code, parser-only change, upload-loop-only
+change and combined candidate on the same machine with interleaved controls. Response
+polling calls the upload driver on every frame, even after the request has finished, so
+the upload-loop change can affect answers without changing the response-copy code.
+That is a hypothesis to isolate, not an explanation established by the macro rerun.
 
 `VARIANTS` names what is run, in turns: `thread-per-core`,
 `thread-per-core-kernel` — the same without balancing connections at accept — and `ours`,
