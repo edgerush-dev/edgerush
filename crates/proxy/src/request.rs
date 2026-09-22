@@ -596,7 +596,6 @@ upstreams:
         for said in [
             &[("te", "Trailers")][..],
             &[("te", "trailers, gzip")],
-            &[("te", "trailers;q=1")],
             &[("te", "trailers"), ("te", "trailers")],
             &[("te", "trailers"), ("connection", "te")],
             &[("te", "trailers"), ("keep-alive", "timeout=5")],
@@ -612,11 +611,14 @@ upstreams:
             assert!(!request.headers.contains_key("keep-alive"), "{said:?}");
         }
 
-        // And a `TE` that does not accept trailers goes.
-        let mut request = head("/cart", &[("host", "shop.example.com"), ("te", "gzip")]);
-        assert!(hop_by_hop_to_take_off(&request.headers));
-        assert_eq!(decide_on("web", &mut request, 0).as_deref(), Ok("cart"));
-        assert!(!request.headers.contains_key("te"));
+        // And a `TE` that does not accept trailers goes, a weighted `trailers` among them:
+        // the keyword takes no weight.
+        for te in ["gzip", "trailers;q=1"] {
+            let mut request = head("/cart", &[("host", "shop.example.com"), ("te", te)]);
+            assert!(hop_by_hop_to_take_off(&request.headers), "{te}");
+            assert_eq!(decide_on("web", &mut request, 0).as_deref(), Ok("cart"));
+            assert!(!request.headers.contains_key("te"), "{te}");
+        }
     }
 
     /// Whether the pass over the headers finds hop-by-hop headers that need work.

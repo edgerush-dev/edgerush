@@ -97,9 +97,9 @@ pub(crate) fn strip_request(headers: &mut HeaderMap) {
         .get_all(TE)
         .iter()
         .flat_map(options)
-        // A `TE` option may carry a weight (`trailers;q=1`), and means the same with it.
-        .filter_map(|option| option.split(|byte| *byte == b';').next())
-        .any(|name| name.trim_ascii().eq_ignore_ascii_case(b"trailers"));
+        // Only the bare keyword: RFC 9110 §10.1.4 gives `trailers` no weight, so
+        // `trailers;q=1` is not it, and `trailers;q=0` would mean the opposite.
+        .any(|option| option.eq_ignore_ascii_case(b"trailers"));
     strip(headers);
     if accepts_trailers {
         headers.insert(TE, HeaderValue::from_static("trailers"));
@@ -346,8 +346,7 @@ mod tests {
             "trailers",
             "Trailers",
             "gzip, trailers",
-            "trailers;q=0.5",
-            "deflate,TRAILERS ;q=1",
+            "deflate;q=0.5, TRAILERS ",
         ] {
             let stripped = request_without_hop_by_hop(&[("connection", "TE"), ("te", te)]);
             assert_eq!(left(&stripped), [("te", "trailers")], "{te}");
@@ -355,7 +354,19 @@ mod tests {
         let twice = request_without_hop_by_hop(&[("te", "gzip"), ("te", "trailers")]);
         assert_eq!(left(&twice), [("te", "trailers")]);
 
-        for te in ["gzip", "trailersx", "x-trailers", ""] {
+        // RFC 9110 §10.1.4 gives `t-codings = "trailers" / ( transfer-coding [ weight ] )`:
+        // the keyword takes no weight, so a weighted one is not it — `q=0` would even mean
+        // the opposite — and is dropped with the rest.
+        for te in [
+            "gzip",
+            "trailersx",
+            "x-trailers",
+            "",
+            "trailers;q=0",
+            "trailers;q=0.5",
+            "trailers;q=1",
+            "deflate,TRAILERS ;q=1",
+        ] {
             let stripped = request_without_hop_by_hop(&[("te", te)]);
             assert_eq!(left(&stripped), [], "{te}");
         }
