@@ -5,6 +5,7 @@
 //! can be checked against a table and every split of its input tried.
 
 pub mod codec;
+pub mod continuing;
 pub mod date;
 pub mod writer;
 // Where the codec and hyper's server answer the same bytes differently.
