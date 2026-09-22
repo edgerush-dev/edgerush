@@ -598,6 +598,36 @@ async fn an_http_1_0_client_is_sent_a_chunked_answer_without_its_chunks() {
     assert_eq!(rest, "hello there", "{head}");
 }
 
+/// The gateway's own error answers leave an HTTP/1.1 client's connection open: a 400 is
+/// about a target that was framed without doubt, and a 502 about the upstream, so neither
+/// is a reason to make the client connect again (03 §11). Where a body is left unread
+/// the engine's server closes, which is another test's business.
+#[tokio::test]
+async fn the_gateways_own_errors_leave_the_clients_connection_open() {
+    let (upstream, _accepts) = hostile_first(|mut wire| async move {
+        // Read, and gone without answering: a 502.
+        let _request = wire.until(b"\r\n\r\n").await;
+    });
+    let mut client = Wire::to(proxy_to(upstream).await).await;
+    for (path, status) in [("/../above", "400"), ("/first", "502"), ("/second", "200")] {
+        let head = asks(&mut client, path).await;
+        assert!(
+            head.starts_with(&format!("HTTP/1.1 {status}")),
+            "{path}: {head}"
+        );
+        assert!(
+            !head.to_ascii_lowercase().contains("connection: close"),
+            "{path}: {head}"
+        );
+        let length = head
+            .to_ascii_lowercase()
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .map_or(0, |length| length.trim().parse::<usize>().unwrap());
+        let _body = within(client.body(length)).await;
+    }
+}
+
 /// An HTTP/1.0 client's request goes upstream as HTTP/1.1, and the connection it went on
 /// may carry the next client's: upstream the gateway is the client, and RFC 9110 §2.5 has
 /// a client send the highest version it conforms to (03 §11).
