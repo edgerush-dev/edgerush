@@ -574,8 +574,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                 if staged >= STAGING {
                     break;
                 }
-                // What is in hand goes first, a bounded slice at a time. The frame itself is
-                // not copied in whole: that would be the client's pace, not the upstream's.
+                // What is in hand goes first: the rest of the frame, in one write. It is
+                // shared with the frame rather than copied into staging, so the staging
+                // bound says nothing about how much of it one write may carry, and every
+                // write it is cut into is another call and another push of segments into
+                // the kernel — on an 8 MiB upload, most of what it cost
+                // ([13 §7](../../../docs/13-http1-upstream.md)).
                 if let Some((frame, at)) = upload.pending.as_mut() {
                     if *at == frame.len() {
                         upload.pending = None;
@@ -584,14 +588,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                     if batch == ROUNDS {
                         break;
                     }
-                    // Room for the framing as well as the bytes: a chunk carries a size line
-                    // and a line ending of its own, and payload written to the brim leaves
-                    // nowhere but past the bound for them to go.
-                    let room = (STAGING - staged).saturating_sub(upload.writer.framing_room());
-                    let take = room.min(frame.len() - *at);
-                    if take == 0 {
+                    // Staging holds only the framing: a chunk's size line, and room behind
+                    // it for the line ending and for the chunk that ends the body.
+                    if STAGING - staged < upload.writer.framing_room() {
                         break;
                     }
+                    let take = frame.len() - *at;
                     let chunked = upload.writer.data_prefix(&mut self.outgoing, take)?;
                     self.payload = frame.slice(*at..*at + take);
                     self.chunk_tail = if chunked { 2 } else { 0 };
@@ -3616,26 +3618,44 @@ mod tests {
 mod lifecycle {
     use super::*;
 
+    /// A body of `left` frames of a hundred bytes each, and then its end.
+    #[derive(Debug)]
+    struct Several {
+        left: usize,
+    }
+
+    impl Body for Several {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            if self.left == 0 {
+                return Poll::Ready(None);
+            }
+            self.left -= 1;
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(&[b'x'; 100])))))
+        }
+    }
+
+    /// One push writes at most `ROUNDS` frames, each in a batch of its own, and the batch
+    /// after them may still see the body end and write what ends it — but may not start
+    /// another frame. Otherwise a bodyless answer arriving just as the budget ran out could
+    /// hide that the request had finished, and cost the connection for nothing.
     #[tokio::test]
     async fn the_last_write_batch_observes_eof_without_starting_another_payload() {
-        use http_body_util::Full;
         for chunked in [false, true] {
-            let framing = if chunked { 25 } else { 0 };
-            let budget = ROUNDS * (STAGING - framing);
             for extra in [0, 1] {
-                let size = budget + extra;
+                let frames = ROUNDS + extra;
                 let sending = if chunked {
                     Sending::Chunked
                 } else {
-                    Sending::Length(size as u64)
+                    Sending::Length(100 * frames as u64)
                 };
-                let (socket, _peer) = tokio::io::duplex(size + STAGING);
+                let (socket, _peer) = tokio::io::duplex(64 * 1024);
                 let mut exchange = Exchange::new(socket, test_blocks());
-                let mut upload = Upload::new(
-                    Full::new(Bytes::from(vec![b'x'; size])),
-                    sending,
-                    Vec::new(),
-                );
+                let mut upload = Upload::new(Several { left: frames }, sending, Vec::new());
                 exchange
                     .push(
                         &mut Context::from_waker(Waker::noop()),
@@ -3644,10 +3664,11 @@ mod lifecycle {
                         &H1Limits::default(),
                     )
                     .unwrap();
-                assert!(exchange.nothing_queued());
-                assert_eq!(upload.finished(), extra == 0);
+                assert!(exchange.nothing_queued(), "{chunked} {extra}");
+                assert_eq!(upload.finished(), extra == 0, "{chunked} {extra}");
                 if extra != 0 {
-                    assert_eq!(upload.pending.as_ref().unwrap().1, budget);
+                    // The frame the last batch took is held, not started.
+                    assert_eq!(upload.pending.as_ref().unwrap().1, 0, "{chunked}");
                 }
             }
         }
@@ -3699,6 +3720,107 @@ mod lifecycle {
             assert_eq!(wire, expected);
         }
     }
+    /// A socket that records how much each write took, which is what a write costs the
+    /// kernel by: one call and one push of segments, however large.
+    struct Recording {
+        inner: tokio::io::DuplexStream,
+        writes: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl AsyncRead for Recording {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Recording {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let written = Pin::new(&mut self.inner).poll_write(cx, buf);
+            if let Poll::Ready(Ok(gone)) = written {
+                self.writes.borrow_mut().push(gone);
+            }
+            written
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            // All of the slices in one call, as a socket's writev does; a duplex on its
+            // own would take only the first.
+            let whole: Vec<u8> = bufs.iter().flat_map(|buf| buf.iter().copied()).collect();
+            self.poll_write(cx, &whole)
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A frame the client handed over goes to an upstream that will take it in one write,
+    /// not in pieces the size of the staging buffer. The payload is not staged, so the
+    /// staging bound says nothing about how much of it one write may carry; every extra
+    /// write is another call and another push of segments into the kernel, which is what
+    /// an upload of 8 MiB spent most of its time on (23 times the writes of the engine's
+    /// client, measured on Linux).
+    #[tokio::test]
+    async fn a_frame_goes_upstream_in_one_write() {
+        use http_body_util::Full;
+        const SIZE: usize = 256 * 1024;
+        for sending in [Sending::Length(SIZE as u64), Sending::Chunked] {
+            let (inner, _peer) = tokio::io::duplex(4 * SIZE);
+            let writes = Rc::new(RefCell::new(Vec::new()));
+            let socket = Recording {
+                inner,
+                writes: Rc::clone(&writes),
+            };
+            let mut exchange = Exchange::new(socket, test_blocks());
+            let mut upload = Upload::new(
+                Full::new(Bytes::from(vec![b'x'; SIZE])),
+                sending,
+                Vec::new(),
+            );
+            exchange
+                .push(
+                    &mut Context::from_waker(Waker::noop()),
+                    &mut upload,
+                    true,
+                    &H1Limits::default(),
+                )
+                .unwrap();
+            assert!(
+                upload.finished() && exchange.nothing_queued(),
+                "{sending:?}"
+            );
+            let writes = writes.borrow();
+            // The frame and its framing in one write; the chunk that ends the body may
+            // follow in another.
+            assert!(
+                writes.iter().any(|&gone| gone >= SIZE),
+                "{sending:?}: the frame went out as {} writes: {writes:?}",
+                writes.len()
+            );
+            assert!(writes.len() <= 2, "{sending:?}: {writes:?}");
+        }
+    }
+
     #[derive(Debug)]
     struct Frames;
     impl Body for Frames {
