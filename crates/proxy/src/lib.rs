@@ -11,6 +11,7 @@
 //! own and never leaves the thread it was made on.
 
 mod cookies;
+mod h1;
 mod hop_by_hop;
 pub mod host;
 mod linger;
