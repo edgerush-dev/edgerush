@@ -11,6 +11,9 @@
 //! head even the reason for a refusal must be the same however the bytes were cut. A body
 //! is read by the reader both sides share, whose refusals may differ in which bound they
 //! name, so there only being refused is compared.
+//!
+//! Seeded from the boundary corpus the proxy's tests check in, with new finds kept apart:
+//! `cargo fuzz run h1_request corpus/h1_request ../crates/proxy/tests/corpus/h1_request`.
 
 #![no_main]
 

@@ -185,6 +185,38 @@ pub fn read(bytes: &[u8]) -> Reading {
 /// The lines of a section of fields, and where the section ends.
 type Section<'a> = (Vec<&'a [u8]>, usize);
 
+/// Whether `start`, the beginning of a request line with no line ending yet, could still
+/// become `method SP request-target SP HTTP-version`: each part complete so far is one,
+/// and the part still arriving is a beginning of one.
+fn could_begin(start: &[u8]) -> bool {
+    let parts: Vec<&[u8]> = start.split(|byte| *byte == b' ').collect();
+    if parts.len() > 3 {
+        return false;
+    }
+    let last = parts.len() - 1;
+    parts.iter().enumerate().all(|(at, part)| {
+        let whole = at < last;
+        match at {
+            0 => (!whole || !part.is_empty()) && part.iter().copied().all(tchar),
+            1 => {
+                (!whole || !part.is_empty())
+                    && part
+                        .iter()
+                        .all(|byte| (0x21..=0x7e).contains(byte) || *byte >= 0x80)
+            }
+            _ => {
+                // A beginning of `HTTP/` DIGIT `.` DIGIT, however far it has come.
+                let shape = b"HTTP/0.0";
+                part.len() <= shape.len()
+                    && part.iter().zip(shape).all(|(byte, shape)| match shape {
+                        b'0' => byte.is_ascii_digit(),
+                        _ => byte == shape,
+                    })
+            }
+        }
+    })
+}
+
 /// `tchar`, from RFC 9110 §5.6.2.
 fn tchar(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
@@ -282,6 +314,10 @@ fn reading(bytes: &[u8]) -> Result<Option<Request>, Invalid> {
         .position(|byte| *byte == b'\n' || *byte == b'\r')
         .map(|found| at + found)
     else {
+        // Not a whole line yet, but what has come may already be no beginning of one.
+        if !could_begin(&bytes[at..]) {
+            return Err(Invalid::RequestLine);
+        }
         return Ok(None);
     };
     match (bytes[line_end], bytes.get(line_end + 1)) {
@@ -594,6 +630,21 @@ mod tests {
     #[test]
     fn a_head_or_body_not_all_there_is_not_yet_a_request() {
         assert_eq!(read(b"GET / HTTP/1.1\r\nhost: x\r\n"), Reading::Unfinished);
+        assert_eq!(read(b"GET /a HTTP/1."), Reading::Unfinished);
+        // What can be no beginning of a request line is not waited on.
+        for start in [
+            &b"\x16\x03\x01"[..],
+            b"GET  /",
+            b"GET / http",
+            b"GET / HTTP/1.1x",
+        ] {
+            assert_eq!(
+                read(start),
+                Reading::Invalid(Invalid::RequestLine),
+                "{:?}",
+                String::from_utf8_lossy(start)
+            );
+        }
         let request = read_whole(b"POST / HTTP/1.1\r\ncontent-length: 5\r\n\r\nab");
         assert_eq!(request.body, BodyReading::Unfinished);
         let request = read_whole(b"POST / HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\nzz\r\n");
@@ -705,8 +756,8 @@ mod tests {
             )
         }
 
-        /// The statuses a refusal of this reading may carry.
-        fn allowed(reading: &Reading, limits: &H1Limits) -> Vec<u16> {
+        /// The statuses a refusal of this reading of `bytes` may carry.
+        fn allowed(reading: &Reading, bytes: &[u8], limits: &H1Limits) -> Vec<u16> {
             let mut allowed = Vec::new();
             match reading {
                 // Nothing is measured of what is not a request, and a bound can be met
@@ -719,7 +770,16 @@ mod tests {
                     });
                     allowed.extend([414, 431]);
                 }
-                Reading::Unfinished => {}
+                // A head that has not ended may already be past a bound, and is refused
+                // for it without waiting for an end that would change nothing.
+                Reading::Unfinished => {
+                    if bytes.len() > limits.request_line {
+                        allowed.push(414);
+                    }
+                    if bytes.len() > limits.head {
+                        allowed.push(431);
+                    }
+                }
                 Reading::Read(request) => {
                     for notable in &request.notable {
                         allowed.push(match notable {
@@ -745,13 +805,13 @@ mod tests {
         fn candidate_body(
             bytes: &[u8],
             framing: crate::h1::Framing,
+            limits: &H1Limits,
         ) -> Result<Option<(Vec<u8>, usize)>, ()> {
-            let limits = limits();
             let mut reader = BodyReader::new(framing);
             let mut at = 0;
             let mut data = Vec::new();
             loop {
-                match reader.read(&bytes[at..], false, &limits).map_err(|_| ())? {
+                match reader.read(&bytes[at..], false, limits).map_err(|_| ())? {
                     Piece::More => return Ok(None),
                     Piece::Data {
                         data: range,
@@ -765,93 +825,193 @@ mod tests {
             }
         }
 
+        /// Whether the candidate reads `bytes` as the reference does under `limits`, and
+        /// where it does not, how not.
+        fn agreement(bytes: &[u8], limits: &H1Limits) -> Result<(), String> {
+            let reference = read(bytes);
+            let candidate = HeadReader::default()
+                .read(bytes, limits)
+                .and_then(|head| match head {
+                    Head::Read { head, consumed } => {
+                        arrival(&head).map(|arrival| Some((head, consumed, arrival)))
+                    }
+                    Head::More => Ok(None),
+                });
+            let within = |request: &Request| {
+                request.notable.is_empty()
+                    && request.measured.request_line <= limits.request_line
+                    && request.measured.head <= limits.head
+                    && request.measured.fields <= limits.fields
+            };
+            let differ = |what: &str, candidate: String, reference: String| {
+                if candidate == reference {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{what}: candidate {candidate}, reference {reference}"
+                    ))
+                }
+            };
+            match (&reference, candidate) {
+                (
+                    Reading::Read(request),
+                    Ok(Some((
+                        head,
+                        consumed,
+                        Arrival {
+                            framing,
+                            persistent,
+                        },
+                    ))),
+                ) if within(request) => {
+                    differ(
+                        "head end",
+                        consumed.to_string(),
+                        request.measured.head.to_string(),
+                    )?;
+                    differ("method", head.method.to_string(), request.method.clone())?;
+                    differ("target", head.target.to_string(), request.target.clone())?;
+                    let version = if head.version == http::Version::HTTP_10 {
+                        Version::Ten
+                    } else {
+                        Version::Eleven
+                    };
+                    differ(
+                        "version",
+                        format!("{version:?}"),
+                        format!("{:?}", request.version),
+                    )?;
+                    let mut fields: Vec<(String, String)> = head
+                        .headers
+                        .iter()
+                        .map(|(name, value)| {
+                            let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
+                            (name.as_str().to_owned(), value)
+                        })
+                        .collect();
+                    let mut expected = request.fields.clone();
+                    // A header map groups repeats by name; order within a name is kept.
+                    expected.sort_by(|a, b| a.0.cmp(&b.0));
+                    fields.sort_by(|a, b| a.0.cmp(&b.0));
+                    differ("fields", format!("{fields:?}"), format!("{expected:?}"))?;
+                    let expected_framing = match request.framing {
+                        Framing::None => crate::h1::Framing::None,
+                        Framing::Length(length) => crate::h1::Framing::Length(length),
+                        Framing::Chunked => crate::h1::Framing::Chunked,
+                    };
+                    differ(
+                        "framing",
+                        format!("{framing:?}"),
+                        format!("{expected_framing:?}"),
+                    )?;
+                    differ(
+                        "persistence",
+                        persistent.to_string(),
+                        request.persistent.to_string(),
+                    )?;
+                    // And the body the two readers find, where the reference finds one.
+                    match (
+                        &request.body,
+                        candidate_body(&bytes[consumed..], framing, limits),
+                    ) {
+                        (BodyReading::Whole(body), Ok(Some((data, used)))) => {
+                            differ("body", format!("{data:?}"), format!("{:?}", body.data))?;
+                            differ(
+                                "request end",
+                                (consumed + used).to_string(),
+                                body.end.to_string(),
+                            )
+                        }
+                        (BodyReading::Unfinished, Ok(None))
+                        | (BodyReading::Invalid(_), Err(())) => Ok(()),
+                        (reference, candidate) => Err(format!(
+                            "the body: candidate {candidate:?}, reference {reference:?}"
+                        )),
+                    }
+                }
+                (Reading::Read(request), Ok(Some(_))) => Err(format!(
+                    "accepted what is notable or past a bound: {request:?}"
+                )),
+                (_, Ok(Some(_))) => Err(format!(
+                    "accepted what the reference reads as {reference:?}"
+                )),
+                (Reading::Unfinished, Ok(None)) => Ok(()),
+                (_, Ok(None)) => Err(format!("waited for more of a whole head: {reference:?}")),
+                (_, Err(error)) => {
+                    let status = codec::RequestError::status(error).as_u16();
+                    if !allowed(&reference, bytes, limits).contains(&status) {
+                        return Err(format!(
+                            "refused {error:?} ({status}) where the reference read {reference:?}"
+                        ));
+                    }
+                    if matches!(&reference, Reading::Read(request) if within(request)) {
+                        return Err(format!(
+                            "refused {error:?} what the reference reads cleanly: {reference:?}"
+                        ));
+                    }
+                    Ok(())
+                }
+            }
+        }
+
         proptest! {
             #[test]
             fn the_candidate_reads_what_the_reference_reads(bytes in request()) {
-                let limits = limits();
-                let reference = read(&bytes);
-                let candidate = HeadReader::default()
-                    .read(&bytes, &limits)
-                    .and_then(|head| match head {
-                        Head::Read { head, consumed } => {
-                            arrival(&head).map(|arrival| Some((head, consumed, arrival)))
-                        }
-                        Head::More => Ok(None),
-                    });
-                let within = |request: &Request| {
-                    request.notable.is_empty()
-                        && request.measured.request_line <= limits.request_line
-                        && request.measured.head <= limits.head
-                        && request.measured.fields <= limits.fields
-                };
-                match (&reference, candidate) {
-                    (Reading::Read(request), Ok(Some((head, consumed, Arrival { framing, persistent }))))
-                        if within(request) =>
-                    {
-                        prop_assert_eq!(consumed, request.measured.head);
-                        prop_assert_eq!(head.method.as_str(), request.method.as_str());
-                        prop_assert_eq!(head.target.to_string(), request.target.clone());
-                        let version = if head.version == http::Version::HTTP_10 { Version::Ten } else { Version::Eleven };
-                        prop_assert_eq!(version, request.version);
-                        let fields: Vec<(String, String)> = head
-                            .headers
-                            .iter()
-                            .map(|(name, value)| (name.as_str().to_owned(), String::from_utf8_lossy(value.as_bytes()).into_owned()))
-                            .collect();
-                        let mut expected = request.fields.clone();
-                        let mut fields = fields;
-                        // A header map groups repeats by name; order within a name is kept.
-                        expected.sort_by(|a, b| a.0.cmp(&b.0));
-                        fields.sort_by(|a, b| a.0.cmp(&b.0));
-                        prop_assert_eq!(fields, expected);
-                        let expected_framing = match request.framing {
-                            Framing::None => crate::h1::Framing::None,
-                            Framing::Length(length) => crate::h1::Framing::Length(length),
-                            Framing::Chunked => crate::h1::Framing::Chunked,
-                        };
-                        prop_assert_eq!(framing, expected_framing);
-                        prop_assert_eq!(persistent, request.persistent);
-                        // And the body the two readers find, where the reference finds one.
-                        let found = candidate_body(&bytes[consumed..], framing);
-                        match (&request.body, found) {
-                            (BodyReading::Whole(body), Ok(Some((data, used)))) => {
-                                prop_assert_eq!(data, body.data.clone());
-                                prop_assert_eq!(consumed + used, body.end);
-                            }
-                            (BodyReading::Unfinished, Ok(None))
-                            | (BodyReading::Invalid(_), Err(())) => {}
-                            (reference, candidate) => prop_assert!(
-                                false,
-                                "the body: reference {:?}, candidate {:?}",
-                                reference,
-                                candidate
-                            ),
-                        }
-                    }
-                    (Reading::Read(request), Ok(Some(_))) => {
-                        prop_assert!(false, "accepted what is notable or past a bound: {:?}", request);
-                    }
-                    (_, Ok(Some(_))) => {
-                        prop_assert!(false, "accepted what the reference reads as {:?}", reference);
-                    }
-                    (Reading::Unfinished, Ok(None)) => {}
-                    (_, Ok(None)) => {
-                        prop_assert!(false, "waited for more of a whole head: {:?}", reference);
-                    }
-                    (_, Err(error)) => {
-                        let status = codec::RequestError::status(error).as_u16();
-                        let allowed = allowed(&reference, &limits);
-                        prop_assert!(
-                            allowed.contains(&status),
-                            "refused {:?} ({}) where the reference read {:?}", error, status, reference
-                        );
-                        prop_assert!(
-                            !matches!(&reference, Reading::Read(request) if within(request)),
-                            "refused {:?} what the reference reads cleanly: {:?}", error, reference
-                        );
-                    }
+                if let Err(disagreement) = agreement(&bytes, &limits()) {
+                    prop_assert!(false, "{}", disagreement);
                 }
             }
+        }
+
+        /// What the candidate makes of `bytes` read whole: `read`, the status it refuses
+        /// with, or `more` for a head that has not ended.
+        fn verdict(bytes: &[u8], limits: &H1Limits) -> String {
+            match HeadReader::default().read(bytes, limits) {
+                Err(error) => error.status().as_str().to_owned(),
+                Ok(Head::More) => "more".to_owned(),
+                Ok(Head::Read { head, .. }) => match arrival(&head) {
+                    Err(error) => error.status().as_str().to_owned(),
+                    Ok(_) => "read".to_owned(),
+                },
+            }
+        }
+
+        /// The checked-in boundary corpus, under the default bounds: each case comes to
+        /// what the manifest says, comes to it however it is cut, and is read as the
+        /// reference reads it. The same files seed the fuzz target.
+        #[test]
+        fn the_boundary_corpus_reads_as_its_manifest_says() {
+            let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("corpus")
+                .join("h1_request");
+            let manifest = std::fs::read_to_string(directory.join("EXPECTED")).unwrap();
+            let limits = H1Limits::default();
+            let mut cases = 0;
+            for line in manifest.lines().filter(|line| !line.starts_with('#')) {
+                let (name, expected) = line.split_once(' ').unwrap();
+                let bytes = std::fs::read(directory.join(name)).unwrap();
+                assert_eq!(verdict(&bytes, &limits), expected, "{name}");
+
+                let whole = HeadReader::default().read(&bytes, &limits);
+                let mut reader = HeadReader::default();
+                for end in 1..=bytes.len() {
+                    match reader.read(&bytes[..end], &limits) {
+                        Ok(Head::More) => {}
+                        answer => {
+                            assert_eq!(answer, whole, "{name} cut at {end}");
+                            break;
+                        }
+                    }
+                }
+
+                if let Err(disagreement) = agreement(&bytes, &limits) {
+                    panic!("{name}: {disagreement}");
+                }
+                cases += 1;
+            }
+            let files = std::fs::read_dir(&directory).unwrap().count();
+            assert_eq!(files, cases + 1, "a case with no line in the manifest");
         }
     }
 }
