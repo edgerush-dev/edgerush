@@ -496,6 +496,35 @@ async fn an_interim_response_is_consumed_and_not_passed_on() {
     assert_eq!(client.body(2).await, "ok");
 }
 
+/// **A limitation, not a promise.** A 426 reaches the client without the `Upgrade` that
+/// [RFC 9110 §15.5.22](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.5.22) says
+/// it MUST carry: `Upgrade` is hop-by-hop and always taken off, and this proxy upgrades no
+/// connection, so naming a protocol to the client would offer what the gateway cannot do.
+/// The answer itself is still forwarded, status and body as they came (03 §11).
+#[tokio::test]
+async fn a_426_is_forwarded_without_its_upgrade() {
+    let upstream = raw_upstream(move |mut wire| async move {
+        let _head = wire.head().await;
+        // No `Connection: upgrade`: `Upgrade` goes whether or not anything names it.
+        wire.write(concat!(
+            "HTTP/1.1 426 Upgrade Required\r\nupgrade: h2c\r\n",
+            "content-length: 4\r\n\r\nplea"
+        ))
+        .await;
+    });
+    let mut client = Wire::to(proxy_to(upstream).await).await;
+    client
+        .write("GET /up HTTP/1.1\r\nhost: a.test\r\n\r\n")
+        .await;
+
+    let head = client.head().await;
+    assert!(head.starts_with("HTTP/1.1 426 "), "{head}");
+    let lower = head.to_ascii_lowercase();
+    assert!(!lower.contains("upgrade:"), "{head}");
+    assert!(!lower.contains("h2c"), "{head}");
+    assert_eq!(client.body(4).await, "plea");
+}
+
 /// An upstream that answers before it has read the body is not waited for: the answer
 /// goes to the client while the upload is still in the air.
 #[tokio::test]
