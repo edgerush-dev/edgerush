@@ -277,7 +277,7 @@ impl Blocks {
     /// One that has been used before if there is one, and a new one otherwise. Either way
     /// it holds nothing as far as its reader is concerned.
     pub fn take(&mut self) -> Block {
-        Self::lend(&mut self.small, self.sizes.small)
+        Self::lend(&mut self.small, self.sizes.small, self.sizes.small / 2)
     }
 
     /// The same block with room to read into, what it held kept at the front.
@@ -300,8 +300,10 @@ impl Blocks {
             } else {
                 &mut self.small
             };
-            let mut fresh = Self::lend(free, block.size);
             let held = block.len();
+            // Room for what it holds, and half a block more to read into.
+            let least = held.saturating_add(block.size / 2).min(block.size);
+            let mut fresh = Self::lend(free, block.size, least);
             fresh.room()[..held].copy_from_slice(block.data());
             fresh.arrived(held);
             block.consume(held);
@@ -324,7 +326,8 @@ impl Blocks {
         if block.capacity() >= self.sizes.large {
             return block;
         }
-        let mut grown = Self::lend(&mut self.large, self.sizes.large);
+        // Whole: its size is what guarantees a head fits in it.
+        let mut grown = Self::lend(&mut self.large, self.sizes.large, self.sizes.large);
         let data = block.data();
         grown.bytes[..data.len()].copy_from_slice(data);
         grown.filled = data.len();
@@ -389,15 +392,17 @@ impl Blocks {
         self.trim(self.sizes.kept);
     }
 
-    /// A free block that is whole, or can be made whole, if there is one, and a new one
-    /// if there is not.
+    /// A free block with at least `least` of its memory left, if there is one, and a new
+    /// one if there is not.
     ///
-    /// A free block whose frames the engine still holds is passed over and left where it
-    /// is, to be taken back once they have gone. A new block is set to zeros once, at its
-    /// full length; one lent again is not set to anything.
-    fn lend(free: &mut Vec<BytesMut>, size: usize) -> Block {
+    /// One with that much left is lent as it is, frames cut from it or not: what is left is
+    /// its own, and taking the rest back would mean setting all of it to zeros, for every
+    /// small answer. One with less is taken back whole if its frames have gone, and passed
+    /// over otherwise, left where it is to be taken back once they have. A new block is set
+    /// to zeros once, at its full length; one lent as it is, is not set to anything.
+    fn lend(free: &mut Vec<BytesMut>, size: usize, least: usize) -> Block {
         let found = free.iter_mut().rposition(|bytes| {
-            if bytes.len() == size {
+            if bytes.len() >= least {
                 return true;
             }
             // Holds nothing any reader will look at: it came back empty.
@@ -817,6 +822,25 @@ mod tests {
             again.room().as_ptr(),
             base.cast_mut(),
             "the block was made again"
+        );
+    }
+
+    /// A block given back with a frame cut from it, and plenty of its memory left, is lent
+    /// again as it is: taking the memory back means setting it to zeros, and doing that
+    /// for every small answer cost a request more than the copy it replaced.
+    #[test]
+    fn a_block_with_room_left_is_lent_again_without_being_cleared() {
+        let mut blocks = Blocks::new(sizes());
+        let mut block = blocks.take();
+        put(&mut block, b"was here before!");
+        drop(block.take_frame(0..2, 2));
+        block.consume(block.len());
+        blocks.give(block);
+        let mut again = blocks.take();
+        assert_eq!(
+            again.room(),
+            &b"s here before!"[..],
+            "the block was taken back and cleared"
         );
     }
 
