@@ -59,6 +59,33 @@ use tokio::time::Instant;
 /// failing again at once, over and over.
 pub(crate) const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 
+/// How long a connection has from being accepted to finishing its first request head,
+/// whatever it spends the time on: saying nothing, the engine working out which HTTP it
+/// speaks, or the head itself ([14 §8](../../docs/14-downstream-server.md)).
+pub(crate) const FIRST_REQUEST: Duration = Duration::from_secs(10);
+
+/// How long a connection has, once an answer is done, to finish its next request head:
+/// the engine's head timeout, which also runs while nothing is said. The engine has one
+/// clock for both, so this cannot yet be two deadlines as 14 §8 proposes.
+pub(crate) const NEXT_REQUEST: Duration = Duration::from_secs(30);
+
+/// The deadlines a worker holds its client connections to: [`FIRST_REQUEST`] and
+/// [`NEXT_REQUEST`], short in tests so that they can run on real sockets and real time.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Deadlines {
+    first_request: Duration,
+    next_request: Duration,
+}
+
+impl Default for Deadlines {
+    fn default() -> Self {
+        Self {
+            first_request: FIRST_REQUEST,
+            next_request: NEXT_REQUEST,
+        }
+    }
+}
+
 /// Where the futures the engine spawns of its own accord go: the worker that is serving
 /// the connection they belong to, never a thread pool. A worker is a single-threaded
 /// runtime and a `LocalSet`, so a request and everything it holds stay on one core and
@@ -291,6 +318,7 @@ pub struct Worker {
     /// no worker waits on another to find out whether it may take a request.
     in_flight: Rc<Cell<usize>>,
     limits: H1Limits,
+    deadlines: Deadlines,
 }
 
 /// One exchange's place among those a worker has in hand, given back when it is dropped.
@@ -479,6 +507,11 @@ impl Worker {
     /// then say that it did.
     #[must_use]
     pub fn with_limits(proxy: Arc<Proxy>, limits: H1Limits) -> Rc<Self> {
+        Self::with_deadlines(proxy, limits, Deadlines::default())
+    }
+
+    /// The same, holding client connections to `deadlines`.
+    fn with_deadlines(proxy: Arc<Proxy>, limits: H1Limits, deadlines: Deadlines) -> Rc<Self> {
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
         let client = Client::builder(TokioExecutor::new())
@@ -496,6 +529,7 @@ impl Worker {
             blocks: Rc::new(RefCell::new(Blocks::new(Sizes::within(&limits, SMALL)))),
             in_flight: Rc::new(Cell::new(0)),
             limits,
+            deadlines,
         })
     }
 
@@ -677,11 +711,17 @@ impl Worker {
     pub async fn serve_connection(self: Rc<Self>, listener: usize, stream: TcpStream) {
         // Worth having, not worth refusing a connection over.
         let _unset = stream.set_nodelay(true);
+        let deadlines = self.deadlines;
         let connection = Rc::new(Connection::open(self, listener));
+        // Set when the engine hands over the first request, which is the end of the one
+        // stretch its own deadlines do not cover.
+        let asked = Rc::new(Cell::new(false));
+        let asking = Rc::clone(&asked);
         // Every request clones a handle, as the engine wants futures that own what they
         // use. A handle of the connection's own keeps that count off a line of cache that
         // all the workers would otherwise write to.
         let service = service_fn(move |request| {
+            asking.set(true);
             let connection = Rc::clone(&connection);
             async move {
                 let response = connection.worker.handle(listener, request).await;
@@ -690,16 +730,47 @@ impl Worker {
         });
         // Lent rather than given, so that it comes back once the engine is done with it.
         let (lent, back) = Lent::new(stream);
-        // An error here is the end of one connection: the peer went away or spoke
-        // nonsense. There is nobody to tell.
-        let _closed = auto::Builder::new(OnThisWorker)
-            .serve_connection(TokioIo::new(lent), service)
-            .await;
-        // Dropped with bytes the client sent still unread — the rest of an upload the
-        // engine never read — the connection would be reset, and the reset can take the
-        // answer the client has not read yet with it. So it lingers instead.
+        let mut server = auto::Builder::new(OnThisWorker);
+        // The engine's head timeout runs only with a timer to run on; without one it is
+        // silently off, and a connection that stops part way through a head, or waits for
+        // ever between requests, is held for ever. It restarts for each request head, so
+        // it covers the wait before one as well as the head itself.
+        server
+            .http1()
+            .timer(TokioTimer::new())
+            .header_read_timeout(deadlines.next_request);
+        // What that timeout cannot see: the time before the engine has chosen which HTTP
+        // the connection speaks — it waits for the first bytes with no deadline of its
+        // own — and so a connection that never says anything, or stops part way through
+        // the HTTP/2 preface. Bounded here instead, from accept to the first request.
+        let cut_off = {
+            let mut serving = std::pin::pin!(server.serve_connection(TokioIo::new(lent), service));
+            let mut first = std::pin::pin!(tokio::time::sleep(deadlines.first_request));
+            std::future::poll_fn(|cx| {
+                // An error here is the end of one connection: the peer went away or spoke
+                // nonsense. There is nobody to tell.
+                if serving.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(false);
+                }
+                if !asked.get() && first.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(true);
+                }
+                Poll::Pending
+            })
+            .await
+        };
         if let Some(stream) = back.take() {
-            linger(stream, linger::QUIET, linger::MOST).await;
+            if cut_off {
+                // It has been sent nothing, so there is no answer a reset could take with
+                // it, and lingering would only hold the connection longer.
+                drop(stream);
+            } else {
+                // Dropped with bytes the client sent still unread — the rest of an upload
+                // the engine never read — the connection would be reset, and the reset can
+                // take the answer the client has not read yet with it. So it lingers
+                // instead.
+                linger(stream, linger::QUIET, linger::MOST).await;
+            }
         }
     }
 
@@ -1156,6 +1227,136 @@ mod tests {
                     blocks.sizes().kept,
                     "the burst is still parked"
                 );
+            })
+            .await;
+    }
+
+    /// Deadlines short enough that the tests of them run on real sockets and real time: a
+    /// stopped clock jumps ahead whenever every task waits on a socket, which a loopback
+    /// round trip does, and that would fire a deadline nobody reached.
+    const SHORT: Deadlines = Deadlines {
+        first_request: Duration::from_millis(300),
+        next_request: Duration::from_millis(700),
+    };
+
+    /// How late a deadline may be seen to fire on a loaded machine.
+    const SLACK: Duration = Duration::from_millis(400);
+
+    /// Serves a worker for `upstream` on a listener of its own, and says where.
+    async fn serving_worker(upstream: SocketAddr) -> SocketAddr {
+        let worker = Worker::with_deadlines(sending_to(upstream), H1Limits::default(), SHORT);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        front
+    }
+
+    /// Reads from `stream` until the proxy closes it, and says how long that took. Bounded
+    /// well past every deadline under test, so that a deadline missing fails rather than
+    /// hangs.
+    async fn closed_after(stream: &mut TcpStream) -> Duration {
+        use tokio::io::AsyncReadExt;
+        let started = tokio::time::Instant::now();
+        let mut rest = Vec::new();
+        let _ended = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut rest))
+            .await
+            .expect("the connection was never closed");
+        started.elapsed()
+    }
+
+    /// Reads one answer of the counting upstream's (`ok`, and its head) off `stream`.
+    async fn answered(stream: &mut TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut seen = Vec::new();
+        let mut byte = [0; 1];
+        while !seen.ends_with(b"\r\n\r\nok") {
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte))
+                .await
+                .expect("no answer")
+                .unwrap();
+            assert_ne!(
+                read,
+                0,
+                "closed before answering: {}",
+                String::from_utf8_lossy(&seen)
+            );
+            seen.push(byte[0]);
+        }
+        String::from_utf8(seen).unwrap()
+    }
+
+    const ASKED: &[u8] = b"GET / HTTP/1.1\r\nhost: example.test\r\n\r\n";
+
+    /// A connection that has not finished its first request head is closed at its first
+    /// request deadline from being accepted, whether it never said anything, stalled part
+    /// way through the HTTP/2 preface — where the engine's own protocol detection waits
+    /// with no deadline of its own — or is trickling a head. Without this each of them
+    /// holds its connection for ever.
+    #[tokio::test]
+    async fn a_connection_without_a_first_request_is_closed_at_its_deadline() {
+        use tokio::io::AsyncWriteExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let front = serving_worker(upstream).await;
+                for said in [&b""[..], b"PRI * HT", b"GET / HTTP/1.1\r\nhost: exa"] {
+                    let mut stream = TcpStream::connect(front).await.unwrap();
+                    stream.write_all(said).await.unwrap();
+                    let took = closed_after(&mut stream).await;
+                    assert!(
+                        took >= SHORT.first_request && took < SHORT.first_request + SLACK,
+                        "{:?}: closed after {took:?}",
+                        String::from_utf8_lossy(said)
+                    );
+                }
+            })
+            .await;
+    }
+
+    /// After an answer, a connection waiting for its next request head — idle, or with
+    /// part of one — is closed at its next request deadline.
+    #[tokio::test]
+    async fn a_connection_waiting_for_its_next_request_is_closed_at_its_deadline() {
+        use tokio::io::AsyncWriteExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let front = serving_worker(upstream).await;
+                for then in [&b""[..], b"GET / HT"] {
+                    let mut stream = TcpStream::connect(front).await.unwrap();
+                    stream.write_all(ASKED).await.unwrap();
+                    answered(&mut stream).await;
+                    stream.write_all(then).await.unwrap();
+                    let took = closed_after(&mut stream).await;
+                    assert!(
+                        took >= SHORT.next_request && took < SHORT.next_request + SLACK,
+                        "{:?}: closed after {took:?}",
+                        String::from_utf8_lossy(then)
+                    );
+                }
+            })
+            .await;
+    }
+
+    /// The deadlines cut off nobody who is keeping to them: a first head sent just inside
+    /// its deadline is answered, and so is another request well inside the next.
+    #[tokio::test]
+    async fn a_connection_that_keeps_to_the_deadlines_is_served() {
+        use tokio::io::AsyncWriteExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let front = serving_worker(upstream).await;
+                let mut stream = TcpStream::connect(front).await.unwrap();
+                tokio::time::sleep(SHORT.first_request - Duration::from_millis(150)).await;
+                stream.write_all(ASKED).await.unwrap();
+                assert!(answered(&mut stream).await.starts_with("HTTP/1.1 200"));
+                tokio::time::sleep(SHORT.next_request - Duration::from_millis(250)).await;
+                stream.write_all(ASKED).await.unwrap();
+                assert!(answered(&mut stream).await.starts_with("HTTP/1.1 200"));
             })
             .await;
     }
