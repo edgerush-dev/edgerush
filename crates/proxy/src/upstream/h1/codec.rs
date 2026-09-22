@@ -160,6 +160,10 @@ impl HeadReader {
     /// A head that goes past `limits`, is not HTTP/1.0 or HTTP/1.1, does not parse, or
     /// says its length in a way that cannot be trusted.
     pub fn read(&mut self, bytes: &[u8], limits: &H1Limits) -> Result<Head, CodecError> {
+        // Past its first few bytes a head has already been found to start as one.
+        if self.searched < STATUS_START {
+            status_start(bytes)?;
+        }
         let Some(end) = self.end_of_head(bytes)? else {
             // Nothing yet, and it may never come: a head that has grown past its bound
             // without ending is not going to end well.
@@ -209,6 +213,43 @@ impl HeadReader {
         self.searched = bytes.len();
         Ok(end)
     }
+}
+
+/// How many bytes of a head [`status_start`] looks at: `HTTP/1.x`, a space, three digits,
+/// and what follows them.
+const STATUS_START: usize = 13;
+
+/// Whether what has arrived can still become the start of a status line, which is all of
+/// it that is known before the line ends.
+///
+/// Refusing here rather than at the end of the head is the point: bytes that can never be
+/// an answer are not held until a bound or a deadline gives up on them. Nothing may come
+/// before the status line — [RFC 9112 §2.2](https://www.rfc-editor.org/rfc/rfc9112.html#section-2.2)
+/// lets a server skip empty lines before a request, and gives a client no such leave.
+/// After the code comes the space before the reason phrase, or the end of a line that
+/// stops at the code, which is read ([13 §5](../../../docs/13-http1-upstream.md)).
+fn status_start(bytes: &[u8]) -> Result<(), CodecError> {
+    const VERSION: &[u8] = b"HTTP/1.";
+    for (at, &byte) in bytes.iter().take(STATUS_START).enumerate() {
+        let fits = match at {
+            0..7 => byte == VERSION[at],
+            7 => byte == b'0' || byte == b'1',
+            8 => byte == b' ',
+            9..12 => byte.is_ascii_digit(),
+            _ => byte == b' ' || byte == b'\r',
+        };
+        if fits {
+            continue;
+        }
+        return Err(match at {
+            0 if byte == b'\r' || byte == b'\n' => {
+                CodecError::Malformed("an empty line comes before its status line")
+            }
+            0..8 => CodecError::Version,
+            _ => CodecError::Malformed("its status line cannot become one"),
+        });
+    }
+    Ok(())
 }
 
 /// Makes a head of the bytes of one, which are known to end with an empty line.
@@ -1413,6 +1454,53 @@ mod tests {
             // Everything given has been looked at, so the next call starts at its end
             // (less the three bytes an empty line could be split across).
             assert_eq!(reader.searched, upto);
+        }
+    }
+
+    /// A head begins `HTTP/1.0 ` or `HTTP/1.1 ` and three digits, and nothing may come
+    /// before it — a leading empty line included, which RFC 9112 §2.2 lets a server skip
+    /// before a request and gives no client before a response. Bytes that can no longer
+    /// become that are refused as they arrive, not once a head's bound or deadline is spent.
+    #[test]
+    fn a_start_that_cannot_become_a_status_line_is_refused_at_once() {
+        for start in [
+            &b"\r"[..],
+            b"\r\n",
+            b"\n",
+            b" ",
+            b"X",
+            b"http",
+            b"HTTP/2",
+            b"HTTP/1.2",
+            b"HTTP/1.1\t",
+            b"HTTP/1.10",
+            b"HTTP/1.1  ",
+            b"HTTP/1.1 2x",
+            b"HTTP/1.1 20 ",
+        ] {
+            assert!(
+                HeadReader::default()
+                    .read(start, &H1Limits::default())
+                    .is_err(),
+                "{:?} was waited on",
+                String::from_utf8_lossy(start)
+            );
+        }
+        // Whole heads behind an empty line are refused too, however many there are.
+        for whole in [
+            &b"\r\nHTTP/1.1 200 OK\r\n\r\n"[..],
+            b"\r\n\r\nHTTP/1.1 200 OK\r\n\r\n",
+        ] {
+            assert!(read(whole).is_err(), "{whole:?} was read");
+        }
+        // Every prefix of a sound head is still waited on.
+        let sound = b"HTTP/1.1 200 OK\r\n\r\n";
+        for upto in 0..sound.len() {
+            assert_eq!(
+                HeadReader::default().read(&sound[..upto], &H1Limits::default()),
+                Ok(Head::More),
+                "{upto}"
+            );
         }
     }
 
@@ -3158,11 +3246,12 @@ mod tests {
     #[test]
     fn which_bound_a_bad_head_trips_depends_on_what_has_arrived() {
         let limits = H1Limits {
-            head: 8,
+            head: 16,
             ..H1Limits::default()
         };
         // No empty line anywhere, longer than a head may be, and a bare newline past that.
-        let bytes = b"aaaaaaaaaa\n";
+        // It starts as a status line would, so that the start is not what refuses it.
+        let bytes = b"HTTP/1.1 200 aaaaaaaa\n";
 
         assert_eq!(
             HeadReader::default().read(bytes, &limits),
@@ -3177,6 +3266,6 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(refused, Some(CodecError::HeadTooLong { limit: 8 }));
+        assert_eq!(refused, Some(CodecError::HeadTooLong { limit: 16 }));
     }
 }

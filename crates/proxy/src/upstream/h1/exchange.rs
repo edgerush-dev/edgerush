@@ -2323,7 +2323,9 @@ mod tests {
         let (exchange, mut peer) = connected(4096);
         tokio::spawn(async move {
             peer.until(b"\r\n\r\n").await;
-            // A byte of a head that never ends, often enough never to be idle.
+            // A byte of a head that never ends, often enough never to be idle. It starts
+            // as a head would, so that the start is not what refuses it.
+            peer.say("HTTP/1.1 200 OK\r\nx-a: ").await;
             loop {
                 peer.say("x").await;
                 tokio::time::sleep(Duration::from_secs(5)).await;

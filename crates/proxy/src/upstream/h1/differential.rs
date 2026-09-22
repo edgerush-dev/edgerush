@@ -1896,6 +1896,51 @@ mod tests {
         }
     }
 
+    /// Bytes that cannot become a status line are refused as soon as they arrive, not
+    /// when the head's deadline runs out; an upstream that sends them and goes quiet
+    /// holds nothing for long.
+    #[test]
+    fn a_start_that_cannot_become_a_status_line_is_refused_at_once() {
+        for start in ["X", "HTTP/2", "HTTP/1.1 2x", "\r\n"] {
+            let ours = checked(Path::Ours, &says(start), &Asking::Nothing);
+            assert!(
+                matches!(ours.got, Got::Refused(_)),
+                "{start:?}: {:?}",
+                ours.got
+            );
+            assert!(
+                ours.tape.elapsed < Duration::from_secs(1),
+                "{start:?} was waited on: {ours:?}"
+            );
+        }
+    }
+
+    /// An empty line before a status line is not a message: RFC 9112 §2.2 lets a server
+    /// skip one before a request, and gives a client no such leave before a response.
+    #[test]
+    fn an_empty_line_before_the_status_line_is_refused() {
+        for before in ["\r\n", "\r\n\r\n"] {
+            let script = says(&format!(
+                "{before}HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"
+            ));
+            let ours = checked(Path::Ours, &script, &Asking::Nothing);
+            assert!(
+                matches!(ours.got, Got::Refused(_)),
+                "{before:?}: {:?}",
+                ours.got
+            );
+            assert_eq!(ours.verdict, Verdict::Agrees, "{before:?}: {ours:?}");
+            // One of 13 section 5's differences, of the kind where hyper's client reads
+            // input the grammar does not have: it skips the empty lines.
+            let theirs = checked(Path::Theirs, &script, &Asking::Nothing);
+            assert_eq!(seen(&theirs).body, b"ok", "{before:?}");
+            assert!(
+                matches!(theirs.verdict, Verdict::Disagrees(_)),
+                "{before:?}: {theirs:?}"
+            );
+        }
+    }
+
     /// What follows an interim head is a head, and one that is not is a failure to read
     /// an answer rather than another interim one (Pingora's client tests).
     #[test]
