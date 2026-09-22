@@ -61,6 +61,11 @@ pub struct Sizes {
     /// is not kept at all — nginx keeps four of its large header buffers for the same
     /// reason.
     pub kept: usize,
+    /// The smallest frame cut from a block rather than copied out of it
+    /// ([`Block::take_frame`]). Cutting saves a large answer an allocation and a copy a
+    /// piece, and the allocator's handing that memory back to the kernel; copying keeps a
+    /// small answer in the hot front of its block, where the next one reads too.
+    pub cut: usize,
 }
 
 impl Sizes {
@@ -78,6 +83,7 @@ impl Sizes {
             large: whole + small,
             parked: 64,
             kept: 4,
+            cut: 4 * 1024,
         }
     }
 }
@@ -113,6 +119,8 @@ pub struct Block {
     taken: usize,
     /// What it was made at, whatever is left of it now.
     size: usize,
+    /// The smallest frame cut from it rather than copied ([`Sizes::cut`]).
+    cut: usize,
 }
 
 impl Block {
@@ -164,6 +172,9 @@ impl Block {
     /// memory rather than copying it, and says everything up to `through` has been dealt
     /// with. What came before the frame goes with it; what comes after it stays.
     ///
+    /// A frame smaller than [`Sizes::cut`] is copied instead, and the block keeps its
+    /// memory.
+    ///
     /// # Panics
     ///
     /// In a debug build, if `range` does not lie within the first `through` bytes of
@@ -177,6 +188,11 @@ impl Block {
         );
         let start = self.taken.saturating_add(range.start).min(self.filled);
         let count = range.len().min(self.filled - start);
+        if count < self.cut {
+            let frame = Bytes::copy_from_slice(&self.bytes[start..start + count]);
+            self.consume(through.min(self.len()));
+            return frame;
+        }
         // The frame has to be at the front to be cut off, so what lies before it goes
         // first: bytes already dealt with, and whatever framing preceded it.
         self.bytes.advance(start);
@@ -277,7 +293,12 @@ impl Blocks {
     /// One that has been used before if there is one, and a new one otherwise. Either way
     /// it holds nothing as far as its reader is concerned.
     pub fn take(&mut self) -> Block {
-        Self::lend(&mut self.small, self.sizes.small, self.sizes.small / 2)
+        Self::lend(
+            &mut self.small,
+            self.sizes.small,
+            self.sizes.small / 2,
+            self.sizes.cut,
+        )
     }
 
     /// The same block with room to read into, what it held kept at the front.
@@ -303,7 +324,7 @@ impl Blocks {
             let held = block.len();
             // Room for what it holds, and half a block more to read into.
             let least = held.saturating_add(block.size / 2).min(block.size);
-            let mut fresh = Self::lend(free, block.size, least);
+            let mut fresh = Self::lend(free, block.size, least, block.cut);
             fresh.room()[..held].copy_from_slice(block.data());
             fresh.arrived(held);
             block.consume(held);
@@ -327,7 +348,8 @@ impl Blocks {
             return block;
         }
         // Whole: its size is what guarantees a head fits in it.
-        let mut grown = Self::lend(&mut self.large, self.sizes.large, self.sizes.large);
+        let (large, cut) = (self.sizes.large, self.sizes.cut);
+        let mut grown = Self::lend(&mut self.large, large, large, cut);
         let data = block.data();
         grown.bytes[..data.len()].copy_from_slice(data);
         grown.filled = data.len();
@@ -400,7 +422,7 @@ impl Blocks {
     /// small answer. One with less is taken back whole if its frames have gone, and passed
     /// over otherwise, left where it is to be taken back once they have. A new block is set
     /// to zeros once, at its full length; one lent as it is, is not set to anything.
-    fn lend(free: &mut Vec<BytesMut>, size: usize, least: usize) -> Block {
+    fn lend(free: &mut Vec<BytesMut>, size: usize, least: usize, cut: usize) -> Block {
         let found = free.iter_mut().rposition(|bytes| {
             if bytes.len() >= least {
                 return true;
@@ -422,6 +444,7 @@ impl Blocks {
             filled: 0,
             taken: 0,
             size,
+            cut,
         }
     }
 }
@@ -437,6 +460,7 @@ mod tests {
             large: 64,
             parked: 2,
             kept: 1,
+            cut: 4,
         }
     }
 
@@ -833,15 +857,34 @@ mod tests {
         let mut blocks = Blocks::new(sizes());
         let mut block = blocks.take();
         put(&mut block, b"was here before!");
-        drop(block.take_frame(0..2, 2));
+        drop(block.take_frame(0..4, 4));
         block.consume(block.len());
         blocks.give(block);
         let mut again = blocks.take();
         assert_eq!(
             again.room(),
-            &b"s here before!"[..],
+            &b"here before!"[..],
             "the block was taken back and cleared"
         );
+    }
+
+    /// A frame smaller than `cut` is copied instead, and the block keeps its memory: a
+    /// small answer then reads into the same few hot bytes at the front of its block as
+    /// the one before it did, rather than into memory further along that is cold, and
+    /// a small copy costs less than that. Measured, cutting every small frame cost the
+    /// proxy 5% at saturation.
+    #[test]
+    fn a_small_frame_is_copied_and_the_block_keeps_its_memory() {
+        let mut blocks = Blocks::new(sizes());
+        let mut block = blocks.take();
+        let base = block.room().as_ptr();
+        put(&mut block, b"ab");
+        let frame = block.take_frame(0..2, 2);
+        assert_eq!(&frame[..], b"ab");
+        assert_ne!(frame.as_ptr(), base, "a small frame was cut");
+        assert!(block.is_empty());
+        assert_eq!(block.room().len(), 16, "the block gave up memory");
+        assert_eq!(block.room().as_ptr(), base.cast_mut());
     }
 
     #[test]
