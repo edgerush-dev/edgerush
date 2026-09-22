@@ -598,6 +598,35 @@ async fn an_http_1_0_client_is_sent_a_chunked_answer_without_its_chunks() {
     assert_eq!(rest, "hello there", "{head}");
 }
 
+/// An HTTP/1.0 client's request goes upstream as HTTP/1.1, and the connection it went on
+/// may carry the next client's: upstream the gateway is the client, and RFC 9110 §2.5 has
+/// a client send the highest version it conforms to (03 §11).
+#[tokio::test]
+async fn an_http_1_0_request_goes_upstream_as_1_1_on_a_pooled_connection() {
+    let (saw, mut seen) = reporter();
+    let (upstream, accepts) = counted(move |mut wire| {
+        let saw = saw.clone();
+        async move {
+            while let Some(head) = wire.until(b"\r\n\r\n").await {
+                saw.send(String::from_utf8(head).unwrap()).unwrap();
+                wire.write(FRESH).await;
+            }
+        }
+    });
+    let proxy = proxy_to(upstream).await;
+    for _ in 0..2 {
+        let mut client = Wire::to(proxy).await;
+        client
+            .write("GET /up HTTP/1.0\r\nhost: a.test\r\n\r\n")
+            .await;
+        let head = within(client.head()).await;
+        assert!(head.contains(" 200 "), "{head}");
+        let sent = within(seen.recv()).await.unwrap();
+        assert!(sent.starts_with("GET /up HTTP/1.1\r\n"), "{sent}");
+    }
+    assert_eq!(accepts.load(Ordering::SeqCst), 1, "a connection each");
+}
+
 /// Requests for two Hosts routed to one upstream share its connection, because reuse is
 /// keyed by the endpoint and never by the incoming Host (13 §3), and each carries its own
 /// Host and not the one the connection first carried (linkerd2-proxy's tests).
