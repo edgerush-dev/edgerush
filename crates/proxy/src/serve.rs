@@ -106,16 +106,16 @@ impl<F: Future<Output = ()> + 'static> Executor<F> for OnThisWorker {
 /// Named, and not a box or a trait object, because every request would pay for that and
 /// because the engine can see through this to what is really left to send — a body whose
 /// length is known keeps it, and an answer of ours is end-of-stream from the start.
-/// A second kind, read by EdgeRush's own upstream path, goes beside [`Self::Upstream`]
-/// when there is one ([13 §1](../../../docs/13-http1-upstream.md)).
+///
+/// An upstream's answer carries its exchange's place with it, whichever client read it:
+/// the exchange is over when the body is.
 enum Body {
     /// The upstream's answer, as the engine's client reads it, and what that answer's
     /// own `Connection` named. The names are kept because the trailers have not arrived
     /// yet and the head they were read from will be gone by the time they do.
-    Upstream(Incoming, Vec<HeaderName>, Watch),
+    Upstream(Incoming, Vec<HeaderName>, Admitted, Watch),
     /// The upstream's answer, as EdgeRush's own path reads it. In a box because it is
     /// much the larger of the two, and every answer would otherwise carry room for it.
-    /// It carries its exchange's place with it: the exchange is over when this is.
     Ours(Box<H1Body<TcpStream, Incoming>>, Admitted, Watch),
     /// An answer of the data plane's own. It has no body, and never will have one.
     Empty,
@@ -210,7 +210,7 @@ impl HttpBody for Body {
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         match self.get_mut() {
-            Self::Upstream(incoming, nominated, watch) => {
+            Self::Upstream(incoming, nominated, _place, watch) => {
                 Pin::new(incoming).poll_frame(context).map(|frame| {
                     frame.map(|frame| {
                         frame
@@ -813,20 +813,22 @@ impl Worker {
             );
         }
 
+        // Before either client looks for a connection or opens one: a place is what
+        // entitles a request to a connection, so it is taken before one is sought. The same
+        // bound whichever client carries the request, so that the two are compared doing
+        // the same work ([14 §2](../../docs/14-downstream-server.md)).
+        let Some(admitted) = self.admit() else {
+            return self.proxy.answer(listener, Answer::TooBusy);
+        };
         let answered = match self.proxy.upstream {
             Upstream::Hyper => {
                 let watch = Watch {
                     proxy: Arc::clone(&self.proxy),
                     upstream: directed.upstream_slot,
                 };
-                self.by_hyper(head, body, watch).await
+                self.by_hyper(head, body, admitted, watch).await
             }
             Upstream::Ours => {
-                // Before anything is looked for or opened: a place is what entitles a
-                // request to a connection, so it is taken before one is sought.
-                let Some(admitted) = self.admit() else {
-                    return self.proxy.answer(listener, Answer::TooBusy);
-                };
                 self.by_ours(&directed, &head, &nominated, sending, body, admitted)
                     .await
             }
@@ -862,6 +864,7 @@ impl Worker {
         &self,
         head: Parts,
         body: Incoming,
+        admitted: Admitted,
         watch: Watch,
     ) -> Option<(response::Parts, Body)> {
         let response = self
@@ -894,7 +897,8 @@ impl Worker {
         let nominated = crate::hop_by_hop::nominated(&head.headers);
         // What may not travel on is not declared onwards either.
         filter_declaration(&mut head.headers, &nominated);
-        Some((head, Body::Upstream(body, nominated, watch)))
+        // The place goes with the body, as it does on the other path.
+        Some((head, Body::Upstream(body, nominated, admitted, watch)))
     }
 
     /// By EdgeRush's own path. Never after the other has been tried: by the time one has
@@ -1361,65 +1365,225 @@ mod tests {
             .await;
     }
 
-    /// A worker takes on only so many exchanges at once, and answers the rest rather
-    /// than opening another connection for them. The place is given back by every way out
-    /// of an exchange, a failed one included, so a worker that has been full is not full
-    /// for ever ([13 §7](../../docs/13-http1-upstream.md)).
+    /// A worker takes on only so many exchanges at once, whichever client carries them,
+    /// and answers the rest rather than opening another connection for them. The place is
+    /// given back by every way out of an exchange, a failed one included, so a worker that
+    /// has been full is not full for ever ([13 §7](../../docs/13-http1-upstream.md)).
     #[test]
     fn a_worker_full_of_exchanges_answers_rather_than_take_another() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let local = tokio::task::LocalSet::new();
-        runtime.block_on(local.run_until(async {
-            // An upstream that accepts and says nothing: every request sent to it stays
-            // in hand, which is the only way to have a worker hold several at once.
-            let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let upstream = backend.local_addr().unwrap();
-            let held = Rc::new(RefCell::new(Vec::new()));
-            let holding = Rc::clone(&held);
-            let _accepting = tokio::task::spawn_local(async move {
-                loop {
-                    let (stream, _) = backend.accept().await.unwrap();
-                    holding.borrow_mut().push(stream);
+        for by in [Upstream::Hyper, Upstream::Ours] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            runtime.block_on(local.run_until(async {
+                let (upstream, held) = scripted_upstream().await;
+                let limits = H1Limits {
+                    exchanges: 2,
+                    ..H1Limits::default()
+                };
+                let worker = Worker::with_limits(sending_to_by(upstream, by), limits);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+
+                // Two that will not come back, waited for where the worker has committed
+                // to them rather than where they were sent.
+                for _ in 0..2 {
+                    let _parked = tokio::task::spawn_local(async move {
+                        let _never = status_of(front, "/silent").await;
+                    });
                 }
-            });
+                until(|| held.borrow().len() == 2).await;
 
-            // Short bounds so that the exchange which is meant to fail fails in a
-            // second or two rather than in the default half-minute. Long enough that
-            // nothing parked here is given up on before the test has looked at it.
-            let limits = H1Limits {
-                exchanges: 2,
-                idle: Duration::from_secs(2),
-                final_head: Duration::from_secs(2),
-                ..H1Limits::default()
-            };
-            let worker = Worker::with_limits(sending_to(upstream), limits);
-            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let front = socket.local_addr().unwrap();
-            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+                // Bounded, because a worker that does not refuse it holds it for as long
+                // as the upstream says nothing, which is for ever.
+                let refused = tokio::time::timeout(Duration::from_secs(5), status_of(front, "/ok"))
+                    .await
+                    .unwrap_or_else(|_| panic!("{by:?} took on a third exchange"));
+                assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE, "{by:?}");
 
-            // Two that will not come back, waited for where the worker has committed to
-            // them rather than where they were sent.
-            for _ in 0..2 {
-                let _parked = tokio::task::spawn_local(async move {
-                    let _never = status_over_http1(front).await;
+                // The upstream lets both go without answering, so both exchanges fail; a
+                // failure gives its place back like any other ending, and the worker
+                // takes requests again.
+                held.borrow_mut().clear();
+                until(|| worker.in_flight.get() == 0).await;
+                assert_eq!(status_of(front, "/ok").await, StatusCode::OK, "{by:?}");
+            }));
+        }
+    }
+
+    /// Every way out of an exchange gives its place back, whichever client carried it: an
+    /// upstream that could not be reached, an answer with no body, one read to its end, one
+    /// the client stopped reading, one that failed part way, and a client that went before
+    /// anything came back. A place that one of them kept would be kept for ever, and a
+    /// worker would fill up with exchanges nobody has in hand.
+    #[test]
+    fn every_way_out_of_an_exchange_gives_its_place_back() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for by in [Upstream::Hyper, Upstream::Ours] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            runtime.block_on(local.run_until(async {
+                let serving = |upstream| {
+                    let worker =
+                        Worker::with_limits(sending_to_by(upstream, by), H1Limits::default());
+                    async move {
+                        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        let front = socket.local_addr().unwrap();
+                        let _serving =
+                            tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+                        (worker, front)
+                    }
+                };
+                let given_back = |worker: &Rc<Worker>, case: &str| {
+                    let worker = Rc::clone(worker);
+                    let case = format!("{by:?}, {case}");
+                    async move {
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            while worker.in_flight.get() != 0 {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|_| panic!("{case}: the place was kept"));
+                    }
+                };
+
+                // Nothing listening where the upstream should be.
+                let gone = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let nowhere = gone.local_addr().unwrap();
+                drop(gone);
+                let (worker, front) = serving(nowhere).await;
+                assert_eq!(
+                    status_of(front, "/ok").await,
+                    StatusCode::BAD_GATEWAY,
+                    "{by:?}"
+                );
+                given_back(&worker, "unreachable").await;
+
+                let (upstream, held) = scripted_upstream().await;
+                let (worker, front) = serving(upstream).await;
+
+                assert_eq!(status_of(front, "/nothing").await, StatusCode::NO_CONTENT);
+                given_back(&worker, "no body").await;
+
+                assert_eq!(status_of(front, "/ok").await, StatusCode::OK);
+                given_back(&worker, "a whole body").await;
+
+                // Taken as far as the answer's first bytes, then no further.
+                let mut client = TcpStream::connect(front).await.unwrap();
+                client.write_all(&asking("/endless")).await.unwrap();
+                let mut some = [0; 1024];
+                let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut some))
+                    .await
+                    .expect("no answer");
+                assert!(read.unwrap() > 0, "{by:?}: closed before answering");
+                assert_eq!(
+                    worker.in_flight.get(),
+                    1,
+                    "{by:?}: not in hand while answering"
+                );
+                drop(client);
+                given_back(&worker, "a client that stopped reading").await;
+
+                // The head says ten bytes, and five come before the upstream goes.
+                let mut client = TcpStream::connect(front).await.unwrap();
+                client.write_all(&asking("/short")).await.unwrap();
+                let mut rest = Vec::new();
+                let _ended =
+                    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest))
+                        .await
+                        .expect("the failed answer was never ended");
+                given_back(&worker, "a body that failed").await;
+
+                // Asked, and gone before the upstream says anything.
+                let mut client = TcpStream::connect(front).await.unwrap();
+                client.write_all(&asking("/silent")).await.unwrap();
+                until(|| held.borrow().len() == 1).await;
+                assert_eq!(
+                    worker.in_flight.get(),
+                    1,
+                    "{by:?}: not in hand while waiting"
+                );
+                drop(client);
+                given_back(&worker, "a client that went").await;
+            }));
+        }
+    }
+
+    /// A request for `path` as a client would write it, asking for the connection to be
+    /// closed after the answer so that reading to the end reads the one answer.
+    fn asking(path: &str) -> Vec<u8> {
+        format!("GET {path} HTTP/1.1\r\nhost: example.test\r\nconnection: close\r\n\r\n")
+            .into_bytes()
+    }
+
+    /// An upstream that answers by the last part of the path it is asked for, one request
+    /// after another on a connection: `nothing` with a 204, `ok` with a short body,
+    /// `endless` with a body that never ends, `short` with a body that stops part way, and
+    /// anything else not at all, its connection held open in what is returned.
+    async fn scripted_upstream() -> (SocketAddr, Rc<RefCell<Vec<TcpStream>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = backend.local_addr().unwrap();
+        let held = Rc::new(RefCell::new(Vec::new()));
+        let holding = Rc::clone(&held);
+        let _accepting = tokio::task::spawn_local(async move {
+            loop {
+                let (mut stream, _) = backend.accept().await.unwrap();
+                let holding = Rc::clone(&holding);
+                let _answering = tokio::task::spawn_local(async move {
+                    let mut seen = Vec::new();
+                    let mut byte = [0; 1];
+                    loop {
+                        match stream.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => seen.push(byte[0]),
+                        }
+                        if !seen.ends_with(b"\r\n\r\n") {
+                            continue;
+                        }
+                        let asked = String::from_utf8_lossy(&seen).into_owned();
+                        seen.clear();
+                        let target = asked.split(' ').nth(1).unwrap_or_default();
+                        let answer: &[u8] = match target.rsplit('/').next() {
+                            Some("nothing") => b"HTTP/1.1 204 No Content\r\n\r\n",
+                            Some("ok") => b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+                            Some("endless") => {
+                                let head =
+                                    b"HTTP/1.1 200 OK\r\ncontent-length: 1000000000000\r\n\r\n";
+                                let mut said = stream.write_all(head).await;
+                                while said.is_ok() {
+                                    said = stream.write_all(&[b'x'; 16 * 1024]).await;
+                                }
+                                return;
+                            }
+                            Some("short") => {
+                                let head = b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nshort";
+                                let _said = stream.write_all(head).await;
+                                // Long enough for the head to be on its way to the client
+                                // before the body stops.
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                return;
+                            }
+                            _ => {
+                                holding.borrow_mut().push(stream);
+                                return;
+                            }
+                        };
+                        if stream.write_all(answer).await.is_err() {
+                            return;
+                        }
+                    }
                 });
             }
-            until(|| held.borrow().len() == 2).await;
-
-            assert_eq!(
-                status_over_http1(front).await,
-                StatusCode::SERVICE_UNAVAILABLE
-            );
-
-            // The upstream goes away, so both exchanges fail; a failure gives its place
-            // back like any other ending, and the worker takes requests again.
-            held.borrow_mut().clear();
-            until(|| worker.in_flight.get() == 0).await;
-            assert_eq!(status_over_http1(front).await, StatusCode::BAD_GATEWAY);
-        }));
+        });
+        (address, held)
     }
 
     /// The same, by whichever client is named: how many idle connections a worker keeps
@@ -1708,6 +1872,11 @@ upstreams:
 
     /// What one HTTP/1.1 request to `address` is answered with.
     async fn status_over_http1(address: SocketAddr) -> StatusCode {
+        status_of(address, "/").await
+    }
+
+    /// What one HTTP/1.1 request for `path` to `address` is answered with.
+    async fn status_of(address: SocketAddr, path: &str) -> StatusCode {
         let stream = TcpStream::connect(address).await.unwrap();
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
@@ -1717,7 +1886,7 @@ upstreams:
         });
         // Routed like any other request, so it needs a host to be routed by.
         let request = Request::builder()
-            .uri("/")
+            .uri(path)
             .header("host", "example.test")
             .body(Empty::<Bytes>::new())
             .unwrap();
