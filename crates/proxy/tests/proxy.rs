@@ -13,7 +13,7 @@
 )]
 
 use edgerush_config::{Compiled, Config, compile};
-use edgerush_proxy::{Proxy, Upstream, Worker};
+use edgerush_proxy::{Downstream, Proxy, Upstream, Worker};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Either, Empty, Full};
@@ -152,10 +152,28 @@ fn upstream_under_test() -> Upstream {
     }
 }
 
+/// Which server takes the suite's connections, told the same way:
+///
+/// ```text
+/// EDGERUSH_TEST_DOWNSTREAM=ours cargo test     EdgeRush's own, as far as it goes
+/// ```
+fn downstream_under_test() -> Downstream {
+    match std::env::var("EDGERUSH_TEST_DOWNSTREAM").as_deref() {
+        Ok("ours") => Downstream::Ours,
+        _ => Downstream::Hyper,
+    }
+}
+
+/// A data plane of `config`, reaching upstreams and serving clients as the suite is told.
+fn under_test(config: edgerush_config::Compiled) -> Proxy {
+    Proxy::new(config, NonZeroUsize::MIN, upstream_under_test())
+        .and_then(|proxy| proxy.serving_by(downstream_under_test()))
+        .unwrap()
+}
+
 /// The same, with the proxy itself for reloading it.
 async fn reloadable_proxy(yaml: &str) -> (Arc<Proxy>, BTreeMap<String, SocketAddr>) {
-    let proxy =
-        Arc::new(Proxy::new(compiled(yaml), NonZeroUsize::MIN, upstream_under_test()).unwrap());
+    let proxy = Arc::new(under_test(compiled(yaml)));
     let mut addresses = BTreeMap::new();
     let mut sockets = Vec::new();
     for (position, listener) in proxy.listeners().iter().enumerate() {
@@ -973,7 +991,7 @@ async fn the_scrape_endpoint_serves_what_was_counted_and_nothing_else() {
 async fn a_connection_accepted_on_one_thread_is_served_on_another() {
     let up = upstream("up").await;
     let config = compiled(&everything_to(&[("web", up)], "0"));
-    let proxy = Arc::new(Proxy::new(config, NonZeroUsize::MIN, upstream_under_test()).unwrap());
+    let proxy = Arc::new(under_test(config));
     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = socket.local_addr().unwrap();
 
@@ -1023,7 +1041,7 @@ fn a_failure_to_accept_is_counted_and_only_some_are_waited_after() {
         &[("web", "127.0.0.1:1".parse().unwrap())],
         "0",
     ));
-    let proxy = Proxy::new(config, NonZeroUsize::MIN, upstream_under_test()).unwrap();
+    let proxy = under_test(config);
     let gone = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
     assert_eq!(proxy.accept_failed(0, &gone), None);
     // Out of file descriptors: accepting again at once would fail again at once.

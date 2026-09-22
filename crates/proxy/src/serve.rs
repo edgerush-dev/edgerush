@@ -16,6 +16,7 @@
 //! touches need be `Send`. That is what lets a worker own things a thread cannot share —
 //! the pool of upstream connections to come, above all.
 
+use crate::downstream::detect::{Protocol, detect};
 use crate::hop_by_hop::strip_response;
 use crate::linger::{self, Lent, linger};
 use crate::metrics::{Answer, Metrics, Socket, Stopped};
@@ -286,6 +287,20 @@ pub enum Upstream {
     Ours,
 }
 
+/// Which server takes a client's connection.
+///
+/// One choice for the process, as [`Upstream`] is. EdgeRush's own is being built in
+/// steps ([14 §9](../../docs/14-downstream-server.md)): so far it tells HTTP/1 from
+/// HTTP/2 by itself and hands each to the engine's server for that protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Downstream {
+    /// The engine's server, which tells the protocols apart itself.
+    #[default]
+    Hyper,
+    /// EdgeRush's own.
+    Ours,
+}
+
 /// A data plane: one for the whole process, whatever its workers. It holds what must be
 /// one — the config every worker serves, and the counters they all add to — and takes a
 /// new config while they run.
@@ -304,6 +319,8 @@ pub struct Proxy {
     keys: Keys,
     /// Which way its workers reach an upstream.
     upstream: Upstream,
+    /// Which server takes its clients' connections.
+    downstream: Downstream,
 }
 
 /// One worker's share of the data plane: the connections it holds to the upstreams, which
@@ -433,7 +450,24 @@ impl Proxy {
             metrics,
             keys,
             upstream,
+            downstream: Downstream::default(),
         })
+    }
+
+    /// The same data plane, its clients' connections taken by `downstream`. Chosen before
+    /// anything is served, and never changed while it runs.
+    ///
+    /// # Errors
+    ///
+    /// A [`ProxyError`] for a pairing that cannot work: EdgeRush's own server hands on
+    /// request bodies that cannot leave the worker, and the engine's pooled client takes
+    /// only bodies that can ([14 §9](../../docs/14-downstream-server.md)).
+    pub fn serving_by(mut self, downstream: Downstream) -> Result<Self, ProxyError> {
+        if downstream == Downstream::Ours && self.upstream == Upstream::Hyper {
+            return Err(ProxyError::Pairing);
+        }
+        self.downstream = downstream;
+        Ok(self)
     }
 
     /// The names of the listeners that can be served: those of the config the data plane
@@ -726,6 +760,7 @@ impl Worker {
         // Worth having, not worth refusing a connection over.
         let _unset = stream.set_nodelay(true);
         let deadlines = self.deadlines;
+        let downstream = self.proxy.downstream;
         let connection = Rc::new(Connection::open(self, listener));
         // Set when the engine hands over the first request, which is the end of the one
         // stretch its own deadlines do not cover.
@@ -747,21 +782,47 @@ impl Worker {
         });
         // Lent rather than given, so that it comes back once the engine is done with it.
         let (lent, back) = Lent::new(stream);
-        let mut server = auto::Builder::new(OnThisWorker);
         // The engine's head timeout runs only with a timer to run on; without one it is
         // silently off, and a connection that stops part way through a head, or waits for
         // ever between requests, is held for ever. It restarts for each request head, so
         // it covers the wait before one as well as the head itself.
-        server
-            .http1()
-            .timer(TokioTimer::new())
-            .header_read_timeout(deadlines.next_request);
+        let serving = async move {
+            match downstream {
+                Downstream::Hyper => {
+                    let mut server = auto::Builder::new(OnThisWorker);
+                    server
+                        .http1()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(deadlines.next_request);
+                    let _closed = server.serve_connection(TokioIo::new(lent), service).await;
+                }
+                // Told apart by our own detector, and each protocol then served by the
+                // engine's server for it.
+                Downstream::Ours => match detect(lent).await {
+                    Ok(Some((Protocol::Http1, replay))) => {
+                        // Configured as the engine's own detector configures it above.
+                        let _closed = hyper::server::conn::http1::Builder::new()
+                            .timer(TokioTimer::new())
+                            .header_read_timeout(deadlines.next_request)
+                            .serve_connection(TokioIo::new(replay), service)
+                            .await;
+                    }
+                    Ok(Some((Protocol::Http2, replay))) => {
+                        let _closed = hyper::server::conn::http2::Builder::new(OnThisWorker)
+                            .serve_connection(TokioIo::new(replay), service)
+                            .await;
+                    }
+                    // Closed having said nothing, or failed before saying enough.
+                    Ok(None) | Err(_) => {}
+                },
+            }
+        };
         // What that timeout cannot see: the time before the engine has chosen which HTTP
         // the connection speaks — it waits for the first bytes with no deadline of its
         // own — and so a connection that never says anything, or stops part way through
         // the HTTP/2 preface. Bounded here instead, from accept to the first request.
         let cut_off = {
-            let mut serving = std::pin::pin!(server.serve_connection(TokioIo::new(lent), service));
+            let mut serving = std::pin::pin!(serving);
             let mut first = std::pin::pin!(tokio::time::sleep(deadlines.first_request));
             std::future::poll_fn(|cx| {
                 // An error here is the end of one connection: the peer went away or spoke
@@ -1189,6 +1250,10 @@ pub enum ProxyError {
     /// An endpoint address that cannot be written into a request target.
     #[error("endpoint {0} cannot be part of a request target")]
     Endpoint(SocketAddr),
+    /// EdgeRush's own server with the engine's pooled client, which cannot carry what it
+    /// reads.
+    #[error("the engine's pooled client cannot carry requests EdgeRush's own server reads")]
+    Pairing,
 }
 
 fn authority(endpoint: &SocketAddr) -> Result<Authority, ProxyError> {
@@ -1343,9 +1408,16 @@ mod tests {
     /// How late a deadline may be seen to fire on a loaded machine.
     const SLACK: Duration = Duration::from_millis(400);
 
-    /// Serves a worker for `upstream` on a listener of its own, and says where.
-    async fn serving_worker(upstream: SocketAddr) -> SocketAddr {
-        let worker = Worker::with_deadlines(sending_to(upstream), H1Limits::default(), SHORT);
+    /// The servers a client's connection can be taken by.
+    const DOWNSTREAMS: [Downstream; 2] = [Downstream::Hyper, Downstream::Ours];
+
+    /// Serves a worker for `upstream` on a listener of its own, its clients taken by `by`,
+    /// and says where.
+    async fn serving_worker(upstream: SocketAddr, by: Downstream) -> SocketAddr {
+        let proxy = Proxy::new(everything_to(upstream), NonZeroUsize::MIN, Upstream::Ours)
+            .and_then(|proxy| proxy.serving_by(by))
+            .unwrap();
+        let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
         let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
@@ -1390,9 +1462,9 @@ mod tests {
 
     /// A connection that has not finished its first request head is closed at its first
     /// request deadline from being accepted, whether it never said anything, stalled part
-    /// way through the HTTP/2 preface — where the engine's own protocol detection waits
-    /// with no deadline of its own — or is trickling a head. Without this each of them
-    /// holds its connection for ever.
+    /// way through the HTTP/2 preface — where protocol detection, the engine's or ours,
+    /// waits with no deadline of its own — or is trickling a head. Without this each of
+    /// them holds its connection for ever.
     #[tokio::test]
     async fn a_connection_without_a_first_request_is_closed_at_its_deadline() {
         use tokio::io::AsyncWriteExt;
@@ -1400,16 +1472,24 @@ mod tests {
         local
             .run_until(async {
                 let (upstream, _) = counting_upstream().await;
-                let front = serving_worker(upstream).await;
-                for said in [&b""[..], b"PRI * HT", b"GET / HTTP/1.1\r\nhost: exa"] {
-                    let mut stream = TcpStream::connect(front).await.unwrap();
-                    stream.write_all(said).await.unwrap();
-                    let took = closed_after(&mut stream).await;
-                    assert!(
-                        took >= SHORT.first_request && took < SHORT.first_request + SLACK,
-                        "{:?}: closed after {took:?}",
-                        String::from_utf8_lossy(said)
-                    );
+                for by in DOWNSTREAMS {
+                    let front = serving_worker(upstream, by).await;
+                    for said in [
+                        &b""[..],
+                        b"PRI * HT",
+                        // All of the preface but its last byte.
+                        &crate::downstream::detect::PREFACE[..23],
+                        b"GET / HTTP/1.1\r\nhost: exa",
+                    ] {
+                        let mut stream = TcpStream::connect(front).await.unwrap();
+                        stream.write_all(said).await.unwrap();
+                        let took = closed_after(&mut stream).await;
+                        assert!(
+                            took >= SHORT.first_request && took < SHORT.first_request + SLACK,
+                            "{by:?}, {:?}: closed after {took:?}",
+                            String::from_utf8_lossy(said)
+                        );
+                    }
                 }
             })
             .await;
@@ -1424,18 +1504,20 @@ mod tests {
         local
             .run_until(async {
                 let (upstream, _) = counting_upstream().await;
-                let front = serving_worker(upstream).await;
-                for then in [&b""[..], b"GET / HT"] {
-                    let mut stream = TcpStream::connect(front).await.unwrap();
-                    stream.write_all(ASKED).await.unwrap();
-                    answered(&mut stream).await;
-                    stream.write_all(then).await.unwrap();
-                    let took = closed_after(&mut stream).await;
-                    assert!(
-                        took >= SHORT.next_request && took < SHORT.next_request + SLACK,
-                        "{:?}: closed after {took:?}",
-                        String::from_utf8_lossy(then)
-                    );
+                for by in DOWNSTREAMS {
+                    let front = serving_worker(upstream, by).await;
+                    for then in [&b""[..], b"GET / HT"] {
+                        let mut stream = TcpStream::connect(front).await.unwrap();
+                        stream.write_all(ASKED).await.unwrap();
+                        answered(&mut stream).await;
+                        stream.write_all(then).await.unwrap();
+                        let took = closed_after(&mut stream).await;
+                        assert!(
+                            took >= SHORT.next_request && took < SHORT.next_request + SLACK,
+                            "{by:?}, {:?}: closed after {took:?}",
+                            String::from_utf8_lossy(then)
+                        );
+                    }
                 }
             })
             .await;
@@ -1450,16 +1532,69 @@ mod tests {
         local
             .run_until(async {
                 let (upstream, _) = counting_upstream().await;
-                let front = serving_worker(upstream).await;
-                let mut stream = TcpStream::connect(front).await.unwrap();
-                tokio::time::sleep(SHORT.first_request - Duration::from_millis(150)).await;
-                stream.write_all(ASKED).await.unwrap();
-                assert!(answered(&mut stream).await.starts_with("HTTP/1.1 200"));
-                tokio::time::sleep(SHORT.next_request - Duration::from_millis(250)).await;
-                stream.write_all(ASKED).await.unwrap();
-                assert!(answered(&mut stream).await.starts_with("HTTP/1.1 200"));
+                for by in DOWNSTREAMS {
+                    let front = serving_worker(upstream, by).await;
+                    let mut stream = TcpStream::connect(front).await.unwrap();
+                    tokio::time::sleep(SHORT.first_request - Duration::from_millis(150)).await;
+                    stream.write_all(ASKED).await.unwrap();
+                    assert!(
+                        answered(&mut stream).await.starts_with("HTTP/1.1 200"),
+                        "{by:?}"
+                    );
+                    tokio::time::sleep(SHORT.next_request - Duration::from_millis(250)).await;
+                    stream.write_all(ASKED).await.unwrap();
+                    assert!(
+                        answered(&mut stream).await.starts_with("HTTP/1.1 200"),
+                        "{by:?}"
+                    );
+                }
             })
             .await;
+    }
+
+    /// A TLS ClientHello sent to a plaintext listener is not the HTTP/2 preface, so it
+    /// goes to HTTP/1, which refuses it as a request line that is not one and closes:
+    /// nothing hangs waiting for a preface that will never come.
+    #[tokio::test]
+    async fn a_tls_hello_on_a_plaintext_listener_is_refused_as_http1() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                for by in DOWNSTREAMS {
+                    let front = serving_worker(upstream, by).await;
+                    let mut stream = TcpStream::connect(front).await.unwrap();
+                    stream
+                        .write_all(b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03")
+                        .await
+                        .unwrap();
+                    let mut answer = Vec::new();
+                    let _ended = tokio::time::timeout(
+                        SHORT.first_request / 2,
+                        stream.read_to_end(&mut answer),
+                    )
+                    .await
+                    .unwrap_or_else(|_| panic!("{by:?}: still open"));
+                    let answer = String::from_utf8_lossy(&answer);
+                    assert!(answer.starts_with("HTTP/1.1 400"), "{by:?}: {answer}");
+                }
+            })
+            .await;
+    }
+
+    /// EdgeRush's own server reads bodies the engine's pooled client cannot carry, so the
+    /// two are never put together: the pairing is refused before anything is served.
+    #[test]
+    fn our_server_is_not_paired_with_the_engines_pooled_client() {
+        let paired = |upstream| {
+            Proxy::new(config_with(&["web"]), NonZeroUsize::MIN, upstream)
+                .and_then(|proxy| proxy.serving_by(Downstream::Ours))
+                .map(|_| ())
+        };
+        assert_eq!(paired(Upstream::Hyper), Err(ProxyError::Pairing));
+        assert_eq!(paired(Upstream::HyperConn), Ok(()));
+        assert_eq!(paired(Upstream::Ours), Ok(()));
     }
 
     /// A worker takes on only so many exchanges at once, whichever client carries them,
@@ -1973,6 +2108,11 @@ upstreams:
     /// A proxy of one listener that sends everything to `upstream`, by EdgeRush's own
     /// path because that is the path with a bound on it.
     fn sending_to(upstream: SocketAddr) -> Arc<Proxy> {
+        Arc::new(Proxy::new(everything_to(upstream), NonZeroUsize::MIN, Upstream::Ours).unwrap())
+    }
+
+    /// A config of one listener that sends everything to `upstream`.
+    fn everything_to(upstream: SocketAddr) -> Compiled {
         let yaml = format!(
             r#"
 listeners:
@@ -1991,8 +2131,7 @@ upstreams:
 "#
         );
         let config: Config = serde_saphyr::from_str(&yaml).unwrap();
-        let compiled = compile(&config).unwrap();
-        Arc::new(Proxy::new(compiled, NonZeroUsize::MIN, Upstream::Ours).unwrap())
+        compile(&config).unwrap()
     }
 
     /// Waits for something the test is about to depend on, and fails rather than hangs

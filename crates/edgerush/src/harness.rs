@@ -20,7 +20,7 @@ use crate::bind::{Port, listen};
 use crate::config_file::{ConfigFile, Rejected};
 use crate::per_core::{self, Accept};
 use edgerush_config::Compiled;
-use edgerush_proxy::{H1Limits, Proxy, ProxyError, Upstream};
+use edgerush_proxy::{Downstream, H1Limits, Proxy, ProxyError, Upstream};
 use std::convert::Infallible;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -53,6 +53,9 @@ Options:
                            over our pool, which ours is compared with; hyper: the
                            engine's pooled client, kept as a fixed point
                            [default: ours]
+      --downstream <BY>    Which server takes a client's connection. hyper: the
+                           engine's; ours: EdgeRush's own, being built, which cannot
+                           be paired with '--upstream hyper' [default: hyper]
       --idle-per-destination <N>
                            How many idle connections a worker keeps to one destination,
                            whichever client carries the request. For comparing the two at
@@ -94,6 +97,7 @@ enum Parsed {
 struct Options {
     config: PathBuf,
     upstream: Upstream,
+    downstream: Downstream,
     metrics: Option<SocketAddr>,
     /// `None` is one for every CPU the process may use.
     workers: Option<NonZeroUsize>,
@@ -122,6 +126,8 @@ enum UsageError {
     Accept(String),
     #[error("'{0}' is not a way to reach an upstream: ours, hyper-conn or hyper")]
     Upstream(String),
+    #[error("'{0}' is not a server for clients: hyper or ours")]
+    Downstream(String),
     #[error("'{1}' is not a number of idle connections for '{0}': 0 or more")]
     Idle(&'static str, String),
 }
@@ -134,6 +140,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut limits = H1Limits::default();
     let (mut per_destination, mut total) = (false, false);
     let mut upstream = None;
+    let mut downstream = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
@@ -167,6 +174,17 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                 };
                 if upstream.replace(by).is_some() {
                     return Err(UsageError::Twice("--upstream"));
+                }
+            }
+            "--downstream" => {
+                let by = args.next().ok_or(UsageError::NoValue("--downstream"))?;
+                let by = match by.as_str() {
+                    "hyper" => Downstream::Hyper,
+                    "ours" => Downstream::Ours,
+                    _ => return Err(UsageError::Downstream(by)),
+                };
+                if downstream.replace(by).is_some() {
+                    return Err(UsageError::Twice("--downstream"));
                 }
             }
             "--idle-per-destination" => {
@@ -207,6 +225,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     Ok(Parsed::Run(Box::new(Options {
         config,
         upstream: upstream.unwrap_or_default(),
+        downstream: downstream.unwrap_or_default(),
         metrics,
         workers,
         accept: accept.unwrap_or(Accept::Balanced),
@@ -235,6 +254,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
     let Options {
         config: path,
         upstream,
+        downstream,
         metrics,
         workers,
         accept,
@@ -257,6 +277,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
     };
     let mut bound: Vec<Bound> = config.listeners.iter().map(Bound::from).collect();
     let proxy = Proxy::new(config, workers, upstream)
+        .and_then(|proxy| proxy.serving_by(downstream))
         .map(Arc::new)
         .map_err(|error| Failure::Proxy { path, error })?;
 
@@ -307,7 +328,13 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
     };
     say(
         stderr,
-        format_args!("{workers} worker{plural}, thread-per-core, upstreams by {by}"),
+        format_args!(
+            "{workers} worker{plural}, thread-per-core, clients by {}, upstreams by {by}",
+            match downstream {
+                Downstream::Hyper => "hyper's server",
+                Downstream::Ours => "our own server",
+            }
+        ),
     );
 
     loop {
@@ -435,6 +462,7 @@ mod tests {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
             upstream: Upstream::Ours,
+            downstream: Downstream::Hyper,
             metrics: None,
             workers: None,
             accept: Accept::Balanced,
@@ -453,6 +481,7 @@ mod tests {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
             upstream: Upstream::Ours,
+            downstream: Downstream::Hyper,
             metrics: None,
             workers: None,
             accept: Accept::Balanced,
@@ -496,6 +525,32 @@ mod tests {
     }
 
     #[test]
+    fn the_downstream_server_is_as_the_command_line_says() {
+        for (by, downstream) in [("hyper", Downstream::Hyper), ("ours", Downstream::Ours)] {
+            let Ok(Parsed::Run(options)) = parsed(&["--config", "dev.yaml", "--downstream", by])
+            else {
+                panic!("{by} was not taken");
+            };
+            assert_eq!(options.downstream, downstream, "{by}");
+        }
+        assert_eq!(
+            parsed(&["--config", "dev.yaml", "--downstream", "nginx"]),
+            Err(UsageError::Downstream("nginx".to_owned()))
+        );
+        assert_eq!(
+            parsed(&[
+                "--config",
+                "dev.yaml",
+                "--downstream",
+                "ours",
+                "--downstream",
+                "ours"
+            ]),
+            Err(UsageError::Twice("--downstream"))
+        );
+    }
+
+    #[test]
     fn the_upstream_client_is_as_the_command_line_says() {
         for (by, upstream) in [
             ("ours", Upstream::Ours),
@@ -505,6 +560,7 @@ mod tests {
             let options = Options {
                 config: PathBuf::from("dev.yaml"),
                 upstream,
+                downstream: Downstream::Hyper,
                 metrics: None,
                 workers: None,
                 accept: Accept::Balanced,
@@ -538,6 +594,7 @@ mod tests {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
             upstream: Upstream::Ours,
+            downstream: Downstream::Hyper,
             metrics: None,
             workers: NonZeroUsize::new(4),
             accept: Accept::Balanced,
@@ -554,6 +611,7 @@ mod tests {
         let options = Options {
             config: PathBuf::from("dev.yaml"),
             upstream: Upstream::Ours,
+            downstream: Downstream::Hyper,
             metrics: Some("[::]:9090".parse().unwrap()),
             workers: None,
             accept: Accept::Balanced,

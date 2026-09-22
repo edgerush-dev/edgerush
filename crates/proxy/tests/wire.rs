@@ -18,7 +18,7 @@
 )]
 
 use edgerush_config::{Config, compile};
-use edgerush_proxy::{Proxy, Upstream, Worker};
+use edgerush_proxy::{Downstream, Proxy, Upstream, Worker};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -67,14 +67,7 @@ upstreams:
 "#
     );
     let config: Config = serde_saphyr::from_str(&yaml).unwrap();
-    let proxy = Arc::new(
-        Proxy::new(
-            compile(&config).unwrap(),
-            NonZeroUsize::MIN,
-            upstream_under_test(),
-        )
-        .unwrap(),
-    );
+    let proxy = Arc::new(under_test(compile(&config).unwrap()));
     let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     socket.set_nonblocking(true).unwrap();
     let address = socket.local_addr().unwrap();
@@ -109,6 +102,25 @@ fn upstream_under_test() -> Upstream {
         Ok("hyper-conn") => Upstream::HyperConn,
         _ => Upstream::Ours,
     }
+}
+
+/// Which server takes the suite's connections, told the same way:
+///
+/// ```text
+/// EDGERUSH_TEST_DOWNSTREAM=ours cargo test     EdgeRush's own, as far as it goes
+/// ```
+fn downstream_under_test() -> Downstream {
+    match std::env::var("EDGERUSH_TEST_DOWNSTREAM").as_deref() {
+        Ok("ours") => Downstream::Ours,
+        _ => Downstream::Hyper,
+    }
+}
+
+/// A data plane of `config`, reaching upstreams and serving clients as the suite is told.
+fn under_test(config: edgerush_config::Compiled) -> Proxy {
+    Proxy::new(config, NonZeroUsize::MIN, upstream_under_test())
+        .and_then(|proxy| proxy.serving_by(downstream_under_test()))
+        .unwrap()
 }
 
 /// An upstream that is a socket and nothing more: every connection it accepts is handed to
@@ -261,7 +273,7 @@ async fn a_body_of_unknown_length_is_chunked_in_both_directions() {
         ))
         .await;
 
-    let sent = seen.recv().await.unwrap();
+    let sent = within(seen.recv()).await.unwrap();
     assert!(sent.contains("transfer-encoding: chunked\r\n"), "{sent}");
     assert!(sent.ends_with("5\r\nhello\r\n0\r\n\r\n"), "{sent}");
     let head = client.head().await;
@@ -299,7 +311,7 @@ async fn a_requests_trailers_reach_the_upstream_only_by_our_own_path() {
         ))
         .await;
 
-    let body = seen.recv().await.unwrap();
+    let body = within(seen.recv()).await.unwrap();
     match upstream_under_test() {
         // Lost between the service and the wire, which is the half being replaced.
         Upstream::Hyper | Upstream::HyperConn => assert_eq!(body, "5\r\nhello\r\n0\r\n\r\n"),
@@ -336,7 +348,7 @@ async fn a_trailer_the_requests_connection_named_does_not_travel_on() {
         ))
         .await;
 
-    let sent = seen.recv().await.unwrap();
+    let sent = within(seen.recv()).await.unwrap();
     // Neither as a trailer nor as a name the head declared it would send.
     assert!(
         !sent.to_ascii_lowercase().contains("x-secret"),
@@ -386,7 +398,7 @@ async fn hypers_server_gives_a_service_the_requests_trailers() {
             "5\r\nhello\r\n0\r\nx-sent: yes\r\n\r\n"
         ))
         .await;
-    assert_eq!(seen.recv().await.unwrap(), "{\"x-sent\": \"yes\"}");
+    assert_eq!(within(seen.recv()).await.unwrap(), "{\"x-sent\": \"yes\"}");
 }
 
 /// A response's trailers reach a client that said it would take them.
@@ -461,11 +473,14 @@ async fn an_expectation_of_continue_is_answered_here_and_forwarded_too() {
 
     // Before the client has sent a byte of body, and whatever the upstream has said.
     assert_eq!(client.head().await, "HTTP/1.1 100 Continue\r\n\r\n");
-    let sent = seen.recv().await.unwrap();
+    let sent = within(seen.recv()).await.unwrap();
     assert!(sent.contains("expect: 100-continue\r\n"), "{sent}");
 
     client.write("5\r\nhello\r\n0\r\n\r\n").await;
-    assert_eq!(seen.recv().await.unwrap(), "5\r\nhello\r\n0\r\n\r\n");
+    assert_eq!(
+        within(seen.recv()).await.unwrap(),
+        "5\r\nhello\r\n0\r\n\r\n"
+    );
     let head = client.head().await;
     assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
     assert_eq!(client.body(2).await, "ok");
@@ -792,7 +807,7 @@ async fn equal_repeated_request_lengths_are_made_one_by_the_engine() {
 
     let head = client.head().await;
     assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
-    let sent = seen.recv().await.unwrap();
+    let sent = within(seen.recv()).await.unwrap();
     assert_eq!(sent.matches("content-length:").count(), 1, "{sent}");
     assert!(sent.ends_with("content-length: 5\r\n\r\nhello"), "{sent}");
 }
@@ -2098,7 +2113,11 @@ async fn a_withheld_body_goes_when_the_continue_wait_runs_out() {
     }
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert_eq!(within(client.body(2)).await, "ok");
-    assert_eq!(hears.recv().await.unwrap(), "hello", "the body never went");
+    assert_eq!(
+        within(hears.recv()).await.unwrap(),
+        "hello",
+        "the body never went"
+    );
 
     // **Where the two paths differ, on purpose.** Ours holds the body back for the wait
     // in [13 §7](../../../docs/13-http1-upstream.md) and sends it when that runs out,
