@@ -28,16 +28,21 @@ pub mod script;
 
 use std::time::Duration;
 
-/// What a worker will not go beyond, whatever an upstream sends. Conservative numbers for
-/// development, not settings anybody configures and not the pool's policy, which waits for
-/// the benchmark to be run again with TLS ([13 §7](../../../docs/13-http1-upstream.md)).
+/// What a worker will not go beyond, whatever a client or an upstream sends. Conservative
+/// numbers for development, not settings anybody configures and not the pool's policy,
+/// which waits for the benchmark to be run again with TLS
+/// ([13 §7](../../../docs/13-http1-upstream.md), [14 §8](../../../docs/14-downstream-server.md)).
 ///
 /// A gain that came of loosening these is not a gain, so a benchmark that changes them
 /// says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct H1Limits {
-    /// The most a response head may come to, status line and fields together.
+    /// The most a head may come to, a request's or a response's, its first line and its
+    /// fields together.
     pub head: usize,
+    /// The most a request line may come to, its line ending included. Within `head`, and
+    /// answered apart from it: a target too long to parse has a status of its own.
+    pub request_line: usize,
     /// The most fields a head may carry. The head parser has a maximum of its own
     /// and no more than that is read, whatever this says.
     pub fields: usize,
@@ -102,6 +107,7 @@ impl Default for H1Limits {
     fn default() -> Self {
         Self {
             head: 64 * 1024,
+            request_line: 8 * 1024,
             fields: codec::MOST_FIELDS,
             chunk_line: 4 * 1024,
             trailers: 16 * 1024,

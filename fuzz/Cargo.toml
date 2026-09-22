@@ -57,6 +57,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "h1_request"
+path = "fuzz_targets/h1_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "h1_response"
 path = "fuzz_targets/h1_response.rs"
 test = false
