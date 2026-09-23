@@ -749,7 +749,7 @@ upstreams:
     }
 
     /// A request's head as our own server reads it — the bytes, where each field line lies
-    /// in them — and the header map the engine's server would make of the same bytes; `None`
+    /// in them — and the header map an engine's server would make of the same bytes; `None`
     /// for bytes that neither would take.
     fn both_heads(sent: &[u8]) -> Option<(Parts, RawHead)> {
         let mut room = [httparse::EMPTY_HEADER; 32];

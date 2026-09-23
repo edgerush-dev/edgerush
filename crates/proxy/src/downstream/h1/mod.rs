@@ -21,6 +21,6 @@ pub mod writer;
 // The coordinator, writer and commitment tracker composed against a scripted socket.
 #[cfg(test)]
 mod races;
-// Where the codec and hyper's server answer the same bytes differently.
+// Where the codec and hyper's server, the one it replaced, answer the same bytes differently.
 #[cfg(test)]
 mod differences;

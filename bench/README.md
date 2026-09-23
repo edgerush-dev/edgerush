@@ -29,7 +29,7 @@ bench/run.sh latency 25000 25000 2000   # open loop at these rates: h1, h2, chur
 bench/run.sh carrying               # streamed bodies, a slow upstream, cancellation,
                                     # reload under load, and what idle connections cost
 bench/run.sh hotpaths [RATE]        # H1 saturation and both streamed bodies (default 20/s)
-bench/run.sh frontend               # the engine alone against NGINX, with no upstream
+bench/run.sh frontend               # serving alone against NGINX, with no upstream
 bench/run.sh idle                   # idle connections: never written to, after one
                                     # request, after one large head, at IDLE_COUNTS
 bench/run.sh summary bench/results/<run>
@@ -50,10 +50,9 @@ two is comparing them at the same bounds; every run writes what they were into
 
 ## The variants
 
-`own-server` puts EdgeRush's own downstream server in front of its own client
-(`--downstream ours`, [14 §9](../../docs/14-downstream-server.md)); `ours` and
-`ours-kernel` are served by the engine's server. Every EdgeRush variant reaches its
-upstreams by EdgeRush's own client, the only one there is.
+Both EdgeRush variants serve HTTP/1 clients by EdgeRush's own server and HTTP/2 clients
+by hyper's, and reach their upstreams by EdgeRush's own client
+([14 §9](../../docs/14-downstream-server.md)).
 
 For the client optimisation rerun, use the original machine and fixed frequency with
 `WORKERS=2 REPS=3 VARIANTS="ours nginx" IDLE_PER_DESTINATION=1024
@@ -73,7 +72,7 @@ scenario on the benchmark machine (retain its CPU affinity and frequency setting
 ```sh
 cargo build --profile profiling -p edgerush
 sudo -v
-WORKERS=2 REPS=3 VARIANTS="ours own-server" \
+WORKERS=2 REPS=3 VARIANTS="ours" \
 IDLE_PER_DESTINATION=1024 IDLE_TOTAL=1024 STREAMED=8388608 \
 bench/run.sh profile-body upload 20
 ```
@@ -98,8 +97,7 @@ the upload-loop change can affect answers without changing the response-copy cod
 That is a hypothesis to isolate, not an explanation established by the macro rerun.
 
 `VARIANTS` names what is run, in turns: `ours` — EdgeRush, the default —, `ours-kernel`
-— the same without balancing connections at accept —, and `own-server` — EdgeRush's own
-server in front of its own client (EdgeRush, `proxy.yaml`); then `nginx`
+— the same without balancing connections at accept — (EdgeRush, `proxy.yaml`); then `nginx`
 (`nginx-proxy.conf`), `haproxy` (`haproxy.cfg`), `envoy` (`envoy.yaml`) and `kong`
 (`kong.yml`, without a database). The configs ask for the same
 thing — the same hosts and rules, the same header changes on
@@ -124,7 +122,7 @@ worth as much as the care that went into the other side.
 | `cancelled` | the same, with a 200 ms timeout on every request | Clients that go away part way through an answer: everything the exchange holds has to go with them |
 | `reload` | oha at a steady rate while the config is taken over once a second | The one in [10 §1](../../docs/10-testing.md): no failed request while a config changes. EdgeRush only — the others would need their own reload, which is a different thing to measure |
 | `idle-memory` | `IDLE_CONNECTIONS` connections, answered and then left quiet, on a proxy started afresh | What a connection costs while nothing is happening on it, as the proxy's own resident memory |
-| `frontend` | h2load at saturation, HTTP/1.1 and HTTP/2, for the benchmark's host and for one no route is for; instructions and cycles counted over every process of the variant | What the engine costs by itself: `bare-hyper` (hyper's server answering every request, `crates/proxy/examples/bare_hyper.rs`, built with `cargo build --release -p edgerush-proxy --example bare_hyper`) against `nginx-direct` (`nginx-direct.conf`, NGINX answering itself), and EdgeRush's own answer to an unrouted host (the engine and the request core) against its forwarding (all of it) |
+| `frontend` | h2load at saturation, HTTP/1.1 and HTTP/2, for the benchmark's host and for one no route is for; instructions and cycles counted over every process of the variant | What serving costs by itself: EdgeRush's own answer to an unrouted host (its server and the request core) against `nginx-direct` (`nginx-direct.conf`, NGINX answering itself), and against its forwarding (all of it) |
 
 Every request goes through routing on a config with several hosts and rules and through a
 small filter chain (request and response header changes): `proxy.yaml`.

@@ -1,9 +1,9 @@
-//! EdgeRush's own way of serving a client, beside the engine's.
+//! EdgeRush's own way of serving a client.
 //!
-//! What is here is a candidate: hyper's server takes every connection by default, and this
-//! is adopted only if it passes the gates of [14 §9](../../../docs/14-downstream-server.md).
-//! So far `--downstream ours` uses the detector, which hands each protocol to hyper's
-//! server for it; the HTTP/1 pieces are pure, bytes in and an answer out, with no socket.
+//! Every connection goes through the detector: HTTP/1 to EdgeRush's own server, HTTP/2 to
+//! hyper's until a direct HTTP/2 server of our own passes its gates
+//! ([14 §9](../../../docs/14-downstream-server.md)). The HTTP/1 pieces are pure, bytes in
+//! and an answer out, with no socket, except the connection driver that holds them.
 
 // The HTTP/1 pieces answer only to their own tests until the connection driver arrives
 // (14 §9, step 3). An expectation and not an allowance, so that the day a caller appears

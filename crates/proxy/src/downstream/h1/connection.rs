@@ -17,9 +17,9 @@
 //! from the answer's body, then wakes itself and yields, so that a connection that is always
 //! ready does not keep the worker from its others.
 //!
-//! An `Expect: 100-continue` is met as the engine's server meets it: with a `100` the
-//! first time the body is asked for and nothing of it has arrived. The coordinator that
-//! also relays an upstream's interim heads replaces this in a later step (14 §5, §9).
+//! An `Expect: 100-continue` is the request's continue coordinator's to decide (14 §5): the
+//! driver writes the upstream's interim heads it is to forward, and a `100` of the
+//! coordinator's own when it wants one.
 
 use super::codec::{Head, HeadReader, RequestError, RequestHead, arrival};
 use super::date::HttpDate;
@@ -911,8 +911,8 @@ where
                         connection.deadlines.body_moved(now());
                         let inbound = connection.inbound.borrow();
                         if inbound.ended && inbound.reader.is_none() {
-                            // The engine's server gives up on a request whose client
-                            // closes, and so does this: there is nobody to answer.
+                            // A request whose client closes is given up: there is
+                            // nobody to answer.
                             return Poll::Ready(Err(Stop::Gone));
                         }
                     }

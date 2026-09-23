@@ -42,7 +42,7 @@ repo=$(dirname "$here")
 : "${IDLE_CONNECTIONS:=2000}"
 # The counts `idle` weighs each kind of idle connection at (14 §8).
 : "${IDLE_COUNTS:=2000 20000}"
-: "${VARIANTS:=ours}" # and: own-server ours-kernel nginx haproxy envoy kong
+: "${VARIANTS:=ours}" # and: ours-kernel nginx haproxy envoy kong
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
 
 # Hundreds of connections on either side of the proxy, and more when they churn.
@@ -50,8 +50,6 @@ ulimit -n 65536
 
 # The binary under test. `instructions` points this at a build with symbols in it.
 edgerush=${EDGERUSH:-$repo/target/release/edgerush}
-# The engine alone, for the `frontend` scenarios: cargo build --release -p edgerush-proxy --example bare_hyper
-bare_hyper=${BARE_HYPER:-$repo/target/release/examples/bare_hyper}
 run=/tmp/edgerush-bench
 # The proxy is given a copy rather than the file in the repository: one scenario
 # rewrites it while the load is on, and the repository is not the place for that.
@@ -103,13 +101,9 @@ start_proxy() { # variant
         ) >>"$OUT/proxy.log" 2>&1
         daemon=$(cat "$run-kong/pids/nginx.pid")
         ;;
-    bare-hyper)
-        # The engine alone, answering every request itself (crates/proxy/examples).
-        taskset -c "$PROXY_CPUS" "$bare_hyper" "$proxy_at" "$WORKERS" \
-            2>>"$OUT/proxy.log" &
-        ;;
     nginx-direct)
-        # NGINX answering every request itself: the counterpart of bare-hyper.
+        # NGINX answering every request itself: the counterpart of EdgeRush's own answer to
+        # a host no route is for.
         mkdir -p "$run-direct/tmp"
         sed "s/WORKERS/$WORKERS/" "$here/nginx-direct.conf" >"$run-direct/nginx.conf"
         taskset -c "$PROXY_CPUS" nginx -p "$run-direct/" -c "$run-direct/nginx.conf" \
@@ -132,16 +126,8 @@ start_proxy() { # variant
             2>>"$OUT/proxy.log" &
         ;;
     ours)
-        # EdgeRush, the engine's server in front of its own client.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
             --workers "$WORKERS" $idle \
-            2>>"$OUT/proxy.log" &
-        ;;
-    own-server)
-        # EdgeRush's own downstream server in front of its own client: the path the
-        # downstream work builds (14 section 9).
-        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
-            --downstream ours --workers "$WORKERS" $idle \
             2>>"$OUT/proxy.log" &
         ;;
     *)
@@ -425,7 +411,7 @@ profile-body)
     }
     # -p attaches to every thread in EdgeRush, but not workers of a separate process.
     for variant in $VARIANTS; do
-        case "$variant" in ours | ours-kernel | own-server) ;;
+        case "$variant" in ours | ours-kernel) ;;
         *) echo "profile-body supports EdgeRush client variants only" >&2; exit 2 ;;
         esac
     done
@@ -504,15 +490,11 @@ profile-body)
     each_variant profile_body_runs
     ;;
 frontend)
-    # What the engine costs by itself against NGINX, and what the request core and the
-    # upstream add: every variant at saturation for the benchmark's host (the bare engine
-    # and NGINX answer it themselves; EdgeRush forwards it) and for a host no route is
-    # for (answered by each itself: EdgeRush's 404 is the engine and the request core).
-    # Counted over every process of the variant, so NGINX's workers are included.
-    [ -x "$bare_hyper" ] || {
-        echo "build first: cargo build --release -p edgerush-proxy --example bare_hyper" >&2
-        exit 2
-    }
+    # What serving costs by itself against NGINX, and what the upstream adds: every
+    # variant at saturation for the benchmark's host (nginx-direct answers it itself;
+    # EdgeRush forwards it) and for a host no route is for (answered by each itself:
+    # EdgeRush's 404 is its server and the request core). Counted over every process of
+    # the variant, so NGINX's workers are included.
     frontend_runs() {
         local host_as
         for host_as in "bench.example.com:served" "nowhere.example.com:unrouted"; do

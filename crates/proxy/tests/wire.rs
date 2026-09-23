@@ -18,11 +18,9 @@
 )]
 
 use edgerush_config::{Config, compile};
-use edgerush_proxy::{Downstream, Proxy, Worker};
-use http_body_util::Full;
-use hyper::body::{Bytes, Incoming};
+use edgerush_proxy::{Proxy, Worker};
+use hyper::body::Bytes;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -88,29 +86,7 @@ upstreams:
     address
 }
 
-/// Which server takes the suite's connections. The suite is the same either way — that is
-/// the point of it — so it is told rather than written twice:
-///
-/// ```text
-/// EDGERUSH_TEST_DOWNSTREAM=ours cargo test     EdgeRush's own, as far as it goes
-/// ```
-fn downstream_under_test() -> Downstream {
-    match std::env::var("EDGERUSH_TEST_DOWNSTREAM").as_deref() {
-        Ok("ours") => Downstream::Ours,
-        _ => Downstream::Hyper,
-    }
-}
-
-/// Whether a client is passed the upstream's interim answers: only where EdgeRush's own
-/// server and its own client both carry the request ([14 §5](../../../docs/14-downstream-server.md)).
-/// The engine's server cannot send a 1xx of a service's, and the engine's client consumes
-/// the ones it reads.
-fn interim_answers_are_passed_on() -> bool {
-    downstream_under_test() == Downstream::Ours
-}
-
-/// The first head after `first` that is not interim, and the interim ones before it, which
-/// a client is sent only where [`interim_answers_are_passed_on`].
+/// The first head after `first` that is not interim, and the interim ones before it.
 async fn past_interim(client: &mut Wire, first: String) -> (Vec<String>, String) {
     let mut interim = Vec::new();
     let mut head = first;
@@ -118,17 +94,12 @@ async fn past_interim(client: &mut Wire, first: String) -> (Vec<String>, String)
         interim.push(head);
         head = within(client.head()).await;
     }
-    if !interim_answers_are_passed_on() {
-        assert!(interim.is_empty(), "passed on: {interim:?}");
-    }
     (interim, head)
 }
 
-/// A data plane of `config`, serving clients as the suite is told.
+/// A data plane of `config`, on one worker.
 fn under_test(config: edgerush_config::Compiled) -> Proxy {
-    Proxy::new(config, NonZeroUsize::MIN)
-        .unwrap()
-        .serving_by(downstream_under_test())
+    Proxy::new(config, NonZeroUsize::MIN).unwrap()
 }
 
 /// An upstream that is a socket and nothing more: every connection it accepts is handed to
@@ -289,17 +260,10 @@ async fn a_body_of_unknown_length_is_chunked_in_both_directions() {
     assert_eq!(client.chunked_body().await, "2\r\nhi\r\n0\r\n\r\n");
 }
 
-/// **Where the two paths differ, on purpose.** A client's trailers reach the service
-/// either way — hyper's server parses them, which
-/// [`hypers_server_gives_a_service_the_requests_trailers`] shows. What becomes of them
-/// next is the difference: hyper's client puts none on the wire, and EdgeRush's own puts
-/// them there.
-///
-/// This is the one place the candidate is meant to disagree with the baseline, and it
-/// disagrees by being right ([13 §5](../../../docs/13-http1-upstream.md)). A differential
-/// test that expected these to match would be asking the new path to lose them too.
+/// A client's trailers reach the upstream ([13 §5](../../../docs/13-http1-upstream.md)),
+/// which hyper's client, the one EdgeRush used before its own, never did.
 #[tokio::test]
-async fn a_requests_trailers_reach_the_upstream_only_by_our_own_path() {
+async fn a_requests_trailers_reach_the_upstream() {
     let (saw, mut seen) = reporter();
     let upstream = raw_upstream(move |mut wire| {
         let saw = saw.clone();
@@ -367,42 +331,6 @@ async fn a_trailer_the_requests_connection_named_does_not_travel_on() {
     );
 }
 
-/// Hyper's server does hand the trailers to the service, so what the test above measures
-/// is the upstream half losing them and not the downstream half never seeing them. This
-/// asks hyper alone, with no proxy in the way, so that the two halves cannot be confused.
-#[tokio::test]
-async fn hypers_server_gives_a_service_the_requests_trailers() {
-    use http_body_util::BodyExt;
-
-    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = socket.local_addr().unwrap();
-    let (saw, mut seen) = reporter();
-    tokio::spawn(async move {
-        let (stream, _) = socket.accept().await.unwrap();
-        let service = hyper::service::service_fn(move |request: hyper::Request<Incoming>| {
-            let saw = saw.clone();
-            async move {
-                let body = request.into_body().collect().await.unwrap();
-                let trailers = body.trailers().cloned().unwrap_or_default();
-                saw.send(format!("{trailers:?}")).unwrap();
-                Ok::<_, Infallible>(hyper::Response::new(Full::new(Bytes::new())))
-            }
-        });
-        let _closed = auto::Builder::new(TokioExecutor::new())
-            .serve_connection(TokioIo::new(stream), service)
-            .await;
-    });
-
-    let mut client = Wire::to(address).await;
-    client
-        .write(concat!(
-            "POST /x HTTP/1.1\r\nhost: a.test\r\ntransfer-encoding: chunked\r\n\r\n",
-            "5\r\nhello\r\n0\r\nx-sent: yes\r\n\r\n"
-        ))
-        .await;
-    assert_eq!(within(seen.recv()).await.unwrap(), "{\"x-sent\": \"yes\"}");
-}
-
 /// A response's trailers reach a client that said it would take them.
 #[tokio::test]
 async fn a_responses_trailers_reach_a_client_that_asked_for_them() {
@@ -447,9 +375,7 @@ fn trailing_upstream() -> SocketAddr {
 }
 
 /// The client sees exactly one 100, before it has sent a byte, and the expectation is
-/// forwarded to the upstream as well. Where EdgeRush's own server and client carry the
-/// request, that 100 is the upstream's own, passed on (14 §5); behind hyper's server it is
-/// the server's own, sent as soon as the body is wanted, and the upstream's is consumed.
+/// forwarded to the upstream as well. That 100 is the upstream's own, passed on (14 §5).
 #[tokio::test]
 async fn an_expectation_of_continue_is_answered_here_and_forwarded_too() {
     let (saw, mut seen) = reporter();
@@ -490,13 +416,10 @@ async fn an_expectation_of_continue_is_answered_here_and_forwarded_too() {
 
 /// An interim answer reaches the client ahead of the final one, as
 /// [RFC 9110 §15.2](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.2) has a proxy
-/// do ("A proxy MUST forward 1xx responses"), where EdgeRush's own server and client carry
-/// the request ([14 §5](../../../docs/14-downstream-server.md)). **Elsewhere a gap, not a
-/// promise:** hyper's server has no way to send one from a service's response, and hyper's
-/// client consumes them, so there the final response follows alone
-/// ([13 §5](../../../docs/13-http1-upstream.md)).
+/// do ("A proxy MUST forward 1xx responses")
+/// ([14 §5](../../../docs/14-downstream-server.md)).
 #[tokio::test]
-async fn an_interim_response_is_passed_on_where_both_ends_are_ours() {
+async fn an_interim_response_is_passed_on() {
     let upstream = raw_upstream(move |mut wire| async move {
         let _head = wire.head().await;
         wire.write("HTTP/1.1 103 Early Hints\r\nlink: </s.css>; rel=preload\r\n\r\n")
@@ -512,14 +435,12 @@ async fn an_interim_response_is_passed_on_where_both_ends_are_ours() {
 
     let first = within(client.head()).await;
     let (interim, head) = past_interim(&mut client, first).await;
-    if interim_answers_are_passed_on() {
-        assert_eq!(interim.len(), 1, "{interim:?}");
-        assert!(interim[0].starts_with("HTTP/1.1 103 "), "{interim:?}");
-        assert!(
-            interim[0].contains("link: </s.css>; rel=preload\r\n"),
-            "{interim:?}"
-        );
-    }
+    assert_eq!(interim.len(), 1, "{interim:?}");
+    assert!(interim[0].starts_with("HTTP/1.1 103 "), "{interim:?}");
+    assert!(
+        interim[0].contains("link: </s.css>; rel=preload\r\n"),
+        "{interim:?}"
+    );
     assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
     assert!(!head.contains("link:"), "{head}");
     assert_eq!(client.body(2).await, "ok");
@@ -630,7 +551,7 @@ async fn an_http_1_0_client_is_sent_a_chunked_answer_without_its_chunks() {
 /// The gateway's own error answers leave an HTTP/1.1 client's connection open: a 400 is
 /// about a target that was framed without doubt, and a 502 about the upstream, so neither
 /// is a reason to make the client connect again (03 §11). Where a body is left unread
-/// the engine's server closes, which is another test's business.
+/// the server closes, which is another test's business.
 #[tokio::test]
 async fn the_gateways_own_errors_leave_the_clients_connection_open() {
     let (upstream, _accepts) = hostile_first(|mut wire| async move {
@@ -790,17 +711,11 @@ async fn a_close_delimited_response_is_framed_again_as_chunks() {
     );
 }
 
-/// **What the upstream parser may not claim.** Two `Content-Length` fields that say the
-/// same thing are made one by hyper's server before the request reaches EdgeRush at all,
-/// so the upstream sees a single field and nothing here rejected anything. A new upstream
-/// *response* parser rejects repeated lengths, equal or not
-/// ([13 §4](../../../docs/13-http1-upstream.md)); that is the other direction, and this
-/// test is here so that the two are not confused.
-///
-/// EdgeRush's own server refuses such a request with a 400, the other choice RFC 9110 §8.6
-/// allows and the one its upstream side makes ([14 §4](../../../docs/14-downstream-server.md)).
+/// Two `Content-Length` fields that say the same thing are refused with a 400, one of the
+/// two choices RFC 9110 §8.6 allows and the one the upstream side makes of a response
+/// ([14 §4](../../../docs/14-downstream-server.md)); the upstream never sees the request.
 #[tokio::test]
-async fn equal_repeated_request_lengths_are_made_one_by_the_engine() {
+async fn equal_repeated_request_lengths_are_refused() {
     let (saw, mut seen) = reporter();
     let upstream = raw_upstream(move |mut wire| {
         let saw = saw.clone();
@@ -821,18 +736,11 @@ async fn equal_repeated_request_lengths_are_made_one_by_the_engine() {
         .await;
 
     let head = client.head().await;
-    if downstream_under_test() == Downstream::Ours {
-        assert!(head.starts_with("HTTP/1.1 400 "), "{head}");
-        assert!(
-            seen.try_recv().is_err(),
-            "a refused request reached the upstream"
-        );
-        return;
-    }
-    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
-    let sent = within(seen.recv()).await.unwrap();
-    assert_eq!(sent.matches("content-length:").count(), 1, "{sent}");
-    assert!(sent.ends_with("content-length: 5\r\n\r\nhello"), "{sent}");
+    assert!(head.starts_with("HTTP/1.1 400 "), "{head}");
+    assert!(
+        seen.try_recv().is_err(),
+        "a refused request reached the upstream"
+    );
 }
 
 /// What the engine puts on the wire follows what the answer's body says is left of it,
@@ -1528,9 +1436,7 @@ async fn a_connection_that_closes_after_an_interim_answer_fails_the_request() {
 
     let first = asks(&mut client, "/first").await;
     let (interim, head) = past_interim(&mut client, first).await;
-    if interim_answers_are_passed_on() {
-        assert_eq!(interim.len(), 1, "{interim:?}");
-    }
+    assert_eq!(interim.len(), 1, "{interim:?}");
     assert!(head.starts_with("HTTP/1.1 502"), "{head}");
     assert_eq!(
         accepts.load(Ordering::SeqCst),
@@ -1755,8 +1661,8 @@ async fn an_answer_with_two_lengths_that_disagree_is_refused() {
 /// end's to guess.
 ///
 /// Lengths that *disagree* are an unrecoverable error either way, which is the test
-/// above. The request direction is hyper's server and not this rule at all, which
-/// `equal_repeated_request_lengths_are_made_one_by_the_engine` measures.
+/// above. The request direction makes the same choice, which
+/// `equal_repeated_request_lengths_are_refused` measures.
 #[tokio::test]
 async fn an_answer_with_two_equal_lengths_is_refused_by_our_own_path() {
     let answer = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
@@ -1782,8 +1688,7 @@ async fn an_answer_with_a_length_too_big_to_count_is_refused() {
 /// chooses to forward it "MUST first remove the received Content-Length field and process
 /// the Transfer-Encoding". Ours takes the error route. The engine's client reads the body
 /// by its chunks but leaves the length in the head it hands over, so the gateway removes
-/// it: left in, the engine's server would tell the client that length and cut the body to
-/// it. Here the length says three and the chunks carry five, so a length that survived
+/// it: left in, the server would tell the client that length and cut the body to it. Here the length says three and the chunks carry five, so a length that survived
 /// shows ([13 §5](../../../docs/13-http1-upstream.md)).
 #[tokio::test]
 async fn an_answer_with_both_a_length_and_chunking_is_refused_by_our_own_path() {
@@ -2268,9 +2173,8 @@ async fn an_answer_that_says_close_is_not_reused_though_the_socket_stays_open() 
 
 /// An intermediary speaks its own version: "Intermediaries that process HTTP messages ...
 /// MUST send their own HTTP-version in forwarded messages" (RFC 9110 §6.2). An upstream
-/// that answers in HTTP/1.0 is answered on to an HTTP/1.1 client in HTTP/1.1, and one that
-/// answers in HTTP/1.1 is answered on to an HTTP/1.0 client in 1.0 by the engine's server.
-/// EdgeRush's own answers every client in HTTP/1.1, as RFC 9112 §2.3 asks of a server —
+/// that answers in HTTP/1.0 is answered on to an HTTP/1.1 client in HTTP/1.1. And EdgeRush
+/// answers every client in HTTP/1.1, as RFC 9112 §2.3 asks of a server —
 /// the highest version it conforms to within the request's major version — and as NGINX
 /// does; the framing an HTTP/1.0 client can read is unchanged
 /// ([14 §4](../../../docs/14-downstream-server.md)). Found while writing the test above.
@@ -2295,11 +2199,7 @@ async fn an_answer_is_passed_on_in_the_proxys_own_version() {
     old.write("GET /first HTTP/1.0\r\nHost: example.test\r\n\r\n")
         .await;
     let head = within(old.head()).await;
-    let spoken = match downstream_under_test() {
-        Downstream::Hyper => "HTTP/1.0 200",
-        Downstream::Ours => "HTTP/1.1 200",
-    };
-    assert!(head.starts_with(spoken), "{head}");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
 }
 
 /// An idle connection the upstream resets, rather than closes, is as gone as one it
@@ -2693,9 +2593,9 @@ async fn a_bodyless_answer_with_a_length_reaches_an_http2_client_whole() {
 /// answer's framing fields say what a GET would have been sent (RFC 9110 §9.3.2), so a
 /// length is passed on as it came and none is made up — a `content-length: 0` for a GET
 /// that would have been chunked is a claim about a body nobody measured. A 204 is told
-/// nothing about a length at all (RFC 9110 §8.6). A 304's length is dropped on both paths
-/// by the engine's server, which §8.6 allows ("A server MAY send a Content-Length header
-/// field in a 304 response"); this says so if that ever changes.
+/// nothing about a length at all (RFC 9110 §8.6). A 304's length is dropped, which §8.6
+/// allows ("A server MAY send a Content-Length header field in a 304 response"); this says
+/// so if that ever changes.
 #[tokio::test]
 async fn a_bodyless_answer_tells_an_http1_client_no_length_it_did_not_have() {
     let upstream = raw_upstream(|mut wire| async move {

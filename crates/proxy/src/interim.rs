@@ -7,7 +7,7 @@
 //! of its own, since a request's extensions take only what may cross threads, and this may
 //! not. The upstream exchange tells it what it sees in wire order, and the server writes out
 //! what it is to forward while it waits for the final answer. A request that comes with none
-//! — one the engine's server read — is served by an exchange with a channel of its own that
+//! — one hyper's HTTP/2 server read — is served by an exchange with a channel of its own that
 //! nobody listens on: the same continue decision, and every 1xx consumed.
 //!
 //! What waits here is bounded by the exchange's own interim limits (13 §7), and the server

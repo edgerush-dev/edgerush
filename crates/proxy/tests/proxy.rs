@@ -13,7 +13,7 @@
 )]
 
 use edgerush_config::{Compiled, Config, compile};
-use edgerush_proxy::{Downstream, Proxy, Worker};
+use edgerush_proxy::{Proxy, Worker};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Either, Empty, Full};
@@ -136,24 +136,9 @@ async fn proxy(yaml: &str) -> BTreeMap<String, SocketAddr> {
     reloadable_proxy(yaml).await.1
 }
 
-/// Which server takes the suite's connections. The suite is the same either way — that is
-/// the point of it — so it is told rather than written twice:
-///
-/// ```text
-/// EDGERUSH_TEST_DOWNSTREAM=ours cargo test     EdgeRush's own, as far as it goes
-/// ```
-fn downstream_under_test() -> Downstream {
-    match std::env::var("EDGERUSH_TEST_DOWNSTREAM").as_deref() {
-        Ok("ours") => Downstream::Ours,
-        _ => Downstream::Hyper,
-    }
-}
-
-/// A data plane of `config`, serving clients as the suite is told.
+/// A data plane of `config`, on one worker.
 fn under_test(config: edgerush_config::Compiled) -> Proxy {
-    Proxy::new(config, NonZeroUsize::MIN)
-        .unwrap()
-        .serving_by(downstream_under_test())
+    Proxy::new(config, NonZeroUsize::MIN).unwrap()
 }
 
 /// The same, with the proxy itself for reloading it.
