@@ -26,6 +26,12 @@ pub const RESERVED: [HeaderName; 8] = [
     header::CONTENT_LENGTH,
 ];
 
+/// The most entries each of `set`, `add` and `remove` may have: Gateway API's own bound
+/// (`HTTPHeaderFilter`, `MaxItems=16` on each). With a rule's modifier the only one a request
+/// meets, what a request's head may have added to it is bounded, which a head kept as the
+/// bytes it arrived in, with its edits beside it, relies on.
+pub const MOST_PER_LIST: usize = 16;
+
 /// A validated set of changes to a header map.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HeaderModifier {
@@ -41,7 +47,8 @@ impl HeaderModifier {
     ///
     /// Returns a [`HeaderModifierError`] for a name that is not a header name or is
     /// [`RESERVED`], a value that no header could have (empty, white space at either end,
-    /// control characters), or a header that is named more than once.
+    /// control characters), a header that is named more than once, or more than
+    /// [`MOST_PER_LIST`] entries in one of the three.
     pub fn new<'a>(
         set: impl IntoIterator<Item = (&'a str, &'a str)>,
         add: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -50,10 +57,19 @@ impl HeaderModifier {
         let mut named = Named(Vec::new());
         let set = named.pairs(set)?;
         let add = named.pairs(add)?;
-        let remove = remove
+        let remove: Box<[HeaderName]> = remove
             .into_iter()
             .map(|name| named.once(name))
             .collect::<Result<_, _>>()?;
+        for (list, count) in [
+            ("set", set.len()),
+            ("add", add.len()),
+            ("remove", remove.len()),
+        ] {
+            if count > MOST_PER_LIST {
+                return Err(HeaderModifierError::TooMany(list));
+            }
+        }
         Ok(Self { set, add, remove })
     }
 
@@ -130,6 +146,9 @@ pub enum HeaderModifierError {
     /// The header is named more than once, within `set`, `add` and `remove` or across them.
     #[error("header `{0}` is named more than once")]
     NamedTwice(String),
+    /// More than [`MOST_PER_LIST`] entries in `set`, `add` or `remove`.
+    #[error("more than {MOST_PER_LIST} headers in `{0}`")]
+    TooMany(&'static str),
 }
 
 #[cfg(test)]
@@ -271,6 +290,31 @@ mod tests {
         );
         assert_eq!(HeaderModifier::new([("x-a", "1")], [], ["x-a"]), twice);
         assert_eq!(HeaderModifier::new([], [("x-a", "1")], ["x-a"]), twice);
+    }
+
+    /// Gateway API holds each of `set`, `add` and `remove` to 16 entries, and so does this:
+    /// 16 goes, 17 does not, in any of the three.
+    #[test]
+    fn more_than_sixteen_in_a_list_is_rejected() {
+        let names: Vec<String> = (0..=MOST_PER_LIST).map(|n| format!("x-{n}")).collect();
+        let pairs = |count: usize| names[..count].iter().map(|name| (name.as_str(), "v"));
+        let removed = |count: usize| names[..count].iter().map(String::as_str);
+        assert!(HeaderModifier::new(pairs(MOST_PER_LIST), [], []).is_ok());
+        assert!(HeaderModifier::new([], pairs(MOST_PER_LIST), []).is_ok());
+        assert!(HeaderModifier::new([], [], removed(MOST_PER_LIST)).is_ok());
+        let too_many = |list| Err(HeaderModifierError::TooMany(list));
+        assert_eq!(
+            HeaderModifier::new(pairs(MOST_PER_LIST + 1), [], []),
+            too_many("set")
+        );
+        assert_eq!(
+            HeaderModifier::new([], pairs(MOST_PER_LIST + 1), []),
+            too_many("add")
+        );
+        assert_eq!(
+            HeaderModifier::new([], [], removed(MOST_PER_LIST + 1)),
+            too_many("remove")
+        );
     }
 
     #[test]
