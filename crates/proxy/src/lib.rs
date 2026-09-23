@@ -23,6 +23,9 @@ pub mod fields;
 mod fields;
 mod h1;
 pub mod head;
+#[cfg(feature = "fuzzing")]
+pub mod hop_by_hop;
+#[cfg(not(feature = "fuzzing"))]
 mod hop_by_hop;
 pub mod host;
 mod interim;

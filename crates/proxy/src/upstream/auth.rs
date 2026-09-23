@@ -4,8 +4,8 @@
 //! must never leave a connection available to a different downstream client.
 
 use edgerush_router::Fields;
+use http::StatusCode;
 use http::header::{AUTHORIZATION, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, WWW_AUTHENTICATE};
-use http::{HeaderMap, StatusCode};
 
 /// Read the outgoing head, after filters: proxy credentials from the client were
 /// stripped, but a rule can add them, or replace or remove origin credentials.
@@ -17,16 +17,13 @@ pub(crate) fn carries_credentials<F: Fields + ?Sized>(headers: &F) -> bool {
 
 /// A challenge is an extra reason for the custom path not to pool a connection. It
 /// does not itself authenticate a client; the shared guarantee is on sent credentials.
-pub(crate) fn challenges(status: StatusCode, headers: &HeaderMap) -> bool {
+pub fn challenges<F: Fields + ?Sized>(status: StatusCode, headers: &F) -> bool {
     let name = match status {
         StatusCode::UNAUTHORIZED => WWW_AUTHENTICATE,
         StatusCode::PROXY_AUTHENTICATION_REQUIRED => PROXY_AUTHENTICATE,
         _ => return false,
     };
-    headers
-        .get_all(name)
-        .iter()
-        .any(|value| has_challenge(value.as_bytes()))
+    headers.values(&name).any(has_challenge)
 }
 
 fn ows(bytes: &[u8]) -> &[u8] {
@@ -70,7 +67,7 @@ fn has_challenge(value: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::HeaderValue;
+    use http::{HeaderMap, HeaderValue};
 
     #[test]
     fn connection_bound_credentials_match_schemes_not_substrings() {

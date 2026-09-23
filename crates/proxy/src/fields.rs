@@ -204,7 +204,6 @@ impl FieldLines {
     }
 
     /// How many lines there are.
-    #[cfg(any(test, feature = "fuzzing"))]
     #[must_use]
     pub fn len(&self) -> usize {
         self.lines.len()

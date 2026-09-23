@@ -22,6 +22,10 @@
 //! request whose `Connection` names `Host` or an `X-Forwarded-*` header is rejected, as
 //! Envoy and Pingora do, and so is one whose `Connection` is not a list of tokens.
 
+// `pub` for the benchmarks, which are crates of their own; in an ordinary build none of
+// this is API.
+#![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
+
 use edgerush_router::Fields;
 use http::HeaderMap;
 use http::header::{
@@ -50,10 +54,26 @@ pub(crate) fn is_present(headers: &HeaderMap) -> bool {
 }
 
 /// Whether a name as it arrived, in whatever case, is one of [`HOP_BY_HOP`].
+///
+/// Asked of every line of a head, most of which are none of them. Their lengths tell them
+/// apart all but once, so a name is compared with one of them, or two, or none at all.
+// Always, because with a request's survey and an answer's strip both calling it the
+// compiler stopped putting it in the survey, and a call for every line of every request
+// cost a request's decision more than 1% (the `raw_head` benchmark).
+#[inline(always)]
 pub(crate) fn is_hop_by_hop_name(name: &[u8]) -> bool {
-    HOP_BY_HOP
-        .iter()
-        .any(|hop| hop.as_str().as_bytes().eq_ignore_ascii_case(name))
+    let is = |hop: &[u8]| name.eq_ignore_ascii_case(hop);
+    match name.len() {
+        2 => is(b"te"),
+        7 => is(b"upgrade"),
+        10 => is(b"connection") || is(b"keep-alive"),
+        16 => is(b"proxy-connection"),
+        17 => is(b"transfer-encoding"),
+        18 => is(b"proxy-authenticate"),
+        19 => is(b"proxy-authorization"),
+        25 => is(b"proxy-authentication-info"),
+        _ => false,
+    }
 }
 
 /// Whether the header is one of [`HOP_BY_HOP`]. Header names are held in lower case, and
@@ -126,7 +146,7 @@ pub(crate) fn strip_request(headers: &mut HeaderMap) {
 }
 
 /// Takes the hop-by-hop headers off a response.
-pub(crate) fn strip_response(headers: &mut HeaderMap) {
+pub fn strip_response(headers: &mut HeaderMap) {
     if is_present(headers) {
         strip(headers);
     }
@@ -157,7 +177,7 @@ fn strip(headers: &mut HeaderMap) {
 /// these are hop-by-hop for this hop and do not travel on, among the trailers no more
 /// than among the fields ([13 §4](../../docs/13-http1-upstream.md)). Which client read
 /// the message does not come into it: this is what being an intermediary requires.
-pub(crate) fn nominated<F: Fields + ?Sized>(headers: &F) -> Vec<HeaderName> {
+pub fn nominated<F: Fields + ?Sized>(headers: &F) -> Vec<HeaderName> {
     headers
         .values(&CONNECTION)
         .flat_map(options_of)
@@ -206,6 +226,68 @@ pub enum ConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name as it arrived is hop-by-hop exactly when it is one of the list, in whatever
+    /// case: every one of them, each in upper case, and names that differ by a byte or
+    /// share a length.
+    #[test]
+    fn a_name_is_hop_by_hop_as_the_list_says() {
+        for name in &HOP_BY_HOP {
+            let lower = name.as_str().as_bytes();
+            assert!(is_hop_by_hop_name(lower), "{name}");
+            assert!(is_hop_by_hop_name(&lower.to_ascii_uppercase()), "{name}");
+            let mut near = lower.to_vec();
+            if let Some(last) = near.last_mut() {
+                *last = b'x';
+            }
+            assert!(!is_hop_by_hop_name(&near), "{name}");
+            assert!(!is_hop_by_hop_name(&lower[1..]), "{name}");
+        }
+        for other in [
+            &b""[..],
+            b"t",
+            b"trailer",
+            b"content-length",
+            b"x-connection",
+            b"connectionx",
+            b"keep-alivex",
+            b"proxy-authorisation",
+        ] {
+            assert!(
+                !is_hop_by_hop_name(other),
+                "{}",
+                String::from_utf8_lossy(other)
+            );
+        }
+    }
+
+    /// Names of the list in any case, and any names at all.
+    fn any_name() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        let listed = (
+            prop::sample::select(HOP_BY_HOP.to_vec()),
+            prop::collection::vec(any::<bool>(), 26),
+        )
+            .prop_map(|(name, upper)| {
+                name.as_str()
+                    .chars()
+                    .zip(upper)
+                    .map(|(c, up)| if up { c.to_ascii_uppercase() } else { c })
+                    .collect::<String>()
+            });
+        prop_oneof![listed, "[a-zA-Z-]{0,26}"]
+    }
+
+    proptest::proptest! {
+        /// And for any name at all, the same as comparing it with each of the list.
+        #[test]
+        fn any_name_is_hop_by_hop_as_the_list_says(name in any_name()) {
+            let by_list = HOP_BY_HOP
+                .iter()
+                .any(|hop| hop.as_str().eq_ignore_ascii_case(&name));
+            proptest::prop_assert_eq!(is_hop_by_hop_name(name.as_bytes()), by_list);
+        }
+    }
 
     fn headers(fields: &[(&str, &str)]) -> HeaderMap {
         let mut headers = HeaderMap::new();

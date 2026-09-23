@@ -18,6 +18,6 @@
 // here and nowhere else.
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
 
-pub(crate) mod auth;
+pub mod auth;
 pub mod destination;
 pub mod h1;

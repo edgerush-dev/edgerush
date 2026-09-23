@@ -1,7 +1,8 @@
 //! Instruction counts for taking a request's head down and deciding on it, both ways (14 §6):
 //! as a raw head, the way our own server reads it, and as the header map the engine's
 //! server builds. The same bytes and the same requests as the `decide` benchmark; what is
-//! measured is everything from the parser's reading of them to the decision.
+//! measured is everything from the parser's reading of them to the decision. And the same
+//! for an upstream's answer, from its bytes to what the client is to be sent.
 //!
 //! Linux only (valgrind):
 //! `cargo bench -p edgerush-proxy --features fuzzing --bench raw_head`, see the repository
@@ -18,15 +19,18 @@
 
 use bytes::Bytes;
 use edgerush_config::{Compiled, Config, compile};
+use edgerush_filters::HeaderModifier;
 use edgerush_proxy::decide;
 use edgerush_proxy::fields::FieldLines;
 use edgerush_proxy::head::Head;
-use edgerush_proxy::raw::RawHead;
+use edgerush_proxy::hop_by_hop::{nominated, strip_response};
+use edgerush_proxy::raw::{RawAnswer, RawHead};
+use edgerush_proxy::upstream::auth::challenges;
 use edgerush_proxy::upstream::h1::H1Limits;
-use edgerush_proxy::upstream::h1::codec::{Sending, write_head};
+use edgerush_proxy::upstream::h1::codec::{Sending, filter_declaration, write_head};
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::request::Parts;
-use http::{Method, Request, Uri};
+use http::{Method, Request, StatusCode, Uri};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
 
@@ -288,5 +292,115 @@ fn write_map(head: Parts) -> (Parts, Vec<u8>) {
     (head, out)
 }
 
-library_benchmark_group!(name = raw; benchmarks = by_raw, by_map, write_raw, write_map);
+/// An upstream's answer with a server's usual fields, and any more.
+fn answer(more: &[(&'static str, &'static str)]) -> Bytes {
+    let fields = [
+        ("date", "Tue, 23 Sep 2026 10:15:00 GMT"),
+        ("server", "gunicorn"),
+        ("content-type", "application/json; charset=utf-8"),
+        ("content-length", "1432"),
+        ("cache-control", "private, max-age=0, must-revalidate"),
+        ("etag", "\"33a64df551425fcc55e4d42a148795d9f25f89d4\""),
+        ("vary", "Accept-Encoding, Origin"),
+        ("x-request-id", "0199e8a4-7c1b-7d2e-9a57-3f1c2b4d5e6f"),
+    ];
+    let mut sent = b"HTTP/1.1 200 OK\r\n".to_vec();
+    for (name, value) in fields.into_iter().chain(more.iter().copied()) {
+        sent.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    sent.extend_from_slice(b"\r\n");
+    Bytes::from(sent)
+}
+
+/// A rule's response header changes.
+fn response_changes() -> Option<HeaderModifier> {
+    Some(
+        HeaderModifier::new(
+            [("x-served-by", "edgerush")],
+            [("cache-tag", "orders")],
+            ["server"],
+        )
+        .expect("a modifier"),
+    )
+}
+
+// Both from the same bytes to the answer the client is to be sent, as the way back puts it
+// through: the parser's reading, its fields taken down, the `Trailer` declaration, the
+// challenge check, the hop-by-hop fields taken off and the rule's changes.
+#[library_benchmark]
+#[bench::usual(answer(&[]), None)]
+#[bench::keep_alive(answer(&[("connection", "keep-alive"), ("keep-alive", "timeout=5")]), None)]
+#[bench::with_header_changes(answer(&[]), response_changes())]
+fn answer_raw(
+    sent: Bytes,
+    changes: Option<HeaderModifier>,
+) -> (Option<HeaderModifier>, Option<RawAnswer>) {
+    let mut room = [httparse::EMPTY_HEADER; 32];
+    let mut response = httparse::Response::new(&mut room);
+    let parsed = response.parse(black_box(&sent));
+    let status = response
+        .code
+        .and_then(|code| StatusCode::from_u16(code).ok());
+    let lines = FieldLines::new(&sent, response.headers).ok();
+    let answer = match (parsed, status, lines) {
+        (Ok(httparse::Status::Complete(_)), Some(status), Some(lines)) => {
+            let mut raw = RawAnswer::new(status, sent.clone(), lines);
+            let nominated = nominated(&raw);
+            let declared = raw.filter_declaration(&nominated).is_ok();
+            let _challenged = black_box(challenges(status, &raw));
+            raw.strip();
+            let applied = changes
+                .as_ref()
+                .is_none_or(|changes| raw.apply(changes).is_ok());
+            (declared && applied).then_some(raw)
+        }
+        _ => None,
+    };
+    (changes, answer)
+}
+
+#[library_benchmark]
+#[bench::usual(answer(&[]), None)]
+#[bench::keep_alive(answer(&[("connection", "keep-alive"), ("keep-alive", "timeout=5")]), None)]
+#[bench::with_header_changes(answer(&[]), response_changes())]
+fn answer_map(
+    sent: Bytes,
+    changes: Option<HeaderModifier>,
+) -> (Option<HeaderModifier>, Option<HeaderMap>) {
+    let mut room = [httparse::EMPTY_HEADER; 32];
+    let mut response = httparse::Response::new(&mut room);
+    let parsed = response.parse(black_box(&sent));
+    let status = response
+        .code
+        .and_then(|code| StatusCode::from_u16(code).ok());
+    let answer = match (parsed, status) {
+        (Ok(httparse::Status::Complete(_)), Some(status)) => {
+            // As our client's codec builds its map.
+            let mut headers = HeaderMap::with_capacity(response.headers.len());
+            for field in response.headers.iter() {
+                if let (Ok(name), Ok(value)) = (
+                    HeaderName::from_bytes(field.name.as_bytes()),
+                    HeaderValue::from_bytes(field.value),
+                ) {
+                    headers.append(name, value);
+                }
+            }
+            let nominated = nominated(&headers);
+            filter_declaration(&mut headers, &nominated);
+            let _challenged = black_box(challenges(status, &headers));
+            strip_response(&mut headers);
+            if let Some(changes) = &changes {
+                changes.apply(&mut headers);
+            }
+            Some(headers)
+        }
+        _ => None,
+    };
+    (changes, answer)
+}
+
+library_benchmark_group!(
+    name = raw;
+    benchmarks = by_raw, by_map, write_raw, write_map, answer_raw, answer_map
+);
 main!(library_benchmark_groups = raw);

@@ -7,7 +7,7 @@
 // build none of this is API.
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
 
-use crate::fields::{Edited, FieldLines, Known, Overlay, Piece, View};
+use crate::fields::{Edited, FieldLines, Known, Overlay, OverlayFull, Piece, View};
 use crate::h1::{Declaration, declaration};
 use crate::head::{Forwarded, Head, Survey};
 use crate::hop_by_hop::{self, ConnectionError, HOP_BY_HOP, is_hop_by_hop_name, options_of};
@@ -17,12 +17,12 @@ use crate::upstream::h1::codec::OutgoingFields;
 use bytes::Bytes;
 use edgerush_filters::{Edit, HeaderModifier};
 use edgerush_router::Fields;
+#[cfg(any(test, feature = "fuzzing"))]
+use http::Request;
 use http::header::{CONNECTION, COOKIE, HOST, HeaderName, HeaderValue, TE, TRAILER};
 #[cfg(any(test, feature = "fuzzing"))]
 use http::request::Parts;
-#[cfg(any(test, feature = "fuzzing"))]
-use http::{HeaderMap, Request};
-use http::{Method, Uri, Version};
+use http::{HeaderMap, Method, Response, StatusCode, Uri, Version, response};
 
 /// A request's head as our own server read it: its method and target, the bytes of the
 /// head, where each field line lies in them, and an overlay of what the core changes. Its
@@ -214,14 +214,7 @@ impl Head for RawHead {
             .any(|option| option.eq_ignore_ascii_case(b"trailers"));
         // What `Connection` names comes from the head as it arrived: the core never adds a
         // `Connection` field, and nothing has taken one off before this.
-        for value in view.values(&CONNECTION) {
-            for option in options_of(value) {
-                self.overlay.remove_named(&view, option);
-            }
-        }
-        for name in &HOP_BY_HOP {
-            self.overlay.remove(&view, name);
-        }
+        strip(view, &mut self.overlay);
         if accepts_trailers {
             self.overlay
                 .set(&view, TE, HeaderValue::from_static("trailers"))
@@ -231,16 +224,7 @@ impl Head for RawHead {
     }
 
     fn apply(&mut self, changes: &HeaderModifier) -> Result<(), Rejection> {
-        let mut editing = Editing {
-            view: self.lines.view(&self.head),
-            overlay: &mut self.overlay,
-            full: false,
-        };
-        changes.apply(&mut editing);
-        if editing.full {
-            return Err(Rejection::Edits);
-        }
-        Ok(())
+        apply(self.lines.view(&self.head), &mut self.overlay, changes).map_err(|_| Rejection::Edits)
     }
 }
 
@@ -260,19 +244,8 @@ impl Forwarded for RawHead {
     }
 
     fn filter_declaration(&mut self, nominated: &[HeaderName]) -> Result<(), Rejection> {
-        let declared = declaration(self.fields().values_of(&TRAILER), nominated);
-        let view = self.lines.view(&self.head);
-        match declared {
-            Declaration::None => Ok(()),
-            Declaration::Gone => {
-                self.overlay.remove(&view, &TRAILER);
-                Ok(())
-            }
-            Declaration::Kept(value) => self
-                .overlay
-                .set(&view, TRAILER, value)
-                .map_err(|_| Rejection::Edits),
-        }
+        filter_declaration(self.lines.view(&self.head), &mut self.overlay, nominated)
+            .map_err(|_| Rejection::Edits)
     }
 
     fn close_connection(&mut self) -> Result<(), Rejection> {
@@ -302,6 +275,170 @@ impl RawHead {
         parts.version = self.version;
         parts.headers = headers;
         parts
+    }
+}
+
+/// An upstream's answer as our own client reads it: its status, the bytes of its head,
+/// where each field line lies in them, and an overlay of what the way to the client
+/// changes. A line nothing changes reaches the client as it arrived (14 §6).
+#[cfg_attr(
+    not(any(test, feature = "fuzzing")),
+    expect(
+        dead_code,
+        reason = "read by the tests until our client reads answers raw (14 §9, step 4)"
+    )
+)]
+#[derive(Debug)]
+pub struct RawAnswer {
+    status: StatusCode,
+    head: Bytes,
+    lines: FieldLines,
+    overlay: Overlay,
+}
+
+#[cfg_attr(
+    not(any(test, feature = "fuzzing")),
+    expect(
+        dead_code,
+        reason = "read by the tests until our client reads answers raw (14 §9, step 4)"
+    )
+)]
+impl RawAnswer {
+    /// The answer whose head is `head`, whose field lines `lines` says where they are.
+    pub fn new(status: StatusCode, head: Bytes, lines: FieldLines) -> Self {
+        Self {
+            status,
+            head,
+            lines,
+            overlay: Overlay::default(),
+        }
+    }
+
+    /// What the upstream answered.
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// Its fields as edited, read like a header map.
+    pub fn fields(&self) -> Edited<'_> {
+        self.overlay.edited(self.lines.view(&self.head))
+    }
+
+    /// What its fields, as edited, are written as: runs of the lines kept, then the fields
+    /// added, the known headers in `skip` left out.
+    pub fn pieces<'a>(&'a self, skip: &'a [Known]) -> impl Iterator<Item = Piece<'a>> {
+        self.overlay.pieces(&self.lines, skip)
+    }
+
+    /// Takes the names its own `Connection` gave, and those that may never follow, out of
+    /// its `Trailer` declaration.
+    ///
+    /// # Errors
+    ///
+    /// [`OverlayFull`] if the declaration that is left cannot be added.
+    pub fn filter_declaration(&mut self, nominated: &[HeaderName]) -> Result<(), OverlayFull> {
+        filter_declaration(self.lines.view(&self.head), &mut self.overlay, nominated)
+    }
+
+    /// Takes off the fields that are about the upstream's connection and not the client's.
+    pub fn strip(&mut self) {
+        let view = self.lines.view(&self.head);
+        // Most answers say nothing about their connection, and one pass over their names is
+        // all they pay, as a map's does: looking each of the names up costs several times as
+        // much. Without one of them there is no `Connection` to name any other field either.
+        // A request's core has surveyed its head for these already.
+        if self
+            .overlay
+            .edited(view)
+            .iter()
+            .any(|(name, _)| is_hop_by_hop_name(name))
+        {
+            strip(view, &mut self.overlay);
+        }
+    }
+
+    /// Makes a rule's changes to the answer.
+    ///
+    /// # Errors
+    ///
+    /// [`OverlayFull`] if more fields are added than an overlay holds, which no config the
+    /// gateway takes comes to.
+    pub fn apply(&mut self, changes: &HeaderModifier) -> Result<(), OverlayFull> {
+        apply(self.lines.view(&self.head), &mut self.overlay, changes)
+    }
+
+    /// The answer as `http`'s parts, in this hop's version, for a server that takes those:
+    /// HTTP/2's.
+    pub fn into_parts(self) -> response::Parts {
+        let mut headers = HeaderMap::with_capacity(self.lines.len());
+        for (name, value) in self.fields().iter() {
+            // Every line was found to be a field when it was read, and every field added
+            // was made one, so nothing here is left out.
+            if let (Ok(name), Ok(value)) =
+                (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+            {
+                headers.append(name, value);
+            }
+        }
+        let (mut parts, ()) = Response::new(()).into_parts();
+        parts.status = self.status;
+        parts.version = Version::HTTP_11;
+        parts.headers = headers;
+        parts
+    }
+}
+
+impl Fields for RawAnswer {
+    fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
+        self.fields().values_of(name)
+    }
+}
+
+/// Takes out the hop-by-hop fields: those the head's own `Connection` names, as it arrived,
+/// and those that go whether named or not.
+fn strip(view: View<'_>, overlay: &mut Overlay) {
+    for value in view.values(&CONNECTION) {
+        for option in options_of(value) {
+            overlay.remove_named(&view, option);
+        }
+    }
+    for name in &HOP_BY_HOP {
+        overlay.remove(&view, name);
+    }
+}
+
+/// Makes a modifier's changes to a head's overlay.
+fn apply(
+    view: View<'_>,
+    overlay: &mut Overlay,
+    changes: &HeaderModifier,
+) -> Result<(), OverlayFull> {
+    let mut editing = Editing {
+        view,
+        overlay,
+        full: false,
+    };
+    changes.apply(&mut editing);
+    if editing.full {
+        return Err(OverlayFull);
+    }
+    Ok(())
+}
+
+/// Takes what will not arrive out of a head's `Trailer` declaration
+/// ([`crate::h1::filter_declaration`]).
+fn filter_declaration(
+    view: View<'_>,
+    overlay: &mut Overlay,
+    nominated: &[HeaderName],
+) -> Result<(), OverlayFull> {
+    match declaration(overlay.edited(view).values_of(&TRAILER), nominated) {
+        Declaration::None => Ok(()),
+        Declaration::Gone => {
+            overlay.remove(&view, &TRAILER);
+            Ok(())
+        }
+        Declaration::Kept(value) => overlay.set(&view, TRAILER, value),
     }
 }
 
@@ -365,5 +502,177 @@ mod tests {
             assert_eq!(raw.apply(&sixteen), Ok(()));
         }
         assert_eq!(raw.apply(&sixteen), Err(Rejection::Edits));
+    }
+
+    /// An upstream's answer as our own client reads it, and the header map the same bytes
+    /// make; `None` for bytes neither would take.
+    fn both_answers(sent: &[u8]) -> Option<(HeaderMap, RawAnswer)> {
+        let mut room = [httparse::EMPTY_HEADER; 32];
+        let mut response = httparse::Response::new(&mut room);
+        if !matches!(response.parse(sent), Ok(httparse::Status::Complete(_))) {
+            return None;
+        }
+        let status = http::StatusCode::from_u16(response.code?).ok()?;
+        let mut map = HeaderMap::new();
+        for field in response.headers.iter() {
+            map.append(
+                HeaderName::from_bytes(field.name.as_bytes()).ok()?,
+                HeaderValue::from_bytes(field.value).ok()?,
+            );
+        }
+        let lines = FieldLines::new(sent, response.headers).ok()?;
+        let raw = RawAnswer::new(status, Bytes::copy_from_slice(sent), lines);
+        Some((map, raw))
+    }
+
+    /// Every field, the name in lower case, sorted by name and in arrival order within
+    /// one: what a field section means, whoever holds it (RFC 9110 §5.3).
+    fn meaning<'a>(fields: impl Iterator<Item = (&'a [u8], &'a [u8])>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut all: Vec<(Vec<u8>, Vec<u8>)> = fields
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.to_vec()))
+            .collect();
+        all.sort_by(|one, other| one.0.cmp(&other.0));
+        all
+    }
+
+    fn of_map(map: &HeaderMap) -> Vec<(Vec<u8>, Vec<u8>)> {
+        meaning(
+            map.iter()
+                .map(|(name, value)| (name.as_str().as_bytes(), value.as_bytes())),
+        )
+    }
+
+    /// Names in any case, among them every one the answer's rules do something with, and
+    /// values that make them mean something: `Connection` naming other fields, `Trailer`
+    /// declaring denied and nominated ones, challenges.
+    fn answer_field() -> impl proptest::strategy::Strategy<Value = (&'static str, &'static str)> {
+        use proptest::prelude::*;
+        (
+            prop::sample::select(vec![
+                "connection",
+                "Connection",
+                "keep-alive",
+                "Keep-Alive",
+                "trailer",
+                "Trailer",
+                "te",
+                "transfer-encoding",
+                "upgrade",
+                "proxy-connection",
+                "proxy-authenticate",
+                "Proxy-Authentication-Info",
+                "www-authenticate",
+                "WWW-Authenticate",
+                "content-length",
+                "date",
+                "x-a",
+                "X-A",
+                "x-b",
+                "set-cookie",
+            ]),
+            prop::sample::select(vec![
+                "close",
+                "x-a",
+                "x-a, keep-alive",
+                "X-B, trailer",
+                "x-a, x-b, content-length",
+                "grpc-status, x-a",
+                "x-b, date",
+                "NTLM",
+                "Negotiate abc",
+                "Basic realm=\"a\"",
+                "5",
+                "chunked",
+                "Tue, 15 Nov 1994 08:12:31 GMT",
+                "a=1",
+                "",
+            ]),
+        )
+    }
+
+    fn edit() -> impl proptest::strategy::Strategy<Value = (&'static str, &'static str)> {
+        use proptest::prelude::*;
+        (
+            prop::sample::select(vec!["x-a", "x-b", "x-c", "trailer", "date", "set-cookie"]),
+            prop::sample::select(vec!["1", "2", "x-a", "grpc-status"]),
+        )
+    }
+
+    proptest::proptest! {
+        /// A raw answer is edited as the header map of the same bytes is, by each of the
+        /// rules the way to the client puts it through, in the order it does: every field
+        /// the same after, whether it counts as a challenge the same, and made into a map
+        /// for HTTP/2 the same map.
+        #[test]
+        fn a_raw_answer_is_edited_as_its_header_map_is(
+            status in proptest::sample::select(vec![200u16, 204, 304, 401, 407, 500]),
+            fields in proptest::collection::vec(answer_field(), 0..8),
+            set in proptest::collection::vec(edit(), 0..3),
+            add in proptest::collection::vec(edit(), 0..3),
+            remove in proptest::collection::vec(
+                proptest::sample::select(vec!["x-a", "x-b", "date", "trailer"]), 0..3),
+        ) {
+            use crate::upstream::auth::challenges;
+            use proptest::prelude::*;
+            let mut sent = format!("HTTP/1.1 {status} Any\r\n").into_bytes();
+            for (name, value) in &fields {
+                sent.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+            }
+            sent.extend_from_slice(b"\r\n");
+            let (mut map, mut raw) = both_answers(&sent).unwrap();
+            // A modifier the gateway would take; one it would refuse is no case at all.
+            let Ok(changes) = HeaderModifier::new(set, add, remove) else {
+                return Ok(());
+            };
+            let status = raw.status();
+
+            let nominated = crate::hop_by_hop::nominated(&map);
+            prop_assert_eq!(&crate::hop_by_hop::nominated(&raw), &nominated);
+            crate::h1::filter_declaration(&mut map, &nominated);
+            prop_assert_eq!(raw.filter_declaration(&nominated), Ok(()));
+            prop_assert_eq!(of_map(&map), meaning(raw.fields().iter()), "declaration");
+            prop_assert_eq!(challenges(status, &raw), challenges(status, &map));
+            crate::hop_by_hop::strip_response(&mut map);
+            raw.strip();
+            prop_assert_eq!(of_map(&map), meaning(raw.fields().iter()), "stripped");
+            changes.apply(&mut map);
+            prop_assert_eq!(raw.apply(&changes), Ok(()));
+            prop_assert_eq!(of_map(&map), meaning(raw.fields().iter()), "edited");
+
+            let parts = raw.into_parts();
+            prop_assert_eq!(parts.status, status);
+            prop_assert_eq!(parts.version, Version::HTTP_11);
+            prop_assert_eq!(of_map(&parts.headers), of_map(&map));
+        }
+    }
+
+    /// An overlay that can take no more refuses the answer's changes, rather than dropping
+    /// one or panicking, as a request's does.
+    #[test]
+    fn a_raw_answer_that_cannot_take_its_changes_says_so() {
+        let (_, mut raw) = both_answers(b"HTTP/1.1 200 OK\r\nx-a: 1\r\n\r\n").unwrap();
+        let names: Vec<String> = (0..edgerush_filters::MOST_PER_LIST)
+            .map(|n| format!("x-{n}"))
+            .collect();
+        let sixteen =
+            HeaderModifier::new([], names.iter().map(|name| (name.as_str(), "v")), []).unwrap();
+        let fits = crate::fields::MOST_ADDED / edgerush_filters::MOST_PER_LIST;
+        for _ in 0..fits {
+            assert_eq!(raw.apply(&sixteen), Ok(()));
+        }
+        assert_eq!(raw.apply(&sixteen), Err(OverlayFull));
+    }
+
+    /// What nothing changes is left as it came: an answer with no hop-by-hop fields and no
+    /// rule to meet is one run of its lines, copied whole.
+    #[test]
+    fn an_answer_left_alone_is_copied_whole() {
+        let sent = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Trace: a\r\n\r\n";
+        let (_, mut raw) = both_answers(sent).unwrap();
+        assert_eq!(raw.filter_declaration(&[]), Ok(()));
+        raw.strip();
+        let pieces: Vec<_> = raw.pieces(&[]).collect();
+        let section = b"HTTP/1.1 200 OK\r\n".len()..sent.len() - 2;
+        assert_eq!(pieces, [Piece::Copy(section)]);
     }
 }
