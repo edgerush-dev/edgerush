@@ -18,9 +18,10 @@ use super::codec::{
     ResponseHead, Sending, Trailers, delivery, head_len, write_head,
 };
 use super::pool::Lease;
+use crate::interim::Interim;
 use crate::storage::{Charge, Exhausted};
 use bytes::Bytes;
-use http::{HeaderMap, HeaderName, Method, StatusCode, Uri};
+use http::{HeaderMap, HeaderName, Method, Uri};
 use http_body::{Body, Frame, SizeHint};
 use std::cell::RefCell;
 use std::error::Error as StdError;
@@ -173,8 +174,9 @@ pub struct Answer {
     pub head: ResponseHead,
     /// What delimits the body after it, and whether the connection may be kept.
     pub delivery: Delivery,
-    /// How many interim heads came before it. They are consumed and not passed on; the
-    /// engine that serves the client has no way to send one ([13 §5]).
+    /// How many interim heads came before it. Each was told to the exchange's side channel,
+    /// which passes it on where EdgeRush's own server listens and consumes it otherwise
+    /// ([14 §5](../../../docs/14-downstream-server.md)).
     pub interim: usize,
     /// What this answer's own `Connection` named as its own. Read here, because by the
     /// time the hop-by-hop fields have been taken off there is nothing left to read.
@@ -212,6 +214,10 @@ pub struct Exchange<S> {
     outgoing: Vec<u8>,
     /// The charge for `outgoing`'s capacity, while it has any.
     outgoing_charge: Option<Charge>,
+    /// The continue decision, and where the interim answers go: the downstream server's,
+    /// when it listens for them, and one nobody listens on otherwise
+    /// ([14 §5](../../../docs/14-downstream-server.md)).
+    interim: Interim,
     written: usize,
     /// A shared slice of the upload frame, between its encoded prefix and suffix.
     payload: Bytes,
@@ -224,6 +230,13 @@ pub struct Exchange<S> {
 }
 
 impl<S> Exchange<S> {
+    /// Tells `interim` what the upstream says in the meantime, and takes the continue
+    /// decision from it: for a request whose server passes interim answers on.
+    pub(crate) fn heard_by(mut self, interim: Interim) -> Self {
+        self.interim = interim;
+        self
+    }
+
     /// Whether everything encoded has left for the socket.
     fn nothing_queued(&self) -> bool {
         self.written >= self.outgoing.len() && self.payload.is_empty() && self.chunk_tail == 0
@@ -365,6 +378,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             blocks,
             outgoing: Vec::new(),
             outgoing_charge: None,
+            interim: Interim::unheard(),
             written: 0,
             payload: Bytes::new(),
             chunk_tail: 0,
@@ -477,8 +491,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         // then abandon an upload that was never there, and the connection with it. One of
         // unknown length is another matter: nobody knows it is empty until it is asked.
         let nothing_to_send = matches!(sending, Sending::None | Sending::Length(0));
-        let mut may_send = nothing_to_send || !expects_continue(headers);
-        let withheld = !may_send;
+        self.interim
+            .begin(expects_continue(headers), nothing_to_send);
+        let mut may_send = self.interim.may_poll_upload();
         let mut final_wait = std::pin::pin!(None::<Sleep>);
         let mut continue_wait = std::pin::pin!(None::<Sleep>);
 
@@ -516,7 +531,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                             }));
                         }
                         if !may_send {
-                            if continue_wait.is_none() {
+                            if continue_wait.is_none() && self.interim.head_sent() {
                                 continue_wait.set(Some(tokio::time::sleep_until(
                                     sent + limits.continue_wait,
                                 )));
@@ -526,7 +541,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                                 .as_pin_mut()
                                 .is_some_and(|deadline| deadline.poll(cx).is_ready())
                             {
-                                may_send = true;
+                                self.interim.wait_expired();
+                                may_send = self.interim.may_poll_upload();
                                 clocks = Clocks::default();
                             }
                         }
@@ -548,14 +564,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             let mut delivery = delivery(&head, Asked::from(method))?;
 
             if head.status.is_informational() {
-                // Only a 100 says to send the body. Another interim answer says something
-                // else entirely, and saying something else is not saying yes.
-                if head.status == StatusCode::CONTINUE {
-                    may_send = true;
-                }
-                // Consumed and not passed on. The exchange goes on to the final head.
                 // A 1.1 interim head is persistent unless it says close; 1.0 ones are
-                // refused before this.
+                // refused before this. Read before its hop-by-hop fields come off.
                 close_said |= !delivery.persistent;
                 interim += 1;
                 interim_bytes += consumed;
@@ -570,6 +580,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                     });
                 }
                 self.used(consumed);
+                // Only a 100 says to send the body; another interim answer says something
+                // else entirely. Which are passed on, and which the gateway keeps, is the
+                // coordinator's to say.
+                self.interim.upstream_interim(head.status, head.headers);
+                may_send = self.interim.may_poll_upload();
                 reader = HeadReader::default();
                 continue;
             }
@@ -588,7 +603,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             let refused = head.status.is_client_error() || head.status.is_server_error();
             // A request still being withheld for a 100 is never started by an answer:
             // the upstream answered instead of asking, so it is not waiting for a body.
-            let never_asked_for = withheld && !may_send;
+            self.interim.final_head();
+            let never_asked_for = self.interim.abandoned();
             let stop_uploading = never_asked_for || (refused && close_said);
             return Ok(Answer {
                 nominated: crate::hop_by_hop::nominated(&head.headers),
@@ -1517,6 +1533,7 @@ mod tests {
     use super::*;
     use crate::upstream::h1::blocks::{SMALL, Sizes};
     use http::HeaderValue;
+    use http::StatusCode;
     use http_body_util::{Empty, Full};
     use std::convert::Infallible;
     use std::sync::Arc;

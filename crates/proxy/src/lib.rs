@@ -19,6 +19,7 @@ mod downstream;
 mod h1;
 mod hop_by_hop;
 pub mod host;
+mod interim;
 mod linger;
 mod metrics;
 mod random;

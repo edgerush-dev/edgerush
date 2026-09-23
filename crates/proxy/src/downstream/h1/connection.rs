@@ -24,8 +24,9 @@
 use super::codec::{Head, HeadReader, RequestError, RequestHead, arrival};
 use super::date::HttpDate;
 use super::deadlines::{Bounds, Clock, Deadlines};
-use super::writer::{Asked, BodyFramer, Content, Delimited, write_head};
+use super::writer::{Asked, BodyFramer, Content, Delimited, write_head, write_interim};
 use crate::h1::{BodyReader, CodecError, Framing, Piece};
+use crate::interim::Interim;
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::storage::{Charge, Storage};
 use crate::upstream::h1::H1Limits;
@@ -145,10 +146,9 @@ struct Inbound {
     /// Woken by a body polled from another task, which would otherwise ask and never be
     /// heard.
     driver: Option<Waker>,
-    /// A `100 Continue` is owed the moment the body is asked for with nothing of it here.
-    continue_owed: bool,
-    /// ...and it has been asked for: the connection writes it.
-    continue_due: bool,
+    /// The request being served's interim answers and continue decision, which its body
+    /// tells when it is asked for and when the client sends it unasked (14 §5).
+    interim: Option<Interim>,
     limits: H1Limits,
 }
 
@@ -246,8 +246,8 @@ impl Body for IncomingBody {
                         let lost = io::Error::from(io::ErrorKind::ConnectionReset);
                         return Poll::Ready(Some(Err(RequestBodyError::Other(Box::new(lost)))));
                     }
-                    if std::mem::take(&mut inbound.continue_owed) {
-                        inbound.continue_due = true;
+                    if let Some(interim) = &inbound.interim {
+                        interim.body_wanted();
                     }
                     inbound.wanted = true;
                     inbound.waker = Some(context.waker().clone());
@@ -266,7 +266,9 @@ impl Body for IncomingBody {
                         continue;
                     }
                     // Some of it is here already: nobody is waiting to be told to send it.
-                    inbound.continue_owed = false;
+                    if let Some(interim) = &inbound.interim {
+                        interim.client_sent_body();
+                    }
                     // Cut, however small: a frame shares the block it was read into, and is
                     // paid for through it for as long as it lives (14 §8), which a copy
                     // would not be.
@@ -283,7 +285,9 @@ impl Body for IncomingBody {
                 Ok(Piece::End { trailers, consumed }) => {
                     used(&mut inbound.input, &inbound.blocks, consumed);
                     inbound.reader = None;
-                    inbound.continue_owed = false;
+                    if let Some(interim) = &inbound.interim {
+                        interim.client_sent_body();
+                    }
                     this.done = true;
                     return Poll::Ready(
                         trailers
@@ -364,8 +368,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 reader: None,
                 wanted: false,
                 waker: None,
-                continue_owed: false,
-                continue_due: false,
+                interim: None,
                 driver: None,
                 limits: settings.limits,
             })),
@@ -466,6 +469,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     fn queue_frame(&mut self, frame: Bytes) -> Result<(), Stop> {
         let charged = frame.len();
         self.queue(frame, charged)
+    }
+
+    /// Queues what the upstream said in the meantime that the client is to hear, in the
+    /// order it came, and a `100` of the coordinator's own if it wants one. Says whether
+    /// anything was queued.
+    fn queue_interim(&mut self, interim: &Interim, asked: Asked) -> Result<bool, Stop> {
+        let mut queued = false;
+        while let Some((status, headers)) = interim.next_forwarded() {
+            let mut head = Vec::new();
+            // Only what the client may be sent is kept to be forwarded; the writer is the
+            // backstop, and refuses anything else rather than write it.
+            if write_interim(&mut head, status, &headers, asked).is_ok() {
+                self.queue_built(head)?;
+                queued = true;
+            }
+        }
+        if interim.take_local_continue() {
+            self.queue_static(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            queued = true;
+        }
+        Ok(queued)
     }
 
     /// Queues bytes that live in the program itself, and cost nothing.
@@ -648,7 +672,7 @@ pub(crate) async fn serve<S, R, F, B>(
 ) -> Ended
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    R: FnMut(Request<RequestBody>) -> F,
+    R: FnMut(Request<RequestBody>, Interim) -> F,
     F: Future<Output = Response<B>>,
     B: Body<Data = Bytes> + Unpin,
 {
@@ -739,11 +763,10 @@ where
             Framing::Length(length) => (Some(BodyReader::new(arrived.framing)), Some(length)),
             framing => (Some(BodyReader::new(framing)), None),
         };
+        let interim = Interim::listened(expects_continue(&headers), version, reader.is_none());
         {
             let mut inbound = connection.inbound.borrow_mut();
-            inbound.continue_owed =
-                reader.is_some() && version == Version::HTTP_11 && expects_continue(&headers);
-            inbound.continue_due = false;
+            inbound.interim = Some(interim.clone());
             inbound.reader = reader;
         }
         let body = IncomingBody {
@@ -759,7 +782,7 @@ where
 
         // The answer, with both directions kept moving while it is worked out.
         let answer = {
-            let mut responding = std::pin::pin!(respond(request));
+            let mut responding = std::pin::pin!(respond(request, interim.clone()));
             poll_fn(|context| -> Poll<Result<Response<B>, Stop>> {
                 connection.inbound.borrow_mut().heard_by(context);
                 loop {
@@ -769,15 +792,9 @@ where
                     if let Poll::Ready(response) = responding.as_mut().poll(context) {
                         return Poll::Ready(Ok(response));
                     }
-                    let mut moved = false;
-                    {
-                        let mut inbound = connection.inbound.borrow_mut();
-                        if std::mem::take(&mut inbound.continue_due) {
-                            drop(inbound);
-                            connection.queue_static(b"HTTP/1.1 100 Continue\r\n\r\n")?;
-                            moved = true;
-                        }
-                    }
+                    // What the upstream said in the meantime that the client is to hear, and
+                    // a `100` of the coordinator's own, in the order they came.
+                    let mut moved = connection.queue_interim(&interim, asked)?;
                     moved |= connection.poll_write_queued(context)?;
                     let (wanted, body_done) = {
                         let inbound = connection.inbound.borrow();
@@ -812,8 +829,13 @@ where
             Ok(response) => response,
             Err(stop) => return stop.into(),
         };
-        // A `100` not yet written is never written now: the answer says what it would have.
-        connection.inbound.borrow_mut().continue_due = false;
+        // A local `100` not yet queued is never sent now: the answer says what it would have
+        // (14 §5). What the upstream said before its final answer still goes first, in the
+        // order it came.
+        interim.final_head();
+        if let Err(stop) = connection.queue_interim(&interim, asked) {
+            return stop.into();
+        }
 
         let (parts, mut body) = response.into_parts();
         let content = if body.is_end_stream() {
@@ -1099,10 +1121,10 @@ mod tests {
     /// prefixed by the method and target it was asked.
     fn echoing(
         asked: &Asked,
-    ) -> impl FnMut(Request<RequestBody>) -> Pin<Box<dyn Future<Output = Response<Answer>>>> + use<>
-    {
+    ) -> impl FnMut(Request<RequestBody>, Interim) -> Pin<Box<dyn Future<Output = Response<Answer>>>>
+    + use<> {
         let asked = Rc::clone(asked);
-        move |request| {
+        move |request, _: Interim| {
             let asked = Rc::clone(&asked);
             Box::pin(async move {
                 let (head, body) = request.into_parts();
@@ -1133,7 +1155,7 @@ mod tests {
     /// `close` says so, and returns what the client received and how serving ended.
     async fn served<R, F, B>(sent: &[u8], split: usize, close: bool, respond: R) -> (String, Ended)
     where
-        R: FnMut(Request<RequestBody>) -> F,
+        R: FnMut(Request<RequestBody>, Interim) -> F,
         F: Future<Output = Response<B>>,
         B: Body<Data = Bytes> + Unpin,
     {
@@ -1259,7 +1281,7 @@ mod tests {
         assert!(received.contains("GET /b"), "{received}");
         assert_eq!(ended, Ended::Answered);
 
-        let unknown = |_: Request<RequestBody>| async {
+        let unknown = |_: Request<RequestBody>, _: Interim| async {
             let parts = VecDeque::from([Bytes::from_static(b"some"), Bytes::from_static(b"thing")]);
             Response::new(Answer::Unknown(Unknown(parts)))
         };
@@ -1274,7 +1296,7 @@ mod tests {
     /// where the core hands it one, and the connection goes on to the next request.
     #[tokio::test]
     async fn an_answer_to_head_sends_no_body() {
-        let answering = |_: Request<RequestBody>| async {
+        let answering = |_: Request<RequestBody>, _: Interim| async {
             let mut response = Response::new(Answer::Full(Full::new(Bytes::from_static(b"hello"))));
             response.headers_mut().insert(
                 http::header::CONTENT_LENGTH,
@@ -1296,7 +1318,7 @@ mod tests {
     /// written: what is still arriving is not read as the next request.
     #[tokio::test]
     async fn an_answer_before_the_upload_is_read_closes_the_connection() {
-        let refusing = |_: Request<RequestBody>| async {
+        let refusing = |_: Request<RequestBody>, _: Interim| async {
             let mut response = Response::new(Answer::Full(Full::new(Bytes::from_static(b"no"))));
             *response.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
             response
@@ -1479,7 +1501,7 @@ mod tests {
         let counting = Rc::clone(&handed);
         let (mut client, server) = tokio::io::duplex(8 * 1024);
         client.write_all(GET).await.unwrap();
-        let answering = move |_: Request<RequestBody>| {
+        let answering = move |_: Request<RequestBody>, _: Interim| {
             let counting = Rc::clone(&counting);
             async move { Response::new(Plenty(counting)) }
         };
@@ -1500,7 +1522,7 @@ mod tests {
     async fn a_client_that_goes_while_waiting_drops_the_work() {
         let dropped = Rc::new(Cell::new(false));
         let noticing = Rc::clone(&dropped);
-        let waiting = move |_: Request<RequestBody>| {
+        let waiting = move |_: Request<RequestBody>, _: Interim| {
             struct Noticed(Rc<Cell<bool>>);
             impl Drop for Noticed {
                 fn drop(&mut self) {
@@ -1526,7 +1548,8 @@ mod tests {
         const PIPE: usize = 1024;
         const PIECE: usize = 256;
         let (mut client, server) = tokio::io::duplex(PIPE);
-        let waiting = |_: Request<RequestBody>| std::future::pending::<Response<Answer>>();
+        let waiting =
+            |_: Request<RequestBody>, _: Interim| std::future::pending::<Response<Answer>>();
         let serving = serve(server, settings(), blocks(), date, waiting);
         let sending = async move {
             client.write_all(GET).await.unwrap();
@@ -1573,7 +1596,7 @@ mod tests {
                 busy.shutdown().await.unwrap();
                 let asked = Rc::new(Cell::new(0usize));
                 let counting = Rc::clone(&asked);
-                let respond = move |_: Request<RequestBody>| {
+                let respond = move |_: Request<RequestBody>, _: Interim| {
                     counting.set(counting.get() + 1);
                     async { Response::new(Full::new(Bytes::from_static(b"ok"))) }
                 };
@@ -1672,7 +1695,7 @@ mod tests {
         }
         let taken = Rc::new(Cell::new(0));
         let counting = Rc::clone(&taken);
-        let answering = move |_: Request<RequestBody>| {
+        let answering = move |_: Request<RequestBody>, _: Interim| {
             let taken = Rc::clone(&counting);
             async move {
                 Response::new(Frames {
@@ -1780,7 +1803,8 @@ mod tests {
     async fn a_head_behind_a_long_answer_gets_its_time_when_it_is_next() {
         const TICKS: usize = 30;
         let (mut client, server) = tokio::io::duplex(1 << 16);
-        let streaming = |_: Request<RequestBody>| async { Response::new(Slow::new(TICKS)) };
+        let streaming =
+            |_: Request<RequestBody>, _: Interim| async { Response::new(Slow::new(TICKS)) };
         let started = Instant::now();
         let serving = async move {
             let ended = serve(server, settings(), blocks(), date, streaming).await;
@@ -1826,7 +1850,7 @@ mod tests {
     /// long that answer takes.
     #[tokio::test(start_paused = true)]
     async fn a_refusal_of_the_next_request_follows_the_answer_before_it() {
-        let streaming = |_: Request<RequestBody>| async { Response::new(Slow::new(3)) };
+        let streaming = |_: Request<RequestBody>, _: Interim| async { Response::new(Slow::new(3)) };
         let sent = b"GET /a HTTP/1.1\r\nhost: a\r\n\r\nGET /b HTTP/1.1\nhost: a\n\n";
         let (received, ended) = served(sent, sent.len(), false, streaming).await;
         assert!(received.starts_with("HTTP/1.1 200 OK\r\n"), "{received}");
@@ -1965,7 +1989,7 @@ mod tests {
         let (blocks, _storage) = blocks_within(small + 2048);
         let (mut client, server) = tokio::io::duplex(1 << 20);
         client.write_all(GET).await.unwrap();
-        let answering = |_: Request<RequestBody>| async {
+        let answering = |_: Request<RequestBody>, _: Interim| async {
             Response::new(Full::new(Bytes::from(vec![b'x'; 64 * 1024])))
         };
         let ended = tokio::time::timeout(
@@ -2024,7 +2048,7 @@ mod tests {
             let (mut client, server) = tokio::io::duplex(1 << 16);
             client.write_all(GET).await.unwrap();
             client.shutdown().await.unwrap();
-            let answering = move |_: Request<RequestBody>| async move {
+            let answering = move |_: Request<RequestBody>, _: Interim| async move {
                 let mut response = Response::new(Answer::Full(Full::new(Bytes::new())));
                 *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
                 if local {
@@ -2058,7 +2082,7 @@ mod tests {
     async fn a_request_read_holds_no_storage_while_its_answer_is_written() {
         let (blocks, storage) = blocks_within(crate::storage::LIMIT);
         let (mut client, server) = tokio::io::duplex(1 << 16);
-        let reading = |request: Request<RequestBody>| async {
+        let reading = |request: Request<RequestBody>, _: Interim| async {
             let _read = request.into_body().collect().await;
             Response::new(Slow::new(3))
         };
@@ -2087,5 +2111,81 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// A core that tells the side channel what an exchange would have seen — a `103` and a
+    /// `102`, then its final answer — all in the one turn.
+    fn hinting(
+        _: Request<RequestBody>,
+        interim: Interim,
+    ) -> Pin<Box<dyn Future<Output = Response<Answer>>>> {
+        Box::pin(async move {
+            interim.begin(false, false);
+            let mut hints = HeaderMap::new();
+            hints.insert(
+                "link",
+                http::HeaderValue::from_static("</s.css>; rel=preload"),
+            );
+            interim.upstream_interim(StatusCode::from_u16(103).unwrap(), hints);
+            interim.upstream_interim(StatusCode::PROCESSING, HeaderMap::new());
+            interim.final_head();
+            Response::new(Answer::Full(Full::new(Bytes::from_static(b"ok"))))
+        })
+    }
+
+    /// The interim answers an exchange passes on reach the client ahead of the final one
+    /// and in the order they came, those that came in the same turn as the final one
+    /// included (14 §5). An HTTP/1.0 client is sent none
+    /// ([RFC 9110 §15.2](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.2)).
+    #[tokio::test]
+    async fn interim_answers_reach_the_client_in_order_before_the_final_one() {
+        let (received, ended) = served(GET, GET.len(), true, hinting).await;
+        assert!(
+            received.starts_with(concat!(
+                "HTTP/1.1 103 Early Hints\r\nlink: </s.css>; rel=preload\r\n\r\n",
+                "HTTP/1.1 102 Processing\r\n\r\n",
+                "HTTP/1.1 200 OK\r\n"
+            )),
+            "{received}"
+        );
+        assert!(received.ends_with("\r\n\r\nok"), "{received}");
+        assert_eq!(ended, Ended::Closed);
+
+        let old = b"GET /a HTTP/1.0\r\n\r\n";
+        let (received, _) = served(old, old.len(), false, hinting).await;
+        assert!(received.starts_with("HTTP/1.1 200 OK\r\n"), "{received}");
+        assert!(!received.contains(" 103 "), "{received}");
+    }
+
+    /// A local `100` the coordinator wants but the client has not been sent is never sent
+    /// once the final answer is in: the answer says what it would have (14 §5). The core
+    /// here does not report its answer to the channel, as none of its own local answers
+    /// does; the server reports it before writing anything more. One wanted a turn before
+    /// the answer came has gone ahead of it.
+    #[tokio::test]
+    async fn a_final_answer_cancels_a_local_continue_not_yet_sent() {
+        let head =
+            b"POST / HTTP/1.1\r\nhost: a\r\nexpect: 100-continue\r\ncontent-length: 3\r\n\r\n";
+        for (turn_between, sent) in [(false, false), (true, true)] {
+            let answering = move |_: Request<RequestBody>, interim: Interim| async move {
+                interim.begin(true, false);
+                assert!(interim.head_sent());
+                interim.wait_expired();
+                if turn_between {
+                    tokio::task::yield_now().await;
+                }
+                Response::new(Answer::Full(Full::new(Bytes::from_static(b"no"))))
+            };
+            let (received, _) = served(head, head.len(), false, answering).await;
+            if sent {
+                assert!(
+                    received.starts_with("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n"),
+                    "{received}"
+                );
+            } else {
+                assert!(received.starts_with("HTTP/1.1 200 OK\r\n"), "{received}");
+                assert!(!received.contains("100 Continue"), "{received}");
+            }
+        }
     }
 }

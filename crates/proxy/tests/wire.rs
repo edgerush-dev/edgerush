@@ -116,6 +116,29 @@ fn downstream_under_test() -> Downstream {
     }
 }
 
+/// Whether a client is passed the upstream's interim answers: only where EdgeRush's own
+/// server and its own client both carry the request ([14 §5](../../../docs/14-downstream-server.md)).
+/// The engine's server cannot send a 1xx of a service's, and the engine's client consumes
+/// the ones it reads.
+fn interim_answers_are_passed_on() -> bool {
+    downstream_under_test() == Downstream::Ours && upstream_under_test() == Upstream::Ours
+}
+
+/// The first head after `first` that is not interim, and the interim ones before it, which
+/// a client is sent only where [`interim_answers_are_passed_on`].
+async fn past_interim(client: &mut Wire, first: String) -> (Vec<String>, String) {
+    let mut interim = Vec::new();
+    let mut head = first;
+    while head.starts_with("HTTP/1.1 1") {
+        interim.push(head);
+        head = within(client.head()).await;
+    }
+    if !interim_answers_are_passed_on() {
+        assert!(interim.is_empty(), "passed on: {interim:?}");
+    }
+    (interim, head)
+}
+
 /// A data plane of `config`, reaching upstreams and serving clients as the suite is told.
 fn under_test(config: edgerush_config::Compiled) -> Proxy {
     Proxy::new(config, NonZeroUsize::MIN, upstream_under_test())
@@ -444,10 +467,10 @@ fn trailing_upstream() -> SocketAddr {
     })
 }
 
-/// The 100 a client is waiting for is hyper's server's own, sent as soon as the body is
-/// wanted; the expectation is forwarded to the upstream as well, so an upstream that
-/// answers 100 of its own is answering the proxy, not the client, and that answer is
-/// consumed here. The client sees exactly one 100.
+/// The client sees exactly one 100, before it has sent a byte, and the expectation is
+/// forwarded to the upstream as well. Where EdgeRush's own server and client carry the
+/// request, that 100 is the upstream's own, passed on (14 §5); behind hyper's server it is
+/// the server's own, sent as soon as the body is wanted, and the upstream's is consumed.
 #[tokio::test]
 async fn an_expectation_of_continue_is_answered_here_and_forwarded_too() {
     let (saw, mut seen) = reporter();
@@ -486,13 +509,15 @@ async fn an_expectation_of_continue_is_answered_here_and_forwarded_too() {
     assert_eq!(client.body(2).await, "ok");
 }
 
-/// **A gap, not a promise.** An interim head is consumed and the final response follows
-/// it, which is what the client needs; but the interim one is not passed on, so `103
-/// Early Hints` never reaches the client. That is hyper's server, which has no way to
-/// send one from a service's response ([13 §5](../../../docs/13-http1-upstream.md)), and
-/// so is not something an own upstream path would change.
+/// An interim answer reaches the client ahead of the final one, as
+/// [RFC 9110 §15.2](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.2) has a proxy
+/// do ("A proxy MUST forward 1xx responses"), where EdgeRush's own server and client carry
+/// the request ([14 §5](../../../docs/14-downstream-server.md)). **Elsewhere a gap, not a
+/// promise:** hyper's server has no way to send one from a service's response, and hyper's
+/// client consumes them, so there the final response follows alone
+/// ([13 §5](../../../docs/13-http1-upstream.md)).
 #[tokio::test]
-async fn an_interim_response_is_consumed_and_not_passed_on() {
+async fn an_interim_response_is_passed_on_where_both_ends_are_ours() {
     let upstream = raw_upstream(move |mut wire| async move {
         let _head = wire.head().await;
         wire.write("HTTP/1.1 103 Early Hints\r\nlink: </s.css>; rel=preload\r\n\r\n")
@@ -506,9 +531,17 @@ async fn an_interim_response_is_consumed_and_not_passed_on() {
         .write("GET /up HTTP/1.1\r\nhost: a.test\r\n\r\n")
         .await;
 
-    let head = client.head().await;
+    let first = within(client.head()).await;
+    let (interim, head) = past_interim(&mut client, first).await;
+    if interim_answers_are_passed_on() {
+        assert_eq!(interim.len(), 1, "{interim:?}");
+        assert!(interim[0].starts_with("HTTP/1.1 103 "), "{interim:?}");
+        assert!(
+            interim[0].contains("link: </s.css>; rel=preload\r\n"),
+            "{interim:?}"
+        );
+    }
     assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
-    assert!(!head.contains("103"), "{head}");
     assert!(!head.contains("link:"), "{head}");
     assert_eq!(client.body(2).await, "ok");
 }
@@ -1512,7 +1545,9 @@ async fn a_connection_that_closes_during_an_upload_fails_the_request() {
 }
 
 /// An interim answer is not an answer. A connection that says one and then closes has
-/// left the exchange where it was: still waiting for the head that never came.
+/// left the exchange where it was: still waiting for the head that never came. Passed on,
+/// the interim answer has not committed the final one, which is then the gateway's own
+/// ([14 §4](../../../docs/14-downstream-server.md)).
 #[tokio::test]
 async fn a_connection_that_closes_after_an_interim_answer_fails_the_request() {
     let (backend, accepts) = hostile_first(|mut wire| async move {
@@ -1523,7 +1558,11 @@ async fn a_connection_that_closes_after_an_interim_answer_fails_the_request() {
     });
     let mut client = Wire::to(proxy_to(backend).await).await;
 
-    let head = asks(&mut client, "/first").await;
+    let first = asks(&mut client, "/first").await;
+    let (interim, head) = past_interim(&mut client, first).await;
+    if interim_answers_are_passed_on() {
+        assert_eq!(interim.len(), 1, "{interim:?}");
+    }
     assert!(head.starts_with("HTTP/1.1 502"), "{head}");
     assert_eq!(
         accepts.load(Ordering::SeqCst),
@@ -1710,6 +1749,7 @@ async fn told_when_answered(answer: String) -> (String, String, usize) {
 
     let mut client = Wire::to(proxy).await;
     let first = asks(&mut client, "/first").await;
+    let (_interim, first) = past_interim(&mut client, first).await;
     let mut again = Wire::to(proxy).await;
     let second = asks(&mut again, "/second").await;
     let served = within(again.body(5)).await;

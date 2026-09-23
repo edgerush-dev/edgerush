@@ -21,6 +21,7 @@ use crate::downstream::h1::connection as h1;
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h1::deadlines::Bounds;
 use crate::hop_by_hop::strip_response;
+use crate::interim::Interim;
 use crate::linger::{self, Lent, linger};
 use crate::metrics::{Answer, Metrics, Socket, Stopped};
 use crate::random::random;
@@ -665,6 +666,7 @@ impl Worker {
         nominated: &[HeaderName],
         sending: Sending,
         body: B,
+        interim: Option<Interim>,
     ) -> Result<(ResponseHead, H1Body<TcpStream, B>), ExchangeError>
     where
         B: HttpBody<Data = Bytes> + Unpin,
@@ -705,7 +707,10 @@ impl Worker {
             }
         };
 
-        let exchange = Exchange::new(socket, Rc::clone(&self.blocks));
+        let mut exchange = Exchange::new(socket, Rc::clone(&self.blocks));
+        if let Some(interim) = interim {
+            exchange = exchange.heard_by(interim);
+        }
         let (answer, rest) = exchange
             .send(method, uri, headers, nominated, sending, body, &self.limits)
             .await?;
@@ -792,7 +797,7 @@ impl Worker {
                 // Where the engine's body stops: from here on the request's body is one
                 // any engine could have read.
                 let request = request.map(RequestBody::Hyper);
-                let response = connection.worker.handle(listener, request).await;
+                let response = connection.worker.handle(listener, request, None).await;
                 Ok::<_, Infallible>(response)
             }
         });
@@ -829,10 +834,15 @@ impl Worker {
                             },
                             budget: h1::Budget::default(),
                         };
-                        let respond = move |request| {
+                        let respond = move |request, interim| {
                             ours_asking.set(true);
                             let connection = Rc::clone(&ours);
-                            async move { connection.worker.handle(listener, request).await }
+                            async move {
+                                connection
+                                    .worker
+                                    .handle(listener, request, Some(interim))
+                                    .await
+                            }
                         };
                         let _ended = h1::serve(
                             replay,
@@ -888,9 +898,17 @@ impl Worker {
         }
     }
 
-    async fn handle(&self, listener: usize, request: Request<RequestBody>) -> Response<Body> {
+    /// Answers a request that came in on `listener`. `interim` is where the server that
+    /// read it wants the upstream's interim answers, if it passes them on
+    /// ([14 §5](../../docs/14-downstream-server.md)).
+    async fn handle(
+        &self,
+        listener: usize,
+        request: Request<RequestBody>,
+        interim: Option<Interim>,
+    ) -> Response<Body> {
         let came_in = Instant::now();
-        let response = self.respond(listener, request).await;
+        let response = self.respond(listener, request, interim).await;
         if let Some(counters) = self.proxy.metrics.listener(listener) {
             let took = u64::try_from(came_in.elapsed().as_nanos()).unwrap_or(u64::MAX);
             counters.responded(response.status(), took);
@@ -898,7 +916,12 @@ impl Worker {
         response
     }
 
-    async fn respond(&self, listener: usize, request: Request<RequestBody>) -> Response<Body> {
+    async fn respond(
+        &self,
+        listener: usize,
+        request: Request<RequestBody>,
+        interim: Option<Interim>,
+    ) -> Response<Body> {
         let (mut head, body) = request.into_parts();
         // How the body is to be sent on, worked out from what arrived and before `direct`
         // takes the hop-by-hop fields off it — and before the body itself is touched,
@@ -945,8 +968,10 @@ impl Worker {
                     .ok_or(Answer::UpstreamFailed)
             }
             Upstream::Ours => {
-                self.by_ours(&directed, &head, &nominated, sending, body, admitted)
-                    .await
+                self.by_ours(
+                    &directed, &head, &nominated, sending, body, admitted, interim,
+                )
+                .await
             }
         };
 
@@ -1118,6 +1143,10 @@ impl Worker {
     /// By EdgeRush's own path. Never after the other has been tried: by the time one has
     /// failed the request may already have reached the upstream, and a second attempt
     /// would be a second request.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a different thing the exchange needs, as for `through_h1`"
+    )]
     async fn by_ours(
         &self,
         directed: &Directed,
@@ -1126,6 +1155,7 @@ impl Worker {
         sending: Sending,
         body: RequestBody,
         admitted: Admitted,
+        interim: Option<Interim>,
     ) -> Result<(response::Parts, Body), Answer> {
         let answer = match self
             .through_h1(
@@ -1136,6 +1166,7 @@ impl Worker {
                 nominated,
                 sending,
                 body,
+                interim,
             )
             .await
         {
@@ -2692,6 +2723,7 @@ upstreams:
                             &[],
                             Sending::None,
                             http_body_util::Empty::<Bytes>::new(),
+                            None,
                         )
                         .await
                         .unwrap();
