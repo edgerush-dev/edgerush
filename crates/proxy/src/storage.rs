@@ -8,16 +8,18 @@
 //! charge held beside the allocation it pays for goes when the allocation does. Growth
 //! reserves the new size before the old charge goes, because for a moment both are live.
 //!
-//! A reservation that would pass the limit fails at once. Nothing here waits for memory to
-//! come free, and what a refusal means — closing a connection, cancelling an exchange — is
-//! the caller's to decide (14 §8).
+//! A reservation that would pass the limit fails at once, once memory freed since the last
+//! sweep has been looked for. Nothing here waits for memory to come free, and what a
+//! refusal means — closing a connection, cancelling an exchange — is the caller's to decide
+//! (14 §8).
 //!
 //! Memory its owner lets go of is not always gone: a frame cut from a block shares the
 //! block's memory, and holds all of it for as long as the frame lives. So an owner that lets
 //! go of memory something else still holds a piece of hands it here with its charge
 //! ([`Charge::outlive`]), and the charge goes only when a [`Storage::sweep`] finds nothing
 //! else holding it — the one moment this end can learn that the last piece has gone
-//! (14 §3).
+//! (14 §3). The worker sweeps once a second, and a reservation that would not fit sweeps
+//! first: between two sweeps a worker streaming fast frees far more than its limit.
 //!
 //! One per worker, and it never leaves it. Nothing here does I/O or reads a clock.
 
@@ -77,7 +79,8 @@ impl Storage {
     }
 
     /// Releases the charges of memory handed over by [`Charge::outlive`] that nothing else
-    /// holds any longer, and drops that memory. For the worker's once-a-second sweep.
+    /// holds any longer, and drops that memory. For the worker's once-a-second sweep, and
+    /// for a reservation that would otherwise be refused.
     pub fn sweep(&self) {
         let mut released = 0;
         self.outlived.borrow_mut().retain_mut(|(memory, bytes)| {
@@ -137,13 +140,21 @@ impl Storage {
             Ceiling::Limit => self.limit,
             Ceiling::Provision => self.limit.saturating_add(self.provision),
         };
-        let used = self.used.get();
-        match used.checked_add(bytes) {
-            Some(total) if total <= limit => {
+        let fits = |used: usize| used.checked_add(bytes).filter(|&total| total <= limit);
+        let mut used = self.used.get();
+        if fits(used).is_none() && !self.outlived.borrow().is_empty() {
+            // Memory outlived may have been freed since the last sweep: a worker streaming
+            // fast frees far more than its limit in the time between two. Looked for only
+            // here, where the answer would otherwise be a refusal.
+            self.sweep();
+            used = self.used.get();
+        }
+        match fits(used) {
+            Some(total) => {
                 self.used.set(total);
                 Ok(())
             }
-            _ => Err(Exhausted {
+            None => Err(Exhausted {
                 wanted: bytes,
                 used,
                 limit,
@@ -346,6 +357,47 @@ mod tests {
         whole.outlive(BytesMut::zeroed(64));
         drop(whole);
         assert_eq!((storage.used(), storage.outlived()), (0, 0));
+    }
+
+    /// Memory freed since the last sweep is not held against a reservation: one that would
+    /// not fit looks again before it is refused. Between sweeps a worker streaming fast can
+    /// free far more than its limit, and refusing then fails answers for memory nothing
+    /// holds.
+    #[test]
+    fn a_reservation_that_does_not_fit_sweeps_before_it_is_refused() {
+        let storage = Storage::new(64);
+        let mut charge = storage.reserve(64).unwrap();
+        let mut memory = BytesMut::zeroed(64);
+        let piece = memory.split_to(16).freeze();
+        charge.outlive(memory);
+        drop(charge);
+        assert!(storage.reserve(1).is_err(), "refused while a piece is held");
+        let mut growing = storage.reserve_answer(0).unwrap();
+        assert!(
+            growing.grow(1).is_ok(),
+            "the provision is there all the same"
+        );
+        drop(growing);
+
+        drop(piece);
+        let again = storage
+            .reserve(64)
+            .expect("nothing holds the memory any more");
+        assert_eq!((storage.used(), storage.outlived()), (64, 0));
+        drop(again);
+
+        // And growing looks again too.
+        let mut charge = storage.reserve(48).unwrap();
+        let mut memory = BytesMut::zeroed(48);
+        let piece = memory.split_to(16).freeze();
+        charge.outlive(memory);
+        drop(charge);
+        let mut growing = storage.reserve(16).unwrap();
+        drop(piece);
+        assert!(
+            growing.grow(48).is_ok(),
+            "grown into memory freed since the sweep"
+        );
     }
 
     /// What a test does to an account.
