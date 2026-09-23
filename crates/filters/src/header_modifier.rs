@@ -26,6 +26,31 @@ pub const RESERVED: [HeaderName; 8] = [
     header::CONTENT_LENGTH,
 ];
 
+/// What a modifier's changes are made to: a header map, or anything else that holds a
+/// message's fields and can take them out, give one a single value, and add to one.
+pub trait Edit {
+    /// Takes away every value of `name`.
+    fn remove(&mut self, name: &HeaderName);
+    /// Gives `name` this one value, in place of every one it had.
+    fn set(&mut self, name: &HeaderName, value: &HeaderValue);
+    /// Adds a value to `name`, after every one it has.
+    fn append(&mut self, name: &HeaderName, value: &HeaderValue);
+}
+
+impl Edit for HeaderMap {
+    fn remove(&mut self, name: &HeaderName) {
+        HeaderMap::remove(self, name);
+    }
+
+    fn set(&mut self, name: &HeaderName, value: &HeaderValue) {
+        self.insert(name.clone(), value.clone());
+    }
+
+    fn append(&mut self, name: &HeaderName, value: &HeaderValue) {
+        HeaderMap::append(self, name.clone(), value.clone());
+    }
+}
+
 /// The most entries each of `set`, `add` and `remove` may have: Gateway API's own bound
 /// (`HTTPHeaderFilter`, `MaxItems=16` on each). With a rule's modifier the only one a request
 /// meets, what a request's head may have added to it is bounded, which a head kept as the
@@ -79,17 +104,17 @@ impl HeaderModifier {
         self.set.is_empty() && self.add.is_empty() && self.remove.is_empty()
     }
 
-    /// Carries out the changes. Allocates only as the header map does to hold what is
+    /// Carries out the changes. Allocates only as what is edited does to hold what is
     /// added; names and values are shared with the modifier, not copied.
-    pub fn apply(&self, headers: &mut HeaderMap) {
+    pub fn apply<E: Edit + ?Sized>(&self, headers: &mut E) {
         for name in &self.remove {
             headers.remove(name);
         }
         for (name, value) in &self.set {
-            headers.insert(name.clone(), value.clone());
+            headers.set(name, value);
         }
         for (name, value) in &self.add {
-            headers.append(name.clone(), value.clone());
+            headers.append(name, value);
         }
     }
 }
