@@ -20,7 +20,10 @@ use bytes::Bytes;
 use edgerush_config::{Compiled, Config, compile};
 use edgerush_proxy::decide;
 use edgerush_proxy::fields::FieldLines;
+use edgerush_proxy::head::Head;
 use edgerush_proxy::raw::RawHead;
+use edgerush_proxy::upstream::h1::H1Limits;
+use edgerush_proxy::upstream::h1::codec::{Sending, write_head};
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::request::Parts;
 use http::{Method, Request, Uri};
@@ -204,5 +207,76 @@ fn by_map(snapshot: Compiled, head: Bytes) -> (Compiled, Option<Parts>, bool) {
     (snapshot, parts, forwarded)
 }
 
-library_benchmark_group!(name = raw; benchmarks = by_raw, by_map);
+/// A request decided on as a raw head, ready to be written upstream.
+fn decided_raw(sent: &Bytes) -> RawHead {
+    let mut room = [httparse::EMPTY_HEADER; 32];
+    let mut request = httparse::Request::new(&mut room);
+    request.parse(sent).expect("a request");
+    let lines = FieldLines::new(sent, request.headers).expect("lines of the head");
+    let uri: Uri = request.path.expect("a target").parse().expect("a target");
+    let mut head = RawHead::new(Method::GET, uri, sent.clone(), lines);
+    let snapshot = shop();
+    let listener = snapshot.listeners.first().expect("a listener");
+    decide(&snapshot, listener, &mut head, 0).expect("decided");
+    head
+}
+
+/// The same, as a header map.
+fn decided_map(sent: &Bytes) -> Parts {
+    let mut room = [httparse::EMPTY_HEADER; 32];
+    let mut request = httparse::Request::new(&mut room);
+    request.parse(sent).expect("a request");
+    let mut headers = HeaderMap::new();
+    for field in request.headers.iter() {
+        headers.append(
+            HeaderName::from_bytes(field.name.as_bytes()).expect("a name"),
+            HeaderValue::from_bytes(field.value).expect("a value"),
+        );
+    }
+    let (mut parts, ()) = Request::new(()).into_parts();
+    parts.uri = request.path.expect("a target").parse().expect("a target");
+    parts.headers = headers;
+    let snapshot = shop();
+    let listener = snapshot.listeners.first().expect("a listener");
+    decide(&snapshot, listener, &mut parts, 0).expect("decided");
+    parts
+}
+
+// Writing a decided request's head for the upstream, both ways: the usual request, and one
+// the rule changes. Into room made beforehand, as the exchange makes it.
+#[library_benchmark]
+#[bench::usual_form(decided_raw(&sent("/pages/about?lang=en", Some("shop.example.com"))))]
+#[bench::with_header_changes(decided_raw(&sent("/cart/items?page=3", Some("shop.example.com"))))]
+fn write_raw(head: RawHead) -> (RawHead, Vec<u8>) {
+    let mut out = Vec::with_capacity(2048);
+    let written = write_head(
+        &mut out,
+        head.method(),
+        head.uri(),
+        black_box(&head),
+        Sending::None,
+        &H1Limits::default(),
+    );
+    assert!(written.is_ok(), "written");
+    (head, out)
+}
+
+#[library_benchmark]
+#[bench::usual_form(decided_map(&sent("/pages/about?lang=en", Some("shop.example.com"))))]
+#[bench::with_header_changes(decided_map(&sent("/cart/items?page=3", Some("shop.example.com"))))]
+fn write_map(head: Parts) -> (Parts, Vec<u8>) {
+    let mut out = Vec::with_capacity(2048);
+    let written = write_head(
+        &mut out,
+        &head.method,
+        &head.uri,
+        black_box(&head.headers),
+        Sending::None,
+        &H1Limits::default(),
+    );
+    assert!(written.is_ok(), "written");
+    (head, out)
+}
+
+library_benchmark_group!(name = raw; benchmarks = by_raw, by_map, write_raw, write_map);
 main!(library_benchmark_groups = raw);

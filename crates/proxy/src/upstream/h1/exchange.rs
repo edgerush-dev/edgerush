@@ -14,13 +14,14 @@
 use super::H1Limits;
 use super::blocks::{Block, Blocks};
 use super::codec::{
-    Asked, BodyReader, BodyWriter, CodecError, Delivery, Framing, Head, HeadReader, Piece,
-    ResponseHead, Sending, Trailers, delivery, head_len, write_head,
+    Asked, BodyReader, BodyWriter, CodecError, Delivery, Framing, Head, HeadReader, OutgoingFields,
+    Piece, ResponseHead, Sending, Trailers, delivery, head_len, write_head,
 };
 use super::pool::Lease;
 use crate::interim::{Channel, Interim};
 use crate::storage::{Charge, Exhausted};
 use bytes::Bytes;
+use edgerush_router::Fields;
 use http::{HeaderMap, HeaderName, Method, Uri};
 use http_body::{Body, Frame, SizeHint};
 use std::cell::RefCell;
@@ -408,17 +409,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         clippy::too_many_arguments,
         reason = "each of them is a different thing an exchange needs, and a struct \n                  to hold them would be indirection for a lint rather than for a reader"
     )]
-    pub async fn send<B>(
+    pub async fn send<F, B>(
         mut self,
         method: &Method,
         uri: &Uri,
-        headers: &HeaderMap,
+        headers: &F,
         nominated: &[HeaderName],
         sending: Sending,
         body: B,
         limits: &H1Limits,
     ) -> Result<(Answer, Rest<S, B>), ExchangeError>
     where
+        F: OutgoingFields + ?Sized,
         B: Body<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
@@ -446,9 +448,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         // separate from upload refusal: closing after an authenticated request must
         // not stop its body from reaching the backend or replace the backend's answer.
         let request_closes = headers
-            .get_all(http::header::CONNECTION)
-            .iter()
-            .flat_map(crate::hop_by_hop::options)
+            .values(&http::header::CONNECTION)
+            .flat_map(crate::hop_by_hop::options_of)
             .any(|option| option.eq_ignore_ascii_case(b"close"));
         answer.delivery.persistent &= !request_closes;
         Ok((
@@ -461,16 +462,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
     }
 
     /// The exchange itself, with deadlines anchored to transmission of the request head.
-    async fn exchange<B>(
+    async fn exchange<F, B>(
         &mut self,
         method: &Method,
         uri: &Uri,
-        headers: &HeaderMap,
+        headers: &F,
         sending: Sending,
         upload: &mut Upload<B>,
         limits: &H1Limits,
     ) -> Result<Answer, ExchangeError>
     where
+        F: OutgoingFields + ?Sized,
         B: Body<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
@@ -1309,11 +1311,10 @@ pub fn nothing_to_say<S: AsyncRead + Unpin>(socket: &mut S) -> bool {
 ///
 /// Only `100-continue` is waited on. An expectation this does not know is passed on as it
 /// came and waited on by nobody, which is what the engine's own client does with one.
-fn expects_continue(headers: &HeaderMap) -> bool {
+fn expects_continue<F: Fields + ?Sized>(headers: &F) -> bool {
     headers
-        .get_all(http::header::EXPECT)
-        .iter()
-        .flat_map(crate::hop_by_hop::options)
+        .values(&http::header::EXPECT)
+        .flat_map(crate::hop_by_hop::options_of)
         .any(|option| option.eq_ignore_ascii_case(b"100-continue"))
 }
 

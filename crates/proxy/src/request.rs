@@ -798,8 +798,12 @@ upstreams:
                 "upgrade",
                 "proxy-connection",
                 "accept",
+                "content-length",
+                "Transfer-Encoding",
             ]),
             prop::sample::select(vec![
+                "5",
+                "chunked",
                 "shop.example.com",
                 "tenant.example.net",
                 "other.example.org",
@@ -896,6 +900,44 @@ upstreams:
                 let from_map: Vec<&[u8]> = Fields::values(&map.headers, &name).collect();
                 prop_assert_eq!(read, from_map, "{}", name);
             }
+
+            // And as the upstream's head, both ways: the same request, framed by what the
+            // writer says and nothing the client said, in as many bytes as it said it would
+            // take.
+            if by_map.is_ok() {
+                use crate::upstream::h1::codec::{Sending, head_len, write_head};
+                let limits = crate::upstream::h1::H1Limits::default();
+                let sending = Sending::Length(3);
+                let mut by_map_head = Vec::new();
+                write_head(&mut by_map_head, map.method(), map.uri(), &map.headers, sending, &limits)
+                    .map_err(|error| TestCaseError::fail(error.to_string()))?;
+                let mut by_raw_head = Vec::new();
+                write_head(&mut by_raw_head, raw.method(), raw.uri(), &raw, sending, &limits)
+                    .map_err(|error| TestCaseError::fail(error.to_string()))?;
+                prop_assert_eq!(by_raw_head.len(), head_len(raw.method(), raw.uri(), &raw, sending));
+                let read = |head: &[u8]| -> Vec<(String, Vec<u8>)> {
+                    let mut room = [httparse::EMPTY_HEADER; 64];
+                    let mut request = httparse::Request::new(&mut room);
+                    assert!(request.parse(head).unwrap().is_complete());
+                    let mut fields: Vec<(String, Vec<u8>)> = request
+                        .headers
+                        .iter()
+                        .map(|field| (field.name.to_ascii_lowercase(), field.value.to_vec()))
+                        .collect();
+                    // Order matters within a name only.
+                    fields.sort_by(|one, other| one.0.cmp(&other.0));
+                    fields
+                };
+                let (from_map, from_raw) = (read(&by_map_head), read(&by_raw_head));
+                prop_assert_eq!(&from_raw, &from_map);
+                let framing: Vec<_> = from_raw
+                    .iter()
+                    .filter(|(name, _)| name == "content-length" || name == "transfer-encoding")
+                    .collect();
+                prop_assert_eq!(framing, [&("content-length".to_owned(), b"3".to_vec())]);
+                let line = |head: &[u8]| head.split(|&byte| byte == b'\n').next().map(<[u8]>::to_vec);
+                prop_assert_eq!(line(&by_raw_head), line(&by_map_head));
+            }
         }
     }
 
@@ -903,7 +945,7 @@ upstreams:
     /// fields added written out.
     fn written(raw: &RawHead) -> Vec<u8> {
         let mut out = b"GET / HTTP/1.1\r\n".to_vec();
-        for piece in raw.pieces() {
+        for piece in raw.pieces(&[]) {
             match piece {
                 crate::fields::Piece::Copy(span) => out.extend_from_slice(&raw.bytes()[span]),
                 crate::fields::Piece::Field(name, value) => {
@@ -925,7 +967,7 @@ upstreams:
         let sent = b"GET http://shop.example.com/account HTTP/1.1\r\nHost: shop.example.com\r\nCookie: a=1; b=2\r\nAccept: */*\r\n\r\n";
         let (_, mut raw) = both_heads(sent).unwrap();
         assert_eq!(decide_on("web", &mut raw, 0).as_deref(), Ok("search"));
-        let pieces: Vec<_> = raw.pieces().collect();
+        let pieces: Vec<_> = raw.pieces(&[]).collect();
         let section = b"GET http://shop.example.com/account HTTP/1.1\r\n".len()..sent.len() - 2;
         assert_eq!(pieces, [crate::fields::Piece::Copy(section)]);
     }

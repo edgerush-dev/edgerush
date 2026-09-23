@@ -7,11 +7,12 @@
 // build none of this is API.
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
 
-use crate::fields::{Edited, FieldLines, Overlay, Piece, View};
+use crate::fields::{Edited, FieldLines, Known, Overlay, Piece, View};
 use crate::head::{Head, Survey};
 use crate::hop_by_hop::{self, ConnectionError, HOP_BY_HOP, is_hop_by_hop_name, options_of};
 use crate::host::HostError;
 use crate::request::Rejection;
+use crate::upstream::h1::codec::OutgoingFields;
 use bytes::Bytes;
 use edgerush_filters::{Edit, HeaderModifier};
 use edgerush_router::Fields;
@@ -53,9 +54,44 @@ impl RawHead {
     }
 
     /// What its fields, as edited, are written as: runs of the lines kept, then the fields
-    /// added.
-    pub fn pieces(&self) -> impl Iterator<Item = Piece<'_>> {
-        self.overlay.pieces(&self.lines)
+    /// added, the known headers in `skip` left out.
+    pub fn pieces<'a>(&'a self, skip: &'a [Known]) -> impl Iterator<Item = Piece<'a>> {
+        self.overlay.pieces(&self.lines, skip)
+    }
+}
+
+/// What a request's head writer writes itself, and so leaves out of what it copies.
+const UPSTREAM_FRAMING: [Known; 2] = [Known::ContentLength, Known::TransferEncoding];
+
+impl Fields for RawHead {
+    fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
+        self.fields().values_of(name)
+    }
+}
+
+impl OutgoingFields for RawHead {
+    fn written_len(&self) -> usize {
+        self.pieces(&UPSTREAM_FRAMING)
+            .map(|piece| match piece {
+                Piece::Copy(span) => span.len(),
+                Piece::Field(name, value) => name.as_str().len() + 2 + value.len() + 2,
+            })
+            .sum()
+    }
+
+    fn write_fields(&self, out: &mut Vec<u8>) {
+        for piece in self.pieces(&UPSTREAM_FRAMING) {
+            match piece {
+                // Whole lines as they arrived, line breaks and all.
+                Piece::Copy(span) => out.extend_from_slice(self.head.get(span).unwrap_or_default()),
+                Piece::Field(name, value) => {
+                    out.extend_from_slice(name.as_str().as_bytes());
+                    out.extend_from_slice(b": ");
+                    out.extend_from_slice(value.as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                }
+            }
+        }
     }
 }
 

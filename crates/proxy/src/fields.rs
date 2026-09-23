@@ -389,29 +389,39 @@ impl Overlay {
     }
 
     /// What the edited fields are written as: the lines kept, each run of them that stood
-    /// side by side copied as one, and then the fields added, in the order they were.
-    pub fn pieces<'a>(&'a self, lines: &'a FieldLines) -> impl Iterator<Item = Piece<'a>> + 'a {
-        let removed = self.removed;
+    /// side by side copied as one, and then the fields added, in the order they were. The
+    /// known headers in `skip` are left out wherever they are: those a writer writes
+    /// itself, as its framing.
+    pub fn pieces<'a>(
+        &'a self,
+        lines: &'a FieldLines,
+        skip: &'a [Known],
+    ) -> impl Iterator<Item = Piece<'a>> + 'a {
         let lines = &lines.lines;
+        let removed = self.removed;
+        let left = move |at: usize, line: &Line| {
+            removed & bit(at) == 0 && line.known.is_none_or(|known| !skip.contains(&known))
+        };
         let mut at = 0;
         let runs = std::iter::from_fn(move || {
-            while at < lines.len() && removed & bit(at) != 0 {
+            while lines.get(at).is_some_and(|line| !left(at, line)) {
                 at += 1;
             }
             let first = lines.get(at)?;
             let mut last = first;
             at += 1;
-            while let Some(line) = lines.get(at).filter(|_| removed & bit(at) == 0) {
+            while let Some(line) = lines.get(at).filter(|line| left(at, line)) {
                 last = line;
                 at += 1;
             }
             Some(Piece::Copy(first.start as usize..last.end as usize))
         });
-        runs.chain(
-            self.added
-                .iter()
-                .map(|(name, value)| Piece::Field(name, value)),
-        )
+        let added = self
+            .added
+            .iter()
+            .filter(move |(name, _)| !skip.iter().any(|known| known.name() == name))
+            .map(|(name, value)| Piece::Field(name, value));
+        runs.chain(added)
     }
 }
 
@@ -669,7 +679,7 @@ mod tests {
     /// request line and the empty line.
     fn written(head: &[u8], overlay: &Overlay, lines: &FieldLines) -> Vec<u8> {
         let mut out = b"GET / HTTP/1.1\r\n".to_vec();
-        for piece in overlay.pieces(lines) {
+        for piece in overlay.pieces(lines, &[]) {
             match piece {
                 Piece::Copy(span) => out.extend_from_slice(&head[span]),
                 Piece::Field(name, value) => {
@@ -730,7 +740,7 @@ mod tests {
         let mut overlay = Overlay::default();
         overlay.remove(&view, &name("c"));
         let copied: Vec<&[u8]> = overlay
-            .pieces(&lines)
+            .pieces(&lines, &[])
             .map(|piece| match piece {
                 Piece::Copy(span) => &head[span],
                 Piece::Field(..) => panic!("nothing was added"),
@@ -743,7 +753,7 @@ mod tests {
 
         let untouched = Overlay::default();
         assert_eq!(
-            untouched.pieces(&lines).count(),
+            untouched.pieces(&lines, &[]).count(),
             1,
             "one run for a whole head"
         );
@@ -850,7 +860,7 @@ mod tests {
             }
 
             // Runs are as long as they can be.
-            let pieces: Vec<Piece<'_>> = overlay.pieces(&lines).collect();
+            let pieces: Vec<Piece<'_>> = overlay.pieces(&lines, &[]).collect();
             for pair in pieces.windows(2) {
                 if let [Piece::Copy(before), Piece::Copy(after)] = pair {
                     prop_assert_ne!(before.end, after.start);

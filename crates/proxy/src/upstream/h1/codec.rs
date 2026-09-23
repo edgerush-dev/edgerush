@@ -395,17 +395,54 @@ fn origin_form(uri: &Uri) -> &str {
         .map_or("/", http::uri::PathAndQuery::as_str)
 }
 
+/// The fields of a request as they are to go upstream, whatever holds them: a header map,
+/// or a raw head's lines with its edits ([14 §6](../../../docs/14-downstream-server.md)).
+/// Read by name as any fields are, and written by the head writer without their
+/// `Content-Length` and `Transfer-Encoding`, whose place the framing it writes itself takes.
+pub trait OutgoingFields: edgerush_router::Fields {
+    /// What writing them comes to: every line, its line break included.
+    fn written_len(&self) -> usize;
+
+    /// Appends them to `out`, one line each.
+    fn write_fields(&self, out: &mut Vec<u8>);
+}
+
+impl OutgoingFields for HeaderMap {
+    fn written_len(&self) -> usize {
+        self.iter()
+            .filter(|(name, _)| !is_framing(name))
+            .map(|(name, value)| name.as_str().len() + 2 + value.as_bytes().len() + 2)
+            .sum()
+    }
+
+    fn write_fields(&self, out: &mut Vec<u8>) {
+        for (name, value) in self {
+            if is_framing(name) {
+                continue;
+            }
+            out.extend_from_slice(name.as_str().as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+}
+
+/// Whether the head writer writes this field itself.
+fn is_framing(name: &HeaderName) -> bool {
+    name == http::header::CONTENT_LENGTH || name == http::header::TRANSFER_ENCODING
+}
+
 /// How many bytes [`write_head`] writes for this head, so that room for them can be paid for
 /// before it is made ([14 §8](../../../docs/14-downstream-server.md)).
-pub fn head_len(method: &Method, uri: &Uri, headers: &HeaderMap, sending: Sending) -> usize {
+pub fn head_len<F: OutgoingFields + ?Sized>(
+    method: &Method,
+    uri: &Uri,
+    headers: &F,
+    sending: Sending,
+) -> usize {
     let line = method.as_str().len() + 1 + origin_form(uri).len() + b" HTTP/1.1\r\n".len();
-    let fields: usize = headers
-        .iter()
-        .filter(|(name, _)| {
-            *name != http::header::CONTENT_LENGTH && *name != http::header::TRANSFER_ENCODING
-        })
-        .map(|(name, value)| name.as_str().len() + 2 + value.as_bytes().len() + 2)
-        .sum();
+    let fields = headers.written_len();
     let framing = match sending {
         Sending::None => 0,
         Sending::Length(length) => b"content-length: ".len() + decimal_len(length) + 2,
@@ -433,11 +470,11 @@ fn decimal_len(number: u64) -> usize {
 ///
 /// A head that would come to more than `limits` allows, or a target that cannot be written
 /// in origin form.
-pub fn write_head(
+pub fn write_head<F: OutgoingFields + ?Sized>(
     out: &mut Vec<u8>,
     method: &Method,
     uri: &Uri,
-    headers: &HeaderMap,
+    headers: &F,
     sending: Sending,
     limits: &H1Limits,
 ) -> Result<(), CodecError> {
@@ -449,16 +486,7 @@ pub fn write_head(
     out.push(b' ');
     out.extend_from_slice(target.as_bytes());
     out.extend_from_slice(b" HTTP/1.1\r\n");
-
-    for (name, value) in headers {
-        if name == http::header::CONTENT_LENGTH || name == http::header::TRANSFER_ENCODING {
-            continue;
-        }
-        out.extend_from_slice(name.as_str().as_bytes());
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(value.as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
+    headers.write_fields(out);
     match sending {
         Sending::None => {}
         Sending::Length(length) => {
