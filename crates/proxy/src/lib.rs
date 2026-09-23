@@ -16,6 +16,16 @@ mod cookies;
 pub mod downstream;
 #[cfg(not(feature = "fuzzing"))]
 mod downstream;
+// Private, save when the fuzz targets are being built. Nothing reads a head through it yet:
+// step 4 proves it reads as the header map does before the parser builds it (14 §6).
+#[cfg(feature = "fuzzing")]
+pub mod fields;
+#[cfg(not(feature = "fuzzing"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into the parser by the next change")
+)]
+mod fields;
 mod h1;
 mod hop_by_hop;
 pub mod host;

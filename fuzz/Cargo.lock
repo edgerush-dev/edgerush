@@ -82,6 +82,7 @@ dependencies = [
  "edgerush-proxy",
  "edgerush-router",
  "http",
+ "httparse",
  "libfuzzer-sys",
 ]
 

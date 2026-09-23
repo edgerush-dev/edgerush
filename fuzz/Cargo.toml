@@ -19,6 +19,8 @@ edgerush-proxy = { path = "../crates/proxy", features = ["fuzzing"] }
 edgerush-router = { path = "../crates/router", features = ["reference"] }
 # The reading of a request's host is compared with this crate's own.
 http = "1.5"
+# The field lines of a head are taken from what this parser finds, as the proxy's are.
+httparse = "1.10"
 libfuzzer-sys = "0.4"
 
 [[bin]]
@@ -80,6 +82,13 @@ bench = false
 [[bin]]
 name = "h1_differential"
 path = "fuzz_targets/h1_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h1_fields"
+path = "fuzz_targets/h1_fields.rs"
 test = false
 doc = false
 bench = false
