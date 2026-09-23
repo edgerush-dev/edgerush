@@ -24,8 +24,20 @@ use std::rc::Rc;
 #[derive(Debug, Clone)]
 pub(crate) struct Interim(Rc<RefCell<State>>);
 
+/// The exchange's side of it: the server's, shared, where a server listens, and otherwise
+/// the exchange's own, held in place — so that a request nobody listens on pays for no
+/// allocation to make the continue decision it has to make all the same.
 #[derive(Debug)]
-struct State {
+pub(crate) enum Channel {
+    /// Shared with the server that read the request.
+    Listened(Interim),
+    /// The exchange's alone: the same decision, and every 1xx consumed.
+    Unheard(State),
+}
+
+/// The decision and what waits to be passed on.
+#[derive(Debug)]
+pub(crate) struct State {
     /// The client sent `Expect: 100-continue`, read before any filter touched the head.
     client: bool,
     version: Version,
@@ -40,81 +52,68 @@ struct State {
     forwarded: VecDeque<(StatusCode, HeaderMap)>,
 }
 
-impl Interim {
-    /// For a request read by our own server: whether its client asked to be told before
-    /// sending its body, the version it spoke, and whether the body it framed is nothing.
-    pub(crate) fn listened(client: bool, version: Version, nothing_to_send: bool) -> Self {
-        Self::new(client, version, nothing_to_send, true)
-    }
-
-    /// For an exchange whose request nobody listens for informational answers on.
-    pub(crate) fn unheard() -> Self {
-        Self::new(false, Version::HTTP_11, false, false)
-    }
-
+impl State {
     fn new(client: bool, version: Version, nothing_to_send: bool, listened: bool) -> Self {
-        Self(Rc::new(RefCell::new(State {
+        Self {
             client,
             version,
             nothing_to_send,
             listened,
             coordinator: None,
             forwarded: VecDeque::new(),
-        })))
-    }
-
-    // What the exchange tells it.
-
-    /// The exchange begins: whether the request going upstream, filters and all, carries
-    /// `Expect: 100-continue`, and whether its body is framed as nothing.
-    pub(crate) fn begin(&self, upstream: bool, nothing_to_send: bool) {
-        let mut state = self.0.borrow_mut();
-        let expectation = Expectation {
-            client: state.client,
-            version: state.version,
-            upstream,
-            nothing_to_send,
-        };
-        state.coordinator = Some(Coordinator::new(expectation));
-    }
-
-    /// The last byte of the request head has been taken by the socket. Says whether to arm
-    /// the continue wait.
-    pub(crate) fn head_sent(&self) -> bool {
-        self.with(Coordinator::head_sent)
-    }
-
-    /// The continue wait ran out.
-    pub(crate) fn wait_expired(&self) {
-        self.with(Coordinator::wait_expired);
-    }
-
-    /// An interim answer from upstream, in wire order. Kept to be passed on, less its
-    /// hop-by-hop fields, if it is the client's to hear and a server listens; consumed
-    /// otherwise.
-    pub(crate) fn upstream_interim(&self, status: StatusCode, mut headers: HeaderMap) {
-        let relay = self.with(|coordinator| coordinator.upstream_interim(status));
-        let mut state = self.0.borrow_mut();
-        if relay == Relay::Forward && state.listened {
-            crate::hop_by_hop::strip_response(&mut headers);
-            state.forwarded.push_back((status, headers));
         }
     }
 
-    /// The final answer, in wire order.
+    fn begin(&mut self, upstream: bool, nothing_to_send: bool) {
+        let expectation = Expectation {
+            client: self.client,
+            version: self.version,
+            upstream,
+            nothing_to_send,
+        };
+        self.coordinator = Some(Coordinator::new(expectation));
+    }
+
+    fn upstream_interim(&mut self, status: StatusCode, mut headers: HeaderMap) {
+        let relay = self.with(|coordinator| coordinator.upstream_interim(status));
+        if relay == Relay::Forward && self.listened {
+            crate::hop_by_hop::strip_response(&mut headers);
+            self.forwarded.push_back((status, headers));
+        }
+    }
+
+    /// The coordinator, made now if no exchange of ours began one: what goes upstream is
+    /// then not ours to know, and nothing holds the body back.
+    fn with<T>(&mut self, act: impl FnOnce(&mut Coordinator) -> T) -> T {
+        let (client, version, nothing_to_send) = (self.client, self.version, self.nothing_to_send);
+        let coordinator = self.coordinator.get_or_insert_with(|| {
+            Coordinator::new(Expectation {
+                client,
+                version,
+                upstream: false,
+                nothing_to_send,
+            })
+        });
+        act(coordinator)
+    }
+}
+
+impl Interim {
+    /// For a request read by our own server: whether its client asked to be told before
+    /// sending its body, the version it spoke, and whether the body it framed is nothing.
+    pub(crate) fn listened(client: bool, version: Version, nothing_to_send: bool) -> Self {
+        Self(Rc::new(RefCell::new(State::new(
+            client,
+            version,
+            nothing_to_send,
+            true,
+        ))))
+    }
+
+    /// Final answer, in wire order: also told by the server, for an answer no exchange of
+    /// ours reported.
     pub(crate) fn final_head(&self) {
-        self.with(Coordinator::final_head);
-    }
-
-    /// Whether the upload may be polled now.
-    pub(crate) fn may_poll_upload(&self) -> bool {
-        self.with(|coordinator| coordinator.may_poll_upload())
-    }
-
-    /// Whether the upload was abandoned before it started: the answer came instead of the
-    /// upstream's leave to send it.
-    pub(crate) fn abandoned(&self) -> bool {
-        self.with(|coordinator| coordinator.abandoned())
+        self.0.borrow_mut().with(Coordinator::final_head);
     }
 
     // What the server tells it and asks of it.
@@ -122,12 +121,12 @@ impl Interim {
     /// The body has been asked for and nothing of it is here. A client still waiting for
     /// leave to send it is given it, unless an upstream expectation is still to be settled.
     pub(crate) fn body_wanted(&self) {
-        self.with(Coordinator::ready_for_body);
+        self.0.borrow_mut().with(Coordinator::ready_for_body);
     }
 
     /// The client sent body bytes without waiting to be told.
     pub(crate) fn client_sent_body(&self) {
-        self.with(Coordinator::client_sent_body);
+        self.0.borrow_mut().with(Coordinator::client_sent_body);
     }
 
     /// The next interim answer to pass on, if one is waiting.
@@ -137,23 +136,71 @@ impl Interim {
 
     /// A local `100` to write, if one is wanted. At most one per request.
     pub(crate) fn take_local_continue(&self) -> bool {
-        self.with(Coordinator::take_local_continue)
+        self.0.borrow_mut().with(Coordinator::take_local_continue)
+    }
+}
+
+impl Channel {
+    /// For an exchange whose request nobody listens for informational answers on.
+    pub(crate) fn unheard() -> Self {
+        Self::Unheard(State::new(false, Version::HTTP_11, false, false))
     }
 
-    /// The coordinator, made now if no exchange of ours began one: what goes upstream is
-    /// then not ours to know, and nothing holds the body back.
-    fn with<T>(&self, act: impl FnOnce(&mut Coordinator) -> T) -> T {
-        let mut state = self.0.borrow_mut();
-        let state = &mut *state;
-        let coordinator = state.coordinator.get_or_insert_with(|| {
-            Coordinator::new(Expectation {
-                client: state.client,
-                version: state.version,
-                upstream: false,
-                nothing_to_send: state.nothing_to_send,
-            })
-        });
-        act(coordinator)
+    fn state<T>(&mut self, act: impl FnOnce(&mut State) -> T) -> T {
+        match self {
+            Self::Listened(interim) => act(&mut interim.0.borrow_mut()),
+            Self::Unheard(state) => act(state),
+        }
+    }
+
+    // What the exchange tells it.
+
+    /// The exchange begins: whether the request going upstream, filters and all, carries
+    /// `Expect: 100-continue`, and whether its body is framed as nothing.
+    pub(crate) fn begin(&mut self, upstream: bool, nothing_to_send: bool) {
+        self.state(|state| state.begin(upstream, nothing_to_send));
+    }
+
+    /// The last byte of the request head has been taken by the socket. Says whether to arm
+    /// the continue wait.
+    pub(crate) fn head_sent(&mut self) -> bool {
+        self.state(|state| state.with(Coordinator::head_sent))
+    }
+
+    /// The continue wait ran out.
+    pub(crate) fn wait_expired(&mut self) {
+        self.state(|state| state.with(Coordinator::wait_expired));
+    }
+
+    /// An interim answer from upstream, in wire order. Kept to be passed on, less its
+    /// hop-by-hop fields, if it is the client's to hear and a server listens; consumed
+    /// otherwise.
+    pub(crate) fn upstream_interim(&mut self, status: StatusCode, headers: HeaderMap) {
+        self.state(|state| state.upstream_interim(status, headers));
+    }
+
+    /// The final answer, in wire order.
+    pub(crate) fn final_head(&mut self) {
+        self.state(|state| state.with(Coordinator::final_head));
+    }
+
+    /// Whether the upload may be polled now.
+    pub(crate) fn may_poll_upload(&mut self) -> bool {
+        self.state(|state| state.with(|coordinator| coordinator.may_poll_upload()))
+    }
+
+    /// Whether the upload was abandoned before it started: the answer came instead of the
+    /// upstream's leave to send it.
+    pub(crate) fn abandoned(&mut self) -> bool {
+        self.state(|state| state.with(|coordinator| coordinator.abandoned()))
+    }
+}
+
+#[cfg(test)]
+impl Channel {
+    /// How many interim answers wait to be passed on.
+    fn kept(&mut self) -> usize {
+        self.state(|state| state.forwarded.len())
     }
 }
 
@@ -174,13 +221,20 @@ mod tests {
         fields(&[("link", "</style.css>; rel=preload")])
     }
 
+    /// A request our own server read, as the server and the exchange each see it.
+    fn listened(client: bool, version: Version, nothing_to_send: bool) -> (Interim, Channel) {
+        let interim = Interim::listened(client, version, nothing_to_send);
+        let exchange = Channel::Listened(interim.clone());
+        (interim, exchange)
+    }
+
     /// Interim answers are passed on in the order they came, each less its hop-by-hop
     /// fields and those its `Connection` named; nothing after the final answer is.
     #[test]
     fn interim_answers_are_passed_on_in_order_without_their_hop_fields() {
-        let interim = Interim::listened(false, Version::HTTP_11, false);
-        interim.begin(false, false);
-        interim.upstream_interim(
+        let (interim, mut exchange) = listened(false, Version::HTTP_11, false);
+        exchange.begin(false, false);
+        exchange.upstream_interim(
             StatusCode::from_u16(103).unwrap(),
             fields(&[
                 ("link", "</a.css>; rel=preload"),
@@ -189,9 +243,9 @@ mod tests {
                 ("keep-alive", "timeout=5"),
             ]),
         );
-        interim.upstream_interim(StatusCode::PROCESSING, HeaderMap::new());
-        interim.final_head();
-        interim.upstream_interim(StatusCode::from_u16(103).unwrap(), early_hints());
+        exchange.upstream_interim(StatusCode::PROCESSING, HeaderMap::new());
+        exchange.final_head();
+        exchange.upstream_interim(StatusCode::from_u16(103).unwrap(), early_hints());
 
         let (status, first) = interim.next_forwarded().unwrap();
         assert_eq!(status.as_u16(), 103);
@@ -208,27 +262,27 @@ mod tests {
     /// request nobody listens on.
     #[test]
     fn nothing_is_kept_for_a_client_that_cannot_hear_it_or_nobody_listening() {
-        let old = Interim::listened(false, Version::HTTP_10, false);
-        old.begin(false, false);
-        old.upstream_interim(StatusCode::from_u16(103).unwrap(), early_hints());
+        let (old, mut exchange) = listened(false, Version::HTTP_10, false);
+        exchange.begin(false, false);
+        exchange.upstream_interim(StatusCode::from_u16(103).unwrap(), early_hints());
         assert!(old.next_forwarded().is_none());
 
-        let unheard = Interim::unheard();
+        let mut unheard = Channel::unheard();
         unheard.begin(false, false);
         unheard.upstream_interim(StatusCode::from_u16(103).unwrap(), early_hints());
-        assert!(unheard.next_forwarded().is_none());
+        assert_eq!(unheard.kept(), 0);
     }
 
     /// The client's expectation, forwarded: the upstream's `100` is what releases the
     /// upload and is passed on, and no local one is made.
     #[test]
     fn an_upstream_continue_is_passed_on_and_releases_the_upload() {
-        let interim = Interim::listened(true, Version::HTTP_11, false);
-        interim.begin(true, false);
-        assert!(!interim.may_poll_upload());
-        assert!(interim.head_sent(), "the wait was not armed");
-        interim.upstream_interim(StatusCode::CONTINUE, HeaderMap::new());
-        assert!(interim.may_poll_upload());
+        let (interim, mut exchange) = listened(true, Version::HTTP_11, false);
+        exchange.begin(true, false);
+        assert!(!exchange.may_poll_upload());
+        assert!(exchange.head_sent(), "the wait was not armed");
+        exchange.upstream_interim(StatusCode::CONTINUE, HeaderMap::new());
+        assert!(exchange.may_poll_upload());
         assert_eq!(interim.next_forwarded().unwrap().0, StatusCode::CONTINUE);
         interim.body_wanted();
         assert!(!interim.take_local_continue());
@@ -238,14 +292,14 @@ mod tests {
     /// the upstream's later one passed on as well.
     #[test]
     fn the_wait_running_out_releases_the_upload_and_makes_one_local_continue() {
-        let interim = Interim::listened(true, Version::HTTP_11, false);
-        interim.begin(true, false);
-        assert!(interim.head_sent());
-        interim.wait_expired();
-        assert!(interim.may_poll_upload());
+        let (interim, mut exchange) = listened(true, Version::HTTP_11, false);
+        exchange.begin(true, false);
+        assert!(exchange.head_sent());
+        exchange.wait_expired();
+        assert!(exchange.may_poll_upload());
         assert!(interim.take_local_continue());
         assert!(!interim.take_local_continue(), "a second local 100");
-        interim.upstream_interim(StatusCode::CONTINUE, HeaderMap::new());
+        exchange.upstream_interim(StatusCode::CONTINUE, HeaderMap::new());
         assert_eq!(interim.next_forwarded().unwrap().0, StatusCode::CONTINUE);
     }
 
@@ -253,12 +307,12 @@ mod tests {
     /// yet taken.
     #[test]
     fn a_final_answer_while_held_abandons_the_upload() {
-        let interim = Interim::listened(true, Version::HTTP_11, false);
-        interim.begin(true, false);
-        assert!(interim.head_sent());
-        interim.final_head();
-        assert!(interim.abandoned());
-        interim.wait_expired();
+        let (interim, mut exchange) = listened(true, Version::HTTP_11, false);
+        exchange.begin(true, false);
+        assert!(exchange.head_sent());
+        exchange.final_head();
+        assert!(exchange.abandoned());
+        exchange.wait_expired();
         assert!(!interim.take_local_continue());
     }
 
@@ -267,8 +321,8 @@ mod tests {
     /// server does. One that sends without waiting is sent nothing.
     #[test]
     fn with_no_exchange_of_ours_the_client_is_released_when_its_body_is_asked_for() {
-        let asked = Interim::listened(true, Version::HTTP_11, false);
-        assert!(asked.may_poll_upload());
+        let (asked, mut view) = listened(true, Version::HTTP_11, false);
+        assert!(view.may_poll_upload());
         asked.body_wanted();
         assert!(asked.take_local_continue());
 
@@ -286,10 +340,10 @@ mod tests {
     /// brings releases the upload and is not passed on (RFC 9110 §15.2).
     #[test]
     fn a_continue_the_gateway_asked_for_is_not_passed_on() {
-        let interim = Interim::listened(false, Version::HTTP_11, false);
-        interim.begin(true, false);
-        interim.upstream_interim(StatusCode::CONTINUE, HeaderMap::new());
-        assert!(interim.may_poll_upload());
+        let (interim, mut exchange) = listened(false, Version::HTTP_11, false);
+        exchange.begin(true, false);
+        exchange.upstream_interim(StatusCode::CONTINUE, HeaderMap::new());
+        assert!(exchange.may_poll_upload());
         assert!(interim.next_forwarded().is_none());
     }
 }

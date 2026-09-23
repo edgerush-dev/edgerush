@@ -2120,15 +2120,16 @@ mod tests {
         interim: Interim,
     ) -> Pin<Box<dyn Future<Output = Response<Answer>>>> {
         Box::pin(async move {
-            interim.begin(false, false);
+            let mut exchange = crate::interim::Channel::Listened(interim);
+            exchange.begin(false, false);
             let mut hints = HeaderMap::new();
             hints.insert(
                 "link",
                 http::HeaderValue::from_static("</s.css>; rel=preload"),
             );
-            interim.upstream_interim(StatusCode::from_u16(103).unwrap(), hints);
-            interim.upstream_interim(StatusCode::PROCESSING, HeaderMap::new());
-            interim.final_head();
+            exchange.upstream_interim(StatusCode::from_u16(103).unwrap(), hints);
+            exchange.upstream_interim(StatusCode::PROCESSING, HeaderMap::new());
+            exchange.final_head();
             Response::new(Answer::Full(Full::new(Bytes::from_static(b"ok"))))
         })
     }
@@ -2168,9 +2169,10 @@ mod tests {
             b"POST / HTTP/1.1\r\nhost: a\r\nexpect: 100-continue\r\ncontent-length: 3\r\n\r\n";
         for (turn_between, sent) in [(false, false), (true, true)] {
             let answering = move |_: Request<RequestBody>, interim: Interim| async move {
-                interim.begin(true, false);
-                assert!(interim.head_sent());
-                interim.wait_expired();
+                let mut exchange = crate::interim::Channel::Listened(interim);
+                exchange.begin(true, false);
+                assert!(exchange.head_sent());
+                exchange.wait_expired();
                 if turn_between {
                     tokio::task::yield_now().await;
                 }

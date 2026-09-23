@@ -18,7 +18,7 @@ use super::codec::{
     ResponseHead, Sending, Trailers, delivery, head_len, write_head,
 };
 use super::pool::Lease;
-use crate::interim::Interim;
+use crate::interim::{Channel, Interim};
 use crate::storage::{Charge, Exhausted};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, Method, Uri};
@@ -217,7 +217,7 @@ pub struct Exchange<S> {
     /// The continue decision, and where the interim answers go: the downstream server's,
     /// when it listens for them, and one nobody listens on otherwise
     /// ([14 §5](../../../docs/14-downstream-server.md)).
-    interim: Interim,
+    interim: Channel,
     written: usize,
     /// A shared slice of the upload frame, between its encoded prefix and suffix.
     payload: Bytes,
@@ -233,7 +233,7 @@ impl<S> Exchange<S> {
     /// Tells `interim` what the upstream says in the meantime, and takes the continue
     /// decision from it: for a request whose server passes interim answers on.
     pub(crate) fn heard_by(mut self, interim: Interim) -> Self {
-        self.interim = interim;
+        self.interim = Channel::Listened(interim);
         self
     }
 
@@ -378,7 +378,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             blocks,
             outgoing: Vec::new(),
             outgoing_charge: None,
-            interim: Interim::unheard(),
+            interim: Channel::unheard(),
             written: 0,
             payload: Bytes::new(),
             chunk_tail: 0,
