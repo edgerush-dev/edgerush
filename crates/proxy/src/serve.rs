@@ -17,6 +17,9 @@
 //! the pool of upstream connections to come, above all.
 
 use crate::downstream::detect::{Protocol, detect};
+use crate::downstream::h1::connection as h1;
+use crate::downstream::h1::date::HttpDate;
+use crate::downstream::h1::deadlines::Bounds;
 use crate::hop_by_hop::strip_response;
 use crate::linger::{self, Lent, linger};
 use crate::metrics::{Answer, Metrics, Socket, Stopped};
@@ -334,7 +337,9 @@ pub struct Worker {
     proxy: Arc<Proxy>,
     /// One for the life of the worker: a reload does not throw warm connections away.
     /// Those to an endpoint that is no longer used grow idle and are closed.
-    client: Client<HttpConnector, RequestBody>,
+    /// It takes the engine's own body: one of EdgeRush's own server's cannot leave the
+    /// worker, and the two are never paired ([`Proxy::serving_by`]).
+    client: Client<HttpConnector, hyper::body::Incoming>,
     /// The connections this worker keeps by EdgeRush's own path.
     pool: Rc<RefCell<Pool<TcpStream>>>,
     /// The connections it keeps by the engine's client a connection at a time, under the
@@ -348,6 +353,9 @@ pub struct Worker {
     in_flight: Rc<Cell<usize>>,
     limits: H1Limits,
     deadlines: Deadlines,
+    /// The time an answer is dated with, which the worker's sweep keeps current so that
+    /// no answer reads a clock for it (14 §4).
+    date: Cell<HttpDate>,
 }
 
 /// One exchange's place among those a worker has in hand, given back when it is dropped.
@@ -577,6 +585,7 @@ impl Worker {
             in_flight: Rc::new(Cell::new(0)),
             limits,
             deadlines,
+            date: Cell::new(HttpDate::from_unix(unix_now())),
         })
     }
 
@@ -590,6 +599,7 @@ impl Worker {
         let every = self.limits.sweep;
         loop {
             tokio::time::sleep(every).await;
+            self.date.set(HttpDate::from_unix(unix_now()));
             // Borrowed for the sweep and let go of before anything is waited on again.
             let swept = self.pool.borrow_mut().sweep(&self.limits)
                 + self.hyper_pool.borrow_mut().sweep(&self.limits);
@@ -766,6 +776,7 @@ impl Worker {
         // stretch its own deadlines do not cover.
         let asked = Rc::new(Cell::new(false));
         let asking = Rc::clone(&asked);
+        let (ours, ours_asking) = (Rc::clone(&connection), Rc::clone(&asked));
         // Every request clones a handle, as the engine wants futures that own what they
         // use. A handle of the connection's own keeps that count off a line of cache that
         // all the workers would otherwise write to.
@@ -800,12 +811,25 @@ impl Worker {
                 // engine's server for it.
                 Downstream::Ours => match detect(lent).await {
                     Ok(Some((Protocol::Http1, replay))) => {
-                        // Configured as the engine's own detector configures it above.
-                        let _closed = hyper::server::conn::http1::Builder::new()
-                            .timer(TokioTimer::new())
-                            .header_read_timeout(deadlines.next_request)
-                            .serve_connection(TokioIo::new(replay), service)
-                            .await;
+                        let worker = Rc::clone(&ours.worker);
+                        let settings = h1::Settings {
+                            limits: worker.limits,
+                            bounds: Bounds {
+                                first_request: deadlines.first_request,
+                                // 14 §8's ten seconds for a head once it has begun, never
+                                // longer than the wait for it to begin.
+                                next_head: Bounds::default().next_head.min(deadlines.next_request),
+                                keep_alive: deadlines.next_request,
+                                ..Bounds::default()
+                            },
+                        };
+                        let respond = move |request| {
+                            ours_asking.set(true);
+                            let connection = Rc::clone(&ours);
+                            async move { connection.worker.handle(listener, request).await }
+                        };
+                        let _ended =
+                            h1::serve(replay, settings, || worker.date.get(), respond).await;
                     }
                     Ok(Some((Protocol::Http2, replay))) => {
                         let _closed = hyper::server::conn::http2::Builder::new(OnThisWorker)
@@ -952,6 +976,11 @@ impl Worker {
             let (head, incoming) = response.into_parts();
             (head, incoming, Some(connection))
         } else {
+            // Only the engine's server hands over a body this client can carry, and no
+            // other server is paired with it.
+            let RequestBody::Hyper(body) = body else {
+                return None;
+            };
             let response = self
                 .client
                 .request(Request::from_parts(head, body))
@@ -1273,6 +1302,13 @@ fn at_endpoint(target: &Uri, endpoint: &Authority) -> Option<Uri> {
     parts.scheme = Some(Scheme::HTTP);
     parts.authority = Some(endpoint.clone());
     Uri::from_parts(parts).ok()
+}
+
+/// Seconds since the Unix epoch, for dating answers.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// Whether a failure to accept is the failure of the one connection that was next in line,
@@ -1603,7 +1639,7 @@ mod tests {
     /// has been full is not full for ever ([13 §7](../../docs/13-http1-upstream.md)).
     #[test]
     fn a_worker_full_of_exchanges_answers_rather_than_take_another() {
-        for by in [Upstream::Hyper, Upstream::HyperConn, Upstream::Ours] {
+        for (by, down) in PAIRINGS {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1615,7 +1651,7 @@ mod tests {
                     exchanges: 2,
                     ..H1Limits::default()
                 };
-                let worker = Worker::with_limits(sending_to_by(upstream, by), limits);
+                let worker = Worker::with_limits(served_by(upstream, by, down), limits);
                 let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let front = socket.local_addr().unwrap();
                 let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
@@ -1654,7 +1690,7 @@ mod tests {
     #[test]
     fn every_way_out_of_an_exchange_gives_its_place_back() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for by in [Upstream::Hyper, Upstream::HyperConn, Upstream::Ours] {
+        for (by, down) in PAIRINGS {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1663,7 +1699,7 @@ mod tests {
             runtime.block_on(local.run_until(async {
                 let serving = |upstream| {
                     let worker =
-                        Worker::with_limits(sending_to_by(upstream, by), H1Limits::default());
+                        Worker::with_limits(served_by(upstream, by, down), H1Limits::default());
                     async move {
                         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
                         let front = socket.local_addr().unwrap();
@@ -1820,6 +1856,23 @@ mod tests {
 
     /// The same, by whichever client is named: how many idle connections a worker keeps
     /// is the data plane's bound, so it has to hold for both of them.
+    /// Every client with every server it can be paired with.
+    const PAIRINGS: [(Upstream, Downstream); 5] = [
+        (Upstream::Hyper, Downstream::Hyper),
+        (Upstream::HyperConn, Downstream::Hyper),
+        (Upstream::Ours, Downstream::Hyper),
+        (Upstream::HyperConn, Downstream::Ours),
+        (Upstream::Ours, Downstream::Ours),
+    ];
+
+    /// The same, its clients' connections taken by `down`.
+    fn served_by(upstream: SocketAddr, by: Upstream, down: Downstream) -> Arc<Proxy> {
+        let proxy = Proxy::new(everything_to(upstream), NonZeroUsize::MIN, by)
+            .and_then(|proxy| proxy.serving_by(down))
+            .unwrap();
+        Arc::new(proxy)
+    }
+
     fn sending_to_by(upstream: SocketAddr, by: Upstream) -> Arc<Proxy> {
         let yaml = format!(
             r#"

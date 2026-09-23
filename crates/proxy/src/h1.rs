@@ -383,6 +383,17 @@ impl BodyReader {
         }
     }
 
+    /// For a counted body, how many of its bytes have still to be read out of it: what an
+    /// answer passed on can say of its length before it has all arrived. `None` for a body
+    /// delimited any other way, whose length nobody knows until its end.
+    pub fn remaining(&self) -> Option<u64> {
+        match (self.framing, &self.state) {
+            (Framing::Length(_), State::Data { left }) => Some(*left),
+            (Framing::Length(_), State::Done) => Some(0),
+            _ => None,
+        }
+    }
+
     /// Whether the whole body has been read. Only then may the connection be kept.
     pub fn is_done(&self) -> bool {
         self.state == State::Done

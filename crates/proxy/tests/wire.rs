@@ -784,6 +784,9 @@ async fn a_close_delimited_response_is_framed_again_as_chunks() {
 /// *response* parser rejects repeated lengths, equal or not
 /// ([13 §4](../../../docs/13-http1-upstream.md)); that is the other direction, and this
 /// test is here so that the two are not confused.
+///
+/// EdgeRush's own server refuses such a request with a 400, the other choice RFC 9110 §8.6
+/// allows and the one its upstream side makes ([14 §4](../../../docs/14-downstream-server.md)).
 #[tokio::test]
 async fn equal_repeated_request_lengths_are_made_one_by_the_engine() {
     let (saw, mut seen) = reporter();
@@ -806,6 +809,14 @@ async fn equal_repeated_request_lengths_are_made_one_by_the_engine() {
         .await;
 
     let head = client.head().await;
+    if downstream_under_test() == Downstream::Ours {
+        assert!(head.starts_with("HTTP/1.1 400 "), "{head}");
+        assert!(
+            seen.try_recv().is_err(),
+            "a refused request reached the upstream"
+        );
+        return;
+    }
     assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
     let sent = within(seen.recv()).await.unwrap();
     assert_eq!(sent.matches("content-length:").count(), 1, "{sent}");
@@ -1719,7 +1730,14 @@ async fn taken(answer: String, connections: usize) {
     let mut client = Wire::to(proxy).await;
     let first = asks(&mut client, "/first").await;
     assert!(first.starts_with("HTTP/1.1 200"), "{first}");
-    assert_eq!(within(client.body(5)).await, "hello");
+    if first.contains("transfer-encoding: chunked") {
+        assert_eq!(
+            within(client.chunked_body()).await,
+            "5\r\nhello\r\n0\r\n\r\n"
+        );
+    } else {
+        assert_eq!(within(client.body(5)).await, "hello");
+    }
     let mut again = Wire::to(proxy).await;
     let second = asks(&mut again, "/second").await;
     assert!(second.starts_with("HTTP/1.1 200"), "{second}");
@@ -1803,10 +1821,15 @@ async fn an_answer_with_both_a_length_and_chunking_is_refused_by_our_own_path() 
             assert!(first.starts_with("HTTP/1.1 200"), "{first}");
             assert_eq!(accepts, 1, "the engine's client kept it");
         }
-        // Delivered by the length the head still carries, and the downstream server stops
-        // reading at it: nobody asks for the chunk that ends the body, so its end is never
-        // seen and the connection closes rather than goes back.
-        Upstream::HyperConn => taken(answer.into(), 2).await,
+        // The engine's server delivers it by the length the head still carries and stops
+        // reading there: nobody asks for the chunk that ends the body, so its end is never
+        // seen and the connection closes rather than goes back. EdgeRush's own server
+        // frames it by what the body says of itself, in chunks, reads it to its end, and
+        // the connection goes back.
+        Upstream::HyperConn => match downstream_under_test() {
+            Downstream::Hyper => taken(answer.into(), 2).await,
+            Downstream::Ours => taken(answer.into(), 1).await,
+        },
     }
 }
 
@@ -2333,8 +2356,11 @@ async fn an_answer_that_says_close_is_not_reused_though_the_socket_stays_open() 
 /// An intermediary speaks its own version: "Intermediaries that process HTTP messages ...
 /// MUST send their own HTTP-version in forwarded messages" (RFC 9110 §6.2). An upstream
 /// that answers in HTTP/1.0 is answered on to an HTTP/1.1 client in HTTP/1.1, and one that
-/// answers in HTTP/1.1 is answered on to an HTTP/1.0 client in 1.0, which is all that
-/// client can be sent. Found while writing the test above.
+/// answers in HTTP/1.1 is answered on to an HTTP/1.0 client in 1.0 by the engine's server.
+/// EdgeRush's own answers every client in HTTP/1.1, as RFC 9112 §2.3 asks of a server —
+/// the highest version it conforms to within the request's major version — and as NGINX
+/// does; the framing an HTTP/1.0 client can read is unchanged
+/// ([14 §4](../../../docs/14-downstream-server.md)). Found while writing the test above.
 #[tokio::test]
 async fn an_answer_is_passed_on_in_the_proxys_own_version() {
     let proxy = proxy_to(
@@ -2356,7 +2382,11 @@ async fn an_answer_is_passed_on_in_the_proxys_own_version() {
     old.write("GET /first HTTP/1.0\r\nHost: example.test\r\n\r\n")
         .await;
     let head = within(old.head()).await;
-    assert!(head.starts_with("HTTP/1.0 200"), "{head}");
+    let spoken = match downstream_under_test() {
+        Downstream::Hyper => "HTTP/1.0 200",
+        Downstream::Ours => "HTTP/1.1 200",
+    };
+    assert!(head.starts_with(spoken), "{head}");
 }
 
 /// An idle connection the upstream resets, rather than closes, is as gone as one it

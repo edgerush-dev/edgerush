@@ -1171,7 +1171,12 @@ where
         if self.complete && self.trailers.is_none() {
             return SizeHint::with_exact(0);
         }
-        SizeHint::default()
+        // A counted body says what is left of it, which is how a server passing it on
+        // knows to give it a length rather than chunks.
+        match self.reader.remaining() {
+            Some(left) if self.rest.is_some() => SizeHint::with_exact(left),
+            _ => SizeHint::default(),
+        }
     }
 }
 

@@ -132,9 +132,10 @@ fn decimal(out: &mut Vec<u8>, mut value: u64) {
     out.extend_from_slice(&digits[at..]);
 }
 
-/// Appends `value` in lower-case hexadecimal, from a buffer on the stack.
+/// Appends `value` in hexadecimal, from a buffer on the stack.
 fn hexadecimal(out: &mut Vec<u8>, mut value: u64) {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    // Upper case, as the grammar writes HEXDIG (RFC 5234 B.1) and as hyper writes it.
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
     // The largest u64 is sixteen hexadecimal digits.
     let mut digits = [0u8; 16];
     let mut at = digits.len();
@@ -650,7 +651,7 @@ mod tests {
                 None
             ),
             Ok(format!(
-                "5\r\nhello\r\n1a\r\n{}\r\n0\r\n\r\n",
+                "5\r\nhello\r\n1A\r\n{}\r\n0\r\n\r\n",
                 "x".repeat(26)
             ))
         );
@@ -731,7 +732,7 @@ mod tests {
             assert_eq!(String::from_utf8(out).unwrap(), value.to_string());
             let mut out = Vec::new();
             hexadecimal(&mut out, value);
-            assert_eq!(String::from_utf8(out).unwrap(), format!("{value:x}"));
+            assert_eq!(String::from_utf8(out).unwrap(), format!("{value:X}"));
         }
     }
 

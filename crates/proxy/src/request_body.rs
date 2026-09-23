@@ -2,10 +2,11 @@
 //!
 //! The request core and the upstream exchange take this, and nothing an engine defines:
 //! what an engine hands over is wrapped where it hands it over, and what it reports going
-//! wrong is sorted into [`RequestBodyError`] there too. Today there is one engine, hyper's
-//! server; a second, EdgeRush's own HTTP/1 server, goes beside it as another case
-//! ([14 §2](../../../docs/14-downstream-server.md)).
+//! wrong is sorted into [`RequestBodyError`] there too. There are two: hyper's server, and
+//! EdgeRush's own HTTP/1 server, whose body cannot leave the worker and so makes this one
+//! that cannot either ([14 §2](../../../docs/14-downstream-server.md)).
 
+use crate::downstream::h1::connection::IncomingBody;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use hyper::body::Incoming;
@@ -25,6 +26,8 @@ use std::task::{Context, Poll};
 pub(crate) enum RequestBody {
     /// Read by hyper's server, over HTTP/1 or HTTP/2.
     Hyper(Incoming),
+    /// Read by EdgeRush's own HTTP/1 server, from the connection's own input.
+    Ours(IncomingBody),
 }
 
 /// What an engine reported going wrong, kept as the cause of a [`RequestBodyError`] without
@@ -75,18 +78,21 @@ impl Body for RequestBody {
             Self::Hyper(incoming) => Pin::new(incoming)
                 .poll_frame(cx)
                 .map_err(RequestBodyError::from_hyper),
+            Self::Ours(body) => Pin::new(body).poll_frame(cx),
         }
     }
 
     fn is_end_stream(&self) -> bool {
         match self {
             Self::Hyper(incoming) => incoming.is_end_stream(),
+            Self::Ours(body) => body.is_end_stream(),
         }
     }
 
     fn size_hint(&self) -> SizeHint {
         match self {
             Self::Hyper(incoming) => incoming.size_hint(),
+            Self::Ours(body) => body.size_hint(),
         }
     }
 }
@@ -195,13 +201,30 @@ mod tests {
         }
     }
 
+    /// Where the server's stream futures go: this thread, as on a worker, because a body
+    /// that may be one of EdgeRush's own server's cannot go anywhere else.
+    #[derive(Clone, Copy)]
+    struct OnThisThread;
+
+    impl<F: std::future::Future<Output = ()> + 'static> hyper::rt::Executor<F> for OnThisThread {
+        fn execute(&self, future: F) {
+            let _detached = tokio::task::spawn_local(future);
+        }
+    }
+
     /// What hyper's HTTP/2 server hands over for a POST whose body is `frames`.
     async fn over_http2(frames: Vec<Result<Frame<Bytes>, &'static str>>) -> Seen {
+        tokio::task::LocalSet::new()
+            .run_until(over_http2_here(frames))
+            .await
+    }
+
+    async fn over_http2_here(frames: Vec<Result<Frame<Bytes>, &'static str>>) -> Seen {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (told, mut hear) = mpsc::unbounded_channel();
         let service = service_fn(move |request| reading(request, told.clone()));
-        let _serving = tokio::spawn(
-            hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+        let _serving = tokio::task::spawn_local(
+            hyper::server::conn::http2::Builder::new(OnThisThread)
                 .serve_connection(TokioIo::new(server), service),
         );
         let (mut sender, connection) =
