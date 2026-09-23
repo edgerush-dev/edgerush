@@ -2201,9 +2201,14 @@ upstreams:
                         if head.starts_with(b"POST /upload") {
                             std::future::pending::<()>().await;
                         } else if head.starts_with(b"GET /big") {
+                            // Said to close: a client's socket buffers can take the whole
+                            // answer, and the connection then goes back to the pool, where
+                            // a later request would wait on it for ever — this upstream
+                            // answers one request a connection.
                             let length = 1 << 20;
-                            let said =
-                                format!("HTTP/1.1 200 OK\r\ncontent-length: {length}\r\n\r\n");
+                            let said = format!(
+                                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {length}\r\n\r\n"
+                            );
                             let _said = stream.write_all(said.as_bytes()).await;
                             let _said = stream.write_all(&vec![b'x'; length]).await;
                             std::future::pending::<()>().await;
