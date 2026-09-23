@@ -58,12 +58,56 @@ const READ_AHEAD: usize = 16 * 1024;
 
 /// How much of an answer is queued for the socket before its body is asked for more: the
 /// body staging of 14 §8.
-const STAGING: usize = 16 * 1024;
+const STAGING: usize = 64 * 1024;
 
 /// The most queued pieces one write carries. A frame is three at most — its chunk size, the
 /// frame and the line break after it — and the staging holds a few frames at most, so this
 /// is rarely what stops a write; it keeps the slices on the stack.
 const GATHERED: usize = 64;
+
+/// How much the next read of a request's body asks for (14 §8): from 16 KiB, doubling
+/// while reads fill what they ask for, up to 64 KiB, and halving after two reads in a row
+/// that bring less than half. hyper's rule for its reads, within Pingora's size: a long
+/// upload is read in few large reads, and anything else stays at a small block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadSize {
+    next: usize,
+    /// Whether the last read brought less than half of what it asked for.
+    short: bool,
+}
+
+impl ReadSize {
+    const LEAST: usize = 16 * 1024;
+    const MOST: usize = 64 * 1024;
+
+    fn next(self) -> usize {
+        self.next
+    }
+
+    /// Takes note of a read that asked for [`ReadSize::next`] and brought `arrived`.
+    fn record(&mut self, arrived: usize) {
+        if arrived >= self.next {
+            self.next = (self.next * 2).min(Self::MOST);
+            self.short = false;
+        } else if arrived < self.next / 2 {
+            if self.short {
+                self.next = (self.next / 2).max(Self::LEAST);
+            }
+            self.short = !self.short;
+        } else {
+            self.short = false;
+        }
+    }
+}
+
+impl Default for ReadSize {
+    fn default() -> Self {
+        Self {
+            next: Self::LEAST,
+            short: false,
+        }
+    }
+}
 
 /// What a connection is held to.
 #[derive(Debug, Clone, Copy)]
@@ -357,6 +401,8 @@ struct Connection<S> {
     budget: Budget,
     /// What is left of the budget in this turn.
     left: Budget,
+    /// How much the next read of a request's body asks for.
+    read_size: ReadSize,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
@@ -386,6 +432,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             armed: None,
             budget: settings.budget,
             left: settings.budget,
+            read_size: ReadSize::default(),
         }
     }
 
@@ -554,7 +601,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
 
     /// Reads one block from the socket into the input, if the input holds less than
     /// `room`, taking no more than brings it to `room`; says whether anything arrived or the
-    /// client closed.
+    /// client closed. A read for a request's `body` asks for as much as [`ReadSize`] says,
+    /// into a grown block when a small one has too little room; any other read takes at
+    /// most a small block's worth.
     ///
     /// The input's block is borrowed for the read and given back if it brought nothing:
     /// a wake with nothing to read, which a stale readiness report gives, leaves the
@@ -564,27 +613,44 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     ///
     /// [`Stop::Exhausted`] if the worker cannot pay for a block to read into. What the
     /// input held may be lost with it, so the connection cannot go on.
-    fn poll_read(&mut self, context: &mut Context<'_>, room: usize) -> Result<bool, Stop> {
+    fn poll_read(
+        &mut self,
+        context: &mut Context<'_>,
+        room: usize,
+        body: bool,
+    ) -> Result<bool, Stop> {
         let mut guard = self.inbound.borrow_mut();
         let inbound = &mut *guard;
         let held = inbound.input.as_ref().map_or(0, Block::len);
         if inbound.ended || inbound.failed || held >= room {
             return Ok(false);
         }
+        let wanted = if body {
+            self.read_size.next()
+        } else {
+            READ_BLOCK
+        };
         let lent = match inbound.input.take() {
             Some(mut block) => {
-                if block.room().is_empty() {
+                if block.is_empty() && block.room().len() < wanted {
+                    // Nothing in it is still to be read, and it has too little room for the
+                    // read asked for: a grown block in its place.
+                    let mut blocks = inbound.blocks.borrow_mut();
+                    blocks.give(block);
+                    blocks.take_grown()
+                } else if block.room().is_empty() {
                     inbound.blocks.borrow_mut().refill(block)
                 } else {
                     Ok(block)
                 }
             }
+            None if wanted > READ_BLOCK => inbound.blocks.borrow_mut().take_grown(),
             None => inbound.blocks.borrow_mut().take(),
         };
         let Ok(mut block) = lent else {
             return Err(Stop::Exhausted);
         };
-        let most = (room - held).min(READ_BLOCK);
+        let most = (room - held).min(wanted);
         let space = block.room();
         let take = space.len().min(most);
         let mut read = ReadBuf::new(&mut space[..take]);
@@ -605,6 +671,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             Poll::Ready(Ok(())) => {
                 inbound.wake();
                 self.deadlines.bytes_arrived(now());
+                // Only a read that asked for all the rule said tells it anything.
+                if body && take == wanted {
+                    self.read_size.record(arrived);
+                }
             }
             Poll::Ready(Err(_)) => {
                 give_back_if_empty(&mut inbound.input, &inbound.blocks);
@@ -736,7 +806,7 @@ where
                 // The head's own bound, plus a read's worth, is all it may hold. A worker
                 // that cannot pay for a block to read it into closes the connection before
                 // the request reaches the core, so no upstream is asked (14 §8).
-                let read = match connection.poll_read(context, limits.head + READ) {
+                let read = match connection.poll_read(context, limits.head + READ, false) {
                     Ok(read) => read,
                     Err(stop) => return Poll::Ready(Err(Ok(stop.into()))),
                 };
@@ -828,7 +898,7 @@ where
                     // hear a client that goes, keeping what arrives for the next request
                     // up to the read-ahead bound.
                     let room = if body_done { READ_AHEAD } else { limits.head };
-                    if (wanted || body_done) && connection.poll_read(context, room)? {
+                    if (wanted || body_done) && connection.poll_read(context, room, !body_done)? {
                         moved = true;
                         connection.deadlines.body_moved(now());
                         let inbound = connection.inbound.borrow();
@@ -954,7 +1024,7 @@ where
                 moved |= connection.poll_write_queued(context)?;
                 // An upload the answer did not wait for is still read for it.
                 let wanted = connection.inbound.borrow().wanted;
-                if wanted && connection.poll_read(context, limits.head)? {
+                if wanted && connection.poll_read(context, limits.head, true)? {
                     moved = true;
                 }
                 if !body_left && connection.queued.is_empty() {
@@ -1213,6 +1283,7 @@ mod tests {
     struct Counted {
         inner: tokio::io::DuplexStream,
         writes: Rc<Cell<usize>>,
+        reads: Rc<Cell<usize>>,
     }
 
     impl AsyncRead for Counted {
@@ -1221,7 +1292,13 @@ mod tests {
             context: &mut Context<'_>,
             buf: &mut tokio::io::ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.get_mut().inner).poll_read(context, buf)
+            let this = self.get_mut();
+            let before = buf.filled().len();
+            let read = Pin::new(&mut this.inner).poll_read(context, buf);
+            if buf.filled().len() > before {
+                this.reads.set(this.reads.get() + 1);
+            }
+            read
         }
     }
 
@@ -1269,14 +1346,27 @@ mod tests {
         F: Future<Output = Response<B>>,
         B: Body<Data = Bytes> + Unpin,
     {
-        let (mut client, server) = tokio::io::duplex(1 << 20);
+        let (received, writes, _) = counted(sent.to_vec(), respond).await;
+        (received, writes)
+    }
+
+    /// The same for any request, with how many reads it took as well.
+    async fn counted<R, F, B>(sent: Vec<u8>, respond: R) -> (String, usize, usize)
+    where
+        R: FnMut(Request<RequestBody>, Interim) -> F,
+        F: Future<Output = Response<B>>,
+        B: Body<Data = Bytes> + Unpin,
+    {
+        let (mut client, server) = tokio::io::duplex(1 << 22);
         let writes = Rc::new(Cell::new(0));
+        let reads = Rc::new(Cell::new(0));
         let socket = Counted {
             inner: server,
             writes: Rc::clone(&writes),
+            reads: Rc::clone(&reads),
         };
         let talking = async move {
-            client.write_all(sent).await.unwrap();
+            client.write_all(&sent).await.unwrap();
             let mut received = Vec::new();
             client.read_to_end(&mut received).await.unwrap();
             String::from_utf8_lossy(&received).into_owned()
@@ -1287,7 +1377,79 @@ mod tests {
         })
         .await
         .expect("serving never finished");
-        (received, writes.get())
+        (received, writes.get(), reads.get())
+    }
+
+    /// The size of a body's reads follows how full they come: doubling from 16 KiB while
+    /// they fill what they ask for, up to 64 KiB, and halving after two in a row that bring
+    /// less than half (14 §8).
+    #[test]
+    fn a_body_read_grows_while_reads_come_full_and_shrinks_after_two_short_ones() {
+        let mut size = ReadSize::default();
+        assert_eq!(size.next(), 16 * 1024);
+        size.record(16 * 1024);
+        assert_eq!(size.next(), 32 * 1024);
+        size.record(32 * 1024);
+        assert_eq!(size.next(), 64 * 1024);
+        size.record(64 * 1024);
+        assert_eq!(size.next(), 64 * 1024, "never past 64 KiB");
+
+        size.record(100);
+        assert_eq!(size.next(), 64 * 1024, "one short read is not enough");
+        size.record(40 * 1024);
+        size.record(100);
+        assert_eq!(
+            size.next(),
+            64 * 1024,
+            "a read of more than half ends the run"
+        );
+        size.record(100);
+        assert_eq!(size.next(), 32 * 1024);
+        size.record(100);
+        size.record(100);
+        size.record(100);
+        size.record(100);
+        assert_eq!(size.next(), 16 * 1024, "never below 16 KiB");
+    }
+
+    /// A long upload is read in reads of up to 64 KiB, not in 16 KiB pieces: a system call
+    /// a piece is what it cost.
+    #[tokio::test]
+    async fn a_long_upload_is_read_in_growing_reads() {
+        const BODY: usize = 1024 * 1024;
+        let mut sent = format!(
+            "POST /up HTTP/1.1\r\nhost: a\r\nconnection: close\r\ncontent-length: {BODY}\r\n\r\n"
+        )
+        .into_bytes();
+        sent.extend(std::iter::repeat_n(b'x', BODY));
+        let taking = |request: Request<RequestBody>, _: Interim| async {
+            let taken = request
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .len();
+            Response::new(Answer::Full(Full::new(Bytes::from(taken.to_string()))))
+        };
+        let (received, _, reads) = counted(sent, taking).await;
+        assert!(received.ends_with(&BODY.to_string()), "{received}");
+        // 16 + 32 KiB, then 64 KiB at a time: about 18 reads, where 16 KiB reads take 64.
+        assert!(reads <= 24, "{reads} reads for {BODY} bytes");
+    }
+
+    /// A long answer whose body keeps up is written 64 KiB at a time.
+    #[tokio::test]
+    async fn a_long_answer_is_gathered_into_large_writes() {
+        const CLOSING: &[u8] = b"GET /one HTTP/1.1\r\nhost: a\r\nconnection: close\r\n\r\n";
+        let frames = |_: Request<RequestBody>, _: Interim| async {
+            let parts = (0..32).map(|_| Bytes::from(vec![b'y'; 8 * 1024])).collect();
+            Response::new(Answer::Unknown(Unknown(parts)))
+        };
+        let (received, writes) = written(CLOSING, frames).await;
+        assert!(received.ends_with("0\r\n\r\n"), "{}", received.len());
+        // 256 KiB in 64 KiB writes, where 16 KiB of staging took 16 or more.
+        assert!(writes <= 6, "{writes} writes");
     }
 
     /// An answer whose body is there as its head is written goes out in one write: a
@@ -1921,7 +2083,7 @@ mod tests {
             inbound.input = Some(grown);
         }
         let arrived =
-            poll_fn(|context| Poll::Ready(connection.poll_read(context, usize::MAX))).await;
+            poll_fn(|context| Poll::Ready(connection.poll_read(context, usize::MAX, false))).await;
         assert_eq!(arrived, Ok(true));
         let held = connection
             .inbound

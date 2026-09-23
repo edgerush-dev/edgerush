@@ -364,6 +364,17 @@ impl Blocks {
         )
     }
 
+    /// An empty grown block, for a read larger than a small block holds: a long request
+    /// body's, which are read up to 64 KiB at a time ([14 §8](../../../../docs/14-downstream-server.md)).
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`] if the worker cannot pay for it.
+    pub fn take_grown(&mut self) -> Result<Block, Exhausted> {
+        let (large, cut) = (self.sizes.large, self.sizes.cut);
+        Self::lend(&self.storage, &mut self.large, large, large, cut)
+    }
+
     /// The same block with room to read into, what it held kept at the front.
     ///
     /// A block that has come to the end of its memory because frames were cut from it
