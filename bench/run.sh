@@ -10,6 +10,8 @@
 #   bench/run.sh carrying [STREAMED SLOW]     streamed bodies, a slow upstream,
 #                                             cancellation, reload under load, idle memory
 #   bench/run.sh instructions                 where a worker's instructions go, by part
+#   bench/run.sh idle                         what idle connections cost: never written to,
+#                                             after one request, after one large head
 #   bench/run.sh profile-body upload|answer [RATE]  CPU stacks during streamed bodies
 #   bench/run.sh summary DIR                  the table of a finished run
 #
@@ -38,6 +40,8 @@ repo=$(dirname "$here")
 # and how many connections are left idle for the one that weighs them.
 : "${STREAMED:=8388608}"
 : "${IDLE_CONNECTIONS:=2000}"
+# The counts `idle` weighs each kind of idle connection at (14 §8).
+: "${IDLE_COUNTS:=2000 20000}"
 : "${VARIANTS:=thread-per-core}" # and: ours hyper-conn thread-per-core-kernel nginx haproxy envoy kong
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
 
@@ -142,6 +146,20 @@ start_proxy() { # variant
         # it measures the pool and the adapter; against ours, the client itself.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
             --upstream hyper-conn --workers "$WORKERS" $idle \
+            2>>"$OUT/proxy.log" &
+        ;;
+    own-server)
+        # EdgeRush's own downstream server in front of its own client: the path the
+        # downstream work builds, whose step 3 checkpoint this is (14 section 9).
+        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
+            --upstream ours --downstream ours --workers "$WORKERS" $idle \
+            2>>"$OUT/proxy.log" &
+        ;;
+    own-server-hyper-conn)
+        # The same server in front of the engine's client a connection at a time: the
+        # server measured apart from which client carries the request.
+        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
+            --upstream hyper-conn --downstream ours --workers "$WORKERS" $idle \
             2>>"$OUT/proxy.log" &
         ;;
     *)
@@ -309,8 +327,8 @@ reload_under_load() { # name, rate
 
 # What connections cost while nothing is happening on them: the proxy's own memory
 # with a few thousand open and answered, against the same proxy with none.
-idle_memory() { # name
-    local name=$1
+idle_memory() { # name, [kind, count]: as bench/idle.py takes them
+    local name=$1 kind=${2:-one-request} count=${3:-$IDLE_CONNECTIONS}
     # On a proxy started afresh. One that has just carried large bodies holds memory it
     # has freed and not handed back, and a small cost per connection disappears into it:
     # measured after the other scenarios, NGINX read as 0 bytes a connection, where a
@@ -321,21 +339,27 @@ idle_memory() { # name
     local quiet
     quiet=$(python3 "$here/rss.py" "$proxy_pid")
     taskset -c "$GEN_CPUS" python3 "$here/idle.py" "$proxy_at" "$host" \
-        "$IDLE_CONNECTIONS" >"$OUT/$name.ready" 2>"$OUT/$name.err" &
+        "$count" "$kind" >"$OUT/$name.ready" 2>"$OUT/$name.err" &
     local holding=$!
-    for _ in $(seq 600); do
+    for _ in $(seq 1200); do
         grep -q ready "$OUT/$name.ready" 2>/dev/null && break
         sleep 0.1
     done
-    # A sweep runs once a second; give it one so that what is held is settled.
-    sleep 2
-    local held
+    # A sweep runs once a second; give it one so that what is held is settled. Not for
+    # connections that have said nothing: the first request's deadline, ten seconds from
+    # accept, would close them first.
+    [ "$kind" = silent ] || sleep 2
+    local held open
     held=$(python3 "$here/rss.py" "$proxy_pid")
+    # What is weighed is what is still open, which is not always all that were opened.
+    open=$(ss -Htn state established "( sport = :${proxy_at##*:} )" | wc -l)
     {
-        echo "connections $IDLE_CONNECTIONS"
+        echo "kind $kind"
+        echo "connections $count"
+        echo "open $open"
         echo "rss_quiet_kb $quiet"
         echo "rss_held_kb $held"
-        echo "per_connection_bytes $(( (held - quiet) * 1024 / IDLE_CONNECTIONS ))"
+        echo "per_connection_bytes $(( (held - quiet) * 1024 / (open > 0 ? open : 1) ))"
     } >"$OUT/$name.out"
     kill "$holding" 2>/dev/null || true
     wait "$holding" 2>/dev/null || true
@@ -432,7 +456,7 @@ profile-body)
         exit 2
     }
     ;;
-ceiling | saturation | latency | carrying | hotpaths | frontend | instructions) ;;
+ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle) ;;
 *)
     sed -n '2,15p' "$0" >&2
     exit 2
@@ -538,6 +562,19 @@ hotpaths)
         streamed_request "$1.streamed-request" "$streamed_rate"
     }
     each_variant hotpath_runs
+    ;;
+idle)
+    # What idle connections cost, each kind at each count on a proxy started afresh: never
+    # written to, after one request, and after one head of most of the 64 KiB a head may
+    # be (14 section 9's measurement checkpoint).
+    idle_runs() {
+        for kind in silent one-request large-head; do
+            for count in $IDLE_COUNTS; do
+                idle_memory "$1.idle-$kind-$count" "$kind" "$count"
+            done
+        done
+    }
+    each_variant idle_runs
     ;;
 carrying)
     # Low rates: every one of these is about what an exchange holds and for how long

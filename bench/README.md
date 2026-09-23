@@ -30,6 +30,8 @@ bench/run.sh carrying               # streamed bodies, a slow upstream, cancella
                                     # reload under load, and what idle connections cost
 bench/run.sh hotpaths [RATE]        # H1 saturation and both streamed bodies (default 20/s)
 bench/run.sh frontend               # the engine alone against NGINX, with no upstream
+bench/run.sh idle                   # idle connections: never written to, after one
+                                    # request, after one large head, at IDLE_COUNTS
 bench/run.sh summary bench/results/<run>
 ```
 
@@ -47,6 +49,11 @@ two is comparing them at the same bounds; every run writes what they were into
 `environment.txt`, because a gain that came of loosening a bound is not a gain.
 
 ## The variants
+
+`own-server` puts EdgeRush's own downstream server in front of its own client, and
+`own-server-hyper-conn` in front of the engine's client a connection at a time
+(`--downstream ours`, [14 §9](../../docs/14-downstream-server.md)); every other EdgeRush
+variant is served by the engine's server.
 
 For the client optimisation rerun, use the original machine and fixed frequency with
 `WORKERS=2 REPS=3 VARIANTS="thread-per-core ours nginx" IDLE_PER_DESTINATION=1024
