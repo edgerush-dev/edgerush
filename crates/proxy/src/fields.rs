@@ -10,17 +10,23 @@
 //! so asking for them again costs nothing. What a line spans, from its first byte to the
 //! end of its line break, is kept too: an unchanged line is forwarded as the bytes it
 //! arrived as.
+//!
+//! Edits leave the head alone. An [`Overlay`] records which lines are taken out and what
+//! is added, reads as a header map edited the same way would, and gives what is to be
+//! written as [`Piece`]s: the kept lines, each run of neighbours one copy, then the added
+//! fields.
 
 // `pub` for the fuzz targets, which are a crate of their own; in an ordinary build none of
 // this is API.
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
 
+use crate::h1::MOST_FIELDS;
 use edgerush_router::Fields;
-use http::HeaderName;
 use http::header::{
     AUTHORIZATION, CONNECTION, CONTENT_LENGTH, COOKIE, EXPECT, HOST, PROXY_AUTHORIZATION, TE,
     TRAILER, TRANSFER_ENCODING,
 };
+use http::{HeaderName, HeaderValue};
 use std::ops::Range;
 
 /// The headers the gateway reads by name for itself, each with a slot of its own.
@@ -125,7 +131,13 @@ pub enum FieldsError {
     /// break there.
     #[error("a field is not a line of its head")]
     NotALine,
+    /// More fields than any head is read into.
+    #[error("more than {MOST_FIELDS} fields")]
+    TooMany,
 }
+
+// Every line has a bit of its own in an overlay's record of what it took out.
+const _: () = assert!(MOST_FIELDS <= u128::BITS as usize);
 
 /// The field lines of one head: where each is, and where the known headers are.
 #[derive(Debug, Clone, Default)]
@@ -141,8 +153,12 @@ impl FieldLines {
     /// # Errors
     ///
     /// [`FieldsError::NotALine`] if a field is not a part of `head`, or its line is not
-    /// ended by a line feed.
+    /// ended by a line feed; [`FieldsError::TooMany`] if there are more than
+    /// [`MOST_FIELDS`].
     pub fn new(head: &[u8], fields: &[httparse::Header<'_>]) -> Result<Self, FieldsError> {
+        if fields.len() > MOST_FIELDS {
+            return Err(FieldsError::TooMany);
+        }
         let mut lines = Vec::with_capacity(fields.len());
         let mut slots = [Slot::default(); Known::ALL.len()];
         for field in fields {
@@ -241,8 +257,12 @@ impl<'a> View<'a> {
     }
 }
 
-impl Fields for View<'_> {
-    fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
+impl<'a> View<'a> {
+    /// The lines called `name`, each with its position, in the order they came.
+    fn called<'n>(
+        &self,
+        name: &'n HeaderName,
+    ) -> impl Iterator<Item = (usize, &'a Line)> + use<'a, 'n> {
         let known = Known::of_name(name);
         let wanted = name.as_str().as_bytes();
         let head = self.head;
@@ -258,7 +278,9 @@ impl Fields for View<'_> {
             .get(first..)
             .unwrap_or_default()
             .iter()
-            .filter(move |line| match known {
+            .enumerate()
+            .map(move |(at, line)| (first + at, line))
+            .filter(move |(_, line)| match known {
                 Some(known) => line.known == Some(known),
                 // A name that is not a known one is not on a line that has one.
                 None => {
@@ -267,8 +289,161 @@ impl Fields for View<'_> {
                 }
             })
             .take(count)
-            .map(move |line| bytes(head, line.value.0..line.value.1))
     }
+
+    fn value(&self, line: &Line) -> &'a [u8] {
+        bytes(self.head, line.value.0..line.value.1)
+    }
+}
+
+impl Fields for View<'_> {
+    fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
+        self.called(name).map(|(_, line)| self.value(line))
+    }
+}
+
+/// The most fields an overlay adds: as many as a head may arrive with.
+pub const MOST_ADDED: usize = MOST_FIELDS;
+
+/// An overlay has added as many fields as it may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("more than {MOST_ADDED} fields added to a head")]
+pub struct OverlayFull;
+
+/// Edits to a head's fields that leave the head as it is: which of its lines are taken
+/// out, and what is added after the rest. It belongs to the lines it was made against, and
+/// is only ever read with them.
+///
+/// It gives what a header map's edits would — for every name the same values in the same
+/// order — while what is kept of the head is still the bytes it arrived as.
+#[derive(Debug, Clone, Default)]
+pub struct Overlay {
+    /// A bit for each of the head's lines, set when the line is taken out.
+    removed: u128,
+    /// Fields to write after what is kept of the head, in the order they were added.
+    added: Vec<(HeaderName, HeaderValue)>,
+}
+
+impl Overlay {
+    /// Takes out every field called `name`: the head's lines, whatever the case of their
+    /// name, and anything added under it before.
+    pub fn remove(&mut self, view: &View<'_>, name: &HeaderName) {
+        for (at, _) in view.called(name) {
+            self.removed |= bit(at);
+        }
+        self.added.retain(|(added, _)| added != name);
+    }
+
+    /// Gives `name` this one value, in place of every one it had.
+    ///
+    /// # Errors
+    ///
+    /// [`OverlayFull`] if as many fields have been added as may be, and then nothing
+    /// is changed.
+    pub fn set(
+        &mut self,
+        view: &View<'_>,
+        name: HeaderName,
+        value: HeaderValue,
+    ) -> Result<(), OverlayFull> {
+        if self.added.len() >= MOST_ADDED {
+            return Err(OverlayFull);
+        }
+        self.remove(view, &name);
+        self.added.push((name, value));
+        Ok(())
+    }
+
+    /// Adds a value to `name`, after every one it has.
+    ///
+    /// # Errors
+    ///
+    /// [`OverlayFull`] if as many fields have been added as may be.
+    pub fn append(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), OverlayFull> {
+        if self.added.len() >= MOST_ADDED {
+            return Err(OverlayFull);
+        }
+        self.added.push((name, value));
+        Ok(())
+    }
+
+    /// The head's fields as edited, read like a header map.
+    #[must_use]
+    pub fn edited<'a>(&'a self, view: View<'a>) -> Edited<'a> {
+        Edited {
+            view,
+            overlay: self,
+        }
+    }
+
+    /// What the edited fields are written as: the lines kept, each run of them that stood
+    /// side by side copied as one, and then the fields added, in the order they were.
+    pub fn pieces<'a>(&'a self, lines: &'a FieldLines) -> impl Iterator<Item = Piece<'a>> + 'a {
+        let removed = self.removed;
+        let lines = &lines.lines;
+        let mut at = 0;
+        let runs = std::iter::from_fn(move || {
+            while at < lines.len() && removed & bit(at) != 0 {
+                at += 1;
+            }
+            let first = lines.get(at)?;
+            let mut last = first;
+            at += 1;
+            while let Some(line) = lines.get(at).filter(|_| removed & bit(at) == 0) {
+                last = line;
+                at += 1;
+            }
+            Some(Piece::Copy(first.start as usize..last.end as usize))
+        });
+        runs.chain(
+            self.added
+                .iter()
+                .map(|(name, value)| Piece::Field(name, value)),
+        )
+    }
+}
+
+/// A piece of an edited head's field section, as it is to be written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Piece<'a> {
+    /// These bytes of the head, whole lines with their line breaks, as they arrived.
+    Copy(Range<usize>),
+    /// A field to write out.
+    Field(&'a HeaderName, &'a HeaderValue),
+}
+
+/// A head's fields as an overlay has edited them.
+#[derive(Debug, Clone, Copy)]
+pub struct Edited<'a> {
+    view: View<'a>,
+    overlay: &'a Overlay,
+}
+
+impl Fields for Edited<'_> {
+    fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
+        let removed = self.overlay.removed;
+        let kept = self
+            .view
+            .called(name)
+            .filter(move |(at, _)| removed & bit(*at) == 0)
+            .map(|(_, line)| self.view.value(line));
+        let added = self
+            .overlay
+            .added
+            .iter()
+            .filter(move |(added, _)| added == name)
+            .map(|(_, value)| value.as_bytes());
+        kept.chain(added)
+    }
+}
+
+/// A line's bit in an overlay's record of what it took out. A head has no more lines than
+/// there are bits (`FieldLines::new`).
+fn bit(at: usize) -> u128 {
+    u32::try_from(at)
+        .ok()
+        .and_then(|at| 1u128.checked_shl(at))
+        .unwrap_or(0)
 }
 
 /// Where `part` lies in `whole`, if it is a part of it.
@@ -434,7 +609,207 @@ mod tests {
             })
     }
 
+    fn name(text: &str) -> HeaderName {
+        HeaderName::from_bytes(text.as_bytes()).unwrap()
+    }
+
+    fn value(text: &str) -> HeaderValue {
+        HeaderValue::from_str(text).unwrap()
+    }
+
+    /// The head an overlay's pieces make: copied runs and written fields, between the
+    /// request line and the empty line.
+    fn written(head: &[u8], overlay: &Overlay, lines: &FieldLines) -> Vec<u8> {
+        let mut out = b"GET / HTTP/1.1\r\n".to_vec();
+        for piece in overlay.pieces(lines) {
+            match piece {
+                Piece::Copy(span) => out.extend_from_slice(&head[span]),
+                Piece::Field(name, value) => {
+                    out.extend_from_slice(name.as_str().as_bytes());
+                    out.extend_from_slice(b": ");
+                    out.extend_from_slice(value.as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                }
+            }
+        }
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    #[test]
+    fn removing_a_name_takes_out_its_lines_in_any_case_and_what_was_added_under_it() {
+        let head = b"GET / HTTP/1.1\r\nX-A: 1\r\nx-b: 2\r\nx-a: 3\r\n\r\n";
+        let (lines, _) = read(head);
+        let view = lines.view(head);
+        let mut overlay = Overlay::default();
+        overlay.append(name("x-a"), value("4")).unwrap();
+        overlay.remove(&view, &name("x-a"));
+        let edited = overlay.edited(view);
+        assert!(values(&edited, &name("x-a")).is_empty());
+        assert_eq!(values(&edited, &name("x-b")), [b"2".to_vec()]);
+        assert_eq!(
+            written(head, &overlay, &lines),
+            b"GET / HTTP/1.1\r\nx-b: 2\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn setting_replaces_every_line_and_appending_adds_after_them() {
+        let head = b"GET / HTTP/1.1\r\nHost: a\r\nX-Tag: 1\r\nx-tag: 2\r\n\r\n";
+        let (lines, _) = read(head);
+        let view = lines.view(head);
+        let mut overlay = Overlay::default();
+        overlay.set(&view, HOST, value("b")).unwrap();
+        overlay.append(name("x-tag"), value("3")).unwrap();
+        let edited = overlay.edited(view);
+        assert_eq!(values(&edited, &HOST), [b"b".to_vec()]);
+        assert_eq!(
+            values(&edited, &name("x-tag")),
+            [b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]
+        );
+        // What is kept goes as it came, case and spacing too; what is new follows.
+        assert_eq!(
+            written(head, &overlay, &lines),
+            b"GET / HTTP/1.1\r\nX-Tag: 1\r\nx-tag: 2\r\nhost: b\r\nx-tag: 3\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn lines_kept_side_by_side_are_copied_as_one_run() {
+        let head = b"GET / HTTP/1.1\r\na: 1\r\nb: 2\r\nc: 3\r\nd: 4\r\ne: 5\r\n\r\n";
+        let (lines, _) = read(head);
+        let view = lines.view(head);
+        let mut overlay = Overlay::default();
+        overlay.remove(&view, &name("c"));
+        let copied: Vec<&[u8]> = overlay
+            .pieces(&lines)
+            .map(|piece| match piece {
+                Piece::Copy(span) => &head[span],
+                Piece::Field(..) => panic!("nothing was added"),
+            })
+            .collect();
+        assert_eq!(
+            copied,
+            [b"a: 1\r\nb: 2\r\n".as_slice(), b"d: 4\r\ne: 5\r\n"]
+        );
+
+        let untouched = Overlay::default();
+        assert_eq!(
+            untouched.pieces(&lines).count(),
+            1,
+            "one run for a whole head"
+        );
+    }
+
+    #[test]
+    fn what_may_be_added_is_bounded_and_a_refused_edit_changes_nothing() {
+        let head = b"GET / HTTP/1.1\r\nx-a: 1\r\n\r\n";
+        let (lines, _) = read(head);
+        let view = lines.view(head);
+        let mut overlay = Overlay::default();
+        for _ in 0..MOST_ADDED {
+            overlay.append(name("x-b"), value("2")).unwrap();
+        }
+        assert_eq!(overlay.append(name("x-b"), value("2")), Err(OverlayFull));
+        assert_eq!(
+            overlay.set(&view, name("x-a"), value("3")),
+            Err(OverlayFull)
+        );
+        assert_eq!(values(&overlay.edited(view), &name("x-a")), [b"1".to_vec()]);
+    }
+
+    #[test]
+    fn a_head_with_more_fields_than_any_is_read_into_is_refused() {
+        let mut head = b"GET / HTTP/1.1\r\n".to_vec();
+        for _ in 0..=MOST_FIELDS {
+            head.extend_from_slice(b"x-a: 1\r\n");
+        }
+        head.extend_from_slice(b"\r\n");
+        let mut room = [httparse::EMPTY_HEADER; MOST_FIELDS + 1];
+        let mut request = httparse::Request::new(&mut room);
+        assert!(request.parse(&head).unwrap().is_complete());
+        assert_eq!(
+            FieldLines::new(&head, request.headers).err(),
+            Some(FieldsError::TooMany)
+        );
+    }
+
+    /// An edit as the gateway makes them: taking a name out, setting it to one value, or
+    /// adding a value to it.
+    #[derive(Debug, Clone)]
+    enum Edit {
+        Remove(&'static str),
+        Set(&'static str, &'static str),
+        Append(&'static str, &'static str),
+    }
+
+    fn edit() -> impl Strategy<Value = Edit> {
+        let names = prop::sample::select(vec![
+            "x-a",
+            "x-b",
+            "host",
+            "connection",
+            "te",
+            "cookie",
+            "x-new",
+        ]);
+        let values = prop::sample::select(vec!["1", "2", "trailers", "a=1; b=2"]);
+        (0..3u8, names, values).prop_map(|(kind, name, value)| match kind {
+            0 => Edit::Remove(name),
+            1 => Edit::Set(name, value),
+            _ => Edit::Append(name, value),
+        })
+    }
+
     proptest! {
+        #[test]
+        fn edits_through_an_overlay_read_and_write_as_the_same_edits_to_a_map(
+            fields in prop::collection::vec(field(), 0..12),
+            edits in prop::collection::vec(edit(), 0..8),
+        ) {
+            let head = head_of(&fields);
+            let (lines, mut map) = read(&head);
+            let view = lines.view(&head);
+            let mut overlay = Overlay::default();
+            for edit in &edits {
+                match *edit {
+                    Edit::Remove(n) => {
+                        map.remove(n);
+                        overlay.remove(&view, &name(n));
+                    }
+                    Edit::Set(n, v) => {
+                        map.insert(name(n), value(v));
+                        overlay.set(&view, name(n), value(v)).unwrap();
+                    }
+                    Edit::Append(n, v) => {
+                        map.append(name(n), value(v));
+                        overlay.append(name(n), value(v)).unwrap();
+                    }
+                }
+            }
+            let edited = overlay.edited(view);
+            let mut names = every_name();
+            names.push(name("x-new"));
+            for n in &names {
+                prop_assert_eq!(values(&edited, n), values(&map, n), "{}", n);
+            }
+
+            // Written out and read again, it is the same head, whatever it looks like.
+            let out = written(&head, &overlay, &lines);
+            let (_, again) = read(&out);
+            for n in &names {
+                prop_assert_eq!(values(&again, n), values(&map, n), "{}", n);
+            }
+
+            // Runs are as long as they can be.
+            let pieces: Vec<Piece<'_>> = overlay.pieces(&lines).collect();
+            for pair in pieces.windows(2) {
+                if let [Piece::Copy(before), Piece::Copy(after)] = pair {
+                    prop_assert_ne!(before.end, after.start);
+                }
+            }
+        }
+
         #[test]
         fn a_view_reads_as_the_map_the_parser_builds(
             fields in prop::collection::vec(field(), 0..12),
