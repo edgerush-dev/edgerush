@@ -27,6 +27,7 @@ use super::deadlines::{Bounds, Clock, Deadlines};
 use super::writer::{Asked, BodyFramer, Content, Delimited, write_head};
 use crate::h1::{BodyReader, CodecError, Framing, Piece};
 use crate::request_body::{RequestBody, RequestBodyError};
+use crate::storage::{Charge, Storage};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Block, Blocks};
 use bytes::{Buf, Bytes};
@@ -326,8 +327,13 @@ impl From<Stop> for Ended {
 struct Connection<S> {
     socket: S,
     inbound: Rc<RefCell<Inbound>>,
-    queued: VecDeque<Bytes>,
+    /// What is waiting to be written, each with what it is charged: the storage it holds
+    /// that nothing else pays for (14 §8).
+    queued: VecDeque<(Bytes, usize)>,
     queued_bytes: usize,
+    /// The charge for everything queued, while anything has been.
+    queued_charge: Option<Charge>,
+    storage: Rc<Storage>,
     deadlines: Deadlines,
     /// When the one timer is set for, so that it is set again only when that changes.
     armed: Option<Instant>,
@@ -339,6 +345,7 @@ struct Connection<S> {
 impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     /// A connection accepted now, reading into blocks lent from `blocks`.
     fn new(socket: S, settings: Settings, blocks: Rc<RefCell<Blocks>>) -> Self {
+        let storage = Rc::clone(blocks.borrow().storage());
         Self {
             socket,
             inbound: Rc::new(RefCell::new(Inbound {
@@ -356,6 +363,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             })),
             queued: VecDeque::new(),
             queued_bytes: 0,
+            queued_charge: None,
+            storage,
             deadlines: Deadlines::accepted(now(), settings.bounds),
             armed: None,
             budget: settings.budget,
@@ -389,24 +398,67 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         self.wait()
     }
 
-    fn queue(&mut self, bytes: Bytes) {
-        if !bytes.is_empty() {
-            self.queued_bytes += bytes.len();
-            self.queued.push_back(bytes);
+    /// Queues `bytes` to be written, paying for `charged` bytes of storage for as long as
+    /// they wait.
+    ///
+    /// # Errors
+    ///
+    /// [`Stop::Exhausted`] if the worker cannot pay for them; nothing is queued.
+    fn queue(&mut self, bytes: Bytes, charged: usize) -> Result<(), Stop> {
+        if bytes.is_empty() {
+            return Ok(());
         }
+        let paid = match self.queued_charge.as_mut() {
+            Some(charge) => charge.grow(charged),
+            None => self
+                .storage
+                .reserve(charged)
+                .map(|charge| self.queued_charge = Some(charge)),
+        };
+        if paid.is_err() {
+            return Err(Stop::Exhausted);
+        }
+        self.queued_bytes += bytes.len();
+        self.queued.push_back((bytes, charged));
+        Ok(())
+    }
+
+    /// Queues what was built here, a head or framing: the whole of the vector it was built
+    /// in goes with it, room and all, and is what it is charged.
+    fn queue_built(&mut self, built: Vec<u8>) -> Result<(), Stop> {
+        let charged = built.capacity();
+        self.queue(Bytes::from(built), charged)
+    }
+
+    /// Queues a frame of an answer's body at its length: a copy holds that much, and a
+    /// frame cut from a block is counted a second time here, which errs towards refusing
+    /// (14 §8).
+    fn queue_frame(&mut self, frame: Bytes) -> Result<(), Stop> {
+        let charged = frame.len();
+        self.queue(frame, charged)
+    }
+
+    /// Queues bytes that live in the program itself, and cost nothing.
+    fn queue_static(&mut self, bytes: &'static [u8]) -> Result<(), Stop> {
+        self.queue(Bytes::from_static(bytes), 0)
     }
 
     /// Writes what is queued, as far as the socket takes it.
     fn poll_write_queued(&mut self, context: &mut Context<'_>) -> Result<bool, Stop> {
         let mut moved = false;
-        while let Some(front) = self.queued.front_mut() {
+        while let Some((front, charged)) = self.queued.front_mut() {
             match Pin::new(&mut self.socket).poll_write(context, front) {
                 Poll::Ready(Ok(0) | Err(_)) => return Err(Stop::Gone),
                 Poll::Ready(Ok(written)) => {
                     front.advance(written);
                     self.queued_bytes -= written;
                     if front.is_empty() {
+                        // Gone to the socket, and with it what it held.
+                        let charged = *charged;
                         self.queued.pop_front();
+                        if let Some(charge) = self.queued_charge.as_mut() {
+                            charge.shrink(charged);
+                        }
                     }
                     self.spend(written);
                     moved = true;
@@ -687,7 +739,7 @@ where
                         let mut inbound = connection.inbound.borrow_mut();
                         if std::mem::take(&mut inbound.continue_due) {
                             drop(inbound);
-                            connection.queue(Bytes::from_static(b"HTTP/1.1 100 Continue\r\n\r\n"));
+                            connection.queue_static(b"HTTP/1.1 100 Continue\r\n\r\n")?;
                             moved = true;
                         }
                     }
@@ -758,7 +810,9 @@ where
             // Only an interim status is refused, and the core returns none.
             Err(_) => return Ended::Gone,
         };
-        connection.queue(Bytes::from(head));
+        if let Err(stop) = connection.queue_built(head) {
+            return stop.into();
+        }
 
         let mut framer = BodyFramer::new(written.delimited);
         let mut body_left = written.delimited != Delimited::Nothing;
@@ -785,10 +839,10 @@ where
                                 let closing = framer
                                     .data_prefix(&mut framing, data.len())
                                     .map_err(|_| Stop::Gone)?;
-                                connection.queue(Bytes::from(framing));
-                                connection.queue(data);
+                                connection.queue_built(framing)?;
+                                connection.queue_frame(data)?;
                                 if closing {
-                                    connection.queue(Bytes::from_static(b"\r\n"));
+                                    connection.queue_static(b"\r\n")?;
                                 }
                             }
                             Err(frame) => {
@@ -796,13 +850,13 @@ where
                                 framer
                                     .finish(&mut framing, trailers.as_ref())
                                     .map_err(|_| Stop::Gone)?;
-                                connection.queue(Bytes::from(framing));
+                                connection.queue_built(framing)?;
                                 body_left = false;
                             }
                         },
                         None => {
                             framer.finish(&mut framing, None).map_err(|_| Stop::Gone)?;
-                            connection.queue(Bytes::from(framing));
+                            connection.queue_built(framing)?;
                             body_left = false;
                         }
                         // After the head nothing can be taken back: the client is left
@@ -868,7 +922,9 @@ async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(
     {
         return Ended::Gone;
     }
-    connection.queue(Bytes::from(head));
+    if let Err(stop) = connection.queue_built(head) {
+        return stop.into();
+    }
     match connection.flush(timer).await {
         Ok(()) => Ended::Refused(status),
         Err(stop) => stop.into(),
@@ -1856,6 +1912,34 @@ mod tests {
         .unwrap();
         assert_eq!(ended, Ended::Exhausted);
         assert!(asked.borrow().is_empty(), "answered: {:?}", asked.borrow());
+    }
+
+    /// What is queued to be written is paid for while it waits: a frame of an answer the
+    /// worker cannot pay to queue ends the connection rather than being held unpaid for
+    /// (14 §8). Here the request's block and the answer's head fit, and the body does not.
+    #[tokio::test]
+    async fn an_answer_the_worker_cannot_pay_to_queue_ends_the_connection() {
+        let small = crate::upstream::h1::blocks::Sizes::default().small;
+        let (blocks, _storage) = blocks_within(small + 2048);
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        client.write_all(GET).await.unwrap();
+        let answering = |_: Request<RequestBody>| async {
+            Response::new(Full::new(Bytes::from(vec![b'x'; 64 * 1024])))
+        };
+        let ended = tokio::time::timeout(
+            Duration::from_secs(10),
+            serve(server, settings(), blocks, date, answering),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ended, Ended::Exhausted);
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert!(
+            !received.contains(&b'x'),
+            "{} bytes of the body went",
+            received.iter().filter(|byte| **byte == b'x').count()
+        );
     }
 
     /// A request whose body has been read holds no storage while its answer is written:

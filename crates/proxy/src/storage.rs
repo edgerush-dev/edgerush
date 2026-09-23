@@ -95,14 +95,20 @@ impl Storage {
     ///
     /// [`Exhausted`] if they do not, or if the count would overflow; nothing is charged.
     pub fn reserve(self: &Rc<Self>, bytes: usize) -> Result<Charge, Exhausted> {
+        self.take(bytes)?;
+        Ok(Charge {
+            storage: Rc::clone(self),
+            bytes,
+        })
+    }
+
+    /// Counts `bytes` more as held, if they fit.
+    fn take(&self, bytes: usize) -> Result<(), Exhausted> {
         let used = self.used.get();
         match used.checked_add(bytes) {
             Some(total) if total <= self.limit => {
                 self.used.set(total);
-                Ok(Charge {
-                    storage: Rc::clone(self),
-                    bytes,
-                })
+                Ok(())
             }
             _ => Err(Exhausted {
                 wanted: bytes,
@@ -110,6 +116,14 @@ impl Storage {
                 limit: self.limit,
             }),
         }
+    }
+
+    /// Counts `bytes` fewer as held. Never short: only a charge gives back, and only what
+    /// it took.
+    fn give(&self, bytes: usize) {
+        let used = self.used.get();
+        debug_assert!(bytes <= used, "{bytes} released of {used}");
+        self.used.set(used.saturating_sub(bytes));
     }
 }
 
@@ -122,6 +136,25 @@ pub struct Charge {
 }
 
 impl Charge {
+    /// Reserves `more` besides, for storage that is growing; on a refusal nothing changes.
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`] if the worker cannot pay for it.
+    pub fn grow(&mut self, more: usize) -> Result<(), Exhausted> {
+        self.storage.take(more)?;
+        self.bytes += more;
+        Ok(())
+    }
+
+    /// Gives back `less` of what it reserves, for storage that has shrunk, and no more than
+    /// it reserves.
+    pub fn shrink(&mut self, less: usize) {
+        let less = less.min(self.bytes);
+        self.storage.give(less);
+        self.bytes -= less;
+    }
+
     /// What it reserves.
     #[cfg(test)]
     pub fn bytes(&self) -> usize {
@@ -153,11 +186,7 @@ fn held_by_nothing_else(memory: &mut BytesMut, size: usize) -> bool {
 
 impl Drop for Charge {
     fn drop(&mut self) {
-        // Never short: every charge's bytes were added when it was made, and only it takes
-        // them away.
-        let used = self.storage.used.get();
-        debug_assert!(self.bytes <= used, "{} released of {used}", self.bytes);
-        self.storage.used.set(used.saturating_sub(self.bytes));
+        self.storage.give(self.bytes);
     }
 }
 
@@ -250,12 +279,18 @@ mod tests {
         Reserve(usize),
         /// Drops the live charge at this position, counted around those there are.
         Drop(usize),
+        /// Grows the live charge at this position by this much.
+        Grow(usize, usize),
+        /// Shrinks the live charge at this position by this much.
+        Shrink(usize, usize),
     }
 
     fn step() -> impl Strategy<Value = Step> {
         prop_oneof![
             (0usize..=64).prop_map(Step::Reserve),
             any::<usize>().prop_map(Step::Drop),
+            (any::<usize>(), 0usize..=64).prop_map(|(at, more)| Step::Grow(at, more)),
+            (any::<usize>(), 0usize..=80).prop_map(|(at, less)| Step::Shrink(at, less)),
         ]
     }
 
@@ -291,7 +326,22 @@ mod tests {
                         let at = at % alive.len();
                         drop(alive.swap_remove(at));
                     }
-                    Step::Drop(_) => {}
+                    Step::Grow(at, more) if !alive.is_empty() => {
+                        let held: usize = alive.iter().map(Charge::bytes).sum();
+                        let at = at % alive.len();
+                        let before = alive[at].bytes();
+                        let fits = held + more <= limit;
+                        prop_assert_eq!(alive[at].grow(more).is_ok(), fits);
+                        let after = if fits { before + more } else { before };
+                        prop_assert_eq!(alive[at].bytes(), after);
+                    }
+                    Step::Shrink(at, less) if !alive.is_empty() => {
+                        let at = at % alive.len();
+                        let before = alive[at].bytes();
+                        alive[at].shrink(less);
+                        prop_assert_eq!(alive[at].bytes(), before - less.min(before));
+                    }
+                    Step::Drop(_) | Step::Grow(..) | Step::Shrink(..) => {}
                 }
                 let held: usize = alive.iter().map(Charge::bytes).sum();
                 prop_assert_eq!(storage.used(), held);
