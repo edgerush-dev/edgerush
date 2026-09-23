@@ -1506,6 +1506,13 @@ mod tests {
     /// How late a deadline may be seen to fire on a loaded machine.
     const SLACK: Duration = Duration::from_millis(400);
 
+    /// How early a deadline may be seen to fire. A server's clock starts at what the client
+    /// sees only afterwards — the accept, before the client's first write; the end of the
+    /// answer, before the client has read it and written again — so a deadline kept to the
+    /// microsecond looks that much early from the client's side. Far less than any wrong
+    /// deadline would be.
+    const EARLY: Duration = Duration::from_millis(50);
+
     /// The servers a client's connection can be taken by.
     const DOWNSTREAMS: [Downstream; 2] = [Downstream::Hyper, Downstream::Ours];
 
@@ -1583,7 +1590,8 @@ mod tests {
                         stream.write_all(said).await.unwrap();
                         let took = closed_after(&mut stream).await;
                         assert!(
-                            took >= SHORT.first_request && took < SHORT.first_request + SLACK,
+                            took + EARLY >= SHORT.first_request
+                                && took < SHORT.first_request + SLACK,
                             "{by:?}, {:?}: closed after {took:?}",
                             String::from_utf8_lossy(said)
                         );
@@ -1611,7 +1619,7 @@ mod tests {
                         stream.write_all(then).await.unwrap();
                         let took = closed_after(&mut stream).await;
                         assert!(
-                            took >= SHORT.next_request && took < SHORT.next_request + SLACK,
+                            took + EARLY >= SHORT.next_request && took < SHORT.next_request + SLACK,
                             "{by:?}, {:?}: closed after {took:?}",
                             String::from_utf8_lossy(then)
                         );
