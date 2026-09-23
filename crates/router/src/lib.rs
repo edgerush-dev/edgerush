@@ -25,7 +25,7 @@ pub mod router;
 mod strategies;
 mod whole_regex;
 
-pub use header::{HeaderPredicate, HeaderPredicateError, HeaderPredicates};
+pub use header::{Fields, HeaderPredicate, HeaderPredicateError, HeaderPredicates};
 pub use host::{HostPattern, HostPatternError, WildcardLabels};
 pub use host_index::{HostClaim, HostIndex};
 pub use normalise::{NormaliseError, normalise_path};

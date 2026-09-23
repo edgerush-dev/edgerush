@@ -12,6 +12,20 @@ use crate::RegexError;
 use crate::whole_regex::WholeRegex;
 use http::header::{COOKIE, HeaderMap, HeaderName, HeaderValue};
 
+/// Read access to a request's header fields, whatever holds them: a map, or the lines of
+/// the head as they arrived.
+pub trait Fields {
+    /// The values of the field lines called `name`, in the order they arrived. Names are
+    /// compared case-insensitively; `name`, like every [`HeaderName`], is lower case.
+    fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]>;
+}
+
+impl Fields for HeaderMap {
+    fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
+        self.get_all(name).iter().map(HeaderValue::as_bytes)
+    }
+}
+
 /// A validated condition on one request header.
 #[derive(Debug, Clone)]
 pub struct HeaderPredicate {
@@ -69,31 +83,31 @@ impl HeaderPredicate {
     /// Whether the request's headers satisfy this predicate. Allocates only to join the
     /// values of a repeated header for a regex.
     #[must_use]
-    pub fn matches(&self, headers: &HeaderMap) -> bool {
-        let mut values = headers.get_all(&self.name).iter();
+    pub fn matches<F: Fields + ?Sized>(&self, headers: &F) -> bool {
+        let mut values = headers.values(&self.name);
         let Some(first) = values.next() else {
             return false;
         };
         let mut rest = values.peekable();
         match &self.value {
-            ValueMatch::Exact(expected) if rest.peek().is_none() => first == expected,
-            ValueMatch::Regex(regex) if rest.peek().is_none() => regex.is_match(first.as_bytes()),
+            ValueMatch::Exact(expected) if rest.peek().is_none() => first == expected.as_bytes(),
+            ValueMatch::Regex(regex) if rest.peek().is_none() => regex.is_match(first),
             // A repeated header. The expected value is compared piece by piece with what
             // joining would give, so the usual kind of match needs no copy.
             ValueMatch::Exact(expected) => {
-                let mut expected = expected.as_bytes().strip_prefix(first.as_bytes());
+                let mut expected = expected.as_bytes().strip_prefix(first);
                 for value in rest {
                     expected = expected
                         .and_then(|expected| expected.strip_prefix(self.between))
-                        .and_then(|expected| expected.strip_prefix(value.as_bytes()));
+                        .and_then(|expected| expected.strip_prefix(value));
                 }
                 expected.is_some_and(<[u8]>::is_empty)
             }
             ValueMatch::Regex(regex) => {
-                let mut joined = first.as_bytes().to_vec();
+                let mut joined = first.to_vec();
                 for value in rest {
                     joined.extend_from_slice(self.between);
-                    joined.extend_from_slice(value.as_bytes());
+                    joined.extend_from_slice(value);
                 }
                 regex.is_match(&joined)
             }
@@ -132,7 +146,7 @@ impl HeaderPredicates {
 
     /// Whether the request's headers satisfy every predicate.
     #[must_use]
-    pub fn matches(&self, headers: &HeaderMap) -> bool {
+    pub fn matches<F: Fields + ?Sized>(&self, headers: &F) -> bool {
         self.0.iter().all(|predicate| predicate.matches(headers))
     }
 }
@@ -321,7 +335,49 @@ mod tests {
             .prop_map(|(name, value)| (name.to_owned(), value.to_owned()))
     }
 
+    /// Field lines as they arrived, found by comparing names case-insensitively: the
+    /// simplest other thing that holds a head, standing in for the raw one.
+    struct Lines(Vec<(String, String)>);
+
+    impl Fields for Lines {
+        fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
+            self.0
+                .iter()
+                .filter(move |(line, _)| line.eq_ignore_ascii_case(name.as_str()))
+                .map(|(_, value)| value.as_bytes())
+        }
+    }
+
+    fn rule_predicate() -> impl Strategy<Value = HeaderPredicate> {
+        (
+            field(),
+            any::<bool>(),
+            prop::sample::select(vec!["1.*", "1(,1)*", "(.*; )?2", ".*,.*"]),
+        )
+            .prop_map(|((name, value), is_regex, pattern)| {
+                if is_regex {
+                    regex(&name, pattern)
+                } else {
+                    exact(&name, &value)
+                }
+            })
+    }
+
     proptest! {
+        #[test]
+        fn predicates_see_the_same_through_a_map_and_through_lines(
+            request in prop::collection::vec(field(), 0..6),
+            rule in prop::collection::vec(rule_predicate(), 0..4),
+        ) {
+            let fields: Vec<(&str, &str)> =
+                request.iter().map(|(name, value)| (&**name, &**value)).collect();
+            let predicates = HeaderPredicates::new(rule);
+            prop_assert_eq!(
+                predicates.matches(&headers(&fields)),
+                predicates.matches(&Lines(request.clone()))
+            );
+        }
+
         #[test]
         fn exact_predicates_agree_with_the_join_everything_reference(
             request in prop::collection::vec(field(), 0..6),

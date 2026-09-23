@@ -18,7 +18,9 @@
 //! All of this is laid out when the router is built. A request walks its host's groups and
 //! checks predicates of candidates in order; it never sorts and never allocates.
 
-use crate::{HeaderPredicates, HostClaim, HostIndex, PathIndex, PathPattern, QueryPredicates};
+use crate::{
+    Fields, HeaderPredicates, HostClaim, HostIndex, PathIndex, PathPattern, QueryPredicates,
+};
 use http::{HeaderMap, Method};
 use std::cmp::Reverse;
 
@@ -42,8 +44,10 @@ pub struct RouteMatch<T> {
 }
 
 /// What routing looks at in a request.
-#[derive(Debug, Clone, Copy)]
-pub struct RequestParts<'a> {
+///
+/// The headers can be held by anything that gives [`Fields`]; a map is the default.
+#[derive(Debug)]
+pub struct RequestParts<'a, F: Fields + ?Sized = HeaderMap> {
     /// The bare hostname: no port, no trailing dot.
     pub host: &'a str,
     /// The normalised path ([`normalise_path`](crate::normalise_path)).
@@ -53,8 +57,17 @@ pub struct RequestParts<'a> {
     /// The request method.
     pub method: &'a Method,
     /// The request headers.
-    pub headers: &'a HeaderMap,
+    pub headers: &'a F,
 }
+
+// By hand: a derive would ask that the headers themselves be `Clone` and `Copy`.
+impl<F: Fields + ?Sized> Clone for RequestParts<'_, F> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<F: Fields + ?Sized> Copy for RequestParts<'_, F> {}
 
 /// An immutable router, built once per config snapshot.
 #[derive(Debug)]
@@ -75,7 +88,7 @@ struct Entry<T> {
 }
 
 impl<T> Entry<T> {
-    fn serves(&self, request: &RequestParts<'_>) -> bool {
+    fn serves<F: Fields + ?Sized>(&self, request: &RequestParts<'_, F>) -> bool {
         self.method
             .as_ref()
             .is_none_or(|method| method == request.method)
@@ -132,7 +145,7 @@ impl<T> Router<T> {
     /// The value of the match that serves the request, or `None` if nothing does — which is
     /// a 404. Never allocates, except as the predicates say they do.
     #[must_use]
-    pub fn route(&self, request: &RequestParts<'_>) -> Option<&T> {
+    pub fn route<F: Fields + ?Sized>(&self, request: &RequestParts<'_, F>) -> Option<&T> {
         self.hosts
             .lookup(request.host)
             .flat_map(|paths| paths.lookup(request.path))
