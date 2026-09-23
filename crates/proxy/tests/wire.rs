@@ -18,7 +18,7 @@
 )]
 
 use edgerush_config::{Config, compile};
-use edgerush_proxy::{Downstream, Proxy, Upstream, Worker};
+use edgerush_proxy::{Downstream, Proxy, Worker};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -88,23 +88,8 @@ upstreams:
     address
 }
 
-/// Which way these tests reach an upstream. The suite is the same either way — that is
+/// Which server takes the suite's connections. The suite is the same either way — that is
 /// the point of it — so it is told rather than written twice:
-///
-/// ```text
-/// cargo test                                       EdgeRush's own, the default
-/// EDGERUSH_TEST_UPSTREAM=hyper cargo test          the engine's pooled client
-/// EDGERUSH_TEST_UPSTREAM=hyper-conn cargo test     the engine's, over our pool
-/// ```
-fn upstream_under_test() -> Upstream {
-    match std::env::var("EDGERUSH_TEST_UPSTREAM").as_deref() {
-        Ok("hyper") => Upstream::Hyper,
-        Ok("hyper-conn") => Upstream::HyperConn,
-        _ => Upstream::Ours,
-    }
-}
-
-/// Which server takes the suite's connections, told the same way:
 ///
 /// ```text
 /// EDGERUSH_TEST_DOWNSTREAM=ours cargo test     EdgeRush's own, as far as it goes
@@ -121,7 +106,7 @@ fn downstream_under_test() -> Downstream {
 /// The engine's server cannot send a 1xx of a service's, and the engine's client consumes
 /// the ones it reads.
 fn interim_answers_are_passed_on() -> bool {
-    downstream_under_test() == Downstream::Ours && upstream_under_test() == Upstream::Ours
+    downstream_under_test() == Downstream::Ours
 }
 
 /// The first head after `first` that is not interim, and the interim ones before it, which
@@ -139,11 +124,11 @@ async fn past_interim(client: &mut Wire, first: String) -> (Vec<String>, String)
     (interim, head)
 }
 
-/// A data plane of `config`, reaching upstreams and serving clients as the suite is told.
+/// A data plane of `config`, serving clients as the suite is told.
 fn under_test(config: edgerush_config::Compiled) -> Proxy {
-    Proxy::new(config, NonZeroUsize::MIN, upstream_under_test())
-        .and_then(|proxy| proxy.serving_by(downstream_under_test()))
+    Proxy::new(config, NonZeroUsize::MIN)
         .unwrap()
+        .serving_by(downstream_under_test())
 }
 
 /// An upstream that is a socket and nothing more: every connection it accepts is handed to
@@ -335,11 +320,7 @@ async fn a_requests_trailers_reach_the_upstream_only_by_our_own_path() {
         .await;
 
     let body = within(seen.recv()).await.unwrap();
-    match upstream_under_test() {
-        // Lost between the service and the wire, which is the half being replaced.
-        Upstream::Hyper | Upstream::HyperConn => assert_eq!(body, "5\r\nhello\r\n0\r\n\r\n"),
-        Upstream::Ours => assert_eq!(body, "5\r\nhello\r\n0\r\nx-sent: yes\r\n\r\n"),
-    }
+    assert_eq!(body, "5\r\nhello\r\n0\r\nx-sent: yes\r\n\r\n");
 }
 
 /// A field the request's own `Connection` named is hop-by-hop for that hop, so it may not
@@ -379,13 +360,11 @@ async fn a_trailer_the_requests_connection_named_does_not_travel_on() {
     );
     // What the `Connection` did not name is untouched: by our own path the trailer
     // travels and the declaration still names it.
-    if matches!(upstream_under_test(), Upstream::Ours) {
-        assert!(sent.contains("x-keep: fine"), "{sent}");
-        assert!(
-            sent.to_ascii_lowercase().contains("trailer: x-keep"),
-            "{sent}"
-        );
-    }
+    assert!(sent.contains("x-keep: fine"), "{sent}");
+    assert!(
+        sent.to_ascii_lowercase().contains("trailer: x-keep"),
+        "{sent}"
+    );
 }
 
 /// Hyper's server does hand the trailers to the service, so what the test above measures
@@ -932,16 +911,9 @@ async fn an_interim_answer_claiming_a_body_is_refused_by_our_own_path() {
         .write("GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
         .await;
     let head = within(client.head()).await;
-    match upstream_under_test() {
-        // Waved through: the engine's client consumes the interim head without asking
-        // what it claimed, and answers with the 200 behind it.
-        Upstream::Hyper | Upstream::HyperConn => {
-            assert!(head.starts_with("HTTP/1.1 200"), "{head}")
-        }
-        // An interim head that claims a body is a body nobody here will read and
-        // something else may: the exchange fails rather than pass it on.
-        Upstream::Ours => assert!(head.starts_with("HTTP/1.1 502"), "{head}"),
-    }
+    // An interim head that claims a body is a body nobody here will read and something
+    // else may: the exchange fails rather than pass it on.
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
 }
 
 /// A field an answer's own `Connection` names is that hop's business and no further.
@@ -1140,11 +1112,7 @@ async fn connection_bound_challenges_prevent_reuse_on_the_custom_path() {
         }
         // Held to by whatever sees the answer before its connection goes back, which
         // the engine's pooled client does not let this end do.
-        let expected = match upstream_under_test() {
-            Upstream::Hyper => 1,
-            Upstream::Ours | Upstream::HyperConn => 2,
-        };
-        assert_eq!(accepts.load(Ordering::SeqCst), expected, "{challenge}");
+        assert_eq!(accepts.load(Ordering::SeqCst), 2, "{challenge}");
     }
 }
 
@@ -1760,30 +1728,6 @@ async fn told_when_answered(answer: String) -> (String, String, usize) {
     )
 }
 
-/// For the engine's client over our pool: an answer it takes is delivered, and read to
-/// its end before the next request is asked, which takes `connections` in all. Read to
-/// the end first, because our pool does not wait for a connection on its way back as the
-/// engine's pooled client does; a request sent while the answer is still going gets a
-/// connection of its own, which says nothing about whether this one was kept.
-async fn taken(answer: String, connections: usize) {
-    let (proxy, accepts) = facing(answer).await;
-    let mut client = Wire::to(proxy).await;
-    let first = asks(&mut client, "/first").await;
-    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
-    if first.contains("transfer-encoding: chunked") {
-        assert_eq!(
-            within(client.chunked_body()).await,
-            "5\r\nhello\r\n0\r\n\r\n"
-        );
-    } else {
-        assert_eq!(within(client.body(5)).await, "hello");
-    }
-    let mut again = Wire::to(proxy).await;
-    let second = asks(&mut again, "/second").await;
-    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
-    assert_eq!(accepts.load(Ordering::SeqCst), connections);
-}
-
 /// A head refused is a request failed and a connection gone, and the next request is
 /// served all the same. Every case below is one head away from a head that works.
 async fn is_refused(answer: String) {
@@ -1816,16 +1760,7 @@ async fn an_answer_with_two_lengths_that_disagree_is_refused() {
 #[tokio::test]
 async fn an_answer_with_two_equal_lengths_is_refused_by_our_own_path() {
     let answer = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
-    match upstream_under_test() {
-        Upstream::Ours => is_refused(answer.into()).await,
-        Upstream::Hyper => {
-            let (first, _second, accepts) = told_when_answered(answer.into()).await;
-            assert!(first.starts_with("HTTP/1.1 200"), "{first}");
-            assert_eq!(accepts, 1, "the engine's client kept it");
-        }
-        // Delivered as one message of the length, and kept once it has been read.
-        Upstream::HyperConn => taken(answer.into(), 1).await,
-    }
+    is_refused(answer.into()).await;
 }
 
 /// A sign is not a digit. `+5` is a length only to a parser that was being helpful.
@@ -1853,12 +1788,7 @@ async fn an_answer_with_a_length_too_big_to_count_is_refused() {
 #[tokio::test]
 async fn an_answer_with_both_a_length_and_chunking_is_refused_by_our_own_path() {
     let answer = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-    match upstream_under_test() {
-        Upstream::Ours => is_refused(answer.into()).await,
-        // Forwarded in chunks, whichever server sends it, read to its end, and the
-        // connection kept.
-        Upstream::Hyper | Upstream::HyperConn => taken(answer.into(), 1).await,
-    }
+    is_refused(answer.into()).await;
 }
 
 /// Trailers that the gateway does not forward are dropped from the message, not held
@@ -1949,10 +1879,7 @@ async fn a_chunk_size_line_past_its_bound_is_refused_by_our_own_path() {
     let answer = format!(
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5{padding}\r\nhello\r\n0\r\n\r\n"
     );
-    match upstream_under_test() {
-        Upstream::Ours => never_finished(answer).await,
-        Upstream::Hyper | Upstream::HyperConn => delivered_whole(answer).await,
-    }
+    never_finished(answer).await;
 }
 
 /// **A different kind of refusal from the one above: this one does not parse.**
@@ -1968,10 +1895,7 @@ async fn a_chunk_extension_without_a_name_is_refused_by_our_own_path() {
     let answer =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;=novalue\r\nhello\r\n0\r\n\r\n"
             .to_owned();
-    match upstream_under_test() {
-        Upstream::Ours => never_finished(answer).await,
-        Upstream::Hyper | Upstream::HyperConn => delivered_whole(answer).await,
-    }
+    never_finished(answer).await;
 }
 
 /// A chunk that does not end where it said it would is a length that meant nothing.
@@ -2027,10 +1951,7 @@ async fn a_trailer_section_past_its_bound_is_refused() {
 async fn an_upstream_that_floods_interim_heads_is_given_up_on_by_our_own_path() {
     let flood = "HTTP/1.1 103 Early Hints\r\n\r\n".repeat(20);
     let answer = format!("{flood}HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
-    match upstream_under_test() {
-        Upstream::Ours => is_refused(answer).await,
-        Upstream::Hyper | Upstream::HyperConn => answered_anyway(answer).await,
-    }
+    is_refused(answer).await;
 }
 
 /// And the same deviation by the other measure: counting heads alone would let a peer
@@ -2043,44 +1964,7 @@ async fn an_upstream_whose_interim_heads_are_too_long_is_given_up_on_by_our_own_
         "{}HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
         one.repeat(12)
     );
-    match upstream_under_test() {
-        Upstream::Ours => is_refused(answer).await,
-        Upstream::Hyper | Upstream::HyperConn => answered_anyway(answer).await,
-    }
-}
-
-/// What the engine's client does with the four above: reads past what the candidate would
-/// have stopped at, and delivers the message whole. Recorded so that the difference is a
-/// measured thing rather than an assumption; in three of the four it is doing nothing
-/// wrong ([13 §5](../../../docs/13-http1-upstream.md)).
-async fn delivered_whole(answer: String) {
-    let (proxy, accepts) = facing(answer).await;
-    let mut client = Wire::to(proxy).await;
-    let head = asks(&mut client, "/first").await;
-    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    let body = within(client.chunked_body()).await;
-    assert!(body.contains("hello"), "{body}");
-    carries_the_next(proxy, &accepts).await;
-}
-
-/// The same for the interim floods, where what arrives is the final head behind them.
-async fn answered_anyway(answer: String) {
-    let (proxy, accepts) = facing(answer).await;
-    let mut client = Wire::to(proxy).await;
-    let head = asks(&mut client, "/first").await;
-    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    assert_eq!(within(client.body(2)).await, "ok");
-    carries_the_next(proxy, &accepts).await;
-}
-
-/// After an answer read to its end, a second request goes on the connection that carried
-/// it: the upstream is asked twice and accepts once. Asked on a client connection of its
-/// own, as in [`taken`], so that only the upstream connection could have been shared.
-async fn carries_the_next(proxy: SocketAddr, accepts: &AtomicUsize) {
-    let mut again = Wire::to(proxy).await;
-    let second = asks(&mut again, "/second").await;
-    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
-    assert_eq!(accepts.load(Ordering::SeqCst), 1, "and kept the connection");
+    is_refused(answer).await;
 }
 
 // ---- peers that stop part way, on either side ----
@@ -2186,16 +2070,10 @@ async fn a_withheld_body_goes_when_the_continue_wait_runs_out() {
     // which is why the same test finishes at once there; the body arriving is what both
     // are held to, and the waiting is only ours.
     let waited = began.elapsed();
-    match upstream_under_test() {
-        Upstream::Ours => assert!(
-            waited >= Duration::from_secs(1),
-            "the body went without the wait: {waited:?}"
-        ),
-        Upstream::Hyper | Upstream::HyperConn => assert!(
-            waited < Duration::from_secs(1),
-            "the engine's client waited after all: {waited:?}"
-        ),
-    }
+    assert!(
+        waited >= Duration::from_secs(1),
+        "the body went without the wait: {waited:?}"
+    );
 }
 
 /// A client that goes away part way through its upload leaves an upstream part way
@@ -2358,10 +2236,7 @@ async fn an_answer_that_says_close_is_not_reused_though_the_socket_stays_open() 
     // An HTTP/1.0 answer that asks to be kept alive is kept by the engine's client, which
     // RFC 9112 §9.3 allows; ours never pools a connection that speaks 1.0 (13 §4), one
     // of 13 §5's open choices.
-    let kept_alive = match upstream_under_test() {
-        Upstream::Ours => 2,
-        Upstream::Hyper | Upstream::HyperConn => 1,
-    };
+    let kept_alive = 2;
     for (answer, connections) in [
         (
             "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nfresh",
@@ -2661,13 +2536,8 @@ async fn an_http2_request_that_ends_with_an_empty_frame_is_ended_in_chunks() {
     assert_eq!(answer.status(), 200);
     let seen = within(seen.recv()).await.unwrap().to_ascii_lowercase();
     assert!(!seen.contains("content-length"), "{seen}");
-    match upstream_under_test() {
-        Upstream::Ours => {
-            assert!(seen.contains("transfer-encoding: chunked\r\n"), "{seen}");
-            assert!(seen.ends_with("\r\n\r\n0\r\n\r\n"), "{seen}");
-        }
-        Upstream::Hyper | Upstream::HyperConn => assert!(seen.ends_with("\r\n\r\n"), "{seen}"),
-    }
+    assert!(seen.contains("transfer-encoding: chunked\r\n"), "{seen}");
+    assert!(seen.ends_with("\r\n\r\n0\r\n\r\n"), "{seen}");
 }
 
 /// An HTTP/2 request that says its length and then sends trailers is carried whole and
@@ -2720,20 +2590,12 @@ async fn an_http2_request_with_a_length_and_trailers_is_carried() {
     assert_eq!(answer.status(), 200);
 
     let seen = within(seen.recv()).await.unwrap().to_ascii_lowercase();
-    match upstream_under_test() {
-        Upstream::Ours => {
-            assert!(!seen.contains("content-length"), "{seen}");
-            assert!(seen.contains("transfer-encoding: chunked\r\n"), "{seen}");
-            assert!(
-                seen.ends_with("\r\n\r\n5\r\nhello\r\n0\r\nx-t: 1\r\n\r\n"),
-                "{seen}"
-            );
-        }
-        Upstream::Hyper | Upstream::HyperConn => {
-            assert!(seen.contains("content-length: 5\r\n"), "{seen}");
-            assert!(seen.ends_with("\r\n\r\nhello"), "{seen}");
-        }
-    }
+    assert!(!seen.contains("content-length"), "{seen}");
+    assert!(seen.contains("transfer-encoding: chunked\r\n"), "{seen}");
+    assert!(
+        seen.ends_with("\r\n\r\n5\r\nhello\r\n0\r\nx-t: 1\r\n\r\n"),
+        "{seen}"
+    );
 }
 
 /// An answer of trailers and no data reaches an HTTP/2 client as HEADERS and trailers,

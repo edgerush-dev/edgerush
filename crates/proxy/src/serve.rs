@@ -3,8 +3,7 @@
 //! between the HTTP engine (hyper) and the core, and the only place that knows both.
 //!
 //! Bodies stream in both directions and are never held here. Upstream connections are
-//! HTTP/1.1, by EdgeRush's own client and pool unless one of the engine's is asked for
-//! ([`Upstream`]).
+//! HTTP/1.1, by EdgeRush's own client and pool.
 //!
 //! The config is published whole and at once ([`Proxy::reload`]): a request reads the
 //! current snapshot without waiting for anybody, works with that one snapshot until it has
@@ -33,25 +32,19 @@ use crate::storage::Storage;
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Blocks, SMALL, Sizes};
-use crate::upstream::h1::codec::{
-    OutgoingFields, ResponseHead, Sending, filter_declaration, filter_trailers,
-};
+use crate::upstream::h1::codec::{OutgoingFields, ResponseHead, Sending, filter_declaration};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, nothing_to_say};
 use crate::upstream::h1::pool::{Lease, Pool};
-use crate::upstream::hyper_conn::{HyperBody, HyperConnection};
 use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRule};
 use edgerush_router::Fields;
-use http::request::Parts;
 use http::response;
 use http::uri::{Authority, Scheme};
 use http::{HeaderName, Method, Request, Response, Uri, Version};
 use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
 use hyper::rt::Executor;
 use hyper::service::service_fn;
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use std::cell::{Cell, RefCell};
 use std::convert::Infallible;
@@ -123,31 +116,12 @@ impl<F: Future<Output = ()> + 'static> Executor<F> for OnThisWorker {
 /// An upstream's answer carries its exchange's place with it, whichever client read it:
 /// the exchange is over when the body is.
 enum Body {
-    /// The upstream's answer, as one of the engine's clients reads it, and what that
-    /// answer's own `Connection` named. The names are kept because the trailers have not
-    /// arrived yet and the head they were read from will be gone by the time they do.
-    Upstream(HyperBody<RequestBody>, Vec<HeaderName>, Admitted, Watch),
     /// The upstream's answer, as EdgeRush's own path reads it. In a box because it is
-    /// much the larger of the two, and every answer would otherwise carry room for it.
+    /// much larger than an empty answer, and every answer would otherwise carry room for
+    /// it.
     Ours(Box<H1Body<TcpStream, RequestBody>>, Admitted, Watch),
     /// An answer of the data plane's own. It has no body, and never will have one.
     Empty,
-}
-
-/// A frame on its way to the client, with what may not travel on taken out of it.
-///
-/// Only a trailer section is touched, and only by name: a field the answer's own
-/// `Connection` named is hop-by-hop for that hop, and forwarding it is a thing an
-/// intermediary may not do whichever client read it
-/// ([13 §4](../../docs/13-http1-upstream.md)).
-fn filtered(frame: Frame<Bytes>, nominated: &[HeaderName]) -> Frame<Bytes> {
-    match frame.into_trailers() {
-        Ok(mut fields) => {
-            let _discarded = filter_trailers(&mut fields, nominated);
-            Frame::trailers(fields)
-        }
-        Err(frame) => frame,
-    }
 }
 
 /// Waits for `opening` to connect, and gives up after `limit`: a destination that never
@@ -210,8 +184,6 @@ impl Watch {
 #[derive(Debug, thiserror::Error)]
 enum BodyError {
     #[error("the upstream's answer could not be read: {0}")]
-    Upstream(#[from] hyper::Error),
-    #[error("the upstream's answer could not be read: {0}")]
     Ours(#[from] ExchangeError),
 }
 
@@ -224,18 +196,6 @@ impl HttpBody for Body {
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         match self.get_mut() {
-            Self::Upstream(incoming, nominated, _place, watch) => {
-                Pin::new(incoming).poll_frame(context).map(|frame| {
-                    frame.map(|frame| {
-                        frame
-                            .map(|frame| filtered(frame, nominated))
-                            .map_err(|error| {
-                                watch.body_failed();
-                                BodyError::Upstream(error)
-                            })
-                    })
-                })
-            }
             Self::Ours(ours, _place, watch) => {
                 let frame = Pin::new(&mut *ours).poll_frame(context);
                 // The moment the answer is known to be over, which for a body of known
@@ -260,7 +220,6 @@ impl HttpBody for Body {
 
     fn is_end_stream(&self) -> bool {
         match self {
-            Self::Upstream(incoming, ..) => incoming.is_end_stream(),
             Self::Ours(ours, ..) => ours.is_end_stream(),
             Self::Empty => true,
         }
@@ -268,39 +227,15 @@ impl HttpBody for Body {
 
     fn size_hint(&self) -> SizeHint {
         match self {
-            Self::Upstream(incoming, ..) => incoming.size_hint(),
             Self::Ours(ours, ..) => ours.size_hint(),
             Self::Empty => SizeHint::with_exact(0),
         }
     }
 }
 
-/// Which way a request reaches its upstream.
-///
-/// One choice for the process, made on the command line and never changed while it runs
-/// — and never changed part way through a request. A path that failed is not a reason to
-/// try the other: by then the request may already have reached the upstream, and sending
-/// it again would be sending it twice ([13 §1](../../docs/13-http1-upstream.md)).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Upstream {
-    /// The engine's pooled client (hyper-util's), which carried every request before
-    /// EdgeRush's own did. Kept unchanged as the fixed point earlier measurements were made
-    /// against ([14 §2](../../docs/14-downstream-server.md)).
-    Hyper,
-    /// The engine's client a connection at a time, over this worker's own pool and its
-    /// policy: what EdgeRush's own is compared with. It takes a request body that cannot
-    /// leave the worker, which the pooled one cannot
-    /// ([14 §2](../../docs/14-downstream-server.md)).
-    HyperConn,
-    /// EdgeRush's own, measured against the engine's and chosen over it
-    /// ([13 §8](../../docs/13-http1-upstream.md)).
-    #[default]
-    Ours,
-}
-
 /// Which server takes a client's connection.
 ///
-/// One choice for the process, as [`Upstream`] is. EdgeRush's own is being built in
+/// One choice for the process. EdgeRush's own is being built in
 /// steps ([14 §9](../../docs/14-downstream-server.md)): so far it tells HTTP/1 from
 /// HTTP/2 by itself and hands each to the engine's server for that protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -328,8 +263,6 @@ pub struct Proxy {
     /// Outside it for a different reason: a key must not come round again when a config
     /// does, so what hands them out lives as long as the process.
     keys: Keys,
-    /// Which way its workers reach an upstream.
-    upstream: Upstream,
     /// Which server takes its clients' connections.
     downstream: Downstream,
 }
@@ -343,16 +276,10 @@ pub struct Proxy {
 #[derive(Debug)]
 pub struct Worker {
     proxy: Arc<Proxy>,
-    /// One for the life of the worker: a reload does not throw warm connections away.
-    /// Those to an endpoint that is no longer used grow idle and are closed.
-    /// It takes the engine's own body: one of EdgeRush's own server's cannot leave the
-    /// worker, and the two are never paired ([`Proxy::serving_by`]).
-    client: Client<HttpConnector, hyper::body::Incoming>,
-    /// The connections this worker keeps by EdgeRush's own path.
+    /// The connections this worker keeps to its upstreams. One for the life of the worker:
+    /// a reload does not throw warm connections away. Those to an endpoint that is no
+    /// longer used grow idle and are closed.
     pool: Rc<RefCell<Pool<TcpStream>>>,
-    /// The connections it keeps by the engine's client a connection at a time, under the
-    /// same policy.
-    hyper_pool: Rc<RefCell<Pool<HyperConnection<RequestBody>>>>,
     /// What its exchanges read into, lent and taken back rather than made each time
     /// ([13 §7](../../docs/13-http1-upstream.md)).
     blocks: Rc<RefCell<Blocks>>,
@@ -445,11 +372,7 @@ impl Proxy {
     ///
     /// Returns a [`ProxyError`] for an endpoint address that cannot be part of a request
     /// target (one with an IPv6 zone).
-    pub fn new(
-        config: Compiled,
-        workers: NonZeroUsize,
-        upstream: Upstream,
-    ) -> Result<Self, ProxyError> {
+    pub fn new(config: Compiled, workers: NonZeroUsize) -> Result<Self, ProxyError> {
         let listeners: Vec<String> = config
             .listeners
             .iter()
@@ -465,25 +388,16 @@ impl Proxy {
             current: ArcSwap::from_pointee(snapshot),
             metrics,
             keys,
-            upstream,
             downstream: Downstream::default(),
         })
     }
 
     /// The same data plane, its clients' connections taken by `downstream`. Chosen before
     /// anything is served, and never changed while it runs.
-    ///
-    /// # Errors
-    ///
-    /// A [`ProxyError`] for a pairing that cannot work: EdgeRush's own server hands on
-    /// request bodies that cannot leave the worker, and the engine's pooled client takes
-    /// only bodies that can ([14 §9](../../docs/14-downstream-server.md)).
-    pub fn serving_by(mut self, downstream: Downstream) -> Result<Self, ProxyError> {
-        if downstream == Downstream::Ours && self.upstream == Upstream::Hyper {
-            return Err(ProxyError::Pairing);
-        }
+    #[must_use]
+    pub fn serving_by(mut self, downstream: Downstream) -> Self {
         self.downstream = downstream;
-        Ok(self)
+        self
     }
 
     /// The names of the listeners that can be served: those of the config the data plane
@@ -574,21 +488,9 @@ impl Worker {
 
     /// The same, holding client connections to `deadlines`.
     fn with_deadlines(proxy: Arc<Proxy>, limits: H1Limits, deadlines: Deadlines) -> Rc<Self> {
-        let mut connector = HttpConnector::new();
-        connector.set_nodelay(true);
-        let client = Client::builder(TokioExecutor::new())
-            .pool_timer(TokioTimer::new())
-            // How many idle connections a worker keeps to one destination is the data
-            // plane's bound and not one client's, so the engine's pool is held to it too
-            // ([13 §7](../../docs/13-http1-upstream.md)). Left alone it keeps as many as
-            // it likes, which is a different proxy from the one that document describes.
-            .pool_max_idle_per_host(limits.idle_per_destination)
-            .build(connector);
         Rc::new(Self {
             proxy,
-            client,
             pool: Rc::new(RefCell::new(Pool::default())),
-            hyper_pool: Rc::new(RefCell::new(Pool::default())),
             blocks: Rc::new(RefCell::new(Blocks::new(
                 Sizes::within(&limits, SMALL),
                 Storage::new(limits.storage),
@@ -612,8 +514,7 @@ impl Worker {
             tokio::time::sleep(every).await;
             self.date.set(HttpDate::from_unix(unix_now()));
             // Borrowed for the sweep and let go of before anything is waited on again.
-            let swept = self.pool.borrow_mut().sweep(&self.limits)
-                + self.hyper_pool.borrow_mut().sweep(&self.limits);
+            let swept = self.pool.borrow_mut().sweep(&self.limits);
             // And what a burst left parked of the blocks, down to what a quiet worker keeps.
             self.blocks.borrow_mut().sweep();
             let metrics = &self.proxy.metrics;
@@ -632,7 +533,7 @@ impl Worker {
     /// How many connections this worker is keeping. For tests and, later, a gauge.
     #[must_use]
     pub fn idle_connections(&self) -> usize {
-        self.pool.borrow().idle() + self.hyper_pool.borrow().idle()
+        self.pool.borrow().idle()
     }
 
     /// Takes a place among the exchanges this worker has in hand, if one is going.
@@ -977,23 +878,11 @@ impl Worker {
         let Some(admitted) = self.admit() else {
             return self.proxy.answer(listener, Answer::TooBusy);
         };
-        let answered = match self.proxy.upstream {
-            Upstream::Hyper | Upstream::HyperConn => {
-                let watch = Watch {
-                    proxy: Arc::clone(&self.proxy),
-                    upstream: directed.upstream_slot,
-                };
-                self.by_hyper(&directed.endpoint, head.into_parts(), body, admitted, watch)
-                    .await
-                    .ok_or(Answer::UpstreamFailed)
-            }
-            Upstream::Ours => {
-                self.by_ours(
-                    &directed, &head, &nominated, sending, body, admitted, interim,
-                )
-                .await
-            }
-        };
+        let answered = self
+            .by_ours(
+                &directed, &head, &nominated, sending, body, admitted, interim,
+            )
+            .await;
 
         let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
         let (mut head, body) = match answered {
@@ -1026,143 +915,7 @@ impl Worker {
         Response::from_parts(head, body)
     }
 
-    /// By one of the engine's clients.
-    async fn by_hyper(
-        &self,
-        identity: &Arc<ReuseIdentity>,
-        head: Parts,
-        body: RequestBody,
-        admitted: Admitted,
-        watch: Watch,
-    ) -> Option<(response::Parts, Body)> {
-        let (mut head, incoming, connection) = if self.proxy.upstream == Upstream::HyperConn {
-            let (response, connection) = self.through_hyper_conn(identity, head, body).await?;
-            let (head, incoming) = response.into_parts();
-            (head, incoming, Some(connection))
-        } else {
-            // Only the engine's server hands over a body this client can carry, and no
-            // other server is paired with it.
-            let RequestBody::Hyper(body) = body else {
-                return None;
-            };
-            let response = self
-                .client
-                .request(Request::from_parts(head, body))
-                .await
-                .ok()?;
-            let (head, incoming) = response.into_parts();
-            (head, incoming, None)
-        };
-        // HTTP has only the statuses from 100 to 599, and
-        // [RFC 9110 §15](https://www.rfc-editor.org/rfc/rfc9110.html#section-15) says
-        // "Values outside the range 100..599 are invalid"; the engine's client allows the
-        // range above, which libraries use for errors of their own. An invalid status is
-        // answered 502, which is the "process the response as if it had a 5xx" that §15
-        // asks for, and the body goes unread so that the engine does not hand the
-        // connection on. The pooled client's connection may be back in its pool already if
-        // its body is complete, which this end cannot prevent; a connection of our pool's
-        // goes back only through the body, which has not been made yet, so it is closed.
-        if !(100..=599).contains(&head.status.as_u16()) {
-            return None;
-        }
-        // The engine's client consumes every other interim answer, so only a 101 arrives
-        // here. No request asked for one — `Upgrade` is taken off every request — and this
-        // proxy tunnels nothing, so passing it on would hand the client a switch it never
-        // asked for. Dropping the answer unread drops the connection the engine set aside
-        // for the switch ([13 §1](../../../docs/13-http1-upstream.md)).
-        if head.status.is_informational() {
-            return None;
-        }
-        // The engine's client reads a body by its chunks but leaves a `Content-Length`
-        // beside them in the head, and an intermediary that forwards such an answer "MUST
-        // first remove the received Content-Length field" (RFC 9112 §6.3 rule 3). Left in,
-        // the engine's server frames the answer by it and cuts a longer body short
-        // ([13 §5](../../docs/13-http1-upstream.md)).
-        if head.headers.contains_key(http::header::TRANSFER_ENCODING) {
-            head.headers.remove(http::header::CONTENT_LENGTH);
-        }
-        // Read here, because `respond` takes the hop-by-hop fields off this head before
-        // the trailers behind it arrive.
-        let nominated = crate::hop_by_hop::nominated(&head.headers);
-        // What may not travel on is not declared onwards either.
-        filter_declaration(&mut head.headers, &nominated);
-        let body = match connection {
-            None => HyperBody::unpooled(incoming),
-            // An answer that binds its connection to this client's credentials closes it,
-            // as on EdgeRush's own path.
-            Some((connection, _))
-                if crate::upstream::auth::challenges(head.status, &head.headers) =>
-            {
-                HyperBody::closing(incoming, connection)
-            }
-            Some((connection, opened)) => {
-                let lease = Lease::in_use(Arc::clone(identity), opened, &self.hyper_pool);
-                HyperBody::returning(incoming, connection, lease, self.limits)
-            }
-        };
-        // The place goes with the body, as it does on the other path.
-        Some((head, Body::Upstream(body, nominated, admitted, watch)))
-    }
-
-    /// Sends a request by the engine's client on a connection of this worker's pool, or
-    /// on one opened for it, and returns the answer with the connection it came on.
-    ///
-    /// A connection is taken only if hyper says it will take a request now, which it says
-    /// only while the connection is open and the last exchange on it is over: one the
-    /// upstream closed, or that it said something unasked on, is not ready and goes.
-    async fn through_hyper_conn(
-        &self,
-        identity: &Arc<ReuseIdentity>,
-        mut head: Parts,
-        body: RequestBody,
-    ) -> Option<(
-        Response<hyper::body::Incoming>,
-        (HyperConnection<RequestBody>, Instant),
-    )> {
-        let mut kept = None;
-        loop {
-            // Bound in its own statement, so the pool is not still borrowed below.
-            let found = self.hyper_pool.borrow_mut().take(identity, &self.limits);
-            let Some((connection, opened)) = found else {
-                break;
-            };
-            if connection.is_ready() {
-                kept = Some((connection, opened));
-                break;
-            }
-            self.proxy.metrics.socket(Socket::Discarded);
-        }
-        let (mut connection, opened) = match kept {
-            Some(reused) => {
-                self.proxy.metrics.socket(Socket::Reused);
-                reused
-            }
-            None => {
-                self.proxy.metrics.socket(Socket::Opened);
-                let opening = TcpStream::connect(identity.address());
-                let socket = connect_within(self.limits.connect, opening).await.ok()?;
-                // Worth having, not worth refusing an upstream over.
-                let _unset = socket.set_nodelay(true);
-                (HyperConnection::open(socket).await.ok()?, Instant::now())
-            }
-        };
-        // Sent as the target is written, so in origin form as every client here sends it;
-        // the pooled client makes the same change for itself.
-        head.uri = head
-            .uri
-            .path_and_query()
-            .cloned()
-            .map_or_else(Uri::default, Uri::from);
-        let response = connection
-            .send(Request::from_parts(head, body))
-            .await
-            .ok()?;
-        Some((response, (connection, opened)))
-    }
-
-    /// By EdgeRush's own path. Never after the other has been tried: by the time one has
-    /// failed the request may already have reached the upstream, and a second attempt
-    /// would be a second request.
+    /// By EdgeRush's own path, the one there is.
     #[expect(
         clippy::too_many_arguments,
         reason = "each is a different thing the exchange needs, as for `through_h1`"
@@ -1367,10 +1120,6 @@ pub enum ProxyError {
     /// An endpoint address that cannot be written into a request target.
     #[error("endpoint {0} cannot be part of a request target")]
     Endpoint(SocketAddr),
-    /// EdgeRush's own server with the engine's pooled client, which cannot carry what it
-    /// reads.
-    #[error("the engine's pooled client cannot carry requests EdgeRush's own server reads")]
-    Pairing,
 }
 
 fn authority(endpoint: &SocketAddr) -> Result<Authority, ProxyError> {
@@ -1545,9 +1294,9 @@ mod tests {
     /// Serves a worker for `upstream` on a listener of its own, its clients taken by `by`,
     /// and says where.
     async fn serving_worker(upstream: SocketAddr, by: Downstream) -> SocketAddr {
-        let proxy = Proxy::new(everything_to(upstream), NonZeroUsize::MIN, Upstream::Ours)
-            .and_then(|proxy| proxy.serving_by(by))
-            .unwrap();
+        let proxy = Proxy::new(everything_to(upstream), NonZeroUsize::MIN)
+            .unwrap()
+            .serving_by(by);
         let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
@@ -1707,26 +1456,12 @@ mod tests {
                         stream.read_to_end(&mut answer),
                     )
                     .await
-                    .unwrap_or_else(|_| panic!("{by:?}: still open"));
+                    .unwrap_or_else(|_| panic!("still open"));
                     let answer = String::from_utf8_lossy(&answer);
-                    assert!(answer.starts_with("HTTP/1.1 400"), "{by:?}: {answer}");
+                    assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
                 }
             })
             .await;
-    }
-
-    /// EdgeRush's own server reads bodies the engine's pooled client cannot carry, so the
-    /// two are never put together: the pairing is refused before anything is served.
-    #[test]
-    fn our_server_is_not_paired_with_the_engines_pooled_client() {
-        let paired = |upstream| {
-            Proxy::new(config_with(&["web"]), NonZeroUsize::MIN, upstream)
-                .and_then(|proxy| proxy.serving_by(Downstream::Ours))
-                .map(|_| ())
-        };
-        assert_eq!(paired(Upstream::Hyper), Err(ProxyError::Pairing));
-        assert_eq!(paired(Upstream::HyperConn), Ok(()));
-        assert_eq!(paired(Upstream::Ours), Ok(()));
     }
 
     /// A worker takes on only so many exchanges at once, whichever client carries them,
@@ -1735,7 +1470,7 @@ mod tests {
     /// has been full is not full for ever ([13 §7](../../docs/13-http1-upstream.md)).
     #[test]
     fn a_worker_full_of_exchanges_answers_rather_than_take_another() {
-        for (by, down) in PAIRINGS {
+        for down in DOWNSTREAMS {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1747,7 +1482,7 @@ mod tests {
                     exchanges: 2,
                     ..H1Limits::default()
                 };
-                let worker = Worker::with_limits(served_by(upstream, by, down), limits);
+                let worker = Worker::with_limits(served_by(upstream, down), limits);
                 let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let front = socket.local_addr().unwrap();
                 let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
@@ -1765,15 +1500,15 @@ mod tests {
                 // as the upstream says nothing, which is for ever.
                 let refused = tokio::time::timeout(Duration::from_secs(5), status_of(front, "/ok"))
                     .await
-                    .unwrap_or_else(|_| panic!("{by:?} took on a third exchange"));
-                assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE, "{by:?}");
+                    .unwrap_or_else(|_| panic!("{down:?} took on a third exchange"));
+                assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
 
                 // The upstream lets both go without answering, so both exchanges fail; a
                 // failure gives its place back like any other ending, and the worker
                 // takes requests again.
                 held.borrow_mut().clear();
                 until(|| worker.in_flight.get() == 0).await;
-                assert_eq!(status_of(front, "/ok").await, StatusCode::OK, "{by:?}");
+                assert_eq!(status_of(front, "/ok").await, StatusCode::OK);
             }));
         }
     }
@@ -1786,7 +1521,7 @@ mod tests {
     #[test]
     fn every_way_out_of_an_exchange_gives_its_place_back() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for (by, down) in PAIRINGS {
+        for down in DOWNSTREAMS {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1795,7 +1530,7 @@ mod tests {
             runtime.block_on(local.run_until(async {
                 let serving = |upstream| {
                     let worker =
-                        Worker::with_limits(served_by(upstream, by, down), H1Limits::default());
+                        Worker::with_limits(served_by(upstream, down), H1Limits::default());
                     async move {
                         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
                         let front = socket.local_addr().unwrap();
@@ -1806,7 +1541,7 @@ mod tests {
                 };
                 let given_back = |worker: &Rc<Worker>, case: &str| {
                     let worker = Rc::clone(worker);
-                    let case = format!("{by:?}, {case}");
+                    let case = format!("{down:?}, {case}");
                     async move {
                         tokio::time::timeout(Duration::from_secs(10), async {
                             while worker.in_flight.get() != 0 {
@@ -1824,7 +1559,7 @@ mod tests {
                 assert_eq!(
                     status_of(front, "/ok").await,
                     StatusCode::BAD_GATEWAY,
-                    "{by:?}"
+                    "{down:?}"
                 );
                 given_back(&worker, "unreachable").await;
 
@@ -1844,12 +1579,8 @@ mod tests {
                 let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut some))
                     .await
                     .expect("no answer");
-                assert!(read.unwrap() > 0, "{by:?}: closed before answering");
-                assert_eq!(
-                    worker.in_flight.get(),
-                    1,
-                    "{by:?}: not in hand while answering"
-                );
+                assert!(read.unwrap() > 0, "closed before answering");
+                assert_eq!(worker.in_flight.get(), 1, "not in hand while answering");
                 drop(client);
                 given_back(&worker, "a client that stopped reading").await;
 
@@ -1867,11 +1598,7 @@ mod tests {
                 let mut client = TcpStream::connect(front).await.unwrap();
                 client.write_all(&asking("/silent")).await.unwrap();
                 until(|| held.borrow().len() == 1).await;
-                assert_eq!(
-                    worker.in_flight.get(),
-                    1,
-                    "{by:?}: not in hand while waiting"
-                );
+                assert_eq!(worker.in_flight.get(), 1, "not in hand while waiting");
                 drop(client);
                 given_back(&worker, "a client that went").await;
             }));
@@ -1948,57 +1675,23 @@ mod tests {
         (address, held)
     }
 
-    /// The same, by whichever client is named: how many idle connections a worker keeps
-    /// is the data plane's bound, so it has to hold for both of them.
-    /// Every client with every server it can be paired with.
-    const PAIRINGS: [(Upstream, Downstream); 5] = [
-        (Upstream::Hyper, Downstream::Hyper),
-        (Upstream::HyperConn, Downstream::Hyper),
-        (Upstream::Ours, Downstream::Hyper),
-        (Upstream::HyperConn, Downstream::Ours),
-        (Upstream::Ours, Downstream::Ours),
-    ];
-
-    /// The same, its clients' connections taken by `down`.
-    fn served_by(upstream: SocketAddr, by: Upstream, down: Downstream) -> Arc<Proxy> {
-        let proxy = Proxy::new(everything_to(upstream), NonZeroUsize::MIN, by)
-            .and_then(|proxy| proxy.serving_by(down))
-            .unwrap();
+    /// A data plane for `upstream`, its clients' connections taken by `down`.
+    fn served_by(upstream: SocketAddr, down: Downstream) -> Arc<Proxy> {
+        let proxy = Proxy::new(everything_to(upstream), NonZeroUsize::MIN)
+            .unwrap()
+            .serving_by(down);
         Arc::new(proxy)
-    }
-
-    fn sending_to_by(upstream: SocketAddr, by: Upstream) -> Arc<Proxy> {
-        let yaml = format!(
-            r#"
-listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http }}
-routes:
-  - name: everything
-    listeners: [web]
-    hostnames:
-      - {{ name: "*", falls_through: true }}
-    rules:
-      - matches:
-          - path: {{ prefix: / }}
-        backends: [{{ upstream: up, weight: 1 }}]
-upstreams:
-  up: {{ endpoints: ["{upstream}"] }}
-"#
-        );
-        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
-        let compiled = compile(&config).unwrap();
-        Arc::new(Proxy::new(compiled, NonZeroUsize::MIN, by).unwrap())
     }
 
     /// How many connections a worker opens for `requests` sent one after another, when it
     /// may keep `idle_per_destination` of them.
-    async fn connections_for(by: Upstream, keeping: usize, requests: usize) -> usize {
+    async fn connections_for(keeping: usize, requests: usize) -> usize {
         let (upstream, opened) = counting_upstream().await;
         let limits = H1Limits {
             idle_per_destination: keeping,
             ..H1Limits::default()
         };
-        let worker = Worker::with_limits(sending_to_by(upstream, by), limits);
+        let worker = Worker::with_limits(sending_to(upstream), limits);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
         let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
@@ -2020,12 +1713,10 @@ upstreams:
             .unwrap();
         let local = tokio::task::LocalSet::new();
         runtime.block_on(local.run_until(async {
-            for by in [Upstream::Hyper, Upstream::HyperConn, Upstream::Ours] {
-                // Keeping none: every request after the first opens its own connection.
-                assert_eq!(connections_for(by, 0, 3).await, 3, "{by:?} keeping none");
-                // Keeping one: the first connection carries all three.
-                assert_eq!(connections_for(by, 1, 3).await, 1, "{by:?} keeping one");
-            }
+            // Keeping none: every request after the first opens its own connection.
+            assert_eq!(connections_for(0, 3).await, 3, "keeping none");
+            // Keeping one: the first connection carries all three.
+            assert_eq!(connections_for(1, 3).await, 1, "keeping one");
         }));
     }
 
@@ -2034,36 +1725,34 @@ upstreams:
     /// again ([13 §3](../../docs/13-http1-upstream.md)).
     #[test]
     fn the_sweep_closes_what_every_pool_left_idle_too_long() {
-        for by in [Upstream::HyperConn, Upstream::Ours] {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let local = tokio::task::LocalSet::new();
-            runtime.block_on(local.run_until(async {
-                let (upstream, _opened) = counting_upstream().await;
-                let limits = H1Limits {
-                    idle_timeout: Duration::from_millis(100),
-                    sweep: Duration::from_millis(50),
-                    ..H1Limits::default()
-                };
-                let worker = Worker::with_limits(sending_to_by(upstream, by), limits);
-                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let front = socket.local_addr().unwrap();
-                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
-                assert_eq!(status_over_http1(front).await, StatusCode::OK);
-                until(|| worker.idle_connections() == 1).await;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let (upstream, _opened) = counting_upstream().await;
+            let limits = H1Limits {
+                idle_timeout: Duration::from_millis(100),
+                sweep: Duration::from_millis(50),
+                ..H1Limits::default()
+            };
+            let worker = Worker::with_limits(sending_to(upstream), limits);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+            assert_eq!(status_over_http1(front).await, StatusCode::OK);
+            until(|| worker.idle_connections() == 1).await;
 
-                let _maintaining = tokio::task::spawn_local(Rc::clone(&worker).maintain());
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    while worker.idle_connections() != 0 {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .unwrap_or_else(|_| panic!("{by:?}: an idle connection outlived the sweep"));
-            }));
-        }
+            let _maintaining = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while worker.idle_connections() != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("an idle connection outlived the sweep"));
+        }));
     }
 
     /// What became of every connection is counted, and so is a worker's own holding, for
@@ -2072,54 +1761,52 @@ upstreams:
     /// ([13 §7](../../docs/13-http1-upstream.md)).
     #[test]
     fn what_became_of_a_connection_is_counted() {
-        for by in [Upstream::HyperConn, Upstream::Ours] {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let local = tokio::task::LocalSet::new();
-            runtime.block_on(local.run_until(async {
-                let (upstream, _opened) = counting_upstream().await;
-                let proxy = sending_to_by(upstream, by);
-                let worker = Worker::with_limits(Arc::clone(&proxy), H1Limits::default());
-                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let front = socket.local_addr().unwrap();
-                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let (upstream, _opened) = counting_upstream().await;
+            let proxy = sending_to(upstream);
+            let worker = Worker::with_limits(Arc::clone(&proxy), H1Limits::default());
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
 
-                for _ in 0..3 {
-                    assert_eq!(status_over_http1(front).await, StatusCode::OK);
-                }
-                // One connection opened for the first request, and taken again for the rest.
-                let scrape = proxy.metrics.render(&["web".to_owned()], &[]);
-                assert!(
-                    scrape.contains(
-                        "edgerush_upstream_connections_total{state=\"opened\"} 1
+            for _ in 0..3 {
+                assert_eq!(status_over_http1(front).await, StatusCode::OK);
+            }
+            // One connection opened for the first request, and taken again for the rest.
+            let scrape = proxy.metrics.render(&["web".to_owned()], &[]);
+            assert!(
+                scrape.contains(
+                    "edgerush_upstream_connections_total{state=\"opened\"} 1
 "
-                    ),
-                    "{scrape}"
-                );
-                assert!(
-                    scrape.contains(
-                        "edgerush_upstream_connections_total{state=\"reused\"} 2
+                ),
+                "{scrape}"
+            );
+            assert!(
+                scrape.contains(
+                    "edgerush_upstream_connections_total{state=\"reused\"} 2
 "
-                    ),
-                    "{scrape}"
-                );
-                // And what the worker holds, which it says as it sweeps.
-                proxy
-                    .metrics
-                    .worker()
-                    .holding(worker.in_flight.get(), worker.idle_connections());
-                let scrape = proxy.metrics.render(&["web".to_owned()], &[]);
-                assert!(
-                    scrape.contains(
-                        "edgerush_upstream_connections_idle 1
+                ),
+                "{scrape}"
+            );
+            // And what the worker holds, which it says as it sweeps.
+            proxy
+                .metrics
+                .worker()
+                .holding(worker.in_flight.get(), worker.idle_connections());
+            let scrape = proxy.metrics.render(&["web".to_owned()], &[]);
+            assert!(
+                scrape.contains(
+                    "edgerush_upstream_connections_idle 1
 "
-                    ),
-                    "{scrape}"
-                );
-            }));
-        }
+                ),
+                "{scrape}"
+            );
+        }));
     }
 
     /// An exchange the worker could not pay for is counted as that, and not as the
@@ -2163,7 +1850,7 @@ upstreams:
                 }
             });
 
-            let proxy = served_by(upstream, Upstream::Ours, Downstream::Hyper);
+            let proxy = served_by(upstream, Downstream::Hyper);
             let limits = H1Limits {
                 storage: 0,
                 ..H1Limits::default()
@@ -2247,7 +1934,7 @@ upstreams:
                 }
             });
 
-            let proxy = served_by(upstream, Upstream::Ours, Downstream::Ours);
+            let proxy = served_by(upstream, Downstream::Ours);
             // An upload stalled on its upstream is not read, so its client going unseen until
             // the exchange's own wait runs out: shortened here, so that the test sees the end
             // of what an upload pins without waiting the usual thirty seconds for it.
@@ -2364,7 +2051,7 @@ upstreams:
         let local = tokio::task::LocalSet::new();
         runtime.block_on(local.run_until(async {
             let (_held, nowhere) = refusing();
-            let proxy = served_by(nowhere, Upstream::Ours, Downstream::Ours);
+            let proxy = served_by(nowhere, Downstream::Ours);
             let limits = H1Limits {
                 storage: crate::upstream::h1::blocks::SMALL,
                 ..H1Limits::default()
@@ -2419,7 +2106,7 @@ upstreams:
                 }
             });
 
-            let proxy = sending_to_by(upstream, Upstream::Ours);
+            let proxy = sending_to(upstream);
             let worker = Worker::with_limits(Arc::clone(&proxy), H1Limits::default());
             let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let front = socket.local_addr().unwrap();
@@ -2447,85 +2134,83 @@ upstreams:
     /// ([13 §7](../../docs/13-http1-upstream.md)). Both paths count it.
     #[test]
     fn a_body_that_fails_after_its_head_is_counted() {
-        for by in [Upstream::Hyper, Upstream::HyperConn, Upstream::Ours] {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let local = tokio::task::LocalSet::new();
-            runtime.block_on(local.run_until(async move {
-                // A head that promises ten bytes, five bytes, and then the end.
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let upstream = listener.local_addr().unwrap();
-                tokio::spawn(async move {
-                    loop {
-                        let (mut stream, _) = listener.accept().await.unwrap();
-                        tokio::spawn(async move {
-                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                            let mut asked = [0; 1024];
-                            let _read = stream.read(&mut asked).await;
-                            let _said = stream
-                                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nshort")
-                                .await;
-                            // Long enough for the head to reach the client before
-                            // the body stops. Which of the two a client sees when a
-                            // body fails is the downstream server's buffering rather
-                            // than anything decided here, and this test is about the
-                            // counter rather than about that.
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                        });
-                    }
-                });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async move {
+            // A head that promises ten bytes, five bytes, and then the end.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut asked = [0; 1024];
+                        let _read = stream.read(&mut asked).await;
+                        let _said = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nshort")
+                            .await;
+                        // Long enough for the head to reach the client before
+                        // the body stops. Which of the two a client sees when a
+                        // body fails is the downstream server's buffering rather
+                        // than anything decided here, and this test is about the
+                        // counter rather than about that.
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    });
+                }
+            });
 
-                let proxy = sending_to_by(upstream, by);
-                let worker = Worker::with_limits(Arc::clone(&proxy), H1Limits::default());
-                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let front = socket.local_addr().unwrap();
-                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+            let proxy = sending_to(upstream);
+            let worker = Worker::with_limits(Arc::clone(&proxy), H1Limits::default());
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
 
-                // The head arrives and says the answer succeeded; the body does not.
-                let stream = TcpStream::connect(front).await.unwrap();
-                let (mut sender, connection) =
-                    hyper::client::conn::http1::handshake(TokioIo::new(stream))
-                        .await
-                        .unwrap();
-                let _driving = tokio::task::spawn_local(async move {
-                    let _closed = connection.await;
-                });
-                let request = Request::builder()
-                    .uri("/")
-                    .header("host", "example.test")
-                    .body(Empty::<Bytes>::new())
+            // The head arrives and says the answer succeeded; the body does not.
+            let stream = TcpStream::connect(front).await.unwrap();
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
                     .unwrap();
-                let answer = sender.send_request(request).await.unwrap();
-                assert_eq!(answer.status(), StatusCode::OK, "{by:?}");
-                assert!(
-                    answer.into_body().collect().await.is_err(),
-                    "{by:?} made a truncated body look whole"
-                );
+            let _driving = tokio::task::spawn_local(async move {
+                let _closed = connection.await;
+            });
+            let request = Request::builder()
+                .uri("/")
+                .header("host", "example.test")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let answer = sender.send_request(request).await.unwrap();
+            assert_eq!(answer.status(), StatusCode::OK);
+            assert!(
+                answer.into_body().collect().await.is_err(),
+                "a truncated body was made to look whole"
+            );
 
-                let up = proxy.metrics.upstream_slot("up");
-                let scrape = proxy.metrics.render(&["web".to_owned()], &[("up", up)]);
-                assert!(
-                    scrape.contains("edgerush_upstream_body_failures_total{upstream=\"up\"} 1\n"),
-                    "{by:?}: {scrape}"
-                );
-                // And the answer was counted a success, which is why the body needed
-                // a counter of its own.
-                assert!(
-                    scrape.contains(
-                        "edgerush_upstream_responses_total{upstream=\"up\",class=\"2xx\"} 1\n"
-                    ),
-                    "{by:?}: {scrape}"
-                );
-            }));
-        }
+            let up = proxy.metrics.upstream_slot("up");
+            let scrape = proxy.metrics.render(&["web".to_owned()], &[("up", up)]);
+            assert!(
+                scrape.contains("edgerush_upstream_body_failures_total{upstream=\"up\"} 1\n"),
+                "{scrape}"
+            );
+            // And the answer was counted a success, which is why the body needed
+            // a counter of its own.
+            assert!(
+                scrape.contains(
+                    "edgerush_upstream_responses_total{upstream=\"up\",class=\"2xx\"} 1\n"
+                ),
+                "{scrape}"
+            );
+        }));
     }
 
     /// A proxy of one listener that sends everything to `upstream`, by EdgeRush's own
     /// path because that is the path with a bound on it.
     fn sending_to(upstream: SocketAddr) -> Arc<Proxy> {
-        Arc::new(Proxy::new(everything_to(upstream), NonZeroUsize::MIN, Upstream::Ours).unwrap())
+        Arc::new(Proxy::new(everything_to(upstream), NonZeroUsize::MIN).unwrap())
     }
 
     /// A config of one listener that sends everything to `upstream`.
@@ -2662,7 +2347,6 @@ upstreams:
         let proxy = Proxy::new(
             upstreams(&[("web", "127.0.0.1:1"), ("zed", "127.0.0.1:2")]),
             NonZeroUsize::MIN,
-            Upstream::Ours,
         )
         .unwrap();
         let web = filed_under(&proxy, 0);
@@ -2747,8 +2431,7 @@ upstreams:
         local
             .run_until(async move {
                 let config = upstreams(&[("web", &upstream.to_string())]);
-                let proxy =
-                    Arc::new(Proxy::new(config, NonZeroUsize::MIN, Upstream::Ours).unwrap());
+                let proxy = Arc::new(Proxy::new(config, NonZeroUsize::MIN).unwrap());
                 let worker = Worker::new(Arc::clone(&proxy));
                 let identity = Arc::clone(proxy.current.load().destinations.at(0, 0).unwrap());
 
@@ -2828,12 +2511,7 @@ upstreams:
 
     #[test]
     fn a_data_plane_serves_the_listeners_it_was_made_with() {
-        let proxy = Proxy::new(
-            config_with(&["web", "admin"]),
-            NonZeroUsize::MIN,
-            Upstream::Hyper,
-        )
-        .unwrap();
+        let proxy = Proxy::new(config_with(&["web", "admin"]), NonZeroUsize::MIN).unwrap();
         assert_eq!(proxy.listeners(), ["admin", "web"]);
         proxy.reload(config_with(&["later"])).unwrap();
         assert_eq!(proxy.listeners(), ["admin", "web"]);
@@ -2874,7 +2552,7 @@ upstreams:
 
     #[test]
     fn an_answer_of_our_own_is_a_status_and_nothing_else_and_is_counted() {
-        let proxy = Proxy::new(config_with(&["web"]), NonZeroUsize::MIN, Upstream::Hyper).unwrap();
+        let proxy = Proxy::new(config_with(&["web"]), NonZeroUsize::MIN).unwrap();
         let answer = proxy.answer(0, Answer::NoRoute);
         assert_eq!(answer.status(), 404);
         assert!(answer.headers().is_empty());
@@ -2886,7 +2564,7 @@ upstreams:
 
     #[test]
     fn a_reload_is_counted_and_resets_nothing() {
-        let proxy = Proxy::new(config_with(&["web"]), NonZeroUsize::MIN, Upstream::Hyper).unwrap();
+        let proxy = Proxy::new(config_with(&["web"]), NonZeroUsize::MIN).unwrap();
         let _counted = proxy.answer(0, Answer::NoRoute);
         assert!(proxy.metrics().contains(
             "edgerush_config_reloads_total 0

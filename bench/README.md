@@ -50,13 +50,13 @@ two is comparing them at the same bounds; every run writes what they were into
 
 ## The variants
 
-`own-server` puts EdgeRush's own downstream server in front of its own client, and
-`own-server-hyper-conn` in front of the engine's client a connection at a time
-(`--downstream ours`, [14 §9](../../docs/14-downstream-server.md)); every other EdgeRush
-variant is served by the engine's server.
+`own-server` puts EdgeRush's own downstream server in front of its own client
+(`--downstream ours`, [14 §9](../../docs/14-downstream-server.md)); `ours` and
+`ours-kernel` are served by the engine's server. Every EdgeRush variant reaches its
+upstreams by EdgeRush's own client, the only one there is.
 
 For the client optimisation rerun, use the original machine and fixed frequency with
-`WORKERS=2 REPS=3 VARIANTS="thread-per-core ours nginx" IDLE_PER_DESTINATION=1024
+`WORKERS=2 REPS=3 VARIANTS="ours nginx" IDLE_PER_DESTINATION=1024
 IDLE_TOTAL=1024 STREAMED=8388608 bench/run.sh hotpaths`. Preserve the original CPU
 affinity settings and verify the backend/generator ceiling first. This command keeps the
 anchors interleaved and runs only H1 saturation, large responses and large uploads.
@@ -73,7 +73,7 @@ scenario on the benchmark machine (retain its CPU affinity and frequency setting
 ```sh
 cargo build --profile profiling -p edgerush
 sudo -v
-WORKERS=2 REPS=3 VARIANTS="thread-per-core ours" \
+WORKERS=2 REPS=3 VARIANTS="ours own-server" \
 IDLE_PER_DESTINATION=1024 IDLE_TOTAL=1024 STREAMED=8388608 \
 bench/run.sh profile-body upload 20
 ```
@@ -97,16 +97,11 @@ polling calls the upload driver on every frame, even after the request has finis
 the upload-loop change can affect answers without changing the response-copy code.
 That is a hypothesis to isolate, not an explanation established by the macro rerun.
 
-`VARIANTS` names what is run, in turns: `thread-per-core` — EdgeRush by the engine's
-upstream client, named with `--upstream hyper` since it is not the default —,
-`thread-per-core-kernel` — the same without balancing connections at accept —, `ours`,
-the same again by EdgeRush's own upstream client, the default, and `hyper-conn`, by the
-engine's client a connection at a time over EdgeRush's own pool, which is what `ours` is
-compared with from the downstream work on (EdgeRush, `proxy.yaml`,
-[14 §2](../../docs/14-downstream-server.md)); then `nginx` (`nginx-proxy.conf`), `haproxy` (`haproxy.cfg`), `envoy`
-(`envoy.yaml`) and `kong` (`kong.yml`, without a database). `thread-per-core` and `ours`
-differ in nothing but that client, which is what makes the pair of them a measurement of
-it ([13 §8](../../docs/13-http1-upstream.md) step 6). The configs ask for the same
+`VARIANTS` names what is run, in turns: `ours` — EdgeRush, the default —, `ours-kernel`
+— the same without balancing connections at accept —, and `own-server` — EdgeRush's own
+server in front of its own client (EdgeRush, `proxy.yaml`); then `nginx`
+(`nginx-proxy.conf`), `haproxy` (`haproxy.cfg`), `envoy` (`envoy.yaml`) and `kong`
+(`kong.yml`, without a database). The configs ask for the same
 thing — the same hosts and rules, the same header changes on
 request and response, HTTP/1.1 and cleartext HTTP/2 on one port, keep-alive connections to
 the backend that any client's request may use, no access log — and each proxy gets

@@ -193,9 +193,6 @@ pub(crate) trait Forwarded: Head {
     ///
     /// [`Rejection::Edits`] if the head cannot take the change.
     fn close_connection(&mut self) -> Result<(), Rejection>;
-
-    /// The head as `http`'s parts, for a client that takes those.
-    fn into_parts(self) -> Parts;
 }
 
 impl Forwarded for Parts {
@@ -224,10 +221,6 @@ impl Forwarded for Parts {
         self.headers
             .insert(CONNECTION, HeaderValue::from_static("close"));
         Ok(())
-    }
-
-    fn into_parts(self) -> Parts {
-        self
     }
 }
 

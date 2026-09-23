@@ -15,7 +15,6 @@
 use super::H1Limits;
 pub use crate::h1::{
     BodyReader, CodecError, Framing, MOST_FIELDS, Piece, Trailers, filter_declaration,
-    filter_trailers,
 };
 #[cfg(test)]
 use crate::h1::{DENIED_TRAILERS, EXAMINED};
@@ -2178,36 +2177,6 @@ mod tests {
             assert!(trailers.fields.is_empty(), "{denied} travelled on");
             assert_eq!(trailers.discarded, 1, "{denied}");
         }
-    }
-
-    /// A section somebody else parsed is filtered by the same set, every value of a
-    /// repeated name with it.
-    #[test]
-    fn a_section_read_elsewhere_loses_what_may_not_travel_on() {
-        let mut fields = HeaderMap::new();
-        fields.append(
-            HeaderName::from_static("x-secret"),
-            HeaderValue::from_static("a"),
-        );
-        fields.append(
-            HeaderName::from_static("x-secret"),
-            HeaderValue::from_static("b"),
-        );
-        fields.append(
-            HeaderName::from_static("content-length"),
-            HeaderValue::from_static("7"),
-        );
-        fields.append(
-            HeaderName::from_static("x-kept"),
-            HeaderValue::from_static("here"),
-        );
-
-        let nominated = vec![HeaderName::from_static("x-secret")];
-        assert_eq!(filter_trailers(&mut fields, &nominated), 3);
-
-        assert!(fields.get("x-secret").is_none());
-        assert!(fields.get("content-length").is_none());
-        assert_eq!(fields.get("x-kept").unwrap(), "here");
     }
 
     /// Whatever case it is written in.

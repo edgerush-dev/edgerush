@@ -18,8 +18,11 @@ use bytes::Bytes;
 use edgerush_filters::{Edit, HeaderModifier};
 use edgerush_router::Fields;
 use http::header::{CONNECTION, COOKIE, HOST, HeaderName, HeaderValue, TE, TRAILER};
+#[cfg(any(test, feature = "fuzzing"))]
 use http::request::Parts;
-use http::{HeaderMap, Method, Request, Uri, Version};
+#[cfg(any(test, feature = "fuzzing"))]
+use http::{HeaderMap, Request};
+use http::{Method, Uri, Version};
 
 /// A request's head as our own server read it: its method and target, the bytes of the
 /// head, where each field line lies in them, and an overlay of what the core changes. Its
@@ -278,8 +281,12 @@ impl Forwarded for RawHead {
             .set(&view, CONNECTION, HeaderValue::from_static("close"))
             .map_err(|_| Rejection::Edits)
     }
+}
 
-    fn into_parts(self) -> Parts {
+impl RawHead {
+    /// The head as `http`'s parts, which tests hand to cores written for those.
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn into_parts(self) -> Parts {
         let mut headers = HeaderMap::with_capacity(self.lines.len());
         for (name, value) in self.fields().iter() {
             // Every line was a field when it was read, and every field added was made one.

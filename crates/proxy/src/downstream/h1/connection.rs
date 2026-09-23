@@ -1100,7 +1100,6 @@ async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::head::Forwarded;
     use http::Request;
     use http_body_util::{BodyExt, Full};
     use std::cell::Cell;

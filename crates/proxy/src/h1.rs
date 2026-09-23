@@ -243,27 +243,6 @@ pub(crate) fn is_denied(name: &HeaderName, nominated: &[HeaderName]) -> bool {
     DENIED_TRAILERS.contains(&name.as_str()) || nominated.contains(name)
 }
 
-/// Takes out of a trailer section what may not travel on, and says how many went.
-///
-/// For a body somebody else parsed. What may not be a trailer follows from being an
-/// intermediary, not from how the answer was read, so a body the engine's client read is
-/// filtered by this same set ([13 §4](../../../docs/13-http1-upstream.md)).
-pub fn filter_trailers(fields: &mut HeaderMap, nominated: &[HeaderName]) -> usize {
-    // Named first and removed after: the map cannot be read while it is changed, and a
-    // name may carry more than one value.
-    let denied: Vec<HeaderName> = fields
-        .keys()
-        .filter(|name| is_denied(name, nominated))
-        .cloned()
-        .collect();
-    let mut discarded = 0;
-    for name in denied {
-        discarded += fields.get_all(&name).iter().count();
-        fields.remove(&name);
-    }
-    discarded
-}
-
 /// Takes the denied names out of a `Trailer` declaration, leaving one that says only what
 /// will really arrive, and takes the declaration away altogether when nothing will.
 ///

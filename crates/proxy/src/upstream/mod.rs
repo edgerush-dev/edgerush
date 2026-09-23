@@ -1,19 +1,15 @@
-//! EdgeRush's own way to an upstream, beside the engine's.
-//!
-//! What is here is a candidate: hyper's client still carries every request, and this is
-//! adopted only if it keeps to what that client does and a worthwhile gain survives being
-//! measured on the finished thing ([13](../../../docs/13-http1-upstream.md)). What the
-//! current path does, measured on raw sockets, is `crates/proxy/tests/wire.rs`.
+//! EdgeRush's way to an upstream: its own HTTP/1 client, its pool, and what decides which
+//! connections a request may share ([13](../../../docs/13-http1-upstream.md)). What it does,
+//! measured on raw sockets, is `crates/proxy/tests/wire.rs`.
 
-// Nothing outside reaches into this yet: the engine's client still carries every request,
-// and what is here answers only to its own tests until the code that drives a socket
-// arrives (13 §8, step 3). An expectation and not an allowance, so that the day a caller
-// appears the compiler says this line has served its purpose.
+// Some items here are reached only by the tests and the fuzz targets. An expectation and
+// not an allowance, so that once each is kept to the builds that use it the compiler says
+// this has served its purpose.
 #![cfg_attr(
     not(feature = "fuzzing"),
     expect(
         dead_code,
-        reason = "reached only by its own tests until the exchange that drives a socket exists"
+        reason = "some items are reached only by tests and the fuzz targets"
     )
 )]
 // What is here is `pub` so that the fuzz targets, which are a crate of their own, can name
@@ -25,4 +21,3 @@
 pub(crate) mod auth;
 pub mod destination;
 pub mod h1;
-pub mod hyper_conn;

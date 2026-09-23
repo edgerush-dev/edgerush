@@ -201,7 +201,6 @@ mod tests {
     use super::*;
     use crate::bind::{Port, listen};
     use edgerush_config::{Config, compile};
-    use edgerush_proxy::Upstream;
     use std::io::{Read, Write};
     use std::net::SocketAddr;
     use std::num::NonZeroUsize;
@@ -227,8 +226,7 @@ upstreams:
 "#;
         let config: Config = serde_saphyr::from_str(yaml).unwrap();
         let workers = NonZeroUsize::new(count).unwrap();
-        let proxy =
-            Arc::new(Proxy::new(compile(&config).unwrap(), workers, Upstream::default()).unwrap());
+        let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), workers).unwrap());
         let mut address: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut sockets = Vec::new();
         for _ in 0..count {

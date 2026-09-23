@@ -13,7 +13,7 @@
 )]
 
 use edgerush_config::{Compiled, Config, compile};
-use edgerush_proxy::{Downstream, Proxy, Upstream, Worker};
+use edgerush_proxy::{Downstream, Proxy, Worker};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Either, Empty, Full};
@@ -136,23 +136,8 @@ async fn proxy(yaml: &str) -> BTreeMap<String, SocketAddr> {
     reloadable_proxy(yaml).await.1
 }
 
-/// Which way these tests reach an upstream. The suite is the same either way — that is
+/// Which server takes the suite's connections. The suite is the same either way — that is
 /// the point of it — so it is told rather than written twice:
-///
-/// ```text
-/// cargo test                                       EdgeRush's own, the default
-/// EDGERUSH_TEST_UPSTREAM=hyper cargo test          the engine's pooled client
-/// EDGERUSH_TEST_UPSTREAM=hyper-conn cargo test     the engine's, over our pool
-/// ```
-fn upstream_under_test() -> Upstream {
-    match std::env::var("EDGERUSH_TEST_UPSTREAM").as_deref() {
-        Ok("hyper") => Upstream::Hyper,
-        Ok("hyper-conn") => Upstream::HyperConn,
-        _ => Upstream::Ours,
-    }
-}
-
-/// Which server takes the suite's connections, told the same way:
 ///
 /// ```text
 /// EDGERUSH_TEST_DOWNSTREAM=ours cargo test     EdgeRush's own, as far as it goes
@@ -164,11 +149,11 @@ fn downstream_under_test() -> Downstream {
     }
 }
 
-/// A data plane of `config`, reaching upstreams and serving clients as the suite is told.
+/// A data plane of `config`, serving clients as the suite is told.
 fn under_test(config: edgerush_config::Compiled) -> Proxy {
-    Proxy::new(config, NonZeroUsize::MIN, upstream_under_test())
-        .and_then(|proxy| proxy.serving_by(downstream_under_test()))
+    Proxy::new(config, NonZeroUsize::MIN)
         .unwrap()
+        .serving_by(downstream_under_test())
 }
 
 /// The same, with the proxy itself for reloading it.
@@ -1153,21 +1138,13 @@ async fn an_upstream_that_goes_and_comes_back_is_not_the_one_that_left() {
     proxy.reload(compiled(&back)).unwrap();
     assert_eq!(answered_by(&client, web, "/alpha").await, "alpha");
 
-    match upstream_under_test() {
-        // **Where the pools differ, by design rather than by rule.** Ours gives the
-        // recreated destination a key of its own, so the connection retired with the old
-        // one is not used for it ([13 §3](../../../docs/13-http1-upstream.md)), whichever
-        // client's connection it is.
-        Upstream::Ours | Upstream::HyperConn => assert_eq!(
-            opened.load(Ordering::SeqCst),
-            2,
-            "a retired connection was used again"
-        ),
-        // The engine's pooled client keeps its connections by authority, which has not changed,
-        // so the same socket carries on. Nothing in HTTP says otherwise; it simply has no
-        // notion of a destination that was taken away.
-        Upstream::Hyper => assert_eq!(opened.load(Ordering::SeqCst), 1),
-    }
+    // The recreated destination has a key of its own, so the connection retired with the
+    // old one is not used for it ([13 §3](../../../docs/13-http1-upstream.md)).
+    assert_eq!(
+        opened.load(Ordering::SeqCst),
+        2,
+        "a retired connection was used again"
+    );
 }
 
 /// Two upstreams that point at one address are two destinations. What they are for
@@ -1187,18 +1164,12 @@ async fn two_upstreams_at_one_address_do_not_share_a_connection() {
     assert_eq!(answered_by(&client, web, "/alpha").await, "shared");
     assert_eq!(answered_by(&client, web, "/beta").await, "shared");
 
-    match upstream_under_test() {
-        // One connection each, kept and reused: separate, and separately reused.
-        Upstream::Ours | Upstream::HyperConn => assert_eq!(
-            opened.load(Ordering::SeqCst),
-            2,
-            "two upstreams shared a connection"
-        ),
-        // The engine's pooled client keys on the authority alone, so one address is one pool
-        // however many upstreams point at it. That is the isolation §3 asks for and the
-        // candidate adds; it is not a rule hyper's client is breaking.
-        Upstream::Hyper => assert_eq!(opened.load(Ordering::SeqCst), 1),
-    }
+    // One connection each, kept and reused: separate, and separately reused.
+    assert_eq!(
+        opened.load(Ordering::SeqCst),
+        2,
+        "two upstreams shared a connection"
+    );
 }
 
 // ---- an HTTP/2 client in front of it ----

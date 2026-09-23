@@ -42,7 +42,7 @@ repo=$(dirname "$here")
 : "${IDLE_CONNECTIONS:=2000}"
 # The counts `idle` weighs each kind of idle connection at (14 §8).
 : "${IDLE_COUNTS:=2000 20000}"
-: "${VARIANTS:=thread-per-core}" # and: ours hyper-conn thread-per-core-kernel nginx haproxy envoy kong
+: "${VARIANTS:=ours}" # and: own-server ours-kernel nginx haproxy envoy kong
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
 
 # Hundreds of connections on either side of the proxy, and more when they churn.
@@ -125,48 +125,28 @@ start_proxy() { # variant
         # A thread for every CPU it may run on: WORKERS of them, if PROXY_CPUS is as many.
         taskset -c "$PROXY_CPUS" haproxy -db -f "$here/haproxy.cfg" 2>>"$OUT/proxy.log" &
         ;;
-    thread-per-core-kernel)
+    ours-kernel)
         # Connections left where the kernel put them: what balancing is measured against.
-        # By the engine's client, as the variant it is compared with is.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
-            --upstream hyper --accept kernel --workers "$WORKERS" $idle \
+            --accept kernel --workers "$WORKERS" $idle \
             2>>"$OUT/proxy.log" &
         ;;
     ours)
-        # The same proxy by EdgeRush's own upstream client, the default, rather than
-        # the engine's (13 section 8 step 6). Nothing else about it changes, which is
-        # what makes the pair of them the measurement.
+        # EdgeRush, the engine's server in front of its own client.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
-            --upstream ours --workers "$WORKERS" $idle \
-            2>>"$OUT/proxy.log" &
-        ;;
-    hyper-conn)
-        # The engine's client a connection at a time over EdgeRush's own pool: what ours is
-        # compared with from the downstream work on (14 section 2). Against thread-per-core
-        # it measures the pool and the adapter; against ours, the client itself.
-        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
-            --upstream hyper-conn --workers "$WORKERS" $idle \
+            --workers "$WORKERS" $idle \
             2>>"$OUT/proxy.log" &
         ;;
     own-server)
         # EdgeRush's own downstream server in front of its own client: the path the
-        # downstream work builds, whose step 3 checkpoint this is (14 section 9).
+        # downstream work builds (14 section 9).
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
-            --upstream ours --downstream ours --workers "$WORKERS" $idle \
-            2>>"$OUT/proxy.log" &
-        ;;
-    own-server-hyper-conn)
-        # The same server in front of the engine's client a connection at a time: the
-        # server measured apart from which client carries the request.
-        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
-            --upstream hyper-conn --downstream ours --workers "$WORKERS" $idle \
+            --downstream ours --workers "$WORKERS" $idle \
             2>>"$OUT/proxy.log" &
         ;;
     *)
-        # The engine's upstream client, named: it is not the default, and this is the
-        # variant EdgeRush's own is held against.
-        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
-            --upstream hyper --workers "$WORKERS" $idle 2>>"$OUT/proxy.log" &
+        echo "no variant $variant" >&2
+        exit 2
         ;;
     esac
     proxy_pid=${daemon:-$!}
@@ -445,7 +425,7 @@ profile-body)
     }
     # -p attaches to every thread in EdgeRush, but not workers of a separate process.
     for variant in $VARIANTS; do
-        case "$variant" in thread-per-core | thread-per-core-kernel | ours) ;;
+        case "$variant" in ours | ours-kernel | own-server) ;;
         *) echo "profile-body supports EdgeRush client variants only" >&2; exit 2 ;;
         esac
     done
