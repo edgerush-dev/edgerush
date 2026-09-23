@@ -69,6 +69,8 @@ pub(crate) enum Stopped {
     TooSlow,
     /// Whatever was being waited for stopped happening for long enough.
     Idle,
+    /// The worker could not pay for storage the exchange needed.
+    Exhausted,
 }
 
 impl Stopped {
@@ -83,11 +85,12 @@ impl Stopped {
             Self::Interim => "interim",
             Self::TooSlow => "too_slow",
             Self::Idle => "idle",
+            Self::Exhausted => "exhausted",
         }
     }
 
     /// Every one of them, for a scrape that shows a series whether it has happened or not.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Codec,
         Self::Io,
         Self::RequestBody,
@@ -96,6 +99,7 @@ impl Stopped {
         Self::Interim,
         Self::TooSlow,
         Self::Idle,
+        Self::Exhausted,
     ];
 }
 
@@ -262,7 +266,7 @@ pub(crate) struct Metrics {
     /// Seconds since the Unix epoch; zero before the first reload.
     pub(crate) last_reload: AtomicU64,
     /// Exchanges of EdgeRush's own that ended without an answer, by reason.
-    stopped: Sharded<[Counter; 8]>,
+    stopped: Sharded<[Counter; Stopped::ALL.len()]>,
     /// What became of the connections a worker used, by which of the three it was.
     connections: Sharded<[Counter; 3]>,
     /// What each worker has in hand, sampled by the worker itself as it sweeps.
@@ -502,7 +506,7 @@ impl Metrics {
         scrape.family(name, Kind::Counter, help);
         for why in Stopped::ALL {
             let labels = [("reason", why.name())];
-            let count = |shard: &[Counter; 8]| shard[why as usize].get();
+            let count = |shard: &[Counter; Stopped::ALL.len()]| shard[why as usize].get();
             scrape.sample(name, &labels, self.stopped.sum(count));
         }
 

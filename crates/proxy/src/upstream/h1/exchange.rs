@@ -15,9 +15,10 @@ use super::H1Limits;
 use super::blocks::{Block, Blocks};
 use super::codec::{
     Asked, BodyReader, BodyWriter, CodecError, Delivery, Framing, Head, HeadReader, Piece,
-    ResponseHead, Sending, Trailers, delivery, write_head,
+    ResponseHead, Sending, Trailers, delivery, head_len, write_head,
 };
 use super::pool::Lease;
+use crate::storage::{Charge, Exhausted};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, Method, StatusCode, Uri};
 use http_body::{Body, Frame, SizeHint};
@@ -49,6 +50,11 @@ pub enum ExchangeError {
     /// The connection itself failed.
     #[error("the connection to the upstream failed: {0}")]
     Io(#[from] io::Error),
+    /// The worker could not pay for storage the exchange needed. Never taken for an
+    /// upstream that stopped reading: the exchange is cancelled, not carried on with half a
+    /// request sent ([14 §8](../../../docs/14-downstream-server.md)).
+    #[error("the worker could not pay for what the exchange needed: {0}")]
+    Exhausted(#[from] Exhausted),
     /// The request's own body could not be read, which is the client's end failing, not
     /// the upstream's.
     #[error("the request body could not be read: {0}")]
@@ -204,6 +210,8 @@ pub struct Exchange<S> {
     /// Lent from the worker's blocks with its room already made, and given back once
     /// everything in it has gone; empty and unallocated in between.
     outgoing: Vec<u8>,
+    /// The charge for `outgoing`'s capacity, while it has any.
+    outgoing_charge: Option<Charge>,
     written: usize,
     /// A shared slice of the upload frame, between its encoded prefix and suffix.
     payload: Bytes,
@@ -255,12 +263,41 @@ impl<S> Exchange<S> {
 
     /// Makes sure there is a staging buffer with its room made, lent from the worker's
     /// blocks if none is held.
-    fn lend_staging(&mut self) {
+    fn lend_staging(&mut self) -> Result<(), Exhausted> {
         if self.outgoing.capacity() < STAGING {
-            let mut lent = self.blocks.borrow_mut().take_staging(STAGING);
+            let (mut lent, charge) = self.blocks.borrow_mut().take_staging(STAGING)?;
             lent.extend_from_slice(&self.outgoing);
             self.outgoing = lent;
+            self.outgoing_charge = Some(charge);
         }
+        Ok(())
+    }
+
+    /// Makes room in the staging buffer for `more` bytes, paying for the larger buffer
+    /// before it is made, while the smaller one is still paid for
+    /// ([14 §8](../../../docs/14-downstream-server.md)). A buffer with the room already
+    /// changes nothing.
+    fn stage_room(&mut self, more: usize) -> Result<(), Exhausted> {
+        let wanted = self.outgoing.len().saturating_add(more);
+        if wanted <= self.outgoing.capacity() {
+            return Ok(());
+        }
+        let charge = self.blocks.borrow().storage().reserve(wanted)?;
+        // Exactly, so that what is paid for is what is held.
+        self.outgoing.reserve_exact(more);
+        self.outgoing_charge = Some(charge);
+        #[cfg(test)]
+        assert!(
+            self.staging_paid_for(),
+            "staging grew without being paid for"
+        );
+        Ok(())
+    }
+
+    /// Whether the staging buffer's whole capacity, and no more, is paid for.
+    #[cfg(test)]
+    fn staging_paid_for(&self) -> bool {
+        self.outgoing_charge.as_ref().map_or(0, Charge::bytes) == self.outgoing.capacity()
     }
 
     /// Gives the staging buffer back if everything staged in it has gone, rather than
@@ -268,7 +305,9 @@ impl<S> Exchange<S> {
     fn give_back_staging_if_empty(&mut self) {
         if self.outgoing.is_empty() && self.outgoing.capacity() > 0 {
             let spent = std::mem::take(&mut self.outgoing);
-            self.blocks.borrow_mut().give_staging(spent);
+            if let Some(charge) = self.outgoing_charge.take() {
+                self.blocks.borrow_mut().give_staging(spent, charge);
+            }
         }
     }
 }
@@ -280,7 +319,7 @@ impl<S: AsyncRead + Unpin> Exchange<S> {
     /// callers decide on. A block with no room is refilled first — its memory taken back
     /// from frames that have gone, or grown for a head that does not fit — because a read
     /// into no room comes back with nothing, and nothing is what a close looks like.
-    fn poll_fill(&mut self, cx: &mut Context<'_>) -> (Poll<io::Result<()>>, usize) {
+    fn poll_fill(&mut self, cx: &mut Context<'_>) -> (Poll<Result<(), ExchangeError>>, usize) {
         // A block the worker cannot pay for fails the read rather than waits for memory to
         // come free (14 §8); what was held goes with it.
         let lent = match self.incoming.take() {
@@ -295,7 +334,7 @@ impl<S: AsyncRead + Unpin> Exchange<S> {
         };
         let mut block = match lent {
             Ok(block) => block,
-            Err(exhausted) => return (Poll::Ready(Err(io::Error::other(exhausted))), 0),
+            Err(exhausted) => return (Poll::Ready(Err(exhausted.into())), 0),
         };
         if block.room().is_empty() {
             // Not reached while the blocks are sized by `Sizes::within`: a grown block has
@@ -304,7 +343,7 @@ impl<S: AsyncRead + Unpin> Exchange<S> {
             // would be taken for the upstream closing.
             self.incoming = Some(block);
             let outgrown = io::Error::other("an answer outgrew the most a block holds");
-            return (Poll::Ready(Err(outgrown)), 0);
+            return (Poll::Ready(Err(outgrown.into())), 0);
         }
         let mut read = ReadBuf::new(block.room());
         let outcome = Pin::new(&mut self.socket).poll_read(cx, &mut read);
@@ -312,7 +351,7 @@ impl<S: AsyncRead + Unpin> Exchange<S> {
         block.arrived(filled);
         self.incoming = Some(block);
         self.give_back_if_empty();
-        (outcome, filled)
+        (outcome.map_err(ExchangeError::from), filled)
     }
 }
 
@@ -325,6 +364,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             incoming: None,
             blocks,
             outgoing: Vec::new(),
+            outgoing_charge: None,
             written: 0,
             payload: Bytes::new(),
             chunk_tail: 0,
@@ -420,7 +460,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         B: Body<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
-        self.lend_staging();
+        self.lend_staging()?;
+        // Paid for before it is written. A head over the bound is refused below, before a
+        // byte of it is, so no room is made for one.
+        let head = head_len(method, uri, headers, sending);
+        if head <= limits.head {
+            self.stage_room(head)?;
+        }
         write_head(&mut self.outgoing, method, uri, headers, sending, limits)?;
         self.head_left = self.outgoing.len();
         // A request that asks to be told before it sends its body has its head go out
@@ -585,7 +631,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         // another payload. Otherwise a bodyless answer arriving exactly at the work
         // budget could hide request completion and unnecessarily discard the socket.
         for batch in 0..=ROUNDS {
-            self.lend_staging();
+            self.lend_staging()?;
 
             // Bounded work per turn: a body that keeps handing over frames must not be able
             // to hold this loop for as long as it cares to.
@@ -658,6 +704,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                         }
                     }
                     Poll::Ready(None) => {
+                        self.stage_room(upload.writer.finish_room(upload.trailers.as_ref()))?;
                         upload.writer.finish(
                             &mut self.outgoing,
                             upload.trailers.as_ref(),
@@ -729,6 +776,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                 break;
             }
         }
+        // What the staging buffer holds is what is paid for, to the byte.
+        #[cfg(test)]
+        assert!(
+            self.staging_paid_for(),
+            "staging grew without being paid for"
+        );
         Ok(pushed)
     }
 
@@ -778,7 +831,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         // And read, whatever the writing did. This is the part that must not be skipped.
         let (outcome, filled) = self.poll_fill(cx);
         match outcome {
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Ready(Ok(())) if filled == 0 => return Poll::Ready(Ok(Moved::Closed)),
             Poll::Ready(Ok(())) => {
                 clocks.answer_moved();
@@ -1157,7 +1210,7 @@ where
                 }
                 Poll::Ready(Err(error)) => {
                     this.rest = None;
-                    return Poll::Ready(Some(Err(error.into())));
+                    return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(Ok(())) => {
                     // The upstream said something, so its clock starts again from here.
@@ -1725,9 +1778,24 @@ mod tests {
         assert!(matches!(error, ExchangeError::Io(_)), "{error}");
     }
 
+    /// An exchange failed because the worker could not pay for what it needed.
+    fn refused_for_storage(error: &ExchangeError) -> bool {
+        matches!(error, ExchangeError::Exhausted(_))
+    }
+
+    /// Blocks paying against an account of `limit` bytes.
+    fn blocks_within(limit: usize) -> Rc<RefCell<Blocks>> {
+        Rc::new(RefCell::new(Blocks::new(
+            Sizes::default(),
+            crate::storage::Storage::new(limit),
+        )))
+    }
+
     /// **And a worker that cannot pay for a block to read an answer into fails the
     /// exchange**, at once and saying why, rather than reading into nothing — which would
-    /// be taken for a close — or waiting for memory to come free (14 §8).
+    /// be taken for a close — or waiting for memory to come free (14 §8). It can pay for
+    /// the staging the request goes out in, and no more, so the request does go out: the
+    /// upstream sees the head before the read that fails.
     #[tokio::test]
     async fn an_answer_the_worker_cannot_pay_to_read_is_a_failure() {
         let (ours, theirs) = tokio::io::duplex(4096);
@@ -1743,8 +1811,7 @@ mod tests {
             peer
         });
 
-        let blocks = Blocks::new(Sizes::default(), crate::storage::Storage::new(0));
-        let error = Exchange::new(ours, Rc::new(RefCell::new(blocks)))
+        let error = Exchange::new(ours, blocks_within(STAGING))
             .send(
                 &Method::GET,
                 &"/".parse().unwrap(),
@@ -1757,15 +1824,121 @@ mod tests {
             .await
             .unwrap_err();
         let _peer = answered.await.unwrap();
+        assert!(refused_for_storage(&error), "{error}");
+    }
 
-        let ExchangeError::Io(cause) = &error else {
-            panic!("{error}");
+    /// A head too long for the staging buffer grows it, and the growth is paid for before
+    /// it is made: a worker that cannot pay fails the exchange before a byte of the head has
+    /// gone (14 §8).
+    #[tokio::test]
+    async fn a_head_the_worker_cannot_pay_to_stage_is_refused_before_it_is_sent() {
+        let (ours, mut theirs) = tokio::io::duplex(1 << 17);
+        let limits = H1Limits::default();
+        let long = "a".repeat(40 * 1024);
+        let error = Exchange::new(ours, blocks_within(48 * 1024))
+            .send(
+                &Method::GET,
+                &"/".parse().unwrap(),
+                &headers(&[("host", "up.test"), ("x-long", &long)]),
+                &[],
+                Sending::None,
+                Empty::<Bytes>::new(),
+                &limits,
+            )
+            .await
+            .unwrap_err();
+        assert!(refused_for_storage(&error), "{error}");
+        let mut sent = Vec::new();
+        theirs.read_to_end(&mut sent).await.unwrap();
+        assert!(sent.is_empty(), "{} bytes went out", sent.len());
+    }
+
+    /// A chunked body of nothing but trailers ends while its head is still staged, unsent,
+    /// so the room made for the trailers is on top of what is already there: the growth
+    /// is paid for at the buffer's whole new size, and the exchange goes through (14 §8).
+    #[tokio::test]
+    async fn trailers_behind_a_head_still_staged_are_paid_for_in_full() {
+        let (exchange, mut peer) = connected(1 << 17);
+        let limits = H1Limits {
+            trailers: 64 * 1024,
+            ..H1Limits::default()
         };
+        let answered = tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            let rest = peer.until(b"\r\n\r\n").await;
+            peer.say("HTTP/1.1 204 No Content\r\n\r\n").await;
+            rest.len()
+        });
+        let mut trailers = HeaderMap::new();
+        trailers.insert(
+            HeaderName::from_static("x-long"),
+            HeaderValue::from_str(&"a".repeat(20 * 1024)).unwrap(),
+        );
+        let body = Frames {
+            left: 0,
+            size: 0,
+            trailers: Some(trailers),
+        };
+        let (head, _rest) = exchange
+            .send(
+                &Method::POST,
+                &"/".parse().unwrap(),
+                &headers(&[("host", "up.test"), ("te", "trailers")]),
+                &[],
+                Sending::Chunked,
+                body,
+                &limits,
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.head.status, StatusCode::NO_CONTENT);
         assert!(
-            cause
-                .get_ref()
-                .is_some_and(|inner| inner.is::<crate::storage::Exhausted>()),
-            "{error}"
+            answered.await.unwrap() > 20 * 1024,
+            "the trailers never went"
+        );
+    }
+
+    /// The same for the end of a chunked body, whose trailers may need more room than the
+    /// staging buffer has: that room is paid for before the section is written (14 §8).
+    #[tokio::test]
+    async fn trailers_the_worker_cannot_pay_to_stage_fail_the_exchange() {
+        let (ours, mut theirs) = tokio::io::duplex(1 << 17);
+        let draining = tokio::spawn(async move {
+            let mut sent = Vec::new();
+            let _ended = theirs.read_to_end(&mut sent).await;
+            sent
+        });
+        let limits = H1Limits {
+            trailers: 64 * 1024,
+            ..H1Limits::default()
+        };
+        let mut trailers = HeaderMap::new();
+        trailers.insert(
+            HeaderName::from_static("x-long"),
+            HeaderValue::from_str(&"a".repeat(40 * 1024)).unwrap(),
+        );
+        let body = Frames {
+            left: 1,
+            size: 10,
+            trailers: Some(trailers),
+        };
+        let error = Exchange::new(ours, blocks_within(48 * 1024))
+            .send(
+                &Method::POST,
+                &"/".parse().unwrap(),
+                &headers(&[("host", "up.test"), ("te", "trailers")]),
+                &[],
+                Sending::Chunked,
+                body,
+                &limits,
+            )
+            .await
+            .unwrap_err();
+        assert!(refused_for_storage(&error), "{error}");
+        let sent = draining.await.unwrap();
+        assert!(
+            !sent.windows(6).any(|at| at == b"x-long"),
+            "the trailers went out"
         );
     }
 

@@ -387,12 +387,47 @@ pub enum Sending {
     Chunked,
 }
 
+/// The target a request is written with. Origin form: the path and query alone. The
+/// endpoint is who we are speaking to, not what we are asking for, and a proxy that sends
+/// the whole URI is asking for the upstream to treat it as a forward proxy request.
+fn origin_form(uri: &Uri) -> &str {
+    uri.path_and_query()
+        .map_or("/", http::uri::PathAndQuery::as_str)
+}
+
+/// How many bytes [`write_head`] writes for this head, so that room for them can be paid for
+/// before it is made ([14 §8](../../../docs/14-downstream-server.md)).
+pub fn head_len(method: &Method, uri: &Uri, headers: &HeaderMap, sending: Sending) -> usize {
+    let line = method.as_str().len() + 1 + origin_form(uri).len() + b" HTTP/1.1\r\n".len();
+    let fields: usize = headers
+        .iter()
+        .filter(|(name, _)| {
+            *name != http::header::CONTENT_LENGTH && *name != http::header::TRANSFER_ENCODING
+        })
+        .map(|(name, value)| name.as_str().len() + 2 + value.as_bytes().len() + 2)
+        .sum();
+    let framing = match sending {
+        Sending::None => 0,
+        Sending::Length(length) => b"content-length: ".len() + decimal_len(length) + 2,
+        Sending::Chunked => b"transfer-encoding: chunked\r\n".len(),
+    };
+    line + fields + framing + 2
+}
+
+/// How many decimal digits `number` is written with.
+fn decimal_len(number: u64) -> usize {
+    number.checked_ilog10().map_or(1, |log| log as usize + 1)
+}
+
 /// Writes the head of a request as an upstream is to receive it, appending to `out`.
 ///
 /// `Content-Length` and `Transfer-Encoding` on the head are left out and `sending` is
 /// written instead. The config already refuses a filter that sets either
 /// (`edgerush_filters::RESERVED`); this is the backstop, so that what is sent is what was
 /// decided and not what something along the way added.
+///
+/// What it writes is [`head_len`] bytes, which a caller makes room for first; a head over
+/// the bound is refused before anything is written.
 ///
 /// # Errors
 ///
@@ -406,13 +441,10 @@ pub fn write_head(
     sending: Sending,
     limits: &H1Limits,
 ) -> Result<(), CodecError> {
-    let began = out.len();
-    // Origin form: the path and query alone. The endpoint is who we are speaking to, not
-    // what we are asking for, and a proxy that sends the whole URI is asking for the
-    // upstream to treat it as a forward proxy request.
-    let target = uri
-        .path_and_query()
-        .map_or("/", http::uri::PathAndQuery::as_str);
+    if head_len(method, uri, headers, sending) > limits.head {
+        return Err(CodecError::HeadTooLong { limit: limits.head });
+    }
+    let target = origin_form(uri);
     out.extend_from_slice(method.as_str().as_bytes());
     out.push(b' ');
     out.extend_from_slice(target.as_bytes());
@@ -438,12 +470,17 @@ pub fn write_head(
         Sending::Chunked => out.extend_from_slice(b"transfer-encoding: chunked\r\n"),
     }
     out.extend_from_slice(b"\r\n");
-
-    if out.len() - began > limits.head {
-        out.truncate(began);
-        return Err(CodecError::HeadTooLong { limit: limits.head });
-    }
     Ok(())
+}
+
+/// What a trailer section's field lines come to before any is filtered out, without the
+/// empty line that ends it.
+fn trailer_section(trailers: Option<&HeaderMap>) -> usize {
+    trailers
+        .into_iter()
+        .flatten()
+        .map(|(name, value)| name.as_str().len() + 2 + value.as_bytes().len() + 2)
+        .sum()
 }
 
 /// A number as its decimal digits. Small enough to build backwards on the stack, which
@@ -578,11 +615,7 @@ impl BodyWriter {
                         limit: limits.trailer_fields,
                     });
                 }
-                let section: usize = trailers
-                    .into_iter()
-                    .flatten()
-                    .map(|(name, value)| name.as_str().len() + 2 + value.as_bytes().len() + 2)
-                    .sum();
+                let section = trailer_section(trailers);
                 // The empty line that ends the section is part of it.
                 if section + 2 > limits.trailers {
                     return Err(CodecError::TrailersTooLong {
@@ -604,6 +637,16 @@ impl BodyWriter {
                 out.extend_from_slice(b"\r\n");
                 Ok(())
             }
+        }
+    }
+
+    /// The most [`BodyWriter::finish`] writes with these trailers, so that room for it can
+    /// be paid for before it is made: the last chunk and the whole trailer section, before
+    /// any of it is filtered out. Nothing for a body that is not chunked.
+    pub fn finish_room(&self, trailers: Option<&HeaderMap>) -> usize {
+        match self.sending {
+            Sending::Chunked => b"0\r\n".len() + trailer_section(trailers) + 2,
+            Sending::None | Sending::Length(_) => 0,
         }
     }
 
@@ -2567,5 +2610,82 @@ mod tests {
             }
         }
         assert_eq!(refused, Some(CodecError::HeadTooLong { limit: 16 }));
+    }
+
+    /// Fields for a property test: a few names, some of them framing that the writer
+    /// leaves out, with values of any length a field may have.
+    fn fields() -> impl proptest::strategy::Strategy<Value = HeaderMap> {
+        use proptest::prelude::*;
+        let name = prop_oneof![
+            Just("x-a"),
+            Just("x-bb"),
+            Just("host"),
+            Just("content-length"),
+            Just("transfer-encoding"),
+            Just("connection"),
+            Just("te"),
+        ];
+        proptest::collection::vec((name, "[ -~]{0,40}"), 0..12).prop_map(|pairs| {
+            let mut fields = HeaderMap::new();
+            for (name, value) in pairs {
+                fields.append(name, HeaderValue::from_str(&value).unwrap());
+            }
+            fields
+        })
+    }
+
+    proptest::proptest! {
+        /// What room is made for a head is exactly what writing it takes, whatever the head
+        /// and however its body goes: room paid for up front is room that suffices, and no
+        /// more is paid for than is used (14 §8).
+        #[test]
+        fn a_head_is_as_long_as_it_was_said_to_be(
+            method in proptest::sample::select(vec![Method::GET, Method::POST, Method::DELETE]),
+            path in "/[a-z0-9/?=&]{0,30}",
+            headers in fields(),
+            sending in proptest::prop_oneof![
+                proptest::strategy::Just(Sending::None),
+                proptest::strategy::Just(Sending::Chunked),
+                proptest::strategy::Strategy::prop_map(
+                    proptest::prelude::any::<u64>(),
+                    Sending::Length,
+                ),
+            ],
+        ) {
+            use proptest::prelude::*;
+            let uri: Uri = path.parse().unwrap();
+            let mut out = b"before".to_vec();
+            let said = head_len(&method, &uri, &headers, sending);
+            write_head(&mut out, &method, &uri, &headers, sending, &H1Limits::default()).unwrap();
+            prop_assert_eq!(out.len() - b"before".len(), said);
+        }
+
+        /// The room made for the end of a chunked body is never less than finishing it
+        /// writes, and is exactly that when nothing is filtered out of its trailers.
+        #[test]
+        fn the_end_of_a_body_fits_the_room_made_for_it(
+            trailers in proptest::option::of(fields()),
+            nominated in proptest::sample::subsequence(vec!["x-a", "x-bb"], 0..=2),
+        ) {
+            use proptest::prelude::*;
+            let nominated: Vec<HeaderName> = nominated
+                .into_iter()
+                .map(HeaderName::from_static)
+                .collect();
+            let mut writer = BodyWriter::new(Sending::Chunked);
+            let room = writer.finish_room(trailers.as_ref());
+            let mut out = Vec::new();
+            let limits = H1Limits { trailers: 1 << 20, ..H1Limits::default() };
+            if writer.finish(&mut out, trailers.as_ref(), &nominated, &limits).is_ok() {
+                prop_assert!(out.len() <= room, "{} written in {room}", out.len());
+                let filtered = trailers
+                    .iter()
+                    .flatten()
+                    .any(|(name, _)| is_denied(name, &nominated));
+                if !filtered {
+                    prop_assert_eq!(out.len(), room);
+                }
+            }
+        }
     }
 }

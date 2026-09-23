@@ -290,8 +290,9 @@ pub struct Blocks {
     /// them in the engine's hands, and are lent only once those have gone.
     small: Vec<Memory>,
     large: Vec<Memory>,
-    /// Free buffers for what is waiting to be written, empty and with their room made.
-    staging: Vec<Vec<u8>>,
+    /// Free buffers for what is waiting to be written, empty and with their room made, each
+    /// with the charge for its capacity.
+    staging: Vec<(Vec<u8>, Charge)>,
     sizes: Sizes,
     /// What every block made here is paid for against.
     storage: Rc<Storage>,
@@ -428,20 +429,35 @@ impl Blocks {
     /// can be reached, and appending needs no bytes to have been set first. What it saves
     /// is the growing: a buffer built up from nothing reaches its size by doubling, and
     /// every doubling is another allocation and another copy of what was already in it.
-    pub fn take_staging(&mut self, room: usize) -> Vec<u8> {
+    ///
+    /// Lent with the charge for its capacity, which goes wherever it goes: whoever grows it
+    /// pays for the growth first ([14 §8](../../../docs/14-downstream-server.md)).
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`] if a new one is needed and the worker cannot pay for it.
+    pub fn take_staging(&mut self, room: usize) -> Result<(Vec<u8>, Charge), Exhausted> {
         match self.staging.pop() {
-            Some(buffer) if buffer.capacity() >= room => buffer,
-            _ => Vec::with_capacity(room),
+            Some((buffer, charge)) if buffer.capacity() >= room => Ok((buffer, charge)),
+            _ => {
+                let charge = self.storage.reserve(room)?;
+                Ok((Vec::with_capacity(room), charge))
+            }
         }
     }
 
-    /// Takes a staging buffer back, to be lent again, emptied; or drops it, when there are
-    /// already enough.
-    pub fn give_staging(&mut self, mut buffer: Vec<u8>) {
+    /// Takes a staging buffer back with its charge, to be lent again, emptied; or drops
+    /// both, when there are already enough.
+    pub fn give_staging(&mut self, mut buffer: Vec<u8>, charge: Charge) {
         buffer.clear();
         if self.staging.len() < self.sizes.parked {
-            self.staging.push(buffer);
+            self.staging.push((buffer, charge));
         }
+    }
+
+    /// What everything lent here is paid for against.
+    pub fn storage(&self) -> &Rc<Storage> {
+        &self.storage
     }
 
     /// Drops free blocks down to `keep` of each size.
@@ -704,7 +720,7 @@ mod tests {
     #[test]
     fn a_staging_buffer_is_lent_empty_with_its_room_made() {
         let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
-        let buffer = blocks.take_staging(32);
+        let (buffer, _charge) = blocks.take_staging(32).unwrap();
         assert!(buffer.is_empty());
         assert!(
             buffer.capacity() >= 32,
@@ -716,12 +732,12 @@ mod tests {
     #[test]
     fn a_staging_buffer_comes_back_empty_and_is_the_same_memory() {
         let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
-        let mut buffer = blocks.take_staging(32);
+        let (mut buffer, charge) = blocks.take_staging(32).unwrap();
         buffer.extend_from_slice(b"GET / HTTP/1.1\r\n");
         let memory = buffer.as_ptr();
-        blocks.give_staging(buffer);
+        blocks.give_staging(buffer, charge);
 
-        let again = blocks.take_staging(32);
+        let (again, _charge) = blocks.take_staging(32).unwrap();
         assert!(again.is_empty(), "a staging buffer carried something over");
         // The same allocation and not a new one of the same size: making it again is
         // exactly the work lending it is there to save.
@@ -731,9 +747,9 @@ mod tests {
     #[test]
     fn a_staging_buffer_too_small_for_the_room_is_not_lent() {
         let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
-        let small = blocks.take_staging(8);
-        blocks.give_staging(small);
-        let bigger = blocks.take_staging(64);
+        let (small, charge) = blocks.take_staging(8).unwrap();
+        blocks.give_staging(small, charge);
+        let (bigger, _charge) = blocks.take_staging(64).unwrap();
         assert!(
             bigger.capacity() >= 64,
             "lent with {} of room",
@@ -744,9 +760,10 @@ mod tests {
     #[test]
     fn only_so_many_staging_buffers_are_kept() {
         let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
-        let held: Vec<Vec<u8>> = (0..5).map(|_| blocks.take_staging(32)).collect();
-        for buffer in held {
-            blocks.give_staging(buffer);
+        let held: Vec<(Vec<u8>, Charge)> =
+            (0..5).map(|_| blocks.take_staging(32).unwrap()).collect();
+        for (buffer, charge) in held {
+            blocks.give_staging(buffer, charge);
         }
         assert_eq!(blocks.parked(), 2, "a burst left its memory parked");
         blocks.trim(1);
@@ -792,14 +809,15 @@ mod tests {
     fn a_sweep_keeps_what_a_quiet_worker_keeps() {
         let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
         let small: Vec<Block> = (0..2).map(|_| blocks.take().unwrap()).collect();
-        let staging: Vec<Vec<u8>> = (0..2).map(|_| blocks.take_staging(8)).collect();
+        let staging: Vec<(Vec<u8>, Charge)> =
+            (0..2).map(|_| blocks.take_staging(8).unwrap()).collect();
         let block = blocks.take().unwrap();
         let grown = blocks.grow(block).unwrap();
         for block in small {
             blocks.give(block);
         }
-        for buffer in staging {
-            blocks.give_staging(buffer);
+        for (buffer, charge) in staging {
+            blocks.give_staging(buffer, charge);
         }
         blocks.give(grown);
         assert_eq!(blocks.parked(), 5);

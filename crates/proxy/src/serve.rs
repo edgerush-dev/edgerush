@@ -176,6 +176,7 @@ fn why_stopped(error: &ExchangeError) -> Stopped {
         }
         ExchangeError::TooSlow { .. } => Stopped::TooSlow,
         ExchangeError::Idle { .. } => Stopped::Idle,
+        ExchangeError::Exhausted(_) => Stopped::Exhausted,
     }
 }
 
@@ -2039,6 +2040,18 @@ upstreams:
                 );
             }));
         }
+    }
+
+    /// An exchange the worker could not pay for is counted as that, and not as the
+    /// connection failing, which is what it would pass for among the I/O failures
+    /// (14 §8).
+    #[test]
+    fn an_exchange_the_worker_could_not_pay_for_is_counted_as_that() {
+        let exhausted = crate::storage::Storage::new(0).reserve(1).unwrap_err();
+        assert_eq!(
+            why_stopped(&ExchangeError::Exhausted(exhausted)),
+            Stopped::Exhausted
+        );
     }
 
     /// An exchange that ends without an answer says which of the named reasons it
