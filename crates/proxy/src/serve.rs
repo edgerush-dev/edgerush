@@ -822,6 +822,7 @@ impl Worker {
                                 keep_alive: deadlines.next_request,
                                 ..Bounds::default()
                             },
+                            budget: h1::Budget::default(),
                         };
                         let respond = move |request| {
                             ours_asking.set(true);

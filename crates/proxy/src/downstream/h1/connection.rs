@@ -9,9 +9,13 @@
 //! shared with another connection.
 //!
 //! Requests are served one after another. Bytes of the next request that arrive with this
-//! one stay in the input, bounded, and are read as the next head once this answer is done;
-//! nothing of them is looked at before then. Which deadline runs is the pure
-//! [`Deadlines`]'s to say, and one timer follows its answer.
+//! one stay in the input, at most [`READ_AHEAD`] of them, and are read as the next head once
+//! this answer is done; nothing of them is looked at before then. Which deadline runs is the
+//! pure [`Deadlines`]'s to say, and one timer follows its answer.
+//!
+//! Each turn of the task does at most a [`Budget`]'s worth of reading, writing and taking
+//! from the answer's body, then wakes itself and yields, so that a connection that is always
+//! ready does not keep the worker from its others.
 //!
 //! An `Expect: 100-continue` is met as the engine's server meets it: with a `100` the
 //! first time the body is asked for and nothing of it has arrived. The coordinator that
@@ -24,7 +28,7 @@ use super::writer::{Asked, BodyFramer, Content, Delimited, write_head};
 use crate::h1::{BodyReader, CodecError, Framing, Piece};
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::upstream::h1::H1Limits;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
 use http_body::{Body, Frame, SizeHint};
 use std::cell::RefCell;
@@ -37,8 +41,17 @@ use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::time::{Instant, Sleep};
 
-/// How much is read from the socket at a time.
+/// How much room is made in the input for a read.
 const READ: usize = 4096;
+
+/// The most one read takes from the socket, however much room there is: the read block of
+/// 14 §8. What a read brings past the end of the request being served is the next one's
+/// read-ahead, so this bounds that too.
+const READ_BLOCK: usize = 16 * 1024;
+
+/// How much of what follows a request is read while its answer is worked out: enough to
+/// hear a client that goes, and to have the next head at hand, and no more (14 §8).
+const READ_AHEAD: usize = 16 * 1024;
 
 /// How much of an answer is queued for the socket before its body is asked for more: the
 /// body staging of 14 §8.
@@ -51,6 +64,30 @@ pub(crate) struct Settings {
     pub limits: H1Limits,
     /// The connection's deadlines.
     pub bounds: Bounds,
+    /// What one turn of the connection's task may do.
+    pub budget: Budget,
+}
+
+/// What one turn of a connection's task may do before it lets the worker's other tasks run
+/// (14 §2): a connection whose socket and answer are always ready would otherwise keep the
+/// worker to itself. The engine's own cooperative budget is not relied on, as it counts
+/// only what passes through its own resources. Every answer costs at least one write, so a
+/// pipeline of them is bounded too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Budget {
+    /// Reads and writes of the socket, and frames taken from an answer's body.
+    pub operations: u32,
+    /// Bytes read from and written to the socket.
+    pub bytes: usize,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            operations: 128,
+            bytes: 256 * 1024,
+        }
+    }
 }
 
 /// How serving a connection ended, for the caller and for tests.
@@ -242,9 +279,63 @@ struct Connection<S> {
     deadlines: Deadlines,
     /// When the one timer is set for, so that it is set again only when that changes.
     armed: Option<Instant>,
+    budget: Budget,
+    /// What is left of the budget in this turn.
+    left: Budget,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
+    /// A connection accepted now.
+    fn new(socket: S, settings: Settings) -> Self {
+        Self {
+            socket,
+            inbound: Rc::new(RefCell::new(Inbound {
+                input: BytesMut::new(),
+                ended: false,
+                failed: false,
+                reader: None,
+                wanted: false,
+                waker: None,
+                continue_owed: false,
+                continue_due: false,
+                driver: None,
+                limits: settings.limits,
+            })),
+            queued: VecDeque::new(),
+            queued_bytes: 0,
+            deadlines: Deadlines::accepted(now(), settings.bounds),
+            armed: None,
+            budget: settings.budget,
+            left: settings.budget,
+        }
+    }
+
+    /// Charges this turn with one operation that moved `bytes`.
+    fn spend(&mut self, bytes: usize) {
+        self.left.operations = self.left.operations.saturating_sub(1);
+        self.left.bytes = self.left.bytes.saturating_sub(bytes);
+    }
+
+    /// Whether this turn has done all it may.
+    fn spent(&self) -> bool {
+        self.left.operations == 0 || self.left.bytes == 0
+    }
+
+    /// Ends the turn to wait for what was registered. Every wait in the driver comes
+    /// through here or `yield_turn`, so the budget is whole again whenever the task next
+    /// runs.
+    fn wait<T>(&mut self) -> Poll<T> {
+        self.left = self.budget;
+        Poll::Pending
+    }
+
+    /// Ends the turn with work still to do: the task is woken at once, and runs again
+    /// after the worker's other tasks have had theirs.
+    fn yield_turn<T>(&mut self, context: &Context<'_>) -> Poll<T> {
+        context.waker().wake_by_ref();
+        self.wait()
+    }
+
     fn queue(&mut self, bytes: Bytes) {
         if !bytes.is_empty() {
             self.queued_bytes += bytes.len();
@@ -264,6 +355,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     if front.is_empty() {
                         self.queued.pop_front();
                     }
+                    self.spend(written);
                     moved = true;
                     self.deadlines.write_moved(now());
                 }
@@ -275,17 +367,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         Ok(moved)
     }
 
-    /// Reads from the socket into the input if `wanted` says to and there is room, and
-    /// says whether anything arrived or the client closed.
+    /// Reads one block from the socket into the input, if the input holds less than
+    /// `room`, taking no more than brings it to `room`; says whether anything arrived or the
+    /// client closed.
     fn poll_read(&mut self, context: &mut Context<'_>, room: usize) -> bool {
         let mut inbound = self.inbound.borrow_mut();
         if inbound.ended || inbound.failed || inbound.input.len() >= room {
             return false;
         }
-        inbound.input.reserve(READ);
-        let before = inbound.input.len();
+        let most = (room - inbound.input.len()).min(READ_BLOCK);
+        inbound.input.reserve(most.min(READ));
         let polled = {
-            let reading = std::pin::pin!(self.socket.read_buf(&mut inbound.input));
+            let mut limited = (&mut inbound.input).limit(most);
+            let reading = std::pin::pin!(self.socket.read_buf(&mut limited));
             reading.poll(context)
         };
         match polled {
@@ -293,11 +387,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             Poll::Ready(Ok(0)) => {
                 inbound.ended = true;
                 inbound.wake();
+                drop(inbound);
+                self.spend(0);
                 true
             }
-            Poll::Ready(Ok(_)) => {
-                debug_assert!(inbound.input.len() > before);
+            Poll::Ready(Ok(read)) => {
                 drop(inbound);
+                self.spend(read);
                 self.deadlines.bytes_arrived(now());
                 self.inbound.borrow_mut().wake();
                 true
@@ -305,6 +401,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             Poll::Ready(Err(_)) => {
                 inbound.failed = true;
                 inbound.wake();
+                drop(inbound);
+                self.spend(0);
                 true
             }
         }
@@ -334,13 +432,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     async fn flush(&mut self, mut timer: Pin<&mut Sleep>) -> Result<(), Stop> {
         poll_fn(|context| {
             loop {
+                if self.spent() {
+                    return self.yield_turn(context);
+                }
                 let moved = self.poll_write_queued(context)?;
                 if self.queued.is_empty() {
                     return Poll::Ready(Ok(()));
                 }
                 if !moved {
                     self.poll_deadline(context, timer.as_mut())?;
-                    return Poll::Pending;
+                    return self.wait();
                 }
             }
         })
@@ -387,25 +488,7 @@ where
     B: Body<Data = Bytes> + Unpin,
 {
     let limits = settings.limits;
-    let mut connection = Connection {
-        socket,
-        inbound: Rc::new(RefCell::new(Inbound {
-            input: BytesMut::new(),
-            ended: false,
-            failed: false,
-            reader: None,
-            wanted: false,
-            waker: None,
-            continue_owed: false,
-            continue_due: false,
-            driver: None,
-            limits,
-        })),
-        queued: VecDeque::new(),
-        queued_bytes: 0,
-        deadlines: Deadlines::accepted(now(), settings.bounds),
-        armed: None,
-    };
+    let mut connection = Connection::new(socket, settings);
     let mut timer = std::pin::pin!(tokio::time::sleep_until(Instant::now()));
 
     loop {
@@ -413,6 +496,9 @@ where
         let mut reader = HeadReader::default();
         let read = poll_fn(|context| {
             loop {
+                if connection.spent() {
+                    return connection.yield_turn(context);
+                }
                 let found = {
                     let inbound = connection.inbound.borrow();
                     reader.read(&inbound.input, &limits)
@@ -444,7 +530,7 @@ where
                     {
                         return Poll::Ready(Err(Ok(Ended::TimedOut(clock))));
                     }
-                    return Poll::Pending;
+                    return connection.wait();
                 }
             }
         })
@@ -502,6 +588,9 @@ where
             poll_fn(|context| {
                 connection.inbound.borrow_mut().heard_by(context);
                 loop {
+                    if connection.spent() {
+                        return connection.yield_turn(context);
+                    }
                     if let Poll::Ready(response) = responding.as_mut().poll(context) {
                         return Poll::Ready(Ok(response));
                     }
@@ -523,8 +612,10 @@ where
                         .deadlines
                         .body_waited_on(now(), wanted && !body_done);
                     // Read for the body when it asks; once it is whole, read on only to
-                    // hear a client that goes, keeping what arrives for the next request.
-                    if (wanted || body_done) && connection.poll_read(context, limits.head) {
+                    // hear a client that goes, keeping what arrives for the next request
+                    // up to the read-ahead bound.
+                    let room = if body_done { READ_AHEAD } else { limits.head };
+                    if (wanted || body_done) && connection.poll_read(context, room) {
                         moved = true;
                         connection.deadlines.body_moved(now());
                         let inbound = connection.inbound.borrow();
@@ -536,7 +627,7 @@ where
                     }
                     if !moved {
                         connection.poll_deadline(context, timer.as_mut())?;
-                        return Poll::Pending;
+                        return connection.wait();
                     }
                 }
             })
@@ -586,13 +677,19 @@ where
         let mut body_left = written.delimited != Delimited::Nothing;
         let sent = poll_fn(|context| {
             loop {
+                if connection.spent() {
+                    return connection.yield_turn(context);
+                }
                 connection.inbound.borrow_mut().heard_by(context);
                 let mut moved = connection.poll_write_queued(context)?;
-                while body_left && connection.queued_bytes < STAGING {
+                // Bounded by the budget as well as the staging: a body of empty frames
+                // queues nothing, and would otherwise be taken from without end.
+                while body_left && connection.queued_bytes < STAGING && !connection.spent() {
                     let frame = match Pin::new(&mut body).poll_frame(context) {
                         Poll::Pending => break,
                         Poll::Ready(frame) => frame,
                     };
+                    connection.spend(0);
                     moved = true;
                     let mut framing = Vec::new();
                     match frame {
@@ -636,7 +733,7 @@ where
                 }
                 if !moved {
                     connection.poll_deadline(context, timer.as_mut())?;
-                    return Poll::Pending;
+                    return connection.wait();
                 }
             }
         })
@@ -756,10 +853,47 @@ mod tests {
         }
     }
 
+    /// An answer's body that sends a frame each second, `left` more times.
+    struct Slow {
+        left: usize,
+        tick: Pin<Box<Sleep>>,
+    }
+
+    impl Slow {
+        fn new(frames: usize) -> Self {
+            Self {
+                left: frames,
+                tick: Box::pin(tokio::time::sleep(Duration::from_secs(1))),
+            }
+        }
+    }
+
+    impl Body for Slow {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            if this.left == 0 {
+                return Poll::Ready(None);
+            }
+            std::task::ready!(this.tick.as_mut().poll(context));
+            this.left -= 1;
+            this.tick
+                .as_mut()
+                .reset(Instant::now() + Duration::from_secs(1));
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"tick")))))
+        }
+    }
+
     fn settings() -> Settings {
         Settings {
             limits: H1Limits::default(),
             bounds: Bounds::default(),
+            budget: Budget::default(),
         }
     }
 
@@ -774,7 +908,8 @@ mod tests {
     /// prefixed by the method and target it was asked.
     fn echoing(
         asked: &Asked,
-    ) -> impl FnMut(Request<RequestBody>) -> Pin<Box<dyn Future<Output = Response<Answer>>>> {
+    ) -> impl FnMut(Request<RequestBody>) -> Pin<Box<dyn Future<Output = Response<Answer>>>> + use<>
+    {
         let asked = Rc::clone(asked);
         move |request| {
             let asked = Rc::clone(&asked);
@@ -805,10 +940,11 @@ mod tests {
 
     /// Serves `sent` in pieces of `split`, the client closing its side after it when
     /// `close` says so, and returns what the client received and how serving ended.
-    async fn served<R, F>(sent: &[u8], split: usize, close: bool, respond: R) -> (String, Ended)
+    async fn served<R, F, B>(sent: &[u8], split: usize, close: bool, respond: R) -> (String, Ended)
     where
         R: FnMut(Request<RequestBody>) -> F,
-        F: Future<Output = Response<Answer>>,
+        F: Future<Output = Response<B>>,
+        B: Body<Data = Bytes> + Unpin,
     {
         let (mut client, server) = tokio::io::duplex(1 << 20);
         let sending = sent.to_vec();
@@ -1187,5 +1323,305 @@ mod tests {
         assert_eq!(received, "");
         assert_eq!(ended, Ended::Gone);
         assert!(dropped.get());
+    }
+
+    /// While a request is answered, what follows it is read only as far as the read-ahead
+    /// bound: a pipeline sent all at once is not taken in beyond it.
+    #[tokio::test(start_paused = true)]
+    async fn what_follows_a_request_is_read_ahead_only_so_far() {
+        const PIPE: usize = 1024;
+        const PIECE: usize = 256;
+        let (mut client, server) = tokio::io::duplex(PIPE);
+        let waiting = |_: Request<RequestBody>| std::future::pending::<Response<Answer>>();
+        let serving = serve(server, settings(), date, waiting);
+        let sending = async move {
+            client.write_all(GET).await.unwrap();
+            let piece = [b'x'; PIECE];
+            let mut sent = 0;
+            // Until the server stops taking any: a second with the pipe full.
+            while tokio::time::timeout(Duration::from_secs(1), client.write_all(&piece))
+                .await
+                .is_ok()
+            {
+                sent += PIECE;
+            }
+            sent
+        };
+        let sent = tokio::select! {
+            ended = serving => panic!("serving ended: {ended:?}"),
+            sent = sending => sent,
+        };
+        assert!(sent >= READ_AHEAD, "only {sent} bytes read ahead");
+        assert!(
+            sent <= READ_AHEAD + PIPE + PIECE,
+            "{sent} bytes taken while a request is answered"
+        );
+    }
+
+    /// A connection kept busy by a pipeline that never runs dry shares its worker: each
+    /// turn of its task does a bounded amount of work and then lets the others run, so a
+    /// small request on another connection is answered while the pipeline is still being
+    /// served, and the pipeline is still served to its end. The engine's own cooperative
+    /// budget is switched off, so that only the driver's is tested.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_pipeline_shares_its_worker() {
+        const REQUESTS: usize = 2000;
+        let budget = Budget {
+            operations: 16,
+            bytes: 1 << 20,
+        };
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                // Every request at once, and room for every answer: nothing ever waits.
+                let (mut busy, server) = tokio::io::duplex(1 << 22);
+                busy.write_all(&GET.repeat(REQUESTS)).await.unwrap();
+                busy.shutdown().await.unwrap();
+                let asked = Rc::new(Cell::new(0usize));
+                let counting = Rc::clone(&asked);
+                let respond = move |_: Request<RequestBody>| {
+                    counting.set(counting.get() + 1);
+                    async { Response::new(Full::new(Bytes::from_static(b"ok"))) }
+                };
+                let most = Rc::new(Cell::new(0usize));
+                let mut serving = Box::pin(tokio::task::unconstrained(serve(
+                    server,
+                    Settings {
+                        budget,
+                        ..settings()
+                    },
+                    date,
+                    respond,
+                )));
+                let (asked_here, most_here) = (Rc::clone(&asked), Rc::clone(&most));
+                let mut turns_taken = 0;
+                let turns = poll_fn(move |context| {
+                    // Bounded by turns, not time: a task that yields and does nothing, turn
+                    // after turn, keeps a stopped clock from ever moving.
+                    turns_taken += 1;
+                    assert!(turns_taken < 20 * REQUESTS, "turns without progress");
+                    let before = asked_here.get();
+                    let polled = serving.as_mut().poll(context);
+                    most_here.set(most_here.get().max(asked_here.get() - before));
+                    polled
+                });
+                let busy_served = tokio::task::spawn_local(turns);
+                let busy_read = tokio::task::spawn_local(async move {
+                    let mut received = Vec::new();
+                    busy.read_to_end(&mut received).await.unwrap();
+                    String::from_utf8(received).unwrap()
+                });
+
+                let (mut small, server) = tokio::io::duplex(1 << 16);
+                let small_served = tokio::task::spawn_local(serve(
+                    server,
+                    settings(),
+                    date,
+                    echoing(&Asked::default()),
+                ));
+                small.write_all(GET).await.unwrap();
+                let mut received = Vec::new();
+                while !received.ends_with(b"GET /one ") {
+                    let mut piece = [0; 256];
+                    let read = small.read(&mut piece).await.unwrap();
+                    assert_ne!(read, 0, "{}", String::from_utf8_lossy(&received));
+                    received.extend_from_slice(&piece[..read]);
+                }
+                let busy_by_then = asked.get();
+                drop(small);
+
+                let (ended, received) = tokio::time::timeout(Duration::from_secs(60), async {
+                    (busy_served.await.unwrap(), busy_read.await.unwrap())
+                })
+                .await
+                .expect("the pipeline was never served to its end");
+                assert_eq!(ended, Ended::Closed);
+                assert_eq!(received.matches("HTTP/1.1 200 OK").count(), REQUESTS);
+                assert!(
+                    busy_by_then < REQUESTS / 2,
+                    "the small request waited for {busy_by_then} of the pipeline's"
+                );
+                assert!(
+                    most.get() <= budget.operations as usize,
+                    "{} requests in one turn",
+                    most.get()
+                );
+                assert_eq!(small_served.await.unwrap(), Ended::Closed);
+            })
+            .await;
+    }
+
+    /// Serves one request whose answer is `frames` frames of `size` bytes, always ready, to a
+    /// client that takes all of it at once, and says the most frames taken in one turn.
+    async fn most_frames_in_a_turn(size: usize, frames: usize, budget: Budget) -> usize {
+        struct Frames {
+            taken: Rc<Cell<usize>>,
+            size: usize,
+            frames: usize,
+        }
+        impl Body for Frames {
+            type Data = Bytes;
+            type Error = std::convert::Infallible;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+                let this = self.get_mut();
+                if this.taken.get() == this.frames {
+                    return Poll::Ready(None);
+                }
+                this.taken.set(this.taken.get() + 1);
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![b'x'; this.size])))))
+            }
+        }
+        let taken = Rc::new(Cell::new(0));
+        let counting = Rc::clone(&taken);
+        let answering = move |_: Request<RequestBody>| {
+            let taken = Rc::clone(&counting);
+            async move {
+                Response::new(Frames {
+                    taken,
+                    size,
+                    frames,
+                })
+            }
+        };
+        let (mut client, server) = tokio::io::duplex(2 * size * frames + 1024);
+        client.write_all(GET).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut serving = Box::pin(tokio::task::unconstrained(serve(
+            server,
+            Settings {
+                budget,
+                ..settings()
+            },
+            date,
+            answering,
+        )));
+        let mut most = 0;
+        let turns = poll_fn(|context| {
+            let before = taken.get();
+            let polled = serving.as_mut().poll(context);
+            most = most.max(taken.get() - before);
+            polled
+        });
+        let reading = async move {
+            let mut received = Vec::new();
+            client.read_to_end(&mut received).await.unwrap();
+            String::from_utf8(received).unwrap()
+        };
+        let (ended, received) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(turns, reading)
+        })
+        .await
+        .expect("the answer was never written");
+        assert_eq!(ended, Ended::Closed);
+        assert!(received.ends_with("\r\n0\r\n\r\n"), "{received}");
+        assert_eq!(received.matches('x').count(), size * frames);
+        most
+    }
+
+    /// An answer's body that gives frames with nothing in them fills no staging, and is
+    /// still taken from only an operation budget's worth a turn.
+    #[tokio::test]
+    async fn empty_frames_are_taken_a_budget_at_a_time() {
+        let budget = Budget {
+            operations: 16,
+            bytes: 1 << 20,
+        };
+        let most = most_frames_in_a_turn(0, 10_000, budget).await;
+        assert!(most <= 16, "{most} frames in one turn");
+    }
+
+    /// A long answer to a client that takes everything is written a byte budget's worth a
+    /// turn, however many operations are left.
+    #[tokio::test]
+    async fn a_long_answer_is_written_a_byte_budget_at_a_time() {
+        let budget = Budget {
+            operations: u32::MAX,
+            bytes: 16 * 1024,
+        };
+        let most = most_frames_in_a_turn(1024, 1024, budget).await;
+        // A budget's worth written, and the staging filled again before the turn ends.
+        let bound = (budget.bytes + STAGING) / 1024 + 1;
+        assert!(most <= bound, "{most} frames of 1 KiB in one turn");
+    }
+
+    /// One read takes at most a block from the socket, however much room the input has
+    /// and however much the client has sent, so what comes after a request is bounded by it.
+    #[tokio::test]
+    async fn one_read_takes_at_most_a_block() {
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        client.write_all(&vec![b'x'; 256 * 1024]).await.unwrap();
+        let mut connection = Connection::new(server, settings());
+        connection.inbound.borrow_mut().input.reserve(1 << 20);
+        let arrived =
+            poll_fn(|context| Poll::Ready(connection.poll_read(context, usize::MAX))).await;
+        assert!(arrived);
+        assert_eq!(connection.inbound.borrow().input.len(), READ_BLOCK);
+    }
+
+    /// A head that arrives in part while a long answer is still streaming gets its full time
+    /// from when it becomes next, not from when its bytes came, and trickling it then buys
+    /// nothing (14 §8).
+    #[tokio::test(start_paused = true)]
+    async fn a_head_behind_a_long_answer_gets_its_time_when_it_is_next() {
+        const TICKS: usize = 30;
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let streaming = |_: Request<RequestBody>| async { Response::new(Slow::new(TICKS)) };
+        let started = Instant::now();
+        let serving = async move {
+            let ended = serve(server, settings(), date, streaming).await;
+            (ended, Instant::now())
+        };
+        let talking = async move {
+            client
+                .write_all(b"GET /a HTTP/1.1\r\nhost: a\r\n\r\nGET /b HTTP/1.1\r\nx-long: ")
+                .await
+                .unwrap();
+            let mut received = Vec::new();
+            while !received.ends_with(b"\r\n0\r\n\r\n") {
+                let mut piece = [0; 256];
+                let read = client.read(&mut piece).await.unwrap();
+                assert_ne!(read, 0, "{}", String::from_utf8_lossy(&received));
+                received.extend_from_slice(&piece[..read]);
+            }
+            let answered = Instant::now();
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if client.write_all(b"x").await.is_err() {
+                    break;
+                }
+            }
+            answered
+        };
+        let ((ended, closed), answered) = tokio::time::timeout(Duration::from_secs(120), async {
+            tokio::join!(serving, talking)
+        })
+        .await
+        .expect("the next head's deadline never ran out");
+        assert_eq!(ended, Ended::TimedOut(Clock::NextHead));
+        assert!(answered - started >= Duration::from_secs(TICKS as u64));
+        let waited = closed - answered;
+        let next_head = Bounds::default().next_head;
+        assert!(
+            waited >= next_head && waited < next_head + Duration::from_millis(10),
+            "closed {waited:?} after the answer before it"
+        );
+    }
+
+    /// A pipelined request that is refused is refused after the answer before it, however
+    /// long that answer takes.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_of_the_next_request_follows_the_answer_before_it() {
+        let streaming = |_: Request<RequestBody>| async { Response::new(Slow::new(3)) };
+        let sent = b"GET /a HTTP/1.1\r\nhost: a\r\n\r\nGET /b HTTP/1.1\nhost: a\n\n";
+        let (received, ended) = served(sent, sent.len(), false, streaming).await;
+        assert!(received.starts_with("HTTP/1.1 200 OK\r\n"), "{received}");
+        assert!(
+            received.contains("\r\n4\r\ntick\r\n4\r\ntick\r\n4\r\ntick\r\n0\r\n\r\nHTTP/1.1 400 "),
+            "{received}"
+        );
+        assert_eq!(ended, Ended::Refused(StatusCode::BAD_REQUEST));
     }
 }
