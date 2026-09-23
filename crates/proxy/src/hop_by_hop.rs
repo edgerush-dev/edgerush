@@ -29,7 +29,7 @@ use http::header::{
 };
 
 /// The headers that go whether `Connection` names them or not.
-const HOP_BY_HOP: [HeaderName; 9] = [
+pub(crate) const HOP_BY_HOP: [HeaderName; 9] = [
     CONNECTION,
     HeaderName::from_static("keep-alive"),
     PROXY_AUTHENTICATE,
@@ -46,6 +46,20 @@ const HOP_BY_HOP: [HeaderName; 9] = [
 /// up costs several times as much. Without `Connection` no other header is named either.
 pub(crate) fn is_present(headers: &HeaderMap) -> bool {
     headers.keys().any(is_hop_by_hop)
+}
+
+/// Whether a name as it arrived, in whatever case, is one of [`HOP_BY_HOP`].
+#[cfg_attr(
+    not(any(test, feature = "fuzzing")),
+    expect(
+        dead_code,
+        reason = "our server builds raw heads in the next change of step 4"
+    )
+)]
+pub(crate) fn is_hop_by_hop_name(name: &[u8]) -> bool {
+    HOP_BY_HOP
+        .iter()
+        .any(|hop| hop.as_str().as_bytes().eq_ignore_ascii_case(name))
 }
 
 /// Whether the header is one of [`HOP_BY_HOP`]. Header names are held in lower case, and
@@ -67,8 +81,20 @@ pub(crate) fn is_hop_by_hop(name: &HeaderName) -> bool {
 
 /// Checks what a request's `Connection` names, before anything is taken off on its word.
 pub(crate) fn check_connection(headers: &HeaderMap) -> Result<(), ConnectionError> {
-    for value in headers.get_all(CONNECTION) {
-        for option in options(value) {
+    check_connection_values(
+        headers
+            .get_all(CONNECTION)
+            .iter()
+            .map(HeaderValue::as_bytes),
+    )
+}
+
+/// The same, given the values of the `Connection` fields.
+pub(crate) fn check_connection_values<'a>(
+    values: impl Iterator<Item = &'a [u8]>,
+) -> Result<(), ConnectionError> {
+    for value in values {
+        for option in options_of(value) {
             if !option.iter().copied().all(is_token_byte) {
                 return Err(ConnectionError::Malformed);
             }
@@ -150,8 +176,12 @@ pub(crate) fn nominated(headers: &HeaderMap) -> Vec<HeaderName> {
 /// The members of a comma-separated list, without the white space around them and without
 /// the empty ones that the list syntax allows.
 pub(crate) fn options(value: &HeaderValue) -> impl Iterator<Item = &[u8]> {
+    options_of(value.as_bytes())
+}
+
+/// The same, of a value's bytes.
+pub(crate) fn options_of(value: &[u8]) -> impl Iterator<Item = &[u8]> {
     value
-        .as_bytes()
         .split(|byte| *byte == b',')
         .map(<[u8]>::trim_ascii)
         .filter(|option| !option.is_empty())

@@ -12,6 +12,7 @@
 use crate::cookies;
 use crate::hop_by_hop::{self, ConnectionError, is_hop_by_hop};
 use crate::host::{self, HostError};
+use crate::request::Rejection;
 use edgerush_filters::HeaderModifier;
 use edgerush_router::Fields;
 use http::header::{COOKIE, HOST, HeaderMap, HeaderValue, TE};
@@ -50,7 +51,11 @@ pub trait Head {
     fn survey(&self) -> Survey;
 
     /// Makes one `Cookie` field of several, in their order, the pieces joined by `"; "`.
-    fn join_cookies(&mut self);
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection::Edits`] if the head cannot take the change.
+    fn join_cookies(&mut self) -> Result<(), Rejection>;
 
     /// When the target names the host, makes the `Host` field say the same, unless it is
     /// one field that already does. The target's host has already been found to be one
@@ -58,9 +63,9 @@ pub trait Head {
     ///
     /// # Errors
     ///
-    /// [`HostError::Invalid`] if what the target names cannot be a field's value; the
-    /// field is then left as it was.
-    fn agree_host(&mut self) -> Result<(), HostError>;
+    /// [`HostError::Invalid`] if what the target names cannot be a field's value, the field
+    /// then left as it was, or [`Rejection::Edits`] if the head cannot take the change.
+    fn agree_host(&mut self) -> Result<(), Rejection>;
 
     /// The only `Host` field, as text ([`crate::host::host_field`]).
     ///
@@ -78,10 +83,18 @@ pub trait Head {
     fn check_connection(&self) -> Result<(), ConnectionError>;
 
     /// Takes the hop-by-hop headers off; `TE: trailers` stays if it was said.
-    fn strip_request(&mut self);
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection::Edits`] if the head cannot take the change.
+    fn strip_request(&mut self) -> Result<(), Rejection>;
 
     /// Carries out a rule's changes to the headers.
-    fn apply(&mut self, changes: &HeaderModifier);
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection::Edits`] if the head cannot take them.
+    fn apply(&mut self, changes: &HeaderModifier) -> Result<(), Rejection>;
 }
 
 impl Head for Parts {
@@ -107,11 +120,12 @@ impl Head for Parts {
         survey(&self.headers)
     }
 
-    fn join_cookies(&mut self) {
+    fn join_cookies(&mut self) -> Result<(), Rejection> {
         cookies::join(&mut self.headers);
+        Ok(())
     }
 
-    fn agree_host(&mut self) -> Result<(), HostError> {
+    fn agree_host(&mut self) -> Result<(), Rejection> {
         let Some(authority) = self.uri.authority() else {
             return Ok(());
         };
@@ -135,12 +149,14 @@ impl Head for Parts {
         hop_by_hop::check_connection(&self.headers)
     }
 
-    fn strip_request(&mut self) {
+    fn strip_request(&mut self) -> Result<(), Rejection> {
         hop_by_hop::strip_request(&mut self.headers);
+        Ok(())
     }
 
-    fn apply(&mut self, changes: &HeaderModifier) {
+    fn apply(&mut self, changes: &HeaderModifier) -> Result<(), Rejection> {
         changes.apply(&mut self.headers);
+        Ok(())
     }
 }
 

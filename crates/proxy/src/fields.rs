@@ -334,6 +334,18 @@ impl Overlay {
         self.added.retain(|(added, _)| added != name);
     }
 
+    /// The same for a name given as bytes, in whatever case: what a `Connection` field
+    /// names, which need not be a name the gateway knows.
+    pub fn remove_named(&mut self, view: &View<'_>, name: &[u8]) {
+        for (at, line) in view.lines.lines.iter().enumerate() {
+            if bytes(view.head, line.start..line.name_end).eq_ignore_ascii_case(name) {
+                self.removed |= bit(at);
+            }
+        }
+        self.added
+            .retain(|(added, _)| !added.as_str().as_bytes().eq_ignore_ascii_case(name));
+    }
+
     /// Gives `name` this one value, in place of every one it had.
     ///
     /// # Errors
@@ -419,21 +431,57 @@ pub struct Edited<'a> {
     overlay: &'a Overlay,
 }
 
-impl Fields for Edited<'_> {
-    fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
-        let removed = self.overlay.removed;
-        let kept = self
-            .view
+impl<'a> Edited<'a> {
+    /// Every field as edited, a name as it arrived or was added and a value: the lines
+    /// kept, in their order, then what was added.
+    pub fn iter(&self) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + use<'a> {
+        let (view, overlay) = (self.view, self.overlay);
+        let removed = overlay.removed;
+        let kept = view
+            .lines
+            .lines
+            .iter()
+            .enumerate()
+            .filter(move |(at, _)| removed & bit(*at) == 0)
+            .map(move |(_, line)| {
+                (
+                    bytes(view.head, line.start..line.name_end),
+                    view.value(line),
+                )
+            });
+        let added = overlay
+            .added
+            .iter()
+            .map(|(name, value)| (name.as_str().as_bytes(), value.as_bytes()));
+        kept.chain(added)
+    }
+}
+
+impl<'a> Edited<'a> {
+    /// The values of `name` as edited, for as long as the head they are read from: the
+    /// lines kept, in their order, then what was added.
+    pub fn values_of<'n>(
+        &self,
+        name: &'n HeaderName,
+    ) -> impl Iterator<Item = &'a [u8]> + use<'a, 'n> {
+        let (view, overlay) = (self.view, self.overlay);
+        let removed = overlay.removed;
+        let kept = view
             .called(name)
             .filter(move |(at, _)| removed & bit(*at) == 0)
-            .map(|(_, line)| self.view.value(line));
-        let added = self
-            .overlay
+            .map(move |(_, line)| view.value(line));
+        let added = overlay
             .added
             .iter()
             .filter(move |(added, _)| added == name)
             .map(|(_, value)| value.as_bytes());
         kept.chain(added)
+    }
+}
+
+impl Fields for Edited<'_> {
+    fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
+        self.values_of(name)
     }
 }
 

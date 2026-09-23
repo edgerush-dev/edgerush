@@ -33,7 +33,17 @@ pub mod host;
 mod interim;
 mod linger;
 mod metrics;
+// Private, save when the fuzz targets and benchmarks are being built. Our server builds raw
+// heads in the next change of step 4 (14 §6).
 mod random;
+#[cfg(feature = "fuzzing")]
+pub mod raw;
+#[cfg(not(feature = "fuzzing"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "our server builds raw heads next")
+)]
+mod raw;
 mod request;
 mod request_body;
 mod scrape;

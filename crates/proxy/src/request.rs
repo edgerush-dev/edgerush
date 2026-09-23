@@ -54,6 +54,10 @@ pub enum Rejection {
     /// The rule has no backend with a share of its requests.
     #[error("no backend")]
     NoBackend,
+    /// The head could not take the changes asked of it: more fields added than its edits
+    /// hold. Not reachable from a config the gateway accepts (14 §6).
+    #[error("request head cannot take its changes")]
+    Edits,
 }
 
 impl Rejection {
@@ -67,7 +71,7 @@ impl Rejection {
                 StatusCode::BAD_REQUEST
             }
             Self::NoRoute => StatusCode::NOT_FOUND,
-            Self::NoBackend => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::NoBackend | Self::Edits => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -96,7 +100,7 @@ pub fn decide<'a, H: Head>(
     let found = head.survey();
     if found.cookie_fields > 1 {
         // Before routing, so that rules and the upstream read the same cookie string.
-        head.join_cookies();
+        head.join_cookies()?;
     }
     // A request has one host, for everything that looks at it: the router's hostnames, a
     // rule's predicate on the `Host` header, and the upstream. When the target names it,
@@ -144,10 +148,10 @@ pub fn decide<'a, H: Head>(
         head.set_uri(target);
     }
     if found.hop_by_hop {
-        head.strip_request();
+        head.strip_request()?;
     }
     if let Some(changes) = &rule.request_headers {
-        head.apply(changes);
+        head.apply(changes)?;
     }
     Ok(Forward { rule, upstream })
 }
@@ -168,7 +172,9 @@ fn with_path(uri: &Uri, path: String) -> Result<Uri, Rejection> {
 mod tests {
     use super::*;
     use crate::head::survey;
+    use crate::raw::RawHead;
     use edgerush_config::{Config, compile};
+    use edgerush_router::Fields;
     use http::header::{HOST, HeaderMap, HeaderValue};
     use http::request::Parts;
     use http::{Method, Request};
@@ -252,7 +258,7 @@ upstreams:
     }
 
     /// Decides on the named listener; the name of the upstream, or the rejection.
-    fn decide_on(listener: &str, head: &mut Parts, random: u64) -> Result<String, Rejection> {
+    fn decide_on<H: Head>(listener: &str, head: &mut H, random: u64) -> Result<String, Rejection> {
         let shop = shop();
         let listener = shop.listeners.iter().find(|l| l.name == listener).unwrap();
         decide(&shop, listener, head, random)
@@ -740,5 +746,187 @@ upstreams:
                 (decided, normal) => prop_assert!(false, "{target}: {decided:?}, {normal:?}"),
             }
         }
+    }
+
+    /// A request's head as our own server reads it — the bytes, where each field line lies
+    /// in them — and the header map the engine's server would make of the same bytes; `None`
+    /// for bytes that neither would take.
+    fn both_heads(sent: &[u8]) -> Option<(Parts, RawHead)> {
+        let mut room = [httparse::EMPTY_HEADER; 32];
+        let mut request = httparse::Request::new(&mut room);
+        if !matches!(request.parse(sent), Ok(httparse::Status::Complete(_))) {
+            return None;
+        }
+        let method = Method::from_bytes(request.method?.as_bytes()).ok()?;
+        let uri: http::Uri = request.path?.parse().ok()?;
+        let mut map = HeaderMap::new();
+        for field in request.headers.iter() {
+            map.append(
+                http::HeaderName::from_bytes(field.name.as_bytes()).ok()?,
+                HeaderValue::from_bytes(field.value).ok()?,
+            );
+        }
+        let lines = crate::fields::FieldLines::new(sent, request.headers).ok()?;
+        let (mut parts, ()) = Request::new(()).into_parts();
+        parts.method = method.clone();
+        parts.uri = uri.clone();
+        parts.headers = map;
+        let raw = RawHead::new(method, uri, bytes::Bytes::copy_from_slice(sent), lines);
+        Some((parts, raw))
+    }
+
+    /// Names in any case, among them every one the core does something with, and values
+    /// that make them mean something: hosts that route, cookies in pieces, `Connection`
+    /// naming other fields, `TE` with and without trailers.
+    fn raw_field() -> impl Strategy<Value = (&'static str, &'static str)> {
+        (
+            prop::sample::select(vec![
+                "host",
+                "Host",
+                "cookie",
+                "Cookie",
+                "connection",
+                "Connection",
+                "te",
+                "TE",
+                "keep-alive",
+                "x-hop",
+                "X-Hop",
+                "x-debug",
+                "X-Debug",
+                "x-gateway",
+                "upgrade",
+                "proxy-connection",
+                "accept",
+            ]),
+            prop::sample::select(vec![
+                "shop.example.com",
+                "tenant.example.net",
+                "other.example.org",
+                "a=1",
+                "b=2",
+                "a=1; b=2",
+                "keep-alive",
+                "x-hop",
+                "close",
+                "te",
+                "trailers",
+                "gzip",
+                "trailers, gzip",
+                "1",
+                "x-hop, keep-alive",
+                "x-debug",
+                "host",
+                "x hop",
+            ]),
+        )
+    }
+
+    fn every_name() -> Vec<http::HeaderName> {
+        [
+            "host",
+            "cookie",
+            "connection",
+            "te",
+            "keep-alive",
+            "x-hop",
+            "x-debug",
+            "x-gateway",
+            "upgrade",
+            "proxy-connection",
+            "accept",
+        ]
+        .into_iter()
+        .map(http::HeaderName::from_static)
+        .collect()
+    }
+
+    proptest! {
+        /// A raw head is decided on as the header map of the same bytes is: the same rule
+        /// or the same refusal, the same target, and every field the same after.
+        #[test]
+        fn a_raw_head_is_decided_on_as_its_header_map_is(
+            target in prop::sample::select(vec![
+                "/cart/items", "/account", "/tenant/x", "/search?q=a%20b", "/pages/./a/../b",
+                "/status", "/closed", "http://shop.example.com/cart",
+                "http://tenant.example.net/tenant/y", "http://Shop.Example.com:80/account",
+            ]),
+            // Most requests name a host that routes, so that what is done after routing is
+            // reached; the rest may name any, or none.
+            host in prop::sample::select(vec![
+                Some("shop.example.com"), Some("tenant.example.net"), Some("shop.example.com"),
+                None,
+            ]),
+            fields in prop::collection::vec(raw_field(), 0..8),
+            listener in prop::sample::select(vec!["web", "web", "admin"]),
+            random in 0..10u64,
+        ) {
+            let mut sent = format!("GET {target} HTTP/1.1\r\n").into_bytes();
+            if let Some(host) = host {
+                sent.extend_from_slice(format!("Host: {host}\r\n").as_bytes());
+            }
+            for (name, value) in &fields {
+                sent.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+            }
+            sent.extend_from_slice(b"\r\n");
+            let (mut map, mut raw) = both_heads(&sent).unwrap();
+            let by_map = decide_on(listener, &mut map, random);
+            let by_raw = decide_on(listener, &mut raw, random);
+            prop_assert_eq!(&by_raw, &by_map);
+            prop_assert_eq!(raw.uri(), map.uri());
+            let edited = raw.fields();
+            for name in every_name() {
+                let from_raw: Vec<&[u8]> = edited.values(&name).collect();
+                let from_map: Vec<&[u8]> = Fields::values(&map.headers, &name).collect();
+                prop_assert_eq!(from_raw, from_map, "{}", name);
+            }
+
+            // Written out as it will be, and read again, it is still the same.
+            let written = written(&raw);
+            let mut room = [httparse::EMPTY_HEADER; 64];
+            let mut again = httparse::Request::new(&mut room);
+            prop_assert!(matches!(again.parse(&written), Ok(httparse::Status::Complete(_))));
+            for name in every_name() {
+                let read: Vec<&[u8]> = again
+                    .headers
+                    .iter()
+                    .filter(|field| field.name.eq_ignore_ascii_case(name.as_str()))
+                    .map(|field| field.value)
+                    .collect();
+                let from_map: Vec<&[u8]> = Fields::values(&map.headers, &name).collect();
+                prop_assert_eq!(read, from_map, "{}", name);
+            }
+        }
+    }
+
+    /// The head of a request line and a raw head's pieces: its kept lines copied, the
+    /// fields added written out.
+    fn written(raw: &RawHead) -> Vec<u8> {
+        let mut out = b"GET / HTTP/1.1\r\n".to_vec();
+        for piece in raw.pieces() {
+            match piece {
+                crate::fields::Piece::Copy(span) => out.extend_from_slice(&raw.bytes()[span]),
+                crate::fields::Piece::Field(name, value) => {
+                    out.extend_from_slice(name.as_str().as_bytes());
+                    out.extend_from_slice(b": ");
+                    out.extend_from_slice(value.as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                }
+            }
+        }
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    /// What the core does not change is left as it came: a head whose `Host` already says
+    /// what its target names, with nothing else to do, is copied whole.
+    #[test]
+    fn a_raw_head_the_core_leaves_alone_is_copied_whole() {
+        let sent = b"GET http://shop.example.com/account HTTP/1.1\r\nHost: shop.example.com\r\nCookie: a=1; b=2\r\nAccept: */*\r\n\r\n";
+        let (_, mut raw) = both_heads(sent).unwrap();
+        assert_eq!(decide_on("web", &mut raw, 0).as_deref(), Ok("search"));
+        let pieces: Vec<_> = raw.pieces().collect();
+        let section = b"GET http://shop.example.com/account HTTP/1.1\r\n".len()..sent.len() - 2;
+        assert_eq!(pieces, [crate::fields::Piece::Copy(section)]);
     }
 }

@@ -143,10 +143,12 @@ pub(crate) enum Answer {
     /// This worker could not pay for the storage an exchange needed
     /// ([14 §8](../../docs/14-downstream-server.md)): its own failing, not the upstream's.
     Exhausted,
+    /// The request's head could not take its changes ([14 §6](../../docs/14-downstream-server.md)).
+    Edits,
 }
 
 impl Answer {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -157,6 +159,7 @@ impl Answer {
         Self::UpstreamFailed,
         Self::TooBusy,
         Self::Exhausted,
+        Self::Edits,
     ];
 
     /// The status that is answered with.
@@ -166,7 +169,7 @@ impl Answer {
                 StatusCode::BAD_REQUEST
             }
             Self::NoRoute => StatusCode::NOT_FOUND,
-            Self::NoBackend => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::NoBackend | Self::Edits => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NoEndpoints | Self::TooBusy | Self::Exhausted => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamFailed => StatusCode::BAD_GATEWAY,
         }
@@ -184,6 +187,7 @@ impl Answer {
             Self::UpstreamFailed => "upstream_failed",
             Self::TooBusy => "too_busy",
             Self::Exhausted => "exhausted",
+            Self::Edits => "edits",
         }
     }
 }
@@ -197,6 +201,7 @@ impl From<Rejection> for Answer {
             Rejection::Target => Self::BadTarget,
             Rejection::NoRoute => Self::NoRoute,
             Rejection::NoBackend => Self::NoBackend,
+            Rejection::Edits => Self::Edits,
         }
     }
 }
@@ -597,6 +602,7 @@ mod tests {
             Rejection::Target,
             Rejection::NoRoute,
             Rejection::NoBackend,
+            Rejection::Edits,
         ] {
             assert_eq!(
                 Answer::from(rejection).status(),

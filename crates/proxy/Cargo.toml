@@ -54,5 +54,10 @@ name = "h1_codec"
 harness = false
 required-features = ["fuzzing"]
 
+[[bench]]
+name = "raw_head"
+harness = false
+required-features = ["fuzzing"]
+
 [lints]
 workspace = true
