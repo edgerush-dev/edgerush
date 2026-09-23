@@ -2032,7 +2032,7 @@ async fn delivered_whole(answer: String) {
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     let body = within(client.chunked_body()).await;
     assert!(body.contains("hello"), "{body}");
-    assert_eq!(accepts.load(Ordering::SeqCst), 1, "and kept the connection");
+    carries_the_next(proxy, &accepts).await;
 }
 
 /// The same for the interim floods, where what arrives is the final head behind them.
@@ -2042,6 +2042,16 @@ async fn answered_anyway(answer: String) {
     let head = asks(&mut client, "/first").await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert_eq!(within(client.body(2)).await, "ok");
+    carries_the_next(proxy, &accepts).await;
+}
+
+/// After an answer read to its end, a second request goes on the connection that carried
+/// it: the upstream is asked twice and accepts once. Asked on a client connection of its
+/// own, as in [`taken`], so that only the upstream connection could have been shared.
+async fn carries_the_next(proxy: SocketAddr, accepts: &AtomicUsize) {
+    let mut again = Wire::to(proxy).await;
+    let second = asks(&mut again, "/second").await;
+    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
     assert_eq!(accepts.load(Ordering::SeqCst), 1, "and kept the connection");
 }
 
