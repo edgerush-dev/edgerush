@@ -26,6 +26,12 @@ impl Fields for HeaderMap {
     }
 }
 
+impl<F: Fields + ?Sized> Fields for &F {
+    fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
+        (**self).values(name)
+    }
+}
+
 /// A validated condition on one request header.
 #[derive(Debug, Clone)]
 pub struct HeaderPredicate {

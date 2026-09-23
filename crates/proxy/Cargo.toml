@@ -18,6 +18,7 @@ fuzzing = ["tokio/test-util"]
 arc-swap.workspace = true
 bytes.workspace = true
 edgerush-config.workspace = true
+edgerush-filters.workspace = true
 edgerush-router.workspace = true
 edgerush-telemetry.workspace = true
 http.workspace = true

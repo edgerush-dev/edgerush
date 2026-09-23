@@ -93,6 +93,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "edgerush-config",
+ "edgerush-filters",
  "edgerush-router",
  "edgerush-telemetry",
  "http",

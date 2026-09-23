@@ -12,13 +12,11 @@
 //! before the rule's own changes to the headers. A cookie string that came in pieces, as
 //! HTTP/2 allows, is put together before anything looks at it ([`crate::cookies`]).
 
-use crate::cookies;
-use crate::hop_by_hop::{ConnectionError, check_connection, is_hop_by_hop, strip_request};
-use crate::host::{HostError, bare_host, host_field};
+use crate::head::Head;
+use crate::hop_by_hop::ConnectionError;
+use crate::host::{HostError, bare_host};
 use edgerush_config::{Compiled, CompiledListener, CompiledRule, UpstreamId};
 use edgerush_router::{NormaliseError, RequestParts, normalise_path};
-use http::header::{COOKIE, HOST, HeaderMap, HeaderValue, TE};
-use http::request::Parts;
 use http::uri::PathAndQuery;
 use http::{StatusCode, Uri};
 use std::borrow::Cow;
@@ -89,43 +87,49 @@ impl Rejection {
 /// Returns a [`Rejection`] for a request to answer locally. Its target is then as it came;
 /// of its headers, a cookie string that came in pieces may be whole and the `Host` field
 /// may have been made to agree with the target, as both are before anything is matched.
-pub fn decide<'a>(
+pub fn decide<'a, H: Head>(
     snapshot: &'a Compiled,
     listener: &CompiledListener,
-    head: &mut Parts,
+    head: &mut H,
     random: u64,
 ) -> Result<Forward<'a>, Rejection> {
-    let found = survey(&head.headers);
+    let found = head.survey();
     if found.cookie_fields > 1 {
         // Before routing, so that rules and the upstream read the same cookie string.
-        cookies::join(&mut head.headers);
+        head.join_cookies();
     }
     // A request has one host, for everything that looks at it: the router's hostnames, a
     // rule's predicate on the `Host` header, and the upstream. When the target names it,
     // the `Host` field is made to say the same before anything is matched.
-    let host = if let Some(authority) = head.uri.authority() {
-        let host = bare_host(authority.as_str())?;
-        if !names_host(&head.headers, authority.as_str()) {
-            let named =
-                HeaderValue::from_str(authority.as_str()).map_err(|_| HostError::Invalid)?;
-            head.headers.insert(HOST, named);
+    // A bare host is the front of what names it, so its length is all that is kept of
+    // it while the `Host` field is made to agree: the target does not change meanwhile.
+    let named = match head.uri().authority() {
+        Some(authority) => Some(bare_host(authority.as_str())?.len()),
+        None => None,
+    };
+    head.agree_host()?;
+    let host = match (named, head.uri().authority()) {
+        (Some(length), Some(authority)) => {
+            authority.as_str().get(..length).ok_or(HostError::Invalid)?
         }
-        host
-    } else {
-        bare_host(host_field(&head.headers)?)?
+        _ => bare_host(head.host_field()?)?,
     };
-    let path = normalise_path(head.uri.path())?;
+    let path = normalise_path(head.uri().path())?;
     if found.hop_by_hop {
-        check_connection(&head.headers)?;
+        head.check_connection()?;
     }
-    let request = RequestParts {
-        host,
-        path: &path,
-        query: head.uri.query().unwrap_or_default(),
-        method: &head.method,
-        headers: &head.headers,
+    // What routing reads of the head is let go of before anything in it changes.
+    let id = {
+        let fields = head.fields();
+        let request = RequestParts {
+            host,
+            path: &path,
+            query: head.uri().query().unwrap_or_default(),
+            method: head.method(),
+            headers: &fields,
+        };
+        *listener.router.route(&request).ok_or(Rejection::NoRoute)?
     };
-    let id = *listener.router.route(&request).ok_or(Rejection::NoRoute)?;
     // A router only ever yields rules of the snapshot it was compiled into.
     let rule = snapshot.rule(id).ok_or(Rejection::NoBackend)?;
     let upstream = rule.backends.pick(random).ok_or(Rejection::NoBackend)?;
@@ -133,56 +137,19 @@ pub fn decide<'a>(
     // Whatever can still fail comes before the target and the rest of the headers change.
     let target = match path {
         Cow::Borrowed(_) => None,
-        Cow::Owned(path) => Some(with_path(&head.uri, path)?),
+        Cow::Owned(path) => Some(with_path(head.uri(), path)?),
     };
 
     if let Some(target) = target {
-        head.uri = target;
+        head.set_uri(target);
     }
     if found.hop_by_hop {
-        strip_request(&mut head.headers);
+        head.strip_request();
     }
     if let Some(changes) = &rule.request_headers {
-        changes.apply(&mut head.headers);
+        head.apply(changes);
     }
     Ok(Forward { rule, upstream })
-}
-
-/// What one pass over the header fields finds of the rare things that need work. Most
-/// requests have none of them and pay for the pass alone: looking every name up would cost
-/// several times as much.
-struct Survey {
-    /// Whether there are hop-by-hop headers to check and to take off.
-    hop_by_hop: bool,
-    cookie_fields: usize,
-}
-
-fn survey(headers: &HeaderMap) -> Survey {
-    let mut found = Survey {
-        hop_by_hop: false,
-        cookie_fields: 0,
-    };
-    let mut plain_te_fields = 0;
-    // A header that is repeated comes up once for each of its fields.
-    for (name, value) in headers {
-        if *name == COOKIE {
-            found.cookie_fields += 1;
-        } else if *name == TE && value == "trailers" {
-            // What every gRPC client says, and already the one form in which `TE` is
-            // forwarded: on its own there is nothing to take off only to put it back.
-            plain_te_fields += 1;
-        } else if is_hop_by_hop(name) {
-            found.hop_by_hop = true;
-        }
-    }
-    found.hop_by_hop |= plain_te_fields > 1;
-    found
-}
-
-/// Whether the `Host` field already says what the target's authority says.
-fn names_host(headers: &HeaderMap, authority: &str) -> bool {
-    let mut fields = headers.get_all(HOST).iter();
-    fields.next().is_some_and(|field| field == authority) && fields.next().is_none()
 }
 
 /// The same target with another path.
@@ -200,7 +167,10 @@ fn with_path(uri: &Uri, path: String) -> Result<Uri, Rejection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::head::survey;
     use edgerush_config::{Config, compile};
+    use http::header::{HOST, HeaderMap, HeaderValue};
+    use http::request::Parts;
     use http::{Method, Request};
     use proptest::prelude::*;
 

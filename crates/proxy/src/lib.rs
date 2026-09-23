@@ -27,6 +27,7 @@ pub mod fields;
 )]
 mod fields;
 mod h1;
+pub mod head;
 mod hop_by_hop;
 pub mod host;
 mod interim;
