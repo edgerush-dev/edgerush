@@ -10,6 +10,22 @@ cd "$(dirname "$0")"
 
 say() { printf '%s\n' "-- $1"; }
 
+# Linux gives a shell 1024 open files unless told otherwise, and the socket tests running
+# side by side can need more; a run that hits the limit fails for a reason that is not the
+# code's. Raised for this run alone, to 8192 or as far as the hard limit allows, and never
+# lowered.
+if [ "$(uname -s)" = Linux ]; then
+    want=8192
+    soft=$(ulimit -Sn)
+    hard=$(ulimit -Hn)
+    if [ "$soft" != unlimited ] && [ "$soft" -lt "$want" ]; then
+        if [ "$hard" != unlimited ] && [ "$hard" -lt "$want" ]; then
+            want=$hard
+        fi
+        ulimit -n "$want"
+    fi
+fi
+
 say "fmt"
 cargo fmt --check
 
