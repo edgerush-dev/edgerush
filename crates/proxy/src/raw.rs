@@ -8,7 +8,8 @@
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
 
 use crate::fields::{Edited, FieldLines, Known, Overlay, Piece, View};
-use crate::head::{Head, Survey};
+use crate::h1::{Declaration, declaration};
+use crate::head::{Forwarded, Head, Survey};
 use crate::hop_by_hop::{self, ConnectionError, HOP_BY_HOP, is_hop_by_hop_name, options_of};
 use crate::host::HostError;
 use crate::request::Rejection;
@@ -16,8 +17,9 @@ use crate::upstream::h1::codec::OutgoingFields;
 use bytes::Bytes;
 use edgerush_filters::{Edit, HeaderModifier};
 use edgerush_router::Fields;
-use http::header::{CONNECTION, COOKIE, HOST, HeaderName, HeaderValue, TE};
-use http::{Method, Uri};
+use http::header::{CONNECTION, COOKIE, HOST, HeaderName, HeaderValue, TE, TRAILER};
+use http::request::Parts;
+use http::{HeaderMap, Method, Request, Uri, Version};
 
 /// A request's head as our own server read it: its method and target, the bytes of the
 /// head, where each field line lies in them, and an overlay of what the core changes. Its
@@ -27,6 +29,7 @@ use http::{Method, Uri};
 pub struct RawHead {
     method: Method,
     uri: Uri,
+    version: Version,
     head: Bytes,
     lines: FieldLines,
     overlay: Overlay,
@@ -34,10 +37,11 @@ pub struct RawHead {
 
 impl RawHead {
     /// The head in `head`, whose field lines `lines` says where they are.
-    pub fn new(method: Method, uri: Uri, head: Bytes, lines: FieldLines) -> Self {
+    pub fn new(method: Method, uri: Uri, version: Version, head: Bytes, lines: FieldLines) -> Self {
         Self {
             method,
             uri,
+            version,
             head,
             lines,
             overlay: Overlay::default(),
@@ -236,6 +240,63 @@ impl Head for RawHead {
     }
 }
 
+impl Forwarded for RawHead {
+    type Outgoing = Self;
+
+    fn outgoing(&self) -> &Self {
+        self
+    }
+
+    fn version(&self) -> Version {
+        self.version
+    }
+
+    fn onward(&mut self) {
+        self.version = Version::HTTP_11;
+    }
+
+    fn filter_declaration(&mut self, nominated: &[HeaderName]) -> Result<(), Rejection> {
+        let declared = declaration(self.fields().values_of(&TRAILER), nominated);
+        let view = self.lines.view(&self.head);
+        match declared {
+            Declaration::None => Ok(()),
+            Declaration::Gone => {
+                self.overlay.remove(&view, &TRAILER);
+                Ok(())
+            }
+            Declaration::Kept(value) => self
+                .overlay
+                .set(&view, TRAILER, value)
+                .map_err(|_| Rejection::Edits),
+        }
+    }
+
+    fn close_connection(&mut self) -> Result<(), Rejection> {
+        let view = self.lines.view(&self.head);
+        self.overlay
+            .set(&view, CONNECTION, HeaderValue::from_static("close"))
+            .map_err(|_| Rejection::Edits)
+    }
+
+    fn into_parts(self) -> Parts {
+        let mut headers = HeaderMap::with_capacity(self.lines.len());
+        for (name, value) in self.fields().iter() {
+            // Every line was a field when it was read, and every field added was made one.
+            if let (Ok(name), Ok(value)) =
+                (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+            {
+                headers.append(name, value);
+            }
+        }
+        let (mut parts, ()) = Request::new(()).into_parts();
+        parts.method = self.method;
+        parts.uri = self.uri;
+        parts.version = self.version;
+        parts.headers = headers;
+        parts
+    }
+}
+
 /// A raw head's overlay while a modifier's changes are made to it, keeping note of a change
 /// it could not take.
 struct Editing<'a> {
@@ -282,6 +343,7 @@ mod tests {
         let mut raw = RawHead::new(
             Method::GET,
             Uri::from_static("/"),
+            Version::HTTP_11,
             Bytes::from_static(sent),
             lines,
         );

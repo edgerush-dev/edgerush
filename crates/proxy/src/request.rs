@@ -771,7 +771,13 @@ upstreams:
         parts.method = method.clone();
         parts.uri = uri.clone();
         parts.headers = map;
-        let raw = RawHead::new(method, uri, bytes::Bytes::copy_from_slice(sent), lines);
+        let raw = RawHead::new(
+            method,
+            uri,
+            http::Version::HTTP_11,
+            bytes::Bytes::copy_from_slice(sent),
+            lines,
+        );
         Some((parts, raw))
     }
 
@@ -800,10 +806,17 @@ upstreams:
                 "accept",
                 "content-length",
                 "Transfer-Encoding",
+                "Trailer",
+                "authorization",
+                "Expect",
             ]),
             prop::sample::select(vec![
                 "5",
                 "chunked",
+                "x-sum, x-hop",
+                "NTLM TlRMTVNTUAABAAAA",
+                "Bearer abc",
+                "100-continue",
                 "shop.example.com",
                 "tenant.example.net",
                 "other.example.org",
@@ -839,6 +852,11 @@ upstreams:
             "upgrade",
             "proxy-connection",
             "accept",
+            "trailer",
+            "authorization",
+            "expect",
+            "content-length",
+            "transfer-encoding",
         ]
         .into_iter()
         .map(http::HeaderName::from_static)
@@ -874,15 +892,56 @@ upstreams:
             }
             sent.extend_from_slice(b"\r\n");
             let (mut map, mut raw) = both_heads(&sent).unwrap();
+            // What is read before anything is decided, for how the body goes and what may
+            // not travel on.
+            let nominated = crate::hop_by_hop::nominated(&map.headers);
+            prop_assert_eq!(&crate::hop_by_hop::nominated(&raw), &nominated);
+            prop_assert_eq!(
+                crate::hop_by_hop::is_chunked_request(&raw),
+                crate::hop_by_hop::is_chunked_request(&map.headers)
+            );
             let by_map = decide_on(listener, &mut map, random);
             let by_raw = decide_on(listener, &mut raw, random);
             prop_assert_eq!(&by_raw, &by_map);
             prop_assert_eq!(raw.uri(), map.uri());
+            // And what the rest of the way does to a head that is going.
+            if by_map.is_ok() {
+                use crate::head::Forwarded;
+                use crate::upstream::auth::carries_credentials;
+                prop_assert_eq!(raw.filter_declaration(&nominated), map.filter_declaration(&nominated));
+                prop_assert_eq!(carries_credentials(&raw), carries_credentials(&map.headers));
+                if carries_credentials(&raw) {
+                    prop_assert_eq!(raw.close_connection(), map.close_connection());
+                }
+            }
             let edited = raw.fields();
             for name in every_name() {
                 let from_raw: Vec<&[u8]> = edited.values(&name).collect();
                 let from_map: Vec<&[u8]> = Fields::values(&map.headers, &name).collect();
                 prop_assert_eq!(from_raw, from_map, "{}", name);
+            }
+
+            // Made into `http`'s parts, for a client that takes those, it is the map.
+            {
+                use crate::head::Forwarded;
+                let decided = {
+                    let (_, mut fresh) = both_heads(&sent).unwrap();
+                    let _ = decide_on(listener, &mut fresh, random);
+                    if by_map.is_ok() {
+                        let _ = fresh.filter_declaration(&nominated);
+                        if crate::upstream::auth::carries_credentials(&fresh) {
+                            let _ = fresh.close_connection();
+                        }
+                    }
+                    fresh.into_parts()
+                };
+                for name in every_name() {
+                    let from_parts: Vec<&[u8]> = Fields::values(&decided.headers, &name).collect();
+                    let from_map: Vec<&[u8]> = Fields::values(&map.headers, &name).collect();
+                    prop_assert_eq!(from_parts, from_map, "{}", name);
+                }
+                prop_assert_eq!(&decided.uri, &map.uri);
+                prop_assert_eq!(&decided.method, &map.method);
             }
 
             // Written out as it will be, and read again, it is still the same.
@@ -958,6 +1017,38 @@ upstreams:
         }
         out.extend_from_slice(b"\r\n");
         out
+    }
+
+    /// A raw head carrying credentials that bind a connection is sent on saying so: its
+    /// upstream connection is closed after it, as a map head's is.
+    #[test]
+    fn a_raw_head_with_credentials_closes_its_upstream_connection() {
+        use crate::head::Forwarded;
+        use crate::upstream::auth::carries_credentials;
+        use crate::upstream::h1::codec::{Sending, write_head};
+        let sent = b"GET /account HTTP/1.1\r\nHost: shop.example.com\r\nAuthorization: NTLM TlRMTVNTUAABAAAA\r\nAccept: */*\r\n\r\n";
+        let (_, mut raw) = both_heads(sent).unwrap();
+        assert_eq!(decide_on("web", &mut raw, 0).as_deref(), Ok("fallback"));
+        assert!(carries_credentials(&raw));
+        assert_eq!(raw.close_connection(), Ok(()));
+        let close: Vec<&[u8]> = Fields::values(&raw, &http::header::CONNECTION).collect();
+        assert_eq!(close, [b"close".as_slice()]);
+        let mut out = Vec::new();
+        write_head(
+            &mut out,
+            raw.method(),
+            raw.uri(),
+            &raw,
+            Sending::None,
+            &crate::upstream::h1::H1Limits::default(),
+        )
+        .unwrap();
+        let written = String::from_utf8(out).unwrap();
+        assert!(written.contains("\r\nconnection: close\r\n"), "{written}");
+        assert!(
+            written.contains("\r\nAuthorization: NTLM TlRMTVNTUAABAAAA\r\n"),
+            "{written}"
+        );
     }
 
     /// What the core does not change is left as it came: a head whose `Host` already says

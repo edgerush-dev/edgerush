@@ -270,17 +270,46 @@ pub fn filter_trailers(fields: &mut HeaderMap, nominated: &[HeaderName]) -> usiz
 /// Doing this to the declaration is not doing it to the trailers: both are filtered, and
 /// a permitted trailer that was never declared is still passed on.
 pub fn filter_declaration(headers: &mut HeaderMap, nominated: &[HeaderName]) {
-    let declared: Vec<HeaderValue> = headers
-        .get_all(http::header::TRAILER)
-        .iter()
-        .cloned()
-        .collect();
-    if declared.is_empty() {
-        return;
+    let declared = declaration(
+        headers
+            .get_all(http::header::TRAILER)
+            .iter()
+            .map(HeaderValue::as_bytes),
+        nominated,
+    );
+    match declared {
+        Declaration::None => {}
+        Declaration::Gone => {
+            headers.remove(http::header::TRAILER);
+        }
+        Declaration::Kept(value) => {
+            headers.insert(http::header::TRAILER, value);
+        }
     }
+}
+
+/// What a `Trailer` declaration comes to once what will not arrive is taken out of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Declaration {
+    /// There was none, and there is nothing to do.
+    None,
+    /// It declared nothing that will arrive, and goes.
+    Gone,
+    /// What is left of it, one field in place of every one there was.
+    Kept(HeaderValue),
+}
+
+/// Works out what the `Trailer` fields with these values come to ([`filter_declaration`]),
+/// for whatever holds them.
+pub fn declaration<'a>(
+    values: impl Iterator<Item = &'a [u8]>,
+    nominated: &[HeaderName],
+) -> Declaration {
+    let mut declared = false;
     let mut kept: Vec<String> = Vec::new();
-    for value in &declared {
-        for name in crate::hop_by_hop::options(value) {
+    for value in values {
+        declared = true;
+        for name in crate::hop_by_hop::options_of(value) {
             // A name that is no name declares nothing, and goes the way of the rest.
             let Ok(name) = HeaderName::from_bytes(name) else {
                 continue;
@@ -290,13 +319,13 @@ pub fn filter_declaration(headers: &mut HeaderMap, nominated: &[HeaderName]) {
             }
         }
     }
-    headers.remove(http::header::TRAILER);
+    if !declared {
+        return Declaration::None;
+    }
     if kept.is_empty() {
-        return;
+        return Declaration::Gone;
     }
-    if let Ok(value) = HeaderValue::from_str(&kept.join(", ")) {
-        headers.insert(http::header::TRAILER, value);
-    }
+    HeaderValue::from_str(&kept.join(", ")).map_or(Declaration::Gone, Declaration::Kept)
 }
 
 /// A piece of a body, as it is read.

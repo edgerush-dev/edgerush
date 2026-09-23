@@ -128,9 +128,13 @@ fn by_raw(snapshot: Compiled, head: Bytes) -> (Compiled, Option<RawHead>, bool) 
             let uri = target.parse::<Uri>().ok();
             let lines = FieldLines::new(&head, request.headers).ok();
             match (method, uri, lines) {
-                (Some(method), Some(uri), Some(lines)) => {
-                    Some(RawHead::new(method, uri, head.clone(), lines))
-                }
+                (Some(method), Some(uri), Some(lines)) => Some(RawHead::new(
+                    method,
+                    uri,
+                    http::Version::HTTP_11,
+                    head.clone(),
+                    lines,
+                )),
                 _ => None,
             }
         }
@@ -214,7 +218,13 @@ fn decided_raw(sent: &Bytes) -> RawHead {
     request.parse(sent).expect("a request");
     let lines = FieldLines::new(sent, request.headers).expect("lines of the head");
     let uri: Uri = request.path.expect("a target").parse().expect("a target");
-    let mut head = RawHead::new(Method::GET, uri, sent.clone(), lines);
+    let mut head = RawHead::new(
+        Method::GET,
+        uri,
+        http::Version::HTTP_11,
+        sent.clone(),
+        lines,
+    );
     let snapshot = shop();
     let listener = snapshot.listeners.first().expect("a listener");
     decide(&snapshot, listener, &mut head, 0).expect("decided");

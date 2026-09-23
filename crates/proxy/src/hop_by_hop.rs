@@ -22,6 +22,7 @@
 //! request whose `Connection` names `Host` or an `X-Forwarded-*` header is rejected, as
 //! Envoy and Pingora do, and so is one whose `Connection` is not a list of tokens.
 
+use edgerush_router::Fields;
 use http::HeaderMap;
 use http::header::{
     CONNECTION, HeaderName, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE,
@@ -108,11 +109,10 @@ pub(crate) fn check_connection_values<'a>(
 
 /// Whether a request said its body is chunked. Asked before the hop-by-hop fields come
 /// off, because afterwards there is nothing left to ask.
-pub(crate) fn is_chunked_request(headers: &HeaderMap) -> bool {
+pub(crate) fn is_chunked_request<F: Fields + ?Sized>(headers: &F) -> bool {
     headers
-        .get_all(TRANSFER_ENCODING)
-        .iter()
-        .flat_map(options)
+        .values(&TRANSFER_ENCODING)
+        .flat_map(options_of)
         .any(|coding| coding.eq_ignore_ascii_case(b"chunked"))
 }
 
@@ -164,11 +164,10 @@ fn strip(headers: &mut HeaderMap) {
 /// these are hop-by-hop for this hop and do not travel on, among the trailers no more
 /// than among the fields ([13 §4](../../docs/13-http1-upstream.md)). Which client read
 /// the message does not come into it: this is what being an intermediary requires.
-pub(crate) fn nominated(headers: &HeaderMap) -> Vec<HeaderName> {
+pub(crate) fn nominated<F: Fields + ?Sized>(headers: &F) -> Vec<HeaderName> {
     headers
-        .get_all(CONNECTION)
-        .iter()
-        .flat_map(options)
+        .values(&CONNECTION)
+        .flat_map(options_of)
         .filter_map(|option| HeaderName::from_bytes(option).ok())
         .collect()
 }

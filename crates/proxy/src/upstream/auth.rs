@@ -3,18 +3,16 @@
 //! This does not implement a handshake. It recognizes the schemes whose credentials
 //! must never leave a connection available to a different downstream client.
 
+use edgerush_router::Fields;
 use http::header::{AUTHORIZATION, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, WWW_AUTHENTICATE};
 use http::{HeaderMap, StatusCode};
 
 /// Read the outgoing head, after filters: proxy credentials from the client were
 /// stripped, but a rule can add them, or replace or remove origin credentials.
-pub(crate) fn carries_credentials(headers: &HeaderMap) -> bool {
-    [AUTHORIZATION, PROXY_AUTHORIZATION].iter().any(|name| {
-        headers
-            .get_all(name)
-            .iter()
-            .any(|value| uses_scheme(value.as_bytes()))
-    })
+pub(crate) fn carries_credentials<F: Fields + ?Sized>(headers: &F) -> bool {
+    [AUTHORIZATION, PROXY_AUTHORIZATION]
+        .iter()
+        .any(|name| headers.values(name).any(uses_scheme))
 }
 
 /// A challenge is an extra reason for the custom path not to pool a connection. It

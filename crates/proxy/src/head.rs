@@ -13,11 +13,12 @@ use crate::cookies;
 use crate::hop_by_hop::{self, ConnectionError, is_hop_by_hop};
 use crate::host::{self, HostError};
 use crate::request::Rejection;
+use crate::upstream::h1::codec::OutgoingFields;
 use edgerush_filters::HeaderModifier;
 use edgerush_router::Fields;
-use http::header::{COOKIE, HOST, HeaderMap, HeaderValue, TE};
+use http::header::{CONNECTION, COOKIE, HOST, HeaderMap, HeaderName, HeaderValue, TE};
 use http::request::Parts;
-use http::{Method, Uri};
+use http::{Method, Uri, Version};
 
 /// What one pass over a head's fields finds of the rare things that need work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -157,6 +158,76 @@ impl Head for Parts {
     fn apply(&mut self, changes: &HeaderModifier) -> Result<(), Rejection> {
         changes.apply(&mut self.headers);
         Ok(())
+    }
+}
+
+/// A request's head as the rest of its way through the gateway needs it, once the core has
+/// decided where it goes: its fields as they are to go upstream, and the changes made to
+/// them on the way there.
+pub(crate) trait Forwarded: Head {
+    /// Its fields as they are to be written upstream.
+    type Outgoing: OutgoingFields + ?Sized;
+
+    /// Its fields as they are to be written upstream.
+    fn outgoing(&self) -> &Self::Outgoing;
+
+    /// The version it came in.
+    fn version(&self) -> Version;
+
+    /// Makes it this hop's to send on: HTTP/1.1, and nothing kept that was about the
+    /// connection it came in on.
+    fn onward(&mut self);
+
+    /// Takes out of its `Trailer` declaration what will not arrive
+    /// ([`crate::h1::filter_declaration`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection::Edits`] if the head cannot take the change.
+    fn filter_declaration(&mut self, nominated: &[HeaderName]) -> Result<(), Rejection>;
+
+    /// Has the upstream close the connection after it: `Connection: close`, in place of
+    /// any it has.
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection::Edits`] if the head cannot take the change.
+    fn close_connection(&mut self) -> Result<(), Rejection>;
+
+    /// The head as `http`'s parts, for a client that takes those.
+    fn into_parts(self) -> Parts;
+}
+
+impl Forwarded for Parts {
+    type Outgoing = HeaderMap;
+
+    fn outgoing(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    fn version(&self) -> Version {
+        self.version
+    }
+
+    fn onward(&mut self) {
+        self.version = Version::HTTP_11;
+        // What the engine attached to the request is about the connection it came in on.
+        self.extensions.clear();
+    }
+
+    fn filter_declaration(&mut self, nominated: &[HeaderName]) -> Result<(), Rejection> {
+        crate::h1::filter_declaration(&mut self.headers, nominated);
+        Ok(())
+    }
+
+    fn close_connection(&mut self) -> Result<(), Rejection> {
+        self.headers
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+        Ok(())
+    }
+
+    fn into_parts(self) -> Parts {
+        self
     }
 }
 

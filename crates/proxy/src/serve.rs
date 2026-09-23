@@ -20,6 +20,7 @@ use crate::downstream::detect::{Protocol, detect};
 use crate::downstream::h1::connection as h1;
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h1::deadlines::Bounds;
+use crate::head::Forwarded;
 use crate::hop_by_hop::strip_response;
 use crate::interim::Interim;
 use crate::linger::{self, Lent, linger};
@@ -31,16 +32,19 @@ use crate::storage::Storage;
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Blocks, SMALL, Sizes};
-use crate::upstream::h1::codec::{ResponseHead, Sending, filter_declaration, filter_trailers};
+use crate::upstream::h1::codec::{
+    OutgoingFields, ResponseHead, Sending, filter_declaration, filter_trailers,
+};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, nothing_to_say};
 use crate::upstream::h1::pool::{Lease, Pool};
 use crate::upstream::hyper_conn::{HyperBody, HyperConnection};
 use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRule};
+use edgerush_router::Fields;
 use http::request::Parts;
 use http::response;
 use http::uri::{Authority, Scheme};
-use http::{HeaderMap, HeaderName, Method, Request, Response, Uri, Version};
+use http::{HeaderName, Method, Request, Response, Uri, Version};
 use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
 use hyper::rt::Executor;
 use hyper::service::service_fn;
@@ -657,18 +661,19 @@ impl Worker {
         clippy::too_many_arguments,
         reason = "each of them is a different thing an exchange needs, and a struct \n                  to hold them would be indirection for a lint rather than for a reader"
     )]
-    async fn through_h1<B>(
+    async fn through_h1<F, B>(
         &self,
         identity: &Arc<ReuseIdentity>,
         method: &Method,
         uri: &Uri,
-        headers: &HeaderMap,
+        headers: &F,
         nominated: &[HeaderName],
         sending: Sending,
         body: B,
         interim: Option<Interim>,
     ) -> Result<(ResponseHead, H1Body<TcpStream, B>), ExchangeError>
     where
+        F: OutgoingFields + ?Sized,
         B: HttpBody<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
@@ -922,7 +927,19 @@ impl Worker {
         request: Request<RequestBody>,
         interim: Option<Interim>,
     ) -> Response<Body> {
-        let (mut head, body) = request.into_parts();
+        let (head, body) = request.into_parts();
+        self.respond_to(listener, head, body, interim).await
+    }
+
+    /// The same for a request's head of whatever kind: a map, or the raw head our own
+    /// server reads ([14 §6](../../docs/14-downstream-server.md)).
+    async fn respond_to<H: Forwarded>(
+        &self,
+        listener: usize,
+        mut head: H,
+        body: RequestBody,
+        interim: Option<Interim>,
+    ) -> Response<Body> {
         // How the body is to be sent on, worked out from what arrived and before `direct`
         // takes the hop-by-hop fields off it — and before the body itself is touched,
         // because the path is chosen while there is still nothing to undo.
@@ -931,23 +948,24 @@ impl Worker {
         // hop-by-hop fields off the head. Afterwards there is nothing left to read them
         // from and everything it named looks like an ordinary field, so a trailer of that
         // name would travel on ([13 §4](../../docs/13-http1-upstream.md)).
-        let nominated = crate::hop_by_hop::nominated(&head.headers);
+        let nominated = crate::hop_by_hop::nominated(head.outgoing());
         let directed = match self.proxy.direct(listener, &mut head) {
             Ok(directed) => directed,
             Err(answer) => return self.proxy.answer(listener, answer),
         };
         // A name it gave is not declared onwards either: the declaration says what the
         // trailers will hold, and it will not hold that.
-        filter_declaration(&mut head.headers, &nominated);
+        if let Err(rejection) = head.filter_declaration(&nominated) {
+            return self.proxy.answer(listener, rejection.into());
+        }
 
         // Credentials can bind the upstream socket to this client, even when the
         // response is successful. Decide after rule filters and before either client
         // dispatches: hyper can return a socket to its pool before we see the response.
-        if crate::upstream::auth::carries_credentials(&head.headers) {
-            head.headers.insert(
-                http::header::CONNECTION,
-                http::HeaderValue::from_static("close"),
-            );
+        if crate::upstream::auth::carries_credentials(head.outgoing())
+            && let Err(rejection) = head.close_connection()
+        {
+            return self.proxy.answer(listener, rejection.into());
         }
 
         // Before either client looks for a connection or opens one: a place is what
@@ -963,7 +981,7 @@ impl Worker {
                     proxy: Arc::clone(&self.proxy),
                     upstream: directed.upstream_slot,
                 };
-                self.by_hyper(&directed.endpoint, head, body, admitted, watch)
+                self.by_hyper(&directed.endpoint, head.into_parts(), body, admitted, watch)
                     .await
                     .ok_or(Answer::UpstreamFailed)
             }
@@ -1147,10 +1165,10 @@ impl Worker {
         clippy::too_many_arguments,
         reason = "each is a different thing the exchange needs, as for `through_h1`"
     )]
-    async fn by_ours(
+    async fn by_ours<H: Forwarded>(
         &self,
         directed: &Directed,
-        head: &Parts,
+        head: &H,
         nominated: &[HeaderName],
         sending: Sending,
         body: RequestBody,
@@ -1160,9 +1178,9 @@ impl Worker {
         let answer = match self
             .through_h1(
                 &directed.endpoint,
-                &head.method,
-                &head.uri,
-                &head.headers,
+                head.method(),
+                head.uri(),
+                head.outgoing(),
                 nominated,
                 sending,
                 body,
@@ -1216,7 +1234,7 @@ impl Proxy {
     /// on one snapshot, which is let go of before anything is waited for; what is kept for
     /// the response is the rule, and only if it has something to do to the response, and
     /// the slot of the upstream's counters.
-    fn direct(&self, listener: usize, head: &mut Parts) -> Result<Directed, Answer> {
+    fn direct<H: Forwarded>(&self, listener: usize, head: &mut H) -> Result<Directed, Answer> {
         let snapshot = self.current.load();
         let listener = snapshot
             .listeners
@@ -1240,10 +1258,9 @@ impl Proxy {
             .at(upstream, at)
             .ok_or(Answer::NoEndpoints)?;
 
-        head.uri = at_endpoint(&head.uri, endpoint).ok_or(Answer::BadTarget)?;
-        head.version = Version::HTTP_11;
-        // What the engine attached to the request is about the connection it came in on.
-        head.extensions.clear();
+        let target = at_endpoint(head.uri(), endpoint).ok_or(Answer::BadTarget)?;
+        head.set_uri(target);
+        head.onward();
         if let Some(counters) = self.metrics.upstream(upstream_slot) {
             counters.requests.inc();
         }
@@ -1271,27 +1288,27 @@ struct Directed {
 /// a body that says how long it is may still end with trailers, and over HTTP/2 it always
 /// may. What is certain is what the client framed it as
 /// ([13 §4](../../docs/13-http1-upstream.md)).
-fn sending_for(head: &Parts, body: &RequestBody) -> Sending {
+fn sending_for<H: Forwarded>(head: &H, body: &RequestBody) -> Sending {
     // The engine says outright when there is no body, and that is the one thing a length
     // alone would not settle. A client that said its body is a length of nothing goes on
     // saying so: RFC 9110 §8.6 has a sender state a length for a method whose content
     // means something, and a server may answer 411 without one. One that said nothing,
     // as an HTTP/2 request ended by its headers does, is sent no framing either.
     if body.is_end_stream() {
-        return match request_length(&head.headers) {
+        return match request_length(head.outgoing()) {
             Some(0) => Sending::Length(0),
             _ => Sending::None,
         };
     }
-    if head.version == Version::HTTP_2 {
+    if head.version() == Version::HTTP_2 {
         // Framed as frames, with trailers allowed after any of them. There is no length
         // here that would still be true by the end.
         return Sending::Chunked;
     }
-    if crate::hop_by_hop::is_chunked_request(&head.headers) {
+    if crate::hop_by_hop::is_chunked_request(head.outgoing()) {
         return Sending::Chunked;
     }
-    match request_length(&head.headers) {
+    match request_length(head.outgoing()) {
         Some(length) => Sending::Length(length),
         // No length and no coding, over HTTP/1.1, is no body at all.
         None => Sending::None,
@@ -1301,13 +1318,20 @@ fn sending_for(head: &Parts, body: &RequestBody) -> Sending {
 /// A request's `Content-Length`, where it has exactly one that is a plain number. Hyper
 /// has already refused what it will refuse; anything left that does not read as a length
 /// is treated as no length, and the body is framed by this end instead.
-fn request_length(headers: &HeaderMap) -> Option<u64> {
-    let mut lengths = headers.get_all(http::header::CONTENT_LENGTH).iter();
+fn request_length<F: Fields + ?Sized>(headers: &F) -> Option<u64> {
+    let mut lengths = headers.values(&http::header::CONTENT_LENGTH);
     let only = lengths.next()?;
     if lengths.next().is_some() {
         return None;
     }
-    only.to_str().ok()?.trim().parse().ok()
+    // What `HeaderValue::to_str` takes, visible ASCII and tabs, before it is read as text.
+    if !only
+        .iter()
+        .all(|&byte| (32..127).contains(&byte) || byte == b'\t')
+    {
+        return None;
+    }
+    std::str::from_utf8(only).ok()?.trim().parse().ok()
 }
 
 /// A connection that came in on a listener's socket: what its requests share, and what
@@ -2732,7 +2756,7 @@ upstreams:
                             &identity,
                             &Method::GET,
                             &"/x".parse().unwrap(),
-                            &HeaderMap::new(),
+                            &http::HeaderMap::new(),
                             &[],
                             Sending::None,
                             http_body_util::Empty::<Bytes>::new(),
