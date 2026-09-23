@@ -2127,6 +2127,160 @@ upstreams:
         }));
     }
 
+    /// **Many incomplete large heads, pinned frames and slow consumers, all at once**
+    /// (14 §8), against a worker whose storage is a fraction of what they ask for and far
+    /// below its exchange cap: at every moment it is looked at, it holds no more than its
+    /// limit and provision; the limit, not the cap, is what stops it, since it comes within
+    /// a grown block of it; and once they have all gone it holds no more than a quiet worker
+    /// keeps, and serves again.
+    #[test]
+    fn a_worker_under_every_kind_of_load_at_once_stays_within_its_storage() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const LIMIT: usize = 1 << 20;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            // An upstream that reads no more of an upload than its head, answers `/big`
+            // with more than any client here will read, and `/ok` at once.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        let mut byte = [0; 1];
+                        while !head.ends_with(b"\r\n\r\n") {
+                            if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                            head.push(byte[0]);
+                        }
+                        if head.starts_with(b"POST /upload") {
+                            std::future::pending::<()>().await;
+                        } else if head.starts_with(b"GET /big") {
+                            let length = 1 << 20;
+                            let said =
+                                format!("HTTP/1.1 200 OK\r\ncontent-length: {length}\r\n\r\n");
+                            let _said = stream.write_all(said.as_bytes()).await;
+                            let _said = stream.write_all(&vec![b'x'; length]).await;
+                            std::future::pending::<()>().await;
+                        } else {
+                            let _said = stream
+                                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                                .await;
+                        }
+                    });
+                }
+            });
+
+            let proxy = served_by(upstream, Upstream::Ours, Downstream::Ours);
+            // An upload stalled on its upstream is not read, so its client going unseen until
+            // the exchange's own wait runs out: shortened here, so that the test sees the end
+            // of what an upload pins without waiting the usual thirty seconds for it.
+            let limits = H1Limits {
+                storage: LIMIT,
+                idle: Duration::from_secs(3),
+                ..H1Limits::default()
+            };
+            let worker = Worker::with_limits(Arc::clone(&proxy), limits);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+            let _maintaining = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+            let storage = Rc::clone(worker.blocks.borrow().storage());
+
+            // Each client holds its connection until it is aborted.
+            let client = |sent: Vec<u8>| {
+                tokio::task::spawn_local(async move {
+                    let mut client = TcpStream::connect(front).await.unwrap();
+                    let _sent = client.write_all(&sent).await;
+                    std::future::pending::<()>().await;
+                })
+            };
+            let mut clients = Vec::new();
+            // Uploads whose frames the upstream never takes, pinning the blocks they were
+            // cut from once the sockets' own buffers are full: longer than any of those,
+            // written until the worker stops reading them.
+            for _ in 0..10 {
+                clients.push(tokio::task::spawn_local(async move {
+                    let mut client = TcpStream::connect(front).await.unwrap();
+                    let head = b"POST /upload HTTP/1.1\r\nhost: example.test\r\n\
+                        content-length: 1073741824\r\n\r\n";
+                    let _sent = client.write_all(head).await;
+                    let piece = vec![b'u'; 64 * 1024];
+                    while client.write_all(&piece).await.is_ok() {}
+                    std::future::pending::<()>().await;
+                }));
+            }
+            // Clients that ask for a large answer and never read it.
+            for _ in 0..10 {
+                clients.push(client(
+                    b"GET /big HTTP/1.1\r\nhost: example.test\r\n\r\n".to_vec(),
+                ));
+            }
+            // The uploads and the slow consumers are under way, their frames pinned and
+            // their answers queued, before the heads arrive to compete with them.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Heads that never end, each longer than a small block holds. Those the worker
+            // cannot pay to read are closed, and say so.
+            let turned_away = Rc::new(Cell::new(0));
+            for _ in 0..40 {
+                let mut head = b"GET / HTTP/1.1\r\nhost: example.test\r\nx-pad: ".to_vec();
+                head.extend(std::iter::repeat_n(b'a', 50 * 1024));
+                let turned_away = Rc::clone(&turned_away);
+                clients.push(tokio::task::spawn_local(async move {
+                    let mut client = TcpStream::connect(front).await.unwrap();
+                    let _sent = client.write_all(&head).await;
+                    let mut nothing = [0; 64];
+                    if matches!(client.read(&mut nothing).await, Ok(0) | Err(_)) {
+                        turned_away.set(turned_away.get() + 1);
+                    }
+                    std::future::pending::<()>().await;
+                }));
+            }
+
+            let ceiling = LIMIT + crate::storage::PROVISION;
+            let (mut most, mut outlived) = (0, 0);
+            for _ in 0..250 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let used = storage.used();
+                assert!(used <= ceiling, "{used} held, past {ceiling}");
+                most = most.max(used);
+                outlived = outlived.max(storage.outlived());
+            }
+            let sizes = worker.blocks.borrow().sizes();
+            assert!(
+                most + sizes.large > LIMIT,
+                "the most held was {most}: the limit was never what stopped it"
+            );
+            assert!(turned_away.get() > 0, "no head was turned away");
+            // Memory held by frames alone, its blocks let go of by a sweep while the frames
+            // wait on the upstream, was among what was counted.
+            assert!(outlived > 0, "no pinned memory was ever held to account");
+            assert!(worker.in_flight.get() < limits.exchanges);
+
+            for client in &clients {
+                client.abort();
+            }
+            // Closes are noticed, stalled uploads given up on at their exchanges' wait, and a
+            // sweep or two finds the last pinned frames gone and trims what is parked.
+            tokio::time::sleep(limits.idle + limits.sweep * 3).await;
+            let staging = 16 * 1024;
+            let kept = sizes.kept * (sizes.small + sizes.large + staging);
+            let used = storage.used();
+            assert!(
+                used <= kept,
+                "{used} held once it was all over, past {kept}"
+            );
+            assert_eq!(storage.outlived(), 0, "pinned memory still charged");
+            assert_eq!(status_of(front, "/ok").await, StatusCode::OK);
+        }));
+    }
+
     /// A local answer of the request core reaches the client from a worker that has run
     /// out, as our own server writes it from the provision (14 §8): here the head that asks
     /// takes the whole limit, and names no host.
