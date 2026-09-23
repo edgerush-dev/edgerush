@@ -16,15 +16,10 @@ mod cookies;
 pub mod downstream;
 #[cfg(not(feature = "fuzzing"))]
 mod downstream;
-// Private, save when the fuzz targets are being built. Nothing reads a head through it yet:
-// step 4 proves it reads as the header map does before the parser builds it (14 §6).
+// Private, save when the fuzz targets and benchmarks are being built.
 #[cfg(feature = "fuzzing")]
 pub mod fields;
 #[cfg(not(feature = "fuzzing"))]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the parser by the next change")
-)]
 mod fields;
 mod h1;
 pub mod head;
@@ -33,16 +28,11 @@ pub mod host;
 mod interim;
 mod linger;
 mod metrics;
-// Private, save when the fuzz targets and benchmarks are being built. Our server builds raw
-// heads in the next change of step 4 (14 §6).
 mod random;
+// Private, save when the fuzz targets and benchmarks are being built.
 #[cfg(feature = "fuzzing")]
 pub mod raw;
 #[cfg(not(feature = "fuzzing"))]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "our server builds raw heads next")
-)]
 mod raw;
 mod request;
 mod request_body;

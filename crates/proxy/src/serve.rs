@@ -26,6 +26,7 @@ use crate::interim::Interim;
 use crate::linger::{self, Lent, linger};
 use crate::metrics::{Answer, Metrics, Socket, Stopped};
 use crate::random::random;
+use crate::raw::RawHead;
 use crate::request::decide;
 use crate::request_body::RequestBody;
 use crate::storage::Storage;
@@ -839,13 +840,13 @@ impl Worker {
                             },
                             budget: h1::Budget::default(),
                         };
-                        let respond = move |request, interim| {
+                        let respond = move |head: RawHead, body, interim| {
                             ours_asking.set(true);
                             let connection = Rc::clone(&ours);
                             async move {
                                 connection
                                     .worker
-                                    .handle(listener, request, Some(interim))
+                                    .handle_head(listener, head, body, Some(interim))
                                     .await
                             }
                         };
@@ -912,8 +913,21 @@ impl Worker {
         request: Request<RequestBody>,
         interim: Option<Interim>,
     ) -> Response<Body> {
+        let (head, body) = request.into_parts();
+        self.handle_head(listener, head, body, interim).await
+    }
+
+    /// The same for a request's head of whatever kind: a map, or the raw head our own
+    /// server reads ([14 §6](../../docs/14-downstream-server.md)).
+    async fn handle_head<H: Forwarded>(
+        &self,
+        listener: usize,
+        head: H,
+        body: RequestBody,
+        interim: Option<Interim>,
+    ) -> Response<Body> {
         let came_in = Instant::now();
-        let response = self.respond(listener, request, interim).await;
+        let response = self.respond_to(listener, head, body, interim).await;
         if let Some(counters) = self.proxy.metrics.listener(listener) {
             let took = u64::try_from(came_in.elapsed().as_nanos()).unwrap_or(u64::MAX);
             counters.responded(response.status(), took);
@@ -921,18 +935,6 @@ impl Worker {
         response
     }
 
-    async fn respond(
-        &self,
-        listener: usize,
-        request: Request<RequestBody>,
-        interim: Option<Interim>,
-    ) -> Response<Body> {
-        let (head, body) = request.into_parts();
-        self.respond_to(listener, head, body, interim).await
-    }
-
-    /// The same for a request's head of whatever kind: a map, or the raw head our own
-    /// server reads ([14 §6](../../docs/14-downstream-server.md)).
     async fn respond_to<H: Forwarded>(
         &self,
         listener: usize,

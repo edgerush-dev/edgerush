@@ -12,10 +12,12 @@
 //! ([14 §4](../../../../docs/14-downstream-server.md)). A body is read with the upstream
 //! side's own reader ([`crate::h1::BodyReader`]); only its framing is decided here.
 
+use crate::fields::FieldLines;
 use crate::h1::{Framing, MOST_FIELDS, length, reason};
-use crate::hop_by_hop::{is_token_byte, options};
+use crate::hop_by_hop::{is_token_byte, options_of};
 use crate::upstream::h1::H1Limits;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
+use edgerush_router::Fields;
+use http::{Method, StatusCode, Uri, Version};
 
 /// Why a client's request cannot be read, and so what it is answered with.
 ///
@@ -111,10 +113,10 @@ pub struct RequestHead {
     pub target: Uri,
     /// The version it asked in, which is HTTP/1.0 or HTTP/1.1 and nothing else.
     pub version: Version,
-    /// Its fields, in the order they came, repeats and all.
-    pub headers: HeaderMap,
-    /// The one `Content-Length`, already checked, because a [`HeaderMap`] cannot be asked
-    /// afterwards whether there had been two of them.
+    /// Where its fields lie in the bytes it was read from, in the order they came, repeats
+    /// and all: read out of those bytes, never copied (14 §6).
+    pub fields: FieldLines,
+    /// The one `Content-Length`, already checked.
     pub content_length: Option<u64>,
 }
 
@@ -208,7 +210,9 @@ impl HeadReader {
         let Some(end) = self.end_of_head(bytes, line_end, limits)? else {
             return Ok(Head::More);
         };
-        let head = parse(&bytes[start..end], self.fields, limits)?;
+        // The lines are taken down against everything given up to the head's end, the
+        // empty line before it included, which is what a reader of them is handed.
+        let head = parse(&bytes[..end], start, self.fields, limits)?;
         Ok(Head::Read {
             head,
             consumed: end,
@@ -348,16 +352,29 @@ impl HeadReader {
 
 /// Makes a head of the bytes of one, which are known to end with an empty line and to
 /// begin with a sound request line.
-fn parse(head: &[u8], fields: usize, limits: &H1Limits) -> Result<RequestHead, RequestError> {
+///
+/// `given` is everything up to the end of the head, which begins at `start`: its field lines
+/// are taken down as places in `given`.
+fn parse(
+    given: &[u8],
+    start: usize,
+    fields: usize,
+    limits: &H1Limits,
+) -> Result<RequestHead, RequestError> {
     // Most requests have only a few fields; the full room is there for those that do not.
     if fields <= 16 {
-        parse_with::<16>(head, limits)
+        parse_with::<16>(given, start, limits)
     } else {
-        parse_with::<MOST_FIELDS>(head, limits)
+        parse_with::<MOST_FIELDS>(given, start, limits)
     }
 }
 
-fn parse_with<const N: usize>(head: &[u8], limits: &H1Limits) -> Result<RequestHead, RequestError> {
+fn parse_with<const N: usize>(
+    given: &[u8],
+    start: usize,
+    limits: &H1Limits,
+) -> Result<RequestHead, RequestError> {
+    let head = given.get(start..).unwrap_or_default();
     let mut fields = [httparse::EMPTY_HEADER; N];
     let room = limits.fields.min(N);
     let mut request = httparse::Request::new(&mut fields[..room]);
@@ -390,29 +407,26 @@ fn parse_with<const N: usize>(head: &[u8], limits: &H1Limits) -> Result<RequestH
         .and_then(|target| target.parse::<Uri>().ok())
         .ok_or(RequestError::Malformed("its target is not one"))?;
 
-    // Every field is looked at while they are still apart, because a header map keeps no
-    // record of a name having come twice.
+    // The parser holds a field name to a token and a value to what a value may be, which
+    // is all a header map would: nothing is checked again (the `h1_request` fuzz target
+    // holds every head it reads to making a map without losing a field).
     let mut content_length = None;
-    let mut headers = HeaderMap::with_capacity(request.headers.len());
     for field in request.headers.iter() {
-        let name = HeaderName::from_bytes(field.name.as_bytes())
-            .map_err(|_| RequestError::Malformed("a field name is not one"))?;
-        let value = HeaderValue::from_bytes(field.value)
-            .map_err(|_| RequestError::Malformed("a field value is not one"))?;
-        if name == http::header::CONTENT_LENGTH {
+        if field.name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() {
                 return Err(RequestError::RepeatedLength);
             }
             content_length = Some(length(field.value).map_err(|_| RequestError::BadLength)?);
         }
-        headers.append(name, value);
     }
+    let fields = FieldLines::new(given, request.headers)
+        .map_err(|_| RequestError::Malformed("a field is not a line of it"))?;
 
     Ok(RequestHead {
         method,
         target,
         version,
-        headers,
+        fields,
         content_length,
     })
 }
@@ -435,12 +449,11 @@ pub struct Arrival {
 /// A coding on HTTP/1.0, a coding beside a length, a coding list that does not end with a
 /// single `chunked`, or a `Connection` that is not a list of tokens
 /// ([14 §4](../../../../docs/14-downstream-server.md)).
-pub fn arrival(head: &RequestHead) -> Result<Arrival, RequestError> {
-    let mut codings = head
-        .headers
-        .get_all(http::header::TRANSFER_ENCODING)
-        .iter()
-        .peekable();
+pub fn arrival<F: Fields + ?Sized>(
+    head: &RequestHead,
+    fields: &F,
+) -> Result<Arrival, RequestError> {
+    let mut codings = fields.values(&http::header::TRANSFER_ENCODING).peekable();
     // Decided by whether the field is there, not by what it lists: RFC 9112 §6.3 frames by
     // its presence, so one listing nothing still overrules a length beside it.
     let framing = if codings.peek().is_some() {
@@ -457,7 +470,7 @@ pub fn arrival(head: &RequestHead) -> Result<Arrival, RequestError> {
         let mut chunked = 0;
         let mut others = 0;
         let mut all_tokens = true;
-        for coding in codings.flat_map(options) {
+        for coding in codings.flat_map(options_of) {
             if coding.eq_ignore_ascii_case(b"chunked") {
                 chunked += 1;
             } else {
@@ -491,8 +504,8 @@ pub fn arrival(head: &RequestHead) -> Result<Arrival, RequestError> {
 
     let mut closing = false;
     let mut keep_alive = false;
-    for value in head.headers.get_all(http::header::CONNECTION) {
-        for option in options(value) {
+    for value in fields.values(&http::header::CONNECTION) {
+        for option in options_of(value) {
             if !option.iter().copied().all(is_token_byte) {
                 return Err(RequestError::BadConnection);
             }
@@ -579,15 +592,40 @@ mod tests {
         assert_eq!(head.target, "/cart?x=1");
         assert_eq!(head.version, Version::HTTP_11);
         assert_eq!(head.content_length, Some(3));
-        let repeated: Vec<_> = head.headers.get_all("x-a").iter().collect();
-        assert_eq!(repeated, ["1", "2"], "repeats are kept, in order");
+        let view = head.fields.view(bytes);
+        let repeated: Vec<&[u8]> = view.values(&http::HeaderName::from_static("x-a")).collect();
+        assert_eq!(
+            repeated,
+            [b"1".as_slice(), b"2"],
+            "repeats are kept, in order"
+        );
+    }
+
+    /// A head after the one empty line a client may send first has its fields read where
+    /// they are in what was given, the empty line included: a reader of them is handed all
+    /// of it.
+    #[test]
+    fn fields_after_an_empty_line_are_read_where_they_are() {
+        let bytes = b"\r\nGET / HTTP/1.1\r\nHost: shop.test\r\nX-A: 1\r\n\r\n";
+        let Ok(Head::Read { head, consumed }) = read(bytes) else {
+            panic!("not read");
+        };
+        assert_eq!(consumed, bytes.len());
+        let view = head.fields.view(bytes);
+        assert_eq!(
+            view.iter().collect::<Vec<_>>(),
+            [
+                (b"Host".as_slice(), b"shop.test".as_slice()),
+                (b"X-A", b"1")
+            ]
+        );
     }
 
     #[test]
     fn a_head_with_no_fields_is_a_head() {
         let head = head(b"GET / HTTP/1.0\r\n\r\n");
         assert_eq!(head.version, Version::HTTP_10);
-        assert!(head.headers.is_empty());
+        assert!(head.fields.is_empty());
     }
 
     #[test]
@@ -790,7 +828,8 @@ mod tests {
 
     fn arrived(fields: &str, version: &str) -> Result<Arrival, RequestError> {
         let bytes = format!("POST / {version}\r\n{fields}\r\n");
-        arrival(&head(bytes.as_bytes()))
+        let head = head(bytes.as_bytes());
+        arrival(&head, &head.fields.view(bytes.as_bytes()))
     }
 
     fn framed(fields: &str) -> Result<Framing, RequestError> {

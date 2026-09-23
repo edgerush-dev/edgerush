@@ -25,7 +25,7 @@ fn ours(bytes: &[u8]) -> u16 {
     match HeadReader::default().read(bytes, &H1Limits::default()) {
         Err(error) => error.status().as_u16(),
         Ok(Head::More) => panic!("{:?} is not a whole head", String::from_utf8_lossy(bytes)),
-        Ok(Head::Read { head, .. }) => match arrival(&head) {
+        Ok(Head::Read { head, .. }) => match arrival(&head, &head.fields.view(bytes)) {
             Err(error) => error.status().as_u16(),
             Ok(_) => 200,
         },

@@ -26,13 +26,16 @@ use super::date::HttpDate;
 use super::deadlines::{Bounds, Clock, Deadlines};
 use super::writer::{Asked, BodyFramer, Content, Delimited, write_head, write_interim};
 use crate::h1::{BodyReader, CodecError, Framing, Piece};
+use crate::head::Head as _;
 use crate::interim::Interim;
+use crate::raw::RawHead;
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::storage::{Charge, Storage};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Block, Blocks};
 use bytes::{Buf, Bytes};
-use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
+use edgerush_router::Fields;
+use http::{HeaderMap, Method, Response, StatusCode, Version};
 use http_body::{Body, Frame, SizeHint};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -735,25 +738,24 @@ fn now() -> std::time::Instant {
 }
 
 /// Whether a request asked to be told before it sends its body.
-fn expects_continue(headers: &HeaderMap) -> bool {
+fn expects_continue<F: Fields + ?Sized>(headers: &F) -> bool {
     headers
-        .get_all(http::header::EXPECT)
-        .iter()
-        .flat_map(crate::hop_by_hop::options)
+        .values(&http::header::EXPECT)
+        .flat_map(crate::hop_by_hop::options_of)
         .any(|option| option.eq_ignore_ascii_case(b"100-continue"))
 }
 
 /// Whether a request said it can take trailers.
-fn takes_trailers(headers: &HeaderMap) -> bool {
+fn takes_trailers<F: Fields + ?Sized>(headers: &F) -> bool {
     headers
-        .get_all(http::header::TE)
-        .iter()
-        .flat_map(crate::hop_by_hop::options)
+        .values(&http::header::TE)
+        .flat_map(crate::hop_by_hop::options_of)
         .any(|option| option.eq_ignore_ascii_case(b"trailers"))
 }
 
-/// Serves `socket` until the connection ends, handing each request to `respond`, and says
-/// how it ended. The caller closes the socket, lingering where bytes may still be arriving.
+/// Serves `socket` until the connection ends, handing each request to `respond` as its raw
+/// head and its body, and says how it ended. The caller closes the socket, lingering where
+/// bytes may still be arriving.
 pub(crate) async fn serve<S, R, F, B>(
     socket: S,
     settings: Settings,
@@ -763,7 +765,7 @@ pub(crate) async fn serve<S, R, F, B>(
 ) -> Ended
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    R: FnMut(Request<RequestBody>, Interim) -> F,
+    R: FnMut(RawHead, RequestBody, Interim) -> F,
     F: Future<Output = Response<B>>,
     B: Body<Data = Bytes> + Unpin,
 {
@@ -827,12 +829,22 @@ where
             Err(Err(error)) => return refuse(&mut connection, timer.as_mut(), error, &date).await,
         };
         connection.deadlines.head_read();
-        {
+        // The head's bytes, cut out of the block they were read into rather than copied:
+        // its fields are read out of them from here on, and they stay paid for through the
+        // block for as long as the request holds them (14 §6, §8). Everything the head said
+        // was in what was read, so there is a block to cut them from.
+        let bytes = {
             let mut inbound = connection.inbound.borrow_mut();
             let inbound = &mut *inbound;
-            used(&mut inbound.input, &inbound.blocks, consumed);
-        }
-        let arrived = match arrival(&head) {
+            let bytes = inbound
+                .input
+                .as_mut()
+                .map(|block| block.cut_frame(0..consumed, consumed))
+                .unwrap_or_default();
+            give_back_if_empty(&mut inbound.input, &inbound.blocks);
+            bytes
+        };
+        let arrived = match arrival(&head, &head.fields.view(&bytes)) {
             Ok(arrived) => arrived,
             Err(error) => return refuse(&mut connection, timer.as_mut(), error, &date).await,
         };
@@ -841,20 +853,21 @@ where
             method,
             target,
             version,
-            headers,
+            fields,
             content_length: _,
         } = head;
+        let head = RawHead::new(method, target, version, bytes, fields);
         let asked = Asked {
-            head: method == Method::HEAD,
+            head: head.method() == Method::HEAD,
             version,
-            trailers: takes_trailers(&headers),
+            trailers: takes_trailers(&head),
         };
         let (reader, left) = match arrived.framing {
             Framing::None | Framing::Length(0) => (None, None),
             Framing::Length(length) => (Some(BodyReader::new(arrived.framing)), Some(length)),
             framing => (Some(BodyReader::new(framing)), None),
         };
-        let interim = Interim::listened(expects_continue(&headers), version, reader.is_none());
+        let interim = Interim::listened(expects_continue(&head), version, reader.is_none());
         {
             let mut inbound = connection.inbound.borrow_mut();
             inbound.interim = Some(interim.clone());
@@ -865,15 +878,10 @@ where
             left,
             done: false,
         };
-        let mut request = Request::new(RequestBody::Ours(body));
-        *request.method_mut() = method;
-        *request.uri_mut() = target;
-        *request.version_mut() = version;
-        *request.headers_mut() = headers;
-
         // The answer, with both directions kept moving while it is worked out.
         let answer = {
-            let mut responding = std::pin::pin!(respond(request, interim.clone()));
+            let mut responding =
+                std::pin::pin!(respond(head, RequestBody::Ours(body), interim.clone()));
             poll_fn(|context| -> Poll<Result<Response<B>, Stop>> {
                 connection.inbound.borrow_mut().heard_by(context);
                 loop {
@@ -1092,10 +1100,40 @@ async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::head::Forwarded;
+    use http::Request;
     use http_body_util::{BodyExt, Full};
     use std::cell::Cell;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The driver, with a core written as the tests' are: taking a request as `http`'s,
+    /// which the raw head the driver hands over is made into. Everything the driver does is
+    /// as it is; only what the core is handed is put into another shape.
+    async fn serve<S, R, F, B>(
+        socket: S,
+        settings: Settings,
+        blocks: Rc<RefCell<Blocks>>,
+        date: impl Fn() -> HttpDate,
+        mut respond: R,
+    ) -> Ended
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+        R: FnMut(Request<RequestBody>, Interim) -> F,
+        F: Future<Output = Response<B>>,
+        B: Body<Data = Bytes> + Unpin,
+    {
+        super::serve(
+            socket,
+            settings,
+            blocks,
+            date,
+            |head: RawHead, body, interim| {
+                respond(Request::from_parts(head.into_parts(), body), interim)
+            },
+        )
+        .await
+    }
 
     /// An answer's body of a length nobody knows until it ends.
     struct Unknown(VecDeque<Bytes>);

@@ -290,7 +290,7 @@ pub fn filter_declaration(headers: &mut HeaderMap, nominated: &[HeaderName]) {
 
 /// What a `Trailer` declaration comes to once what will not arrive is taken out of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Declaration {
+pub(crate) enum Declaration {
     /// There was none, and there is nothing to do.
     None,
     /// It declared nothing that will arrive, and goes.
@@ -301,7 +301,7 @@ pub enum Declaration {
 
 /// Works out what the `Trailer` fields with these values come to ([`filter_declaration`]),
 /// for whatever holds them.
-pub fn declaration<'a>(
+pub(crate) fn declaration<'a>(
     values: impl Iterator<Item = &'a [u8]>,
     nominated: &[HeaderName],
 ) -> Declaration {

@@ -104,7 +104,7 @@ impl Known {
 }
 
 /// Where one field line lies in its head.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Line {
     /// The first byte of the name, which is where the line begins.
     start: u32,
@@ -116,7 +116,7 @@ struct Line {
 }
 
 /// Where a known header's lines are.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Slot {
     /// The position of the first line with the name.
     first: u32,
@@ -140,7 +140,7 @@ pub enum FieldsError {
 const _: () = assert!(MOST_FIELDS <= u128::BITS as usize);
 
 /// The field lines of one head: where each is, and where the known headers are.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FieldLines {
     lines: Vec<Line>,
     slots: [Slot; Known::ALL.len()],
@@ -197,6 +197,7 @@ impl FieldLines {
     }
 
     /// How many lines have the known header's name.
+    #[cfg(any(test, feature = "fuzzing"))]
     #[must_use]
     pub fn count(&self, known: Known) -> usize {
         self.slots[known.slot()].count as usize
@@ -209,6 +210,7 @@ impl FieldLines {
     }
 
     /// Whether there are none.
+    #[cfg(any(test, feature = "fuzzing"))]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
@@ -216,6 +218,7 @@ impl FieldLines {
 
     /// The bytes each line spans in its head, from its first byte to the end of its line
     /// break, in the order the lines came.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn spans(&self) -> impl Iterator<Item = Range<usize>> + '_ {
         self.lines
             .iter()
@@ -232,6 +235,7 @@ pub struct View<'a> {
 
 impl<'a> View<'a> {
     /// The values of the known header, in the order its lines came.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn known(&self, known: Known) -> impl Iterator<Item = &'a [u8]> + use<'a> {
         let slot = self.lines.slots[known.slot()];
         let head = self.head;
@@ -246,6 +250,7 @@ impl<'a> View<'a> {
     }
 
     /// Every field as a name as it arrived and a value, in the order the lines came.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn iter(&self) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + use<'a> {
         let head = self.head;
         self.lines.lines.iter().map(move |line| {

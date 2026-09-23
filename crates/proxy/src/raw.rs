@@ -53,6 +53,7 @@ impl RawHead {
     }
 
     /// The bytes of the head, which [`RawHead::pieces`] copies from.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn bytes(&self) -> &Bytes {
         &self.head
     }

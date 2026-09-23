@@ -832,9 +832,8 @@ mod tests {
             let candidate = HeadReader::default()
                 .read(bytes, limits)
                 .and_then(|head| match head {
-                    Head::Read { head, consumed } => {
-                        arrival(&head).map(|arrival| Some((head, consumed, arrival)))
-                    }
+                    Head::Read { head, consumed } => arrival(&head, &head.fields.view(bytes))
+                        .map(|arrival| Some((head, consumed, arrival))),
                     Head::More => Ok(None),
                 });
             let within = |request: &Request| {
@@ -882,15 +881,16 @@ mod tests {
                         format!("{:?}", request.version),
                     )?;
                     let mut fields: Vec<(String, String)> = head
-                        .headers
+                        .fields
+                        .view(bytes)
                         .iter()
                         .map(|(name, value)| {
-                            let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
-                            (name.as_str().to_owned(), value)
+                            let name = String::from_utf8_lossy(name).to_ascii_lowercase();
+                            (name, String::from_utf8_lossy(value).into_owned())
                         })
                         .collect();
                     let mut expected = request.fields.clone();
-                    // A header map groups repeats by name; order within a name is kept.
+                    // Names in any case are one name; order within a name is kept.
                     expected.sort_by(|a, b| a.0.cmp(&b.0));
                     fields.sort_by(|a, b| a.0.cmp(&b.0));
                     differ("fields", format!("{fields:?}"), format!("{expected:?}"))?;
@@ -969,7 +969,7 @@ mod tests {
             match HeadReader::default().read(bytes, limits) {
                 Err(error) => error.status().as_str().to_owned(),
                 Ok(Head::More) => "more".to_owned(),
-                Ok(Head::Read { head, .. }) => match arrival(&head) {
+                Ok(Head::Read { head, .. }) => match arrival(&head, &head.fields.view(bytes)) {
                     Err(error) => error.status().as_str().to_owned(),
                     Ok(_) => "read".to_owned(),
                 },

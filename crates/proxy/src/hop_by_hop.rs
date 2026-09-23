@@ -50,13 +50,6 @@ pub(crate) fn is_present(headers: &HeaderMap) -> bool {
 }
 
 /// Whether a name as it arrived, in whatever case, is one of [`HOP_BY_HOP`].
-#[cfg_attr(
-    not(any(test, feature = "fuzzing")),
-    expect(
-        dead_code,
-        reason = "our server builds raw heads in the next change of step 4"
-    )
-)]
 pub(crate) fn is_hop_by_hop_name(name: &[u8]) -> bool {
     HOP_BY_HOP
         .iter()

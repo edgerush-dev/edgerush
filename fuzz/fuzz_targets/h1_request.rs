@@ -68,7 +68,20 @@ fn read(bytes: &[u8], step: usize) -> Read {
     };
     assert!(consumed <= given, "more was consumed than was given");
 
-    let body = match arrival(&head) {
+    // The parser's field checks are all there are (14 §6): whatever it takes would make a
+    // header map, name by name and value by value, without a field left out.
+    for (name, value) in head.fields.view(&bytes[..consumed]).iter() {
+        assert!(
+            http::HeaderName::from_bytes(name).is_ok(),
+            "a field name the parser took is no name: {name:?}"
+        );
+        assert!(
+            http::HeaderValue::from_bytes(value).is_ok(),
+            "a field value the parser took is no value: {value:?}"
+        );
+    }
+
+    let body = match arrival(&head, &head.fields.view(&bytes[..consumed])) {
         Err(error) => {
             // Refused for its framing: an answer every client gets, and a status for it.
             let _status = error.status();
