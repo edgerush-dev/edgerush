@@ -1743,9 +1743,7 @@ mod tests {
                 };
 
                 // Nothing listening where the upstream should be.
-                let gone = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let nowhere = gone.local_addr().unwrap();
-                drop(gone);
+                let (_held, nowhere) = refusing();
                 let (worker, front) = serving(nowhere).await;
                 assert_eq!(
                     status_of(front, "/ok").await,
@@ -2237,6 +2235,19 @@ upstreams:
     }
 
     /// What one HTTP/1.1 request for `path` to `address` is answered with.
+    /// An address that refuses every connection for as long as the socket returned with it
+    /// is held: bound, so that nothing else can be given its port, and never listening.
+    ///
+    /// **Not a port read from a socket that was then let go of.** That hands the port back
+    /// for the operating system to give to whatever asks next, and a test running beside
+    /// this one was given it and answered 200 where a 502 was expected.
+    fn refusing() -> (tokio::net::TcpSocket, SocketAddr) {
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = held.local_addr().unwrap();
+        (held, address)
+    }
+
     async fn status_of(address: SocketAddr, path: &str) -> StatusCode {
         let stream = TcpStream::connect(address).await.unwrap();
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))

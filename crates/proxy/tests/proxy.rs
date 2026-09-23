@@ -111,12 +111,12 @@ fn upstream_answer(
 /// answered a request meant for nowhere, and failed both the test that expected 502 and
 /// the test whose connections it had quietly added to.
 ///
-/// Holding the port costs the one thing the dropped socket gave, which was a connection
-/// *refused* rather than a connection closed. Nothing available here refuses on both
-/// Windows and WSL: a port low enough to sit outside the ephemeral range is filtered and
-/// not refused under WSL, and a second loopback address is unanswered on Windows. So what
-/// these tests place a request on is an upstream that answers nothing, which reaches a
-/// client as the same 502.
+/// Holding the port by listening on it costs the one thing the dropped socket gave, which
+/// was a connection *refused* rather than a connection closed. A low port outside the
+/// ephemeral range is filtered and not refused under WSL, and a second loopback address is
+/// unanswered on Windows; a socket bound and never listening does refuse on both, and is
+/// what the worker's own tests use. What these tests place a request on is an upstream
+/// that answers nothing, which reaches a client as the same 502.
 async fn dead_endpoint() -> SocketAddr {
     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = socket.local_addr().unwrap();
