@@ -101,6 +101,11 @@ pub struct H1Limits {
     /// same unboundedness somewhere quieter
     /// ([13 §7](../../../../docs/13-http1-upstream.md)).
     pub exchanges: usize,
+    /// How much storage a worker may hold for requests on both hops at once: blocks read
+    /// into, what is staged or queued to be written
+    /// ([14 §8](../../../../docs/14-downstream-server.md)). A reservation past it is
+    /// refused, never waited for.
+    pub storage: usize,
 }
 
 impl Default for H1Limits {
@@ -124,6 +129,7 @@ impl Default for H1Limits {
             sweep: Duration::from_secs(1),
             connect: Duration::from_secs(5),
             exchanges: 1024,
+            storage: crate::storage::LIMIT,
         }
     }
 }

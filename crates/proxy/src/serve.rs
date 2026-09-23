@@ -26,7 +26,7 @@ use crate::metrics::{Answer, Metrics, Socket, Stopped};
 use crate::random::random;
 use crate::request::decide;
 use crate::request_body::RequestBody;
-use crate::storage::{self, Storage};
+use crate::storage::Storage;
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Blocks, SMALL, Sizes};
@@ -585,7 +585,7 @@ impl Worker {
             hyper_pool: Rc::new(RefCell::new(Pool::default())),
             blocks: Rc::new(RefCell::new(Blocks::new(
                 Sizes::within(&limits, SMALL),
-                Storage::new(storage::LIMIT),
+                Storage::new(limits.storage),
             ))),
             in_flight: Rc::new(Cell::new(0)),
             limits,
@@ -942,6 +942,7 @@ impl Worker {
                 };
                 self.by_hyper(&directed.endpoint, head, body, admitted, watch)
                     .await
+                    .ok_or(Answer::UpstreamFailed)
             }
             Upstream::Ours => {
                 self.by_ours(&directed, &head, &nominated, sending, body, admitted)
@@ -950,11 +951,17 @@ impl Worker {
         };
 
         let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
-        let Some((mut head, body)) = answered else {
-            if let Some(upstream) = upstream {
-                upstream.failures.inc();
+        let (mut head, body) = match answered {
+            Ok(answered) => answered,
+            // The worker's own storage running out is not the upstream failing, and is
+            // not counted as though it were ([14 §8](../../docs/14-downstream-server.md)).
+            Err(Answer::Exhausted) => return self.proxy.answer(listener, Answer::Exhausted),
+            Err(answer) => {
+                if let Some(upstream) = upstream {
+                    upstream.failures.inc();
+                }
+                return self.proxy.answer(listener, answer);
             }
-            return self.proxy.answer(listener, Answer::UpstreamFailed);
         };
         if let Some(upstream) = upstream {
             upstream.responded(head.status);
@@ -1119,7 +1126,7 @@ impl Worker {
         sending: Sending,
         body: RequestBody,
         admitted: Admitted,
-    ) -> Option<(response::Parts, Body)> {
+    ) -> Result<(response::Parts, Body), Answer> {
         let answer = match self
             .through_h1(
                 &directed.endpoint,
@@ -1135,7 +1142,10 @@ impl Worker {
             Ok(answer) => answer,
             Err(error) => {
                 self.proxy.metrics.stopped(why_stopped(&error));
-                return None;
+                return Err(match error {
+                    ExchangeError::Exhausted(_) => Answer::Exhausted,
+                    _ => Answer::UpstreamFailed,
+                });
             }
         };
         let (read, mut body) = answer;
@@ -1154,7 +1164,7 @@ impl Worker {
             proxy: Arc::clone(&self.proxy),
             upstream: directed.upstream_slot,
         };
-        Some((parts, Body::Ours(Box::new(body), admitted, watch)))
+        Ok((parts, Body::Ours(Box::new(body), admitted, watch)))
     }
 }
 
@@ -1166,6 +1176,7 @@ impl Proxy {
         }
         let mut response = Response::new(Body::Empty);
         *response.status_mut() = answer.status();
+        response.extensions_mut().insert(h1::Local);
         response
     }
 
@@ -2056,6 +2067,105 @@ upstreams:
             why_stopped(&ExchangeError::Exhausted(exhausted)),
             Stopped::Exhausted
         );
+    }
+
+    /// And the client is answered 503, counted under an answer reason of its own and not
+    /// against the upstream, which did not fail: the worker did (14 §8). hyper's server in
+    /// front, whose storage is its own, so that the request is read and it is the
+    /// exchange that has nothing to pay with.
+    #[test]
+    fn an_exchange_the_worker_cannot_pay_for_is_answered_503() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = listener.local_addr().unwrap();
+            // Answers at once, so that a worker that could pay would be seen to.
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    tokio::spawn(async move {
+                        let mut asked = [0; 1024];
+                        let _read = stream.read(&mut asked).await;
+                        let _said = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                            .await;
+                    });
+                }
+            });
+
+            let proxy = served_by(upstream, Upstream::Ours, Downstream::Hyper);
+            let limits = H1Limits {
+                storage: 0,
+                ..H1Limits::default()
+            };
+            let worker = Worker::with_limits(Arc::clone(&proxy), limits);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+
+            assert_eq!(
+                status_over_http1(front).await,
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            let up = proxy.metrics.upstream_slot("up");
+            let scrape = proxy.metrics.render(&["web".to_owned()], &[("up", up)]);
+            assert!(
+                scrape.contains(
+                    "edgerush_listener_local_answers_total{listener=\"web\",reason=\"exhausted\"} 1\n"
+                ),
+                "{scrape}"
+            );
+            assert!(
+                scrape.contains("edgerush_upstream_failures_total{upstream=\"up\"} 0\n"),
+                "{scrape}"
+            );
+        }));
+    }
+
+    /// A local answer of the request core reaches the client from a worker that has run
+    /// out, as our own server writes it from the provision (14 §8): here the head that asks
+    /// takes the whole limit, and names no host.
+    #[test]
+    fn a_worker_that_has_run_out_still_gives_its_own_answers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let (_held, nowhere) = refusing();
+            let proxy = served_by(nowhere, Upstream::Ours, Downstream::Ours);
+            let limits = H1Limits {
+                storage: crate::upstream::h1::blocks::SMALL,
+                ..H1Limits::default()
+            };
+            let worker = Worker::with_limits(Arc::clone(&proxy), limits);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+
+            let mut client = tokio::net::TcpStream::connect(front).await.unwrap();
+            client
+                .write_all(b"GET / HTTP/1.1\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut received = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                received.starts_with(b"HTTP/1.1 400 "),
+                "{}",
+                String::from_utf8_lossy(&received)
+            );
+        }));
     }
 
     /// An exchange that ends without an answer says which of the named reasons it

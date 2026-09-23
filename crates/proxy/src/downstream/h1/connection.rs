@@ -92,6 +92,12 @@ impl Default for Budget {
     }
 }
 
+/// Marks a response as the data plane's own answer rather than one it forwards: its head
+/// is paid for from the worker's provision, so that a worker that has run out can still say
+/// so (14 §8).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Local;
+
 /// How serving a connection ended, for the caller and for tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ended {
@@ -327,12 +333,14 @@ impl From<Stop> for Ended {
 struct Connection<S> {
     socket: S,
     inbound: Rc<RefCell<Inbound>>,
-    /// What is waiting to be written, each with what it is charged: the storage it holds
-    /// that nothing else pays for (14 §8).
-    queued: VecDeque<(Bytes, usize)>,
+    /// What is waiting to be written, each with what it is charged — the storage it holds
+    /// that nothing else pays for (14 §8) — and whether that is from the provision.
+    queued: VecDeque<(Bytes, usize, bool)>,
     queued_bytes: usize,
     /// The charge for everything queued, while anything has been.
     queued_charge: Option<Charge>,
+    /// The same for the connection's own answers, from the provision.
+    answer_charge: Option<Charge>,
     storage: Rc<Storage>,
     deadlines: Deadlines,
     /// When the one timer is set for, so that it is set again only when that changes.
@@ -364,6 +372,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             queued: VecDeque::new(),
             queued_bytes: 0,
             queued_charge: None,
+            answer_charge: None,
             storage,
             deadlines: Deadlines::accepted(now(), settings.bounds),
             armed: None,
@@ -405,22 +414,43 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     ///
     /// [`Stop::Exhausted`] if the worker cannot pay for them; nothing is queued.
     fn queue(&mut self, bytes: Bytes, charged: usize) -> Result<(), Stop> {
+        self.queue_from(bytes, charged, false)
+    }
+
+    /// The same, from the provision if `answer` says this is the connection's own answer.
+    fn queue_from(&mut self, bytes: Bytes, charged: usize, answer: bool) -> Result<(), Stop> {
         if bytes.is_empty() {
             return Ok(());
         }
-        let paid = match self.queued_charge.as_mut() {
+        let held = if answer {
+            &mut self.answer_charge
+        } else {
+            &mut self.queued_charge
+        };
+        let paid = match held.as_mut() {
             Some(charge) => charge.grow(charged),
-            None => self
-                .storage
-                .reserve(charged)
-                .map(|charge| self.queued_charge = Some(charge)),
+            None => {
+                let reserved = if answer {
+                    self.storage.reserve_answer(charged)
+                } else {
+                    self.storage.reserve(charged)
+                };
+                reserved.map(|charge| *held = Some(charge))
+            }
         };
         if paid.is_err() {
             return Err(Stop::Exhausted);
         }
         self.queued_bytes += bytes.len();
-        self.queued.push_back((bytes, charged));
+        self.queued.push_back((bytes, charged, answer));
         Ok(())
+    }
+
+    /// Queues the head of the connection's own answer or refusal, built here, from the
+    /// provision.
+    fn queue_answer(&mut self, built: Vec<u8>) -> Result<(), Stop> {
+        let charged = built.capacity();
+        self.queue_from(Bytes::from(built), charged, true)
     }
 
     /// Queues what was built here, a head or framing: the whole of the vector it was built
@@ -446,7 +476,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     /// Writes what is queued, as far as the socket takes it.
     fn poll_write_queued(&mut self, context: &mut Context<'_>) -> Result<bool, Stop> {
         let mut moved = false;
-        while let Some((front, charged)) = self.queued.front_mut() {
+        while let Some((front, charged, answer)) = self.queued.front_mut() {
             match Pin::new(&mut self.socket).poll_write(context, front) {
                 Poll::Ready(Ok(0) | Err(_)) => return Err(Stop::Gone),
                 Poll::Ready(Ok(written)) => {
@@ -454,9 +484,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     self.queued_bytes -= written;
                     if front.is_empty() {
                         // Gone to the socket, and with it what it held.
-                        let charged = *charged;
+                        let (charged, answer) = (*charged, *answer);
                         self.queued.pop_front();
-                        if let Some(charge) = self.queued_charge.as_mut() {
+                        let held = if answer {
+                            self.answer_charge.as_mut()
+                        } else {
+                            self.queued_charge.as_mut()
+                        };
+                        if let Some(charge) = held {
                             charge.shrink(charged);
                         }
                     }
@@ -810,7 +845,14 @@ where
             // Only an interim status is refused, and the core returns none.
             Err(_) => return Ended::Gone,
         };
-        if let Err(stop) = connection.queue_built(head) {
+        // The data plane's own answer is written from the provision, so that a worker that
+        // has run out can still say so; one it forwards is paid for like anything else.
+        let queued = if parts.extensions.get::<Local>().is_some() {
+            connection.queue_answer(head)
+        } else {
+            connection.queue_built(head)
+        };
+        if let Err(stop) = queued {
             return stop.into();
         }
 
@@ -922,7 +964,7 @@ async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(
     {
         return Ended::Gone;
     }
-    if let Err(stop) = connection.queue_built(head) {
+    if let Err(stop) = connection.queue_answer(head) {
         return stop.into();
     }
     match connection.flush(timer).await {
@@ -1940,6 +1982,72 @@ mod tests {
             "{} bytes of the body went",
             received.iter().filter(|byte| **byte == b'x').count()
         );
+    }
+
+    /// A worker that has run out can still refuse a request it cannot read: the refusal's
+    /// head is written from the provision (14 §8). The block the head was read into takes
+    /// the whole of the limit.
+    #[tokio::test]
+    async fn a_refusal_is_written_from_the_provision() {
+        let small = crate::upstream::h1::blocks::Sizes::default().small;
+        let blocks = Rc::new(RefCell::new(Blocks::new(
+            crate::upstream::h1::blocks::Sizes::default(),
+            crate::storage::Storage::with_provision(small, 4096),
+        )));
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        client
+            .write_all(b"GET / HTTP/1.1\nhost: a\n\n")
+            .await
+            .unwrap();
+        let ended = tokio::time::timeout(
+            Duration::from_secs(10),
+            serve(server, settings(), blocks, date, echoing(&Asked::default())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ended, Ended::Refused(StatusCode::BAD_REQUEST));
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert!(received.starts_with(b"HTTP/1.1 400 "), "{received:?}");
+    }
+
+    /// And a local answer of the request core, which says so, is written from it too;
+    /// one the core forwards is not.
+    #[tokio::test]
+    async fn a_local_answer_is_written_from_the_provision() {
+        let small = crate::upstream::h1::blocks::Sizes::default().small;
+        for (local, answered) in [(true, true), (false, false)] {
+            let blocks = Rc::new(RefCell::new(Blocks::new(
+                crate::upstream::h1::blocks::Sizes::default(),
+                crate::storage::Storage::with_provision(small, 4096),
+            )));
+            let (mut client, server) = tokio::io::duplex(1 << 16);
+            client.write_all(GET).await.unwrap();
+            client.shutdown().await.unwrap();
+            let answering = move |_: Request<RequestBody>| async move {
+                let mut response = Response::new(Answer::Full(Full::new(Bytes::new())));
+                *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                if local {
+                    response.extensions_mut().insert(Local);
+                }
+                response
+            };
+            let ended = tokio::time::timeout(
+                Duration::from_secs(10),
+                serve(server, settings(), blocks, date, answering),
+            )
+            .await
+            .unwrap();
+            let mut received = Vec::new();
+            client.read_to_end(&mut received).await.unwrap();
+            if answered {
+                assert!(received.starts_with(b"HTTP/1.1 503 "), "{received:?}");
+                assert_eq!(ended, Ended::Closed);
+            } else {
+                assert!(received.is_empty(), "{received:?}");
+                assert_eq!(ended, Ended::Exhausted);
+            }
+        }
     }
 
     /// A request whose body has been read holds no storage while its answer is written:

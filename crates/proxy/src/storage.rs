@@ -31,10 +31,16 @@ use std::rc::Rc;
 /// be checked against measurement before it is adopted.
 pub const LIMIT: usize = 256 * 1024 * 1024;
 
+/// What a worker's own answers and refusals may draw on above the limit, and nothing else:
+/// enough for a worker that has run out to say so rather than close (14 §8).
+pub const PROVISION: usize = 1024 * 1024;
+
 /// One worker's account of the storage it holds for requests.
 #[derive(Debug)]
 pub struct Storage {
     limit: usize,
+    /// How far past `limit` a charge for the worker's own answers may go.
+    provision: usize,
     used: Cell<usize>,
     /// Memory its owner let go of while something else still held a piece of it, and what
     /// it is charged.
@@ -54,10 +60,17 @@ pub struct Exhausted {
 }
 
 impl Storage {
-    /// An account that may hold up to `limit` bytes, holding none.
+    /// An account that may hold up to `limit` bytes, and [`PROVISION`] more for the worker's
+    /// own answers, holding none.
     pub fn new(limit: usize) -> Rc<Self> {
+        Self::with_provision(limit, PROVISION)
+    }
+
+    /// The same, with `provision` for the worker's own answers.
+    pub fn with_provision(limit: usize, provision: usize) -> Rc<Self> {
         Rc::new(Self {
             limit,
+            provision,
             used: Cell::new(0),
             outlived: RefCell::new(Vec::new()),
         })
@@ -95,25 +108,45 @@ impl Storage {
     ///
     /// [`Exhausted`] if they do not, or if the count would overflow; nothing is charged.
     pub fn reserve(self: &Rc<Self>, bytes: usize) -> Result<Charge, Exhausted> {
-        self.take(bytes)?;
+        self.charge(bytes, Ceiling::Limit)
+    }
+
+    /// Reserves `bytes` for the worker's own answer or refusal, which may go past the limit
+    /// as far as the provision allows. Nothing else may use it: while such a charge takes
+    /// the account past its limit, [`Storage::reserve`] refuses everything.
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`] if they do not fit under the limit and the provision together.
+    pub fn reserve_answer(self: &Rc<Self>, bytes: usize) -> Result<Charge, Exhausted> {
+        self.charge(bytes, Ceiling::Provision)
+    }
+
+    fn charge(self: &Rc<Self>, bytes: usize, ceiling: Ceiling) -> Result<Charge, Exhausted> {
+        self.take(bytes, ceiling)?;
         Ok(Charge {
             storage: Rc::clone(self),
             bytes,
+            ceiling,
         })
     }
 
-    /// Counts `bytes` more as held, if they fit.
-    fn take(&self, bytes: usize) -> Result<(), Exhausted> {
+    /// Counts `bytes` more as held, if they fit under `ceiling`.
+    fn take(&self, bytes: usize, ceiling: Ceiling) -> Result<(), Exhausted> {
+        let limit = match ceiling {
+            Ceiling::Limit => self.limit,
+            Ceiling::Provision => self.limit.saturating_add(self.provision),
+        };
         let used = self.used.get();
         match used.checked_add(bytes) {
-            Some(total) if total <= self.limit => {
+            Some(total) if total <= limit => {
                 self.used.set(total);
                 Ok(())
             }
             _ => Err(Exhausted {
                 wanted: bytes,
                 used,
-                limit: self.limit,
+                limit,
             }),
         }
     }
@@ -133,6 +166,17 @@ impl Storage {
 pub struct Charge {
     storage: Rc<Storage>,
     bytes: usize,
+    /// How far it may grow.
+    ceiling: Ceiling,
+}
+
+/// Which of an account's two ceilings a charge is made under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ceiling {
+    /// The limit, which everything is held to.
+    Limit,
+    /// The limit and the provision above it, for the worker's own answers alone.
+    Provision,
 }
 
 impl Charge {
@@ -142,7 +186,7 @@ impl Charge {
     ///
     /// [`Exhausted`] if the worker cannot pay for it.
     pub fn grow(&mut self, more: usize) -> Result<(), Exhausted> {
-        self.storage.take(more)?;
+        self.storage.take(more, self.ceiling)?;
         self.bytes += more;
         Ok(())
     }
@@ -247,6 +291,37 @@ mod tests {
         let new = storage.reserve(60).unwrap();
         drop(old);
         assert_eq!(storage.used(), new.bytes());
+    }
+
+    /// The provision above the limit is for the worker's own answers alone: an ordinary
+    /// reservation stops at the limit, one for an answer goes on to the provision's end,
+    /// and while it is out nothing ordinary fits. Each charge grows only as far as the
+    /// ceiling it was made under.
+    #[test]
+    fn the_provision_is_for_the_workers_own_answers_alone() {
+        let storage = Storage::with_provision(100, 50);
+        let mut ordinary = storage.reserve(100).unwrap();
+        assert!(storage.reserve(1).is_err());
+        assert!(
+            ordinary.grow(1).is_err(),
+            "an ordinary charge grew past the limit"
+        );
+        let mut answer = storage.reserve_answer(40).unwrap();
+        assert_eq!(storage.used(), 140);
+        assert!(answer.grow(10).is_ok());
+        assert!(answer.grow(1).is_err(), "grew past the provision");
+        assert!(storage.reserve_answer(1).is_err());
+        drop(ordinary);
+        assert!(
+            storage.reserve(49).is_ok(),
+            "the limit counts the answer's charge"
+        );
+        assert!(
+            storage.reserve(51).is_err(),
+            "the limit counts the answer's charge"
+        );
+        drop(answer);
+        assert_eq!(storage.used(), 0);
     }
 
     /// Memory let go of while a piece of it is held elsewhere keeps its charge, through any

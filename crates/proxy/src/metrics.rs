@@ -140,10 +140,13 @@ pub(crate) enum Answer {
     UpstreamFailed,
     /// This worker already has as many exchanges in hand as it will take.
     TooBusy,
+    /// This worker could not pay for the storage an exchange needed
+    /// ([14 §8](../../docs/14-downstream-server.md)): its own failing, not the upstream's.
+    Exhausted,
 }
 
 impl Answer {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -153,6 +156,7 @@ impl Answer {
         Self::NoEndpoints,
         Self::UpstreamFailed,
         Self::TooBusy,
+        Self::Exhausted,
     ];
 
     /// The status that is answered with.
@@ -163,7 +167,7 @@ impl Answer {
             }
             Self::NoRoute => StatusCode::NOT_FOUND,
             Self::NoBackend => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::NoEndpoints | Self::TooBusy => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NoEndpoints | Self::TooBusy | Self::Exhausted => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamFailed => StatusCode::BAD_GATEWAY,
         }
     }
@@ -179,6 +183,7 @@ impl Answer {
             Self::NoEndpoints => "no_endpoints",
             Self::UpstreamFailed => "upstream_failed",
             Self::TooBusy => "too_busy",
+            Self::Exhausted => "exhausted",
         }
     }
 }
