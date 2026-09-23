@@ -1010,6 +1010,14 @@ impl Worker {
         if head.status.is_informational() {
             return None;
         }
+        // The engine's client reads a body by its chunks but leaves a `Content-Length`
+        // beside them in the head, and an intermediary that forwards such an answer "MUST
+        // first remove the received Content-Length field" (RFC 9112 §6.3 rule 3). Left in,
+        // the engine's server frames the answer by it and cuts a longer body short
+        // ([13 §5](../../docs/13-http1-upstream.md)).
+        if head.headers.contains_key(http::header::TRANSFER_ENCODING) {
+            head.headers.remove(http::header::CONTENT_LENGTH);
+        }
         // Read here, because `respond` takes the hop-by-hop fields off this head before
         // the trailers behind it arrive.
         let nominated = crate::hop_by_hop::nominated(&head.headers);

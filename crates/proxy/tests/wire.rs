@@ -1806,30 +1806,18 @@ async fn an_answer_with_a_length_too_big_to_count_is_refused() {
 /// message with both "ought to be handled as an error", and that an intermediary which
 /// chooses to forward it "MUST first remove the received Content-Length field and process
 /// the Transfer-Encoding". Ours takes the error route. The engine's client reads the body
-/// by its chunks but leaves the length in the head it hands over, so the client is sent
-/// that length: here it happens to match the five bytes the chunks carry, and where it
-/// does not the client is told the length and given a body cut to it. What ours buys is
-/// that nothing downstream is asked to trust a head this end could not make sense of
-/// ([13 §5](../../../docs/13-http1-upstream.md)).
+/// by its chunks but leaves the length in the head it hands over, so the gateway removes
+/// it: left in, the engine's server would tell the client that length and cut the body to
+/// it. Here the length says three and the chunks carry five, so a length that survived
+/// shows ([13 §5](../../../docs/13-http1-upstream.md)).
 #[tokio::test]
 async fn an_answer_with_both_a_length_and_chunking_is_refused_by_our_own_path() {
-    let answer = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    let answer = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     match upstream_under_test() {
         Upstream::Ours => is_refused(answer.into()).await,
-        Upstream::Hyper => {
-            let (first, _second, accepts) = told_when_answered(answer.into()).await;
-            assert!(first.starts_with("HTTP/1.1 200"), "{first}");
-            assert_eq!(accepts, 1, "the engine's client kept it");
-        }
-        // The engine's server delivers it by the length the head still carries and stops
-        // reading there: nobody asks for the chunk that ends the body, so its end is never
-        // seen and the connection closes rather than goes back. EdgeRush's own server
-        // frames it by what the body says of itself, in chunks, reads it to its end, and
-        // the connection goes back.
-        Upstream::HyperConn => match downstream_under_test() {
-            Downstream::Hyper => taken(answer.into(), 2).await,
-            Downstream::Ours => taken(answer.into(), 1).await,
-        },
+        // Forwarded in chunks, whichever server sends it, read to its end, and the
+        // connection kept.
+        Upstream::Hyper | Upstream::HyperConn => taken(answer.into(), 1).await,
     }
 }
 
