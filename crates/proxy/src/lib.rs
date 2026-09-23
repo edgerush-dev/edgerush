@@ -26,6 +26,11 @@ mod request;
 mod request_body;
 mod scrape;
 mod serve;
+// Private, save when the fuzz targets are being built, for the blocks `upstream` lends.
+#[cfg(feature = "fuzzing")]
+pub mod storage;
+#[cfg(not(feature = "fuzzing"))]
+mod storage;
 // Private, save when the fuzz targets are being built: they are a crate of their own and
 // cannot otherwise reach what they drive.
 #[cfg(feature = "fuzzing")]

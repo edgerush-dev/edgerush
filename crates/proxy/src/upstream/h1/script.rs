@@ -1016,7 +1016,10 @@ mod tests {
 
         let (outcome, tape) = run(script, Budget::default(), move |socket| async move {
             let limits = H1Limits::default();
-            let blocks = Rc::new(RefCell::new(Blocks::new(Sizes::default())));
+            let blocks = Rc::new(RefCell::new(Blocks::new(
+                Sizes::default(),
+                crate::storage::Storage::new(crate::storage::LIMIT),
+            )));
             let (answer, rest) = Exchange::new(socket, blocks)
                 .send(
                     &Method::GET,

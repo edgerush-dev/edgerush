@@ -30,11 +30,19 @@
 //! of scope would have to reach the store from wherever it was dropped, and the hot path
 //! is not the place to find out whether that reach is allowed.
 //!
+//! **Every block's memory is paid for** against the worker's [`Storage`] before it is made,
+//! and stays paid for as long as it lives: lent, parked, or let go of while a frame cut
+//! from it is still held, which is when the memory is still there though no block is
+//! ([14 §8](../../../docs/14-downstream-server.md)). A block the worker cannot pay for is
+//! not made.
+//!
 //! Nothing here does I/O or reads a clock ([13 §7](../../../docs/13-http1-upstream.md)).
 
 use super::H1Limits;
+use crate::storage::{Charge, Exhausted, Storage};
 use bytes::{Buf, Bytes, BytesMut};
 use std::ops::Range;
+use std::rc::Rc;
 
 /// What a block holds when it is first lent: the read bound of
 /// [13 §7](../../../docs/13-http1-upstream.md).
@@ -96,6 +104,23 @@ impl Default for Sizes {
     }
 }
 
+/// A block's memory and what it is charged, which go everywhere together.
+///
+/// Let go of, it gives its charge back if the memory goes with it, and leaves the charge
+/// with the worker's account if a frame cut from it is still held
+/// ([`Charge::outlive`]).
+#[derive(Debug)]
+struct Memory {
+    bytes: BytesMut,
+    charge: Charge,
+}
+
+impl Drop for Memory {
+    fn drop(&mut self) {
+        self.charge.outlive(std::mem::take(&mut self.bytes));
+    }
+}
+
 /// Bytes on loan, and how far into them the reading and the writing have got.
 ///
 /// The bytes are held at their full length throughout, which is what lets the same block
@@ -111,8 +136,8 @@ impl Default for Sizes {
 #[derive(Debug)]
 pub struct Block {
     /// What is left of the block's memory, initialised throughout. Frames cut from the
-    /// front of it no longer belong to it.
-    bytes: BytesMut,
+    /// front of it no longer belong to it; its charge is for all of it.
+    memory: Memory,
     /// How much of `bytes` holds anything.
     filled: usize,
     /// How much of what it holds has been dealt with. Never past `filled`.
@@ -126,7 +151,7 @@ pub struct Block {
 impl Block {
     /// What is in it and has not been dealt with yet.
     pub fn data(&self) -> &[u8] {
-        &self.bytes[self.taken..self.filled]
+        &self.memory.bytes[self.taken..self.filled]
     }
 
     /// How much [`Block::data`] would give.
@@ -189,16 +214,16 @@ impl Block {
         let start = self.taken.saturating_add(range.start).min(self.filled);
         let count = range.len().min(self.filled - start);
         if count < self.cut {
-            let frame = Bytes::copy_from_slice(&self.bytes[start..start + count]);
+            let frame = Bytes::copy_from_slice(&self.memory.bytes[start..start + count]);
             self.consume(through.min(self.len()));
             return frame;
         }
         // The frame has to be at the front to be cut off, so what lies before it goes
         // first: bytes already dealt with, and whatever framing preceded it.
-        self.bytes.advance(start);
+        self.memory.bytes.advance(start);
         self.filled -= start;
         self.taken = 0;
-        let frame = self.bytes.split_to(count).freeze();
+        let frame = self.memory.bytes.split_to(count).freeze();
         self.filled -= count;
         self.consume(through.saturating_sub(range.end).min(self.filled));
         frame
@@ -212,12 +237,12 @@ impl Block {
         // Bytes already dealt with are in the way of nothing until the block is full, and
         // then they are in the way of everything: move what is left down over them, which
         // is a copy of what remains rather than of the block.
-        if self.filled == self.bytes.len() && self.taken > 0 {
-            self.bytes.copy_within(self.taken..self.filled, 0);
+        if self.filled == self.memory.bytes.len() && self.taken > 0 {
+            self.memory.bytes.copy_within(self.taken..self.filled, 0);
             self.filled -= self.taken;
             self.taken = 0;
         }
-        &mut self.bytes[self.filled..]
+        &mut self.memory.bytes[self.filled..]
     }
 
     /// Says that `count` bytes were put into the front of [`Block::room`].
@@ -227,9 +252,12 @@ impl Block {
     /// In a debug build, if `count` is more than the room there was, for the reason
     /// [`Block::consume`] gives.
     pub fn arrived(&mut self, count: usize) {
-        let room = self.bytes.len() - self.filled;
+        let room = self.memory.bytes.len() - self.filled;
         debug_assert!(count <= room, "arrived {count} where {room} would fit");
-        self.filled = self.filled.saturating_add(count).min(self.bytes.len());
+        self.filled = self
+            .filled
+            .saturating_add(count)
+            .min(self.memory.bytes.len());
     }
 
     /// Takes the block's memory back, at its full size, with what it holds moved to the
@@ -238,16 +266,16 @@ impl Block {
     /// what it holds, with no room after it.
     fn reclaim(&mut self) -> bool {
         let held = self.len();
-        self.bytes.advance(self.taken);
-        self.bytes.truncate(held);
+        self.memory.bytes.advance(self.taken);
+        self.memory.bytes.truncate(held);
         self.filled = held;
         self.taken = 0;
-        if !self.bytes.try_reclaim(self.size - held) {
+        if !self.memory.bytes.try_reclaim(self.size - held) {
             return false;
         }
         // The one place memory taken back is set to anything. What was there is bytes of
         // frames that have gone, and a read is given initialised room to put its bytes in.
-        self.bytes.resize(self.size, 0);
+        self.memory.bytes.resize(self.size, 0);
         true
     }
 }
@@ -260,21 +288,25 @@ impl Block {
 pub struct Blocks {
     /// Free blocks, by the size they were made at. Some may still have frames cut from
     /// them in the engine's hands, and are lent only once those have gone.
-    small: Vec<BytesMut>,
-    large: Vec<BytesMut>,
+    small: Vec<Memory>,
+    large: Vec<Memory>,
     /// Free buffers for what is waiting to be written, empty and with their room made.
     staging: Vec<Vec<u8>>,
     sizes: Sizes,
+    /// What every block made here is paid for against.
+    storage: Rc<Storage>,
 }
 
 impl Blocks {
-    /// A worker's blocks, holding nothing until something is asked of them.
-    pub fn new(sizes: Sizes) -> Self {
+    /// A worker's blocks, holding nothing until something is asked of them, and paying for
+    /// what they make against `storage`.
+    pub fn new(sizes: Sizes, storage: Rc<Storage>) -> Self {
         Self {
             small: Vec::new(),
             large: Vec::new(),
             staging: Vec::new(),
             sizes,
+            storage,
         }
     }
 
@@ -292,8 +324,13 @@ impl Blocks {
     ///
     /// One that has been used before if there is one, and a new one otherwise. Either way
     /// it holds nothing as far as its reader is concerned.
-    pub fn take(&mut self) -> Block {
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`] if a new one is needed and the worker cannot pay for it.
+    pub fn take(&mut self) -> Result<Block, Exhausted> {
         Self::lend(
+            &self.storage,
             &mut self.small,
             self.sizes.small,
             self.sizes.small / 2,
@@ -308,13 +345,18 @@ impl Blocks {
     /// moves into a free block and it is given back, to be taken back into use once they
     /// have. A block that is simply full of one thing — a head that does not fit — is
     /// grown ([`Blocks::grow`]).
-    pub fn refill(&mut self, mut block: Block) -> Block {
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`] if a new block is needed and the worker cannot pay for it. The block
+    /// and what it held are let go of.
+    pub fn refill(&mut self, mut block: Block) -> Result<Block, Exhausted> {
         if !block.room().is_empty() {
-            return block;
+            return Ok(block);
         }
-        if block.bytes.len() < block.size {
+        if block.memory.bytes.len() < block.size {
             if block.reclaim() {
-                return block;
+                return Ok(block);
             }
             let free = if block.size >= self.sizes.large {
                 &mut self.large
@@ -324,14 +366,14 @@ impl Blocks {
             let held = block.len();
             // Room for what it holds, and half a block more to read into.
             let least = held.saturating_add(block.size / 2).min(block.size);
-            let mut fresh = Self::lend(free, block.size, least, block.cut);
+            let mut fresh = Self::lend(&self.storage, free, block.size, least, block.cut)?;
             fresh.room()[..held].copy_from_slice(block.data());
             fresh.arrived(held);
             block.consume(held);
             self.give(block);
             block = fresh;
             if !block.room().is_empty() {
-                return block;
+                return Ok(block);
             }
         }
         self.grow(block)
@@ -343,24 +385,31 @@ impl Blocks {
     /// that is already large gives it back unchanged: there is one step, because `large`
     /// is bigger than the most a head may be and a head is the only thing that has to be
     /// assembled whole.
-    pub fn grow(&mut self, block: Block) -> Block {
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`] if a new grown block is needed and the worker cannot pay for it while
+    /// still paying for this one, as it has to until what is in it has moved across. The
+    /// block and what it held are let go of.
+    pub fn grow(&mut self, block: Block) -> Result<Block, Exhausted> {
         if block.capacity() >= self.sizes.large {
-            return block;
+            return Ok(block);
         }
         // Whole: its size is what guarantees a head fits in it.
         let (large, cut) = (self.sizes.large, self.sizes.cut);
-        let mut grown = Self::lend(&mut self.large, large, large, cut);
+        let mut grown = Self::lend(&self.storage, &mut self.large, large, large, cut)?;
         let data = block.data();
-        grown.bytes[..data.len()].copy_from_slice(data);
+        grown.memory.bytes[..data.len()].copy_from_slice(data);
         grown.filled = data.len();
         self.give(block);
-        grown
+        Ok(grown)
     }
 
     /// Takes a block back, to be lent again.
     ///
     /// Dropped rather than kept when there are already enough of its size: memory parked
-    /// here is memory a worker is holding for work it is not doing.
+    /// here is memory a worker is holding for work it is not doing. A block dropped while
+    /// a frame cut from it is still held stays charged until the frame has gone.
     pub fn give(&mut self, block: Block) {
         let (free, most) = if block.capacity() >= self.sizes.large {
             (&mut self.large, self.sizes.kept)
@@ -368,7 +417,7 @@ impl Blocks {
             (&mut self.small, self.sizes.parked)
         };
         if free.len() < most {
-            free.push(block.bytes);
+            free.push(block.memory);
         }
     }
 
@@ -405,25 +454,34 @@ impl Blocks {
         self.staging.truncate(keep);
     }
 
-    /// Trims down to what a quiet worker keeps, for the worker's once-a-second sweep.
+    /// Trims down to what a quiet worker keeps, for the worker's once-a-second sweep, and
+    /// releases the charges of blocks let go of whose last frame has gone since.
     ///
     /// Under load the blocks trimmed are made again within the second, which is a few
     /// allocations a second rather than one a request; once the load has gone, they are
     /// not.
     pub fn sweep(&mut self) {
         self.trim(self.sizes.kept);
+        self.storage.sweep();
     }
 
     /// A free block with at least `least` of its memory left, if there is one, and a new
-    /// one if there is not.
+    /// one paid for against `storage` if there is not.
     ///
     /// One with that much left is lent as it is, frames cut from it or not: what is left is
     /// its own, and taking the rest back would mean setting all of it to zeros, for every
     /// small answer. One with less is taken back whole if its frames have gone, and passed
     /// over otherwise, left where it is to be taken back once they have. A new block is set
     /// to zeros once, at its full length; one lent as it is, is not set to anything.
-    fn lend(free: &mut Vec<BytesMut>, size: usize, least: usize, cut: usize) -> Block {
-        let found = free.iter_mut().rposition(|bytes| {
+    fn lend(
+        storage: &Rc<Storage>,
+        free: &mut Vec<Memory>,
+        size: usize,
+        least: usize,
+        cut: usize,
+    ) -> Result<Block, Exhausted> {
+        let found = free.iter_mut().rposition(|memory| {
+            let bytes = &mut memory.bytes;
             if bytes.len() >= least {
                 return true;
             }
@@ -435,17 +493,24 @@ impl Blocks {
             }
             false
         });
-        let bytes = match found {
+        let memory = match found {
             Some(at) => free.swap_remove(at),
-            None => BytesMut::zeroed(size),
+            // Paid for before it is made.
+            None => {
+                let charge = storage.reserve(size)?;
+                Memory {
+                    bytes: BytesMut::zeroed(size),
+                    charge,
+                }
+            }
         };
-        Block {
-            bytes,
+        Ok(Block {
+            memory,
             filled: 0,
             taken: 0,
             size,
             cut,
-        }
+        })
     }
 }
 
@@ -475,8 +540,8 @@ mod tests {
 
     #[test]
     fn a_block_starts_empty_and_at_its_size() {
-        let mut blocks = Blocks::new(sizes());
-        let block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let block = blocks.take().unwrap();
         assert!(block.is_empty());
         assert_eq!(block.len(), 0);
         assert_eq!(block.data(), b"");
@@ -485,8 +550,8 @@ mod tests {
 
     #[test]
     fn what_was_put_in_is_what_comes_out() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         assert_eq!(put(&mut block, b"hello"), 5);
         assert_eq!(block.data(), b"hello");
         block.consume(2);
@@ -496,12 +561,12 @@ mod tests {
 
     #[test]
     fn a_block_used_again_shows_nothing_of_what_it_held() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         put(&mut block, b"secrets");
         blocks.give(block);
 
-        let again = blocks.take();
+        let again = blocks.take().unwrap();
         assert!(again.is_empty(), "a lent block carried something over");
         assert_eq!(again.data(), b"");
         // The same memory came back rather than being made again: that is the point of
@@ -511,13 +576,13 @@ mod tests {
 
     #[test]
     fn a_block_lent_again_is_not_cleared() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         put(&mut block, b"was here before!");
         block.consume(16);
         blocks.give(block);
 
-        let mut again = blocks.take();
+        let mut again = blocks.take().unwrap();
         // Clearing a block that is about to be written over is work nobody asked for, and
         // not doing it is why a block is lent rather than made. What was in it is still
         // there, out of reach of `data` and harmless. This is the module's one claim that
@@ -531,8 +596,8 @@ mod tests {
 
     #[test]
     fn room_is_what_is_left_and_runs_out() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         assert_eq!(block.room().len(), 16);
         put(&mut block, &[b'x'; 16]);
         assert_eq!(block.room().len(), 0, "a full block offered room");
@@ -541,8 +606,8 @@ mod tests {
 
     #[test]
     fn using_everything_costs_no_move() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         put(&mut block, b"abcd");
         block.consume(4);
         // Dealt with entirely, so it starts again rather than holding a cursor at the end:
@@ -553,8 +618,8 @@ mod tests {
 
     #[test]
     fn a_full_block_makes_room_by_moving_what_is_left() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         put(&mut block, &[b'a'; 16]);
         block.consume(10);
         // Full, and ten of it dealt with. The six that are left move down and the ten they
@@ -565,8 +630,8 @@ mod tests {
 
     #[test]
     fn a_part_full_block_moves_nothing() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         put(&mut block, b"abcdefgh");
         block.consume(4);
         // Room remains, so the four dealt with are in nobody's way and stay where they are.
@@ -576,12 +641,12 @@ mod tests {
 
     #[test]
     fn growing_carries_what_was_in_it_across() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         put(&mut block, &[b'h'; 16]);
         block.consume(4);
 
-        let grown = blocks.grow(block);
+        let grown = blocks.grow(block).unwrap();
         assert_eq!(grown.capacity(), 64);
         assert_eq!(
             grown.data(),
@@ -594,24 +659,24 @@ mod tests {
 
     #[test]
     fn growing_a_grown_block_leaves_it_alone() {
-        let mut blocks = Blocks::new(sizes());
-        let block = blocks.take();
-        let grown = blocks.grow(block);
-        let again = blocks.grow(grown);
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let block = blocks.take().unwrap();
+        let grown = blocks.grow(block).unwrap();
+        let again = blocks.grow(grown).unwrap();
         assert_eq!(again.capacity(), 64);
         assert_eq!(blocks.parked(), 1, "the large block was not kept as it was");
     }
 
     #[test]
     fn a_grown_block_goes_back_to_its_own_size() {
-        let mut blocks = Blocks::new(sizes());
-        let block = blocks.take();
-        let grown = blocks.grow(block);
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let block = blocks.take().unwrap();
+        let grown = blocks.grow(block).unwrap();
         blocks.give(grown);
         // One small, from the growing, and one large.
         assert_eq!(blocks.parked(), 2);
         assert_eq!(
-            blocks.take().capacity(),
+            blocks.take().unwrap().capacity(),
             16,
             "a large block was lent as a small one"
         );
@@ -638,7 +703,7 @@ mod tests {
 
     #[test]
     fn a_staging_buffer_is_lent_empty_with_its_room_made() {
-        let mut blocks = Blocks::new(sizes());
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
         let buffer = blocks.take_staging(32);
         assert!(buffer.is_empty());
         assert!(
@@ -650,7 +715,7 @@ mod tests {
 
     #[test]
     fn a_staging_buffer_comes_back_empty_and_is_the_same_memory() {
-        let mut blocks = Blocks::new(sizes());
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
         let mut buffer = blocks.take_staging(32);
         buffer.extend_from_slice(b"GET / HTTP/1.1\r\n");
         let memory = buffer.as_ptr();
@@ -665,7 +730,7 @@ mod tests {
 
     #[test]
     fn a_staging_buffer_too_small_for_the_room_is_not_lent() {
-        let mut blocks = Blocks::new(sizes());
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
         let small = blocks.take_staging(8);
         blocks.give_staging(small);
         let bigger = blocks.take_staging(64);
@@ -678,7 +743,7 @@ mod tests {
 
     #[test]
     fn only_so_many_staging_buffers_are_kept() {
-        let mut blocks = Blocks::new(sizes());
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
         let held: Vec<Vec<u8>> = (0..5).map(|_| blocks.take_staging(32)).collect();
         for buffer in held {
             blocks.give_staging(buffer);
@@ -690,8 +755,8 @@ mod tests {
 
     #[test]
     fn only_so_many_are_kept() {
-        let mut blocks = Blocks::new(sizes());
-        let held: Vec<Block> = (0..5).map(|_| blocks.take()).collect();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let held: Vec<Block> = (0..5).map(|_| blocks.take().unwrap()).collect();
         for block in held {
             blocks.give(block);
         }
@@ -702,11 +767,11 @@ mod tests {
     /// them are parked: one given back beyond `kept` is freed.
     #[test]
     fn only_so_many_grown_blocks_are_kept() {
-        let mut blocks = Blocks::new(sizes());
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
         let grown: Vec<Block> = (0..3)
             .map(|_| {
-                let block = blocks.take();
-                blocks.grow(block)
+                let block = blocks.take().unwrap();
+                blocks.grow(block).unwrap()
             })
             .collect();
         for block in grown {
@@ -725,11 +790,11 @@ mod tests {
     /// each kind.
     #[test]
     fn a_sweep_keeps_what_a_quiet_worker_keeps() {
-        let mut blocks = Blocks::new(sizes());
-        let small: Vec<Block> = (0..2).map(|_| blocks.take()).collect();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let small: Vec<Block> = (0..2).map(|_| blocks.take().unwrap()).collect();
         let staging: Vec<Vec<u8>> = (0..2).map(|_| blocks.take_staging(8)).collect();
-        let block = blocks.take();
-        let grown = blocks.grow(block);
+        let block = blocks.take().unwrap();
+        let grown = blocks.grow(block).unwrap();
         for block in small {
             blocks.give(block);
         }
@@ -744,8 +809,8 @@ mod tests {
 
     #[test]
     fn trimming_drops_to_what_is_asked() {
-        let mut blocks = Blocks::new(sizes());
-        let held: Vec<Block> = (0..2).map(|_| blocks.take()).collect();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let held: Vec<Block> = (0..2).map(|_| blocks.take().unwrap()).collect();
         for block in held {
             blocks.give(block);
         }
@@ -760,8 +825,8 @@ mod tests {
     /// allocation behind it, is what a large answer spent its time on.
     #[test]
     fn a_frame_is_cut_from_the_block_rather_than_copied() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         put(&mut block, b"5\r\nhello\r\n");
         let at = block.data()[3..].as_ptr();
         let frame = block.take_frame(3..8, 10);
@@ -772,8 +837,8 @@ mod tests {
 
     #[test]
     fn what_follows_a_frame_stays_in_the_block() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         put(&mut block, b"5\r\nhello\r\n3\r\nab");
         let frame = block.take_frame(3..8, 10);
         assert_eq!(&frame[..], b"hello");
@@ -784,13 +849,13 @@ mod tests {
     /// memory the block no longer owns, and nothing read after it may land there.
     #[test]
     fn a_frame_still_held_is_never_written_over() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         put(&mut block, &[b'a'; 16]);
         let held = block.take_frame(0..16, 16);
         // Nothing of its own is left, and what it had is held: refilling it cannot take
         // that memory back.
-        let mut block = blocks.refill(block);
+        let mut block = blocks.refill(block).unwrap();
         assert!(!block.room().is_empty(), "refilled with no room");
         assert_eq!(put(&mut block, &[b'b'; 16]), 16);
         assert_eq!(&held[..], &[b'a'; 16], "a held frame was written over");
@@ -802,12 +867,12 @@ mod tests {
     /// along to the front.
     #[test]
     fn a_block_whose_frames_are_gone_is_its_own_again() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         put(&mut block, &[b'a'; 16]);
         let base = block.data().as_ptr();
         drop(block.take_frame(0..10, 10));
-        let mut block = blocks.refill(block);
+        let mut block = blocks.refill(block).unwrap();
         assert_eq!(block.data(), &[b'a'; 6], "unread bytes were lost");
         assert_eq!(block.data().as_ptr(), base, "the memory was not taken back");
         assert_eq!(block.room().len(), 10);
@@ -818,11 +883,11 @@ mod tests {
     /// what had not been dealt with moves into it.
     #[test]
     fn a_block_whose_frames_are_held_is_refilled_elsewhere_with_what_it_had() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         put(&mut block, b"0123456789abcdef");
         let held = block.take_frame(0..10, 10);
-        let mut block = blocks.refill(block);
+        let mut block = blocks.refill(block).unwrap();
         assert_eq!(block.data(), b"abcdef");
         assert_eq!(block.room().len(), 10);
         assert_eq!(&held[..], b"0123456789");
@@ -832,14 +897,14 @@ mod tests {
     /// once the frame has gone, rather than being made again.
     #[test]
     fn a_block_given_back_while_a_frame_holds_it_is_lent_again_once_it_has_gone() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         put(&mut block, &[b'a'; 16]);
         let base = block.data().as_ptr();
         let frame = block.take_frame(0..16, 16);
         blocks.give(block);
         drop(frame);
-        let mut again = blocks.take();
+        let mut again = blocks.take().unwrap();
         assert!(again.is_empty());
         assert_eq!(again.room().len(), 16);
         assert_eq!(
@@ -854,13 +919,13 @@ mod tests {
     /// for every small answer cost a request more than the copy it replaced.
     #[test]
     fn a_block_with_room_left_is_lent_again_without_being_cleared() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         put(&mut block, b"was here before!");
         drop(block.take_frame(0..4, 4));
         block.consume(block.len());
         blocks.give(block);
-        let mut again = blocks.take();
+        let mut again = blocks.take().unwrap();
         assert_eq!(
             again.room(),
             &b"here before!"[..],
@@ -875,8 +940,8 @@ mod tests {
     /// proxy 5% at saturation.
     #[test]
     fn a_small_frame_is_copied_and_the_block_keeps_its_memory() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         let base = block.room().as_ptr();
         put(&mut block, b"ab");
         let frame = block.take_frame(0..2, 2);
@@ -890,8 +955,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "consumed")]
     fn dealing_with_more_than_is_there_is_a_bug() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         put(&mut block, b"abc");
         block.consume(4);
     }
@@ -899,8 +964,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "arrived")]
     fn arriving_past_the_end_is_a_bug() {
-        let mut blocks = Blocks::new(sizes());
-        let mut block = blocks.take();
+        let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+        let mut block = blocks.take().unwrap();
         block.arrived(17);
     }
 
@@ -939,8 +1004,8 @@ mod tests {
         /// is ever written over, whatever is read after it.
         #[test]
         fn a_block_is_a_queue_of_bytes(doings in doings()) {
-            let mut blocks = Blocks::new(sizes());
-            let mut block = blocks.take();
+            let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
+            let mut block = blocks.take().unwrap();
             // Frames still held, with what each was when it was cut.
             let mut held: std::collections::VecDeque<(Bytes, Vec<u8>)> = Default::default();
             // What the block should be holding, and what to put in next: every byte put in
@@ -973,7 +1038,7 @@ mod tests {
                         // exchange gives one back.
                         if block.is_empty() {
                             blocks.give(block);
-                            block = blocks.take();
+                            block = blocks.take().unwrap();
                             expected.clear();
                         }
                     }
@@ -988,7 +1053,7 @@ mod tests {
                     }
                     Doing::Refill => {
                         if block.room().is_empty() {
-                            block = blocks.refill(block);
+                            block = blocks.refill(block).unwrap();
                         }
                     }
                     Doing::Release => {
@@ -1007,14 +1072,224 @@ mod tests {
         /// However many go out and come back, only so many are kept.
         #[test]
         fn what_is_parked_stays_bounded(rounds in 0usize..40) {
-            let mut blocks = Blocks::new(sizes());
+            let mut blocks = Blocks::new(sizes(), Storage::new(crate::storage::LIMIT));
             for _ in 0..rounds {
-                let held: Vec<Block> = (0..3).map(|_| blocks.take()).collect();
+                let held: Vec<Block> = (0..3).map(|_| blocks.take().unwrap()).collect();
                 for block in held {
                     blocks.give(block);
                 }
                 prop_assert!(blocks.parked() <= 2 * sizes().parked);
             }
+        }
+    }
+
+    /// Blocks paying against an account of `limit` bytes, and the account.
+    fn charged(limit: usize) -> (Blocks, Rc<Storage>) {
+        let storage = Storage::new(limit);
+        (Blocks::new(sizes(), Rc::clone(&storage)), storage)
+    }
+
+    /// A block is paid for when it is made, and stays paid for while it is lent and while it
+    /// is parked; lent again, it is not paid for twice.
+    #[test]
+    fn a_block_is_paid_for_once_lent_or_parked() {
+        let small = sizes().small;
+        let (mut blocks, storage) = charged(1024);
+        let block = blocks.take().unwrap();
+        assert_eq!(storage.used(), small);
+        blocks.give(block);
+        assert_eq!(storage.used(), small, "parked");
+        let again = blocks.take().unwrap();
+        let other = blocks.take().unwrap();
+        assert_eq!(storage.used(), 2 * small);
+        drop((again, other));
+        assert_eq!(storage.used(), 0);
+    }
+
+    /// A block the worker cannot pay for is not made, and nothing is charged.
+    #[test]
+    fn a_block_the_worker_cannot_pay_for_is_not_made() {
+        let (mut blocks, storage) = charged(sizes().small - 1);
+        assert!(blocks.take().is_err());
+        assert_eq!(storage.used(), 0);
+    }
+
+    /// Growing pays for the grown block while the small one is still held, because what it
+    /// holds has yet to move across.
+    #[test]
+    fn growing_is_paid_for_while_the_small_block_is_still_held() {
+        let Sizes { small, large, .. } = sizes();
+        let (mut blocks, storage) = charged(small + large - 1);
+        let block = blocks.take().unwrap();
+        assert!(blocks.grow(block).is_err());
+        assert_eq!(storage.used(), 0, "a refused growth lets go of the block");
+
+        let (mut blocks, storage) = charged(small + large);
+        let block = blocks.take().unwrap();
+        let grown = blocks.grow(block).unwrap();
+        assert_eq!(grown.capacity(), large);
+        assert_eq!(storage.used(), small + large, "the small one parked");
+    }
+
+    /// Given back to a pool that already keeps enough, a block is dropped and its memory
+    /// goes with its charge.
+    #[test]
+    fn a_block_given_back_to_a_full_pool_is_no_longer_paid_for() {
+        let Sizes { small, parked, .. } = sizes();
+        let (mut blocks, storage) = charged(1024);
+        let lent: Vec<Block> = (0..parked + 1).map(|_| blocks.take().unwrap()).collect();
+        for block in lent {
+            blocks.give(block);
+        }
+        assert_eq!(storage.used(), parked * small);
+    }
+
+    /// A block let go of while a frame cut from it is still held has not gone: its memory
+    /// stays paid for, through sweeps, until the frame has gone too.
+    #[test]
+    fn a_block_let_go_of_with_a_frame_out_stays_paid_for_until_the_frame_goes() {
+        let small = sizes().small;
+        let (mut blocks, storage) = charged(1024);
+        let mut block = blocks.take().unwrap();
+        put(&mut block, &[7; 12]);
+        let frame = block.take_frame(0..8, 8);
+        drop(block);
+        blocks.sweep();
+        assert_eq!(storage.used(), small, "released while its frame was held");
+        drop(frame);
+        blocks.sweep();
+        assert_eq!(storage.used(), 0);
+    }
+
+    /// The same for a parked block the pool lets go of, by a trim or by a sweep.
+    #[test]
+    fn a_parked_block_trimmed_with_a_frame_out_stays_paid_for_until_the_frame_goes() {
+        let small = sizes().small;
+        let (mut blocks, storage) = charged(1024);
+        let mut block = blocks.take().unwrap();
+        put(&mut block, &[7; 12]);
+        let frame = block.take_frame(0..8, 8);
+        block.consume(block.len());
+        blocks.give(block);
+        blocks.trim(0);
+        assert_eq!(blocks.parked(), 0);
+        blocks.sweep();
+        assert_eq!(storage.used(), small, "released while its frame was held");
+        drop(frame);
+        blocks.sweep();
+        assert_eq!(storage.used(), 0);
+    }
+
+    /// What a test does to a worker's blocks.
+    #[derive(Debug, Clone)]
+    enum Using {
+        Take,
+        /// Fills the block at this position, counted around those lent, with this much.
+        Fill(usize, usize),
+        /// Cuts a frame of up to this much from the block at this position.
+        Frame(usize, usize),
+        Grow(usize),
+        Refill(usize),
+        Give(usize),
+        Drop(usize),
+        DropFrame(usize),
+        Trim(usize),
+        Sweep,
+    }
+
+    fn using() -> impl Strategy<Value = Using> {
+        prop_oneof![
+            Just(Using::Take),
+            (any::<usize>(), 1usize..80).prop_map(|(at, n)| Using::Fill(at, n)),
+            (any::<usize>(), 1usize..40).prop_map(|(at, n)| Using::Frame(at, n)),
+            any::<usize>().prop_map(Using::Grow),
+            any::<usize>().prop_map(Using::Refill),
+            any::<usize>().prop_map(Using::Give),
+            any::<usize>().prop_map(Using::Drop),
+            any::<usize>().prop_map(Using::DropFrame),
+            (0usize..3).prop_map(Using::Trim),
+            Just(Using::Sweep),
+        ]
+    }
+
+    proptest! {
+        /// Whatever is lent, filled, cut, grown, given back, dropped and swept, in whatever
+        /// order: nothing passes the limit, a refusal leaves nothing charged that is not
+        /// held, and once everything is let go of and swept the account is empty — no charge
+        /// lost, none released twice.
+        #[test]
+        fn the_blocks_account_for_everything_they_make(
+            limit in 0usize..=512,
+            steps in proptest::collection::vec(using(), 0..80),
+        ) {
+            let (mut blocks, storage) = charged(limit);
+            let mut lent: Vec<Block> = Vec::new();
+            let mut frames: Vec<Bytes> = Vec::new();
+            for step in steps {
+                let pick = |at: usize, len: usize| (len > 0).then(|| at % len);
+                match step {
+                    Using::Take => {
+                        if let Ok(block) = blocks.take() {
+                            lent.push(block);
+                        }
+                    }
+                    Using::Fill(at, n) => {
+                        if let Some(at) = pick(at, lent.len()) {
+                            put(&mut lent[at], &vec![1; n]);
+                        }
+                    }
+                    Using::Frame(at, n) => {
+                        if let Some(at) = pick(at, lent.len()) {
+                            let count = n.min(lent[at].len());
+                            frames.push(lent[at].take_frame(0..count, count));
+                        }
+                    }
+                    Using::Grow(at) => {
+                        if let Some(at) = pick(at, lent.len()) {
+                            let block = lent.swap_remove(at);
+                            if let Ok(grown) = blocks.grow(block) {
+                                lent.push(grown);
+                            }
+                        }
+                    }
+                    Using::Refill(at) => {
+                        if let Some(at) = pick(at, lent.len()) {
+                            let block = lent.swap_remove(at);
+                            if let Ok(block) = blocks.refill(block) {
+                                lent.push(block);
+                            }
+                        }
+                    }
+                    Using::Give(at) => {
+                        if let Some(at) = pick(at, lent.len()) {
+                            let mut block = lent.swap_remove(at);
+                            block.consume(block.len());
+                            blocks.give(block);
+                        }
+                    }
+                    Using::Drop(at) => {
+                        if let Some(at) = pick(at, lent.len()) {
+                            drop(lent.swap_remove(at));
+                        }
+                    }
+                    Using::DropFrame(at) => {
+                        if let Some(at) = pick(at, frames.len()) {
+                            drop(frames.swap_remove(at));
+                        }
+                    }
+                    Using::Trim(keep) => blocks.trim(keep),
+                    Using::Sweep => blocks.sweep(),
+                }
+                prop_assert!(storage.used() <= limit, "{} of {limit}", storage.used());
+                let held: usize = lent.iter().map(Block::capacity).sum();
+                prop_assert!(storage.used() >= held, "{} for {held} lent", storage.used());
+            }
+            drop(lent);
+            drop(frames);
+            drop(blocks);
+            storage.sweep();
+            prop_assert_eq!(storage.used(), 0);
+            prop_assert_eq!(storage.outlived(), 0);
         }
     }
 }

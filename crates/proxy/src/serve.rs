@@ -26,6 +26,7 @@ use crate::metrics::{Answer, Metrics, Socket, Stopped};
 use crate::random::random;
 use crate::request::decide;
 use crate::request_body::RequestBody;
+use crate::storage::{self, Storage};
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Blocks, SMALL, Sizes};
@@ -581,7 +582,10 @@ impl Worker {
             client,
             pool: Rc::new(RefCell::new(Pool::default())),
             hyper_pool: Rc::new(RefCell::new(Pool::default())),
-            blocks: Rc::new(RefCell::new(Blocks::new(Sizes::within(&limits, SMALL)))),
+            blocks: Rc::new(RefCell::new(Blocks::new(
+                Sizes::within(&limits, SMALL),
+                Storage::new(storage::LIMIT),
+            ))),
             in_flight: Rc::new(Cell::new(0)),
             limits,
             deadlines,
@@ -1424,7 +1428,7 @@ mod tests {
                     Worker::with_limits(sending_to("127.0.0.1:9".parse().unwrap()), limits);
                 {
                     let mut blocks = worker.blocks.borrow_mut();
-                    let burst: Vec<_> = (0..20).map(|_| blocks.take()).collect();
+                    let burst: Vec<_> = (0..20).map(|_| blocks.take().unwrap()).collect();
                     for block in burst {
                         blocks.give(block);
                     }

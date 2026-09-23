@@ -281,13 +281,22 @@ impl<S: AsyncRead + Unpin> Exchange<S> {
     /// from frames that have gone, or grown for a head that does not fit — because a read
     /// into no room comes back with nothing, and nothing is what a close looks like.
     fn poll_fill(&mut self, cx: &mut Context<'_>) -> (Poll<io::Result<()>>, usize) {
-        let mut block = match self.incoming.take() {
-            Some(block) => block,
+        // A block the worker cannot pay for fails the read rather than waits for memory to
+        // come free (14 §8); what was held goes with it.
+        let lent = match self.incoming.take() {
+            Some(mut block) => {
+                if block.room().is_empty() {
+                    self.blocks.borrow_mut().refill(block)
+                } else {
+                    Ok(block)
+                }
+            }
             None => self.blocks.borrow_mut().take(),
         };
-        if block.room().is_empty() {
-            block = self.blocks.borrow_mut().refill(block);
-        }
+        let mut block = match lent {
+            Ok(block) => block,
+            Err(exhausted) => return (Poll::Ready(Err(io::Error::other(exhausted))), 0),
+        };
         if block.room().is_empty() {
             // Not reached while the blocks are sized by `Sizes::within`: a grown block has
             // room for anything the codec assembles whole, and the codec refuses anything
@@ -1395,7 +1404,10 @@ struct Held {
 /// Blocks of their own, for a test that is not a worker.
 #[cfg(test)]
 fn test_blocks() -> Rc<RefCell<Blocks>> {
-    Rc::new(RefCell::new(Blocks::new(super::blocks::Sizes::default())))
+    Rc::new(RefCell::new(Blocks::new(
+        super::blocks::Sizes::default(),
+        crate::storage::Storage::new(crate::storage::LIMIT),
+    )))
 }
 
 #[cfg(test)]
@@ -1403,9 +1415,9 @@ impl<S> Exchange<S> {
     /// Puts `bytes` where a read would have, for a test that starts part way through.
     fn holding(&mut self, bytes: &[u8]) {
         let mut blocks = self.blocks.borrow_mut();
-        let mut block = blocks.take();
+        let mut block = blocks.take().unwrap();
         if bytes.len() > block.capacity() {
-            block = blocks.grow(block);
+            block = blocks.grow(block).unwrap();
         }
         block.room()[..bytes.len()].copy_from_slice(bytes);
         block.arrived(bytes.len());
@@ -1690,7 +1702,49 @@ mod tests {
             peer
         });
 
-        let error = Exchange::new(ours, Rc::new(RefCell::new(Blocks::new(tiny))))
+        let error = Exchange::new(
+            ours,
+            Rc::new(RefCell::new(Blocks::new(
+                tiny,
+                crate::storage::Storage::new(crate::storage::LIMIT),
+            ))),
+        )
+        .send(
+            &Method::GET,
+            &"/".parse().unwrap(),
+            &headers(&[("host", "up.test")]),
+            &[],
+            Sending::None,
+            Empty::<Bytes>::new(),
+            &limits,
+        )
+        .await
+        .unwrap_err();
+        let _peer = answered.await.unwrap();
+
+        assert!(matches!(error, ExchangeError::Io(_)), "{error}");
+    }
+
+    /// **And a worker that cannot pay for a block to read an answer into fails the
+    /// exchange**, at once and saying why, rather than reading into nothing — which would
+    /// be taken for a close — or waiting for memory to come free (14 §8).
+    #[tokio::test]
+    async fn an_answer_the_worker_cannot_pay_to_read_is_a_failure() {
+        let (ours, theirs) = tokio::io::duplex(4096);
+        let mut peer = Peer(theirs);
+        let limits = H1Limits::default();
+        let answered = tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            // The exchange may have failed and gone already, as it should.
+            let _gone = peer
+                .0
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await;
+            peer
+        });
+
+        let blocks = Blocks::new(Sizes::default(), crate::storage::Storage::new(0));
+        let error = Exchange::new(ours, Rc::new(RefCell::new(blocks)))
             .send(
                 &Method::GET,
                 &"/".parse().unwrap(),
@@ -1704,7 +1758,15 @@ mod tests {
             .unwrap_err();
         let _peer = answered.await.unwrap();
 
-        assert!(matches!(error, ExchangeError::Io(_)), "{error}");
+        let ExchangeError::Io(cause) = &error else {
+            panic!("{error}");
+        };
+        assert!(
+            cause
+                .get_ref()
+                .is_some_and(|inner| inner.is::<crate::storage::Exhausted>()),
+            "{error}"
+        );
     }
 
     #[tokio::test]

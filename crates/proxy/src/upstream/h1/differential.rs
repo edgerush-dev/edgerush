@@ -611,12 +611,18 @@ pub fn twice(path: Path, script: &Script, ask: &Asking, budget: Budget, limits: 
 /// wrong, which is what both oracles are there to see.
 fn used_blocks(limits: &H1Limits) -> Rc<RefCell<Blocks>> {
     const STALE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 6\r\n\r\nSTALE!";
-    let mut blocks = Blocks::new(Sizes::within(limits, SMALL));
+    // Unbounded: what these oracles judge is framing, not the worker's budget, so nothing
+    // here is ever refused and nothing is skipped below.
+    let mut blocks = Blocks::new(
+        Sizes::within(limits, SMALL),
+        crate::storage::Storage::new(usize::MAX),
+    );
     // As many of each size as one exchange could want at once, and then some.
-    let mut lent: Vec<_> = (0..4).map(|_| blocks.take()).collect();
+    let mut lent: Vec<_> = (0..4).filter_map(|_| blocks.take().ok()).collect();
     for _ in 0..4 {
-        let small = blocks.take();
-        lent.push(blocks.grow(small));
+        if let Ok(grown) = blocks.take().and_then(|small| blocks.grow(small)) {
+            lent.push(grown);
+        }
     }
     for mut block in lent {
         let room = block.room();
