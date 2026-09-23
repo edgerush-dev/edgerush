@@ -206,18 +206,43 @@ impl Block {
     /// [`Block::data`], for the reason [`Block::consume`] gives. A release build holds
     /// both inside what is there instead.
     pub fn take_frame(&mut self, range: Range<usize>, through: usize) -> Bytes {
+        let (start, count) = self.placed(&range, through);
+        if count < self.cut {
+            let frame = Bytes::copy_from_slice(&self.memory.bytes[start..start + count]);
+            self.consume(through.min(self.len()));
+            return frame;
+        }
+        self.cut_at(start, count, range.end, through)
+    }
+
+    /// The same, cutting however small the frame is: for bytes that are to stay paid for
+    /// through the block they were read into for as long as they live, as a copy could
+    /// not be ([14 §8](../../../docs/14-downstream-server.md)). The block's memory is held
+    /// until the frame goes.
+    ///
+    /// # Panics
+    ///
+    /// As [`Block::take_frame`].
+    pub fn cut_frame(&mut self, range: Range<usize>, through: usize) -> Bytes {
+        let (start, count) = self.placed(&range, through);
+        self.cut_at(start, count, range.end, through)
+    }
+
+    /// Where `range` of [`Block::data`] starts in the block's memory, and how long it is,
+    /// held inside what is there.
+    fn placed(&self, range: &Range<usize>, through: usize) -> (usize, usize) {
         debug_assert!(
             range.start <= range.end && range.end <= through && through <= self.len(),
             "a frame of {range:?} through {through} of {}",
             self.len()
         );
         let start = self.taken.saturating_add(range.start).min(self.filled);
-        let count = range.len().min(self.filled - start);
-        if count < self.cut {
-            let frame = Bytes::copy_from_slice(&self.memory.bytes[start..start + count]);
-            self.consume(through.min(self.len()));
-            return frame;
-        }
+        (start, range.len().min(self.filled - start))
+    }
+
+    /// Cuts `count` bytes at `start` off as a frame, and deals with everything up to
+    /// `through`, whose frame ended at `end`.
+    fn cut_at(&mut self, start: usize, count: usize, end: usize, through: usize) -> Bytes {
         // The frame has to be at the front to be cut off, so what lies before it goes
         // first: bytes already dealt with, and whatever framing preceded it.
         self.memory.bytes.advance(start);
@@ -225,7 +250,7 @@ impl Block {
         self.taken = 0;
         let frame = self.memory.bytes.split_to(count).freeze();
         self.filled -= count;
-        self.consume(through.saturating_sub(range.end).min(self.filled));
+        self.consume(through.saturating_sub(end).min(self.filled));
         frame
     }
 

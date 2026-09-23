@@ -834,8 +834,14 @@ impl Worker {
                             let connection = Rc::clone(&ours);
                             async move { connection.worker.handle(listener, request).await }
                         };
-                        let _ended =
-                            h1::serve(replay, settings, || worker.date.get(), respond).await;
+                        let _ended = h1::serve(
+                            replay,
+                            settings,
+                            Rc::clone(&worker.blocks),
+                            || worker.date.get(),
+                            respond,
+                        )
+                        .await;
                     }
                     Ok(Some((Protocol::Http2, replay))) => {
                         let _closed = hyper::server::conn::http2::Builder::new(OnThisWorker)

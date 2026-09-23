@@ -28,7 +28,8 @@ use super::writer::{Asked, BodyFramer, Content, Delimited, write_head};
 use crate::h1::{BodyReader, CodecError, Framing, Piece};
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::upstream::h1::H1Limits;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use crate::upstream::h1::blocks::{Block, Blocks};
+use bytes::{Buf, Bytes};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
 use http_body::{Body, Frame, SizeHint};
 use std::cell::RefCell;
@@ -38,7 +39,7 @@ use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Instant, Sleep};
 
 /// How much room is made in the input for a read.
@@ -106,13 +107,21 @@ pub(crate) enum Ended {
     /// The answer's body failed after its head had gone, and the client was left with a
     /// message it can tell is unfinished.
     Cut,
+    /// The worker could not pay for what the connection needed to read (14 §8). Before a
+    /// request reaches the core no upstream is asked; after, its exchange goes with the
+    /// connection.
+    Exhausted,
 }
 
 /// What the connection has read and not yet handed on, shared with the body of the
 /// request being served.
 #[derive(Debug)]
 struct Inbound {
-    input: BytesMut,
+    /// What has been read and not yet handed on, in a block lent from the worker's blocks
+    /// while there is anything in it and given back the moment there is not (14 §3): a
+    /// connection waiting for its next request holds none.
+    input: Option<Block>,
+    blocks: Rc<RefCell<Blocks>>,
     /// The client has closed its sending half.
     ended: bool,
     /// Reading the socket failed.
@@ -153,6 +162,31 @@ impl Inbound {
         if let Some(waker) = self.waker.take() {
             waker.wake();
         }
+    }
+
+    /// Whether anything read is waiting to be handed on.
+    fn holds_any(&self) -> bool {
+        self.input.as_ref().is_some_and(|block| !block.is_empty())
+    }
+}
+
+/// What has been read and not yet handed on.
+fn unread(input: &Option<Block>) -> &[u8] {
+    input.as_ref().map_or(&[][..], Block::data)
+}
+
+/// Says the first `count` of what is unread has been handed on, and gives the block back to
+/// `blocks` if nothing is left in it.
+fn used(input: &mut Option<Block>, blocks: &RefCell<Blocks>, count: usize) {
+    if let Some(block) = input.as_mut() {
+        block.consume(count);
+    }
+    give_back_if_empty(input, blocks);
+}
+
+fn give_back_if_empty(input: &mut Option<Block>, blocks: &RefCell<Blocks>) {
+    if let Some(block) = input.take_if(|block| block.is_empty()) {
+        blocks.borrow_mut().give(block);
     }
 }
 
@@ -198,7 +232,7 @@ impl Body for IncomingBody {
             return Poll::Ready(None);
         };
         loop {
-            match reader.read(&inbound.input, inbound.ended, &inbound.limits) {
+            match reader.read(unread(&inbound.input), inbound.ended, &inbound.limits) {
                 Ok(Piece::More) => {
                     if inbound.failed {
                         this.done = true;
@@ -220,20 +254,27 @@ impl Body for IncomingBody {
                     return Poll::Pending;
                 }
                 Ok(Piece::Data { data, consumed }) => {
-                    let taken = inbound.input.split_to(consumed).freeze();
                     if data.is_empty() {
+                        used(&mut inbound.input, &inbound.blocks, consumed);
                         continue;
                     }
                     // Some of it is here already: nobody is waiting to be told to send it.
                     inbound.continue_owed = false;
-                    let frame = taken.slice(data);
+                    // Cut, however small: a frame shares the block it was read into, and is
+                    // paid for through it for as long as it lives (14 §8), which a copy
+                    // would not be.
+                    let frame = inbound
+                        .input
+                        .as_mut()
+                        .map_or_else(Bytes::new, |block| block.cut_frame(data, consumed));
+                    give_back_if_empty(&mut inbound.input, &inbound.blocks);
                     if let Some(left) = &mut this.left {
                         *left = left.saturating_sub(u64::try_from(frame.len()).unwrap_or(0));
                     }
                     return Poll::Ready(Some(Ok(Frame::data(frame))));
                 }
                 Ok(Piece::End { trailers, consumed }) => {
-                    inbound.input.advance(consumed);
+                    used(&mut inbound.input, &inbound.blocks, consumed);
                     inbound.reader = None;
                     inbound.continue_owed = false;
                     this.done = true;
@@ -268,6 +309,17 @@ impl Body for IncomingBody {
 enum Stop {
     TimedOut(Clock),
     Gone,
+    Exhausted,
+}
+
+impl From<Stop> for Ended {
+    fn from(stop: Stop) -> Self {
+        match stop {
+            Stop::TimedOut(clock) => Self::TimedOut(clock),
+            Stop::Gone => Self::Gone,
+            Stop::Exhausted => Self::Exhausted,
+        }
+    }
 }
 
 /// The connection's socket, what it has queued to write, and its deadlines.
@@ -285,12 +337,13 @@ struct Connection<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
-    /// A connection accepted now.
-    fn new(socket: S, settings: Settings) -> Self {
+    /// A connection accepted now, reading into blocks lent from `blocks`.
+    fn new(socket: S, settings: Settings, blocks: Rc<RefCell<Blocks>>) -> Self {
         Self {
             socket,
             inbound: Rc::new(RefCell::new(Inbound {
-                input: BytesMut::new(),
+                input: None,
+                blocks,
                 ended: false,
                 failed: false,
                 reader: None,
@@ -370,42 +423,66 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     /// Reads one block from the socket into the input, if the input holds less than
     /// `room`, taking no more than brings it to `room`; says whether anything arrived or the
     /// client closed.
-    fn poll_read(&mut self, context: &mut Context<'_>, room: usize) -> bool {
-        let mut inbound = self.inbound.borrow_mut();
-        if inbound.ended || inbound.failed || inbound.input.len() >= room {
-            return false;
+    ///
+    /// The input's block is borrowed for the read and given back if it brought nothing:
+    /// a wake with nothing to read, which a stale readiness report gives, leaves the
+    /// connection holding no storage while it waits again (14 §3).
+    ///
+    /// # Errors
+    ///
+    /// [`Stop::Exhausted`] if the worker cannot pay for a block to read into. What the
+    /// input held may be lost with it, so the connection cannot go on.
+    fn poll_read(&mut self, context: &mut Context<'_>, room: usize) -> Result<bool, Stop> {
+        let mut guard = self.inbound.borrow_mut();
+        let inbound = &mut *guard;
+        let held = inbound.input.as_ref().map_or(0, Block::len);
+        if inbound.ended || inbound.failed || held >= room {
+            return Ok(false);
         }
-        let most = (room - inbound.input.len()).min(READ_BLOCK);
-        inbound.input.reserve(most.min(READ));
-        let polled = {
-            let mut limited = (&mut inbound.input).limit(most);
-            let reading = std::pin::pin!(self.socket.read_buf(&mut limited));
-            reading.poll(context)
+        let lent = match inbound.input.take() {
+            Some(mut block) => {
+                if block.room().is_empty() {
+                    inbound.blocks.borrow_mut().refill(block)
+                } else {
+                    Ok(block)
+                }
+            }
+            None => inbound.blocks.borrow_mut().take(),
         };
+        let Ok(mut block) = lent else {
+            return Err(Stop::Exhausted);
+        };
+        let most = (room - held).min(READ_BLOCK);
+        let space = block.room();
+        let take = space.len().min(most);
+        let mut read = ReadBuf::new(&mut space[..take]);
+        let polled = Pin::new(&mut self.socket).poll_read(context, &mut read);
+        let arrived = read.filled().len();
+        block.arrived(arrived);
+        inbound.input = Some(block);
         match polled {
-            Poll::Pending => false,
-            Poll::Ready(Ok(0)) => {
+            Poll::Pending => {
+                give_back_if_empty(&mut inbound.input, &inbound.blocks);
+                return Ok(false);
+            }
+            Poll::Ready(Ok(())) if arrived == 0 => {
+                give_back_if_empty(&mut inbound.input, &inbound.blocks);
                 inbound.ended = true;
                 inbound.wake();
-                drop(inbound);
-                self.spend(0);
-                true
             }
-            Poll::Ready(Ok(read)) => {
-                drop(inbound);
-                self.spend(read);
+            Poll::Ready(Ok(())) => {
+                inbound.wake();
                 self.deadlines.bytes_arrived(now());
-                self.inbound.borrow_mut().wake();
-                true
             }
             Poll::Ready(Err(_)) => {
+                give_back_if_empty(&mut inbound.input, &inbound.blocks);
                 inbound.failed = true;
                 inbound.wake();
-                drop(inbound);
-                self.spend(0);
-                true
             }
         }
+        drop(guard);
+        self.spend(arrived);
+        Ok(true)
     }
 
     /// Checks the one deadline that is next, setting the timer again if it has moved.
@@ -478,6 +555,7 @@ fn takes_trailers(headers: &HeaderMap) -> bool {
 pub(crate) async fn serve<S, R, F, B>(
     socket: S,
     settings: Settings,
+    blocks: Rc<RefCell<Blocks>>,
     date: impl Fn() -> HttpDate,
     mut respond: R,
 ) -> Ended
@@ -488,7 +566,7 @@ where
     B: Body<Data = Bytes> + Unpin,
 {
     let limits = settings.limits;
-    let mut connection = Connection::new(socket, settings);
+    let mut connection = Connection::new(socket, settings, blocks);
     let mut timer = std::pin::pin!(tokio::time::sleep_until(Instant::now()));
 
     loop {
@@ -501,7 +579,7 @@ where
                 }
                 let found = {
                     let inbound = connection.inbound.borrow();
-                    reader.read(&inbound.input, &limits)
+                    reader.read(unread(&inbound.input), &limits)
                 };
                 match found {
                     Err(error) => return Poll::Ready(Err(Err(error))),
@@ -512,7 +590,7 @@ where
                 }
                 let (ended, failed, empty) = {
                     let inbound = connection.inbound.borrow();
-                    (inbound.ended, inbound.failed, inbound.input.is_empty())
+                    (inbound.ended, inbound.failed, !inbound.holds_any())
                 };
                 if ended || failed {
                     // Between requests a close is the client's to make; part way through a
@@ -523,8 +601,14 @@ where
                         Ended::Gone
                     })));
                 }
-                // The head's own bound, plus a read's worth, is all it may hold.
-                if !connection.poll_read(context, limits.head + READ) {
+                // The head's own bound, plus a read's worth, is all it may hold. A worker
+                // that cannot pay for a block to read it into closes the connection before
+                // the request reaches the core, so no upstream is asked (14 §8).
+                let read = match connection.poll_read(context, limits.head + READ) {
+                    Ok(read) => read,
+                    Err(stop) => return Poll::Ready(Err(Ok(stop.into()))),
+                };
+                if !read {
                     if let Err(Stop::TimedOut(clock)) =
                         connection.poll_deadline(context, timer.as_mut())
                     {
@@ -541,7 +625,11 @@ where
             Err(Err(error)) => return refuse(&mut connection, timer.as_mut(), error, &date).await,
         };
         connection.deadlines.head_read();
-        connection.inbound.borrow_mut().input.advance(consumed);
+        {
+            let mut inbound = connection.inbound.borrow_mut();
+            let inbound = &mut *inbound;
+            used(&mut inbound.input, &inbound.blocks, consumed);
+        }
         let arrived = match arrival(&head) {
             Ok(arrived) => arrived,
             Err(error) => return refuse(&mut connection, timer.as_mut(), error, &date).await,
@@ -585,7 +673,7 @@ where
         // The answer, with both directions kept moving while it is worked out.
         let answer = {
             let mut responding = std::pin::pin!(respond(request));
-            poll_fn(|context| {
+            poll_fn(|context| -> Poll<Result<Response<B>, Stop>> {
                 connection.inbound.borrow_mut().heard_by(context);
                 loop {
                     if connection.spent() {
@@ -615,7 +703,7 @@ where
                     // hear a client that goes, keeping what arrives for the next request
                     // up to the read-ahead bound.
                     let room = if body_done { READ_AHEAD } else { limits.head };
-                    if (wanted || body_done) && connection.poll_read(context, room) {
+                    if (wanted || body_done) && connection.poll_read(context, room)? {
                         moved = true;
                         connection.deadlines.body_moved(now());
                         let inbound = connection.inbound.borrow();
@@ -635,8 +723,7 @@ where
         };
         let response = match answer {
             Ok(response) => response,
-            Err(Stop::Gone) => return Ended::Gone,
-            Err(Stop::TimedOut(clock)) => return Ended::TimedOut(clock),
+            Err(stop) => return stop.into(),
         };
         // A `100` not yet written is never written now: the answer says what it would have.
         connection.inbound.borrow_mut().continue_due = false;
@@ -675,7 +762,7 @@ where
 
         let mut framer = BodyFramer::new(written.delimited);
         let mut body_left = written.delimited != Delimited::Nothing;
-        let sent = poll_fn(|context| {
+        let sent = poll_fn(|context| -> Poll<Result<bool, Stop>> {
             loop {
                 if connection.spent() {
                     return connection.yield_turn(context);
@@ -725,7 +812,7 @@ where
                 }
                 // An upload the answer did not wait for is still read for it.
                 let wanted = connection.inbound.borrow().wanted;
-                if wanted && connection.poll_read(context, limits.head) {
+                if wanted && connection.poll_read(context, limits.head)? {
                     moved = true;
                 }
                 if !body_left && connection.queued.is_empty() {
@@ -742,15 +829,14 @@ where
         match sent {
             Ok(true) => {}
             Ok(false) => return Ended::Cut,
-            Err(Stop::Gone) => return Ended::Gone,
-            Err(Stop::TimedOut(clock)) => return Ended::TimedOut(clock),
+            Err(stop) => return stop.into(),
         }
         // A kept connection's request had ended when its answer began (`persistent`), and
         // nothing is read while the answer is written unless that request's body asks.
         if written.closes {
             return Ended::Answered;
         }
-        let read_ahead = !connection.inbound.borrow().input.is_empty();
+        let read_ahead = connection.inbound.borrow().holds_any();
         connection.deadlines.answered(now(), read_ahead);
     }
 }
@@ -785,8 +871,7 @@ async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(
     connection.queue(Bytes::from(head));
     match connection.flush(timer).await {
         Ok(()) => Ended::Refused(status),
-        Err(Stop::Gone) => Ended::Gone,
-        Err(Stop::TimedOut(clock)) => Ended::TimedOut(clock),
+        Err(stop) => stop.into(),
     }
 }
 
@@ -889,6 +974,14 @@ mod tests {
         }
     }
 
+    /// Blocks paying against a worker's account of the usual size.
+    fn blocks() -> Rc<RefCell<Blocks>> {
+        Rc::new(RefCell::new(Blocks::new(
+            crate::upstream::h1::blocks::Sizes::default(),
+            crate::storage::Storage::new(crate::storage::LIMIT),
+        )))
+    }
+
     fn settings() -> Settings {
         Settings {
             limits: H1Limits::default(),
@@ -960,7 +1053,7 @@ mod tests {
             client.read_to_end(&mut received).await.unwrap();
             String::from_utf8_lossy(&received).into_owned()
         };
-        let serving = serve(server, settings(), date, respond);
+        let serving = serve(server, settings(), blocks(), date, respond);
         let (received, ended) = tokio::time::timeout(Duration::from_secs(30), async {
             tokio::join!(writing, serving)
         })
@@ -1128,7 +1221,7 @@ mod tests {
         // The client waits for the 100 before sending its body.
         let (mut client, server) = tokio::io::duplex(1 << 16);
         let asked = Asked::default();
-        let serving = serve(server, settings(), date, echoing(&asked));
+        let serving = serve(server, settings(), blocks(), date, echoing(&asked));
         let talking = async move {
             client.write_all(head).await.unwrap();
             let mut seen = Vec::new();
@@ -1163,7 +1256,7 @@ mod tests {
         // An HTTP/1.0 client that waits hears nothing until it gives up waiting and sends.
         let old = b"POST / HTTP/1.0\r\nexpect: 100-continue\r\ncontent-length: 3\r\n\r\n";
         let (mut client, server) = tokio::io::duplex(1 << 16);
-        let serving = serve(server, settings(), date, echoing(&asked));
+        let serving = serve(server, settings(), blocks(), date, echoing(&asked));
         let talking = async move {
             client.write_all(old).await.unwrap();
             let mut early = [0; 64];
@@ -1214,7 +1307,7 @@ mod tests {
             // Bounded, so that a deadline never set fails here rather than waiting forever.
             let ended = tokio::time::timeout(
                 after + Duration::from_secs(1),
-                serve(server, settings(), date, echoing(&asked)),
+                serve(server, settings(), blocks(), date, echoing(&asked)),
             )
             .await
             .unwrap_or_else(|_| panic!("{clock:?} never ran out"));
@@ -1250,7 +1343,10 @@ mod tests {
         };
         let started = Instant::now();
         let (ended, _client) = tokio::time::timeout(Duration::from_secs(60), async {
-            tokio::join!(serve(server, settings(), date, echoing(&asked)), trickling)
+            tokio::join!(
+                serve(server, settings(), blocks(), date, echoing(&asked)),
+                trickling
+            )
         })
         .await
         .expect("the first request's deadline never ran out");
@@ -1289,7 +1385,7 @@ mod tests {
             let counting = Rc::clone(&counting);
             async move { Response::new(Plenty(counting)) }
         };
-        let serving = serve(server, settings(), date, answering);
+        let serving = serve(server, settings(), blocks(), date, answering);
         // Long enough for an unbounded driver to take far more than it may.
         let _still = tokio::time::timeout(Duration::from_millis(200), serving).await;
         assert!(
@@ -1333,7 +1429,7 @@ mod tests {
         const PIECE: usize = 256;
         let (mut client, server) = tokio::io::duplex(PIPE);
         let waiting = |_: Request<RequestBody>| std::future::pending::<Response<Answer>>();
-        let serving = serve(server, settings(), date, waiting);
+        let serving = serve(server, settings(), blocks(), date, waiting);
         let sending = async move {
             client.write_all(GET).await.unwrap();
             let piece = [b'x'; PIECE];
@@ -1390,6 +1486,7 @@ mod tests {
                         budget,
                         ..settings()
                     },
+                    blocks(),
                     date,
                     respond,
                 )));
@@ -1416,6 +1513,7 @@ mod tests {
                 let small_served = tokio::task::spawn_local(serve(
                     server,
                     settings(),
+                    blocks(),
                     date,
                     echoing(&Asked::default()),
                 ));
@@ -1495,6 +1593,7 @@ mod tests {
                 budget,
                 ..settings()
             },
+            blocks(),
             date,
             answering,
         )));
@@ -1553,12 +1652,27 @@ mod tests {
     async fn one_read_takes_at_most_a_block() {
         let (mut client, server) = tokio::io::duplex(1 << 20);
         client.write_all(&vec![b'x'; 256 * 1024]).await.unwrap();
-        let mut connection = Connection::new(server, settings());
-        connection.inbound.borrow_mut().input.reserve(1 << 20);
+        let mut connection = Connection::new(server, settings(), blocks());
+        // Room for far more than a block, as a grown block has.
+        {
+            let mut inbound = connection.inbound.borrow_mut();
+            let mut blocks = inbound.blocks.borrow_mut();
+            let small = blocks.take().unwrap();
+            let grown = blocks.grow(small).unwrap();
+            assert!(grown.capacity() > 2 * READ_BLOCK);
+            drop(blocks);
+            inbound.input = Some(grown);
+        }
         let arrived =
             poll_fn(|context| Poll::Ready(connection.poll_read(context, usize::MAX))).await;
-        assert!(arrived);
-        assert_eq!(connection.inbound.borrow().input.len(), READ_BLOCK);
+        assert_eq!(arrived, Ok(true));
+        let held = connection
+            .inbound
+            .borrow()
+            .input
+            .as_ref()
+            .map_or(0, Block::len);
+        assert_eq!(held, READ_BLOCK);
     }
 
     /// A head that arrives in part while a long answer is still streaming gets its full time
@@ -1571,7 +1685,7 @@ mod tests {
         let streaming = |_: Request<RequestBody>| async { Response::new(Slow::new(TICKS)) };
         let started = Instant::now();
         let serving = async move {
-            let ended = serve(server, settings(), date, streaming).await;
+            let ended = serve(server, settings(), blocks(), date, streaming).await;
             (ended, Instant::now())
         };
         let talking = async move {
@@ -1623,5 +1737,163 @@ mod tests {
             "{received}"
         );
         assert_eq!(ended, Ended::Refused(StatusCode::BAD_REQUEST));
+    }
+
+    /// Blocks paying against an account of `limit` bytes, and the account.
+    fn blocks_within(limit: usize) -> (Rc<RefCell<Blocks>>, Rc<crate::storage::Storage>) {
+        let storage = crate::storage::Storage::new(limit);
+        let blocks = Blocks::new(
+            crate::upstream::h1::blocks::Sizes::default(),
+            Rc::clone(&storage),
+        );
+        (Rc::new(RefCell::new(blocks)), storage)
+    }
+
+    /// Whether every block the worker has made is back in its pool: nothing lent, so
+    /// nothing held by a connection.
+    fn all_parked(blocks: &RefCell<Blocks>, storage: &crate::storage::Storage) -> bool {
+        let blocks = blocks.borrow();
+        storage.used() == blocks.parked() * blocks.sizes().small
+    }
+
+    /// A connection that has read nothing yet, and one waiting for its next request, hold
+    /// no storage: the block a read is made into goes back when the read brings nothing,
+    /// and when what it held has all been handed on (14 §3).
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_holds_no_storage() {
+        let (blocks, storage) = blocks_within(crate::storage::LIMIT);
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let asked = Asked::default();
+        let serving = serve(
+            server,
+            settings(),
+            Rc::clone(&blocks),
+            date,
+            echoing(&asked),
+        );
+        let talking = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(all_parked(&blocks, &storage), "held before a byte came");
+            client
+                .write_all(b"POST /a HTTP/1.1\r\nhost: a\r\ncontent-length: 3\r\n\r\nabc")
+                .await
+                .unwrap();
+            let mut received = Vec::new();
+            while !received.ends_with(b"POST /a abc") {
+                let mut piece = [0; 256];
+                let read = client.read(&mut piece).await.unwrap();
+                assert_ne!(read, 0);
+                received.extend_from_slice(&piece[..read]);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(storage.used() > 0, "no block was ever used");
+            assert!(all_parked(&blocks, &storage), "held between requests");
+            drop(client);
+        };
+        let (ended, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(serving, talking)
+        })
+        .await
+        .unwrap();
+        assert_eq!(ended, Ended::Closed);
+    }
+
+    /// A worker that cannot pay for a block to read a head into closes the connection:
+    /// nothing is answered and the core is never asked (14 §8).
+    #[tokio::test]
+    async fn a_head_the_worker_cannot_pay_to_read_closes_the_connection_unasked() {
+        let (blocks, _storage) = blocks_within(0);
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        client.write_all(GET).await.unwrap();
+        let asked = Asked::default();
+        let ended = tokio::time::timeout(
+            Duration::from_secs(10),
+            serve(server, settings(), blocks, date, echoing(&asked)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ended, Ended::Exhausted);
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert!(
+            received.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&received)
+        );
+        assert!(asked.borrow().is_empty());
+    }
+
+    /// And one that cannot pay for a block to read the rest of a body into ends the
+    /// connection, and the core's work with it. The body arrives in small pieces, and each
+    /// frame the core holds was cut from the block it was read into, however small, so that
+    /// block stays paid for while they live: with one block's worth of storage, the read
+    /// after it has filled has nothing to pay with. Frames copied out would have freed it.
+    #[tokio::test]
+    async fn a_body_the_worker_cannot_pay_to_read_ends_the_connection() {
+        let small = crate::upstream::h1::blocks::Sizes::default().small;
+        let (blocks, _storage) = blocks_within(small);
+        let length = 4 * small;
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        let sending = async move {
+            let head = format!("POST /up HTTP/1.1\r\nhost: a\r\ncontent-length: {length}\r\n\r\n");
+            client.write_all(head.as_bytes()).await.unwrap();
+            for _ in 0..length / 1000 + 1 {
+                tokio::task::yield_now().await;
+                if client.write_all(&[b'x'; 1000]).await.is_err() {
+                    break;
+                }
+            }
+            client
+        };
+        let asked = Asked::default();
+        let (ended, _client) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                serve(server, settings(), blocks, date, echoing(&asked)),
+                sending
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(ended, Ended::Exhausted);
+        assert!(asked.borrow().is_empty(), "answered: {:?}", asked.borrow());
+    }
+
+    /// A request whose body has been read holds no storage while its answer is written:
+    /// the block goes back the moment the last of the body is handed on, not at the next
+    /// read, which does not come until the answer is done (14 §3). Chunked, so that what
+    /// the body ends with is framing that is dealt with, not a frame that is cut.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_read_holds_no_storage_while_its_answer_is_written() {
+        let (blocks, storage) = blocks_within(crate::storage::LIMIT);
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let reading = |request: Request<RequestBody>| async {
+            let _read = request.into_body().collect().await;
+            Response::new(Slow::new(3))
+        };
+        let serving = serve(server, settings(), Rc::clone(&blocks), date, reading);
+        let talking = async {
+            client
+                .write_all(b"POST /a HTTP/1.1\r\nhost: a\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n")
+                .await
+                .unwrap();
+            let mut received = Vec::new();
+            while !received.ends_with(b"tick\r\n") {
+                let mut piece = [0; 256];
+                let read = client.read(&mut piece).await.unwrap();
+                assert_ne!(read, 0);
+                received.extend_from_slice(&piece[..read]);
+            }
+            assert!(storage.used() > 0, "no block was ever used");
+            assert!(
+                all_parked(&blocks, &storage),
+                "held while the answer was written"
+            );
+            drop(client);
+        };
+        let (_ended, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(serving, talking)
+        })
+        .await
+        .unwrap();
     }
 }
