@@ -60,6 +60,11 @@ const READ_AHEAD: usize = 16 * 1024;
 /// body staging of 14 §8.
 const STAGING: usize = 16 * 1024;
 
+/// The most queued pieces one write carries. A frame is three at most — its chunk size, the
+/// frame and the line break after it — and the staging holds a few frames at most, so this
+/// is rarely what stops a write; it keeps the slices on the stack.
+const GATHERED: usize = 64;
+
 /// What a connection is held to.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Settings {
@@ -497,34 +502,50 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         self.queue(Bytes::from_static(bytes), 0)
     }
 
-    /// Writes what is queued, as far as the socket takes it.
+    /// Writes what is queued, as far as the socket takes it: as many pieces at a time as
+    /// one vectored write carries, so that a head and its framing and frames go out in one
+    /// system call rather than one each.
     fn poll_write_queued(&mut self, context: &mut Context<'_>) -> Result<bool, Stop> {
         let mut moved = false;
-        while let Some((front, charged, answer)) = self.queued.front_mut() {
-            match Pin::new(&mut self.socket).poll_write(context, front) {
-                Poll::Ready(Ok(0) | Err(_)) => return Err(Stop::Gone),
-                Poll::Ready(Ok(written)) => {
-                    front.advance(written);
-                    self.queued_bytes -= written;
-                    if front.is_empty() {
-                        // Gone to the socket, and with it what it held.
-                        let (charged, answer) = (*charged, *answer);
-                        self.queued.pop_front();
-                        let held = if answer {
-                            self.answer_charge.as_mut()
-                        } else {
-                            self.queued_charge.as_mut()
-                        };
-                        if let Some(charge) = held {
-                            charge.shrink(charged);
-                        }
-                    }
-                    self.spend(written);
-                    moved = true;
-                    self.deadlines.write_moved(now());
-                }
-                Poll::Pending => break,
+        while !self.queued.is_empty() {
+            let mut slices = [io::IoSlice::new(&[]); GATHERED];
+            let mut count = 0;
+            for ((bytes, _, _), slice) in self.queued.iter().zip(slices.iter_mut()) {
+                *slice = io::IoSlice::new(bytes);
+                count += 1;
             }
+            let written =
+                match Pin::new(&mut self.socket).poll_write_vectored(context, &slices[..count]) {
+                    Poll::Ready(Ok(0) | Err(_)) => return Err(Stop::Gone),
+                    Poll::Ready(Ok(written)) => written,
+                    Poll::Pending => break,
+                };
+            self.queued_bytes -= written;
+            let mut left = written;
+            while left > 0 {
+                let Some((front, charged, answer)) = self.queued.front_mut() else {
+                    break;
+                };
+                if left < front.len() {
+                    front.advance(left);
+                    break;
+                }
+                left -= front.len();
+                // Gone to the socket, and with it what it held.
+                let (charged, answer) = (*charged, *answer);
+                self.queued.pop_front();
+                let held = if answer {
+                    self.answer_charge.as_mut()
+                } else {
+                    self.queued_charge.as_mut()
+                };
+                if let Some(charge) = held {
+                    charge.shrink(charged);
+                }
+            }
+            self.spend(written);
+            moved = true;
+            self.deadlines.write_moved(now());
         }
         self.deadlines
             .write_waited_on(now(), !self.queued.is_empty());
@@ -886,7 +907,9 @@ where
                     return connection.yield_turn(context);
                 }
                 connection.inbound.borrow_mut().heard_by(context);
-                let mut moved = connection.poll_write_queued(context)?;
+                let mut moved = false;
+                // What the body has ready is queued before anything is written, so that it
+                // goes out with the head, or with the frames before it, in one write.
                 // Bounded by the budget as well as the staging: a body of empty frames
                 // queues nothing, and would otherwise be taken from without end.
                 while body_left && connection.queued_bytes < STAGING && !connection.spent() {
@@ -928,6 +951,7 @@ where
                         Some(Err(_)) => return Poll::Ready(Ok(false)),
                     }
                 }
+                moved |= connection.poll_write_queued(context)?;
                 // An upload the answer did not wait for is still read for it.
                 let wanted = connection.inbound.borrow().wanted;
                 if wanted && connection.poll_read(context, limits.head)? {
@@ -1183,6 +1207,118 @@ mod tests {
     }
 
     const GET: &[u8] = b"GET /one HTTP/1.1\r\nhost: a\r\n\r\n";
+
+    /// The server's end of a pipe, counting the writes made to it: a vectored write is
+    /// one, as it is one system call on a socket.
+    struct Counted {
+        inner: tokio::io::DuplexStream,
+        writes: Rc<Cell<usize>>,
+    }
+
+    impl AsyncRead for Counted {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(context, buf)
+        }
+    }
+
+    impl AsyncWrite for Counted {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let written = Pin::new(&mut this.inner).poll_write(context, buf);
+            if matches!(written, Poll::Ready(Ok(1..))) {
+                this.writes.set(this.writes.get() + 1);
+            }
+            written
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let joined: Vec<u8> = bufs.iter().flat_map(|buf| buf.iter().copied()).collect();
+            self.poll_write(context, &joined)
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+        }
+    }
+
+    /// Serves one request that closes the connection, and returns what the client received
+    /// and how many writes it took.
+    async fn written<R, F, B>(sent: &'static [u8], respond: R) -> (String, usize)
+    where
+        R: FnMut(Request<RequestBody>, Interim) -> F,
+        F: Future<Output = Response<B>>,
+        B: Body<Data = Bytes> + Unpin,
+    {
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        let writes = Rc::new(Cell::new(0));
+        let socket = Counted {
+            inner: server,
+            writes: Rc::clone(&writes),
+        };
+        let talking = async move {
+            client.write_all(sent).await.unwrap();
+            let mut received = Vec::new();
+            client.read_to_end(&mut received).await.unwrap();
+            String::from_utf8_lossy(&received).into_owned()
+        };
+        let serving = serve(socket, settings(), blocks(), date, respond);
+        let (received, _) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(talking, serving)
+        })
+        .await
+        .expect("serving never finished");
+        (received, writes.get())
+    }
+
+    /// An answer whose body is there as its head is written goes out in one write: a
+    /// write of its own for the head is a system call, and a packet the client wakes for,
+    /// on every request.
+    #[tokio::test]
+    async fn an_answer_ready_with_its_head_goes_out_in_one_write() {
+        const CLOSING: &[u8] = b"GET /one HTTP/1.1\r\nhost: a\r\nconnection: close\r\n\r\n";
+        let full = |_: Request<RequestBody>, _: Interim| async {
+            Response::new(Answer::Full(Full::new(Bytes::from_static(b"hello"))))
+        };
+        let (received, writes) = written(CLOSING, full).await;
+        assert!(received.ends_with("\r\n\r\nhello"), "{received}");
+        assert_eq!(writes, 1, "{received}");
+
+        // And a body in frames, each with its chunk framing, all of them ready at once.
+        let frames = |_: Request<RequestBody>, _: Interim| async {
+            let parts = VecDeque::from([
+                Bytes::from_static(b"one"),
+                Bytes::from_static(b"two"),
+                Bytes::from_static(b"three"),
+            ]);
+            Response::new(Answer::Unknown(Unknown(parts)))
+        };
+        let (received, writes) = written(CLOSING, frames).await;
+        assert!(
+            received.ends_with("3\r\none\r\n3\r\ntwo\r\n5\r\nthree\r\n0\r\n\r\n"),
+            "{received}"
+        );
+        assert_eq!(writes, 1, "{received}");
+    }
 
     /// Two requests sent together are answered in turn, however they arrive, and the core
     /// is asked the second only after the first is answered.
