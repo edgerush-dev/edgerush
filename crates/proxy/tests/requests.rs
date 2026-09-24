@@ -444,6 +444,8 @@ fn targets() -> Vec<Case> {
             .seen(b"GET /x?q=1 HTTP/1.1\r\nHost: a\r\n"),
         case("absolute-form with no path", "HAProxy h1_host_normalization.vtc:820", b"GET http://a HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(200)], Open)
             .seen(b"GET / HTTP/1.1\r\n"),
+        case("absolute-form with a query and no path", "HAProxy h1_host_normalization.vtc:925; RFC 9112 §3.2.1", b"GET http://a?q=1 HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(200)], Open)
+            .seen(b"GET /?q=1 HTTP/1.1\r\n"),
         case("absolute-form names another host than Host", "RFC 9112 §3.2.2: the target's wins; HAProxy h1_host_normalization.vtc:423 and Pingora test_upstream.rs:872 refuse it", b"GET http://a/ HTTP/1.1\r\nHost: b\r\n\r\n", &[Is(200)], Open)
             .seen(b"host: a\r\n")
             .unseen("host: b"),

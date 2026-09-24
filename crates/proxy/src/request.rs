@@ -139,9 +139,16 @@ pub fn decide<'a, H: Head>(
     let upstream = rule.backends.pick(random).ok_or(Rejection::NoBackend)?;
 
     // Whatever can still fail comes before the target and the rest of the headers change.
+    // A query with no path before it (`http://a?q=1`) is read as the path `/`, and is
+    // given it: origin-form has no target without a path (RFC 9112 §3.2.1).
+    let pathless = head
+        .uri()
+        .path_and_query()
+        .is_some_and(|target| target.as_str().starts_with('?'));
     let target = match path {
-        Cow::Borrowed(_) => None,
         Cow::Owned(path) => Some(with_path(head.uri(), path)?),
+        Cow::Borrowed(path) if pathless => Some(with_path(head.uri(), path.to_owned())?),
+        Cow::Borrowed(_) => None,
     };
 
     if let Some(target) = target {
@@ -414,6 +421,21 @@ upstreams:
         let mut absolute = self::head("http://shop.example.com/./cart", &[]);
         assert_eq!(decide_on("web", &mut absolute, 0).as_deref(), Ok("cart"));
         assert_eq!(absolute.uri, "http://shop.example.com/cart");
+    }
+
+    /// A target with a query and no path is read as the path `/`, and goes on with one:
+    /// origin-form has no target without a path, and an upstream sent `?q=1` alone has
+    /// been sent a request line it cannot read ([RFC 9112 §3.2.1]).
+    ///
+    /// [RFC 9112 §3.2.1]: https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2.1
+    #[test]
+    fn a_query_with_no_path_is_given_the_root() {
+        let mut head = head("http://shop.example.com?q=1", &[]);
+        assert_eq!(decide_on("web", &mut head, 0).as_deref(), Ok("fallback"));
+        assert_eq!(
+            head.uri.path_and_query().map(PathAndQuery::as_str),
+            Some("/?q=1")
+        );
     }
 
     #[test]
