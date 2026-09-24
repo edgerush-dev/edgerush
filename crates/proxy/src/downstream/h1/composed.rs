@@ -711,6 +711,98 @@ fn interim_heads(bytes: &[u8]) -> usize {
     count
 }
 
+/// Requests that are whole and well formed, for a decoded script to send by number: a
+/// fuzzer that could only send what it made up would rarely get past the request line.
+const FORMED: [&[u8]; 8] = [
+    b"GET / HTTP/1.1\r\nhost: a\r\n\r\n",
+    b"HEAD /h HTTP/1.1\r\nhost: a\r\n\r\n",
+    b"POST /p HTTP/1.1\r\nhost: a\r\ncontent-length: 3\r\n\r\nabc",
+    b"POST /c HTTP/1.1\r\nhost: a\r\ntransfer-encoding: chunked\r\n\r\n2\r\nab\r\n0\r\nx-t: 1\r\n\r\n",
+    b"POST /e HTTP/1.1\r\nhost: a\r\nexpect: 100-continue\r\ncontent-length: 2\r\n\r\n",
+    b"GET /close HTTP/1.1\r\nhost: a\r\nconnection: close\r\n\r\n",
+    b"GET /old HTTP/1.0\r\nhost: a\r\n\r\n",
+    b"GET /keep HTTP/1.0\r\nhost: a\r\nconnection: keep-alive\r\n\r\n",
+];
+
+/// The most steps a decoded script has, and the most bytes one sends in all: bounds that
+/// keep every input a fuzzer tries quick.
+const MOST_STEPS: usize = 24;
+const MOST_SENT: usize = 4096;
+
+/// Makes a client's script and a core from bytes, whatever they are: the fuzzer's input.
+///
+/// The first byte says how many acts the core has (up to four), and four bytes each
+/// describe them. The rest is the client's script, a byte of step and what that step
+/// takes after it: raw bytes to send, a well-formed request to send by number, a pause,
+/// answers to wait for, an interim answer to wait for, a close of the sending half, or
+/// reading stopped and started.
+#[must_use]
+pub fn decode(bytes: &[u8]) -> (Vec<ClientStep>, Core) {
+    let mut input = bytes.iter().copied();
+    let mut next = move || input.next();
+    let acts = usize::from(next().unwrap_or(0) % 5);
+    let mut core = Core::default();
+    for _ in 0..acts {
+        let (a, b, c, d) = (
+            next().unwrap_or(0),
+            next().unwrap_or(0),
+            next().unwrap_or(0),
+            next().unwrap_or(0),
+        );
+        core.acts.push(Act {
+            delay: Duration::from_millis([0, 10, 1_000, 40_000][usize::from(a % 4)]),
+            take: match b % 4 {
+                0 | 1 => Take::All,
+                2 => Take::Upto(usize::from(b / 4)),
+                _ => Take::Nothing,
+            },
+            status: [200, 204, 404, 500][usize::from(c % 4)],
+            body: vec![b'x'; usize::from(d % 64)],
+            known_length: d & 0x40 == 0,
+            ending: match c / 4 % 8 {
+                0 => Ending::FailsFirst,
+                1 => Ending::FailsLater,
+                _ => Ending::Whole,
+            },
+        });
+    }
+    let mut steps = Vec::new();
+    let mut sent = 0;
+    while steps.len() < MOST_STEPS {
+        let Some(step) = next() else { break };
+        let argument = next().unwrap_or(0);
+        steps.push(match step % 9 {
+            0 | 1 => {
+                let mut raw = Vec::new();
+                for _ in 0..argument % 64 {
+                    match next() {
+                        Some(byte) => raw.push(byte),
+                        None => break,
+                    }
+                }
+                ClientStep::Send(raw)
+            }
+            2 | 3 => ClientStep::Send(FORMED[usize::from(argument) % FORMED.len()].to_vec()),
+            4 => ClientStep::Pause(Duration::from_millis(
+                [0, 10, 1_000, 40_000][usize::from(argument % 4)],
+            )),
+            5 => ClientStep::Answers(usize::from(argument % 6)),
+            6 => ClientStep::Interim,
+            7 => ClientStep::CloseWrite,
+            _ if argument % 2 == 0 => ClientStep::StopReading,
+            _ => ClientStep::ResumeReading,
+        });
+        if let Some(ClientStep::Send(bytes)) = steps.last() {
+            sent += bytes.len();
+            if sent > MOST_SENT {
+                steps.pop();
+                break;
+            }
+        }
+    }
+    (steps, core)
+}
+
 /// What a run got wrong, by one oracle or the other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Finding {
@@ -1276,6 +1368,15 @@ mod tests {
                 let core = Core { acts };
                 let run = run(&client, &core);
                 prop_assert_eq!(judge(&run), Ok(()), "{:?}\n{:?}", run.events, String::from_utf8_lossy(&run.sent));
+            }
+
+            /// The fuzz target's own assertion, on bytes of no shape at all: whatever they
+            /// decode to, the run passes both oracles.
+            #[test]
+            fn any_decoded_script_passes_both_oracles(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
+                let (client, core) = decode(&bytes);
+                let run = run(&client, &core);
+                prop_assert_eq!(judge(&run), Ok(()), "{:?}\n{:?}\n{:?}", client, run.events, String::from_utf8_lossy(&run.sent));
             }
         }
     }
