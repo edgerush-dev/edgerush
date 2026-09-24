@@ -699,14 +699,12 @@ impl Worker {
                         ours_asking.set(true);
                         Rc::clone(&ours.worker).handle(listener, request, None)
                     });
-                    h2::connection::serve(
-                        replay,
-                        h2::connection::Settings::default(),
-                        storage,
-                        date,
-                        respond,
-                    )
-                    .await;
+                    let settings = h2::connection::Settings {
+                        keep_alive: deadlines.next_request,
+                        closing: Bounds::default().next_head.min(deadlines.next_request),
+                        ..h2::connection::Settings::default()
+                    };
+                    h2::connection::serve(replay, settings, storage, date, respond).await;
                 }
                 // Closed having said nothing, or failed before saying enough.
                 Ok(None) | Err(_) => {}
@@ -1329,6 +1327,123 @@ mod tests {
                 tokio::time::sleep(SHORT.next_request - Duration::from_millis(250)).await;
                 stream.write_all(ASKED).await.unwrap();
                 assert!(answered(&mut stream).await.starts_with("HTTP/1.1 200"));
+            })
+            .await;
+    }
+
+    /// An HTTP/2 client of the worker at `front`, past its handshake, over a real socket.
+    async fn h2_client(front: SocketAddr) -> crate::h2_peer::Peer<TcpStream> {
+        use crate::h2_peer::{self, Peer, flag, kind};
+        let stream = TcpStream::connect(front).await.unwrap();
+        let mut peer = Peer::open_as_client(stream, &[]).await;
+        peer.until(|f| f.kind == kind::SETTINGS && !f.has(flag::ACK))
+            .await;
+        peer.send(&h2_peer::settings_ack()).await;
+        peer
+    }
+
+    /// A GET of `path` on stream `id`, ending the stream.
+    async fn h2_get(peer: &mut crate::h2_peer::Peer<TcpStream>, id: u32, path: &str) {
+        use crate::h2_peer::{self};
+        let block = h2_peer::block(&[
+            (":method", "GET"),
+            (":scheme", "http"),
+            (":authority", "example.test"),
+            (":path", path),
+        ]);
+        peer.send(&h2_peer::headers(id, block, true)).await;
+    }
+
+    /// An HTTP/2 connection with no stream open is told to go at its keep-alive deadline —
+    /// a graceful GOAWAY, naming no last stream yet — and, as this client never answers the
+    /// PING that comes with it, closed at its closing bound after that. hyper's HTTP/2
+    /// server, before ours, held such a connection for ever.
+    #[tokio::test]
+    async fn an_idle_http2_connection_is_told_to_go_at_its_keep_alive_deadline() {
+        use crate::h2_peer::{code, flag, kind};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let front = serving_worker(upstream).await;
+                let mut peer = h2_client(front).await;
+                h2_get(&mut peer, 1, "/").await;
+                peer.until(|f| f.stream == 1 && f.has(flag::END_STREAM))
+                    .await;
+                let answered = tokio::time::Instant::now();
+
+                let (goaway, _) = peer.until(|f| f.kind == kind::GOAWAY).await;
+                let took = answered.elapsed();
+                assert!(
+                    took + EARLY >= SHORT.next_request && took < SHORT.next_request + SLACK,
+                    "told to go after {took:?}"
+                );
+                assert_eq!(goaway.goaway(), (0x7fff_ffff, code::NO_ERROR));
+
+                let told = tokio::time::Instant::now();
+                let _rest = peer.rest().await;
+                let took = told.elapsed();
+                let closing = Bounds::default().next_head.min(SHORT.next_request);
+                assert!(took < closing + SLACK, "closed {took:?} after GOAWAY");
+            })
+            .await;
+    }
+
+    /// A stream still waiting for its answer keeps its connection: the keep-alive clock
+    /// runs only while no stream is open, and starts when the last one ends.
+    #[tokio::test]
+    async fn an_http2_connection_with_a_stream_open_is_not_idle() {
+        use crate::h2_peer::{flag, kind};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, held) = scripted_upstream().await;
+                let front = serving_worker(upstream).await;
+                let mut peer = h2_client(front).await;
+                // Held unanswered by the upstream.
+                h2_get(&mut peer, 1, "/held").await;
+                let quiet = peer.drain_for(SHORT.next_request * 2).await;
+                assert!(
+                    quiet.iter().all(|f| f.kind != kind::GOAWAY),
+                    "told to go with a stream open: {quiet:?}"
+                );
+
+                // The upstream goes away; the stream is answered for it, and ends.
+                held.borrow_mut().clear();
+                peer.until(|f| f.stream == 1 && f.has(flag::END_STREAM))
+                    .await;
+                let ended = tokio::time::Instant::now();
+                peer.until(|f| f.kind == kind::GOAWAY).await;
+                let took = ended.elapsed();
+                assert!(
+                    took + EARLY >= SHORT.next_request && took < SHORT.next_request + SLACK,
+                    "told to go {took:?} after the last stream ended"
+                );
+            })
+            .await;
+    }
+
+    /// A stream the client resets ends with nothing written, and the keep-alive clock still
+    /// starts then: the stream's end wakes the connection, where no frame would.
+    #[tokio::test]
+    async fn the_keep_alive_clock_starts_when_the_client_resets_its_last_stream() {
+        use crate::h2_peer::{self, code, kind};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _held) = scripted_upstream().await;
+                let front = serving_worker(upstream).await;
+                let mut peer = h2_client(front).await;
+                h2_get(&mut peer, 1, "/held").await;
+                peer.settled().await;
+                peer.send(&h2_peer::rst_stream(1, code::CANCEL)).await;
+                let reset = tokio::time::Instant::now();
+                peer.until(|f| f.kind == kind::GOAWAY).await;
+                let took = reset.elapsed();
+                assert!(
+                    took + EARLY >= SHORT.next_request && took < SHORT.next_request + SLACK,
+                    "told to go {took:?} after the reset"
+                );
             })
             .await;
     }

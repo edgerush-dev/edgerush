@@ -6,6 +6,11 @@
 //! answer goes out through [`send_body`], within the room the client grants. A client that
 //! resets a stream before it is answered takes the stream's exchange with it: the future
 //! answering it is dropped where it stands, and with it whatever it held upstream.
+//!
+//! A connection with no stream open for its keep-alive time is told to go, with a graceful
+//! GOAWAY, and closed once it has finished or its closing time is up
+//! ([14 §8](../../../../../docs/14-downstream-server.md)). Its first request is the serving
+//! connection's to time, as for any protocol.
 
 use crate::downstream::h1::connection::Answered;
 use crate::downstream::h1::date::HttpDate;
@@ -17,11 +22,14 @@ use bytes::Bytes;
 use http::header::{DATE, HeaderValue};
 use http::{Request, Response};
 use http_body::Body;
+use std::cell::{Cell, RefCell};
 use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
 use std::rc::Rc;
-use std::task::Poll;
+use std::task::{Poll, Waker};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::Instant;
 
 /// What an HTTP/2 connection is served with (15 §3).
 #[derive(Debug, Clone, Copy)]
@@ -38,6 +46,10 @@ pub(crate) struct Settings {
     /// at 64 KiB, room is granted in smaller pieces and an 8 MiB answer took 17% more CPU
     /// (15 §3).
     pub(crate) send_buffer: usize,
+    /// How long a connection may stay with no stream open before it is told to go.
+    pub(crate) keep_alive: Duration,
+    /// How long a connection told to go has to finish before it is closed regardless.
+    pub(crate) closing: Duration,
 }
 
 impl Default for Settings {
@@ -48,6 +60,40 @@ impl Default for Settings {
             connection_window: 16 << 20,
             header_list: 64 * 1024,
             send_buffer: 400 * 1024,
+            keep_alive: Duration::from_secs(30),
+            closing: Duration::from_secs(10),
+        }
+    }
+}
+
+/// The streams a connection has open, and the driver to wake when the last one ends: the
+/// keep-alive clock starts then. Today h2 wakes the driver too, as the stream's handles
+/// go, so no test can tell this wake from that one; it is here because h2 does not promise
+/// it.
+#[derive(Default)]
+struct Streams {
+    open: Cell<usize>,
+    driver: RefCell<Option<Waker>>,
+}
+
+/// One open stream, counted for as long as its task lives.
+struct Open(Rc<Streams>);
+
+impl Open {
+    fn new(streams: &Rc<Streams>) -> Self {
+        streams.open.set(streams.open.get() + 1);
+        Self(Rc::clone(streams))
+    }
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        let left = self.0.open.get() - 1;
+        self.0.open.set(left);
+        if left == 0
+            && let Some(driver) = self.0.driver.take()
+        {
+            driver.wake();
         }
     }
 }
@@ -92,14 +138,47 @@ pub(crate) async fn serve<S, R, F, B, D>(
     let Ok(mut connection) = settings.builder().handshake::<_, Outgoing>(socket).await else {
         return;
     };
+    let streams = Rc::new(Streams::default());
+    let mut idle = std::pin::pin!(tokio::time::sleep(settings.keep_alive));
+    let mut idle_from_now = false;
     // Accepting is what drives the connection: it is polled for as long as the connection
     // lives, streams running beside it.
-    while let Some(Ok((request, send))) = connection.accept().await {
+    loop {
+        let accepted = poll_fn(|cx| {
+            if streams.open.get() == 0 {
+                if idle_from_now {
+                    idle.as_mut().reset(Instant::now() + settings.keep_alive);
+                    idle_from_now = false;
+                }
+                if idle.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(None);
+                }
+            } else {
+                idle_from_now = true;
+                *streams.driver.borrow_mut() = Some(cx.waker().clone());
+            }
+            connection.poll_accept(cx).map(Some)
+        })
+        .await;
+        let Some(Some(Ok((request, send)))) = accepted else {
+            if accepted.is_some() {
+                // Closed, or failed: either way there is nothing left to serve.
+                return;
+            }
+            break;
+        };
+        let open = Open::new(&streams);
         let (storage, date, respond) = (Rc::clone(&storage), Rc::clone(&date), Rc::clone(&respond));
         let _detached = tokio::task::spawn_local(async move {
             answer(request, Responder::new(send), &*respond, &storage, &*date).await;
+            drop(open);
         });
     }
+    // Idle for its keep-alive time: told to go, gracefully — a request already on its way is
+    // still taken — and given its closing time to finish before the socket goes regardless.
+    connection.graceful_shutdown();
+    let _closing =
+        tokio::time::timeout(settings.closing, poll_fn(|cx| connection.poll_closed(cx))).await;
 }
 
 /// Answers one stream.
