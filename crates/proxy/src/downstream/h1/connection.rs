@@ -773,7 +773,7 @@ fn now() -> std::time::Instant {
 }
 
 /// Whether a request asked to be told before it sends its body.
-fn expects_continue<F: Fields + ?Sized>(headers: &F) -> bool {
+pub(crate) fn expects_continue<F: Fields + ?Sized>(headers: &F) -> bool {
     headers
         .values(&http::header::EXPECT)
         .flat_map(crate::hop_by_hop::options_of)

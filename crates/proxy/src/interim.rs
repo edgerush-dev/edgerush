@@ -6,10 +6,10 @@
 //! for each request it reads and hands it to the request core with the request — an argument
 //! of its own, since a request's extensions take only what may cross threads, and this may
 //! not. The upstream exchange tells it what it sees in wire order, and the server writes out
-//! what it is to forward while it waits for the final answer. A request that comes with none
-//! — one our HTTP/2 server read, until it forwards 1xx itself — is served by an exchange
-//! with a channel of its own that nobody listens on: the same continue decision, and every
-//! 1xx consumed.
+//! what it is to forward while it waits for the final answer; both of our servers, HTTP/1's
+//! and HTTP/2's, listen. A request that comes with none is served by an exchange with a
+//! channel of its own that nobody listens on: the same continue decision, and every 1xx
+//! consumed.
 //!
 //! What waits here is bounded by the exchange's own interim limits (13 §7), and the server
 //! takes it in the same turn it polls the answer in. Worker-local, never `Send`.

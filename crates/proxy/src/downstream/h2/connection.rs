@@ -12,15 +12,16 @@
 //! ([14 §8](../../../../../docs/14-downstream-server.md)). Its first request is the serving
 //! connection's to time, as for any protocol.
 
-use crate::downstream::h1::connection::Answered;
+use crate::downstream::h1::connection::{Answered, expects_continue};
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h2::body::IncomingH2;
 use crate::downstream::h2::writer::{Outgoing, Responder, send_body};
+use crate::interim::Interim;
 use crate::request_body::RequestBody;
 use crate::storage::Storage;
 use bytes::Bytes;
 use http::header::{DATE, HeaderValue};
-use http::{Request, Response};
+use http::{Request, Response, StatusCode, Version};
 use http_body::Body;
 use std::cell::{Cell, RefCell};
 use std::error::Error as StdError;
@@ -133,7 +134,7 @@ pub(crate) async fn serve<S, R, F, B, D>(
     respond: Rc<R>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
-    R: Fn(Request<RequestBody>) -> F + 'static,
+    R: Fn(Request<RequestBody>, Interim) -> F + 'static,
     F: Future<Output = Answered<B>> + 'static,
     B: Body<Data = Bytes> + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
@@ -194,6 +195,26 @@ pub(crate) async fn serve<S, R, F, B, D>(
         tokio::time::timeout(settings.closing, poll_fn(|cx| connection.poll_closed(cx))).await;
 }
 
+/// Sends what waits in `interim` to be passed on, and a `100` of the continue decision's
+/// own if it wants one. A `101` is never sent: HTTP/2 has no upgrade (RFC 9113 §8.6).
+fn send_interim(responder: &mut Responder, interim: &Interim) {
+    while let Some((status, headers)) = interim.next_forwarded() {
+        if status == StatusCode::SWITCHING_PROTOCOLS {
+            continue;
+        }
+        let mut head = Response::new(());
+        *head.status_mut() = status;
+        *head.headers_mut() = headers;
+        // Refused only once the final head has gone, when there is nothing to tell.
+        let _sent = responder.interim(head);
+    }
+    if interim.take_local_continue() {
+        let mut head = Response::new(());
+        *head.status_mut() = StatusCode::CONTINUE;
+        let _sent = responder.interim(head);
+    }
+}
+
 /// Answers one stream.
 async fn answer<R, F, B, D>(
     request: Request<::h2::RecvStream>,
@@ -203,25 +224,39 @@ async fn answer<R, F, B, D>(
     date: &D,
     idle: Duration,
 ) where
-    R: Fn(Request<RequestBody>) -> F,
+    R: Fn(Request<RequestBody>, Interim) -> F,
     F: Future<Output = Answered<B>>,
     B: Body<Data = Bytes>,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     D: Fn() -> HttpDate,
 {
-    let request = request.map(|body| RequestBody::H2(IncomingH2::new(body, idle)));
-    let mut answering = std::pin::pin!(respond(request));
+    // Read before any filter touches the head, as for HTTP/1 (14 §5).
+    let interim = Interim::listened(
+        expects_continue(request.headers()),
+        Version::HTTP_2,
+        request.body().is_end_stream(),
+    );
+    let request =
+        request.map(|body| RequestBody::H2(IncomingH2::new(body, idle).heard_by(interim.clone())));
+    let mut answering = std::pin::pin!(respond(request, interim.clone()));
     let answered = poll_fn(|cx| {
         if responder.poll_reset(cx).is_ready() {
             return Poll::Ready(None);
         }
-        answering.as_mut().poll(cx).map(Some)
+        let answered = answering.as_mut().poll(cx);
+        // What the exchange heard, or the continue decision made, in this turn goes out now.
+        send_interim(&mut responder, &interim);
+        answered.map(Some)
     })
     .await;
     // Reset by the client: nothing is to be sent, and the exchange has gone.
     let Some(answered) = answered else {
         return;
     };
+    // A local `100` not yet sent is not sent now: the answer says what it would have. What
+    // the upstream said before its final answer still goes first, in the order it came.
+    interim.final_head();
+    send_interim(&mut responder, &interim);
     let (mut head, body) = answered.into_response().into_parts();
     if !head.headers.contains_key(DATE)
         && let Ok(now) = HeaderValue::from_bytes(date().as_bytes())

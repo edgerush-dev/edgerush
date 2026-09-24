@@ -703,9 +703,9 @@ impl Worker {
                     let storage = Rc::clone(worker.blocks.borrow().storage());
                     let dating = Rc::clone(&worker);
                     let date = Rc::new(move || dating.date.get());
-                    let respond = Rc::new(move |request: Request<RequestBody>| {
+                    let respond = Rc::new(move |request: Request<RequestBody>, interim| {
                         ours_asking.set(true);
-                        Rc::clone(&ours.worker).handle(listener, request, None)
+                        Rc::clone(&ours.worker).handle(listener, request, Some(interim))
                     });
                     let settings = h2::connection::Settings {
                         keep_alive: deadlines.next_request,
@@ -1593,6 +1593,231 @@ mod tests {
                     took + EARLY >= SHORT.idle && took < SHORT.idle + SLACK,
                     "cancelled after {took:?}"
                 );
+            })
+            .await;
+    }
+
+    /// An upstream that reads a request's head — and its chunked body to the end, if
+    /// `whole` — then says `said` and holds the connection.
+    async fn saying_upstream(said: &'static [u8], whole: bool) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = backend.local_addr().unwrap();
+        let _accepting = tokio::task::spawn_local(async move {
+            loop {
+                let (mut stream, _) = backend.accept().await.unwrap();
+                let _answering = tokio::task::spawn_local(async move {
+                    let mut seen = Vec::new();
+                    let mut byte = [0; 1];
+                    let end: &[u8] = if whole { b"0\r\n\r\n" } else { b"\r\n\r\n" };
+                    while !seen.ends_with(end) {
+                        match stream.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => seen.push(byte[0]),
+                        }
+                    }
+                    let _ = stream.write_all(said).await;
+                    let mut rest = Vec::new();
+                    let _ = stream.read_to_end(&mut rest).await;
+                });
+            }
+        });
+        address
+    }
+
+    /// An upstream that reads a request's head, says `first`, and says `then` only once
+    /// `gate` opens: what it said first cannot have waited for what it says after.
+    async fn gated_upstream(
+        first: &'static [u8],
+        gate: tokio::sync::oneshot::Receiver<()>,
+        then: &'static [u8],
+    ) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = backend.local_addr().unwrap();
+        let _answering = tokio::task::spawn_local(async move {
+            let (mut stream, _) = backend.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut byte = [0; 1];
+            while !seen.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => seen.push(byte[0]),
+                }
+            }
+            let _ = stream.write_all(first).await;
+            let _ = gate.await;
+            let _ = stream.write_all(then).await;
+            let mut rest = Vec::new();
+            let _ = stream.read_to_end(&mut rest).await;
+        });
+        address
+    }
+
+    /// The interim heads a response future hands over, until the final head is next.
+    async fn interim_heads(
+        response: &mut ::h2::client::ResponseFuture,
+    ) -> Vec<(StatusCode, http::HeaderMap)> {
+        let mut heads = Vec::new();
+        while let Some(head) = tokio::time::timeout(
+            Duration::from_secs(10),
+            std::future::poll_fn(|cx| response.poll_informational(cx)),
+        )
+        .await
+        .expect("no interim head nor final one")
+        {
+            let head = head.unwrap();
+            heads.push((head.status(), head.headers().clone()));
+        }
+        heads
+    }
+
+    /// An upstream's 103 reaches an HTTP/2 client before its final answer, with its fields:
+    /// what hyper's HTTP/2 server could not send (14 §5, 15 §1).
+    #[tokio::test]
+    async fn an_upstream_103_reaches_an_http2_client_before_its_answer() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (open, gate) = tokio::sync::oneshot::channel();
+                let upstream = gated_upstream(
+                    b"HTTP/1.1 103 Early Hints\r\nlink: </a.css>; rel=preload\r\n\r\n",
+                    gate,
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+                )
+                .await;
+                let front = serving_worker(upstream).await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::get("http://example.test/")
+                    .version(Version::HTTP_2)
+                    .body(())
+                    .unwrap();
+                let (mut response, _) = send.send_request(request, true).unwrap();
+                // Heard while the upstream is still working on its answer: the final head is
+                // not written until the hint has arrived.
+                let hint = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    std::future::poll_fn(|cx| response.poll_informational(cx)),
+                )
+                .await
+                .expect("the hint waited for the answer")
+                .expect("the final head came first")
+                .unwrap();
+                assert_eq!(hint.status(), StatusCode::EARLY_HINTS);
+                assert_eq!(hint.headers()["link"], "</a.css>; rel=preload");
+                open.send(()).unwrap();
+                assert!(interim_heads(&mut response).await.is_empty());
+                let response = tokio::time::timeout(Duration::from_secs(10), response)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            })
+            .await;
+    }
+
+    /// An HTTP/2 client that asks to be told before it sends its body is told, with a
+    /// `100`, and answered once it has sent it.
+    #[tokio::test]
+    async fn an_http2_client_expecting_continue_is_told_to_send_its_body() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let upstream =
+                    saying_upstream(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok", true).await;
+                let front = serving_worker(upstream).await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::post("http://example.test/")
+                    .version(Version::HTTP_2)
+                    .header("expect", "100-continue")
+                    .body(())
+                    .unwrap();
+                let (mut response, mut upload) = send.send_request(request, false).unwrap();
+                // Nothing sent until told to: the first thing heard is the 100.
+                let told = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    std::future::poll_fn(|cx| response.poll_informational(cx)),
+                )
+                .await
+                .expect("never told to send")
+                .expect("the final head came first")
+                .unwrap();
+                assert_eq!(told.status(), StatusCode::CONTINUE);
+                upload.send_data(Bytes::from_static(b"abc"), true).unwrap();
+                let response = tokio::time::timeout(Duration::from_secs(10), response)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            })
+            .await;
+    }
+
+    /// Where the upstream is not asked to say yes first — a filter takes `Expect` off — the
+    /// client is told to send its body as soon as the body is wanted, not after the
+    /// continue wait (14 §5).
+    #[tokio::test]
+    async fn an_http2_client_expecting_continue_is_told_at_once_when_the_upstream_is_not_asked() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let upstream =
+                    saying_upstream(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok", true).await;
+                let yaml = format!(
+                    r#"
+listeners:
+  web: {{ address: "127.0.0.1:0", protocol: http }}
+routes:
+  - name: everything
+    listeners: [web]
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: / }}
+        filters:
+          - type: request_header_modifier
+            remove: [expect]
+        backends: [{{ upstream: up, weight: 1 }}]
+upstreams:
+  up: {{ endpoints: ["{upstream}"] }}
+"#
+                );
+                let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+                let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+                let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::post("http://example.test/")
+                    .version(Version::HTTP_2)
+                    .header("expect", "100-continue")
+                    .body(())
+                    .unwrap();
+                let asked = tokio::time::Instant::now();
+                let (mut response, mut upload) = send.send_request(request, false).unwrap();
+                let told = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    std::future::poll_fn(|cx| response.poll_informational(cx)),
+                )
+                .await
+                .expect("never told to send")
+                .expect("the final head came first")
+                .unwrap();
+                assert_eq!(told.status(), StatusCode::CONTINUE);
+                let took = asked.elapsed();
+                assert!(
+                    took < H1Limits::default().continue_wait / 2,
+                    "told only after {took:?}: by the wait, not the wanted body"
+                );
+                upload.send_data(Bytes::from_static(b"abc"), true).unwrap();
+                let response = tokio::time::timeout(Duration::from_secs(10), response)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
             })
             .await;
     }

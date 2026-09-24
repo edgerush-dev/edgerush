@@ -19,7 +19,8 @@ use http::{StatusCode, Version};
 pub struct Expectation {
     /// The client sent `Expect: 100-continue`, read before any filter touched the head.
     pub client: bool,
-    /// The version the client spoke, which decides whether it can be sent a 1xx at all.
+    /// The version the client spoke, which decides whether it can be sent a 1xx at all:
+    /// not HTTP/1.0.
     pub version: Version,
     /// The request going upstream carries `Expect: 100-continue`, after filters.
     pub upstream: bool,
@@ -74,10 +75,16 @@ pub struct Coordinator {
     local: Local,
 }
 
+/// Whether a client of `version` can be sent an interim answer: HTTP/1.1 and later. HTTP/1.0
+/// has no 1xx (RFC 9110 §15.2); HTTP/2 keeps them (RFC 9113 §8.1).
+fn hears_interim(version: Version) -> bool {
+    version >= Version::HTTP_11
+}
+
 impl Coordinator {
     /// The decision for an exchange whose expectation is `expectation`.
     pub fn new(expectation: Expectation) -> Self {
-        let can_hear = expectation.version == Version::HTTP_11;
+        let can_hear = hears_interim(expectation.version);
         // Held only where the upstream was asked to say yes first and there is something
         // to hold back; otherwise the body goes as soon as the exchange wants it.
         let held = expectation.upstream && !expectation.nothing_to_send;
@@ -139,7 +146,7 @@ impl Coordinator {
                 self.local = Local::None;
             }
         }
-        if self.expectation.version == Version::HTTP_11 {
+        if hears_interim(self.expectation.version) {
             Relay::Forward
         } else {
             Relay::Consume
@@ -434,6 +441,26 @@ mod tests {
             Relay::Consume
         );
         assert!(exchange.may_poll_upload());
+    }
+
+    /// An HTTP/2 client hears interim answers as an HTTP/1.1 one does, and is told to send
+    /// its body: RFC 9113 §8.1 keeps 1xx, and only HTTP/1.0 lacks them.
+    #[test]
+    fn an_http_2_client_hears_interim_answers_and_is_sent_a_100() {
+        let two = Expectation {
+            version: Version::HTTP_2,
+            ..BOTH
+        };
+        let mut exchange = Coordinator::new(two);
+        exchange.head_sent();
+        assert_eq!(exchange.upstream_interim(early_hints()), Relay::Forward);
+        let mut exchange = Coordinator::new(two);
+        exchange.head_sent();
+        exchange.wait_expired();
+        assert!(
+            exchange.take_local_continue(),
+            "no 100 for an HTTP/2 client"
+        );
     }
 
     #[test]

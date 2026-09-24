@@ -118,13 +118,6 @@ impl Responder {
     }
 
     /// Sends an interim head, before the final one only.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "interim heads reach HTTP/2 clients in 15 step 2's third slice"
-        )
-    )]
     pub(crate) fn interim(&mut self, head: Response<()>) -> Result<(), SendError> {
         if self.final_sent {
             return Err(SendError::AfterFinal);

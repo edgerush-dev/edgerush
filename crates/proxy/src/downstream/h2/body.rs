@@ -15,6 +15,7 @@
 //! [`RequestBodyError::TimedOut`], which the core answers 408 before its answer has begun.
 
 use crate::downstream::h2::idle::Idle;
+use crate::interim::Interim;
 use crate::request_body::RequestBodyError;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
@@ -31,6 +32,9 @@ pub(crate) struct IncomingH2 {
     /// Every DATA frame has been handed over; what is left is trailers, if any.
     data_done: bool,
     idle: Idle,
+    /// Told when the body is wanted and nothing is here, and when the client sent some
+    /// without waiting: what decides a `100` of our own (14 §5).
+    interim: Option<Interim>,
 }
 
 impl IncomingH2 {
@@ -42,7 +46,15 @@ impl IncomingH2 {
             owed: 0,
             data_done: false,
             idle: Idle::new(idle),
+            interim: None,
         }
+    }
+
+    /// The same, telling `interim` what the continue decision needs to know.
+    #[must_use]
+    pub(crate) fn heard_by(mut self, interim: Interim) -> Self {
+        self.interim = Some(interim);
+        self
     }
 
     /// Pending, unless the wait has run out.
@@ -75,9 +87,15 @@ impl Body for IncomingH2 {
         }
         if !this.data_done {
             let Poll::Ready(data) = this.stream.poll_data(cx) else {
+                if let Some(interim) = &this.interim {
+                    interim.body_wanted();
+                }
                 return this.waited(cx);
             };
             this.idle.moved();
+            if let Some(interim) = &this.interim {
+                interim.client_sent_body();
+            }
             match data {
                 Some(Ok(data)) => {
                     this.owed = data.len();
