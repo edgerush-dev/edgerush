@@ -845,9 +845,12 @@ impl Worker {
         let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
         let (mut answer, body) = match answered {
             Ok(answered) => answered,
-            // The worker's own storage running out is not the upstream failing, and is
-            // not counted as though it were ([14 §8](../../docs/14-downstream-server.md)).
-            Err(Answer::Exhausted) => return self.proxy.answer(listener, Answer::Exhausted).into(),
+            // The worker's own storage running out, or a client's body that cannot be read,
+            // is not the upstream failing, and is not counted as though it were
+            // ([14 §8](../../docs/14-downstream-server.md)).
+            Err(answer @ (Answer::Exhausted | Answer::BadBody)) => {
+                return self.proxy.answer(listener, answer).into();
+            }
             Err(answer) => {
                 if let Some(upstream) = upstream {
                     upstream.failures.inc();
@@ -912,6 +915,7 @@ impl Worker {
                 self.proxy.metrics.stopped(why_stopped(&error));
                 return Err(match error {
                     ExchangeError::Exhausted(_) => Answer::Exhausted,
+                    ExchangeError::RequestBody(_) => Answer::BadBody,
                     _ => Answer::UpstreamFailed,
                 });
             }
@@ -1794,6 +1798,67 @@ mod tests {
             assert!(
                 scrape.contains(
                     "edgerush_listener_local_answers_total{listener=\"web\",reason=\"exhausted\"} 1\n"
+                ),
+                "{scrape}"
+            );
+            assert!(
+                scrape.contains("edgerush_upstream_failures_total{upstream=\"up\"} 0\n"),
+                "{scrape}"
+            );
+        }));
+    }
+
+    /// A request whose body cannot be read is the client's fault, found after the request
+    /// went upstream: it is answered 400 and counted as that, not as the upstream failing,
+    /// which is what a 502 would have said.
+    #[test]
+    fn a_body_that_cannot_be_read_is_answered_400_and_not_held_against_the_upstream() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = listener.local_addr().unwrap();
+            // Takes what it is sent and never answers: only the client can end this.
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    tokio::spawn(async move {
+                        let mut taken = [0; 1024];
+                        while matches!(stream.read(&mut taken).await, Ok(read) if read > 0) {}
+                    });
+                }
+            });
+
+            let proxy = served(upstream);
+            let worker = Worker::new(Arc::clone(&proxy));
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+
+            let mut client = TcpStream::connect(front).await.unwrap();
+            client
+                .write_all(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")
+                .await
+                .unwrap();
+            let mut answer = Vec::new();
+            let _read = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.read_to_end(&mut answer),
+            )
+            .await
+            .unwrap();
+            let answer = String::from_utf8_lossy(&answer);
+            assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+
+            let up = proxy.metrics.upstream_slot("up");
+            let scrape = proxy.metrics.render(&["web".to_owned()], &[("up", up)]);
+            assert!(
+                scrape.contains(
+                    "edgerush_listener_local_answers_total{listener=\"web\",reason=\"bad_body\"} 1\n"
                 ),
                 "{scrape}"
             );

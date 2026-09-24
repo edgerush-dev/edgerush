@@ -145,10 +145,13 @@ pub(crate) enum Answer {
     Exhausted,
     /// The request's head could not take its changes ([14 §6](../../docs/14-downstream-server.md)).
     Edits,
+    /// The request's body could not be read: the client's fault, found once the request
+    /// had gone upstream, and not the upstream failing.
+    BadBody,
 }
 
 impl Answer {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -160,14 +163,17 @@ impl Answer {
         Self::TooBusy,
         Self::Exhausted,
         Self::Edits,
+        Self::BadBody,
     ];
 
     /// The status that is answered with.
     pub(crate) fn status(self) -> StatusCode {
         match self {
-            Self::BadHost | Self::BadPath | Self::BadConnection | Self::BadTarget => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::BadHost
+            | Self::BadPath
+            | Self::BadConnection
+            | Self::BadTarget
+            | Self::BadBody => StatusCode::BAD_REQUEST,
             Self::NoRoute => StatusCode::NOT_FOUND,
             Self::NoBackend | Self::Edits => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NoEndpoints | Self::TooBusy | Self::Exhausted => StatusCode::SERVICE_UNAVAILABLE,
@@ -188,6 +194,7 @@ impl Answer {
             Self::TooBusy => "too_busy",
             Self::Exhausted => "exhausted",
             Self::Edits => "edits",
+            Self::BadBody => "bad_body",
         }
     }
 }

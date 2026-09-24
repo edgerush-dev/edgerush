@@ -802,6 +802,104 @@ fn codings() -> Vec<Case> {
     ]
 }
 
+/// Chunked bodies that cannot be read. The request has gone upstream by the time its body
+/// is found wanting, but the client is the one at fault: it is answered 400, not 502, and
+/// the connection closes, since nothing after the fault can be told apart from the body.
+fn broken_bodies() -> Vec<Case> {
+    let broken = |name, from, body: &[u8]| {
+        let sent = [
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+            body,
+        ]
+        .concat();
+        case(name, from, &sent, &[Is(400)], Closed)
+    };
+    vec![
+        broken(
+            "a chunk size past what a count holds, then a request",
+            "hyper server.rs:524",
+            b"f0000000000000003\r\nabc\r\n0\r\n\r\nGET /sneaky HTTP/1.1\r\nHost: a\r\n\r\n",
+        )
+        .unseen("sneaky"),
+        broken(
+            "a chunk size that is not a number",
+            "nginx-tests perl.t:300",
+            b"ak\r\n1234567890\r\n0\r\n\r\n",
+        ),
+        broken("a negative chunk size", "hyper decode.rs:741", b"-1\r\n"),
+        broken(
+            "spaces after a chunk size",
+            "hyper decode.rs:741 accepts them; RFC 9112 §7.1",
+            b"1   \r\nq\r\n0\r\n\r\n",
+        ),
+        broken(
+            "an extension with no semicolon",
+            "hyper decode.rs:741",
+            b"1 A\r\nq\r\n0\r\n\r\n",
+        ),
+        broken(
+            "a CR in an extension",
+            "Envoy codec_impl_test.cc:5293",
+            b"1;\ra\r\nq\r\n0\r\n\r\n",
+        ),
+        broken(
+            "an LF in an extension",
+            "hyper decode.rs:741",
+            b"1;a\nb\r\nq\r\n0\r\n\r\n",
+        ),
+        broken(
+            "a chunk longer than it said",
+            "nginx-tests body_chunked.t:150",
+            b"4\r\nSEE-THIS\r\n0\r\n\r\n",
+        ),
+        broken(
+            "chunk data with no CRLF after it",
+            "Pingora body.rs:2430",
+            b"1\r\na\rn0\r\n\r\n",
+        ),
+        broken(
+            "a bare CR in a chunk size",
+            "hyper decode.rs:741",
+            b"F\rF\r\n",
+        ),
+        broken(
+            "a chunk size ending in LF alone",
+            "RFC 9112 §7.1",
+            b"1\nq\r\n0\r\n\r\n",
+        ),
+        broken(
+            "no last chunk",
+            "hyper server.rs:576",
+            b"1\r\nZ\r\n\r\n\r\n",
+        ),
+        broken(
+            "the end of the trailers malformed",
+            "Pingora body.rs:2257",
+            b"0\r\nr\n",
+        ),
+        broken(
+            "a trailer with no colon",
+            "Envoy codec_impl_test.cc:1195",
+            b"0\r\nbadtrailer\r\n\r\n",
+        ),
+        broken(
+            "a space in a trailer's name",
+            "HAProxy http_transfer_encoding.vtc:299",
+            b"0\r\nx t: v\r\n\r\n",
+        ),
+        broken(
+            "a bare CR in a trailer's value",
+            "HAProxy http_transfer_encoding.vtc:335",
+            b"0\r\nx: v\rw\r\n\r\n",
+        ),
+        broken(
+            "DEL in a trailer",
+            "Envoy protocol_integration_test.cc:6218",
+            b"0\r\nx: a\x7f\r\n\r\n",
+        ),
+    ]
+}
+
 fn expectations() -> Vec<Case> {
     vec![
         case(
@@ -896,6 +994,7 @@ fn every_case_is_answered_as_it_should_be() {
         fields(),
         lengths(),
         codings(),
+        broken_bodies(),
         expectations(),
         connections(),
     ]
