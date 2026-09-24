@@ -402,6 +402,12 @@ fn parse_with<const N: usize>(
         .method
         .and_then(|method| Method::from_bytes(method.as_bytes()).ok())
         .ok_or(RequestError::Malformed("its method is not one"))?;
+    // A fragment is no part of any form of request target (RFC 9112 §3.2). Looked for
+    // before the target is made a `Uri`, which would drop it and read what is left: one
+    // reader that keeps it and another that does not would not agree on what was asked.
+    if request.path.is_some_and(|target| target.contains('#')) {
+        return Err(RequestError::Malformed("its target has a fragment"));
+    }
     let target = request
         .path
         .and_then(|target| target.parse::<Uri>().ok())
@@ -633,6 +639,26 @@ mod tests {
         for target in ["/", "/a/b?c", "http://shop.test/a", "shop.test:443", "*"] {
             let bytes = format!("OPTIONS {target} HTTP/1.1\r\nhost: shop.test\r\n\r\n");
             assert_eq!(head(bytes.as_bytes()).target, target);
+        }
+    }
+
+    /// A fragment is not part of any form of request target (RFC 9112 §3.2), and a target
+    /// that carries one is refused rather than read without it: a reader that drops it
+    /// and one that keeps it would not agree on what was asked for (14 §4).
+    #[test]
+    fn a_target_with_a_fragment_is_refused() {
+        for target in [
+            "/a#b",
+            "/#",
+            "/a?q#x",
+            "http://shop.test/a#b",
+            "http://shop.test#b",
+        ] {
+            let bytes = format!("GET {target} HTTP/1.1\r\nhost: shop.test\r\n\r\n");
+            assert!(
+                matches!(refused(bytes.as_bytes()), RequestError::Malformed(_)),
+                "{target}"
+            );
         }
     }
 

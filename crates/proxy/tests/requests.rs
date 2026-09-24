@@ -465,6 +465,8 @@ fn targets() -> Vec<Case> {
         case("a percent sign with no digits after it", "nginx-tests http_uri.t:55", b"GET /foo% HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Open),
         case("a path above the root", "nginx-tests http_variables.t:85", b"GET /../x HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Open),
         case("an encoded slash", "Envoy protocol_integration_test.cc:4226 (03 §4)", b"GET /a%2Fb HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Open),
+        case("a fragment", "Envoy protocol_integration_test.cc:5270; astra's review; nginx and Pingora drop it (14 §4)", b"GET /allowed#hidden HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Closed),
+        case("a fragment in absolute-form", "HAProxy h1_authority_fragment_char.vtc:34", b"GET http://a/x#frag HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Closed),
     ]
 }
 
