@@ -15,11 +15,11 @@ use edgerush_proxy::downstream::h1::composed::{self, judge};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|bytes: &[u8]| {
-    let (client, core) = composed::decode(bytes);
-    let run = composed::run(&client, &core);
+    let (client, core, pipe) = composed::decode(bytes);
+    let run = composed::run_with(&client, &core, pipe);
     if let Err(finding) = judge(&run) {
         panic!(
-            "{finding:?}\nclient: {client:?}\ncore: {core:?}\nevents: {:?}\nsent: {:?}\nreceived: {:?}",
+            "{finding:?}\npipe: {pipe}\nclient: {client:?}\ncore: {core:?}\nevents: {:?}\nsent: {:?}\nreceived: {:?}",
             run.events,
             String::from_utf8_lossy(&run.sent),
             String::from_utf8_lossy(&run.received),

@@ -22,7 +22,7 @@ use super::date::HttpDate;
 use super::deadlines::Bounds;
 use super::lifecycle::{self, Event, Trace, Violation};
 use super::reference as request_reference;
-use crate::interim::Interim;
+use crate::interim::{Channel, Interim};
 use crate::raw::RawHead;
 use crate::request_body::RequestBody;
 use crate::storage::{LIMIT, Storage};
@@ -30,7 +30,7 @@ use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Blocks, Sizes};
 use crate::upstream::h1::reference::{self, Asked, Reading};
 use bytes::Bytes;
-use http::{HeaderValue, Response, StatusCode};
+use http::{HeaderMap, HeaderValue, Response, StatusCode};
 use http_body::{Body, Frame, SizeHint};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -102,6 +102,8 @@ pub struct Act {
     pub known_length: bool,
     /// How the answer ends.
     pub ending: Ending,
+    /// Whether a `103` goes before the answer, as an upstream's hints would.
+    pub hint: bool,
 }
 
 impl Default for Act {
@@ -113,6 +115,7 @@ impl Default for Act {
             body: b"ok".to_vec(),
             known_length: true,
             ending: Ending::Whole,
+            hint: false,
         }
     }
 }
@@ -180,18 +183,33 @@ pub const RUN_TIME: Duration = Duration::from_secs(600);
 ///
 /// If a runtime cannot be built, which is not known to happen.
 #[must_use]
+pub fn run(client: &[ClientStep], core: &Core) -> Run {
+    run_with(client, core, PIPE)
+}
+
+/// How much the socket between the client and the driver holds, each way, unless a run
+/// says otherwise.
+pub const PIPE: usize = 64 * 1024;
+
+/// The same, over a socket that holds `pipe` bytes each way: a small one, with a client
+/// that has stopped reading, is what catches the driver part way through writing a head.
+///
+/// # Panics
+///
+/// If a runtime cannot be built, which is not known to happen.
+#[must_use]
 #[expect(
     clippy::expect_used,
     reason = "a harness for tests and fuzzing: a runtime that cannot be built is the harness failing"
 )]
-pub fn run(client: &[ClientStep], core: &Core) -> Run {
+pub fn run_with(client: &[ClientStep], core: &Core, pipe: usize) -> Run {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .start_paused(true)
         .build()
         .expect("a runtime for the harness");
     let local = tokio::task::LocalSet::new();
-    runtime.block_on(local.run_until(composed(client.to_vec(), core.clone())))
+    runtime.block_on(local.run_until(composed(client.to_vec(), core.clone(), pipe.max(1))))
 }
 
 /// What both ends of the run share: what the client sent, what the driver wrote, how far
@@ -216,7 +234,7 @@ struct Wire {
 type Shared = Rc<RefCell<Wire>>;
 
 /// The run itself, on the harness's runtime.
-async fn composed(client: Vec<ClientStep>, core: Core) -> Run {
+async fn composed(client: Vec<ClientStep>, core: Core, pipe: usize) -> Run {
     let wire: Shared = Rc::new(RefCell::new(Wire::default()));
     let handed = Rc::new(RefCell::new(Vec::new()));
     let storage = Storage::new(LIMIT);
@@ -229,7 +247,7 @@ async fn composed(client: Vec<ClientStep>, core: Core) -> Run {
         bounds: Bounds::default(),
         budget: Budget::default(),
     };
-    let (near, far) = tokio::io::duplex(64 * 1024);
+    let (near, far) = tokio::io::duplex(pipe);
     let far = Recorded {
         inner: far,
         wire: Rc::clone(&wire),
@@ -238,7 +256,7 @@ async fn composed(client: Vec<ClientStep>, core: Core) -> Run {
     let respond = {
         let (wire, handed) = (Rc::clone(&wire), Rc::clone(&handed));
         let count = Rc::new(RefCell::new(0_usize));
-        move |head: RawHead, body: RequestBody, _interim: Interim| {
+        move |head: RawHead, body: RequestBody, interim: Interim| {
             let index = {
                 let mut count = count.borrow_mut();
                 let index = *count;
@@ -247,7 +265,15 @@ async fn composed(client: Vec<ClientStep>, core: Core) -> Run {
             };
             wire.borrow_mut().events.push(Event::Dispatched(index));
             let act = core.acts.get(index).cloned().unwrap_or_default();
-            respond(index, head, body, act, Rc::clone(&wire), Rc::clone(&handed))
+            respond(
+                index,
+                head,
+                body,
+                interim,
+                act,
+                Rc::clone(&wire),
+                Rc::clone(&handed),
+            )
         }
     };
     let serving = {
@@ -396,6 +422,7 @@ async fn respond(
     index: usize,
     head: RawHead,
     mut body: RequestBody,
+    interim: Interim,
     act: Act,
     wire: Shared,
     handed: Rc<RefCell<Vec<Handed>>>,
@@ -417,6 +444,15 @@ async fn respond(
         ..Handed::default()
     };
     tokio::time::sleep(act.delay).await;
+    if act.hint {
+        // What an upstream says before its answer: the driver is to pass it on first.
+        let mut exchange = Channel::Listened(interim);
+        exchange.begin(false, false);
+        let mut hints = HeaderMap::new();
+        hints.insert("link", HeaderValue::from_static("</s.css>; rel=preload"));
+        exchange.upstream_interim(StatusCode::EARLY_HINTS, hints);
+        tokio::task::yield_now().await;
+    }
     let limit = match act.take {
         Take::All => usize::MAX,
         Take::Upto(most) => most,
@@ -731,16 +767,20 @@ const MOST_SENT: usize = 4096;
 
 /// Makes a client's script and a core from bytes, whatever they are: the fuzzer's input.
 ///
-/// The first byte says how many acts the core has (up to four), and four bytes each
-/// describe them. The rest is the client's script, a byte of step and what that step
+/// The first byte says how many acts the core has (up to four), and whether the socket
+/// between the client and the driver is a small one, and four bytes each describe the
+/// acts. The rest is the client's script, a byte of step and what that step
 /// takes after it: raw bytes to send, a well-formed request to send by number, a pause,
 /// answers to wait for, an interim answer to wait for, a close of the sending half, or
 /// reading stopped and started.
 #[must_use]
-pub fn decode(bytes: &[u8]) -> (Vec<ClientStep>, Core) {
+pub fn decode(bytes: &[u8]) -> (Vec<ClientStep>, Core, usize) {
     let mut input = bytes.iter().copied();
     let mut next = move || input.next();
-    let acts = usize::from(next().unwrap_or(0) % 5);
+    let first = next().unwrap_or(0);
+    let acts = usize::from(first % 5);
+    // Now and then a socket that holds a few bytes, so that a head is caught part way.
+    let pipe = if first >= 0xc0 { 16 } else { PIPE };
     let mut core = Core::default();
     for _ in 0..acts {
         let (a, b, c, d) = (
@@ -764,6 +804,7 @@ pub fn decode(bytes: &[u8]) -> (Vec<ClientStep>, Core) {
                 1 => Ending::FailsLater,
                 _ => Ending::Whole,
             },
+            hint: d & 0x80 != 0,
         });
     }
     let mut steps = Vec::new();
@@ -800,7 +841,7 @@ pub fn decode(bytes: &[u8]) -> (Vec<ClientStep>, Core) {
             }
         }
     }
-    (steps, core)
+    (steps, core, pipe)
 }
 
 /// What a run got wrong, by one oracle or the other.
@@ -1116,6 +1157,66 @@ mod tests {
         assert_eq!(run.events.last(), Some(&Event::Closed));
     }
 
+    /// An upstream's hints go before its answer; and before an answer that fails before
+    /// its head goes, a local 502 follows them — whole hints, then a whole answer.
+    #[test]
+    fn hints_go_first_whether_the_answer_holds_or_fails() {
+        for (ending, then) in [
+            (Ending::Whole, "HTTP/1.1 200 OK\r\n"),
+            (Ending::FailsFirst, "HTTP/1.1 502 Bad Gateway\r\n"),
+        ] {
+            let core = Core {
+                acts: vec![Act {
+                    hint: true,
+                    known_length: false,
+                    ending,
+                    ..Act::default()
+                }],
+            };
+            let run = run(&[Send(get("/")), Answers(1)], &core);
+            let received = String::from_utf8_lossy(&run.received);
+            assert!(
+                received.starts_with("HTTP/1.1 103 Early Hints\r\n"),
+                "{received:?}"
+            );
+            let after = received.split_once("\r\n\r\n").map_or("", |(_, rest)| rest);
+            assert!(after.starts_with(then), "{ending:?}: {received:?}");
+            assert_eq!(judge(&run), Ok(()), "{ending:?}: {:?}", run.events);
+        }
+    }
+
+    /// Hints part written when the answer fails are finished before the 502 goes after
+    /// them: a status line in the middle of a head would be two messages spliced into one
+    /// (14 §4). A socket of a few bytes, and a client that has stopped reading, catch the
+    /// driver part way through the hints.
+    #[test]
+    fn hints_part_written_are_finished_before_the_502() {
+        let core = Core {
+            acts: vec![Act {
+                hint: true,
+                known_length: false,
+                ending: Ending::FailsFirst,
+                ..Act::default()
+            }],
+        };
+        let client = [
+            StopReading,
+            Send(get("/")),
+            Pause(Duration::from_secs(1)),
+            ResumeReading,
+            Answers(1),
+        ];
+        let run = run_with(&client, &core, 16);
+        let received = String::from_utf8_lossy(&run.received);
+        assert!(
+            received.starts_with(
+                "HTTP/1.1 103 Early Hints\r\nlink: </s.css>; rel=preload\r\n\r\nHTTP/1.1 502 "
+            ),
+            "{received:?}"
+        );
+        assert_eq!(judge(&run), Ok(()), "{:?}", run.events);
+    }
+
     /// The examples above, each held against both oracles too.
     #[test]
     fn the_examples_pass_both_oracles() {
@@ -1295,14 +1396,18 @@ mod tests {
                     1 => Just(Ending::FailsFirst),
                     1 => Just(Ending::FailsLater),
                 ],
+                prop::bool::weighted(0.2),
             )
-                .prop_map(|(delay, take, status, body, known_length, ending)| Act {
-                    delay: Duration::from_millis(delay),
-                    take,
-                    status,
-                    body,
-                    known_length,
-                    ending,
+                .prop_map(|(delay, take, status, body, known_length, ending, hint)| {
+                    Act {
+                        delay: Duration::from_millis(delay),
+                        take,
+                        status,
+                        body,
+                        known_length,
+                        ending,
+                        hint,
+                    }
                 })
         }
 
@@ -1364,9 +1469,13 @@ mod tests {
             /// connection lives as the lifecycle oracle says it must, the core is handed
             /// what the client sent, and nothing is left held.
             #[test]
-            fn every_run_passes_both_oracles(client in client(), acts in prop::collection::vec(act(), 0..5)) {
+            fn every_run_passes_both_oracles(
+                client in client(),
+                acts in prop::collection::vec(act(), 0..5),
+                pipe in prop_oneof![3 => Just(PIPE), 1 => Just(16_usize)],
+            ) {
                 let core = Core { acts };
-                let run = run(&client, &core);
+                let run = run_with(&client, &core, pipe);
                 prop_assert_eq!(judge(&run), Ok(()), "{:?}\n{:?}", run.events, String::from_utf8_lossy(&run.sent));
             }
 
@@ -1374,8 +1483,8 @@ mod tests {
             /// decode to, the run passes both oracles.
             #[test]
             fn any_decoded_script_passes_both_oracles(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
-                let (client, core) = decode(&bytes);
-                let run = run(&client, &core);
+                let (client, core, pipe) = decode(&bytes);
+                let run = run_with(&client, &core, pipe);
                 prop_assert_eq!(judge(&run), Ok(()), "{:?}\n{:?}\n{:?}", client, run.events, String::from_utf8_lossy(&run.sent));
             }
         }
