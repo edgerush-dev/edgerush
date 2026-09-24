@@ -1112,7 +1112,7 @@ fn at_endpoint(target: &Uri, endpoint: &Authority) -> Option<Uri> {
 }
 
 /// Seconds since the Unix epoch, for dating answers.
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs())

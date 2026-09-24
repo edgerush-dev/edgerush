@@ -32,10 +32,11 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-# Clients of the engine's, for tests only: what talks to the proxy as a client would, and
-# a second oracle for EdgeRush's own HTTP/1 client (`upstream::h1::differential`).
+# The engine's clients and its either-version server, for tests only: what talks to the
+# proxy as a client would, upstreams that speak both versions, and a second oracle for
+# EdgeRush's own HTTP/1 client (`upstream::h1::differential`).
 hyper = { workspace = true, features = ["client"] }
-hyper-util = { workspace = true, features = ["client-legacy"] }
+hyper-util = { workspace = true, features = ["client-legacy", "server-auto"] }
 iai-callgrind.workspace = true
 proptest.workspace = true
 # Fixtures are written the way harness files are.

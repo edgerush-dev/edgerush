@@ -923,13 +923,33 @@ async fn what_happens_is_counted_and_a_reload_resets_nothing() {
     assert!(sample(&scrape, "edgerush_config_last_reload_timestamp_seconds") > 1_700_000_000);
 }
 
+/// Serves scrapes of `proxy` as the data plane does: a thread of its own, a single-threaded
+/// runtime and a `LocalSet`. Returns where.
+fn scraped(proxy: Arc<Proxy>) -> SocketAddr {
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let scrape = socket.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let socket = {
+            let _entered = runtime.enter();
+            TcpListener::from_std(socket).unwrap()
+        };
+        // Serving never ends, so neither does this: the thread goes with the process.
+        local.block_on(&runtime, proxy.serve_metrics(socket));
+    });
+    scrape
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_scrape_endpoint_serves_what_was_counted_and_nothing_else() {
     let up = upstream("up").await;
     let (proxy, addresses) = reloadable_proxy(&everything_to(&[("web", up)], "0")).await;
-    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let scrape = socket.local_addr().unwrap();
-    tokio::spawn(Arc::clone(&proxy).serve_metrics(socket));
+    let scrape = scraped(Arc::clone(&proxy));
     assert_eq!(send(get(addresses["web"], "/")).await.0, 200);
 
     let (status, headers, body) = send(get(scrape, "/metrics")).await;
@@ -955,6 +975,26 @@ async fn the_scrape_endpoint_serves_what_was_counted_and_nothing_else() {
 
     // Scrapes are not traffic: no listener counts them.
     assert_eq!(sample(&proxy.metrics(), web_2xx), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_scrape_endpoint_speaks_http1_only() {
+    let up = upstream("up").await;
+    let (proxy, _) = reloadable_proxy(&everything_to(&[("web", up)], "0")).await;
+    let scrape = scraped(proxy);
+
+    // Our own HTTP/1 server serves it, so a client that starts HTTP/2 with prior knowledge
+    // is told the version is not spoken, and the connection closes rather than being
+    // taken up.
+    let mut http2 = get(scrape, "/metrics");
+    *http2.version_mut() = Version::HTTP_2;
+    let answer = within(client(true).request(http2)).await;
+    assert!(answer.is_err(), "{answer:?} was answered over HTTP/2");
+    let answer = raw(scrape, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await;
+    assert!(
+        answer.starts_with("HTTP/1.1 505 "),
+        "{answer:?} is not a 505"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

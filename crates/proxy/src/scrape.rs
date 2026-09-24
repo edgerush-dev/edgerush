@@ -1,17 +1,27 @@
 //! The scrape endpoint: what was counted, over HTTP, on a socket of its own.
 //!
 //! It is not a listener of the config: no route leads to it, nothing of what it answers is
-//! counted as traffic, and a data plane that was given no socket for it serves none.
+//! counted as traffic, and a data plane that was given no socket for it serves none. It is
+//! served by our own HTTP/1 server, held to the same bounds and deadlines as a worker's
+//! connections, on blocks and an account of its own: scrapers speak HTTP/1.1, and no
+//! worker's storage goes on them.
 
-use crate::serve::{ACCEPT_PAUSE, Proxy, is_about_one_connection};
+use crate::downstream::h1::connection::{self as h1, Answered};
+use crate::downstream::h1::date::HttpDate;
+use crate::downstream::h1::deadlines::Bounds;
+use crate::head::Head;
+use crate::linger::linger;
+use crate::raw::RawHead;
+use crate::serve::{ACCEPT_PAUSE, Proxy, is_about_one_connection, unix_now};
+use crate::storage::Storage;
+use crate::upstream::h1::H1Limits;
+use crate::upstream::h1::blocks::{Blocks, SMALL, Sizes};
 use http::header::{ALLOW, CONTENT_TYPE};
-use http::{HeaderValue, Method, Request, Response, StatusCode};
+use http::{HeaderValue, Method, Response, StatusCode};
 use http_body_util::Full;
-use hyper::body::{Bytes, Incoming};
-use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
-use std::convert::Infallible;
+use hyper::body::Bytes;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -23,10 +33,24 @@ const ALLOWED: HeaderValue = HeaderValue::from_static("GET, HEAD");
 impl Proxy {
     /// Serves [`Proxy::metrics`] at `/metrics` to whoever connects to `socket`, and nothing
     /// else. Never returns; dropping the future stops accepting.
+    ///
+    /// # Panics
+    ///
+    /// Runs inside a `LocalSet`, where each connection's task goes: our server's
+    /// connections are not `Send`.
     pub async fn serve_metrics(self: Arc<Self>, socket: TcpListener) {
-        let server = auto::Builder::new(TokioExecutor::new());
+        let limits = H1Limits::default();
+        let blocks = Rc::new(RefCell::new(Blocks::new(
+            Sizes::within(&limits, SMALL),
+            Storage::new(limits.storage),
+        )));
+        let settings = h1::Settings {
+            limits,
+            bounds: Bounds::default(),
+            budget: h1::Budget::default(),
+        };
         loop {
-            let stream = match socket.accept().await {
+            let mut stream = match socket.accept().await {
                 Ok((stream, _)) => stream,
                 Err(error) => {
                     if !is_about_one_connection(&error) {
@@ -36,35 +60,53 @@ impl Proxy {
                 }
             };
             let proxy = Arc::clone(&self);
-            let server = server.clone();
-            tokio::spawn(async move {
-                let service = service_fn(move |request| {
-                    let response = proxy.scrape(&request);
-                    async move { Ok::<_, Infallible>(response) }
-                });
-                // The end of one scraper's connection, however it came.
-                let _closed = server.serve_connection(TokioIo::new(stream), service).await;
+            let blocks = Rc::clone(&blocks);
+            tokio::task::spawn_local(async move {
+                // Dated as each answer is written: scrapes are too few for a worker's
+                // cached date to be worth keeping here.
+                let date = || HttpDate::from_unix(unix_now());
+                let respond = |head: RawHead, _, _| {
+                    let answer = Answered::Map(proxy.scrape(&head));
+                    async move { answer }
+                };
+                // How it ended is the scraper's business; the socket is closed either way.
+                let _ended = h1::serve(&mut stream, settings, blocks, date, respond).await;
+                // Closed without a reset, so that one taking an answer with it is not
+                // possible even with a request body left unread.
+                linger(
+                    stream,
+                    settings.bounds.linger_quiet,
+                    settings.bounds.linger_most,
+                )
+                .await;
             });
         }
     }
 
-    fn scrape(&self, request: &Request<Incoming>) -> Response<Full<Bytes>> {
-        if request.uri().path() != "/metrics" {
+    fn scrape(&self, head: &RawHead) -> Response<Full<Bytes>> {
+        if head.uri().path() != "/metrics" {
             return empty(StatusCode::NOT_FOUND);
         }
-        if request.method() != Method::GET && request.method() != Method::HEAD {
+        if head.method() != Method::GET && head.method() != Method::HEAD {
             let mut response = empty(StatusCode::METHOD_NOT_ALLOWED);
             response.headers_mut().insert(ALLOW, ALLOWED);
             return response;
         }
         let mut response = Response::new(Full::new(Bytes::from(self.metrics())));
         response.headers_mut().insert(CONTENT_TYPE, TEXT_FORMAT);
-        response
+        local(response)
     }
 }
 
 fn empty(status: StatusCode) -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::default());
     *response.status_mut() = status;
+    local(response)
+}
+
+/// Marks an answer as the data plane's own, so that its head is paid for from the
+/// provision.
+fn local(mut response: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
+    response.extensions_mut().insert(h1::Local);
     response
 }

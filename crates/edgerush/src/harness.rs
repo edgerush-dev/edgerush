@@ -325,7 +325,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
 
 /// Answers scrapes on `socket`, on a small runtime and a thread of their own: what a
 /// scraper asks for is added up over every worker's shard, and no worker's time goes on
-/// it ([03 §2] in the docs).
+/// it ([03 §2] in the docs). Our own server serves them, so the thread runs a `LocalSet`
+/// as a worker's does.
 fn scrapes(proxy: Arc<Proxy>, socket: std::net::TcpListener) -> io::Result<()> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
     // The socket is handed to the runtime that is entered, as a worker's are.
@@ -334,7 +335,9 @@ fn scrapes(proxy: Arc<Proxy>, socket: std::net::TcpListener) -> io::Result<()> {
     drop(entered);
     thread::Builder::new()
         .name("metrics".to_owned())
-        .spawn(move || runtime.block_on(proxy.serve_metrics(socket)))?;
+        .spawn(move || {
+            tokio::task::LocalSet::new().block_on(&runtime, proxy.serve_metrics(socket));
+        })?;
     Ok(())
 }
 

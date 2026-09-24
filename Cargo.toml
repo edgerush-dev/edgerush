@@ -33,7 +33,7 @@ http-body-util = "0.1.5"
 httparse = "1.10"
 # The HTTP engine. Only the proxy crate may depend on these two.
 hyper = { version = "1.11", features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "http1", "http2"] }
+hyper-util = { version = "0.1.20", features = ["tokio", "http1", "http2"] }
 # Unicode tables are left out: regex paths are matched against normalised, ASCII-only paths.
 # The config model derives these traits and knows no format; formats belong to whoever
 # reads or writes a file or a stream.
