@@ -60,7 +60,7 @@ pub enum ExchangeError {
     /// The request's own body could not be read, which is the client's end failing, not
     /// the upstream's.
     #[error("the request body could not be read: {0}")]
-    RequestBody(Box<dyn StdError + Send + Sync>),
+    RequestBody(#[source] Box<dyn StdError + Send + Sync>),
     /// The upstream went away without answering. The request may have reached it, so
     /// there is nothing to do but say so: it is never sent a second time.
     #[error("the upstream closed the connection without answering")]

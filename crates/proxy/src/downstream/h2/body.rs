@@ -10,12 +10,17 @@
 //!
 //! Data and trailers stay separate frames, and the body says truthfully whether it has
 //! ended: a request whose HEADERS ended the stream has ended before it is read.
+//!
+//! A body waited on that brings nothing for its idle bound fails with
+//! [`RequestBodyError::TimedOut`], which the core answers 408 before its answer has begun.
 
+use crate::downstream::h2::idle::Idle;
 use crate::request_body::RequestBodyError;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use std::pin::Pin;
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 /// A request body h2 is receiving.
 #[derive(Debug)]
@@ -25,15 +30,29 @@ pub(crate) struct IncomingH2 {
     owed: usize,
     /// Every DATA frame has been handed over; what is left is trailers, if any.
     data_done: bool,
+    idle: Idle,
 }
 
 impl IncomingH2 {
-    /// The body of a request h2 accepted.
-    pub(crate) fn new(stream: ::h2::RecvStream) -> Self {
+    /// The body of a request h2 accepted, which may keep its reader waiting for `idle`
+    /// at the most.
+    pub(crate) fn new(stream: ::h2::RecvStream, idle: Duration) -> Self {
         Self {
             stream,
             owed: 0,
             data_done: false,
+            idle: Idle::new(idle),
+        }
+    }
+
+    /// Pending, unless the wait has run out.
+    fn waited(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, RequestBodyError>>> {
+        match self.idle.waiting(cx) {
+            Poll::Ready(()) => Poll::Ready(Some(Err(RequestBodyError::TimedOut))),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -55,7 +74,11 @@ impl Body for IncomingH2 {
                 .release_capacity(std::mem::take(&mut this.owed));
         }
         if !this.data_done {
-            match ready!(this.stream.poll_data(cx)) {
+            let Poll::Ready(data) = this.stream.poll_data(cx) else {
+                return this.waited(cx);
+            };
+            this.idle.moved();
+            match data {
                 Some(Ok(data)) => {
                     this.owed = data.len();
                     return Poll::Ready(Some(Ok(Frame::data(data))));
@@ -66,7 +89,11 @@ impl Body for IncomingH2 {
                 None => this.data_done = true,
             }
         }
-        Poll::Ready(match ready!(this.stream.poll_trailers(cx)) {
+        let Poll::Ready(trailers) = this.stream.poll_trailers(cx) else {
+            return this.waited(cx);
+        };
+        this.idle.moved();
+        Poll::Ready(match trailers {
             Ok(Some(trailers)) => Some(Ok(Frame::trailers(trailers))),
             Ok(None) => None,
             Err(error) => Some(Err(RequestBodyError::from_h2(error))),
@@ -91,7 +118,7 @@ impl Body for IncomingH2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::downstream::h2::testing::{locally, pair, post, wire, within};
+    use crate::downstream::h2::testing::{LONG, locally, locally_paused, pair, post, wire, within};
     use crate::downstream::h2::writer::Outgoing;
     use crate::h2_peer::{self, Peer, kind};
     use http::HeaderMap;
@@ -120,6 +147,7 @@ mod tests {
                         RequestBodyError::Incomplete(_) => "incomplete",
                         RequestBodyError::Invalid(_) => "invalid",
                         RequestBodyError::Other(_) => "other",
+                        RequestBodyError::TimedOut => "timed out",
                     }));
                     break;
                 }
@@ -143,7 +171,7 @@ mod tests {
     ) -> (::h2::SendStream<Bytes>, IncomingH2) {
         let (_response, sending) = send.send_request(post(), end_stream).unwrap();
         let (request, _respond) = within(server.accept()).await.unwrap().unwrap();
-        (sending, IncomingH2::new(request.into_body()))
+        (sending, IncomingH2::new(request.into_body(), LONG))
     }
 
     #[test]
@@ -227,7 +255,7 @@ mod tests {
             let (request, _respond) = within(server.accept()).await.unwrap().unwrap();
             tokio::task::spawn_local(async move { while server.accept().await.is_some() {} });
             drop(peer);
-            let body = IncomingH2::new(request.into_body());
+            let body = IncomingH2::new(request.into_body(), LONG);
             assert_eq!(
                 read(body).await,
                 vec![Read::Data("hel"), Read::Failed("incomplete")]
@@ -254,7 +282,7 @@ mod tests {
             }
             let (request, _respond) = within(server.accept()).await.unwrap().unwrap();
             tokio::task::spawn_local(async move { while server.accept().await.is_some() {} });
-            let mut body = IncomingH2::new(request.into_body());
+            let mut body = IncomingH2::new(request.into_body(), LONG);
             let updates = |frames: Vec<h2_peer::Frame>| -> Vec<(u32, u32)> {
                 frames
                     .into_iter()
@@ -273,6 +301,59 @@ mod tests {
             let _second = within(body.frame()).await.unwrap().unwrap();
             assert_eq!(updates(peer.settled().await), vec![(1, 16_384)]);
             drop(body);
+        });
+    }
+
+    /// The body's clock runs only while it is asked for and nothing comes, and each frame
+    /// that comes starts it afresh: a client that sends within its bound is never cut off,
+    /// a reader that stops asking does not charge the client for the time, and a client
+    /// that stops is cut off one bound after its last frame.
+    #[test]
+    fn the_upload_clock_runs_only_while_the_body_is_waited_on_with_nothing() {
+        locally_paused(async {
+            let idle = std::time::Duration::from_secs(5);
+            let (near, far) = wire();
+            let mut peer = Peer::open_as_client(far, &[]).await;
+            let mut server = ::h2::server::Builder::new()
+                .handshake::<_, Outgoing>(near)
+                .await
+                .unwrap();
+            peer.send(&h2_peer::headers(1, h2_peer::request("POST", "/"), false))
+                .await;
+            let (request, _respond) = server.accept().await.unwrap().unwrap();
+            tokio::task::spawn_local(async move { while server.accept().await.is_some() {} });
+            let mut body = IncomingH2::new(request.into_body(), idle);
+            let started = tokio::time::Instant::now();
+
+            // A frame every four seconds, inside the bound each time.
+            let sending = tokio::task::spawn_local(async move {
+                for _ in 0..4 {
+                    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                    peer.send(&h2_peer::data(1, b"x", false)).await;
+                }
+                peer
+            });
+            for _ in 0..4 {
+                let frame = within(body.frame()).await.unwrap().unwrap();
+                assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"x"));
+            }
+            let _peer = sending.await.unwrap();
+            assert_eq!(started.elapsed(), std::time::Duration::from_secs(16));
+
+            // Not asked for twenty seconds: the reader's time, not the client's.
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            let asked = tokio::time::Instant::now();
+            // Bounded, so that a clock that never runs out fails here rather than hangs.
+            let ended = within(body.frame()).await.unwrap();
+            assert!(
+                matches!(ended, Err(RequestBodyError::TimedOut)),
+                "{ended:?}"
+            );
+            assert_eq!(
+                asked.elapsed(),
+                idle,
+                "cut off by the bound after it was asked"
+            );
         });
     }
 }

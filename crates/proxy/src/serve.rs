@@ -27,7 +27,7 @@ use crate::metrics::{Answer, Metrics, Socket, Stopped};
 use crate::random::random;
 use crate::raw::{RawAnswer, RawHead};
 use crate::request::decide;
-use crate::request_body::RequestBody;
+use crate::request_body::{RequestBody, RequestBodyError};
 use crate::storage::Storage;
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
@@ -70,12 +70,18 @@ pub(crate) const FIRST_REQUEST: Duration = Duration::from_secs(10);
 /// clock for both, so this cannot yet be two deadlines as 14 §8 proposes.
 pub(crate) const NEXT_REQUEST: Duration = Duration::from_secs(30);
 
-/// The deadlines a worker holds its client connections to: [`FIRST_REQUEST`] and
-/// [`NEXT_REQUEST`], short in tests so that they can run on real sockets and real time.
+/// How long a request body, or the room to write an answer, may be waited on with nothing
+/// coming ([14 §8](../../docs/14-downstream-server.md)).
+pub(crate) const IDLE: Duration = Duration::from_secs(30);
+
+/// The deadlines a worker holds its client connections to: [`FIRST_REQUEST`],
+/// [`NEXT_REQUEST`] and [`IDLE`], short in tests so that they can run on real sockets and
+/// real time.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Deadlines {
     first_request: Duration,
     next_request: Duration,
+    idle: Duration,
 }
 
 impl Default for Deadlines {
@@ -83,6 +89,7 @@ impl Default for Deadlines {
         Self {
             first_request: FIRST_REQUEST,
             next_request: NEXT_REQUEST,
+            idle: IDLE,
         }
     }
 }
@@ -669,6 +676,7 @@ impl Worker {
                             // longer than the wait for it to begin.
                             next_head: Bounds::default().next_head.min(deadlines.next_request),
                             keep_alive: deadlines.next_request,
+                            idle: deadlines.idle,
                             ..Bounds::default()
                         },
                         budget: h1::Budget::default(),
@@ -702,6 +710,7 @@ impl Worker {
                     let settings = h2::connection::Settings {
                         keep_alive: deadlines.next_request,
                         closing: Bounds::default().next_head.min(deadlines.next_request),
+                        idle: deadlines.idle,
                         ..h2::connection::Settings::default()
                     };
                     h2::connection::serve(replay, settings, storage, date, respond).await;
@@ -830,7 +839,7 @@ impl Worker {
             // The worker's own storage running out, or a client's body that cannot be read,
             // is not the upstream failing, and is not counted as though it were
             // ([14 §8](../../docs/14-downstream-server.md)).
-            Err(answer @ (Answer::Exhausted | Answer::BadBody)) => {
+            Err(answer @ (Answer::Exhausted | Answer::BadBody | Answer::BodyTimedOut)) => {
                 return self.proxy.answer(listener, answer).into();
             }
             Err(answer) => {
@@ -897,6 +906,14 @@ impl Worker {
                 self.proxy.metrics.stopped(why_stopped(&error));
                 return Err(match error {
                     ExchangeError::Exhausted(_) => Answer::Exhausted,
+                    ExchangeError::RequestBody(cause)
+                        if matches!(
+                            cause.downcast_ref::<RequestBodyError>(),
+                            Some(RequestBodyError::TimedOut)
+                        ) =>
+                    {
+                        Answer::BodyTimedOut
+                    }
                     ExchangeError::RequestBody(_) => Answer::BadBody,
                     _ => Answer::UpstreamFailed,
                 });
@@ -1193,6 +1210,7 @@ mod tests {
     const SHORT: Deadlines = Deadlines {
         first_request: Duration::from_millis(300),
         next_request: Duration::from_millis(700),
+        idle: Duration::from_millis(500),
     };
 
     /// How late a deadline may be seen to fire on a loaded machine.
@@ -1443,6 +1461,137 @@ mod tests {
                 assert!(
                     took + EARLY >= SHORT.next_request && took < SHORT.next_request + SLACK,
                     "told to go {took:?} after the reset"
+                );
+            })
+            .await;
+    }
+
+    /// An HTTP/2 client of h2's own, over a real socket to `front`, built as `builder` says.
+    async fn h2_library_client(
+        front: SocketAddr,
+        builder: &::h2::client::Builder,
+    ) -> ::h2::client::SendRequest<Bytes> {
+        let stream = TcpStream::connect(front).await.unwrap();
+        let (send, connection) = builder.handshake(stream).await.unwrap();
+        let _driving = tokio::task::spawn_local(async move {
+            let _ended = connection.await;
+        });
+        send
+    }
+
+    /// An upload that stops while it is waited on is answered 408 at its idle deadline, on
+    /// its own stream: the connection and its other streams carry on (14 §8).
+    #[tokio::test]
+    async fn a_stalled_http2_upload_is_answered_408_at_its_idle_deadline() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _held) = scripted_upstream().await;
+                let front = serving_worker(upstream).await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::post("http://example.test/held")
+                    .version(Version::HTTP_2)
+                    .body(())
+                    .unwrap();
+                let (response, mut upload) = send.send_request(request, false).unwrap();
+                upload.send_data(Bytes::from_static(b"abc"), false).unwrap();
+                let stalled = tokio::time::Instant::now();
+                let response = tokio::time::timeout(Duration::from_secs(10), response)
+                    .await
+                    .expect("never answered")
+                    .unwrap();
+                let took = stalled.elapsed();
+                assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+                assert!(
+                    took + EARLY >= SHORT.idle && took < SHORT.idle + SLACK,
+                    "answered after {took:?}"
+                );
+            })
+            .await;
+    }
+
+    /// An upload that stops after its answer has begun cannot be answered 408 any more: the
+    /// stream is cancelled at the idle deadline, CANCEL and not INTERNAL_ERROR, since it
+    /// was the client that stopped.
+    #[tokio::test]
+    async fn an_http2_upload_stalled_under_its_answer_is_cancelled_at_its_idle_deadline() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _held) = scripted_upstream().await;
+                let front = serving_worker(upstream).await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::post("http://example.test/endless")
+                    .version(Version::HTTP_2)
+                    .body(())
+                    .unwrap();
+                let (response, mut upload) = send.send_request(request, false).unwrap();
+                upload.send_data(Bytes::from_static(b"abc"), false).unwrap();
+                let stalled = tokio::time::Instant::now();
+                let response = tokio::time::timeout(Duration::from_secs(10), response)
+                    .await
+                    .expect("no head")
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let mut body = response.into_body();
+                let error = loop {
+                    match tokio::time::timeout(Duration::from_secs(10), body.data())
+                        .await
+                        .expect("never cancelled")
+                    {
+                        Some(Ok(data)) => {
+                            let _ = body.flow_control().release_capacity(data.len());
+                        }
+                        Some(Err(error)) => break error,
+                        None => panic!("the endless answer ended"),
+                    }
+                };
+                let took = stalled.elapsed();
+                assert_eq!(error.reason(), Some(::h2::Reason::CANCEL), "{error:?}");
+                assert!(
+                    took + EARLY >= SHORT.idle && took < SHORT.idle + SLACK,
+                    "cancelled after {took:?}"
+                );
+            })
+            .await;
+    }
+
+    /// A client that gives no room for its answer has the stream cancelled at the idle
+    /// deadline, and the upstream's answer is let go of with it.
+    #[tokio::test]
+    async fn an_http2_answer_given_no_room_is_cancelled_at_its_idle_deadline() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let front = serving_worker(upstream).await;
+                let mut builder = ::h2::client::Builder::new();
+                builder.initial_window_size(0);
+                let mut send = h2_library_client(front, &builder).await;
+                let request = Request::get("http://example.test/")
+                    .version(Version::HTTP_2)
+                    .body(())
+                    .unwrap();
+                let (response, _) = send.send_request(request, true).unwrap();
+                let response = tokio::time::timeout(Duration::from_secs(10), response)
+                    .await
+                    .expect("no head")
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let headed = tokio::time::Instant::now();
+                let mut body = response.into_body();
+                let ended = tokio::time::timeout(Duration::from_secs(10), body.data())
+                    .await
+                    .expect("never cancelled");
+                let took = headed.elapsed();
+                let error = match ended {
+                    Some(Err(error)) => error,
+                    other => panic!("not cancelled: {other:?}"),
+                };
+                assert_eq!(error.reason(), Some(::h2::Reason::CANCEL), "{error:?}");
+                assert!(
+                    took + EARLY >= SHORT.idle && took < SHORT.idle + SLACK,
+                    "cancelled after {took:?}"
                 );
             })
             .await;

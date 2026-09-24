@@ -50,6 +50,9 @@ pub(crate) struct Settings {
     pub(crate) keep_alive: Duration,
     /// How long a connection told to go has to finish before it is closed regardless.
     pub(crate) closing: Duration,
+    /// How long a stream's body, or the room to send its answer, may be waited on with
+    /// nothing coming.
+    pub(crate) idle: Duration,
 }
 
 impl Default for Settings {
@@ -62,6 +65,7 @@ impl Default for Settings {
             send_buffer: 400 * 1024,
             keep_alive: Duration::from_secs(30),
             closing: Duration::from_secs(10),
+            idle: Duration::from_secs(30),
         }
     }
 }
@@ -169,8 +173,17 @@ pub(crate) async fn serve<S, R, F, B, D>(
         };
         let open = Open::new(&streams);
         let (storage, date, respond) = (Rc::clone(&storage), Rc::clone(&date), Rc::clone(&respond));
+        let idle = settings.idle;
         let _detached = tokio::task::spawn_local(async move {
-            answer(request, Responder::new(send), &*respond, &storage, &*date).await;
+            answer(
+                request,
+                Responder::new(send),
+                &*respond,
+                &storage,
+                &*date,
+                idle,
+            )
+            .await;
             drop(open);
         });
     }
@@ -188,6 +201,7 @@ async fn answer<R, F, B, D>(
     respond: &R,
     storage: &Rc<Storage>,
     date: &D,
+    idle: Duration,
 ) where
     R: Fn(Request<RequestBody>) -> F,
     F: Future<Output = Answered<B>>,
@@ -195,7 +209,7 @@ async fn answer<R, F, B, D>(
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     D: Fn() -> HttpDate,
 {
-    let request = request.map(|body| RequestBody::H2(IncomingH2::new(body)));
+    let request = request.map(|body| RequestBody::H2(IncomingH2::new(body, idle)));
     let mut answering = std::pin::pin!(respond(request));
     let answered = poll_fn(|cx| {
         if responder.poll_reset(cx).is_ready() {
@@ -222,6 +236,6 @@ async fn answer<R, F, B, D>(
     if !end {
         // However the sending ends, there is nobody left to tell: a reset stream or a
         // failed body has been reset already.
-        let _sent = send_body(&mut stream, body, storage).await;
+        let _sent = send_body(&mut stream, body, storage, idle).await;
     }
 }

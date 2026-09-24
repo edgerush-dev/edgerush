@@ -4,7 +4,7 @@
 //! grants, paid for while h2 holds it.
 
 use crate::downstream::h2::body::IncomingH2;
-use crate::downstream::h2::testing::{locally, serving, wire, within};
+use crate::downstream::h2::testing::{LONG, locally, serving, wire, within};
 use crate::downstream::h2::writer::{Outgoing, Responder, send_body};
 use crate::h2_peer::{self, Peer, flag, kind, setting};
 use crate::storage::{LIMIT, Storage};
@@ -79,7 +79,7 @@ fn an_upload_s_credit_follows_the_exchange_writing_it_upstream() {
                 .await;
         }
         let (request, _respond) = within(accepted.recv()).await.unwrap();
-        let body = IncomingH2::new(request.into_body());
+        let body = IncomingH2::new(request.into_body(), LONG);
 
         // An upstream with 4 KiB of room, which reads nothing yet.
         let (ours, mut upstream) = tokio::io::duplex(4096);
@@ -179,7 +179,9 @@ fn an_upstream_answer_goes_out_within_the_client_s_window_and_is_paid_for() {
             .unwrap();
         let paid = Rc::clone(&storage);
         let sending =
-            tokio::task::spawn_local(async move { send_body(&mut stream, body, &paid).await });
+            tokio::task::spawn_local(
+                async move { send_body(&mut stream, body, &paid, LONG).await },
+            );
 
         let delivered = |frames: &[h2_peer::Frame]| -> usize {
             frames

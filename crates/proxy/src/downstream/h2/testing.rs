@@ -7,6 +7,9 @@ use std::future::Future;
 use std::time::Duration;
 use tokio::io::DuplexStream;
 
+/// An idle bound no test here runs into, for the ones that are not about it.
+pub(super) const LONG: Duration = Duration::from_secs(600);
+
 /// A test that waits for what never comes should fail, not hang.
 pub(super) async fn within<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(10), future)
@@ -18,6 +21,16 @@ pub(super) async fn within<T>(future: impl Future<Output = T>) -> T {
 pub(super) fn locally<F: Future>(test: F) -> F::Output {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(tokio::task::LocalSet::new().run_until(test))
+}
+
+/// The same on a stopped clock, which moves only when every task is waiting.
+pub(super) fn locally_paused<F: Future>(test: F) -> F::Output {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
         .build()
         .expect("a runtime");
     runtime.block_on(tokio::task::LocalSet::new().run_until(test))

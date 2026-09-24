@@ -148,10 +148,13 @@ pub(crate) enum Answer {
     /// The request's body could not be read: the client's fault, found once the request
     /// had gone upstream, and not the upstream failing.
     BadBody,
+    /// The request's body stopped arriving for longer than its idle bound, while it was
+    /// being waited on ([14 §8](../../docs/14-downstream-server.md)).
+    BodyTimedOut,
 }
 
 impl Answer {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -164,6 +167,7 @@ impl Answer {
         Self::Exhausted,
         Self::Edits,
         Self::BadBody,
+        Self::BodyTimedOut,
     ];
 
     /// The status that is answered with.
@@ -178,6 +182,7 @@ impl Answer {
             Self::NoBackend | Self::Edits => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NoEndpoints | Self::TooBusy | Self::Exhausted => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamFailed => StatusCode::BAD_GATEWAY,
+            Self::BodyTimedOut => StatusCode::REQUEST_TIMEOUT,
         }
     }
 
@@ -195,6 +200,7 @@ impl Answer {
             Self::Exhausted => "exhausted",
             Self::Edits => "edits",
             Self::BadBody => "bad_body",
+            Self::BodyTimedOut => "body_timed_out",
         }
     }
 }

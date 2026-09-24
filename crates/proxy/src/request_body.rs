@@ -47,6 +47,10 @@ pub(crate) enum RequestBodyError {
     /// Anything else the server reported, an HTTP/2 stream the client reset among them.
     #[error("the request body could not be read")]
     Other(#[source] Cause),
+    /// The client sent nothing more for longer than the body's idle bound while it was
+    /// waited on.
+    #[error("the client stopped sending the request body")]
+    TimedOut,
 }
 
 impl RequestBodyError {

@@ -17,6 +17,8 @@
 //! Interim heads go only before the final head: h2 would send one after it, on a stream it
 //! has closed (15 §3), and [`Responder`] refuses it instead.
 
+use crate::downstream::h2::idle::Idle;
+use crate::request_body::RequestBodyError;
 use crate::storage::{Charge, Exhausted, Storage};
 use bytes::{Buf, Bytes};
 use http::Response;
@@ -25,6 +27,7 @@ use std::error::Error as StdError;
 use std::future::poll_fn;
 use std::rc::Rc;
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 /// The most handed to h2 at once: one frame of the size every client accepts (RFC 9113
 /// §4.2).
@@ -88,6 +91,9 @@ pub(crate) enum SendError {
     /// An interim head after the final head, or a second final head.
     #[error("the final head has already been sent")]
     AfterFinal,
+    /// The client gave no room for the answer for longer than its idle bound.
+    #[error("the client stopped taking the answer")]
+    TimedOut,
 }
 
 /// A stream's heads: interim ones, then one final head.
@@ -141,27 +147,56 @@ impl Responder {
 }
 
 /// Sends `body` on `stream`, whose final head has gone without ending it, to the body's
-/// end. On failure the stream is reset unless the client reset it first.
+/// end, waiting for room no longer than `idle` at a time. On failure the stream is reset
+/// unless the client reset it first: CANCEL for a client that stopped taking the answer,
+/// INTERNAL_ERROR for a failure of ours or the body's.
 pub(crate) async fn send_body<B>(
     stream: &mut ::h2::SendStream<Outgoing>,
     body: B,
     storage: &Rc<Storage>,
+    idle: Duration,
 ) -> Result<(), SendError>
 where
     B: Body<Data = Bytes>,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    let sent = sending(stream, body, storage).await;
-    if let Err(SendError::Body(_) | SendError::Exhausted(_) | SendError::H2(_)) = &sent {
-        stream.send_reset(::h2::Reason::INTERNAL_ERROR);
+    let mut idle = Idle::new(idle);
+    let sent = sending(stream, body, storage, &mut idle).await;
+    match &sent {
+        // The client's own upload stopping is the client's doing, whatever it broke on
+        // the way: the upstream's answer, cut short because its request was.
+        Err(SendError::Body(error)) if client_stopped(&**error) => {
+            stream.send_reset(::h2::Reason::CANCEL);
+        }
+        Err(SendError::Body(_) | SendError::Exhausted(_) | SendError::H2(_)) => {
+            stream.send_reset(::h2::Reason::INTERNAL_ERROR);
+        }
+        Err(SendError::TimedOut) => stream.send_reset(::h2::Reason::CANCEL),
+        _ => {}
     }
     sent
+}
+
+/// Whether `error` comes of the client's upload stopping for longer than its idle bound.
+fn client_stopped(error: &(dyn StdError + 'static)) -> bool {
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if matches!(
+            error.downcast_ref::<RequestBodyError>(),
+            Some(RequestBodyError::TimedOut)
+        ) {
+            return true;
+        }
+        cause = error.source();
+    }
+    false
 }
 
 async fn sending<B>(
     stream: &mut ::h2::SendStream<Outgoing>,
     body: B,
     storage: &Rc<Storage>,
+    idle: &mut Idle,
 ) -> Result<(), SendError>
 where
     B: Body<Data = Bytes>,
@@ -185,7 +220,7 @@ where
         match frame.into_data() {
             Ok(data) => {
                 let end = body.is_end_stream();
-                send_data(stream, data, end, storage).await?;
+                send_data(stream, data, end, storage, idle).await?;
                 if end {
                     return Ok(());
                 }
@@ -206,6 +241,7 @@ async fn send_data(
     mut data: Bytes,
     end: bool,
     storage: &Rc<Storage>,
+    idle: &mut Idle,
 ) -> Result<(), SendError> {
     if data.is_empty() {
         if end {
@@ -215,7 +251,7 @@ async fn send_data(
     }
     while !data.is_empty() {
         stream.reserve_capacity(data.len());
-        let granted = poll_fn(|cx| granted(stream, cx)).await?;
+        let granted = poll_fn(|cx| granted(stream, cx, idle)).await?;
         // No larger than a frame: h2 keeps a piece until its last byte is written, while it
         // grants room again as each frame of it goes, so a larger piece would be paid for
         // beside the next.
@@ -226,21 +262,30 @@ async fn send_data(
     Ok(())
 }
 
-/// Room h2 has granted, waiting for some if there is none, and for a reset meanwhile.
+/// Room h2 has granted, waiting for some if there is none — for its idle bound at the
+/// most — and for a reset meanwhile.
 fn granted(
     stream: &mut ::h2::SendStream<Outgoing>,
     cx: &mut Context<'_>,
+    idle: &mut Idle,
 ) -> Poll<Result<usize, SendError>> {
     ready!(unless_reset(stream, cx))?;
     loop {
         let capacity = stream.capacity();
         if capacity > 0 {
+            idle.moved();
             return Poll::Ready(Ok(capacity));
         }
-        match ready!(stream.poll_capacity(cx)) {
-            Some(Ok(_)) => {}
-            Some(Err(error)) => return Poll::Ready(Err(error.into())),
-            None => return Poll::Ready(Err(SendError::Closed)),
+        match stream.poll_capacity(cx) {
+            Poll::Ready(Some(Ok(_))) => {}
+            Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error.into())),
+            Poll::Ready(None) => return Poll::Ready(Err(SendError::Closed)),
+            Poll::Pending => {
+                return match idle.waiting(cx) {
+                    Poll::Ready(()) => Poll::Ready(Err(SendError::TimedOut)),
+                    Poll::Pending => Poll::Pending,
+                };
+            }
         }
     }
 }
@@ -262,7 +307,7 @@ fn unless_reset(
 mod tests {
     use super::*;
     use crate::downstream::h2::body::IncomingH2;
-    use crate::downstream::h2::testing::{locally, pair, post, serving, wire, within};
+    use crate::downstream::h2::testing::{LONG, locally, pair, post, serving, wire, within};
     use crate::h2_peer::{self, Frame as Wire, Peer, code, flag, kind, setting};
     use http::HeaderMap;
     use http_body::{Frame, SizeHint};
@@ -406,7 +451,7 @@ mod tests {
             let mut responder = stream_one(&mut peer, &mut accepted).await;
             let mut stream = responder.final_head(Response::new(()), false).unwrap();
             let (body, _) = Scripted::new(vec![data(b"hello"), data(b"world")]);
-            within(send_body(&mut stream, body, &storage))
+            within(send_body(&mut stream, body, &storage, LONG))
                 .await
                 .unwrap();
             assert_eq!(
@@ -429,7 +474,7 @@ mod tests {
             let mut responder = stream_one(&mut peer, &mut accepted).await;
             let mut stream = responder.final_head(Response::new(()), false).unwrap();
             let (body, _) = Scripted::new(vec![data(b"hello"), Ok(Frame::trailers(sum()))]);
-            within(send_body(&mut stream, body, &storage))
+            within(send_body(&mut stream, body, &storage, LONG))
                 .await
                 .unwrap();
             assert_eq!(
@@ -452,7 +497,7 @@ mod tests {
             let mut responder = stream_one(&mut peer, &mut accepted).await;
             let mut stream = responder.final_head(Response::new(()), false).unwrap();
             let (body, _) = Scripted::new(vec![data(b"hel"), Err("the upstream went away")]);
-            let sent = within(send_body(&mut stream, body, &storage)).await;
+            let sent = within(send_body(&mut stream, body, &storage, LONG)).await;
             assert!(matches!(sent, Err(SendError::Body(_))), "{sent:?}");
             // Whatever of it had gone before the reset, the stream never ends cleanly: h2
             // drops a reset stream's frames still queued.
@@ -488,7 +533,9 @@ mod tests {
             let (body, dropped) = Scripted::new(frames.collect());
             let paid = Rc::clone(&storage);
             let sending =
-                tokio::task::spawn_local(async move { send_body(&mut stream, body, &paid).await });
+                tokio::task::spawn_local(
+                    async move { send_body(&mut stream, body, &paid, LONG).await },
+                );
 
             // The window is 16 KiB: that much is handed over, and it waits in h2, paid for,
             // behind a connection that will not take it.
@@ -539,7 +586,9 @@ mod tests {
             let (body, dropped) = Scripted::new(vec![data(b"never sent")]);
             let paid = Rc::clone(&storage);
             let sending =
-                tokio::task::spawn_local(async move { send_body(&mut stream, body, &paid).await });
+                tokio::task::spawn_local(
+                    async move { send_body(&mut stream, body, &paid, LONG).await },
+                );
             peer.settled().await;
             assert!(!sending.is_finished(), "sent into a window of nothing");
             peer.send(&h2_peer::rst_stream(1, code::CANCEL)).await;
@@ -615,15 +664,14 @@ mod tests {
             let (response, mut upload) = send.send_request(post(), false).unwrap();
             upload.send_data(quarter_mib(), true).unwrap();
             let (request, respond) = within(accepted.recv()).await.unwrap();
-            let held_back = IncomingH2::new(request.into_body());
+            let held_back = IncomingH2::new(request.into_body(), LONG);
             let mut stream = Responder::new(respond)
                 .final_head(Response::new(()), false)
                 .unwrap();
             let paid = Rc::clone(&storage);
-            let answering =
-                tokio::task::spawn_local(
-                    async move { send_body(&mut stream, answer(), &paid).await },
-                );
+            let answering = tokio::task::spawn_local(async move {
+                send_body(&mut stream, answer(), &paid, LONG).await
+            });
             assert_eq!(received(response).await, 256 * 1024);
             within(answering).await.unwrap().unwrap();
 
@@ -635,11 +683,10 @@ mod tests {
                 .final_head(Response::new(()), false)
                 .unwrap();
             let paid = Rc::clone(&storage);
-            let answering =
-                tokio::task::spawn_local(
-                    async move { send_body(&mut stream, answer(), &paid).await },
-                );
-            let uploaded = within(BodyExt::collect(IncomingH2::new(request.into_body())))
+            let answering = tokio::task::spawn_local(async move {
+                send_body(&mut stream, answer(), &paid, LONG).await
+            });
+            let uploaded = within(BodyExt::collect(IncomingH2::new(request.into_body(), LONG)))
                 .await
                 .unwrap();
             assert_eq!(uploaded.to_bytes().len(), 256 * 1024);

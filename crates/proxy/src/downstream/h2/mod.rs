@@ -4,6 +4,7 @@
 
 pub(crate) mod body;
 pub(crate) mod connection;
+pub(crate) mod idle;
 pub(crate) mod writer;
 
 #[cfg(test)]
