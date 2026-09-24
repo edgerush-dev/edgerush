@@ -594,7 +594,7 @@ soak)
     METRICS=127.0.0.1:9090
     start_proxy ours
     taskset -c "$GEN_CPUS" python3 "$here/idle.py" "$proxy_at" "$host" \
-        "$IDLE_CONNECTIONS" one-request >"$OUT/soak.idle-ready" 2>"$OUT/soak.idle-err" &
+        "$IDLE_CONNECTIONS" refreshed >"$OUT/soak.idle-ready" 2>"$OUT/soak.idle-err" &
     holding=$!
     # -w: requests under way when the time is up are waited for, not counted as errors.
     taskset -c "$GEN_CPUS" oha -z "${minutes}m" -w -q "$rate" -c 256 --no-tui \
