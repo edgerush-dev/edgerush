@@ -28,6 +28,7 @@ use super::outbound::{OnFailure, Outbound};
 use super::writer::{
     Asked, BodyFramer, Content, Delimited, WriteError, Written, write_head, write_interim,
 };
+use crate::drain::Drain;
 use crate::h1::{BodyReader, CodecError, Framing, Piece};
 use crate::head::Head as _;
 use crate::interim::Interim;
@@ -874,6 +875,7 @@ pub(crate) async fn serve<S, R, F, B>(
     settings: Settings,
     blocks: Rc<RefCell<Blocks>>,
     date: impl Fn() -> HttpDate,
+    drain: &Drain,
     mut respond: R,
 ) -> Ended
 where
@@ -885,6 +887,7 @@ where
     let limits = settings.limits;
     let mut connection = Connection::new(socket, settings, blocks);
     let mut timer = std::pin::pin!(tokio::time::sleep_until(Instant::now()));
+    let mut draining = std::pin::pin!(drain.notified());
 
     loop {
         // The head, from what is already here and then from the socket.
@@ -930,6 +933,11 @@ where
                         connection.poll_deadline(context, timer.as_mut())
                     {
                         return Poll::Ready(Err(Ok(Ended::TimedOut(clock))));
+                    }
+                    // Draining, and nothing of a next request here: it is closed rather
+                    // than waited on (03 §10). A head begun is read and answered, closing.
+                    if empty && drain.poll_on(draining.as_mut(), context).is_ready() {
+                        return Poll::Ready(Err(Ok(Ended::Closed)));
                     }
                     return connection.wait();
                 }
@@ -1068,7 +1076,7 @@ where
         // The connection is kept only if the request was read to its end by the time its
         // answer began; an upload still arriving is closed, lingering, rather than read
         // as the next request.
-        let persistent = arrived.persistent && {
+        let persistent = arrived.persistent && !drain.is_on() && {
             let inbound = connection.inbound.borrow();
             inbound.reader.is_none() && !inbound.ended && !inbound.failed
         };
@@ -1291,11 +1299,13 @@ mod tests {
         F: Future<Output = Response<B>>,
         B: Body<Data = Bytes> + Unpin,
     {
+        let never = Drain::default();
         super::serve(
             socket,
             settings,
             blocks,
             date,
+            &never,
             |head: RawHead, body, interim| {
                 let answering = respond(Request::from_parts(head.into_parts(), body), interim);
                 async move { Answered::Map(answering.await) }
@@ -2778,7 +2788,14 @@ mod tests {
         };
         let ended = tokio::time::timeout(
             Duration::from_secs(10),
-            super::serve(server, settings(), blocks, date, answering),
+            super::serve(
+                server,
+                settings(),
+                blocks,
+                date,
+                &Drain::default(),
+                answering,
+            ),
         )
         .await
         .unwrap();

@@ -207,6 +207,70 @@ fn what_every_worker_counts_is_added_up_in_one_scrape() -> io::Result<()> {
     Ok(())
 }
 
+/// Told to stop, the harness drains (03 §10): a request under way is answered, saying the
+/// connection closes; nothing new is taken; and the process exits once the last
+/// connection has gone.
+#[cfg(unix)]
+#[test]
+fn told_to_stop_it_finishes_what_is_under_way_and_exits() -> io::Result<()> {
+    let (up, arrived, release) = held_upstream()?;
+    let file = scratch("drained.yaml");
+    std::fs::write(&file, config("127.0.0.1:0", "up", Some(up)))?;
+    let mut harness = Harness::start(&["--config", &file, "--workers", "2"])?;
+    let web = harness.address_after("listener \"web\" is on ");
+    harness.wait_for("2 workers, thread-per-core");
+
+    let mut under_way = TcpStream::connect(web)?;
+    under_way.set_read_timeout(Some(PATIENCE))?;
+    under_way.write_all(b"GET / HTTP/1.1\r\nhost: harness.test\r\n\r\n")?;
+    arrived
+        .recv_timeout(PATIENCE)
+        .expect("the request reached the upstream");
+    harness.signal("TERM")?;
+    harness.wait_for("draining");
+    // Every worker's sweep, which comes every second, has brought it the drain.
+    thread::sleep(Duration::from_millis(1500));
+    assert!(
+        TcpStream::connect(web).is_err(),
+        "still accepting while draining"
+    );
+
+    release.send(()).expect("the upstream waits");
+    let mut answer = String::new();
+    under_way.read_to_string(&mut answer)?;
+    let answer = answer.to_lowercase();
+    assert!(answer.starts_with("http/1.1 200 ok\r\n"), "{answer}");
+    assert!(answer.contains("connection: close\r\n"), "{answer}");
+    harness.wait_for("drained");
+    assert_eq!(harness.exited()?.code(), Some(0));
+    Ok(())
+}
+
+/// A second signal while draining does not wait for what is under way.
+#[cfg(unix)]
+#[test]
+fn a_second_signal_while_draining_exits_at_once() -> io::Result<()> {
+    let (up, arrived, _release) = held_upstream()?;
+    let file = scratch("stopped.yaml");
+    std::fs::write(&file, config("127.0.0.1:0", "up", Some(up)))?;
+    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
+    let web = harness.address_after("listener \"web\" is on ");
+    harness.wait_for("1 worker, thread-per-core");
+
+    let mut under_way = TcpStream::connect(web)?;
+    under_way.write_all(b"GET / HTTP/1.1\r\nhost: harness.test\r\n\r\n")?;
+    arrived
+        .recv_timeout(PATIENCE)
+        .expect("the request reached the upstream");
+    harness.signal("TERM")?;
+    harness.wait_for("draining");
+    harness.signal("INT")?;
+    let said = harness.wait_for("stopped while draining");
+    assert_eq!(said, "stopped while draining: 1 connections cut off");
+    assert_eq!(harness.exited()?.code(), Some(0));
+    Ok(())
+}
+
 /// A second worker wants a second socket on the one port, which is `SO_REUSEPORT` and is
 /// not everywhere. One worker asks nothing of the kernel and runs anywhere.
 #[cfg(not(unix))]
@@ -275,6 +339,31 @@ fn upstream(name: &'static str) -> io::Result<SocketAddr> {
     Ok(address)
 }
 
+/// Starts an upstream that says on `arrived` when a request has come, and answers it
+/// once told to on `release`.
+#[cfg(unix)]
+fn held_upstream() -> io::Result<(SocketAddr, Receiver<()>, mpsc::Sender<()>)> {
+    let socket = TcpListener::bind("127.0.0.1:0")?;
+    let address = socket.local_addr()?;
+    let (arrive, arrived) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        let Ok((mut stream, _)) = socket.accept() else {
+            return;
+        };
+        let mut head = Vec::new();
+        let mut byte = [0];
+        while !head.ends_with(b"\r\n\r\n") && matches!(stream.read(&mut byte), Ok(1)) {
+            head.push(byte[0]);
+        }
+        let _arrived = arrive.send(());
+        if released.recv().is_ok() {
+            let _gone = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+        }
+    });
+    Ok((address, arrived, release))
+}
+
 /// Sends a request on a connection of its own and reads the answer to its end.
 fn get(to: SocketAddr, target: &str) -> io::Result<String> {
     let mut stream = TcpStream::connect(to)?;
@@ -326,6 +415,30 @@ impl Harness {
                 Ok(line) => passed.push(line),
                 Err(_) => panic!("no line with {part:?} came; these did: {passed:#?}"),
             }
+        }
+    }
+
+    /// Sends the process the signal named, as `kill` names it.
+    #[cfg(unix)]
+    fn signal(&self, name: &str) -> io::Result<()> {
+        let status = Command::new("kill")
+            .arg(format!("-{name}"))
+            .arg(self.process.id().to_string())
+            .status()?;
+        assert!(status.success(), "kill -{name} failed");
+        Ok(())
+    }
+
+    /// Waits for the process to exit, for no longer than [`PATIENCE`].
+    #[cfg(unix)]
+    fn exited(&mut self) -> io::Result<std::process::ExitStatus> {
+        let began = std::time::Instant::now();
+        loop {
+            if let Some(status) = self.process.try_wait()? {
+                return Ok(status);
+            }
+            assert!(began.elapsed() < PATIENCE, "the process did not exit");
+            thread::sleep(Duration::from_millis(20));
         }
     }
 

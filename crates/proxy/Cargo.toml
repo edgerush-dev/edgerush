@@ -31,7 +31,8 @@ httparse.workspace = true
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 thiserror.workspace = true
-tokio.workspace = true
+# "sync": what wakes a worker's connections when it drains.
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 # The engine's clients and its either-version server, for tests only: what talks to the

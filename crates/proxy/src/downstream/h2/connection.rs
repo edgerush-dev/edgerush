@@ -16,6 +16,7 @@ use crate::downstream::h1::connection::{Answered, expects_continue};
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h2::body::IncomingH2;
 use crate::downstream::h2::writer::{Outgoing, Responder, send_body};
+use crate::drain::Drain;
 use crate::interim::Interim;
 use crate::request_body::RequestBody;
 use crate::storage::Storage;
@@ -56,6 +57,9 @@ pub(crate) struct Settings {
     pub(crate) idle: Duration,
     /// How many streams a connection must have had before its share reset early is judged.
     pub(crate) reset_judged_after: u64,
+    /// How long a draining connection's streams have to finish before it is closed
+    /// regardless (03 §10).
+    pub(crate) drain_within: Duration,
 }
 
 impl Default for Settings {
@@ -70,6 +74,7 @@ impl Default for Settings {
             closing: Duration::from_secs(10),
             idle: Duration::from_secs(30),
             reset_judged_after: 500,
+            drain_within: Duration::from_secs(25),
         }
     }
 }
@@ -148,6 +153,7 @@ pub(crate) async fn serve<S, R, F, B, D>(
     settings: Settings,
     storage: Rc<Storage>,
     date: Rc<D>,
+    drain: &Drain,
     respond: Rc<R>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -163,12 +169,22 @@ pub(crate) async fn serve<S, R, F, B, D>(
     let streams = Rc::new(Streams::default());
     let mut idle = std::pin::pin!(tokio::time::sleep(settings.keep_alive));
     let mut idle_from_now = false;
+    let mut drain_heard = std::pin::pin!(drain.notified());
+    let mut out_of_time = std::pin::pin!(tokio::time::sleep(settings.drain_within));
+    let mut draining = false;
     // Accepting is what drives the connection: it is polled for as long as the connection
     // lives, streams running beside it.
     loop {
         let accepted = poll_fn(|cx| {
             if streams.resetting(settings.reset_judged_after) {
                 return Poll::Ready(Next::Resetting);
+            }
+            if !draining {
+                if drain.poll_on(drain_heard.as_mut(), cx).is_ready() {
+                    return Poll::Ready(Next::Draining);
+                }
+            } else if out_of_time.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Next::OutOfTime);
             }
             if streams.open.get() == 0 {
                 if idle_from_now {
@@ -190,6 +206,25 @@ pub(crate) async fn serve<S, R, F, B, D>(
             // Closed, or failed: either way there is nothing left to serve.
             Next::Accepted(_) => return,
             Next::Idle => break,
+            Next::Draining => {
+                // Told to go, gracefully: what it has sent is still taken and answered, and
+                // the connection closes once the last stream ends — or when time is up.
+                connection.graceful_shutdown();
+                draining = true;
+                out_of_time
+                    .as_mut()
+                    .reset(Instant::now() + settings.drain_within);
+                continue;
+            }
+            Next::OutOfTime => {
+                connection.abrupt_shutdown(::h2::Reason::NO_ERROR);
+                let _closing = tokio::time::timeout(
+                    settings.closing,
+                    poll_fn(|cx| connection.poll_closed(cx)),
+                )
+                .await;
+                return;
+            }
             Next::Resetting => {
                 connection.abrupt_shutdown(::h2::Reason::ENHANCE_YOUR_CALM);
                 let _closing = tokio::time::timeout(
@@ -234,6 +269,10 @@ enum Next<T> {
     Idle,
     /// Too many of its streams reset before their answer.
     Resetting,
+    /// The worker has begun to drain.
+    Draining,
+    /// Draining, and its streams have not finished within the drain's time.
+    OutOfTime,
 }
 
 /// How a stream ended, as far as the driver cares.

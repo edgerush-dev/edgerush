@@ -11,6 +11,7 @@
 //! own and never leaves the thread it was made on.
 
 mod cookies;
+mod drain;
 // Private, save when the fuzz targets are being built, as `upstream` is below.
 #[cfg(feature = "fuzzing")]
 pub mod downstream;

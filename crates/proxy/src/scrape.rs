@@ -70,7 +70,9 @@ impl Proxy {
                     async move { answer }
                 };
                 // How it ended is the scraper's business; the socket is closed either way.
-                let _ended = h1::serve(&mut stream, settings, blocks, date, respond).await;
+                // Scraping goes on while the data plane drains: that is when it is watched.
+                let never = crate::drain::Drain::default();
+                let _ended = h1::serve(&mut stream, settings, blocks, date, &never, respond).await;
                 // Closed without a reset, so that one taking an answer with it is not
                 // possible even with a request body left unread.
                 linger(

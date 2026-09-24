@@ -20,6 +20,7 @@ use crate::downstream::h1::connection::{self as h1, Answered};
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h1::deadlines::Bounds;
 use crate::downstream::h2;
+use crate::drain::Drain;
 use crate::head::Forwarded;
 use crate::interim::Interim;
 use crate::linger::{self, Lent, linger};
@@ -47,10 +48,10 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
@@ -74,14 +75,19 @@ pub(crate) const NEXT_REQUEST: Duration = Duration::from_secs(30);
 /// coming ([14 §8](../../docs/14-downstream-server.md)).
 pub(crate) const IDLE: Duration = Duration::from_secs(30);
 
+/// How long a draining worker's connections have to finish: inside Kubernetes' default
+/// termination grace of 30 seconds, with room to exit (03 §10).
+pub(crate) const DRAIN: Duration = Duration::from_secs(25);
+
 /// The deadlines a worker holds its client connections to: [`FIRST_REQUEST`],
-/// [`NEXT_REQUEST`] and [`IDLE`], short in tests so that they can run on real sockets and
-/// real time.
+/// [`NEXT_REQUEST`], [`IDLE`] and [`DRAIN`], short in tests so that they can run on real
+/// sockets and real time.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Deadlines {
     first_request: Duration,
     next_request: Duration,
     idle: Duration,
+    drain: Duration,
 }
 
 impl Default for Deadlines {
@@ -90,6 +96,7 @@ impl Default for Deadlines {
             first_request: FIRST_REQUEST,
             next_request: NEXT_REQUEST,
             idle: IDLE,
+            drain: DRAIN,
         }
     }
 }
@@ -236,6 +243,8 @@ pub struct Proxy {
     /// Outside it for a different reason: a key must not come round again when a config
     /// does, so what hands them out lives as long as the process.
     keys: Keys,
+    /// Set once, to drain: every worker's sweep brings it to the worker (03 §10).
+    draining: AtomicBool,
 }
 
 /// One worker's share of the data plane: the connections it holds to the upstreams, which
@@ -262,6 +271,8 @@ pub struct Worker {
     /// The time an answer is dated with, which the worker's sweep keeps current so that
     /// no answer reads a clock for it (14 §4).
     date: Cell<HttpDate>,
+    /// This worker's drain, which its sweep starts once the data plane's has.
+    drain: Rc<Drain>,
 }
 
 /// One exchange's place among those a worker has in hand, given back when it is dropped.
@@ -359,6 +370,7 @@ impl Proxy {
             current: ArcSwap::from_pointee(snapshot),
             metrics,
             keys,
+            draining: AtomicBool::new(false),
         })
     }
 
@@ -367,6 +379,12 @@ impl Proxy {
     #[must_use]
     pub fn listeners(&self) -> &[String] {
         &self.listeners
+    }
+
+    /// Drains the data plane: every worker, at its next sweep, stops accepting and lets its
+    /// connections go as they finish (03 §10). It cannot be undone.
+    pub fn drain(&self) {
+        self.draining.store(true, Ordering::Release);
     }
 
     /// Runs `config` from now on. It is published whole and at once: every request is
@@ -461,7 +479,35 @@ impl Worker {
             limits,
             deadlines,
             date: Cell::new(HttpDate::from_unix(unix_now())),
+            drain: Rc::new(Drain::default()),
         })
+    }
+
+    /// Starts this worker's drain now: it stops accepting, HTTP/1 connections close once
+    /// idle and say so on the answer in hand, and HTTP/2 connections are told to go
+    /// (03 §10). A worker's sweep does this by itself once [`Proxy::drain`] has been called.
+    pub fn drain(&self) {
+        self.drain.start();
+    }
+
+    /// Until this worker drains.
+    pub async fn draining(&self) {
+        self.drain.started().await;
+    }
+
+    /// The next connection on `socket`, or `None` once this worker drains: a draining
+    /// worker takes nothing new (03 §10).
+    pub async fn accept(&self, socket: &TcpListener) -> Option<io::Result<TcpStream>> {
+        let mut draining = pin!(self.drain.notified());
+        std::future::poll_fn(|cx| {
+            if self.drain.poll_on(draining.as_mut(), cx).is_ready() {
+                return Poll::Ready(None);
+            }
+            socket
+                .poll_accept(cx)
+                .map(|accepted| Some(accepted.map(|(stream, _)| stream)))
+        })
+        .await
     }
 
     /// Looks over the connections this worker is keeping, for as long as it runs.
@@ -475,6 +521,9 @@ impl Worker {
         loop {
             tokio::time::sleep(every).await;
             self.date.set(HttpDate::from_unix(unix_now()));
+            if self.proxy.draining.load(Ordering::Acquire) {
+                self.drain.start();
+            }
             // Borrowed for the sweep and let go of before anything is waited on again.
             let swept = self.pool.borrow_mut().sweep(&self.limits);
             // And what a burst left parked of the blocks, down to what a quiet worker keeps.
@@ -626,9 +675,10 @@ impl Worker {
     /// Runs inside the worker's `LocalSet`, where the connections it accepts are served;
     /// without one there is nowhere to put them and the first connection panics.
     pub async fn serve(self: Rc<Self>, listener: usize, socket: TcpListener) {
-        loop {
-            match socket.accept().await {
-                Ok((stream, _)) => {
+        // Draining: nothing new is taken, and the socket goes with this.
+        while let Some(accepted) = self.accept(&socket).await {
+            match accepted {
+                Ok(stream) => {
                     let connection = Rc::clone(&self).serve_connection(listener, stream);
                     let _detached = tokio::task::spawn_local(connection);
                 }
@@ -694,6 +744,7 @@ impl Worker {
                         settings,
                         Rc::clone(&worker.blocks),
                         || worker.date.get(),
+                        &worker.drain,
                         respond,
                     )
                     .await;
@@ -711,9 +762,11 @@ impl Worker {
                         keep_alive: deadlines.next_request,
                         closing: Bounds::default().next_head.min(deadlines.next_request),
                         idle: deadlines.idle,
+                        drain_within: deadlines.drain,
                         ..h2::connection::Settings::default()
                     };
-                    h2::connection::serve(replay, settings, storage, date, respond).await;
+                    h2::connection::serve(replay, settings, storage, date, &worker.drain, respond)
+                        .await;
                 }
                 // Closed having said nothing, or failed before saying enough.
                 Ok(None) | Err(_) => {}
@@ -1211,6 +1264,7 @@ mod tests {
         first_request: Duration::from_millis(300),
         next_request: Duration::from_millis(700),
         idle: Duration::from_millis(500),
+        drain: Duration::from_millis(900),
     };
 
     /// How late a deadline may be seen to fire on a loaded machine.
@@ -1950,6 +2004,169 @@ upstreams:
                 assert_eq!(
                     statuses,
                     vec![StatusCode::OK, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE]
+                );
+            })
+            .await;
+    }
+
+    /// A draining worker closes an HTTP/1 connection waiting idle for its next request at
+    /// once, and takes no new connection (03 §10).
+    #[tokio::test]
+    async fn a_draining_worker_closes_idle_http1_connections_and_accepts_nothing() {
+        use tokio::io::AsyncWriteExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let (front, worker) = serving_worker_and(upstream).await;
+                let mut stream = TcpStream::connect(front).await.unwrap();
+                stream.write_all(ASKED).await.unwrap();
+                answered(&mut stream).await;
+                worker.drain();
+                let took = closed_after(&mut stream).await;
+                assert!(took < SLACK, "closed {took:?} after the drain began");
+
+                // Nothing new is taken: the listening socket went with the drain, so a
+                // connection is refused.
+                tokio::task::yield_now().await;
+                let late = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(front))
+                    .await
+                    .expect("connecting hung");
+                assert!(late.is_err(), "a draining worker still listens");
+            })
+            .await;
+    }
+
+    /// An HTTP/1 request under way when the worker drains is answered, saying the
+    /// connection closes, and then it does.
+    #[tokio::test]
+    async fn an_http1_answer_in_hand_while_draining_says_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, held) = scripted_upstream().await;
+                let (front, worker) = serving_worker_and(upstream).await;
+                let mut stream = TcpStream::connect(front).await.unwrap();
+                stream
+                    .write_all(b"GET /held HTTP/1.1\r\nhost: example.test\r\n\r\n")
+                    .await
+                    .unwrap();
+                until(|| held.borrow().len() == 1).await;
+                worker.drain();
+                // The upstream goes; the proxy answers for it.
+                held.borrow_mut().clear();
+                let mut answer = Vec::new();
+                tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut answer))
+                    .await
+                    .expect("never closed")
+                    .unwrap();
+                let answer = String::from_utf8_lossy(&answer).to_lowercase();
+                assert!(answer.starts_with("http/1.1 502"), "{answer}");
+                assert!(answer.contains("connection: close\r\n"), "{answer}");
+            })
+            .await;
+    }
+
+    /// An HTTP/2 connection with a stream under way when the worker drains is told to go,
+    /// gracefully; the stream is still answered, and then the connection closes.
+    #[tokio::test]
+    async fn a_draining_http2_connection_finishes_its_streams_then_closes() {
+        use crate::h2_peer::{Frame, code, flag, kind};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, held) = scripted_upstream().await;
+                let (front, worker) = serving_worker_and(upstream).await;
+                let mut peer = h2_client(front).await;
+                h2_get(&mut peer, 1, "/held").await;
+                until(|| held.borrow().len() == 1).await;
+                worker.drain();
+                let (announced, _) = peer.until(|f| f.kind == kind::GOAWAY).await;
+                assert_eq!(announced.goaway(), (0x7fff_ffff, code::NO_ERROR));
+                let (ping, _) = peer
+                    .until(|f| f.kind == kind::PING && !f.has(flag::ACK))
+                    .await;
+                peer.send(&Frame::new(kind::PING, flag::ACK, 0, ping.payload.clone()))
+                    .await;
+                let (last, _) = peer.until(|f| f.kind == kind::GOAWAY).await;
+                assert_eq!(last.goaway(), (1, code::NO_ERROR));
+
+                held.borrow_mut().clear();
+                let rest = peer.rest().await;
+                assert!(
+                    rest.iter()
+                        .any(|f| f.stream == 1 && f.has(flag::END_STREAM)),
+                    "stream 1 was not answered: {rest:?}"
+                );
+            })
+            .await;
+    }
+
+    /// A stream that outlasts the drain's time is not waited for: the connection is closed
+    /// at the drain's bound.
+    #[tokio::test]
+    async fn a_draining_http2_connection_is_closed_at_the_drain_bound() {
+        use crate::h2_peer::{Frame, flag, kind};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _held) = scripted_upstream().await;
+                let (front, worker) = serving_worker_and(upstream).await;
+                let mut peer = h2_client(front).await;
+                h2_get(&mut peer, 1, "/held").await;
+                peer.settled().await;
+                worker.drain();
+                let began = tokio::time::Instant::now();
+                let (ping, _) = peer
+                    .until(|f| f.kind == kind::PING && !f.has(flag::ACK))
+                    .await;
+                peer.send(&Frame::new(kind::PING, flag::ACK, 0, ping.payload.clone()))
+                    .await;
+                let (_, rest) = peer
+                    .until(|f| f.kind == kind::GOAWAY && f.goaway().0 == 1)
+                    .await;
+                assert!(rest.iter().all(|f| f.kind != kind::RST_STREAM));
+                // Closed at the bound, not after waiting out the time a closing connection
+                // is given to flush.
+                let _closed = peer.rest().await;
+                let took = began.elapsed();
+                assert!(
+                    took + EARLY >= SHORT.drain && took < SHORT.drain + SLACK,
+                    "closed {took:?} after the drain began"
+                );
+            })
+            .await;
+    }
+
+    /// The data plane's drain reaches a worker at its next sweep.
+    #[tokio::test]
+    async fn the_data_planes_drain_reaches_a_worker_at_its_sweep() {
+        use tokio::io::AsyncWriteExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                // A sweep far shorter than the time an idle connection is kept, so that it is
+                // the drain that closes it.
+                let limits = H1Limits {
+                    sweep: Duration::from_millis(50),
+                    ..H1Limits::default()
+                };
+                let proxy = Proxy::new(everything_to(upstream), NonZeroUsize::MIN).unwrap();
+                let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+                let _sweeping = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+                let mut stream = TcpStream::connect(front).await.unwrap();
+                stream.write_all(ASKED).await.unwrap();
+                answered(&mut stream).await;
+                worker.proxy.drain();
+                let took = closed_after(&mut stream).await;
+                assert!(
+                    took < worker.limits.sweep + SLACK && took < SHORT.next_request,
+                    "closed {took:?} after the data plane began to drain"
                 );
             })
             .await;

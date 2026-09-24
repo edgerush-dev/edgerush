@@ -136,8 +136,12 @@ impl Worker {
             // A worker at its cap leaves what comes in the backlog until one of its
             // connections ends, rather than take on what it has no room for.
             self.loads.room(self.position).await;
-            match socket.accept().await {
-                Ok((stream, _)) => self.place(listener, stream),
+            // Draining: nothing new is taken, and the socket goes with this.
+            let Some(accepted) = self.plane.accept(&socket).await else {
+                return;
+            };
+            match accepted {
+                Ok(stream) => self.place(listener, stream),
                 Err(error) => {
                     if let Some(pause) = self.plane.proxy().accept_failed(listener, &error) {
                         tokio::time::sleep(pause).await;

@@ -279,11 +279,13 @@ async fn composed(client: Vec<ClientStep>, core: Core, pipe: usize) -> Run {
     let serving = {
         let wire = Rc::clone(&wire);
         async move {
+            let never = crate::drain::Drain::default();
             let ended = serve(
                 far,
                 settings,
                 Rc::clone(&blocks),
                 || HttpDate::from_unix(0),
+                &never,
                 respond,
             )
             .await;

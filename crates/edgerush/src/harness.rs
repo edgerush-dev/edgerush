@@ -12,23 +12,29 @@
 //! and counters every worker shares, and upstream connections that belong to a worker
 //! alone. Scrapes are answered away from the workers, on a runtime of their own.
 //!
+//! Told to stop — Ctrl-C, or SIGTERM on Unix, which is how Kubernetes asks — the data
+//! plane drains ([03 §10] in the docs): nothing new is accepted, what is under way is
+//! finished, and the process exits once every connection has gone or [`DRAIN`] is up. A
+//! second signal while draining exits at once.
+//!
 //! Workers past the first share the port of every listener (`SO_REUSEPORT`), which only
 //! Unix has; a single worker has the port to itself and needs nothing of the kind, so
 //! that is the shape the harness runs in on Windows.
 
+use crate::balance::Loads;
 use crate::bind::{Port, listen};
 use crate::config_file::{ConfigFile, Rejected};
 use crate::per_core::{self, Accept};
 use edgerush_config::Compiled;
 use edgerush_proxy::{H1Limits, Proxy, ProxyError};
-use std::convert::Infallible;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
 
@@ -38,6 +44,8 @@ Usage: edgerush proxy --config <FILE> [OPTIONS]
 Runs a data plane from a config file, without Kubernetes: a harness for development.
 The file is read again every second, and a changed config takes over without dropping a
 request. Listeners are bound once: one that is new or has moved takes a restart.
+Ctrl-C or SIGTERM drains it: what is under way is finished, for up to 29 seconds; a
+second one stops it at once.
 
 Options:
       --config <FILE>      The config, in YAML
@@ -60,8 +68,16 @@ Options:
 /// nothing else to do.
 const POLL: Duration = Duration::from_secs(1);
 
-/// Runs `edgerush proxy` with the arguments after its name. Returns the exit status, and
-/// only when there is nothing to run or no way to: a data plane runs until it is killed.
+/// How long a draining process waits for its connections before it exits anyway: inside
+/// Kubernetes' default 30 s grace, and past the 25 s a worker gives its connections, the
+/// sweep that brings the drain to it and the flush of what it then closes.
+const DRAIN: Duration = Duration::from_secs(29);
+
+/// How often a draining process looks at what its workers still hold.
+const DRAIN_POLL: Duration = Duration::from_millis(100);
+
+/// Runs `edgerush proxy` with the arguments after its name. Returns the exit status: once
+/// the data plane has drained, or at once when there is nothing to run or no way to.
 pub(crate) fn command(
     args: impl Iterator<Item = String>,
     stdout: &mut impl Write,
@@ -70,6 +86,7 @@ pub(crate) fn command(
     let written = match parse(args) {
         Ok(Parsed::Help) => write!(stdout, "{USAGE}").map(|()| 0),
         Ok(Parsed::Run(options)) => match run(*options, stderr) {
+            Ok(()) => Ok(0),
             Err(failure) => writeln!(stderr, "error: {failure}").map(|()| 1),
         },
         Err(error) => write!(stderr, "error: {error}\n\n{USAGE}").map(|()| crate::EXIT_USAGE),
@@ -209,7 +226,7 @@ enum Failure {
     Runtime(io::Error),
 }
 
-fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure> {
+fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     let Options {
         config: path,
         metrics,
@@ -265,8 +282,12 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
             ),
         );
     }
+    // Listened for before a request is served, so that no signal finds the default
+    // action, which is to die on the spot.
+    let (stopping, stop) = mpsc::channel();
+    stop_signals(stopping.clone()).map_err(Failure::Runtime)?;
     // Every worker runs on a thread of its own, which stays for as long as the process.
-    per_core::start(
+    let loads = per_core::start(
         &proxy,
         sockets,
         accept,
@@ -289,8 +310,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
         format_args!("{workers} worker{plural}, thread-per-core"),
     );
 
-    loop {
-        thread::sleep(POLL);
+    // Until told to stop; `stopping` is still held here, so the channel cannot close.
+    while let Err(RecvTimeoutError::Timeout) = stop.recv_timeout(POLL) {
         let Some(changed) = file.changed() else {
             continue;
         };
@@ -321,6 +342,92 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
             say(stderr, format_args!("warning: {warning}"));
         }
     }
+    drop(stopping);
+    say(stderr, format_args!("draining"));
+    proxy.drain();
+    match drained(&loads, &stop, DRAIN) {
+        Drained::Empty => say(stderr, format_args!("drained")),
+        Drained::OutOfTime(held) => say(
+            stderr,
+            format_args!("out of time draining: {held} connections cut off"),
+        ),
+        Drained::Stopped(held) => say(
+            stderr,
+            format_args!("stopped while draining: {held} connections cut off"),
+        ),
+    }
+    Ok(())
+}
+
+/// How a drain ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Drained {
+    /// Every connection went.
+    Empty,
+    /// Time was up with this many still held.
+    OutOfTime(usize),
+    /// Told to stop again, with this many still held.
+    Stopped(usize),
+}
+
+/// Waits until the workers hold no connection, `within` is up, or `stop` says to stop
+/// again.
+fn drained(loads: &Loads, stop: &Receiver<()>, within: Duration) -> Drained {
+    let until = Instant::now() + within;
+    loop {
+        let held: usize = loads.now().iter().sum();
+        if held == 0 {
+            return Drained::Empty;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Drained::OutOfTime(held);
+        }
+        match stop.recv_timeout(DRAIN_POLL.min(left)) {
+            Ok(()) => return Drained::Stopped(held),
+            // With nobody left to say stop, the drain runs its course.
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
+        }
+    }
+}
+
+/// Says on `stopping`, from a thread of its own, every time the process is told to stop:
+/// Ctrl-C, and on Unix SIGTERM, which is how Kubernetes asks. Both are listened for
+/// before this returns.
+fn stop_signals(stopping: Sender<()>) -> io::Result<()> {
+    let runtime = Builder::new_current_thread().enable_io().build()?;
+    let entered = runtime.enter();
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    drop(entered);
+    // Ctrl-C is listened for from the first poll of what waits for it, on that thread.
+    let (listening, listens) = mpsc::channel();
+    thread::Builder::new()
+        .name("signals".to_owned())
+        .spawn(move || {
+            runtime.block_on(async move {
+                loop {
+                    let mut interrupt = std::pin::pin!(tokio::signal::ctrl_c());
+                    let told = std::future::poll_fn(|cx| {
+                        #[cfg(unix)]
+                        if terminate.poll_recv(cx).is_ready() {
+                            return std::task::Poll::Ready(Ok(()));
+                        }
+                        let polled = interrupt.as_mut().poll(cx);
+                        let _listening = listening.send(());
+                        polled
+                    })
+                    .await;
+                    // A signal that cannot be listened for is one that is not heard; the
+                    // others still are, and so is being killed.
+                    if told.is_err() || stopping.send(()).is_err() {
+                        return;
+                    }
+                }
+            });
+        })?;
+    let _listening = listens.recv();
+    Ok(())
 }
 
 /// Answers scrapes on `socket`, on a small runtime and a thread of their own: what a
@@ -616,5 +723,57 @@ mod tests {
                  until a restart",
             ]
         );
+    }
+
+    /// A drain ends as soon as the last connection goes.
+    #[test]
+    fn a_drain_ends_when_the_last_connection_goes() {
+        let loads = Loads::new(2, 8);
+        let (one, two) = (loads.hold(0), loads.hold(1));
+        let (_stopping, stop) = mpsc::channel();
+        let going = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(one);
+            thread::sleep(Duration::from_millis(50));
+            drop(two);
+        });
+        let began = Instant::now();
+        assert_eq!(
+            drained(&loads, &stop, Duration::from_secs(10)),
+            Drained::Empty
+        );
+        assert!(began.elapsed() < Duration::from_secs(2));
+        going.join().unwrap();
+    }
+
+    /// A connection that outlasts the drain is not waited for.
+    #[test]
+    fn a_drain_ends_when_time_is_up() {
+        let loads = Loads::new(1, 8);
+        let _held = loads.hold(0);
+        let (_stopping, stop) = mpsc::channel();
+        let began = Instant::now();
+        let within = Duration::from_millis(300);
+        assert_eq!(drained(&loads, &stop, within), Drained::OutOfTime(1));
+        let took = began.elapsed();
+        assert!(took >= within && took < within * 3, "{took:?}");
+    }
+
+    /// Told to stop again, a drain ends at once, and so does one nobody can stop.
+    #[test]
+    fn a_drain_ends_when_told_to_stop_again() {
+        let loads = Loads::new(1, 8);
+        let _held = loads.hold(0);
+        let (stopping, stop) = mpsc::channel();
+        stopping.send(()).unwrap();
+        let began = Instant::now();
+        assert_eq!(
+            drained(&loads, &stop, Duration::from_secs(10)),
+            Drained::Stopped(1)
+        );
+        assert!(began.elapsed() < Duration::from_secs(1));
+        drop(stopping);
+        let within = Duration::from_millis(200);
+        assert_eq!(drained(&loads, &stop, within), Drained::OutOfTime(1));
     }
 }
