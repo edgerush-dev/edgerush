@@ -34,7 +34,9 @@ pub(crate) struct Settings {
     pub(crate) connection_window: u32,
     /// The largest header list accepted, by RFC 9113's measure.
     pub(crate) header_list: u32,
-    /// What h2 may hold of one stream's answer before it is written.
+    /// What h2 may hold of one stream's answer before it is written. h2's own default:
+    /// at 64 KiB, room is granted in smaller pieces and an 8 MiB answer took 17% more CPU
+    /// (15 §3).
     pub(crate) send_buffer: usize,
 }
 
@@ -45,7 +47,7 @@ impl Default for Settings {
             stream_window: 1 << 20,
             connection_window: 16 << 20,
             header_list: 64 * 1024,
-            send_buffer: 64 * 1024,
+            send_buffer: 400 * 1024,
         }
     }
 }
