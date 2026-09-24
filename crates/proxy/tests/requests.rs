@@ -906,6 +906,11 @@ fn broken_bodies() -> Vec<Case> {
             "Envoy protocol_integration_test.cc:6218",
             b"0\r\nx: a\x7f\r\n\r\n",
         ),
+        broken(
+            "a stray CR where the trailers should end",
+            "hyper decode.rs:964; refused as it is read (14 §4)",
+            b"0\r\nbad\r\r\n",
+        ),
     ]
 }
 

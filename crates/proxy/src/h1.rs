@@ -720,7 +720,23 @@ fn section(bytes: &[u8], from: usize, bound: usize) -> Result<Option<usize>, Cod
     // Everything else goes through the search, however little of it there is: a byte
     // passed over here would be counted as searched, and never looked at again.
     examining(bytes.len().saturating_sub(from));
+    // A carriage return is only ever the start of a line's end, and one that anything
+    // else follows is refused as soon as that is read, not when the section ends — which
+    // then may never come. One that was last of what had arrived is looked at again here,
+    // now that what follows it has.
+    let stray =
+        |at: usize| bytes[at] == b'\r' && bytes.get(at + 1).is_some_and(|next| *next != b'\n');
+    if from > 0 && stray(from - 1) {
+        return Err(CodecError::Malformed(
+            "a carriage return is not a line's end",
+        ));
+    }
     for at in from..bytes.len() {
+        if stray(at) {
+            return Err(CodecError::Malformed(
+                "a carriage return is not a line's end",
+            ));
+        }
         if bytes[at] != b'\n' {
             continue;
         }

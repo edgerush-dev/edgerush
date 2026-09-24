@@ -2146,6 +2146,35 @@ mod tests {
         }
     }
 
+    /// A carriage return that no line feed follows is refused as soon as the byte after it
+    /// is read, and not when the section ends, which may be never: a section that cannot be
+    /// read waits for nothing (14 §4). One that has nothing after it yet may still become
+    /// a line's end.
+    #[test]
+    fn a_stray_carriage_return_in_trailers_is_refused_when_it_is_read() {
+        let limits = H1Limits::default();
+        for (first, then) in [
+            (&b"bad\r\r"[..], None),
+            (b"x-a: 1\r\nbad\rX", None),
+            (b"bad\r", Some(&b"bad\rX"[..])),
+        ] {
+            let mut reader = BodyReader::new(Framing::Chunked);
+            assert!(matches!(
+                reader.read(b"0\r\n", false, &limits),
+                Ok(Piece::Data { .. })
+            ));
+            let read = reader.read(first, false, &limits);
+            match then {
+                None => assert!(read.is_err(), "{first:?}: {read:?}"),
+                Some(then) => {
+                    assert!(matches!(read, Ok(Piece::More)), "{first:?}: {read:?}");
+                    let read = reader.read(then, false, &limits);
+                    assert!(read.is_err(), "{then:?}: {read:?}");
+                }
+            }
+        }
+    }
+
     /// Drives a reader a byte at a time to its end or its first refusal: the refusal, or
     /// `None` if the body was read whole.
     fn refused_a_byte_at_a_time(framing: Framing, whole: &[u8]) -> Option<CodecError> {
