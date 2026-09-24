@@ -545,7 +545,7 @@ impl Worker {
         sending: Sending,
         body: B,
         interim: Option<Interim>,
-    ) -> Result<(RawAnswer, H1Body<TcpStream, B>), ExchangeError>
+    ) -> Result<(RawAnswer, Box<H1Body<TcpStream, B>>), ExchangeError>
     where
         F: OutgoingFields + ?Sized,
         B: HttpBody<Data = Bytes> + Unpin,
@@ -595,19 +595,22 @@ impl Worker {
             .await?;
 
         // The request may still be going out; what is left of it goes with the body,
-        // which drives it while the client reads the answer.
+        // which drives it while the client reads the answer. Boxed where it is made, so
+        // that only a pointer to it is passed back up to where it is served.
         let lease = Lease::in_use(Arc::clone(identity), opened, &self.pool);
         let head = answer.head;
         let persistent =
             answer.delivery.persistent && !crate::upstream::auth::challenges(head.status, &head);
-        let body = H1Body::new(
-            rest,
-            answer.delivery.framing,
-            persistent,
-            answer.nominated,
-            self.limits,
-        )
-        .returning_to(lease);
+        let body = Box::new(
+            H1Body::new(
+                rest,
+                answer.delivery.framing,
+                persistent,
+                answer.nominated,
+                self.limits,
+            )
+            .returning_to(lease),
+        );
         Ok((head.into_answer(), body))
     }
 
@@ -925,7 +928,7 @@ impl Worker {
             proxy: Arc::clone(&self.proxy),
             upstream: directed.upstream_slot,
         };
-        Ok((read, Body::Ours(Box::new(body), admitted, watch)))
+        Ok((read, Body::Ours(body, admitted, watch)))
     }
 }
 
@@ -2389,7 +2392,7 @@ upstreams:
                         .unwrap();
                     assert_eq!(head.status(), 200, "round {round}");
 
-                    let (data, went_back) = drain(body, &worker.limits).await;
+                    let (data, went_back) = drain(*body, &worker.limits).await;
                     assert_eq!(data, b"ok", "round {round}");
                     assert!(went_back, "round {round} did not put its connection back");
                     assert_eq!(worker.idle_connections(), 1, "round {round}");
