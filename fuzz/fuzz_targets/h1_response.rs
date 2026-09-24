@@ -64,6 +64,20 @@ fn read(bytes: &[u8], step: usize) -> Result<Answer, CodecError> {
         }
     };
 
+    // The parser's field checks are all there are (14 §6): whatever it takes would make a
+    // header map, name by name and value by value, without a field left out.
+    let head = head.of(bytes::Bytes::copy_from_slice(&bytes[..used]));
+    for (name, value) in head.fields().iter() {
+        assert!(
+            http::HeaderName::from_bytes(name).is_ok(),
+            "a field name the parser took is no name: {name:?}"
+        );
+        assert!(
+            http::HeaderValue::from_bytes(value).is_ok(),
+            "a field value the parser took is no value: {value:?}"
+        );
+    }
+
     let delivery = delivery(&head, Asked::Anything)?;
     let (body, trailers) = read_body(&bytes[used..], delivery.framing, step, &limits)?;
     Ok(Answer {

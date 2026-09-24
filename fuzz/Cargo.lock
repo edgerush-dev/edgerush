@@ -79,6 +79,7 @@ dependencies = [
 name = "edgerush-fuzz"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "edgerush-proxy",
  "edgerush-router",
  "http",

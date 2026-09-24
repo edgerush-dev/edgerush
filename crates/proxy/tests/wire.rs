@@ -331,6 +331,64 @@ async fn a_trailer_the_requests_connection_named_does_not_travel_on() {
     );
 }
 
+/// An answer's fields reach the client as the upstream wrote them: the case of each name,
+/// the space around each value and the order of the lines, copied rather than rebuilt
+/// ([14 §6](../../../docs/14-downstream-server.md)). What is about the upstream's connection
+/// does not, and the framing is the gateway's own.
+#[tokio::test]
+async fn an_answers_fields_reach_the_client_as_the_upstream_wrote_them() {
+    let upstream = raw_upstream(|mut wire| async move {
+        let _head = wire.head().await;
+        wire.write(concat!(
+            "HTTP/1.1 200 OK\r\nX-Mixed-Case:  spaced \r\nKeep-Alive: timeout=5\r\n",
+            "ETag: \"a\"\r\nContent-Length: 2\r\n\r\nok"
+        ))
+        .await;
+    });
+    let mut client = Wire::to(proxy_to(upstream).await).await;
+    client
+        .write("GET /up HTTP/1.1\r\nhost: a.test\r\n\r\n")
+        .await;
+
+    let head = client.head().await;
+    assert!(
+        head.contains("\r\nX-Mixed-Case:  spaced \r\nETag: \"a\"\r\n"),
+        "{head}"
+    );
+    assert!(!head.to_ascii_lowercase().contains("keep-alive"), "{head}");
+    assert_eq!(head.matches("content-length: 2\r\n").count(), 1, "{head}");
+    assert_eq!(client.body(2).await, "ok");
+}
+
+/// An answer's `Trailer` declaration names only what will follow: not a field its own
+/// `Connection` made hop-by-hop, nor one that may never be a trailer, whichever of them the
+/// upstream declared ([13 §4](../../../docs/13-http1-upstream.md)). The trailers themselves are
+/// filtered the same way.
+#[tokio::test]
+async fn an_answers_declaration_names_only_the_trailers_that_will_follow() {
+    let upstream = raw_upstream(|mut wire| async move {
+        let _head = wire.head().await;
+        wire.write(concat!(
+            "HTTP/1.1 200 OK\r\nconnection: x-hop\r\ntrailer: x-hop, content-length, x-keep\r\n",
+            "transfer-encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nx-hop: 1\r\nx-keep: yes\r\n\r\n"
+        ))
+        .await;
+    });
+    let mut client = Wire::to(proxy_to(upstream).await).await;
+    client
+        .write("GET /up HTTP/1.1\r\nhost: a.test\r\nte: trailers\r\n\r\n")
+        .await;
+
+    let head = client.head().await;
+    assert!(head.contains("trailer: x-keep\r\n"), "{head}");
+    assert!(!head.contains("x-hop"), "{head}");
+    assert!(!head.contains("content-length"), "{head}");
+    assert_eq!(
+        client.chunked_body().await,
+        "2\r\nhi\r\n0\r\nx-keep: yes\r\n\r\n"
+    );
+}
+
 /// A response's trailers reach a client that said it would take them.
 #[tokio::test]
 async fn a_responses_trailers_reach_a_client_that_asked_for_them() {

@@ -6,7 +6,7 @@
 //! and a [`View`] puts the two together to read like a header map — the values of a name in
 //! the order they came — through [`Fields`], so that route predicates see the same either
 //! way. A name is found by a scan, which for a head's few lines costs less than building a
-//! hash would; the ten names the gateway reads for itself ([`Known`]) have slots instead,
+//! hash would; the eleven names the gateway reads for itself ([`Known`]) have slots instead,
 //! so asking for them again costs nothing. What a line spans, from its first byte to the
 //! end of its line break, is kept too: an unchanged line is forwarded as the bytes it
 //! arrived as.
@@ -23,7 +23,7 @@
 use crate::h1::MOST_FIELDS;
 use edgerush_router::Fields;
 use http::header::{
-    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, COOKIE, EXPECT, HOST, PROXY_AUTHORIZATION, TE,
+    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, COOKIE, DATE, EXPECT, HOST, PROXY_AUTHORIZATION, TE,
     TRAILER, TRANSFER_ENCODING,
 };
 use http::{HeaderName, HeaderValue};
@@ -52,11 +52,13 @@ pub enum Known {
     Authorization,
     /// `Proxy-Authorization`.
     ProxyAuthorization,
+    /// `Date`, which the writer asks of every answer.
+    Date,
 }
 
 impl Known {
     /// Every one of them, in the order of their slots.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Host,
         Self::Connection,
         Self::ContentLength,
@@ -67,6 +69,7 @@ impl Known {
         Self::Trailer,
         Self::Authorization,
         Self::ProxyAuthorization,
+        Self::Date,
     ];
 
     /// The header's name.
@@ -83,14 +86,30 @@ impl Known {
             Self::Trailer => TRAILER,
             Self::Authorization => AUTHORIZATION,
             Self::ProxyAuthorization => PROXY_AUTHORIZATION,
+            Self::Date => DATE,
         }
     }
 
     /// Which of them a field name as it arrived is, in whatever case.
+    ///
+    /// Asked of every line of every head. Their lengths tell them apart all but once, so a
+    /// name is compared with one of them, or two, or none at all.
     fn of_bytes(name: &[u8]) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|known| known.name().as_str().as_bytes().eq_ignore_ascii_case(name))
+        let is = |known: &[u8]| name.eq_ignore_ascii_case(known);
+        match name.len() {
+            2 if is(b"te") => Some(Self::Te),
+            4 if is(b"host") => Some(Self::Host),
+            4 if is(b"date") => Some(Self::Date),
+            6 if is(b"cookie") => Some(Self::Cookie),
+            6 if is(b"expect") => Some(Self::Expect),
+            7 if is(b"trailer") => Some(Self::Trailer),
+            10 if is(b"connection") => Some(Self::Connection),
+            13 if is(b"authorization") => Some(Self::Authorization),
+            14 if is(b"content-length") => Some(Self::ContentLength),
+            17 if is(b"transfer-encoding") => Some(Self::TransferEncoding),
+            19 if is(b"proxy-authorization") => Some(Self::ProxyAuthorization),
+            _ => None,
+        }
     }
 
     /// Which of them a header name is.
@@ -250,7 +269,6 @@ impl<'a> View<'a> {
     }
 
     /// Every field as a name as it arrived and a value, in the order the lines came.
-    #[cfg(any(test, feature = "fuzzing"))]
     pub fn iter(&self) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + use<'a> {
         let head = self.head;
         self.lines.lines.iter().map(move |line| {
@@ -301,9 +319,21 @@ impl<'a> View<'a> {
     }
 }
 
+impl<'a> View<'a> {
+    /// The values of `name`, in the order its lines came, for as long as the head they are
+    /// read from.
+    pub fn values_of<'n>(
+        &self,
+        name: &'n HeaderName,
+    ) -> impl Iterator<Item = &'a [u8]> + use<'a, 'n> {
+        let view = *self;
+        self.called(name).map(move |(_, line)| view.value(line))
+    }
+}
+
 impl Fields for View<'_> {
     fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
-        self.called(name).map(|(_, line)| self.value(line))
+        self.values_of(name)
     }
 }
 
@@ -339,16 +369,16 @@ impl Overlay {
         self.added.retain(|(added, _)| added != name);
     }
 
-    /// The same for a name given as bytes, in whatever case: what a `Connection` field
-    /// names, which need not be a name the gateway knows.
-    pub fn remove_named(&mut self, view: &View<'_>, name: &[u8]) {
+    /// Takes out every field whose name, as it arrived or was added, `unwanted` picks: one
+    /// pass over the head's lines, however many names that comes to.
+    pub fn remove_where(&mut self, view: &View<'_>, mut unwanted: impl FnMut(&[u8]) -> bool) {
         for (at, line) in view.lines.lines.iter().enumerate() {
-            if bytes(view.head, line.start..line.name_end).eq_ignore_ascii_case(name) {
+            if unwanted(bytes(view.head, line.start..line.name_end)) {
                 self.removed |= bit(at);
             }
         }
         self.added
-            .retain(|(added, _)| !added.as_str().as_bytes().eq_ignore_ascii_case(name));
+            .retain(|(name, _)| !unwanted(name.as_str().as_bytes()));
     }
 
     /// Gives `name` this one value, in place of every one it had.
@@ -535,6 +565,61 @@ mod tests {
     use edgerush_router::{HeaderPredicate, HeaderPredicates};
     use http::{HeaderMap, HeaderValue};
     use proptest::prelude::*;
+
+    /// Which known header a name is, by comparing it with each of them: what `of_bytes`
+    /// must agree with.
+    fn by_list(name: &[u8]) -> Option<Known> {
+        Known::ALL
+            .into_iter()
+            .find(|known| known.name().as_str().as_bytes().eq_ignore_ascii_case(name))
+    }
+
+    /// Every known name is itself, in any case, and a name a byte off is none of them.
+    #[test]
+    fn a_known_name_is_found_in_any_case() {
+        for known in Known::ALL {
+            let name = known.name();
+            let lower = name.as_str().as_bytes();
+            assert_eq!(Known::of_bytes(lower), Some(known), "{name}");
+            assert_eq!(
+                Known::of_bytes(&lower.to_ascii_uppercase()),
+                Some(known),
+                "{name}"
+            );
+            let mut near = lower.to_vec();
+            if let Some(last) = near.last_mut() {
+                *last = b'x';
+            }
+            assert_eq!(Known::of_bytes(&near), None, "{name}");
+            assert_eq!(Known::of_bytes(&lower[1..]), None, "{name}");
+        }
+    }
+
+    /// Names of the list in any case, and any names at all.
+    fn any_name() -> impl Strategy<Value = String> {
+        let listed = (
+            prop::sample::select(Known::ALL.to_vec()),
+            prop::collection::vec(any::<bool>(), 20),
+        )
+            .prop_map(|(known, upper)| {
+                known
+                    .name()
+                    .as_str()
+                    .chars()
+                    .zip(upper)
+                    .map(|(c, up)| if up { c.to_ascii_uppercase() } else { c })
+                    .collect::<String>()
+            });
+        prop_oneof![listed, "[a-zA-Z-]{0,20}"]
+    }
+
+    proptest! {
+        /// And any name at all is the known header comparing it with each would say.
+        #[test]
+        fn any_name_is_known_as_the_list_says(name in any_name()) {
+            prop_assert_eq!(Known::of_bytes(name.as_bytes()), by_list(name.as_bytes()));
+        }
+    }
 
     /// A head's field lines as a parser finds them, and the header map the downstream
     /// parser builds of them today.

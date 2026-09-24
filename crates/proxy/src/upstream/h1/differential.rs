@@ -681,7 +681,7 @@ async fn one_ours(socket: Scripted, ask: &Asking, limits: H1Limits) -> (Got, Opt
     let kept = body.take_if_reusable();
     let seen = Seen {
         status: answer.head.status.as_u16(),
-        fields: fields_of(&answer.head.headers),
+        fields: fields_of(&answer.head.to_map()),
         body: data,
         trailers,
         kept: kept.is_some(),

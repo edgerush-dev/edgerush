@@ -11,6 +11,7 @@
 
 use super::date::HttpDate;
 use crate::h1::{is_denied, length};
+use edgerush_router::Fields;
 use http::{HeaderMap, HeaderName, StatusCode, Version, header};
 
 /// Why an answer cannot be written as asked. Each is a mistake of the caller's, or a body
@@ -87,6 +88,28 @@ pub struct Written {
     pub closes: bool,
 }
 
+/// The fields of a final head as the writer takes them, whatever holds them: a header map,
+/// or a raw answer's lines with its edits ([14 §6](../../../../docs/14-downstream-server.md)).
+/// Read by name as any fields are, and written by the writer less the ones it writes itself.
+pub trait AnswerFields: Fields {
+    /// Appends every field but `Content-Length`, `Transfer-Encoding`, `Connection` and
+    /// `Trailer`, one line each, and says whether a `Date` was among them.
+    fn write_fields(&self, out: &mut Vec<u8>) -> bool;
+}
+
+impl AnswerFields for HeaderMap {
+    fn write_fields(&self, out: &mut Vec<u8>) -> bool {
+        let mut dated = false;
+        for (name, value) in self {
+            dated |= name == header::DATE;
+            if !framing_field(name) {
+                field(out, name.as_str().as_bytes(), value.as_bytes());
+            }
+        }
+        dated
+    }
+}
+
 /// The fields this writer writes for itself, or not at all.
 fn framing_field(name: &HeaderName) -> bool {
     name == header::CONTENT_LENGTH
@@ -108,7 +131,8 @@ fn status_line(out: &mut Vec<u8>, status: StatusCode) {
     out.extend_from_slice(b"\r\n");
 }
 
-fn field(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+/// Appends one field line.
+pub(crate) fn field(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
     out.extend_from_slice(name);
     out.extend_from_slice(b": ");
     out.extend_from_slice(value);
@@ -190,10 +214,10 @@ pub fn write_interim(
 /// # Errors
 ///
 /// An informational status, which [`write_interim`] writes.
-pub fn write_head(
+pub fn write_head<F: AnswerFields + ?Sized>(
     out: &mut Vec<u8>,
     status: StatusCode,
-    headers: &HeaderMap,
+    headers: &F,
     content: Content,
     asked: Asked,
     persistent: bool,
@@ -221,13 +245,7 @@ pub fn write_head(
     let closes = !persistent || delimited == Delimited::Close;
 
     status_line(out, status);
-    let mut dated = false;
-    for (name, value) in headers {
-        dated |= name == header::DATE;
-        if !framing_field(name) {
-            field(out, name.as_str().as_bytes(), value.as_bytes());
-        }
-    }
+    let dated = headers.write_fields(out);
     match delimited {
         // A HEAD answer's length describes what a GET would have been sent (RFC 9110
         // §9.3.2), so the upstream's is passed on as it came, and none is made up. A 204
@@ -235,10 +253,11 @@ pub fn write_head(
         Delimited::Nothing => {
             if asked.head && !bodyless_status {
                 let given = headers
-                    .get(header::CONTENT_LENGTH)
-                    .filter(|value| length(value.as_bytes()).is_ok());
+                    .values(&header::CONTENT_LENGTH)
+                    .next()
+                    .filter(|value| length(value).is_ok());
                 if let Some(value) = given {
-                    field(out, b"content-length", value.as_bytes());
+                    field(out, b"content-length", value);
                 }
             }
         }
@@ -250,8 +269,8 @@ pub fn write_head(
         Delimited::Chunked { .. } => {
             out.extend_from_slice(b"transfer-encoding: chunked\r\n");
             // What the trailers will hold is declared only where they can be sent.
-            for value in headers.get_all(header::TRAILER) {
-                field(out, b"trailer", value.as_bytes());
+            for value in headers.values(&header::TRAILER) {
+                field(out, b"trailer", value);
             }
         }
         Delimited::Close => {}
@@ -844,10 +863,12 @@ mod tests {
                 else {
                     panic!("not read back: {:?}", String::from_utf8_lossy(&wire));
                 };
+                let head = head.of(bytes::Bytes::copy_from_slice(&wire[..consumed]));
                 prop_assert_eq!(head.status, status);
+                let read_back = head.to_map();
                 for (name, value) in &fields {
                     prop_assert!(
-                        head.headers.get_all(name).iter().any(|read| read == value),
+                        read_back.get_all(name).iter().any(|read| read == value),
                         "{} lost", name
                     );
                 }

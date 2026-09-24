@@ -13,26 +13,99 @@
 //! allowed here ([13 §4](../../../docs/13-http1-upstream.md)).
 
 use super::H1Limits;
-pub use crate::h1::{
-    BodyReader, CodecError, Framing, MOST_FIELDS, Piece, Trailers, filter_declaration,
-};
+pub use crate::h1::{BodyReader, CodecError, Framing, MOST_FIELDS, Piece, Trailers};
+// What the way back does to an answer's map, which the tests and the benchmarks compare the
+// raw answer's with.
+use crate::fields::{FieldLines, View};
+#[cfg(any(test, feature = "fuzzing"))]
+pub use crate::h1::filter_declaration;
 #[cfg(test)]
 use crate::h1::{DENIED_TRAILERS, EXAMINED};
 use crate::h1::{END, is_denied, length, reason};
+use crate::raw::RawAnswer;
+use bytes::Bytes;
+use edgerush_router::Fields;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
 
-/// A response head, once it has been read and found sound.
+/// A response head as the reader found it in the bytes it was given, which it does not
+/// keep: what the status line says, and where each field line lies in them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadLines {
+    /// What the upstream answered.
+    pub status: StatusCode,
+    /// The version it answered in, which is HTTP/1.0 or HTTP/1.1 and nothing else.
+    pub version: Version,
+    /// The one `Content-Length`, already checked while the lines were still apart.
+    pub content_length: Option<u64>,
+    /// Where its fields are in the bytes of the head.
+    pub fields: FieldLines,
+}
+
+impl HeadLines {
+    /// The head, with the bytes it was read out of: from the first byte of what was given,
+    /// through as many as it consumed.
+    #[must_use]
+    pub fn of(self, head: Bytes) -> ResponseHead {
+        ResponseHead {
+            status: self.status,
+            version: self.version,
+            content_length: self.content_length,
+            head,
+            fields: self.fields,
+        }
+    }
+}
+
+/// A response head, once it has been read and found sound: its bytes and where its field
+/// lines lie in them, read by name as any fields are. Nothing is copied out of them; an
+/// answer made of it forwards them as they came ([14 §6](../../../docs/14-downstream-server.md)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseHead {
     /// What the upstream answered.
     pub status: StatusCode,
     /// The version it answered in, which is HTTP/1.0 or HTTP/1.1 and nothing else.
     pub version: Version,
-    /// Its fields, in the order they came, repeats and all.
-    pub headers: HeaderMap,
-    /// The one `Content-Length`, already checked, because a [`HeaderMap`] cannot be asked
-    /// afterwards whether there had been two of them.
+    /// The one `Content-Length`, already checked while the lines were still apart.
     pub content_length: Option<u64>,
+    head: Bytes,
+    fields: FieldLines,
+}
+
+impl ResponseHead {
+    /// Its fields, in the order they came, repeats and all.
+    #[must_use]
+    pub fn fields(&self) -> View<'_> {
+        self.fields.view(&self.head)
+    }
+
+    /// The answer this head begins, for the way to the client to edit.
+    #[must_use]
+    pub fn into_answer(self) -> RawAnswer {
+        RawAnswer::new(self.status, self.head, self.fields)
+    }
+
+    /// Its fields as a header map: for an interim head, which is passed on as one, and for
+    /// what compares heads by map.
+    #[must_use]
+    pub fn to_map(&self) -> HeaderMap {
+        let mut map = HeaderMap::with_capacity(self.fields.len());
+        for (name, value) in self.fields().iter() {
+            // The parser takes a field only if a map would: a token for its name, and a
+            // value of visible bytes, spaces and tabs (the `h1_response` fuzz target).
+            if let (Ok(name), Ok(value)) =
+                (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+            {
+                map.append(name, value);
+            }
+        }
+        map
+    }
+}
+
+impl Fields for ResponseHead {
+    fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
+        self.fields.view(&self.head).values_of(name)
+    }
 }
 
 /// How far reading a head has got.
@@ -43,8 +116,8 @@ pub enum Head {
     /// A head, and how many bytes of what was given it took. What follows those bytes is
     /// the body, or the next head.
     Read {
-        /// The head that was read.
-        head: ResponseHead,
+        /// The head that was read, whose lines lie in the first `consumed` bytes.
+        head: HeadLines,
         /// How many bytes of what was given it took.
         consumed: usize,
     },
@@ -164,7 +237,7 @@ fn status_start(bytes: &[u8]) -> Result<(), CodecError> {
 }
 
 /// Makes a head of the bytes of one, which are known to end with an empty line.
-fn parse(head: &[u8], fields: usize, limits: &H1Limits) -> Result<ResponseHead, CodecError> {
+fn parse(head: &[u8], fields: usize, limits: &H1Limits) -> Result<HeadLines, CodecError> {
     // Most answers have only a few fields. Do not initialise 128 header slots (4 KiB)
     // on every request; the full bound is still available to larger heads.
     if fields <= 16 {
@@ -174,7 +247,7 @@ fn parse(head: &[u8], fields: usize, limits: &H1Limits) -> Result<ResponseHead, 
     }
 }
 
-fn parse_with<const N: usize>(head: &[u8], limits: &H1Limits) -> Result<ResponseHead, CodecError> {
+fn parse_with<const N: usize>(head: &[u8], limits: &H1Limits) -> Result<HeadLines, CodecError> {
     let mut fields = [httparse::EMPTY_HEADER; N];
     let room = limits.fields.min(N);
     let mut response = httparse::Response::new(&mut fields[..room]);
@@ -215,29 +288,26 @@ fn parse_with<const N: usize>(head: &[u8], limits: &H1Limits) -> Result<Response
     let status =
         StatusCode::from_u16(code).map_err(|_| CodecError::Malformed("its status is not one"))?;
 
-    // Every field is looked at while they are still apart, because a header map keeps no
-    // record of a name having come twice.
+    // The length is checked while the fields are still apart, so that a name that came
+    // twice is seen to have. What a field may be made of the parser has already held it
+    // to: a token for a name, and visible bytes, spaces and tabs for a value.
     let mut content_length = None;
-    let mut headers = HeaderMap::with_capacity(response.headers.len());
     for field in response.headers.iter() {
-        let name = HeaderName::from_bytes(field.name.as_bytes())
-            .map_err(|_| CodecError::Malformed("a field name is not one"))?;
-        let value = HeaderValue::from_bytes(field.value)
-            .map_err(|_| CodecError::Malformed("a field value is not one"))?;
-        if name == http::header::CONTENT_LENGTH {
+        if field.name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() {
                 return Err(CodecError::RepeatedLength);
             }
             content_length = Some(length(field.value)?);
         }
-        headers.append(name, value);
     }
+    let fields = FieldLines::new(head, response.headers)
+        .map_err(|_| CodecError::Malformed("a field is not a line of its head"))?;
 
-    Ok(ResponseHead {
+    Ok(HeadLines {
         status,
         version,
-        headers,
         content_length,
+        fields,
     })
 }
 
@@ -272,7 +342,7 @@ pub enum Asked {
 /// interim answer on HTTP/1.0, a body described where none may be, an upgrade, or a
 /// `Connection` that is not a list of tokens.
 pub fn delivery(head: &ResponseHead, asked: Asked) -> Result<Delivery, CodecError> {
-    let chunked = is_chunked(&head.headers)?;
+    let chunked = is_chunked(head)?;
     // Two ways of saying how long a body is, and no way to know which the sender meant or
     // which the next reader will believe. This is the shape request smuggling is built on.
     if chunked && head.content_length.is_some() {
@@ -287,7 +357,7 @@ pub fn delivery(head: &ResponseHead, asked: Asked) -> Result<Delivery, CodecErro
     if head.status.is_informational() && head.version == Version::HTTP_10 {
         return Err(CodecError::InterimOnHttp10);
     }
-    let closing = says_close(&head.headers)?;
+    let closing = says_close(head)?;
     // A connection that is to close, one that speaks 1.0, or one whose body only the
     // close ends, carries nothing after this.
     let persists =
@@ -344,14 +414,14 @@ pub fn delivery(head: &ResponseHead, asked: Asked) -> Result<Delivery, CodecErro
 /// its presence: one that names no coding at all has no `chunked` last, so the close
 /// would end the body and a length beside it would be overruled. Taking it for absent
 /// would frame by that length instead, which is the two readers again.
-fn is_chunked(headers: &HeaderMap) -> Result<bool, CodecError> {
-    let mut fields = headers.get_all(http::header::TRANSFER_ENCODING).iter();
+fn is_chunked<F: Fields + ?Sized>(headers: &F) -> Result<bool, CodecError> {
+    let mut fields = headers.values(&http::header::TRANSFER_ENCODING);
     let Some(first) = fields.next() else {
         return Ok(false);
     };
     let mut codings = std::iter::once(first)
         .chain(fields)
-        .flat_map(crate::hop_by_hop::options);
+        .flat_map(crate::hop_by_hop::options_of);
     match (codings.next(), codings.next()) {
         (Some(only), None) if only.eq_ignore_ascii_case(b"chunked") => Ok(true),
         _ => Err(CodecError::Coding),
@@ -360,10 +430,10 @@ fn is_chunked(headers: &HeaderMap) -> Result<bool, CodecError> {
 
 /// Whether `Connection` asks for the connection to close, having first checked that what
 /// it holds is a list of tokens at all: a value that is not is not something to act on.
-fn says_close(headers: &HeaderMap) -> Result<bool, CodecError> {
+fn says_close<F: Fields + ?Sized>(headers: &F) -> Result<bool, CodecError> {
     let mut closing = false;
-    for value in headers.get_all(http::header::CONNECTION) {
-        for option in crate::hop_by_hop::options(value) {
+    for value in headers.values(&http::header::CONNECTION) {
+        for option in crate::hop_by_hop::options_of(value) {
             if !option.iter().copied().all(crate::hop_by_hop::is_token_byte) {
                 return Err(CodecError::BadConnection);
             }
@@ -727,7 +797,9 @@ mod tests {
     /// The head of a read, or a failure of the test.
     fn head_of(bytes: &[u8]) -> ResponseHead {
         match read(bytes) {
-            Ok(Head::Read { head, .. }) => head,
+            Ok(Head::Read { head, consumed }) => {
+                head.of(bytes::Bytes::copy_from_slice(&bytes[..consumed]))
+            }
             other => panic!("a head was expected, not {other:?}"),
         }
     }
@@ -737,8 +809,8 @@ mod tests {
         let head = head_of(b"HTTP/1.1 204 No Content\r\nx-a: 1\r\nx-b: two\r\n\r\n");
         assert_eq!(head.status, StatusCode::NO_CONTENT);
         assert_eq!(head.version, Version::HTTP_11);
-        assert_eq!(head.headers["x-a"], "1");
-        assert_eq!(head.headers["x-b"], "two");
+        assert_eq!(head.to_map()["x-a"], "1");
+        assert_eq!(head.to_map()["x-b"], "two");
         assert_eq!(head.content_length, None);
     }
 
@@ -898,7 +970,7 @@ mod tests {
                     let Head::Read { head, .. } = got.unwrap() else {
                         panic!("incomplete head")
                     };
-                    assert_eq!(head.headers.len(), count);
+                    assert_eq!(head.fields.len(), count);
                 }
             }
         }
@@ -1078,11 +1150,11 @@ mod tests {
         }
         // A value of nothing but whitespace is an empty value.
         assert_eq!(
-            head_of(b"HTTP/1.1 200 OK\r\nx-a:   \r\n\r\n").headers["x-a"],
+            head_of(b"HTTP/1.1 200 OK\r\nx-a:   \r\n\r\n").to_map()["x-a"],
             ""
         );
         assert_eq!(
-            head_of(b"HTTP/1.1 200 OK\r\nx-a: \thello\t \r\n\r\n").headers["x-a"],
+            head_of(b"HTTP/1.1 200 OK\r\nx-a: \thello\t \r\n\r\n").to_map()["x-a"],
             "hello"
         );
     }
@@ -1098,28 +1170,85 @@ mod tests {
         for upto in 0..=whole.len() {
             match reader.read(&whole[..upto], &H1Limits::default()) {
                 Ok(Head::More) => {}
-                Ok(Head::Read { head: read, .. }) => {
-                    head = Some(read);
+                Ok(Head::Read {
+                    head: read,
+                    consumed,
+                }) => {
+                    head = Some(read.of(bytes::Bytes::copy_from_slice(&whole[..consumed])));
                     break;
                 }
                 Err(error) => panic!("refused at {upto}: {error:?}"),
             }
         }
         let head = head.expect("a head");
-        assert_eq!(head.headers["x-a"], format!("v{padding}v"));
+        assert_eq!(head.to_map()["x-a"], format!("v{padding}v"));
+    }
+
+    /// Bytes for a field's name or value: mostly what a token is made of, and any byte at
+    /// all besides, but for those that would end the name or the line instead.
+    fn field_bytes(least: usize) -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::*;
+        let byte = prop_oneof![
+            3 => prop::sample::select(b"abcXYZ-_.!~09".to_vec()),
+            2 => any::<u8>(),
+        ]
+        .prop_filter("ends the name or the line", |byte| {
+            !matches!(byte, b':' | b'\r' | b'\n')
+        });
+        prop::collection::vec(byte, least..8)
+    }
+
+    proptest::proptest! {
+        // Cheap cases, and the only thing between the parser and the client: many of them.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4096))]
+
+        /// **What a map would refuse, the reader refuses.** A head's lines are kept as they
+        /// came, not made into a header map on the way, so nothing but the parser stands
+        /// between a field and the client: a field is read exactly when a map would take
+        /// it, and then read as the map would read it — the name in any case, the value
+        /// without the white space around it.
+        #[test]
+        fn a_field_is_read_exactly_when_a_map_would_take_it(
+            name in field_bytes(1),
+            value in field_bytes(0),
+        ) {
+            let mut bytes = b"HTTP/1.1 200 OK\r\n".to_vec();
+            bytes.extend_from_slice(&name);
+            bytes.extend_from_slice(b": ");
+            bytes.extend_from_slice(&value);
+            bytes.extend_from_slice(b"\r\n\r\n");
+            // The white space around a value is spaces and tabs, and nothing else.
+            let blank = |byte: &u8| *byte == b' ' || *byte == b'\t';
+            let start = value.iter().position(|byte| !blank(byte)).unwrap_or(value.len());
+            let end = value.iter().rposition(|byte| !blank(byte)).map_or(start, |at| at + 1);
+            let trimmed = &value[start..end];
+            let by_map = HeaderName::from_bytes(&name)
+                .ok()
+                .zip(HeaderValue::from_bytes(trimmed).ok());
+            match (read(&bytes), by_map) {
+                (Ok(Head::Read { head, consumed }), Some((name, value))) => {
+                    let head = head.of(bytes::Bytes::copy_from_slice(&bytes[..consumed]));
+                    let read: Vec<&[u8]> = head.values(&name).collect();
+                    proptest::prop_assert_eq!(read, [value.as_bytes()]);
+                }
+                (Err(_), None) => {}
+                (read, by_map) => proptest::prop_assert!(
+                    false,
+                    "{:?}: read {:?}, a map {:?}",
+                    String::from_utf8_lossy(&bytes),
+                    read,
+                    by_map
+                ),
+            }
+        }
     }
 
     #[test]
     fn a_field_may_come_twice_when_it_is_not_a_length() {
         let bytes = b"HTTP/1.1 200 OK\r\nset-cookie: a=1\r\nset-cookie: b=2\r\n\r\n";
         let head = head_of(bytes);
-        let cookies: Vec<&str> = head
-            .headers
-            .get_all("set-cookie")
-            .iter()
-            .map(|value| value.to_str().unwrap())
-            .collect();
-        assert_eq!(cookies, ["a=1", "b=2"]);
+        let cookies: Vec<&[u8]> = head.values(&http::header::SET_COOKIE).collect();
+        assert_eq!(cookies, [b"a=1".as_slice(), b"b=2"]);
     }
 
     #[test]

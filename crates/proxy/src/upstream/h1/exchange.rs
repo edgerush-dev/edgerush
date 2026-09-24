@@ -512,7 +512,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             // What is already in hand comes first. Going back to the socket before
             // looking at it is how an upstream that answers and closes at once has its
             // answer thrown away for a close that had already been overtaken.
-            let Head::Read { head, consumed } = reader.read(self.unread(), limits)? else {
+            let Head::Read {
+                head: lines,
+                consumed,
+            } = reader.read(self.unread(), limits)?
+            else {
                 let outcome = poll_fn(|cx| {
                     // The write-idle clock covers the head while it is queued. These
                     // two waits begin only once the complete head has reached the socket.
@@ -558,6 +562,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                     Ok(Moved::Closed) => return Err(ExchangeError::Closed),
                 }
             };
+            // Copied out of the block, which is then free to be read into again: a head
+            // lives only until it is written, and a cut one would hold the block's memory
+            // until it was reclaimed and set to zeros again, which costs more than the copy
+            // ([14 §8](../../../docs/14-downstream-server.md)).
+            let head = lines.of(Bytes::copy_from_slice(
+                self.unread().get(..consumed).unwrap_or_default(),
+            ));
             // Checked before it is believed, interim or final alike. An interim head
             // that claims a body is a sender describing bytes that nobody will read as
             // one here and something else may read as one next; a 101 is a protocol this
@@ -585,17 +596,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                 // Only a 100 says to send the body; another interim answer says something
                 // else entirely. Which are passed on, and which the gateway keeps, is the
                 // coordinator's to say.
-                self.interim.upstream_interim(head.status, head.headers);
+                self.interim.upstream_interim(head.status, head.to_map());
                 may_send = self.interim.may_poll_upload();
                 reader = HeadReader::default();
                 continue;
             }
             self.used(consumed);
             close_said |= head
-                .headers
-                .get_all(http::header::CONNECTION)
-                .iter()
-                .flat_map(crate::hop_by_hop::options)
+                .values(&http::header::CONNECTION)
+                .flat_map(crate::hop_by_hop::options_of)
                 .any(|option| option.eq_ignore_ascii_case(b"close"));
             delivery.persistent &= !close_said;
             // A refusal that says close is what says to stop (RFC 9112 §9.5). A connection
@@ -609,7 +618,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             let never_asked_for = self.interim.abandoned();
             let stop_uploading = never_asked_for || (refused && close_said);
             return Ok(Answer {
-                nominated: crate::hop_by_hop::nominated(&head.headers),
+                nominated: crate::hop_by_hop::nominated(&head),
                 head,
                 delivery,
                 interim,
@@ -1745,7 +1754,52 @@ mod tests {
         let _peer = answered.await.unwrap();
 
         assert_eq!(answer.head.status, 200);
-        assert_eq!(answer.head.headers["x-long"].len(), length);
+        assert_eq!(answer.head.to_map()["x-long"].len(), length);
+    }
+
+    /// **An answer's head holds no block.** It is copied out of the block it was read
+    /// into, so once the exchange and its blocks have gone nothing of the worker's is left
+    /// to count while the answer is still held: a head lives only until it is written, and
+    /// holding the block for it would cost setting the block to zeros again (14 §8).
+    #[tokio::test]
+    async fn an_answers_head_holds_no_block() {
+        let blocks = test_blocks();
+        let storage = Rc::clone(blocks.borrow().storage());
+        let (ours, theirs) = tokio::io::duplex(4096);
+        let mut peer = Peer(theirs);
+        let answered = tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            peer.say("HTTP/1.1 200 OK\r\nx-a: 1\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            peer
+        });
+
+        let (answer, rest) = Exchange::new(ours, Rc::clone(&blocks))
+            .send(
+                &Method::GET,
+                &"/".parse().unwrap(),
+                &headers(&[("host", "up.test")]),
+                &[],
+                Sending::None,
+                Empty::<Bytes>::new(),
+                &H1Limits::default(),
+            )
+            .await
+            .unwrap();
+        let _peer = answered.await.unwrap();
+        drop(rest);
+        blocks.borrow_mut().trim(0);
+        storage.sweep();
+
+        assert_eq!(storage.outlived(), 0, "the head holds its block's memory");
+        assert_eq!(storage.used(), 0, "the head holds its block's memory");
+        let head = answer.head.into_answer();
+        assert_eq!(
+            head.fields()
+                .values_of(&HeaderName::from_static("x-a"))
+                .next(),
+            Some(&b"1"[..])
+        );
     }
 
     /// **And an answer no block can hold is a failure, not a close.** Not reached with
@@ -2136,7 +2190,7 @@ mod tests {
         assert_eq!(answer.head.status, 200);
         assert_eq!(answer.interim, 2);
         // Nothing of the interim heads is passed on.
-        assert!(!answer.head.headers.contains_key("link"));
+        assert!(!answer.head.to_map().contains_key("link"));
     }
 
     #[tokio::test]

@@ -15,6 +15,8 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
+# A response head keeps the bytes it was read from, as the proxy's does.
+bytes = "1.12"
 edgerush-proxy = { path = "../crates/proxy", features = ["fuzzing"] }
 edgerush-router = { path = "../crates/router", features = ["reference"] }
 # The reading of a request's host is compared with this crate's own.

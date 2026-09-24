@@ -7,10 +7,11 @@
 // build none of this is API.
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
 
+use crate::downstream::h1::writer::{AnswerFields, field};
 use crate::fields::{Edited, FieldLines, Known, Overlay, OverlayFull, Piece, View};
 use crate::h1::{Declaration, declaration};
 use crate::head::{Forwarded, Head, Survey};
-use crate::hop_by_hop::{self, ConnectionError, HOP_BY_HOP, is_hop_by_hop_name, options_of};
+use crate::hop_by_hop::{self, ConnectionError, is_hop_by_hop_name, options_of};
 use crate::host::HostError;
 use crate::request::Rejection;
 use crate::upstream::h1::codec::OutgoingFields;
@@ -19,7 +20,7 @@ use edgerush_filters::{Edit, HeaderModifier};
 use edgerush_router::Fields;
 #[cfg(any(test, feature = "fuzzing"))]
 use http::Request;
-use http::header::{CONNECTION, COOKIE, HOST, HeaderName, HeaderValue, TE, TRAILER};
+use http::header::{CONNECTION, COOKIE, DATE, HOST, HeaderName, HeaderValue, TE, TRAILER};
 #[cfg(any(test, feature = "fuzzing"))]
 use http::request::Parts;
 use http::{HeaderMap, Method, Response, StatusCode, Uri, Version, response};
@@ -281,13 +282,6 @@ impl RawHead {
 /// An upstream's answer as our own client reads it: its status, the bytes of its head,
 /// where each field line lies in them, and an overlay of what the way to the client
 /// changes. A line nothing changes reaches the client as it arrived (14 §6).
-#[cfg_attr(
-    not(any(test, feature = "fuzzing")),
-    expect(
-        dead_code,
-        reason = "read by the tests until our client reads answers raw (14 §9, step 4)"
-    )
-)]
 #[derive(Debug)]
 pub struct RawAnswer {
     status: StatusCode,
@@ -296,13 +290,6 @@ pub struct RawAnswer {
     overlay: Overlay,
 }
 
-#[cfg_attr(
-    not(any(test, feature = "fuzzing")),
-    expect(
-        dead_code,
-        reason = "read by the tests until our client reads answers raw (14 §9, step 4)"
-    )
-)]
 impl RawAnswer {
     /// The answer whose head is `head`, whose field lines `lines` says where they are.
     pub fn new(status: StatusCode, head: Bytes, lines: FieldLines) -> Self {
@@ -394,17 +381,45 @@ impl Fields for RawAnswer {
     }
 }
 
+/// What the client's head writer writes itself, and so leaves out of what it copies.
+const DOWNSTREAM_FRAMING: [Known; 4] = [
+    Known::ContentLength,
+    Known::TransferEncoding,
+    Known::Connection,
+    Known::Trailer,
+];
+
+impl AnswerFields for RawAnswer {
+    fn write_fields(&self, out: &mut Vec<u8>) -> bool {
+        for piece in self.pieces(&DOWNSTREAM_FRAMING) {
+            match piece {
+                // Whole lines as they arrived, line breaks and all.
+                Piece::Copy(span) => out.extend_from_slice(self.head.get(span).unwrap_or_default()),
+                Piece::Field(name, value) => field(out, name.as_str().as_bytes(), value.as_bytes()),
+            }
+        }
+        self.values(&DATE).next().is_some()
+    }
+}
+
 /// Takes out the hop-by-hop fields: those the head's own `Connection` names, as it arrived,
 /// and those that go whether named or not.
 fn strip(view: View<'_>, overlay: &mut Overlay) {
-    for value in view.values(&CONNECTION) {
-        for option in options_of(value) {
-            overlay.remove_named(&view, option);
-        }
-    }
-    for name in &HOP_BY_HOP {
-        overlay.remove(&view, name);
-    }
+    // One pass over the lines, rather than one for each name. What `Connection` names is
+    // most often nothing but `keep-alive`, a field that goes anyway, and then it is not
+    // asked again for every line.
+    let names_others = view
+        .values(&CONNECTION)
+        .flat_map(options_of)
+        .any(|option| !is_hop_by_hop_name(option));
+    let named = |name: &[u8]| {
+        names_others
+            && view
+                .values(&CONNECTION)
+                .flat_map(options_of)
+                .any(|option| option.eq_ignore_ascii_case(name))
+    };
+    overlay.remove_where(&view, |name| is_hop_by_hop_name(name) || named(name));
 }
 
 /// Makes a modifier's changes to a head's overlay.
@@ -611,6 +626,12 @@ mod tests {
             add in proptest::collection::vec(edit(), 0..3),
             remove in proptest::collection::vec(
                 proptest::sample::select(vec!["x-a", "x-b", "date", "trailer"]), 0..3),
+            content in 0..3u8,
+            length in 0..100u64,
+            asked_head in proptest::prelude::any::<bool>(),
+            old in proptest::prelude::any::<bool>(),
+            trailers in proptest::prelude::any::<bool>(),
+            persistent in proptest::prelude::any::<bool>(),
         ) {
             use crate::upstream::auth::challenges;
             use proptest::prelude::*;
@@ -639,6 +660,39 @@ mod tests {
             prop_assert_eq!(raw.apply(&changes), Ok(()));
             prop_assert_eq!(of_map(&map), meaning(raw.fields().iter()), "edited");
 
+            // Written for the client, both ways: the same status line, and the same fields
+            // by meaning, the framing and the date the writer adds among them.
+            {
+                use crate::downstream::h1::date::HttpDate;
+                use crate::downstream::h1::writer::{Asked, Content, write_head};
+                let content = match content {
+                    0 => Content::Empty,
+                    1 => Content::Length(length),
+                    _ => Content::Unknown,
+                };
+                let asked = Asked {
+                    head: asked_head,
+                    version: if old { Version::HTTP_10 } else { Version::HTTP_11 },
+                    trailers,
+                };
+                let date = HttpDate::from_unix(784_111_777);
+                let (mut by_map, mut by_raw) = (Vec::new(), Vec::new());
+                let from_map = write_head(&mut by_map, status, &map, content, asked, persistent, &date);
+                let from_raw = write_head(&mut by_raw, status, &raw, content, asked, persistent, &date);
+                prop_assert_eq!(from_raw, from_map);
+                let read = |head: &[u8]| {
+                    let mut room = [httparse::EMPTY_HEADER; 64];
+                    let mut response = httparse::Response::new(&mut room);
+                    assert!(response.parse(head).unwrap().is_complete(), "{head:?}");
+                    let line = head.split(|&byte| byte == b'\n').next().map(<[u8]>::to_vec);
+                    let fields = meaning(response.headers.iter().map(|field| (field.name.as_bytes(), field.value)));
+                    (line, fields)
+                };
+                if from_map.is_ok() {
+                    prop_assert_eq!(read(&by_raw), read(&by_map));
+                }
+            }
+
             let parts = raw.into_parts();
             prop_assert_eq!(parts.status, status);
             prop_assert_eq!(parts.version, Version::HTTP_11);
@@ -661,6 +715,38 @@ mod tests {
             assert_eq!(raw.apply(&sixteen), Ok(()));
         }
         assert_eq!(raw.apply(&sixteen), Err(OverlayFull));
+    }
+
+    /// **An answer's lines reach the client as the upstream wrote them**: the case of each
+    /// name, the space around each value and the order of the lines, in one run, with only
+    /// what the writer owns written anew after them.
+    #[test]
+    fn an_answer_is_written_with_its_lines_as_they_came() {
+        use crate::downstream::h1::date::HttpDate;
+        use crate::downstream::h1::writer::{Asked, Content, write_head};
+        let sent = b"HTTP/1.1 200 OK\r\nX-Mixed-Case:  spaced \r\nContent-Length: 2\r\nDate: Sun, 06 Nov 1994 08:49:37 GMT\r\nconnection: keep-alive\r\n\r\n";
+        let (_, mut raw) = both_answers(sent).unwrap();
+        raw.strip();
+        let asked = Asked {
+            head: false,
+            version: Version::HTTP_11,
+            trailers: false,
+        };
+        let mut out = Vec::new();
+        write_head(
+            &mut out,
+            raw.status(),
+            &raw,
+            Content::Length(2),
+            asked,
+            true,
+            &HttpDate::from_unix(0),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "HTTP/1.1 200 OK\r\nX-Mixed-Case:  spaced \r\nDate: Sun, 06 Nov 1994 08:49:37 GMT\r\ncontent-length: 2\r\n\r\n"
+        );
     }
 
     /// What nothing changes is left as it came: an answer with no hop-by-hop fields and no

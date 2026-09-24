@@ -16,29 +16,27 @@
 //! the pool of upstream connections to come, above all.
 
 use crate::downstream::detect::{Protocol, detect};
-use crate::downstream::h1::connection as h1;
+use crate::downstream::h1::connection::{self as h1, Answered};
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h1::deadlines::Bounds;
 use crate::head::Forwarded;
-use crate::hop_by_hop::strip_response;
 use crate::interim::Interim;
 use crate::linger::{self, Lent, linger};
 use crate::metrics::{Answer, Metrics, Socket, Stopped};
 use crate::random::random;
-use crate::raw::RawHead;
+use crate::raw::{RawAnswer, RawHead};
 use crate::request::decide;
 use crate::request_body::RequestBody;
 use crate::storage::Storage;
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Blocks, SMALL, Sizes};
-use crate::upstream::h1::codec::{OutgoingFields, ResponseHead, Sending, filter_declaration};
+use crate::upstream::h1::codec::{OutgoingFields, Sending};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, nothing_to_say};
 use crate::upstream::h1::pool::{Lease, Pool};
 use arc_swap::ArcSwap;
 use edgerush_config::{Compiled, CompiledRule};
 use edgerush_router::Fields;
-use http::response;
 use http::uri::{Authority, Scheme};
 use http::{HeaderName, Method, Request, Response, Uri, Version};
 use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
@@ -547,7 +545,7 @@ impl Worker {
         sending: Sending,
         body: B,
         interim: Option<Interim>,
-    ) -> Result<(ResponseHead, H1Body<TcpStream, B>), ExchangeError>
+    ) -> Result<(RawAnswer, H1Body<TcpStream, B>), ExchangeError>
     where
         F: OutgoingFields + ?Sized,
         B: HttpBody<Data = Bytes> + Unpin,
@@ -599,12 +597,9 @@ impl Worker {
         // The request may still be going out; what is left of it goes with the body,
         // which drives it while the client reads the answer.
         let lease = Lease::in_use(Arc::clone(identity), opened, &self.pool);
-        let mut head = answer.head;
-        // The same for the answer: a name its `Connection` gave does not travel on, and
-        // is not declared onwards either.
-        filter_declaration(&mut head.headers, &answer.nominated);
-        let persistent = answer.delivery.persistent
-            && !crate::upstream::auth::challenges(head.status, &head.headers);
+        let head = answer.head;
+        let persistent =
+            answer.delivery.persistent && !crate::upstream::auth::challenges(head.status, &head);
         let body = H1Body::new(
             rest,
             answer.delivery.framing,
@@ -613,7 +608,7 @@ impl Worker {
             self.limits,
         )
         .returning_to(lease);
-        Ok((head, body))
+        Ok((head.into_answer(), body))
     }
 
     /// What this worker serves: the data plane the whole process shares.
@@ -677,7 +672,11 @@ impl Worker {
                 // Where the engine's body stops: from here on the request's body is one
                 // any engine could have read.
                 let request = request.map(RequestBody::Hyper);
-                let response = connection.worker.handle(listener, request, None).await;
+                let response = connection
+                    .worker
+                    .handle(listener, request, None)
+                    .await
+                    .into_response();
                 Ok::<_, Infallible>(response)
             }
         });
@@ -772,7 +771,7 @@ impl Worker {
         listener: usize,
         request: Request<RequestBody>,
         interim: Option<Interim>,
-    ) -> Response<Body> {
+    ) -> Answered<Body> {
         let (head, body) = request.into_parts();
         self.handle_head(listener, head, body, interim).await
     }
@@ -785,14 +784,14 @@ impl Worker {
         head: H,
         body: RequestBody,
         interim: Option<Interim>,
-    ) -> Response<Body> {
+    ) -> Answered<Body> {
         let came_in = Instant::now();
-        let response = self.respond_to(listener, head, body, interim).await;
+        let answered = self.respond_to(listener, head, body, interim).await;
         if let Some(counters) = self.proxy.metrics.listener(listener) {
             let took = u64::try_from(came_in.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            counters.responded(response.status(), took);
+            counters.responded(answered.status(), took);
         }
-        response
+        answered
     }
 
     async fn respond_to<H: Forwarded>(
@@ -801,7 +800,7 @@ impl Worker {
         mut head: H,
         body: RequestBody,
         interim: Option<Interim>,
-    ) -> Response<Body> {
+    ) -> Answered<Body> {
         // How the body is to be sent on, worked out from what arrived and before `direct`
         // takes the hop-by-hop fields off it — and before the body itself is touched,
         // because the path is chosen while there is still nothing to undo.
@@ -813,12 +812,12 @@ impl Worker {
         let nominated = crate::hop_by_hop::nominated(head.outgoing());
         let directed = match self.proxy.direct(listener, &mut head) {
             Ok(directed) => directed,
-            Err(answer) => return self.proxy.answer(listener, answer),
+            Err(answer) => return self.proxy.answer(listener, answer).into(),
         };
         // A name it gave is not declared onwards either: the declaration says what the
         // trailers will hold, and it will not hold that.
         if let Err(rejection) = head.filter_declaration(&nominated) {
-            return self.proxy.answer(listener, rejection.into());
+            return self.proxy.answer(listener, rejection.into()).into();
         }
 
         // Credentials can bind the upstream socket to this client, even when the
@@ -827,7 +826,7 @@ impl Worker {
         if crate::upstream::auth::carries_credentials(head.outgoing())
             && let Err(rejection) = head.close_connection()
         {
-            return self.proxy.answer(listener, rejection.into());
+            return self.proxy.answer(listener, rejection.into()).into();
         }
 
         // Before either client looks for a connection or opens one: a place is what
@@ -835,7 +834,7 @@ impl Worker {
         // bound whichever client carries the request, so that the two are compared doing
         // the same work ([14 §2](../../docs/14-downstream-server.md)).
         let Some(admitted) = self.admit() else {
-            return self.proxy.answer(listener, Answer::TooBusy);
+            return self.proxy.answer(listener, Answer::TooBusy).into();
         };
         let answered = self
             .by_ours(
@@ -844,34 +843,40 @@ impl Worker {
             .await;
 
         let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
-        let (mut head, body) = match answered {
+        let (mut answer, body) = match answered {
             Ok(answered) => answered,
             // The worker's own storage running out is not the upstream failing, and is
             // not counted as though it were ([14 §8](../../docs/14-downstream-server.md)).
-            Err(Answer::Exhausted) => return self.proxy.answer(listener, Answer::Exhausted),
+            Err(Answer::Exhausted) => return self.proxy.answer(listener, Answer::Exhausted).into(),
             Err(answer) => {
                 if let Some(upstream) = upstream {
                     upstream.failures.inc();
                 }
-                return self.proxy.answer(listener, answer);
+                return self.proxy.answer(listener, answer).into();
             }
         };
         if let Some(upstream) = upstream {
-            upstream.responded(head.status);
+            upstream.responded(answer.status());
         }
-        strip_response(&mut head.headers);
-        // The version is this hop's and not the upstream's: "Intermediaries that process
-        // HTTP messages ... MUST send their own HTTP-version in forwarded messages" (RFC
-        // 9110 §6.2).
-        head.version = Version::HTTP_11;
-        if let Some(changes) = directed
+        // A name the answer's own `Connection` gave does not travel on, and is not declared
+        // onwards either; then what is about the upstream's connection comes off, and the
+        // rule's changes are made (14 §6).
+        let nominated = crate::hop_by_hop::nominated(&answer);
+        let changes = directed
             .rule
             .as_ref()
-            .and_then(|rule| rule.response_headers.as_ref())
-        {
-            changes.apply(&mut head.headers);
+            .and_then(|rule| rule.response_headers.as_ref());
+        let edited = answer.filter_declaration(&nominated).and_then(|()| {
+            answer.strip();
+            changes.map_or(Ok(()), |changes| answer.apply(changes))
+        });
+        if edited.is_err() {
+            return self.proxy.answer(listener, Answer::Edits).into();
         }
-        Response::from_parts(head, body)
+        // Written in this hop's version and not the upstream's: "Intermediaries that
+        // process HTTP messages ... MUST send their own HTTP-version in forwarded messages"
+        // (RFC 9110 §6.2). Our writer says HTTP/1.1, and so does a map made for HTTP/2.
+        Answered::Raw(answer, body)
     }
 
     /// By EdgeRush's own path, the one there is.
@@ -888,7 +893,7 @@ impl Worker {
         body: RequestBody,
         admitted: Admitted,
         interim: Option<Interim>,
-    ) -> Result<(response::Parts, Body), Answer> {
+    ) -> Result<(RawAnswer, Body), Answer> {
         let answer = match self
             .through_h1(
                 &directed.endpoint,
@@ -917,17 +922,13 @@ impl Worker {
         if body.is_end_stream() {
             body.settle();
         }
-        let mut parts = Response::new(()).into_parts().0;
-        parts.status = read.status;
-        parts.version = read.version;
-        parts.headers = read.headers;
         // The place goes with the body, which is what is still being worked on. Every
         // other way out of here has dropped it already.
         let watch = Watch {
             proxy: Arc::clone(&self.proxy),
             upstream: directed.upstream_slot,
         };
-        Ok((parts, Body::Ours(Box::new(body), admitted, watch)))
+        Ok((read, Body::Ours(Box::new(body), admitted, watch)))
     }
 }
 
@@ -2389,7 +2390,7 @@ upstreams:
                         )
                         .await
                         .unwrap();
-                    assert_eq!(head.status, 200, "round {round}");
+                    assert_eq!(head.status(), 200, "round {round}");
 
                     let (data, went_back) = drain(body, &worker.limits).await;
                     assert_eq!(data, b"ok", "round {round}");

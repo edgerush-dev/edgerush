@@ -24,11 +24,13 @@
 use super::codec::{Head, HeadReader, RequestError, RequestHead, arrival};
 use super::date::HttpDate;
 use super::deadlines::{Bounds, Clock, Deadlines};
-use super::writer::{Asked, BodyFramer, Content, Delimited, write_head, write_interim};
+use super::writer::{
+    Asked, BodyFramer, Content, Delimited, WriteError, Written, write_head, write_interim,
+};
 use crate::h1::{BodyReader, CodecError, Framing, Piece};
 use crate::head::Head as _;
 use crate::interim::Interim;
-use crate::raw::RawHead;
+use crate::raw::{RawAnswer, RawHead};
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::storage::{Charge, Storage};
 use crate::upstream::h1::H1Limits;
@@ -753,6 +755,84 @@ fn takes_trailers<F: Fields + ?Sized>(headers: &F) -> bool {
         .any(|option| option.eq_ignore_ascii_case(b"trailers"))
 }
 
+/// An answer as the request core hands it back ([14 §6](../../../../docs/14-downstream-server.md)):
+/// one our own client read, as its lines with the way back's edits, or a map — the data
+/// plane's own answers, and any a test's core makes.
+pub(crate) enum Answered<B> {
+    /// An upstream's answer, written as the lines it came in.
+    Raw(RawAnswer, B),
+    /// An answer held as a header map.
+    Map(Response<B>),
+}
+
+impl<B> Answered<B> {
+    /// What it answers.
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            Self::Raw(answer, _) => answer.status(),
+            Self::Map(response) => response.status(),
+        }
+    }
+
+    /// The answer as a map, for a server that takes nothing else: HTTP/2's.
+    pub(crate) fn into_response(self) -> Response<B> {
+        match self {
+            Self::Raw(answer, body) => Response::from_parts(answer.into_parts(), body),
+            Self::Map(response) => response,
+        }
+    }
+}
+
+impl<B> From<Response<B>> for Answered<B> {
+    fn from(response: Response<B>) -> Self {
+        Self::Map(response)
+    }
+}
+
+/// The final head of an answer, of whichever kind, once its body has been taken off it.
+enum FinalHead {
+    Raw(RawAnswer),
+    Map(http::response::Parts),
+}
+
+impl FinalHead {
+    /// Writes it, as [`write_head`] does either kind.
+    fn write(
+        &self,
+        out: &mut Vec<u8>,
+        content: Content,
+        asked: Asked,
+        persistent: bool,
+        date: &HttpDate,
+    ) -> Result<Written, WriteError> {
+        match self {
+            Self::Raw(answer) => write_head(
+                out,
+                answer.status(),
+                answer,
+                content,
+                asked,
+                persistent,
+                date,
+            ),
+            Self::Map(parts) => write_head(
+                out,
+                parts.status,
+                &parts.headers,
+                content,
+                asked,
+                persistent,
+                date,
+            ),
+        }
+    }
+
+    /// Whether it is an answer of the data plane's own, written from the provision.
+    fn is_local(&self) -> bool {
+        matches!(self, Self::Map(parts) if parts.extensions.get::<Local>().is_some())
+    }
+}
+
 /// Serves `socket` until the connection ends, handing each request to `respond` as its raw
 /// head and its body, and says how it ended. The caller closes the socket, lingering where
 /// bytes may still be arriving.
@@ -766,7 +846,7 @@ pub(crate) async fn serve<S, R, F, B>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
     R: FnMut(RawHead, RequestBody, Interim) -> F,
-    F: Future<Output = Response<B>>,
+    F: Future<Output = Answered<B>>,
     B: Body<Data = Bytes> + Unpin,
 {
     let limits = settings.limits;
@@ -882,7 +962,7 @@ where
         let answer = {
             let mut responding =
                 std::pin::pin!(respond(head, RequestBody::Ours(body), interim.clone()));
-            poll_fn(|context| -> Poll<Result<Response<B>, Stop>> {
+            poll_fn(|context| -> Poll<Result<Answered<B>, Stop>> {
                 connection.inbound.borrow_mut().heard_by(context);
                 loop {
                     if connection.spent() {
@@ -936,7 +1016,13 @@ where
             return stop.into();
         }
 
-        let (parts, mut body) = response.into_parts();
+        let (final_head, mut body) = match response {
+            Answered::Raw(answer, body) => (FinalHead::Raw(answer), body),
+            Answered::Map(response) => {
+                let (parts, body) = response.into_parts();
+                (FinalHead::Map(parts), body)
+            }
+        };
         let content = if body.is_end_stream() {
             Content::Empty
         } else {
@@ -953,22 +1039,14 @@ where
             inbound.reader.is_none() && !inbound.ended && !inbound.failed
         };
         let mut head = Vec::with_capacity(512);
-        let written = match write_head(
-            &mut head,
-            parts.status,
-            &parts.headers,
-            content,
-            asked,
-            persistent,
-            &date(),
-        ) {
+        let written = match final_head.write(&mut head, content, asked, persistent, &date()) {
             Ok(written) => written,
             // Only an interim status is refused, and the core returns none.
             Err(_) => return Ended::Gone,
         };
         // The data plane's own answer is written from the provision, so that a worker that
         // has run out can still say so; one it forwards is paid for like anything else.
-        let queued = if parts.extensions.get::<Local>().is_some() {
+        let queued = if final_head.is_local() {
             connection.queue_answer(head)
         } else {
             connection.queue_built(head)
@@ -1128,7 +1206,8 @@ mod tests {
             blocks,
             date,
             |head: RawHead, body, interim| {
-                respond(Request::from_parts(head.into_parts(), body), interim)
+                let answering = respond(Request::from_parts(head.into_parts(), body), interim);
+                async move { Answered::Map(answering.await) }
             },
         )
         .await
@@ -2407,6 +2486,42 @@ mod tests {
                 assert_eq!(ended, Ended::Exhausted);
             }
         }
+    }
+
+    /// And an upstream's answer, which the core hands back raw, is paid for like any other
+    /// it forwards: the provision is the data plane's own.
+    #[tokio::test]
+    async fn a_raw_answer_is_not_written_from_the_provision() {
+        use crate::upstream::h1::codec::{Head as AnswerHead, HeadReader as AnswerReader};
+        let small = crate::upstream::h1::blocks::Sizes::default().small;
+        let blocks = Rc::new(RefCell::new(Blocks::new(
+            crate::upstream::h1::blocks::Sizes::default(),
+            crate::storage::Storage::with_provision(small, 4096),
+        )));
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        client.write_all(GET).await.unwrap();
+        client.shutdown().await.unwrap();
+        let answering = |_: RawHead, _: RequestBody, _: Interim| async {
+            let sent = Bytes::from_static(b"HTTP/1.1 503 Busy\r\nx-a: 1\r\n\r\n");
+            let limits = crate::upstream::h1::H1Limits::default();
+            let Ok(AnswerHead::Read { head, consumed }) =
+                AnswerReader::default().read(&sent, &limits)
+            else {
+                panic!("an answer's head");
+            };
+            let answer = head.of(sent.slice(..consumed)).into_answer();
+            Answered::Raw(answer, Answer::Full(Full::new(Bytes::new())))
+        };
+        let ended = tokio::time::timeout(
+            Duration::from_secs(10),
+            super::serve(server, settings(), blocks, date, answering),
+        )
+        .await
+        .unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert!(received.is_empty(), "{received:?}");
+        assert_eq!(ended, Ended::Exhausted);
     }
 
     /// A request whose body has been read holds no storage while its answer is written:
