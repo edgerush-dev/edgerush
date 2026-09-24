@@ -1108,10 +1108,20 @@ where
                     }
                 }
                 moved |= connection.poll_write_queued(context)?;
-                // An upload the answer did not wait for is still read for it.
-                let wanted = connection.inbound.borrow().wanted;
+                // An upload the answer did not wait for is still read for it, and its clock
+                // is kept as while the answer was worked out: running while it is waited
+                // on, put back by what arrives, and stopped once it is whole — or a clock
+                // set before the answer began would cut off an answer still moving.
+                let (wanted, body_done) = {
+                    let inbound = connection.inbound.borrow();
+                    (inbound.wanted, inbound.reader.is_none())
+                };
+                connection
+                    .deadlines
+                    .body_waited_on(now(), wanted && !body_done);
                 if wanted && connection.poll_read(context, limits.head, true)? {
                     moved = true;
+                    connection.deadlines.body_moved(now());
                 }
                 if !body_left && connection.queued.is_empty() {
                     return Poll::Ready(Ok(true));
@@ -1858,6 +1868,120 @@ mod tests {
             );
             drop(client);
         }
+    }
+
+    /// An answer that drives the upload as it goes, as an upstream answer does before the
+    /// request body is all sent: it reads the upload to its end, then sends a byte every
+    /// `gap`, `left` more times.
+    struct AfterUpload {
+        upload: Option<RequestBody>,
+        left: usize,
+        gap: Duration,
+        tick: Pin<Box<Sleep>>,
+    }
+
+    impl Body for AfterUpload {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            while let Some(upload) = &mut this.upload {
+                match std::task::ready!(Pin::new(upload).poll_frame(context)) {
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => {
+                        this.upload = None;
+                        this.tick.as_mut().reset(Instant::now() + this.gap);
+                    }
+                }
+            }
+            if this.left == 0 {
+                return Poll::Ready(None);
+            }
+            std::task::ready!(this.tick.as_mut().poll(context));
+            this.left -= 1;
+            let gap = this.gap;
+            this.tick.as_mut().reset(Instant::now() + gap);
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"x")))))
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(self.left as u64)
+        }
+    }
+
+    /// The wait on an upload ends when the upload does, however far the answer has got:
+    /// an answer that keeps moving after the upload is done is not cut off by the upload's
+    /// clock, which ran while the upload was waited on before the answer began. The clock is
+    /// stopped, so the answer's 32 seconds take none.
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_upload_does_not_time_out_an_answer_still_moving() {
+        let gap = Duration::from_secs(8);
+        assert!(gap * 4 > Bounds::default().idle);
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let answering = move |request: Request<RequestBody>, _: Interim| async move {
+            let (_, mut upload) = request.into_parts();
+            // Asked for once before the answer, as an exchange sending it does: the
+            // upload's clock starts, and nothing of it has come.
+            poll_fn(|context| {
+                let _pending = Pin::new(&mut upload).poll_frame(context);
+                Poll::Ready(())
+            })
+            .await;
+            // And the answer comes a moment later, as an upstream's does.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Response::new(AfterUpload {
+                upload: Some(upload),
+                left: 4,
+                gap,
+                tick: Box::pin(tokio::time::sleep(gap)),
+            })
+        };
+        let serving = serve(server, settings(), blocks(), date, answering);
+        let talking = async move {
+            client
+                .write_all(b"POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 1\r\n\r\n")
+                .await
+                .unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                client.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            client.write_all(b"q").await.unwrap();
+            let mut body = [0; 4];
+            let read = client.read_exact(&mut body).await;
+            (
+                String::from_utf8_lossy(&head).into_owned(),
+                read.map(|_| body),
+            )
+        };
+        let (ended, (head, body)) = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(serving, talking)
+        })
+        .await
+        .unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert_eq!(body.ok().as_ref(), Some(b"xxxx"), "ended {ended:?}");
+
+        // An upload that never comes is still given up on, answer or not.
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let serving = serve(server, settings(), blocks(), date, answering);
+        client
+            .write_all(b"POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 1\r\n\r\n")
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let ended = tokio::time::timeout(Duration::from_secs(60), serving)
+            .await
+            .unwrap();
+        assert_eq!(ended, Ended::TimedOut(Clock::BodyIdle));
+        assert!(started.elapsed() <= Bounds::default().idle + Duration::from_millis(20));
+        drop(client);
     }
 
     /// A trickled head gets no more time for trickling: the first request's deadline is
