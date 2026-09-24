@@ -5,6 +5,9 @@
 //! can be checked against a table and every split of its input tried.
 
 pub mod codec;
+// The driver composed with a scripted core, for the harness to judge (step 5).
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod composed;
 pub(crate) mod connection;
 pub mod continuing;
 pub mod date;
