@@ -20,6 +20,10 @@ edgerush-filters = { path = "crates/filters" }
 edgerush-proxy = { path = "crates/proxy" }
 edgerush-router = { path = "crates/router" }
 edgerush-telemetry = { path = "crates/telemetry" }
+# HTTP/2 on both hops, used directly rather than through hyper (15 §3). The version is the
+# one already locked under hyper; its behaviour is pinned by the probes in
+# `crates/proxy/tests/h2_library.rs`, so moving it is a deliberate change of its own.
+h2 = "=0.4.19"
 # Types only (header map, method): the request core works on these, never on an engine's.
 http = "1.5"
 # The body trait the request core and the upstream exchange work on, whichever engine read

@@ -97,6 +97,7 @@ dependencies = [
  "edgerush-filters",
  "edgerush-router",
  "edgerush-telemetry",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
