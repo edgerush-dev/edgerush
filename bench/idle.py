@@ -10,7 +10,9 @@ What each connection does first is the fourth argument:
 - `silent`: nothing at all, which is what a connection costs before its first byte;
 - `refreshed`: one request, and then another on each connection every 20 seconds, within
   the proxy's keep-alive deadline, so that a long run holds them the whole time; one the
-  proxy closes anyway is opened again.
+  proxy closes anyway is opened again;
+- `h2`: one request over cleartext HTTP/2 with prior knowledge, answered, and then nothing
+  more: what an idle HTTP/2 connection costs.
 
 Says `ready` on its standard output once they are all answered, or all open, and then waits
 to be killed.
@@ -23,6 +25,7 @@ import sys
 import time
 
 READY = b"HTTP/1.1 "
+H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 # Within the proxy's 30-second keep-alive deadline, with room to spare.
 REFRESH = 20
 
@@ -51,16 +54,67 @@ def answer(connection) -> bytes:
     return head
 
 
-def opened(address, port, request):
+def h2_frame(kind: int, flags: int, stream: int, payload: bytes) -> bytes:
+    """One HTTP/2 frame (RFC 9113 §4.1)."""
+    return len(payload).to_bytes(3, "big") + bytes([kind, flags]) + stream.to_bytes(4, "big") + payload
+
+
+def h2_request(host: str) -> bytes:
+    """A client's preface, empty SETTINGS and a GET on stream 1 that ends it.
+
+    The header block is literal fields without indexing or Huffman coding (RFC 7541
+    §6.2.2), each name and value under 127 bytes so that its length is one byte."""
+    fields = [(":method", "GET"), (":scheme", "http"), (":authority", host), (":path", "/")]
+    block = b"".join(
+        b"\x00" + bytes([len(name)]) + name.encode() + bytes([len(value)]) + value.encode()
+        for name, value in fields
+    )
+    end_stream_and_headers = 0x1 | 0x4
+    return H2_PREFACE + h2_frame(0x4, 0, 0, b"") + h2_frame(0x1, end_stream_and_headers, 1, block)
+
+
+def h2_answer(connection) -> bytes:
+    """Reads frames until stream 1 ends, acknowledging the server's SETTINGS on the way,
+    and returns the first header block on stream 1.
+
+    Raises `ConnectionError` if the connection ends first, or the stream is reset."""
+    received = b""
+    head = None
+    while True:
+        while len(received) < 9 or len(received) < 9 + int.from_bytes(received[:3], "big"):
+            chunk = connection.recv(4096)
+            if not chunk:
+                raise ConnectionError("closed before stream 1 ended")
+            received += chunk
+        length = int.from_bytes(received[:3], "big")
+        kind, flags = received[3], received[4]
+        stream = int.from_bytes(received[5:9], "big") & 0x7FFFFFFF
+        payload, received = received[9 : 9 + length], received[9 + length :]
+        if kind == 0x4 and not flags & 0x1:
+            connection.sendall(h2_frame(0x4, 0x1, 0, b""))
+        elif kind == 0x3 and stream == 1:
+            raise ConnectionError("stream 1 was reset")
+        elif stream == 1 and kind in (0x0, 0x1):
+            if kind == 0x1 and head is None:
+                head = payload
+            if flags & 0x1:
+                return head
+
+
+def opened(address, port, request, http2=False):
     """A connection, asked once and answered."""
     connection = socket.create_connection((address, int(port)), timeout=30)
     if request is not None:
         connection.sendall(request)
         # Read the answer so that the exchange is over and the upstream connection is
         # back in the pool; an exchange still under way is not an idle connection.
-        head = answer(connection)
-        if not head.startswith(READY):
-            raise ConnectionError(f"unexpected answer: {head[:40]!r}")
+        if http2:
+            if h2_answer(connection) is None:
+                raise ConnectionError("stream 1 ended without a head")
+        else:
+            head = answer(connection)
+            if not head.startswith(READY):
+                raise ConnectionError(f"unexpected answer: {head[:40]!r}")
     return connection
 
 
@@ -73,10 +127,10 @@ def main() -> int:
     request = (
         f"GET / HTTP/1.1\r\nhost: {host}\r\nconnection: keep-alive\r\n{padding}\r\n".encode()
     )
-    asked = None if kind == "silent" else request
+    asked = None if kind == "silent" else h2_request(host) if kind == "h2" else request
 
     try:
-        held = [opened(address, port, asked) for _ in range(many)]
+        held = [opened(address, port, asked, http2=kind == "h2") for _ in range(many)]
     except (OSError, ConnectionError) as error:
         print(error, file=sys.stderr)
         return 1

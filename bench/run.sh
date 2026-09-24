@@ -15,6 +15,8 @@
 #                                             and beside a steady load
 #   bench/run.sh soak [MINUTES] [RATE]        EdgeRush under mixed load and reloads for a
 #                                             long while: what it holds, every ten seconds
+#   bench/run.sh h2 [RATE] [STREAMED]         HTTP/2 clients alone: few and one hot
+#                                             connection, latency, streamed bodies, idle
 #   bench/run.sh profile-body upload|answer [RATE]  CPU stacks during streamed bodies
 #   bench/run.sh summary DIR                  the table of a finished run
 #
@@ -223,6 +225,14 @@ oha_at() { # name, rate, url, options...
 
 latency_h1() { oha_at "$1" "$2" "$3" -c 256; }
 latency_h2() { oha_at "$1" "$2" "$3" --http2 -c 4 -p 100; }
+
+# One connection carrying hundreds of streams, as a gRPC client's does: everything it asks
+# for lands on the one worker that owns it (15 §8).
+hot_h2() { # name, url, options...
+    local name=$1 url=$2
+    shift 2
+    measured "$name" h2load -c1 -m256 -t1 -D "$DURATION" --warm-up-time=3 "$@" "$url"
+}
 churn() { oha_at "$1" "$2" "$3" -c 64 --disable-keepalive; }
 
 # A body neither end holds whole, in each direction: what the paths cost when they
@@ -465,9 +475,9 @@ profile-body)
         exit 2
     }
     ;;
-ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak) ;;
+ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2) ;;
 *)
-    sed -n '2,19p' "$0" >&2
+    sed -n '2,21p' "$0" >&2
     exit 2
     ;;
 esac
@@ -633,6 +643,26 @@ soak)
     stop_proxy
     python3 "$here/soak.py" "$OUT" | tee "$OUT/soak.summary"
     exit 0
+    ;;
+h2)
+    # What HTTP/2 clients get, by themselves: the comparison a replacement of the HTTP/2
+    # server is measured by (15 §7, steps 0 and 3). Few hot connections and a single one at
+    # saturation, latency at RATE, 8 MiB bodies each way over a few connections' streams at
+    # STREAMED a second, and idle connections after one request at IDLE_COUNTS.
+    h2_rate=${2:-25000} streamed_rate=${3:-20}
+    h2_runs() {
+        saturation_h2 "$1.saturation-h2" "$proxy" --connect-to="$proxy_at"
+        hot_h2 "$1.hot-h2" "$proxy" --connect-to="$proxy_at"
+        latency_h2 "$1.latency-h2" "$h2_rate" "$proxy"
+        oha_at "$1.streamed-answer-h2" "$streamed_rate" "$proxy/big" --http2 -c 4 -p 8
+        oha_at "$1.streamed-request-h2" "$streamed_rate" "$proxy/sink" --http2 -c 4 -p 8 \
+            -m POST -D "$run/big.bin"
+        local count
+        for count in $IDLE_COUNTS; do
+            idle_memory "$1.idle-h2-$count" h2 "$count"
+        done
+    }
+    each_variant h2_runs
     ;;
 carrying)
     # Low rates: every one of these is about what an exchange holds and for how long

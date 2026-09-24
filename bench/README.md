@@ -36,6 +36,9 @@ bench/run.sh idle                   # idle connections: never written to, after 
 bench/run.sh soak [MINUTES] [RATE]  # EdgeRush under mixed load and reloads (30 min,
                                     # 25,000/s): what it holds every ten seconds, and
                                     # whether that stayed flat (bench/soak.py)
+bench/run.sh h2 [RATE] [STREAMED]   # HTTP/2 clients alone (25,000/s, 20/s): few and one
+                                    # hot connection, latency, streamed bodies, and idle
+                                    # connections at IDLE_COUNTS
 bench/run.sh summary bench/results/<run>
 ```
 
@@ -119,6 +122,9 @@ worth as much as the care that went into the other side.
 | `saturation-h2` | h2load, 4 HTTP/2 connections (h2c) with 100 streams each, closed loop | The same when load sits on a few hot connections — where a worker that owns a connection cannot be helped by the others |
 | `latency-h1` | oha, 256 connections, a fixed request rate | Latency (p50, p99, p99.9) at a load below the knee |
 | `latency-h2` | oha, 4 connections × 100 streams, a fixed rate | Latency on a few hot connections |
+| `hot-h2` | h2load, 1 HTTP/2 connection with 256 streams, closed loop | One connection carrying everything, as a gRPC client's does: all of it lands on the worker that owns it |
+| `streamed-answer-h2`, `streamed-request-h2` | oha over HTTP/2, 4 connections × 8 streams, `STREAMED` bytes each way | The body paths when HTTP/2 carries them: flow control and the server's staging, not only framing |
+| `idle-h2-N` | `N` HTTP/2 connections, one request each and then quiet, on a proxy started afresh | What an idle HTTP/2 connection costs, beside `idle-memory`'s HTTP/1 ones |
 | `churn` | oha, a new connection for every request, a fixed rate | The cost of accepting, and of a connection's first request |
 | `streamed-answer` | oha, a body of `STREAMED` bytes coming back | What the answer's path costs when it is carrying something rather than passing a few bytes along |
 | `streamed-request` | oha, the same body going out | The same for the request's path, where the body is read from the client and framed again |
