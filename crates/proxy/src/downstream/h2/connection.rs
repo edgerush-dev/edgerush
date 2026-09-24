@@ -54,6 +54,8 @@ pub(crate) struct Settings {
     /// How long a stream's body, or the room to send its answer, may be waited on with
     /// nothing coming.
     pub(crate) idle: Duration,
+    /// How many streams a connection must have had before its share reset early is judged.
+    pub(crate) reset_judged_after: u64,
 }
 
 impl Default for Settings {
@@ -67,6 +69,7 @@ impl Default for Settings {
             keep_alive: Duration::from_secs(30),
             closing: Duration::from_secs(10),
             idle: Duration::from_secs(30),
+            reset_judged_after: 500,
         }
     }
 }
@@ -79,6 +82,20 @@ impl Default for Settings {
 struct Streams {
     open: Cell<usize>,
     driver: RefCell<Option<Waker>>,
+    /// Streams accepted in the connection's life.
+    seen: Cell<u64>,
+    /// Of those, the ones the client reset before their final head was sent.
+    premature: Cell<u64>,
+}
+
+impl Streams {
+    /// Whether the connection is a rapid reset (CVE-2023-44487): at least `after` streams
+    /// seen, half or more of them reset by the client before they were answered. Envoy's
+    /// rule and its numbers; h2 bounds only resets that come before a stream is accepted.
+    fn resetting(&self, after: u64) -> bool {
+        let seen = self.seen.get();
+        seen >= after && self.premature.get().saturating_mul(2) >= seen
+    }
 }
 
 /// One open stream, counted for as long as its task lives.
@@ -150,33 +167,45 @@ pub(crate) async fn serve<S, R, F, B, D>(
     // lives, streams running beside it.
     loop {
         let accepted = poll_fn(|cx| {
+            if streams.resetting(settings.reset_judged_after) {
+                return Poll::Ready(Next::Resetting);
+            }
             if streams.open.get() == 0 {
                 if idle_from_now {
                     idle.as_mut().reset(Instant::now() + settings.keep_alive);
                     idle_from_now = false;
                 }
                 if idle.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(None);
+                    return Poll::Ready(Next::Idle);
                 }
             } else {
                 idle_from_now = true;
-                *streams.driver.borrow_mut() = Some(cx.waker().clone());
             }
-            connection.poll_accept(cx).map(Some)
+            *streams.driver.borrow_mut() = Some(cx.waker().clone());
+            connection.poll_accept(cx).map(Next::Accepted)
         })
         .await;
-        let Some(Some(Ok((request, send)))) = accepted else {
-            if accepted.is_some() {
-                // Closed, or failed: either way there is nothing left to serve.
+        let (request, send) = match accepted {
+            Next::Accepted(Some(Ok(stream))) => stream,
+            // Closed, or failed: either way there is nothing left to serve.
+            Next::Accepted(_) => return,
+            Next::Idle => break,
+            Next::Resetting => {
+                connection.abrupt_shutdown(::h2::Reason::ENHANCE_YOUR_CALM);
+                let _closing = tokio::time::timeout(
+                    settings.closing,
+                    poll_fn(|cx| connection.poll_closed(cx)),
+                )
+                .await;
                 return;
             }
-            break;
         };
+        streams.seen.set(streams.seen.get() + 1);
         let open = Open::new(&streams);
         let (storage, date, respond) = (Rc::clone(&storage), Rc::clone(&date), Rc::clone(&respond));
         let idle = settings.idle;
         let _detached = tokio::task::spawn_local(async move {
-            answer(
+            let answered = answer(
                 request,
                 Responder::new(send),
                 &*respond,
@@ -185,6 +214,9 @@ pub(crate) async fn serve<S, R, F, B, D>(
                 idle,
             )
             .await;
+            if answered == Ended::ResetEarly {
+                open.0.premature.set(open.0.premature.get() + 1);
+            }
             drop(open);
         });
     }
@@ -193,6 +225,24 @@ pub(crate) async fn serve<S, R, F, B, D>(
     connection.graceful_shutdown();
     let _closing =
         tokio::time::timeout(settings.closing, poll_fn(|cx| connection.poll_closed(cx))).await;
+}
+
+/// What the driver was woken for.
+enum Next<T> {
+    Accepted(T),
+    /// No stream open for the keep-alive time.
+    Idle,
+    /// Too many of its streams reset before their answer.
+    Resetting,
+}
+
+/// How a stream ended, as far as the driver cares.
+#[derive(PartialEq, Eq)]
+enum Ended {
+    /// Reset by the client before its final head was sent.
+    ResetEarly,
+    /// Anything else.
+    Otherwise,
 }
 
 /// Sends what waits in `interim` to be passed on, and a `100` of the continue decision's
@@ -223,7 +273,8 @@ async fn answer<R, F, B, D>(
     storage: &Rc<Storage>,
     date: &D,
     idle: Duration,
-) where
+) -> Ended
+where
     R: Fn(Request<RequestBody>, Interim) -> F,
     F: Future<Output = Answered<B>>,
     B: Body<Data = Bytes>,
@@ -251,7 +302,7 @@ async fn answer<R, F, B, D>(
     .await;
     // Reset by the client: nothing is to be sent, and the exchange has gone.
     let Some(answered) = answered else {
-        return;
+        return Ended::ResetEarly;
     };
     // A local `100` not yet sent is not sent now: the answer says what it would have. What
     // the upstream said before its final answer still goes first, in the order it came.
@@ -266,11 +317,54 @@ async fn answer<R, F, B, D>(
     let end = body.is_end_stream();
     // A head h2 refuses is not sent, and the stream is reset when its responder goes.
     let Ok(mut stream) = responder.final_head(Response::from_parts(head, ()), end) else {
-        return;
+        return Ended::Otherwise;
     };
     if !end {
         // However the sending ends, there is nobody left to tell: a reset stream or a
         // failed body has been reset already.
         let _sent = send_body(&mut stream, body, storage, idle).await;
+    }
+    Ended::Otherwise
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::downstream::h2::testing::{LONG, locally, post, serving, wire, within};
+    use http_body_util::BodyExt;
+
+    /// A stream whose upload nobody reads holds at most its stream window of the connection
+    /// window, so another stream on the same connection uploads megabytes past it: 16 MiB
+    /// for the connection against 1 MiB a stream (15 §3).
+    #[test]
+    fn an_upload_nobody_reads_leaves_room_for_another_on_the_connection() {
+        locally(async {
+            let (near, far) = wire();
+            let (client, server) = tokio::join!(
+                ::h2::client::handshake(far),
+                Settings::default().builder().handshake::<_, Outgoing>(near)
+            );
+            let (mut send, connection) = client.unwrap();
+            tokio::task::spawn_local(connection);
+            let mut accepted = serving(server.unwrap());
+
+            // Stalled: a full stream window sent, and never read.
+            let (_stalled, mut stuck) = send.send_request(post(), false).unwrap();
+            stuck
+                .send_data(Bytes::from(vec![1u8; 1 << 20]), false)
+                .unwrap();
+            let (never_read, _) = within(accepted.recv()).await.unwrap();
+
+            // Beside it, four megabytes, read as they come.
+            let (_answer, mut moving) = send.send_request(post(), false).unwrap();
+            moving
+                .send_data(Bytes::from(vec![2u8; 4 << 20]), true)
+                .unwrap();
+            let (request, _) = within(accepted.recv()).await.unwrap();
+            let body = IncomingH2::new(request.into_body(), LONG);
+            let uploaded = within(BodyExt::collect(body)).await.unwrap();
+            assert_eq!(uploaded.to_bytes().len(), 4 << 20);
+            drop(never_read);
+        });
     }
 }

@@ -1822,6 +1822,139 @@ upstreams:
             .await;
     }
 
+    /// The same as [`serving_worker`], with the worker, for a test that looks inside it.
+    async fn serving_worker_and(upstream: SocketAddr) -> (SocketAddr, Rc<Worker>) {
+        let proxy = Proxy::new(everything_to(upstream), NonZeroUsize::MIN).unwrap();
+        let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        (front, worker)
+    }
+
+    /// A rapid reset (CVE-2023-44487): streams opened and reset at once, each let settle so
+    /// that h2's own bound on resets waiting to be accepted is not what stops it. Past 500
+    /// streams, half or more reset before their answer, the connection is told to calm
+    /// down and closed (15 §3).
+    #[tokio::test]
+    async fn a_rapid_reset_is_cut_off_by_its_share_of_early_resets() {
+        use crate::h2_peer::{self, code, kind};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _held) = scripted_upstream().await;
+                let front = serving_worker(upstream).await;
+                let mut peer = h2_client(front).await;
+                let mut cut_off = None;
+                for n in 0..600u32 {
+                    let id = n * 2 + 1;
+                    h2_get(&mut peer, id, "/held").await;
+                    peer.send_if_open(&h2_peer::rst_stream(id, code::CANCEL))
+                        .await;
+                    let frames = peer.settled().await;
+                    if let Some(goaway) = frames.iter().find(|f| f.kind == kind::GOAWAY) {
+                        cut_off = Some((n + 1, goaway.goaway().1));
+                        break;
+                    }
+                }
+                let (after, code) = cut_off.expect("never cut off");
+                assert_eq!(code, code::ENHANCE_YOUR_CALM);
+                assert!(
+                    (500..=510).contains(&after),
+                    "cut off after {after} streams"
+                );
+            })
+            .await;
+    }
+
+    /// A client that cancels now and then — one stream in ten — is nowhere near the rule,
+    /// and keeps its connection.
+    #[tokio::test]
+    async fn a_client_that_cancels_now_and_then_keeps_its_connection() {
+        use crate::h2_peer::{self, code, flag, kind};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let front = serving_worker(upstream).await;
+                let mut peer = h2_client(front).await;
+                for n in 0..600u32 {
+                    let id = n * 2 + 1;
+                    h2_get(&mut peer, id, "/").await;
+                    if n % 10 == 0 {
+                        peer.send_if_open(&h2_peer::rst_stream(id, code::CANCEL))
+                            .await;
+                        let frames = peer.settled().await;
+                        assert!(frames.iter().all(|f| f.kind != kind::GOAWAY), "at {n}");
+                    } else {
+                        let (_, before) = peer
+                            .until(|f| f.stream == id && f.has(flag::END_STREAM))
+                            .await;
+                        assert!(before.iter().all(|f| f.kind != kind::GOAWAY), "at {n}");
+                    }
+                }
+            })
+            .await;
+    }
+
+    /// Streams the client resets while their upstream is still working let go of what they
+    /// held: the worker's count of exchanges in hand goes back to nothing.
+    #[tokio::test]
+    async fn resetting_http2_streams_leaks_no_admission() {
+        use crate::h2_peer::{self, code};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, held) = scripted_upstream().await;
+                let (front, worker) = serving_worker_and(upstream).await;
+                let mut peer = h2_client(front).await;
+                for n in 0..20u32 {
+                    h2_get(&mut peer, n * 2 + 1, "/held").await;
+                }
+                until(|| held.borrow().len() == 20).await;
+                assert_eq!(worker.in_flight.get(), 20);
+                for n in 0..20u32 {
+                    peer.send(&h2_peer::rst_stream(n * 2 + 1, code::CANCEL))
+                        .await;
+                }
+                until(|| worker.in_flight.get() == 0).await;
+            })
+            .await;
+    }
+
+    /// The HTTP/2 server holds header lists to 64 KiB, as HTTP/1 holds heads: one under it is
+    /// served, one over it answered 431 by h2 before the core sees it, and the connection
+    /// carries on (15 §3).
+    #[tokio::test]
+    async fn an_http2_header_list_past_64_kib_is_answered_431() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let front = serving_worker(upstream).await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let mut statuses = Vec::new();
+                for size in [60_000, 70_000] {
+                    let request = Request::get("http://example.test/")
+                        .version(Version::HTTP_2)
+                        .header("x-large", "a".repeat(size))
+                        .body(())
+                        .unwrap();
+                    let (response, _) = send.send_request(request, true).unwrap();
+                    let response = tokio::time::timeout(Duration::from_secs(10), response)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    statuses.push(response.status());
+                }
+                assert_eq!(
+                    statuses,
+                    vec![StatusCode::OK, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE]
+                );
+            })
+            .await;
+    }
+
     /// A TLS ClientHello sent to a plaintext listener is not the HTTP/2 preface, so it
     /// goes to HTTP/1, which refuses it as a request line that is not one and closes:
     /// nothing hangs waiting for a preface that will never come.
