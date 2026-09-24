@@ -672,8 +672,7 @@ impl Worker {
                 // Where the engine's body stops: from here on the request's body is one
                 // any engine could have read.
                 let request = request.map(RequestBody::Hyper);
-                let response = connection
-                    .worker
+                let response = Rc::clone(&connection.worker)
                     .handle(listener, request, None)
                     .await
                     .into_response();
@@ -700,15 +699,13 @@ impl Worker {
                         },
                         budget: h1::Budget::default(),
                     };
+                    // The connection is kept by this for as long as it is served; each
+                    // request's future owns only a handle on the worker. It is that future
+                    // itself, not one wrapped around it, so that it is not moved into another
+                    // on every request.
                     let respond = move |head: RawHead, body, interim| {
                         ours_asking.set(true);
-                        let connection = Rc::clone(&ours);
-                        async move {
-                            connection
-                                .worker
-                                .handle_head(listener, head, body, Some(interim))
-                                .await
-                        }
+                        Rc::clone(&ours.worker).handle_head(listener, head, body, Some(interim))
                     };
                     let _ended = h1::serve(
                         replay,
@@ -767,7 +764,7 @@ impl Worker {
     /// read it wants the upstream's interim answers, if it passes them on
     /// ([14 §5](../../docs/14-downstream-server.md)).
     async fn handle(
-        &self,
+        self: Rc<Self>,
         listener: usize,
         request: Request<RequestBody>,
         interim: Option<Interim>,
@@ -779,7 +776,7 @@ impl Worker {
     /// The same for a request's head of whatever kind: a map, or the raw head our own
     /// server reads ([14 §6](../../docs/14-downstream-server.md)).
     async fn handle_head<H: Forwarded>(
-        &self,
+        self: Rc<Self>,
         listener: usize,
         head: H,
         body: RequestBody,
