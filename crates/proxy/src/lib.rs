@@ -22,6 +22,9 @@ pub mod fields;
 #[cfg(not(feature = "fuzzing"))]
 mod fields;
 mod h1;
+// A scripted HTTP/2 peer, for tests here and for the probes in `tests/h2_library.rs`.
+#[cfg(test)]
+mod h2_peer;
 pub mod head;
 #[cfg(feature = "fuzzing")]
 pub mod hop_by_hop;

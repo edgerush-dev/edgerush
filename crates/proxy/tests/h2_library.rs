@@ -14,6 +14,8 @@
     reason = "test set-up: the helpers around the tests fail them the way the tests would"
 )]
 
+// Kept beside the code whose own tests also drive it.
+#[path = "../src/h2_peer.rs"]
 mod h2_peer;
 
 use bytes::Bytes;

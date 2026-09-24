@@ -2,11 +2,13 @@
 //!
 //! The request core and the upstream exchange take this, and nothing an engine defines:
 //! what an engine hands over is wrapped where it hands it over, and what it reports going
-//! wrong is sorted into [`RequestBodyError`] there too. There are two: hyper's HTTP/2
-//! server, and EdgeRush's own HTTP/1 server, whose body cannot leave the worker and so makes
-//! this one that cannot either ([14 §2](../../../docs/14-downstream-server.md)).
+//! wrong is sorted into [`RequestBodyError`] there too. There are three: hyper's HTTP/2
+//! server, h2 used directly (15 step 1; the HTTP/2 server that replaces hyper's), and
+//! EdgeRush's own HTTP/1 server, whose body cannot leave the worker and so makes this one
+//! that cannot either ([14 §2](../../../docs/14-downstream-server.md)).
 
 use crate::downstream::h1::connection::IncomingBody;
+use crate::downstream::h2::body::IncomingH2;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use hyper::body::Incoming;
@@ -28,6 +30,12 @@ pub(crate) enum RequestBody {
     Hyper(Incoming),
     /// Read by EdgeRush's own HTTP/1 server, from the connection's own input.
     Ours(IncomingBody),
+    /// Received by h2, used directly.
+    #[expect(
+        dead_code,
+        reason = "made by the HTTP/2 driver of 15 step 2, not yet here"
+    )]
+    H2(IncomingH2),
 }
 
 /// What an engine reported going wrong, kept as the cause of a [`RequestBodyError`] without
@@ -64,6 +72,16 @@ impl RequestBodyError {
             _ => Self::Other(cause),
         }
     }
+
+    /// Sorts an error of h2's: a connection that ended under the stream cut its body short;
+    /// anything else, a reset above all, is the stream failing.
+    pub(crate) fn from_h2(error: ::h2::Error) -> Self {
+        if error.is_io() {
+            Self::Incomplete(Box::new(error))
+        } else {
+            Self::Other(Box::new(error))
+        }
+    }
 }
 
 impl Body for RequestBody {
@@ -79,6 +97,7 @@ impl Body for RequestBody {
                 .poll_frame(cx)
                 .map_err(RequestBodyError::from_hyper),
             Self::Ours(body) => Pin::new(body).poll_frame(cx),
+            Self::H2(body) => Pin::new(body).poll_frame(cx),
         }
     }
 
@@ -86,6 +105,7 @@ impl Body for RequestBody {
         match self {
             Self::Hyper(incoming) => incoming.is_end_stream(),
             Self::Ours(body) => body.is_end_stream(),
+            Self::H2(body) => body.is_end_stream(),
         }
     }
 
@@ -93,6 +113,7 @@ impl Body for RequestBody {
         match self {
             Self::Hyper(incoming) => incoming.size_hint(),
             Self::Ours(body) => body.size_hint(),
+            Self::H2(body) => body.size_hint(),
         }
     }
 }
