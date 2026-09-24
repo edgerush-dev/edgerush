@@ -178,6 +178,10 @@ pub struct Answer {
     /// How many interim heads came before it. Each was told to the exchange's side channel,
     /// which passes it on where EdgeRush's own server listens and consumes it otherwise
     /// ([14 §5](../../../docs/14-downstream-server.md)).
+    #[cfg_attr(
+        not(any(test, feature = "fuzzing")),
+        expect(dead_code, reason = "counted for the tests, which check how many came")
+    )]
     pub interim: usize,
     /// What this answer's own `Connection` named as its own. Read here, because by the
     /// time the hop-by-hop fields have been taken off there is nothing left to read.
@@ -898,13 +902,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             answer: behind || !(pushed.wants_client || pushed.wants_upstream),
         }
     }
-
-    /// The bytes that came after the head, and the socket they came on. What is left is
-    /// the start of the answer's body.
-    pub fn into_body_parts(self) -> (S, Vec<u8>) {
-        let unread = self.unread().to_vec();
-        (self.socket, unread)
-    }
 }
 
 /// The body of an upstream's answer, read as the client asks for it.
@@ -991,6 +988,7 @@ impl<S, B> H1Body<S, B> {
     }
 
     /// How many trailer fields were dropped as fields that may not travel on.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn discarded_trailers(&self) -> usize {
         self.discarded
     }
@@ -1062,6 +1060,7 @@ impl<S, B> H1Body<S, B> {
 
     /// What is left of the connection whatever state it is in, for a caller that means to
     /// close it. Never a way back into a pool: that is [`H1Body::take_if_reusable`] alone.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn into_connection(self) -> Option<(S, Vec<u8>)> {
         self.rest.map(|rest| {
             let unread = rest.exchange.unread().to_vec();
@@ -1289,6 +1288,7 @@ impl<S> Kept<S> {
     }
 
     /// The connection itself, for a caller that means to do something else with it.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn into_socket(self) -> S {
         self.socket
     }

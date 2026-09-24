@@ -145,11 +145,6 @@ impl<S> Pool<S> {
         self.total
     }
 
-    /// How many are idle for one destination.
-    pub fn idle_for(&self, identity: &ReuseIdentity) -> usize {
-        self.idle.get(&identity.key()).map_or(0, Vec::len)
-    }
-
     /// Throws away everything held for a destination, and the bucket with it, so that the
     /// churn of many reloads cannot leave a map full of nothing.
     fn forget(&mut self, key: u64) {
@@ -171,6 +166,13 @@ impl<S> Pool<S> {
 /// back, and closes it.
 #[derive(Debug)]
 pub struct Lease<S> {
+    #[cfg_attr(
+        not(any(test, feature = "fuzzing")),
+        expect(
+            dead_code,
+            reason = "a lease holds a socket only in the pool's own tests; one in use holds none"
+        )
+    )]
     socket: Option<S>,
     identity: Arc<ReuseIdentity>,
     opened: Instant,
@@ -195,6 +197,7 @@ impl<S> Lease<S> {
     }
 
     /// A lease on `socket`, which was opened to `identity` at `opened`.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn new(
         socket: S,
         identity: Arc<ReuseIdentity>,
@@ -209,19 +212,10 @@ impl<S> Lease<S> {
         }
     }
 
-    /// The destination this was opened to.
-    pub fn identity(&self) -> &Arc<ReuseIdentity> {
-        &self.identity
-    }
-
-    /// When it was opened, which bounds how long it may go on being used.
-    pub fn opened(&self) -> Instant {
-        self.opened
-    }
-
     /// The connection, taken out for the length of an exchange. The lease stays behind
     /// to say where it came from and where it may go back to; whatever becomes of it in
     /// the meantime, only [`Lease::keep`] puts one back.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn take_socket(&mut self) -> Option<S> {
         self.socket.take()
     }

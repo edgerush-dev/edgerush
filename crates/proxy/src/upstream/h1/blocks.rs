@@ -337,11 +337,13 @@ impl Blocks {
     }
 
     /// The sizes it was made with.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn sizes(&self) -> Sizes {
         self.sizes
     }
 
     /// How many free blocks and buffers are being kept, which is the memory parked here.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn parked(&self) -> usize {
         self.small.len() + self.large.len() + self.staging.len()
     }

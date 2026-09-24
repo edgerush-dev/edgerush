@@ -629,6 +629,7 @@ impl BodyWriter {
     ///
     /// More bytes than a counted body said it would have, or anything at all after the
     /// body was finished.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn data(&mut self, out: &mut Vec<u8>, data: &[u8]) -> Result<(), CodecError> {
         let chunked = self.data_prefix(out, data.len())?;
         out.extend_from_slice(data);

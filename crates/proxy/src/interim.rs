@@ -2,7 +2,7 @@
 //! the downstream driver, and the continue decision both ends report to
 //! ([14 §5](../../docs/14-downstream-server.md)).
 //!
-//! A side channel, as the engine's client carries 1xx to a callback: our own server makes one
+//! A side channel, as hyper's client carries 1xx to a callback: our own server makes one
 //! for each request it reads and hands it to the request core with the request — an argument
 //! of its own, since a request's extensions take only what may cross threads, and this may
 //! not. The upstream exchange tells it what it sees in wire order, and the server writes out

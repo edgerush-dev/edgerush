@@ -587,6 +587,10 @@ pub struct Twice {
     /// [`Expected::reuse`] answers.
     pub second: Option<Got>,
     /// What the socket recorded across both of them.
+    #[cfg_attr(
+        not(feature = "fuzzing"),
+        expect(dead_code, reason = "read by the h1_differential fuzz target")
+    )]
     pub tape: Tape,
 }
 

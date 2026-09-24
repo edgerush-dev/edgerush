@@ -5,10 +5,9 @@
 //! would not say — an early final response, an interim head, a body the connection's close
 //! delimits. The client side is raw for the same reason.
 //!
-//! These tests are a **characterisation** of the path as it is today, hyper's client
-//! included. They are written before that client is replaced, so that "the same as before"
-//! is a measured thing and not an assumption ([13 §8](../../../docs/13-http1-upstream.md)).
-//! Where the behaviour is hyper's own and not a promise EdgeRush makes, the test says so.
+//! Where EdgeRush chooses differently from hyper's client, a widely used reader of the same
+//! bytes, the test says so and why ([13 §5](../../../docs/13-http1-upstream.md)): differing
+//! from it is a decision, not a drift.
 
 #![allow(
     clippy::unwrap_used,
@@ -260,8 +259,8 @@ async fn a_body_of_unknown_length_is_chunked_in_both_directions() {
     assert_eq!(client.chunked_body().await, "2\r\nhi\r\n0\r\n\r\n");
 }
 
-/// A client's trailers reach the upstream ([13 §5](../../../docs/13-http1-upstream.md)),
-/// which hyper's client, the one EdgeRush used before its own, never did.
+/// A client's trailers reach the upstream ([13 §5](../../../docs/13-http1-upstream.md));
+/// hyper's client puts none on the wire.
 #[tokio::test]
 async fn a_requests_trailers_reach_the_upstream() {
     let (saw, mut seen) = reporter();
@@ -322,8 +321,8 @@ async fn a_trailer_the_requests_connection_named_does_not_travel_on() {
         !sent.to_ascii_lowercase().contains("x-secret"),
         "a field the request's own Connection named crossed the hop:\n{sent}"
     );
-    // What the `Connection` did not name is untouched: by our own path the trailer
-    // travels and the declaration still names it.
+    // What the `Connection` did not name is untouched: the trailer travels and the
+    // declaration still names it.
     assert!(sent.contains("x-keep: fine"), "{sent}");
     assert!(
         sent.to_ascii_lowercase().contains("trailer: x-keep"),
@@ -534,7 +533,7 @@ async fn a_426_is_forwarded_without_its_upgrade() {
 }
 
 /// A 101 to a request that did not ask to switch — none can have asked, since `Upgrade`
-/// is taken off every request — is answered 502 on both paths. Passing it on would hand
+/// is taken off every request — is answered 502. Passing it on would hand
 /// the client a switch it never asked for and tunnel whatever the upstream said next,
 /// which this slice does not do ([13 §1](../../../docs/13-http1-upstream.md);
 /// linkerd2-proxy's `http1_upgrade_not_requested` tests the same).
@@ -862,11 +861,11 @@ async fn a_finished_answer_leaves_its_connection_for_the_next_request() {
     );
 }
 
-/// **Where the two paths differ, on purpose.** An interim head that claims a body
-/// describes bytes that nothing here will read as one and that the next reader may.
-/// Ours refuses the exchange; the engine's client waves it through.
+/// **Where EdgeRush differs from hyper's client, on purpose.** An interim head that claims
+/// a body describes bytes that nothing here will read as one and that the next reader may.
+/// Ours refuses the exchange; hyper's client waves it through.
 #[tokio::test]
-async fn an_interim_answer_claiming_a_body_is_refused_by_our_own_path() {
+async fn an_interim_answer_claiming_a_body_is_refused() {
     let backend = raw_upstream(|mut wire| async move {
         wire.head().await;
         wire.write("HTTP/1.1 100 Continue\r\nContent-Length: 7\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
@@ -1076,8 +1075,7 @@ async fn connection_bound_challenges_prevent_reuse_on_the_custom_path() {
             assert_eq!(within(client.body(2)).await, "ok");
             clients.push(client);
         }
-        // Held to by whatever sees the answer before its connection goes back, which
-        // the engine's pooled client does not let this end do.
+        // Held to by whatever sees the answer before its connection goes back.
         assert_eq!(accepts.load(Ordering::SeqCst), 2, "{challenge}");
     }
 }
@@ -1653,7 +1651,7 @@ async fn a_connection_whose_framing_failed_is_never_lent_again() {
 // Some are messages that do not parse. Some are shapes the specification names and leaves
 // to the recipient, where refusing is this project's choice and reading on is equally
 // correct. Some are limits this project sets for itself, one of them against a MUST.
-// Where a test differs from the engine's client it says which of the three it is, because
+// Where a test differs from hyper's client it says which of the three it is, because
 // differing from hyper is not by itself being right
 // ([13 §5](../../../docs/13-http1-upstream.md)).
 
@@ -1709,11 +1707,11 @@ async fn an_answer_with_two_lengths_that_disagree_is_refused() {
         .await;
 }
 
-/// **A choice the specification leaves open, and the two paths take different ones.**
+/// **A choice the specification leaves open, and hyper's client makes the other one.**
 /// [RFC 9110 §8.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6) says a
 /// recipient "MAY either reject the message as invalid or replace that invalid field
 /// value with a single instance of the decimal value". Both are named in the one
-/// sentence: ours rejects, the engine's client replaces and keeps the connection, and
+/// sentence: ours rejects, hyper's client replaces and keeps the connection, and
 /// neither is more correct than the other. Ours rejects because a duplicate means some
 /// processor upstream has already rewritten this message, and what it meant is not this
 /// end's to guess.
@@ -1722,7 +1720,7 @@ async fn an_answer_with_two_lengths_that_disagree_is_refused() {
 /// above. The request direction makes the same choice, which
 /// `equal_repeated_request_lengths_are_refused` measures.
 #[tokio::test]
-async fn an_answer_with_two_equal_lengths_is_refused_by_our_own_path() {
+async fn an_answer_with_two_equal_lengths_is_refused() {
     let answer = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
     is_refused(answer.into()).await;
 }
@@ -1740,16 +1738,16 @@ async fn an_answer_with_a_length_too_big_to_count_is_refused() {
         .await;
 }
 
-/// **Another choice left open, and neither path forwards the ambiguity.**
+/// **Another choice left open.**
 /// [RFC 9112 §6.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3) rule 3 says a
 /// message with both "ought to be handled as an error", and that an intermediary which
 /// chooses to forward it "MUST first remove the received Content-Length field and process
-/// the Transfer-Encoding". Ours takes the error route. The engine's client reads the body
-/// by its chunks but leaves the length in the head it hands over, so the gateway removes
-/// it: left in, the server would tell the client that length and cut the body to it. Here the length says three and the chunks carry five, so a length that survived
-/// shows ([13 §5](../../../docs/13-http1-upstream.md)).
+/// the Transfer-Encoding". Ours takes the error route; hyper's client reads the body by its
+/// chunks and leaves the length in the head it hands over. Here the length says three and
+/// the chunks carry five, so a length that survived would show
+/// ([13 §5](../../../docs/13-http1-upstream.md)).
 #[tokio::test]
-async fn an_answer_with_both_a_length_and_chunking_is_refused_by_our_own_path() {
+async fn an_answer_with_both_a_length_and_chunking_is_refused() {
     let answer = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     is_refused(answer.into()).await;
 }
@@ -1833,11 +1831,11 @@ async fn never_finished(answer: String) {
 /// long. Nothing in HTTP sets a length for it --
 /// [RFC 9112 §7.1.1](https://www.rfc-editor.org/rfc/rfc9112.html#section-7.1.1) says only
 /// that a *server* ought to limit chunk extensions in a *request* -- so reading it however
-/// long it is, as the engine's client does, is correct. Ours refuses at 4 KiB so that a
+/// long it is, as hyper's client does, is correct. Ours refuses at 4 KiB so that a
 /// peer cannot choose how much a worker holds for it
 /// ([13 §7](../../../docs/13-http1-upstream.md)).
 #[tokio::test]
-async fn a_chunk_size_line_past_its_bound_is_refused_by_our_own_path() {
+async fn a_chunk_size_line_past_its_bound_is_refused() {
     let padding = ";x=".to_owned() + &"a".repeat(8 * 1024);
     let answer = format!(
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5{padding}\r\nhello\r\n0\r\n\r\n"
@@ -1851,10 +1849,10 @@ async fn a_chunk_size_line_past_its_bound_is_refused_by_our_own_path() {
 /// recipient MUST ignore unrecognized chunk extensions" is about names nobody knows, not
 /// about input that does not parse, which is why framing bytes are validated here even
 /// where their meaning is ignored: what is waved through is parsed by whatever reads
-/// these bytes next. The engine's client skips to the CRLF without looking, which
+/// these bytes next. hyper's client skips to the CRLF without looking, which
 /// nothing forbids.
 #[tokio::test]
-async fn a_chunk_extension_without_a_name_is_refused_by_our_own_path() {
+async fn a_chunk_extension_without_a_name_is_refused() {
     let answer =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;=novalue\r\nhello\r\n0\r\n\r\n"
             .to_owned();
@@ -1902,7 +1900,7 @@ async fn a_trailer_section_past_its_bound_is_refused() {
 /// **A limit of this project's, and the one that sits against a MUST.**
 /// [RFC 9110 §15.2](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.2) says a client
 /// "MUST be able to parse one or more 1xx responses received prior to a final response",
-/// and names no limit; the engine's client consumes as many as arrive and answers with
+/// and names no limit; hyper's client consumes as many as arrive and answers with
 /// the final head behind them, which is what the specification asks for.
 ///
 /// Ours stops at sixteen, because without a limit one upstream holds a worker for as long
@@ -1911,7 +1909,7 @@ async fn a_trailer_section_past_its_bound_is_refused() {
 /// ([13 §5](../../../docs/13-http1-upstream.md)); the test is here so that changing it
 /// is a decision and not a drift.
 #[tokio::test]
-async fn an_upstream_that_floods_interim_heads_is_given_up_on_by_our_own_path() {
+async fn an_upstream_that_floods_interim_heads_is_given_up_on() {
     let flood = "HTTP/1.1 103 Early Hints\r\n\r\n".repeat(20);
     let answer = format!("{flood}HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     is_refused(answer).await;
@@ -1919,9 +1917,9 @@ async fn an_upstream_that_floods_interim_heads_is_given_up_on_by_our_own_path() 
 
 /// And the same deviation by the other measure: counting heads alone would let a peer
 /// hold as much as it liked in sixteen of them, so there is a bound on what they come to
-/// as well. Both are ours; the engine's client has neither.
+/// as well. Both are ours; hyper's client has neither.
 #[tokio::test]
-async fn an_upstream_whose_interim_heads_are_too_long_is_given_up_on_by_our_own_path() {
+async fn an_upstream_whose_interim_heads_are_too_long_is_given_up_on() {
     let one = "HTTP/1.1 103 Early Hints\r\nLink: ".to_owned() + &"a".repeat(16 * 1024) + "\r\n\r\n";
     let answer = format!(
         "{}HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
@@ -2027,11 +2025,9 @@ async fn a_withheld_body_goes_when_the_continue_wait_runs_out() {
         "the body never went"
     );
 
-    // **Where the two paths differ, on purpose.** Ours holds the body back for the wait
-    // in [13 §7](../../../docs/13-http1-upstream.md) and sends it when that runs out,
-    // so this cannot finish sooner. The engine's client does not hold it back at all,
-    // which is why the same test finishes at once there; the body arriving is what both
-    // are held to, and the waiting is only ours.
+    // **Where EdgeRush differs from hyper's client, on purpose.** Ours holds the body back
+    // for the wait in [13 §7](../../../docs/13-http1-upstream.md) and sends it when that
+    // runs out, so this cannot finish sooner; hyper's client does not hold it back at all.
     let waited = began.elapsed();
     assert!(
         waited >= Duration::from_secs(1),
@@ -2196,7 +2192,7 @@ async fn a_body_sent_to_a_head_request_is_never_the_next_answer() {
 /// goes on answering, so only the count of connections can tell.
 #[tokio::test]
 async fn an_answer_that_says_close_is_not_reused_though_the_socket_stays_open() {
-    // An HTTP/1.0 answer that asks to be kept alive is kept by the engine's client, which
+    // An HTTP/1.0 answer that asks to be kept alive is kept by hyper's client, which
     // RFC 9112 §9.3 allows; ours never pools a connection that speaks 1.0 (13 §4), one
     // of 13 §5's open choices.
     let kept_alive = 2;
@@ -2362,7 +2358,7 @@ async fn a_trailer_section_that_is_not_fields_is_refused() {
 /// A `POST` that says it carries nothing still says so upstream. RFC 9110 §8.6 has a user
 /// agent send a length for a method that defines a meaning for content, some servers
 /// answer 411 without one, and the message that arrived had it (HAProxy's
-/// `h1_to_h1.vtc`). The engine's client keeps it.
+/// `h1_to_h1.vtc`). hyper's client keeps it too.
 #[tokio::test]
 async fn a_post_of_nothing_still_says_its_length() {
     let (saw, mut seen) = reporter();
@@ -2479,7 +2475,7 @@ async fn an_http2_request_that_ends_with_its_headers_goes_up_with_no_framing() {
 
 /// A request whose body turns out to be empty only when its stream ends: no length was
 /// ever said, so it is framed in chunks and ended by one (13 §4: "do not infer absence
-/// merely from a missing CL on H2"; nginx's `h2_proxy_request_buffering.t`). The engine's
+/// merely from a missing CL on H2"; nginx's `h2_proxy_request_buffering.t`). hyper's
 /// client takes a body already over as an absent one, which is one of 13 §5's differences.
 #[tokio::test]
 async fn an_http2_request_that_ends_with_an_empty_frame_is_ended_in_chunks() {
@@ -2500,8 +2496,8 @@ async fn an_http2_request_that_ends_with_an_empty_frame_is_ended_in_chunks() {
 
 /// An HTTP/2 request that says its length and then sends trailers is carried whole and
 /// answered (linkerd2-proxy #15414, where one hung). A length cannot carry trailers on
-/// HTTP/1.1, so EdgeRush's own path frames it in chunks with the length removed and the
-/// trailers after the last chunk (13 §4); the engine's client keeps the length and drops
+/// HTTP/1.1, so EdgeRush frames it in chunks with the length removed and the trailers
+/// after the last chunk (13 §4); hyper's client keeps the length and drops
 /// the trailers, which is the request-trailer difference in 13 §5.
 #[tokio::test]
 async fn an_http2_request_with_a_length_and_trailers_is_carried() {

@@ -133,6 +133,7 @@ impl Destinations {
     }
 
     /// How many endpoints the upstream at `upstream` has.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn endpoints(&self, upstream: usize) -> usize {
         self.0.get(upstream).map_or(0, Vec::len)
     }
