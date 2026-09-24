@@ -635,6 +635,28 @@ async fn the_gateways_own_errors_leave_the_clients_connection_open() {
     }
 }
 
+/// An upstream answer whose body cannot be read, found before any byte of its head has
+/// reached the client, is answered 502 in its place rather than with a close and nothing
+/// (14 §4; astra's review of the downstream server).
+#[tokio::test]
+async fn a_broken_answer_found_before_its_head_goes_is_answered_502() {
+    let upstream = raw_upstream(|mut wire| async move {
+        let _request = wire.until(b"\r\n\r\n").await;
+        wire.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZ\r\n")
+            .await;
+        let _rest = wire.rest().await;
+    });
+    let mut client = Wire::to(proxy_to(upstream).await).await;
+    client.write("GET / HTTP/1.1\r\nHost: a\r\n\r\n").await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 502 "), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("\r\nconnection: close\r\n"),
+        "{head}"
+    );
+}
+
 /// An HTTP/1.0 client's request goes upstream as HTTP/1.1, and the connection it went on
 /// may carry the next client's: upstream the gateway is the client, and RFC 9110 §2.5 has
 /// a client send the highest version it conforms to (03 §11).

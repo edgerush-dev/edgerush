@@ -24,6 +24,7 @@
 use super::codec::{Head, HeadReader, RequestError, RequestHead, arrival};
 use super::date::HttpDate;
 use super::deadlines::{Bounds, Clock, Deadlines};
+use super::outbound::{OnFailure, Outbound};
 use super::writer::{
     Asked, BodyFramer, Content, Delimited, WriteError, Written, write_head, write_interim,
 };
@@ -395,6 +396,9 @@ struct Connection<S> {
     /// that nothing else pays for (14 §8) — and whether that is from the provision.
     queued: VecDeque<(Bytes, usize, bool)>,
     queued_bytes: usize,
+    /// Which heads of the answer being written are among what is queued, and whether its
+    /// final head has begun to go: what a failure can still put right (14 §4).
+    outbound: Outbound,
     /// The charge for everything queued, while anything has been.
     queued_charge: Option<Charge>,
     /// The same for the connection's own answers, from the provision.
@@ -430,6 +434,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             })),
             queued: VecDeque::new(),
             queued_bytes: 0,
+            outbound: Outbound::default(),
             queued_charge: None,
             answer_charge: None,
             storage,
@@ -538,15 +543,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             // Only what the client may be sent is kept to be forwarded; the writer is the
             // backstop, and refuses anything else rather than write it.
             if write_interim(&mut head, status, &headers, asked).is_ok() {
+                let length = head.len();
                 self.queue_built(head)?;
+                self.outbound.interim(length).map_err(|_| Stop::Gone)?;
                 queued = true;
             }
         }
         if interim.take_local_continue() {
-            self.queue_static(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+            self.queue_static(CONTINUE)?;
+            self.outbound
+                .interim(CONTINUE.len())
+                .map_err(|_| Stop::Gone)?;
             queued = true;
         }
         Ok(queued)
+    }
+
+    /// Drops what is queued and has not begun to go, and with it what it was charged: all
+    /// of it, or all but the rest of a head part-written, which must be finished before
+    /// anything else follows it.
+    fn discard_queued(&mut self, keep_front: bool) {
+        let keep = usize::from(keep_front);
+        while self.queued.len() > keep {
+            let Some((bytes, charged, answer)) = self.queued.pop_back() else {
+                break;
+            };
+            self.queued_bytes -= bytes.len();
+            let held = if answer {
+                self.answer_charge.as_mut()
+            } else {
+                self.queued_charge.as_mut()
+            };
+            if let Some(charge) = held {
+                charge.shrink(charged);
+            }
+        }
     }
 
     /// Queues bytes that live in the program itself, and cost nothing.
@@ -573,6 +605,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     Poll::Pending => break,
                 };
             self.queued_bytes -= written;
+            self.outbound.accepted(written);
             let mut left = written;
             while left > 0 {
                 let Some((front, charged, answer)) = self.queued.front_mut() else {
@@ -909,6 +942,7 @@ where
             Err(Err(error)) => return refuse(&mut connection, timer.as_mut(), error, &date).await,
         };
         connection.deadlines.head_read();
+        connection.outbound = Outbound::default();
         // The head's bytes, cut out of the block they were read into rather than copied:
         // its fields are read out of them from here on, and they stay paid for through the
         // block for as long as the request holds them (14 §6, §8). Everything the head said
@@ -1044,6 +1078,7 @@ where
             // Only an interim status is refused, and the core returns none.
             Err(_) => return Ended::Gone,
         };
+        let length = head.len();
         // The data plane's own answer is written from the provision, so that a worker that
         // has run out can still say so; one it forwards is paid for like anything else.
         let queued = if final_head.is_local() {
@@ -1051,7 +1086,12 @@ where
         } else {
             connection.queue_built(head)
         };
-        if let Err(stop) = queued {
+        if let Err(stop) = queued.and_then(|()| {
+            connection
+                .outbound
+                .final_head(length)
+                .map_err(|_| Stop::Gone)
+        }) {
             return stop.into();
         }
 
@@ -1102,8 +1142,8 @@ where
                             connection.queue_built(framing)?;
                             body_left = false;
                         }
-                        // After the head nothing can be taken back: the client is left
-                        // with a message it can tell is unfinished.
+                        // What becomes of the answer depends on how much of it has gone,
+                        // which is for the caller to settle.
                         Some(Err(_)) => return Poll::Ready(Ok(false)),
                     }
                 }
@@ -1136,7 +1176,9 @@ where
         drop(body);
         match sent {
             Ok(true) => {}
-            Ok(false) => return Ended::Cut,
+            Ok(false) => {
+                return replace_or_cut(&mut connection, timer.as_mut(), asked, &date).await;
+            }
             Err(stop) => return stop.into(),
         }
         // A kept connection's request had ended when its answer began (`persistent`), and
@@ -1146,6 +1188,45 @@ where
         }
         let read_ahead = connection.inbound.borrow().holds_any();
         connection.deadlines.answered(now(), read_ahead);
+    }
+}
+
+/// Ends a connection whose answer's body failed. Before any byte of the final head has
+/// gone the answer can still be put right: what is queued is dropped — all but the rest of
+/// an informational head part-written, which must be finished first — and the client is
+/// answered 502 in its place, the connection closing after it. After, the answer is the
+/// upstream's, and the client is left with a message it can tell is unfinished (14 §4).
+async fn replace_or_cut<S: AsyncRead + AsyncWrite + Unpin>(
+    connection: &mut Connection<S>,
+    timer: Pin<&mut Sleep>,
+    asked: Asked,
+    date: &impl Fn() -> HttpDate,
+) -> Ended {
+    match connection.outbound.on_failure() {
+        OnFailure::Close => return Ended::Cut,
+        OnFailure::Answer => connection.discard_queued(false),
+        OnFailure::FinishThenAnswer(_) => connection.discard_queued(true),
+    }
+    let mut head = Vec::with_capacity(128);
+    if write_head(
+        &mut head,
+        StatusCode::BAD_GATEWAY,
+        &HeaderMap::new(),
+        Content::Empty,
+        asked,
+        false,
+        &date(),
+    )
+    .is_err()
+    {
+        return Ended::Gone;
+    }
+    if let Err(stop) = connection.queue_answer(head) {
+        return stop.into();
+    }
+    match connection.flush(timer).await {
+        Ok(()) => Ended::Answered,
+        Err(stop) => stop.into(),
     }
 }
 
@@ -1867,6 +1948,65 @@ mod tests {
                 "{clock:?} after {took:?}"
             );
             drop(client);
+        }
+    }
+
+    /// An answer's body that fails, after `pending` polls that find nothing ready.
+    struct Failing {
+        pending: usize,
+    }
+
+    impl Body for Failing {
+        type Data = Bytes;
+        type Error = &'static str;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            if this.pending > 0 {
+                this.pending -= 1;
+                context.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Poll::Ready(Some(Err("the upstream's body could not be read")))
+        }
+    }
+
+    /// An answer whose body fails before any byte of its head has gone can still be put
+    /// right: the client is answered 502 in its place, and the connection closes. Once the
+    /// head has begun to go the answer is the upstream's, and the client is left with a
+    /// message it can tell is unfinished (14 §4).
+    #[tokio::test]
+    async fn a_body_that_fails_before_its_head_goes_is_answered_502_instead() {
+        for (pending, answer, ending) in [
+            (0, "HTTP/1.1 502 Bad Gateway\r\n", Ended::Answered),
+            (1, "HTTP/1.1 200 OK\r\n", Ended::Cut),
+        ] {
+            let failing = move |_: Request<RequestBody>, _: Interim| async move {
+                Response::new(Failing { pending })
+            };
+            let (mut client, server) = tokio::io::duplex(1 << 16);
+            client.write_all(GET).await.unwrap();
+            let serving = serve(server, settings(), blocks(), date, failing);
+            let (ended, received) = tokio::time::timeout(Duration::from_secs(10), async {
+                let ended = serving.await;
+                let mut received = Vec::new();
+                client.read_to_end(&mut received).await.unwrap();
+                (ended, String::from_utf8(received).unwrap())
+            })
+            .await
+            .unwrap();
+            assert!(received.starts_with(answer), "{pending}: {received:?}");
+            assert_eq!(ended, ending, "{pending}: {received:?}");
+            if pending == 0 {
+                assert!(
+                    received.contains("\r\nconnection: close\r\n"),
+                    "{received:?}"
+                );
+                assert!(!received.contains(" 200 "), "{received:?}");
+            }
         }
     }
 
