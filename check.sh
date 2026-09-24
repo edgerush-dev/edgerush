@@ -32,6 +32,12 @@ cargo fmt --check
 say "clippy"
 cargo clippy --all-targets -- -D warnings
 
+say "without test features"
+# Clippy and the tests build every crate with its dev-dependencies' features added in: a
+# feature the code uses but never asks for (tokio's macros, say) builds there and fails in
+# the binary that ships.
+cargo check --workspace
+
 say "tests"
 cargo test --workspace
 
