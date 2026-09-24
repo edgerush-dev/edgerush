@@ -10,9 +10,15 @@
 //! What is counted is connections — open, or on their way to the worker — as everybody who
 //! balances at accept counts them. A connection that turns out busier than the others
 //! stays where it is.
+//!
+//! The same count bounds what a worker holds ([14 §8](../../../docs/14-downstream-server.md)).
+//! A worker at its cap does not accept: what comes meanwhile waits in the kernel's backlog,
+//! as with HAProxy, and costs the worker nothing until one of its connections ends —
+//! lingering to its close included, since a connection counts until it is let go of.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::Notify;
 
 /// The worker that a connection accepted by `own` goes to: the one with the least load.
 /// `own` keeps it if none has less; among others that tie, the next one after `own` gets
@@ -33,14 +39,55 @@ pub(crate) fn least_loaded(loads: &[usize], own: usize) -> usize {
         .unwrap_or(own)
 }
 
-/// How many connections every worker holds. Written to when a connection comes or goes,
-/// never for a request, so the workers' numbers can share a line of cache.
+/// How many connections every worker holds, and how many it may. Written to when a
+/// connection comes or goes, never for a request, so the workers' numbers can share a line
+/// of cache.
 #[derive(Debug)]
-pub(crate) struct Loads(Vec<AtomicUsize>);
+pub(crate) struct Loads {
+    held: Vec<AtomicUsize>,
+    /// How many connections a worker may hold before it stops accepting.
+    cap: usize,
+    /// For every worker, what wakes it when it has room again.
+    room: Vec<Notify>,
+}
 
 impl Loads {
-    pub(crate) fn new(workers: usize) -> Arc<Self> {
-        Arc::new(Self((0..workers).map(|_| AtomicUsize::new(0)).collect()))
+    pub(crate) fn new(workers: usize, cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            held: (0..workers).map(|_| AtomicUsize::new(0)).collect(),
+            cap,
+            room: (0..workers).map(|_| Notify::new()).collect(),
+        })
+    }
+
+    /// Whether `worker` holds fewer connections than its cap. One that is not there has
+    /// none.
+    ///
+    /// A worker that accepts only while this holds stays within its cap, and so does every
+    /// worker it gives connections to, which hold no more than it does — except that
+    /// workers that look at the same moment may each place one on the same worker, and a
+    /// worker's listeners that are woken together may each accept one: the cap is passed
+    /// by at most that many.
+    pub(crate) fn has_room(&self, worker: usize) -> bool {
+        self.held
+            .get(worker)
+            .is_none_or(|load| load.load(Ordering::Relaxed) < self.cap)
+    }
+
+    /// Waits until `worker` has room.
+    pub(crate) async fn room(&self, worker: usize) {
+        let Some(room) = self.room.get(worker) else {
+            return;
+        };
+        loop {
+            // Asked for before looking, so that a connection that ends between the look and
+            // the wait still wakes it.
+            let woken = room.notified();
+            if self.has_room(worker) {
+                return;
+            }
+            woken.await;
+        }
     }
 
     /// Finds the worker for a connection that `own` has accepted, and counts it as that
@@ -56,7 +103,7 @@ impl Loads {
 
     /// Counts a connection as `worker`'s, without looking at the others.
     pub(crate) fn hold(self: &Arc<Self>, worker: usize) -> Held {
-        if let Some(load) = self.0.get(worker) {
+        if let Some(load) = self.held.get(worker) {
             load.fetch_add(1, Ordering::Relaxed);
         }
         Held {
@@ -67,7 +114,7 @@ impl Loads {
 
     /// What every worker holds at this moment.
     pub(crate) fn now(&self) -> Vec<usize> {
-        self.0
+        self.held
             .iter()
             .map(|load| load.load(Ordering::Relaxed))
             .collect()
@@ -90,8 +137,15 @@ impl Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        if let Some(load) = self.loads.0.get(self.worker) {
-            load.fetch_sub(1, Ordering::Relaxed);
+        let Some(load) = self.loads.held.get(self.worker) else {
+            return;
+        };
+        let before = load.fetch_sub(1, Ordering::Relaxed);
+        // Only a worker that was full can be waiting, so only then is there anyone to wake.
+        if before >= self.loads.cap
+            && let Some(room) = self.loads.room.get(self.worker)
+        {
+            room.notify_one();
         }
     }
 }
@@ -132,7 +186,7 @@ mod tests {
 
     #[test]
     fn four_connections_that_one_worker_accepts_go_to_four_workers() {
-        let loads = Loads::new(4);
+        let loads = Loads::new(4, usize::MAX);
         let held: Vec<Held> = (0..4).map(|_| loads.place(2)).collect();
         assert_eq!(loads.now(), [1, 1, 1, 1]);
         let mut workers: Vec<usize> = held.iter().map(Held::worker).collect();
@@ -143,7 +197,7 @@ mod tests {
 
     #[test]
     fn a_connection_counts_until_it_is_let_go_of() {
-        let loads = Loads::new(2);
+        let loads = Loads::new(2, usize::MAX);
         let first = loads.hold(1);
         let second = loads.hold(1);
         assert_eq!(loads.now(), [0, 2]);
@@ -176,7 +230,7 @@ mod tests {
             workers in 1_usize..9,
             accepted_by in prop::collection::vec(0_usize..8, 0..200),
         ) {
-            let loads = Loads::new(workers);
+            let loads = Loads::new(workers, usize::MAX);
             let mut held = Vec::new();
             for own in accepted_by {
                 held.push(loads.place(own % workers));
@@ -193,7 +247,7 @@ mod tests {
             workers in 1_usize..9,
             events in prop::collection::vec((any::<bool>(), 0_usize..64), 0..200),
         ) {
-            let loads = Loads::new(workers);
+            let loads = Loads::new(workers, usize::MAX);
             let mut held: Vec<Held> = Vec::new();
             for (ends, which) in events {
                 if ends && !held.is_empty() {
@@ -207,5 +261,63 @@ mod tests {
                 prop_assert_eq!(loads.now().iter().sum::<usize>(), held.len());
             }
         }
+
+        /// A worker that accepts only while it has room never has a connection placed on it
+        /// past its cap, nor on any other: whatever balancing chooses holds no more than
+        /// the one that accepted, which was under it.
+        #[test]
+        fn a_worker_that_accepts_only_with_room_keeps_every_worker_within_the_cap(
+            workers in 1_usize..9,
+            cap in 1_usize..6,
+            events in prop::collection::vec((any::<bool>(), 0_usize..64), 0..300),
+        ) {
+            let loads = Loads::new(workers, cap);
+            let mut held: Vec<Held> = Vec::new();
+            for (ends, which) in events {
+                if ends && !held.is_empty() {
+                    held.swap_remove(which % held.len());
+                } else if loads.has_room(which % workers) {
+                    held.push(loads.place(which % workers));
+                }
+                prop_assert!(loads.now().iter().all(|load| *load <= cap), "{:?}", loads.now());
+            }
+        }
+    }
+
+    /// A worker at its cap has no room, and is woken when one of its connections ends; a
+    /// connection of another worker's that ends does not wake it.
+    #[test]
+    fn a_worker_at_its_cap_waits_for_one_of_its_connections_to_end() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(waits_for_one_of_its_connections_to_end());
+    }
+
+    async fn waits_for_one_of_its_connections_to_end() {
+        let loads = Loads::new(2, 2);
+        let first = loads.hold(0);
+        let _second = loads.hold(0);
+        let other = loads.hold(1);
+        assert!(!loads.has_room(0));
+        assert!(loads.has_room(1));
+
+        let waiting = tokio::spawn({
+            let loads = Arc::clone(&loads);
+            async move { loads.room(0).await }
+        });
+        drop(other);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "woken by another worker's connection"
+        );
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("not woken when a connection of its own ended")
+            .unwrap();
+        assert!(loads.has_room(0));
     }
 }

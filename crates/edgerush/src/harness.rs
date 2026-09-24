@@ -266,7 +266,14 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<Infallible, Failure>
         );
     }
     // Every worker runs on a thread of its own, which stays for as long as the process.
-    per_core::start(&proxy, sockets, accept, limits).map_err(Failure::Runtime)?;
+    per_core::start(
+        &proxy,
+        sockets,
+        accept,
+        limits,
+        per_core::CONNECTIONS_PER_WORKER,
+    )
+    .map_err(Failure::Runtime)?;
     if let Some(socket) = metrics {
         let address = socket.local_addr().map_err(Failure::Runtime)?;
         scrapes(Arc::clone(&proxy), socket).map_err(Failure::Runtime)?;

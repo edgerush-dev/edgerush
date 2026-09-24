@@ -22,6 +22,13 @@ use tokio::runtime::Builder;
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
 use tokio::task::LocalSet;
 
+/// How many connections a worker holds before it stops accepting ([14 §8]): open ones,
+/// ones on their way to it and ones lingering to their close. Past it, connections wait in
+/// the kernel's backlog.
+///
+/// [14 §8]: ../../../docs/14-downstream-server.md
+pub(crate) const CONNECTIONS_PER_WORKER: usize = 32_768;
+
 /// How many connections can be on their way to a worker that is busy with something else.
 /// With more than that, a connection stays with the worker that accepted it.
 const ON_THEIR_WAY: usize = 1024;
@@ -59,8 +66,9 @@ struct Worker {
 }
 
 /// Starts a worker on a thread of its own for every entry of `sockets` — one socket for
-/// every listener, in the order of the listeners — all serving the one `proxy`. Returns
-/// what the workers hold, for whoever wants to look.
+/// every listener, in the order of the listeners — all serving the one `proxy`, each
+/// accepting only while it holds fewer than `connections`. Returns what the workers hold,
+/// for whoever wants to look.
 ///
 /// # Errors
 ///
@@ -71,8 +79,9 @@ pub(crate) fn start(
     sockets: Vec<Vec<std::net::TcpListener>>,
     accept: Accept,
     limits: H1Limits,
+    connections: usize,
 ) -> io::Result<Arc<Loads>> {
-    let loads = Loads::new(sockets.len());
+    let loads = Loads::new(sockets.len(), connections);
     let (workers, handed_over): (Vec<_>, Vec<_>) = sockets
         .iter()
         .map(|_| mpsc::channel::<HandedOver>(ON_THEIR_WAY))
@@ -124,6 +133,9 @@ pub(crate) fn start(
 impl Worker {
     async fn accept(self, listener: usize, socket: TcpListener) {
         loop {
+            // A worker at its cap leaves what comes in the backlog until one of its
+            // connections ends, rather than take on what it has no room for.
+            self.loads.room(self.position).await;
             match socket.accept().await {
                 Ok((stream, _)) => self.place(listener, stream),
                 Err(error) => {
@@ -209,6 +221,15 @@ mod tests {
     /// Workers whose one listener `web` has nowhere to send a request: every request is
     /// answered with 503 by the worker that serves its connection.
     fn workers(count: usize, accept: Accept) -> (SocketAddr, Arc<Loads>) {
+        capped_workers(count, accept, CONNECTIONS_PER_WORKER)
+    }
+
+    /// The same, each holding no more than `connections`.
+    fn capped_workers(
+        count: usize,
+        accept: Accept,
+        connections: usize,
+    ) -> (SocketAddr, Arc<Loads>) {
         let yaml = r#"
 listeners:
   web: { address: "127.0.0.1:0", protocol: http }
@@ -236,7 +257,7 @@ upstreams:
         }
         (
             address,
-            start(&proxy, sockets, accept, H1Limits::default()).unwrap(),
+            start(&proxy, sockets, accept, H1Limits::default(), connections).unwrap(),
         )
     }
 
@@ -268,6 +289,43 @@ upstreams:
         }
         let answer = String::from_utf8_lossy(&answer);
         answer.lines().next().unwrap().to_owned()
+    }
+
+    /// A worker at its cap leaves the next connection in the backlog, unserved, until one of
+    /// its own ends; then it is served.
+    #[test]
+    fn a_connection_past_the_cap_waits_until_another_ends() {
+        let (address, loads) = capped_workers(1, Accept::Balanced, 1);
+        let mut first = std::net::TcpStream::connect(address).unwrap();
+        assert_eq!(request(&mut first), "HTTP/1.1 503 Service Unavailable");
+
+        // Connected by the kernel, and not accepted: its request goes unanswered.
+        let mut second = std::net::TcpStream::connect(address).unwrap();
+        second
+            .write_all(b"GET / HTTP/1.1\r\nhost: balance.test\r\n\r\n")
+            .unwrap();
+        second
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut byte = [0];
+        let unanswered = second.read(&mut byte);
+        assert!(unanswered.is_err(), "answered past the cap: {unanswered:?}");
+        assert_eq!(loads.now(), [1]);
+
+        drop(first);
+        second
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut answer = Vec::new();
+        while !answer.ends_with(b"\r\n\r\n") {
+            second.read_exact(&mut byte).unwrap();
+            answer.push(byte[0]);
+        }
+        assert!(
+            answer.starts_with(b"HTTP/1.1 503 "),
+            "{}",
+            String::from_utf8_lossy(&answer)
+        );
     }
 
     #[test]

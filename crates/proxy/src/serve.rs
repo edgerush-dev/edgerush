@@ -625,6 +625,11 @@ impl Worker {
     /// returns; dropping the future stops accepting, and connections already accepted
     /// carry on.
     ///
+    /// It accepts whatever comes, with no bound on how many connections it holds: it is
+    /// for tests and single-worker harnesses. The data plane's workers accept through
+    /// their own loop, which stops at each worker's cap
+    /// ([14 §8](../../docs/14-downstream-server.md)).
+    ///
     /// # Panics
     ///
     /// Runs inside the worker's `LocalSet`, where the connections it accepts are served;
