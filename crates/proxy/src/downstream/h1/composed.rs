@@ -577,7 +577,16 @@ async fn client_side(mut socket: DuplexStream, steps: Vec<ClientStep>, wire: Sha
                     )
                     .await;
                 } else {
-                    tokio::time::sleep(time).await;
+                    // A wait that ends early if the connection does: past its end there is
+                    // nothing left to wait for, and the run would only wait on the client.
+                    let until = tokio::time::Instant::now() + time;
+                    while !wire.borrow().done {
+                        let now = tokio::time::Instant::now();
+                        if now >= until {
+                            break;
+                        }
+                        tokio::time::sleep(LOOK_AGAIN.min(until - now)).await;
+                    }
                 }
             }
             ClientStep::Answers(count) => {
@@ -1070,6 +1079,35 @@ mod tests {
         let run = run(&[Send(b"GET / HT".to_vec())], &Core::default());
         assert!(!run.given_up(), "the run was given up on");
         assert_eq!(run.events, [Event::Closed]);
+    }
+
+    /// A client's pauses after its connection has ended wait for nothing: however long its
+    /// script says to wait, the run ends with the connection. The fuzzer's first finding:
+    /// a client that stopped reading and then paused past the run's whole time.
+    #[test]
+    fn pauses_after_the_connection_ends_do_not_hold_the_run() {
+        let post = b"POST /p HTTP/1.1\r\nhost: a\r\ncontent-length: 3\r\n\r\nabc".to_vec();
+        let mut client = vec![Send(post), StopReading];
+        client.extend(std::iter::repeat_n(Pause(Duration::from_secs(40)), 20));
+        let core = Core {
+            acts: vec![Act {
+                take: Take::Nothing,
+                ..Act::default()
+            }],
+        };
+        let run = run(&client, &core);
+        assert!(!run.given_up(), "{:?}", run.events);
+        assert_eq!(judge(&run), Ok(()));
+
+        // The input the fuzzer found it with, as it found it.
+        let mut found = vec![
+            0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0x3a, 0x3e, 0x3a, 0x3a, 0x3a, 0x3a, 0x21,
+        ];
+        found.extend([0x67; 28]);
+        found.extend([0x2a, 0x2a, 0x0d, 0xfb]);
+        let (client, core, pipe) = decode(&found);
+        let run = run_with(&client, &core, pipe);
+        assert_eq!(judge(&run), Ok(()), "{client:?}");
     }
 
     #[test]
