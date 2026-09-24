@@ -11,7 +11,10 @@
 #                                             cancellation, reload under load, idle memory
 #   bench/run.sh instructions                 where a worker's instructions go, by part
 #   bench/run.sh idle                         what idle connections cost: never written to,
-#                                             after one request, after one large head
+#                                             after one request, after one large head,
+#                                             and beside a steady load
+#   bench/run.sh soak [MINUTES] [RATE]        EdgeRush under mixed load and reloads for a
+#                                             long while: what it holds, every ten seconds
 #   bench/run.sh profile-body upload|answer [RATE]  CPU stacks during streamed bodies
 #   bench/run.sh summary DIR                  the table of a finished run
 #
@@ -126,8 +129,9 @@ start_proxy() { # variant
             2>>"$OUT/proxy.log" &
         ;;
     ours)
+        # `/metrics` only where a run reads it, as the soak does: METRICS is its address.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
-            --workers "$WORKERS" $idle \
+            --workers "$WORKERS" $idle ${METRICS:+--metrics "$METRICS"} \
             2>>"$OUT/proxy.log" &
         ;;
     *)
@@ -332,6 +336,45 @@ idle_memory() { # name, [kind, count]: as bench/idle.py takes them
     echo "done: $name"
 }
 
+# What idle connections cost on a proxy that is busy at the same time (14 §8): the same
+# load runs throughout, so what the idle ones add is read against a proxy doing the same
+# work without them rather than against one doing nothing.
+busy_idle_memory() { # name, count
+    local name=$1 count=$2 rate=${BUSY_RATE:-10000}
+    stop_proxy
+    start_proxy "${name%%.*}"
+    sleep 1
+    taskset -c "$GEN_CPUS" oha -z 60s -q "$rate" -c 64 --no-tui \
+        --connect-to "$host:8080:$proxy_at" "$proxy" >/dev/null 2>&1 &
+    local load=$!
+    sleep 5
+    local busy
+    busy=$(python3 "$here/rss.py" "$proxy_pid")
+    taskset -c "$GEN_CPUS" python3 "$here/idle.py" "$proxy_at" "$host" \
+        "$count" one-request >"$OUT/$name.ready" 2>"$OUT/$name.err" &
+    local holding=$!
+    for _ in $(seq 1200); do
+        grep -q ready "$OUT/$name.ready" 2>/dev/null && break
+        sleep 0.1
+    done
+    sleep 2
+    local held open
+    held=$(python3 "$here/rss.py" "$proxy_pid")
+    # The idle ones only: the load's own connections are open too.
+    open=$(( $(ss -Htn state established "( sport = :${proxy_at##*:} )" | wc -l) - 64 ))
+    {
+        echo "kind busy"
+        echo "connections $count"
+        echo "open $open"
+        echo "rss_quiet_kb $busy"
+        echo "rss_held_kb $held"
+        echo "per_connection_bytes $(( (held - busy) * 1024 / (open > 0 ? open : 1) ))"
+    } >"$OUT/$name.out"
+    kill "$holding" "$load" 2>/dev/null || true
+    wait "$holding" "$load" 2>/dev/null || true
+    echo "done: $name"
+}
+
 each_variant() { # function, that is given: prefix of the names
     for rep in $(seq "$REPS"); do
         for variant in $VARIANTS; do
@@ -422,9 +465,9 @@ profile-body)
         exit 2
     }
     ;;
-ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle) ;;
+ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak) ;;
 *)
-    sed -n '2,15p' "$0" >&2
+    sed -n '2,19p' "$0" >&2
     exit 2
     ;;
 esac
@@ -535,8 +578,61 @@ idle)
                 idle_memory "$1.idle-$kind-$count" "$kind" "$count"
             done
         done
+        # And held beside a load, which is where they are in a real deployment.
+        for count in $IDLE_COUNTS; do
+            busy_idle_memory "$1.idle-busy-$count" "$count"
+        done
     }
     each_variant idle_runs
+    ;;
+soak)
+    # EdgeRush under a steady mixed load for a long while (14 §9, step 5): requests at a
+    # fixed rate, idle connections held, uploads trickling, and the config taken over
+    # every half minute. Every ten seconds what the process holds is written down; the
+    # summary compares the first minutes with the last, and flat is the pass.
+    minutes=${2:-30} rate=${3:-25000}
+    METRICS=127.0.0.1:9090
+    start_proxy ours
+    taskset -c "$GEN_CPUS" python3 "$here/idle.py" "$proxy_at" "$host" \
+        "$IDLE_CONNECTIONS" one-request >"$OUT/soak.idle-ready" 2>"$OUT/soak.idle-err" &
+    holding=$!
+    # -w: requests under way when the time is up are waited for, not counted as errors.
+    taskset -c "$GEN_CPUS" oha -z "${minutes}m" -w -q "$rate" -c 256 --no-tui \
+        --output-format json --connect-to "$host:8080:$proxy_at" "$proxy" \
+        >"$OUT/soak.load.json" 2>"$OUT/soak.load.err" &
+    load=$!
+    taskset -c "$GEN_CPUS" oha -z "${minutes}m" -w -q 5 -c 4 --no-tui --output-format json \
+        --connect-to "$host:8080:$proxy_at" -m POST -D "$run/big.bin" "$proxy/sink" \
+        >"$OUT/soak.uploads.json" 2>"$OUT/soak.uploads.err" &
+    uploads=$!
+    (
+        turn=0
+        while sleep 30; do
+            turn=$((turn + 1))
+            sed "s/x-served-by, value: edgerush/x-served-by, value: edgerush-$turn/" \
+                "$here/proxy.yaml" >"$config.next"
+            mv "$config.next" "$config"
+        done
+    ) &
+    rewriting=$!
+    echo "seconds,rss_kb,fds,client_sockets,storage_bytes,exchanges,idle_upstream" >"$OUT/soak.csv"
+    began=$(date +%s)
+    while kill -0 "$load" 2>/dev/null; do
+        scrape=$(curl -s "http://$METRICS/metrics" || true)
+        gauge() { awk -v name="$1" '$1 == name { print $2 }' <<<"$scrape"; }
+        echo "$(( $(date +%s) - began )),$(python3 "$here/rss.py" "$proxy_pid")," \
+            "$(ls "/proc/$proxy_pid/fd" | wc -l),$(ss -Htn state established \
+            "( sport = :${proxy_at##*:} )" | wc -l),$(gauge edgerush_worker_storage_bytes)," \
+            "$(gauge edgerush_upstream_exchanges_active),$(gauge edgerush_upstream_connections_idle)" \
+            | tr -d ' ' >>"$OUT/soak.csv"
+        sleep 10
+    done
+    kill "$rewriting" "$uploads" "$holding" 2>/dev/null || true
+    wait "$load" "$rewriting" "$uploads" "$holding" 2>/dev/null || true
+    cp "$here/proxy.yaml" "$config"
+    stop_proxy
+    python3 "$here/soak.py" "$OUT" | tee "$OUT/soak.summary"
+    exit 0
     ;;
 carrying)
     # Low rates: every one of these is about what an exchange holds and for how long

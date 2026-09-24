@@ -31,7 +31,11 @@ bench/run.sh carrying               # streamed bodies, a slow upstream, cancella
 bench/run.sh hotpaths [RATE]        # H1 saturation and both streamed bodies (default 20/s)
 bench/run.sh frontend               # serving alone against NGINX, with no upstream
 bench/run.sh idle                   # idle connections: never written to, after one
-                                    # request, after one large head, at IDLE_COUNTS
+                                    # request, after one large head, and beside a
+                                    # steady load, at IDLE_COUNTS
+bench/run.sh soak [MINUTES] [RATE]  # EdgeRush under mixed load and reloads (30 min,
+                                    # 25,000/s): what it holds every ten seconds, and
+                                    # whether that stayed flat (bench/soak.py)
 bench/run.sh summary bench/results/<run>
 ```
 
@@ -122,6 +126,8 @@ worth as much as the care that went into the other side.
 | `cancelled` | the same, with a 200 ms timeout on every request | Clients that go away part way through an answer: everything the exchange holds has to go with them |
 | `reload` | oha at a steady rate while the config is taken over once a second | The one in [10 §1](../../docs/10-testing.md): no failed request while a config changes. EdgeRush only — the others would need their own reload, which is a different thing to measure |
 | `idle-memory` | `IDLE_CONNECTIONS` connections, answered and then left quiet, on a proxy started afresh | What a connection costs while nothing is happening on it, as the proxy's own resident memory |
+| `idle-busy` | the same, opened while oha keeps a steady 10,000 requests a second (`BUSY_RATE`) going | What an idle connection costs on a proxy that is busy, read against the same load without it |
+| `soak` | oha at a steady rate, `IDLE_CONNECTIONS` held, 8 MiB uploads at 5 a second, the config taken over every 30 s; memory, descriptors, client sockets and the `edgerush_worker_storage_bytes` gauge sampled every 10 s | That nothing grows over a long run ([14 §9](../../docs/14-downstream-server.md), step 5): the first five minutes against the last. EdgeRush only |
 | `frontend` | h2load at saturation, HTTP/1.1 and HTTP/2, for the benchmark's host and for one no route is for; instructions and cycles counted over every process of the variant | What serving costs by itself: EdgeRush's own answer to an unrouted host (its server and the request core) against `nginx-direct` (`nginx-direct.conf`, NGINX answering itself), and against its forwarding (all of it) |
 
 Every request goes through routing on a config with several hosts and rules and through a
