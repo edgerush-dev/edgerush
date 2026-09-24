@@ -300,14 +300,18 @@ pub(crate) struct WorkerGauges {
     exchanges: Gauge,
     /// Connections the worker is keeping for an upstream to be asked again.
     idle: Gauge,
+    /// Bytes of application storage the worker holds (14 §8): its ledger's count.
+    storage: Gauge,
 }
 
 impl WorkerGauges {
     /// What this worker holds now. A gauge counts up and down rather than being told a
     /// number, so what it is given is the difference from what it last said.
-    pub(crate) fn holding(&self, exchanges: usize, idle: usize) {
+    pub(crate) fn holding(&self, exchanges: usize, idle: usize, storage: usize) {
         move_to(&self.exchanges, exchanges);
         move_to(&self.idle, idle);
+        // Bytes change by far too much between sweeps to be stepped to.
+        self.storage.set(i64::try_from(storage).unwrap_or(i64::MAX));
     }
 }
 
@@ -553,6 +557,16 @@ impl Metrics {
             &[],
             self.workers
                 .sum(|shard| shard.idle.get().max(0).cast_unsigned()),
+        );
+        let name = "edgerush_worker_storage_bytes";
+        let help =
+            "Bytes of application storage the workers hold, as their last sweeps found them.";
+        scrape.family(name, Kind::Gauge, help);
+        scrape.sample(
+            name,
+            &[],
+            self.workers
+                .sum(|shard| shard.storage.get().max(0).cast_unsigned()),
         );
 
         let name = "edgerush_config_reloads_total";

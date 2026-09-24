@@ -46,6 +46,12 @@ impl Gauge {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Sets this shard's part to `value`: for a gauge whose shard has one writer, which
+    /// samples what it holds rather than counting it up and down.
+    pub fn set(&self, value: i64) {
+        self.0.store(value, Ordering::Relaxed);
+    }
+
     /// This shard's part of the number.
     #[must_use]
     pub fn get(&self) -> i64 {
@@ -84,5 +90,14 @@ mod tests {
         gauge.dec();
         gauge.dec();
         assert_eq!(gauge.get(), -1);
+    }
+
+    #[test]
+    fn a_gauge_can_be_set_to_what_its_one_writer_found() {
+        let gauge = Gauge::default();
+        gauge.set(3_145_728);
+        assert_eq!(gauge.get(), 3_145_728);
+        gauge.set(0);
+        assert_eq!(gauge.get(), 0);
     }
 }

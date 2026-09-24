@@ -100,7 +100,6 @@ impl Storage {
     }
 
     /// What it holds: the bytes of every charge not yet dropped, and of memory outlived.
-    #[cfg(any(test, feature = "fuzzing"))]
     pub fn used(&self) -> usize {
         self.used.get()
     }

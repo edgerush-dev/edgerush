@@ -496,9 +496,10 @@ impl Worker {
             // What this worker holds at the moment it last looked. A sweep already walks
             // everything these ask about, so nothing is counted on the request path for
             // them ([13 §7](../../docs/13-http1-upstream.md)).
+            let storage = self.blocks.borrow().storage().used();
             metrics
                 .worker()
-                .holding(self.in_flight.get(), self.idle_connections());
+                .holding(self.in_flight.get(), self.idle_connections(), storage);
         }
     }
 
@@ -1727,16 +1728,23 @@ mod tests {
                 "{scrape}"
             );
             // And what the worker holds, which it says as it sweeps.
-            proxy
-                .metrics
-                .worker()
-                .holding(worker.in_flight.get(), worker.idle_connections());
+            let storage = worker.blocks.borrow().storage().used();
+            proxy.metrics.worker().holding(
+                worker.in_flight.get(),
+                worker.idle_connections(),
+                storage,
+            );
             let scrape = proxy.metrics.render(&["web".to_owned()], &[]);
             assert!(
                 scrape.contains(
                     "edgerush_upstream_connections_idle 1
 "
                 ),
+                "{scrape}"
+            );
+            assert!(storage > 0, "a connection kept holds a block");
+            assert!(
+                scrape.contains(&format!("\nedgerush_worker_storage_bytes {storage}\n")),
                 "{scrape}"
             );
         }));
