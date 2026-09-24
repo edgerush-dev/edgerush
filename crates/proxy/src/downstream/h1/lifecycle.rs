@@ -154,12 +154,53 @@ fn refused_early(bytes: &[u8], limits: &H1Limits) -> bool {
         empty += 1;
         rest = after;
     }
-    if empty > 1 {
+    if empty > 1 || cannot_begin_a_request_line(rest) {
         return true;
     }
     let line_ended = rest.contains(&b'\n');
     let head_ended = bytes.windows(4).any(|window| window == b"\r\n\r\n");
     (!line_ended && rest.len() > limits.request_line) || (!head_ended && bytes.len() > limits.head)
+}
+
+/// Whether no bytes that could follow these would make them a request line
+/// ([RFC 9112 §3](https://www.rfc-editor.org/rfc/rfc9112.html#section-3)): a method that
+/// is a token, one space, a target of visible characters, one space, `HTTP/`, a digit, a
+/// dot, a digit, and the line's end. Read from the grammar, not from the reader.
+fn cannot_begin_a_request_line(bytes: &[u8]) -> bool {
+    let is_token = |byte: &u8| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(byte);
+    let method = bytes.iter().take_while(|byte| is_token(byte)).count();
+    let Some(&after) = bytes.get(method) else {
+        return false;
+    };
+    if method == 0 || after != b' ' {
+        return true;
+    }
+    let rest = &bytes[method + 1..];
+    let target = rest
+        .iter()
+        .take_while(|byte| (0x21..=0x7e).contains(*byte))
+        .count();
+    let Some(&after) = rest.get(target) else {
+        return false;
+    };
+    if target == 0 || after != b' ' {
+        return true;
+    }
+    let version = &rest[target + 1..];
+    for (at, byte) in version.iter().enumerate() {
+        let fits = match at {
+            0..=4 => *byte == b"HTTP/"[at],
+            5 | 7 => byte.is_ascii_digit(),
+            6 => *byte == b'.',
+            8 => *byte == b'\r',
+            9 => *byte == b'\n',
+            _ => return false,
+        };
+        if !fits {
+            return true;
+        }
+    }
+    false
 }
 
 /// Holds what the harness saw of a connection against what the client sent.
@@ -288,7 +329,14 @@ mod tests {
             complete: true,
         };
         let long = [GET, format!("GET /{}", "a".repeat(9_000)).as_bytes()].concat();
-        for bytes in [[GET, b"\r\n\r\n"].concat(), long] {
+        for bytes in [
+            [GET, b"\r\n\r\n"].concat(),
+            long,
+            // No line yet, but none it could become: a NUL is no part of a method.
+            [GET, b"\0\0\x0e"].concat(),
+            [GET, b"GET  /"].concat(),
+            [GET, b"GET / HTTX"].concat(),
+        ] {
             assert_eq!(
                 judged(&bytes, &[Dispatched(0), answer(0), refusal, Closed]),
                 Ok(())
@@ -299,7 +347,12 @@ mod tests {
             );
         }
         // One empty line is allowed, and a request line within its bound may yet end.
-        for bytes in [[GET, b"\r\n"].concat(), [GET, b"GET /a"].concat()] {
+        for bytes in [
+            [GET, b"\r\n"].concat(),
+            [GET, b"GET /a"].concat(),
+            [GET, b"GET /a HTTP/1."].concat(),
+            [GET, b"GET /a HTTP/1.1\r"].concat(),
+        ] {
             assert_eq!(
                 judged(&bytes, &[Dispatched(0), answer(0), refusal, Closed]),
                 Err(Violation::AnswerForNothing)
