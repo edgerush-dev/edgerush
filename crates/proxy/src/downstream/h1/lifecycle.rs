@@ -99,7 +99,18 @@ fn requests(bytes: &[u8], limits: &H1Limits) -> Vec<Sent> {
     let mut at = 0;
     while at < bytes.len() {
         match read(&bytes[at..]) {
-            Reading::Unfinished => break,
+            Reading::Unfinished => {
+                // Not a request yet, but already one this project refuses, which it may
+                // say as soon as it knows rather than wait for the rest.
+                if refused_early(&bytes[at..], limits) {
+                    sent.push(Sent {
+                        refused: true,
+                        whole: false,
+                        persistent: false,
+                    });
+                }
+                break;
+            }
             Reading::Invalid(_) => {
                 sent.push(Sent {
                     refused: true,
@@ -130,6 +141,25 @@ fn requests(bytes: &[u8], limits: &H1Limits) -> Vec<Sent> {
         }
     }
     sent
+}
+
+/// Whether bytes that are not yet a whole request are already one this project refuses
+/// ([14 §4](../../../../docs/14-downstream-server.md)), whatever follows them: more than
+/// one empty line before the request line, a request line past its bound with no end, or
+/// a head past its bound with no end. Read here from the bytes, not from the reader.
+fn refused_early(bytes: &[u8], limits: &H1Limits) -> bool {
+    let mut rest = bytes;
+    let mut empty = 0;
+    while let Some(after) = rest.strip_prefix(b"\r\n") {
+        empty += 1;
+        rest = after;
+    }
+    if empty > 1 {
+        return true;
+    }
+    let line_ended = rest.contains(&b'\n');
+    let head_ended = bytes.windows(4).any(|window| window == b"\r\n\r\n");
+    (!line_ended && rest.len() > limits.request_line) || (!head_ended && bytes.len() > limits.head)
 }
 
 /// Holds what the harness saw of a connection against what the client sent.
@@ -245,6 +275,36 @@ mod tests {
 
     fn two() -> Vec<u8> {
         [GET, GET].concat()
+    }
+
+    /// What is refused before it is whole may be refused as soon as that is known: after a
+    /// request, two empty lines, or a request line past its bound, are owed a refusal and
+    /// a close, and nothing else.
+    #[test]
+    fn a_refusal_owed_before_the_request_is_whole_may_come_at_once() {
+        let refusal = Answered {
+            request: None,
+            status: 400,
+            complete: true,
+        };
+        let long = [GET, format!("GET /{}", "a".repeat(9_000)).as_bytes()].concat();
+        for bytes in [[GET, b"\r\n\r\n"].concat(), long] {
+            assert_eq!(
+                judged(&bytes, &[Dispatched(0), answer(0), refusal, Closed]),
+                Ok(())
+            );
+            assert_eq!(
+                judged(&bytes, &[Dispatched(0), answer(0), refusal]),
+                Err(Violation::NotClosed)
+            );
+        }
+        // One empty line is allowed, and a request line within its bound may yet end.
+        for bytes in [[GET, b"\r\n"].concat(), [GET, b"GET /a"].concat()] {
+            assert_eq!(
+                judged(&bytes, &[Dispatched(0), answer(0), refusal, Closed]),
+                Err(Violation::AnswerForNothing)
+            );
+        }
     }
 
     #[test]

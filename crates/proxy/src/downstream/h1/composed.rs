@@ -20,7 +20,8 @@
 use super::connection::{Answered, Budget, Ended, Settings, serve};
 use super::date::HttpDate;
 use super::deadlines::Bounds;
-use super::lifecycle::Event;
+use super::lifecycle::{self, Event, Trace, Violation};
+use super::reference as request_reference;
 use crate::interim::Interim;
 use crate::raw::RawHead;
 use crate::request_body::RequestBody;
@@ -32,6 +33,7 @@ use bytes::Bytes;
 use http::{HeaderValue, Response, StatusCode};
 use http_body::{Body, Frame, SizeHint};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
@@ -155,6 +157,8 @@ pub struct Run {
     pub storage_left: usize,
     /// Everything the client received.
     pub received: Vec<u8>,
+    /// Everything the client sent.
+    pub sent: Vec<u8>,
 }
 
 impl Run {
@@ -274,6 +278,7 @@ async fn composed(client: Vec<ClientStep>, core: Core) -> Run {
         Err(_) => (None, Vec::new()),
     };
     let events = wire.borrow().events.clone();
+    let sent = wire.borrow().sent.clone();
     let handed = handed.borrow().clone();
     Run {
         events,
@@ -281,6 +286,7 @@ async fn composed(client: Vec<ClientStep>, core: Core) -> Run {
         ended,
         storage_left: storage.used(),
         received,
+        sent,
     }
 }
 
@@ -705,6 +711,108 @@ fn interim_heads(bytes: &[u8]) -> usize {
     count
 }
 
+/// What a run got wrong, by one oracle or the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Finding {
+    /// The connection's life broke a rule of the lifecycle oracle.
+    Lifecycle(Violation),
+    /// The core was handed something the client did not send: the request at this
+    /// position, and what of it differed.
+    Meaning {
+        /// The request, by position among those the core was handed.
+        request: usize,
+        /// What differed.
+        what: &'static str,
+    },
+    /// The core was handed a request the client did not send whole, or at all.
+    HandedNothingSent(usize),
+    /// Storage was still held once serving had ended.
+    StorageHeld(usize),
+    /// The run was given up on: no deadline of the driver's ended it.
+    GivenUp,
+}
+
+/// Holds a run against both oracles: its life against the lifecycle model, and what the
+/// core was handed against what the reference reader says the client sent.
+///
+/// # Errors
+///
+/// The first thing the run got wrong.
+pub fn judge(run: &Run) -> Result<(), Finding> {
+    if run.given_up() {
+        return Err(Finding::GivenUp);
+    }
+    let limits = H1Limits::default();
+    let trace = Trace {
+        events: run.events.clone(),
+        permits_left: 0,
+    };
+    lifecycle::judge(&run.sent, &trace, &limits).map_err(Finding::Lifecycle)?;
+
+    let mut at = 0;
+    for (index, handed) in run.handed.iter().enumerate() {
+        let request = match request_reference::read(run.sent.get(at..).unwrap_or_default()) {
+            request_reference::Reading::Read(request) => request,
+            _ => return Err(Finding::HandedNothingSent(index)),
+        };
+        let meaning = |what| Finding::Meaning {
+            request: index,
+            what,
+        };
+        if handed.method != request.method {
+            return Err(meaning("method"));
+        }
+        if handed.target != request.target {
+            return Err(meaning("target"));
+        }
+        if by_name(&handed.fields) != by_name(&request.fields) {
+            return Err(meaning("fields"));
+        }
+        match &request.body {
+            request_reference::BodyReading::Whole(body) => {
+                if handed.body_whole && handed.body != body.data {
+                    return Err(meaning("body"));
+                }
+                if !body.data.starts_with(&handed.body) {
+                    return Err(meaning("part of the body"));
+                }
+                // Filtered, but never made up: every trailer handed on was sent.
+                let sent = by_name(&body.trailers);
+                for (name, value) in by_name(&handed.trailers) {
+                    if sent.get(&name) != Some(&value) {
+                        return Err(meaning("trailers"));
+                    }
+                }
+                at += body.end;
+            }
+            // Not all of it came, so only what did can be held to it.
+            request_reference::BodyReading::Unfinished
+            | request_reference::BodyReading::Invalid(_) => {
+                if handed.body_whole {
+                    return Err(meaning("a body that did not end was handed on whole"));
+                }
+                at = run.sent.len();
+            }
+        }
+    }
+    if run.storage_left > 0 {
+        return Err(Finding::StorageHeld(run.storage_left));
+    }
+    Ok(())
+}
+
+/// Fields as a map from name to its values in order, names lowered and values trimmed,
+/// so that two readers that group repeated names differently still compare equal.
+fn by_name(fields: &[(String, String)]) -> BTreeMap<String, Vec<String>> {
+    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, value) in fields {
+        map.entry(name.to_ascii_lowercase())
+            .or_default()
+            .push(value.trim_matches([' ', '\t']).to_owned());
+    }
+    map
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::deadlines::Clock;
@@ -914,5 +1022,261 @@ mod tests {
             run.events
         );
         assert_eq!(run.events.last(), Some(&Event::Closed));
+    }
+
+    /// The examples above, each held against both oracles too.
+    #[test]
+    fn the_examples_pass_both_oracles() {
+        let post = b"POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 3\r\n\r\nabc".to_vec();
+        for (client, core) in [
+            (
+                vec![
+                    Send([get("/0"), get("/1")].concat()),
+                    Answers(2),
+                    CloseWrite,
+                ],
+                Core::default(),
+            ),
+            (
+                vec![Send(post.clone()), Answers(1), CloseWrite],
+                Core::default(),
+            ),
+            (
+                vec![Send(post), Answers(1)],
+                Core {
+                    acts: vec![Act {
+                        take: Take::Nothing,
+                        ..Act::default()
+                    }],
+                },
+            ),
+            (
+                vec![Send(b"GE T / HTTP/1.1\r\n\r\n".to_vec())],
+                Core::default(),
+            ),
+            (vec![Send(b"GET / HT".to_vec())], Core::default()),
+        ] {
+            let run = run(&client, &core);
+            assert_eq!(judge(&run), Ok(()), "{client:?}: {:?}", run.events);
+        }
+    }
+
+    mod generated {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::sample::Index;
+
+        /// How a request's body is framed.
+        #[derive(Debug, Clone)]
+        enum Framed {
+            None,
+            Length(Vec<u8>),
+            Chunked(Vec<Vec<u8>>, Vec<(String, String)>),
+        }
+
+        fn text(max: usize) -> impl Strategy<Value = String> {
+            proptest::string::string_regex(&format!("[a-z0-9]{{0,{max}}}")).unwrap()
+        }
+
+        fn framed() -> impl Strategy<Value = Framed> {
+            prop_oneof![
+                3 => Just(Framed::None),
+                2 => prop::collection::vec(any::<u8>(), 0..40).prop_map(Framed::Length),
+                2 => (
+                    prop::collection::vec(prop::collection::vec(any::<u8>(), 1..12), 0..4),
+                    prop::collection::vec(
+                        (prop::sample::select(vec!["x-t", "x-u", "content-length", "host"]), text(6)),
+                        0..3
+                    ),
+                )
+                    .prop_map(|(chunks, trailers)| {
+                        Framed::Chunked(
+                            chunks,
+                            trailers
+                                .into_iter()
+                                .map(|(name, value)| (name.to_owned(), value))
+                                .collect(),
+                        )
+                    }),
+            ]
+        }
+
+        /// One request, from parts that are each valid on their own; together they can
+        /// still be one this project refuses, which is for the oracles to know.
+        fn request() -> impl Strategy<Value = Vec<u8>> {
+            (
+                prop::sample::select(vec!["GET", "POST", "HEAD", "PUT", "OPTIONS"]),
+                prop::sample::select(vec!["/", "/a?b=c", "/%61/b", "http://h.test/x", "/a/../b"]),
+                // Most requests keep the connection, so that pipelines are long enough to
+                // be about pipelining.
+                prop::bool::weighted(0.2),
+                prop::bool::weighted(0.9),
+                prop::collection::vec(
+                    (prop::sample::select(vec!["x-a", "x-b", "accept"]), text(8)),
+                    0..3,
+                ),
+                prop::bool::weighted(0.15),
+                prop::bool::weighted(0.2),
+                framed(),
+            )
+                .prop_map(
+                    |(method, target, old, host, fields, close, expect, framed)| {
+                        let version = if old { "1.0" } else { "1.1" };
+                        let mut head = format!("{method} {target} HTTP/{version}\r\n");
+                        if host {
+                            head.push_str("host: h.test\r\n");
+                        }
+                        for (name, value) in fields {
+                            head.push_str(&format!("{name}: {value}\r\n"));
+                        }
+                        if close {
+                            head.push_str("connection: close\r\n");
+                        }
+                        if expect {
+                            head.push_str("expect: 100-continue\r\n");
+                        }
+                        let mut bytes = match &framed {
+                            Framed::None => head.into_bytes(),
+                            Framed::Length(body) => {
+                                format!("{head}content-length: {}\r\n", body.len()).into_bytes()
+                            }
+                            Framed::Chunked(..) => {
+                                format!("{head}te: trailers\r\ntransfer-encoding: chunked\r\n")
+                                    .into_bytes()
+                            }
+                        };
+                        bytes.extend_from_slice(b"\r\n");
+                        match framed {
+                            Framed::None => {}
+                            Framed::Length(body) => bytes.extend_from_slice(&body),
+                            Framed::Chunked(chunks, trailers) => {
+                                for chunk in chunks {
+                                    bytes.extend_from_slice(
+                                        format!("{:x}\r\n", chunk.len()).as_bytes(),
+                                    );
+                                    bytes.extend_from_slice(&chunk);
+                                    bytes.extend_from_slice(b"\r\n");
+                                }
+                                bytes.extend_from_slice(b"0\r\n");
+                                for (name, value) in trailers {
+                                    bytes.extend_from_slice(
+                                        format!("{name}: {value}\r\n").as_bytes(),
+                                    );
+                                }
+                                bytes.extend_from_slice(b"\r\n");
+                            }
+                        }
+                        bytes
+                    },
+                )
+        }
+
+        /// Bytes that are not a request, or not one this project reads, to follow the
+        /// requests now and then.
+        fn junk() -> impl Strategy<Value = Vec<u8>> {
+            prop::sample::select(vec![
+                &b""[..],
+                b"GE T / HTTP/1.1\r\n\r\n",
+                b"\r\n\r\n",
+                b"GET / HTTP/1.1\nhost: a\n\n",
+                b"POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 1\r\ncontent-length: 2\r\n\r\nab",
+                b"POST / HTTP/1.1\r\nhost: a\r\ntransfer-encoding: chunked\r\n\r\nzz\r\n",
+                b"GET /x#y HTTP/1.1\r\nhost: a\r\n\r\n",
+                b"GET / HT",
+            ])
+            .prop_map(<[u8]>::to_vec)
+        }
+
+        fn act() -> impl Strategy<Value = Act> {
+            (
+                prop::sample::select(vec![0_u64, 100, 5_000]),
+                prop_oneof![
+                    6 => Just(Take::All),
+                    1 => (0_usize..20).prop_map(Take::Upto),
+                    1 => Just(Take::Nothing),
+                ],
+                prop::sample::select(vec![200_u16, 404, 500]),
+                prop::collection::vec(any::<u8>(), 0..50),
+                any::<bool>(),
+                prop_oneof![
+                    8 => Just(Ending::Whole),
+                    1 => Just(Ending::FailsFirst),
+                    1 => Just(Ending::FailsLater),
+                ],
+            )
+                .prop_map(|(delay, take, status, body, known_length, ending)| Act {
+                    delay: Duration::from_millis(delay),
+                    take,
+                    status,
+                    body,
+                    known_length,
+                    ending,
+                })
+        }
+
+        /// A client's script: requests, maybe junk after them, cut at chosen bytes and
+        /// sent with pauses between, with an early stop in reading now and then, and an
+        /// end that waits for answers, closes its sending half, or does neither.
+        fn client() -> impl Strategy<Value = Vec<ClientStep>> {
+            (
+                prop::collection::vec(request(), 1..6),
+                prop_oneof![3 => Just(Vec::new()), 1 => junk()],
+                prop::collection::vec(any::<Index>(), 0..4),
+                prop::sample::select(vec![0_u64, 50, 2_000]),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+            )
+                .prop_map(
+                    |(requests, junk, cuts, pause, stop_reading, wait, close)| {
+                        let count = requests.len();
+                        let mut bytes = requests.concat();
+                        bytes.extend_from_slice(&junk);
+                        let mut cuts: Vec<usize> =
+                            cuts.iter().map(|cut| cut.index(bytes.len() + 1)).collect();
+                        cuts.sort_unstable();
+                        cuts.dedup();
+                        let mut steps = Vec::new();
+                        if stop_reading {
+                            steps.push(StopReading);
+                        }
+                        let mut from = 0;
+                        for cut in cuts.into_iter().chain([bytes.len()]) {
+                            if cut > from {
+                                steps.push(Send(bytes[from..cut].to_vec()));
+                                steps.push(Pause(Duration::from_millis(pause)));
+                                from = cut;
+                            }
+                        }
+                        if stop_reading {
+                            steps.push(ResumeReading);
+                        }
+                        if wait {
+                            steps.push(Answers(count));
+                        }
+                        if close {
+                            steps.push(CloseWrite);
+                        }
+                        steps
+                    },
+                )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 256,
+                ..ProptestConfig::default()
+            })]
+
+            /// However a client sends its requests and however the core answers them, the
+            /// connection lives as the lifecycle oracle says it must, the core is handed
+            /// what the client sent, and nothing is left held.
+            #[test]
+            fn every_run_passes_both_oracles(client in client(), acts in prop::collection::vec(act(), 0..5)) {
+                let core = Core { acts };
+                let run = run(&client, &core);
+                prop_assert_eq!(judge(&run), Ok(()), "{:?}\n{:?}", run.events, String::from_utf8_lossy(&run.sent));
+            }
+        }
     }
 }
