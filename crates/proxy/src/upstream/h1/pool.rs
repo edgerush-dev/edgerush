@@ -15,6 +15,7 @@ use super::H1Limits;
 use crate::upstream::destination::ReuseIdentity;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use tokio::time::Instant;
@@ -39,7 +40,7 @@ struct Idle<S> {
 /// a config ([`ReuseIdentity`]).
 #[derive(Debug)]
 pub struct Pool<S> {
-    idle: HashMap<u64, Vec<Idle<S>>>,
+    idle: HashMap<u64, Vec<Idle<S>>, BuildHasherDefault<Keyed>>,
     /// Kept as a number so the whole-worker bound costs no walking.
     total: usize,
 }
@@ -47,7 +48,7 @@ pub struct Pool<S> {
 impl<S> Default for Pool<S> {
     fn default() -> Self {
         Self {
-            idle: HashMap::new(),
+            idle: HashMap::default(),
             total: 0,
         }
     }
@@ -150,6 +151,31 @@ impl<S> Pool<S> {
     fn forget(&mut self, key: u64) {
         if let Some(held) = self.idle.remove(&key) {
             self.total -= held.len();
+        }
+    }
+}
+
+/// Hashes a destination's key, which is a number this process handed out and not anything a
+/// client or a config chose, so no key can be picked to collide with others and a keyed
+/// hash would buy nothing for what it costs on every take and put. One multiplication by
+/// the golden ratio spreads keys that are neighbours over the high bits as well as the low
+/// ones, which the map sorts by too.
+#[derive(Debug, Default)]
+struct Keyed(u64);
+
+impl Hasher for Keyed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write_u64(&mut self, key: u64) {
+        self.0 = (self.0 ^ key).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    // Only keys are hashed here, which come as a `u64`; anything else still hashes.
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
         }
     }
 }
@@ -266,6 +292,24 @@ mod tests {
         let destinations = destinations(&[("web", &["127.0.0.1:1"])], keys);
         let identity = Arc::clone(destinations.at(0, 0).unwrap());
         (destinations, identity)
+    }
+
+    /// Keys handed out one after another land apart in both the bits the map files by and
+    /// the ones it tells entries apart with, so neighbours neither share buckets nor look
+    /// alike to its probe.
+    #[test]
+    fn neighbouring_keys_hash_apart() {
+        let hashes: Vec<u64> = (0..128u64)
+            .map(|key| {
+                let mut hasher = Keyed::default();
+                hasher.write_u64(key);
+                hasher.finish()
+            })
+            .collect();
+        let low: std::collections::HashSet<u64> = hashes.iter().map(|hash| hash & 127).collect();
+        let high: std::collections::HashSet<u64> = hashes.iter().map(|hash| hash >> 57).collect();
+        assert_eq!(low.len(), 128);
+        assert!(high.len() >= 100, "{}", high.len());
     }
 
     #[tokio::test(start_paused = true)]
