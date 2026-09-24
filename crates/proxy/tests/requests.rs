@@ -462,6 +462,7 @@ fn targets() -> Vec<Case> {
         case("absolute-form with a port that is not a number", "nginx-tests control_api.t:229", b"GET http://a:abc/ HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Open),
         case("absolute-form with a port too large", "Envoy codec_impl_test.cc:1239", b"GET http://a:1000000/ HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Open),
         case("a scheme in mixed case", "Envoy integration_test.cc:1678", b"GET hTtP://a/ HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(200)], Open),
+        case("a scheme that is not HTTP's", "Envoy integration_test.cc:1584", b"GET hps://a/ HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Closed),
         case("a percent sign with no digits after it", "nginx-tests http_uri.t:55", b"GET /foo% HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Open),
         case("a path above the root", "nginx-tests http_variables.t:85", b"GET /../x HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Open),
         case("an encoded slash", "Envoy protocol_integration_test.cc:4226 (03 §4)", b"GET /a%2Fb HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Open),

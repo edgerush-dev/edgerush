@@ -17,6 +17,7 @@ use crate::h1::{Framing, MOST_FIELDS, length, reason};
 use crate::hop_by_hop::{is_token_byte, options_of};
 use crate::upstream::h1::H1Limits;
 use edgerush_router::Fields;
+use http::uri::Scheme;
 use http::{Method, StatusCode, Uri, Version};
 
 /// Why a client's request cannot be read, and so what it is answered with.
@@ -412,6 +413,17 @@ fn parse_with<const N: usize>(
         .path
         .and_then(|target| target.parse::<Uri>().ok())
         .ok_or(RequestError::Malformed("its target is not one"))?;
+    // A target in absolute-form names `http` or `https`, which `Uri` reads in any letter
+    // case: a gateway of HTTP is no forward proxy for any other scheme, and a request for
+    // one is not served as though it named HTTP.
+    if target
+        .scheme()
+        .is_some_and(|scheme| *scheme != Scheme::HTTP && *scheme != Scheme::HTTPS)
+    {
+        return Err(RequestError::Malformed(
+            "its target names a scheme that is not HTTP's",
+        ));
+    }
 
     // The parser holds a field name to a token and a value to what a value may be, which
     // is all a header map would: nothing is checked again (the `h1_request` fuzz target
@@ -654,6 +666,28 @@ mod tests {
             "http://shop.test/a#b",
             "http://shop.test#b",
         ] {
+            let bytes = format!("GET {target} HTTP/1.1\r\nhost: shop.test\r\n\r\n");
+            assert!(
+                matches!(refused(bytes.as_bytes()), RequestError::Malformed(_)),
+                "{target}"
+            );
+        }
+    }
+
+    /// An absolute-form target is for `http` or `https`, whatever its letter case, and
+    /// nothing else: a gateway of HTTP is not a forward proxy for other schemes, and a
+    /// request for one is refused rather than served as though it named HTTP.
+    #[test]
+    fn a_target_of_another_scheme_is_refused() {
+        for target in [
+            "http://shop.test/a",
+            "HTTPS://shop.test/a",
+            "hTtP://shop.test",
+        ] {
+            let bytes = format!("GET {target} HTTP/1.1\r\nhost: shop.test\r\n\r\n");
+            assert_eq!(head(bytes.as_bytes()).target, target);
+        }
+        for target in ["hps://shop.test/a", "ftp://shop.test/a", "ws://shop.test/"] {
             let bytes = format!("GET {target} HTTP/1.1\r\nhost: shop.test\r\n\r\n");
             assert!(
                 matches!(refused(bytes.as_bytes()), RequestError::Malformed(_)),
