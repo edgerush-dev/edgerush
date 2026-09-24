@@ -532,8 +532,9 @@ fn decimal_len(number: u64) -> usize {
 /// (`edgerush_filters::RESERVED`); this is the backstop, so that what is sent is what was
 /// decided and not what something along the way added.
 ///
-/// What it writes is [`head_len`] bytes, which a caller makes room for first; a head over
-/// the bound is refused before anything is written.
+/// What it writes is `len` bytes, which the caller has from [`head_len`] for this head and
+/// makes room for first; the fields are gone through once more only to write them. A head
+/// over the bound is refused before anything is written.
 ///
 /// # Errors
 ///
@@ -545,9 +546,10 @@ pub fn write_head<F: OutgoingFields + ?Sized>(
     uri: &Uri,
     headers: &F,
     sending: Sending,
+    len: usize,
     limits: &H1Limits,
 ) -> Result<(), CodecError> {
-    if head_len(method, uri, headers, sending) > limits.head {
+    if len > limits.head {
         return Err(CodecError::HeadTooLong { limit: limits.head });
     }
     let target = origin_form(uri);
@@ -2457,12 +2459,16 @@ mod tests {
             );
         }
         let mut out = Vec::new();
+        let method = Method::from_bytes(method.as_bytes()).unwrap();
+        let uri = target.parse::<Uri>().unwrap();
+        let len = head_len(&method, &uri, &headers, sending);
         write_head(
             &mut out,
-            &Method::from_bytes(method.as_bytes()).unwrap(),
-            &target.parse::<Uri>().unwrap(),
+            &method,
+            &uri,
             &headers,
             sending,
+            len,
             &H1Limits::default(),
         )
         .unwrap();
@@ -2532,12 +2538,15 @@ mod tests {
         };
         let mut headers = HeaderMap::new();
         headers.insert("x-long", HeaderValue::from_static("0123456789abcdef"));
+        let uri = "/x".parse().unwrap();
+        let len = head_len(&Method::GET, &uri, &headers, Sending::None);
         let written = write_head(
             &mut out,
             &Method::GET,
-            &"/x".parse().unwrap(),
+            &uri,
             &headers,
             Sending::None,
+            len,
             &limits,
         );
         assert_eq!(written, Err(CodecError::HeadTooLong { limit: 16 }));
@@ -2783,7 +2792,7 @@ mod tests {
             let uri: Uri = path.parse().unwrap();
             let mut out = b"before".to_vec();
             let said = head_len(&method, &uri, &headers, sending);
-            write_head(&mut out, &method, &uri, &headers, sending, &H1Limits::default()).unwrap();
+            write_head(&mut out, &method, &uri, &headers, sending, said, &H1Limits::default()).unwrap();
             prop_assert_eq!(out.len() - b"before".len(), said);
         }
 

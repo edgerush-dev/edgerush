@@ -27,7 +27,7 @@ use edgerush_proxy::hop_by_hop::{nominated, strip_response};
 use edgerush_proxy::raw::{RawAnswer, RawHead};
 use edgerush_proxy::upstream::auth::challenges;
 use edgerush_proxy::upstream::h1::H1Limits;
-use edgerush_proxy::upstream::h1::codec::{Sending, filter_declaration, write_head};
+use edgerush_proxy::upstream::h1::codec::{Sending, filter_declaration, head_len, write_head};
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::request::Parts;
 use http::{Method, Request, StatusCode, Uri};
@@ -257,18 +257,20 @@ fn decided_map(sent: &Bytes) -> Parts {
 }
 
 // Writing a decided request's head for the upstream, both ways: the usual request, and one
-// the rule changes. Into room made beforehand, as the exchange makes it.
+// the rule changes. Its length worked out first and room made for it, as the exchange does.
 #[library_benchmark]
 #[bench::usual_form(decided_raw(&sent("/pages/about?lang=en", Some("shop.example.com"))))]
 #[bench::with_header_changes(decided_raw(&sent("/cart/items?page=3", Some("shop.example.com"))))]
 fn write_raw(head: RawHead) -> (RawHead, Vec<u8>) {
     let mut out = Vec::with_capacity(2048);
+    let len = head_len(head.method(), head.uri(), black_box(&head), Sending::None);
     let written = write_head(
         &mut out,
         head.method(),
         head.uri(),
         black_box(&head),
         Sending::None,
+        len,
         &H1Limits::default(),
     );
     assert!(written.is_ok(), "written");
@@ -280,12 +282,19 @@ fn write_raw(head: RawHead) -> (RawHead, Vec<u8>) {
 #[bench::with_header_changes(decided_map(&sent("/cart/items?page=3", Some("shop.example.com"))))]
 fn write_map(head: Parts) -> (Parts, Vec<u8>) {
     let mut out = Vec::with_capacity(2048);
+    let len = head_len(
+        &head.method,
+        &head.uri,
+        black_box(&head.headers),
+        Sending::None,
+    );
     let written = write_head(
         &mut out,
         &head.method,
         &head.uri,
         black_box(&head.headers),
         Sending::None,
+        len,
         &H1Limits::default(),
     );
     assert!(written.is_ok(), "written");

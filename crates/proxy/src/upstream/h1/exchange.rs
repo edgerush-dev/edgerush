@@ -487,7 +487,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         if head <= limits.head {
             self.stage_room(head)?;
         }
-        write_head(&mut self.outgoing, method, uri, headers, sending, limits)?;
+        write_head(
+            &mut self.outgoing,
+            method,
+            uri,
+            headers,
+            sending,
+            head,
+            limits,
+        )?;
         self.head_left = self.outgoing.len();
         // A request that asks to be told before it sends its body has its head go out
         // alone; what follows waits for the upstream to answer, or for the wait to end.

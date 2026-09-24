@@ -968,12 +968,15 @@ upstreams:
                 let limits = crate::upstream::h1::H1Limits::default();
                 let sending = Sending::Length(3);
                 let mut by_map_head = Vec::new();
-                write_head(&mut by_map_head, map.method(), map.uri(), &map.headers, sending, &limits)
+                let map_len = head_len(map.method(), map.uri(), &map.headers, sending);
+                write_head(&mut by_map_head, map.method(), map.uri(), &map.headers, sending, map_len, &limits)
                     .map_err(|error| TestCaseError::fail(error.to_string()))?;
                 let mut by_raw_head = Vec::new();
-                write_head(&mut by_raw_head, raw.method(), raw.uri(), &raw, sending, &limits)
+                let raw_len = head_len(raw.method(), raw.uri(), &raw, sending);
+                write_head(&mut by_raw_head, raw.method(), raw.uri(), &raw, sending, raw_len, &limits)
                     .map_err(|error| TestCaseError::fail(error.to_string()))?;
-                prop_assert_eq!(by_raw_head.len(), head_len(raw.method(), raw.uri(), &raw, sending));
+                prop_assert_eq!(by_raw_head.len(), raw_len);
+                prop_assert_eq!(by_map_head.len(), map_len);
                 let read = |head: &[u8]| -> Vec<(String, Vec<u8>)> {
                     let mut room = [httparse::EMPTY_HEADER; 64];
                     let mut request = httparse::Request::new(&mut room);
@@ -1025,7 +1028,7 @@ upstreams:
     fn a_raw_head_with_credentials_closes_its_upstream_connection() {
         use crate::head::Forwarded;
         use crate::upstream::auth::carries_credentials;
-        use crate::upstream::h1::codec::{Sending, write_head};
+        use crate::upstream::h1::codec::{Sending, head_len, write_head};
         let sent = b"GET /account HTTP/1.1\r\nHost: shop.example.com\r\nAuthorization: NTLM TlRMTVNTUAABAAAA\r\nAccept: */*\r\n\r\n";
         let (_, mut raw) = both_heads(sent).unwrap();
         assert_eq!(decide_on("web", &mut raw, 0).as_deref(), Ok("fallback"));
@@ -1034,12 +1037,14 @@ upstreams:
         let close: Vec<&[u8]> = Fields::values(&raw, &http::header::CONNECTION).collect();
         assert_eq!(close, [b"close".as_slice()]);
         let mut out = Vec::new();
+        let len = head_len(raw.method(), raw.uri(), &raw, Sending::None);
         write_head(
             &mut out,
             raw.method(),
             raw.uri(),
             &raw,
             Sending::None,
+            len,
             &crate::upstream::h1::H1Limits::default(),
         )
         .unwrap();
