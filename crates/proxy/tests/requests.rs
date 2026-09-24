@@ -452,6 +452,12 @@ fn targets() -> Vec<Case> {
         case("absolute-form names another port than Host", "HAProxy h1_host_normalization.vtc:437 refuses it", b"GET http://a:80/ HTTP/1.1\r\nHost: a:81\r\n\r\n", &[Is(200)], Open)
             .seen(b"host: a:80\r\n"),
         case("user information in absolute-form", "Pingora test_upstream.rs:872; RFC 9110 §4.2.4", b"GET http://u:p@a/ HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Open),
+        case("absolute-form with two Hosts", "astra's review; RFC 9112 §3.2", b"GET http://a/ HTTP/1.1\r\nHost: b\r\nHost: c\r\n\r\n", &[Is(400)], Open),
+        case("absolute-form with the same Host twice", "Pingora test_upstream.rs:872; RFC 9112 §3.2", b"GET http://a/ HTTP/1.1\r\nHost: a\r\nHost: a\r\n\r\n", &[Is(400)], Open),
+        case("absolute-form with a Host that cannot be one", "astra's review; RFC 9112 §3.2", b"GET http://a/ HTTP/1.1\r\nHost: invalid/host\r\n\r\n", &[Is(400)], Open),
+        case("absolute-form with no Host from HTTP/1.1", "RFC 9112 §3.2", b"GET http://a/ HTTP/1.1\r\n\r\n", &[Is(400)], Open),
+        case("absolute-form with no Host from HTTP/1.0", "Pingora test_upstream.rs:812; HTTP/1.0 did not have to send one", b"GET http://a/ HTTP/1.0\r\n\r\n", &[Is(200)], Closed)
+            .seen(b"GET / HTTP/1.1\r\nhost: a\r\n"),
         case("absolute-form with an empty authority", "nginx-tests http_host.t:57", b"GET http:/// HTTP/1.1\r\nHost: \r\n\r\n", &[Is(400)], Closed),
         case("absolute-form with a port that is not a number", "nginx-tests control_api.t:229", b"GET http://a:abc/ HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Open),
         case("absolute-form with a port too large", "Envoy codec_impl_test.cc:1239", b"GET http://a:1000000/ HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Open),

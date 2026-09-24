@@ -18,7 +18,7 @@ use crate::host::{HostError, bare_host};
 use edgerush_config::{Compiled, CompiledListener, CompiledRule, UpstreamId};
 use edgerush_router::{NormaliseError, RequestParts, normalise_path};
 use http::uri::PathAndQuery;
-use http::{StatusCode, Uri};
+use http::{StatusCode, Uri, Version};
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -111,6 +111,20 @@ pub fn decide<'a, H: Head>(
         Some(authority) => Some(bare_host(authority.as_str())?.len()),
         None => None,
     };
+    // Before the target's host takes the `Host` field's place, the field an HTTP/1 request
+    // came with is held to what RFC 9112 §3.2 asks of it: one field line, holding a host,
+    // and one there at all from HTTP/1.1. Replaced first, a second field or an invalid one
+    // would be gone before anything could refuse it. A request in origin-form has its field
+    // read for routing below, and HTTP/2 carries its host as `:authority`.
+    if named.is_some() && matches!(head.version(), Version::HTTP_10 | Version::HTTP_11) {
+        match head.host_field() {
+            Ok(field) => {
+                bare_host(field)?;
+            }
+            Err(HostError::Missing) if head.version() == Version::HTTP_10 => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     head.agree_host()?;
     let host = match (named, head.uri().authority()) {
         (Some(length), Some(authority)) => {
@@ -329,6 +343,7 @@ upstreams:
     fn the_host_of_the_target_is_used_and_the_host_field_made_to_agree() {
         // An HTTP/2 request: `:authority` and no `Host` field.
         let mut h2 = head("http://shop.example.com/cart", &[]);
+        h2.version = http::Version::HTTP_2;
         assert_eq!(decide_on("web", &mut h2, 0).as_deref(), Ok("cart"));
         assert_eq!(
             h2.headers.get_all(HOST).iter().collect::<Vec<_>>(),
@@ -346,15 +361,42 @@ upstreams:
             ["shop.example.com:8080"]
         );
         assert_eq!(absolute.uri, "http://shop.example.com:8080/cart");
+    }
 
-        // Two fields, of which one agrees, are still made one.
-        let mut twice = head(
-            "http://shop.example.com/cart",
-            &[("host", "shop.example.com"), ("host", "other.example.org")],
-        );
-        assert_eq!(decide_on("web", &mut twice, 0).as_deref(), Ok("cart"));
+    /// The target's host wins over the `Host` field only once the field has been found to
+    /// be one, and one that could be a host: an HTTP/1 request with more than one `Host`
+    /// field line or an invalid one is refused, whatever its target names, and so is an
+    /// HTTP/1.1 request with none ([RFC 9112 §3.2]). HTTP/1.0 did not have to send one.
+    ///
+    /// [RFC 9112 §3.2]: https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2
+    #[test]
+    fn the_host_fields_of_an_http_1_request_are_checked_before_the_target_wins() {
+        let target = "http://shop.example.com/cart";
         assert_eq!(
-            twice.headers.get_all(HOST).iter().collect::<Vec<_>>(),
+            upstream_for(
+                target,
+                &[("host", "shop.example.com"), ("host", "other.example.org")]
+            ),
+            Err(Rejection::Host(HostError::Repeated))
+        );
+        assert_eq!(
+            upstream_for(target, &[("host", "b"), ("host", "b")]),
+            Err(Rejection::Host(HostError::Repeated))
+        );
+        assert_eq!(
+            upstream_for(target, &[("host", "invalid/host")]),
+            Err(Rejection::Host(HostError::Invalid))
+        );
+        assert_eq!(
+            upstream_for(target, &[]),
+            Err(Rejection::Host(HostError::Missing))
+        );
+
+        let mut from_1_0 = head(target, &[]);
+        from_1_0.version = http::Version::HTTP_10;
+        assert_eq!(decide_on("web", &mut from_1_0, 0).as_deref(), Ok("cart"));
+        assert_eq!(
+            from_1_0.headers.get_all(HOST).iter().collect::<Vec<_>>(),
             ["shop.example.com"]
         );
     }
@@ -401,7 +443,7 @@ upstreams:
             upstream_for("*", &host),
             Err(Rejection::Path(NormaliseError::NotAbsolute))
         );
-        let mut connect = head("shop.example.com:443", &[]);
+        let mut connect = head("shop.example.com:443", &[("host", "shop.example.com:443")]);
         connect.method = Method::CONNECT;
         assert_eq!(
             decide_on("web", &mut connect, 0),
@@ -418,7 +460,10 @@ upstreams:
         assert_eq!(decide_on("web", &mut head, 0).as_deref(), Ok("cart"));
         assert_eq!(head.uri, "/cart/items/a?next=/a/../b&x=%61");
 
-        let mut absolute = self::head("http://shop.example.com/./cart", &[]);
+        let mut absolute = self::head(
+            "http://shop.example.com/./cart",
+            &[("host", "shop.example.com")],
+        );
         assert_eq!(decide_on("web", &mut absolute, 0).as_deref(), Ok("cart"));
         assert_eq!(absolute.uri, "http://shop.example.com/cart");
     }
@@ -430,7 +475,10 @@ upstreams:
     /// [RFC 9112 §3.2.1]: https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2.1
     #[test]
     fn a_query_with_no_path_is_given_the_root() {
-        let mut head = head("http://shop.example.com?q=1", &[]);
+        let mut head = head(
+            "http://shop.example.com?q=1",
+            &[("host", "shop.example.com")],
+        );
         assert_eq!(decide_on("web", &mut head, 0).as_deref(), Ok("fallback"));
         assert_eq!(
             head.uri.path_and_query().map(PathAndQuery::as_str),
@@ -585,6 +633,7 @@ upstreams:
             "http://shop.example.com/cart",
             &[("te", "trailers"), ("content-type", "application/grpc")],
         );
+        grpc.version = http::Version::HTTP_2;
         assert_eq!(decide_on("web", &mut grpc, 0).as_deref(), Ok("cart"));
         let te: Vec<_> = grpc.headers.get_all("te").iter().collect();
         assert_eq!(te, ["trailers"]);
@@ -685,6 +734,7 @@ upstreams:
 
         // HTTP/2 has `:authority` and no `Host` field at all.
         let mut h2 = head("http://tenant.example.net/tenant", &[]);
+        h2.version = http::Version::HTTP_2;
         assert_eq!(decide_on("web", &mut h2, 0).as_deref(), Ok("search"));
 
         // Without a host in the target, the `Host` field is the host.

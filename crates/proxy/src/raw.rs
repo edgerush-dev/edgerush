@@ -227,6 +227,10 @@ impl Head for RawHead {
     fn apply(&mut self, changes: &HeaderModifier) -> Result<(), Rejection> {
         apply(self.lines.view(&self.head), &mut self.overlay, changes).map_err(|_| Rejection::Edits)
     }
+
+    fn version(&self) -> Version {
+        self.version
+    }
 }
 
 impl Forwarded for RawHead {
@@ -234,10 +238,6 @@ impl Forwarded for RawHead {
 
     fn outgoing(&self) -> &Self {
         self
-    }
-
-    fn version(&self) -> Version {
-        self.version
     }
 
     fn onward(&mut self) {

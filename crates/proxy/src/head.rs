@@ -96,6 +96,9 @@ pub trait Head {
     ///
     /// [`Rejection::Edits`] if the head cannot take them.
     fn apply(&mut self, changes: &HeaderModifier) -> Result<(), Rejection>;
+
+    /// The version it came in.
+    fn version(&self) -> Version;
 }
 
 impl Head for Parts {
@@ -159,6 +162,10 @@ impl Head for Parts {
         changes.apply(&mut self.headers);
         Ok(())
     }
+
+    fn version(&self) -> Version {
+        self.version
+    }
 }
 
 /// A request's head as the rest of its way through the gateway needs it, once the core has
@@ -170,9 +177,6 @@ pub(crate) trait Forwarded: Head {
 
     /// Its fields as they are to be written upstream.
     fn outgoing(&self) -> &Self::Outgoing;
-
-    /// The version it came in.
-    fn version(&self) -> Version;
 
     /// Makes it this hop's to send on: HTTP/1.1, and nothing kept that was about the
     /// connection it came in on.
@@ -200,10 +204,6 @@ impl Forwarded for Parts {
 
     fn outgoing(&self) -> &HeaderMap {
         &self.headers
-    }
-
-    fn version(&self) -> Version {
-        self.version
     }
 
     fn onward(&mut self) {
