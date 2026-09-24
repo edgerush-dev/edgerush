@@ -35,7 +35,9 @@ http-body-util = "0.1.5"
 # hyper, actix and Pingora all parse heads with; what it allows is not what EdgeRush
 # allows, so every head it returns is checked again here.
 httparse = "1.10"
-# The HTTP engine. Only the proxy crate may depend on these two.
+# Clients for the proxy's tests and the second oracle of its differential fuzz target: no
+# longer on the data path, which is EdgeRush's own servers and client. Only the proxy crate
+# may depend on these two.
 hyper = { version = "1.11", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "http1", "http2"] }
 # Unicode tables are left out: regex paths are matched against normalised, ASCII-only paths.

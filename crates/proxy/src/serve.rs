@@ -1,6 +1,6 @@
 //! Serving: connections come in, requests go through the request core, and what it
-//! forwards goes to an endpoint of the chosen upstream and comes back. This is the adapter
-//! between the HTTP engine (hyper) and the core, and the only place that knows both.
+//! forwards goes to an endpoint of the chosen upstream and comes back. This is where
+//! EdgeRush's own servers, of HTTP/1 and of HTTP/2, meet the core.
 //!
 //! Bodies stream in both directions and are never held here. Upstream connections are
 //! HTTP/1.1, by EdgeRush's own client and pool.
@@ -11,14 +11,15 @@
 //! connections belong to the data plane, not to a snapshot, and outlive every reload.
 //!
 //! A connection is served on the worker that took it, and stays there: everything it
-//! spawns goes into that worker's `LocalSet` ([`OnThisWorker`]), so nothing a request
-//! touches need be `Send`. That is what lets a worker own things a thread cannot share —
+//! spawns goes into that worker's `LocalSet`, so nothing a request touches need be
+//! `Send`. That is what lets a worker own things a thread cannot share —
 //! the pool of upstream connections to come, above all.
 
 use crate::downstream::detect::{Protocol, detect};
 use crate::downstream::h1::connection::{self as h1, Answered};
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h1::deadlines::Bounds;
+use crate::downstream::h2;
 use crate::head::Forwarded;
 use crate::interim::Interim;
 use crate::linger::{self, Lent, linger};
@@ -35,16 +36,13 @@ use crate::upstream::h1::codec::{OutgoingFields, Sending};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, nothing_to_say};
 use crate::upstream::h1::pool::{Lease, Pool};
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use edgerush_config::{Compiled, CompiledRule};
 use edgerush_router::Fields;
 use http::uri::{Authority, Scheme};
 use http::{HeaderName, Method, Request, Response, Uri, Version};
-use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
-use hyper::rt::Executor;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use std::cell::{Cell, RefCell};
-use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -86,21 +84,6 @@ impl Default for Deadlines {
             first_request: FIRST_REQUEST,
             next_request: NEXT_REQUEST,
         }
-    }
-}
-
-/// Where the futures the engine spawns of its own accord go: the worker that is serving
-/// the connection they belong to, never a thread pool. A worker is a single-threaded
-/// runtime and a `LocalSet`, so a request and everything it holds stay on one core and
-/// need not be `Send`.
-#[derive(Debug, Clone, Copy, Default)]
-struct OnThisWorker;
-
-impl<F: Future<Output = ()> + 'static> Executor<F> for OnThisWorker {
-    fn execute(&self, future: F) {
-        // The engine only spawns while serving a connection, and a connection is only
-        // ever served inside a worker's LocalSet, which is the one this goes into.
-        let _detached = tokio::task::spawn_local(future);
     }
 }
 
@@ -669,29 +652,11 @@ impl Worker {
         // Set when the engine hands over the first request, which is the end of the one
         // stretch its own deadlines do not cover.
         let asked = Rc::new(Cell::new(false));
-        let asking = Rc::clone(&asked);
         let (ours, ours_asking) = (Rc::clone(&connection), Rc::clone(&asked));
-        // Every request clones a handle, as the engine wants futures that own what they
-        // use. A handle of the connection's own keeps that count off a line of cache that
-        // all the workers would otherwise write to.
-        let service = service_fn(move |request| {
-            asking.set(true);
-            let connection = Rc::clone(&connection);
-            async move {
-                // Where the engine's body stops: from here on the request's body is one
-                // any engine could have read.
-                let request = request.map(RequestBody::Hyper);
-                let response = Rc::clone(&connection.worker)
-                    .handle(listener, request, None)
-                    .await
-                    .into_response();
-                Ok::<_, Infallible>(response)
-            }
-        });
         // Lent rather than given, so that it comes back once the engine is done with it.
         let (lent, back) = Lent::new(stream);
-        // Told apart by our own detector: HTTP/1 served by our own server, HTTP/2 by the
-        // engine's (14 §9).
+        // Told apart by our own detector, and each served by our own server: HTTP/1 by the
+        // one of 14, HTTP/2 over h2 (15 step 2).
         let serving = async move {
             match detect(lent).await {
                 Ok(Some((Protocol::Http1, replay))) => {
@@ -726,9 +691,22 @@ impl Worker {
                     .await;
                 }
                 Ok(Some((Protocol::Http2, replay))) => {
-                    let _closed = hyper::server::conn::http2::Builder::new(OnThisWorker)
-                        .serve_connection(TokioIo::new(replay), service)
-                        .await;
+                    let worker = Rc::clone(&ours.worker);
+                    let storage = Rc::clone(worker.blocks.borrow().storage());
+                    let dating = Rc::clone(&worker);
+                    let date = Rc::new(move || dating.date.get());
+                    let respond = Rc::new(move |request: Request<RequestBody>| {
+                        ours_asking.set(true);
+                        Rc::clone(&ours.worker).handle(listener, request, None)
+                    });
+                    h2::connection::serve(
+                        replay,
+                        h2::connection::Settings::default(),
+                        storage,
+                        date,
+                        respond,
+                    )
+                    .await;
                 }
                 // Closed having said nothing, or failed before saying enough.
                 Ok(None) | Err(_) => {}
@@ -1132,53 +1110,24 @@ pub(crate) fn is_about_one_connection(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::rt::Executor;
+    use hyper_util::rt::TokioIo;
+
+    /// Where the futures hyper's HTTP/2 client spawns go: this worker's `LocalSet`.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct OnThisWorker;
+
+    impl<F: Future<Output = ()> + 'static> Executor<F> for OnThisWorker {
+        fn execute(&self, future: F) {
+            let _detached = tokio::task::spawn_local(future);
+        }
+    }
     use edgerush_config::{Config, compile};
     use http::StatusCode;
-    use http_body_util::{BodyExt, Empty, Full};
+    use http_body_util::{BodyExt, Empty};
     use std::num::NonZeroUsize;
     use std::rc::Rc;
     use std::time::Duration;
-
-    /// The engine must take a service, and a body, that cannot leave the thread they were
-    /// made on: a worker's own things — the pool of upstream connections above all — will
-    /// be exactly that, and an executor that wanted `Send` would refuse them. HTTP/2 is
-    /// where it would refuse, because the engine spawns a future for every stream, so both
-    /// protocols are asked here.
-    #[test]
-    fn the_engine_serves_what_cannot_leave_the_worker() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let local = tokio::task::LocalSet::new();
-        runtime.block_on(local.run_until(async {
-            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = socket.local_addr().unwrap();
-            tokio::task::spawn_local(async move {
-                loop {
-                    let (stream, _) = socket.accept().await.unwrap();
-                    let _detached = tokio::task::spawn_local(async move {
-                        // An Rc is held for the life of the connection and cloned into
-                        // every request: nothing here could be sent to another thread.
-                        let answer = Rc::new(Bytes::from_static(b"on this worker"));
-                        let service = service_fn(move |_| {
-                            let answer = Rc::clone(&answer);
-                            async move {
-                                let body = Full::new(Bytes::clone(&answer));
-                                Ok::<_, Infallible>(Response::new(body))
-                            }
-                        });
-                        let _closed = hyper_util::server::conn::auto::Builder::new(OnThisWorker)
-                            .serve_connection(TokioIo::new(stream), service)
-                            .await;
-                    });
-                }
-            });
-
-            assert_eq!(asked_over_http1(address).await, "on this worker");
-            assert_eq!(asked_over_http2(address).await, "on this worker");
-        }));
-    }
 
     /// A connect that never completes is given up on at the limit and not before, and one
     /// that completes inside it is kept (linkerd2-proxy tests its connect timeout the same
@@ -2287,35 +2236,6 @@ upstreams:
         sender.send_request(request).await.unwrap().status()
     }
 
-    /// What one HTTP/1.1 request to `address` answers, as text.
-    async fn asked_over_http1(address: SocketAddr) -> String {
-        let stream = TcpStream::connect(address).await.unwrap();
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .unwrap();
-        let _detached = tokio::task::spawn_local(async move {
-            let _closed = connection.await;
-        });
-        let request = Request::new(Empty::<Bytes>::new());
-        collected(sender.send_request(request).await.unwrap()).await
-    }
-
-    /// The same over HTTP/2, which the engine tells apart by the preface the client sends.
-    async fn asked_over_http2(address: SocketAddr) -> String {
-        let stream = TcpStream::connect(address).await.unwrap();
-        let (mut sender, connection) =
-            hyper::client::conn::http2::handshake(OnThisWorker, TokioIo::new(stream))
-                .await
-                .unwrap();
-        let _detached = tokio::task::spawn_local(async move {
-            let _closed = connection.await;
-        });
-        let mut request = Request::new(Empty::<Bytes>::new());
-        *request.version_mut() = Version::HTTP_2;
-        *request.uri_mut() = format!("http://{address}/").parse().unwrap();
-        collected(sender.send_request(request).await.unwrap()).await
-    }
-
     /// The status one HTTP/2 request to `address` is answered with.
     async fn status_over_http2(address: SocketAddr) -> StatusCode {
         let stream = TcpStream::connect(address).await.unwrap();
@@ -2330,12 +2250,6 @@ upstreams:
         *request.version_mut() = Version::HTTP_2;
         *request.uri_mut() = format!("http://{address}/").parse().unwrap();
         sender.send_request(request).await.unwrap().status()
-    }
-
-    async fn collected(response: Response<hyper::body::Incoming>) -> String {
-        assert_eq!(response.status(), 200);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        String::from_utf8(body.to_vec()).unwrap()
     }
 
     /// A config with the named upstreams, each at the address given.

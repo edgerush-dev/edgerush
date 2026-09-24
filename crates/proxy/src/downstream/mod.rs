@@ -1,8 +1,8 @@
 //! EdgeRush's own way of serving a client.
 //!
-//! Every connection goes through the detector: HTTP/1 to EdgeRush's own server, HTTP/2 to
-//! hyper's until a direct HTTP/2 server of our own passes its gates
-//! ([14 §9](../../../docs/14-downstream-server.md)). The HTTP/1 pieces are pure, bytes in
+//! Every connection goes through the detector: HTTP/1 to EdgeRush's own server
+//! ([14](../../../docs/14-downstream-server.md)), HTTP/2 to its own server over h2
+//! ([15](../../../docs/15-http2-and-grpc.md)). The HTTP/1 pieces are pure, bytes in
 //! and an answer out, with no socket, except the connection driver that holds them.
 
 // The HTTP/1 pieces answer only to their own tests until the connection driver arrives

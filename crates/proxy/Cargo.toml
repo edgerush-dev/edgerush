@@ -12,8 +12,9 @@ publish.workspace = true
 # in EdgeRush turns this on, and the workspace's checks never build with it.
 # A stopped clock is what makes a scripted run deterministic, and it is `test-util`
 # that lets anything but a test stop one. hyper's client is the second oracle the
-# differential target holds EdgeRush's own client against.
-fuzzing = ["tokio/test-util", "hyper/client"]
+# differential target holds EdgeRush's own client against, and the only reason hyper is
+# built outside the tests.
+fuzzing = ["tokio/test-util", "dep:hyper", "dep:hyper-util", "hyper/client"]
 
 [dependencies]
 arc-swap.workspace = true
@@ -27,8 +28,8 @@ http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
 httparse.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 

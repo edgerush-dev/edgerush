@@ -5,6 +5,7 @@
 //! tests, as `downstream`'s expectation of dead code says.
 
 pub(crate) mod body;
+pub(crate) mod connection;
 pub(crate) mod writer;
 
 #[cfg(test)]

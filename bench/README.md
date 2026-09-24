@@ -57,9 +57,9 @@ two is comparing them at the same bounds; every run writes what they were into
 
 ## The variants
 
-Both EdgeRush variants serve HTTP/1 clients by EdgeRush's own server and HTTP/2 clients
-by hyper's, and reach their upstreams by EdgeRush's own client
-([14 §9](../../docs/14-downstream-server.md)).
+Both EdgeRush variants serve HTTP/1 and HTTP/2 clients by EdgeRush's own servers, HTTP/2
+over h2 ([15](../../docs/15-http2-and-grpc.md)), and reach their upstreams by EdgeRush's own
+client ([14 §9](../../docs/14-downstream-server.md)).
 
 For the client optimisation rerun, use the original machine and fixed frequency with
 `WORKERS=2 REPS=3 VARIANTS="ours nginx" IDLE_PER_DESTINATION=1024

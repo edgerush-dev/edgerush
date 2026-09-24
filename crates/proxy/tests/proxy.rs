@@ -1317,3 +1317,136 @@ async fn cancelling_one_http2_stream_leaves_the_rest_of_its_connection_alone() {
     let body = within(answered.into_body().collect()).await.unwrap();
     assert!(!body.to_bytes().is_empty());
 }
+
+// ===== HTTP/2 clients, served by EdgeRush's own server over h2 (15 step 2) =====
+
+/// An HTTP/2 request to `target` on the everything-to-`any` proxy at `proxy`.
+fn h2(method: Method, proxy: SocketAddr, target: &str, body: ClientBody) -> Request<ClientBody> {
+    Request::builder()
+        .method(method)
+        .version(Version::HTTP_2)
+        .uri(format!("http://{proxy}{target}"))
+        .body(body)
+        .unwrap()
+}
+
+/// An upstream that reads a request's head and answers every request with `answer`, as
+/// written, and then closes.
+async fn saying(answer: &'static [u8]) -> SocketAddr {
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = socket.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut byte = [0u8; 1];
+                while !seen.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    seen.push(byte[0]);
+                }
+                let _ = stream.write_all(answer).await;
+            });
+        }
+    });
+    address
+}
+
+/// An upload over HTTP/2 reaches the upstream whole, and so does the answer that echoes it:
+/// both directions stream through the one server, a megabyte each way.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_http2_upload_and_its_echo_go_through_whole() {
+    let any = upstream("any").await;
+    let proxy = proxy(&everything_to(&[("web", any)], "0")).await["web"];
+    let upload: Vec<u8> = (0..1 << 20).map(|n| (n % 251) as u8).collect();
+    let body = Full::new(Bytes::from(upload.clone())).boxed();
+    let response = within(client(true).request(h2(Method::POST, proxy, "/echo", body)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let echoed = within(response.into_body().collect()).await.unwrap();
+    assert!(echoed.to_bytes() == upload, "the echo is not the upload");
+}
+
+/// What an upstream says about its connection to us never reaches an HTTP/2 client — h2
+/// would refuse to send it — and the answer arrives all the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_s_connection_fields_never_reach_an_http2_client() {
+    let any = upstream("any").await;
+    let proxy = proxy(&everything_to(&[("web", any)], "0")).await["web"];
+    let request = h2(Method::GET, proxy, "/hop", Empty::new().boxed());
+    let (status, headers, _) = send(request).await;
+    assert_eq!(status, StatusCode::OK);
+    for hop in ["connection", "keep-alive", "x-upstream-hop"] {
+        assert!(
+            !headers.contains_key(hop),
+            "{hop} reached the client: {headers:?}"
+        );
+    }
+    assert_eq!(headers["www-authenticate"], "Basic realm=\"origin\"");
+}
+
+/// An upstream's trailers reach an HTTP/2 client as trailers, after the body.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_s_trailers_reach_an_http2_client() {
+    let upstream = saying(
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ntrailer: x-sum\r\n\r\n\
+          5\r\nhello\r\n0\r\nx-sum: 7\r\n\r\n",
+    )
+    .await;
+    let proxy = proxy(&everything_to(&[("web", upstream)], "0")).await["web"];
+    let request = h2(Method::GET, proxy, "/", Empty::new().boxed());
+    let response = within(client(true).request(request)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let collected = within(response.into_body().collect()).await.unwrap();
+    let trailers = collected.trailers().cloned();
+    assert_eq!(collected.to_bytes(), Bytes::from_static(b"hello"));
+    assert_eq!(
+        trailers.map(|t| t["x-sum"].clone()),
+        Some("7".parse().unwrap())
+    );
+}
+
+/// An answer of the proxy's own, over HTTP/2, carries a date as every answer does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_of_the_proxy_s_own_over_http2_is_dated() {
+    let proxy = shop().await;
+    // The authority is the proxy's address, which no route is for.
+    let (status, headers, _) = send(h2(Method::GET, proxy, "/", Empty::new().boxed())).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(headers.contains_key("date"), "{headers:?}");
+}
+
+/// Twice the streams the server allows at once, on one connection: the client holds back
+/// what does not fit, and every one is answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_hundred_streams_on_one_connection_are_all_answered() {
+    let any = upstream("any").await;
+    let proxy = proxy(&everything_to(&[("web", any)], "0")).await["web"];
+    let stream = TcpStream::connect(proxy).await.unwrap();
+    let (sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .unwrap();
+    let _pumping = tokio::spawn(connection);
+    let asked: Vec<_> = (0..200)
+        .map(|n| {
+            let mut sender = sender.clone();
+            let request = h2(Method::GET, proxy, &format!("/n/{n}"), Empty::new().boxed());
+            tokio::spawn(async move {
+                let response = sender.send_request(request).await.unwrap();
+                let status = response.status();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                (status, body)
+            })
+        })
+        .collect();
+    for (n, asking) in asked.into_iter().enumerate() {
+        let (status, body) = within(asking).await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let seen = String::from_utf8(body.to_vec()).unwrap();
+        assert!(seen.starts_with(&format!("GET /n/{n} ")), "{seen}");
+    }
+}
