@@ -30,8 +30,9 @@ use std::time::{Duration, Instant};
 /// Server connection IDs are 20 bytes, as 16 §3 has them.
 const ID_LEN: usize = 20;
 
-/// The field-section limit 16 §6 announces: the H1 and H2 head limit.
-const FIELD_SECTION: u64 = 64 << 10;
+/// The field-section size 16 §6 announces to quiche: twice the 64 KiB head limit, which
+/// the driver keeps itself.
+const FIELD_SECTION: u64 = 128 << 10;
 
 fn server_ids() -> quiche::Config {
     server_config(server_tls())
@@ -669,8 +670,10 @@ fn headers_are_refused_on_declared_length() {
 }
 
 /// A field section within the frame bound but past the announced size once decoded closes
-/// the whole connection, as the frame bound does: there is no answer for the one request,
-/// where HTTP/1 and HTTP/2 answer 431 and keep the connection (16 §6).
+/// the whole connection, as the frame bound does: there is no answer for the one request.
+/// Below the announced size a head reaches the driver whole, which is why quiche is told
+/// twice the head limit: a head that is only too big is the driver's to answer 431
+/// (16 §6).
 #[test]
 fn a_field_section_past_the_announced_size_closes_the_connection() {
     let (mut pipe, mut server) = raw_pipe();
