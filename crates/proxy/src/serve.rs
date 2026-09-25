@@ -3217,6 +3217,11 @@ upstreams:
                     let at = socket.local_addr().unwrap();
                     let _first = TcpStream::connect(at).await.unwrap();
                     let _second = TcpStream::connect(at).await.unwrap();
+                    // A connect can return before the listener has the connection in its
+                    // queue: on Linux the handshake's last step reaches the listening side
+                    // just after. Nothing can be asked about the queue without taking from
+                    // it, so the kernel is given the moment it needs.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
 
                     within(worker.accept(&socket)).await.unwrap().unwrap();
                     let ran = Rc::new(Cell::new(false));
