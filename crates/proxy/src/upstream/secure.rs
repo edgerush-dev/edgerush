@@ -7,6 +7,7 @@
 //! An HTTP/2 upstream must agree on `h2` in the handshake: one that does not is a failed
 //! connection, never one spoken to in HTTP/1.1 instead (15 §5).
 
+use crate::gathered::Gathered;
 use crate::tls::TlsError;
 use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
 use boring::x509::X509;
@@ -133,8 +134,8 @@ impl Secure {
 pub(crate) enum Socket {
     /// Plain TCP.
     Plain(TcpStream),
-    /// TLS over TCP.
-    Secured(SslStream<TcpStream>),
+    /// TLS over TCP, a request's pieces gathered into records ([`Gathered`]).
+    Secured(Gathered<SslStream<TcpStream>>),
 }
 
 impl AsyncRead for Socket {

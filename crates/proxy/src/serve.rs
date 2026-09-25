@@ -21,6 +21,7 @@ use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h1::deadlines::Bounds;
 use crate::downstream::h2;
 use crate::drain::Drain;
+use crate::gathered::Gathered;
 use crate::grpc::answer::{Answered as GrpcAnswered, Count, is_grpc_answer};
 use crate::grpc::call::Call;
 use crate::head::Forwarded;
@@ -889,7 +890,10 @@ impl Worker {
                     let _unset = socket.set_nodelay(true);
                     match secure {
                         None => Ok(UpstreamSocket::Plain(socket)),
-                        Some(secure) => secure.connect(socket).await.map(UpstreamSocket::Secured),
+                        Some(secure) => secure
+                            .connect(socket)
+                            .await
+                            .map(|secured| UpstreamSocket::Secured(Gathered::new(secured))),
                     }
                 };
                 let socket = connect_within(self.limits.connect, opening).await?;
@@ -1016,7 +1020,8 @@ impl Worker {
                     if secured.ssl().selected_alpn_protocol() == Some(tls::H2) {
                         serve_h2(ours, ours_asking, deadlines, secured).await;
                     } else {
-                        serve_h1(ours, ours_asking, deadlines, secured).await;
+                        // An answer's pieces sealed as one record, not one each.
+                        serve_h1(ours, ours_asking, deadlines, Gathered::new(secured)).await;
                     }
                 }
             }
@@ -3135,6 +3140,110 @@ upstreams:
         let mut answer = Vec::new();
         let _ended = within(stream.read_to_end(&mut answer)).await;
         String::from_utf8_lossy(&answer).into_owned()
+    }
+
+    /// A TCP stream that keeps every byte it reads: what arrived on the wire, records and
+    /// all, under the TLS the client puts over it.
+    #[derive(Debug)]
+    struct Tapped {
+        stream: TcpStream,
+        read: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl AsyncRead for Tapped {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let before = buf.filled().len();
+            let polled = Pin::new(&mut this.stream).poll_read(context, buf);
+            this.read
+                .borrow_mut()
+                .extend_from_slice(&buf.filled()[before..]);
+            polled
+        }
+    }
+
+    impl AsyncWrite for Tapped {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().stream).poll_write(context, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().stream).poll_flush(context)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().stream).poll_shutdown(context)
+        }
+    }
+
+    /// An answer over TLS is one record, its head and body sealed together, as it is one
+    /// write in plain TCP: sealed a piece at a time it was two records and two sends,
+    /// which cost more than the rest of TLS. Counted on the second answer of a connection:
+    /// the first comes with the session tickets.
+    #[tokio::test]
+    async fn an_answer_over_tls_is_one_record() {
+        use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let certificates = vec![crate::tls::testing::certificate(&["example.test"])];
+                let (front, _worker) = serving_secured_worker(upstream, certificates).await;
+                let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+                builder.set_verify(SslVerifyMode::NONE);
+                let config = builder.build().configure().unwrap().verify_hostname(false);
+                let read = Rc::new(RefCell::new(Vec::new()));
+                let tapped = Tapped {
+                    stream: TcpStream::connect(front).await.unwrap(),
+                    read: Rc::clone(&read),
+                };
+                let mut client = within(tokio_boring::connect(config, "example.test", tapped))
+                    .await
+                    .unwrap();
+                let mut answers = Vec::new();
+                let mut arrived = 0;
+                for _ in 0..2 {
+                    arrived = read.borrow().len();
+                    client
+                        .write_all(b"GET / HTTP/1.1\r\nhost: example.test\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut answer = Vec::new();
+                    while !(answer.ends_with(b"ok") && answer.windows(4).any(|w| w == b"\r\n\r\n"))
+                    {
+                        let mut some = [0; 512];
+                        let got = within(client.read(&mut some)).await.unwrap();
+                        assert_ne!(got, 0, "{:?}", String::from_utf8_lossy(&answer));
+                        answer.extend_from_slice(&some[..got]);
+                    }
+                    answers.push(String::from_utf8_lossy(&answer).into_owned());
+                }
+                assert!(
+                    answers[1].starts_with("HTTP/1.1 200 OK\r\n"),
+                    "{}",
+                    answers[1]
+                );
+                // The records the second answer came in: a type, a version and a length each.
+                let wire = read.borrow()[arrived..].to_vec();
+                let mut records = 0;
+                let mut at = 0;
+                while let Some(header) = wire.get(at..at + 5) {
+                    records += 1;
+                    at += 5 + usize::from(u16::from_be_bytes([header[3], header[4]]));
+                }
+                assert_eq!(at, wire.len(), "records cut short");
+                assert_eq!(records, 1, "{} bytes in {records} records", wire.len());
+            })
+            .await;
     }
 
     /// An `https` listener speaks HTTP/2 to a client that agreed on it in the handshake,

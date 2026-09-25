@@ -5,6 +5,7 @@
 //! balancer between) that a new one would meet, as Pingora's documentation warns, and a
 //! probe must not take a place in the pool that requests are waiting for.
 
+use crate::gathered::Gathered;
 use crate::upstream::destination::ReuseIdentity;
 use crate::upstream::secure::Socket;
 use bytes::{Buf, Bytes};
@@ -36,7 +37,7 @@ async fn probe(destination: &ReuseIdentity, probe: &Probe) -> Option<bool> {
     let (socket, authority) = match destination.secure() {
         None => (Socket::Plain(socket), destination.address().to_string()),
         Some(secure) => (
-            Socket::Secured(secure.connect(socket).await.ok()?),
+            Socket::Secured(Gathered::new(secure.connect(socket).await.ok()?)),
             secure.source().server_name.clone(),
         ),
     };
