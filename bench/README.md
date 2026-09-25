@@ -40,6 +40,9 @@ bench/run.sh h2 [RATE] [STREAMED]   # HTTP/2 clients alone (25,000/s, 20/s): few
                                     # hot connection, latency, streamed bodies, and idle
                                     # connections at IDLE_COUNTS
 bench/run.sh summary bench/results/<run>
+bench/window.sh [RTTS] [VARIANTS]   # HTTP/2 uploads over a delayed path, by stream window
+                                    # and against NGINX: the client in a network namespace
+                                    # behind a router that adds the delay (15 §3)
 ```
 
 Results go to `bench/results/<time>/` (not committed): the raw output of every

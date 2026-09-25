@@ -38,7 +38,9 @@ use tokio::time::Instant;
 pub(crate) struct Settings {
     /// Streams a client may have open at once.
     pub(crate) streams: u32,
-    /// What a client may send on one stream before it is given more.
+    /// What a client may send on one stream before it is given more. An upload moves at
+    /// most this much a round trip: at 4 MiB it went as fast as TCP took it at 20 and
+    /// 100 ms, 2.5 and 3 times what 1 MiB moved, and 16 MiB added nothing (15 §3).
     pub(crate) stream_window: u32,
     /// The same for the whole connection.
     pub(crate) connection_window: u32,
@@ -66,7 +68,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             streams: 100,
-            stream_window: 1 << 20,
+            stream_window: 4 << 20,
             connection_window: 16 << 20,
             header_list: 64 * 1024,
             send_buffer: 400 * 1024,
@@ -374,7 +376,7 @@ mod tests {
 
     /// A stream whose upload nobody reads holds at most its stream window of the connection
     /// window, so another stream on the same connection uploads megabytes past it: 16 MiB
-    /// for the connection against 1 MiB a stream (15 §3).
+    /// for the connection against 4 MiB a stream (15 §3).
     #[test]
     fn an_upload_nobody_reads_leaves_room_for_another_on_the_connection() {
         locally(async {
@@ -389,8 +391,9 @@ mod tests {
 
             // Stalled: a full stream window sent, and never read.
             let (_stalled, mut stuck) = send.send_request(post(), false).unwrap();
+            let window = Settings::default().stream_window as usize;
             stuck
-                .send_data(Bytes::from(vec![1u8; 1 << 20]), false)
+                .send_data(Bytes::from(vec![1u8; window]), false)
                 .unwrap();
             let (never_read, _) = within(accepted.recv()).await.unwrap();
 
