@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 38758df93bd698574cae9496799fbf1d45890b34a46fcbef444dc20c611cb841 # shrinks to events = [Take(0), Open(0, 0), Open(0, 0), Take(0), Sweep(60)], streams = 1, connections = 1, waiting = 1, dialing = 1, requests = 1
+cc b8d77367af591eef7131a2734a2e76b02cafc5bbefcc1c7bebbb9a8efb36dbe9 # shrinks to events = [Take(0), Take(0), Open(0, 0), Take(0), Take(1), Open(0, 1), Take(0), Take(1), Open(0, 1), Take(0), Fail(0), PeerLimit(2806267258873507494, 1), Sweep(90)], streams = 1, connections = 2, waiting = 2, dialing = 1, requests = 2
+cc 3d21b35835d7fcf1c46dc78787c938153b8beffcde1f832298add81cda8cbf9e # shrinks to events = [Take(0), Take(0), Take(1), Take(1), Take(0), Open(0, 0), Take(1), Open(5623123705920304845, 0)], streams = 1, connections = 3, waiting = 2, dialing = 2, requests = 1
+cc 4f176e44949c84be5dc56399dd8215e43230cfad4a5a5e068f7065a819bc0ec4 # shrinks to events = [Take(0), Fail(0), Take(0), Take(1), Take(1), Take(0), End(0), Take(0), Open(1580594790027608654, 1), Fail(440802758526676699), Open(0, 0), Take(0), Open(999419270794200649, 0), Open(1320667944675926852, 0), Take(1), GoAway(7883286252299699437), Close(4266258452837841998), Take(0), Take(1), Open(7616987780208705039, 1), Open(0, 1), Fail(0)], streams = 3, connections = 3, waiting = 2, dialing = 1, requests = 1
