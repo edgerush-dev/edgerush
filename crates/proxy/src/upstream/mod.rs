@@ -11,12 +11,5 @@
 pub mod auth;
 pub mod destination;
 pub mod h1;
-// Not yet used by the data plane: the multiplexed client that sends by it is 15 step 6.
-#[cfg_attr(
-    not(any(test, feature = "fuzzing")),
-    expect(
-        dead_code,
-        reason = "sent by the HTTP/2 client of 15 step 6, still to come"
-    )
-)]
-pub mod h2;
+// Crate-private even when the fuzz targets are built: nothing of it is theirs.
+pub(crate) mod h2;

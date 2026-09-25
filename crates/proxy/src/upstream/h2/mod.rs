@@ -3,5 +3,7 @@
 //! So far, the head a request is sent with and the pool that decides which connection
 //! its stream goes on.
 
-pub mod head;
-pub mod pool;
+pub(crate) mod client;
+pub(crate) mod exchange;
+pub(crate) mod head;
+pub(crate) mod pool;

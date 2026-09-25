@@ -92,7 +92,16 @@ pub struct H1Limits {
     /// How often a worker looks over what it is keeping.
     pub sweep: Duration,
     /// How long opening a connection to an upstream may take before it is given up on.
+    /// For an HTTP/2 upstream, also how long a request may wait for a place on one.
     pub connect: Duration,
+    /// Streams at once on one HTTP/2 connection to an upstream, however many the upstream
+    /// would allow: what spreads a busy destination over several connections (15 §4).
+    pub h2_streams: u32,
+    /// HTTP/2 connections a worker keeps to any one destination, being opened and closing
+    /// ones included.
+    pub h2_connections: usize,
+    /// Requests that may wait for a place on an HTTP/2 connection to any one destination.
+    pub h2_waiting: usize,
     /// How many exchanges a worker will have in hand at once, counted from before a
     /// connection is looked for until the answer's body has been let go of.
     ///
@@ -128,6 +137,9 @@ impl Default for H1Limits {
             max_age: Duration::from_secs(5 * 60),
             sweep: Duration::from_secs(1),
             connect: Duration::from_secs(5),
+            h2_streams: 100,
+            h2_connections: 8,
+            h2_waiting: 1024,
             exchanges: 1024,
             storage: crate::storage::LIMIT,
         }

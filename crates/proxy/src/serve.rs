@@ -37,6 +37,9 @@ use crate::upstream::h1::blocks::{Blocks, SMALL, Sizes};
 use crate::upstream::h1::codec::{OutgoingFields, Sending};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, nothing_to_say};
 use crate::upstream::h1::pool::{Lease, Pool};
+use crate::upstream::h2::client::{Client as H2Client, PlaceError, Settings as H2Settings};
+use crate::upstream::h2::exchange::{self as h2_exchange, Timing};
+use crate::upstream::h2::pool::Limits as H2Limits;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use edgerush_config::{Compiled, CompiledRule, UpstreamProtocol};
@@ -116,6 +119,8 @@ enum Body {
     /// much larger than an empty answer, and every answer would otherwise carry room for
     /// it.
     Ours(Box<H1Body<TcpStream, RequestBody>>, Admitted, Watch),
+    /// An HTTP/2 upstream's answer, read by EdgeRush's own HTTP/2 client (15 step 6).
+    H2(Box<h2_exchange::Answer>, Admitted, Watch),
     /// An answer of the data plane's own. It has no body, and never will have one.
     Empty,
 }
@@ -181,6 +186,8 @@ impl Watch {
 enum BodyError {
     #[error("the upstream's answer could not be read: {0}")]
     Ours(#[from] ExchangeError),
+    #[error("the HTTP/2 upstream's answer could not be read: {0}")]
+    H2(RequestBodyError),
 }
 
 impl HttpBody for Body {
@@ -210,6 +217,16 @@ impl HttpBody for Body {
                     })
                 })
             }
+            Self::H2(answer, _place, watch) => {
+                Pin::new(&mut **answer).poll_frame(context).map(|frame| {
+                    frame.map(|frame| {
+                        frame.map_err(|error| {
+                            watch.body_failed();
+                            BodyError::H2(error)
+                        })
+                    })
+                })
+            }
             Self::Empty => Poll::Ready(None),
         }
     }
@@ -217,6 +234,7 @@ impl HttpBody for Body {
     fn is_end_stream(&self) -> bool {
         match self {
             Self::Ours(ours, ..) => ours.is_end_stream(),
+            Self::H2(answer, ..) => answer.is_end_stream(),
             Self::Empty => true,
         }
     }
@@ -224,6 +242,7 @@ impl HttpBody for Body {
     fn size_hint(&self) -> SizeHint {
         match self {
             Self::Ours(ours, ..) => ours.size_hint(),
+            Self::H2(answer, ..) => answer.size_hint(),
             Self::Empty => SizeHint::with_exact(0),
         }
     }
@@ -275,6 +294,8 @@ pub struct Worker {
     date: Cell<HttpDate>,
     /// This worker's drain, which its sweep starts once the data plane's has.
     drain: Rc<Drain>,
+    /// Its HTTP/2 connections to upstreams, many requests at once on each (15 §4).
+    h2: Rc<H2Client>,
 }
 
 /// Serves `socket`, a connection of `ours` that speaks HTTP/1, with our own server (14).
@@ -387,13 +408,6 @@ impl Snapshot {
         previous: Option<&Snapshot>,
         keys: &Keys,
     ) -> Result<Self, ProxyError> {
-        if let Some(upstream) = config
-            .upstreams
-            .iter()
-            .find(|upstream| upstream.protocol == UpstreamProtocol::Http2)
-        {
-            return Err(ProxyError::Http2Upstream(upstream.name.clone()));
-        }
         let endpoints = config
             .upstreams
             .iter()
@@ -585,6 +599,7 @@ impl Worker {
             deadlines,
             date: Cell::new(HttpDate::from_unix(unix_now())),
             drain: Rc::new(Drain::default()),
+            h2: H2Client::new(h2_settings(&limits)),
         })
     }
 
@@ -633,6 +648,7 @@ impl Worker {
             let swept = self.pool.borrow_mut().sweep(&self.limits);
             // And what a burst left parked of the blocks, down to what a quiet worker keeps.
             self.blocks.borrow_mut().sweep();
+            self.h2.sweep();
             let metrics = &self.proxy.metrics;
             for _discarded in 0..swept {
                 metrics.socket(Socket::Discarded);
@@ -651,6 +667,13 @@ impl Worker {
     #[must_use]
     pub fn idle_connections(&self) -> usize {
         self.pool.borrow().idle()
+    }
+
+    /// How many HTTP/2 connections to upstreams this worker has, open or being opened.
+    /// For tests and, later, a gauge.
+    #[must_use]
+    pub fn h2_connections(&self) -> usize {
+        self.h2.connections()
     }
 
     /// Takes a place among the exchanges this worker has in hand, if one is going.
@@ -948,12 +971,17 @@ impl Worker {
         }
 
         // Credentials can bind the upstream socket to this client, even when the
-        // response is successful. Decide after rule filters and before either client
-        // dispatches: hyper can return a socket to its pool before we see the response.
-        if crate::upstream::auth::carries_credentials(head.outgoing())
-            && let Err(rejection) = head.close_connection()
-        {
-            return self.proxy.answer(listener, rejection.into()).into();
+        // response is successful. Decide after rule filters and before the client
+        // dispatches. On HTTP/2 there is no connection of one client's to bind them to,
+        // and they are not sent at all (15 §5).
+        let multiplexed = directed.endpoint.protocol() == UpstreamProtocol::Http2;
+        if crate::upstream::auth::carries_credentials(head.outgoing()) {
+            if multiplexed {
+                return self.proxy.answer(listener, Answer::ConnectionAuth).into();
+            }
+            if let Err(rejection) = head.close_connection() {
+                return self.proxy.answer(listener, rejection.into()).into();
+            }
         }
 
         // Before either client looks for a connection or opens one: a place is what
@@ -963,6 +991,11 @@ impl Worker {
         let Some(admitted) = self.admit() else {
             return self.proxy.answer(listener, Answer::TooBusy).into();
         };
+        if multiplexed {
+            return self
+                .respond_by_h2(listener, &directed, &head, sending, body, admitted)
+                .await;
+        }
         let answered = self
             .by_ours(
                 &directed, &head, &nominated, sending, body, admitted, interim,
@@ -1007,6 +1040,87 @@ impl Worker {
         // process HTTP messages ... MUST send their own HTTP-version in forwarded messages"
         // (RFC 9110 §6.2). Our writer says HTTP/1.1, and so does a map made for HTTP/2.
         Answered::Raw(answer, body)
+    }
+
+    /// The answer of an HTTP/2 upstream, edited as an HTTP/1 upstream's would be: what its
+    /// `Connection` named and what is about its connection comes off — h2 lets none of
+    /// the latter through, and this does not rest on it — and the rule's changes are made.
+    async fn respond_by_h2<H: Forwarded>(
+        &self,
+        listener: usize,
+        directed: &Directed,
+        head: &H,
+        sending: Sending,
+        body: RequestBody,
+        admitted: Admitted,
+    ) -> Answered<Body> {
+        let storage = Rc::clone(self.blocks.borrow().storage());
+        let timing = Timing {
+            final_head: self.limits.final_head,
+            idle: self.limits.idle,
+        };
+        let exchanged = h2_exchange::exchange(
+            &self.h2,
+            &directed.endpoint,
+            head.method(),
+            head.uri(),
+            head.outgoing(),
+            sending,
+            body,
+            &storage,
+            timing,
+        )
+        .await;
+        let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
+        let (parts, answer) = match exchanged {
+            Ok(exchanged) => exchanged,
+            Err(error) => {
+                let answer = match error {
+                    h2_exchange::ExchangeError::Place(PlaceError::Full) => Answer::QueueFull,
+                    h2_exchange::ExchangeError::Place(PlaceError::TimedOut) => {
+                        Answer::QueueTimedOut
+                    }
+                    h2_exchange::ExchangeError::RequestBody(cause)
+                        if matches!(
+                            cause.downcast_ref::<RequestBodyError>(),
+                            Some(RequestBodyError::TimedOut)
+                        ) =>
+                    {
+                        Answer::BodyTimedOut
+                    }
+                    h2_exchange::ExchangeError::RequestBody(_) => Answer::BadBody,
+                    _ => Answer::UpstreamFailed,
+                };
+                // Waiting for a place, or the client's own body, is not the upstream
+                // failing.
+                if answer == Answer::UpstreamFailed
+                    && let Some(upstream) = upstream
+                {
+                    upstream.failures.inc();
+                }
+                return self.proxy.answer(listener, answer).into();
+            }
+        };
+        if let Some(upstream) = upstream {
+            upstream.responded(parts.status);
+        }
+        let watch = Watch {
+            proxy: Arc::clone(&self.proxy),
+            upstream: directed.upstream_slot,
+        };
+        let mut response = Response::from_parts(parts, Body::H2(Box::new(answer), admitted, watch));
+        let headers = response.headers_mut();
+        let nominated = crate::hop_by_hop::nominated(&*headers);
+        crate::h1::filter_declaration(headers, &nominated);
+        crate::hop_by_hop::strip_response(headers);
+        if let Some(changes) = directed
+            .rule
+            .as_ref()
+            .and_then(|rule| rule.response_headers.as_ref())
+        {
+            changes.apply(headers);
+        }
+        Answered::Map(response)
     }
 
     /// By EdgeRush's own path, the one there is.
@@ -1219,10 +1333,6 @@ pub enum ProxyError {
     /// An endpoint address that cannot be written into a request target.
     #[error("endpoint {0} cannot be part of a request target")]
     Endpoint(SocketAddr),
-    /// An upstream to be spoken to in HTTP/2, which the data plane cannot do yet
-    /// ([15](../../docs/15-http2-and-grpc.md) step 6).
-    #[error("upstream `{0}`: HTTP/2 to upstreams is not built yet")]
-    Http2Upstream(String),
     /// A listener's certificates that cannot be served.
     #[error("listener `{listener}`: {error}")]
     Tls {
@@ -1250,6 +1360,31 @@ fn at_endpoint(target: &Uri, endpoint: &Authority) -> Option<Uri> {
     parts.scheme = Some(Scheme::HTTP);
     parts.authority = Some(endpoint.clone());
     Uri::from_parts(parts).ok()
+}
+
+/// What a worker's HTTP/2 client is held to, from the worker's bounds (15 §3, §4).
+fn h2_settings(limits: &H1Limits) -> H2Settings {
+    H2Settings {
+        pool: H2Limits {
+            streams: limits.h2_streams,
+            connections: limits.h2_connections,
+            connections_total: limits.idle_total,
+            waiting: limits.h2_waiting,
+            // One connection opened at a time for a destination; demand queued meanwhile
+            // is served by it, or has the next opened (15 §4).
+            dialing: 1,
+            // Well short of the 2^30 streams a connection's identifiers allow.
+            requests: 1 << 29,
+            age: limits.max_age,
+            idle: limits.idle_timeout,
+        },
+        connect: limits.connect,
+        stream_window: 1 << 20,
+        connection_window: 16 << 20,
+        header_list: 64 * 1024,
+        send_buffer: 400 * 1024,
+        closing: Duration::from_secs(10),
+    }
 }
 
 /// Seconds since the Unix epoch, for dating answers.
@@ -2482,19 +2617,6 @@ upstreams:
             .await;
     }
 
-    /// An upstream to be spoken to in HTTP/2 is refused, by name, until there is a client
-    /// to speak it with.
-    #[test]
-    fn an_http2_upstream_is_refused_until_it_can_be_served() {
-        let mut config = everything_config("127.0.0.1:9".parse().unwrap());
-        config.upstreams.get_mut("up").unwrap().protocol = UpstreamProtocol::Http2;
-        let refused = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN);
-        assert_eq!(
-            refused.unwrap_err(),
-            ProxyError::Http2Upstream("up".to_owned())
-        );
-    }
-
     /// A config whose certificates are those of the config before keeps what it served
     /// them with, and so the session tickets that were issued with it; other certificates
     /// are served afresh; and certificates that cannot be used are refused, with the
@@ -2528,6 +2650,480 @@ upstreams:
             "{refused:?}"
         );
         assert!(Arc::ptr_eq(&after, &tls(&proxy)));
+    }
+
+    /// What an HTTP/2 upstream of the tests saw.
+    #[derive(Debug, Default)]
+    struct SeenUp {
+        /// Connections accepted.
+        connections: Cell<usize>,
+        /// Streams open now.
+        open: Cell<usize>,
+        /// Every request's head, and how many bytes of body came with it.
+        requests: RefCell<Vec<(Request<()>, usize)>>,
+    }
+
+    /// How an HTTP/2 upstream of the tests behaves.
+    #[derive(Clone, Copy)]
+    struct UpstreamH2 {
+        /// What it announces as its limit on streams.
+        streams: u32,
+        /// Answer only once `gate` lets it: for requests to be held open.
+        gated: bool,
+        /// Send the answer's head before reading the body, then read it, then end the
+        /// answer: as a server of a bidirectional stream does.
+        early: bool,
+        /// Tell the client to go away after this many requests on a connection.
+        away_after: Option<usize>,
+    }
+
+    impl Default for UpstreamH2 {
+        fn default() -> Self {
+            Self {
+                streams: 100,
+                gated: false,
+                early: false,
+                away_after: None,
+            }
+        }
+    }
+
+    /// An upstream that speaks HTTP/2 by prior knowledge, answering each request `200`
+    /// with `ok` and the length of the body it read in `x-read`. With `gated`, each
+    /// answer waits for a permit of `gate`.
+    async fn h2_upstream(how: UpstreamH2) -> (SocketAddr, Rc<SeenUp>, Rc<tokio::sync::Semaphore>) {
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let seen = Rc::new(SeenUp::default());
+        let gate = Rc::new(tokio::sync::Semaphore::new(0));
+        let (seeing, gating) = (Rc::clone(&seen), Rc::clone(&gate));
+        let _accepting = tokio::task::spawn_local(async move {
+            loop {
+                let Ok((stream, _)) = socket.accept().await else {
+                    return;
+                };
+                seeing.connections.set(seeing.connections.get() + 1);
+                let (seeing, gating) = (Rc::clone(&seeing), Rc::clone(&gating));
+                let _serving = tokio::task::spawn_local(async move {
+                    let mut builder = ::h2::server::Builder::new();
+                    builder.max_concurrent_streams(how.streams);
+                    let Ok(mut connection) = builder.handshake::<_, Bytes>(stream).await else {
+                        return;
+                    };
+                    let mut served = 0;
+                    while let Some(Ok((request, mut respond))) = connection.accept().await {
+                        served += 1;
+                        if how.away_after == Some(served) {
+                            connection.graceful_shutdown();
+                        }
+                        let (seeing, gating) = (Rc::clone(&seeing), Rc::clone(&gating));
+                        let _answering = tokio::task::spawn_local(async move {
+                            seeing.open.set(seeing.open.get() + 1);
+                            let (head, mut body) = request.into_parts();
+                            let at = seeing.requests.borrow().len();
+                            seeing
+                                .requests
+                                .borrow_mut()
+                                .push((Request::from_parts(head, ()), 0));
+                            let mut read = 0;
+                            // Read in full by `read_all`.
+                            if !how.early {
+                                read = read_all(&mut body).await;
+                            }
+                            if how.gated {
+                                let _permit = gating.acquire().await.unwrap();
+                                _permit.forget();
+                            }
+                            let answer = Response::builder()
+                                .status(200)
+                                .header("x-read", read.to_string())
+                                .body(())
+                                .unwrap();
+                            if let Ok(mut sending) = respond.send_response(answer, false) {
+                                if how.early {
+                                    read = read_all(&mut body).await;
+                                }
+                                let _ = sending.send_data(Bytes::from_static(b"ok"), true);
+                            }
+                            seeing.requests.borrow_mut()[at].1 = read;
+                            seeing.open.set(seeing.open.get() - 1);
+                        });
+                    }
+                });
+            }
+        });
+        (address, seen, gate)
+    }
+
+    /// Reads a body h2 received to its end, giving the credit back, and says how much.
+    async fn read_all(body: &mut ::h2::RecvStream) -> usize {
+        let mut read = 0;
+        while let Some(Ok(data)) = body.data().await {
+            read += data.len();
+            let _ = body.flow_control().release_capacity(data.len());
+        }
+        read
+    }
+
+    /// A worker whose one upstream `up`, at `upstream`, is spoken to in HTTP/2.
+    async fn serving_worker_to_h2(
+        upstream: SocketAddr,
+        limits: H1Limits,
+    ) -> (SocketAddr, Rc<Worker>) {
+        let mut config = everything_config(upstream);
+        config.upstreams.get_mut("up").unwrap().protocol = UpstreamProtocol::Http2;
+        let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+        let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        (front, worker)
+    }
+
+    /// Sends one HTTP/1.1 request of `request` bytes, and reads the answer to its end.
+    async fn h1_answer(front: SocketAddr, request: &[u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = TcpStream::connect(front).await.unwrap();
+        stream.write_all(request).await.unwrap();
+        let mut answer = Vec::new();
+        let _ended = within(stream.read_to_end(&mut answer)).await;
+        String::from_utf8_lossy(&answer).into_owned()
+    }
+
+    const CLOSING_GET: &[u8] =
+        b"GET /a/b?c=d HTTP/1.1\r\nhost: shop.example.com\r\nconnection: close\r\naccept: */*\r\n\r\n";
+
+    /// An upstream configured for HTTP/2 is spoken to in HTTP/2, whatever the client
+    /// spoke: the host in `:authority`, nothing about a connection, and the answer back.
+    #[tokio::test]
+    async fn an_http2_upstream_is_spoken_to_in_http2() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, seen, _gate) = h2_upstream(UpstreamH2::default()).await;
+                let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                assert!(answer.contains("\r\n\r\n2\r\nok\r\n0\r\n\r\n"), "{answer}");
+                {
+                    let requests = seen.requests.borrow();
+                    let (request, _) = &requests[0];
+                    assert_eq!(request.version(), Version::HTTP_2);
+                    assert_eq!(request.method(), Method::GET);
+                    assert_eq!(request.uri().authority().unwrap(), "shop.example.com");
+                    assert_eq!(request.uri().path_and_query().unwrap(), "/a/b?c=d");
+                    assert!(request.headers().get("connection").is_none());
+                    assert!(request.headers().get("host").is_none());
+                    assert_eq!(request.headers()["accept"], "*/*");
+                }
+
+                // And from a client that spoke HTTP/2 itself.
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::get("http://shop.example.com/x").body(()).unwrap();
+                let (answer, _) = send.send_request(request, true).unwrap();
+                let answer = within(answer).await.unwrap();
+                assert_eq!(answer.status(), StatusCode::OK);
+                assert_eq!(seen.requests.borrow().len(), 2);
+                assert_eq!(seen.connections.get(), 1, "the connection was not shared");
+            })
+            .await;
+    }
+
+    /// Requests share a connection up to its stream cap; past it another is opened, and no
+    /// more than needed.
+    #[tokio::test]
+    async fn requests_share_http2_connections_up_to_their_stream_cap() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let how = UpstreamH2 {
+                    gated: true,
+                    ..UpstreamH2::default()
+                };
+                let (upstream, seen, gate) = h2_upstream(how).await;
+                let limits = H1Limits {
+                    h2_streams: 2,
+                    ..H1Limits::default()
+                };
+                let (front, worker) = serving_worker_to_h2(upstream, limits).await;
+                // A burst on a cold destination: on each new connection only the first
+                // stream goes before the upstream's SETTINGS are heard, and what the
+                // connection will take once they are is counted on meanwhile.
+                let held: Vec<_> = (0..5)
+                    .map(|_| tokio::task::spawn_local(h1_answer(front, CLOSING_GET)))
+                    .collect();
+                until(|| seen.open.get() == 5).await;
+                assert_eq!(seen.connections.get(), 3);
+                assert_eq!(worker.h2_connections(), 3);
+                // One more for the request after them.
+                gate.add_permits(6);
+                for answer in held {
+                    let answer = answer.await.unwrap();
+                    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                }
+                // All three are kept for what comes next.
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                assert_eq!(seen.connections.get(), 3);
+            })
+            .await;
+    }
+
+    /// An upstream's own limit on streams, below ours, is what fills a connection: past it
+    /// the next request goes on another, never into h2's queue behind the limit.
+    #[tokio::test]
+    async fn an_upstreams_stream_limit_below_ours_is_honoured() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let how = UpstreamH2 {
+                    streams: 1,
+                    gated: true,
+                    ..UpstreamH2::default()
+                };
+                let (upstream, seen, gate) = h2_upstream(how).await;
+                let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+                // The first opens a connection and learns the limit from its SETTINGS.
+                let first = tokio::task::spawn_local(h1_answer(front, CLOSING_GET));
+                until(|| seen.open.get() == 1).await;
+                let rest: Vec<_> = (0..2)
+                    .map(|_| tokio::task::spawn_local(h1_answer(front, CLOSING_GET)))
+                    .collect();
+                until(|| seen.open.get() == 3).await;
+                assert_eq!(seen.connections.get(), 3);
+                gate.add_permits(3);
+                for answer in std::iter::once(first).chain(rest) {
+                    assert!(answer.await.unwrap().starts_with("HTTP/1.1 200 OK\r\n"));
+                }
+            })
+            .await;
+    }
+
+    /// A request's body goes up while its answer is waited for, and on after an answer that
+    /// came before the upstream had read it.
+    #[tokio::test]
+    async fn an_upload_goes_up_to_an_http2_upstream_before_and_after_its_answer() {
+        let body = vec![b'x'; 200 * 1024];
+        let mut request =
+            b"POST /upload HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\ncontent-length: 204800\r\n\r\n"
+                .to_vec();
+        request.extend_from_slice(&body);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for early in [false, true] {
+                    let how = UpstreamH2 {
+                        early,
+                        ..UpstreamH2::default()
+                    };
+                    let (upstream, seen, _gate) = h2_upstream(how).await;
+                    let (front, _worker) =
+                        serving_worker_to_h2(upstream, H1Limits::default()).await;
+                    let answer = h1_answer(front, &request).await;
+                    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                    if !early {
+                        assert!(answer.contains("x-read: 204800\r\n"), "{answer}");
+                    }
+                    until(|| {
+                        seen.requests
+                            .borrow()
+                            .first()
+                            .is_some_and(|(_, read)| *read == 204_800)
+                    })
+                    .await;
+                    let requests = seen.requests.borrow();
+                    assert_eq!(requests[0].0.headers()["content-length"], "204800");
+                }
+            })
+            .await;
+    }
+
+    /// An HTTP/2 upstream nobody listens at is answered 502, promptly.
+    #[tokio::test]
+    async fn an_unreachable_http2_upstream_is_answered_502() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let nobody = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upstream = nobody.local_addr().unwrap();
+                drop(nobody);
+                let (front, worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
+                until(|| worker.h2_connections() == 0).await;
+            })
+            .await;
+    }
+
+    /// Connection-bound credentials are not sent to an HTTP/2 upstream, where they would
+    /// authenticate every client's streams (15 §5).
+    #[tokio::test]
+    async fn connection_bound_credentials_are_not_sent_to_an_http2_upstream() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, seen, _gate) = h2_upstream(UpstreamH2::default()).await;
+                let (front, worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+                let asked = b"GET / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\nauthorization: NTLM TlRMTVNTUAABAAAA\r\n\r\n";
+                let answer = h1_answer(front, asked).await;
+                assert!(answer.starts_with("HTTP/1.1 501 "), "{answer}");
+                assert!(seen.requests.borrow().is_empty());
+                assert_eq!(seen.connections.get(), 0);
+                let scrape = worker.proxy().metrics();
+                assert!(scrape.contains("reason=\"connection_auth\"} 1"), "{scrape}");
+            })
+            .await;
+    }
+
+    /// Requests past the queue's bound are refused at once; one that waits too long for a
+    /// place is refused when its time is up; the two are told apart.
+    #[tokio::test]
+    async fn waiting_for_a_place_is_bounded_in_number_and_in_time() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let how = UpstreamH2 {
+                    gated: true,
+                    ..UpstreamH2::default()
+                };
+                let (upstream, seen, gate) = h2_upstream(how).await;
+                let limits = H1Limits {
+                    h2_streams: 1,
+                    h2_connections: 1,
+                    h2_waiting: 1,
+                    connect: Duration::from_millis(500),
+                    ..H1Limits::default()
+                };
+                let (front, worker) = serving_worker_to_h2(upstream, limits).await;
+                let first = tokio::task::spawn_local(h1_answer(front, CLOSING_GET));
+                until(|| seen.open.get() == 1).await;
+                let waiting = tokio::task::spawn_local(h1_answer(front, CLOSING_GET));
+                // Let the second join the queue before the third arrives.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let refused = h1_answer(front, CLOSING_GET).await;
+                assert!(refused.starts_with("HTTP/1.1 503 "), "{refused}");
+                let timed_out = waiting.await.unwrap();
+                assert!(timed_out.starts_with("HTTP/1.1 503 "), "{timed_out}");
+                let scrape = worker.proxy().metrics();
+                assert!(
+                    scrape.contains("reason=\"upstream_queue_full\"} 1"),
+                    "{scrape}"
+                );
+                assert!(
+                    scrape.contains("reason=\"upstream_queue_timeout\"} 1"),
+                    "{scrape}"
+                );
+                // The one that gave up gave its place in the queue up with it: another may
+                // wait there, and is served once the first is answered.
+                let next = tokio::task::spawn_local(h1_answer(front, CLOSING_GET));
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                gate.add_permits(2);
+                assert!(first.await.unwrap().starts_with("HTTP/1.1 200 OK\r\n"));
+                let next = next.await.unwrap();
+                assert!(next.starts_with("HTTP/1.1 200 OK\r\n"), "{next}");
+            })
+            .await;
+    }
+
+    /// An upstream that says GOAWAY finishes what it has, and what comes next goes on a new
+    /// connection.
+    #[tokio::test]
+    async fn after_goaway_requests_go_on_a_new_http2_connection() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let how = UpstreamH2 {
+                    away_after: Some(2),
+                    ..UpstreamH2::default()
+                };
+                let (upstream, seen, _gate) = h2_upstream(how).await;
+                let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+                for _ in 0..5 {
+                    let answer = h1_answer(front, CLOSING_GET).await;
+                    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                }
+                assert_eq!(seen.connections.get(), 3);
+
+                // A request that comes while a connection told to go still has a stream
+                // on it goes on a new one, rather than on the one going.
+                let how = UpstreamH2 {
+                    away_after: Some(1),
+                    gated: true,
+                    ..UpstreamH2::default()
+                };
+                let (upstream, seen, gate) = h2_upstream(how).await;
+                let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+                let first = tokio::task::spawn_local(h1_answer(front, CLOSING_GET));
+                until(|| seen.open.get() == 1).await;
+                // Long enough for the GOAWAY to be heard.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let second = tokio::task::spawn_local(h1_answer(front, CLOSING_GET));
+                until(|| seen.open.get() == 2).await;
+                assert_eq!(seen.connections.get(), 2);
+                gate.add_permits(2);
+                for answer in [first, second] {
+                    let answer = answer.await.unwrap();
+                    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                }
+            })
+            .await;
+    }
+
+    /// A request whose body stalls on its way to an HTTP/2 upstream, before any answer, is
+    /// answered 408 as the client's doing, not 502 as the upstream's.
+    #[tokio::test]
+    async fn a_stalled_upload_to_an_http2_upstream_is_answered_408() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _seen, _gate) = h2_upstream(UpstreamH2::default()).await;
+                let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::post("http://example.test/")
+                    .version(Version::HTTP_2)
+                    .body(())
+                    .unwrap();
+                let (response, mut upload) = send.send_request(request, false).unwrap();
+                upload.send_data(Bytes::from_static(b"abc"), false).unwrap();
+                let response = within(response).await.unwrap();
+                assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+            })
+            .await;
+    }
+
+    /// A client that gives its request up gives its stream's place back: with room for one
+    /// stream on one connection, the next request is served rather than kept waiting.
+    #[tokio::test]
+    async fn a_request_given_up_gives_its_http2_place_back() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let how = UpstreamH2 {
+                    gated: true,
+                    ..UpstreamH2::default()
+                };
+                let (upstream, seen, gate) = h2_upstream(how).await;
+                let limits = H1Limits {
+                    h2_streams: 1,
+                    h2_connections: 1,
+                    ..H1Limits::default()
+                };
+                let (front, _worker) = serving_worker_to_h2(upstream, limits).await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::get("http://a.test/").body(()).unwrap();
+                let (answer, _sending) = send.send_request(request, true).unwrap();
+                until(|| seen.open.get() == 1).await;
+                // Dropping what waits for the answer resets the stream.
+                drop(answer);
+                drop(_sending);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                // One permit for the given-up stream, which finds it reset; one for this.
+                gate.add_permits(2);
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+            })
+            .await;
     }
 
     /// A TLS ClientHello sent to a plaintext listener is not the HTTP/2 preface, so it

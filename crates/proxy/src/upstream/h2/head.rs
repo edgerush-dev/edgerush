@@ -14,7 +14,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri, Version};
 
 /// Why a request cannot be sent over HTTP/2.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum HeadError {
+pub(crate) enum HeadError {
     /// It names no host, which the core does not let through.
     #[error("the request names no host")]
     NoAuthority,
@@ -33,7 +33,7 @@ pub enum HeadError {
 /// # Errors
 ///
 /// A [`HeadError`] for a request that names no host that could be an authority.
-pub fn request<F: OutgoingFields + ?Sized>(
+pub(crate) fn request<F: OutgoingFields + ?Sized>(
     method: &Method,
     target: &Uri,
     fields: &F,

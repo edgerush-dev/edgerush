@@ -85,7 +85,14 @@ impl Harness {
         };
         assert_eq!(dialled, key);
         assert_eq!(self.opened(key, id, peer), [Action::Grant(waiter, id)]);
+        assert!(self.settled(key, id, peer).is_empty());
         id
+    }
+
+    fn settled(&mut self, key: u64, id: ConnectionId, peer: u32) -> Vec<Action> {
+        let mut actions = Vec::new();
+        self.pool.settled(key, id, peer, self.now, &mut actions);
+        actions
     }
 }
 
@@ -198,13 +205,45 @@ fn a_peer_that_allows_nothing_has_another_connection_opened_beside_it() {
     let [Action::Dial(KEY, first)] = actions[..] else {
         panic!()
     };
-    let actions = pool.opened(KEY, first, 0);
+    // Not heard from yet: what it will take is counted as coming.
+    assert!(pool.opened(KEY, first, 0).is_empty());
+    let actions = pool.settled(KEY, first, 0);
     let [Action::Dial(KEY, second)] = actions[..] else {
         panic!("{actions:?}")
     };
     assert_eq!(
         pool.opened(KEY, second, 10),
         [Action::Grant(waiter, second)]
+    );
+}
+
+/// On a connection not yet heard from, only what may be sent before the peer's SETTINGS
+/// goes; the rest wait for them rather than have another connection opened beside it.
+#[test]
+fn a_new_connection_is_counted_on_until_its_peer_is_heard_from() {
+    let mut pool = Harness::new(Limits {
+        streams: 3,
+        ..limits()
+    });
+    let (Taken::Waiting(first), actions) = pool.take(KEY) else {
+        panic!()
+    };
+    let [Action::Dial(KEY, id)] = actions[..] else {
+        panic!()
+    };
+    let (Taken::Waiting(second), none) = pool.take(KEY) else {
+        panic!()
+    };
+    assert!(none.is_empty());
+    // One may go before the SETTINGS.
+    assert_eq!(pool.opened(KEY, id, 1), [Action::Grant(first, id)]);
+    let (Taken::Waiting(third), none) = pool.take(KEY) else {
+        panic!()
+    };
+    assert!(none.is_empty(), "another was opened beside it: {none:?}");
+    assert_eq!(
+        pool.settled(KEY, id, 100),
+        [Action::Grant(second, id), Action::Grant(third, id)]
     );
 }
 
@@ -381,6 +420,7 @@ enum Event {
     Cancel(usize),
     Sweep(u64),
     Retire(u64),
+    Settle(usize, u32),
 }
 
 fn event() -> impl Strategy<Value = Event> {
@@ -395,6 +435,7 @@ fn event() -> impl Strategy<Value = Event> {
         1 => any::<usize>().prop_map(Event::Cancel),
         1 => (0..120_u64).prop_map(Event::Sweep),
         1 => (0..2_u64).prop_map(Event::Retire),
+        2 => (any::<usize>(), 0..4_u32).prop_map(|(at, peer)| Event::Settle(at, peer)),
     ]
 }
 
@@ -544,6 +585,8 @@ proptest! {
                 Event::Open(at, peer) => {
                     if let Some(at) = pick(at, world.dialling.len()) {
                         let (key, id) = world.dialling.remove(at);
+                        // What may be sent before the peer's SETTINGS: one, or none.
+                        let peer = peer.min(1);
                         world.open.insert(id, (key, peer, 0));
                         pool.opened(key, id, peer, now, &mut actions);
                     }
@@ -613,6 +656,15 @@ proptest! {
                     pool.sweep(now, &mut actions);
                 }
                 Event::Retire(key) => pool.retire(key, now, &mut actions),
+                Event::Settle(at, peer) => {
+                    let ids: Vec<ConnectionId> = world.open.keys().copied().collect();
+                    if let Some(at) = pick(at, ids.len()) {
+                        let entry = world.open.get_mut(&ids[at]).unwrap();
+                        entry.1 = peer;
+                        let key = entry.0;
+                        pool.settled(key, ids[at], peer, now, &mut actions);
+                    }
+                }
             }
             world.apply(&actions, &limits)?;
             invariants(&pool, &world)?;

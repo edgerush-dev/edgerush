@@ -151,10 +151,18 @@ pub(crate) enum Answer {
     /// The request's body stopped arriving for longer than its idle bound, while it was
     /// being waited on ([14 §8](../../docs/14-downstream-server.md)).
     BodyTimedOut,
+    /// As many requests wait for a place on an HTTP/2 upstream's connections as may
+    /// ([15 §4](../../docs/15-http2-and-grpc.md)).
+    QueueFull,
+    /// The request waited as long as it may for a place on one.
+    QueueTimedOut,
+    /// Connection-bound credentials (NTLM, Negotiate) for an HTTP/2 upstream, where they
+    /// would authenticate every client's streams ([15 §5](../../docs/15-http2-and-grpc.md)).
+    ConnectionAuth,
 }
 
 impl Answer {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 16] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -168,6 +176,9 @@ impl Answer {
         Self::Edits,
         Self::BadBody,
         Self::BodyTimedOut,
+        Self::QueueFull,
+        Self::QueueTimedOut,
+        Self::ConnectionAuth,
     ];
 
     /// The status that is answered with.
@@ -180,7 +191,12 @@ impl Answer {
             | Self::BadBody => StatusCode::BAD_REQUEST,
             Self::NoRoute => StatusCode::NOT_FOUND,
             Self::NoBackend | Self::Edits => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::NoEndpoints | Self::TooBusy | Self::Exhausted => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NoEndpoints
+            | Self::TooBusy
+            | Self::Exhausted
+            | Self::QueueFull
+            | Self::QueueTimedOut => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ConnectionAuth => StatusCode::NOT_IMPLEMENTED,
             Self::UpstreamFailed => StatusCode::BAD_GATEWAY,
             Self::BodyTimedOut => StatusCode::REQUEST_TIMEOUT,
         }
@@ -201,6 +217,9 @@ impl Answer {
             Self::Edits => "edits",
             Self::BadBody => "bad_body",
             Self::BodyTimedOut => "body_timed_out",
+            Self::QueueFull => "upstream_queue_full",
+            Self::QueueTimedOut => "upstream_queue_timeout",
+            Self::ConnectionAuth => "connection_auth",
         }
     }
 }

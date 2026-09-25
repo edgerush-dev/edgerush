@@ -23,36 +23,36 @@ use tokio::time::Instant;
 
 /// What a pool will not go beyond.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Limits {
+pub(crate) struct Limits {
     /// Streams at once on one connection, however many the peer would allow.
-    pub streams: u32,
+    pub(crate) streams: u32,
     /// Connections to one destination, opening and closing ones included.
-    pub connections: usize,
+    pub(crate) connections: usize,
     /// Connections to all destinations together, the same way.
-    pub connections_total: usize,
+    pub(crate) connections_total: usize,
     /// Requests waiting for a place, for one destination.
-    pub waiting: usize,
+    pub(crate) waiting: usize,
     /// Connections being opened at once to one destination.
-    pub dialing: usize,
+    pub(crate) dialing: usize,
     /// Streams a connection carries in its life before it is retired.
-    pub requests: u64,
+    pub(crate) requests: u64,
     /// How long a connection is used for new streams before it is retired.
-    pub age: Duration,
+    pub(crate) age: Duration,
     /// How long a connection with no streams is kept before it is closed.
-    pub idle: Duration,
+    pub(crate) idle: Duration,
 }
 
 /// A connection, as the pool names it. Never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ConnectionId(u64);
+pub(crate) struct ConnectionId(u64);
 
 /// A request waiting for a place, as the pool names it. Never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct WaiterId(u64);
+pub(crate) struct WaiterId(u64);
 
 /// What became of a request that asked for a place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Taken {
+pub(crate) enum Taken {
     /// A place on this connection, reserved: open the stream on it now.
     Place(ConnectionId),
     /// No place yet. It is granted, or refused, by an [`Action`] later; or the request
@@ -64,7 +64,7 @@ pub enum Taken {
 
 /// Why a waiting request was refused after all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Failure {
+pub(crate) enum Failure {
     /// Every connection that could have served it failed or went, and there is no other
     /// being opened.
     Unreachable,
@@ -72,7 +72,7 @@ pub enum Failure {
 
 /// What the driver is to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
+pub(crate) enum Action {
     /// Open a connection to the destination under this key; say how it went with
     /// [`Pool::opened`] or [`Pool::failed`].
     Dial(u64, ConnectionId),
@@ -103,6 +103,9 @@ struct Connection {
     active: u32,
     /// What the peer allows at once, as its latest SETTINGS said.
     peer: u32,
+    /// Whether the peer's first SETTINGS have been heard. Until then `peer` is what may
+    /// be sent before them, and the room it will have is counted as on its way.
+    settled: bool,
     /// Streams it has carried, those under way included.
     requests: u64,
     opened: Instant,
@@ -150,7 +153,7 @@ impl Destination {
 /// One worker's HTTP/2 connections, by destination key
 /// ([`crate::upstream::destination::ReuseIdentity::key`]).
 #[derive(Debug)]
-pub struct Pool {
+pub(crate) struct Pool {
     limits: Limits,
     destinations: HashMap<u64, Destination>,
     /// Connections to every destination, kept as a number.
@@ -160,7 +163,7 @@ pub struct Pool {
 
 impl Pool {
     /// An empty pool held to `limits`.
-    pub fn new(limits: Limits) -> Self {
+    pub(crate) fn new(limits: Limits) -> Self {
         Self {
             limits,
             destinations: HashMap::new(),
@@ -177,7 +180,7 @@ impl Pool {
     /// A place for a request to the destination under `key`, at `now`: on a connection
     /// that has one, or in the queue, or refused. What else is to be done as a result —
     /// open a connection, close a spent one — is added to `actions`.
-    pub fn take(&mut self, key: u64, now: Instant, actions: &mut Vec<Action>) -> Taken {
+    pub(crate) fn take(&mut self, key: u64, now: Instant, actions: &mut Vec<Action>) -> Taken {
         let limits = self.limits;
         let before = self.total;
         let destination = self.destinations.entry(key).or_default();
@@ -206,8 +209,9 @@ impl Pool {
         Taken::Waiting(waiter)
     }
 
-    /// The connection `id` to `key` is open, and its peer allows `peer` streams at once.
-    pub fn opened(
+    /// The connection `id` to `key` is open, and `peer` streams may be sent on it before
+    /// the peer's SETTINGS are heard ([`Pool::settled`]).
+    pub(crate) fn opened(
         &mut self,
         key: u64,
         id: ConnectionId,
@@ -226,12 +230,35 @@ impl Pool {
         self.serve_waiting(key, now, actions);
     }
 
+    /// The peer of connection `id` to `key` has been heard from: its SETTINGS allow `peer`
+    /// streams at once.
+    pub(crate) fn settled(
+        &mut self,
+        key: u64,
+        id: ConnectionId,
+        peer: u32,
+        now: Instant,
+        actions: &mut Vec<Action>,
+    ) {
+        if let Some(connection) = self.connection(key, id) {
+            connection.peer = peer;
+            connection.settled = true;
+        }
+        self.serve_waiting(key, now, actions);
+    }
+
     /// The connection `id` to `key` could not be opened.
     ///
     /// Nothing is dialled again in its place: whoever waited is served by another
     /// connection that is up or being opened, or, when there is none, refused. Trying again
     /// at once would turn an upstream that refuses connections into a storm of attempts.
-    pub fn failed(&mut self, key: u64, id: ConnectionId, now: Instant, actions: &mut Vec<Action>) {
+    pub(crate) fn failed(
+        &mut self,
+        key: u64,
+        id: ConnectionId,
+        now: Instant,
+        actions: &mut Vec<Action>,
+    ) {
         let before = self.total;
         self.remove(key, id);
         if !self.refuse_if_hopeless(key, actions) {
@@ -244,7 +271,13 @@ impl Pool {
     }
 
     /// A stream on connection `id` to `key` has ended, whichever way.
-    pub fn ended(&mut self, key: u64, id: ConnectionId, now: Instant, actions: &mut Vec<Action>) {
+    pub(crate) fn ended(
+        &mut self,
+        key: u64,
+        id: ConnectionId,
+        now: Instant,
+        actions: &mut Vec<Action>,
+    ) {
         let before = self.total;
         if let Some(connection) = self.connection(key, id) {
             connection.active = connection.active.saturating_sub(1);
@@ -262,7 +295,7 @@ impl Pool {
 
     /// The peer of connection `id` to `key` now allows `peer` streams at once. Streams
     /// already over a lowered limit finish; no more are opened until there is room.
-    pub fn peer_limit(
+    pub(crate) fn peer_limit(
         &mut self,
         key: u64,
         id: ConnectionId,
@@ -272,13 +305,15 @@ impl Pool {
     ) {
         if let Some(connection) = self.connection(key, id) {
             connection.peer = peer;
+            // A change is the peer's SETTINGS heard.
+            connection.settled = true;
         }
         self.serve_waiting(key, now, actions);
     }
 
     /// Connection `id` to `key` takes no new streams: its peer said GOAWAY, or it is to be
     /// retired. It is closed once its streams end.
-    pub fn going_away(
+    pub(crate) fn going_away(
         &mut self,
         key: u64,
         id: ConnectionId,
@@ -299,7 +334,13 @@ impl Pool {
 
     /// Connection `id` to `key` is gone: its driver has finished, and whatever streams it
     /// had have failed with it.
-    pub fn closed(&mut self, key: u64, id: ConnectionId, now: Instant, actions: &mut Vec<Action>) {
+    pub(crate) fn closed(
+        &mut self,
+        key: u64,
+        id: ConnectionId,
+        now: Instant,
+        actions: &mut Vec<Action>,
+    ) {
         let before = self.total;
         self.remove(key, id);
         self.after_loss(key, now, actions);
@@ -307,7 +348,7 @@ impl Pool {
     }
 
     /// The waiting request `waiter` for `key` gives up its place in the queue.
-    pub fn cancel(&mut self, key: u64, waiter: WaiterId) {
+    pub(crate) fn cancel(&mut self, key: u64, waiter: WaiterId) {
         if let Some(destination) = self.destinations.get_mut(&key)
             && let Some(at) = destination.waiting.iter().position(|w| *w == waiter)
         {
@@ -319,7 +360,7 @@ impl Pool {
     /// The destination under `key` is gone from the running config: nothing more is
     /// opened to it once its waiting requests are served, and its connections close as
     /// their streams end.
-    pub fn retire(&mut self, key: u64, now: Instant, actions: &mut Vec<Action>) {
+    pub(crate) fn retire(&mut self, key: u64, now: Instant, actions: &mut Vec<Action>) {
         let before = self.total;
         let Some(destination) = self.destinations.get_mut(&key) else {
             return;
@@ -348,7 +389,7 @@ impl Pool {
     }
 
     /// Closes what has been idle too long, and retires what has had its time, at `now`.
-    pub fn sweep(&mut self, now: Instant, actions: &mut Vec<Action>) {
+    pub(crate) fn sweep(&mut self, now: Instant, actions: &mut Vec<Action>) {
         let limits = self.limits;
         let before = self.total;
         let mut closed = Vec::new();
@@ -414,7 +455,7 @@ impl Pool {
     }
 
     /// Connections to every destination, opening and closing ones included.
-    pub fn connections(&self) -> usize {
+    pub(crate) fn connections(&self) -> usize {
         self.total
     }
 
@@ -526,8 +567,15 @@ impl Pool {
         if destination.waiting.is_empty() {
             return;
         }
-        // What the connections being opened will take between them.
-        let coming = destination.dialing() * limits.streams as usize;
+        // What the connections being opened will take between them, and those open but not
+        // yet heard from will take once they are.
+        let unsettled: usize = destination
+            .connections
+            .iter()
+            .filter(|connection| connection.state == State::Usable && !connection.settled)
+            .map(|connection| limits.streams.saturating_sub(connection.active) as usize)
+            .sum();
+        let coming = destination.dialing() * limits.streams as usize + unsettled;
         if destination.waiting.len() <= coming
             || destination.dialing() >= limits.dialing
             || destination.connections.len() >= limits.connections
@@ -541,9 +589,9 @@ impl Pool {
             id,
             state: State::Connecting,
             active: 0,
-            // Until the peer's SETTINGS say otherwise, the stream cap is the limit
-            // (15 §3: `initial_max_send_streams` is set to it).
-            peer: limits.streams,
+            // What `opened` will say may be sent before the peer's SETTINGS.
+            peer: 1,
+            settled: false,
             requests: 0,
             opened: now,
             quiet_since: now,

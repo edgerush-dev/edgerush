@@ -62,10 +62,6 @@ impl ReuseIdentity {
     }
 
     /// What its connections speak.
-    #[cfg_attr(
-        not(any(test, feature = "fuzzing")),
-        expect(dead_code, reason = "dispatched on by the HTTP/2 client of 15 step 6")
-    )]
     pub fn protocol(&self) -> UpstreamProtocol {
         self.protocol
     }
