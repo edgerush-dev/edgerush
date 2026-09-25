@@ -108,8 +108,13 @@ pub struct Backend {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Match {
-    /// The path; `{ prefix: / }` is how to say any path.
-    pub path: PathMatch,
+    /// The path; `{ prefix: / }` is how to say any path. A match says this or `grpc`:
+    /// one of the two, never both.
+    #[serde(default)]
+    pub path: Option<PathMatch>,
+    /// A gRPC method, as a GRPCRoute matches one: said in place of `path`.
+    #[serde(default)]
+    pub grpc: Option<GrpcMethod>,
     /// The method, in upper case, if it matters.
     #[serde(default)]
     pub method: Option<String>,
@@ -119,6 +124,21 @@ pub struct Match {
     /// Conditions on decoded query parameters; names are case-sensitive.
     #[serde(default)]
     pub query: Vec<ValuePredicate>,
+}
+
+/// A gRPC method, matched exactly — Gateway API's Core matching for GRPCRoute: its
+/// service, its method, or both; at least one. A gRPC call's path is `/service/method`,
+/// and this is matched as that path would be: both as the exact path, a service alone as
+/// the prefix `/service`, a method alone in any service.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcMethod {
+    /// The fully qualified service, as `package.Service`.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// The method.
+    #[serde(default)]
+    pub method: Option<String>,
 }
 
 /// How a path is matched.

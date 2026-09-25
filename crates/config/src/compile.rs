@@ -4,7 +4,8 @@
 
 use crate::backends::{UpstreamId, WeightedBackends};
 use crate::route::{
-    Filter, HeaderChanges, Hostname, Match, PathMatch, Route, ValueMatch, ValuePredicate, Wildcard,
+    Filter, GrpcMethod, HeaderChanges, Hostname, Match, PathMatch, Route, ValueMatch,
+    ValuePredicate, Wildcard,
 };
 use crate::{Config, Protocol, Rule, Tls, UpstreamProtocol, UpstreamTls};
 use edgerush_filters::{HeaderModifier, HeaderModifierError};
@@ -331,13 +332,26 @@ fn route_match(
 ) -> Result<RouteMatch<RuleId>, Vec<Problem>> {
     let mut problems = Vec::new();
 
-    let path = match &matching.path {
-        PathMatch::Exact(path) => PathPattern::exact(path),
-        PathMatch::Prefix(path) => PathPattern::prefix(path),
-        PathMatch::Regex(pattern) => PathPattern::regex(pattern),
-    }
-    .map_err(|reason| problems.push(Problem::Path(reason)))
-    .ok();
+    let path = match (&matching.path, &matching.grpc) {
+        (Some(path), None) => match path {
+            PathMatch::Exact(path) => PathPattern::exact(path),
+            PathMatch::Prefix(path) => PathPattern::prefix(path),
+            PathMatch::Regex(pattern) => PathPattern::regex(pattern),
+        }
+        .map_err(|reason| problems.push(Problem::Path(reason)))
+        .ok(),
+        (None, Some(grpc)) => grpc_path(grpc)
+            .map_err(|problem| problems.push(problem))
+            .ok(),
+        (None, None) => {
+            problems.push(Problem::NoPath);
+            None
+        }
+        (Some(_), Some(_)) => {
+            problems.push(Problem::PathAndGrpc);
+            None
+        }
+    };
 
     // Any token is a method to the `http` crate; one in lower case would be a method of its
     // own that no request has.
@@ -392,6 +406,45 @@ fn route_match(
         }),
         _ => Err(problems),
     }
+}
+
+/// The path a gRPC method match stands for. Names are checked as GRPCRoute checks them:
+/// a service is dot-separated identifiers, a method one identifier.
+fn grpc_path(grpc: &GrpcMethod) -> Result<PathPattern, Problem> {
+    fn identifier(name: &str) -> bool {
+        let mut bytes = name.bytes();
+        bytes
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    }
+    let service_ok = |service: &str| {
+        let service = service.strip_prefix('.').unwrap_or(service);
+        service.split('.').all(identifier)
+    };
+    let bad = || Problem::GrpcMethod {
+        service: grpc.service.clone().unwrap_or_default(),
+        method: grpc.method.clone().unwrap_or_default(),
+    };
+    if grpc
+        .service
+        .as_deref()
+        .is_some_and(|service| !service_ok(service))
+        || grpc
+            .method
+            .as_deref()
+            .is_some_and(|method| !identifier(method))
+    {
+        return Err(bad());
+    }
+    let path = match (&grpc.service, &grpc.method) {
+        (Some(service), Some(method)) => PathPattern::exact(&format!("/{service}/{method}")),
+        (Some(service), None) => PathPattern::prefix(&format!("/{service}")),
+        // Checked to be an identifier: nothing in it means anything to a pattern.
+        (None, Some(method)) => PathPattern::regex(&format!("/[^/]+/{method}")),
+        (None, None) => return Err(bad()),
+    };
+    path.map_err(Problem::Path)
 }
 
 /// The rule's header modifiers, for the request and for the response.
@@ -602,6 +655,20 @@ pub enum Problem {
     /// The rule is for no request.
     #[error("no matches; any path is `{{ prefix: / }}`")]
     NoMatches,
+    /// The match says neither a path nor a gRPC method.
+    #[error("a match needs `path` or `grpc`; any path is `{{ prefix: / }}`")]
+    NoPath,
+    /// The match says both.
+    #[error("a match has `path` or `grpc`, not both")]
+    PathAndGrpc,
+    /// The gRPC method match names no service or method, or not in their form.
+    #[error("gRPC service `{service}` and method `{method}` are not names a call could have")]
+    GrpcMethod {
+        /// The service as written, if any.
+        service: String,
+        /// The method as written, if any.
+        method: String,
+    },
     /// The rule has two filters of a kind that it may have once.
     #[error("a rule may have one `{0}`")]
     FilterTwice(&'static str),
@@ -1000,11 +1067,11 @@ upstreams:
             parse("[{ name: a, listeners: [], hostnames: [{ name: a.example.com }], rules: [] }]")
                 .is_err()
         );
-        // A match always states its path, a backend its weight.
+        // A backend always states its weight; a match its path or its gRPC method, which
+        // compiling holds it to (`a_match_says_its_path_or_its_grpc_method`).
         let rule =
             |rule: &str| format!("[{{ name: a, listeners: [], hostnames: [], rules: [{rule}] }}]");
         assert!(parse(&rule("{ matches: [], backends: [] }")).is_ok());
-        assert!(parse(&rule("{ matches: [{ method: GET }], backends: [] }")).is_err());
         assert!(parse(&rule("{ matches: [], backends: [{ upstream: u }] }")).is_err());
         assert!(parse(&rule("{ matches: [] }")).is_err());
         // Misspelt keys are errors, not silence.
@@ -1170,6 +1237,83 @@ upstreams: {}
         // Both are said.
         let yaml = "listeners: {}\nroutes: []\nupstreams: { u: { endpoints: [], tls: { server_name: a.b } } }\n";
         assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
+    }
+
+    /// A match states its path or its gRPC method: one of them, and not both.
+    #[test]
+    fn a_match_says_its_path_or_its_grpc_method() {
+        let with = |matching: &str| {
+            let yaml = format!(
+                r#"
+listeners: {{ web: {{ address: "[::]:80", protocol: http }} }}
+routes:
+  - name: r
+    listeners: [web]
+    hostnames: [{{ name: "*", falls_through: true }}]
+    rules: [{{ matches: [{matching}], backends: [{{ upstream: u, weight: 1 }}] }}]
+upstreams: {{ u: {{ endpoints: [] }} }}
+"#
+            );
+            compile(&config(&yaml))
+                .map(|_| ())
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        assert!(with("{ path: { prefix: / } }").is_ok());
+        assert!(with("{ grpc: { service: pkg.Svc } }").is_ok());
+        let problem = |matching: &str| with(matching).unwrap_err()[0].clone();
+        assert!(
+            problem("{ method: GET }")
+                .ends_with("a match needs `path` or `grpc`; any path is `{ prefix: / }`")
+        );
+        assert!(
+            problem("{ path: { prefix: / }, grpc: { service: pkg.Svc } }")
+                .ends_with("a match has `path` or `grpc`, not both")
+        );
+        for bad in [
+            "{ grpc: {} }",
+            "{ grpc: { service: \"pkg/Svc\" } }",
+            "{ grpc: { service: \"pkg..Svc\" } }",
+            "{ grpc: { method: \"1Do\" } }",
+            "{ grpc: { method: \"Do.It\" } }",
+            "{ grpc: { service: \"pkg.Svc\", method: \"Do it\" } }",
+        ] {
+            assert!(
+                problem(bad).contains("are not names a call could have"),
+                "{bad}"
+            );
+        }
+    }
+
+    /// A gRPC method match is the path the call would have: both names as that path, a
+    /// service alone as its methods, a method alone in any service. Precedence follows
+    /// from it as GRPCRoute has it: service before method, exact before either.
+    #[test]
+    fn a_grpc_method_matches_as_the_path_its_calls_have() {
+        let compiled = compile(&config(
+            r#"
+listeners: { web: { address: "[::]:80", protocol: http } }
+routes:
+  - name: r
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ grpc: { method: Do } }]
+        backends: [{ upstream: u, weight: 1 }]
+      - matches: [{ grpc: { service: pkg.Svc } }]
+        backends: [{ upstream: u, weight: 1 }]
+      - matches: [{ grpc: { service: pkg.Svc, method: Do } }]
+        backends: [{ upstream: u, weight: 1 }]
+upstreams: { u: { endpoints: [] } }
+"#,
+        ))
+        .unwrap();
+        let rule = |target: &str| route(&compiled, "a.test", target).map(|(_, rule)| rule);
+        // Listed least specific first: which wins is precedence's doing, not the order's.
+        assert_eq!(rule("/pkg.Svc/Do"), Some(2));
+        assert_eq!(rule("/pkg.Svc/Other"), Some(1));
+        assert_eq!(rule("/other.Svc/Do"), Some(0));
+        assert_eq!(rule("/other.Svc/Other"), None);
+        assert_eq!(rule("/pkg.SvcX/Other"), None);
     }
 
     /// A private key is never printed, whatever prints the config.

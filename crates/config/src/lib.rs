@@ -27,6 +27,6 @@ pub use config::{
     Certificate, Config, Listener, Protocol, Tls, Upstream, UpstreamProtocol, UpstreamTls,
 };
 pub use route::{
-    Backend, Filter, Header, HeaderChanges, Hostname, Match, PathMatch, Route, Rule, ValueMatch,
-    ValuePredicate, Wildcard,
+    Backend, Filter, GrpcMethod, Header, HeaderChanges, Hostname, Match, PathMatch, Route, Rule,
+    ValueMatch, ValuePredicate, Wildcard,
 };
