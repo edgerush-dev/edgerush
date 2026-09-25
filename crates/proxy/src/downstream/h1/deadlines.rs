@@ -44,6 +44,24 @@ impl Default for Bounds {
     }
 }
 
+impl Bounds {
+    /// The least of them: no deadline is ever set to fall due sooner than this after
+    /// whatever set it.
+    pub fn shortest(&self) -> Duration {
+        [
+            self.first_request,
+            self.next_head,
+            self.keep_alive,
+            self.idle,
+            self.linger_quiet,
+            self.linger_most,
+        ]
+        .into_iter()
+        .min()
+        .unwrap_or_default()
+    }
+}
+
 /// Which deadline it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Clock {
@@ -426,5 +444,59 @@ mod tests {
         connection.lingering(start + secs(2));
         connection.head_read();
         assert_eq!(connection.next(), None, "a closed connection has no clocks");
+    }
+
+    #[test]
+    fn the_shortest_bound_is_the_least_of_them() {
+        assert_eq!(Bounds::default().shortest(), secs(5));
+        let bounds = Bounds {
+            idle: secs(2),
+            ..Bounds::default()
+        };
+        assert_eq!(bounds.shortest(), secs(2));
+    }
+
+    proptest::proptest! {
+        /// Whatever happens and whenever, the next deadline comes sooner only by being set
+        /// at least the shortest bound after what set it. The connection's timer relies on
+        /// this: set that far ahead, no deadline set after it falls due before it.
+        #[test]
+        fn a_deadline_comes_sooner_only_by_the_shortest_bound_from_now(
+            seconds in proptest::collection::vec(1_u64..40, 6),
+            events in proptest::collection::vec((0_u8..10, 0_u64..20_000, proptest::bool::ANY), 0..40),
+        ) {
+            let [first_request, next_head, keep_alive, idle, linger_quiet, linger_most] =
+                [0, 1, 2, 3, 4, 5].map(|at| secs(seconds[at]));
+            let bounds = Bounds { first_request, next_head, keep_alive, idle, linger_quiet, linger_most };
+            let start = Instant::now();
+            let mut connection = Deadlines::accepted(start, bounds);
+            let mut now = start;
+            for (event, later, flag) in events {
+                now += Duration::from_millis(later);
+                let before = connection.next().map(|(_, due)| due);
+                match event {
+                    0 => connection.head_read(),
+                    1 => connection.bytes_arrived(now),
+                    2 => connection.body_waited_on(now, flag),
+                    3 => connection.body_moved(now),
+                    4 => connection.write_waited_on(now, flag),
+                    5 => connection.write_moved(now),
+                    6 => connection.answered(now, flag),
+                    7 => connection.lingering(now),
+                    8 => connection.closed(),
+                    _ => {}
+                }
+                if let Some((clock, due)) = connection.next()
+                    && before.is_none_or(|before| due < before)
+                {
+                    proptest::prop_assert!(
+                        due >= now + bounds.shortest(),
+                        "{clock:?} came sooner, to {:?} after an event at {:?}",
+                        due - start,
+                        now - start
+                    );
+                }
+            }
+        }
     }
 }

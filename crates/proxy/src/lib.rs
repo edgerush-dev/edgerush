@@ -10,6 +10,7 @@
 //! thread that serves, which forwards to upstreams over HTTP/1.1 on connections of its
 //! own and never leaves the thread it was made on.
 
+mod alarm;
 mod cookies;
 mod drain;
 mod grpc;

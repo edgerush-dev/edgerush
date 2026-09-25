@@ -18,6 +18,7 @@ use super::codec::{
     Piece, ResponseHead, Sending, Trailers, delivery, head_len, write_head,
 };
 use super::pool::Lease;
+use crate::alarm::Alarm;
 use crate::interim::{Channel, Interim};
 use crate::storage::{Charge, Exhausted};
 use bytes::Bytes;
@@ -26,7 +27,7 @@ use http::{HeaderMap, HeaderName, Method, Uri};
 use http_body::{Body, Frame, SizeHint};
 use std::cell::RefCell;
 use std::error::Error as StdError;
-use std::future::{Future, poll_fn};
+use std::future::poll_fn;
 use std::io;
 use std::ops::Range;
 use std::pin::Pin;
@@ -34,7 +35,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::{Instant, Sleep};
+use tokio::time::Instant;
 
 /// How much of a request waits in memory to be written. One frame at a time is staged;
 /// the body is not asked for more until what it gave has gone.
@@ -232,6 +233,9 @@ pub struct Exchange<S> {
     /// takes body bytes; neither encoding the head nor starting its write is enough.
     head_left: usize,
     head_sent: Option<Instant>,
+    /// The one timer for every deadline of the exchange, and then of its answer's body:
+    /// made once an exchange rather than once a wait, and moved rather than made again.
+    alarm: Alarm,
 }
 
 impl<S> Exchange<S> {
@@ -389,6 +393,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             chunk_tail: 0,
             head_left: 0,
             head_sent: None,
+            alarm: Alarm::default(),
         }
     }
 
@@ -480,6 +485,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         B: Body<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
+        // Set no further ahead than the answer's clock and the final head's deadline, so
+        // that the clocks starting as the exchange goes on fall due after it and leave it
+        // where it is. A wait for a `100` is shorter, and rare: it moves the timer.
+        self.alarm = Alarm::new(limits.idle.min(limits.final_head));
         self.lend_staging()?;
         // Paid for before it is written. A head over the bound is refused below, before a
         // byte of it is, so no room is made for one.
@@ -508,8 +517,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         self.interim
             .begin(expects_continue(headers), nothing_to_send);
         let mut may_send = self.interim.may_poll_upload();
-        let mut final_wait = std::pin::pin!(None::<Sleep>);
-        let mut continue_wait = std::pin::pin!(None::<Sleep>);
+        // Whether the wait for a `100` was started, which the coordinator says once.
+        let mut continuing = false;
 
         let mut reader = HeadReader::default();
         let mut interim = 0;
@@ -532,40 +541,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                 let outcome = poll_fn(|cx| {
                     // The write-idle clock covers the head while it is queued. These
                     // two waits begin only once the complete head has reached the socket.
-                    // They are polled even when I/O is ready: a busy peer cannot extend
+                    // They are looked at even when I/O is ready: a busy peer cannot extend
                     // an absolute deadline by supplying progress or interim heads.
-                    if let Some(sent) = self.head_sent {
-                        if final_wait.is_none() {
-                            final_wait
-                                .set(Some(tokio::time::sleep_until(sent + limits.final_head)));
-                        }
-                        if final_wait
-                            .as_mut()
-                            .as_pin_mut()
-                            .is_some_and(|deadline| deadline.poll(cx).is_ready())
-                        {
+                    if self.head_sent.is_some() && !may_send && !continuing {
+                        continuing = self.interim.head_sent();
+                    }
+                    let mut waits = self.waits(continuing && !may_send, limits);
+                    if let Some(soonest) = waits.soonest(clocks.soonest())
+                        && self.alarm.poll_until(cx, soonest).is_ready()
+                    {
+                        if waits.final_head.is_some_and(|due| self.alarm.reached(due)) {
                             return Poll::Ready(Err(ExchangeError::TooSlow {
                                 after: limits.final_head,
                             }));
                         }
-                        if !may_send {
-                            if continue_wait.is_none() && self.interim.head_sent() {
-                                continue_wait.set(Some(tokio::time::sleep_until(
-                                    sent + limits.continue_wait,
-                                )));
-                            }
-                            if continue_wait
-                                .as_mut()
-                                .as_pin_mut()
-                                .is_some_and(|deadline| deadline.poll(cx).is_ready())
-                            {
-                                self.interim.wait_expired();
-                                may_send = self.interim.may_poll_upload();
-                                clocks = Clocks::default();
-                            }
+                        if waits.continuing.is_some_and(|due| self.alarm.reached(due)) {
+                            self.interim.wait_expired();
+                            may_send = self.interim.may_poll_upload();
+                            clocks = Clocks::default();
+                            waits = self.waits(continuing && !may_send, limits);
                         }
                     }
-                    self.round(cx, upload, may_send, &mut clocks, limits)
+                    self.round(
+                        cx,
+                        upload,
+                        may_send,
+                        &mut clocks,
+                        waits.soonest(None),
+                        limits,
+                    )
                 })
                 .await;
                 match outcome {
@@ -636,6 +640,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
                 interim,
                 stop_uploading,
             });
+        }
+    }
+
+    /// The exchange's absolute deadlines as they stand: none until the whole head has gone,
+    /// and the wait for a `100` only while `continuing`.
+    fn waits(&self, continuing: bool, limits: &H1Limits) -> Waits {
+        let Some(sent) = self.head_sent else {
+            return Waits::default();
+        };
+        Waits {
+            final_head: Some(sent + limits.final_head),
+            continuing: continuing.then_some(sent + limits.continue_wait),
         }
     }
 
@@ -840,6 +856,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         upload: &mut Upload<B>,
         may_send: bool,
         clocks: &mut Clocks,
+        waits: Option<Instant>,
         limits: &H1Limits,
     ) -> Poll<Result<Moved, ExchangeError>>
     where
@@ -885,7 +902,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         // Nothing moved, so what is left is to say what is being waited for and see
         // whether that wait has gone on too long.
         let waiting = self.waiting_on(upload, pushed);
-        if let Some(stalled) = clocks.expired(cx, waiting, idle) {
+        if let Some(stalled) = clocks.expired(cx, waiting, idle, &mut self.alarm, waits) {
             return Poll::Ready(Err(ExchangeError::Idle {
                 after: idle,
                 waiting: stalled,
@@ -1191,6 +1208,15 @@ where
                         answer: false,
                         ..rest.exchange.waiting_on(&rest.upload, pushed)
                     };
+                    let idle = this.limits.idle;
+                    let alarm = &mut rest.exchange.alarm;
+                    if let Some(stalled) = this.clocks.expired(cx, waiting, idle, alarm, None) {
+                        this.rest = None;
+                        return Poll::Ready(Some(Err(ExchangeError::Idle {
+                            after: idle,
+                            waiting: stalled,
+                        })));
+                    }
                     // Whether that was the last of it is worth knowing now: a client
                     // told how long a body is need never poll it again, and a body whose
                     // end was never checked is one whose connection cannot be trusted.
@@ -1204,14 +1230,6 @@ where
                             rest.exchange.used(consumed);
                             this.ended_with(trailers);
                         }
-                    }
-                    let idle = this.limits.idle;
-                    if let Some(stalled) = this.clocks.expired(cx, waiting, idle) {
-                        this.rest = None;
-                        return Poll::Ready(Some(Err(ExchangeError::Idle {
-                            after: idle,
-                            waiting: stalled,
-                        })));
                     }
                     this.clocks.answer_moved();
                     return Poll::Ready(Some(Ok(Frame::data(frame))));
@@ -1232,7 +1250,8 @@ where
                     }
                     let idle = this.limits.idle;
                     let waiting = rest.exchange.waiting_on(&rest.upload, pushed);
-                    let Some(stalled) = this.clocks.expired(cx, waiting, idle) else {
+                    let alarm = &mut rest.exchange.alarm;
+                    let Some(stalled) = this.clocks.expired(cx, waiting, idle, alarm, None) else {
                         return Poll::Pending;
                     };
                     // Long enough waiting for one thing, with a poll outstanding and
@@ -1377,43 +1396,90 @@ struct Waiting {
     answer: bool,
 }
 
-/// The clocks themselves, one per thing that can be waited for.
+/// The exchange's absolute deadlines, from the moment its head went: the final answer's
+/// head, and the end of the wait for a `100` while the body is held back for one.
+#[derive(Debug, Clone, Copy, Default)]
+struct Waits {
+    final_head: Option<Instant>,
+    continuing: Option<Instant>,
+}
+
+impl Waits {
+    /// The soonest of these and `also`.
+    fn soonest(self, also: Option<Instant>) -> Option<Instant> {
+        [self.final_head, self.continuing, also]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+}
+
+/// When each wait runs out, one clock per thing that can be waited for.
 ///
-/// A clock exists only while its own thing is being waited for: it is made when that
-/// starts and dropped when it stops, so time spent waiting for something else is not
-/// counted against it. Progress in one direction never touches another's
-/// ([13 §7](../../../docs/13-http1-upstream.md)).
+/// A clock runs only while its own thing is being waited for: it starts when that starts
+/// and stops when it stops, so time spent waiting for something else is not counted
+/// against it. Progress in one direction never touches another's
+/// ([13 §7](../../../docs/13-http1-upstream.md)). They are deadlines rather than timers:
+/// the exchange's one [`Alarm`] keeps them, with its other deadlines.
 #[derive(Debug, Default)]
 struct Clocks {
-    client: Option<Pin<Box<Sleep>>>,
-    upstream: Option<Pin<Box<Sleep>>>,
-    answer: Option<Pin<Box<Sleep>>>,
+    client: Option<Instant>,
+    upstream: Option<Instant>,
+    answer: Option<Instant>,
 }
 
 impl Clocks {
     /// Sets the clocks to `on`, and says which has run out.
     ///
-    /// One that is not running is dropped rather than paused, which is what makes the
+    /// One that is not running is stopped rather than paused, which is what makes the
     /// next wait a fresh one. A clock that is already running keeps running: the same
-    /// wait going on is not a new wait.
-    fn expired(&mut self, cx: &mut Context<'_>, on: Waiting, idle: Duration) -> Option<Stalled> {
+    /// wait going on is not a new wait. `waits` is the soonest of the exchange's other
+    /// deadlines, which the alarm keeps too; when that is what came, the task is woken
+    /// to find it where it is looked for.
+    fn expired(
+        &mut self,
+        cx: &mut Context<'_>,
+        on: Waiting,
+        idle: Duration,
+        alarm: &mut Alarm,
+        waits: Option<Instant>,
+    ) -> Option<Stalled> {
+        let mut now = None;
         let each = [
-            (&mut self.upstream, on.upstream, Stalled::Upstream),
-            (&mut self.client, on.client, Stalled::Client),
-            (&mut self.answer, on.answer, Stalled::Answer),
+            (&mut self.upstream, on.upstream),
+            (&mut self.client, on.client),
+            (&mut self.answer, on.answer),
         ];
-        let mut ran_out = None;
-        for (clock, running, which) in each {
+        for (clock, running) in each {
             if !running {
                 *clock = None;
-                continue;
-            }
-            let ticking = clock.get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
-            if ticking.as_mut().poll(cx).is_ready() && ran_out.is_none() {
-                ran_out = Some(which);
+            } else if clock.is_none() {
+                *clock = Some(*now.get_or_insert_with(Instant::now) + idle);
             }
         }
+        let soonest = [self.soonest(), waits].into_iter().flatten().min()?;
+        if alarm.poll_until(cx, soonest).is_pending() {
+            return None;
+        }
+        let ran_out = [
+            (self.upstream, Stalled::Upstream),
+            (self.client, Stalled::Client),
+            (self.answer, Stalled::Answer),
+        ]
+        .into_iter()
+        .find_map(|(due, which)| due.filter(|&due| alarm.reached(due)).map(|_| which));
+        if ran_out.is_none() {
+            cx.waker().wake_by_ref();
+        }
         ran_out
+    }
+
+    /// When the first of the running clocks runs out.
+    fn soonest(&self) -> Option<Instant> {
+        [self.upstream, self.client, self.answer]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Something of the request went out, so the upstream is taking it.
@@ -1673,6 +1739,46 @@ mod tests {
         let head = String::from_utf8(head).unwrap();
         assert!(head.starts_with("GET /a?b=1 HTTP/1.1\r\n"), "{head}");
         assert!(head.contains("host: up.test\r\n"), "{head}");
+    }
+
+    /// An exchange sets one timer for all its waits, from the head going out to the last
+    /// of its answer's body: the final head's deadline, the answer's clock, then the
+    /// body's, which each start as the one before is done with. Setting a timer is what
+    /// costs, and it was once each of them. The clock is stopped, so the waits take none.
+    #[tokio::test(start_paused = true)]
+    async fn an_exchange_sets_one_timer_for_all_its_waits() {
+        use http_body_util::BodyExt;
+        let (exchange, mut peer) = connected(4096);
+        let limits = H1Limits::default();
+        let before = crate::alarm::times_set();
+        let answering = tokio::spawn(async move {
+            peer.until(b"\r\n\r\n").await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            peer.say("HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nhello")
+                .await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            peer.say("there").await;
+            peer
+        });
+
+        let (answer, rest) = exchange
+            .send(
+                &Method::GET,
+                &"/".parse().unwrap(),
+                &headers(&[("host", "up.test")]),
+                &[],
+                Sending::None,
+                Empty::<Bytes>::new(),
+                &limits,
+            )
+            .await
+            .unwrap();
+        let framing = answer.delivery.framing;
+        let body = H1Body::new(rest, framing, true, Vec::new(), limits);
+        let read = body.collect().await.unwrap().to_bytes();
+        assert_eq!(&read[..], b"hellothere");
+        let _peer = answering.await.unwrap();
+        assert_eq!(crate::alarm::times_set() - before, 1);
     }
 
     /// **A finished exchange gives back what it was lent.** The block it read the answer

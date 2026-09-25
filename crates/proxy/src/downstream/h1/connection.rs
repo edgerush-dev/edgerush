@@ -28,6 +28,7 @@ use super::outbound::{OnFailure, Outbound};
 use super::writer::{
     Asked, BodyFramer, Content, Delimited, WriteError, Written, write_head, write_interim,
 };
+use crate::alarm::Alarm;
 use crate::drain::Drain;
 use crate::h1::{BodyReader, CodecError, Framing, Piece};
 use crate::head::Head as _;
@@ -49,7 +50,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::{Instant, Sleep};
+use tokio::time::Instant;
 
 /// How much room is made in the input for a read.
 const READ: usize = 4096;
@@ -406,8 +407,8 @@ struct Connection<S> {
     answer_charge: Option<Charge>,
     storage: Rc<Storage>,
     deadlines: Deadlines,
-    /// When the one timer is set for, so that it is set again only when that changes.
-    armed: Option<Instant>,
+    /// The one timer, for whichever deadline is next.
+    alarm: Alarm,
     budget: Budget,
     /// What is left of the budget in this turn.
     left: Budget,
@@ -440,7 +441,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             answer_charge: None,
             storage,
             deadlines: Deadlines::accepted(now(), settings.bounds),
-            armed: None,
+            // No deadline is set sooner than the shortest bound after what set it, so the
+            // timer need never be set further ahead than that.
+            alarm: Alarm::new(settings.bounds.shortest()),
             budget: settings.budget,
             left: settings.budget,
             read_size: ReadSize::default(),
@@ -726,28 +729,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         Ok(true)
     }
 
-    /// Checks the one deadline that is next, setting the timer again if it has moved.
-    fn poll_deadline(
-        &mut self,
-        context: &mut Context<'_>,
-        mut timer: Pin<&mut Sleep>,
-    ) -> Result<(), Stop> {
+    /// Checks the one deadline that is next.
+    ///
+    /// Every request moves it sooner, from the wait between requests to the reading of a
+    /// head, and the alarm is what keeps that from moving the timer once a request.
+    fn poll_deadline(&mut self, context: &mut Context<'_>) -> Result<(), Stop> {
         let Some((clock, due)) = self.deadlines.next() else {
             return Ok(());
         };
-        let due = Instant::from_std(due);
-        if self.armed != Some(due) {
-            timer.as_mut().reset(due);
-            self.armed = Some(due);
-        }
-        match timer.poll(context) {
+        match self.alarm.poll_until(context, Instant::from_std(due)) {
             Poll::Ready(()) => Err(Stop::TimedOut(clock)),
             Poll::Pending => Ok(()),
         }
     }
 
     /// Writes what is queued until nothing is, keeping the deadlines.
-    async fn flush(&mut self, mut timer: Pin<&mut Sleep>) -> Result<(), Stop> {
+    async fn flush(&mut self) -> Result<(), Stop> {
         poll_fn(|context| {
             loop {
                 if self.spent() {
@@ -758,7 +755,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                     return Poll::Ready(Ok(()));
                 }
                 if !moved {
-                    self.poll_deadline(context, timer.as_mut())?;
+                    self.poll_deadline(context)?;
                     return self.wait();
                 }
             }
@@ -886,7 +883,6 @@ where
 {
     let limits = settings.limits;
     let mut connection = Connection::new(socket, settings, blocks);
-    let mut timer = std::pin::pin!(tokio::time::sleep_until(Instant::now()));
     let mut draining = std::pin::pin!(drain.notified());
 
     loop {
@@ -929,9 +925,7 @@ where
                     Err(stop) => return Poll::Ready(Err(Ok(stop.into()))),
                 };
                 if !read {
-                    if let Err(Stop::TimedOut(clock)) =
-                        connection.poll_deadline(context, timer.as_mut())
-                    {
+                    if let Err(Stop::TimedOut(clock)) = connection.poll_deadline(context) {
                         return Poll::Ready(Err(Ok(Ended::TimedOut(clock))));
                     }
                     // Draining, and nothing of a next request here: it is closed rather
@@ -947,7 +941,7 @@ where
         let (head, consumed) = match read {
             Ok(read) => read,
             Err(Ok(ended)) => return ended,
-            Err(Err(error)) => return refuse(&mut connection, timer.as_mut(), error, &date).await,
+            Err(Err(error)) => return refuse(&mut connection, error, &date).await,
         };
         connection.deadlines.head_read();
         connection.outbound.reset();
@@ -968,7 +962,7 @@ where
         };
         let arrived = match arrival(&head, &head.fields.view(&bytes)) {
             Ok(arrived) => arrived,
-            Err(error) => return refuse(&mut connection, timer.as_mut(), error, &date).await,
+            Err(error) => return refuse(&mut connection, error, &date).await,
         };
 
         let RequestHead {
@@ -1039,7 +1033,7 @@ where
                         }
                     }
                     if !moved {
-                        connection.poll_deadline(context, timer.as_mut())?;
+                        connection.poll_deadline(context)?;
                         return connection.wait();
                     }
                 }
@@ -1175,7 +1169,7 @@ where
                     return Poll::Ready(Ok(true));
                 }
                 if !moved {
-                    connection.poll_deadline(context, timer.as_mut())?;
+                    connection.poll_deadline(context)?;
                     return connection.wait();
                 }
             }
@@ -1185,7 +1179,7 @@ where
         match sent {
             Ok(true) => {}
             Ok(false) => {
-                return replace_or_cut(&mut connection, timer.as_mut(), asked, &date).await;
+                return replace_or_cut(&mut connection, asked, &date).await;
             }
             Err(stop) => return stop.into(),
         }
@@ -1206,7 +1200,6 @@ where
 /// upstream's, and the client is left with a message it can tell is unfinished (14 §4).
 async fn replace_or_cut<S: AsyncRead + AsyncWrite + Unpin>(
     connection: &mut Connection<S>,
-    timer: Pin<&mut Sleep>,
     asked: Asked,
     date: &impl Fn() -> HttpDate,
 ) -> Ended {
@@ -1232,7 +1225,7 @@ async fn replace_or_cut<S: AsyncRead + AsyncWrite + Unpin>(
     if let Err(stop) = connection.queue_answer(head) {
         return stop.into();
     }
-    match connection.flush(timer).await {
+    match connection.flush().await {
         Ok(()) => Ended::Answered,
         Err(stop) => stop.into(),
     }
@@ -1241,7 +1234,6 @@ async fn replace_or_cut<S: AsyncRead + AsyncWrite + Unpin>(
 /// Answers a request refused before it reached the core, and ends the connection.
 async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(
     connection: &mut Connection<S>,
-    timer: Pin<&mut Sleep>,
     error: RequestError,
     date: &impl Fn() -> HttpDate,
 ) -> Ended {
@@ -1268,7 +1260,7 @@ async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(
     if let Err(stop) = connection.queue_answer(head) {
         return stop.into();
     }
-    match connection.flush(timer).await {
+    match connection.flush().await {
         Ok(()) => Ended::Refused(status),
         Err(stop) => stop.into(),
     }
@@ -1282,6 +1274,7 @@ mod tests {
     use std::cell::Cell;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::Sleep;
 
     /// The driver, with a core written as the tests' are: taking a request as `http`'s,
     /// which the raw head the driver hands over is made into. Everything the driver does is
@@ -1959,6 +1952,79 @@ mod tests {
             );
             drop(client);
         }
+    }
+
+    /// Sends `GET` and reads its whole answer, which [`echoing`] makes end with the
+    /// request line's method and target.
+    async fn asked_once(client: &mut tokio::io::DuplexStream) {
+        client.write_all(GET).await.unwrap();
+        let mut received = Vec::new();
+        while !received.ends_with(b"GET /one ") {
+            let mut some = [0; 256];
+            let read = client.read(&mut some).await.unwrap();
+            assert_ne!(read, 0, "{:?}", String::from_utf8_lossy(&received));
+            received.extend_from_slice(&some[..read]);
+        }
+    }
+
+    /// A busy connection sets its timer when it starts and not again for every request:
+    /// each request moves the next deadline sooner (from waiting between requests to
+    /// reading a head), and moving a timer sooner is what costs. The clock is stopped.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_connection_does_not_set_its_timer_for_every_request() {
+        let before = crate::alarm::times_set();
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let asked = Asked::default();
+        let serving = serve(server, settings(), blocks(), date, echoing(&asked));
+        let talking = async move {
+            for _ in 0..50 {
+                asked_once(&mut client).await;
+                tokio::time::advance(Duration::from_millis(20)).await;
+            }
+        };
+        let (ended, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(serving, talking)
+        })
+        .await
+        .unwrap();
+        assert_eq!(ended, Ended::Closed);
+        assert_eq!(asked.borrow().len(), 50);
+        let armed = crate::alarm::times_set() - before;
+        assert!(armed <= 2, "set {armed} times for 50 requests");
+    }
+
+    /// A deadline that moved on after the timer was set is kept at its own time and not
+    /// the timer's: requests come four seconds apart, so the timer goes off between them,
+    /// and the wait after the last still runs its whole time. The clock is stopped.
+    #[tokio::test(start_paused = true)]
+    async fn a_deadline_is_kept_at_its_time_however_early_the_timer_was_set() {
+        let bounds = Bounds::default();
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let asked = Asked::default();
+        let serving = serve(server, settings(), blocks(), date, echoing(&asked));
+        let talking = async move {
+            for _ in 0..5 {
+                asked_once(&mut client).await;
+                tokio::time::sleep(Duration::from_secs(4)).await;
+            }
+            asked_once(&mut client).await;
+            let last = Instant::now();
+            let mut rest = Vec::new();
+            client.read_to_end(&mut rest).await.unwrap();
+            (last, rest)
+        };
+        let (ended, (last, rest)) = tokio::time::timeout(Duration::from_secs(90), async {
+            tokio::join!(serving, talking)
+        })
+        .await
+        .unwrap();
+        assert_eq!(ended, Ended::TimedOut(Clock::KeepAlive));
+        assert!(rest.is_empty(), "{:?}", String::from_utf8_lossy(&rest));
+        let took = last.elapsed();
+        assert!(
+            took >= bounds.keep_alive && took < bounds.keep_alive + Duration::from_millis(10),
+            "kept alive for {took:?} after the last answer"
+        );
     }
 
     /// An answer's body that fails, after `pending` polls that find nothing ready.
