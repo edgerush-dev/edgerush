@@ -18,7 +18,18 @@
 #   bench/run.sh h2 [RATE] [STREAMED]         HTTP/2 clients alone: few and one hot
 #                                             connection, latency, streamed bodies, idle
 #   bench/run.sh profile-body upload|answer [RATE]  CPU stacks during streamed bodies
+#   bench/run.sh grpc                         unary gRPC calls: few connections, one hot one
+#   bench/run.sh handshakes [RATE] [FLOOD]    (TLS=1) steady clients at RATE beside a flood of
+#                                             FLOOD connections each made anew, by
+#                                             variant: ours-abN accepts N at a time
 #   bench/run.sh summary DIR                  the table of a finished run
+#
+# UPSTREAM_H2=1 has the proxy speak HTTP/2 to the backend, by prior knowledge, many
+# requests on each connection: EdgeRush and HAProxy (NGINX's proxy cannot).
+#
+# TLS=1 has clients reach the proxy over TLS — EdgeRush, NGINX and HAProxy, with one
+# self-signed ECDSA P-256 certificate — for saturation, latency and h2. Its churn is a
+# full handshake for every request.
 #
 # The variants — EdgeRush, and NGINX, HAProxy, Envoy and Kong set up to do the same
 # — are run in turns, REPS times, so that whatever drifts, heat above all, drifts
@@ -47,6 +58,8 @@ repo=$(dirname "$here")
 : "${IDLE_CONNECTIONS:=2000}"
 # The counts `idle` weighs each kind of idle connection at (14 §8).
 : "${IDLE_COUNTS:=2000 20000}"
+: "${TLS:=0}"
+: "${UPSTREAM_H2:=0}"
 : "${VARIANTS:=ours}" # and: ours-kernel nginx haproxy envoy kong
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
 
@@ -63,8 +76,11 @@ backend=http://127.0.0.1:9000/
 # The proxy is asked for by the name its routes are for, and the generators are told where
 # that is: a `host` header would not do, as HTTP/2 names the host in the target.
 host=bench.example.com
-proxy=http://$host:8080/
+scheme=http
+[ "$TLS" = 1 ] && scheme=https
+proxy=$scheme://$host:8080/
 proxy_at=127.0.0.1:8080
+tls=$run/tls
 proxy_pid=
 
 start_backend() {
@@ -74,9 +90,41 @@ start_backend() {
     # What the trickling one trickles: small enough that a request finishes in a few
     # seconds at the rate that location is held to.
     [ -s "$run/slow.bin" ] || head -c $((STREAMED / 8)) /dev/zero >"$run/slow.bin"
+    # A gRPC message frame with nothing in it: uncompressed, of length 0. What the gRPC
+    # scenario's calls send and what the backend's service answers.
+    printf '\0\0\0\0\0' >"$run/grpc.bin"
     cp "$here/proxy.yaml" "$config"
+    [ "$TLS" = 1 ] && secure
+    if [ "$UPSTREAM_H2" = 1 ]; then
+        sed -i 's#backend: { endpoints: \["127.0.0.1:9000"\] }#backend: { endpoints: ["127.0.0.1:9000"], protocol: http2 }#' "$config"
+        grep -q 'protocol: http2' "$config"
+    fi
     taskset -c "$BACKEND_CPUS" nginx -p "$run/" -c "$here/nginx.conf" -e "$run/error.log"
     await "$backend"
+}
+
+# The certificate every variant presents, made once, and EdgeRush's config made to listen
+# with it; NGINX's and HAProxy's are made as they start.
+secure() {
+    mkdir -p "$tls"
+    [ -s "$tls/both.pem" ] || {
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
+            -subj "/CN=$host" -addext "subjectAltName=DNS:$host" \
+            -keyout "$tls/key.pem" -out "$tls/cert.pem" 2>/dev/null
+        cat "$tls/cert.pem" "$tls/key.pem" >"$tls/both.pem"
+    }
+    python3 - "$config" "$tls" <<'PY'
+import json, sys
+config, tls = sys.argv[1], sys.argv[2]
+chain = json.dumps(open(f"{tls}/cert.pem").read())
+key = json.dumps(open(f"{tls}/key.pem").read())
+text = open(config).read()
+plain = 'web: { address: "127.0.0.1:8080", protocol: http }'
+assert plain in text
+text = text.replace(plain, 'web: { address: "127.0.0.1:8080", protocol: https, '
+                    f'tls: {{ certificates: [{{ chain: {chain}, key: {key} }}] }} }}')
+open(config, "w").write(text)
+PY
 }
 
 stop_backend() {
@@ -115,14 +163,32 @@ start_proxy() { # variant
             -e "$run-direct/error.log" 2>>"$OUT/proxy.log" &
         ;;
     nginx)
+        if [ "$UPSTREAM_H2" = 1 ]; then
+            echo "NGINX cannot proxy to an HTTP/2 upstream: leave it out of UPSTREAM_H2 runs" >&2
+            exit 2
+        fi
         mkdir -p "$run-proxy/tmp"
         sed "s/WORKERS/$WORKERS/" "$here/nginx-proxy.conf" >"$run-proxy/nginx.conf"
+        if [ "$TLS" = 1 ]; then
+            sed -i "s#listen 127.0.0.1:8080#listen 127.0.0.1:8080 ssl#;
+                s#^http {#http {\n    ssl_certificate $tls/cert.pem;\n    ssl_certificate_key $tls/key.pem;#" \
+                "$run-proxy/nginx.conf"
+        fi
         taskset -c "$PROXY_CPUS" nginx -p "$run-proxy/" -c "$run-proxy/nginx.conf" \
             -e "$run-proxy/error.log" 2>>"$OUT/proxy.log" &
         ;;
     haproxy)
         # A thread for every CPU it may run on: WORKERS of them, if PROXY_CPUS is as many.
-        taskset -c "$PROXY_CPUS" haproxy -db -f "$here/haproxy.cfg" 2>>"$OUT/proxy.log" &
+        local haproxy_cfg=$run-haproxy.cfg
+        cp "$here/haproxy.cfg" "$haproxy_cfg"
+        if [ "$TLS" = 1 ]; then
+            sed -i "s#bind 127.0.0.1:8080#bind 127.0.0.1:8080 ssl crt $tls/both.pem alpn h2,http/1.1#" \
+                "$haproxy_cfg"
+        fi
+        if [ "$UPSTREAM_H2" = 1 ]; then
+            sed -i "s#server nginx 127.0.0.1:9000#server nginx 127.0.0.1:9000 proto h2#" "$haproxy_cfg"
+        fi
+        taskset -c "$PROXY_CPUS" haproxy -db -f "$haproxy_cfg" 2>>"$OUT/proxy.log" &
         ;;
     ours-kernel)
         # Connections left where the kernel put them: what balancing is measured against.
@@ -136,13 +202,19 @@ start_proxy() { # variant
             --workers "$WORKERS" $idle ${METRICS:+--metrics "$METRICS"} \
             2>>"$OUT/proxy.log" &
         ;;
+    ours-ab*)
+        # EdgeRush accepting N connections before its other work goes first: ours-ab1.
+        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
+            --workers "$WORKERS" $idle --accept-batch "${1#ours-ab}" \
+            2>>"$OUT/proxy.log" &
+        ;;
     *)
         echo "no variant $variant" >&2
         exit 2
         ;;
     esac
     proxy_pid=${daemon:-$!}
-    await "http://$proxy_at/"
+    await "$scheme://$proxy_at/"
 }
 
 stop_proxy() {
@@ -159,7 +231,7 @@ stop_proxy() {
 
 await() { # url
     for _ in $(seq 100); do
-        curl -s -o /dev/null -H "host: $host" "$1" && return
+        curl -sk -o /dev/null -H "host: $host" "$1" && return
         sleep 0.1
     done
     echo "nothing answers at $1" >&2
@@ -219,8 +291,10 @@ saturation_h2() { # name, url, options...: few connections, many streams on each
 oha_at() { # name, rate, url, options...
     local name=$1 rate=$2 url=$3
     shift 3
+    local insecure=
+    [ "$TLS" = 1 ] && insecure=--insecure
     measured "$name" oha -z "${DURATION}s" -w -q "$rate" --latency-correction --no-tui \
-        --output-format json --connect-to "$host:8080:$proxy_at" "$@" "$url"
+        --output-format json --connect-to "$host:8080:$proxy_at" $insecure "$@" "$url"
 }
 
 latency_h1() { oha_at "$1" "$2" "$3" -c 256; }
@@ -433,6 +507,8 @@ environment() {
             "backend on $BACKEND_CPUS, ${DURATION}s, $REPS repetitions"
         echo "idle upstream connections: $IDLE_PER_DESTINATION per destination," \
             "$IDLE_TOTAL in all"
+        [ "$TLS" = 1 ] && echo "clients over TLS: $(openssl version), ECDSA P-256 certificate"
+        [ "$UPSTREAM_H2" = 1 ] && echo "upstream spoken to in HTTP/2 (prior knowledge)"
         h2load --version
         oha --version
         nginx -v 2>&1
@@ -475,9 +551,9 @@ profile-body)
         exit 2
     }
     ;;
-ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2) ;;
+ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes) ;;
 *)
-    sed -n '2,21p' "$0" >&2
+    sed -n '2,32p' "$0" >&2
     exit 2
     ;;
 esac
@@ -594,6 +670,37 @@ idle)
         done
     }
     each_variant idle_runs
+    ;;
+grpc)
+    # Unary gRPC calls over HTTP/2, a message each way and a status in the trailers:
+    # few connections with many calls on each, and one hot connection (15 §8). Best with
+    # UPSTREAM_H2=1, which is how a gRPC backend is spoken to.
+    grpc_call=(-d "$run/grpc.bin" -H "content-type: application/grpc" -H "te: trailers")
+    grpc_runs() {
+        saturation_h2 "$1.saturation-grpc" "${proxy}bench.Echo/Call" --connect-to="$proxy_at" \
+            "${grpc_call[@]}"
+        hot_h2 "$1.hot-grpc" "${proxy}bench.Echo/Call" --connect-to="$proxy_at" "${grpc_call[@]}"
+    }
+    each_variant grpc_runs
+    ;;
+handshakes)
+    # A flood of new TLS connections, a full handshake each, beside steady keep-alive
+    # clients at RATE: what the steady clients' latency comes to, by variant — above all
+    # by how many connections a worker accepts at a time (ours-abN; 03 §3). The flood has CPUs
+    # of its own, FLOOD_CPUS, so that it does not slow the steady generator down.
+    [ "$TLS" = 1 ] || { echo "handshakes is a TLS scenario: TLS=1" >&2; exit 2; }
+    steady_rate=${2:-10000} flood_connections=${3:-256}
+    : "${FLOOD_CPUS:=4,5}"
+    handshake_runs() {
+        taskset -c "$FLOOD_CPUS" oha -z "$((DURATION + 6))s" -c "$flood_connections" \
+            --disable-keepalive --insecure --no-tui --output-format json \
+            --connect-to "$host:8080:$proxy_at" "$proxy" >"$OUT/$1.flood.out" 2>&1 &
+        local flood=$!
+        sleep 3
+        latency_h1 "$1.steady-h1" "$steady_rate" "$proxy"
+        wait "$flood" || true
+    }
+    each_variant handshake_runs
     ;;
 soak)
     # EdgeRush under a steady mixed load for a long while (14 §9, step 5): requests at a

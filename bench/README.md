@@ -39,6 +39,13 @@ bench/run.sh soak [MINUTES] [RATE]  # EdgeRush under mixed load and reloads (30 
 bench/run.sh h2 [RATE] [STREAMED]   # HTTP/2 clients alone (25,000/s, 20/s): few and one
                                     # hot connection, latency, streamed bodies, and idle
                                     # connections at IDLE_COUNTS
+bench/run.sh grpc                   # unary gRPC calls, a message and a status each way:
+                                    # few connections, and one hot one (best with
+                                    # UPSTREAM_H2=1)
+TLS=1 bench/run.sh handshakes [RATE] [FLOOD]
+                                    # steady clients at RATE (10,000/s) beside FLOOD (256)
+                                    # connections each made anew, a full handshake each;
+                                    # variant ours-abN accepts N connections at a time
 bench/run.sh summary bench/results/<run>
 bench/window.sh [RTTS] [VARIANTS]   # HTTP/2 uploads over a delayed path, by stream window
                                     # and against NGINX: the client in a network namespace
@@ -51,6 +58,14 @@ measurement, the proxy's CPU time around it, `environment.txt`, and the table th
 `GEN_CPUS`, `BACKEND_CPUS`, `DURATION`, `REPS`, `VARIANTS`, `IDLE_PER_DESTINATION`,
 `IDLE_TOTAL`, `OUT`; the defaults are for a machine with 4 cores and 8 threads where CPUs
 *n* and *n+4* are one core.
+
+`TLS=1` has the clients reach the proxy over TLS — EdgeRush, NGINX and HAProxy, one
+self-signed ECDSA P-256 certificate made for the run — for `saturation`, `latency`
+(whose churn is then a full handshake for every request), `h2`, `grpc` and `handshakes`.
+`UPSTREAM_H2=1` has the proxy speak HTTP/2 to the backend by prior knowledge: EdgeRush
+and HAProxy, as NGINX cannot proxy to an HTTP/2 upstream. Compare with other runs at the
+same `IDLE_PER_DESTINATION` and `IDLE_TOTAL`: at 8 and 256 a few hundred clients make
+EdgeRush open upstream connections all the time, which NGINX's `keepalive 1024` does not.
 
 `IDLE_PER_DESTINATION` and `IDLE_TOTAL` are the bounds of
 [13 §7](../../docs/13-http1-upstream.md) on how many idle upstream connections a worker
