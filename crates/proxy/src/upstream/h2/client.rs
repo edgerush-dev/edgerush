@@ -87,6 +87,9 @@ pub(crate) enum PlaceError {
     Unreachable,
 }
 
+/// The most a destination's keepalive interval is doubled: 64 times what was configured.
+const MOST_DOUBLINGS: u32 = 6;
+
 /// What a connection to an upstream is carried over, before HTTP/2 is spoken on it.
 enum Transport {
     Plain(TcpStream),
@@ -112,6 +115,9 @@ pub(crate) struct Client {
     /// Every destination asked for, by key: where to open the connections the pool asks
     /// for, and whether a reload has retired it.
     destinations: RefCell<HashMap<u64, Arc<ReuseIdentity>>>,
+    /// How many times a destination's keepalive interval has been doubled, by key, for
+    /// telling this client to calm down: gRPC's backoff for too many PINGs.
+    calmer: RefCell<HashMap<u64, u32>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -189,6 +195,7 @@ impl Client {
             links: RefCell::new(HashMap::new()),
             waiters: RefCell::new(HashMap::new()),
             destinations: RefCell::new(HashMap::new()),
+            calmer: RefCell::new(HashMap::new()),
         })
     }
 
@@ -424,17 +431,34 @@ impl Client {
         let mut away = false;
         // One PING, whose answer says the peer's SETTINGS have been heard: a peer sends
         // them before anything else, and frames arrive in order. Until then the pool
-        // counts on the connection without dialling beside it.
-        let mut settling = connection.ping_pong();
-        if let Some(pinging) = settling.as_mut()
-            && pinging.send_ping(::h2::Ping::opaque()).is_err()
-        {
-            settling = None;
-        }
-        if settling.is_none() {
+        // counts on the connection without dialling beside it. The same handle sends the
+        // keepalive's PINGs after it, one at a time.
+        let mut pings = connection.ping_pong();
+        let mut settling = pings
+            .as_mut()
+            .is_some_and(|pinging| pinging.send_ping(::h2::Ping::opaque()).is_ok());
+        if !settling {
             let peer = u32::try_from(limit).unwrap_or(u32::MAX);
             self.event(|pool, at, actions| pool.settled(key, id, peer, at, actions));
         }
+        let keepalive = self
+            .destinations
+            .borrow()
+            .get(&key)
+            .and_then(|destination| destination.keepalive());
+        let calmer = self.calmer.borrow().get(&key).copied().unwrap_or(0);
+        let interval = keepalive.map(|keepalive| {
+            Duration::from_secs(keepalive.interval_seconds).saturating_mul(1 << calmer)
+        });
+        let mut next_ping = interval.map(|interval| Box::pin(tokio::time::sleep(interval)));
+        // The settling PING is held to the keepalive's timeout as its PINGs are: a
+        // connection that never answers one is as dead as one that stops.
+        let mut pong_due: Option<std::pin::Pin<Box<tokio::time::Sleep>>> =
+            keepalive.filter(|_| settling).map(|keepalive| {
+                Box::pin(tokio::time::sleep(Duration::from_secs(
+                    keepalive.timeout_seconds,
+                )))
+            });
         let mut letting_go = pin!(link.released.notified());
         // Made when the pool lets the connection go: with the last handle gone h2 closes
         // it once its streams are done, and it has so long to do so.
@@ -450,20 +474,62 @@ impl Client {
             {
                 return Poll::Ready(());
             }
-            if std::pin::Pin::new(&mut connection).poll(cx).is_ready() {
+            if let Poll::Ready(ended) = std::pin::Pin::new(&mut connection).poll(cx) {
+                // Told to calm down: its PINGs, gRPC says, were too many. The next
+                // connection to it waits twice as long between them.
+                if let Err(error) = ended
+                    && error.is_go_away()
+                    && error.is_remote()
+                    && error.reason() == Some(::h2::Reason::ENHANCE_YOUR_CALM)
+                {
+                    let mut calmer = self.calmer.borrow_mut();
+                    let doubled = calmer.entry(key).or_insert(0);
+                    *doubled = (*doubled + 1).min(MOST_DOUBLINGS);
+                }
                 return Poll::Ready(());
             }
-            if let Some(pinging) = settling.as_mut()
+            if let Some(pinging) = pings.as_mut()
+                && (settling || pong_due.is_some())
                 && let Poll::Ready(answered) = pinging.poll_pong(cx)
             {
-                settling = None;
-                // A connection that failed instead is about to end, and says so then.
-                if answered.is_ok()
-                    && let Some(watching) = watch.as_ref()
+                pong_due = None;
+                if settling {
+                    settling = false;
+                    // A connection that failed instead is about to end, and says so then.
+                    if answered.is_ok()
+                        && let Some(watching) = watch.as_ref()
+                    {
+                        limit = watching.current_max_send_streams();
+                        let peer = u32::try_from(limit).unwrap_or(u32::MAX);
+                        self.event(|pool, at, actions| pool.settled(key, id, peer, at, actions));
+                    }
+                }
+            }
+            if let Some(due) = pong_due.as_mut()
+                && due.as_mut().poll(cx).is_ready()
+            {
+                // No answer in time: taken for dead, and whatever is on it with it.
+                return Poll::Ready(());
+            }
+            if let (Some(keepalive), Some(interval), Some(next)) =
+                (keepalive, interval, next_ping.as_mut())
+                && next.as_mut().poll(cx).is_ready()
+            {
+                next.as_mut().reset(Instant::now() + interval);
+                let calls = self.pool.borrow().streams(key, id) > 0;
+                if !settling
+                    && pong_due.is_none()
+                    && (calls || keepalive.without_calls)
+                    && let Some(pinging) = pings.as_mut()
+                    && pinging.send_ping(::h2::Ping::opaque()).is_ok()
                 {
-                    limit = watching.current_max_send_streams();
-                    let peer = u32::try_from(limit).unwrap_or(u32::MAX);
-                    self.event(|pool, at, actions| pool.settled(key, id, peer, at, actions));
+                    let timeout = Duration::from_secs(keepalive.timeout_seconds);
+                    pong_due = Some(Box::pin(tokio::time::sleep(timeout)));
+                }
+                // Polled again, so that the timer just set is watched.
+                let _armed = next.as_mut().poll(cx);
+                if let Some(due) = pong_due.as_mut() {
+                    let _armed = due.as_mut().poll(cx);
                 }
             }
             if let Some(watching) = watch.as_mut() {

@@ -7,7 +7,7 @@ use crate::route::{
     Filter, GrpcMethod, HeaderChanges, Hostname, Match, PathMatch, Route, ValueMatch,
     ValuePredicate, Wildcard,
 };
-use crate::{Config, Protocol, Rule, Tls, UpstreamProtocol, UpstreamTls};
+use crate::{Config, Keepalive, Protocol, Rule, Tls, UpstreamProtocol, UpstreamTls};
 use edgerush_filters::{HeaderModifier, HeaderModifierError};
 use edgerush_router::{
     HeaderPredicate, HeaderPredicateError, HeaderPredicates, HostClaim, HostPattern,
@@ -94,6 +94,8 @@ pub struct CompiledUpstream {
     pub protocol: UpstreamProtocol,
     /// TLS to its endpoints, if any.
     pub tls: Option<UpstreamTls>,
+    /// PINGs on its HTTP/2 connections, if any.
+    pub keepalive: Option<Keepalive>,
 }
 
 /// Compiles a config. The order of the routes, then of the rules, then of a rule's matches
@@ -121,9 +123,26 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             endpoints: upstream.endpoints.clone(),
             protocol: upstream.protocol,
             tls: upstream.tls.clone(),
+            keepalive: upstream.keepalive,
         })
         .collect();
     for (name, upstream) in &config.upstreams {
+        if let Some(keepalive) = &upstream.keepalive {
+            let problem = if upstream.protocol != UpstreamProtocol::Http2 {
+                Some(Problem::KeepaliveNeedsHttp2)
+            } else if keepalive.interval_seconds < KEEPALIVE_FLOOR_SECONDS
+                && !keepalive.backend_allows_short_intervals
+            {
+                Some(Problem::KeepaliveTooOften(keepalive.interval_seconds))
+            } else if keepalive.interval_seconds == 0 || keepalive.timeout_seconds == 0 {
+                Some(Problem::KeepaliveZero)
+            } else {
+                None
+            };
+            if let Some(problem) = problem {
+                errors.push(Place::upstream(name).problem(problem));
+            }
+        }
         if let Some(tls) = &upstream.tls {
             if tls.authorities.is_empty() {
                 errors.push(Place::upstream(name).problem(Problem::NoAuthority));
@@ -235,6 +254,9 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
         Err(errors)
     }
 }
+
+/// What gRPC servers enforce by default between a client's PINGs: five minutes.
+const KEEPALIVE_FLOOR_SECONDS: u64 = 300;
 
 /// Whether `name` is a host name as a certificate names one: labels of letters, digits and
 /// hyphens, none empty, none starting or ending with a hyphen. No port, no wildcard, and
@@ -631,6 +653,18 @@ pub enum Problem {
     /// TLS to an upstream that trusts nobody.
     #[error("`tls` needs an authority to trust")]
     NoAuthority,
+    /// PINGs for an upstream that is not spoken to in HTTP/2.
+    #[error("`keepalive` is for an upstream spoken to in HTTP/2")]
+    KeepaliveNeedsHttp2,
+    /// PINGs more often than gRPC servers take, without saying the backend takes them.
+    #[error(
+        "a PING every {0} s is more often than the 300 s gRPC servers take; say \
+         `backend_allows_short_intervals` if this backend takes it"
+    )]
+    KeepaliveTooOften(u64),
+    /// A keepalive interval or timeout of nothing.
+    #[error("`keepalive` needs an interval and a timeout of at least a second")]
+    KeepaliveZero,
     /// TLS to an upstream whose server is not named by a host name.
     #[error("server name `{0}` is not a host name")]
     ServerName(String),
@@ -1314,6 +1348,30 @@ upstreams: { u: { endpoints: [] } }
         assert_eq!(rule("/other.Svc/Do"), Some(0));
         assert_eq!(rule("/other.Svc/Other"), None);
         assert_eq!(rule("/pkg.SvcX/Other"), None);
+    }
+
+    /// PINGs are for HTTP/2 upstreams, and no more often than gRPC servers take unless the
+    /// backend is said to take more.
+    #[test]
+    fn keepalive_is_for_http2_upstreams_and_no_more_often_than_they_take() {
+        let with = |upstream: &str| {
+            let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{ u: {upstream} }}\n");
+            compile(&config(&yaml))
+                .map(|compiled| compiled.upstreams[0].keepalive)
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let ok = with("{ endpoints: [], protocol: http2, keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false } }")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok.interval_seconds, 300);
+        assert!(with("{ endpoints: [], protocol: http2, keepalive: { interval_seconds: 10, timeout_seconds: 5, without_calls: true, backend_allows_short_intervals: true } }").is_ok());
+        let problem = |upstream: &str| with(upstream).unwrap_err()[0].clone();
+        assert!(problem("{ endpoints: [], keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false } }")
+            .ends_with("`keepalive` is for an upstream spoken to in HTTP/2"));
+        assert!(problem("{ endpoints: [], protocol: http2, keepalive: { interval_seconds: 60, timeout_seconds: 20, without_calls: false } }")
+            .contains("more often than the 300 s gRPC servers take"));
+        assert!(problem("{ endpoints: [], protocol: http2, keepalive: { interval_seconds: 0, timeout_seconds: 20, without_calls: false, backend_allows_short_intervals: true } }")
+            .ends_with("needs an interval and a timeout of at least a second"));
     }
 
     /// A private key is never printed, whatever prints the config.

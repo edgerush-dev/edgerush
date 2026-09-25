@@ -4174,6 +4174,218 @@ upstreams:
             .await;
     }
 
+    /// A worker whose one upstream `up`, at `upstream`, is spoken to in HTTP/2 with
+    /// `keepalive`.
+    async fn serving_worker_with_keepalive(
+        upstream: SocketAddr,
+        keepalive: edgerush_config::Keepalive,
+    ) -> (SocketAddr, Rc<Worker>) {
+        let mut config = everything_config(upstream);
+        let up = config.upstreams.get_mut("up").unwrap();
+        up.protocol = UpstreamProtocol::Http2;
+        up.keepalive = Some(keepalive);
+        let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+        let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        (front, worker)
+    }
+
+    fn every_second(without_calls: bool) -> edgerush_config::Keepalive {
+        edgerush_config::Keepalive {
+            interval_seconds: 1,
+            timeout_seconds: 1,
+            without_calls,
+            backend_allows_short_intervals: true,
+        }
+    }
+
+    /// What a raw HTTP/2 upstream of the keepalive tests does with PINGs.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Pinged {
+        /// Answers every one.
+        Answers,
+        /// Answers the first (the settling PING), then none.
+        GoesQuiet,
+        /// Answers the first, and says GOAWAY(ENHANCE_YOUR_CALM) at the next.
+        CalmsDown,
+        /// Answers none, the settling PING included.
+        Deaf,
+    }
+
+    /// A raw HTTP/2 upstream that answers each request `200` after `hold`, does with
+    /// PINGs as `pinged` says on its first connection (and answers them on the rest), and
+    /// tells, in order, when each PING arrived and on which connection.
+    async fn pinged_upstream(
+        hold: Duration,
+        pinged: Pinged,
+    ) -> (SocketAddr, Rc<RefCell<Vec<(usize, tokio::time::Instant)>>>) {
+        use crate::h2_peer::{self, Frame, Peer, code, flag, kind};
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let pings = Rc::new(RefCell::new(Vec::new()));
+        let recording = Rc::clone(&pings);
+        let _accepting = tokio::task::spawn_local(async move {
+            let mut connections = 0;
+            while let Ok((stream, _)) = socket.accept().await {
+                connections += 1;
+                let (connection, recording) = (connections, Rc::clone(&recording));
+                let pinged = if connection == 1 {
+                    pinged
+                } else {
+                    Pinged::Answers
+                };
+                let _serving = tokio::task::spawn_local(async move {
+                    let (mut peer, _) = Peer::accept_as_server(stream, &[]).await;
+                    let mut due: Vec<(u32, tokio::time::Instant)> = Vec::new();
+                    let mut seen = 0;
+                    loop {
+                        let next_answer = due.first().map(|(_, at)| *at);
+                        let frame = match next_answer {
+                            Some(at) => tokio::select! {
+                                frame = peer.try_next() => frame,
+                                () = tokio::time::sleep_until(at) => {
+                                    let (stream, _) = due.remove(0);
+                                    let answer = h2_peer::headers(stream, h2_peer::response(200), true);
+                                    peer.send(&answer).await;
+                                    continue;
+                                }
+                            },
+                            None => peer.try_next().await,
+                        };
+                        let Some(frame) = frame else { return };
+                        if frame.kind == kind::HEADERS {
+                            due.push((frame.stream, tokio::time::Instant::now() + hold));
+                        } else if frame.kind == kind::PING && !frame.has(flag::ACK) {
+                            seen += 1;
+                            recording
+                                .borrow_mut()
+                                .push((connection, tokio::time::Instant::now()));
+                            let answers = match pinged {
+                                Pinged::Answers => true,
+                                Pinged::GoesQuiet | Pinged::CalmsDown => seen == 1,
+                                Pinged::Deaf => false,
+                            };
+                            if answers {
+                                let ack =
+                                    Frame::new(kind::PING, flag::ACK, 0, frame.payload.clone());
+                                peer.send(&ack).await;
+                            } else if pinged == Pinged::CalmsDown {
+                                peer.send(&h2_peer::goaway(0, code::ENHANCE_YOUR_CALM))
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (address, pings)
+    }
+
+    /// PINGs go while a call is open, one a second, and stop when the connection is idle.
+    #[tokio::test]
+    async fn keepalive_pings_while_a_call_is_open_and_not_when_idle() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, pings) =
+                    pinged_upstream(Duration::from_millis(2500), Pinged::Answers).await;
+                let (front, _worker) =
+                    serving_worker_with_keepalive(upstream, every_second(false)).await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                // The settling PING, then one a second while the call was open.
+                let while_open = pings.borrow().len();
+                assert!(
+                    while_open >= 3,
+                    "{while_open} PINGs while the call was open"
+                );
+                tokio::time::sleep(Duration::from_millis(2500)).await;
+                assert_eq!(pings.borrow().len(), while_open, "PINGs with no call open");
+            })
+            .await;
+    }
+
+    /// A PING nobody answers in time takes its connection for dead: what is on it fails,
+    /// and the next request goes on a new one.
+    #[tokio::test]
+    async fn a_ping_nobody_answers_takes_its_connection_for_dead() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, pings) =
+                    pinged_upstream(Duration::from_secs(8), Pinged::GoesQuiet).await;
+                let (front, worker) =
+                    serving_worker_with_keepalive(upstream, every_second(false)).await;
+                let asked = tokio::time::Instant::now();
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
+                let took = asked.elapsed();
+                assert!(
+                    took >= Duration::from_secs(2) && took < Duration::from_secs(4),
+                    "given up on after {took:?}"
+                );
+                until(|| worker.h2_connections() == 0).await;
+                assert!(pings.borrow().len() >= 2);
+            })
+            .await;
+    }
+
+    /// A connection that never answers even its first PING is as dead as one that stops:
+    /// it is given up on at the keepalive's timeout.
+    #[tokio::test]
+    async fn a_connection_that_never_answers_a_ping_is_given_up_on() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _pings) =
+                    pinged_upstream(Duration::from_secs(8), Pinged::Deaf).await;
+                let (front, _worker) =
+                    serving_worker_with_keepalive(upstream, every_second(false)).await;
+                let asked = tokio::time::Instant::now();
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
+                let took = asked.elapsed();
+                assert!(took < Duration::from_secs(3), "given up on after {took:?}");
+            })
+            .await;
+    }
+
+    /// Told to calm down, the client waits twice as long between PINGs on its next
+    /// connection to the same upstream: gRPC's backoff, so there is no storm of them.
+    #[tokio::test]
+    async fn told_to_calm_down_the_next_connection_pings_half_as_often() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, pings) = pinged_upstream(Duration::ZERO, Pinged::CalmsDown).await;
+                let (front, worker) =
+                    serving_worker_with_keepalive(upstream, every_second(true)).await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                // Its first keepalive PING draws the GOAWAY, and the connection goes.
+                until(|| pings.borrow().len() >= 2).await;
+                until(|| worker.h2_connections() == 0).await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                until(|| pings.borrow().iter().filter(|(on, _)| *on == 2).count() >= 2).await;
+                let second: Vec<tokio::time::Instant> = pings
+                    .borrow()
+                    .iter()
+                    .filter(|(on, _)| *on == 2)
+                    .map(|(_, at)| *at)
+                    .collect();
+                let gap = second[1] - second[0];
+                assert!(
+                    gap >= Duration::from_millis(1800) && gap < Duration::from_millis(2800),
+                    "{gap:?} between the second connection's PINGs"
+                );
+            })
+            .await;
+    }
+
     /// A client that gives its request up gives its stream's place back: with room for one
     /// stream on one connection, the next request is served rather than kept waiting.
     #[tokio::test]

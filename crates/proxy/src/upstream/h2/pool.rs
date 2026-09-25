@@ -459,6 +459,19 @@ impl Pool {
         self.total
     }
 
+    /// The streams connection `id` to `key` has on it now.
+    pub(crate) fn streams(&self, key: u64, id: ConnectionId) -> u32 {
+        self.destinations
+            .get(&key)
+            .and_then(|destination| {
+                destination
+                    .connections
+                    .iter()
+                    .find(|connection| connection.id == id)
+            })
+            .map_or(0, |connection| connection.active)
+    }
+
     fn connection(&mut self, key: u64, id: ConnectionId) -> Option<&mut Connection> {
         let destination = self.destinations.get_mut(&key)?;
         let at = destination.position(id)?;

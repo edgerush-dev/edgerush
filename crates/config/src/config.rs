@@ -85,6 +85,28 @@ pub struct Upstream {
     /// TLS to its endpoints; none is plain TCP.
     #[serde(default)]
     pub tls: Option<UpstreamTls>,
+    /// HTTP/2 PINGs to find a dead connection before a request does; none is no PINGs.
+    #[serde(default)]
+    pub keepalive: Option<Keepalive>,
+}
+
+/// PINGs on an HTTP/2 upstream's idle-looking connections, as gRPC's keepalive has them.
+/// A gRPC server takes a PING more often than every five minutes as abuse, and says so
+/// with GOAWAY(ENHANCE_YOUR_CALM), so nothing shorter is allowed unless the backend is
+/// said to take it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Keepalive {
+    /// Seconds between PINGs.
+    pub interval_seconds: u64,
+    /// Seconds a PING's answer is waited for before the connection is taken for dead.
+    pub timeout_seconds: u64,
+    /// Whether to PING a connection with no call on it too; gRPC asks this be chosen on
+    /// purpose.
+    pub without_calls: bool,
+    /// That the backend takes PINGs more often than every five minutes.
+    #[serde(default)]
+    pub backend_allows_short_intervals: bool,
 }
 
 /// TLS to an upstream's endpoints: whom they are expected to be, and whom to trust to say

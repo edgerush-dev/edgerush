@@ -12,7 +12,7 @@
 //! reload keeps that key only where the destination really is the same one.
 
 use crate::upstream::secure::Secure;
-use edgerush_config::{Compiled, UpstreamProtocol, UpstreamTls};
+use edgerush_config::{Compiled, Keepalive, UpstreamProtocol, UpstreamTls};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -46,6 +46,8 @@ pub struct ReuseIdentity {
     protocol: UpstreamProtocol,
     /// What its connections are secured with; none is plain TCP.
     secure: Option<Arc<Secure>>,
+    /// PINGs on its HTTP/2 connections, if any.
+    keepalive: Option<Keepalive>,
     /// Set when a config without this destination is published. Nothing retired is ever
     /// kept or taken out again; an exchange already under way finishes as it is.
     retired: AtomicBool,
@@ -71,6 +73,11 @@ impl ReuseIdentity {
     /// What its connections are secured with, if anything.
     pub(crate) fn secure(&self) -> Option<&Arc<Secure>> {
         self.secure.as_ref()
+    }
+
+    /// PINGs on its HTTP/2 connections, if any.
+    pub(crate) fn keepalive(&self) -> Option<Keepalive> {
+        self.keepalive
     }
 
     /// Whether this destination is gone from the running config. Checked when a
@@ -111,6 +118,7 @@ impl Destinations {
             SocketAddr,
             UpstreamProtocol,
             Option<&'a UpstreamTls>,
+            Option<Keepalive>,
         );
         let mut known: HashMap<Same<'_>, &Arc<ReuseIdentity>> = previous
             .0
@@ -123,6 +131,7 @@ impl Destinations {
                     identity.address,
                     identity.protocol,
                     tls,
+                    identity.keepalive,
                 );
                 (same, identity)
             })
@@ -145,6 +154,7 @@ impl Destinations {
                                 *address,
                                 upstream.protocol,
                                 upstream.tls.as_ref(),
+                                upstream.keepalive,
                             ))
                             .map_or_else(
                                 || {
@@ -154,6 +164,7 @@ impl Destinations {
                                         address: *address,
                                         protocol: upstream.protocol,
                                         secure: secure.get(position).cloned().flatten(),
+                                        keepalive: upstream.keepalive,
                                         retired: AtomicBool::new(false),
                                     })
                                 },
