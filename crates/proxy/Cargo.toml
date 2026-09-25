@@ -33,7 +33,7 @@ hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 memchr.workspace = true
 thiserror.workspace = true
-# "sync": what wakes a worker's connections when it drains.
+# "sync": what an HTTP/2 upstream connection and its requests wait on each other with.
 tokio = { workspace = true, features = ["sync"] }
 tokio-boring.workspace = true
 
