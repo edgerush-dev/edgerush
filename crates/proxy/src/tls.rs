@@ -1,15 +1,18 @@
 //! TLS on the client hop ([03 §3](../../docs/03-data-plane.md)): BoringSSL, through
 //! `boring` for the setup and `tokio-boring` for the connection.
 //!
-//! A listener's certificates are made into one acceptor when a config arrives, and a
-//! config that has the same certificates keeps it: the keys its session tickets are
-//! sealed with are the acceptor's, so a reload that does not touch them does not cost the
-//! clients their resumption. Which certificate a client is given is decided by the name it
-//! asks for (SNI) against the names the certificates themselves carry.
+//! Every connection to a listener starts in one context of the listener's that holds no
+//! certificate — its front — and is moved to the context of the certificate for the name
+//! it asks for (SNI), against the names the certificates themselves carry. Session
+//! tickets are sealed with the front's keys, which BoringSSL rotates every two days, and
+//! the front is kept by every config that validates clients as it does: new certificates
+//! are new contexts behind the same front, so rotating them does not cost the clients
+//! their resumption. The keys never leave the pod.
 //!
 //! Sessions are resumed by ticket only. BoringSSL's session cache is one table for all
 //! the workers behind a lock, which every full handshake would write to.
 
+use arc_swap::ArcSwap;
 use boring::error::ErrorStack;
 use boring::pkey::PKey;
 use boring::ssl::{
@@ -18,7 +21,7 @@ use boring::ssl::{
 };
 use boring::x509::X509;
 use boring::x509::store::X509StoreBuilder;
-use edgerush_config::Certificate;
+use edgerush_config::{Certificate, ClientValidation};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -36,15 +39,33 @@ const GROUPS: &str = "X25519MLKEM768:X25519:P-256:P-384";
 
 /// A listener's TLS: what a connection is accepted with.
 pub(crate) struct Tls {
-    acceptor: SslAcceptor,
+    front: Arc<Front>,
+    /// Its certificates, which the front serves once they are installed.
+    certificates: Arc<Certificates>,
     /// What it was made from, which a later config's is compared with.
     source: edgerush_config::Tls,
+}
+
+/// Where every connection to a listener starts, and whose keys seal its session tickets.
+struct Front {
+    acceptor: SslAcceptor,
+    /// The clients it was made to validate, which a later config must too to keep it.
+    validation: Option<ClientValidation>,
+    /// The certificates it moves connections to.
+    serving: Arc<ArcSwap<Certificates>>,
+}
+
+/// A listener's certificates, each in a context of its own, and which answers for which
+/// name.
+struct Certificates {
+    names: Names,
+    contexts: Vec<SslContext>,
 }
 
 impl std::fmt::Debug for Tls {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tls")
-            .field("certificates", &self.source.certificates.len())
+            .field("certificates", &self.certificates.contexts.len())
             .finish_non_exhaustive()
     }
 }
@@ -95,68 +116,126 @@ pub enum TlsError {
 }
 
 impl Tls {
-    /// What `source`'s certificates are served with.
+    /// What `source`'s certificates are served with, behind a front of its own.
     ///
     /// # Errors
     ///
-    /// A [`TlsError`] for the first certificate that cannot be used.
+    /// A [`TlsError`] for the first certificate or authority that cannot be used.
     pub(crate) fn new(source: &edgerush_config::Tls) -> Result<Self, TlsError> {
-        let authorities = source
-            .client_validation
-            .as_ref()
-            .map(|validation| authorities(&validation.authorities))
-            .transpose()?;
-        let mut names = Names::default();
-        let mut others = Vec::with_capacity(source.certificates.len().saturating_sub(1));
-        let mut first = None;
-        for (index, certificate) in source.certificates.iter().enumerate() {
-            let (mut builder, leaf) = context(certificate, index)?;
-            // On every certificate's context: a client that asked for another name is moved
-            // to that one's, and must be held to the same.
-            if let Some(authorities) = &authorities {
-                validate_clients(&mut builder, authorities)?;
-            }
-            names.add(&leaf, index);
-            if first.is_none() {
-                first = Some(builder);
-            } else {
-                others.push(builder.build().into_context());
-            }
-        }
-        let Some(mut first) = first else {
-            // The config model refuses an `https` listener with no certificate.
-            return Err(TlsError::Empty { index: 0 });
-        };
-        let others: Arc<[SslContext]> = others.into();
-        // The first certificate is the context every connection starts in; one that asked
-        // for a name another certificate carries is moved to that one's.
-        first.set_servername_callback(move |ssl, _alert| {
-            let asked = ssl.servername(NameType::HOST_NAME);
-            if let Some(other) = asked
-                .map(|name| names.choose(name))
-                .and_then(|chosen| chosen.checked_sub(1))
-                .and_then(|other| others.get(other))
-            {
-                // Only fails for a context with no certificate, which none of these is.
-                let _moved = ssl.set_ssl_context(other);
-            }
-            Ok(())
-        });
+        let authorities = authorities_of(source)?;
+        let certificates = Arc::new(Certificates::new(source, authorities.as_deref())?);
+        let serving = Arc::new(ArcSwap::new(Arc::clone(&certificates)));
+        let front = Front::acceptor(authorities.as_deref(), &serving)?;
         Ok(Self {
-            acceptor: first.build(),
+            front: Arc::new(Front {
+                acceptor: front,
+                validation: source.client_validation.clone(),
+                serving,
+            }),
+            certificates,
             source: source.clone(),
         })
     }
 
+    /// What `source` is served with where `previous` was: behind `previous`'s front, and
+    /// so with its ticket keys, if both validate clients alike; otherwise as new. The
+    /// certificates are served once [`Tls::install`] is called.
+    ///
+    /// # Errors
+    ///
+    /// A [`TlsError`] for the first certificate or authority that cannot be used.
+    pub(crate) fn after(previous: &Self, source: &edgerush_config::Tls) -> Result<Self, TlsError> {
+        if previous.front.validation != source.client_validation {
+            return Self::new(source);
+        }
+        let authorities = authorities_of(source)?;
+        Ok(Self {
+            front: Arc::clone(&previous.front),
+            certificates: Arc::new(Certificates::new(source, authorities.as_deref())?),
+            source: source.clone(),
+        })
+    }
+
+    /// Serves these certificates from now on, in place of whatever the front served.
+    pub(crate) fn install(&self) {
+        self.front.serving.store(Arc::clone(&self.certificates));
+    }
+
     /// What connections are accepted with.
     pub(crate) fn acceptor(&self) -> &SslAcceptor {
-        &self.acceptor
+        &self.front.acceptor
     }
 
     /// Whether this was made from `source`, and can serve a config that has it.
     pub(crate) fn is_for(&self, source: &edgerush_config::Tls) -> bool {
         self.source == *source
     }
+
+    /// Whether this and `other` seal session tickets with the same keys.
+    #[cfg(test)]
+    pub(crate) fn shares_keys_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.front, &other.front)
+    }
+}
+
+impl Front {
+    /// Its context: one with no certificate, which moves every connection to the certificate it
+    /// asked for among those `serving` holds at the time.
+    fn acceptor(
+        authorities: Option<&[X509]>,
+        serving: &Arc<ArcSwap<Certificates>>,
+    ) -> Result<SslAcceptor, TlsError> {
+        let mut builder = protocol()?;
+        // What a connection is held to is set when it starts, here: the certificate's
+        // context it is moved to does not change it.
+        if let Some(authorities) = authorities {
+            validate_clients(&mut builder, authorities)?;
+        }
+        let serving = Arc::clone(serving);
+        // Called for every handshake, a name asked for or not.
+        builder.set_servername_callback(move |ssl, _alert| {
+            let certificates = serving.load();
+            let asked = ssl.servername(NameType::HOST_NAME).unwrap_or("");
+            let chosen = certificates.names.choose(asked);
+            if let Some(context) = certificates.contexts.get(chosen) {
+                // Only fails for a context with no certificate, which none of these is.
+                let _moved = ssl.set_ssl_context(context);
+            }
+            Ok(())
+        });
+        Ok(builder.build())
+    }
+}
+
+impl Certificates {
+    fn new(source: &edgerush_config::Tls, authorities: Option<&[X509]>) -> Result<Self, TlsError> {
+        let mut names = Names::default();
+        let mut contexts = Vec::with_capacity(source.certificates.len());
+        for (index, certificate) in source.certificates.iter().enumerate() {
+            let (mut builder, leaf) = context(certificate, index)?;
+            // As the front: whatever this context's own settings, it is the front's that
+            // hold, and these are kept the same so that nothing rests on which.
+            if let Some(authorities) = authorities {
+                validate_clients(&mut builder, authorities)?;
+            }
+            names.add(&leaf, index);
+            contexts.push(builder.build().into_context());
+        }
+        if contexts.is_empty() {
+            // The config model refuses an `https` listener with no certificate.
+            return Err(TlsError::Empty { index: 0 });
+        }
+        Ok(Self { names, contexts })
+    }
+}
+
+/// The authorities `source` trusts to vouch for clients, read, if it validates them.
+fn authorities_of(source: &edgerush_config::Tls) -> Result<Option<Vec<X509>>, TlsError> {
+    source
+        .client_validation
+        .as_ref()
+        .map(|validation| authorities(&validation.authorities))
+        .transpose()
 }
 
 /// The certificates of the authorities trusted to vouch for clients, read.
@@ -200,6 +279,19 @@ fn validate_clients(
     Ok(())
 }
 
+/// What every context of a listener's is set up with: TLS 1.2 and 1.3, and for 1.2 only
+/// forward-secret AEAD suites; the key exchanges; tickets and no cache; the protocols.
+fn protocol() -> Result<SslAcceptorBuilder, TlsError> {
+    let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(setup)?;
+    builder.set_curves_list(GROUPS).map_err(setup)?;
+    builder.set_session_cache_mode(SslSessionCacheMode::OFF);
+    builder.set_alpn_select_callback(|_ssl, offered| {
+        select_next_proto(PROTOCOLS, offered).ok_or(AlpnError::NOACK)
+    });
+    Ok(builder)
+}
+
 /// A context for one certificate, and the certificate itself, whose names are for the
 /// caller to file.
 fn context(
@@ -207,14 +299,7 @@ fn context(
     index: usize,
 ) -> Result<(SslAcceptorBuilder, X509), TlsError> {
     let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
-    // TLS 1.2 and 1.3, and for 1.2 only forward-secret AEAD suites.
-    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(setup)?;
-    builder.set_curves_list(GROUPS).map_err(setup)?;
-    builder.set_session_cache_mode(SslSessionCacheMode::OFF);
-    builder.set_alpn_select_callback(|_ssl, offered| {
-        select_next_proto(PROTOCOLS, offered).ok_or(AlpnError::NOACK)
-    });
-
+    let mut builder = protocol()?;
     let identity = Identity::read(certificate, index)?;
     builder.set_certificate(&identity.leaf).map_err(setup)?;
     for intermediate in identity.intermediates {

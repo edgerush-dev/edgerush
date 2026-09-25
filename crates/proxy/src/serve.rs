@@ -462,19 +462,20 @@ impl Snapshot {
                 let Some(source) = &listener.tls else {
                     return Ok(None);
                 };
-                let kept = previous
+                let before = previous
                     .and_then(|previous| previous.tls.get(position))
-                    .and_then(Option::as_ref)
-                    .filter(|kept| kept.is_for(source));
-                match kept {
-                    Some(kept) => Ok(Some(Arc::clone(kept))),
-                    None => Tls::new(source)
-                        .map(|tls| Some(Arc::new(tls)))
-                        .map_err(|error| ProxyError::Tls {
-                            listener: listener.name.clone(),
-                            error,
-                        }),
+                    .and_then(Option::as_ref);
+                if let Some(kept) = before.filter(|kept| kept.is_for(source)) {
+                    return Ok(Some(Arc::clone(kept)));
                 }
+                // New certificates behind the front the listener had, if it can keep it.
+                before
+                    .map_or_else(|| Tls::new(source), |before| Tls::after(before, source))
+                    .map(|tls| Some(Arc::new(tls)))
+                    .map_err(|error| ProxyError::Tls {
+                        listener: listener.name.clone(),
+                        error,
+                    })
             })
             .collect::<Result<_, _>>()?;
         let upstream_slots = config
@@ -589,6 +590,11 @@ impl Proxy {
             &self.keys,
         )?;
         drop(previous);
+        // Only now that all of it is accepted: a config refused for one listener must not
+        // have changed the certificates of another.
+        for tls in snapshot.tls.iter().flatten() {
+            tls.install();
+        }
         self.current.store(Arc::new(snapshot));
         self.metrics.reloads.inc();
         let now = SystemTime::now().duration_since(UNIX_EPOCH);
@@ -3158,6 +3164,35 @@ upstreams:
         String::from_utf8_lossy(&answer).into_owned()
     }
 
+    /// A reload with new certificates has new handshakes given them at once, behind the
+    /// front the listener already had.
+    #[tokio::test]
+    async fn new_certificates_are_served_from_the_reload_on() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::tls::testing::certificate;
+                let (upstream, _) = counting_upstream().await;
+                let old = certificate(&["example.test"]);
+                let (front, worker) = serving_secured_worker(upstream, vec![old.clone()]).await;
+                let shown = || async {
+                    let stream = tls_client(front, "example.test", None, |_| {})
+                        .await
+                        .unwrap();
+                    stream.ssl().peer_certificate().unwrap().to_pem().unwrap()
+                };
+                assert_eq!(shown().await, old.chain.as_bytes());
+
+                let new = certificate(&["example.test"]);
+                worker
+                    .proxy()
+                    .reload(everything_secured_to(upstream, vec![new.clone()]))
+                    .unwrap();
+                assert_eq!(shown().await, new.chain.as_bytes());
+            })
+            .await;
+    }
+
     /// The certificate a client is given is the one whose names cover the name it asked
     /// for, and the first when none does.
     #[tokio::test]
@@ -3285,12 +3320,35 @@ upstreams:
         proxy.reload(everything_secured_to(upstream, same)).unwrap();
         assert!(Arc::ptr_eq(&before, &tls(&proxy)));
 
+        // New certificates are served behind the same front, whose keys seal the tickets:
+        // clients keep their resumption.
         let other = vec![crate::tls::testing::certificate(&["example.test"])];
         proxy
             .reload(everything_secured_to(upstream, other))
             .unwrap();
         let after = tls(&proxy);
         assert!(!Arc::ptr_eq(&before, &after));
+        assert!(after.shares_keys_with(&before));
+
+        // Validating clients otherwise is a new front.
+        let mut validating = everything_config(upstream);
+        let web = validating.listeners.get_mut("web").unwrap();
+        web.protocol = edgerush_config::Protocol::Https;
+        web.tls = Some(edgerush_config::Tls {
+            certificates: vec![crate::tls::testing::certificate(&["example.test"])],
+            client_validation: Some(edgerush_config::ClientValidation {
+                authorities: vec![crate::tls::testing::certificate(&["ca"]).chain],
+            }),
+        });
+        proxy.reload(compile(&validating).unwrap()).unwrap();
+        assert!(!tls(&proxy).shares_keys_with(&after));
+        proxy
+            .reload(everything_secured_to(
+                upstream,
+                vec![crate::tls::testing::certificate(&["example.test"])],
+            ))
+            .unwrap();
+        let after = tls(&proxy);
 
         let unusable = vec![edgerush_config::Certificate {
             chain: "not a certificate".to_owned(),
