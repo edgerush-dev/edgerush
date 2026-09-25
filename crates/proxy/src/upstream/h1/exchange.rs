@@ -1328,7 +1328,7 @@ pub fn nothing_to_say<S: AsyncRead + Unpin>(socket: &mut S) -> bool {
 ///
 /// Only `100-continue` is waited on. An expectation this does not know is passed on as it
 /// came and waited on by nobody, which is what the engine's own client does with one.
-fn expects_continue<F: Fields + ?Sized>(headers: &F) -> bool {
+pub(crate) fn expects_continue<F: Fields + ?Sized>(headers: &F) -> bool {
     headers
         .values(&http::header::EXPECT)
         .flat_map(crate::hop_by_hop::options_of)

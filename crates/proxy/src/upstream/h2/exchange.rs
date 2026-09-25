@@ -16,10 +16,12 @@ use super::client::{Client, Place, PlaceError};
 use super::head::{self, HeadError};
 use crate::downstream::h2::body::IncomingH2;
 use crate::downstream::h2::writer::{SendError, send_body};
+use crate::interim::{Channel, Interim};
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::storage::Storage;
 use crate::upstream::destination::ReuseIdentity;
 use crate::upstream::h1::codec::{OutgoingFields, Sending};
+use crate::upstream::h1::exchange::expects_continue;
 use bytes::Bytes;
 use http::response::Parts;
 use http::{Method, Uri};
@@ -52,22 +54,41 @@ pub(crate) enum ExchangeError {
     /// The request's own body failed while it was being sent, before any answer.
     #[error("the request's body failed")]
     RequestBody(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// More interim heads, or more of them, than an exchange takes before its final one.
+    #[error("the upstream sent more interim answers than {heads} heads or {bytes} bytes")]
+    Interim {
+        /// The most heads taken.
+        heads: usize,
+        /// The most bytes taken, by RFC 9113's measure of a header list.
+        bytes: usize,
+    },
 }
 
 /// What is left of a request's body to send, sending itself.
 type Upload = Pin<Box<dyn Future<Output = Result<(), SendError>>>>;
 
-/// How long things may take.
+/// What an exchange will not go beyond (the HTTP/1 client's own, [13 §7]).
+///
+/// [13 §7]: ../../../../docs/13-http1-upstream.md
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Timing {
+pub(crate) struct Bounds {
     /// From the request's head sent to the answer's final head.
     pub(crate) final_head: Duration,
     /// How long a body, in either direction, may be waited on with nothing moving.
     pub(crate) idle: Duration,
+    /// How long a body held back for `100 Continue` waits for it.
+    pub(crate) continue_wait: Duration,
+    /// Interim heads taken before the final one.
+    pub(crate) interim_heads: usize,
+    /// What those heads may come to, by RFC 9113's measure of a header list.
+    pub(crate) interim_bytes: usize,
 }
 
 /// Sends a request for `target` with `fields` to `destination` and waits for the answer's
-/// head, sending the body meanwhile as `sending` says.
+/// head, sending the body meanwhile as `sending` says. Interim answers go to `interim`, as
+/// the HTTP/1 client's do, and the continue decision is made the same way: a request that
+/// said `Expect: 100-continue` has its body held back until the upstream says `100`, or
+/// the wait runs out, and never sent if the final answer comes first.
 ///
 /// # Errors
 ///
@@ -85,30 +106,61 @@ pub(crate) async fn exchange<F: OutgoingFields + ?Sized>(
     sending: Sending,
     body: RequestBody,
     storage: &Rc<Storage>,
-    timing: Timing,
+    interim: Option<Interim>,
+    bounds: Bounds,
 ) -> Result<(Parts, Answer), ExchangeError> {
     let head = head::request(method, target, fields, sending)?;
+    let mut channel = interim.map_or_else(Channel::unheard, Channel::Listened);
+    let nothing_to_send = matches!(sending, Sending::None | Sending::Length(0));
+    channel.begin(expects_continue(fields), nothing_to_send);
     let mut place = client.place(destination).await?;
     let sender = place.sender();
     // A handle that has opened nothing is ready unless the connection can take no new
     // streams at all; the place is what says there is room on it.
     poll_fn(|cx| sender.poll_ready(cx)).await?;
     let end_stream = matches!(sending, Sending::None) || body.is_end_stream();
-    let (response, stream) = sender.send_request(head, end_stream)?;
+    let (mut response, stream) = sender.send_request(head, end_stream)?;
     let mut upload: Option<Upload> = (!end_stream).then(|| {
         let storage = Rc::clone(storage);
         let upload: Upload = Box::pin(async move {
             let mut stream = stream;
-            send_body(&mut stream, body, &storage, timing.idle).await
+            send_body(&mut stream, body, &storage, bounds.idle).await
         });
         upload
     });
 
-    let mut response = std::pin::pin!(response);
+    // The head is out as far as this hop can tell once h2 has it.
+    let mut continue_wait = channel
+        .head_sent()
+        .then(|| Box::pin(tokio::time::sleep(bounds.continue_wait)));
+    let mut may_send = channel.may_poll_upload();
+    let (mut heads, mut bytes) = (0, 0);
     let answered = tokio::time::timeout(
-        timing.final_head,
+        bounds.final_head,
         poll_fn(|cx| {
-            if let Some(sending) = upload.as_mut()
+            // Interim answers first, as h2 has them asked for, in the order they came.
+            while let Poll::Ready(Some(interim)) = response.poll_informational(cx) {
+                let (interim, ()) = interim.map_err(ExchangeError::H2)?.into_parts();
+                heads += 1;
+                bytes += list_size(&interim.headers);
+                if heads > bounds.interim_heads || bytes > bounds.interim_bytes {
+                    return Poll::Ready(Err(ExchangeError::Interim {
+                        heads: bounds.interim_heads,
+                        bytes: bounds.interim_bytes,
+                    }));
+                }
+                channel.upstream_interim(interim.status, interim.headers);
+                may_send = channel.may_poll_upload();
+            }
+            if let Some(wait) = continue_wait.as_mut()
+                && wait.as_mut().poll(cx).is_ready()
+            {
+                continue_wait = None;
+                channel.wait_expired();
+                may_send = channel.may_poll_upload();
+            }
+            if may_send
+                && let Some(sending) = upload.as_mut()
                 && let Poll::Ready(sent) = sending.as_mut().poll(cx)
             {
                 upload = None;
@@ -118,21 +170,35 @@ pub(crate) async fn exchange<F: OutgoingFields + ?Sized>(
                     return Poll::Ready(Err(ExchangeError::RequestBody(cause)));
                 }
             }
-            response.as_mut().poll(cx).map_err(ExchangeError::H2)
+            Pin::new(&mut response).poll(cx).map_err(ExchangeError::H2)
         }),
     )
     .await
     .map_err(|_| ExchangeError::TooSlow {
-        limit: timing.final_head,
+        limit: bounds.final_head,
     })??;
+    channel.final_head();
+    // Held back for a `100` that never came, and not wanted now the final answer has:
+    // never sent. It goes, resetting the stream, when the answer does.
+    let abandoned = channel.abandoned();
 
     let (parts, received) = answered.into_parts();
     let answer = Answer {
-        body: IncomingH2::new(received, timing.idle),
+        body: IncomingH2::new(received, bounds.idle),
         upload,
+        abandoned,
         _place: place,
     };
     Ok((parts, answer))
+}
+
+/// A header list's size as RFC 9113 §6.5.2 measures it: each field's name and value, and
+/// 32 for each field.
+fn list_size(headers: &http::HeaderMap) -> usize {
+    headers
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.len() + 32)
+        .sum()
 }
 
 /// The body of an HTTP/2 upstream's answer, with what is left of the request's body going
@@ -140,6 +206,8 @@ pub(crate) async fn exchange<F: OutgoingFields + ?Sized>(
 pub(crate) struct Answer {
     body: IncomingH2,
     upload: Option<Upload>,
+    /// The upload was never wanted: it is not sent, only dropped with the answer.
+    abandoned: bool,
     _place: Place,
 }
 
@@ -160,7 +228,8 @@ impl Body for Answer {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, RequestBodyError>>> {
         let this = self.get_mut();
-        if let Some(sending) = this.upload.as_mut()
+        if !this.abandoned
+            && let Some(sending) = this.upload.as_mut()
             && sending.as_mut().poll(cx).is_ready()
         {
             // Whichever way it went: a body that failed has reset the stream, which the

@@ -38,7 +38,7 @@ use crate::upstream::h1::codec::{OutgoingFields, Sending};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, nothing_to_say};
 use crate::upstream::h1::pool::{Lease, Pool};
 use crate::upstream::h2::client::{Client as H2Client, PlaceError, Settings as H2Settings};
-use crate::upstream::h2::exchange::{self as h2_exchange, Timing};
+use crate::upstream::h2::exchange::{self as h2_exchange, Bounds as H2Bounds};
 use crate::upstream::h2::pool::Limits as H2Limits;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -186,8 +186,8 @@ impl Watch {
 enum BodyError {
     #[error("the upstream's answer could not be read: {0}")]
     Ours(#[from] ExchangeError),
-    #[error("the HTTP/2 upstream's answer could not be read: {0}")]
-    H2(RequestBodyError),
+    #[error("the HTTP/2 upstream's answer could not be read")]
+    H2(#[source] RequestBodyError),
 }
 
 impl HttpBody for Body {
@@ -993,7 +993,7 @@ impl Worker {
         };
         if multiplexed {
             return self
-                .respond_by_h2(listener, &directed, &head, sending, body, admitted)
+                .respond_by_h2(listener, &directed, &head, sending, body, admitted, interim)
                 .await;
         }
         let answered = self
@@ -1045,6 +1045,10 @@ impl Worker {
     /// The answer of an HTTP/2 upstream, edited as an HTTP/1 upstream's would be: what its
     /// `Connection` named and what is about its connection comes off — h2 lets none of
     /// the latter through, and this does not rest on it — and the rule's changes are made.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a different thing the exchange needs, as for `through_h1`"
+    )]
     async fn respond_by_h2<H: Forwarded>(
         &self,
         listener: usize,
@@ -1053,11 +1057,15 @@ impl Worker {
         sending: Sending,
         body: RequestBody,
         admitted: Admitted,
+        interim: Option<Interim>,
     ) -> Answered<Body> {
         let storage = Rc::clone(self.blocks.borrow().storage());
-        let timing = Timing {
+        let bounds = H2Bounds {
             final_head: self.limits.final_head,
             idle: self.limits.idle,
+            continue_wait: self.limits.continue_wait,
+            interim_heads: self.limits.interim_heads,
+            interim_bytes: self.limits.interim_bytes,
         };
         let exchanged = h2_exchange::exchange(
             &self.h2,
@@ -1068,7 +1076,8 @@ impl Worker {
             sending,
             body,
             &storage,
-            timing,
+            interim,
+            bounds,
         )
         .await;
         let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
@@ -3088,6 +3097,348 @@ upstreams:
                 upload.send_data(Bytes::from_static(b"abc"), false).unwrap();
                 let response = within(response).await.unwrap();
                 assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+            })
+            .await;
+    }
+
+    /// How a scripted HTTP/2 upstream answers each request.
+    type Script = Rc<
+        dyn Fn(
+            Request<::h2::RecvStream>,
+            ::h2::server::SendResponse<Bytes>,
+        ) -> Pin<Box<dyn Future<Output = ()>>>,
+    >;
+
+    /// An upstream that speaks HTTP/2 by prior knowledge and answers every request as
+    /// `script` does.
+    async fn scripted_h2_upstream(script: Script) -> SocketAddr {
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let _accepting = tokio::task::spawn_local(async move {
+            while let Ok((stream, _)) = socket.accept().await {
+                let script = Rc::clone(&script);
+                let _serving = tokio::task::spawn_local(async move {
+                    let Ok(mut connection) = ::h2::server::handshake(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok((request, respond))) = connection.accept().await {
+                        let _answering = tokio::task::spawn_local(script(request, respond));
+                    }
+                });
+            }
+        });
+        address
+    }
+
+    fn ok_head() -> Response<()> {
+        Response::builder().status(200).body(()).unwrap()
+    }
+
+    /// Interim answers from an HTTP/2 upstream reach the client in order, before the final
+    /// one; past the exchange's bound on them the upstream is given up on.
+    #[tokio::test]
+    async fn interim_answers_from_an_http2_upstream_reach_the_client() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let script: Script = Rc::new(|request, mut respond| {
+                    Box::pin(async move {
+                        let many: usize = request
+                            .uri()
+                            .path()
+                            .trim_start_matches('/')
+                            .parse()
+                            .unwrap_or(1);
+                        for _ in 0..many {
+                            let hint = Response::builder()
+                                .status(103)
+                                .header("link", "</style.css>; rel=preload")
+                                .body(())
+                                .unwrap();
+                            if respond.send_informational(hint).is_err() {
+                                return;
+                            }
+                        }
+                        let _ = respond.send_response(ok_head(), true);
+                    })
+                });
+                let upstream = scripted_h2_upstream(script).await;
+                let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::get("http://a.test/2").body(()).unwrap();
+                let (mut answer, _) = send.send_request(request, true).unwrap();
+                let mut interim = Vec::new();
+                while let Some(head) =
+                    within(std::future::poll_fn(|cx| answer.poll_informational(cx))).await
+                {
+                    let head = head.unwrap();
+                    interim.push((head.status().as_u16(), head.headers()["link"].clone()));
+                }
+                let answer = within(answer).await.unwrap();
+                assert_eq!(answer.status(), StatusCode::OK);
+                assert_eq!(interim.len(), 2);
+                assert!(interim.iter().all(|(status, _)| *status == 103));
+
+                let answer = h1_answer(
+                    front,
+                    b"GET /1 HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+                assert!(answer.starts_with("HTTP/1.1 103 "), "{answer}");
+                assert!(answer.contains("\r\n\r\nHTTP/1.1 200 OK\r\n"), "{answer}");
+
+                // Seventeen are one past the sixteen an exchange takes.
+                let answer = h1_answer(
+                    front,
+                    b"GET /17 HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+                assert!(answer.contains("HTTP/1.1 502 "), "{answer}");
+            })
+            .await;
+    }
+
+    /// A request that said `Expect: 100-continue` has its body held back until the upstream
+    /// says `100`; one whose upstream answers first never has it sent.
+    #[tokio::test]
+    async fn a_body_waits_for_an_http2_upstreams_100_continue() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let read = Rc::new(Cell::new(None::<usize>));
+                let reading = Rc::clone(&read);
+                let script: Script = Rc::new(move |request, mut respond| {
+                    let reading = Rc::clone(&reading);
+                    Box::pin(async move {
+                        let refuse = request.uri().path() == "/refuse";
+                        let mut body = request.into_body();
+                        if refuse {
+                            let no = Response::builder().status(417).body(()).unwrap();
+                            let _ = respond.send_response(no, true);
+                            // Whatever arrives after the answer.
+                            reading.set(Some(read_all(&mut body).await));
+                            return;
+                        }
+                        let go = Response::builder().status(100).body(()).unwrap();
+                        let _ = respond.send_informational(go);
+                        reading.set(Some(read_all(&mut body).await));
+                        let _ = respond.send_response(ok_head(), true);
+                    })
+                });
+                let upstream = scripted_h2_upstream(script).await;
+                let limits = H1Limits {
+                    continue_wait: Duration::from_secs(60),
+                    ..H1Limits::default()
+                };
+                let (front, _worker) = serving_worker_to_h2(upstream, limits).await;
+
+                let mut stream = TcpStream::connect(front).await.unwrap();
+                stream
+                    .write_all(b"POST /go HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\nexpect: 100-continue\r\ncontent-length: 5\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut first = vec![0; 64];
+                let got = within(stream.read(&mut first)).await.unwrap();
+                let first = String::from_utf8_lossy(&first[..got]).into_owned();
+                assert!(first.starts_with("HTTP/1.1 100 "), "{first}");
+                stream.write_all(b"hello").await.unwrap();
+                let mut rest = Vec::new();
+                let _ = within(stream.read_to_end(&mut rest)).await;
+                let rest = String::from_utf8_lossy(&rest);
+                assert!(rest.contains("HTTP/1.1 200 OK\r\n"), "{rest}");
+                until(|| read.get() == Some(5)).await;
+
+                // A client that sends its body without waiting to be told: the gateway still
+                // holds it for the upstream, which answers without asking for it.
+                read.set(None);
+                let mut stream = TcpStream::connect(front).await.unwrap();
+                stream
+                    .write_all(b"POST /refuse HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\nexpect: 100-continue\r\ncontent-length: 5\r\n\r\nhello")
+                    .await
+                    .unwrap();
+                let mut answer = vec![0; 64];
+                let got = within(stream.read(&mut answer)).await.unwrap();
+                let answer = String::from_utf8_lossy(&answer[..got]).into_owned();
+                assert!(answer.starts_with("HTTP/1.1 417 "), "{answer}");
+                drop(stream);
+                until(|| read.get().is_some()).await;
+                assert_eq!(read.get(), Some(0), "the body went up after the answer");
+            })
+            .await;
+    }
+
+    /// Trailers travel both ways between an HTTP/2 client and an HTTP/2 upstream, as gRPC's
+    /// status does.
+    #[tokio::test]
+    async fn trailers_travel_both_ways_through_to_an_http2_upstream() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let heard = Rc::new(RefCell::new(None::<http::HeaderMap>));
+                let hearing = Rc::clone(&heard);
+                let script: Script = Rc::new(move |request, mut respond| {
+                    let hearing = Rc::clone(&hearing);
+                    Box::pin(async move {
+                        let mut body = request.into_body();
+                        let _ = read_all(&mut body).await;
+                        let trailers = std::future::poll_fn(|cx| body.poll_trailers(cx)).await;
+                        *hearing.borrow_mut() = trailers.ok().flatten();
+                        let Ok(mut sending) = respond.send_response(ok_head(), false) else {
+                            return;
+                        };
+                        let _ = sending.send_data(Bytes::from_static(b"reply"), false);
+                        let mut status = http::HeaderMap::new();
+                        status.insert("grpc-status", "0".parse().unwrap());
+                        let _ = sending.send_trailers(status);
+                    })
+                });
+                let upstream = scripted_h2_upstream(script).await;
+                let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::post("http://a.test/rpc")
+                    .header("te", "trailers")
+                    .body(())
+                    .unwrap();
+                let (answer, mut upload) = send.send_request(request, false).unwrap();
+                upload
+                    .send_data(Bytes::from_static(b"call"), false)
+                    .unwrap();
+                let mut sent = http::HeaderMap::new();
+                sent.insert("x-checksum", "abc".parse().unwrap());
+                upload.send_trailers(sent).unwrap();
+
+                let answer = within(answer).await.unwrap();
+                assert_eq!(answer.status(), StatusCode::OK);
+                let mut body = answer.into_body();
+                let mut data = Vec::new();
+                while let Some(chunk) = within(body.data()).await {
+                    let chunk = chunk.unwrap();
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    data.extend_from_slice(&chunk);
+                }
+                assert_eq!(data, b"reply");
+                let trailers = within(std::future::poll_fn(|cx| body.poll_trailers(cx)))
+                    .await
+                    .unwrap()
+                    .expect("no trailers");
+                assert_eq!(trailers["grpc-status"], "0");
+                until(|| heard.borrow().is_some()).await;
+                assert_eq!(heard.borrow().as_ref().unwrap()["x-checksum"], "abc");
+            })
+            .await;
+    }
+
+    /// An HTTP/2 upstream that resets a stream part way through its answer has the client's
+    /// stream reset: with the same reason where it means the same thing on this hop, with
+    /// INTERNAL_ERROR where it was about the upstream's hop.
+    #[tokio::test]
+    async fn an_http2_upstreams_reset_is_passed_on_where_it_means_the_same() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let script: Script = Rc::new(|request, mut respond| {
+                    Box::pin(async move {
+                        let reason = match request.uri().path() {
+                            "/cancel" => ::h2::Reason::CANCEL,
+                            _ => ::h2::Reason::PROTOCOL_ERROR,
+                        };
+                        let Ok(mut sending) = respond.send_response(ok_head(), false) else {
+                            return;
+                        };
+                        let _ = sending.send_data(Bytes::from_static(b"part"), false);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        sending.send_reset(reason);
+                    })
+                });
+                let upstream = scripted_h2_upstream(script).await;
+                let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                for (path, expected) in [
+                    ("/cancel", ::h2::Reason::CANCEL),
+                    ("/protocol", ::h2::Reason::INTERNAL_ERROR),
+                ] {
+                    let request = Request::get(format!("http://a.test{path}"))
+                        .body(())
+                        .unwrap();
+                    let (answer, _) = send.send_request(request, true).unwrap();
+                    let answer = within(answer).await.unwrap();
+                    let mut body = answer.into_body();
+                    let failed = loop {
+                        match within(body.data()).await {
+                            Some(Ok(chunk)) => {
+                                let _ = body.flow_control().release_capacity(chunk.len());
+                            }
+                            Some(Err(error)) => break error,
+                            None => panic!("{path}: the answer ended cleanly"),
+                        }
+                    };
+                    assert_eq!(failed.reason(), Some(expected), "{path}");
+                }
+            })
+            .await;
+    }
+
+    /// One client that stops reading holds only its own stream's window: another stream on
+    /// the same upstream connection is answered in full meanwhile.
+    #[tokio::test]
+    async fn a_slow_reader_does_not_hold_up_another_on_the_same_http2_upstream() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                const BIG: usize = 4 << 20;
+                let script: Script = Rc::new(|_request, mut respond| {
+                    Box::pin(async move {
+                        let Ok(mut sending) = respond.send_response(ok_head(), false) else {
+                            return;
+                        };
+                        let mut left = BIG;
+                        while left > 0 {
+                            let piece = left.min(64 * 1024);
+                            sending.reserve_capacity(piece);
+                            let Some(Ok(room)) =
+                                std::future::poll_fn(|cx| sending.poll_capacity(cx)).await
+                            else {
+                                return;
+                            };
+                            let give = room.min(piece);
+                            if sending
+                                .send_data(Bytes::from(vec![b'z'; give]), left == give)
+                                .is_err()
+                            {
+                                return;
+                            }
+                            left -= give;
+                        }
+                    })
+                });
+                let upstream = scripted_h2_upstream(script).await;
+                let limits = H1Limits {
+                    h2_connections: 1,
+                    ..H1Limits::default()
+                };
+                let (front, _worker) = serving_worker_to_h2(upstream, limits).await;
+
+                let mut slow = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::get("http://a.test/slow").body(()).unwrap();
+                let (stalled, _) = slow.send_request(request, true).unwrap();
+                // Its head arrives; its body is never read.
+                let _stalled = within(stalled).await.unwrap();
+
+                let mut fast = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::get("http://a.test/fast").body(()).unwrap();
+                let (answer, _) = fast.send_request(request, true).unwrap();
+                let answer = within(answer).await.unwrap();
+                let mut body = answer.into_body();
+                let mut read = 0;
+                while let Some(chunk) = within(body.data()).await {
+                    let chunk = chunk.unwrap();
+                    read += chunk.len();
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                }
+                assert_eq!(read, BIG);
             })
             .await;
     }

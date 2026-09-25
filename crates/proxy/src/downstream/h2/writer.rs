@@ -141,8 +141,9 @@ impl Responder {
 
 /// Sends `body` on `stream`, whose final head has gone without ending it, to the body's
 /// end, waiting for room no longer than `idle` at a time. On failure the stream is reset
-/// unless the client reset it first: CANCEL for a client that stopped taking the answer,
-/// INTERNAL_ERROR for a failure of ours or the body's.
+/// unless the client reset it first: CANCEL for a client that stopped taking the answer;
+/// for a body an HTTP/2 upstream reset, its reason where that means the same thing on
+/// this hop (CANCEL, ENHANCE_YOUR_CALM); INTERNAL_ERROR for anything else.
 pub(crate) async fn send_body<B>(
     stream: &mut ::h2::SendStream<Outgoing>,
     body: B,
@@ -161,6 +162,9 @@ where
         Err(SendError::Body(error)) if client_stopped(&**error) => {
             stream.send_reset(::h2::Reason::CANCEL);
         }
+        Err(SendError::Body(error)) if let Some(reason) = passed_on(&**error) => {
+            stream.send_reset(reason);
+        }
         Err(SendError::Body(_) | SendError::Exhausted(_) | SendError::H2(_)) => {
             stream.send_reset(::h2::Reason::INTERNAL_ERROR);
         }
@@ -168,6 +172,25 @@ where
         _ => {}
     }
     sent
+}
+
+/// The reason an HTTP/2 upstream reset the stream with, where it says the same thing on
+/// this hop: it cancelled, or wants its peer to calm down. A framing error or the like is
+/// about the upstream's hop, not this one, and is not passed on.
+fn passed_on(error: &(dyn StdError + 'static)) -> Option<::h2::Reason> {
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if let Some(reset) = error.downcast_ref::<::h2::Error>()
+            && reset.is_reset()
+            && let Some(reason) = reset.reason()
+        {
+            return [::h2::Reason::CANCEL, ::h2::Reason::ENHANCE_YOUR_CALM]
+                .contains(&reason)
+                .then_some(reason);
+        }
+        cause = error.source();
+    }
+    None
 }
 
 /// Whether `error` comes of the client's upload stopping for longer than its idle bound.
