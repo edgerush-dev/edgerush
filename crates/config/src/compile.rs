@@ -6,7 +6,7 @@ use crate::backends::{UpstreamId, WeightedBackends};
 use crate::route::{
     Filter, HeaderChanges, Hostname, Match, PathMatch, Route, ValueMatch, ValuePredicate, Wildcard,
 };
-use crate::{Config, Protocol, Rule};
+use crate::{Config, Protocol, Rule, Tls};
 use edgerush_filters::{HeaderModifier, HeaderModifierError};
 use edgerush_router::{
     HeaderPredicate, HeaderPredicateError, HeaderPredicates, HostClaim, HostPattern,
@@ -64,6 +64,8 @@ pub struct CompiledListener {
     pub address: SocketAddr,
     /// What is spoken there.
     pub protocol: Protocol,
+    /// What an `https` listener presents; `None` for any other.
+    pub tls: Option<Tls>,
     /// Finds the rule a request belongs to, among the routes that are for this listener.
     pub router: Router<RuleId>,
 }
@@ -124,6 +126,16 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                 other: other.to_owned(),
             };
             errors.push(Place::listener(name).problem(problem));
+        }
+        let certificates = listener.tls.as_ref().map(|tls| tls.certificates.len());
+        match (listener.protocol, certificates) {
+            (Protocol::Https, None | Some(0)) => {
+                errors.push(Place::listener(name).problem(Problem::NoCertificate));
+            }
+            (Protocol::Http, Some(_)) => {
+                errors.push(Place::listener(name).problem(Problem::TlsUnwanted));
+            }
+            (Protocol::Https, Some(_)) | (Protocol::Http, None) => {}
         }
     }
 
@@ -192,6 +204,7 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                 name: name.clone(),
                 address: listener.address,
                 protocol: listener.protocol,
+                tls: listener.tls.clone(),
                 router: Router::new(matches.remove(name.as_str()).unwrap_or_default()),
             })
             .collect();
@@ -513,6 +526,12 @@ pub enum Problem {
         /// The listener that has it.
         other: String,
     },
+    /// An `https` listener with nothing to present.
+    #[error("protocol `https` needs `tls` with a certificate")]
+    NoCertificate,
+    /// TLS on a listener that does not speak it.
+    #[error("`tls` is for protocol `https`")]
+    TlsUnwanted,
     /// Another route has the same name.
     #[error("another route has the same name")]
     DuplicateName,
@@ -982,6 +1001,70 @@ upstreams:
         assert!(listener(r#"{ address: "[::]:80", protocol: gopher }"#).is_err());
         assert!(listener(r#"{ address: "[::]:80" }"#).is_err());
         assert!(listener(r#"{ address: ":80", protocol: http }"#).is_err());
+    }
+
+    /// An `https` listener has certificates, at least one; nothing else has any. What is in
+    /// them is for the data plane to read: the model carries them as they came.
+    #[test]
+    fn tls_is_for_https_listeners_and_every_one_has_it() {
+        let with = |listener: &str| {
+            config(&format!(
+                "listeners: {{ l: {listener} }}\nroutes: []\nupstreams: {{}}\n"
+            ))
+        };
+        let one = r#"{ certificates: [{ chain: "C", key: "K" }] }"#;
+
+        let compiled = compile(&with(&format!(
+            r#"{{ address: "[::]:443", protocol: https, tls: {one} }}"#
+        )))
+        .unwrap();
+        assert_eq!(compiled.listeners[0].protocol, Protocol::Https);
+        let tls = compiled.listeners[0].tls.as_ref().unwrap();
+        assert_eq!(tls.certificates.len(), 1);
+        assert_eq!(tls.certificates[0].chain, "C");
+        assert_eq!(tls.certificates[0].key, "K");
+
+        let problems = |listener: String| -> Vec<String> {
+            compile(&with(&listener))
+                .unwrap_err()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(
+            problems(r#"{ address: "[::]:443", protocol: https }"#.to_owned()),
+            ["listener `l`: protocol `https` needs `tls` with a certificate"]
+        );
+        assert_eq!(
+            problems(
+                r#"{ address: "[::]:443", protocol: https, tls: { certificates: [] } }"#.to_owned()
+            ),
+            ["listener `l`: protocol `https` needs `tls` with a certificate"]
+        );
+        assert_eq!(
+            problems(format!(
+                r#"{{ address: "[::]:80", protocol: http, tls: {one} }}"#
+            )),
+            ["listener `l`: `tls` is for protocol `https`"]
+        );
+        // A certificate is its chain and its key, both said.
+        let yaml = r#"listeners: { l: { address: "[::]:443", protocol: https, tls: { certificates: [{ chain: "C" }] } } }
+routes: []
+upstreams: {}
+"#;
+        assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
+    }
+
+    /// A private key is never printed, whatever prints the config.
+    #[test]
+    fn a_private_key_is_not_shown() {
+        let certificate = crate::Certificate {
+            chain: "the chain".to_owned(),
+            key: "the secret".to_owned(),
+        };
+        let shown = format!("{certificate:?}");
+        assert!(shown.contains("the chain"), "{shown}");
+        assert!(!shown.contains("the secret"), "{shown}");
     }
 
     #[test]

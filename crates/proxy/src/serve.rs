@@ -30,6 +30,7 @@ use crate::raw::{RawAnswer, RawHead};
 use crate::request::decide;
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::storage::Storage;
+use crate::tls::{self, Tls, TlsError};
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Blocks, SMALL, Sizes};
@@ -54,6 +55,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
 
@@ -275,6 +277,70 @@ pub struct Worker {
     drain: Rc<Drain>,
 }
 
+/// Serves `socket`, a connection of `ours` that speaks HTTP/1, with our own server (14).
+/// `asking` is set when the first request is handed over.
+async fn serve_h1<S>(ours: Rc<Connection>, asking: Rc<Cell<bool>>, deadlines: Deadlines, socket: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let worker = Rc::clone(&ours.worker);
+    let listener = ours.listener;
+    let settings = h1::Settings {
+        limits: worker.limits,
+        bounds: Bounds {
+            first_request: deadlines.first_request,
+            // 14 §8's ten seconds for a head once it has begun, never longer than the wait
+            // for it to begin.
+            next_head: Bounds::default().next_head.min(deadlines.next_request),
+            keep_alive: deadlines.next_request,
+            idle: deadlines.idle,
+            ..Bounds::default()
+        },
+        budget: h1::Budget::default(),
+    };
+    // The connection is kept by this for as long as it is served; each request's future
+    // owns only a handle on the worker. It is that future itself, not one wrapped around
+    // it, so that it is not moved into another on every request.
+    let respond = move |head: RawHead, body, interim| {
+        asking.set(true);
+        Rc::clone(&ours.worker).handle_head(listener, head, body, Some(interim))
+    };
+    let _ended = h1::serve(
+        socket,
+        settings,
+        Rc::clone(&worker.blocks),
+        || worker.date.get(),
+        &worker.drain,
+        respond,
+    )
+    .await;
+}
+
+/// Serves `socket`, a connection of `ours` that speaks HTTP/2, over h2 (15 step 2).
+/// `asking` is set when the first request is handed over.
+async fn serve_h2<S>(ours: Rc<Connection>, asking: Rc<Cell<bool>>, deadlines: Deadlines, socket: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let worker = Rc::clone(&ours.worker);
+    let listener = ours.listener;
+    let storage = Rc::clone(worker.blocks.borrow().storage());
+    let dating = Rc::clone(&worker);
+    let date = Rc::new(move || dating.date.get());
+    let respond = Rc::new(move |request: Request<RequestBody>, interim| {
+        asking.set(true);
+        Rc::clone(&ours.worker).handle(listener, request, Some(interim))
+    });
+    let settings = h2::connection::Settings {
+        keep_alive: deadlines.next_request,
+        closing: Bounds::default().next_head.min(deadlines.next_request),
+        idle: deadlines.idle,
+        drain_within: deadlines.drain,
+        ..h2::connection::Settings::default()
+    };
+    h2::connection::serve(socket, settings, storage, date, &worker.drain, respond).await;
+}
+
 /// One exchange's place among those a worker has in hand, given back when it is dropped.
 ///
 /// Taken before a connection is looked for and held until the answer's body is let go of,
@@ -307,6 +373,10 @@ struct Snapshot {
     /// filed under. Worked out against the config this one replaces, because that is the
     /// only moment both are in hand ([13 §3](../../docs/13-http1-upstream.md)).
     destinations: Destinations,
+    /// By position in [`Proxy::listeners`]: what a connection to it is accepted with, if
+    /// it is to speak TLS. Kept from the config before for as long as the certificates
+    /// are the same, and with it the keys of the session tickets it has issued.
+    tls: Vec<Option<Arc<Tls>>>,
 }
 
 impl Snapshot {
@@ -314,7 +384,7 @@ impl Snapshot {
         config: Compiled,
         listeners: &[String],
         metrics: &Metrics,
-        previous: &Destinations,
+        previous: Option<&Snapshot>,
         keys: &Keys,
     ) -> Result<Self, ProxyError> {
         let endpoints = config
@@ -322,22 +392,51 @@ impl Snapshot {
             .iter()
             .map(|upstream| upstream.endpoints.iter().map(authority).collect())
             .collect::<Result<_, _>>()?;
-        let listeners = listeners
+        let listeners: Vec<Option<usize>> = listeners
             .iter()
             .map(|name| config.listeners.iter().position(|l| l.name == *name))
             .collect();
+        let tls = listeners
+            .iter()
+            .enumerate()
+            .map(|(position, at)| {
+                let Some(listener) = at.and_then(|at| config.listeners.get(at)) else {
+                    return Ok(None);
+                };
+                let Some(source) = &listener.tls else {
+                    return Ok(None);
+                };
+                let kept = previous
+                    .and_then(|previous| previous.tls.get(position))
+                    .and_then(Option::as_ref)
+                    .filter(|kept| kept.is_for(source));
+                match kept {
+                    Some(kept) => Ok(Some(Arc::clone(kept))),
+                    None => Tls::new(source)
+                        .map(|tls| Some(Arc::new(tls)))
+                        .map_err(|error| ProxyError::Tls {
+                            listener: listener.name.clone(),
+                            error,
+                        }),
+                }
+            })
+            .collect::<Result<_, _>>()?;
         let upstream_slots = config
             .upstreams
             .iter()
             .map(|upstream| metrics.upstream_slot(&upstream.name))
             .collect();
-        let destinations = Destinations::reconcile(&config, previous, keys);
+        let nothing_yet = Destinations::default();
+        let previous_destinations =
+            previous.map_or(&nothing_yet, |previous| &previous.destinations);
+        let destinations = Destinations::reconcile(&config, previous_destinations, keys);
         Ok(Self {
             config,
             listeners,
             endpoints,
             upstream_slots,
             destinations,
+            tls,
         })
     }
 }
@@ -363,8 +462,7 @@ impl Proxy {
         // A shard for every worker, so that no two write to one line of cache.
         let metrics = Metrics::new(workers, listeners.len());
         let keys = Keys::default();
-        let nothing_yet = Destinations::default();
-        let snapshot = Snapshot::new(config, &listeners, &metrics, &nothing_yet, &keys)?;
+        let snapshot = Snapshot::new(config, &listeners, &metrics, None, &keys)?;
         Ok(Self {
             listeners,
             current: ArcSwap::from_pointee(snapshot),
@@ -408,7 +506,7 @@ impl Proxy {
             config,
             &self.listeners,
             &self.metrics,
-            &previous.destinations,
+            Some(&previous),
             &self.keys,
         )?;
         drop(previous);
@@ -705,6 +803,15 @@ impl Worker {
         // Worth having, not worth refusing a connection over.
         let _unset = stream.set_nodelay(true);
         let deadlines = self.deadlines;
+        // The TLS of the config the connection came in under, which it keeps to its end.
+        let tls = self
+            .proxy
+            .current
+            .load()
+            .tls
+            .get(listener)
+            .cloned()
+            .flatten();
         let connection = Rc::new(Connection::open(self, listener));
         // Set when the engine hands over the first request, which is the end of the one
         // stretch its own deadlines do not cover.
@@ -712,64 +819,33 @@ impl Worker {
         let (ours, ours_asking) = (Rc::clone(&connection), Rc::clone(&asked));
         // Lent rather than given, so that it comes back once the engine is done with it.
         let (lent, back) = Lent::new(stream);
-        // Told apart by our own detector, and each served by our own server: HTTP/1 by the
-        // one of 14, HTTP/2 over h2 (15 step 2).
+        // Each served by our own server: HTTP/1 by the one of 14, HTTP/2 over h2 (15 step 2).
         let serving = async move {
-            match detect(lent).await {
-                Ok(Some((Protocol::Http1, replay))) => {
-                    let worker = Rc::clone(&ours.worker);
-                    let settings = h1::Settings {
-                        limits: worker.limits,
-                        bounds: Bounds {
-                            first_request: deadlines.first_request,
-                            // 14 §8's ten seconds for a head once it has begun, never
-                            // longer than the wait for it to begin.
-                            next_head: Bounds::default().next_head.min(deadlines.next_request),
-                            keep_alive: deadlines.next_request,
-                            idle: deadlines.idle,
-                            ..Bounds::default()
-                        },
-                        budget: h1::Budget::default(),
+            match tls {
+                // Told apart by our own detector.
+                None => match detect(lent).await {
+                    Ok(Some((Protocol::Http1, replay))) => {
+                        serve_h1(ours, ours_asking, deadlines, replay).await;
+                    }
+                    Ok(Some((Protocol::Http2, replay))) => {
+                        serve_h2(ours, ours_asking, deadlines, replay).await;
+                    }
+                    // Closed having said nothing, or failed before saying enough.
+                    Ok(None) | Err(_) => {}
+                },
+                // Told apart by what the handshake agreed on (ALPN).
+                Some(tls) => {
+                    // A handshake that fails has nobody to tell but the client, whom
+                    // BoringSSL has sent its alert.
+                    let Ok(secured) = tokio_boring::accept(tls.acceptor(), lent).await else {
+                        return;
                     };
-                    // The connection is kept by this for as long as it is served; each
-                    // request's future owns only a handle on the worker. It is that future
-                    // itself, not one wrapped around it, so that it is not moved into another
-                    // on every request.
-                    let respond = move |head: RawHead, body, interim| {
-                        ours_asking.set(true);
-                        Rc::clone(&ours.worker).handle_head(listener, head, body, Some(interim))
-                    };
-                    let _ended = h1::serve(
-                        replay,
-                        settings,
-                        Rc::clone(&worker.blocks),
-                        || worker.date.get(),
-                        &worker.drain,
-                        respond,
-                    )
-                    .await;
+                    if secured.ssl().selected_alpn_protocol() == Some(tls::H2) {
+                        serve_h2(ours, ours_asking, deadlines, secured).await;
+                    } else {
+                        serve_h1(ours, ours_asking, deadlines, secured).await;
+                    }
                 }
-                Ok(Some((Protocol::Http2, replay))) => {
-                    let worker = Rc::clone(&ours.worker);
-                    let storage = Rc::clone(worker.blocks.borrow().storage());
-                    let dating = Rc::clone(&worker);
-                    let date = Rc::new(move || dating.date.get());
-                    let respond = Rc::new(move |request: Request<RequestBody>, interim| {
-                        ours_asking.set(true);
-                        Rc::clone(&ours.worker).handle(listener, request, Some(interim))
-                    });
-                    let settings = h2::connection::Settings {
-                        keep_alive: deadlines.next_request,
-                        closing: Bounds::default().next_head.min(deadlines.next_request),
-                        idle: deadlines.idle,
-                        drain_within: deadlines.drain,
-                        ..h2::connection::Settings::default()
-                    };
-                    h2::connection::serve(replay, settings, storage, date, &worker.drain, respond)
-                        .await;
-                }
-                // Closed having said nothing, or failed before saying enough.
-                Ok(None) | Err(_) => {}
             }
         };
         // From accept to the first request, whichever server takes the connection: the
@@ -1131,11 +1207,19 @@ impl Drop for Connection {
 }
 
 /// Why a data plane cannot run a config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProxyError {
     /// An endpoint address that cannot be written into a request target.
     #[error("endpoint {0} cannot be part of a request target")]
     Endpoint(SocketAddr),
+    /// A listener's certificates that cannot be served.
+    #[error("listener `{listener}`: {error}")]
+    Tls {
+        /// The listener's name.
+        listener: String,
+        /// What is wrong with them.
+        error: TlsError,
+    },
 }
 
 fn authority(endpoint: &SocketAddr) -> Result<Authority, ProxyError> {
@@ -2172,6 +2256,256 @@ upstreams:
             .await;
     }
 
+    /// Serves a worker whose listener speaks TLS with `certificates`, sending everything
+    /// to `upstream`, and says where.
+    async fn serving_secured_worker(
+        upstream: SocketAddr,
+        certificates: Vec<edgerush_config::Certificate>,
+    ) -> (SocketAddr, Rc<Worker>) {
+        let config = everything_secured_to(upstream, certificates);
+        let proxy = Proxy::new(config, NonZeroUsize::MIN).unwrap();
+        let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        (front, worker)
+    }
+
+    /// A TLS client of `front`, asking for `name` and offering `protocols` (ALPN, in the
+    /// wire form), set up beyond that by `configure`. It takes whatever certificate it is
+    /// given: which one that is, is for the test to look at.
+    async fn tls_client(
+        front: SocketAddr,
+        name: &str,
+        protocols: Option<&[u8]>,
+        configure: impl FnOnce(&mut boring::ssl::SslConnectorBuilder),
+    ) -> Result<tokio_boring::SslStream<TcpStream>, String> {
+        use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
+        let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+        builder.set_verify(SslVerifyMode::NONE);
+        if let Some(protocols) = protocols {
+            builder.set_alpn_protos(protocols).unwrap();
+        }
+        configure(&mut builder);
+        let config = builder.build().configure().unwrap().verify_hostname(false);
+        let stream = TcpStream::connect(front).await.unwrap();
+        within(tokio_boring::connect(config, name, stream))
+            .await
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    /// Bounded, so that what nobody finishes fails the test rather than hangs it.
+    async fn within<F: Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .expect("did not finish")
+    }
+
+    /// Sends one HTTP/1.1 request on `stream` and reads the answer to its end.
+    async fn h1_over<S>(mut stream: S) -> String
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nhost: example.test\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        let _ended = within(stream.read_to_end(&mut answer)).await;
+        String::from_utf8_lossy(&answer).into_owned()
+    }
+
+    /// An `https` listener speaks HTTP/2 to a client that agreed on it in the handshake,
+    /// and HTTP/1.1 to one that agreed on that or on nothing (RFC 9113 §3.2).
+    #[tokio::test]
+    async fn an_https_listener_speaks_what_the_handshake_agreed_on() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let certificates = vec![crate::tls::testing::certificate(&["example.test"])];
+                let (front, _worker) = serving_secured_worker(upstream, certificates).await;
+
+                let offered: &[u8] = b"\x08http/1.1";
+                let h1 = tls_client(front, "example.test", Some(offered), |_| {})
+                    .await
+                    .unwrap();
+                assert_eq!(h1.ssl().selected_alpn_protocol(), Some(&b"http/1.1"[..]));
+                let answer = h1_over(h1).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+
+                let none = tls_client(front, "example.test", None, |_| {})
+                    .await
+                    .unwrap();
+                assert_eq!(none.ssl().selected_alpn_protocol(), None);
+                let answer = h1_over(none).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+
+                // Offered both, it is given HTTP/2, whatever the client's order.
+                let both: &[u8] = b"\x08http/1.1\x02h2";
+                let h2 = tls_client(front, "example.test", Some(both), |_| {})
+                    .await
+                    .unwrap();
+                assert_eq!(h2.ssl().selected_alpn_protocol(), Some(&b"h2"[..]));
+                let (mut send, connection) = within(::h2::client::handshake(h2)).await.unwrap();
+                let _driving = tokio::task::spawn_local(async move {
+                    let _ended = connection.await;
+                });
+                let request = Request::get("https://example.test/").body(()).unwrap();
+                let (answer, _) = send.send_request(request, true).unwrap();
+                let answer = within(answer).await.unwrap();
+                assert_eq!(answer.status(), StatusCode::OK);
+            })
+            .await;
+    }
+
+    /// The certificate a client is given is the one whose names cover the name it asked
+    /// for, and the first when none does.
+    #[tokio::test]
+    async fn the_certificate_is_chosen_by_the_name_asked_for() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let certificates = vec![
+                    crate::tls::testing::certificate(&["first.test"]),
+                    crate::tls::testing::certificate(&["b.test"]),
+                    crate::tls::testing::certificate(&["*.c.test"]),
+                ];
+                let leaves: Vec<Vec<u8>> = certificates
+                    .iter()
+                    .map(|certificate| {
+                        boring::x509::X509::from_pem(certificate.chain.as_bytes())
+                            .unwrap()
+                            .to_der()
+                            .unwrap()
+                    })
+                    .collect();
+                let (front, _worker) = serving_secured_worker(upstream, certificates).await;
+                for (name, expected) in [
+                    ("b.test", 1),
+                    ("B.Test", 1),
+                    ("x.c.test", 2),
+                    ("first.test", 0),
+                    ("nobody.test", 0),
+                ] {
+                    let client = tls_client(front, name, None, |_| {}).await.unwrap();
+                    let given = client.ssl().peer_certificate().unwrap().to_der().unwrap();
+                    assert_eq!(given, leaves[expected], "asked for {name}");
+                }
+            })
+            .await;
+    }
+
+    /// TLS 1.2 is the oldest spoken, and a client that can exchange keys post-quantum
+    /// does.
+    #[tokio::test]
+    async fn tls_is_1_2_or_later_and_keys_are_exchanged_post_quantum_when_they_can_be() {
+        use boring::ssl::SslVersion;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let certificates = vec![crate::tls::testing::certificate(&["example.test"])];
+                let (front, _worker) = serving_secured_worker(upstream, certificates).await;
+
+                // A client of BoringSSL's will not go below 1.2 unless told to.
+                let old = tls_client(front, "example.test", None, |builder| {
+                    builder
+                        .set_min_proto_version(Some(SslVersion::TLS1))
+                        .unwrap();
+                    builder
+                        .set_max_proto_version(Some(SslVersion::TLS1_1))
+                        .unwrap();
+                })
+                .await;
+                assert!(old.is_err(), "TLS 1.1 was accepted");
+
+                let twelve = tls_client(front, "example.test", None, |builder| {
+                    builder
+                        .set_max_proto_version(Some(SslVersion::TLS1_2))
+                        .unwrap();
+                })
+                .await
+                .unwrap();
+                assert_eq!(twelve.ssl().version_str(), "TLSv1.2");
+
+                let hybrid = tls_client(front, "example.test", None, |builder| {
+                    builder.set_curves_list("X25519MLKEM768:X25519").unwrap();
+                })
+                .await
+                .unwrap();
+                assert_eq!(hybrid.ssl().version_str(), "TLSv1.3");
+                assert_eq!(hybrid.ssl().curve_name(), Some("X25519MLKEM768"));
+            })
+            .await;
+    }
+
+    /// A handshake is part of the first request's time: one that never finishes is cut
+    /// off at its deadline, and a client that speaks plain HTTP to a TLS listener is
+    /// answered with nothing a client could read as HTTP.
+    #[tokio::test]
+    async fn a_handshake_is_bounded_by_the_first_request_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let certificates = vec![crate::tls::testing::certificate(&["example.test"])];
+                let (front, _worker) = serving_secured_worker(upstream, certificates).await;
+
+                let mut silent = TcpStream::connect(front).await.unwrap();
+                let took = closed_after(&mut silent).await;
+                assert!(
+                    took + EARLY >= SHORT.first_request && took < SHORT.first_request + SLACK,
+                    "closed {took:?} after connecting"
+                );
+
+                let mut plain = TcpStream::connect(front).await.unwrap();
+                plain.write_all(ASKED).await.unwrap();
+                let mut answer = Vec::new();
+                let _ended = within(plain.read_to_end(&mut answer)).await;
+                assert!(!answer.starts_with(b"HTTP/"), "{answer:?}");
+            })
+            .await;
+    }
+
+    /// A config whose certificates are those of the config before keeps what it served
+    /// them with, and so the session tickets that were issued with it; other certificates
+    /// are served afresh; and certificates that cannot be used are refused, with the
+    /// listener named, and change nothing.
+    #[test]
+    fn a_reload_keeps_the_tls_of_certificates_that_have_not_changed() {
+        let upstream: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let same = vec![crate::tls::testing::certificate(&["example.test"])];
+        let config = everything_secured_to(upstream, same.clone());
+        let proxy = Proxy::new(config, NonZeroUsize::MIN).unwrap();
+        let tls = |proxy: &Proxy| Arc::clone(proxy.current.load().tls[0].as_ref().unwrap());
+        let before = tls(&proxy);
+
+        proxy.reload(everything_secured_to(upstream, same)).unwrap();
+        assert!(Arc::ptr_eq(&before, &tls(&proxy)));
+
+        let other = vec![crate::tls::testing::certificate(&["example.test"])];
+        proxy
+            .reload(everything_secured_to(upstream, other))
+            .unwrap();
+        let after = tls(&proxy);
+        assert!(!Arc::ptr_eq(&before, &after));
+
+        let unusable = vec![edgerush_config::Certificate {
+            chain: "not a certificate".to_owned(),
+            key: "not a key".to_owned(),
+        }];
+        let refused = proxy.reload(everything_secured_to(upstream, unusable));
+        assert!(
+            matches!(&refused, Err(ProxyError::Tls { listener, .. }) if listener == "web"),
+            "{refused:?}"
+        );
+        assert!(Arc::ptr_eq(&after, &tls(&proxy)));
+    }
+
     /// A TLS ClientHello sent to a plaintext listener is not the HTTP/2 preface, so it
     /// goes to HTTP/1, which refuses it as a request line that is not one and closes:
     /// nothing hangs waiting for a preface that will never come.
@@ -3006,6 +3340,22 @@ upstreams:
 
     /// A config of one listener that sends everything to `upstream`.
     fn everything_to(upstream: SocketAddr) -> Compiled {
+        compile(&everything_config(upstream)).unwrap()
+    }
+
+    /// The same, with `web` speaking TLS and presenting `certificates`.
+    fn everything_secured_to(
+        upstream: SocketAddr,
+        certificates: Vec<edgerush_config::Certificate>,
+    ) -> Compiled {
+        let mut config = everything_config(upstream);
+        let web = config.listeners.get_mut("web").unwrap();
+        web.protocol = edgerush_config::Protocol::Https;
+        web.tls = Some(edgerush_config::Tls { certificates });
+        compile(&config).unwrap()
+    }
+
+    fn everything_config(upstream: SocketAddr) -> Config {
         let yaml = format!(
             r#"
 listeners:
@@ -3023,8 +3373,7 @@ upstreams:
   up: {{ endpoints: ["{upstream}"] }}
 "#
         );
-        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
-        compile(&config).unwrap()
+        serde_saphyr::from_str(&yaml).unwrap()
     }
 
     /// Waits for something the test is about to depend on, and fails rather than hangs
@@ -3264,7 +3613,7 @@ upstreams:
                 config_with(names),
                 &sockets,
                 &metrics,
-                &Destinations::default(),
+                None,
                 &Keys::default(),
             )
             .unwrap()

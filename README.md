@@ -11,13 +11,18 @@ yet. This is a hobby project with no timelines.
 
 The Rust toolchain is pinned in `rust-toolchain.toml`; `rustup` installs it on first use.
 
+TLS is BoringSSL, built from source by `boring-sys`, which needs cmake and libclang
+(`apt install cmake libclang-dev` on Ubuntu) and on Windows NASM as well. On Windows,
+point `LIBCLANG_PATH` at the directory holding `libclang.dll` and `ASM_NASM` at
+`nasm.exe`, for instance in the `[env]` table of `~/.cargo/config.toml`. Go is not needed.
+A first build of BoringSSL takes a few minutes.
+
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+./check.sh
 ```
 
-All three must pass before every commit, on Windows and on Linux. There is no CI yet: the
+runs every check, stopping at the first that fails; all must pass before every commit,
+on Windows and on Linux. There is no CI yet: the
 workflow in `.github/workflows/ci.yml` is kept ready for when the repository is published.
 
 ## Benchmarks

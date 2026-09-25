@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6ad1d91e93b7d539d673801856ffb879f3e4b17e43fd66760d05910b56435a11 # shrinks to certificates = [[], ["*.ba"]], asked = ".ba"

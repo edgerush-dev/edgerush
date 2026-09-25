@@ -50,6 +50,7 @@ mod serve;
 pub mod storage;
 #[cfg(not(feature = "fuzzing"))]
 mod storage;
+mod tls;
 // Private, save when the fuzz targets are being built: they are a crate of their own and
 // cannot otherwise reach what they drive.
 #[cfg(feature = "fuzzing")]
@@ -61,6 +62,7 @@ pub use hop_by_hop::ConnectionError;
 pub use host::HostError;
 pub use request::{Forward, Rejection, decide};
 pub use serve::{Proxy, ProxyError, Worker};
+pub use tls::TlsError;
 // What a worker will not go beyond. There is no configuration for these; what there
 // is, is one value per worker, which whoever makes the workers hands them.
 pub use upstream::h1::H1Limits;

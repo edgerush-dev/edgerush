@@ -9,7 +9,7 @@
 //! canonical form — no shorthand, and no defaults that choose behaviour. What is missing is
 //! an error, not "everything".
 //!
-//! So far: listeners, routes with their rules, header filters and weighted backends, and
+//! So far: listeners, with the TLS they terminate, routes with their rules, header filters and weighted backends, and
 //! upstreams ([`Config`]), and their compilation ([`compile`]) into a router per listener
 //! and what each rule does and leads to ([`Compiled`]).
 
@@ -23,7 +23,7 @@ pub use compile::{
     Compiled, CompiledListener, CompiledRule, CompiledUpstream, ConfigError, Object, Place,
     Problem, RuleId, compile,
 };
-pub use config::{Config, Listener, Protocol, Upstream};
+pub use config::{Certificate, Config, Listener, Protocol, Tls, Upstream};
 pub use route::{
     Backend, Filter, Header, HeaderChanges, Hostname, Match, PathMatch, Route, Rule, ValueMatch,
     ValuePredicate, Wildcard,

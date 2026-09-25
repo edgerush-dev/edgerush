@@ -18,6 +18,7 @@ fuzzing = ["tokio/test-util", "dep:hyper", "dep:hyper-util", "hyper/client"]
 
 [dependencies]
 arc-swap.workspace = true
+boring.workspace = true
 bytes.workspace = true
 edgerush-config.workspace = true
 edgerush-filters.workspace = true
@@ -33,6 +34,7 @@ hyper-util = { workspace = true, optional = true }
 thiserror.workspace = true
 # "sync": what wakes a worker's connections when it drains.
 tokio = { workspace = true, features = ["sync"] }
+tokio-boring.workspace = true
 
 [dev-dependencies]
 # The engine's clients and its either-version server, for tests only: what talks to the

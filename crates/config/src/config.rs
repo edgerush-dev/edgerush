@@ -3,6 +3,7 @@
 use crate::Route;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::net::SocketAddr;
 
 /// A data plane's configuration. Filters are to come.
@@ -17,8 +18,8 @@ pub struct Config {
     pub upstreams: BTreeMap<String, Upstream>,
 }
 
-/// A place where requests come in. Hostnames and TLS are to come; until a listener can
-/// be told from another by hostname, each needs an address of its own.
+/// A place where requests come in. Hostnames are to come; until a listener can be told
+/// from another by hostname, each needs an address of its own.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
@@ -26,6 +27,9 @@ pub struct Listener {
     pub address: SocketAddr,
     /// What is spoken there.
     pub protocol: Protocol,
+    /// What an `https` listener presents, which it must have; no other may.
+    #[serde(default)]
+    pub tls: Option<Tls>,
 }
 
 /// What a listener speaks.
@@ -34,6 +38,38 @@ pub struct Listener {
 pub enum Protocol {
     /// HTTP/1.1 and HTTP/2 without TLS.
     Http,
+    /// HTTP/1.1 and HTTP/2 over TLS, told apart by ALPN.
+    Https,
+}
+
+/// The TLS a listener terminates.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tls {
+    /// What it can present, at least one. A client is given the one whose names cover the
+    /// name it asked for (SNI), and the first when none does or it asked for none.
+    pub certificates: Vec<Certificate>,
+}
+
+/// A certificate and its private key, in PEM, as they came: reading them is the data
+/// plane's, which refuses a config whose certificates it cannot use.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Certificate {
+    /// The certificate first, then the intermediates that lead from it towards a root.
+    pub chain: String,
+    /// Its private key.
+    pub key: String,
+}
+
+impl fmt::Debug for Certificate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Whatever prints a config — an error, a log — must not print a secret.
+        f.debug_struct("Certificate")
+            .field("chain", &self.chain)
+            .field("key", &"(not shown)")
+            .finish()
+    }
 }
 
 /// A set of endpoints that serve the same thing.
