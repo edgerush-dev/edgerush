@@ -314,6 +314,13 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             }
             (Protocol::Https, Some(_)) | (Protocol::Http, None) => {}
         }
+        let validation = listener
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.client_validation.as_ref());
+        if validation.is_some_and(|validation| validation.authorities.is_empty()) {
+            errors.push(Place::listener(name).problem(Problem::NoAuthority));
+        }
     }
 
     // The matches of every listener, by the listener's name.
@@ -1403,6 +1410,24 @@ upstreams:
         assert_eq!(tls.certificates.len(), 1);
         assert_eq!(tls.certificates[0].chain, "C");
         assert_eq!(tls.certificates[0].key, "K");
+        assert_eq!(tls.client_validation, None);
+        let validated = compile(&with(
+            r#"{ address: "[::]:443", protocol: https, tls: { certificates: [{ chain: "C", key: "K" }], client_validation: { authorities: ["CA"] } } }"#,
+        ))
+        .unwrap();
+        let validation = validated.listeners[0].tls.as_ref().unwrap();
+        assert_eq!(
+            validation.client_validation.as_ref().unwrap().authorities,
+            ["CA"]
+        );
+        assert!(
+            compile(&with(
+                r#"{ address: "[::]:443", protocol: https, tls: { certificates: [{ chain: "C", key: "K" }], client_validation: { authorities: [] } } }"#,
+            ))
+            .unwrap_err()[0]
+                .to_string()
+                .ends_with("`tls` needs an authority to trust")
+        );
 
         let problems = |listener: String| -> Vec<String> {
             compile(&with(&listener))

@@ -14,9 +14,10 @@ use boring::error::ErrorStack;
 use boring::pkey::PKey;
 use boring::ssl::{
     AlpnError, NameType, SslAcceptor, SslAcceptorBuilder, SslContext, SslMethod,
-    SslSessionCacheMode, select_next_proto,
+    SslSessionCacheMode, SslVerifyMode, select_next_proto,
 };
 use boring::x509::X509;
+use boring::x509::store::X509StoreBuilder;
 use edgerush_config::Certificate;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -79,6 +80,14 @@ pub enum TlsError {
         /// Its position among the listener's certificates.
         index: usize,
     },
+    /// An authority trusted to vouch for clients is not a certificate in PEM.
+    #[error("client validation, authority {index}: not a PEM certificate: {reason}")]
+    Authority {
+        /// Its position among the authorities.
+        index: usize,
+        /// What was wrong with it.
+        reason: String,
+    },
     /// BoringSSL would not set up what every certificate is served with. Not known to
     /// happen: the settings are fixed.
     #[error("TLS cannot be set up: {0}")]
@@ -92,11 +101,21 @@ impl Tls {
     ///
     /// A [`TlsError`] for the first certificate that cannot be used.
     pub(crate) fn new(source: &edgerush_config::Tls) -> Result<Self, TlsError> {
+        let authorities = source
+            .client_validation
+            .as_ref()
+            .map(|validation| authorities(&validation.authorities))
+            .transpose()?;
         let mut names = Names::default();
         let mut others = Vec::with_capacity(source.certificates.len().saturating_sub(1));
         let mut first = None;
         for (index, certificate) in source.certificates.iter().enumerate() {
-            let (builder, leaf) = context(certificate, index)?;
+            let (mut builder, leaf) = context(certificate, index)?;
+            // On every certificate's context: a client that asked for another name is moved
+            // to that one's, and must be held to the same.
+            if let Some(authorities) = &authorities {
+                validate_clients(&mut builder, authorities)?;
+            }
             names.add(&leaf, index);
             if first.is_none() {
                 first = Some(builder);
@@ -138,6 +157,47 @@ impl Tls {
     pub(crate) fn is_for(&self, source: &edgerush_config::Tls) -> bool {
         self.source == *source
     }
+}
+
+/// The certificates of the authorities trusted to vouch for clients, read.
+fn authorities(pems: &[String]) -> Result<Vec<X509>, TlsError> {
+    let mut read = Vec::new();
+    for (index, pem) in pems.iter().enumerate() {
+        let certificates =
+            X509::stack_from_pem(pem.as_bytes()).map_err(|error| TlsError::Authority {
+                index,
+                reason: error.to_string(),
+            })?;
+        if certificates.is_empty() {
+            return Err(TlsError::Authority {
+                index,
+                reason: "no certificate in it".to_owned(),
+            });
+        }
+        read.extend(certificates);
+    }
+    Ok(read)
+}
+
+/// Has a context refuse a client that does not show a certificate `authorities` vouch
+/// for, and name them to the client, as nginx and HAProxy do, so one with several
+/// certificates can tell which to show.
+fn validate_clients(
+    builder: &mut SslAcceptorBuilder,
+    authorities: &[X509],
+) -> Result<(), TlsError> {
+    let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
+    let mut trusted = X509StoreBuilder::new().map_err(setup)?;
+    for authority in authorities {
+        trusted.add_cert(authority.clone()).map_err(setup)?;
+        builder.add_client_ca(authority).map_err(setup)?;
+    }
+    // Only these: the machine's own store is not consulted.
+    builder
+        .set_verify_cert_store(trusted.build())
+        .map_err(setup)?;
+    builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    Ok(())
 }
 
 /// A context for one certificate, and the certificate itself, whose names are for the
@@ -358,11 +418,13 @@ mod tests {
     fn a_listener_with_usable_certificates_is_set_up() {
         let source = edgerush_config::Tls {
             certificates: vec![certificate(&["a.test"]), certificate(&["b.test"])],
+            client_validation: None,
         };
         let tls = Tls::new(&source).unwrap();
         assert!(tls.is_for(&source));
         let other = edgerush_config::Tls {
             certificates: vec![certificate(&["a.test"])],
+            client_validation: None,
         };
         assert!(!tls.is_for(&other));
     }
@@ -371,7 +433,11 @@ mod tests {
     fn a_certificate_that_cannot_be_used_is_refused_and_said_which() {
         let good = certificate(&["a.test"]);
         let tls = |certificates: Vec<Certificate>| {
-            Tls::new(&edgerush_config::Tls { certificates }).map(|_| ())
+            Tls::new(&edgerush_config::Tls {
+                certificates,
+                client_validation: None,
+            })
+            .map(|_| ())
         };
         // Text with no PEM in it is no certificates; a PEM block that is not one is an error.
         let nothing = Certificate {
@@ -407,5 +473,17 @@ mod tests {
             tls(vec![good, mismatched]),
             Err(TlsError::Mismatch { index: 1 })
         );
+        let validated = |authorities: Vec<String>| {
+            Tls::new(&edgerush_config::Tls {
+                certificates: vec![certificate(&["a.test"])],
+                client_validation: Some(edgerush_config::ClientValidation { authorities }),
+            })
+            .map(|_| ())
+        };
+        assert_eq!(validated(vec![certificate(&["ca"]).chain]), Ok(()));
+        assert!(matches!(
+            validated(vec![certificate(&["ca"]).chain, "no PEM".to_owned()]),
+            Err(TlsError::Authority { index: 1, .. })
+        ));
     }
 }

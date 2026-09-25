@@ -49,6 +49,19 @@ pub struct Tls {
     /// What it can present, at least one. A client is given the one whose names cover the
     /// name it asked for (SNI), and the first when none does or it asked for none.
     pub certificates: Vec<Certificate>,
+    /// Clients must show a certificate these authorities vouch for (mTLS); none, and any
+    /// client is served.
+    #[serde(default)]
+    pub client_validation: Option<ClientValidation>,
+}
+
+/// Whom a listener trusts to vouch for its clients (Gateway API's frontend validation, in
+/// its default mode: a client without a valid certificate is refused in the handshake).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientValidation {
+    /// The certificates, in PEM, of the authorities trusted. At least one.
+    pub authorities: Vec<String>,
 }
 
 /// A certificate and its private key, in PEM, as they came: reading them is the data

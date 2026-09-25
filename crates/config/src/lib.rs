@@ -24,8 +24,8 @@ pub use compile::{
     ConfigError, Object, Place, Problem, RuleId, compile,
 };
 pub use config::{
-    Certificate, Config, HealthCheck, Keepalive, Listener, Probe, Protocol, Tls, Upstream,
-    UpstreamProtocol, UpstreamTls,
+    Certificate, ClientValidation, Config, HealthCheck, Keepalive, Listener, Probe, Protocol, Tls,
+    Upstream, UpstreamProtocol, UpstreamTls,
 };
 pub use route::{
     Backend, Filter, Fraction, GrpcMethod, Header, HeaderChanges, Hostname, Match, Mirror,

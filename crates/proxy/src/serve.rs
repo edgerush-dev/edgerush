@@ -3086,6 +3086,78 @@ upstreams:
             .await;
     }
 
+    /// A listener that validates clients serves only one that shows a certificate its
+    /// authorities vouch for — whichever of its certificates the client asked for.
+    #[tokio::test]
+    async fn a_listener_that_validates_clients_serves_only_those_it_trusts() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::tls::testing::certificate;
+                let (upstream, _) = counting_upstream().await;
+                let trusted = certificate(&["client"]);
+                let stranger = certificate(&["client"]);
+                let mut config = everything_config(upstream);
+                let web = config.listeners.get_mut("web").unwrap();
+                web.protocol = edgerush_config::Protocol::Https;
+                web.tls = Some(edgerush_config::Tls {
+                    certificates: vec![certificate(&["a.test"]), certificate(&["b.test"])],
+                    client_validation: Some(edgerush_config::ClientValidation {
+                        authorities: vec![trusted.chain.clone()],
+                    }),
+                });
+                let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+                let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+
+                // What a client asking for `name`, showing `shown`, is answered: nothing at
+                // all if the handshake, or the first read after it, failed.
+                let answered = |name: &'static str, shown: Option<edgerush_config::Certificate>| async move {
+                    let connected = tls_client(front, name, None, |builder| {
+                        if let Some(shown) = &shown {
+                            let chain = boring::x509::X509::from_pem(shown.chain.as_bytes()).unwrap();
+                            let key = boring::pkey::PKey::private_key_from_pem(shown.key.as_bytes()).unwrap();
+                            builder.set_certificate(&chain).unwrap();
+                            builder.set_private_key(&key).unwrap();
+                        }
+                    })
+                    .await;
+                    match connected {
+                        Ok(stream) => h1_over_or_nothing(stream).await,
+                        Err(_) => String::new(),
+                    }
+                };
+                for name in ["a.test", "b.test"] {
+                    let answer = answered(name, Some(trusted.clone())).await;
+                    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{name}: {answer}");
+                    let answer = answered(name, None).await;
+                    assert_eq!(answer, "", "{name}: served a client with no certificate");
+                    let answer = answered(name, Some(stranger.clone())).await;
+                    assert_eq!(answer, "", "{name}: served a client nobody vouches for");
+                }
+            })
+            .await;
+    }
+
+    /// What a request over `stream` is answered, or nothing if the stream fails: under
+    /// TLS 1.3 a client's certificate is judged after the client has finished its side of
+    /// the handshake, so a refusal can arrive as the first thing read.
+    async fn h1_over_or_nothing<S>(mut stream: S) -> String
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let request = b"GET / HTTP/1.1\r\nhost: example.test\r\nconnection: close\r\n\r\n";
+        if stream.write_all(request).await.is_err() {
+            return String::new();
+        }
+        let mut answer = Vec::new();
+        let _ended = within(stream.read_to_end(&mut answer)).await;
+        String::from_utf8_lossy(&answer).into_owned()
+    }
+
     /// The certificate a client is given is the one whose names cover the name it asked
     /// for, and the first when none does.
     #[tokio::test]
@@ -6358,7 +6430,10 @@ upstreams:
         let mut config = everything_config(upstream);
         let web = config.listeners.get_mut("web").unwrap();
         web.protocol = edgerush_config::Protocol::Https;
-        web.tls = Some(edgerush_config::Tls { certificates });
+        web.tls = Some(edgerush_config::Tls {
+            certificates,
+            client_validation: None,
+        });
         compile(&config).unwrap()
     }
 
