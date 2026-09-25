@@ -12,6 +12,7 @@
 
 mod cookies;
 mod drain;
+mod grpc;
 // Private, save when the fuzz targets are being built, as `upstream` is below.
 #[cfg(feature = "fuzzing")]
 pub mod downstream;

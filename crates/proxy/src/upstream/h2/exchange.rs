@@ -108,12 +108,20 @@ pub(crate) async fn exchange<F: OutgoingFields + ?Sized>(
     storage: &Rc<Storage>,
     interim: Option<Interim>,
     bounds: Bounds,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<(Parts, Answer), ExchangeError> {
-    let head = head::request(method, target, fields, sending)?;
+    let mut head = head::request(method, target, fields, sending)?;
     let mut channel = interim.map_or_else(Channel::unheard, Channel::Listened);
     let nothing_to_send = matches!(sending, Sending::None | Sending::Length(0));
     channel.begin(expects_continue(fields), nothing_to_send);
     let mut place = client.place(destination).await?;
+    // A gRPC call's deadline goes up as the time it has left now, waiting for a place and
+    // all: the upstream sees the deadline the client set, not a fresh one (15 §6).
+    if let Some(deadline) = deadline {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        head.headers_mut()
+            .insert("grpc-timeout", crate::grpc::timeout::format(left));
+    }
     let sender = place.sender();
     // A handle that has opened nothing is ready unless the connection can take no new
     // streams at all; the place is what says there is room on it.

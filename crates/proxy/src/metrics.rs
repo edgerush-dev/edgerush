@@ -9,6 +9,7 @@
 //! counted together in one series, as docs/08 wants of anything that a config can make
 //! arbitrarily many of.
 
+use crate::grpc::status::Code;
 use crate::request::Rejection;
 use edgerush_telemetry::{Counter, Exposition, Gauge, Histogram, Kind, Sharded};
 use http::StatusCode;
@@ -159,10 +160,13 @@ pub(crate) enum Answer {
     /// Connection-bound credentials (NTLM, Negotiate) for an HTTP/2 upstream, where they
     /// would authenticate every client's streams ([15 §5](../../docs/15-http2-and-grpc.md)).
     ConnectionAuth,
+    /// A gRPC call's deadline passed before its answer began
+    /// ([15 §6](../../docs/15-http2-and-grpc.md)).
+    DeadlineExceeded,
 }
 
 impl Answer {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 17] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -179,6 +183,7 @@ impl Answer {
         Self::QueueFull,
         Self::QueueTimedOut,
         Self::ConnectionAuth,
+        Self::DeadlineExceeded,
     ];
 
     /// The status that is answered with.
@@ -197,6 +202,7 @@ impl Answer {
             | Self::QueueFull
             | Self::QueueTimedOut => StatusCode::SERVICE_UNAVAILABLE,
             Self::ConnectionAuth => StatusCode::NOT_IMPLEMENTED,
+            Self::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
             Self::UpstreamFailed => StatusCode::BAD_GATEWAY,
             Self::BodyTimedOut => StatusCode::REQUEST_TIMEOUT,
         }
@@ -220,6 +226,43 @@ impl Answer {
             Self::QueueFull => "upstream_queue_full",
             Self::QueueTimedOut => "upstream_queue_timeout",
             Self::ConnectionAuth => "connection_auth",
+            Self::DeadlineExceeded => "deadline_exceeded",
+        }
+    }
+
+    /// The status a gRPC call is answered with instead, and what it is told
+    /// ([15 §6](../../docs/15-http2-and-grpc.md)). Chosen for the cause, not read back
+    /// from the HTTP status, as linkerd chooses: what may be tried again is `UNAVAILABLE`,
+    /// a deadline is `DEADLINE_EXCEEDED`, a method nobody serves is `UNIMPLEMENTED` — what
+    /// a server says of an unknown method — and a request the gateway cannot make sense of
+    /// is `INTERNAL`, as gRPC calls a protocol error.
+    pub(crate) fn grpc(self) -> (Code, &'static str) {
+        match self {
+            Self::BadHost => (Code::Internal, "the call names no host the gateway can use"),
+            Self::BadPath => (Code::Internal, "the call's path cannot be routed"),
+            Self::BadConnection => (Code::Internal, "the call's head is not well formed"),
+            Self::BadTarget => (Code::Internal, "the call's target cannot be sent on"),
+            Self::Edits => (Code::Internal, "the call's head could not take its changes"),
+            Self::BadBody => (Code::Internal, "the call's messages could not be read"),
+            Self::NoRoute => (Code::Unimplemented, "no route serves this method"),
+            Self::ConnectionAuth => (
+                Code::Unimplemented,
+                "connection-bound credentials are not sent over HTTP/2",
+            ),
+            Self::NoBackend | Self::NoEndpoints => {
+                (Code::Unavailable, "no upstream can serve the call")
+            }
+            Self::UpstreamFailed => (Code::Unavailable, "the upstream could not be reached"),
+            Self::TooBusy | Self::QueueFull | Self::QueueTimedOut => (
+                Code::Unavailable,
+                "the gateway is too busy to take the call",
+            ),
+            Self::Exhausted => (Code::ResourceExhausted, "the gateway ran out of room"),
+            Self::BodyTimedOut => (
+                Code::DeadlineExceeded,
+                "the call's messages stopped arriving",
+            ),
+            Self::DeadlineExceeded => (Code::DeadlineExceeded, "the call's deadline passed"),
         }
     }
 }

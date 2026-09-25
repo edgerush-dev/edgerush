@@ -21,6 +21,8 @@ use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h1::deadlines::Bounds;
 use crate::downstream::h2;
 use crate::drain::Drain;
+use crate::grpc::answer::{Answered as GrpcAnswered, is_grpc_answer};
+use crate::grpc::call::Call;
 use crate::head::Forwarded;
 use crate::interim::Interim;
 use crate::linger::{self, Lent, linger};
@@ -46,7 +48,7 @@ use bytes::Bytes;
 use edgerush_config::{Compiled, CompiledRule, UpstreamProtocol};
 use edgerush_router::Fields;
 use http::uri::{Authority, Scheme};
-use http::{HeaderName, Method, Request, Response, Uri, Version};
+use http::{HeaderName, Method, Request, Response, StatusCode, Uri, Version};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -122,6 +124,8 @@ enum Body {
     Ours(Box<H1Body<UpstreamSocket, RequestBody>>, Admitted, Watch),
     /// An HTTP/2 upstream's answer, read by EdgeRush's own HTTP/2 client (15 step 6).
     H2(Box<h2_exchange::Answer>, Admitted, Watch),
+    /// A gRPC call's answer, ended by one status whatever becomes of it (15 §6).
+    Grpc(Box<GrpcAnswered<Body>>),
     /// An answer of the data plane's own. It has no body, and never will have one.
     Empty,
 }
@@ -228,6 +232,7 @@ impl HttpBody for Body {
                     })
                 })
             }
+            Self::Grpc(answered) => Pin::new(&mut **answered).poll_frame(context),
             Self::Empty => Poll::Ready(None),
         }
     }
@@ -236,6 +241,7 @@ impl HttpBody for Body {
         match self {
             Self::Ours(ours, ..) => ours.is_end_stream(),
             Self::H2(answer, ..) => answer.is_end_stream(),
+            Self::Grpc(answered) => answered.is_end_stream(),
             Self::Empty => true,
         }
     }
@@ -244,6 +250,7 @@ impl HttpBody for Body {
         match self {
             Self::Ours(ours, ..) => ours.size_hint(),
             Self::H2(answer, ..) => answer.size_hint(),
+            Self::Grpc(answered) => answered.size_hint(),
             Self::Empty => SizeHint::with_exact(0),
         }
     }
@@ -990,6 +997,16 @@ impl Worker {
         // takes the hop-by-hop fields off it — and before the body itself is touched,
         // because the path is chosen while there is still nothing to undo.
         let sending = sending_for(&head, &body);
+        // A gRPC call is answered as one, the gateway's own answers included; read from the
+        // head as the client sent it, before any filter touches it (15 §6).
+        let call = Call::of(head.version(), head.outgoing(), Instant::now());
+        let deadline = call.and_then(|call| call.deadline());
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            return self
+                .proxy
+                .answer_to(listener, Answer::DeadlineExceeded, call)
+                .into();
+        }
         // What this request's own `Connection` named, read before routing takes the
         // hop-by-hop fields off the head. Afterwards there is nothing left to read them
         // from and everything it named looks like an ordinary field, so a trailer of that
@@ -997,12 +1014,15 @@ impl Worker {
         let nominated = crate::hop_by_hop::nominated(head.outgoing());
         let directed = match self.proxy.direct(listener, &mut head) {
             Ok(directed) => directed,
-            Err(answer) => return self.proxy.answer(listener, answer).into(),
+            Err(answer) => return self.proxy.answer_to(listener, answer, call).into(),
         };
         // A name it gave is not declared onwards either: the declaration says what the
         // trailers will hold, and it will not hold that.
         if let Err(rejection) = head.filter_declaration(&nominated) {
-            return self.proxy.answer(listener, rejection.into()).into();
+            return self
+                .proxy
+                .answer_to(listener, rejection.into(), call)
+                .into();
         }
 
         // Credentials can bind the upstream socket to this client, even when the
@@ -1012,10 +1032,16 @@ impl Worker {
         let multiplexed = directed.endpoint.protocol() == UpstreamProtocol::Http2;
         if crate::upstream::auth::carries_credentials(head.outgoing()) {
             if multiplexed {
-                return self.proxy.answer(listener, Answer::ConnectionAuth).into();
+                return self
+                    .proxy
+                    .answer_to(listener, Answer::ConnectionAuth, call)
+                    .into();
             }
             if let Err(rejection) = head.close_connection() {
-                return self.proxy.answer(listener, rejection.into()).into();
+                return self
+                    .proxy
+                    .answer_to(listener, rejection.into(), call)
+                    .into();
             }
         }
 
@@ -1024,18 +1050,24 @@ impl Worker {
         // bound whichever client carries the request, so that the two are compared doing
         // the same work ([14 §2](../../docs/14-downstream-server.md)).
         let Some(admitted) = self.admit() else {
-            return self.proxy.answer(listener, Answer::TooBusy).into();
+            return self.proxy.answer_to(listener, Answer::TooBusy, call).into();
         };
         if multiplexed {
             return self
-                .respond_by_h2(listener, &directed, &head, sending, body, admitted, interim)
+                .respond_by_h2(
+                    listener, &directed, &head, sending, body, admitted, interim, call,
+                )
                 .await;
         }
-        let answered = self
-            .by_ours(
-                &directed, &head, &nominated, sending, body, admitted, interim,
-            )
-            .await;
+        let exchanged = self.by_ours(
+            &directed, &head, &nominated, sending, body, admitted, interim,
+        );
+        let answered = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, exchanged)
+                .await
+                .unwrap_or(Err(Answer::DeadlineExceeded)),
+            None => exchanged.await,
+        };
 
         let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
         let (mut answer, body) = match answered {
@@ -1043,14 +1075,19 @@ impl Worker {
             // The worker's own storage running out, or a client's body that cannot be read,
             // is not the upstream failing, and is not counted as though it were
             // ([14 §8](../../docs/14-downstream-server.md)).
-            Err(answer @ (Answer::Exhausted | Answer::BadBody | Answer::BodyTimedOut)) => {
-                return self.proxy.answer(listener, answer).into();
+            Err(
+                answer @ (Answer::Exhausted
+                | Answer::BadBody
+                | Answer::BodyTimedOut
+                | Answer::DeadlineExceeded),
+            ) => {
+                return self.proxy.answer_to(listener, answer, call).into();
             }
             Err(answer) => {
                 if let Some(upstream) = upstream {
                     upstream.failures.inc();
                 }
-                return self.proxy.answer(listener, answer).into();
+                return self.proxy.answer_to(listener, answer, call).into();
             }
         };
         if let Some(upstream) = upstream {
@@ -1069,7 +1106,7 @@ impl Worker {
             changes.map_or(Ok(()), |changes| answer.apply(changes))
         });
         if edited.is_err() {
-            return self.proxy.answer(listener, Answer::Edits).into();
+            return self.proxy.answer_to(listener, Answer::Edits, call).into();
         }
         // Written in this hop's version and not the upstream's: "Intermediaries that
         // process HTTP messages ... MUST send their own HTTP-version in forwarded messages"
@@ -1093,7 +1130,9 @@ impl Worker {
         body: RequestBody,
         admitted: Admitted,
         interim: Option<Interim>,
+        call: Option<Call>,
     ) -> Answered<Body> {
+        let deadline = call.and_then(|call| call.deadline());
         let storage = Rc::clone(self.blocks.borrow().storage());
         let bounds = H2Bounds {
             final_head: self.limits.final_head,
@@ -1102,7 +1141,7 @@ impl Worker {
             interim_heads: self.limits.interim_heads,
             interim_bytes: self.limits.interim_bytes,
         };
-        let exchanged = h2_exchange::exchange(
+        let exchanging = h2_exchange::exchange(
             &self.h2,
             &directed.endpoint,
             head.method(),
@@ -1113,8 +1152,20 @@ impl Worker {
             &storage,
             interim,
             bounds,
-        )
-        .await;
+            deadline,
+        );
+        let exchanged = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, exchanging).await {
+                Ok(exchanged) => exchanged,
+                Err(_) => {
+                    return self
+                        .proxy
+                        .answer_to(listener, Answer::DeadlineExceeded, call)
+                        .into();
+                }
+            },
+            None => exchanging.await,
+        };
         let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
         let (parts, answer) = match exchanged {
             Ok(exchanged) => exchanged,
@@ -1142,7 +1193,7 @@ impl Worker {
                 {
                     upstream.failures.inc();
                 }
-                return self.proxy.answer(listener, answer).into();
+                return self.proxy.answer_to(listener, answer, call).into();
             }
         };
         if let Some(upstream) = upstream {
@@ -1163,6 +1214,13 @@ impl Worker {
             .and_then(|rule| rule.response_headers.as_ref())
         {
             changes.apply(headers);
+        }
+        // A gRPC call's answer that is gRPC's own ends with one status, whatever becomes
+        // of it; any other answer goes on as it came, for the client to read (15 §6).
+        if call.is_some() && is_grpc_answer(response.status(), response.headers()) {
+            let (parts, body) = response.into_parts();
+            let answered = GrpcAnswered::new(body, &parts.headers, deadline);
+            response = Response::from_parts(parts, Body::Grpc(Box::new(answered)));
         }
         Answered::Map(response)
     }
@@ -1230,6 +1288,26 @@ impl Worker {
 }
 
 impl Proxy {
+    /// An answer of the data plane's own for a request that may be a gRPC `call`: for one
+    /// that is, `200` and the status gRPC gives the cause, with nothing after the head — a
+    /// trailers-only answer, which is how gRPC answers a call it fails before any message
+    /// (15 §6). Counted by its reason either way.
+    fn answer_to(&self, listener: usize, answer: Answer, call: Option<Call>) -> Response<Body> {
+        let mut response = self.answer(listener, answer);
+        if call.is_some() {
+            let (code, why) = answer.grpc();
+            *response.status_mut() = StatusCode::OK;
+            let headers = response.headers_mut();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/grpc"),
+            );
+            headers.insert("grpc-status", code.value());
+            headers.insert("grpc-message", crate::grpc::status::message(why));
+        }
+        response
+    }
+
     /// An answer of the data plane's own, counted by its reason.
     fn answer(&self, listener: usize, answer: Answer) -> Response<Body> {
         if let Some(counters) = self.metrics.listener(listener) {
@@ -3719,6 +3797,233 @@ upstreams:
             matches!(&refused, Err(ProxyError::UpstreamTls { upstream, .. }) if upstream == "up"),
             "{refused:?}"
         );
+    }
+
+    /// A gRPC call, as a gRPC client makes one: POST, `application/grpc`, `te: trailers`,
+    /// and `grpc-timeout` if `timeout` says one.
+    fn grpc_call(path: &str, timeout: Option<&str>) -> Request<()> {
+        let mut call = Request::post(format!("http://a.test{path}"))
+            .header("content-type", "application/grpc")
+            .header("te", "trailers");
+        if let Some(timeout) = timeout {
+            call = call.header("grpc-timeout", timeout);
+        }
+        call.body(()).unwrap()
+    }
+
+    /// What a gRPC call came back with: the HTTP status, and the gRPC status and whether
+    /// it came in the head (a trailers-only answer) or in trailers.
+    async fn grpc_outcome(answer: ::h2::client::ResponseFuture) -> (StatusCode, String, bool) {
+        let answer = within(answer).await.unwrap();
+        let status = answer.status();
+        if let Some(code) = answer.headers().get("grpc-status") {
+            assert!(
+                answer.body().is_end_stream(),
+                "a status in the head, and more after it"
+            );
+            return (status, code.to_str().unwrap().to_owned(), true);
+        }
+        let mut body = answer.into_body();
+        while let Some(chunk) = within(body.data()).await {
+            let chunk = chunk.expect("the stream was reset, not ended with a status");
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+        let trailers = within(std::future::poll_fn(|cx| body.poll_trailers(cx)))
+            .await
+            .expect("the stream was reset, not ended with a status")
+            .expect("no status at all");
+        (
+            status,
+            trailers["grpc-status"].to_str().unwrap().to_owned(),
+            false,
+        )
+    }
+
+    fn grpc_head() -> Response<()> {
+        Response::builder()
+            .status(200)
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap()
+    }
+
+    /// A gRPC call the gateway answers itself is answered as gRPC answers a call it fails
+    /// before any message: `200`, and the status the cause calls for, in the head. The same
+    /// request that is not a gRPC call is answered in HTTP.
+    #[tokio::test]
+    async fn a_grpc_call_the_gateway_answers_itself_is_told_a_grpc_status() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut config = everything_config("127.0.0.1:9".parse().unwrap());
+                let up = config.upstreams.get_mut("up").unwrap();
+                up.endpoints.clear();
+                up.protocol = UpstreamProtocol::Http2;
+                let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+                let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let (answer, _) = send
+                    .send_request(grpc_call("/pkg.Svc/Do", None), true)
+                    .unwrap();
+                let answer = within(answer).await.unwrap();
+                assert_eq!(answer.status(), StatusCode::OK);
+                assert_eq!(answer.headers()["content-type"], "application/grpc");
+                assert_eq!(answer.headers()["grpc-status"], "14");
+                assert!(answer.headers().contains_key("grpc-message"));
+                assert!(answer.body().is_end_stream());
+
+                let plain = Request::post("http://a.test/pkg.Svc/Do").body(()).unwrap();
+                let (answer, _) = send.send_request(plain, true).unwrap();
+                let answer = within(answer).await.unwrap();
+                assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert!(answer.headers().get("grpc-status").is_none());
+
+                // Connection-bound credentials, which are not sent over HTTP/2.
+                let (upstream, _seen, _gate) = h2_upstream(UpstreamH2::default()).await;
+                let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let mut call = grpc_call("/pkg.Svc/Do", None);
+                call.headers_mut()
+                    .insert("authorization", "Negotiate abc".parse().unwrap());
+                let (answer, _) = send.send_request(call, true).unwrap();
+                assert_eq!(
+                    grpc_outcome(answer).await,
+                    (StatusCode::OK, "12".to_owned(), true)
+                );
+            })
+            .await;
+    }
+
+    /// A gRPC call's deadline bounds how long its answer is waited for, and goes up as the
+    /// time it has left; one already past is answered at once and never sent.
+    #[tokio::test]
+    async fn a_grpc_calls_deadline_bounds_it_and_goes_up_as_the_time_left() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let heard = Rc::new(RefCell::new(Vec::<String>::new()));
+                let hearing = Rc::clone(&heard);
+                let script: Script = Rc::new(move |request, _respond| {
+                    let hearing = Rc::clone(&hearing);
+                    Box::pin(async move {
+                        let timeout = request
+                            .headers()
+                            .get("grpc-timeout")
+                            .map(|value| value.to_str().unwrap().to_owned())
+                            .unwrap_or_default();
+                        hearing.borrow_mut().push(timeout);
+                        // Never answers; keeps the stream open until it is reset.
+                        let _respond = _respond;
+                        std::future::pending::<()>().await;
+                    })
+                });
+                let upstream = scripted_h2_upstream(script).await;
+                let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+
+                let asked = tokio::time::Instant::now();
+                let (answer, _) = send
+                    .send_request(grpc_call("/pkg.Svc/Slow", Some("300m")), true)
+                    .unwrap();
+                assert_eq!(
+                    grpc_outcome(answer).await,
+                    (StatusCode::OK, "4".to_owned(), true)
+                );
+                let took = asked.elapsed();
+                assert!(
+                    took + EARLY >= Duration::from_millis(300)
+                        && took < Duration::from_millis(300) + SLACK,
+                    "answered after {took:?}"
+                );
+                let sent = crate::grpc::timeout::parse(heard.borrow()[0].as_bytes())
+                    .expect("no grpc-timeout went up");
+                // What was left when the stream opened, not what the client said.
+                assert!(
+                    sent < Duration::from_millis(300) && sent > Duration::from_millis(200),
+                    "sent {sent:?}"
+                );
+
+                let (answer, _) = send
+                    .send_request(grpc_call("/pkg.Svc/Late", Some("0n")), true)
+                    .unwrap();
+                assert_eq!(
+                    grpc_outcome(answer).await,
+                    (StatusCode::OK, "4".to_owned(), true)
+                );
+                assert_eq!(heard.borrow().len(), 1, "a call past its deadline went up");
+            })
+            .await;
+    }
+
+    /// Once a gRPC answer has begun, whatever ends it early is told to the client as a
+    /// status in its trailers: the upstream cutting it off, by what gRPC makes of the
+    /// reason, or its deadline passing. The upstream's own status goes through once.
+    #[tokio::test]
+    async fn a_grpc_answer_always_ends_with_exactly_one_status() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let script: Script = Rc::new(|request, mut respond| {
+                    Box::pin(async move {
+                        let path = request.uri().path().to_owned();
+                        if path == "/pkg.Svc/Plain" {
+                            let unavailable = Response::builder()
+                                .status(503)
+                                .header("content-type", "text/plain")
+                                .body(())
+                                .unwrap();
+                            let _ = respond.send_response(unavailable, true);
+                            return;
+                        }
+                        let Ok(mut sending) = respond.send_response(grpc_head(), false) else {
+                            return;
+                        };
+                        let _ = sending.send_data(Bytes::from_static(b"\0\0\0\0\x01m"), false);
+                        match path.as_str() {
+                            "/pkg.Svc/Cancelled" => {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                sending.send_reset(::h2::Reason::CANCEL);
+                            }
+                            "/pkg.Svc/Hangs" => std::future::pending::<()>().await,
+                            _ => {
+                                let mut status = http::HeaderMap::new();
+                                status.insert("grpc-status", "0".parse().unwrap());
+                                let _ = sending.send_trailers(status);
+                            }
+                        }
+                    })
+                });
+                let upstream = scripted_h2_upstream(script).await;
+                let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                for (path, timeout, expected) in [
+                    ("/pkg.Svc/Ok", None, (StatusCode::OK, "0", false)),
+                    ("/pkg.Svc/Cancelled", None, (StatusCode::OK, "1", false)),
+                    ("/pkg.Svc/Hangs", Some("300m"), (StatusCode::OK, "4", false)),
+                ] {
+                    let (answer, _) = send.send_request(grpc_call(path, timeout), true).unwrap();
+                    let (status, code, in_head) = grpc_outcome(answer).await;
+                    assert_eq!((status, code.as_str(), in_head), expected, "{path}");
+                }
+                // An answer that is not gRPC's goes on as it came, for the client to read.
+                let (answer, _) = send
+                    .send_request(grpc_call("/pkg.Svc/Plain", None), true)
+                    .unwrap();
+                let answer = within(answer).await.unwrap();
+                assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert!(answer.headers().get("grpc-status").is_none());
+                let mut body = answer.into_body();
+                while let Some(chunk) = within(body.data()).await {
+                    let _ = body.flow_control().release_capacity(chunk.unwrap().len());
+                }
+                let trailers = within(std::future::poll_fn(|cx| body.poll_trailers(cx))).await;
+                assert!(trailers.unwrap().is_none(), "a status was added to it");
+            })
+            .await;
     }
 
     /// A client that gives its request up gives its stream's place back: with room for one
