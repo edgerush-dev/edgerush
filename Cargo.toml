@@ -61,6 +61,11 @@ memchr = "2.8"
 thiserror = "2.0"
 # A BoringSSL connection as a tokio stream: the handshake and the records, nothing more.
 tokio-boring = "5.2"
+# QUIC and HTTP/3 to clients (16 §2), driven by a worker of ours: it does no I/O and keeps
+# no timers. Its TLS is the `boring` above, so there is one BoringSSL in the binary. It is
+# pre-1.0 and a minor release breaks, so it is pinned; moving it re-checks 16 §2 and the
+# probes in `crates/proxy/tests/h3_library.rs`. Only the proxy crate may depend on it.
+quiche = { version = "=0.30.0", default-features = false, features = ["boringssl-boring-crate"] }
 # Only what is used; tests add the multi-thread runtime and the macros for themselves.
 tokio = { version = "1.53", features = ["net", "rt", "time"] }
 # Benchmark-only: instruction counts under valgrind, so Linux (WSL2) only. The installed

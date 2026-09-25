@@ -32,6 +32,7 @@ httparse.workspace = true
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 memchr.workspace = true
+quiche.workspace = true
 thiserror.workspace = true
 # "sync": what an HTTP/2 upstream connection and its requests wait on each other with.
 tokio = { workspace = true, features = ["sync"] }

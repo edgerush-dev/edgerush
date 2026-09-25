@@ -29,6 +29,10 @@ mod health;
 // A scripted HTTP/2 peer, for tests here and for the probes in `tests/h2_library.rs`.
 #[cfg(test)]
 mod h2_peer;
+// Two quiche connections joined in memory and a scripted HTTP/3 peer, for the probes in
+// `tests/h3_library.rs` and the HTTP/3 tests to come.
+#[cfg(test)]
+mod h3_peer;
 pub mod head;
 #[cfg(feature = "fuzzing")]
 pub mod hop_by_hop;
