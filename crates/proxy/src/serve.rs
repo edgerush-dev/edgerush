@@ -40,6 +40,7 @@ use crate::upstream::h1::pool::{Lease, Pool};
 use crate::upstream::h2::client::{Client as H2Client, PlaceError, Settings as H2Settings};
 use crate::upstream::h2::exchange::{self as h2_exchange, Bounds as H2Bounds};
 use crate::upstream::h2::pool::Limits as H2Limits;
+use crate::upstream::secure::{Secure, Socket as UpstreamSocket};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use edgerush_config::{Compiled, CompiledRule, UpstreamProtocol};
@@ -118,7 +119,7 @@ enum Body {
     /// The upstream's answer, as EdgeRush's own path reads it. In a box because it is
     /// much larger than an empty answer, and every answer would otherwise carry room for
     /// it.
-    Ours(Box<H1Body<TcpStream, RequestBody>>, Admitted, Watch),
+    Ours(Box<H1Body<UpstreamSocket, RequestBody>>, Admitted, Watch),
     /// An HTTP/2 upstream's answer, read by EdgeRush's own HTTP/2 client (15 step 6).
     H2(Box<h2_exchange::Answer>, Admitted, Watch),
     /// An answer of the data plane's own. It has no body, and never will have one.
@@ -280,7 +281,7 @@ pub struct Worker {
     /// The connections this worker keeps to its upstreams. One for the life of the worker:
     /// a reload does not throw warm connections away. Those to an endpoint that is no
     /// longer used grow idle and are closed.
-    pool: Rc<RefCell<Pool<TcpStream>>>,
+    pool: Rc<RefCell<Pool<UpstreamSocket>>>,
     /// What its exchanges read into, lent and taken back rather than made each time
     /// ([13 §7](../../docs/13-http1-upstream.md)).
     blocks: Rc<RefCell<Blocks>>,
@@ -394,6 +395,9 @@ struct Snapshot {
     /// filed under. Worked out against the config this one replaces, because that is the
     /// only moment both are in hand ([13 §3](../../docs/13-http1-upstream.md)).
     destinations: Destinations,
+    /// By position of the upstream: what its connections are secured with, if anything.
+    /// Kept from the config before for as long as the TLS is the same.
+    secure: Vec<Option<Arc<Secure>>>,
     /// By position in [`Proxy::listeners`]: what a connection to it is accepted with, if
     /// it is to speak TLS. Kept from the config before for as long as the certificates
     /// are the same, and with it the keys of the session tickets it has issued.
@@ -447,10 +451,32 @@ impl Snapshot {
             .iter()
             .map(|upstream| metrics.upstream_slot(&upstream.name))
             .collect();
+        let secure: Vec<Option<Arc<Secure>>> = config
+            .upstreams
+            .iter()
+            .map(|upstream| {
+                let Some(source) = &upstream.tls else {
+                    return Ok(None);
+                };
+                let kept = previous
+                    .into_iter()
+                    .flat_map(|previous| previous.secure.iter().flatten())
+                    .find(|kept| kept.is_for(source, upstream.protocol));
+                match kept {
+                    Some(kept) => Ok(Some(Arc::clone(kept))),
+                    None => Secure::new(source, upstream.protocol)
+                        .map(|secure| Some(Arc::new(secure)))
+                        .map_err(|error| ProxyError::UpstreamTls {
+                            upstream: upstream.name.clone(),
+                            error,
+                        }),
+                }
+            })
+            .collect::<Result<_, _>>()?;
         let nothing_yet = Destinations::default();
         let previous_destinations =
             previous.map_or(&nothing_yet, |previous| &previous.destinations);
-        let destinations = Destinations::reconcile(&config, previous_destinations, keys);
+        let destinations = Destinations::reconcile(&config, previous_destinations, keys, &secure);
         Ok(Self {
             config,
             listeners,
@@ -458,6 +484,7 @@ impl Snapshot {
             upstream_slots,
             destinations,
             tls,
+            secure,
         })
     }
 }
@@ -713,7 +740,7 @@ impl Worker {
         sending: Sending,
         body: B,
         interim: Option<Interim>,
-    ) -> Result<(RawAnswer, Box<H1Body<TcpStream, B>>), ExchangeError>
+    ) -> Result<(RawAnswer, Box<H1Body<UpstreamSocket, B>>), ExchangeError>
     where
         F: OutgoingFields + ?Sized,
         B: HttpBody<Data = Bytes> + Unpin,
@@ -746,10 +773,18 @@ impl Worker {
             }
             None => {
                 self.proxy.metrics.socket(Socket::Opened);
-                let opening = TcpStream::connect(identity.address());
+                let secure = identity.secure().cloned();
+                // One bound for the connection and its handshake together.
+                let opening = async {
+                    let socket = TcpStream::connect(identity.address()).await?;
+                    // Worth having, not worth refusing an upstream over.
+                    let _unset = socket.set_nodelay(true);
+                    match secure {
+                        None => Ok(UpstreamSocket::Plain(socket)),
+                        Some(secure) => secure.connect(socket).await.map(UpstreamSocket::Secured),
+                    }
+                };
                 let socket = connect_within(self.limits.connect, opening).await?;
-                // Worth having, not worth refusing an upstream over.
-                let _unset = socket.set_nodelay(true);
                 (socket, Instant::now())
             }
         };
@@ -1342,6 +1377,14 @@ pub enum ProxyError {
     /// An endpoint address that cannot be written into a request target.
     #[error("endpoint {0} cannot be part of a request target")]
     Endpoint(SocketAddr),
+    /// An upstream's TLS that cannot be set up: an authority that is not a certificate.
+    #[error("upstream `{upstream}`: {error}")]
+    UpstreamTls {
+        /// The upstream's name.
+        upstream: String,
+        /// What is wrong.
+        error: TlsError,
+    },
     /// A listener's certificates that cannot be served.
     #[error("listener `{listener}`: {error}")]
     Tls {
@@ -3443,6 +3486,241 @@ upstreams:
             .await;
     }
 
+    /// How a TLS upstream of the tests settles what it speaks.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Agrees {
+        /// `h2` if offered, else `http/1.1`; and speaks what it agreed on.
+        Either,
+        /// Agrees on nothing, and speaks HTTP/2 regardless.
+        NothingButSpeaksH2,
+    }
+
+    /// An upstream that speaks TLS with `certificate`, settling what it speaks as `agrees`
+    /// says. Every request is answered `200` with `ok`.
+    async fn tls_upstream(
+        certificate: &edgerush_config::Certificate,
+        agrees: Agrees,
+    ) -> SocketAddr {
+        use boring::pkey::PKey;
+        use boring::ssl::{AlpnError, SslAcceptor, SslMethod, select_next_proto};
+        use boring::x509::X509;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        builder
+            .set_certificate(&X509::from_pem(certificate.chain.as_bytes()).unwrap())
+            .unwrap();
+        builder
+            .set_private_key(&PKey::private_key_from_pem(certificate.key.as_bytes()).unwrap())
+            .unwrap();
+        builder.set_alpn_select_callback(move |_, client| match agrees {
+            Agrees::Either => {
+                select_next_proto(b"\x02h2\x08http/1.1", client).ok_or(AlpnError::NOACK)
+            }
+            Agrees::NothingButSpeaksH2 => Err(AlpnError::NOACK),
+        });
+        let acceptor = Rc::new(builder.build());
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let _accepting = tokio::task::spawn_local(async move {
+            while let Ok((stream, _)) = socket.accept().await {
+                let acceptor = Rc::clone(&acceptor);
+                let _serving = tokio::task::spawn_local(async move {
+                    let Ok(mut secured) = tokio_boring::accept(&acceptor, stream).await else {
+                        return;
+                    };
+                    if agrees == Agrees::NothingButSpeaksH2
+                        || secured.ssl().selected_alpn_protocol() == Some(&b"h2"[..])
+                    {
+                        let Ok(mut connection) = ::h2::server::handshake(secured).await else {
+                            return;
+                        };
+                        while let Some(Ok((_request, mut respond))) = connection.accept().await {
+                            if let Ok(mut sending) = respond.send_response(ok_head(), false) {
+                                let _ = sending.send_data(Bytes::from_static(b"ok"), true);
+                            }
+                        }
+                        return;
+                    }
+                    let mut seen = Vec::new();
+                    let mut byte = [0; 1];
+                    loop {
+                        match secured.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => seen.push(byte[0]),
+                        }
+                        if seen.ends_with(b"\r\n\r\n") {
+                            seen.clear();
+                            let answer = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+                            if secured.write_all(answer).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        address
+    }
+
+    /// A worker whose one upstream `up`, at `upstream`, is reached over TLS as `tls` says
+    /// and spoken to in `protocol`.
+    async fn serving_worker_to_tls(
+        upstream: SocketAddr,
+        protocol: UpstreamProtocol,
+        tls: edgerush_config::UpstreamTls,
+    ) -> SocketAddr {
+        let mut config = everything_config(upstream);
+        let up = config.upstreams.get_mut("up").unwrap();
+        up.protocol = protocol;
+        up.tls = Some(tls);
+        let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+        let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        front
+    }
+
+    fn trusting(
+        server_name: &str,
+        authority: &edgerush_config::Certificate,
+    ) -> edgerush_config::UpstreamTls {
+        edgerush_config::UpstreamTls {
+            server_name: server_name.to_owned(),
+            authorities: vec![authority.chain.clone()],
+        }
+    }
+
+    /// An upstream reached over TLS is spoken to in HTTP/1.1 or in HTTP/2, as configured,
+    /// once its certificate is found to be the named server's and vouched for by a trusted
+    /// authority.
+    #[tokio::test]
+    async fn an_upstream_is_reached_over_tls_in_either_protocol() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let certificate = crate::tls::testing::certificate(&["backend.test"]);
+                for protocol in [UpstreamProtocol::Http1, UpstreamProtocol::Http2] {
+                    let upstream = tls_upstream(&certificate, Agrees::Either).await;
+                    let front = serving_worker_to_tls(
+                        upstream,
+                        protocol,
+                        trusting("backend.test", &certificate),
+                    )
+                    .await;
+                    for _ in 0..2 {
+                        let answer = h1_answer(front, CLOSING_GET).await;
+                        assert!(
+                            answer.starts_with("HTTP/1.1 200 OK\r\n"),
+                            "{protocol:?}: {answer}"
+                        );
+                        assert!(answer.contains("ok"), "{answer}");
+                    }
+                }
+            })
+            .await;
+    }
+
+    /// An endpoint whose certificate no trusted authority vouches for, or that is not the
+    /// named server's, is not spoken to: 502.
+    #[tokio::test]
+    async fn an_upstream_that_is_not_who_it_should_be_is_not_spoken_to() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let certificate = crate::tls::testing::certificate(&["backend.test"]);
+                let stranger = crate::tls::testing::certificate(&["backend.test"]);
+                for protocol in [UpstreamProtocol::Http1, UpstreamProtocol::Http2] {
+                    let upstream = tls_upstream(&certificate, Agrees::Either).await;
+                    for tls in [
+                        trusting("backend.test", &stranger),
+                        trusting("other.test", &certificate),
+                    ] {
+                        let front = serving_worker_to_tls(upstream, protocol, tls).await;
+                        let answer = h1_answer(front, CLOSING_GET).await;
+                        assert!(
+                            answer.starts_with("HTTP/1.1 502 "),
+                            "{protocol:?}: {answer}"
+                        );
+                    }
+                }
+            })
+            .await;
+    }
+
+    /// An HTTP/2 upstream that does not agree on `h2` in the handshake is a failed
+    /// connection, never one spoken to in HTTP/1.1 instead.
+    #[tokio::test]
+    async fn an_http2_upstream_that_will_not_agree_on_h2_is_not_spoken_to_in_http1() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let certificate = crate::tls::testing::certificate(&["backend.test"]);
+                let upstream = tls_upstream(&certificate, Agrees::NothingButSpeaksH2).await;
+                let front = serving_worker_to_tls(
+                    upstream,
+                    UpstreamProtocol::Http2,
+                    trusting("backend.test", &certificate),
+                )
+                .await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
+            })
+            .await;
+    }
+
+    /// A config whose upstream TLS is the config before's keeps what connections were
+    /// secured with, and its destinations with it; TLS that changed is a new destination,
+    /// whose connections are not the old one's; and an authority that is not a certificate
+    /// is refused, with the upstream named.
+    #[test]
+    fn a_reload_keeps_the_tls_to_an_upstream_that_has_not_changed() {
+        let certificate = crate::tls::testing::certificate(&["backend.test"]);
+        let secured = |tls: edgerush_config::UpstreamTls| {
+            let mut config = everything_config("127.0.0.1:9".parse().unwrap());
+            config.upstreams.get_mut("up").unwrap().tls = Some(tls);
+            compile(&config).unwrap()
+        };
+        let proxy = Proxy::new(
+            secured(trusting("backend.test", &certificate)),
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let identity =
+            |proxy: &Proxy| Arc::clone(proxy.current.load().destinations.at(0, 0).unwrap());
+        let before = identity(&proxy);
+        let connector = Arc::clone(before.secure().unwrap());
+
+        proxy
+            .reload(secured(trusting("backend.test", &certificate)))
+            .unwrap();
+        assert!(Arc::ptr_eq(&before, &identity(&proxy)));
+        let kept = Arc::clone(proxy.current.load().secure[0].as_ref().unwrap());
+        assert!(
+            Arc::ptr_eq(&connector, &kept),
+            "an unchanged TLS was built again"
+        );
+
+        proxy
+            .reload(secured(trusting("other.test", &certificate)))
+            .unwrap();
+        let after = identity(&proxy);
+        assert_ne!(after.key(), before.key());
+        assert!(before.is_retired());
+
+        let unusable = edgerush_config::UpstreamTls {
+            server_name: "backend.test".to_owned(),
+            authorities: vec![
+                "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n".to_owned(),
+            ],
+        };
+        let refused = proxy.reload(secured(unusable));
+        assert!(
+            matches!(&refused, Err(ProxyError::UpstreamTls { upstream, .. }) if upstream == "up"),
+            "{refused:?}"
+        );
+    }
+
     /// A client that gives its request up gives its stream's place back: with room for one
     /// stream on one connection, the next request is served rather than kept waiting.
     #[tokio::test]
@@ -4493,7 +4771,7 @@ upstreams:
 
     /// Reads a body to its end and says whether its connection went back.
     async fn drain(
-        mut body: H1Body<TcpStream, http_body_util::Empty<Bytes>>,
+        mut body: H1Body<UpstreamSocket, http_body_util::Empty<Bytes>>,
         limits: &H1Limits,
     ) -> (Vec<u8>, bool) {
         use http_body_util::BodyExt;

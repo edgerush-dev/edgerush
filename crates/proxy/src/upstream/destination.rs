@@ -11,7 +11,8 @@
 //! So a destination is named by a key of its own, given out once and never again, and a
 //! reload keeps that key only where the destination really is the same one.
 
-use edgerush_config::{Compiled, UpstreamProtocol};
+use crate::upstream::secure::Secure;
+use edgerush_config::{Compiled, UpstreamProtocol, UpstreamTls};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -33,9 +34,8 @@ impl Keys {
 ///
 /// Two connections are interchangeable exactly when their destinations have the same key.
 /// The key stands for the upstream the connection was opened for, the address it was
-/// opened to, the protocol it speaks, and — when there is one — the transport it was
-/// opened with. Plain TCP is the only transport for now; TLS will add its own identity and
-/// verification, and matching addresses will not be enough.
+/// opened to, the protocol it speaks, and the TLS it was secured with, if any: whom the
+/// endpoint was verified to be and by whose word.
 #[derive(Debug)]
 pub struct ReuseIdentity {
     key: u64,
@@ -44,6 +44,8 @@ pub struct ReuseIdentity {
     upstream: Box<str>,
     address: SocketAddr,
     protocol: UpstreamProtocol,
+    /// What its connections are secured with; none is plain TCP.
+    secure: Option<Arc<Secure>>,
     /// Set when a config without this destination is published. Nothing retired is ever
     /// kept or taken out again; an exchange already under way finishes as it is.
     retired: AtomicBool,
@@ -66,6 +68,11 @@ impl ReuseIdentity {
         self.protocol
     }
 
+    /// What its connections are secured with, if anything.
+    pub(crate) fn secure(&self) -> Option<&Arc<Secure>> {
+        self.secure.as_ref()
+    }
+
     /// Whether this destination is gone from the running config. Checked when a
     /// connection is put back and again when one is taken out: a config can change while
     /// a connection sits idle.
@@ -86,27 +93,46 @@ pub struct Destinations(Vec<Vec<Arc<ReuseIdentity>>>);
 impl Destinations {
     /// The destinations of `config`, keeping those of `previous` wherever the destination
     /// is the same one, and retiring those of `previous` that this config does not have.
+    /// `secure` is what each upstream's connections are secured with, by position, for a
+    /// destination that is new.
     ///
-    /// Sameness is the upstream's name, the address and the protocol, and nothing about
-    /// where any of them sits: a config that says the same thing in a different order says the same thing.
+    /// Sameness is the upstream's name, the address, the protocol and the TLS, and nothing
+    /// about where any of them sits: a config that says the same thing in a different order says the same thing.
     /// A destination that goes and comes back is a new one, because nothing here can tell
     /// whether what answers at that address is still what answered before.
-    pub fn reconcile(config: &Compiled, previous: &Self, keys: &Keys) -> Self {
-        let mut known: HashMap<(&str, SocketAddr, UpstreamProtocol), &Arc<ReuseIdentity>> =
-            previous
-                .0
-                .iter()
-                .flatten()
-                .map(|identity| {
-                    let same = (&*identity.upstream, identity.address, identity.protocol);
-                    (same, identity)
-                })
-                .collect();
+    pub(crate) fn reconcile(
+        config: &Compiled,
+        previous: &Self,
+        keys: &Keys,
+        secure: &[Option<Arc<Secure>>],
+    ) -> Self {
+        type Same<'a> = (
+            &'a str,
+            SocketAddr,
+            UpstreamProtocol,
+            Option<&'a UpstreamTls>,
+        );
+        let mut known: HashMap<Same<'_>, &Arc<ReuseIdentity>> = previous
+            .0
+            .iter()
+            .flatten()
+            .map(|identity| {
+                let tls = identity.secure.as_deref().map(Secure::source);
+                let same = (
+                    &*identity.upstream,
+                    identity.address,
+                    identity.protocol,
+                    tls,
+                );
+                (same, identity)
+            })
+            .collect();
 
         let destinations = config
             .upstreams
             .iter()
-            .map(|upstream| {
+            .enumerate()
+            .map(|(position, upstream)| {
                 upstream
                     .endpoints
                     .iter()
@@ -114,7 +140,12 @@ impl Destinations {
                         // Taken out as it is used, so that whatever is left over at the
                         // end is exactly what this config no longer has.
                         known
-                            .remove(&(upstream.name.as_str(), *address, upstream.protocol))
+                            .remove(&(
+                                upstream.name.as_str(),
+                                *address,
+                                upstream.protocol,
+                                upstream.tls.as_ref(),
+                            ))
                             .map_or_else(
                                 || {
                                     Arc::new(ReuseIdentity {
@@ -122,6 +153,7 @@ impl Destinations {
                                         upstream: upstream.name.as_str().into(),
                                         address: *address,
                                         protocol: upstream.protocol,
+                                        secure: secure.get(position).cloned().flatten(),
                                         retired: AtomicBool::new(false),
                                     })
                                 },
@@ -178,8 +210,10 @@ mod tests {
             &config(&[("web", &["127.0.0.1:1"])]),
             &Destinations::default(),
             &keys,
+            &[],
         );
-        let after = Destinations::reconcile(&config(&[("web", &["127.0.0.1:1"])]), &before, &keys);
+        let after =
+            Destinations::reconcile(&config(&[("web", &["127.0.0.1:1"])]), &before, &keys, &[]);
         assert_eq!(keys_of(&before), keys_of(&after));
         assert!(!before.at(0, 0).unwrap().is_retired());
     }
@@ -195,6 +229,7 @@ mod tests {
             &config(&[("web", &["127.0.0.1:1"]), ("zed", &["127.0.0.1:2"])]),
             &Destinations::default(),
             &keys,
+            &[],
         );
         let web = before.at(0, 0).unwrap().key();
         let zed = before.at(1, 0).unwrap().key();
@@ -208,6 +243,7 @@ mod tests {
             ]),
             &before,
             &keys,
+            &[],
         );
         assert_eq!(after.at(1, 0).unwrap().key(), web, "web changed hands");
         assert_eq!(after.at(2, 0).unwrap().key(), zed, "zed changed hands");
@@ -226,6 +262,7 @@ mod tests {
             &config(&[("one", &["127.0.0.1:1"]), ("two", &["127.0.0.1:1"])]),
             &Destinations::default(),
             &keys,
+            &[],
         );
         let (one, two) = (
             destinations.at(0, 0).unwrap(),
@@ -242,11 +279,13 @@ mod tests {
             &config(&[("web", &["127.0.0.1:1", "127.0.0.1:2"])]),
             &Destinations::default(),
             &keys,
+            &[],
         );
         let kept = Arc::clone(before.at(0, 0).unwrap());
         let dropped = Arc::clone(before.at(0, 1).unwrap());
 
-        let after = Destinations::reconcile(&config(&[("web", &["127.0.0.1:1"])]), &before, &keys);
+        let after =
+            Destinations::reconcile(&config(&[("web", &["127.0.0.1:1"])]), &before, &keys, &[]);
         assert!(!kept.is_retired());
         assert!(
             dropped.is_retired(),
@@ -263,9 +302,10 @@ mod tests {
             &config(&[("gone", &["127.0.0.1:1"])]),
             &Destinations::default(),
             &keys,
+            &[],
         );
         let gone = Arc::clone(before.at(0, 0).unwrap());
-        let _after = Destinations::reconcile(&config(&[]), &before, &keys);
+        let _after = Destinations::reconcile(&config(&[]), &before, &keys, &[]);
         assert!(gone.is_retired());
     }
 
@@ -279,13 +319,15 @@ mod tests {
             &config(&[("web", &["127.0.0.1:1"])]),
             &Destinations::default(),
             &keys,
+            &[],
         );
         let was = Arc::clone(first.at(0, 0).unwrap());
 
-        let without = Destinations::reconcile(&config(&[]), &first, &keys);
+        let without = Destinations::reconcile(&config(&[]), &first, &keys, &[]);
         assert!(was.is_retired());
 
-        let again = Destinations::reconcile(&config(&[("web", &["127.0.0.1:1"])]), &without, &keys);
+        let again =
+            Destinations::reconcile(&config(&[("web", &["127.0.0.1:1"])]), &without, &keys, &[]);
         assert_ne!(again.at(0, 0).unwrap().key(), was.key());
         assert!(!again.at(0, 0).unwrap().is_retired());
     }
@@ -297,9 +339,11 @@ mod tests {
             &config(&[("web", &["127.0.0.1:1"])]),
             &Destinations::default(),
             &keys,
+            &[],
         );
         let was = Arc::clone(before.at(0, 0).unwrap());
-        let after = Destinations::reconcile(&config(&[("web", &["127.0.0.1:2"])]), &before, &keys);
+        let after =
+            Destinations::reconcile(&config(&[("web", &["127.0.0.1:2"])]), &before, &keys, &[]);
         assert_ne!(after.at(0, 0).unwrap().key(), was.key());
         assert!(was.is_retired());
     }
@@ -314,12 +358,13 @@ mod tests {
             &config(&[("web", &["127.0.0.1:1"])]),
             &Destinations::default(),
             &keys,
+            &[],
         );
         let was = Arc::clone(before.at(0, 0).unwrap());
         assert_eq!(was.protocol(), UpstreamProtocol::Http1);
         let mut http2 = config(&[("web", &["127.0.0.1:1"])]);
         http2.upstreams[0].protocol = UpstreamProtocol::Http2;
-        let after = Destinations::reconcile(&http2, &before, &keys);
+        let after = Destinations::reconcile(&http2, &before, &keys, &[]);
         let now = after.at(0, 0).unwrap();
         assert_ne!(now.key(), was.key());
         assert_eq!(now.protocol(), UpstreamProtocol::Http2);
@@ -336,7 +381,7 @@ mod tests {
         for round in 0..8 {
             let address = format!("127.0.0.1:{}", round + 1);
             let config = config(&[("web", &[&address])]);
-            previous = Destinations::reconcile(&config, &previous, &keys);
+            previous = Destinations::reconcile(&config, &previous, &keys, &[]);
             seen.extend(keys_of(&previous));
         }
         let mut once = seen.clone();

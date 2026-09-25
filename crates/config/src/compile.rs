@@ -6,7 +6,7 @@ use crate::backends::{UpstreamId, WeightedBackends};
 use crate::route::{
     Filter, HeaderChanges, Hostname, Match, PathMatch, Route, ValueMatch, ValuePredicate, Wildcard,
 };
-use crate::{Config, Protocol, Rule, Tls, UpstreamProtocol};
+use crate::{Config, Protocol, Rule, Tls, UpstreamProtocol, UpstreamTls};
 use edgerush_filters::{HeaderModifier, HeaderModifierError};
 use edgerush_router::{
     HeaderPredicate, HeaderPredicateError, HeaderPredicates, HostClaim, HostPattern,
@@ -91,6 +91,8 @@ pub struct CompiledUpstream {
     pub endpoints: Vec<SocketAddr>,
     /// What to speak there.
     pub protocol: UpstreamProtocol,
+    /// TLS to its endpoints, if any.
+    pub tls: Option<UpstreamTls>,
 }
 
 /// Compiles a config. The order of the routes, then of the rules, then of a rule's matches
@@ -117,8 +119,20 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             name: name.clone(),
             endpoints: upstream.endpoints.clone(),
             protocol: upstream.protocol,
+            tls: upstream.tls.clone(),
         })
         .collect();
+    for (name, upstream) in &config.upstreams {
+        if let Some(tls) = &upstream.tls {
+            if tls.authorities.is_empty() {
+                errors.push(Place::upstream(name).problem(Problem::NoAuthority));
+            }
+            if !is_host_name(&tls.server_name) {
+                let problem = Problem::ServerName(tls.server_name.clone());
+                errors.push(Place::upstream(name).problem(problem));
+            }
+        }
+    }
 
     // Until listeners can share a socket, two on one address cannot both be served.
     let mut addresses: BTreeMap<SocketAddr, &str> = BTreeMap::new();
@@ -219,6 +233,25 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
     } else {
         Err(errors)
     }
+}
+
+/// Whether `name` is a host name as a certificate names one: labels of letters, digits and
+/// hyphens, none empty, none starting or ending with a hyphen. No port, no wildcard, and
+/// not an address.
+fn is_host_name(name: &str) -> bool {
+    let label = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    };
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(label)
+        && name.parse::<std::net::IpAddr>().is_err()
 }
 
 /// The listeners a route is for, each once, as far as they exist.
@@ -451,6 +484,8 @@ pub enum Object {
     Listener(String),
     /// The route of this name.
     Route(String),
+    /// The upstream of this name.
+    Upstream(String),
 }
 
 /// A place in a config: a listener, or a route, a rule in it, a match or a backend in the
@@ -478,6 +513,10 @@ impl Place {
         Self::of(Object::Listener(name.to_owned()))
     }
 
+    fn upstream(name: &str) -> Self {
+        Self::of(Object::Upstream(name.to_owned()))
+    }
+
     fn of(object: Object) -> Self {
         Self {
             object,
@@ -501,6 +540,7 @@ impl fmt::Display for Place {
         match &self.object {
             Object::Listener(name) => write!(f, "listener `{name}`")?,
             Object::Route(name) => write!(f, "route `{name}`")?,
+            Object::Upstream(name) => write!(f, "upstream `{name}`")?,
         }
         if let Some(rule) = self.rule {
             write!(f, ", rules[{rule}]")?;
@@ -535,6 +575,12 @@ pub enum Problem {
     /// TLS on a listener that does not speak it.
     #[error("`tls` is for protocol `https`")]
     TlsUnwanted,
+    /// TLS to an upstream that trusts nobody.
+    #[error("`tls` needs an authority to trust")]
+    NoAuthority,
+    /// TLS to an upstream whose server is not named by a host name.
+    #[error("server name `{0}` is not a host name")]
+    ServerName(String),
     /// Another route has the same name.
     #[error("another route has the same name")]
     DuplicateName,
@@ -1074,6 +1120,55 @@ upstreams:
 routes: []
 upstreams: {}
 "#;
+        assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
+    }
+
+    /// TLS to an upstream names the server it expects and trusts at least one authority to
+    /// vouch for it; the server's name is a host name, nothing more.
+    #[test]
+    fn tls_to_an_upstream_names_its_server_and_whom_to_trust() {
+        let with = |tls: &str| {
+            config(&format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ endpoints: [], tls: {tls} }} }}\n"
+            ))
+        };
+        let compiled = compile(&with(
+            r#"{ server_name: backend.internal, authorities: ["CA"] }"#,
+        ))
+        .unwrap();
+        let tls = compiled.upstreams[0].tls.as_ref().unwrap();
+        assert_eq!(tls.server_name, "backend.internal");
+        assert_eq!(tls.authorities, ["CA"]);
+
+        let problems = |tls: &str| -> Vec<String> {
+            compile(&with(tls))
+                .unwrap_err()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(
+            problems(r#"{ server_name: backend.internal, authorities: [] }"#),
+            ["upstream `u`: `tls` needs an authority to trust"]
+        );
+        for name in [
+            "\"\"",
+            "\"backend.internal:443\"",
+            "\"a b\"",
+            "\"*.internal\"",
+        ] {
+            assert_eq!(
+                problems(&format!(
+                    r#"{{ server_name: {name}, authorities: ["CA"] }}"#
+                )),
+                [format!(
+                    "upstream `u`: server name `{}` is not a host name",
+                    name.trim_matches('"')
+                )]
+            );
+        }
+        // Both are said.
+        let yaml = "listeners: {}\nroutes: []\nupstreams: { u: { endpoints: [], tls: { server_name: a.b } } }\n";
         assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
     }
 

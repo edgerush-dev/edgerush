@@ -284,7 +284,12 @@ mod tests {
             yaml += &format!("  {name}: {{ endpoints: [{}] }}\n", listed.join(", "));
         }
         let config: Config = serde_saphyr::from_str(&yaml).unwrap();
-        Destinations::reconcile(&compile(&config).unwrap(), &Destinations::default(), keys)
+        Destinations::reconcile(
+            &compile(&config).unwrap(),
+            &Destinations::default(),
+            keys,
+            &[],
+        )
     }
 
     /// One destination, for the tests that only need one.
@@ -448,6 +453,7 @@ mod tests {
             .unwrap(),
             &held,
             &keys,
+            &[],
         );
         assert!(identity.is_retired());
 
@@ -483,6 +489,7 @@ mod tests {
             .unwrap(),
             &held,
             &keys,
+            &[],
         );
         assert!(going.is_retired());
         assert!(!staying.is_retired());
@@ -519,7 +526,7 @@ mod tests {
             let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
             yaml += &format!("  web: {{ endpoints: [\"{address}\"] }}\n");
             let config: Config = serde_saphyr::from_str(&yaml).unwrap();
-            previous = Destinations::reconcile(&compile(&config).unwrap(), &previous, &keys);
+            previous = Destinations::reconcile(&compile(&config).unwrap(), &previous, &keys, &[]);
 
             let identity = Arc::clone(previous.at(0, 0).unwrap());
             pool.put(&identity, round, Instant::now(), &limits);

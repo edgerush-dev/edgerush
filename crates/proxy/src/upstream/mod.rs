@@ -11,5 +11,6 @@
 pub mod auth;
 pub mod destination;
 pub mod h1;
+pub(crate) mod secure;
 // Crate-private even when the fuzz targets are built: nothing of it is theirs.
 pub(crate) mod h2;

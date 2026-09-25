@@ -82,6 +82,20 @@ pub struct Upstream {
     /// What its endpoints are spoken to in, whatever the client spoke.
     #[serde(default)]
     pub protocol: UpstreamProtocol,
+    /// TLS to its endpoints; none is plain TCP.
+    #[serde(default)]
+    pub tls: Option<UpstreamTls>,
+}
+
+/// TLS to an upstream's endpoints: whom they are expected to be, and whom to trust to say
+/// so (Gateway API's BackendTLSPolicy: a hostname and CA certificates).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamTls {
+    /// The name asked for (SNI), and the one an endpoint's certificate must carry.
+    pub server_name: String,
+    /// The certificates, in PEM, of the authorities trusted to vouch for it. At least one.
+    pub authorities: Vec<String>,
 }
 
 /// What an upstream is spoken to in. Unsaid, it is HTTP/1.1, as for a Kubernetes Service

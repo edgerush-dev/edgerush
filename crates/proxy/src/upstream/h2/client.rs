@@ -87,6 +87,12 @@ pub(crate) enum PlaceError {
     Unreachable,
 }
 
+/// What a connection to an upstream is carried over, before HTTP/2 is spoken on it.
+enum Transport {
+    Plain(TcpStream),
+    Secured(tokio_boring::SslStream<TcpStream>),
+}
+
 /// One connection, as this worker holds it.
 struct Link {
     key: u64,
@@ -349,13 +355,39 @@ impl Client {
     /// until it ends.
     async fn dial(self: Rc<Self>, key: u64, id: ConnectionId, address: SocketAddr) {
         let settings = self.settings;
+        let secure = self
+            .destinations
+            .borrow()
+            .get(&key)
+            .and_then(|destination| destination.secure().cloned());
         let opening = async {
             let socket = TcpStream::connect(address).await.ok()?;
             // Worth having, not worth refusing an upstream over.
             let _unset = socket.set_nodelay(true);
-            settings.builder().handshake(socket).await.ok()
+            Some(match secure {
+                None => Transport::Plain(socket),
+                Some(secure) => Transport::Secured(secure.connect(socket).await.ok()?),
+            })
         };
-        let Ok(Some((send, connection))) = tokio::time::timeout(settings.connect, opening).await
+        let Ok(Some(transport)) = tokio::time::timeout(settings.connect, opening).await else {
+            self.event(|pool, now, actions| pool.failed(key, id, now, actions));
+            return;
+        };
+        match transport {
+            Transport::Plain(socket) => self.handshaken(key, id, socket).await,
+            Transport::Secured(socket) => self.handshaken(key, id, socket).await,
+        }
+    }
+
+    /// Runs HTTP/2's own handshake on `socket` for connection `id` to `key`, and drives
+    /// the connection until it ends.
+    async fn handshaken<S>(self: Rc<Self>, key: u64, id: ConnectionId, socket: S)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let settings = self.settings;
+        let handshake = settings.builder().handshake(socket);
+        let Ok(Ok((send, connection))) = tokio::time::timeout(settings.connect, handshake).await
         else {
             self.event(|pool, now, actions| pool.failed(key, id, now, actions));
             return;
@@ -374,14 +406,16 @@ impl Client {
     }
 
     /// Drives the connection until it ends, telling the pool what only h2 sees on the way.
-    async fn drive(
+    async fn drive<S>(
         self: &Rc<Self>,
         key: u64,
         id: ConnectionId,
         link: &Link,
         watch: SendRequest<Outgoing>,
-        mut connection: Connection<TcpStream, Outgoing>,
-    ) {
+        mut connection: Connection<S, Outgoing>,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         // A handle kept to see the peer's limit and GOAWAY through, which opens nothing.
         let mut watch = Some(watch);
         let mut limit = watch
