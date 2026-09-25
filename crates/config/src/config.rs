@@ -66,7 +66,7 @@ pub struct ClientValidation {
 
 /// A certificate and its private key, in PEM, as they came: reading them is the data
 /// plane's, which refuses a config whose certificates it cannot use.
-#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Certificate {
     /// The certificate first, then the intermediates that lead from it towards a root.
@@ -170,6 +170,10 @@ pub struct UpstreamTls {
     pub server_name: String,
     /// The certificates, in PEM, of the authorities trusted to vouch for it. At least one.
     pub authorities: Vec<String>,
+    /// What the data plane shows an endpoint that asks who it is (mTLS); none, and it
+    /// shows nothing.
+    #[serde(default)]
+    pub client_certificate: Option<Certificate>,
 }
 
 /// What an upstream is spoken to in. Unsaid, it is HTTP/1.1, as for a Kubernetes Service

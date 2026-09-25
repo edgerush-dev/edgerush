@@ -215,30 +215,57 @@ fn context(
         select_next_proto(PROTOCOLS, offered).ok_or(AlpnError::NOACK)
     });
 
-    let chain =
-        X509::stack_from_pem(certificate.chain.as_bytes()).map_err(|error| TlsError::Chain {
-            index,
-            reason: error.to_string(),
-        })?;
-    let mut chain = chain.into_iter();
-    let leaf = chain.next().ok_or(TlsError::Empty { index })?;
-    builder.set_certificate(&leaf).map_err(setup)?;
-    for intermediate in chain {
+    let identity = Identity::read(certificate, index)?;
+    builder.set_certificate(&identity.leaf).map_err(setup)?;
+    for intermediate in identity.intermediates {
         builder.add_extra_chain_cert(intermediate).map_err(setup)?;
     }
-    let key =
-        PKey::private_key_from_pem(certificate.key.as_bytes()).map_err(|error| TlsError::Key {
-            index,
-            reason: error.to_string(),
+    builder.set_private_key(&identity.key).map_err(setup)?;
+    Ok((builder, identity.leaf))
+}
+
+/// A certificate, the intermediates that lead from it, and its key, read and checked to
+/// belong together.
+pub(crate) struct Identity {
+    pub(crate) leaf: X509,
+    pub(crate) intermediates: Vec<X509>,
+    pub(crate) key: PKey<boring::pkey::Private>,
+}
+
+impl Identity {
+    /// Reads `certificate`, which is the `index`th of its kind, for errors to say so.
+    ///
+    /// # Errors
+    ///
+    /// A [`TlsError`] for a chain or key that cannot be read, or a key not the
+    /// certificate's.
+    pub(crate) fn read(certificate: &Certificate, index: usize) -> Result<Self, TlsError> {
+        let chain = X509::stack_from_pem(certificate.chain.as_bytes()).map_err(|error| {
+            TlsError::Chain {
+                index,
+                reason: error.to_string(),
+            }
         })?;
-    // Compared here, where it can be said which: BoringSSL refuses the pair as well, but
-    // only as a failure to set the key.
-    let matches = leaf.public_key().is_ok_and(|public| public.public_eq(&key));
-    if !matches {
-        return Err(TlsError::Mismatch { index });
+        let mut chain = chain.into_iter();
+        let leaf = chain.next().ok_or(TlsError::Empty { index })?;
+        let key = PKey::private_key_from_pem(certificate.key.as_bytes()).map_err(|error| {
+            TlsError::Key {
+                index,
+                reason: error.to_string(),
+            }
+        })?;
+        // Compared here, where it can be said which: BoringSSL refuses the pair as well,
+        // but only as a failure to set the key.
+        let matches = leaf.public_key().is_ok_and(|public| public.public_eq(&key));
+        if !matches {
+            return Err(TlsError::Mismatch { index });
+        }
+        Ok(Self {
+            leaf,
+            intermediates: chain.collect(),
+            key,
+        })
     }
-    builder.set_private_key(&key).map_err(setup)?;
-    Ok((builder, leaf))
 }
 
 /// Which certificate answers for which name: by the DNS names in each one's subject

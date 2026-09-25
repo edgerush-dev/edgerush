@@ -4101,11 +4101,28 @@ upstreams:
         certificate: &edgerush_config::Certificate,
         agrees: Agrees,
     ) -> SocketAddr {
+        tls_upstream_asking(certificate, agrees, None).await
+    }
+
+    /// The same, requiring a client certificate `clients` vouches for, if given.
+    async fn tls_upstream_asking(
+        certificate: &edgerush_config::Certificate,
+        agrees: Agrees,
+        clients: Option<&edgerush_config::Certificate>,
+    ) -> SocketAddr {
         use boring::pkey::PKey;
-        use boring::ssl::{AlpnError, SslAcceptor, SslMethod, select_next_proto};
+        use boring::ssl::{AlpnError, SslAcceptor, SslMethod, SslVerifyMode, select_next_proto};
         use boring::x509::X509;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        if let Some(clients) = clients {
+            let mut trusted = boring::x509::store::X509StoreBuilder::new().unwrap();
+            trusted
+                .add_cert(X509::from_pem(clients.chain.as_bytes()).unwrap())
+                .unwrap();
+            builder.set_verify_cert_store(trusted.build()).unwrap();
+            builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        }
         builder
             .set_certificate(&X509::from_pem(certificate.chain.as_bytes()).unwrap())
             .unwrap();
@@ -4188,7 +4205,41 @@ upstreams:
         edgerush_config::UpstreamTls {
             server_name: server_name.to_owned(),
             authorities: vec![authority.chain.clone()],
+            client_certificate: None,
         }
+    }
+
+    /// An upstream that asks who the data plane is is shown the client certificate its
+    /// TLS names, in either protocol; without one, it will not speak.
+    #[tokio::test]
+    async fn an_upstream_that_asks_is_shown_the_client_certificate() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::tls::testing::certificate;
+                let server = certificate(&["backend.test"]);
+                let ours = certificate(&["gateway"]);
+                for protocol in [UpstreamProtocol::Http1, UpstreamProtocol::Http2] {
+                    let upstream = tls_upstream_asking(&server, Agrees::Either, Some(&ours)).await;
+                    let mut tls = trusting("backend.test", &server);
+                    tls.client_certificate = Some(ours.clone());
+                    let front = serving_worker_to_tls(upstream, protocol, tls.clone()).await;
+                    let answer = h1_answer(front, CLOSING_GET).await;
+                    assert!(
+                        answer.starts_with("HTTP/1.1 200 OK\r\n"),
+                        "{protocol:?}: {answer}"
+                    );
+
+                    tls.client_certificate = None;
+                    let front = serving_worker_to_tls(upstream, protocol, tls).await;
+                    let answer = h1_answer(front, CLOSING_GET).await;
+                    assert!(
+                        answer.starts_with("HTTP/1.1 502 "),
+                        "{protocol:?}: {answer}"
+                    );
+                }
+            })
+            .await;
     }
 
     /// An upstream reached over TLS is spoken to in HTTP/1.1 or in HTTP/2, as configured,
@@ -4313,6 +4364,7 @@ upstreams:
             authorities: vec![
                 "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n".to_owned(),
             ],
+            client_certificate: None,
         };
         let refused = proxy.reload(secured(unusable));
         assert!(

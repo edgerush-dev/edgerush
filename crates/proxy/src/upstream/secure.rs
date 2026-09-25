@@ -71,6 +71,14 @@ impl Secure {
         builder
             .set_verify_cert_store(trusted.build())
             .map_err(setup)?;
+        if let Some(certificate) = &source.client_certificate {
+            let identity = crate::tls::Identity::read(certificate, 0)?;
+            builder.set_certificate(&identity.leaf).map_err(setup)?;
+            for intermediate in identity.intermediates {
+                builder.add_extra_chain_cert(intermediate).map_err(setup)?;
+            }
+            builder.set_private_key(&identity.key).map_err(setup)?;
+        }
         let offered: &[u8] = match protocol {
             UpstreamProtocol::Http1 => b"\x08http/1.1",
             UpstreamProtocol::Http2 => b"\x02h2",
