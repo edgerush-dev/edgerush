@@ -22,7 +22,7 @@
 //! that is the shape the harness runs in on Windows.
 
 use crate::balance::Loads;
-use crate::bind::{Port, listen};
+use crate::bind::{Port, datagrams, listen};
 use crate::config_file::{ConfigFile, Rejected};
 use crate::per_core::{self, Accept};
 use edgerush_config::Compiled;
@@ -280,7 +280,19 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
             // A port that the operating system chose for the first worker is the port of
             // those after it.
             listener.listens_on = socket.local_addr().unwrap_or(listener.listens_on);
-            of_this_one.push(socket);
+            // HTTP/3 on the port TCP has: what `Alt-Svc` will tell clients (16 §5).
+            let udp = if listener.http3 {
+                let what = format!("listener \"{}\" (HTTP/3)", listener.name);
+                let address = listener.listens_on;
+                Some(datagrams(address, port).map_err(|error| Failure::Listen {
+                    what,
+                    address,
+                    error,
+                })?)
+            } else {
+                None
+            };
+            of_this_one.push((socket, udp));
         }
         sockets.push(of_this_one);
     }
@@ -289,10 +301,11 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         .transpose()?;
 
     for listener in &bound {
+        let also = if listener.http3 { ", HTTP/3 too" } else { "" };
         say(
             stderr,
             format_args!(
-                "listener \"{}\" is on {}",
+                "listener \"{}\" is on {}{also}",
                 listener.name, listener.listens_on
             ),
         );
@@ -486,6 +499,8 @@ struct Bound {
     /// The address its socket has, which is another when the config left the port to the
     /// operating system.
     listens_on: SocketAddr,
+    /// It serves HTTP/3 as well, on the same port over UDP.
+    http3: bool,
 }
 
 impl From<&edgerush_config::CompiledListener> for Bound {
@@ -494,6 +509,7 @@ impl From<&edgerush_config::CompiledListener> for Bound {
             name: listener.name.clone(),
             address: listener.address,
             listens_on: listener.address,
+            http3: listener.http3.is_some(),
         }
     }
 }
@@ -519,6 +535,11 @@ fn restart_needed(bound: &[Bound], config: &Compiled) -> Vec<String> {
             Some(bound) if bound.address != listener.address => warnings.push(format!(
                 "listener \"{}\" has moved from {} to {}: it stays where it was until a restart",
                 listener.name, bound.address, listener.address
+            )),
+            Some(bound) if bound.http3 != listener.http3.is_some() => warnings.push(format!(
+                "listener \"{}\" has HTTP/3 turned {}: its UDP socket is opened or closed at a restart",
+                listener.name,
+                if bound.http3 { "off" } else { "on" }
             )),
             Some(_) => {}
         }

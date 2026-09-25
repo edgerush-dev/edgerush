@@ -2,7 +2,7 @@
 
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, UdpSocket};
 
 /// Connections the kernel holds for us until they are accepted; tokio's own choice. The
 /// kernel lowers it to its limit (`net.core.somaxconn`).
@@ -41,6 +41,26 @@ pub(crate) fn listen(address: SocketAddr, port: Port) -> io::Result<TcpListener>
     socket.set_nonblocking(true)?;
     socket.bind(&address.into())?;
     socket.listen(BACKLOG)?;
+    Ok(socket.into())
+}
+
+/// A UDP socket on `address` for HTTP/3, ready to be handed to the runtime: IPv4 as well on
+/// an IPv6 address, as [`listen`] does, and one of a group on a shared port, where the
+/// kernel deals datagrams out by a hash of their addresses (16 §3).
+pub(crate) fn datagrams(address: SocketAddr, port: Port) -> io::Result<UdpSocket> {
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+    if address.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+    if port == Port::Shared {
+        share(&socket)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
     Ok(socket.into())
 }
 
@@ -126,6 +146,43 @@ mod tests {
     fn a_port_cannot_be_shared_where_the_kernel_does_not_deal_connections_out() {
         let error = listen("127.0.0.1:0".parse().unwrap(), Port::Shared).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn a_datagram_socket_takes_ipv4_and_ipv6_on_every_address() {
+        let socket = datagrams("[::]:0".parse().unwrap(), Port::Own).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        for from in ["127.0.0.1:0", "[::1]:0"] {
+            let client = UdpSocket::bind(from).unwrap();
+            let to: SocketAddr = if from.starts_with('[') {
+                format!("[::1]:{port}").parse().unwrap()
+            } else {
+                format!("127.0.0.1:{port}").parse().unwrap()
+            };
+            client.send_to(b"hello", to).unwrap();
+        }
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0; 16];
+        for _ in 0..2 {
+            let (len, _) = socket.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..len], b"hello");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_datagram_port_has_a_socket_for_every_worker() {
+        let first = datagrams("127.0.0.1:0".parse().unwrap(), Port::Shared).unwrap();
+        let address = first.local_addr().unwrap();
+        let second = datagrams(address, Port::Shared).unwrap();
+        assert_eq!(second.local_addr().unwrap(), address);
+        assert_eq!(
+            datagrams(address, Port::Own).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
     }
 
     #[test]

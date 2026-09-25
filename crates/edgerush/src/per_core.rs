@@ -17,7 +17,7 @@ use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
 use tokio::task::LocalSet;
@@ -65,7 +65,10 @@ struct Worker {
     accept: Accept,
 }
 
-/// Starts a worker on a thread of its own for every entry of `sockets` — one socket for
+/// A worker's sockets for one listener: TCP, and UDP where the listener serves HTTP/3.
+pub(crate) type Sockets = (std::net::TcpListener, Option<std::net::UdpSocket>);
+
+/// Starts a worker on a thread of its own for every entry of `sockets` — the sockets of
 /// every listener, in the order of the listeners — all serving the one `proxy`, each
 /// accepting only while it holds fewer than `connections`. Returns what the workers hold,
 /// for whoever wants to look.
@@ -76,7 +79,7 @@ struct Worker {
 /// Workers that were started before it stay.
 pub(crate) fn start(
     proxy: &Arc<Proxy>,
-    sockets: Vec<Vec<std::net::TcpListener>>,
+    sockets: Vec<Vec<Sockets>>,
     accept: Accept,
     limits: H1Limits,
     connections: usize,
@@ -93,11 +96,19 @@ pub(crate) fn start(
         // Sockets are handed to the runtime that is entered. Here, and not on the worker's
         // thread, so that a socket the runtime will not take stops the harness starting.
         let entered = runtime.enter();
-        let sockets = sockets
-            .into_iter()
-            .map(TcpListener::from_std)
-            .collect::<io::Result<Vec<_>>>()?;
+        let mut streams = Vec::with_capacity(sockets.len());
+        let mut datagrams = Vec::new();
+        for (listener, (tcp, udp)) in sockets.into_iter().enumerate() {
+            streams.push(TcpListener::from_std(tcp)?);
+            if let Some(udp) = udp {
+                datagrams.push((listener, UdpSocket::from_std(udp)?));
+            }
+        }
+        let sockets = streams;
         drop(entered);
+        // The QUIC connection IDs a worker issues carry its number in two bytes (16 §3).
+        let number = u16::try_from(position)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "more than 65,536 workers"))?;
         let (proxy, loads, senders) = (Arc::clone(proxy), Arc::clone(&loads), Arc::clone(&workers));
         // A runtime without threads of its own runs on the thread that waits on it, and a
         // LocalSet belongs to one thread, so it is made on that one.
@@ -108,7 +119,7 @@ pub(crate) fn start(
                 let entered = runtime.enter();
                 // The upstream connections of this worker and of no other, made where
                 // they are used: nothing about them can leave this thread.
-                let plane = edgerush_proxy::Worker::with_limits(proxy, limits);
+                let plane = edgerush_proxy::Worker::at(proxy, limits, number);
                 // One sweep for the worker, beside its listeners, for as long as it runs.
                 local.spawn_local(Rc::clone(&plane).maintain());
                 let worker = Worker {
@@ -120,6 +131,14 @@ pub(crate) fn start(
                 };
                 for (listener, socket) in sockets.into_iter().enumerate() {
                     local.spawn_local(worker.clone().accept(listener, socket));
+                }
+                for (listener, socket) in datagrams {
+                    // Fails only for a socket with no address, or BoringSSL giving no keys:
+                    // the listener's HTTP/3 is then not served, and its TCP still is.
+                    let serving = Rc::clone(&worker.plane).serve_h3(listener, socket);
+                    local.spawn_local(async move {
+                        let _served = serving.await;
+                    });
                 }
                 local.spawn_local(worker.receive(handed_over));
                 drop(entered);
@@ -257,7 +276,7 @@ upstreams:
         for _ in 0..count {
             let socket = listen(address, Port::Shared).unwrap();
             address = socket.local_addr().unwrap();
-            sockets.push(vec![socket]);
+            sockets.push(vec![(socket, None)]);
         }
         (
             address,

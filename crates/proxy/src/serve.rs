@@ -1,6 +1,6 @@
 //! Serving: connections come in, requests go through the request core, and what it
 //! forwards goes to an endpoint of the chosen upstream and comes back. This is where
-//! EdgeRush's own servers, of HTTP/1 and of HTTP/2, meet the core.
+//! EdgeRush's own servers, of HTTP/1, HTTP/2 and HTTP/3, meet the core.
 //!
 //! Bodies stream in both directions and are never held here. Upstream connections are
 //! HTTP/1.1, by EdgeRush's own client and pool.
@@ -20,6 +20,7 @@ use crate::downstream::h1::connection::{self as h1, Answered};
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h1::deadlines::Bounds;
 use crate::downstream::h2;
+use crate::downstream::h3::{self, listener as h3_listener};
 use crate::drain::Drain;
 use crate::gathered::Gathered;
 use crate::grpc::answer::{Answered as GrpcAnswered, Count, is_grpc_answer};
@@ -70,7 +71,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::Instant;
 
 /// How long accepting pauses after an error that is not about one connection, instead of
@@ -296,6 +297,8 @@ pub struct Proxy {
     keys: Keys,
     /// Set once, to drain: every worker's sweep brings it to the worker (03 §10).
     draining: AtomicBool,
+    /// The keys every worker issues and reads QUIC connection IDs and Retry tokens with.
+    quic: h3_listener::Secrets,
 }
 
 /// One worker's share of the data plane: the connections it holds to the upstreams, which
@@ -336,6 +339,9 @@ pub struct Worker {
     body_limits: Rc<H1Limits>,
     /// Itself, for the tasks that send a mirror's copies to hold on to.
     me: Weak<Worker>,
+    /// Its number among the data plane's workers, which the QUIC connection IDs it issues
+    /// carry (16 §3).
+    position: u16,
 }
 
 /// Serves `socket`, a connection of `ours` that speaks HTTP/1, with our own server (14).
@@ -552,12 +558,15 @@ impl Proxy {
         let metrics = Metrics::new(workers, listeners.len());
         let keys = Keys::default();
         let snapshot = Snapshot::new(config, &listeners, &metrics, None, &keys)?;
+        let quic =
+            h3_listener::Secrets::new().map_err(|error| ProxyError::Random(error.to_string()))?;
         Ok(Self {
             listeners,
             current: ArcSwap::from_pointee(snapshot),
             metrics,
             keys,
             draining: AtomicBool::new(false),
+            quic,
         })
     }
 
@@ -694,8 +703,20 @@ impl Worker {
         Self::with_deadlines(proxy, limits, Deadlines::default())
     }
 
+    /// The same, as the `position`th of the data plane's workers: what the QUIC
+    /// connection IDs it issues say, so that another worker can hand it a datagram of its
+    /// connections'.
+    #[must_use]
+    pub fn at(proxy: Arc<Proxy>, limits: H1Limits, position: u16) -> Rc<Self> {
+        Self::made(proxy, limits, Deadlines::default(), position)
+    }
+
     /// The same, holding client connections to `deadlines`.
     fn with_deadlines(proxy: Arc<Proxy>, limits: H1Limits, deadlines: Deadlines) -> Rc<Self> {
+        Self::made(proxy, limits, deadlines, 0)
+    }
+
+    fn made(proxy: Arc<Proxy>, limits: H1Limits, deadlines: Deadlines, position: u16) -> Rc<Self> {
         Rc::new_cyclic(|me| Self {
             proxy,
             pool: Rc::new(RefCell::new(Pool::default())),
@@ -714,6 +735,7 @@ impl Worker {
             accepted: Cell::new(0),
             body_limits: Rc::new(limits),
             me: Weak::clone(me),
+            position,
         })
     }
 
@@ -1059,6 +1081,60 @@ impl Worker {
                 linger(stream, linger::QUIET, linger::MOST).await;
             }
         }
+    }
+
+    /// Serves HTTP/3 on `socket`, the UDP socket of the listener at position `listener` of
+    /// [`Proxy::listeners`], until the worker drains and its last connection has gone
+    /// ([16](../../docs/16-http3.md)). The listener's TLS is that of the config in force
+    /// when a connection comes.
+    ///
+    /// # Errors
+    ///
+    /// A socket with no address of its own, or BoringSSL failing to set up what the
+    /// connection IDs are made with.
+    ///
+    /// # Panics
+    ///
+    /// Runs inside the worker's `LocalSet`, where every connection and request is a task.
+    pub async fn serve_h3(self: Rc<Self>, listener: usize, socket: UdpSocket) -> io::Result<()> {
+        let deadlines = self.deadlines;
+        let settings = h3::Settings {
+            first_request: deadlines.first_request,
+            keep_alive: deadlines.next_request,
+            stream_idle: deadlines.idle,
+            drain_within: deadlines.drain,
+            ..h3::Settings::default()
+        };
+        let shared = h3_listener::Shared::new(
+            socket,
+            settings,
+            &self.proxy.quic,
+            self.position,
+            Rc::clone(&self.timers),
+            Rc::clone(&self.drain),
+        )
+        .map_err(io::Error::other)?;
+        let reading = Rc::clone(&self);
+        let tls = move || {
+            reading
+                .proxy
+                .current
+                .load()
+                .tls
+                .get(listener)
+                .cloned()
+                .flatten()
+        };
+        let answering = Rc::clone(&self);
+        let respond = Rc::new(move |request: Request<RequestBody>, interim| {
+            Rc::clone(&answering).handle(listener, request, Some(interim))
+        });
+        let dating = Rc::clone(&self);
+        let date = Rc::new(move || dating.date.get());
+        let opening = Rc::clone(&self);
+        let opened = move || Connection::open(Rc::clone(&opening), listener);
+        h3_listener::serve(Rc::new(shared), tls, respond, date, opened).await;
+        Ok(())
     }
 
     /// Answers a request that came in on `listener`. `interim` is where the server that
@@ -1884,7 +1960,7 @@ fn sending_for<H: Forwarded>(head: &H, body: &RequestBody) -> Sending {
             _ => Sending::None,
         };
     }
-    if head.version() == Version::HTTP_2 {
+    if matches!(head.version(), Version::HTTP_2 | Version::HTTP_3) {
         // Framed as frames, with trailers allowed after any of them. There is no length
         // here that would still be true by the end.
         return Sending::Chunked;
@@ -1965,6 +2041,9 @@ pub enum ProxyError {
         /// What is wrong with them.
         error: TlsError,
     },
+    /// BoringSSL could not give the keys the data plane makes at start.
+    #[error("no random keys to be had: {0}")]
+    Random(String),
 }
 
 fn authority(endpoint: &SocketAddr) -> Result<Authority, ProxyError> {
@@ -2676,6 +2755,84 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::OK);
+            })
+            .await;
+    }
+
+    /// A worker serving HTTP/3 for `upstream` on a UDP socket of its own, beside its TCP
+    /// listener's configuration: an `https` listener with HTTP/3, for `a.test`.
+    async fn serving_h3_worker(upstream: SocketAddr) -> SocketAddr {
+        let mut config = everything_config(upstream);
+        let web = config.listeners.get_mut("web").unwrap();
+        web.protocol = edgerush_config::Protocol::Https;
+        web.tls = Some(edgerush_config::Tls {
+            certificates: vec![crate::tls::testing::certificate(&["a.test"])],
+            client_validation: None,
+        });
+        web.http3 = Some(edgerush_config::Http3 {
+            alt_svc_max_age: 60,
+        });
+        let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+        let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
+        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket));
+        front
+    }
+
+    /// An HTTP/3 request goes through the request core to an HTTP/1 upstream, and its
+    /// answer comes back, as any request's does.
+    #[tokio::test]
+    async fn an_http3_request_is_answered_by_the_upstream() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::downstream::h3::testing::Client;
+                let (upstream, _) = counting_upstream().await;
+                let front = serving_h3_worker(upstream).await;
+                let mut client = Client::connect(front, "a.test").await;
+                for path in ["/", "/again"] {
+                    let answer = client.get("a.test", path).await;
+                    assert_eq!(answer.final_status(), Some("200"), "{path}");
+                    assert_eq!(answer.body, b"ok");
+                }
+            })
+            .await;
+    }
+
+    /// An upstream's 103 reaches an HTTP/3 client before its final answer, as over HTTP/2.
+    #[tokio::test]
+    async fn an_upstream_103_reaches_an_http3_client_before_its_answer() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::downstream::h3::testing::Client;
+                let (open, gate) = tokio::sync::oneshot::channel();
+                let upstream = gated_upstream(
+                    b"HTTP/1.1 103 Early Hints\r\nlink: </a.css>; rel=preload\r\n\r\n",
+                    gate,
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+                )
+                .await;
+                let front = serving_h3_worker(upstream).await;
+                let mut client = Client::connect(front, "a.test").await;
+                let id = client.request(&crate::downstream::h3::testing::get("a.test", "/"), true);
+                // Heard while the upstream is still working on its answer.
+                client
+                    .until(|client| client.answers.get(&id).is_some_and(|a| !a.heads.is_empty()))
+                    .await;
+                let hint = client.answers[&id].clone();
+                assert_eq!(hint.status(0), Some("103"));
+                assert!(
+                    hint.heads[0]
+                        .iter()
+                        .any(|(name, value)| name == "link" && value == "</a.css>; rel=preload")
+                );
+                open.send(()).unwrap();
+                let answer = client.answer(id).await;
+                assert_eq!(answer.final_status(), Some("200"));
+                assert_eq!(answer.body, b"ok");
             })
             .await;
     }

@@ -30,6 +30,26 @@ pub struct Listener {
     /// What an `https` listener presents, which it must have; no other may.
     #[serde(default)]
     pub tls: Option<Tls>,
+    /// HTTP/3 as well, on the same port over UDP: for an `https` listener only.
+    #[serde(default)]
+    pub http3: Option<Http3>,
+}
+
+/// An `https` listener's HTTP/3 (16 in the docs): the same routes and TLS, over QUIC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Http3 {
+    /// How long, in seconds, a client told over TCP that the listener serves HTTP/3 may
+    /// remember it (the `ma` of `Alt-Svc`, RFC 7838 §3.1). A day unless said otherwise, as
+    /// Envoy advertises it.
+    #[serde(default = "Http3::day")]
+    pub alt_svc_max_age: u32,
+}
+
+impl Http3 {
+    const fn day() -> u32 {
+        86_400
+    }
 }
 
 /// What a listener speaks.

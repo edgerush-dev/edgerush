@@ -8,7 +8,8 @@ use crate::route::{
     ValuePredicate, Wildcard,
 };
 use crate::{
-    Config, HealthCheck, Keepalive, Probe, Protocol, Rule, Tls, UpstreamProtocol, UpstreamTls,
+    Config, HealthCheck, Http3, Keepalive, Probe, Protocol, Rule, Tls, UpstreamProtocol,
+    UpstreamTls,
 };
 use edgerush_filters::{HeaderModifier, HeaderModifierError};
 use edgerush_router::{
@@ -69,6 +70,8 @@ pub struct CompiledListener {
     pub protocol: Protocol,
     /// What an `https` listener presents; `None` for any other.
     pub tls: Option<Tls>,
+    /// Whether it serves HTTP/3 as well, and how it says so; `https` listeners only.
+    pub http3: Option<Http3>,
     /// Finds the rule a request belongs to, among the routes that are for this listener.
     pub router: Router<RuleId>,
 }
@@ -314,6 +317,10 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             }
             (Protocol::Https, Some(_)) | (Protocol::Http, None) => {}
         }
+        // QUIC is always TLS: there is no HTTP/3 in the clear (RFC 9114 §3.1).
+        if listener.http3.is_some() && listener.protocol != Protocol::Https {
+            errors.push(Place::listener(name).problem(Problem::Http3NeedsTls));
+        }
         let validation = listener
             .tls
             .as_ref()
@@ -392,6 +399,7 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                 address: listener.address,
                 protocol: listener.protocol,
                 tls: listener.tls.clone(),
+                http3: listener.http3,
                 router: Router::new(matches.remove(name.as_str()).unwrap_or_default()),
             })
             .collect();
@@ -833,6 +841,9 @@ pub enum Problem {
     /// TLS on a listener that does not speak it.
     #[error("`tls` is for protocol `https`")]
     TlsUnwanted,
+    /// HTTP/3 on a listener without TLS.
+    #[error("`http3` is for protocol `https`")]
+    Http3NeedsTls,
     /// TLS to an upstream that trusts nobody.
     #[error("`tls` needs an authority to trust")]
     NoAuthority,
@@ -1458,6 +1469,52 @@ routes: []
 upstreams: {}
 "#;
         assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
+    }
+
+    /// An `https` listener may serve HTTP/3 as well, on the same port over UDP, and says so
+    /// to its TCP clients for a day unless it gives a lifetime of its own; no other may.
+    #[test]
+    fn http3_is_for_https_listeners() {
+        let with = |listener: &str| {
+            config(&format!(
+                "listeners: {{ l: {listener} }}
+routes: []
+upstreams: {{}}
+"
+            ))
+        };
+        let https = r#"address: "[::]:443", protocol: https, tls: { certificates: [{ chain: "C", key: "K" }] }"#;
+
+        let compiled = compile(&with(&format!("{{ {https}, http3: {{}} }}"))).unwrap();
+        assert_eq!(
+            compiled.listeners[0].http3,
+            Some(Http3 {
+                alt_svc_max_age: 86_400
+            })
+        );
+        let compiled = compile(&with(&format!(
+            "{{ {https}, http3: {{ alt_svc_max_age: 60 }} }}"
+        )))
+        .unwrap();
+        assert_eq!(compiled.listeners[0].http3.unwrap().alt_svc_max_age, 60);
+        let compiled = compile(&with(&format!("{{ {https} }}"))).unwrap();
+        assert_eq!(compiled.listeners[0].http3, None);
+
+        let problems: Vec<String> = compile(&with(
+            r#"{ address: "[::]:80", protocol: http, http3: {} }"#,
+        ))
+        .unwrap_err()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(problems, ["listener `l`: `http3` is for protocol `https`"]);
+        let yaml = format!(
+            "listeners: {{ l: {{ {https}, http3: {{ max_age: 60 }} }} }}
+routes: []
+upstreams: {{}}
+"
+        );
+        assert!(serde_saphyr::from_str::<Config>(&yaml).is_err());
     }
 
     /// TLS to an upstream names the server it expects and trusts at least one authority to

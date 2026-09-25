@@ -2,13 +2,15 @@
 //!
 //! The request core and the upstream exchange take this, and nothing a server defines:
 //! what a server hands over is wrapped where it hands it over, and what it reports going
-//! wrong is sorted into [`RequestBodyError`] there too. There are two: HTTP/1's, whose body
-//! cannot leave the worker and so makes this one that cannot either
-//! ([14 §2](../../../docs/14-downstream-server.md)), and HTTP/2's over h2
-//! ([15](../../../docs/15-http2-and-grpc.md)). Each is tested where it is made.
+//! wrong is sorted into [`RequestBodyError`] there too. There are three: HTTP/1's, whose
+//! body cannot leave the worker and so makes this one that cannot either
+//! ([14 §2](../../../docs/14-downstream-server.md)), HTTP/2's over h2
+//! ([15](../../../docs/15-http2-and-grpc.md)), and HTTP/3's over quiche
+//! ([16](../../../docs/16-http3.md)). Each is tested where it is made.
 
 use crate::downstream::h1::connection::IncomingBody;
 use crate::downstream::h2::body::IncomingH2;
+use crate::downstream::h3::body::IncomingH3;
 use crate::mirror;
 use crate::retry::replay::{Replayed, Tee};
 use bytes::Bytes;
@@ -30,6 +32,8 @@ pub(crate) enum RequestBody {
     Ours(IncomingBody),
     /// Received by EdgeRush's own HTTP/2 server, over h2.
     H2(IncomingH2),
+    /// Received by EdgeRush's own HTTP/3 server, over quiche.
+    H3(IncomingH3),
     /// Either of those, kept as it goes so that it can be sent again: only for a request
     /// whose rule may retry it.
     Recorded(Box<Tee>),
@@ -87,6 +91,7 @@ impl Body for RequestBody {
         match self.get_mut() {
             Self::Ours(body) => Pin::new(body).poll_frame(cx),
             Self::H2(body) => Pin::new(body).poll_frame(cx),
+            Self::H3(body) => Pin::new(body).poll_frame(cx),
             Self::Recorded(body) => Pin::new(&mut **body).poll_frame(cx),
             Self::Replayed(body) => Pin::new(body).poll_frame(cx),
             Self::Mirrored(body) => Pin::new(&mut **body).poll_frame(cx),
@@ -98,6 +103,7 @@ impl Body for RequestBody {
         match self {
             Self::Ours(body) => body.is_end_stream(),
             Self::H2(body) => body.is_end_stream(),
+            Self::H3(body) => body.is_end_stream(),
             Self::Recorded(body) => body.is_end_stream(),
             Self::Replayed(body) => body.is_end_stream(),
             Self::Mirrored(body) => body.is_end_stream(),
@@ -109,6 +115,7 @@ impl Body for RequestBody {
         match self {
             Self::Ours(body) => body.size_hint(),
             Self::H2(body) => body.size_hint(),
+            Self::H3(body) => body.size_hint(),
             Self::Recorded(body) => body.size_hint(),
             Self::Replayed(body) => body.size_hint(),
             Self::Mirrored(body) => body.size_hint(),

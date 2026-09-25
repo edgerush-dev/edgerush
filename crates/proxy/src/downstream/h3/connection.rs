@@ -1,0 +1,583 @@
+//! One HTTP/3 connection's driver, and the task of each of its requests
+//! ([16 §4, §5](../../../../../docs/16-http3.md)).
+//!
+//! The driver is woken when its listener hands the connection a datagram, when a request's
+//! task has read or written, and when a deadline comes. It hands on what quiche has for the
+//! streams, starts a task for each new request, gives the connection its spare IDs, and
+//! sends what quiche wants sent. Its deadlines, one alarm in the worker's timers for the
+//! soonest: quiche's own; the first request, 10 s from the first packet; the keep-alive,
+//! once no request is open; the drain's bound.
+//!
+//! A request whose head is malformed is reset with `H3_MESSAGE_ERROR`; one whose head is too
+//! large is answered 431; one on a stream past the GOAWAY sent is reset with
+//! `H3_REQUEST_REJECTED`, which a client may send again elsewhere (RFC 9114 §5.2).
+
+use crate::downstream::h1::connection::{Answered, expects_continue};
+use crate::downstream::h1::date::HttpDate;
+use crate::downstream::h3::body::IncomingH3;
+use crate::downstream::h3::code;
+use crate::downstream::h3::conn::{Conn, Slot, State, Stream};
+use crate::downstream::h3::head::{self, Refused, RequestHead};
+use crate::downstream::h3::listener::Shared;
+use crate::downstream::h3::writer::{Responder, SendError};
+use crate::interim::Interim;
+use crate::request_body::RequestBody;
+use crate::timers::Alarm;
+use bytes::Bytes;
+use http::header::{DATE, HeaderValue};
+use http::{Request, Response, StatusCode, Version};
+use http_body::Body;
+use quiche::h3::Event;
+use std::error::Error as StdError;
+use std::future::{Future, poll_fn};
+use std::io;
+use std::net::SocketAddr;
+use std::pin::pin;
+use std::rc::Rc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::time::Instant;
+
+/// A datagram quiche made that the socket had no room for, kept for its next chance.
+type Unsent = Option<(Vec<u8>, SocketAddr)>;
+
+/// What the driver keeps between its turns.
+struct Driving {
+    accepted: Instant,
+    /// A request has come.
+    asked: bool,
+    /// No request has been open since then.
+    quiet_since: Option<Instant>,
+    /// Still in its handshake, and counted as one.
+    handshaking: bool,
+    /// The ID the client first chose, which finds the connection until the handshake is
+    /// done.
+    chosen: Vec<u8>,
+    /// Every other ID the connection is known by in the listener's table.
+    ids: Vec<Vec<u8>>,
+    seen: Seen,
+    /// When a draining connection is closed regardless.
+    drain_by: Option<Instant>,
+    /// To be closed once what is queued has gone: the GOAWAY above all, which quiche would
+    /// drop if the connection were closed with it still queued.
+    to_close: bool,
+    /// The connection is closing: only quiche's own deadline is left to keep.
+    closing: bool,
+    unsent: Unsent,
+}
+
+/// The requests a connection has seen, as a GOAWAY counts them.
+#[derive(Debug, Default)]
+struct Seen {
+    /// Past the highest request stream seen, which a GOAWAY names as the first not seen.
+    /// Streams below it may still come, out of order: a lost packet is sent again after
+    /// later ones.
+    next: u64,
+    /// The GOAWAY sent, if one was: no request at or past it is taken.
+    goaway: Option<u64>,
+}
+
+/// A request the driver found, for its task to answer.
+struct Found {
+    id: u64,
+    head: RequestHead,
+    ended: bool,
+}
+
+/// Drives `conn` until it closes. `chosen` is the ID the client first sent to; `opened`
+/// is held as long as the connection lives.
+pub(crate) async fn drive<R, F, B, D, G>(
+    conn: Rc<Conn>,
+    shared: Rc<Shared>,
+    chosen: Vec<u8>,
+    respond: Rc<R>,
+    date: Rc<D>,
+    opened: G,
+) where
+    R: Fn(Request<RequestBody>, Interim) -> F + 'static,
+    F: Future<Output = Answered<B>> + 'static,
+    B: Body<Data = Bytes> + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    D: Fn() -> HttpDate + 'static,
+{
+    let settings = shared.settings;
+    let accepted = Instant::now();
+    let first_id = conn.with(|state| state.quic.source_id().to_vec());
+    let mut driving = Driving {
+        accepted,
+        asked: false,
+        quiet_since: Some(accepted),
+        handshaking: true,
+        chosen,
+        ids: vec![first_id],
+        seen: Seen::default(),
+        drain_by: None,
+        to_close: false,
+        closing: false,
+        unsent: None,
+    };
+    let mut alarm = Alarm::new(&shared.timers, None);
+    let mut out = vec![0; settings.datagram];
+    let mut drain_heard = pin!(shared.drain.notified());
+    let mut found = Vec::new();
+    poll_fn(|cx| {
+        conn.drive_with(cx.waker());
+        loop {
+            if driving.drain_by.is_none()
+                && shared.drain.poll_on(drain_heard.as_mut(), cx).is_ready()
+            {
+                driving.drain_by = Some(Instant::now() + settings.drain_within);
+                go_away(&conn, &mut driving);
+            }
+            if conn.take_stirred() || driving.unsent.is_some() {
+                turn(&conn, &shared, &mut driving, &mut found);
+                for Found { id, head, ended } in found.drain(..) {
+                    driving.asked = true;
+                    let stream = Stream::adopt(&conn, id);
+                    let _detached = tokio::task::spawn_local(answer(
+                        stream,
+                        head,
+                        ended,
+                        Rc::clone(&respond),
+                        Rc::clone(&date),
+                        settings.stream_idle,
+                    ));
+                }
+                flush(&conn, &shared, &mut out, &mut driving.unsent, cx);
+                if driving.to_close && !driving.closing && driving.unsent.is_none() {
+                    conn.with(|state| {
+                        // Fails only for a connection already closing.
+                        let _closing = state.quic.close(true, code::NO_ERROR, b"");
+                    });
+                    driving.closing = true;
+                    flush(&conn, &shared, &mut out, &mut driving.unsent, cx);
+                }
+                if conn.with(|state| state.quic.is_closed()) {
+                    return Poll::Ready(());
+                }
+            }
+            let open = conn.with(|state| state.streams.len());
+            let now = Instant::now();
+            if open == 0 {
+                driving.quiet_since.get_or_insert(now);
+            } else {
+                driving.quiet_since = None;
+            }
+            // Draining, a connection with nothing open goes at once.
+            if !driving.to_close && driving.drain_by.is_some() && open == 0 {
+                close(&conn, &mut driving);
+                continue;
+            }
+            let quic_due = conn
+                .with(|state| state.quic.timeout_instant())
+                .map(Instant::from_std);
+            let (first_due, quiet_due, drain_due) = if driving.to_close {
+                (None, None, None)
+            } else {
+                (
+                    (!driving.asked).then(|| driving.accepted + settings.first_request),
+                    driving
+                        .quiet_since
+                        .filter(|_| driving.asked)
+                        .map(|since| since + settings.keep_alive),
+                    driving.drain_by,
+                )
+            };
+            let due = [quic_due, first_due, quiet_due, drain_due]
+                .into_iter()
+                .flatten()
+                .min();
+            let came = due.is_some_and(|due| alarm.poll_until(cx, due).is_ready());
+            if !came {
+                if conn.is_stirred() {
+                    continue;
+                }
+                return Poll::Pending;
+            }
+            let now = Instant::now();
+            if quic_due.is_some_and(|due| due <= now) {
+                conn.with(|state| state.quic.on_timeout());
+                conn.stir();
+            }
+            let over = [first_due, quiet_due, drain_due]
+                .into_iter()
+                .flatten()
+                .any(|due| due <= now);
+            if over {
+                close(&conn, &mut driving);
+            }
+        }
+    })
+    .await;
+    // Closed: every stream's task learns it, and the connection's IDs find nothing more.
+    conn.with(|state| {
+        state.closed = true;
+        for slot in state.streams.values_mut() {
+            slot.wake();
+        }
+    });
+    {
+        let mut table = shared.table.borrow_mut();
+        for id in driving.ids.iter().chain(std::iter::once(&driving.chosen)) {
+            table.remove(id.as_slice());
+        }
+    }
+    if driving.handshaking {
+        shared
+            .handshakes
+            .set(shared.handshakes.get().saturating_sub(1));
+    }
+    shared
+        .connections
+        .set(shared.connections.get().saturating_sub(1));
+    drop(opened);
+}
+
+/// Closes the connection with nothing wrong, once the client has been told which requests
+/// were not seen, so that it sends them again (RFC 9114 §5.2).
+fn close(conn: &Conn, driving: &mut Driving) {
+    go_away(conn, driving);
+    driving.to_close = true;
+    conn.stir();
+}
+
+/// Sends a GOAWAY naming the first request not seen, once.
+fn go_away(conn: &Conn, driving: &mut Driving) {
+    if driving.seen.goaway.is_some() {
+        return;
+    }
+    let first_unseen = driving.seen.next;
+    let sent = conn.with(|state| {
+        let State { quic, h3, .. } = state;
+        h3.as_mut()
+            .is_some_and(|h3| h3.send_goaway(quic, first_unseen).is_ok())
+    });
+    if sent {
+        driving.seen.goaway = Some(first_unseen);
+        conn.stir();
+    }
+}
+
+/// One turn of the driver's, with the connection in hand: HTTP/3 once the handshake is
+/// done, spare IDs, and everything quiche has for the streams.
+fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec<Found>) {
+    let mut issued = Vec::new();
+    let mut retired = Vec::new();
+    let established = conn.with(|state| {
+        let State {
+            quic, h3, streams, ..
+        } = state;
+        let established = h3.is_none() && quic.is_established();
+        if established {
+            match quiche::h3::Connection::with_transport(quic, &shared.h3) {
+                Ok(connection) => *h3 = Some(connection),
+                Err(_) => {
+                    let _closing = quic.close(true, 0x101, b"");
+                }
+            }
+        }
+        // Drained every turn, so that nothing queues without bound (16 §6).
+        while quic.path_event_next().is_some() {}
+        while let Some(id) = quic.retired_scid_next() {
+            retired.push(id.to_vec());
+        }
+        if quic.is_established() {
+            while quic.scids_left() > 0 {
+                let Ok((id, reset)) = shared.issuer.borrow_mut().issue() else {
+                    break;
+                };
+                if quic
+                    .new_scid(&quiche::ConnectionId::from_ref(&id), reset, false)
+                    .is_err()
+                {
+                    break;
+                }
+                issued.push(id.to_vec());
+            }
+        }
+        if let Some(h3) = h3.as_mut() {
+            events(
+                quic,
+                h3,
+                streams,
+                shared.settings.head_limit,
+                &mut driving.seen,
+                found,
+            );
+        }
+        while let Some(id) = quic.stream_writable_next() {
+            if let Some(writer) = streams.get_mut(&id).and_then(|slot| slot.writer.take()) {
+                writer.wake();
+            }
+        }
+        established
+    });
+    let mut table = shared.table.borrow_mut();
+    for id in retired {
+        table.remove(id.as_slice());
+        driving.ids.retain(|kept| *kept != id);
+    }
+    for id in issued {
+        table.insert(id.clone(), Rc::clone(conn));
+        driving.ids.push(id);
+    }
+    if established {
+        // Done with its handshake, the client sends to the IDs it was given.
+        table.remove(driving.chosen.as_slice());
+        if driving.handshaking {
+            driving.handshaking = false;
+            shared
+                .handshakes
+                .set(shared.handshakes.get().saturating_sub(1));
+        }
+    }
+}
+
+/// Hands on what quiche's HTTP/3 layer has, stream by stream.
+fn events(
+    quic: &mut quiche::Connection,
+    h3: &mut quiche::h3::Connection,
+    streams: &mut std::collections::HashMap<u64, Slot>,
+    head_limit: usize,
+    seen: &mut Seen,
+    found: &mut Vec<Found>,
+) {
+    loop {
+        let (id, event) = match h3.poll(quic) {
+            Ok(polled) => polled,
+            // Done, or an error that quiche has closed the connection over itself.
+            Err(_) => return,
+        };
+        match event {
+            Event::Headers { list, more_frames } => {
+                // A second head on a stream with a task is its trailers. A stream whose task
+                // has ended has stopped reading, so quiche hands on nothing more of it.
+                if let Some(slot) = streams.get_mut(&id) {
+                    slot.trailers = Some(head::trailers(&list, head_limit));
+                    slot.wake();
+                    continue;
+                }
+                if seen.goaway.is_some_and(|goaway| id >= goaway) {
+                    shut(quic, id, code::REQUEST_REJECTED);
+                    continue;
+                }
+                seen.next = seen.next.max(id + 4);
+                match head::request(&list, head_limit) {
+                    Ok(head) => {
+                        streams.insert(id, Slot::default());
+                        found.push(Found {
+                            id,
+                            head,
+                            ended: !more_frames,
+                        });
+                    }
+                    Err(Refused::TooLarge) => too_large(quic, h3, id),
+                    Err(Refused::Malformed(_)) => shut(quic, id, code::MESSAGE_ERROR),
+                }
+            }
+            Event::Data => {
+                if let Some(reader) = streams.get_mut(&id).and_then(|slot| slot.reader.take()) {
+                    reader.wake();
+                }
+            }
+            Event::Finished => {
+                if let Some(slot) = streams.get_mut(&id) {
+                    slot.finished = true;
+                    slot.wake();
+                }
+            }
+            Event::Reset(code) => {
+                if let Some(slot) = streams.get_mut(&id) {
+                    slot.reset = Some(code);
+                    slot.wake();
+                }
+            }
+            Event::PriorityUpdate => {
+                // Held by quiche until taken; priorities are not acted on (16 §1).
+                let _taken = h3.take_last_priority_update(id);
+            }
+            // The client's GOAWAY concerns pushes, which the server makes none of.
+            Event::GoAway => {}
+        }
+    }
+}
+
+/// Resets both sides of stream `id` with `code`.
+fn shut(quic: &mut quiche::Connection, id: u64, code: u64) {
+    let _reset = quic.stream_shutdown(id, quiche::Shutdown::Write, code);
+    let _stopped = quic.stream_shutdown(id, quiche::Shutdown::Read, code);
+}
+
+/// Answers 431 to a request whose head is past the limit, and reads no more of it.
+fn too_large(quic: &mut quiche::Connection, h3: &mut quiche::h3::Connection, id: u64) {
+    let status = StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE;
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    let fields = head::answer(&status, &headers);
+    if h3.send_response(quic, id, &fields, true).is_err() {
+        shut(quic, id, code::REQUEST_REJECTED);
+        return;
+    }
+    let _stopped = quic.stream_shutdown(id, quiche::Shutdown::Read, code::NO_ERROR);
+}
+
+/// Sends what quiche wants sent, until it has nothing more or the socket has no room.
+fn flush(conn: &Conn, shared: &Shared, out: &mut [u8], unsent: &mut Unsent, cx: &mut Context<'_>) {
+    if let Some((datagram, to)) = unsent.take()
+        && !send(shared, &datagram, to, cx)
+    {
+        *unsent = Some((datagram, to));
+        return;
+    }
+    loop {
+        let made = conn.with(|state| state.quic.send(out));
+        let Ok((len, info)) = made else {
+            return;
+        };
+        let datagram = &out[..len];
+        if !send(shared, datagram, info.to, cx) {
+            *unsent = Some((datagram.to_vec(), info.to));
+            return;
+        }
+    }
+}
+
+/// Sends one datagram: false if the socket has no room, which it then says when it has.
+fn send(shared: &Shared, datagram: &[u8], to: SocketAddr, cx: &mut Context<'_>) -> bool {
+    match shared.socket.try_send_to(datagram, to) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            // Ready at once only if room came meanwhile, which the next turn finds.
+            let _ready = shared.socket.poll_send_ready(cx);
+            false
+        }
+        // Lost, as a datagram may be on any path: quiche sends it again.
+        Err(_) => true,
+    }
+}
+
+/// Sends what waits in `interim` to be passed on, and a `100` of the continue decision's
+/// own if it wants one. A `101` is never sent: HTTP/3 has no upgrade (RFC 9114 §4.5).
+fn send_interim(responder: &mut Responder, interim: &Interim) {
+    while let Some((status, headers)) = interim.next_forwarded() {
+        if status == StatusCode::SWITCHING_PROTOCOLS {
+            continue;
+        }
+        let mut head = Response::new(());
+        *head.status_mut() = status;
+        *head.headers_mut() = headers;
+        // Refused only once the final head has gone, when there is nothing to tell.
+        let _sent = responder.interim(&head);
+    }
+    if interim.take_local_continue() {
+        let mut head = Response::new(());
+        *head.status_mut() = StatusCode::CONTINUE;
+        let _sent = responder.interim(&head);
+    }
+}
+
+/// Answers one request.
+async fn answer<R, F, B, D>(
+    stream: Stream,
+    head: RequestHead,
+    ended: bool,
+    respond: Rc<R>,
+    date: Rc<D>,
+    idle: Duration,
+) where
+    R: Fn(Request<RequestBody>, Interim) -> F,
+    F: Future<Output = Answered<B>>,
+    B: Body<Data = Bytes>,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    D: Fn() -> HttpDate,
+{
+    // Read before any filter touches the head, as for HTTP/1 and HTTP/2 (14 §5).
+    let interim = Interim::listened(
+        expects_continue(&head.parts.headers),
+        Version::HTTP_3,
+        ended,
+    );
+    let body = IncomingH3::new(Rc::clone(&stream.conn), stream.id, head.length, ended, idle)
+        .heard_by(interim.clone());
+    let request = Request::from_parts(head.parts, RequestBody::H3(body));
+    let mut responder = Responder::new(Rc::clone(&stream.conn), stream.id, idle);
+    let mut answering = pin!(respond(request, interim.clone()));
+    let answered = poll_fn(|cx| {
+        if responder.poll_reset(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        let answered = answering.as_mut().poll(cx);
+        // What the exchange heard, or the continue decision made, in this turn goes out now.
+        send_interim(&mut responder, &interim);
+        answered.map(Some)
+    })
+    .await;
+    // Reset by the client, or the connection gone: nothing is to be sent.
+    let Some(answered) = answered else {
+        return;
+    };
+    interim.final_head();
+    send_interim(&mut responder, &interim);
+    let (mut head, body) = answered.into_response().into_parts();
+    if !head.headers.contains_key(DATE)
+        && let Ok(now) = HeaderValue::from_bytes(date().as_bytes())
+    {
+        head.headers.insert(DATE, now);
+    }
+    let end = body.is_end_stream();
+    match responder.final_head(&head, end).await {
+        Ok(()) => {}
+        Err(SendError::TimedOut) => return responder.reset(code::REQUEST_CANCELLED),
+        Err(SendError::H3(_)) => return responder.reset(code::INTERNAL_ERROR),
+        Err(_) => return,
+    }
+    if !end {
+        // However the sending ends, there is nobody left to tell: a stream whose answer
+        // failed has been reset already.
+        let _sent = responder.send_body(body).await;
+    }
+    drop(stream);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::h3_peer::{self, Pipe, id, server_config, server_tls};
+
+    /// Two requests whose datagrams come in the other order, as they do when the first is
+    /// lost and sent again: both are found, and the first stream not seen is past both.
+    #[test]
+    fn requests_that_come_out_of_order_are_both_taken() {
+        let mut pipe = Pipe::new(&mut server_config(server_tls()), &id(0xa5, 17));
+        let config = quiche::h3::Config::new().unwrap();
+        let mut client = quiche::h3::Connection::with_transport(&mut pipe.client, &config).unwrap();
+        let mut server = quiche::h3::Connection::with_transport(&mut pipe.server, &config).unwrap();
+        pipe.advance();
+        let get = h3_peer::h3_headers(&h3_peer::get());
+        let first = client.send_request(&mut pipe.client, &get, true).unwrap();
+        let first_flight = pipe.client_flush();
+        let second = client.send_request(&mut pipe.client, &get, true).unwrap();
+        for datagram in pipe.client_flush() {
+            pipe.deliver_to_server(datagram);
+        }
+        for datagram in first_flight {
+            pipe.deliver_to_server(datagram);
+        }
+
+        let mut streams = std::collections::HashMap::new();
+        let mut seen = Seen::default();
+        let mut found = Vec::new();
+        events(
+            &mut pipe.server,
+            &mut server,
+            &mut streams,
+            64 << 10,
+            &mut seen,
+            &mut found,
+        );
+        let mut taken: Vec<u64> = found.iter().map(|found| found.id).collect();
+        taken.sort_unstable();
+        assert_eq!(taken, [first, second]);
+        assert_eq!(seen.next, second + 4);
+    }
+}

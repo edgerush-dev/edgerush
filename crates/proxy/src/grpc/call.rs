@@ -14,7 +14,8 @@ pub(crate) struct Call {
 }
 
 impl Call {
-    /// The call a request makes, if it is one: HTTP/2 with a gRPC content type, read from
+    /// The call a request makes, if it is one: HTTP/2 or HTTP/3 with a gRPC content type
+    /// (16 §5), read from
     /// the head as the client sent it, before any filter could change it. Its deadline is
     /// what its `grpc-timeout` says, counted from `now`, which is asked only then; a
     /// value that is not a timeout, or one said twice, is no deadline — as Envoy reads it
@@ -24,7 +25,7 @@ impl Call {
         fields: &F,
         now: impl FnOnce() -> Instant,
     ) -> Option<Self> {
-        if version != Version::HTTP_2 {
+        if !matches!(version, Version::HTTP_2 | Version::HTTP_3) {
             return None;
         }
         let mut types = fields.values(&CONTENT_TYPE);

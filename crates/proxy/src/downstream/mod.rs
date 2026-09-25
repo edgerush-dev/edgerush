@@ -23,3 +23,4 @@
 pub mod detect;
 pub mod h1;
 pub(crate) mod h2;
+pub(crate) mod h3;

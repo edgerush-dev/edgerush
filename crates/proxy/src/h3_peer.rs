@@ -138,10 +138,28 @@ pub(crate) fn server_config(tls: SslContextBuilder) -> quiche::Config {
 /// A client configuration that does not check the server's certificate: the probes are
 /// about QUIC and HTTP/3, not about the trust store.
 pub(crate) fn client_config() -> quiche::Config {
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+    client_config_over(SslContextBuilder::new(SslMethod::tls()).unwrap())
+}
+
+/// The same over a TLS context of the caller's, one that shows a certificate of its own.
+pub(crate) fn client_config_over(tls: SslContextBuilder) -> quiche::Config {
+    let mut config =
+        quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls).unwrap();
     transport(&mut config);
     config.verify_peer(false);
     config
+}
+
+/// A client asking for `name`, that has sent nothing yet.
+pub(crate) fn client_for(name: &str, config: &mut quiche::Config) -> quiche::Connection {
+    quiche::connect(
+        Some(name),
+        &id(0xc1, 16),
+        client_addr(),
+        server_addr(),
+        config,
+    )
+    .unwrap()
 }
 
 /// A connection ID of `len` bytes, all `byte`: distinct enough to be told apart on the
