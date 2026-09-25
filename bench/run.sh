@@ -22,6 +22,9 @@
 #   bench/run.sh handshakes [RATE] [FLOOD]    (TLS=1) steady clients at RATE beside a flood of
 #                                             FLOOD connections each made anew, by
 #                                             variant: ours-abN accepts N at a time
+#   bench/run.sh h3 [STREAMED]                HTTP/3 clients: few hot connections, many, one
+#                                             hot one, streamed bodies at STREAMED a second,
+#                                             and TLS HTTP/2 beside them to read them by
 #   bench/run.sh summary DIR                  the table of a finished run
 #
 # UPSTREAM_H2=1 has the proxy speak HTTP/2 to the backend, by prior knowledge, many
@@ -30,6 +33,9 @@
 # TLS=1 has clients reach the proxy over TLS — EdgeRush, NGINX and HAProxy, with one
 # self-signed ECDSA P-256 certificate — for saturation, latency and h2. Its churn is a
 # full handshake for every request.
+#
+# H3=1 (which is TLS=1 as well) has those three serve HTTP/3 on the same port, over UDP;
+# the `h3` scenario sets it itself. Its generator is h2load built with HTTP/3 (H2LOAD3).
 #
 # The variants — EdgeRush, and NGINX, HAProxy, Envoy and Kong set up to do the same
 # — are run in turns, REPS times, so that whatever drifts, heat above all, drifts
@@ -59,6 +65,11 @@ repo=$(dirname "$here")
 # The counts `idle` weighs each kind of idle connection at (14 §8).
 : "${IDLE_COUNTS:=2000 20000}"
 : "${TLS:=0}"
+: "${H3:=0}"
+[ "${1:-}" = h3 ] && H3=1
+[ "$H3" = 1 ] && TLS=1
+# h2load with HTTP/3: Ubuntu's is built without it (bench/README.md says how to build one).
+: "${H2LOAD3:=$HOME/tools/h2load3/bin/h2load}"
 : "${UPSTREAM_H2:=0}"
 : "${VARIANTS:=ours}" # and: ours-kernel nginx haproxy envoy kong
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
@@ -119,16 +130,17 @@ secure() {
             -keyout "$tls/key.pem" -out "$tls/cert.pem" 2>/dev/null
         cat "$tls/cert.pem" "$tls/key.pem" >"$tls/both.pem"
     }
-    python3 - "$config" "$tls" <<'PY'
+    python3 - "$config" "$tls" "$H3" <<'PY'
 import json, sys
-config, tls = sys.argv[1], sys.argv[2]
+config, tls, h3 = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 chain = json.dumps(open(f"{tls}/cert.pem").read())
 key = json.dumps(open(f"{tls}/key.pem").read())
 text = open(config).read()
 plain = 'web: { address: "127.0.0.1:8080", protocol: http }'
 assert plain in text
+http3 = ", http3: {}" if h3 else ""
 text = text.replace(plain, 'web: { address: "127.0.0.1:8080", protocol: https, '
-                    f'tls: {{ certificates: [{{ chain: {chain}, key: {key} }}] }} }}')
+                    f'tls: {{ certificates: [{{ chain: {chain}, key: {key} }}] }}{http3} }}')
 open(config, "w").write(text)
 PY
 }
@@ -180,6 +192,14 @@ start_proxy() { # variant
                 s#^http {#http {\n    ssl_certificate $tls/cert.pem;\n    ssl_certificate_key $tls/key.pem;#" \
                 "$run-proxy/nginx.conf"
         fi
+        if [ "$H3" = 1 ]; then
+            # QUIC beside TCP on each server, the default one sharing the port among the
+            # workers as its TCP socket does.
+            sed -i "s#listen 127.0.0.1:8080 ssl reuseport backlog=4096 default_server;#&\n        listen 127.0.0.1:8080 quic reuseport default_server;#;
+                s#listen 127.0.0.1:8080 ssl;#&\n        listen 127.0.0.1:8080 quic;#" \
+                "$run-proxy/nginx.conf"
+            grep -q 'quic reuseport' "$run-proxy/nginx.conf"
+        fi
         taskset -c "$PROXY_CPUS" nginx -p "$run-proxy/" -c "$run-proxy/nginx.conf" \
             -e "$run-proxy/error.log" 2>>"$OUT/proxy.log" &
         ;;
@@ -190,6 +210,11 @@ start_proxy() { # variant
         if [ "$TLS" = 1 ]; then
             sed -i "s#bind 127.0.0.1:8080#bind 127.0.0.1:8080 ssl crt $tls/both.pem alpn h2,http/1.1#" \
                 "$haproxy_cfg"
+        fi
+        if [ "$H3" = 1 ]; then
+            sed -i "s#^    bind 127.0.0.1:8080 ssl .*#&\n    bind quic4@127.0.0.1:8080 ssl crt $tls/both.pem alpn h3#" \
+                "$haproxy_cfg"
+            grep -q 'quic4@' "$haproxy_cfg"
         fi
         if [ "$UPSTREAM_H2" = 1 ]; then
             sed -i "s#server nginx 127.0.0.1:9000#server nginx 127.0.0.1:9000 proto h2#" "$haproxy_cfg"
@@ -290,6 +315,14 @@ saturation_h2() { # name, url, options...: few connections, many streams on each
     local name=$1 url=$2
     shift 2
     measured "$name" h2load -c4 -m100 -t2 -D "$DURATION" --warm-up-time=3 "$@" "$url"
+}
+
+# The same over HTTP/3, by h2load built with it.
+h3load() { # name, options...
+    local name=$1
+    shift
+    measured "$name" "$H2LOAD3" --alpn-list=h3 -D "$DURATION" --warm-up-time=3 "$@" \
+        --connect-to="$proxy_at" "$proxy"
 }
 
 # Open loop: a fixed rate, and latency counted from when a request was due. Requests that
@@ -516,6 +549,7 @@ environment() {
         [ "$TLS" = 1 ] && echo "clients over TLS: $(openssl version), ECDSA P-256 certificate"
         [ "$UPSTREAM_H2" = 1 ] && echo "upstream spoken to in HTTP/2 (prior knowledge)"
         h2load --version
+        [ "$H3" = 1 ] && echo "HTTP/3 by $("$H2LOAD3" --version)"
         oha --version
         nginx -v 2>&1
         { command -v haproxy >/dev/null && haproxy -v | head -1; } || true
@@ -557,7 +591,7 @@ profile-body)
         exit 2
     }
     ;;
-ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes) ;;
+ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3) ;;
 *)
     sed -n '2,32p' "$0" >&2
     exit 2
@@ -776,6 +810,21 @@ h2)
         done
     }
     each_variant h2_runs
+    ;;
+h3)
+    # What HTTP/3 clients get (16 step 6): few hot connections, many connections, a single
+    # hot one, and 8 MiB answers over a few connections' streams; HTTP/2 over TLS beside
+    # them, on the same proxy and port, to read them by.
+    [ -x "$H2LOAD3" ] || { echo "no h2load with HTTP/3 at $H2LOAD3" >&2; exit 2; }
+    h3_runs() {
+        h3load "$1.saturation-h3" -t2 -c4 -m100
+        h3load "$1.many-h3" -t2 -c256 -m1
+        h3load "$1.hot-h3" -t1 -c1 -m256
+        saturation_h2 "$1.saturation-h2tls" "$proxy" --connect-to="$proxy_at"
+        measured "$1.streamed-answer-h3" "$H2LOAD3" --alpn-list=h3 -t2 -c4 -m8 \
+            -D "$DURATION" --warm-up-time=3 --connect-to="$proxy_at" "$proxy/big"
+    }
+    each_variant h3_runs
     ;;
 carrying)
     # Low rates: every one of these is about what an exchange holds and for how long

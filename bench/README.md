@@ -46,6 +46,9 @@ TLS=1 bench/run.sh handshakes [RATE] [FLOOD]
                                     # steady clients at RATE (10,000/s) beside FLOOD (256)
                                     # connections each made anew, a full handshake each;
                                     # variant ours-abN accepts N connections at a time
+bench/run.sh h3                     # HTTP/3 clients (H3=1): 4 connections x 100 streams,
+                                    # 256 connections, one hot connection, 8 MiB answers,
+                                    # and TLS HTTP/2 beside them
 bench/run.sh summary bench/results/<run>
 bench/window.sh [RTTS] [VARIANTS]   # HTTP/2 uploads over a delayed path, by stream window
                                     # and against NGINX: the client in a network namespace
@@ -58,6 +61,24 @@ measurement, the proxy's CPU time around it, `environment.txt`, and the table th
 `GEN_CPUS`, `BACKEND_CPUS`, `DURATION`, `REPS`, `VARIANTS`, `IDLE_PER_DESTINATION`,
 `IDLE_TOTAL`, `OUT`; the defaults are for a machine with 4 cores and 8 threads where CPUs
 *n* and *n+4* are one core.
+
+`H3=1`, which `h3` sets and which is `TLS=1` as well, has EdgeRush, NGINX (`listen ...
+quic`) and HAProxy (`bind quic4@...`) serve HTTP/3 on the proxy's port over UDP beside
+TCP. Its generator is h2load built with HTTP/3, at `H2LOAD3` (`~/tools/h2load3/bin/h2load`
+by default); Ubuntu's is built without it. To build one against Ubuntu's ngtcp2 (with
+OpenSSL 3.5's QUIC) and nghttp3:
+
+```sh
+sudo apt-get install libngtcp2-dev libngtcp2-crypto-ossl-dev libnghttp3-dev libev-dev     libssl-dev zlib1g-dev libc-ares-dev pkg-config
+curl -fsSLO https://github.com/nghttp2/nghttp2/releases/download/v1.68.0/nghttp2-1.68.0.tar.xz
+tar xf nghttp2-1.68.0.tar.xz && cd nghttp2-1.68.0
+./configure --prefix="$HOME/tools/h2load3" --enable-app --enable-http3     --disable-python-bindings --with-libngtcp2 --with-libnghttp3
+make -j"$(nproc)" && make install
+```
+
+Run every comparison at `IDLE_PER_DESTINATION=1024 IDLE_TOTAL=1024`: at the defaults a few
+hundred requests in flight keep EdgeRush opening upstream connections, and that is what
+gets measured.
 
 `TLS=1` has the clients reach the proxy over TLS — EdgeRush, NGINX and HAProxy, one
 self-signed ECDSA P-256 certificate made for the run — for `saturation`, `latency`
@@ -142,6 +163,8 @@ worth as much as the care that went into the other side.
 | `latency-h2` | oha, 4 connections × 100 streams, a fixed rate | Latency on a few hot connections |
 | `hot-h2` | h2load, 1 HTTP/2 connection with 256 streams, closed loop | One connection carrying everything, as a gRPC client's does: all of it lands on the worker that owns it |
 | `streamed-answer-h2`, `streamed-request-h2` | oha over HTTP/2, 4 connections × 8 streams, `STREAMED` bytes each way | The body paths when HTTP/2 carries them: flow control and the server's staging, not only framing |
+| `saturation-h3`, `many-h3`, `hot-h3` | h2load over HTTP/3: 4 connections × 100 streams, 256 connections × 1, 1 connection × 256 | What HTTP/3 clients get, where a connection's packets all land on the worker that owns it ([16](../../docs/16-http3.md)) |
+| `streamed-answer-h3` | h2load over HTTP/3, 4 connections × 8 streams, `STREAMED` bytes back | The answer's path when QUIC carries it: datagrams, acknowledgements, the send buffer |
 | `idle-h2-N` | `N` HTTP/2 connections, one request each and then quiet, on a proxy started afresh | What an idle HTTP/2 connection costs, beside `idle-memory`'s HTTP/1 ones |
 | `churn` | oha, a new connection for every request, a fixed rate | The cost of accepting, and of a connection's first request |
 | `streamed-answer` | oha, a body of `STREAMED` bytes coming back | What the answer's path costs when it is carrying something rather than passing a few bytes along |
