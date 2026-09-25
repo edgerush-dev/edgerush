@@ -20,14 +20,14 @@ mod route;
 
 pub use backends::{UpstreamId, WeightedBackends};
 pub use compile::{
-    Compiled, CompiledListener, CompiledRule, CompiledUpstream, ConfigError, Object, Place,
-    Problem, RuleId, compile,
+    Compiled, CompiledListener, CompiledRetry, CompiledRule, CompiledUpstream, ConfigError, Object,
+    Place, Problem, RuleId, compile,
 };
 pub use config::{
     Certificate, Config, HealthCheck, Keepalive, Listener, Probe, Protocol, Tls, Upstream,
     UpstreamProtocol, UpstreamTls,
 };
 pub use route::{
-    Backend, Filter, GrpcMethod, Header, HeaderChanges, Hostname, Match, PathMatch, Route, Rule,
-    ValueMatch, ValuePredicate, Wildcard,
+    Backend, Filter, GrpcMethod, Header, HeaderChanges, Hostname, Match, PathMatch, Retry, Route,
+    Rule, ValueMatch, ValuePredicate, Wildcard,
 };

@@ -45,6 +45,7 @@ pub mod raw;
 mod raw;
 mod request;
 mod request_body;
+mod retry;
 mod scrape;
 mod serve;
 // Private, save when the fuzz targets are being built, for the blocks `upstream` lends.

@@ -9,6 +9,7 @@
 
 use crate::downstream::h1::connection::IncomingBody;
 use crate::downstream::h2::body::IncomingH2;
+use crate::retry::replay::{Replayed, Tee};
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use std::error::Error as StdError;
@@ -28,6 +29,11 @@ pub(crate) enum RequestBody {
     Ours(IncomingBody),
     /// Received by EdgeRush's own HTTP/2 server, over h2.
     H2(IncomingH2),
+    /// Either of those, kept as it goes so that it can be sent again: only for a request
+    /// whose rule may retry it.
+    Recorded(Box<Tee>),
+    /// What was kept, sent again.
+    Replayed(Replayed),
 }
 
 /// What a server reported going wrong, kept as the cause of a [`RequestBodyError`] without
@@ -76,6 +82,8 @@ impl Body for RequestBody {
         match self.get_mut() {
             Self::Ours(body) => Pin::new(body).poll_frame(cx),
             Self::H2(body) => Pin::new(body).poll_frame(cx),
+            Self::Recorded(body) => Pin::new(&mut **body).poll_frame(cx),
+            Self::Replayed(body) => Pin::new(body).poll_frame(cx),
         }
     }
 
@@ -83,6 +91,8 @@ impl Body for RequestBody {
         match self {
             Self::Ours(body) => body.is_end_stream(),
             Self::H2(body) => body.is_end_stream(),
+            Self::Recorded(body) => body.is_end_stream(),
+            Self::Replayed(body) => body.is_end_stream(),
         }
     }
 
@@ -90,6 +100,8 @@ impl Body for RequestBody {
         match self {
             Self::Ours(body) => body.size_hint(),
             Self::H2(body) => body.size_hint(),
+            Self::Recorded(body) => body.size_hint(),
+            Self::Replayed(body) => body.size_hint(),
         }
     }
 }

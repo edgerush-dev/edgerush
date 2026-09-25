@@ -31,6 +31,8 @@ use crate::random::random;
 use crate::raw::{RawAnswer, RawHead};
 use crate::request::decide;
 use crate::request_body::{RequestBody, RequestBodyError};
+use crate::retry::budget::Budget;
+use crate::retry::replay::Tee;
 use crate::storage::Storage;
 use crate::tls::{self, Tls, TlsError};
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
@@ -45,12 +47,13 @@ use crate::upstream::h2::pool::Limits as H2Limits;
 use crate::upstream::secure::{Secure, Socket as UpstreamSocket};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use edgerush_config::{Compiled, CompiledRule, UpstreamProtocol};
+use edgerush_config::{Compiled, CompiledRetry, CompiledRule, UpstreamProtocol};
 use edgerush_router::Fields;
 use http::uri::{Authority, Scheme};
 use http::{HeaderName, Method, Request, Response, StatusCode, Uri, Version};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -318,6 +321,8 @@ pub struct Worker {
     drain: Rc<Drain>,
     /// Its HTTP/2 connections to upstreams, many requests at once on each (15 §4).
     h2: Rc<H2Client>,
+    /// Its retry budgets, by upstream slot: a worker's own, as its connections are.
+    budgets: RefCell<HashMap<usize, Budget>>,
 }
 
 /// Serves `socket`, a connection of `ours` that speaks HTTP/1, with our own server (14).
@@ -684,6 +689,7 @@ impl Worker {
             date: Cell::new(HttpDate::from_unix(unix_now())),
             drain: Rc::new(Drain::default()),
             h2: H2Client::new(h2_settings(&limits)),
+            budgets: RefCell::new(HashMap::new()),
         })
     }
 
@@ -1102,15 +1108,73 @@ impl Worker {
         let Some(admitted) = self.admit() else {
             return self.proxy.answer_to(listener, Answer::TooBusy, call).into();
         };
-        if multiplexed {
+        let retry = directed.rule.as_ref().and_then(|rule| rule.retry.as_ref());
+        let outcome = match retry {
+            // Only a rule that asks pays for keeping the body and the loop around it.
+            Some(retry) => {
+                self.with_retries(
+                    &directed, &mut head, &nominated, sending, body, admitted, interim, call, retry,
+                )
+                .await
+            }
+            None => {
+                let endpoint = Arc::clone(&directed.endpoint);
+                self.attempt(
+                    &directed, &endpoint, &head, &nominated, sending, body, admitted, interim, call,
+                )
+                .await
+            }
+        };
+        match outcome {
+            // A gRPC call's answer that is gRPC's own ends with one status, whatever becomes
+            // of it; any other answer goes on as it came, for the client to read (15 §6).
+            // Only the answer that goes to the client: one a retry set aside is not counted.
+            Ok(Answered::Map(response))
+                if call.is_some() && is_grpc_answer(response.status(), response.headers()) =>
+            {
+                let (parts, body) = response.into_parts();
+                let called = Called {
+                    proxy: Arc::clone(&self.proxy),
+                    listener,
+                };
+                let deadline = call.and_then(|call| call.deadline());
+                let answered = GrpcAnswered::counted(body, &parts.headers, deadline, called);
+                Answered::Map(Response::from_parts(parts, Body::Grpc(Box::new(answered))))
+            }
+            Ok(answered) => answered,
+            Err(answer) => self.proxy.answer_to(listener, answer, call).into(),
+        }
+    }
+
+    /// One try at an answer from `endpoint`, by the client its protocol calls for: the
+    /// upstream's answer, edited, or the reason there is none, which the caller answers
+    /// with (or tries again for).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a different thing the exchange needs, as for `through_h1`"
+    )]
+    async fn attempt<H: Forwarded>(
+        &self,
+        directed: &Directed,
+        endpoint: &Arc<ReuseIdentity>,
+        head: &H,
+        nominated: &[HeaderName],
+        sending: Sending,
+        body: RequestBody,
+        admitted: Admitted,
+        interim: Option<Interim>,
+        call: Option<Call>,
+    ) -> Result<Answered<Body>, Answer> {
+        if endpoint.protocol() == UpstreamProtocol::Http2 {
             return self
                 .respond_by_h2(
-                    listener, &directed, &head, sending, body, admitted, interim, call,
+                    directed, endpoint, head, sending, body, admitted, interim, call,
                 )
                 .await;
         }
+        let deadline = call.and_then(|call| call.deadline());
         let exchanged = self.by_ours(
-            &directed, &head, &nominated, sending, body, admitted, interim,
+            directed, endpoint, head, nominated, sending, body, admitted, interim,
         );
         let answered = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, exchanged)
@@ -1130,14 +1194,12 @@ impl Worker {
                 | Answer::BadBody
                 | Answer::BodyTimedOut
                 | Answer::DeadlineExceeded),
-            ) => {
-                return self.proxy.answer_to(listener, answer, call).into();
-            }
+            ) => return Err(answer),
             Err(answer) => {
                 if let Some(upstream) = upstream {
                     upstream.failures.inc();
                 }
-                return self.proxy.answer_to(listener, answer, call).into();
+                return Err(answer);
             }
         };
         if let Some(upstream) = upstream {
@@ -1156,12 +1218,109 @@ impl Worker {
             changes.map_or(Ok(()), |changes| answer.apply(changes))
         });
         if edited.is_err() {
-            return self.proxy.answer_to(listener, Answer::Edits, call).into();
+            return Err(Answer::Edits);
         }
         // Written in this hop's version and not the upstream's: "Intermediaries that
         // process HTTP messages ... MUST send their own HTTP-version in forwarded messages"
         // (RFC 9110 §6.2). Our writer says HTTP/1.1, and so does a map made for HTTP/2.
-        Answered::Raw(answer, body)
+        Ok(Answered::Raw(answer, body))
+    }
+
+    /// Tries, and tries again while the rule's retry says to, the budget allows and the
+    /// body was kept whole (03 §6). Each try goes to an endpoint drawn afresh; each waits
+    /// its backoff first; none goes past a gRPC call's deadline. What decides is the
+    /// answer's head alone — its status, or a gRPC status a trailers-only head carries —
+    /// so nothing of an answer has gone to the client when a request is sent again.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a different thing the exchange needs, as for `through_h1`"
+    )]
+    async fn with_retries<H: Forwarded>(
+        &self,
+        directed: &Directed,
+        head: &mut H,
+        nominated: &[HeaderName],
+        sending: Sending,
+        body: RequestBody,
+        admitted: Admitted,
+        interim: Option<Interim>,
+        call: Option<Call>,
+        retry: &CompiledRetry,
+    ) -> Result<Answered<Body>, Answer> {
+        let deadline = call.and_then(|call| call.deadline());
+        let (tee, recorded) = Tee::new(body);
+        let mut body = RequestBody::Recorded(Box::new(tee));
+        let mut admitted = admitted;
+        let mut interim = interim;
+        let mut endpoint = Arc::clone(&directed.endpoint);
+        self.budget(directed.upstream_slot, |budget| {
+            budget.deposit(Instant::now());
+        });
+        let upstream = || self.proxy.metrics.upstream(directed.upstream_slot);
+        let mut tried = 0;
+        loop {
+            let outcome = self
+                .attempt(
+                    directed,
+                    &endpoint,
+                    head,
+                    nominated,
+                    sending,
+                    body,
+                    admitted,
+                    interim.take(),
+                    call,
+                )
+                .await;
+            if tried >= retry.attempts || !wants_again(retry, &outcome) {
+                return outcome;
+            }
+            let Some(replayed) = recorded.replay() else {
+                if let Some(upstream) = upstream() {
+                    upstream.retries_unkept.inc();
+                }
+                return outcome;
+            };
+            if !self.budget(directed.upstream_slot, |budget| {
+                budget.withdraw(Instant::now())
+            }) {
+                if let Some(upstream) = upstream() {
+                    upstream.retries_over_budget.inc();
+                }
+                return outcome;
+            }
+            let wait = backoff(retry, tried);
+            if deadline.is_some_and(|deadline| Instant::now() + wait >= deadline) {
+                return outcome;
+            }
+            // A place for the next try before this one's is given back with its answer:
+            // a worker at its bound keeps the answer it has rather than lose it.
+            let Some(next) = self.admit() else {
+                return outcome;
+            };
+            let Some((target, drawn)) = directed.draw(head.uri()) else {
+                return outcome;
+            };
+            drop(outcome);
+            tokio::time::sleep(wait).await;
+            if let Some(upstream) = upstream() {
+                upstream.retries.inc();
+            }
+            head.set_uri(target);
+            endpoint = drawn;
+            body = RequestBody::Replayed(replayed);
+            admitted = next;
+            tried += 1;
+        }
+    }
+
+    /// This worker's retry budget for the upstream in `slot`, for `act` to use.
+    fn budget<T>(&self, slot: usize, act: impl FnOnce(&mut Budget) -> T) -> T {
+        let mut budgets = self.budgets.borrow_mut();
+        let budget = budgets
+            .entry(slot)
+            .or_insert_with(|| Budget::new(Instant::now()));
+        act(budget)
     }
 
     /// The answer of an HTTP/2 upstream, edited as an HTTP/1 upstream's would be: what its
@@ -1173,15 +1332,15 @@ impl Worker {
     )]
     async fn respond_by_h2<H: Forwarded>(
         &self,
-        listener: usize,
         directed: &Directed,
+        endpoint: &Arc<ReuseIdentity>,
         head: &H,
         sending: Sending,
         body: RequestBody,
         admitted: Admitted,
         interim: Option<Interim>,
         call: Option<Call>,
-    ) -> Answered<Body> {
+    ) -> Result<Answered<Body>, Answer> {
         let deadline = call.and_then(|call| call.deadline());
         let storage = Rc::clone(self.blocks.borrow().storage());
         let bounds = H2Bounds {
@@ -1193,7 +1352,7 @@ impl Worker {
         };
         let exchanging = h2_exchange::exchange(
             &self.h2,
-            &directed.endpoint,
+            endpoint,
             head.method(),
             head.uri(),
             head.outgoing(),
@@ -1212,12 +1371,7 @@ impl Worker {
         let exchanged = match deadline {
             Some(deadline) => match tokio::time::timeout_at(deadline, exchanging).await {
                 Ok(exchanged) => exchanged,
-                Err(_) => {
-                    return self
-                        .proxy
-                        .answer_to(listener, Answer::DeadlineExceeded, call)
-                        .into();
-                }
+                Err(_) => return Err(Answer::DeadlineExceeded),
             },
             None => exchanging.await,
         };
@@ -1248,7 +1402,7 @@ impl Worker {
                 {
                     upstream.failures.inc();
                 }
-                return self.proxy.answer_to(listener, answer, call).into();
+                return Err(answer);
             }
         };
         if let Some(upstream) = upstream {
@@ -1270,18 +1424,7 @@ impl Worker {
         {
             changes.apply(headers);
         }
-        // A gRPC call's answer that is gRPC's own ends with one status, whatever becomes
-        // of it; any other answer goes on as it came, for the client to read (15 §6).
-        if call.is_some() && is_grpc_answer(response.status(), response.headers()) {
-            let (parts, body) = response.into_parts();
-            let called = Called {
-                proxy: Arc::clone(&self.proxy),
-                listener,
-            };
-            let answered = GrpcAnswered::counted(body, &parts.headers, deadline, called);
-            response = Response::from_parts(parts, Body::Grpc(Box::new(answered)));
-        }
-        Answered::Map(response)
+        Ok(Answered::Map(response))
     }
 
     /// By EdgeRush's own path, the one there is.
@@ -1292,6 +1435,7 @@ impl Worker {
     async fn by_ours<H: Forwarded>(
         &self,
         directed: &Directed,
+        endpoint: &Arc<ReuseIdentity>,
         head: &H,
         nominated: &[HeaderName],
         sending: Sending,
@@ -1301,7 +1445,7 @@ impl Worker {
     ) -> Result<(RawAnswer, Body), Answer> {
         let answer = match self
             .through_h1(
-                &directed.endpoint,
+                endpoint,
                 head.method(),
                 head.uri(),
                 head.outgoing(),
@@ -1422,11 +1566,20 @@ impl Proxy {
         if let Some(counters) = self.metrics.upstream(upstream_slot) {
             counters.requests.inc();
         }
-        let has_changes = forward.rule.response_headers.is_some();
+        let kept = forward.rule.response_headers.is_some() || forward.rule.retry.is_some();
+        // Only a request that may be sent again keeps where else it could go.
+        let others = forward.rule.retry.as_ref().map(|_| {
+            endpoints
+                .iter()
+                .cloned()
+                .zip(destinations.iter().map(Arc::clone))
+                .collect()
+        });
         Ok(Directed {
-            rule: has_changes.then(|| Arc::clone(forward.rule)),
+            rule: kept.then(|| Arc::clone(forward.rule)),
             upstream_slot,
             endpoint: Arc::clone(identity),
+            others,
         })
     }
 }
@@ -1438,6 +1591,51 @@ struct Directed {
     /// The endpoint this request was directed to, taken from the same snapshot as the
     /// route so that no reload can come between the two.
     endpoint: Arc<ReuseIdentity>,
+    /// Every endpoint of the upstream, for a request its rule may send again: each try
+    /// draws afresh.
+    others: Option<Vec<(Authority, Arc<ReuseIdentity>)>>,
+}
+
+impl Directed {
+    /// An endpoint drawn afresh for another try, and the target at it.
+    fn draw(&self, target: &Uri) -> Option<(Uri, Arc<ReuseIdentity>)> {
+        let others = self.others.as_ref()?;
+        let at = pick_healthy(others.len(), random(), |at| {
+            others
+                .get(at)
+                .is_some_and(|(_, destination)| destination.is_healthy())
+        })?;
+        let (authority, destination) = others.get(at)?;
+        Some((at_endpoint(target, authority)?, Arc::clone(destination)))
+    }
+}
+
+/// Whether an outcome is one the rule's retry sends a request again for: an answer whose
+/// status it names, a gRPC call whose trailers-only head carries a status it names, or an
+/// upstream that could not be reached or answered nothing, as a `502`.
+fn wants_again(retry: &CompiledRetry, outcome: &Result<Answered<Body>, Answer>) -> bool {
+    match outcome {
+        Ok(Answered::Raw(answer, _)) => retry.on_status(answer.status().as_u16()),
+        Ok(Answered::Map(response)) => {
+            retry.on_status(response.status().as_u16())
+                || response.headers().get("grpc-status").is_some_and(|status| {
+                    retry.on_grpc(crate::grpc::status::code_of(status.as_bytes()))
+                })
+        }
+        Err(Answer::UpstreamFailed) => retry.on_status(502),
+        Err(_) => false,
+    }
+}
+
+/// The wait before try `tried + 1`: the base doubled for each try before, no more than the
+/// most, and as much again at random — linkerd's backoff, with its jitter of one.
+fn backoff(retry: &CompiledRetry, tried: u32) -> Duration {
+    let doubled = retry
+        .backoff_base
+        .saturating_mul(1 << tried.min(16))
+        .min(retry.backoff_max);
+    let jitter = (random() >> 11) as f64 / (1_u64 << 53) as f64;
+    doubled + doubled.mul_f64(jitter)
 }
 
 /// How a request's body is to be sent on.
@@ -4233,6 +4431,292 @@ upstreams:
                     scrape.contains("edgerush_upstream_retries_total{upstream=\"up\"} 1\n"),
                     "{scrape}"
                 );
+            })
+            .await;
+    }
+
+    /// A retry for `statuses` and `grpc` statuses, `attempts` times, waiting `backoff_ms`
+    /// at first and at most.
+    fn retrying(
+        attempts: u32,
+        statuses: &[u16],
+        grpc: &[&str],
+        backoff_ms: u64,
+    ) -> edgerush_config::Retry {
+        edgerush_config::Retry {
+            attempts,
+            http_statuses: statuses.to_vec(),
+            grpc_statuses: grpc.iter().map(|&name| name.to_owned()).collect(),
+            backoff_base_ms: backoff_ms,
+            backoff_max_ms: backoff_ms,
+        }
+    }
+
+    /// A worker whose one rule retries as `retry` says, to `up` at `upstream` in `protocol`.
+    async fn serving_retrying_worker(
+        upstream: SocketAddr,
+        protocol: UpstreamProtocol,
+        retry: edgerush_config::Retry,
+    ) -> (SocketAddr, Rc<Worker>) {
+        let mut config = everything_config(upstream);
+        config.upstreams.get_mut("up").unwrap().protocol = protocol;
+        config.routes[0].rules[0].retry = Some(retry);
+        let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+        let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        (front, worker)
+    }
+
+    /// An HTTP/1 upstream answering its requests with `statuses` in turn, the last of them
+    /// from then on, one request to a connection; and the bodies it was sent.
+    async fn statuses_upstream(statuses: Vec<u16>) -> (SocketAddr, Rc<RefCell<Vec<Vec<u8>>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let bodies = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&bodies);
+        let _accepting = tokio::task::spawn_local(async move {
+            while let Ok((mut stream, _)) = socket.accept().await {
+                let mut read = Vec::new();
+                let mut chunk = [0; 16 * 1024];
+                let head_end = loop {
+                    if let Some(at) = read.windows(4).position(|four| four == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => read.extend_from_slice(&chunk[..n]),
+                    }
+                };
+                let head = String::from_utf8_lossy(&read[..head_end]).to_lowercase();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .map_or(0, |length| length.trim().parse().unwrap());
+                while read.len() < head_end + length {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => read.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let turn = seen.borrow().len();
+                seen.borrow_mut().push(read[head_end..].to_vec());
+                let status = statuses[turn.min(statuses.len() - 1)];
+                let answer = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+                );
+                let _ = stream.write_all(answer.as_bytes()).await;
+            }
+        });
+        (address, bodies)
+    }
+
+    const POSTING_HI: &[u8] =
+        b"POST / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\ncontent-length: 2\r\n\r\nhi";
+
+    /// A request whose answer's status the rule names is sent again, body and all, to the
+    /// answer after it; one whose status it does not name, or with no tries left, is not.
+    #[tokio::test]
+    async fn a_rule_sends_a_request_again_for_a_status_it_names() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let retry = retrying(2, &[503], &[], 1);
+                let (upstream, bodies) = statuses_upstream(vec![503, 200]).await;
+                let (front, worker) =
+                    serving_retrying_worker(upstream, UpstreamProtocol::Http1, retry.clone()).await;
+                let answer = h1_answer(front, POSTING_HI).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+                assert_eq!(*bodies.borrow(), vec![b"hi".to_vec(), b"hi".to_vec()]);
+                let scrape = worker.proxy().metrics();
+                assert!(
+                    scrape.contains("edgerush_upstream_retries_total{upstream=\"up\"} 1\n"),
+                    "{scrape}"
+                );
+
+                // A status it does not name goes to the client as it came.
+                let (upstream, bodies) = statuses_upstream(vec![500, 200]).await;
+                let (front, _worker) =
+                    serving_retrying_worker(upstream, UpstreamProtocol::Http1, retry.clone()).await;
+                let answer = h1_answer(front, POSTING_HI).await;
+                assert!(answer.starts_with("HTTP/1.1 500 "), "{answer}");
+                assert_eq!(bodies.borrow().len(), 1);
+
+                // Out of tries: the last answer is the client's.
+                let (upstream, bodies) = statuses_upstream(vec![503]).await;
+                let (front, _worker) =
+                    serving_retrying_worker(upstream, UpstreamProtocol::Http1, retry).await;
+                let answer = h1_answer(front, POSTING_HI).await;
+                assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
+                assert_eq!(bodies.borrow().len(), 3);
+            })
+            .await;
+    }
+
+    /// An upstream that could not be reached counts as a `502` for a rule that names it.
+    #[tokio::test]
+    async fn an_unreachable_upstream_is_retried_as_a_502() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (_refusing, upstream) = refusing();
+                let (front, worker) = serving_retrying_worker(
+                    upstream,
+                    UpstreamProtocol::Http1,
+                    retrying(2, &[502], &[], 1),
+                )
+                .await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
+                let scrape = worker.proxy().metrics();
+                assert!(
+                    scrape.contains("edgerush_upstream_retries_total{upstream=\"up\"} 2\n"),
+                    "{scrape}"
+                );
+            })
+            .await;
+    }
+
+    /// A body past what is kept goes on as it came, and is not sent again.
+    #[tokio::test]
+    async fn a_body_too_big_to_keep_is_not_sent_again() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, bodies) = statuses_upstream(vec![503, 200]).await;
+                let (front, worker) = serving_retrying_worker(
+                    upstream,
+                    UpstreamProtocol::Http1,
+                    retrying(2, &[503], &[], 1),
+                )
+                .await;
+                let size = crate::retry::replay::MOST + 1;
+                let mut request = format!(
+                    "POST / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\ncontent-length: {size}\r\n\r\n"
+                )
+                .into_bytes();
+                request.resize(request.len() + size, b'x');
+                let answer = h1_answer(front, &request).await;
+                assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
+                assert_eq!(bodies.borrow().len(), 1);
+                assert_eq!(bodies.borrow()[0].len(), size);
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_upstream_retries_refused_total{upstream=\"up\",reason=\"body\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+            })
+            .await;
+    }
+
+    /// Retries stop when the upstream's budget is spent: its reserve of 100 and a fifth of
+    /// its requests, each retry costing five. Request `n` finds `505 - 4n` left, so the
+    /// 126th of an upstream that always fails is the first not sent again.
+    #[tokio::test]
+    async fn retries_stop_when_the_budget_is_spent() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, bodies) = statuses_upstream(vec![503]).await;
+                let (front, worker) = serving_retrying_worker(
+                    upstream,
+                    UpstreamProtocol::Http1,
+                    retrying(1, &[503], &[], 1),
+                )
+                .await;
+                for _ in 0..126 {
+                    let answer = h1_answer(front, CLOSING_GET).await;
+                    assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
+                }
+                assert_eq!(bodies.borrow().len(), 125 * 2 + 1);
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_upstream_retries_refused_total{upstream=\"up\",reason=\"budget\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+            })
+            .await;
+    }
+
+    /// A gRPC call whose trailers-only answer carries a status the rule names is sent
+    /// again, and only the answer the client gets is counted. A status in trailers after
+    /// a head is not retried — the head has gone to the client — and nor is a call whose
+    /// deadline comes before its backoff would end.
+    #[tokio::test]
+    async fn a_grpc_call_is_sent_again_for_a_status_in_its_head() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let asked = Rc::new(Cell::new(0_usize));
+                let asking = Rc::clone(&asked);
+                let script: Script = Rc::new(move |request, mut respond| {
+                    let asking = Rc::clone(&asking);
+                    Box::pin(async move {
+                        asking.set(asking.get() + 1);
+                        let mut unavailable = http::HeaderMap::new();
+                        unavailable.insert("grpc-status", "14".parse().unwrap());
+                        if request.uri().path() == "/pkg.Svc/Late" {
+                            let mut stream = respond.send_response(grpc_head(), false).unwrap();
+                            let _ = stream.send_trailers(unavailable);
+                            return;
+                        }
+                        let first = asking.get() % 2 == 1;
+                        let mut head = grpc_head();
+                        let code = if first { "14" } else { "0" };
+                        head.headers_mut()
+                            .insert("grpc-status", code.parse().unwrap());
+                        let _ = respond.send_response(head, true);
+                    })
+                });
+                let upstream = scripted_h2_upstream(script).await;
+                let (front, worker) = serving_retrying_worker(
+                    upstream,
+                    UpstreamProtocol::Http2,
+                    retrying(2, &[], &["UNAVAILABLE"], 1),
+                )
+                .await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let (answer, _) = send
+                    .send_request(grpc_call("/pkg.Svc/Do", None), true)
+                    .unwrap();
+                assert_eq!(
+                    grpc_outcome(answer).await,
+                    (StatusCode::OK, "0".to_owned(), true)
+                );
+                assert_eq!(asked.get(), 2);
+                let scrape = worker.proxy().metrics();
+                assert!(
+                    !scrape.contains("status=\"UNAVAILABLE\"} 1"),
+                    "a call set aside was counted: {scrape}"
+                );
+                let line = "edgerush_listener_grpc_calls_total{listener=\"web\",status=\"OK\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+
+                asked.set(0);
+                let (answer, _) = send
+                    .send_request(grpc_call("/pkg.Svc/Late", None), true)
+                    .unwrap();
+                assert_eq!(
+                    grpc_outcome(answer).await,
+                    (StatusCode::OK, "14".to_owned(), false)
+                );
+                assert_eq!(asked.get(), 1);
+
+                // A backoff past the deadline: the answer there is, at once.
+                let (front, _worker) = serving_retrying_worker(
+                    upstream,
+                    UpstreamProtocol::Http2,
+                    retrying(2, &[], &["UNAVAILABLE"], 60_000),
+                )
+                .await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                asked.set(0);
+                let (answer, _) = send
+                    .send_request(grpc_call("/pkg.Svc/Do", Some("5S")), true)
+                    .unwrap();
+                assert_eq!(
+                    grpc_outcome(answer).await,
+                    (StatusCode::OK, "14".to_owned(), true)
+                );
+                assert_eq!(asked.get(), 1);
             })
             .await;
     }

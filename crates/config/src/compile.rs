@@ -83,6 +83,98 @@ pub struct CompiledRule {
     pub response_headers: Option<HeaderModifier>,
     /// Where they go.
     pub backends: WeightedBackends,
+    /// When a request is sent again, if ever.
+    pub retry: Option<CompiledRetry>,
+}
+
+/// A rule's retries, checked and in the form an answer is compared with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledRetry {
+    /// Times a request may be sent again, beyond the first.
+    pub attempts: u32,
+    /// HTTP statuses that send it again.
+    pub http_statuses: Vec<u16>,
+    /// gRPC statuses that send a call again, one bit for each by its number.
+    pub grpc_statuses: u32,
+    /// The wait before the first retry.
+    pub backoff_base: std::time::Duration,
+    /// The most a wait may double to.
+    pub backoff_max: std::time::Duration,
+}
+
+impl CompiledRetry {
+    /// Whether an answer with this HTTP status is one to send the request again for.
+    #[must_use]
+    pub fn on_status(&self, status: u16) -> bool {
+        self.http_statuses.contains(&status)
+    }
+
+    /// Whether a call ended with this gRPC status, by number, is one to send again.
+    #[must_use]
+    pub fn on_grpc(&self, code: usize) -> bool {
+        code < 32 && self.grpc_statuses & (1 << code) != 0
+    }
+}
+
+/// gRPC's names for its codes, by number.
+const GRPC_CODES: [&str; 17] = [
+    "OK",
+    "CANCELLED",
+    "UNKNOWN",
+    "INVALID_ARGUMENT",
+    "DEADLINE_EXCEEDED",
+    "NOT_FOUND",
+    "ALREADY_EXISTS",
+    "PERMISSION_DENIED",
+    "RESOURCE_EXHAUSTED",
+    "FAILED_PRECONDITION",
+    "ABORTED",
+    "OUT_OF_RANGE",
+    "UNIMPLEMENTED",
+    "INTERNAL",
+    "UNAVAILABLE",
+    "DATA_LOSS",
+    "UNAUTHENTICATED",
+];
+
+/// The most times a request may be sent again: beyond it a retry policy is a load
+/// multiplier more than a remedy.
+const MOST_ATTEMPTS: u32 = 5;
+
+fn retry(rule: &Rule, place: &Place, errors: &mut Vec<ConfigError>) -> Option<CompiledRetry> {
+    let retry = rule.retry.as_ref()?;
+    let mut problems = Vec::new();
+    if retry.attempts == 0 || retry.attempts > MOST_ATTEMPTS {
+        problems.push(Problem::RetryAttempts(retry.attempts));
+    }
+    if retry.http_statuses.is_empty() && retry.grpc_statuses.is_empty() {
+        problems.push(Problem::RetryOnNothing);
+    }
+    for status in &retry.http_statuses {
+        // An answer that succeeded, or one still to come, is nothing to try again for.
+        if !(400..=599).contains(status) {
+            problems.push(Problem::RetryStatus(*status));
+        }
+    }
+    let mut grpc = 0_u32;
+    for name in &retry.grpc_statuses {
+        match GRPC_CODES.iter().position(|code| code == name) {
+            Some(0) | None => problems.push(Problem::RetryGrpcStatus(name.clone())),
+            Some(code) => grpc |= 1 << code,
+        }
+    }
+    if retry.backoff_base_ms == 0 || retry.backoff_base_ms > retry.backoff_max_ms {
+        problems.push(Problem::RetryBackoff);
+    }
+    let compiled = problems.is_empty().then(|| CompiledRetry {
+        attempts: retry.attempts,
+        http_statuses: retry.http_statuses.clone(),
+        grpc_statuses: grpc,
+        backoff_base: std::time::Duration::from_millis(retry.backoff_base_ms),
+        backoff_max: std::time::Duration::from_millis(retry.backoff_max_ms),
+    });
+    errors.extend(problems.into_iter().map(|problem| place.problem(problem)));
+    compiled
 }
 
 /// An upstream, with the name it had in the config for logs and metrics.
@@ -257,6 +349,7 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                 request_headers,
                 response_headers,
                 backends: backends(rule, &upstream_ids, &place, &mut errors),
+                retry: retry(rule, &place, &mut errors),
             }));
         }
         rules.push(compiled_rules);
@@ -703,6 +796,21 @@ pub enum Problem {
     /// An HTTP probe of something that is not a path.
     #[error("health check path `{0}` does not start with `/`")]
     HealthCheckPath(String),
+    /// A retry count of nothing, or more than a retry is worth.
+    #[error("`retry.attempts` is {0}: from 1 to 5")]
+    RetryAttempts(u32),
+    /// A retry for no answer at all.
+    #[error("`retry` names no status to send a request again for")]
+    RetryOnNothing,
+    /// A retry for an HTTP status that is not a failure.
+    #[error("`retry` on status {0}: only 4xx and 5xx")]
+    RetryStatus(u16),
+    /// A retry for a gRPC status that is not one, or is success.
+    #[error("`retry` on gRPC status `{0}`: not one of gRPC's failures")]
+    RetryGrpcStatus(String),
+    /// A backoff of nothing, or one whose most is less than its first.
+    #[error("`retry` needs a backoff of at least a millisecond, no more than its most")]
+    RetryBackoff,
     /// A gRPC probe of an upstream not spoken to in HTTP/2.
     #[error("a gRPC health check is for an upstream spoken to in HTTP/2")]
     GrpcCheckNeedsHttp2,
@@ -1468,6 +1576,74 @@ upstreams: { u: { endpoints: [] } }
         let missing = "{ endpoints: [], health_check: { interval_seconds: 5, timeout_seconds: 2, probe: { http: { path: / } } } }";
         let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{ u: {missing} }}\n");
         assert!(serde_saphyr::from_str::<Config>(&yaml).is_err());
+    }
+
+    /// A rule's retries say when and how often, and nothing that could not work.
+    #[test]
+    fn a_retry_says_when_and_how_often_and_nothing_that_cannot_work() {
+        let with = |retry: &str| {
+            let yaml = format!(
+                r#"
+listeners: {{ web: {{ address: "[::]:80", protocol: http }} }}
+routes:
+  - name: r
+    listeners: [web]
+    hostnames: [{{ name: "*", falls_through: true }}]
+    rules: [{{ matches: [{{ path: {{ prefix: / }} }}], backends: [{{ upstream: u, weight: 1 }}], retry: {retry} }}]
+upstreams: {{ u: {{ endpoints: [] }} }}
+"#
+            );
+            compile(&config(&yaml))
+                .map(|compiled| {
+                    compiled
+                        .rule(RuleId { route: 0, rule: 0 })
+                        .unwrap()
+                        .retry
+                        .clone()
+                })
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let retry = with("{ attempts: 2, http_statuses: [502, 503], grpc_statuses: [UNAVAILABLE], backoff_base_ms: 25, backoff_max_ms: 250 }")
+            .unwrap()
+            .unwrap();
+        assert!(retry.on_status(503) && !retry.on_status(500));
+        assert!(retry.on_grpc(14) && !retry.on_grpc(13) && !retry.on_grpc(99));
+        assert_eq!(retry.backoff_base, std::time::Duration::from_millis(25));
+
+        let problems = |retry: &str| with(retry).unwrap_err();
+        let base = "backoff_base_ms: 25, backoff_max_ms: 250";
+        assert!(
+            problems(&format!("{{ attempts: 0, http_statuses: [503], {base} }}"))[0]
+                .ends_with("`retry.attempts` is 0: from 1 to 5")
+        );
+        assert!(
+            problems(&format!("{{ attempts: 6, http_statuses: [503], {base} }}"))[0]
+                .contains("from 1 to 5")
+        );
+        assert!(
+            problems(&format!("{{ attempts: 1, {base} }}"))[0]
+                .ends_with("names no status to send a request again for")
+        );
+        assert!(
+            problems(&format!("{{ attempts: 1, http_statuses: [200], {base} }}"))[0]
+                .ends_with("only 4xx and 5xx")
+        );
+        assert!(
+            problems(&format!("{{ attempts: 1, grpc_statuses: [OK], {base} }}"))[0]
+                .contains("`OK`")
+        );
+        assert!(
+            problems(&format!(
+                "{{ attempts: 1, grpc_statuses: [unavailable], {base} }}"
+            ))[0]
+                .contains("`unavailable`")
+        );
+        assert!(
+            problems(
+                "{ attempts: 1, http_statuses: [503], backoff_base_ms: 300, backoff_max_ms: 250 }"
+            )[0]
+            .ends_with("no more than its most")
+        );
     }
 
     /// A private key is never printed, whatever prints the config.

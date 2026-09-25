@@ -329,8 +329,13 @@ pub(crate) struct UpstreamCounters {
     /// the status has been counted and the client has been told
     /// ([13 §7](../../docs/13-http1-upstream.md)).
     pub(crate) body_failures: Counter,
-    /// Requests sent again because the upstream showed it never processed them (15 §6).
+    /// Requests sent again: because the upstream showed it never processed them (15 §6),
+    /// or because a rule's retry said to (03 §6).
     pub(crate) retries: Counter,
+    /// Retries a rule's retry wanted that the budget did not allow.
+    pub(crate) retries_over_budget: Counter,
+    /// Retries a rule's retry wanted for a body not kept whole.
+    pub(crate) retries_unkept: Counter,
 }
 
 impl UpstreamCounters {
@@ -618,11 +623,21 @@ impl Metrics {
         }
 
         let name = "edgerush_upstream_retries_total";
-        let help = "Requests sent again because the upstream showed it never processed them.";
+        let help = "Requests sent again: never processed by the upstream, or a rule's retry.";
         scrape.family(name, Kind::Counter, help);
         for (upstream, series) in upstreams() {
             let labels = [("upstream", upstream)];
             scrape.sample(name, &labels, series.sum(|shard| shard.retries.get()));
+        }
+
+        let name = "edgerush_upstream_retries_refused_total";
+        let help = "Retries a rule's retry wanted and did not get, by why.";
+        scrape.family(name, Kind::Counter, help);
+        for (upstream, series) in upstreams() {
+            let over = series.sum(|shard| shard.retries_over_budget.get());
+            scrape.sample(name, &[("upstream", upstream), ("reason", "budget")], over);
+            let unkept = series.sum(|shard| shard.retries_unkept.get());
+            scrape.sample(name, &[("upstream", upstream), ("reason", "body")], unkept);
         }
 
         let name = "edgerush_upstream_healthy_endpoints";
