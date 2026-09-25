@@ -37,6 +37,7 @@ pub mod host;
 mod interim;
 mod linger;
 mod metrics;
+mod mirror;
 mod random;
 // Private, save when the fuzz targets and benchmarks are being built.
 #[cfg(feature = "fuzzing")]

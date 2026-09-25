@@ -27,6 +27,7 @@ use crate::head::Forwarded;
 use crate::interim::Interim;
 use crate::linger::{self, Lent, linger};
 use crate::metrics::{Answer, Metrics, Socket, Stopped};
+use crate::mirror;
 use crate::random::random;
 use crate::raw::{RawAnswer, RawHead};
 use crate::request::decide;
@@ -50,7 +51,9 @@ use bytes::Bytes;
 use edgerush_config::{Compiled, CompiledRetry, CompiledRule, UpstreamProtocol};
 use edgerush_router::Fields;
 use http::uri::{Authority, Scheme};
-use http::{HeaderName, Method, Request, Response, StatusCode, Uri, Version};
+use http::{
+    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
+};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -59,7 +62,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::{Pin, pin};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
@@ -323,6 +326,8 @@ pub struct Worker {
     h2: Rc<H2Client>,
     /// Its retry budgets, by upstream slot: a worker's own, as its connections are.
     budgets: RefCell<HashMap<usize, Budget>>,
+    /// Itself, for the tasks that send a mirror's copies to hold on to.
+    me: Weak<Worker>,
 }
 
 /// Serves `socket`, a connection of `ours` that speaks HTTP/1, with our own server (14).
@@ -676,7 +681,7 @@ impl Worker {
 
     /// The same, holding client connections to `deadlines`.
     fn with_deadlines(proxy: Arc<Proxy>, limits: H1Limits, deadlines: Deadlines) -> Rc<Self> {
-        Rc::new(Self {
+        Rc::new_cyclic(|me| Self {
             proxy,
             pool: Rc::new(RefCell::new(Pool::default())),
             blocks: Rc::new(RefCell::new(Blocks::new(
@@ -690,6 +695,7 @@ impl Worker {
             drain: Rc::new(Drain::default()),
             h2: H2Client::new(h2_settings(&limits)),
             budgets: RefCell::new(HashMap::new()),
+            me: Weak::clone(me),
         })
     }
 
@@ -1068,7 +1074,7 @@ impl Worker {
         // from and everything it named looks like an ordinary field, so a trailer of that
         // name would travel on ([13 §4](../../docs/13-http1-upstream.md)).
         let nominated = crate::hop_by_hop::nominated(head.outgoing());
-        let directed = match self.proxy.direct(listener, &mut head) {
+        let mut directed = match self.proxy.direct(listener, &mut head) {
             Ok(directed) => directed,
             Err(answer) => return self.proxy.answer_to(listener, answer, call).into(),
         };
@@ -1107,6 +1113,12 @@ impl Worker {
         // the same work ([14 §2](../../docs/14-downstream-server.md)).
         let Some(admitted) = self.admit() else {
             return self.proxy.answer_to(listener, Answer::TooBusy, call).into();
+        };
+        let body = if directed.mirrors.is_empty() {
+            body
+        } else {
+            let mirrors = std::mem::take(&mut directed.mirrors);
+            self.mirror(mirrors, &head, &nominated, sending, body)
         };
         let retry = directed.rule.as_ref().and_then(|rule| rule.retry.as_ref());
         let outcome = match retry {
@@ -1312,6 +1324,112 @@ impl Worker {
             admitted = next;
             tried += 1;
         }
+    }
+
+    /// Sends a copy of the request to each of `mirrors`, each its own exchange on a task
+    /// of its own that nothing waits for, and gives back the body the request is to be
+    /// sent with, which copies itself to them as it goes (03 §6). Each copy takes a place
+    /// as any exchange does; a worker without one to give sends none. Its answer is read
+    /// and thrown away.
+    fn mirror<H: Forwarded>(
+        &self,
+        mirrors: Vec<Mirrored>,
+        head: &H,
+        nominated: &[HeaderName],
+        sending: Sending,
+        body: RequestBody,
+    ) -> RequestBody {
+        let given_up = |slot: usize,
+                        counter: fn(
+            &crate::metrics::UpstreamCounters,
+        ) -> &edgerush_telemetry::Counter| {
+            if let Some(upstream) = self.proxy.metrics.upstream(slot) {
+                counter(upstream).inc();
+            }
+        };
+        // Credentials bound to the client's connection are not the mirror's to use, and
+        // without them the copy would not be the request.
+        if crate::upstream::auth::carries_credentials(head.outgoing()) {
+            for mirror in &mirrors {
+                given_up(mirror.upstream_slot, |counters| {
+                    &counters.mirrors_credentials
+                });
+            }
+            return body;
+        }
+        let Some(worker) = self.me.upgrade() else {
+            return body;
+        };
+        let placed: Vec<_> = mirrors
+            .into_iter()
+            .filter_map(|mirror| match self.admit() {
+                Some(admitted) => Some((mirror, admitted)),
+                None => {
+                    given_up(mirror.upstream_slot, |counters| &counters.mirrors_busy);
+                    None
+                }
+            })
+            .collect();
+        if placed.is_empty() {
+            return body;
+        }
+        let mut headers = HeaderMap::new();
+        head.outgoing().each_field(|name, value| {
+            if let (Ok(name), Ok(value)) =
+                (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+            {
+                headers.append(name, value);
+            }
+        });
+        // Nobody is there to be told to go on: a copy is sent without asking.
+        headers.remove(http::header::EXPECT);
+        let (tee, copies) = mirror::Tee::new(body, placed.len());
+        for ((mirror, admitted), (copy, kept)) in placed.into_iter().zip(copies) {
+            let (mut parts, ()) = Request::new(()).into_parts();
+            parts.method = head.method().clone();
+            parts.uri = mirror.target;
+            parts.headers = headers.clone();
+            let nominated = nominated.to_vec();
+            let worker = Rc::clone(&worker);
+            let _copying = tokio::task::spawn_local(async move {
+                let directed = Directed {
+                    rule: None,
+                    upstream_slot: mirror.upstream_slot,
+                    endpoint: Arc::clone(&mirror.endpoint),
+                    others: None,
+                    mirrors: Vec::new(),
+                };
+                let answered = worker
+                    .attempt(
+                        &directed,
+                        &mirror.endpoint,
+                        &parts,
+                        &nominated,
+                        sending,
+                        RequestBody::Copy(copy),
+                        admitted,
+                        None,
+                        None,
+                    )
+                    .await;
+                // Read to its end, so that its connection can carry another request.
+                let mut body = match answered {
+                    Ok(Answered::Raw(_, body)) => body,
+                    Ok(Answered::Map(response)) => response.into_body(),
+                    Err(_) => Body::Empty,
+                };
+                while let Some(Ok(_)) =
+                    std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+                {
+                }
+                if kept.fell_behind()
+                    && let Some(upstream) = worker.proxy.metrics.upstream(mirror.upstream_slot)
+                {
+                    upstream.mirrors_behind.inc();
+                }
+            });
+        }
+        RequestBody::Mirrored(Box::new(tee))
     }
 
     /// This worker's retry budget for the upstream in `slot`, for `act` to use.
@@ -1566,6 +1684,41 @@ impl Proxy {
         if let Some(counters) = self.metrics.upstream(upstream_slot) {
             counters.requests.inc();
         }
+        let mut mirrors = Vec::new();
+        for mirror in &forward.rule.mirrors {
+            if !mirror.takes(random()) {
+                continue;
+            }
+            let upstream = mirror.upstream.0;
+            let Some(&slot) = snapshot.upstream_slots.get(upstream) else {
+                continue;
+            };
+            let destinations = snapshot.destinations.of(upstream);
+            let found = pick_healthy(destinations.len(), random(), |at| {
+                destinations
+                    .get(at)
+                    .is_some_and(|destination| destination.is_healthy())
+            })
+            .and_then(|at| {
+                let authority = snapshot.endpoints.get(upstream)?.get(at)?;
+                Some((at_endpoint(head.uri(), authority)?, destinations.get(at)?))
+            });
+            let counters = self.metrics.upstream(slot);
+            let Some((target, destination)) = found else {
+                if let Some(counters) = counters {
+                    counters.mirrors_nowhere.inc();
+                }
+                continue;
+            };
+            if let Some(counters) = counters {
+                counters.requests.inc();
+            }
+            mirrors.push(Mirrored {
+                upstream_slot: slot,
+                endpoint: Arc::clone(destination),
+                target,
+            });
+        }
         let kept = forward.rule.response_headers.is_some() || forward.rule.retry.is_some();
         // Only a request that may be sent again keeps where else it could go.
         let others = forward.rule.retry.as_ref().map(|_| {
@@ -1580,6 +1733,7 @@ impl Proxy {
             upstream_slot,
             endpoint: Arc::clone(identity),
             others,
+            mirrors,
         })
     }
 }
@@ -1594,6 +1748,15 @@ struct Directed {
     /// Every endpoint of the upstream, for a request its rule may send again: each try
     /// draws afresh.
     others: Option<Vec<(Authority, Arc<ReuseIdentity>)>>,
+    /// Where the copies of it go, for a request its rule mirrors.
+    mirrors: Vec<Mirrored>,
+}
+
+/// Where one copy of a request goes: drawn with the request, from the same snapshot.
+struct Mirrored {
+    upstream_slot: usize,
+    endpoint: Arc<ReuseIdentity>,
+    target: Uri,
 }
 
 impl Directed {
@@ -4717,6 +4880,178 @@ upstreams:
                     (StatusCode::OK, "14".to_owned(), true)
                 );
                 assert_eq!(asked.get(), 1);
+            })
+            .await;
+    }
+
+    /// A worker whose one rule goes to `up` at `primary` and mirrors every request to each
+    /// of `mirrors`: a name, where it is (nowhere, if not given) and what it speaks.
+    async fn serving_mirroring_worker(
+        primary: SocketAddr,
+        mirrors: &[(&str, Option<SocketAddr>, UpstreamProtocol)],
+    ) -> (SocketAddr, Rc<Worker>) {
+        let mut config = everything_config(primary);
+        for &(name, at, protocol) in mirrors {
+            let mut upstream = config.upstreams["up"].clone();
+            upstream.endpoints = at.into_iter().collect();
+            upstream.protocol = protocol;
+            config.upstreams.insert(name.to_owned(), upstream);
+            config.routes[0].rules[0]
+                .filters
+                .push(edgerush_config::Filter::RequestMirror(
+                    edgerush_config::Mirror {
+                        upstream: name.to_owned(),
+                        fraction: edgerush_config::Fraction {
+                            numerator: 1,
+                            denominator: 1,
+                        },
+                    },
+                ));
+        }
+        let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+        let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        (front, worker)
+    }
+
+    /// An HTTP/2 upstream that takes every request and reads none of its body: a mirror
+    /// that stops keeping up once its stream window is spent. What it was asked for, by
+    /// path.
+    async fn unread_h2_upstream() -> (SocketAddr, Rc<RefCell<Vec<String>>>) {
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let asking = Rc::clone(&asked);
+        let script: Script = Rc::new(move |request, _respond| {
+            asking.borrow_mut().push(request.uri().path().to_owned());
+            Box::pin(async move {
+                // Held, body unread, until the connection goes.
+                let _held = request;
+                std::future::pending::<()>().await;
+            })
+        });
+        (scripted_h2_upstream(script).await, asked)
+    }
+
+    /// Every mirror gets a copy of the request, body and all, in the protocol it speaks,
+    /// and its answer goes nowhere: the client gets the request's own.
+    #[tokio::test]
+    async fn a_mirror_gets_a_copy_and_the_client_the_answer_of_the_request() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (primary, sent) = statuses_upstream(vec![200]).await;
+                let (shadow, copied) = statuses_upstream(vec![500]).await;
+                let seen = Rc::new(RefCell::new(Vec::new()));
+                let seeing = Rc::clone(&seen);
+                let script: Script = Rc::new(move |request, mut respond| {
+                    let seeing = Rc::clone(&seeing);
+                    Box::pin(async move {
+                        let path = request.uri().path().to_owned();
+                        let mut body = request.into_body();
+                        let mut all = Vec::new();
+                        while let Some(Ok(chunk)) = body.data().await {
+                            let _ = body.flow_control().release_capacity(chunk.len());
+                            all.extend_from_slice(&chunk);
+                        }
+                        seeing.borrow_mut().push((path, all));
+                        let answer = Response::builder().status(503).body(()).unwrap();
+                        let _ = respond.send_response(answer, true);
+                    })
+                });
+                let shadow_h2 = scripted_h2_upstream(script).await;
+                let (front, worker) = serving_mirroring_worker(
+                    primary,
+                    &[
+                        ("shadow", Some(shadow), UpstreamProtocol::Http1),
+                        ("shadow-h2", Some(shadow_h2), UpstreamProtocol::Http2),
+                    ],
+                )
+                .await;
+                let request =
+                    b"POST /copied?q=1 HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\ncontent-length: 2\r\n\r\nhi";
+                let answer = h1_answer(front, request).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+                assert_eq!(*sent.borrow(), vec![b"hi".to_vec()]);
+                until(|| copied.borrow().len() == 1 && seen.borrow().len() == 1).await;
+                assert_eq!(*copied.borrow(), vec![b"hi".to_vec()]);
+                assert_eq!(
+                    *seen.borrow(),
+                    vec![("/copied".to_owned(), b"hi".to_vec())]
+                );
+                // Each mirror is an upstream like any other, counted as one.
+                let scrape = worker.proxy().metrics();
+                for name in ["shadow", "shadow-h2"] {
+                    let line = format!("edgerush_upstream_requests_total{{upstream=\"{name}\"}} 1\n");
+                    assert!(scrape.contains(&line), "{scrape}");
+                }
+            })
+            .await;
+    }
+
+    /// A mirror that stops reading is given up on once it is too far behind; the request
+    /// goes on at its own upstream's pace, whole.
+    #[tokio::test]
+    async fn a_mirror_that_stops_reading_never_holds_the_request_up() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (primary, sent) = statuses_upstream(vec![200]).await;
+                let (shadow, asked) = unread_h2_upstream().await;
+                let (front, worker) = serving_mirroring_worker(
+                    primary,
+                    &[("shadow", Some(shadow), UpstreamProtocol::Http2)],
+                )
+                .await;
+                let size = 1 << 20;
+                let mut request = format!(
+                    "POST / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\ncontent-length: {size}\r\n\r\n"
+                )
+                .into_bytes();
+                request.resize(request.len() + size, b'x');
+                let answer = h1_answer(front, &request).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+                assert_eq!(sent.borrow()[0].len(), size);
+                assert_eq!(asked.borrow().len(), 1, "the mirror was not sent a copy");
+                let line = "edgerush_upstream_mirrors_given_up_total{upstream=\"shadow\",reason=\"behind\"} 1\n";
+                until(|| worker.proxy().metrics().contains(line)).await;
+            })
+            .await;
+    }
+
+    /// A copy that cannot go is counted by why, and the request goes as it would have:
+    /// a mirror with no endpoint, and a request with credentials bound to its client's
+    /// connection.
+    #[tokio::test]
+    async fn a_copy_that_cannot_go_is_counted_and_the_request_goes_anyway() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (primary, sent) = statuses_upstream(vec![200]).await;
+                let (shadow, copied) = statuses_upstream(vec![200]).await;
+                let (front, worker) = serving_mirroring_worker(
+                    primary,
+                    &[
+                        ("nowhere", None, UpstreamProtocol::Http1),
+                        ("shadow", Some(shadow), UpstreamProtocol::Http1),
+                    ],
+                )
+                .await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+                until(|| copied.borrow().len() == 1).await;
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_upstream_mirrors_given_up_total{upstream=\"nowhere\",reason=\"nowhere\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+
+                let bound = b"GET / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\nauthorization: Negotiate abc\r\n\r\n";
+                let answer = h1_answer(front, bound).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+                assert_eq!(sent.borrow().len(), 2);
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_upstream_mirrors_given_up_total{upstream=\"shadow\",reason=\"credentials\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+                assert_eq!(copied.borrow().len(), 1, "credentials went to a mirror");
             })
             .await;
     }

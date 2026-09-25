@@ -123,7 +123,7 @@ pub(crate) struct Replayed {
 impl Replayed {
     /// A body of these frames, as though kept: for tests.
     #[cfg(test)]
-    fn of(frames: Vec<Frame<Bytes>>) -> Self {
+    pub(crate) fn of(frames: Vec<Frame<Bytes>>) -> Self {
         Self {
             frames: frames
                 .into_iter()

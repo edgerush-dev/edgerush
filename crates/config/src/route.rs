@@ -93,6 +93,30 @@ pub enum Filter {
     RequestHeaderModifier(HeaderChanges),
     /// Changes the headers of the response before it goes to the client.
     ResponseHeaderModifier(HeaderChanges),
+    /// Sends a copy of the request to another upstream too, and throws its answer away.
+    RequestMirror(Mirror),
+}
+
+/// A copy of some share of a rule's requests, sent to another upstream (Gateway API's
+/// `RequestMirror`). The copy never holds the request up: one that falls behind is given
+/// up on.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mirror {
+    /// Where the copies go.
+    pub upstream: String,
+    /// The share of requests copied: every one is `{ numerator: 1, denominator: 1 }`.
+    pub fraction: Fraction,
+}
+
+/// A share: `numerator` out of every `denominator`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fraction {
+    /// How many.
+    pub numerator: u32,
+    /// Out of how many.
+    pub denominator: u32,
 }
 
 /// Changes to headers. A header may be named once, in one of the three.

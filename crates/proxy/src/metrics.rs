@@ -336,6 +336,13 @@ pub(crate) struct UpstreamCounters {
     pub(crate) retries_over_budget: Counter,
     /// Retries a rule's retry wanted for a body not kept whole.
     pub(crate) retries_unkept: Counter,
+    /// Copies a mirror to this upstream did not get, by why: no place for them on the
+    /// worker, fallen too far behind, no endpoint to send them to, or credentials bound to
+    /// the client's connection.
+    pub(crate) mirrors_busy: Counter,
+    pub(crate) mirrors_behind: Counter,
+    pub(crate) mirrors_nowhere: Counter,
+    pub(crate) mirrors_credentials: Counter,
 }
 
 impl UpstreamCounters {
@@ -638,6 +645,23 @@ impl Metrics {
             scrape.sample(name, &[("upstream", upstream), ("reason", "budget")], over);
             let unkept = series.sum(|shard| shard.retries_unkept.get());
             scrape.sample(name, &[("upstream", upstream), ("reason", "body")], unkept);
+        }
+
+        let name = "edgerush_upstream_mirrors_given_up_total";
+        let help = "Copies of requests a mirror to the upstream did not send or finish, by why.";
+        scrape.family(name, Kind::Counter, help);
+        for (upstream, series) in upstreams() {
+            for (reason, count) in [
+                ("busy", series.sum(|shard| shard.mirrors_busy.get())),
+                ("behind", series.sum(|shard| shard.mirrors_behind.get())),
+                ("nowhere", series.sum(|shard| shard.mirrors_nowhere.get())),
+                (
+                    "credentials",
+                    series.sum(|shard| shard.mirrors_credentials.get()),
+                ),
+            ] {
+                scrape.sample(name, &[("upstream", upstream), ("reason", reason)], count);
+            }
         }
 
         let name = "edgerush_upstream_healthy_endpoints";

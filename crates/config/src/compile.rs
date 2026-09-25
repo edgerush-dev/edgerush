@@ -4,7 +4,7 @@
 
 use crate::backends::{UpstreamId, WeightedBackends};
 use crate::route::{
-    Filter, GrpcMethod, HeaderChanges, Hostname, Match, PathMatch, Route, ValueMatch,
+    Filter, Fraction, GrpcMethod, HeaderChanges, Hostname, Match, PathMatch, Route, ValueMatch,
     ValuePredicate, Wildcard,
 };
 use crate::{
@@ -85,6 +85,25 @@ pub struct CompiledRule {
     pub backends: WeightedBackends,
     /// When a request is sent again, if ever.
     pub retry: Option<CompiledRetry>,
+    /// Where copies of its requests go, if anywhere.
+    pub mirrors: Vec<CompiledMirror>,
+}
+
+/// A rule's mirror, checked: where the copies go, and how many of the requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompiledMirror {
+    /// The upstream the copies go to.
+    pub upstream: UpstreamId,
+    numerator: u32,
+    denominator: u32,
+}
+
+impl CompiledMirror {
+    /// Whether the request `random` was drawn for is one of the share copied.
+    #[must_use]
+    pub fn takes(&self, random: u64) -> bool {
+        random % u64::from(self.denominator) < u64::from(self.numerator)
+    }
 }
 
 /// A rule's retries, checked and in the form an answer is compared with.
@@ -344,12 +363,14 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                     }
                 }
             }
-            let (request_headers, response_headers) = filters(rule, &place, &mut errors);
+            let (request_headers, response_headers, mirrors) =
+                filters(rule, &upstream_ids, &place, &mut errors);
             compiled_rules.push(Arc::new(CompiledRule {
                 request_headers,
                 response_headers,
                 backends: backends(rule, &upstream_ids, &place, &mut errors),
                 retry: retry(rule, &place, &mut errors),
+                mirrors,
             }));
         }
         rules.push(compiled_rules);
@@ -591,20 +612,53 @@ fn grpc_path(grpc: &GrpcMethod) -> Result<PathPattern, Problem> {
     path.map_err(Problem::Path)
 }
 
-/// The rule's header modifiers, for the request and for the response.
+/// The rule's header modifiers, for the request and for the response, and its mirrors.
 fn filters(
     rule: &Rule,
+    upstream_ids: &BTreeMap<&str, UpstreamId>,
     place: &Place,
     errors: &mut Vec<ConfigError>,
-) -> (Option<HeaderModifier>, Option<HeaderModifier>) {
+) -> (
+    Option<HeaderModifier>,
+    Option<HeaderModifier>,
+    Vec<CompiledMirror>,
+) {
     let mut request = None;
     let mut response = None;
+    let mut mirrors = Vec::new();
     for (at, filter) in rule.filters.iter().enumerate() {
         let place = Place {
             filter: Some(at),
             ..place.clone()
         };
         let (slot, changes, kind) = match filter {
+            Filter::RequestMirror(mirror) => {
+                let upstream = upstream_ids.get(mirror.upstream.as_str()).copied();
+                if upstream.is_none() {
+                    errors.push(place.problem(Problem::UnknownUpstream(mirror.upstream.clone())));
+                }
+                let Fraction {
+                    numerator,
+                    denominator,
+                } = mirror.fraction;
+                if denominator == 0 || numerator > denominator {
+                    errors.push(place.problem(Problem::MirrorFraction {
+                        numerator,
+                        denominator,
+                    }));
+                }
+                // A share of none is valid, as Gateway API has it, and costs nothing.
+                if let Some(upstream) = upstream
+                    && numerator > 0
+                {
+                    mirrors.push(CompiledMirror {
+                        upstream,
+                        numerator,
+                        denominator,
+                    });
+                }
+                continue;
+            }
             Filter::RequestHeaderModifier(changes) => {
                 (&mut request, changes, "request_header_modifier")
             }
@@ -621,7 +675,7 @@ fn filters(
         }
     }
     let kept = |modifier: Option<HeaderModifier>| modifier.filter(|modifier| !modifier.is_empty());
-    (kept(request), kept(response))
+    (kept(request), kept(response), mirrors)
 }
 
 fn header_modifier(changes: &HeaderChanges) -> Result<HeaderModifier, HeaderModifierError> {
@@ -811,6 +865,14 @@ pub enum Problem {
     /// A backoff of nothing, or one whose most is less than its first.
     #[error("`retry` needs a backoff of at least a millisecond, no more than its most")]
     RetryBackoff,
+    /// A mirror's share that is not one: out of nothing, or more than all.
+    #[error("a mirror's fraction {numerator}/{denominator} is not a share of the requests")]
+    MirrorFraction {
+        /// How many.
+        numerator: u32,
+        /// Out of how many.
+        denominator: u32,
+    },
     /// A gRPC probe of an upstream not spoken to in HTTP/2.
     #[error("a gRPC health check is for an upstream spoken to in HTTP/2")]
     GrpcCheckNeedsHttp2,
@@ -1579,6 +1641,70 @@ upstreams: { u: { endpoints: [] } }
     }
 
     /// A rule's retries say when and how often, and nothing that could not work.
+    #[test]
+    fn a_mirror_goes_to_an_upstream_there_is_for_a_share_there_can_be() {
+        let with = |mirror: &str| {
+            let yaml = format!(
+                r#"
+listeners: {{ web: {{ address: "[::]:80", protocol: http }} }}
+routes:
+  - name: r
+    listeners: [web]
+    hostnames: [{{ name: "*", falls_through: true }}]
+    rules: [{{ matches: [{{ path: {{ prefix: / }} }}], backends: [{{ upstream: u, weight: 1 }}], filters: [{mirror}] }}]
+upstreams: {{ u: {{ endpoints: [] }}, shadow: {{ endpoints: [] }} }}
+"#
+            );
+            compile(&config(&yaml))
+                .map(|compiled| {
+                    compiled
+                        .rule(RuleId { route: 0, rule: 0 })
+                        .unwrap()
+                        .mirrors
+                        .clone()
+                })
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let mirror = |upstream: &str, numerator: u32, denominator: u32| {
+            format!(
+                "{{ type: request_mirror, upstream: {upstream}, fraction: {{ numerator: {numerator}, denominator: {denominator} }} }}"
+            )
+        };
+        let all = with(&mirror("shadow", 1, 1)).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].upstream,
+            UpstreamId(0),
+            "upstreams are numbered by name"
+        );
+        assert!((0..100).all(|random| all[0].takes(random)));
+        let quarter = with(&mirror("shadow", 1, 4)).unwrap();
+        assert_eq!(
+            (0..400).filter(|&random| quarter[0].takes(random)).count(),
+            100
+        );
+        // Two mirrors, both kept, in order.
+        let two = with(&format!(
+            "{}, {}",
+            mirror("shadow", 1, 1),
+            mirror("u", 1, 2)
+        ))
+        .unwrap();
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[1].upstream, UpstreamId(1));
+        // None of them: nothing to do.
+        assert!(with(&mirror("shadow", 0, 1)).unwrap().is_empty());
+
+        let problems = |mirror: &str| with(mirror).unwrap_err();
+        assert!(problems(&mirror("elsewhere", 1, 1))[0].contains("`elsewhere`"));
+        assert!(problems(&mirror("shadow", 1, 0))[0].contains("1/0"));
+        assert!(problems(&mirror("shadow", 2, 1))[0].contains("2/1"));
+        assert!(
+            serde_saphyr::from_str::<Filter>("{ type: request_mirror, upstream: shadow }").is_err(),
+            "a share is stated"
+        );
+    }
+
     #[test]
     fn a_retry_says_when_and_how_often_and_nothing_that_cannot_work() {
         let with = |retry: &str| {

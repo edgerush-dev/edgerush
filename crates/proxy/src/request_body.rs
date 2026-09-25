@@ -9,6 +9,7 @@
 
 use crate::downstream::h1::connection::IncomingBody;
 use crate::downstream::h2::body::IncomingH2;
+use crate::mirror;
 use crate::retry::replay::{Replayed, Tee};
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
@@ -34,6 +35,10 @@ pub(crate) enum RequestBody {
     Recorded(Box<Tee>),
     /// What was kept, sent again.
     Replayed(Replayed),
+    /// Any of those, copied to mirrors as it goes: only for a request a rule mirrors.
+    Mirrored(Box<mirror::Tee>),
+    /// A mirror's copy.
+    Copy(mirror::Copy),
 }
 
 /// What a server reported going wrong, kept as the cause of a [`RequestBodyError`] without
@@ -84,6 +89,8 @@ impl Body for RequestBody {
             Self::H2(body) => Pin::new(body).poll_frame(cx),
             Self::Recorded(body) => Pin::new(&mut **body).poll_frame(cx),
             Self::Replayed(body) => Pin::new(body).poll_frame(cx),
+            Self::Mirrored(body) => Pin::new(&mut **body).poll_frame(cx),
+            Self::Copy(body) => Pin::new(body).poll_frame(cx),
         }
     }
 
@@ -93,6 +100,8 @@ impl Body for RequestBody {
             Self::H2(body) => body.is_end_stream(),
             Self::Recorded(body) => body.is_end_stream(),
             Self::Replayed(body) => body.is_end_stream(),
+            Self::Mirrored(body) => body.is_end_stream(),
+            Self::Copy(body) => body.is_end_stream(),
         }
     }
 
@@ -102,6 +111,8 @@ impl Body for RequestBody {
             Self::H2(body) => body.size_hint(),
             Self::Recorded(body) => body.size_hint(),
             Self::Replayed(body) => body.size_hint(),
+            Self::Mirrored(body) => body.size_hint(),
+            Self::Copy(body) => body.size_hint(),
         }
     }
 }
