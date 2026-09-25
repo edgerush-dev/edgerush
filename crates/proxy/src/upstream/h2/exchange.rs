@@ -90,6 +90,13 @@ pub(crate) struct Bounds {
 /// said `Expect: 100-continue` has its body held back until the upstream says `100`, or
 /// the wait runs out, and never sent if the final answer comes first.
 ///
+/// A request the upstream shows it never processed — its stream refused, or above the
+/// last one a GOAWAY accepted, the only two signs of it ([15 §3]) — is sent once more if
+/// there is nothing of it that could not be sent again: no body. gRPC retries the same
+/// ones, the same once ("transparent" retries). `retrying` is told when it does.
+///
+/// [15 §3]: ../../../../docs/15-http2-and-grpc.md
+///
 /// # Errors
 ///
 /// An [`ExchangeError`] for whatever stopped the request before its answer's head.
@@ -109,95 +116,166 @@ pub(crate) async fn exchange<F: OutgoingFields + ?Sized>(
     interim: Option<Interim>,
     bounds: Bounds,
     deadline: Option<tokio::time::Instant>,
+    mut retrying: impl FnMut(),
 ) -> Result<(Parts, Answer), ExchangeError> {
-    let mut head = head::request(method, target, fields, sending)?;
+    let first = head::request(method, target, fields, sending)?;
     let mut channel = interim.map_or_else(Channel::unheard, Channel::Listened);
     let nothing_to_send = matches!(sending, Sending::None | Sending::Length(0));
     channel.begin(expects_continue(fields), nothing_to_send);
-    let mut place = client.place(destination).await?;
-    // A gRPC call's deadline goes up as the time it has left now, waiting for a place and
-    // all: the upstream sees the deadline the client set, not a fresh one (15 §6).
-    if let Some(deadline) = deadline {
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        head.headers_mut()
-            .insert("grpc-timeout", crate::grpc::timeout::format(left));
-    }
-    let sender = place.sender();
-    // A handle that has opened nothing is ready unless the connection can take no new
-    // streams at all; the place is what says there is room on it.
-    poll_fn(|cx| sender.poll_ready(cx)).await?;
     let end_stream = matches!(sending, Sending::None) || body.is_end_stream();
-    let (mut response, stream) = sender.send_request(head, end_stream)?;
-    let mut upload: Option<Upload> = (!end_stream).then(|| {
-        let storage = Rc::clone(storage);
-        let upload: Upload = Box::pin(async move {
-            let mut stream = stream;
-            send_body(&mut stream, body, &storage, bounds.idle).await
-        });
-        upload
-    });
+    let mut body = Some(body);
+    let mut head = Some(first);
+    let mut again = false;
+    loop {
+        // A head to send again is made again, from what the first was made from: kept for
+        // a retry only when one happens, so no request pays for a copy it does not use.
+        let request = match head.take() {
+            Some(head) => head,
+            None => head::request(method, target, fields, sending)?,
+        };
+        let attempt = Attempt {
+            client,
+            destination,
+            end_stream,
+            storage,
+            bounds,
+            deadline,
+            again,
+        };
+        match attempt.run(request, &mut body, &mut channel).await {
+            Err(ExchangeError::H2(error)) if end_stream && !again && unprocessed(&error) => {
+                retrying();
+                again = true;
+            }
+            outcome => return outcome,
+        }
+    }
+}
 
-    // The head is out as far as this hop can tell once h2 has it.
-    let mut continue_wait = channel
-        .head_sent()
-        .then(|| Box::pin(tokio::time::sleep(bounds.continue_wait)));
-    let mut may_send = channel.may_poll_upload();
-    let (mut heads, mut bytes) = (0, 0);
-    let answered = tokio::time::timeout(
-        bounds.final_head,
-        poll_fn(|cx| {
-            // Interim answers first, as h2 has them asked for, in the order they came.
-            while let Poll::Ready(Some(interim)) = response.poll_informational(cx) {
-                let (interim, ()) = interim.map_err(ExchangeError::H2)?.into_parts();
-                heads += 1;
-                bytes += list_size(&interim.headers);
-                if heads > bounds.interim_heads || bytes > bounds.interim_bytes {
-                    return Poll::Ready(Err(ExchangeError::Interim {
-                        heads: bounds.interim_heads,
-                        bytes: bounds.interim_bytes,
-                    }));
-                }
-                channel.upstream_interim(interim.status, interim.headers);
-                may_send = channel.may_poll_upload();
-            }
-            if let Some(wait) = continue_wait.as_mut()
-                && wait.as_mut().poll(cx).is_ready()
-            {
-                continue_wait = None;
-                channel.wait_expired();
-                may_send = channel.may_poll_upload();
-            }
-            if may_send
-                && let Some(sending) = upload.as_mut()
-                && let Poll::Ready(sent) = sending.as_mut().poll(cx)
-            {
-                upload = None;
-                // The body failed on its way in: the stream has been reset, and the
-                // answer is the client's doing, not the upstream's.
-                if let Err(SendError::Body(cause)) = sent {
-                    return Poll::Ready(Err(ExchangeError::RequestBody(cause)));
-                }
-            }
-            Pin::new(&mut response).poll(cx).map_err(ExchangeError::H2)
-        }),
-    )
-    .await
-    .map_err(|_| ExchangeError::TooSlow {
-        limit: bounds.final_head,
-    })??;
-    channel.final_head();
-    // Held back for a `100` that never came, and not wanted now the final answer has:
-    // never sent. It goes, resetting the stream, when the answer does.
-    let abandoned = channel.abandoned();
+/// Whether the upstream says it never processed the stream that failed with `error`: it
+/// refused it, or a GOAWAY left it above the last it accepted. Nothing else says so — a
+/// stream it reset any other way, or a connection lost under it, may have been acted on.
+fn unprocessed(error: &::h2::Error) -> bool {
+    error.is_remote()
+        && (error.is_go_away() || error.reason() == Some(::h2::Reason::REFUSED_STREAM))
+}
 
-    let (parts, received) = answered.into_parts();
-    let answer = Answer {
-        body: IncomingH2::new(received, bounds.idle),
-        upload,
-        abandoned,
-        _place: place,
-    };
-    Ok((parts, answer))
+/// One try at an exchange.
+struct Attempt<'a> {
+    client: &'a Rc<Client>,
+    destination: &'a Arc<ReuseIdentity>,
+    end_stream: bool,
+    storage: &'a Rc<Storage>,
+    bounds: Bounds,
+    deadline: Option<tokio::time::Instant>,
+    /// A second try: the continue wait, if any, was the first's to run.
+    again: bool,
+}
+
+impl Attempt<'_> {
+    async fn run(
+        self,
+        mut request: http::Request<()>,
+        body: &mut Option<RequestBody>,
+        channel: &mut Channel,
+    ) -> Result<(Parts, Answer), ExchangeError> {
+        let Self {
+            client,
+            destination,
+            end_stream,
+            storage,
+            bounds,
+            deadline,
+            again,
+        } = self;
+        let mut place = client.place(destination).await?;
+        // A gRPC call's deadline goes up as the time it has left now, waiting for a place
+        // and all: the upstream sees the deadline the client set, not a fresh one (15 §6).
+        if let Some(deadline) = deadline {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            request
+                .headers_mut()
+                .insert("grpc-timeout", crate::grpc::timeout::format(left));
+        }
+        let sender = place.sender();
+        // A handle that has opened nothing is ready unless the connection can take no new
+        // streams at all; the place is what says there is room on it.
+        poll_fn(|cx| sender.poll_ready(cx)).await?;
+        let (mut response, stream) = sender.send_request(request, end_stream)?;
+        let mut upload: Option<Upload> = if end_stream {
+            None
+        } else {
+            body.take().map(|body| {
+                let storage = Rc::clone(storage);
+                let upload: Upload = Box::pin(async move {
+                    let mut stream = stream;
+                    send_body(&mut stream, body, &storage, bounds.idle).await
+                });
+                upload
+            })
+        };
+
+        // The head is out as far as this hop can tell once h2 has it.
+        let mut continue_wait = (!again && channel.head_sent())
+            .then(|| Box::pin(tokio::time::sleep(bounds.continue_wait)));
+        let mut may_send = channel.may_poll_upload();
+        let (mut heads, mut bytes) = (0, 0);
+        let answered = tokio::time::timeout(
+            bounds.final_head,
+            poll_fn(|cx| {
+                // Interim answers first, as h2 has them asked for, in the order they came.
+                while let Poll::Ready(Some(interim)) = response.poll_informational(cx) {
+                    let (interim, ()) = interim.map_err(ExchangeError::H2)?.into_parts();
+                    heads += 1;
+                    bytes += list_size(&interim.headers);
+                    if heads > bounds.interim_heads || bytes > bounds.interim_bytes {
+                        return Poll::Ready(Err(ExchangeError::Interim {
+                            heads: bounds.interim_heads,
+                            bytes: bounds.interim_bytes,
+                        }));
+                    }
+                    channel.upstream_interim(interim.status, interim.headers);
+                    may_send = channel.may_poll_upload();
+                }
+                if let Some(wait) = continue_wait.as_mut()
+                    && wait.as_mut().poll(cx).is_ready()
+                {
+                    continue_wait = None;
+                    channel.wait_expired();
+                    may_send = channel.may_poll_upload();
+                }
+                if may_send
+                    && let Some(sending) = upload.as_mut()
+                    && let Poll::Ready(sent) = sending.as_mut().poll(cx)
+                {
+                    upload = None;
+                    // The body failed on its way in: the stream has been reset, and the
+                    // answer is the client's doing, not the upstream's.
+                    if let Err(SendError::Body(cause)) = sent {
+                        return Poll::Ready(Err(ExchangeError::RequestBody(cause)));
+                    }
+                }
+                Pin::new(&mut response).poll(cx).map_err(ExchangeError::H2)
+            }),
+        )
+        .await
+        .map_err(|_| ExchangeError::TooSlow {
+            limit: bounds.final_head,
+        })??;
+        channel.final_head();
+        // Held back for a `100` that never came, and not wanted now the final answer has:
+        // never sent. It goes, resetting the stream, when the answer does.
+        let abandoned = channel.abandoned();
+
+        let (parts, received) = answered.into_parts();
+        let answer = Answer {
+            body: IncomingH2::new(received, bounds.idle),
+            upload,
+            abandoned,
+            _place: place,
+        };
+        Ok((parts, answer))
+    }
 }
 
 /// A header list's size as RFC 9113 §6.5.2 measures it: each field's name and value, and

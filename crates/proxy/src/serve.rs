@@ -1167,6 +1167,11 @@ impl Worker {
             interim,
             bounds,
             deadline,
+            || {
+                if let Some(upstream) = self.proxy.metrics.upstream(directed.upstream_slot) {
+                    upstream.retries.inc();
+                }
+            },
         );
         let exchanged = match deadline {
             Some(deadline) => match tokio::time::timeout_at(deadline, exchanging).await {
@@ -4066,6 +4071,105 @@ upstreams:
                     );
                     assert!(scrape.contains(&line), "{line}{scrape}");
                 }
+            })
+            .await;
+    }
+
+    /// A request the upstream refuses outright — RST_STREAM(REFUSED_STREAM), which says it
+    /// was never processed — is sent once more when there is nothing of it that could not
+    /// be sent again; one with a body is not, and one refused twice is not sent a third
+    /// time.
+    #[tokio::test]
+    async fn a_request_an_http2_upstream_refused_unprocessed_is_sent_once_more() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let asked = Rc::new(Cell::new(0_usize));
+                let asking = Rc::clone(&asked);
+                let script: Script = Rc::new(move |request, mut respond| {
+                    let asking = Rc::clone(&asking);
+                    Box::pin(async move {
+                        asking.set(asking.get() + 1);
+                        // `/twice` is refused every time; the rest only the first time.
+                        let refuse =
+                            request.uri().path() == "/twice" || asking.get() % 2 == 1;
+                        if refuse {
+                            respond.send_reset(::h2::Reason::REFUSED_STREAM);
+                            return;
+                        }
+                        let _ = respond.send_response(ok_head(), true);
+                    })
+                });
+                let upstream = scripted_h2_upstream(script).await;
+                let (front, worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                assert_eq!(asked.get(), 2);
+                let scrape = worker.proxy().metrics();
+                assert!(
+                    scrape.contains("edgerush_upstream_retries_total{upstream=\"up\"} 1\n"),
+                    "{scrape}"
+                );
+
+                // A body, gone the first time: not sent again.
+                asked.set(0);
+                let with_body = b"POST / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\ncontent-length: 2\r\n\r\nhi";
+                let answer = h1_answer(front, with_body).await;
+                assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
+                assert_eq!(asked.get(), 1);
+
+                // Refused again: not a third time.
+                asked.set(0);
+                let twice = b"GET /twice HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\n\r\n";
+                let answer = h1_answer(front, twice).await;
+                assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
+                assert_eq!(asked.get(), 2);
+            })
+            .await;
+    }
+
+    /// A request left above the last stream an upstream's GOAWAY accepted was never
+    /// processed either, and goes once more — on another connection, the first going.
+    #[tokio::test]
+    async fn a_request_left_above_an_http2_goaway_is_sent_once_more() {
+        use crate::h2_peer::{self, Peer, code, kind};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upstream = socket.local_addr().unwrap();
+                let connections = Rc::new(Cell::new(0_usize));
+                let counting = Rc::clone(&connections);
+                let _accepting = tokio::task::spawn_local(async move {
+                    while let Ok((stream, _)) = socket.accept().await {
+                        counting.set(counting.get() + 1);
+                        let first = counting.get() == 1;
+                        let _serving = tokio::task::spawn_local(async move {
+                            let (mut peer, _) = Peer::accept_as_server(stream, &[]).await;
+                            let (asked, _) = peer.until(|frame| frame.kind == kind::HEADERS).await;
+                            if first {
+                                // Nothing accepted: the stream is above the last one.
+                                peer.send(&h2_peer::goaway(0, code::NO_ERROR)).await;
+                                let _ = peer.rest().await;
+                                return;
+                            }
+                            let answer =
+                                h2_peer::headers(asked.stream, h2_peer::response(200), true);
+                            peer.send(&answer).await;
+                            let _ = peer.rest().await;
+                        });
+                    }
+                });
+                let (front, worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                assert_eq!(connections.get(), 2);
+                let scrape = worker.proxy().metrics();
+                assert!(
+                    scrape.contains("edgerush_upstream_retries_total{upstream=\"up\"} 1\n"),
+                    "{scrape}"
+                );
             })
             .await;
     }

@@ -329,6 +329,8 @@ pub(crate) struct UpstreamCounters {
     /// the status has been counted and the client has been told
     /// ([13 §7](../../docs/13-http1-upstream.md)).
     pub(crate) body_failures: Counter,
+    /// Requests sent again because the upstream showed it never processed them (15 §6).
+    pub(crate) retries: Counter,
 }
 
 impl UpstreamCounters {
@@ -608,6 +610,14 @@ impl Metrics {
         for (upstream, series) in upstreams() {
             let labels = [("upstream", upstream)];
             scrape.sample(name, &labels, series.sum(|shard| shard.body_failures.get()));
+        }
+
+        let name = "edgerush_upstream_retries_total";
+        let help = "Requests sent again because the upstream showed it never processed them.";
+        scrape.family(name, Kind::Counter, help);
+        for (upstream, series) in upstreams() {
+            let labels = [("upstream", upstream)];
+            scrape.sample(name, &labels, series.sum(|shard| shard.retries.get()));
         }
 
         let name = "edgerush_upstream_exchanges_stopped_total";
