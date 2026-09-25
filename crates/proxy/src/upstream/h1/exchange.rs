@@ -930,7 +930,9 @@ pub struct H1Body<S, B> {
     /// message stopped making sense.
     rest: Option<Rest<S, B>>,
     reader: BodyReader,
-    limits: H1Limits,
+    /// The worker's, shared rather than copied: a copy would take the body past the size
+    /// the allocator serves from its fast cache, and it is boxed once a request.
+    limits: Rc<H1Limits>,
     /// The upstream closed its end. Told to the reader, which alone knows whether that is
     /// the end of this body or the loss of it.
     ended: bool,
@@ -963,7 +965,7 @@ impl<S, B> H1Body<S, B> {
         framing: Framing,
         persistent: bool,
         nominated: Vec<HeaderName>,
-        limits: H1Limits,
+        limits: impl Into<Rc<H1Limits>>,
     ) -> Self {
         let reader = BodyReader::nominating(framing, nominated);
         // A body that was never going to carry anything is finished before it starts. Said
@@ -972,7 +974,7 @@ impl<S, B> H1Body<S, B> {
         Self {
             rest: Some(rest),
             reader,
-            limits,
+            limits: limits.into(),
             ended: false,
             complete,
             trailers: None,
@@ -1060,7 +1062,7 @@ impl<S, B> H1Body<S, B> {
     where
         S: AsyncRead + Unpin,
     {
-        let limits = self.limits;
+        let limits = Rc::clone(&self.limits);
         if let Some(kept) = self.take_if_reusable() {
             kept.put_back(&limits);
         }

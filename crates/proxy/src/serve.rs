@@ -326,6 +326,8 @@ pub struct Worker {
     h2: Rc<H2Client>,
     /// Its retry budgets, by upstream slot: a worker's own, as its connections are.
     budgets: RefCell<HashMap<usize, Budget>>,
+    /// Its limits again, for the bodies of answers to share rather than copy.
+    body_limits: Rc<H1Limits>,
     /// Itself, for the tasks that send a mirror's copies to hold on to.
     me: Weak<Worker>,
 }
@@ -701,6 +703,7 @@ impl Worker {
             drain: Rc::new(Drain::default()),
             h2: H2Client::new(h2_settings(&limits)),
             budgets: RefCell::new(HashMap::new()),
+            body_limits: Rc::new(limits),
             me: Weak::clone(me),
         })
     }
@@ -885,7 +888,7 @@ impl Worker {
                 answer.delivery.framing,
                 persistent,
                 answer.nominated,
-                self.limits,
+                Rc::clone(&self.body_limits),
             )
             .returning_to(lease),
         );
@@ -1026,14 +1029,17 @@ impl Worker {
     /// Answers a request that came in on `listener`. `interim` is where the server that
     /// read it wants the upstream's interim answers, if it passes them on
     /// ([14 §5](../../docs/14-downstream-server.md)).
-    async fn handle(
+    ///
+    /// Not itself `async`: a future of its own would hold the request as well as the
+    /// future it hands it to, and every stream's task is made by copying it.
+    fn handle(
         self: Rc<Self>,
         listener: usize,
         request: Request<RequestBody>,
         interim: Option<Interim>,
-    ) -> Answered<Body> {
+    ) -> impl Future<Output = Answered<Body>> {
         let (head, body) = request.into_parts();
-        self.handle_head(listener, head, body, interim).await
+        self.handle_head(listener, head, body, interim)
     }
 
     /// The same for a request's head of whatever kind: a map, or the raw head our own
@@ -1067,7 +1073,7 @@ impl Worker {
         let sending = sending_for(&head, &body);
         // A gRPC call is answered as one, the gateway's own answers included; read from the
         // head as the client sent it, before any filter touches it (15 §6).
-        let call = Call::of(head.version(), head.outgoing(), Instant::now());
+        let call = Call::of(head.version(), head.outgoing(), Instant::now);
         let deadline = call.and_then(|call| call.deadline());
         if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
             return self
@@ -1129,10 +1135,12 @@ impl Worker {
         let retry = directed.rule.as_ref().and_then(|rule| rule.retry.as_ref());
         let outcome = match retry {
             // Only a rule that asks pays for keeping the body and the loop around it.
+            // Boxed: a future is as big as its biggest state, and every request would
+            // otherwise carry room for the retry loop's.
             Some(retry) => {
-                self.with_retries(
+                Box::pin(self.with_retries(
                     &directed, &mut head, &nominated, sending, body, admitted, interim, call, retry,
-                )
+                ))
                 .await
             }
             None => {
@@ -1191,15 +1199,12 @@ impl Worker {
                 .await;
         }
         let deadline = call.and_then(|call| call.deadline());
-        let exchanged = self.by_ours(
+        let exchanged = pin!(self.by_ours(
             directed, endpoint, head, nominated, sending, body, admitted, interim,
-        );
-        let answered = match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, exchanged)
-                .await
-                .unwrap_or(Err(Answer::DeadlineExceeded)),
-            None => exchanged.await,
-        };
+        ));
+        let answered = by_deadline(deadline, exchanged)
+            .await
+            .unwrap_or(Err(Answer::DeadlineExceeded));
 
         let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
         let (mut answer, body) = match answered {
@@ -1474,7 +1479,7 @@ impl Worker {
             interim_heads: self.limits.interim_heads,
             interim_bytes: self.limits.interim_bytes,
         };
-        let exchanging = h2_exchange::exchange(
+        let exchanging = pin!(h2_exchange::exchange(
             &self.h2,
             endpoint,
             head.method(),
@@ -1491,13 +1496,9 @@ impl Worker {
                     upstream.retries.inc();
                 }
             },
-        );
-        let exchanged = match deadline {
-            Some(deadline) => match tokio::time::timeout_at(deadline, exchanging).await {
-                Ok(exchanged) => exchanged,
-                Err(_) => return Err(Answer::DeadlineExceeded),
-            },
-            None => exchanging.await,
+        ));
+        let Some(exchanged) = by_deadline(deadline, exchanging).await else {
+            return Err(Answer::DeadlineExceeded);
         };
         let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
         let (parts, answer) = match exchanged {
@@ -1777,6 +1778,29 @@ impl Directed {
         let (authority, destination) = others.get(at)?;
         Some((at_endpoint(target, authority)?, Arc::clone(destination)))
     }
+}
+
+/// `exchange`'s outcome, or nothing if `deadline` comes first. The
+/// exchange is pinned by the caller, where it is, and not moved into a future of its own
+/// here: a future moved into another keeps its room in both, and these are the biggest
+/// part of a request's.
+async fn by_deadline<F: Future>(
+    deadline: Option<Instant>,
+    mut exchange: Pin<&mut F>,
+) -> Option<F::Output> {
+    let Some(deadline) = deadline else {
+        return Some(exchange.await);
+    };
+    // Boxed: only a gRPC call that set a deadline has one, and the rest should not carry
+    // room for it.
+    let mut expiry = Box::pin(tokio::time::sleep_until(deadline));
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(outcome) = exchange.as_mut().poll(cx) {
+            return Poll::Ready(Some(outcome));
+        }
+        expiry.as_mut().poll(cx).map(|()| None)
+    })
+    .await
 }
 
 /// Whether an outcome is one the rule's retry sends a request again for: an answer whose
