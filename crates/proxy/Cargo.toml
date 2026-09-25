@@ -41,9 +41,14 @@ tokio-boring.workspace = true
 # proxy as a client would, upstreams that speak both versions, and a second oracle for
 # EdgeRush's own HTTP/1 client (`upstream::h1::differential`).
 hyper = { workspace = true, features = ["client"] }
-hyper-util = { workspace = true, features = ["client-legacy", "server-auto"] }
+hyper-util = { workspace = true, features = ["client-legacy", "server-auto", "service"] }
 iai-callgrind.workspace = true
 proptest.workspace = true
+# A real gRPC client and server, for the acceptance tests of the four call shapes
+# (`tests/grpc_calls.rs`): payloads stay bytes, so no protobuf, and no router.
+tokio-stream = "0.1"
+tonic = { version = "0.14", default-features = false, features = ["transport"] }
+tower-service = "0.3"
 # Fixtures are written the way harness files are.
 serde-saphyr.workspace = true
 # "test-util" is what lets a test move the clock itself, so a test of a minute-long
