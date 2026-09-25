@@ -72,16 +72,15 @@ impl<S> Pool<S> {
         let now = Instant::now();
         let held = self.idle.get_mut(&identity.key())?;
         // From the back: the one put back last is the one most recently known to work.
+        // A bucket left empty stays, with its room, for the connection that comes back:
+        // a busy destination's is empty between nearly every take and put, and making it
+        // again each time is an allocation a request. The sweep takes empty ones away.
         while let Some(connection) = held.pop() {
             self.total -= 1;
             if is_fit(&connection, now, limits) {
-                if held.is_empty() {
-                    self.idle.remove(&identity.key());
-                }
                 return Some((connection.socket, connection.opened));
             }
         }
-        self.idle.remove(&identity.key());
         None
     }
 
@@ -315,6 +314,28 @@ mod tests {
         let high: std::collections::HashSet<u64> = hashes.iter().map(|hash| hash >> 57).collect();
         assert_eq!(low.len(), 128);
         assert!(high.len() >= 100, "{}", high.len());
+    }
+
+    /// A destination's bucket outlives a moment of being empty, with the room it had, and
+    /// the sweep is what takes an empty one away.
+    #[tokio::test(start_paused = true)]
+    async fn an_emptied_bucket_is_kept_until_the_sweep() {
+        let keys = Keys::default();
+        let (_held, identity) = one(&keys);
+        let limits = H1Limits::default();
+        let mut pool = Pool::default();
+
+        pool.put(&identity, 7, Instant::now(), &limits);
+        let room = pool.idle[&identity.key()].capacity();
+        assert_eq!(pool.take(&identity, &limits).map(|(s, _)| s), Some(7));
+        let bucket = pool.idle.get(&identity.key()).expect("the bucket went");
+        assert!(bucket.is_empty());
+        assert_eq!(bucket.capacity(), room, "the room went with the socket");
+        assert!(pool.put(&identity, 8, Instant::now(), &limits).is_none());
+        assert_eq!(pool.take(&identity, &limits).map(|(s, _)| s), Some(8));
+
+        assert_eq!(pool.sweep(&limits), 0);
+        assert!(pool.idle.is_empty(), "the sweep left an empty bucket");
     }
 
     #[tokio::test(start_paused = true)]
