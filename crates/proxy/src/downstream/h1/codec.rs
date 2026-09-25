@@ -325,19 +325,29 @@ impl HeadReader {
         line_end: usize,
         limits: &H1Limits,
     ) -> Result<Option<usize>, RequestError> {
-        while let Some(&byte) = bytes.get(self.searched) {
-            let at = self.searched;
+        loop {
+            // Only as far as the bound: a head past it is refused, however it ends.
+            let within = bytes.len().min(limits.head);
+            let unsearched = bytes.get(self.searched..within).unwrap_or_default();
+            // Line feed to line feed, a vector at a time, rather than a byte at a time:
+            // most of a head is field values that nothing needs to look at here.
+            let Some(found) = memchr::memchr(b'\n', unsearched) else {
+                #[cfg(test)]
+                {
+                    self.examined += unsearched.len();
+                }
+                self.searched = self.searched.max(within);
+                if bytes.len() > limits.head {
+                    return Err(RequestError::HeadTooLong { limit: limits.head });
+                }
+                return Ok(None);
+            };
             #[cfg(test)]
             {
-                self.examined += 1;
+                self.examined += found + 1;
             }
-            if at >= limits.head {
-                return Err(RequestError::HeadTooLong { limit: limits.head });
-            }
-            self.searched += 1;
-            if byte != b'\n' {
-                continue;
-            }
+            let at = self.searched + found;
+            self.searched = at + 1;
             if bytes[at - 1] != b'\r' {
                 return Err(RequestError::Malformed("a line ends with a bare newline"));
             }
@@ -347,7 +357,6 @@ impl HeadReader {
             }
             self.fields += 1;
         }
-        Ok(None)
     }
 }
 

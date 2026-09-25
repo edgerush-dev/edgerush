@@ -31,6 +31,7 @@ http-body-util.workspace = true
 httparse.workspace = true
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
+memchr.workspace = true
 thiserror.workspace = true
 # "sync": what wakes a worker's connections when it drains.
 tokio = { workspace = true, features = ["sync"] }

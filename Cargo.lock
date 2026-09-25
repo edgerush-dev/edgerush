@@ -253,6 +253,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iai-callgrind",
+ "memchr",
  "proptest",
  "serde-saphyr",
  "thiserror",
