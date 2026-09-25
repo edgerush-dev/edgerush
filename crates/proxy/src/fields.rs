@@ -112,9 +112,10 @@ impl Known {
         }
     }
 
-    /// Which of them a header name is.
+    /// Which of them a header name is. Asked on every look-up of a field by name, a score
+    /// of times a request: by length, as `of_bytes`, and not by trying each of them.
     fn of_name(name: &HeaderName) -> Option<Self> {
-        Self::ALL.into_iter().find(|known| known.name() == name)
+        Self::of_bytes(name.as_str().as_bytes())
     }
 
     fn slot(self) -> usize {
@@ -618,6 +619,9 @@ mod tests {
         #[test]
         fn any_name_is_known_as_the_list_says(name in any_name()) {
             prop_assert_eq!(Known::of_bytes(name.as_bytes()), by_list(name.as_bytes()));
+            if let Ok(header) = HeaderName::from_bytes(name.as_bytes()) {
+                prop_assert_eq!(Known::of_name(&header), by_list(name.as_bytes()));
+            }
         }
     }
 

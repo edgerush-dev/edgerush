@@ -132,6 +132,16 @@ impl Outbound {
         }
     }
 
+    /// Ready for the next answer on the connection, as a new one would be, keeping the
+    /// room the last one made: a new queue for every answer is an allocation for every
+    /// answer.
+    pub fn reset(&mut self) {
+        self.heads.clear();
+        self.front_sent = 0;
+        self.final_queued = false;
+        self.committed = false;
+    }
+
     /// Whether the final head has begun to go.
     pub fn committed(&self) -> bool {
         self.committed
@@ -160,6 +170,25 @@ impl Outbound {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// Reset in any state, it is as a new one, with the room it had.
+    #[test]
+    fn a_reset_queue_is_as_new_and_keeps_its_room() {
+        let mut out = Outbound::default();
+        out.interim(10).unwrap();
+        out.final_head(40).unwrap();
+        out.accepted(12);
+        assert!(out.committed());
+        let room = out.heads.capacity();
+        out.reset();
+        assert!(!out.committed());
+        assert!(!out.can_replace_final());
+        assert!(out.heads_sent());
+        assert_eq!(out.on_failure(), Outbound::default().on_failure());
+        out.final_head(30).unwrap();
+        assert!(out.can_replace_final());
+        assert_eq!(out.heads.capacity(), room, "the room went");
+    }
 
     #[test]
     fn a_final_head_can_be_replaced_until_its_first_byte_goes() {

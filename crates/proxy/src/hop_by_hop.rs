@@ -177,10 +177,15 @@ fn strip(headers: &mut HeaderMap) {
 /// these are hop-by-hop for this hop and do not travel on, among the trailers no more
 /// than among the fields ([13 §4](../../docs/13-http1-upstream.md)). Which client read
 /// the message does not come into it: this is what being an intermediary requires.
+///
+/// A hop-by-hop name is left out: it is stripped from every head and denied as a trailer
+/// whether it is named or not, and naming it would cost a name made on the heap for every
+/// message that says `Connection: keep-alive`.
 pub fn nominated<F: Fields + ?Sized>(headers: &F) -> Vec<HeaderName> {
     headers
         .values(&CONNECTION)
         .flat_map(options_of)
+        .filter(|option| !is_hop_by_hop_name(option))
         .filter_map(|option| HeaderName::from_bytes(option).ok())
         .collect()
 }
@@ -226,6 +231,26 @@ pub enum ConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `Connection` names is nominated, except what goes anyway; a message that
+    /// names only those nominates nothing.
+    #[test]
+    fn what_goes_anyway_is_not_nominated() {
+        let mut headers = HeaderMap::new();
+        headers.append(CONNECTION, HeaderValue::from_static("Keep-Alive, x-trace"));
+        headers.append(CONNECTION, HeaderValue::from_static("close, TE, upgrade"));
+        let names: Vec<String> = nominated(&headers)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(names, ["x-trace", "close"]);
+
+        let mut only = HeaderMap::new();
+        only.append(CONNECTION, HeaderValue::from_static("keep-alive"));
+        let none = nominated(&only);
+        assert!(none.is_empty());
+        assert_eq!(none.capacity(), 0, "a list was made for nothing");
+    }
 
     /// A name as it arrived is hop-by-hop exactly when it is one of the list, in whatever
     /// case: every one of them, each in upper case, and names that differ by a byte or

@@ -950,7 +950,7 @@ where
             Err(Err(error)) => return refuse(&mut connection, timer.as_mut(), error, &date).await,
         };
         connection.deadlines.head_read();
-        connection.outbound = Outbound::default();
+        connection.outbound.reset();
         // The head's bytes, cut out of the block they were read into rather than copied:
         // its fields are read out of them from here on, and they stay paid for through the
         // block for as long as the request holds them (14 §6, §8). Everything the head said
