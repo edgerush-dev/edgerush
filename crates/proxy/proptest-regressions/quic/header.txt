@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b61cf792b1df9c2a6eea7ff38025d4d3cfe4b58fb5a5e720c2ef48cac142326b # shrinks to first = 128, version = 0, dcid = [], scid = [], rest = []
+cc fec77d553885cf1e421b337481fa741ce302c8aafca65606a713d8e42c2e7ffc # shrinks to datagram = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+cc cf30dd9edcb559daf9da862afbc69fe7a7d83d7eb93d6d11b839ed51c6827aa0 # shrinks to first = 192, version = 2, dcid = [], scid = [], rest = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+cc d6d1fc9dbd95cd00a6880934922d40e05554468d4fe76aa0289d08ebbe73494c # shrinks to first = 192, version = 0, dcid = [], scid = [], rest = []
+cc a1edcbffef2875212d39e843da1af767deb1f1fafd0a3ef426fe20f6de811e6b # shrinks to datagram = [144, 0, 0, 0, 2, 39, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]

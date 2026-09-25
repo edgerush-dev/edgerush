@@ -24,6 +24,9 @@ http = "1.5"
 # The field lines of a head are taken from what this parser finds, as the proxy's are.
 httparse = "1.10"
 libfuzzer-sys = "0.4"
+# The connection IDs a datagram carries are read as this crate's parser reads them, at the
+# version the proxy pins.
+quiche = { version = "=0.30.0", default-features = false, features = ["boringssl-boring-crate"] }
 
 [[bin]]
 name = "host_index"
@@ -98,6 +101,20 @@ bench = false
 [[bin]]
 name = "h1_fields"
 path = "fuzz_targets/h1_fields.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_header"
+path = "fuzz_targets/quic_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_id"
+path = "fuzz_targets/quic_id.rs"
 test = false
 doc = false
 bench = false

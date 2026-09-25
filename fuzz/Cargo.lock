@@ -169,6 +169,7 @@ dependencies = [
  "http",
  "httparse",
  "libfuzzer-sys",
+ "quiche",
 ]
 
 [[package]]

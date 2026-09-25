@@ -27,8 +27,8 @@ use quiche::{PathEvent, Shutdown};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Server connection IDs are 20 bytes, as 16 §3 has them.
-const ID_LEN: usize = 20;
+/// Server connection IDs are 17 bytes, as 16 §3 has them.
+const ID_LEN: usize = 17;
 
 /// The field-section size 16 §6 announces to quiche: twice the 64 KiB head limit, which
 /// the driver keeps itself.
@@ -817,9 +817,5 @@ fn qpack_encoder_instructions_are_dropped() {
     assert_eq!(names(&events), ["headers GET more=false", "finished"]);
 }
 
-/// 20 bytes, the length 16 §3 gives server IDs, is the longest QUIC allows and quiche
-/// takes.
-#[test]
-fn twenty_bytes_is_the_longest_id() {
-    assert_eq!(quiche::MAX_CONN_ID_LEN, ID_LEN);
-}
+// 17 bytes, the length 16 §3 gives server IDs, is within what QUIC allows and quiche takes.
+const _: () = assert!(ID_LEN <= quiche::MAX_CONN_ID_LEN);
