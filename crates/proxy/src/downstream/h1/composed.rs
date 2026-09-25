@@ -280,15 +280,18 @@ async fn composed(client: Vec<ClientStep>, core: Core, pipe: usize) -> Run {
         let wire = Rc::clone(&wire);
         async move {
             let never = crate::drain::Drain::default();
-            let ended = serve(
-                far,
-                settings,
-                Rc::clone(&blocks),
-                || HttpDate::from_unix(0),
-                &never,
-                respond,
-            )
-            .await;
+            let timers = crate::timers::Timers::new();
+            let ended = timers
+                .driving(serve(
+                    far,
+                    settings,
+                    Rc::clone(&blocks),
+                    Rc::clone(&timers),
+                    || HttpDate::from_unix(0),
+                    &never,
+                    respond,
+                ))
+                .await;
             // The socket is gone with the driver: what it wrote is all there is.
             let mut wire = wire.borrow_mut();
             take_answers(&mut wire, true);

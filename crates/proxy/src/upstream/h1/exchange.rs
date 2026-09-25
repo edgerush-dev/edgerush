@@ -18,9 +18,9 @@ use super::codec::{
     Piece, ResponseHead, Sending, Trailers, delivery, head_len, write_head,
 };
 use super::pool::Lease;
-use crate::alarm::Alarm;
 use crate::interim::{Channel, Interim};
 use crate::storage::{Charge, Exhausted};
+use crate::timers::{Alarm, Timers};
 use bytes::Bytes;
 use edgerush_router::Fields;
 use http::{HeaderMap, HeaderName, Method, Uri};
@@ -380,7 +380,7 @@ impl<S: AsyncRead + Unpin> Exchange<S> {
 impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
     /// An exchange on `socket`, which nothing has been said on yet, reading into blocks
     /// lent from `blocks`.
-    pub fn new(socket: S, blocks: Rc<RefCell<Blocks>>) -> Self {
+    pub fn new(socket: S, blocks: Rc<RefCell<Blocks>>, timers: Rc<Timers>) -> Self {
         Self {
             socket,
             incoming: None,
@@ -393,7 +393,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             chunk_tail: 0,
             head_left: 0,
             head_sent: None,
-            alarm: Alarm::default(),
+            alarm: Alarm::new(&timers, None),
         }
     }
 
@@ -488,7 +488,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         // Set no further ahead than the answer's clock and the final head's deadline, so
         // that the clocks starting as the exchange goes on fall due after it and leave it
         // where it is. A wait for a `100` is shorter, and rare: it moves the timer.
-        self.alarm = Alarm::new(limits.idle.min(limits.final_head));
+        self.alarm.set_ahead(limits.idle.min(limits.final_head));
         self.lend_staging()?;
         // Paid for before it is written. A head over the bound is refused below, before a
         // byte of it is, so no room is made for one.
@@ -1665,6 +1665,17 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// The test's timers: each test runs on a thread of its own.
+        static TIMERS: Rc<Timers> = Timers::new();
+    }
+
+    /// The timers of the test running, which a test whose deadlines must come waits on
+    /// with [`Timers::driving`].
+    fn timers() -> Rc<Timers> {
+        TIMERS.with(Rc::clone)
+    }
+
     /// The other end of the connection: what an upstream would be.
     struct Peer(DuplexStream);
 
@@ -1690,7 +1701,7 @@ mod tests {
     /// before a write has to wait.
     fn connected(room: usize) -> (Exchange<DuplexStream>, Peer) {
         let (ours, theirs) = tokio::io::duplex(room);
-        (Exchange::new(ours, test_blocks()), Peer(theirs))
+        (Exchange::new(ours, test_blocks(), timers()), Peer(theirs))
     }
 
     fn headers(fields: &[(&str, &str)]) -> HeaderMap {
@@ -1750,7 +1761,7 @@ mod tests {
         use http_body_util::BodyExt;
         let (exchange, mut peer) = connected(4096);
         let limits = H1Limits::default();
-        let before = crate::alarm::times_set();
+        let before = crate::timers::times_queued();
         let answering = tokio::spawn(async move {
             peer.until(b"\r\n\r\n").await;
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1778,7 +1789,7 @@ mod tests {
         let read = body.collect().await.unwrap().to_bytes();
         assert_eq!(&read[..], b"hellothere");
         let _peer = answering.await.unwrap();
-        assert_eq!(crate::alarm::times_set() - before, 1);
+        assert_eq!(crate::timers::times_queued() - before, 1);
     }
 
     /// **A finished exchange gives back what it was lent.** The block it read the answer
@@ -1798,7 +1809,7 @@ mod tests {
             peer
         });
 
-        let (answer, rest) = Exchange::new(ours, Rc::clone(&blocks))
+        let (answer, rest) = Exchange::new(ours, Rc::clone(&blocks), timers())
             .send(
                 &Method::GET,
                 &"/".parse().unwrap(),
@@ -1890,7 +1901,7 @@ mod tests {
             peer
         });
 
-        let (answer, rest) = Exchange::new(ours, Rc::clone(&blocks))
+        let (answer, rest) = Exchange::new(ours, Rc::clone(&blocks), timers())
             .send(
                 &Method::GET,
                 &"/".parse().unwrap(),
@@ -1949,6 +1960,7 @@ mod tests {
                 tiny,
                 crate::storage::Storage::new(crate::storage::LIMIT),
             ))),
+            timers(),
         )
         .send(
             &Method::GET,
@@ -1999,7 +2011,7 @@ mod tests {
             peer
         });
 
-        let error = Exchange::new(ours, blocks_within(STAGING))
+        let error = Exchange::new(ours, blocks_within(STAGING), timers())
             .send(
                 &Method::GET,
                 &"/".parse().unwrap(),
@@ -2023,7 +2035,7 @@ mod tests {
         let (ours, mut theirs) = tokio::io::duplex(1 << 17);
         let limits = H1Limits::default();
         let long = "a".repeat(40 * 1024);
-        let error = Exchange::new(ours, blocks_within(48 * 1024))
+        let error = Exchange::new(ours, blocks_within(48 * 1024), timers())
             .send(
                 &Method::GET,
                 &"/".parse().unwrap(),
@@ -2110,7 +2122,7 @@ mod tests {
             size: 10,
             trailers: Some(trailers),
         };
-        let error = Exchange::new(ours, blocks_within(48 * 1024))
+        let error = Exchange::new(ours, blocks_within(48 * 1024), timers())
             .send(
                 &Method::POST,
                 &"/".parse().unwrap(),
@@ -2425,7 +2437,7 @@ mod tests {
     /// The same, saying whether the head allowed it to be kept at all.
     fn keepable_body_on(framing: Framing, buffered: &[u8], persistent: bool) -> (SpentBody, Peer) {
         let (ours, theirs) = tokio::io::duplex(4096);
-        let mut exchange = Exchange::new(ours, test_blocks());
+        let mut exchange = Exchange::new(ours, test_blocks(), timers());
         exchange.holding(buffered);
         // A request with nothing in it, already all sent.
         let mut upload = Upload::new(Empty::<Bytes>::new(), Sending::None, Vec::new());
@@ -2451,7 +2463,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_body_that_fails_after_the_head_fails_the_answer() {
         let (ours, theirs) = tokio::io::duplex(4096);
-        let mut exchange = Exchange::new(ours, test_blocks());
+        let mut exchange = Exchange::new(ours, test_blocks(), timers());
         // The whole answer is already in hand, so nothing about the upstream is at fault.
         exchange.holding(b"ok");
         let upload = Upload::new(Failing(true), Sending::Chunked, Vec::new());
@@ -2482,37 +2494,41 @@ mod tests {
     /// ([13 §7](../../../docs/13-http1-upstream.md)).
     #[tokio::test(start_paused = true)]
     async fn an_answer_that_keeps_coming_does_not_hide_a_stalled_request() {
-        let limits = H1Limits::default();
-        let (ours, theirs) = tokio::io::duplex(4096);
-        let mut exchange = Exchange::new(ours, test_blocks());
-        // Chunk after chunk, all of it already in hand, so every ask has a frame
-        // ready without the socket being touched.
-        exchange.holding("4\r\nabcd\r\n".repeat(64).as_bytes());
-        // And a client that has handed over nothing, and will not.
-        let upload = Upload::new(Silent, Sending::Chunked, Vec::new());
-        let rest = Rest { exchange, upload };
-        let mut body = H1Body::new(rest, Framing::Chunked, true, Vec::new(), limits);
-        let _peer = Peer(theirs);
+        timers()
+            .driving(async {
+                let limits = H1Limits::default();
+                let (ours, theirs) = tokio::io::duplex(4096);
+                let mut exchange = Exchange::new(ours, test_blocks(), timers());
+                // Chunk after chunk, all of it already in hand, so every ask has a frame
+                // ready without the socket being touched.
+                exchange.holding("4\r\nabcd\r\n".repeat(64).as_bytes());
+                // And a client that has handed over nothing, and will not.
+                let upload = Upload::new(Silent, Sending::Chunked, Vec::new());
+                let rest = Rest { exchange, upload };
+                let mut body = H1Body::new(rest, Framing::Chunked, true, Vec::new(), limits);
+                let _peer = Peer(theirs);
 
-        let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
-        assert!(matches!(frame, Some(Ok(_))), "{frame:?}");
-        // Time passes with the request still going nowhere.
-        tokio::time::advance(limits.idle + Duration::from_secs(1)).await;
+                let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+                assert!(matches!(frame, Some(Ok(_))), "{frame:?}");
+                // Time passes with the request still going nowhere.
+                tokio::time::advance(limits.idle + Duration::from_secs(1)).await;
 
-        let error = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
-            .await
-            .expect("the answer ended rather than the request being noticed")
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                ExchangeError::Idle {
-                    waiting: Stalled::Client,
-                    ..
-                }
-            ),
-            "the request stopped and the answer went on covering for it: {error}"
-        );
+                let error = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+                    .await
+                    .expect("the answer ended rather than the request being noticed")
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        ExchangeError::Idle {
+                            waiting: Stalled::Client,
+                            ..
+                        }
+                    ),
+                    "the request stopped and the answer went on covering for it: {error}"
+                );
+            })
+            .await;
     }
 
     /// What is staged stays inside its bound, the framing it adds included. Payload
@@ -2522,7 +2538,7 @@ mod tests {
     async fn staging_keeps_room_for_the_framing_it_adds() {
         // A socket that takes almost nothing, so what is staged stays staged.
         let (ours, _theirs) = tokio::io::duplex(1);
-        let mut exchange = Exchange::new(ours, test_blocks());
+        let mut exchange = Exchange::new(ours, test_blocks(), timers());
         let mut upload = Upload::new(
             Full::new(Bytes::from(vec![b'x'; STAGING * 2])),
             Sending::Chunked,
@@ -2594,7 +2610,7 @@ mod tests {
             Vec::new(),
         );
         let rest = Rest {
-            exchange: Exchange::new(ours, test_blocks()),
+            exchange: Exchange::new(ours, test_blocks(), timers()),
             upload,
         };
         let mut body = H1Body::new(
@@ -2712,104 +2728,116 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn final_head_deadline_starts_after_the_request_head_is_written() {
-        let (exchange, mut peer) = connected(1);
-        let limits = H1Limits {
-            final_head: Duration::from_secs(5),
-            idle: Duration::from_secs(30),
-            ..H1Limits::default()
-        };
-        let holding = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            peer.until(b"\r\n\r\n").await;
-            std::future::pending::<()>().await;
-            drop(peer);
-        });
-        let began = Instant::now();
-        let failed = exchange
-            .send(
-                &Method::GET,
-                &"/x".parse().unwrap(),
-                &headers(&[("host", "up.test")]),
-                &[],
-                Sending::None,
-                Empty::<Bytes>::new(),
-                &limits,
-            )
-            .await
-            .unwrap_err();
-        holding.abort();
-        assert!(matches!(failed, ExchangeError::TooSlow { .. }), "{failed}");
-        assert_eq!(began.elapsed(), Duration::from_secs(15));
+        timers()
+            .driving(async {
+                let (exchange, mut peer) = connected(1);
+                let limits = H1Limits {
+                    final_head: Duration::from_secs(5),
+                    idle: Duration::from_secs(30),
+                    ..H1Limits::default()
+                };
+                let holding = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    peer.until(b"\r\n\r\n").await;
+                    std::future::pending::<()>().await;
+                    drop(peer);
+                });
+                let began = Instant::now();
+                let failed = exchange
+                    .send(
+                        &Method::GET,
+                        &"/x".parse().unwrap(),
+                        &headers(&[("host", "up.test")]),
+                        &[],
+                        Sending::None,
+                        Empty::<Bytes>::new(),
+                        &limits,
+                    )
+                    .await
+                    .unwrap_err();
+                holding.abort();
+                assert!(matches!(failed, ExchangeError::TooSlow { .. }), "{failed}");
+                assert_eq!(began.elapsed(), Duration::from_secs(15));
+            })
+            .await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_blocked_request_head_uses_upload_write_idle() {
-        let (exchange, _peer) = connected(1);
-        let limits = H1Limits {
-            final_head: Duration::from_secs(5),
-            idle: Duration::from_secs(10),
-            ..H1Limits::default()
-        };
-        let began = Instant::now();
-        let failed = exchange
-            .send(
-                &Method::GET,
-                &"/x".parse().unwrap(),
-                &headers(&[("host", "up.test")]),
-                &[],
-                Sending::None,
-                Empty::<Bytes>::new(),
-                &limits,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                failed,
-                ExchangeError::Idle {
-                    waiting: Stalled::Upstream,
-                    ..
-                }
-            ),
-            "{failed}"
-        );
-        assert_eq!(began.elapsed(), limits.idle);
+        timers()
+            .driving(async {
+                let (exchange, _peer) = connected(1);
+                let limits = H1Limits {
+                    final_head: Duration::from_secs(5),
+                    idle: Duration::from_secs(10),
+                    ..H1Limits::default()
+                };
+                let began = Instant::now();
+                let failed = exchange
+                    .send(
+                        &Method::GET,
+                        &"/x".parse().unwrap(),
+                        &headers(&[("host", "up.test")]),
+                        &[],
+                        Sending::None,
+                        Empty::<Bytes>::new(),
+                        &limits,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        failed,
+                        ExchangeError::Idle {
+                            waiting: Stalled::Upstream,
+                            ..
+                        }
+                    ),
+                    "{failed}"
+                );
+                assert_eq!(began.elapsed(), limits.idle);
+            })
+            .await;
     }
 
     /// An upstream that takes the request, says nothing, and stays. Time is the test's to
     /// move, so nothing here really waits a minute.
     #[tokio::test(start_paused = true)]
     async fn an_upstream_that_never_answers_is_given_up_on() {
-        let (exchange, mut peer) = connected(4096);
-        tokio::spawn(async move {
-            peer.until(b"\r\n\r\n").await;
-            // It holds the connection open and says nothing at all.
-            std::future::pending::<()>().await;
-            drop(peer);
-        });
+        timers()
+            .driving(async {
+            let (exchange, mut peer) = connected(4096);
+            tokio::spawn(async move {
+                peer.until(b"\r\n\r\n").await;
+                // It holds the connection open and says nothing at all.
+                std::future::pending::<()>().await;
+                drop(peer);
+            });
 
-        let limits = H1Limits::default();
-        let failed = exchange
-            .send(
-                &Method::GET,
-                &"/x".parse().unwrap(),
-                &headers(&[("host", "up.test")]),
-                &[],
-                Sending::None,
-                Empty::<Bytes>::new(),
-                &limits,
-            )
-            .await
-            .unwrap_err();
-        // The idle bound is the shorter of the two, so it is the one that speaks, and
-        // what it was waiting for was the answer: the request was sent long ago.
-        assert!(
-            matches!(
-                failed,
-                ExchangeError::Idle { after, waiting: Stalled::Answer } if after == limits.idle
-            ),
-            "{failed}"
-        );
+            let limits = H1Limits::default();
+            let failed = exchange
+                .send(
+                    &Method::GET,
+                    &"/x".parse().unwrap(),
+                    &headers(&[("host", "up.test")]),
+                    &[],
+                    Sending::None,
+                    Empty::<Bytes>::new(),
+                    &limits,
+                )
+                .await
+                .unwrap_err();
+            // The idle bound is the shorter of the two, so it is the one that speaks, and
+            // what it was waiting for was the answer: the request was sent long ago.
+            assert!(
+                matches!(
+                    failed,
+                    ExchangeError::Idle { after, waiting: Stalled::Answer } if after == limits.idle
+                ),
+                "{failed}"
+            );
+            })
+            .await;
     }
 
     /// An upstream that keeps something happening never goes idle, and is still given up
@@ -2817,71 +2845,79 @@ mod tests {
     /// and is not extended by an upstream that stays busy.
     #[tokio::test(start_paused = true)]
     async fn an_upstream_that_dribbles_does_not_buy_itself_more_time() {
-        let (exchange, mut peer) = connected(4096);
-        tokio::spawn(async move {
-            peer.until(b"\r\n\r\n").await;
-            // A byte of a head that never ends, often enough never to be idle. It starts
-            // as a head would, so that the start is not what refuses it.
-            peer.say("HTTP/1.1 200 OK\r\nx-a: ").await;
-            loop {
-                peer.say("x").await;
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        });
+        timers()
+            .driving(async {
+            let (exchange, mut peer) = connected(4096);
+            tokio::spawn(async move {
+                peer.until(b"\r\n\r\n").await;
+                // A byte of a head that never ends, often enough never to be idle. It starts
+                // as a head would, so that the start is not what refuses it.
+                peer.say("HTTP/1.1 200 OK\r\nx-a: ").await;
+                loop {
+                    peer.say("x").await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            });
 
-        let limits = H1Limits::default();
-        let failed = exchange
-            .send(
-                &Method::GET,
-                &"/x".parse().unwrap(),
-                &headers(&[("host", "up.test")]),
-                &[],
-                Sending::None,
-                Empty::<Bytes>::new(),
-                &limits,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(failed, ExchangeError::TooSlow { after } if after == limits.final_head),
-            "{failed}"
-        );
+            let limits = H1Limits::default();
+            let failed = exchange
+                .send(
+                    &Method::GET,
+                    &"/x".parse().unwrap(),
+                    &headers(&[("host", "up.test")]),
+                    &[],
+                    Sending::None,
+                    Empty::<Bytes>::new(),
+                    &limits,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(failed, ExchangeError::TooSlow { after } if after == limits.final_head),
+                "{failed}"
+            );
+            })
+            .await;
     }
 
     /// Nor do interim answers, which is the same rule said of the other way an upstream
     /// can look busy without getting anywhere.
     #[tokio::test(start_paused = true)]
     async fn interim_answers_do_not_buy_more_time_either() {
-        let (exchange, mut peer) = connected(4096);
-        tokio::spawn(async move {
-            peer.until(b"\r\n\r\n").await;
-            loop {
-                peer.say("HTTP/1.1 100 Continue\r\n\r\n").await;
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        });
+        timers()
+            .driving(async {
+            let (exchange, mut peer) = connected(4096);
+            tokio::spawn(async move {
+                peer.until(b"\r\n\r\n").await;
+                loop {
+                    peer.say("HTTP/1.1 100 Continue\r\n\r\n").await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            });
 
-        // Room for more interim answers than the clock will allow through.
-        let limits = H1Limits {
-            interim_heads: 1024,
-            ..H1Limits::default()
-        };
-        let failed = exchange
-            .send(
-                &Method::GET,
-                &"/x".parse().unwrap(),
-                &headers(&[("host", "up.test")]),
-                &[],
-                Sending::None,
-                Empty::<Bytes>::new(),
-                &limits,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(failed, ExchangeError::TooSlow { after } if after == limits.final_head),
-            "{failed}"
-        );
+            // Room for more interim answers than the clock will allow through.
+            let limits = H1Limits {
+                interim_heads: 1024,
+                ..H1Limits::default()
+            };
+            let failed = exchange
+                .send(
+                    &Method::GET,
+                    &"/x".parse().unwrap(),
+                    &headers(&[("host", "up.test")]),
+                    &[],
+                    Sending::None,
+                    Empty::<Bytes>::new(),
+                    &limits,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(failed, ExchangeError::TooSlow { after } if after == limits.final_head),
+                "{failed}"
+            );
+            })
+            .await;
     }
 
     /// An upstream that answers in good time is not hurried by any of this.
@@ -2915,10 +2951,14 @@ mod tests {
     /// waiting for the rest, is given up on rather than waited for forever.
     #[tokio::test(start_paused = true)]
     async fn an_upstream_that_stops_mid_body_is_given_up_on() {
-        let (mut body, _peer) = body_on(Framing::Length(8), b"hel");
-        let failed = collected(&mut body).await.unwrap_err();
-        assert!(matches!(failed, ExchangeError::Idle { .. }), "{failed}");
-        assert!(!body.is_complete());
+        timers()
+            .driving(async {
+                let (mut body, _peer) = body_on(Framing::Length(8), b"hel");
+                let failed = collected(&mut body).await.unwrap_err();
+                assert!(matches!(failed, ExchangeError::Idle { .. }), "{failed}");
+                assert!(!body.is_complete());
+            })
+            .await;
     }
 
     /// **Only while somebody is waiting.** A client that takes its time between frames is
@@ -2993,113 +3033,121 @@ mod tests {
     /// ([13 §7](../../../docs/13-http1-upstream.md)).
     #[tokio::test(start_paused = true)]
     async fn an_answer_still_arriving_does_not_vouch_for_a_client_that_stopped() {
-        let idle = H1Limits::default().idle;
-        let (ours, theirs) = tokio::io::duplex(4096);
-        let rest = Rest {
-            exchange: Exchange::new(ours, test_blocks()),
-            upload: Upload::new(
-                Stops(Some(Bytes::from_static(b"half"))),
-                Sending::Chunked,
-                Vec::new(),
-            ),
-        };
-        let mut body = H1Body::new(
-            rest,
-            Framing::Chunked,
-            true,
-            Vec::new(),
-            H1Limits::default(),
-        );
+        timers()
+            .driving(async {
+                let idle = H1Limits::default().idle;
+                let (ours, theirs) = tokio::io::duplex(4096);
+                let rest = Rest {
+                    exchange: Exchange::new(ours, test_blocks(), timers()),
+                    upload: Upload::new(
+                        Stops(Some(Bytes::from_static(b"half"))),
+                        Sending::Chunked,
+                        Vec::new(),
+                    ),
+                };
+                let mut body = H1Body::new(
+                    rest,
+                    Framing::Chunked,
+                    true,
+                    Vec::new(),
+                    H1Limits::default(),
+                );
 
-        let (mut reading, mut writing) = tokio::io::split(theirs);
-        // Taking in what arrived, so that a socket backed up is not what ends this. It
-        // reads in a task of its own because an upstream that waited here for a client
-        // that has stopped would stop answering too, and an answer that stops is exactly
-        // what this test must not rely on.
-        let _taking = tokio::spawn(async move {
-            let mut sink = [0; 256];
-            for _ in 0..64 {
-                match reading.read(&mut sink).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-            }
-        });
-        let _answering = tokio::spawn(async move {
-            // Answering all the while, for eight times the bound: one shared clock would
-            // be reset by every one of these and the exchange would never end at all.
-            for _ in 0..64 {
-                tokio::time::sleep(idle / 8).await;
-                if writing.write_all(b"1\r\na\r\n").await.is_err() {
-                    break;
-                }
-            }
-        });
+                let (mut reading, mut writing) = tokio::io::split(theirs);
+                // Taking in what arrived, so that a socket backed up is not what ends this. It
+                // reads in a task of its own because an upstream that waited here for a client
+                // that has stopped would stop answering too, and an answer that stops is exactly
+                // what this test must not rely on.
+                let _taking = tokio::spawn(async move {
+                    let mut sink = [0; 256];
+                    for _ in 0..64 {
+                        match reading.read(&mut sink).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+                let _answering = tokio::spawn(async move {
+                    // Answering all the while, for eight times the bound: one shared clock would
+                    // be reset by every one of these and the exchange would never end at all.
+                    for _ in 0..64 {
+                        tokio::time::sleep(idle / 8).await;
+                        if writing.write_all(b"1\r\na\r\n").await.is_err() {
+                            break;
+                        }
+                    }
+                });
 
-        let began = tokio::time::Instant::now();
-        let failed = collected(&mut body).await.unwrap_err();
-        assert!(
-            matches!(
-                failed,
-                ExchangeError::Idle {
-                    waiting: Stalled::Client,
-                    ..
-                }
-            ),
-            "{failed}"
-        );
-        // A bound after the client went quiet, not a bound after anything else did.
-        assert!(began.elapsed() < idle * 2, "{:?}", began.elapsed());
+                let began = tokio::time::Instant::now();
+                let failed = collected(&mut body).await.unwrap_err();
+                assert!(
+                    matches!(
+                        failed,
+                        ExchangeError::Idle {
+                            waiting: Stalled::Client,
+                            ..
+                        }
+                    ),
+                    "{failed}"
+                );
+                // A bound after the client went quiet, not a bound after anything else did.
+                assert!(began.elapsed() < idle * 2, "{:?}", began.elapsed());
+            })
+            .await;
     }
 
     /// And the other way round: an upstream that answers but stops taking the request is
     /// given up on for that, not excused by the answer it is still sending.
     #[tokio::test(start_paused = true)]
     async fn an_answer_still_arriving_does_not_excuse_an_upstream_that_stopped_reading() {
-        let idle = H1Limits::default().idle;
-        // Room for a little of the request and no more, so the rest stays staged.
-        let (ours, theirs) = tokio::io::duplex(64);
-        let rest = Rest {
-            exchange: Exchange::new(ours, test_blocks()),
-            upload: Upload::new(
-                Full::new(Bytes::from(vec![b'x'; 64 * 1024])),
-                Sending::Length(64 * 1024),
-                Vec::new(),
-            ),
-        };
-        let mut body = H1Body::new(
-            rest,
-            Framing::Chunked,
-            true,
-            Vec::new(),
-            H1Limits::default(),
-        );
+        timers()
+            .driving(async {
+                let idle = H1Limits::default().idle;
+                // Room for a little of the request and no more, so the rest stays staged.
+                let (ours, theirs) = tokio::io::duplex(64);
+                let rest = Rest {
+                    exchange: Exchange::new(ours, test_blocks(), timers()),
+                    upload: Upload::new(
+                        Full::new(Bytes::from(vec![b'x'; 64 * 1024])),
+                        Sending::Length(64 * 1024),
+                        Vec::new(),
+                    ),
+                };
+                let mut body = H1Body::new(
+                    rest,
+                    Framing::Chunked,
+                    true,
+                    Vec::new(),
+                    H1Limits::default(),
+                );
 
-        let _answering = tokio::spawn(async move {
-            let mut peer = Peer(theirs);
-            // Talking, never listening, for eight times the bound: only a clock of its
-            // own for the request going out can end this.
-            for _ in 0..64 {
-                tokio::time::sleep(idle / 8).await;
-                peer.say("1\r\na\r\n").await;
-            }
-            peer
-        });
+                let _answering = tokio::spawn(async move {
+                    let mut peer = Peer(theirs);
+                    // Talking, never listening, for eight times the bound: only a clock of its
+                    // own for the request going out can end this.
+                    for _ in 0..64 {
+                        tokio::time::sleep(idle / 8).await;
+                        peer.say("1\r\na\r\n").await;
+                    }
+                    peer
+                });
 
-        let began = tokio::time::Instant::now();
-        let failed = collected(&mut body).await.unwrap_err();
-        assert!(
-            matches!(
-                failed,
-                ExchangeError::Idle {
-                    waiting: Stalled::Upstream,
-                    ..
-                }
-            ),
-            "{failed}"
-        );
-        // A bound after the socket stopped taking bytes, not after anything else.
-        assert!(began.elapsed() < idle * 2, "{:?}", began.elapsed());
+                let began = tokio::time::Instant::now();
+                let failed = collected(&mut body).await.unwrap_err();
+                assert!(
+                    matches!(
+                        failed,
+                        ExchangeError::Idle {
+                            waiting: Stalled::Upstream,
+                            ..
+                        }
+                    ),
+                    "{failed}"
+                );
+                // A bound after the socket stopped taking bytes, not after anything else.
+                assert!(began.elapsed() < idle * 2, "{:?}", began.elapsed());
+            })
+            .await;
     }
 
     /// An upstream that will not take the request is not a client that is being slow.
@@ -3114,57 +3162,61 @@ mod tests {
     /// ([13 §7](../../../docs/13-http1-upstream.md)).
     #[tokio::test(start_paused = true)]
     async fn a_blocked_upstream_is_not_counted_against_the_client() {
-        let idle = H1Limits::default().idle;
-        // Room for a little of the request and no more, so the rest stays staged and the
-        // client is asked for nothing while it waits.
-        let (ours, theirs) = tokio::io::duplex(64);
-        let rest = Rest {
-            exchange: Exchange::new(ours, test_blocks()),
-            upload: Upload::new(
-                // More than the sips below will ever take, so the socket stays backed up
-                // throughout and the client is never asked for a second frame.
-                Stops(Some(Bytes::from(vec![b'x'; 8 * 1024]))),
-                Sending::Chunked,
-                Vec::new(),
-            ),
-        };
-        let mut body = H1Body::new(
-            rest,
-            Framing::Chunked,
-            true,
-            Vec::new(),
-            H1Limits::default(),
-        );
+        timers()
+            .driving(async {
+                let idle = H1Limits::default().idle;
+                // Room for a little of the request and no more, so the rest stays staged and the
+                // client is asked for nothing while it waits.
+                let (ours, theirs) = tokio::io::duplex(64);
+                let rest = Rest {
+                    exchange: Exchange::new(ours, test_blocks(), timers()),
+                    upload: Upload::new(
+                        // More than the sips below will ever take, so the socket stays backed up
+                        // throughout and the client is never asked for a second frame.
+                        Stops(Some(Bytes::from(vec![b'x'; 8 * 1024]))),
+                        Sending::Chunked,
+                        Vec::new(),
+                    ),
+                };
+                let mut body = H1Body::new(
+                    rest,
+                    Framing::Chunked,
+                    true,
+                    Vec::new(),
+                    H1Limits::default(),
+                );
 
-        let _sipping = tokio::spawn(async move {
-            let mut peer = Peer(theirs);
-            let mut sink = [0; 64];
-            // A sip every half-bound for eight times the bound, and never a word said.
-            // Each rearms the upstream's clock; none of them is the client doing anything.
-            for _ in 0..16 {
-                tokio::time::sleep(idle / 2).await;
-                if peer.0.read(&mut sink).await.is_err() {
-                    break;
-                }
-            }
-            peer
-        });
+                let _sipping = tokio::spawn(async move {
+                    let mut peer = Peer(theirs);
+                    let mut sink = [0; 64];
+                    // A sip every half-bound for eight times the bound, and never a word said.
+                    // Each rearms the upstream's clock; none of them is the client doing anything.
+                    for _ in 0..16 {
+                        tokio::time::sleep(idle / 2).await;
+                        if peer.0.read(&mut sink).await.is_err() {
+                            break;
+                        }
+                    }
+                    peer
+                });
 
-        let began = tokio::time::Instant::now();
-        let failed = collected(&mut body).await.unwrap_err();
-        assert!(
-            matches!(
-                failed,
-                ExchangeError::Idle {
-                    waiting: Stalled::Upstream,
-                    ..
-                }
-            ),
-            "{failed}"
-        );
-        // Long past the bound a client that had said nothing all this time would have
-        // broken, had anybody been counting its silence.
-        assert!(began.elapsed() > idle * 8, "{:?}", began.elapsed());
+                let began = tokio::time::Instant::now();
+                let failed = collected(&mut body).await.unwrap_err();
+                assert!(
+                    matches!(
+                        failed,
+                        ExchangeError::Idle {
+                            waiting: Stalled::Upstream,
+                            ..
+                        }
+                    ),
+                    "{failed}"
+                );
+                // Long past the bound a client that had said nothing all this time would have
+                // broken, had anybody been counting its silence.
+                assert!(began.elapsed() > idle * 8, "{:?}", began.elapsed());
+            })
+            .await;
     }
 
     // ---- what one exchange holds ----
@@ -3233,7 +3285,7 @@ mod tests {
         };
         let (ours, theirs) = tokio::io::duplex(4096);
         let rest = Rest {
-            exchange: Exchange::new(ours, test_blocks()),
+            exchange: Exchange::new(ours, test_blocks(), timers()),
             upload: Upload::new(
                 Frames {
                     left: frames,
@@ -3404,7 +3456,7 @@ mod tests {
         // Room for a little of the request and no more, so the frames have to wait.
         let (ours, _theirs) = tokio::io::duplex(64);
         let rest = Rest {
-            exchange: Exchange::new(ours, test_blocks()),
+            exchange: Exchange::new(ours, test_blocks(), timers()),
             upload: Upload::new(
                 Frames {
                     left: 64,
@@ -3480,40 +3532,44 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn continue_wait_starts_after_the_request_head_is_written() {
-        let (exchange, mut peer) = connected(1);
-        let (body, asked) = Watched::new(b"hello");
-        let peering = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            let asked_before_head = asked.load(Ordering::SeqCst);
-            peer.until(b"\r\n\r\n").await;
-            let sent = Instant::now();
-            let body = peer.until(b"0\r\n\r\n").await;
-            let waited = sent.elapsed();
-            peer.say("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-                .await;
-            (asked_before_head, waited, body)
-        });
-        let limits = H1Limits::default();
-        let (answer, _rest) = exchange
-            .send(
-                &Method::POST,
-                &"/x".parse().unwrap(),
-                &expecting(),
-                &[],
-                Sending::Chunked,
-                body,
-                &limits,
-            )
-            .await
-            .unwrap();
-        let (asked_before_head, waited, body) = peering.await.unwrap();
-        assert!(
-            !asked_before_head,
-            "the continue timer ran during the head write"
-        );
-        assert_eq!(waited, limits.continue_wait);
-        assert_eq!(body, b"5\r\nhello\r\n0\r\n\r\n");
-        assert_eq!(answer.head.status, 200);
+        timers()
+            .driving(async {
+                let (exchange, mut peer) = connected(1);
+                let (body, asked) = Watched::new(b"hello");
+                let peering = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let asked_before_head = asked.load(Ordering::SeqCst);
+                    peer.until(b"\r\n\r\n").await;
+                    let sent = Instant::now();
+                    let body = peer.until(b"0\r\n\r\n").await;
+                    let waited = sent.elapsed();
+                    peer.say("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                    (asked_before_head, waited, body)
+                });
+                let limits = H1Limits::default();
+                let (answer, _rest) = exchange
+                    .send(
+                        &Method::POST,
+                        &"/x".parse().unwrap(),
+                        &expecting(),
+                        &[],
+                        Sending::Chunked,
+                        body,
+                        &limits,
+                    )
+                    .await
+                    .unwrap();
+                let (asked_before_head, waited, body) = peering.await.unwrap();
+                assert!(
+                    !asked_before_head,
+                    "the continue timer ran during the head write"
+                );
+                assert_eq!(waited, limits.continue_wait);
+                assert_eq!(body, b"5\r\nhello\r\n0\r\n\r\n");
+                assert_eq!(answer.head.status, 200);
+            })
+            .await;
     }
 
     /// The head goes out alone and the body waits to be asked for. Only when the upstream
@@ -3573,33 +3629,37 @@ mod tests {
     /// wait it is sent anyway, because the client is waiting on both of them meanwhile.
     #[tokio::test(start_paused = true)]
     async fn a_body_held_back_goes_anyway_once_the_wait_is_up() {
-        let (exchange, mut peer) = connected(4096);
-        let (body, asked) = Watched::new(b"hello");
-        let peering = tokio::spawn(async move {
-            peer.until(b"\r\n\r\n").await;
-            // It says nothing at all about the expectation.
-            let body = peer.until(b"0\r\n\r\n").await;
-            peer.say("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-                .await;
-            body
-        });
+        timers()
+            .driving(async {
+                let (exchange, mut peer) = connected(4096);
+                let (body, asked) = Watched::new(b"hello");
+                let peering = tokio::spawn(async move {
+                    peer.until(b"\r\n\r\n").await;
+                    // It says nothing at all about the expectation.
+                    let body = peer.until(b"0\r\n\r\n").await;
+                    peer.say("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                    body
+                });
 
-        let (answer, _rest) = exchange
-            .send(
-                &Method::POST,
-                &"/x".parse().unwrap(),
-                &expecting(),
-                &[],
-                Sending::Chunked,
-                body,
-                &H1Limits::default(),
-            )
-            .await
-            .unwrap();
+                let (answer, _rest) = exchange
+                    .send(
+                        &Method::POST,
+                        &"/x".parse().unwrap(),
+                        &expecting(),
+                        &[],
+                        Sending::Chunked,
+                        body,
+                        &H1Limits::default(),
+                    )
+                    .await
+                    .unwrap();
 
-        assert_eq!(answer.head.status, 200);
-        assert!(asked.load(Ordering::SeqCst));
-        assert_eq!(peering.await.unwrap(), b"5\r\nhello\r\n0\r\n\r\n");
+                assert_eq!(answer.head.status, 200);
+                assert!(asked.load(Ordering::SeqCst));
+                assert_eq!(peering.await.unwrap(), b"5\r\nhello\r\n0\r\n\r\n");
+            })
+            .await;
     }
 
     /// Another interim answer says something else, and saying something else is not
@@ -4096,7 +4156,7 @@ mod lifecycle {
                     Sending::Length(100 * frames as u64)
                 };
                 let (socket, _peer) = tokio::io::duplex(64 * 1024);
-                let mut exchange = Exchange::new(socket, test_blocks());
+                let mut exchange = Exchange::new(socket, test_blocks(), Timers::new());
                 let mut upload = Upload::new(Several { left: frames }, sending, Vec::new());
                 exchange
                     .push(
@@ -4125,7 +4185,7 @@ mod lifecycle {
             // Split the prefix, payload and suffix at every byte boundary, including
             // the scalar fallback for transports without vectored writes.
             let (socket, mut peer) = tokio::io::duplex(1);
-            let mut exchange = Exchange::new(socket, test_blocks());
+            let mut exchange = Exchange::new(socket, test_blocks(), Timers::new());
             let original = Bytes::from(vec![b'x'; 100]);
             let mut upload = Upload::new(Full::new(original.clone()), sending, Vec::new());
             let mut wire = Vec::new();
@@ -4233,7 +4293,7 @@ mod lifecycle {
                 inner,
                 writes: Rc::clone(&writes),
             };
-            let mut exchange = Exchange::new(socket, test_blocks());
+            let mut exchange = Exchange::new(socket, test_blocks(), Timers::new());
             let mut upload = Upload::new(
                 Full::new(Bytes::from(vec![b'x'; SIZE])),
                 sending,
@@ -4279,7 +4339,7 @@ mod lifecycle {
     async fn staging_does_not_keep_what_it_has_already_sent() {
         use tokio::io::AsyncReadExt;
         let (socket, mut peer) = tokio::io::duplex(1024);
-        let mut exchange = Exchange::new(socket, test_blocks());
+        let mut exchange = Exchange::new(socket, test_blocks(), Timers::new());
         let mut upload = Upload::new(Frames, Sending::Chunked, Vec::new());
         let mut drain = [0; 1024];
         for _ in 0..100 {
@@ -4304,7 +4364,7 @@ mod lifecycle {
     #[tokio::test]
     async fn a_request_still_queued_is_not_a_request_that_went() {
         let (socket, _peer) = tokio::io::duplex(64);
-        let mut exchange = Exchange::new(socket, test_blocks());
+        let mut exchange = Exchange::new(socket, test_blocks(), Timers::new());
         exchange.outgoing.extend_from_slice(b"0\r\n\r\n");
         let mut upload = Upload::new(
             http_body_util::Empty::<Bytes>::new(),

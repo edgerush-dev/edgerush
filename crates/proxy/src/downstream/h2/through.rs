@@ -8,6 +8,7 @@ use crate::downstream::h2::testing::{LONG, locally, serving, wire, within};
 use crate::downstream::h2::writer::{Outgoing, Responder, send_body};
 use crate::h2_peer::{self, Peer, flag, kind, setting};
 use crate::storage::{LIMIT, Storage};
+use crate::timers::Timers;
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Blocks, Sizes};
 use crate::upstream::h1::codec::Sending;
@@ -84,7 +85,7 @@ fn an_upload_s_credit_follows_the_exchange_writing_it_upstream() {
         // An upstream with 4 KiB of room, which reads nothing yet.
         let (ours, mut upstream) = tokio::io::duplex(4096);
         let exchange = tokio::task::spawn_local(async move {
-            Exchange::new(ours, blocks())
+            Exchange::new(ours, blocks(), Timers::new())
                 .send(
                     &Method::POST,
                     &"/".parse().unwrap(),
@@ -149,7 +150,7 @@ fn an_upstream_answer_goes_out_within_the_client_s_window_and_is_paid_for() {
             upstream
         });
         let limits = H1Limits::default();
-        let (answer, rest) = within(Exchange::new(ours, blocks()).send(
+        let (answer, rest) = within(Exchange::new(ours, blocks(), Timers::new()).send(
             &Method::GET,
             &"/".parse().unwrap(),
             &host(),

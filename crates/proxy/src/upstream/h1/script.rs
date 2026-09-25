@@ -1020,7 +1020,7 @@ mod tests {
                 Sizes::default(),
                 crate::storage::Storage::new(crate::storage::LIMIT),
             )));
-            let (answer, rest) = Exchange::new(socket, blocks)
+            let (answer, rest) = Exchange::new(socket, blocks, crate::timers::Timers::new())
                 .send(
                     &Method::GET,
                     &uri,

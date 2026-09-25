@@ -10,7 +10,6 @@
 //! thread that serves, which forwards to upstreams over HTTP/1.1 on connections of its
 //! own and never leaves the thread it was made on.
 
-mod alarm;
 mod cookies;
 mod drain;
 mod grpc;
@@ -55,6 +54,12 @@ mod serve;
 pub mod storage;
 #[cfg(not(feature = "fuzzing"))]
 mod storage;
+// Private, save when the fuzz targets are being built, for the timers an exchange keeps
+// its deadlines in.
+#[cfg(feature = "fuzzing")]
+pub mod timers;
+#[cfg(not(feature = "fuzzing"))]
+mod timers;
 mod tls;
 // Private, save when the fuzz targets are being built: they are a crate of their own and
 // cannot otherwise reach what they drive.

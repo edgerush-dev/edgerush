@@ -24,6 +24,7 @@ use super::blocks::{Blocks, SMALL, Sizes};
 use super::exchange::{Exchange, H1Body, Kept};
 use super::script::{self, Budget, Script, Scripted, Tape};
 use super::{H1Limits, lifecycle, reference};
+use crate::timers::Timers;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
 use hyper::body::{Body as HttpBody, Bytes, Frame, SizeHint};
 use std::cell::RefCell;
@@ -643,8 +644,21 @@ fn used_blocks(limits: &H1Limits) -> Rc<RefCell<Blocks>> {
 
 /// One exchange by EdgeRush's own path, and the connection back if it kept it.
 async fn one_ours(socket: Scripted, ask: &Asking, limits: H1Limits) -> (Got, Option<Scripted>) {
+    // Its deadlines are waited on as a worker's would be.
+    let timers = Timers::new();
+    timers
+        .driving(one_ours_on(socket, ask, limits, Rc::clone(&timers)))
+        .await
+}
+
+async fn one_ours_on(
+    socket: Scripted,
+    ask: &Asking,
+    limits: H1Limits,
+    timers: Rc<Timers>,
+) -> (Got, Option<Scripted>) {
     let uri: Uri = TARGET.parse().unwrap_or_default();
-    let sent = Exchange::new(socket, used_blocks(&limits))
+    let sent = Exchange::new(socket, used_blocks(&limits), timers)
         .send(
             &ask.method(),
             &uri,

@@ -35,6 +35,7 @@ use crate::request_body::{RequestBody, RequestBodyError};
 use crate::retry::budget::Budget;
 use crate::retry::replay::Tee;
 use crate::storage::Storage;
+use crate::timers::Timers;
 use crate::tls::{self, Tls, TlsError};
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
@@ -57,7 +58,7 @@ use http::{
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -312,6 +313,8 @@ pub struct Worker {
     /// What its exchanges read into, lent and taken back rather than made each time
     /// ([13 §7](../../docs/13-http1-upstream.md)).
     blocks: Rc<RefCell<Blocks>>,
+    /// Every deadline the worker keeps ([03 §2](../../docs/03-data-plane.md)).
+    timers: Rc<Timers>,
     /// How many exchanges this worker has in hand. Its own, like everything else here:
     /// no worker waits on another to find out whether it may take a request.
     in_flight: Rc<Cell<usize>>,
@@ -366,6 +369,7 @@ where
         socket,
         settings,
         Rc::clone(&worker.blocks),
+        Rc::clone(&worker.timers),
         || worker.date.get(),
         &worker.drain,
         respond,
@@ -698,6 +702,7 @@ impl Worker {
                 Sizes::within(&limits, SMALL),
                 Storage::new(limits.storage),
             ))),
+            timers: Timers::new(),
             in_flight: Rc::new(Cell::new(0)),
             limits,
             deadlines,
@@ -750,9 +755,23 @@ impl Worker {
     ///
     /// One sweep for the worker rather than a timer for every connection, and it is what
     /// clears out a destination that a reload took away and that nothing will ask for
-    /// again ([13 §3](../../docs/13-http1-upstream.md)). Spawned into the worker's
-    /// `LocalSet` beside its listeners; a worker without it keeps what it should drop.
+    /// again ([13 §3](../../docs/13-http1-upstream.md)). It waits on the worker's timers
+    /// too, beside the sweep. Spawned into the worker's `LocalSet` beside its listeners; a
+    /// worker without it keeps what it should drop, and none of its deadlines ever comes.
     pub async fn maintain(self: Rc<Self>) {
+        let mut timing = pin!(Rc::clone(&self.timers).run());
+        let mut sweeping = pin!(self.sweep());
+        poll_fn(|context| {
+            if let Poll::Ready(never) = timing.as_mut().poll(context) {
+                match never {}
+            }
+            sweeping.as_mut().poll(context)
+        })
+        .await;
+    }
+
+    /// The sweep itself, for as long as the worker runs.
+    async fn sweep(self: Rc<Self>) {
         let every = self.limits.sweep;
         loop {
             tokio::time::sleep(every).await;
@@ -878,7 +897,7 @@ impl Worker {
             }
         };
 
-        let mut exchange = Exchange::new(socket, Rc::clone(&self.blocks));
+        let mut exchange = Exchange::new(socket, Rc::clone(&self.blocks), Rc::clone(&self.timers));
         if let Some(interim) = interim {
             exchange = exchange.heard_by(interim);
         }
@@ -2129,12 +2148,19 @@ mod tests {
     const EARLY: Duration = Duration::from_millis(50);
 
     /// Serves a worker for `upstream` on a listener of its own, and says where.
+    /// Serves `socket` with `worker`, whose timers are waited on beside it as its
+    /// maintenance would wait on them.
+    fn serving(worker: &Rc<Worker>, socket: TcpListener) -> tokio::task::JoinHandle<()> {
+        let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
+        tokio::task::spawn_local(Rc::clone(worker).serve(0, socket))
+    }
+
     async fn serving_worker(upstream: SocketAddr) -> SocketAddr {
         let proxy = Proxy::new(everything_to(upstream), NonZeroUsize::MIN).unwrap();
         let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
-        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        let _serving = serving(&worker, socket);
         front
     }
 
@@ -2203,6 +2229,34 @@ mod tests {
                         String::from_utf8_lossy(said)
                     );
                 }
+            })
+            .await;
+    }
+
+    /// A worker started as the data plane starts one, serving and maintained, keeps its
+    /// deadlines: its maintenance is what waits on its timers, and without it a client
+    /// that has been answered and asks nothing more would be held for ever.
+    #[tokio::test]
+    async fn a_maintained_worker_keeps_its_deadlines() {
+        use tokio::io::AsyncWriteExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let proxy = Proxy::new(everything_to(upstream), NonZeroUsize::MIN).unwrap();
+                let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _maintaining = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+                let mut stream = TcpStream::connect(front).await.unwrap();
+                stream.write_all(ASKED).await.unwrap();
+                answered(&mut stream).await;
+                let took = closed_after(&mut stream).await;
+                assert!(
+                    took + EARLY >= SHORT.next_request && took < SHORT.next_request + SLACK,
+                    "closed after {took:?}"
+                );
             })
             .await;
     }
@@ -2693,7 +2747,7 @@ upstreams:
                 let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
                 let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let front = socket.local_addr().unwrap();
-                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+                let _serving = serving(&worker, socket);
 
                 let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
                 let request = Request::post("http://example.test/")
@@ -2733,7 +2787,7 @@ upstreams:
         let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
-        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        let _serving = serving(&worker, socket);
         (front, worker)
     }
 
@@ -3034,7 +3088,7 @@ upstreams:
         let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
-        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        let _serving = serving(&worker, socket);
         (front, worker)
     }
 
@@ -3151,7 +3205,7 @@ upstreams:
                 let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
                 let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let front = socket.local_addr().unwrap();
-                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+                let _serving = serving(&worker, socket);
 
                 // What a client asking for `name`, showing `shown`, is answered: nothing at
                 // all if the handshake, or the first read after it, failed.
@@ -3556,7 +3610,7 @@ upstreams:
         let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
-        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        let _serving = serving(&worker, socket);
         (front, worker)
     }
 
@@ -4322,7 +4376,7 @@ upstreams:
         let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
-        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        let _serving = serving(&worker, socket);
         front
     }
 
@@ -4565,7 +4619,7 @@ upstreams:
                 let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
                 let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let front = socket.local_addr().unwrap();
-                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+                let _serving = serving(&worker, socket);
 
                 let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
                 let (answer, _) = send
@@ -4904,7 +4958,7 @@ upstreams:
         let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
-        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        let _serving = serving(&worker, socket);
         (front, worker)
     }
 
@@ -5188,7 +5242,7 @@ upstreams:
         let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
-        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        let _serving = serving(&worker, socket);
         (front, worker)
     }
 
@@ -5346,7 +5400,7 @@ upstreams:
         let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
-        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        let _serving = serving(&worker, socket);
         (front, worker)
     }
 
@@ -5601,7 +5655,7 @@ upstreams:
         let worker = Worker::with_deadlines(proxy, H1Limits::default(), SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
-        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        let _serving = serving(&worker, socket);
         (front, worker)
     }
 
@@ -5832,7 +5886,7 @@ upstreams:
             let worker = Worker::with_limits(served(upstream), limits);
             let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let front = socket.local_addr().unwrap();
-            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+            let _serving = serving(&worker, socket);
 
             // Two that will not come back, waited for where the worker has committed
             // to them rather than where they were sent.
@@ -5878,7 +5932,7 @@ upstreams:
                 async move {
                     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let front = socket.local_addr().unwrap();
-                    let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+                    let _serving = serving(&worker, socket);
                     (worker, front)
                 }
             };
@@ -6029,7 +6083,7 @@ upstreams:
         let worker = Worker::with_limits(sending_to(upstream), limits);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
-        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        let _serving = serving(&worker, socket);
         for _ in 0..requests {
             assert_eq!(status_over_http1(front).await, StatusCode::OK);
         }
@@ -6107,7 +6161,7 @@ upstreams:
             let worker = Worker::with_limits(Arc::clone(&proxy), H1Limits::default());
             let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let front = socket.local_addr().unwrap();
-            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+            let _serving = serving(&worker, socket);
 
             for _ in 0..3 {
                 assert_eq!(status_over_http1(front).await, StatusCode::OK);
@@ -6201,7 +6255,7 @@ upstreams:
             let worker = Worker::with_limits(Arc::clone(&proxy), limits);
             let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let front = socket.local_addr().unwrap();
-            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+            let _serving = serving(&worker, socket);
 
             assert_eq!(
                 status_over_http2(front).await,
@@ -6251,7 +6305,7 @@ upstreams:
             let worker = Worker::new(Arc::clone(&proxy));
             let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let front = socket.local_addr().unwrap();
-            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+            let _serving = serving(&worker, socket);
 
             let mut client = TcpStream::connect(front).await.unwrap();
             client
@@ -6463,7 +6517,7 @@ upstreams:
             let worker = Worker::with_limits(Arc::clone(&proxy), limits);
             let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let front = socket.local_addr().unwrap();
-            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+            let _serving = serving(&worker, socket);
 
             let mut client = tokio::net::TcpStream::connect(front).await.unwrap();
             client
@@ -6514,7 +6568,7 @@ upstreams:
             let worker = Worker::with_limits(Arc::clone(&proxy), H1Limits::default());
             let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let front = socket.local_addr().unwrap();
-            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+            let _serving = serving(&worker, socket);
 
             assert_eq!(status_over_http1(front).await, StatusCode::BAD_GATEWAY);
             let up = proxy.metrics.upstream_slot("up");
@@ -6573,7 +6627,7 @@ upstreams:
             let worker = Worker::with_limits(Arc::clone(&proxy), H1Limits::default());
             let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let front = socket.local_addr().unwrap();
-            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+            let _serving = serving(&worker, socket);
 
             // The head arrives and says the answer succeeded; the body does not.
             let stream = TcpStream::connect(front).await.unwrap();

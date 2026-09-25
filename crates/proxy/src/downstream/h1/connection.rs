@@ -28,7 +28,6 @@ use super::outbound::{OnFailure, Outbound};
 use super::writer::{
     Asked, BodyFramer, Content, Delimited, WriteError, Written, write_head, write_interim,
 };
-use crate::alarm::Alarm;
 use crate::drain::Drain;
 use crate::h1::{BodyReader, CodecError, Framing, Piece};
 use crate::head::Head as _;
@@ -36,6 +35,7 @@ use crate::interim::Interim;
 use crate::raw::{RawAnswer, RawHead};
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::storage::{Charge, Storage};
+use crate::timers::{Alarm, Timers};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Block, Blocks};
 use bytes::{Buf, Bytes};
@@ -418,7 +418,12 @@ struct Connection<S> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     /// A connection accepted now, reading into blocks lent from `blocks`.
-    fn new(socket: S, settings: Settings, blocks: Rc<RefCell<Blocks>>) -> Self {
+    fn new(
+        socket: S,
+        settings: Settings,
+        blocks: Rc<RefCell<Blocks>>,
+        timers: &Rc<Timers>,
+    ) -> Self {
         let storage = Rc::clone(blocks.borrow().storage());
         Self {
             socket,
@@ -443,7 +448,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             deadlines: Deadlines::accepted(now(), settings.bounds),
             // No deadline is set sooner than the shortest bound after what set it, so the
             // timer need never be set further ahead than that.
-            alarm: Alarm::new(settings.bounds.shortest()),
+            alarm: Alarm::new(timers, Some(settings.bounds.shortest())),
             budget: settings.budget,
             left: settings.budget,
             read_size: ReadSize::default(),
@@ -871,6 +876,7 @@ pub(crate) async fn serve<S, R, F, B>(
     socket: S,
     settings: Settings,
     blocks: Rc<RefCell<Blocks>>,
+    timers: Rc<Timers>,
     date: impl Fn() -> HttpDate,
     drain: &Drain,
     mut respond: R,
@@ -882,7 +888,7 @@ where
     B: Body<Data = Bytes> + Unpin,
 {
     let limits = settings.limits;
-    let mut connection = Connection::new(socket, settings, blocks);
+    let mut connection = Connection::new(socket, settings, blocks, &timers);
     let mut draining = std::pin::pin!(drain.notified());
 
     loop {
@@ -1293,18 +1299,21 @@ mod tests {
         B: Body<Data = Bytes> + Unpin,
     {
         let never = Drain::default();
-        super::serve(
-            socket,
-            settings,
-            blocks,
-            date,
-            &never,
-            |head: RawHead, body, interim| {
-                let answering = respond(Request::from_parts(head.into_parts(), body), interim);
-                async move { Answered::Map(answering.await) }
-            },
-        )
-        .await
+        let timers = Timers::new();
+        timers
+            .driving(super::serve(
+                socket,
+                settings,
+                blocks,
+                Rc::clone(&timers),
+                date,
+                &never,
+                |head: RawHead, body, interim| {
+                    let answering = respond(Request::from_parts(head.into_parts(), body), interim);
+                    async move { Answered::Map(answering.await) }
+                },
+            ))
+            .await
     }
 
     /// An answer's body of a length nobody knows until it ends.
@@ -1972,7 +1981,7 @@ mod tests {
     /// reading a head), and moving a timer sooner is what costs. The clock is stopped.
     #[tokio::test(start_paused = true)]
     async fn a_busy_connection_does_not_set_its_timer_for_every_request() {
-        let before = crate::alarm::times_set();
+        let before = crate::timers::times_queued();
         let (mut client, server) = tokio::io::duplex(1 << 16);
         let asked = Asked::default();
         let serving = serve(server, settings(), blocks(), date, echoing(&asked));
@@ -1989,7 +1998,7 @@ mod tests {
         .unwrap();
         assert_eq!(ended, Ended::Closed);
         assert_eq!(asked.borrow().len(), 50);
-        let armed = crate::alarm::times_set() - before;
+        let armed = crate::timers::times_queued() - before;
         assert!(armed <= 2, "set {armed} times for 50 requests");
     }
 
@@ -2527,7 +2536,7 @@ mod tests {
     async fn one_read_takes_at_most_a_block() {
         let (mut client, server) = tokio::io::duplex(1 << 20);
         client.write_all(&vec![b'x'; 256 * 1024]).await.unwrap();
-        let mut connection = Connection::new(server, settings(), blocks());
+        let mut connection = Connection::new(server, settings(), blocks(), &Timers::new());
         // Room for far more than a block, as a grown block has.
         {
             let mut inbound = connection.inbound.borrow_mut();
@@ -2858,6 +2867,7 @@ mod tests {
                 server,
                 settings(),
                 blocks,
+                Timers::new(),
                 date,
                 &Drain::default(),
                 answering,

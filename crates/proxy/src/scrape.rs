@@ -14,6 +14,7 @@ use crate::linger::linger;
 use crate::raw::RawHead;
 use crate::serve::{ACCEPT_PAUSE, Proxy, is_about_one_connection, unix_now};
 use crate::storage::Storage;
+use crate::timers::Timers;
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Blocks, SMALL, Sizes};
 use bytes::Bytes;
@@ -49,6 +50,9 @@ impl Proxy {
             bounds: Bounds::default(),
             budget: h1::Budget::default(),
         };
+        // The scrapes' own deadlines, waited on for as long as this serves.
+        let timers = Timers::new();
+        let _timing = tokio::task::spawn_local(Rc::clone(&timers).run());
         loop {
             let mut stream = match socket.accept().await {
                 Ok((stream, _)) => stream,
@@ -61,6 +65,7 @@ impl Proxy {
             };
             let proxy = Arc::clone(&self);
             let blocks = Rc::clone(&blocks);
+            let timers = Rc::clone(&timers);
             tokio::task::spawn_local(async move {
                 // Dated as each answer is written: scrapes are too few for a worker's
                 // cached date to be worth keeping here.
@@ -72,7 +77,8 @@ impl Proxy {
                 // How it ended is the scraper's business; the socket is closed either way.
                 // Scraping goes on while the data plane drains: that is when it is watched.
                 let never = crate::drain::Drain::default();
-                let _ended = h1::serve(&mut stream, settings, blocks, date, &never, respond).await;
+                let _ended =
+                    h1::serve(&mut stream, settings, blocks, timers, date, &never, respond).await;
                 // Closed without a reset, so that one taking an answer with it is not
                 // possible even with a request body left unread.
                 linger(

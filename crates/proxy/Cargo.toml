@@ -76,5 +76,10 @@ name = "raw_head"
 harness = false
 required-features = ["fuzzing"]
 
+[[bench]]
+name = "timers"
+harness = false
+required-features = ["fuzzing"]
+
 [lints]
 workspace = true
