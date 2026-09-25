@@ -18,6 +18,7 @@ use crate::downstream::h2::body::IncomingH2;
 use crate::downstream::h2::writer::{SendError, send_body};
 use crate::interim::{Channel, Interim};
 use crate::request_body::{RequestBody, RequestBodyError};
+use crate::retry::replay::Tee;
 use crate::storage::Storage;
 use crate::upstream::destination::ReuseIdentity;
 use crate::upstream::h1::codec::{OutgoingFields, Sending};
@@ -92,8 +93,11 @@ pub(crate) struct Bounds {
 ///
 /// A request the upstream shows it never processed — its stream refused, or above the
 /// last one a GOAWAY accepted, the only two signs of it ([15 §3]) — is sent once more if
-/// there is nothing of it that could not be sent again: no body. gRPC retries the same
-/// ones, the same once ("transparent" retries). `retrying` is told when it does.
+/// all of it can be: its body is kept as it goes, up to what [`replay`] keeps, and a body
+/// that grew past that or had not ended is not sent again. gRPC retries the same ones,
+/// the same once ("transparent" retries). `retrying` is told when it does.
+///
+/// [`replay`]: crate::retry::replay
 ///
 /// [15 §3]: ../../../../docs/15-http2-and-grpc.md
 ///
@@ -123,7 +127,14 @@ pub(crate) async fn exchange<F: OutgoingFields + ?Sized>(
     let nothing_to_send = matches!(sending, Sending::None | Sending::Length(0));
     channel.begin(expects_continue(fields), nothing_to_send);
     let end_stream = matches!(sending, Sending::None) || body.is_end_stream();
-    let mut body = Some(body);
+    // Kept only where there is something to keep: a request with no body is sent again
+    // from its head alone.
+    let (mut body, kept) = if end_stream {
+        (Some(body), None)
+    } else {
+        let (tee, kept) = Tee::new(body);
+        (Some(RequestBody::Recorded(Box::new(tee))), Some(kept))
+    };
     let mut head = Some(first);
     let mut again = false;
     loop {
@@ -143,7 +154,13 @@ pub(crate) async fn exchange<F: OutgoingFields + ?Sized>(
             again,
         };
         match attempt.run(request, &mut body, &mut channel).await {
-            Err(ExchangeError::H2(error)) if end_stream && !again && unprocessed(&error) => {
+            Err(ExchangeError::H2(error)) if !again && unprocessed(&error) => {
+                if let Some(kept) = &kept {
+                    let Some(replayed) = kept.replay() else {
+                        return Err(ExchangeError::H2(error));
+                    };
+                    body = Some(RequestBody::Replayed(replayed));
+                }
                 retrying();
                 again = true;
             }

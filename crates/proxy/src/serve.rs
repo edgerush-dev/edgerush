@@ -4706,9 +4706,9 @@ upstreams:
     }
 
     /// A request the upstream refuses outright — RST_STREAM(REFUSED_STREAM), which says it
-    /// was never processed — is sent once more when there is nothing of it that could not
-    /// be sent again; one with a body is not, and one refused twice is not sent a third
-    /// time.
+    /// was never processed — is sent once more when all of it can be sent again: its body
+    /// too, if it had one no bigger than what is kept. One refused twice is not sent a
+    /// third time.
     #[tokio::test]
     async fn a_request_an_http2_upstream_refused_unprocessed_is_sent_once_more() {
         let local = tokio::task::LocalSet::new();
@@ -4716,8 +4716,11 @@ upstreams:
             .run_until(async {
                 let asked = Rc::new(Cell::new(0_usize));
                 let asking = Rc::clone(&asked);
+                let bodies = Rc::new(RefCell::new(Vec::new()));
+                let taking = Rc::clone(&bodies);
                 let script: Script = Rc::new(move |request, mut respond| {
                     let asking = Rc::clone(&asking);
+                    let taking = Rc::clone(&taking);
                     Box::pin(async move {
                         asking.set(asking.get() + 1);
                         // `/twice` is refused every time; the rest only the first time.
@@ -4727,6 +4730,13 @@ upstreams:
                             respond.send_reset(::h2::Reason::REFUSED_STREAM);
                             return;
                         }
+                        let mut body = request.into_body();
+                        let mut all = Vec::new();
+                        while let Some(Ok(chunk)) = body.data().await {
+                            let _ = body.flow_control().release_capacity(chunk.len());
+                            all.extend_from_slice(&chunk);
+                        }
+                        taking.borrow_mut().push(all);
                         let _ = respond.send_response(ok_head(), true);
                     })
                 });
@@ -4742,10 +4752,24 @@ upstreams:
                     "{scrape}"
                 );
 
-                // A body, gone the first time: not sent again.
+                // A body, kept as it went the first time, goes again with it.
                 asked.set(0);
+                bodies.borrow_mut().clear();
                 let with_body = b"POST / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\ncontent-length: 2\r\n\r\nhi";
                 let answer = h1_answer(front, with_body).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                assert_eq!(asked.get(), 2);
+                assert_eq!(*bodies.borrow(), vec![b"hi".to_vec()]);
+
+                // One bigger than what is kept is not.
+                asked.set(0);
+                let size = crate::retry::replay::MOST + 1;
+                let mut big = format!(
+                    "POST / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\ncontent-length: {size}\r\n\r\n"
+                )
+                .into_bytes();
+                big.resize(big.len() + size, b'x');
+                let answer = h1_answer(front, &big).await;
                 assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
                 assert_eq!(asked.get(), 1);
 
