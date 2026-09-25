@@ -61,6 +61,8 @@ Options:
                            For benchmarks at stated bounds; there is no configuration
                            for these [default: 8]
       --idle-total <N>     How many it keeps in all, the same way [default: 256]
+      --accept-batch <N>   How many connections a worker accepts before its other work
+                           goes first, the same way [default: 1]
   -h, --help               Print help
 ";
 
@@ -133,6 +135,8 @@ enum UsageError {
     Accept(String),
     #[error("'{1}' is not a number of idle connections for '{0}': 0 or more")]
     Idle(&'static str, String),
+    #[error("'{0}' is not a number of connections to accept at once: 1 or more")]
+    AcceptBatch(String),
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
@@ -141,7 +145,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     let mut workers = None;
     let mut accept = None;
     let mut limits = H1Limits::default();
-    let (mut per_destination, mut total) = (false, false);
+    let (mut per_destination, mut total, mut batch) = (false, false, false);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
@@ -183,6 +187,17 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
                     .map_err(|_| UsageError::Idle("--idle-total", many))?;
                 if std::mem::replace(&mut total, true) {
                     return Err(UsageError::Twice("--idle-total"));
+                }
+            }
+            "--accept-batch" => {
+                let many = args.next().ok_or(UsageError::NoValue("--accept-batch"))?;
+                limits.accept_batch = many
+                    .parse()
+                    .ok()
+                    .filter(|&many: &usize| many > 0)
+                    .ok_or(UsageError::AcceptBatch(many))?;
+                if std::mem::replace(&mut batch, true) {
+                    return Err(UsageError::Twice("--accept-batch"));
                 }
             }
             "--accept" => {

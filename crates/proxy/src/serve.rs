@@ -326,6 +326,8 @@ pub struct Worker {
     h2: Rc<H2Client>,
     /// Its retry budgets, by upstream slot: a worker's own, as its connections are.
     budgets: RefCell<HashMap<usize, Budget>>,
+    /// Connections accepted since everything else last had a turn.
+    accepted: Cell<usize>,
     /// Its limits again, for the bodies of answers to share rather than copy.
     body_limits: Rc<H1Limits>,
     /// Itself, for the tasks that send a mirror's copies to hold on to.
@@ -703,6 +705,7 @@ impl Worker {
             drain: Rc::new(Drain::default()),
             h2: H2Client::new(h2_settings(&limits)),
             budgets: RefCell::new(HashMap::new()),
+            accepted: Cell::new(0),
             body_limits: Rc::new(limits),
             me: Weak::clone(me),
         })
@@ -723,6 +726,14 @@ impl Worker {
     /// The next connection on `socket`, or `None` once this worker drains: a draining
     /// worker takes nothing new (03 §10).
     pub async fn accept(&self, socket: &TcpListener) -> Option<io::Result<TcpStream>> {
+        // After a batch, everything else the worker has ready goes first: accepting all a
+        // backlog holds would put a flood of new connections ahead of the requests of the
+        // ones it has (03 §3).
+        if self.accepted.get() >= self.limits.accept_batch {
+            self.accepted.set(0);
+            tokio::task::yield_now().await;
+        }
+        self.accepted.set(self.accepted.get() + 1);
         let mut draining = pin!(self.drain.notified());
         std::future::poll_fn(|cx| {
             if self.drain.poll_on(draining.as_mut(), cx).is_ready() {
@@ -3186,6 +3197,36 @@ upstreams:
         let mut answer = Vec::new();
         let _ended = within(stream.read_to_end(&mut answer)).await;
         String::from_utf8_lossy(&answer).into_owned()
+    }
+
+    /// A worker takes no more than its batch of connections before whatever else it has
+    /// ready runs: a backlog full of new connections does not go ahead of the rest.
+    #[tokio::test]
+    async fn a_worker_accepts_a_batch_then_lets_the_rest_run() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for (batch, other_ran) in [(1, true), (2, false)] {
+                    let proxy = served("127.0.0.1:9".parse().unwrap());
+                    let limits = H1Limits {
+                        accept_batch: batch,
+                        ..H1Limits::default()
+                    };
+                    let worker = Worker::with_deadlines(proxy, limits, SHORT);
+                    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let at = socket.local_addr().unwrap();
+                    let _first = TcpStream::connect(at).await.unwrap();
+                    let _second = TcpStream::connect(at).await.unwrap();
+
+                    within(worker.accept(&socket)).await.unwrap().unwrap();
+                    let ran = Rc::new(Cell::new(false));
+                    let running = Rc::clone(&ran);
+                    let _other = tokio::task::spawn_local(async move { running.set(true) });
+                    within(worker.accept(&socket)).await.unwrap().unwrap();
+                    assert_eq!(ran.get(), other_ran, "batch of {batch}");
+                }
+            })
+            .await;
     }
 
     /// A reload with new certificates has new handshakes given them at once, behind the

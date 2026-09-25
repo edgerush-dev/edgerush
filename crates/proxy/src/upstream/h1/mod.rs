@@ -115,6 +115,9 @@ pub struct H1Limits {
     /// ([14 §8](../../../../docs/14-downstream-server.md)). A reservation past it is
     /// refused, never waited for.
     pub storage: usize,
+    /// How many connections a worker accepts before everything else it has ready goes
+    /// first (03 §3).
+    pub accept_batch: usize,
 }
 
 impl Default for H1Limits {
@@ -142,6 +145,7 @@ impl Default for H1Limits {
             h2_waiting: 1024,
             exchanges: 1024,
             storage: crate::storage::LIMIT,
+            accept_batch: 1,
         }
     }
 }
