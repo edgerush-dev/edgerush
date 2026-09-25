@@ -84,6 +84,12 @@ tls=$run/tls
 proxy_pid=
 
 start_backend() {
+    # One left over from another run would answer in its place, from whatever config it
+    # was started with, and nothing would say so.
+    if curl -s -o /dev/null "$backend"; then
+        echo "something already answers at $backend: stop it first (pgrep -fa 'nginx -p')" >&2
+        exit 1
+    fi
     mkdir -p "$run/tmp"
     # What the streamed scenarios ask for, and what the trickling one trickles.
     [ -s "$run/big.bin" ] || head -c "$STREAMED" /dev/zero >"$run/big.bin"
