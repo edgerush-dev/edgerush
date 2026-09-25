@@ -6,7 +6,7 @@ use crate::backends::{UpstreamId, WeightedBackends};
 use crate::route::{
     Filter, HeaderChanges, Hostname, Match, PathMatch, Route, ValueMatch, ValuePredicate, Wildcard,
 };
-use crate::{Config, Protocol, Rule, Tls};
+use crate::{Config, Protocol, Rule, Tls, UpstreamProtocol};
 use edgerush_filters::{HeaderModifier, HeaderModifierError};
 use edgerush_router::{
     HeaderPredicate, HeaderPredicateError, HeaderPredicates, HostClaim, HostPattern,
@@ -89,6 +89,8 @@ pub struct CompiledUpstream {
     pub name: String,
     /// Where to connect.
     pub endpoints: Vec<SocketAddr>,
+    /// What to speak there.
+    pub protocol: UpstreamProtocol,
 }
 
 /// Compiles a config. The order of the routes, then of the rules, then of a rule's matches
@@ -114,6 +116,7 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
         .map(|(name, upstream)| CompiledUpstream {
             name: name.clone(),
             endpoints: upstream.endpoints.clone(),
+            protocol: upstream.protocol,
         })
         .collect();
 
@@ -989,6 +992,25 @@ upstreams:
             serde_saphyr::from_str::<Config>(&yaml).map(|_| ())
         };
         assert!(upstream("10.0.0.1:80").is_ok());
+        // Spoken to in HTTP/1.1 unless it says otherwise, as a Kubernetes Service port
+        // without an application protocol is.
+        let spoken = |upstream: &str| {
+            let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{ u: {upstream} }}\n");
+            serde_saphyr::from_str::<Config>(&yaml).map(|config| config.upstreams["u"].protocol)
+        };
+        assert_eq!(
+            spoken("{ endpoints: [] }").unwrap(),
+            UpstreamProtocol::Http1
+        );
+        assert_eq!(
+            spoken("{ endpoints: [], protocol: http1 }").unwrap(),
+            UpstreamProtocol::Http1
+        );
+        assert_eq!(
+            spoken("{ endpoints: [], protocol: http2 }").unwrap(),
+            UpstreamProtocol::Http2
+        );
+        assert!(spoken("{ endpoints: [], protocol: h2c }").is_err());
         assert!(upstream("localhost:80").is_err());
         assert!(upstream("10.0.0.1").is_err());
 

@@ -11,7 +11,7 @@
 //! So a destination is named by a key of its own, given out once and never again, and a
 //! reload keeps that key only where the destination really is the same one.
 
-use edgerush_config::Compiled;
+use edgerush_config::{Compiled, UpstreamProtocol};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -33,9 +33,9 @@ impl Keys {
 ///
 /// Two connections are interchangeable exactly when their destinations have the same key.
 /// The key stands for the upstream the connection was opened for, the address it was
-/// opened to, and — when there is one — the transport it was opened with. Plain TCP is
-/// the only transport for now; TLS will add its own identity, verification and the
-/// protocol that was negotiated, and matching addresses will not be enough.
+/// opened to, the protocol it speaks, and — when there is one — the transport it was
+/// opened with. Plain TCP is the only transport for now; TLS will add its own identity and
+/// verification, and matching addresses will not be enough.
 #[derive(Debug)]
 pub struct ReuseIdentity {
     key: u64,
@@ -43,6 +43,7 @@ pub struct ReuseIdentity {
     /// destinations: what they are for differs, whatever they currently resolve to.
     upstream: Box<str>,
     address: SocketAddr,
+    protocol: UpstreamProtocol,
     /// Set when a config without this destination is published. Nothing retired is ever
     /// kept or taken out again; an exchange already under way finishes as it is.
     retired: AtomicBool,
@@ -58,6 +59,15 @@ impl ReuseIdentity {
     /// Where to connect for it.
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// What its connections speak.
+    #[cfg_attr(
+        not(any(test, feature = "fuzzing")),
+        expect(dead_code, reason = "dispatched on by the HTTP/2 client of 15 step 6")
+    )]
+    pub fn protocol(&self) -> UpstreamProtocol {
+        self.protocol
     }
 
     /// Whether this destination is gone from the running config. Checked when a
@@ -81,17 +91,21 @@ impl Destinations {
     /// The destinations of `config`, keeping those of `previous` wherever the destination
     /// is the same one, and retiring those of `previous` that this config does not have.
     ///
-    /// Sameness is the upstream's name and the address, and nothing about where either
-    /// sits: a config that says the same thing in a different order says the same thing.
+    /// Sameness is the upstream's name, the address and the protocol, and nothing about
+    /// where any of them sits: a config that says the same thing in a different order says the same thing.
     /// A destination that goes and comes back is a new one, because nothing here can tell
     /// whether what answers at that address is still what answered before.
     pub fn reconcile(config: &Compiled, previous: &Self, keys: &Keys) -> Self {
-        let mut known: HashMap<(&str, SocketAddr), &Arc<ReuseIdentity>> = previous
-            .0
-            .iter()
-            .flatten()
-            .map(|identity| ((&*identity.upstream, identity.address), identity))
-            .collect();
+        let mut known: HashMap<(&str, SocketAddr, UpstreamProtocol), &Arc<ReuseIdentity>> =
+            previous
+                .0
+                .iter()
+                .flatten()
+                .map(|identity| {
+                    let same = (&*identity.upstream, identity.address, identity.protocol);
+                    (same, identity)
+                })
+                .collect();
 
         let destinations = config
             .upstreams
@@ -104,13 +118,14 @@ impl Destinations {
                         // Taken out as it is used, so that whatever is left over at the
                         // end is exactly what this config no longer has.
                         known
-                            .remove(&(upstream.name.as_str(), *address))
+                            .remove(&(upstream.name.as_str(), *address, upstream.protocol))
                             .map_or_else(
                                 || {
                                     Arc::new(ReuseIdentity {
                                         key: keys.next(),
                                         upstream: upstream.name.as_str().into(),
                                         address: *address,
+                                        protocol: upstream.protocol,
                                         retired: AtomicBool::new(false),
                                     })
                                 },
@@ -290,6 +305,28 @@ mod tests {
         let was = Arc::clone(before.at(0, 0).unwrap());
         let after = Destinations::reconcile(&config(&[("web", &["127.0.0.1:2"])]), &before, &keys);
         assert_ne!(after.at(0, 0).unwrap().key(), was.key());
+        assert!(was.is_retired());
+    }
+
+    /// An upstream that changes the protocol it is spoken to in is a different destination:
+    /// a connection opened to speak HTTP/1.1 is never lent to a request that is to go by
+    /// HTTP/2, nor the other way round.
+    #[test]
+    fn an_upstream_that_changes_protocol_is_a_different_destination() {
+        let keys = Keys::default();
+        let before = Destinations::reconcile(
+            &config(&[("web", &["127.0.0.1:1"])]),
+            &Destinations::default(),
+            &keys,
+        );
+        let was = Arc::clone(before.at(0, 0).unwrap());
+        assert_eq!(was.protocol(), UpstreamProtocol::Http1);
+        let mut http2 = config(&[("web", &["127.0.0.1:1"])]);
+        http2.upstreams[0].protocol = UpstreamProtocol::Http2;
+        let after = Destinations::reconcile(&http2, &before, &keys);
+        let now = after.at(0, 0).unwrap();
+        assert_ne!(now.key(), was.key());
+        assert_eq!(now.protocol(), UpstreamProtocol::Http2);
         assert!(was.is_retired());
     }
 

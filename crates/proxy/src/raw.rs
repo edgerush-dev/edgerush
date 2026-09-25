@@ -102,6 +102,12 @@ impl OutgoingFields for RawHead {
             }
         }
     }
+
+    fn each_field(&self, mut visit: impl FnMut(&[u8], &[u8])) {
+        for (name, value) in self.fields().iter() {
+            visit(name, value);
+        }
+    }
 }
 
 impl Head for RawHead {

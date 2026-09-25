@@ -79,4 +79,20 @@ pub struct Upstream {
     /// Where to connect: addresses, not names. None is allowed, and means there is nothing
     /// to send a request to — a state a running system passes through, not a mistake.
     pub endpoints: Vec<SocketAddr>,
+    /// What its endpoints are spoken to in, whatever the client spoke.
+    #[serde(default)]
+    pub protocol: UpstreamProtocol,
+}
+
+/// What an upstream is spoken to in. Unsaid, it is HTTP/1.1, as for a Kubernetes Service
+/// port that names no application protocol.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamProtocol {
+    /// HTTP/1.1, a request at a time on each connection.
+    #[default]
+    Http1,
+    /// HTTP/2, many requests at once on each connection. Without TLS, by prior knowledge
+    /// (RFC 9113 §3.3): the upstream is expected to speak it from the first byte.
+    Http2,
 }

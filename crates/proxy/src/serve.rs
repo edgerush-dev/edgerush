@@ -39,7 +39,7 @@ use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, nothing_to_
 use crate::upstream::h1::pool::{Lease, Pool};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use edgerush_config::{Compiled, CompiledRule};
+use edgerush_config::{Compiled, CompiledRule, UpstreamProtocol};
 use edgerush_router::Fields;
 use http::uri::{Authority, Scheme};
 use http::{HeaderName, Method, Request, Response, Uri, Version};
@@ -387,6 +387,13 @@ impl Snapshot {
         previous: Option<&Snapshot>,
         keys: &Keys,
     ) -> Result<Self, ProxyError> {
+        if let Some(upstream) = config
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.protocol == UpstreamProtocol::Http2)
+        {
+            return Err(ProxyError::Http2Upstream(upstream.name.clone()));
+        }
         let endpoints = config
             .upstreams
             .iter()
@@ -1212,6 +1219,10 @@ pub enum ProxyError {
     /// An endpoint address that cannot be written into a request target.
     #[error("endpoint {0} cannot be part of a request target")]
     Endpoint(SocketAddr),
+    /// An upstream to be spoken to in HTTP/2, which the data plane cannot do yet
+    /// ([15](../../docs/15-http2-and-grpc.md) step 6).
+    #[error("upstream `{0}`: HTTP/2 to upstreams is not built yet")]
+    Http2Upstream(String),
     /// A listener's certificates that cannot be served.
     #[error("listener `{listener}`: {error}")]
     Tls {
@@ -2469,6 +2480,19 @@ upstreams:
                 assert!(!answer.starts_with(b"HTTP/"), "{answer:?}");
             })
             .await;
+    }
+
+    /// An upstream to be spoken to in HTTP/2 is refused, by name, until there is a client
+    /// to speak it with.
+    #[test]
+    fn an_http2_upstream_is_refused_until_it_can_be_served() {
+        let mut config = everything_config("127.0.0.1:9".parse().unwrap());
+        config.upstreams.get_mut("up").unwrap().protocol = UpstreamProtocol::Http2;
+        let refused = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN);
+        assert_eq!(
+            refused.unwrap_err(),
+            ProxyError::Http2Upstream("up".to_owned())
+        );
     }
 
     /// A config whose certificates are those of the config before keeps what it served

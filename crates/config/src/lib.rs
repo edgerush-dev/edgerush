@@ -23,7 +23,7 @@ pub use compile::{
     Compiled, CompiledListener, CompiledRule, CompiledUpstream, ConfigError, Object, Place,
     Problem, RuleId, compile,
 };
-pub use config::{Certificate, Config, Listener, Protocol, Tls, Upstream};
+pub use config::{Certificate, Config, Listener, Protocol, Tls, Upstream, UpstreamProtocol};
 pub use route::{
     Backend, Filter, Header, HeaderChanges, Hostname, Match, PathMatch, Route, Rule, ValueMatch,
     ValuePredicate, Wildcard,

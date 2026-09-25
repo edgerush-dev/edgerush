@@ -474,6 +474,10 @@ pub trait OutgoingFields: edgerush_router::Fields {
 
     /// Appends them to `out`, one line each.
     fn write_fields(&self, out: &mut Vec<u8>);
+
+    /// Hands every field to `visit`, its name as it arrived and its value, in order: for a
+    /// hop that sends them as something other than lines. The framing fields included.
+    fn each_field(&self, visit: impl FnMut(&[u8], &[u8]));
 }
 
 impl OutgoingFields for HeaderMap {
@@ -493,6 +497,12 @@ impl OutgoingFields for HeaderMap {
             out.extend_from_slice(b": ");
             out.extend_from_slice(value.as_bytes());
             out.extend_from_slice(b"\r\n");
+        }
+    }
+
+    fn each_field(&self, mut visit: impl FnMut(&[u8], &[u8])) {
+        for (name, value) in self {
+            visit(name.as_str().as_bytes(), value.as_bytes());
         }
     }
 }
