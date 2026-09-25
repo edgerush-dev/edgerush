@@ -88,6 +88,45 @@ pub struct Upstream {
     /// HTTP/2 PINGs to find a dead connection before a request does; none is no PINGs.
     #[serde(default)]
     pub keepalive: Option<Keepalive>,
+    /// Probes of each endpoint, which keep one that fails them out of load balancing;
+    /// none is every endpoint taken as healthy.
+    #[serde(default)]
+    pub health_check: Option<HealthCheck>,
+}
+
+/// An active check of an upstream's endpoints. Everything is stated: how often, how long a
+/// probe may take, and how many results in a row change an endpoint's state (HAProxy's
+/// `rise` and `fall`; Envoy's thresholds).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthCheck {
+    /// Seconds between probes of an endpoint.
+    pub interval_seconds: u64,
+    /// Seconds a probe may take, connection and handshake included.
+    pub timeout_seconds: u64,
+    /// Passes in a row that make an unhealthy endpoint healthy.
+    pub healthy_threshold: u32,
+    /// Failures in a row that make a healthy endpoint unhealthy.
+    pub unhealthy_threshold: u32,
+    /// What a probe asks.
+    pub probe: Probe,
+}
+
+/// What a health check asks an endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Probe {
+    /// `GET` this path, in the upstream's protocol: a 2xx answer passes.
+    Http {
+        /// The path asked for.
+        path: String,
+    },
+    /// gRPC's `grpc.health.v1.Health/Check` for this service (empty for the server as a
+    /// whole): `SERVING` passes, anything else fails. For an upstream spoken to in HTTP/2.
+    Grpc {
+        /// The service asked about.
+        service: String,
+    },
 }
 
 /// PINGs on an HTTP/2 upstream's idle-looking connections, as gRPC's keepalive has them.

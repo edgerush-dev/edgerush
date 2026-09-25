@@ -7,7 +7,9 @@ use crate::route::{
     Filter, GrpcMethod, HeaderChanges, Hostname, Match, PathMatch, Route, ValueMatch,
     ValuePredicate, Wildcard,
 };
-use crate::{Config, Keepalive, Protocol, Rule, Tls, UpstreamProtocol, UpstreamTls};
+use crate::{
+    Config, HealthCheck, Keepalive, Probe, Protocol, Rule, Tls, UpstreamProtocol, UpstreamTls,
+};
 use edgerush_filters::{HeaderModifier, HeaderModifierError};
 use edgerush_router::{
     HeaderPredicate, HeaderPredicateError, HeaderPredicates, HostClaim, HostPattern,
@@ -96,6 +98,8 @@ pub struct CompiledUpstream {
     pub tls: Option<UpstreamTls>,
     /// PINGs on its HTTP/2 connections, if any.
     pub keepalive: Option<Keepalive>,
+    /// Probes of its endpoints, if any.
+    pub health_check: Option<HealthCheck>,
 }
 
 /// Compiles a config. The order of the routes, then of the rules, then of a rule's matches
@@ -124,9 +128,34 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             protocol: upstream.protocol,
             tls: upstream.tls.clone(),
             keepalive: upstream.keepalive,
+            health_check: upstream.health_check.clone(),
         })
         .collect();
     for (name, upstream) in &config.upstreams {
+        if let Some(check) = &upstream.health_check {
+            let problem = if check.interval_seconds == 0
+                || check.timeout_seconds == 0
+                || check.healthy_threshold == 0
+                || check.unhealthy_threshold == 0
+            {
+                Some(Problem::HealthCheckZero)
+            } else if check.timeout_seconds > check.interval_seconds {
+                Some(Problem::HealthCheckOverlaps)
+            } else {
+                match &check.probe {
+                    Probe::Http { path } if !path.starts_with('/') => {
+                        Some(Problem::HealthCheckPath(path.clone()))
+                    }
+                    Probe::Grpc { .. } if upstream.protocol != UpstreamProtocol::Http2 => {
+                        Some(Problem::GrpcCheckNeedsHttp2)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(problem) = problem {
+                errors.push(Place::upstream(name).problem(problem));
+            }
+        }
         if let Some(keepalive) = &upstream.keepalive {
             let problem = if upstream.protocol != UpstreamProtocol::Http2 {
                 Some(Problem::KeepaliveNeedsHttp2)
@@ -665,6 +694,18 @@ pub enum Problem {
     /// A keepalive interval or timeout of nothing.
     #[error("`keepalive` needs an interval and a timeout of at least a second")]
     KeepaliveZero,
+    /// A health check with an interval, timeout or threshold of nothing.
+    #[error("`health_check` needs an interval, a timeout and thresholds of at least one")]
+    HealthCheckZero,
+    /// A probe that could still be running when the next is due.
+    #[error("a health check's timeout is longer than its interval")]
+    HealthCheckOverlaps,
+    /// An HTTP probe of something that is not a path.
+    #[error("health check path `{0}` does not start with `/`")]
+    HealthCheckPath(String),
+    /// A gRPC probe of an upstream not spoken to in HTTP/2.
+    #[error("a gRPC health check is for an upstream spoken to in HTTP/2")]
+    GrpcCheckNeedsHttp2,
     /// TLS to an upstream whose server is not named by a host name.
     #[error("server name `{0}` is not a host name")]
     ServerName(String),
@@ -1372,6 +1413,61 @@ upstreams: { u: { endpoints: [] } }
             .contains("more often than the 300 s gRPC servers take"));
         assert!(problem("{ endpoints: [], protocol: http2, keepalive: { interval_seconds: 0, timeout_seconds: 20, without_calls: false, backend_allows_short_intervals: true } }")
             .ends_with("needs an interval and a timeout of at least a second"));
+    }
+
+    /// A health check says everything it does, and nothing that cannot work.
+    #[test]
+    fn a_health_check_says_everything_and_nothing_that_cannot_work() {
+        let with = |upstream: &str| {
+            let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{ u: {upstream} }}\n");
+            compile(&config(&yaml))
+                .map(|compiled| compiled.upstreams[0].health_check.clone())
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let check = |fields: &str| {
+            format!(
+                "{{ endpoints: [], protocol: http1, health_check: {{ interval_seconds: 5, timeout_seconds: 2, healthy_threshold: 2, unhealthy_threshold: 3, {fields} }} }}"
+            )
+        };
+        let http = with(&check("probe: { http: { path: /healthz } }"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            http.probe,
+            Probe::Http {
+                path: "/healthz".to_owned()
+            }
+        );
+        let grpc = check("probe: { grpc: { service: \"\" } }").replace("http1", "http2");
+        assert!(with(&grpc).is_ok());
+
+        let problem = |upstream: &str| with(upstream).unwrap_err()[0].clone();
+        assert!(
+            problem(&check("probe: { grpc: { service: x } }"))
+                .ends_with("a gRPC health check is for an upstream spoken to in HTTP/2")
+        );
+        assert!(
+            problem(&check("probe: { http: { path: healthz } }"))
+                .ends_with("health check path `healthz` does not start with `/`")
+        );
+        assert!(
+            problem(
+                &check("probe: { http: { path: / } }")
+                    .replace("timeout_seconds: 2", "timeout_seconds: 9")
+            )
+            .ends_with("a health check's timeout is longer than its interval")
+        );
+        assert!(
+            problem(
+                &check("probe: { http: { path: / } }")
+                    .replace("healthy_threshold: 2", "healthy_threshold: 0")
+            )
+            .ends_with("thresholds of at least one")
+        );
+        // Nothing is left to a default.
+        let missing = "{ endpoints: [], health_check: { interval_seconds: 5, timeout_seconds: 2, probe: { http: { path: / } } } }";
+        let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{ u: {missing} }}\n");
+        assert!(serde_saphyr::from_str::<Config>(&yaml).is_err());
     }
 
     /// A private key is never printed, whatever prints the config.

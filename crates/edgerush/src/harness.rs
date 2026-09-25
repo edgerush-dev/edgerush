@@ -295,6 +295,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         per_core::CONNECTIONS_PER_WORKER,
     )
     .map_err(Failure::Runtime)?;
+    health_checks(Arc::clone(&proxy)).map_err(Failure::Runtime)?;
     if let Some(socket) = metrics {
         let address = socket.local_addr().map_err(Failure::Runtime)?;
         scrapes(Arc::clone(&proxy), socket).map_err(Failure::Runtime)?;
@@ -444,6 +445,19 @@ fn scrapes(proxy: Arc<Proxy>, socket: std::net::TcpListener) -> io::Result<()> {
         .name("metrics".to_owned())
         .spawn(move || {
             tokio::task::LocalSet::new().block_on(&runtime, proxy.serve_metrics(socket));
+        })?;
+    Ok(())
+}
+
+/// Probes the upstreams that ask for health checks, on a runtime and a thread of their
+/// own: a worker saturated with requests must not starve the checks that decide where
+/// its requests go ([03 §6] in the docs).
+fn health_checks(proxy: Arc<Proxy>) -> io::Result<()> {
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    thread::Builder::new()
+        .name("health".to_owned())
+        .spawn(move || {
+            tokio::task::LocalSet::new().block_on(&runtime, proxy.check_health());
         })?;
     Ok(())
 }

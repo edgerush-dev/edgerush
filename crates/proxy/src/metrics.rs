@@ -476,7 +476,12 @@ impl Metrics {
 
     /// The scrape: the listeners by their names, and the upstreams of the current config
     /// by theirs, each with the slot it has.
-    pub(crate) fn render(&self, listeners: &[String], upstreams: &[(&str, usize)]) -> String {
+    pub(crate) fn render(
+        &self,
+        listeners: &[String],
+        upstreams: &[(&str, usize)],
+        healthy: &[(&str, usize)],
+    ) -> String {
         let mut scrape = Exposition::new();
         let listeners = || listeners.iter().zip(&self.listeners);
 
@@ -618,6 +623,13 @@ impl Metrics {
         for (upstream, series) in upstreams() {
             let labels = [("upstream", upstream)];
             scrape.sample(name, &labels, series.sum(|shard| shard.retries.get()));
+        }
+
+        let name = "edgerush_upstream_healthy_endpoints";
+        let help = "Endpoints the health checks, if any, say serve.";
+        scrape.family(name, Kind::Gauge, help);
+        for (upstream, serving) in healthy {
+            scrape.sample(name, &[("upstream", upstream)], *serving as u64);
         }
 
         let name = "edgerush_upstream_exchanges_stopped_total";
@@ -767,7 +779,11 @@ mod tests {
         assert_eq!(metrics.upstream_slot("upstream-0"), slots[0]);
 
         metrics.upstream(OVERFLOW_SLOT).unwrap().requests.inc();
-        let scrape = metrics.render(&[], &[("late-a", OVERFLOW_SLOT), ("late-b", OVERFLOW_SLOT)]);
+        let scrape = metrics.render(
+            &[],
+            &[("late-a", OVERFLOW_SLOT), ("late-b", OVERFLOW_SLOT)],
+            &[],
+        );
         let line = "edgerush_upstream_requests_total{upstream=\"_overflow\"} 1\n";
         assert_eq!(scrape.matches(line).count(), 1, "{scrape}");
         assert!(!scrape.contains("late-a"), "{scrape}");
@@ -790,7 +806,7 @@ mod tests {
         upstream.responded(StatusCode::OK);
         metrics.reloads.inc();
 
-        let scrape = metrics.render(&listeners, &[("cart", cart)]);
+        let scrape = metrics.render(&listeners, &[("cart", cart)], &[]);
         for line in [
             "# TYPE edgerush_listener_responses_total counter\n",
             "edgerush_listener_connections_accepted_total{listener=\"web\"} 1\n",
@@ -833,7 +849,7 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-        let scrape = metrics.render(&["web".to_owned()], &[]);
+        let scrape = metrics.render(&["web".to_owned()], &[], &[]);
         let line = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"} 6\n";
         assert!(scrape.contains(line), "{scrape}");
     }
@@ -843,9 +859,9 @@ mod tests {
         let metrics = metrics();
         let cart = metrics.upstream_slot("cart");
         metrics.upstream(cart).unwrap().requests.add(5);
-        assert!(!metrics.render(&[], &[]).contains("cart"));
+        assert!(!metrics.render(&[], &[], &[]).contains("cart"));
         let again = metrics.upstream_slot("cart");
-        let scrape = metrics.render(&[], &[("cart", again)]);
+        let scrape = metrics.render(&[], &[("cart", again)], &[]);
         assert!(scrape.contains("edgerush_upstream_requests_total{upstream=\"cart\"} 5\n"));
     }
 }

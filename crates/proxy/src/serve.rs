@@ -600,7 +600,43 @@ impl Proxy {
             .zip(&snapshot.upstream_slots)
             .map(|(upstream, slot)| (upstream.name.as_str(), *slot))
             .collect();
-        self.metrics.render(&self.listeners, &upstreams)
+        // Read where the health checker writes it, at the moment of the scrape.
+        let healthy: Vec<(&str, usize)> = snapshot
+            .config
+            .upstreams
+            .iter()
+            .enumerate()
+            .map(|(position, upstream)| {
+                let serving = snapshot
+                    .destinations
+                    .of(position)
+                    .iter()
+                    .filter(|destination| destination.is_healthy())
+                    .count();
+                (upstream.name.as_str(), serving)
+            })
+            .collect();
+        self.metrics.render(&self.listeners, &upstreams, &healthy)
+    }
+
+    /// Probes the endpoints of every upstream that asks for health checks, for as long as
+    /// the data plane runs, and keeps those that fail them out of load balancing
+    /// ([03 §6](../../docs/03-data-plane.md)). For a thread and runtime of its own, in a
+    /// `LocalSet`: the probes must still run when the workers are saturated.
+    pub async fn check_health(self: Arc<Self>) {
+        crate::health::check(self).await;
+    }
+
+    /// The destinations of the running config whose endpoints are probed.
+    pub(crate) fn checked(&self) -> impl Iterator<Item = Arc<ReuseIdentity>> + use<> {
+        let snapshot = self.current.load();
+        let checked: Vec<Arc<ReuseIdentity>> = snapshot
+            .destinations
+            .all()
+            .filter(|destination| destination.health_check().is_some())
+            .map(Arc::clone)
+            .collect();
+        checked.into_iter()
     }
 
     /// Counts a failure to accept on the socket of the listener at position `listener`,
@@ -1367,7 +1403,13 @@ impl Proxy {
             .upstream_slots
             .get(upstream)
             .ok_or(Answer::NoBackend)?;
-        let at = pick_at(endpoints.len(), random()).ok_or(Answer::NoEndpoints)?;
+        let destinations = snapshot.destinations.of(upstream);
+        let at = pick_healthy(destinations.len(), random(), |at| {
+            destinations
+                .get(at)
+                .is_some_and(|destination| destination.is_healthy())
+        })
+        .ok_or(Answer::NoEndpoints)?;
         let endpoint = endpoints.get(at).ok_or(Answer::NoEndpoints)?;
         let identity = snapshot
             .destinations
@@ -1507,6 +1549,27 @@ fn authority(endpoint: &SocketAddr) -> Result<Authority, ProxyError> {
 fn pick_at(endpoints: usize, random: u64) -> Option<usize> {
     let count = u64::try_from(endpoints).ok()?;
     usize::try_from(random.checked_rem(count)?).ok()
+}
+
+/// One of the endpoints that `healthy` says serve, each as likely as any other — unless
+/// fewer than half of them do, when their health is set aside and any may be picked:
+/// Envoy's panic threshold, at its default of half. Probes that fail most of an upstream
+/// are more likely wrong themselves, or about to put the rest under a load that fails them
+/// too, than a reason to answer every request 503.
+///
+/// Costs one look when the endpoint first drawn serves, which is the usual case.
+fn pick_healthy(endpoints: usize, random: u64, healthy: impl Fn(usize) -> bool) -> Option<usize> {
+    let first = pick_at(endpoints, random)?;
+    if healthy(first) {
+        return Some(first);
+    }
+    let serving = (0..endpoints).filter(|at| healthy(*at)).count();
+    if serving * 2 < endpoints {
+        return Some(first);
+    }
+    // Another draw, among those that serve.
+    let nth = pick_at(serving, random / endpoints as u64)?;
+    (0..endpoints).filter(|at| healthy(*at)).nth(nth)
 }
 
 /// The same path and query, at the endpoint: the form in which the client is told where to
@@ -4386,6 +4449,213 @@ upstreams:
             .await;
     }
 
+    /// An HTTP/1 upstream that answers `/healthz` 200 while `serving` says so and 503
+    /// otherwise, and every other request 200 with its name in `x-upstream`.
+    async fn checked_upstream(name: &'static str, serving: Rc<Cell<bool>>) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let _accepting = tokio::task::spawn_local(async move {
+            while let Ok((mut stream, _)) = socket.accept().await {
+                let serving = Rc::clone(&serving);
+                let _answering = tokio::task::spawn_local(async move {
+                    let mut seen = Vec::new();
+                    let mut byte = [0; 1];
+                    loop {
+                        match stream.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => seen.push(byte[0]),
+                        }
+                        if !seen.ends_with(b"\r\n\r\n") {
+                            continue;
+                        }
+                        let probe = seen.starts_with(b"GET /healthz ");
+                        seen.clear();
+                        let answer = if probe && !serving.get() {
+                            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n"
+                                .to_owned()
+                        } else {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nx-upstream: {name}\r\ncontent-length: 0\r\n\r\n"
+                            )
+                        };
+                        if stream.write_all(answer.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        address
+    }
+
+    /// A worker whose one upstream `up` has `endpoints`, checked as `check` says, with the
+    /// health checker running.
+    async fn serving_checked_worker(
+        endpoints: Vec<SocketAddr>,
+        protocol: UpstreamProtocol,
+        check: edgerush_config::HealthCheck,
+    ) -> (SocketAddr, Rc<Worker>) {
+        let mut config = everything_config(endpoints[0]);
+        let up = config.upstreams.get_mut("up").unwrap();
+        up.endpoints = endpoints;
+        up.protocol = protocol;
+        up.health_check = Some(check);
+        let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+        let _checking = tokio::task::spawn_local(Arc::clone(&proxy).check_health());
+        let worker = Worker::with_deadlines(proxy, H1Limits::default(), SHORT);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        (front, worker)
+    }
+
+    fn every_second_by(probe: edgerush_config::Probe) -> edgerush_config::HealthCheck {
+        edgerush_config::HealthCheck {
+            interval_seconds: 1,
+            timeout_seconds: 1,
+            healthy_threshold: 1,
+            unhealthy_threshold: 1,
+            probe,
+        }
+    }
+
+    fn healthz() -> edgerush_config::Probe {
+        edgerush_config::Probe::Http {
+            path: "/healthz".to_owned(),
+        }
+    }
+
+    /// How many endpoints of `up` the scrape says serve.
+    fn serving_now(worker: &Worker) -> String {
+        let scrape = worker.proxy().metrics();
+        scrape
+            .lines()
+            .find(|line| line.starts_with("edgerush_upstream_healthy_endpoints{upstream=\"up\"}"))
+            .unwrap_or_default()
+            .rsplit(' ')
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// Until the scrape says `count` endpoints serve, for up to ten seconds.
+    async fn until_serving(worker: &Worker, count: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while serving_now(worker) != count {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("never {count} serving; now {}", serving_now(worker)));
+    }
+
+    /// An endpoint that fails its checks gets no requests while it does, and gets them
+    /// again once it passes.
+    #[tokio::test]
+    async fn an_endpoint_failing_its_checks_is_kept_out_until_it_passes() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let steady = checked_upstream("steady", Rc::new(Cell::new(true))).await;
+                let shaky_serving = Rc::new(Cell::new(false));
+                let shaky = checked_upstream("shaky", Rc::clone(&shaky_serving)).await;
+                let (front, worker) = serving_checked_worker(
+                    vec![steady, shaky],
+                    UpstreamProtocol::Http1,
+                    every_second_by(healthz()),
+                )
+                .await;
+                until_serving(&worker, "1").await;
+                for _ in 0..20 {
+                    let answer = h1_answer(front, CLOSING_GET).await;
+                    assert!(answer.contains("x-upstream: steady\r\n"), "{answer}");
+                }
+                shaky_serving.set(true);
+                until_serving(&worker, "2").await;
+                let mut answered_by_shaky = false;
+                for _ in 0..40 {
+                    answered_by_shaky |= h1_answer(front, CLOSING_GET)
+                        .await
+                        .contains("x-upstream: shaky\r\n");
+                }
+                assert!(answered_by_shaky, "a healthy endpoint got nothing");
+            })
+            .await;
+    }
+
+    /// When fewer than half the endpoints pass, their health is set aside: requests go on
+    /// to all of them rather than being answered 503.
+    #[tokio::test]
+    async fn with_most_endpoints_failing_their_health_is_set_aside() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let one = checked_upstream("one", Rc::new(Cell::new(false))).await;
+                let two = checked_upstream("two", Rc::new(Cell::new(false))).await;
+                let three = checked_upstream("three", Rc::new(Cell::new(true))).await;
+                let (front, worker) = serving_checked_worker(
+                    vec![one, two, three],
+                    UpstreamProtocol::Http1,
+                    every_second_by(healthz()),
+                )
+                .await;
+                until_serving(&worker, "1").await;
+                let mut unhealthy_answered = false;
+                for _ in 0..40 {
+                    let answer = h1_answer(front, CLOSING_GET).await;
+                    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                    unhealthy_answered |= !answer.contains("x-upstream: three\r\n");
+                }
+                assert!(unhealthy_answered, "health was not set aside below half");
+            })
+            .await;
+    }
+
+    /// A gRPC health check passes an endpoint whose health service says `SERVING`, and
+    /// fails one that says anything else.
+    #[tokio::test]
+    async fn a_grpc_health_check_passes_only_serving() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let state = Rc::new(Cell::new(1_u8));
+                let saying = Rc::clone(&state);
+                let script: Script = Rc::new(move |request, mut respond| {
+                    let saying = Rc::clone(&saying);
+                    Box::pin(async move {
+                        assert_eq!(request.uri().path(), "/grpc.health.v1.Health/Check");
+                        let mut body = request.into_body();
+                        let _ = read_all(&mut body).await;
+                        let Ok(mut sending) = respond.send_response(grpc_head(), false) else {
+                            return;
+                        };
+                        let message = [0, 0, 0, 0, 2, 0x08, saying.get()];
+                        let _ = sending.send_data(Bytes::copy_from_slice(&message), false);
+                        let mut status = http::HeaderMap::new();
+                        status.insert("grpc-status", "0".parse().unwrap());
+                        let _ = sending.send_trailers(status);
+                    })
+                });
+                let upstream = scripted_h2_upstream(script).await;
+                let probe = edgerush_config::Probe::Grpc {
+                    service: String::new(),
+                };
+                let (_front, worker) = serving_checked_worker(
+                    vec![upstream],
+                    UpstreamProtocol::Http2,
+                    every_second_by(probe),
+                )
+                .await;
+                // NOT_SERVING takes it out, SERVING brings it back.
+                state.set(2);
+                until_serving(&worker, "0").await;
+                state.set(1);
+                until_serving(&worker, "1").await;
+            })
+            .await;
+    }
+
     /// A client that gives its request up gives its stream's place back: with room for one
     /// stream on one connection, the next request is served rather than kept waiting.
     #[tokio::test]
@@ -4748,7 +5018,7 @@ upstreams:
                 assert_eq!(status_over_http1(front).await, StatusCode::OK);
             }
             // One connection opened for the first request, and taken again for the rest.
-            let scrape = proxy.metrics.render(&["web".to_owned()], &[]);
+            let scrape = proxy.metrics.render(&["web".to_owned()], &[], &[]);
             assert!(
                 scrape.contains(
                     "edgerush_upstream_connections_total{state=\"opened\"} 1
@@ -4770,7 +5040,7 @@ upstreams:
                 worker.idle_connections(),
                 storage,
             );
-            let scrape = proxy.metrics.render(&["web".to_owned()], &[]);
+            let scrape = proxy.metrics.render(&["web".to_owned()], &[], &[]);
             assert!(
                 scrape.contains(
                     "edgerush_upstream_connections_idle 1
@@ -4843,7 +5113,7 @@ upstreams:
                 StatusCode::SERVICE_UNAVAILABLE
             );
             let up = proxy.metrics.upstream_slot("up");
-            let scrape = proxy.metrics.render(&["web".to_owned()], &[("up", up)]);
+            let scrape = proxy.metrics.render(&["web".to_owned()], &[("up", up)], &[]);
             assert!(
                 scrape.contains(
                     "edgerush_listener_local_answers_total{listener=\"web\",reason=\"exhausted\"} 1\n"
@@ -4904,7 +5174,7 @@ upstreams:
             assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
 
             let up = proxy.metrics.upstream_slot("up");
-            let scrape = proxy.metrics.render(&["web".to_owned()], &[("up", up)]);
+            let scrape = proxy.metrics.render(&["web".to_owned()], &[("up", up)], &[]);
             assert!(
                 scrape.contains(
                     "edgerush_listener_local_answers_total{listener=\"web\",reason=\"bad_body\"} 1\n"
@@ -5153,7 +5423,9 @@ upstreams:
 
             assert_eq!(status_over_http1(front).await, StatusCode::BAD_GATEWAY);
             let up = proxy.metrics.upstream_slot("up");
-            let scrape = proxy.metrics.render(&["web".to_owned()], &[("up", up)]);
+            let scrape = proxy
+                .metrics
+                .render(&["web".to_owned()], &[("up", up)], &[]);
             assert!(
                 scrape.contains("edgerush_upstream_exchanges_stopped_total{reason=\"codec\"} 1\n"),
                 "{scrape}"
@@ -5230,7 +5502,9 @@ upstreams:
             );
 
             let up = proxy.metrics.upstream_slot("up");
-            let scrape = proxy.metrics.render(&["web".to_owned()], &[("up", up)]);
+            let scrape = proxy
+                .metrics
+                .render(&["web".to_owned()], &[("up", up)], &[]);
             assert!(
                 scrape.contains("edgerush_upstream_body_failures_total{upstream=\"up\"} 1\n"),
                 "{scrape}"
@@ -5516,6 +5790,39 @@ upstreams:
         }
         let config: Config = serde_saphyr::from_str(&yaml).unwrap();
         compile(&config).unwrap()
+    }
+
+    proptest::proptest! {
+        /// An endpoint is picked from those that serve while at least half do, and from
+        /// all of them when fewer do; never from nowhere.
+        #[test]
+        fn a_pick_follows_health_down_to_the_panic_threshold(
+            health in proptest::collection::vec(proptest::bool::ANY, 0..12),
+            random in proptest::num::u64::ANY,
+        ) {
+            let picked = pick_healthy(health.len(), random, |at| health[at]);
+            let serving = health.iter().filter(|healthy| **healthy).count();
+            match picked {
+                None => proptest::prop_assert!(health.is_empty()),
+                Some(at) => {
+                    proptest::prop_assert!(at < health.len());
+                    if serving * 2 >= health.len() {
+                        proptest::prop_assert!(health[at], "an unhealthy pick above the threshold");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every endpoint that serves can be picked, whichever the first draw lands on.
+    #[test]
+    fn every_serving_endpoint_can_be_picked() {
+        let health = [false, true, false, true, true];
+        let mut seen = std::collections::BTreeSet::new();
+        for random in 0..100 {
+            seen.insert(pick_healthy(health.len(), random, |at| health[at]).unwrap());
+        }
+        assert_eq!(seen, std::collections::BTreeSet::from([1, 3, 4]));
     }
 
     #[test]

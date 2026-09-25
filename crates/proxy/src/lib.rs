@@ -24,6 +24,7 @@ pub mod fields;
 #[cfg(not(feature = "fuzzing"))]
 mod fields;
 mod h1;
+mod health;
 // A scripted HTTP/2 peer, for tests here and for the probes in `tests/h2_library.rs`.
 #[cfg(test)]
 mod h2_peer;

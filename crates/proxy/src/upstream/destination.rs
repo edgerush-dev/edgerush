@@ -12,7 +12,7 @@
 //! reload keeps that key only where the destination really is the same one.
 
 use crate::upstream::secure::Secure;
-use edgerush_config::{Compiled, Keepalive, UpstreamProtocol, UpstreamTls};
+use edgerush_config::{Compiled, HealthCheck, Keepalive, UpstreamProtocol, UpstreamTls};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -48,6 +48,12 @@ pub struct ReuseIdentity {
     secure: Option<Arc<Secure>>,
     /// PINGs on its HTTP/2 connections, if any.
     keepalive: Option<Keepalive>,
+    /// How its endpoint is probed, if it is.
+    health_check: Option<HealthCheck>,
+    /// Whether its last probes say it serves; set by the health checker, read when an
+    /// endpoint is picked. Healthy until a probe says otherwise, as HAProxy and Pingora
+    /// start a server.
+    healthy: AtomicBool,
     /// Set when a config without this destination is published. Nothing retired is ever
     /// kept or taken out again; an exchange already under way finishes as it is.
     retired: AtomicBool,
@@ -78,6 +84,21 @@ impl ReuseIdentity {
     /// PINGs on its HTTP/2 connections, if any.
     pub(crate) fn keepalive(&self) -> Option<Keepalive> {
         self.keepalive
+    }
+
+    /// How its endpoint is probed, if it is.
+    pub(crate) fn health_check(&self) -> Option<&HealthCheck> {
+        self.health_check.as_ref()
+    }
+
+    /// Whether it is to be picked: its probes, if any, say it serves.
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Relaxed)
+    }
+
+    /// What the health checker has found.
+    pub(crate) fn set_healthy(&self, healthy: bool) {
+        self.healthy.store(healthy, Ordering::Relaxed);
     }
 
     /// Whether this destination is gone from the running config. Checked when a
@@ -119,6 +140,7 @@ impl Destinations {
             UpstreamProtocol,
             Option<&'a UpstreamTls>,
             Option<Keepalive>,
+            Option<&'a HealthCheck>,
         );
         let mut known: HashMap<Same<'_>, &Arc<ReuseIdentity>> = previous
             .0
@@ -132,6 +154,7 @@ impl Destinations {
                     identity.protocol,
                     tls,
                     identity.keepalive,
+                    identity.health_check.as_ref(),
                 );
                 (same, identity)
             })
@@ -155,6 +178,7 @@ impl Destinations {
                                 upstream.protocol,
                                 upstream.tls.as_ref(),
                                 upstream.keepalive,
+                                upstream.health_check.as_ref(),
                             ))
                             .map_or_else(
                                 || {
@@ -165,6 +189,8 @@ impl Destinations {
                                         protocol: upstream.protocol,
                                         secure: secure.get(position).cloned().flatten(),
                                         keepalive: upstream.keepalive,
+                                        health_check: upstream.health_check.clone(),
+                                        healthy: AtomicBool::new(true),
                                         retired: AtomicBool::new(false),
                                     })
                                 },
@@ -184,6 +210,16 @@ impl Destinations {
     /// The destination of the endpoint at `endpoint` of the upstream at `upstream`.
     pub fn at(&self, upstream: usize, endpoint: usize) -> Option<&Arc<ReuseIdentity>> {
         self.0.get(upstream)?.get(endpoint)
+    }
+
+    /// The destinations of the upstream at `upstream`, by endpoint.
+    pub(crate) fn of(&self, upstream: usize) -> &[Arc<ReuseIdentity>] {
+        self.0.get(upstream).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every destination, of every upstream.
+    pub(crate) fn all(&self) -> impl Iterator<Item = &Arc<ReuseIdentity>> {
+        self.0.iter().flatten()
     }
 
     /// How many endpoints the upstream at `upstream` has.
