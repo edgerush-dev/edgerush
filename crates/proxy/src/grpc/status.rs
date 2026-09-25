@@ -39,6 +39,37 @@ impl Code {
     }
 }
 
+/// gRPC's names for its codes, by number: what a scrape labels them with.
+pub(crate) const NAMES: [&str; 17] = [
+    "OK",
+    "CANCELLED",
+    "UNKNOWN",
+    "INVALID_ARGUMENT",
+    "DEADLINE_EXCEEDED",
+    "NOT_FOUND",
+    "ALREADY_EXISTS",
+    "PERMISSION_DENIED",
+    "RESOURCE_EXHAUSTED",
+    "FAILED_PRECONDITION",
+    "ABORTED",
+    "OUT_OF_RANGE",
+    "UNIMPLEMENTED",
+    "INTERNAL",
+    "UNAVAILABLE",
+    "DATA_LOSS",
+    "UNAUTHENTICATED",
+];
+
+/// The code a `grpc-status` value says, by number: one that is not one of gRPC's is
+/// `UNKNOWN`, as a client reads it.
+pub(crate) fn code_of(value: &[u8]) -> usize {
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|code| *code < NAMES.len())
+        .unwrap_or(Code::Unknown as usize)
+}
+
 /// Whether a request's `content-type` makes it a gRPC call: `application/grpc`, alone or
 /// with a `+` suffix naming the message encoding, and with or without parameters. Not
 /// gRPC-Web (`application/grpc-web…`), which is another protocol. Compared without regard
@@ -99,6 +130,17 @@ mod tests {
         ] {
             assert!(!is_grpc(other), "{}", String::from_utf8_lossy(other));
         }
+    }
+
+    #[test]
+    fn a_status_value_is_read_as_its_code_and_nothing_else_as_one() {
+        assert_eq!(code_of(b"0"), 0);
+        assert_eq!(code_of(b"16"), 16);
+        for other in [&b"17"[..], b"-1", b"", b"OK", b"1.0", b"\xff"] {
+            assert_eq!(code_of(other), Code::Unknown as usize);
+        }
+        assert_eq!(NAMES[Code::DeadlineExceeded as usize], "DEADLINE_EXCEEDED");
+        assert_eq!(NAMES[Code::Unauthenticated as usize], "UNAUTHENTICATED");
     }
 
     #[test]

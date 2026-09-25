@@ -8,7 +8,7 @@
 //! gRPC's — `200`, `application/grpc` — is given one: any other is passed on as it came,
 //! for the client to read by its HTTP status.
 
-use super::status::{Code, is_grpc, message};
+use super::status::{Code, code_of, is_grpc, message};
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use http_body::{Body, Frame, SizeHint};
@@ -25,9 +25,21 @@ pub(crate) fn is_grpc_answer(status: StatusCode, head: &HeaderMap) -> bool {
             .is_some_and(|content_type| is_grpc(content_type.as_bytes()))
 }
 
+/// Where a call's status is counted, once, when it is known.
+pub(crate) trait Count {
+    /// The call ended with `code`, gRPC's number for it.
+    fn ended(&self, code: usize);
+}
+
+/// Counted nowhere.
+impl Count for () {
+    fn ended(&self, _code: usize) {}
+}
+
 /// A gRPC answer's body.
-pub(crate) struct Answered<B> {
+pub(crate) struct Answered<B, C = ()> {
     inner: B,
+    count: C,
     /// Ends the call as `DEADLINE_EXCEEDED` if it has not ended by then.
     deadline: Option<Pin<Box<Sleep>>>,
     /// A status has gone, the upstream's or ours: nothing more is sent.
@@ -36,7 +48,7 @@ pub(crate) struct Answered<B> {
     status_in_head: bool,
 }
 
-impl<B> std::fmt::Debug for Answered<B> {
+impl<B, C> std::fmt::Debug for Answered<B, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Answered")
             .field("ended", &self.ended)
@@ -46,19 +58,34 @@ impl<B> std::fmt::Debug for Answered<B> {
 
 impl<B> Answered<B> {
     /// The body of a gRPC answer whose head is `head`, for a call that must end by
-    /// `deadline`.
+    /// `deadline`, its status counted nowhere.
+    #[cfg(test)]
     pub(crate) fn new(inner: B, head: &HeaderMap, deadline: Option<Instant>) -> Self {
+        Answered::counted(inner, head, deadline, ())
+    }
+}
+
+impl<B, C: Count> Answered<B, C> {
+    /// The body of a gRPC answer whose head is `head`, for a call that must end by
+    /// `deadline`, its status counted by `count`: now, for a status the head carries.
+    pub(crate) fn counted(inner: B, head: &HeaderMap, deadline: Option<Instant>, count: C) -> Self {
+        let status = head.get("grpc-status");
+        if let Some(status) = status {
+            count.ended(code_of(status.as_bytes()));
+        }
         Self {
             inner,
+            count,
             deadline: deadline.map(|at| Box::pin(tokio::time::sleep_until(at))),
             ended: false,
-            status_in_head: head.contains_key("grpc-status"),
+            status_in_head: status.is_some(),
         }
     }
 
     /// Ends the call with `code`, told as `why`.
     fn end<E>(&mut self, code: Code, why: &str) -> Poll<Option<Result<Frame<Bytes>, E>>> {
         self.ended = true;
+        self.count.ended(code as usize);
         let mut trailers = HeaderMap::new();
         trailers.insert("grpc-status", code.value());
         trailers.insert("grpc-message", message(why));
@@ -89,10 +116,11 @@ fn failed(error: &(dyn StdError + 'static)) -> Code {
     Code::Unavailable
 }
 
-impl<B> Body for Answered<B>
+impl<B, C> Body for Answered<B, C>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: StdError + 'static,
+    C: Count + Unpin,
 {
     type Data = Bytes;
     type Error = B::Error;
@@ -114,8 +142,13 @@ where
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Ok(frame))) => {
-                if frame.trailers_ref().is_some() {
+                if let Some(trailers) = frame.trailers_ref() {
                     this.ended = true;
+                    // Trailers with no status end the call no better than none at all.
+                    let code = trailers
+                        .get("grpc-status")
+                        .map_or(Code::Unknown as usize, |status| code_of(status.as_bytes()));
+                    this.count.ended(code);
                 }
                 Poll::Ready(Some(Ok(frame)))
             }

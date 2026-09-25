@@ -21,7 +21,7 @@ use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h1::deadlines::Bounds;
 use crate::downstream::h2;
 use crate::drain::Drain;
-use crate::grpc::answer::{Answered as GrpcAnswered, is_grpc_answer};
+use crate::grpc::answer::{Answered as GrpcAnswered, Count, is_grpc_answer};
 use crate::grpc::call::Call;
 use crate::head::Forwarded;
 use crate::interim::Interim;
@@ -125,9 +125,23 @@ enum Body {
     /// An HTTP/2 upstream's answer, read by EdgeRush's own HTTP/2 client (15 step 6).
     H2(Box<h2_exchange::Answer>, Admitted, Watch),
     /// A gRPC call's answer, ended by one status whatever becomes of it (15 §6).
-    Grpc(Box<GrpcAnswered<Body>>),
+    Grpc(Box<GrpcAnswered<Body, Called>>),
     /// An answer of the data plane's own. It has no body, and never will have one.
     Empty,
+}
+
+/// Where a gRPC call's status is counted: its listener's.
+struct Called {
+    proxy: Arc<Proxy>,
+    listener: usize,
+}
+
+impl Count for Called {
+    fn ended(&self, code: usize) {
+        if let Some(counters) = self.proxy.metrics.listener(self.listener) {
+            counters.called(code);
+        }
+    }
 }
 
 /// Waits for `opening` to connect, and gives up after `limit`: a destination that never
@@ -1219,7 +1233,11 @@ impl Worker {
         // of it; any other answer goes on as it came, for the client to read (15 §6).
         if call.is_some() && is_grpc_answer(response.status(), response.headers()) {
             let (parts, body) = response.into_parts();
-            let answered = GrpcAnswered::new(body, &parts.headers, deadline);
+            let called = Called {
+                proxy: Arc::clone(&self.proxy),
+                listener,
+            };
+            let answered = GrpcAnswered::counted(body, &parts.headers, deadline, called);
             response = Response::from_parts(parts, Body::Grpc(Box::new(answered)));
         }
         Answered::Map(response)
@@ -1296,6 +1314,9 @@ impl Proxy {
         let mut response = self.answer(listener, answer);
         if call.is_some() {
             let (code, why) = answer.grpc();
+            if let Some(counters) = self.metrics.listener(listener) {
+                counters.called(code as usize);
+            }
             *response.status_mut() = StatusCode::OK;
             let headers = response.headers_mut();
             headers.insert(
@@ -3881,6 +3902,12 @@ upstreams:
                 let answer = within(answer).await.unwrap();
                 assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
                 assert!(answer.headers().get("grpc-status").is_none());
+                // The call is counted by its status; the request that was not a call is not.
+                let scrape = worker.proxy().metrics();
+                let line =
+                    "edgerush_listener_grpc_calls_total{listener=\"web\",status=\"UNAVAILABLE\"} 1
+";
+                assert!(scrape.contains(line), "{scrape}");
 
                 // Connection-bound credentials, which are not sent over HTTP/2.
                 let (upstream, _seen, _gate) = h2_upstream(UpstreamH2::default()).await;
@@ -3998,7 +4025,7 @@ upstreams:
                     })
                 });
                 let upstream = scripted_h2_upstream(script).await;
-                let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+                let (front, worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
                 let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
                 for (path, timeout, expected) in [
                     ("/pkg.Svc/Ok", None, (StatusCode::OK, "0", false)),
@@ -4022,6 +4049,23 @@ upstreams:
                 }
                 let trailers = within(std::future::poll_fn(|cx| body.poll_trailers(cx))).await;
                 assert!(trailers.unwrap().is_none(), "a status was added to it");
+
+                // Each call counted once, by how it ended; the one that was not answered as
+                // gRPC is not counted as a call's status at all.
+                let scrape = worker.proxy().metrics();
+                for (status, count) in [
+                    ("OK", 1),
+                    ("CANCELLED", 1),
+                    ("DEADLINE_EXCEEDED", 1),
+                    ("UNKNOWN", 0),
+                    ("INTERNAL", 0),
+                ] {
+                    let line = format!(
+                        "edgerush_listener_grpc_calls_total{{listener=\"web\",status=\"{status}\"}} {count}
+"
+                    );
+                    assert!(scrape.contains(&line), "{line}{scrape}");
+                }
             })
             .await;
     }

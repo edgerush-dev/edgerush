@@ -9,7 +9,7 @@
 //! counted together in one series, as docs/08 wants of anything that a config can make
 //! arbitrarily many of.
 
-use crate::grpc::status::Code;
+use crate::grpc::status::{Code, NAMES};
 use crate::request::Rejection;
 use edgerush_telemetry::{Counter, Exposition, Gauge, Histogram, Kind, Sharded};
 use http::StatusCode;
@@ -290,6 +290,7 @@ pub(crate) struct ListenerCounters {
     responses: [Counter; 5],
     answers: [Counter; Answer::ALL.len()],
     head_time: Histogram<14>,
+    grpc: [Counter; NAMES.len()],
 }
 
 impl ListenerCounters {
@@ -299,6 +300,13 @@ impl ListenerCounters {
             class.inc();
         }
         self.head_time.observe(&HEAD_TIME_BOUNDS, nanoseconds);
+    }
+
+    /// A gRPC call ended with `code`, gRPC's number for it.
+    pub(crate) fn called(&self, code: usize) {
+        if let Some(counter) = self.grpc.get(code) {
+            counter.inc();
+        }
     }
 
     /// The response is one of the data plane's own.
@@ -512,6 +520,18 @@ impl Metrics {
                 let labels = [("listener", listener.as_str()), ("reason", answer.label())];
                 let count =
                     |shard: &ListenerCounters| shard.answers.get(position).map_or(0, Counter::get);
+                scrape.sample(name, &labels, series.sum(count));
+            }
+        }
+        let name = "edgerush_listener_grpc_calls_total";
+        let help = "gRPC calls ended, by the status they ended with: the upstream's, or \
+                    the gateway's own.";
+        scrape.family(name, Kind::Counter, help);
+        for (listener, series) in listeners() {
+            for (position, status) in NAMES.iter().enumerate() {
+                let labels = [("listener", listener.as_str()), ("status", status)];
+                let count =
+                    |shard: &ListenerCounters| shard.grpc.get(position).map_or(0, Counter::get);
                 scrape.sample(name, &labels, series.sum(count));
             }
         }
