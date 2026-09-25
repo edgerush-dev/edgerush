@@ -10,7 +10,7 @@
 pub(crate) mod body;
 pub(crate) mod conn;
 pub(crate) mod connection;
-pub(crate) mod head;
+pub mod head;
 pub(crate) mod listener;
 #[cfg(test)]
 pub(crate) mod testing;

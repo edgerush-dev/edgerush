@@ -19,7 +19,7 @@ const FIELD_OVERHEAD: usize = 32;
 
 /// Why a head was not taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Refused {
+pub enum Refused {
     /// Against RFC 9114 §4: the stream is reset with `H3_MESSAGE_ERROR`. What it broke is
     /// said, for whoever reads the log.
     Malformed(&'static str),
@@ -30,13 +30,15 @@ pub(crate) enum Refused {
 /// A request's head, and the length its `Content-Length` declares, which its body is held
 /// to (RFC 9114 §4.1.2).
 #[derive(Debug)]
-pub(crate) struct RequestHead {
-    pub(crate) parts: http::request::Parts,
-    pub(crate) length: Option<u64>,
+pub struct RequestHead {
+    /// The head, as the core takes it.
+    pub parts: http::request::Parts,
+    /// What `Content-Length` declares, if anything.
+    pub length: Option<u64>,
 }
 
 /// The request `fields` make, measured against `limit` by RFC 9114 §4.2.2's measure.
-pub(crate) fn request<F: NameValue>(fields: &[F], limit: usize) -> Result<RequestHead, Refused> {
+pub fn request<F: NameValue>(fields: &[F], limit: usize) -> Result<RequestHead, Refused> {
     let mut method = None;
     let mut scheme = None;
     let mut authority = None;
@@ -149,7 +151,7 @@ pub(crate) fn request<F: NameValue>(fields: &[F], limit: usize) -> Result<Reques
 }
 
 /// The trailers `fields` make: regular fields only, held to what a request's are.
-pub(crate) fn trailers<F: NameValue>(fields: &[F], limit: usize) -> Result<HeaderMap, Refused> {
+pub fn trailers<F: NameValue>(fields: &[F], limit: usize) -> Result<HeaderMap, Refused> {
     let mut trailers = HeaderMap::with_capacity(fields.len());
     let mut size = 0_usize;
     for field in fields {
@@ -485,6 +487,10 @@ mod tests {
         assert_eq!(length(&[]), Ok(None));
         assert_eq!(length(&["12"]), Ok(Some(12)));
         assert_eq!(length(&["12", "12"]), Ok(Some(12)));
+        // Leading zeros are digits too (RFC 9110 §8.6), and the same length spelt twice is
+        // one length: found by the fuzz target.
+        assert_eq!(length(&["06"]), Ok(Some(6)));
+        assert_eq!(length(&["6", "06"]), Ok(Some(6)));
         assert_eq!(
             length(&["12", "13"]),
             Err(Refused::Malformed("two lengths in `Content-Length`"))
