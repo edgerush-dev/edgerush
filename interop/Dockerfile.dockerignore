@@ -1,0 +1,6 @@
+# The build needs the sources, not what was built from them here.
+.git
+target
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
