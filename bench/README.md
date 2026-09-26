@@ -49,6 +49,9 @@ TLS=1 bench/run.sh handshakes [RATE] [FLOOD]
 bench/run.sh h3                     # HTTP/3 clients (H3=1): 4 connections x 100 streams,
                                     # 256 connections, one hot connection, 8 MiB answers,
                                     # and TLS HTTP/2 beside them
+bench/run.sh passthrough CHURN      # TCP and TLS passthrough (PASSTHROUGH=1): kept
+                                    # connections at saturation, a connection a request at
+                                    # CHURN a second, 8 MiB answers
 bench/run.sh summary bench/results/<run>
 bench/window.sh [RTTS] [VARIANTS]   # HTTP/2 uploads over a delayed path, by stream window
                                     # and against NGINX: the client in a network namespace
@@ -75,6 +78,12 @@ tar xf nghttp2-1.68.0.tar.xz && cd nghttp2-1.68.0
 ./configure --prefix="$HOME/tools/h2load3" --enable-app --enable-http3     --disable-python-bindings --with-libngtcp2 --with-libnghttp3
 make -j"$(nproc)" && make install
 ```
+
+`PASSTHROUGH=1`, which `passthrough` sets, has the proxies carry connections rather than
+serve them: EdgeRush with `passthrough.yaml` (a `tcp` listener on 8080 and a `tls` one on
+8443), NGINX's `stream` module with `ssl_preread` (`nginx-stream.conf`), HAProxy in `mode
+tcp` routing on `req.ssl_sni` (`haproxy-tcp.cfg`). The backend answers over TLS on 9443
+too, with the bench's certificate, for the `tls` listeners to carry clients to.
 
 While HTTP/3 is measured the loopback's MTU is set to `LOOPBACK_MTU` (1500 by default,
 with sudo; `0` leaves it alone) and put back when the run ends. At the loopback's own
@@ -171,6 +180,9 @@ worth as much as the care that went into the other side.
 | `streamed-answer-h2`, `streamed-request-h2` | oha over HTTP/2, 4 connections × 8 streams, `STREAMED` bytes each way | The body paths when HTTP/2 carries them: flow control and the server's staging, not only framing |
 | `saturation-h3`, `many-h3`, `hot-h3` | h2load over HTTP/3: 4 connections × 100 streams, 256 connections × 1, 1 connection × 256 | What HTTP/3 clients get, where a connection's packets all land on the worker that owns it ([16](../../docs/16-http3.md)) |
 | `streamed-answer-h3` | h2load over HTTP/3, 4 connections × 8 streams, `STREAMED` bytes back | The answer's path when QUIC carries it: datagrams, acknowledgements, the send buffer |
+| `saturation-tcp`, `saturation-tls` | h2load through a tunnel: HTTP/1 over a `tcp` listener (256 connections), HTTP/2 over TLS over a `tls` one (4 connections × 100 streams) | What carrying small messages both ways costs, nothing of them read ([17](../../docs/17-tcp-and-tls-passthrough.md)) |
+| `churn-tcp`, `churn-tls` | oha, a new connection for every request, a fixed rate, through each listener | What a tunnel costs to make: the accept, the ClientHello read and routed by name, the connection to the backend |
+| `streamed-tcp` | oha, `STREAMED` bytes back through the `tcp` listener | What carrying bulk costs |
 | `idle-h2-N` | `N` HTTP/2 connections, one request each and then quiet, on a proxy started afresh | What an idle HTTP/2 connection costs, beside `idle-memory`'s HTTP/1 ones |
 | `churn` | oha, a new connection for every request, a fixed rate | The cost of accepting, and of a connection's first request |
 | `streamed-answer` | oha, a body of `STREAMED` bytes coming back | What the answer's path costs when it is carrying something rather than passing a few bytes along |

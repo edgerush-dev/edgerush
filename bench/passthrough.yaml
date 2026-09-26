@@ -1,0 +1,24 @@
+# The config of the passthrough benchmark (17 step 4): a `tcp` listener whose connections all
+# go to the backend's plain port, and a `tls` listener whose connections go by the name their
+# ClientHello asks for to the backend's TLS port. Nothing here reads HTTP: the clients speak
+# it to the backend through the tunnels.
+listeners:
+  plain: { address: "127.0.0.1:8080", protocol: tcp }
+  named: { address: "127.0.0.1:8443", protocol: tls }
+
+routes: []
+
+tcp_routes:
+  - { name: plain, listeners: [plain], backends: [{ upstream: backend, weight: 1 }] }
+
+tls_routes:
+  - name: named
+    listeners: [named]
+    hostnames:
+      - { name: bench.example.com, falls_through: false }
+      - { name: "*.example.org", wildcard: any_labels, falls_through: false }
+    backends: [{ upstream: secure-backend, weight: 1 }]
+
+upstreams:
+  backend: { endpoints: ["127.0.0.1:9000"] }
+  secure-backend: { endpoints: ["127.0.0.1:9443"] }

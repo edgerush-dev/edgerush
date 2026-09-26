@@ -25,6 +25,9 @@
 #   bench/run.sh h3 [STREAMED]                HTTP/3 clients: few hot connections, many, one
 #                                             hot one, streamed bodies at STREAMED a second,
 #                                             and TLS HTTP/2 beside them to read them by
+#   bench/run.sh passthrough CHURN [STREAMED] TCP and TLS passthrough: kept connections at
+#                                             saturation, a connection a request at CHURN a
+#                                             second, and streamed answers
 #   bench/run.sh summary DIR                  the table of a finished run
 #
 # UPSTREAM_H2=1 has the proxy speak HTTP/2 to the backend, by prior knowledge, many
@@ -68,6 +71,12 @@ repo=$(dirname "$here")
 : "${H3:=0}"
 [ "${1:-}" = h3 ] && H3=1
 [ "$H3" = 1 ] && TLS=1
+# PASSTHROUGH=1, which `passthrough` sets, has the proxies carry connections rather than
+# serve them (17 step 4): passthrough.yaml for EdgeRush, NGINX's stream module
+# (nginx-stream.conf), HAProxy in mode tcp (haproxy-tcp.cfg). The backend answers on a TLS
+# port as well, 9443, for the tls listener at 8443 to carry clients to by name.
+: "${PASSTHROUGH:=0}"
+[ "${1:-}" = passthrough ] && PASSTHROUGH=1
 # h2load with HTTP/3: Ubuntu's is built without it (bench/README.md says how to build one).
 : "${H2LOAD3:=$HOME/tools/h2load3/bin/h2load}"
 # The loopback's MTU while HTTP/3 is measured (sudo). The loopback's own 64 KiB lets a QUIC
@@ -121,13 +130,23 @@ start_backend() {
         sed -i 's#backend: { endpoints: \["127.0.0.1:9000"\] }#backend: { endpoints: ["127.0.0.1:9000"], protocol: http2 }#' "$config"
         grep -q 'protocol: http2' "$config"
     fi
-    taskset -c "$BACKEND_CPUS" nginx -p "$run/" -c "$here/nginx.conf" -e "$run/error.log"
+    local backend_conf=$here/nginx.conf
+    if [ "$PASSTHROUGH" = 1 ]; then
+        cp "$here/passthrough.yaml" "$config"
+        # The same answers over TLS on 9443, with the bench's certificate, for the
+        # proxies' tls listeners to carry clients to.
+        certificate
+        backend_conf=$run-backend.conf
+        sed "0,/^    server {/s##    server {\n        listen 127.0.0.1:9443 ssl reuseport backlog=4096;\n        ssl_certificate $tls/cert.pem;\n        ssl_certificate_key $tls/key.pem;#" \
+            "$here/nginx.conf" >"$backend_conf"
+        grep -q 'listen 127.0.0.1:9443 ssl' "$backend_conf"
+    fi
+    taskset -c "$BACKEND_CPUS" nginx -p "$run/" -c "$backend_conf" -e "$run/error.log"
     await "$backend"
 }
 
-# The certificate every variant presents, made once, and EdgeRush's config made to listen
-# with it; NGINX's and HAProxy's are made as they start.
-secure() {
+# The certificate every variant presents, made once.
+certificate() {
     mkdir -p "$tls"
     [ -s "$tls/both.pem" ] || {
         openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
@@ -135,6 +154,12 @@ secure() {
             -keyout "$tls/key.pem" -out "$tls/cert.pem" 2>/dev/null
         cat "$tls/cert.pem" "$tls/key.pem" >"$tls/both.pem"
     }
+}
+
+# The certificate every variant presents, and EdgeRush's config made to listen with it;
+# NGINX's and HAProxy's are made as they start.
+secure() {
+    certificate
     python3 - "$config" "$tls" "$H3" <<'PY'
 import json, sys
 config, tls, h3 = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
@@ -191,7 +216,11 @@ start_proxy() { # variant
             exit 2
         fi
         mkdir -p "$run-proxy/tmp"
-        sed "s/WORKERS/$WORKERS/" "$here/nginx-proxy.conf" >"$run-proxy/nginx.conf"
+        if [ "$PASSTHROUGH" = 1 ]; then
+            sed "s/WORKERS/$WORKERS/" "$here/nginx-stream.conf" >"$run-proxy/nginx.conf"
+        else
+            sed "s/WORKERS/$WORKERS/" "$here/nginx-proxy.conf" >"$run-proxy/nginx.conf"
+        fi
         if [ "$TLS" = 1 ]; then
             sed -i "s#listen 127.0.0.1:8080#listen 127.0.0.1:8080 ssl#;
                 s#^http {#http {\n    ssl_certificate $tls/cert.pem;\n    ssl_certificate_key $tls/key.pem;#" \
@@ -211,7 +240,11 @@ start_proxy() { # variant
     haproxy)
         # A thread for every CPU it may run on: WORKERS of them, if PROXY_CPUS is as many.
         local haproxy_cfg=$run-haproxy.cfg
-        cp "$here/haproxy.cfg" "$haproxy_cfg"
+        if [ "$PASSTHROUGH" = 1 ]; then
+            cp "$here/haproxy-tcp.cfg" "$haproxy_cfg"
+        else
+            cp "$here/haproxy.cfg" "$haproxy_cfg"
+        fi
         if [ "$TLS" = 1 ]; then
             sed -i "s#bind 127.0.0.1:8080#bind 127.0.0.1:8080 ssl crt $tls/both.pem alpn h2,http/1.1#" \
                 "$haproxy_cfg"
@@ -351,7 +384,11 @@ hot_h2() { # name, url, options...
     shift 2
     measured "$name" h2load -c1 -m256 -t1 -D "$DURATION" --warm-up-time=3 "$@" "$url"
 }
-churn() { oha_at "$1" "$2" "$3" -c 64 --disable-keepalive; }
+churn() { # name, rate, url, options...
+    local name=$1 rate=$2 url=$3
+    shift 3
+    oha_at "$name" "$rate" "$url" -c 64 --disable-keepalive "$@"
+}
 
 # A body neither end holds whole, in each direction: what the paths cost when they
 # are carrying something rather than passing a few bytes along.
@@ -556,6 +593,8 @@ environment() {
         h2load --version
         [ "$H3" = 1 ] && echo "HTTP/3 by $("$H2LOAD3" --version)"
         [ "$H3" = 1 ] && echo "loopback MTU $(cat /sys/class/net/lo/mtu)"
+        [ "$PASSTHROUGH" = 1 ] && echo "passthrough: tcp at 8080 to the backend's 9000," \
+            "tls at 8443 to its 9443 by name"
         oha --version
         nginx -v 2>&1
         { command -v haproxy >/dev/null && haproxy -v | head -1; } || true
@@ -824,6 +863,25 @@ h2)
         done
     }
     each_variant h2_runs
+    ;;
+passthrough)
+    # What TCP and TLS passthrough cost (17 step 4). Clients speak HTTP to the backend
+    # through the tunnels, so every byte of it is carried and none is read: over kept
+    # connections at saturation (HTTP/1 through the tcp listener, HTTP/2 over TLS through
+    # the tls one), with a connection made for every request at CHURN a second (the
+    # accept, the ClientHello read and the connection to the backend each time), and 8 MiB
+    # answers at STREAMED a second.
+    churn_rate=${2:?rate for churn} streamed_rate=${3:-20}
+    named=https://$host:8443/
+    named_at=(--connect-to "$host:8443:127.0.0.1:8443" --insecure)
+    passthrough_runs() {
+        saturation_h1 "$1.saturation-tcp" "$proxy" --connect-to="$proxy_at"
+        saturation_h2 "$1.saturation-tls" "$named" --connect-to=127.0.0.1:8443
+        churn "$1.churn-tcp" "$churn_rate" "$proxy"
+        churn "$1.churn-tls" "$churn_rate" "$named" "${named_at[@]}"
+        streamed_answer "$1.streamed-tcp" "$streamed_rate"
+    }
+    each_variant passthrough_runs
     ;;
 h3)
     # What HTTP/3 clients get (16 step 6): few hot connections, many connections, a single
