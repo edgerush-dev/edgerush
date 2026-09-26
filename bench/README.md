@@ -49,9 +49,10 @@ TLS=1 bench/run.sh handshakes [RATE] [FLOOD]
 bench/run.sh h3                     # HTTP/3 clients (H3=1): 4 connections x 100 streams,
                                     # 256 connections, one hot connection, 8 MiB answers,
                                     # and TLS HTTP/2 beside them
-bench/run.sh passthrough CHURN      # TCP and TLS passthrough (PASSTHROUGH=1): kept
+bench/run.sh passthrough CHURN [TLS_CHURN]
+                                    # TCP and TLS passthrough (PASSTHROUGH=1): kept
                                     # connections at saturation, a connection a request at
-                                    # CHURN a second, 8 MiB answers
+                                    # CHURN (TLS_CHURN) a second, 8 MiB answers
 bench/run.sh summary bench/results/<run>
 bench/window.sh [RTTS] [VARIANTS]   # HTTP/2 uploads over a delayed path, by stream window
                                     # and against NGINX: the client in a network namespace
@@ -83,7 +84,11 @@ make -j"$(nproc)" && make install
 serve them: EdgeRush with `passthrough.yaml` (a `tcp` listener on 8080 and a `tls` one on
 8443), NGINX's `stream` module with `ssl_preread` (`nginx-stream.conf`), HAProxy in `mode
 tcp` routing on `req.ssl_sni` (`haproxy-tcp.cfg`). The backend answers over TLS on 9443
-too, with the bench's certificate, for the `tls` listeners to carry clients to.
+too, with the bench's certificate, for the `tls` listeners to carry clients to. Ubuntu's
+NGINX has its stream module in a package of its own: `sudo apt-get install
+libnginx-mod-stream`. TLS churn is a handshake at the client and one at the backend for
+every request; the laptop's generator and backend keep up with about 1,400 a second, so
+`TLS_CHURN` is half of `CHURN` unless said.
 
 While HTTP/3 is measured the loopback's MTU is set to `LOOPBACK_MTU` (1500 by default,
 with sudo; `0` leaves it alone) and put back when the run ends. At the loopback's own
