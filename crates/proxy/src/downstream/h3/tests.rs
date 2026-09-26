@@ -110,6 +110,7 @@ async fn serving_as(
             u16::try_from(forwarding.worker()).unwrap(),
             timers,
             Rc::clone(&drain),
+            Box::new(|_| {}),
         )
         .unwrap(),
     );

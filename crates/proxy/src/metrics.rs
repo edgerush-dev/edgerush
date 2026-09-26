@@ -104,6 +104,40 @@ impl Stopped {
     ];
 }
 
+/// What an HTTP/3 listener did with a datagram other than hand it to its connection
+/// ([16 §3, §4](../../docs/16-http3.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Quic {
+    /// Handed to the worker whose connection it is for.
+    Forwarded,
+    /// Dropped: that worker's inbox was full.
+    InboxFull,
+    /// Answered with a Retry, handshakes under way being past the threshold.
+    Retry,
+    /// Answered with a version negotiation.
+    Negotiation,
+}
+
+impl Quic {
+    /// The name this is counted under.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Forwarded => "forwarded",
+            Self::InboxFull => "inbox_full",
+            Self::Retry => "retry",
+            Self::Negotiation => "version_negotiation",
+        }
+    }
+
+    /// Every one of them, for a scrape that shows a series whether it has happened or not.
+    const ALL: [Self; 4] = [
+        Self::Forwarded,
+        Self::InboxFull,
+        Self::Retry,
+        Self::Negotiation,
+    ];
+}
+
 /// What became of a connection to an upstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Socket {
@@ -291,6 +325,7 @@ pub(crate) struct ListenerCounters {
     answers: [Counter; Answer::ALL.len()],
     head_time: Histogram<14>,
     grpc: [Counter; NAMES.len()],
+    quic: [Counter; Quic::ALL.len()],
 }
 
 impl ListenerCounters {
@@ -305,6 +340,13 @@ impl ListenerCounters {
     /// A gRPC call ended with `code`, gRPC's number for it.
     pub(crate) fn called(&self, code: usize) {
         if let Some(counter) = self.grpc.get(code) {
+            counter.inc();
+        }
+    }
+
+    /// The listener's HTTP/3 side did `event` with a datagram.
+    pub(crate) fn quic(&self, event: Quic) {
+        if let Some(counter) = self.quic.get(event as usize) {
             counter.inc();
         }
     }
@@ -551,6 +593,20 @@ impl Metrics {
                 let labels = [("listener", listener.as_str()), ("status", status)];
                 let count =
                     |shard: &ListenerCounters| shard.grpc.get(position).map_or(0, Counter::get);
+                scrape.sample(name, &labels, series.sum(count));
+            }
+        }
+        let name = "edgerush_listener_quic_datagrams_total";
+        let help = "HTTP/3 datagrams not simply handed to their connection: forwarded to the \
+                    worker that owns it, dropped for a full inbox, or answered with a Retry or \
+                    a version negotiation.";
+        scrape.family(name, Kind::Counter, help);
+        for (listener, series) in listeners() {
+            for event in Quic::ALL {
+                let labels = [("listener", listener.as_str()), ("event", event.name())];
+                let count = |shard: &ListenerCounters| {
+                    shard.quic.get(event as usize).map_or(0, Counter::get)
+                };
                 scrape.sample(name, &labels, series.sum(count));
             }
         }
@@ -840,6 +896,9 @@ mod tests {
         web.responded(StatusCode::OK, 700_000);
         web.responded(StatusCode::NOT_FOUND, 90_000);
         web.answered(Answer::NoRoute);
+        web.quic(Quic::Forwarded);
+        web.quic(Quic::Forwarded);
+        web.quic(Quic::Retry);
         let upstream = metrics.upstream(cart).unwrap();
         upstream.requests.inc();
         upstream.responded(StatusCode::OK);
@@ -856,6 +915,10 @@ mod tests {
             "edgerush_listener_responses_total{listener=\"web\",class=\"5xx\"} 0\n",
             "edgerush_listener_local_answers_total{listener=\"web\",reason=\"no_route\"} 1\n",
             "edgerush_listener_local_answers_total{listener=\"web\",reason=\"bad_host\"} 0\n",
+            "edgerush_listener_quic_datagrams_total{listener=\"web\",event=\"forwarded\"} 2\n",
+            "edgerush_listener_quic_datagrams_total{listener=\"web\",event=\"inbox_full\"} 0\n",
+            "edgerush_listener_quic_datagrams_total{listener=\"web\",event=\"retry\"} 1\n",
+            "edgerush_listener_quic_datagrams_total{listener=\"admin\",event=\"version_negotiation\"} 0\n",
             "edgerush_listener_time_to_response_head_seconds_bucket{listener=\"web\",le=\"0.0005\"} 1\n",
             "edgerush_listener_time_to_response_head_seconds_bucket{listener=\"web\",le=\"0.001\"} 2\n",
             "edgerush_listener_time_to_response_head_seconds_bucket{listener=\"web\",le=\"+Inf\"} 2\n",

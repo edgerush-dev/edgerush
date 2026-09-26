@@ -53,6 +53,7 @@ use crate::upstream::secure::{Secure, Socket as UpstreamSocket};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use edgerush_config::{Compiled, CompiledRetry, CompiledRule, UpstreamProtocol};
+use edgerush_filters::HeaderModifier;
 use edgerush_router::Fields;
 use http::uri::{Authority, Scheme};
 use http::{
@@ -449,6 +450,9 @@ struct Snapshot {
     /// it is to speak TLS. Kept from the config before for as long as the certificates
     /// are the same, and with it the keys of the session tickets it has issued.
     tls: Vec<Option<Arc<Tls>>>,
+    /// By position in [`Proxy::listeners`]: the `Alt-Svc` its answers carry, if it serves
+    /// HTTP/3 (16 §5), made once so that no answer formats it.
+    alt_svc: Vec<Option<HeaderModifier>>,
 }
 
 impl Snapshot {
@@ -494,6 +498,10 @@ impl Snapshot {
                     })
             })
             .collect::<Result<_, _>>()?;
+        let alt_svc = listeners
+            .iter()
+            .map(|at| alt_svc(at.and_then(|at| config.listeners.get(at))?))
+            .collect();
         let upstream_slots = config
             .upstreams
             .iter()
@@ -532,9 +540,23 @@ impl Snapshot {
             upstream_slots,
             destinations,
             tls,
+            alt_svc,
             secure,
         })
     }
+}
+
+/// The `Alt-Svc` a listener's answers carry: HTTP/3 on the listener's port, for as long as
+/// its config says (RFC 7838 §3). None for a listener without HTTP/3, or on a port the
+/// operating system is to choose, which the config does not know.
+fn alt_svc(listener: &edgerush_config::CompiledListener) -> Option<HeaderModifier> {
+    let http3 = listener.http3?;
+    let port = listener.address.port();
+    if port == 0 {
+        return None;
+    }
+    let value = format!("h3=\":{port}\"; ma={}", http3.alt_svc_max_age);
+    HeaderModifier::new([("alt-svc", value.as_str())], [], []).ok()
 }
 
 impl Proxy {
@@ -1113,6 +1135,12 @@ impl Worker {
             drain_within: deadlines.drain,
             ..h3::Settings::default()
         };
+        let counting = Arc::clone(&self.proxy);
+        let count = Box::new(move |event| {
+            if let Some(counters) = counting.metrics.listener(listener) {
+                counters.quic(event);
+            }
+        });
         let shared = h3_listener::Shared::new(
             socket,
             settings,
@@ -1120,6 +1148,7 @@ impl Worker {
             self.position,
             Rc::clone(&self.timers),
             Rc::clone(&self.drain),
+            count,
         )
         .map_err(io::Error::other)?;
         let reading = Rc::clone(&self);
@@ -1171,7 +1200,8 @@ impl Worker {
         interim: Option<Interim>,
     ) -> Answered<Body> {
         let came_in = Instant::now();
-        let answered = self.respond_to(listener, head, body, interim).await;
+        let mut answered = self.respond_to(listener, head, body, interim).await;
+        self.proxy.advertise(listener, &mut answered);
         if let Some(counters) = self.proxy.metrics.listener(listener) {
             let took = u64::try_from(came_in.elapsed().as_nanos()).unwrap_or(u64::MAX);
             counters.responded(answered.status(), took);
@@ -1739,6 +1769,22 @@ impl Proxy {
     /// that is, `200` and the status gRPC gives the cause, with nothing after the head — a
     /// trailers-only answer, which is how gRPC answers a call it fails before any message
     /// (15 §6). Counted by its reason either way.
+    /// Says on `answered` that the listener serves HTTP/3 as well, if it does. Every answer
+    /// carries it, HTTP/3's own too, which keeps what a client remembers fresh.
+    fn advertise(&self, listener: usize, answered: &mut Answered<Body>) {
+        let snapshot = self.current.load();
+        let Some(alt_svc) = snapshot.alt_svc.get(listener).and_then(Option::as_ref) else {
+            return;
+        };
+        match answered {
+            // An overlay holds as many fields as a rule adds and more; this is one.
+            Answered::Raw(answer, _) => {
+                let _added = answer.apply(alt_svc);
+            }
+            Answered::Map(response) => alt_svc.apply(response.headers_mut()),
+        }
+    }
+
     fn answer_to(&self, listener: usize, answer: Answer, call: Option<Call>) -> Response<Body> {
         let mut response = self.answer(listener, answer);
         if call.is_some() {
@@ -3506,6 +3552,47 @@ upstreams:
                     assert_eq!(answer, "", "{name}: served a client with no certificate");
                     let answer = answered(name, Some(stranger.clone())).await;
                     assert_eq!(answer, "", "{name}: served a client nobody vouches for");
+                }
+            })
+            .await;
+    }
+
+    /// An HTTPS listener that serves HTTP/3 says so on its TCP answers, with the port its
+    /// config gives and for as long as it says (RFC 7838); one that does not, says nothing.
+    #[tokio::test]
+    async fn an_http3_listener_says_so_on_its_tcp_answers() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                for http3 in [true, false] {
+                    let mut config = everything_config(upstream);
+                    let web = config.listeners.get_mut("web").unwrap();
+                    // What Alt-Svc names: the port the config gives, whatever socket the
+                    // test serves on.
+                    web.address = "127.0.0.1:8443".parse().unwrap();
+                    web.protocol = edgerush_config::Protocol::Https;
+                    web.tls = Some(edgerush_config::Tls {
+                        certificates: vec![crate::tls::testing::certificate(&["a.test"])],
+                        client_validation: None,
+                    });
+                    web.http3 = http3.then_some(edgerush_config::Http3 {
+                        alt_svc_max_age: 60,
+                    });
+                    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+                    let worker =
+                        Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+                    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let front = socket.local_addr().unwrap();
+                    let _serving = serving(&worker, socket);
+                    let stream = tls_client(front, "a.test", None, |_| {}).await.unwrap();
+                    let answer = h1_over_or_nothing(stream).await.to_ascii_lowercase();
+                    assert!(answer.starts_with("http/1.1 200 ok\r\n"), "{answer}");
+                    assert_eq!(
+                        answer.contains("\r\nalt-svc: h3=\":8443\"; ma=60\r\n"),
+                        http3,
+                        "{answer}"
+                    );
                 }
             })
             .await;

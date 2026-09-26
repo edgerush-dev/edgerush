@@ -21,6 +21,7 @@ use crate::downstream::h3::conn::Conn;
 use crate::downstream::h3::connection::drive;
 use crate::drain::Drain;
 use crate::interim::Interim;
+use crate::metrics::Quic;
 use crate::quic::header::{self, Header, VERSION_1};
 use crate::quic::id::{self, Codec, IdError, Keys, Nonces};
 use crate::quic::token;
@@ -236,6 +237,8 @@ pub(crate) struct Shared {
     pub(crate) forwarded: Cell<u64>,
     /// Datagrams dropped, the inbox they were for being full.
     pub(crate) dropped: Cell<u64>,
+    /// Where what the listener does is counted.
+    count: Box<dyn Fn(Quic)>,
 }
 
 /// Why a listener cannot be served.
@@ -258,6 +261,7 @@ impl Shared {
         worker: u16,
         timers: Rc<Timers>,
         drain: Rc<Drain>,
+        count: Box<dyn Fn(Quic)>,
     ) -> Result<Self, ListenerError> {
         Ok(Self {
             local: socket.local_addr()?,
@@ -273,6 +277,7 @@ impl Shared {
             connections: Cell::new(0),
             forwarded: Cell::new(0),
             dropped: Cell::new(0),
+            count,
         })
     }
 }
@@ -416,8 +421,10 @@ where
             {
                 if forwarding.forward(owner, datagram, from) {
                     shared.forwarded.set(shared.forwarded.get() + 1);
+                    (shared.count)(Quic::Forwarded);
                 } else {
                     shared.dropped.set(shared.dropped.get() + 1);
+                    (shared.count)(Quic::InboxFull);
                 }
                 return;
             }
@@ -578,6 +585,7 @@ fn negotiate(shared: &Shared, scid: &[u8], dcid: &[u8], to: SocketAddr) {
     if let Ok(written) = written {
         // Lost, the client sends its Initial again.
         let _sent = shared.socket.try_send_to(&out[..written], to);
+        (shared.count)(Quic::Negotiation);
     }
 }
 
@@ -601,6 +609,7 @@ fn retry(shared: &Shared, scid: &[u8], odcid: &[u8], now: u64, to: SocketAddr) {
     );
     if let Ok(written) = written {
         let _sent = shared.socket.try_send_to(&out[..written], to);
+        (shared.count)(Quic::Retry);
     }
 }
 
