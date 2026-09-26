@@ -138,6 +138,60 @@ impl Quic {
     ];
 }
 
+/// How a `tcp` or `tls` listener's connection ended
+/// ([17 §4](../../docs/17-tcp-and-tls-passthrough.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tunnel {
+    /// Carried until both ends had finished.
+    Closed,
+    /// Closed at its idle bound, having carried nothing either way for that long.
+    Idle,
+    /// Closed at the drain's bound.
+    Drained,
+    /// One end failed part way.
+    Failed,
+    /// Not routed: its ClientHello was refused, asked for no name, or for one no route has.
+    Refused,
+    /// Its ClientHello did not come within the first-request deadline.
+    TooSlow,
+    /// Its route had no backend with an endpoint.
+    NoBackend,
+    /// The backend's endpoint could not be reached within the connect bound.
+    ConnectFailed,
+    /// The worker had no storage for its buffers.
+    Exhausted,
+}
+
+impl Tunnel {
+    /// The name this is counted under.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Idle => "idle",
+            Self::Drained => "drained",
+            Self::Failed => "failed",
+            Self::Refused => "refused",
+            Self::TooSlow => "too_slow",
+            Self::NoBackend => "no_backend",
+            Self::ConnectFailed => "connect_failed",
+            Self::Exhausted => "exhausted",
+        }
+    }
+
+    /// Every one of them, for a scrape that shows a series whether it has happened or not.
+    const ALL: [Self; 9] = [
+        Self::Closed,
+        Self::Idle,
+        Self::Drained,
+        Self::Failed,
+        Self::Refused,
+        Self::TooSlow,
+        Self::NoBackend,
+        Self::ConnectFailed,
+        Self::Exhausted,
+    ];
+}
+
 /// What became of a connection to an upstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Socket {
@@ -326,6 +380,7 @@ pub(crate) struct ListenerCounters {
     head_time: Histogram<14>,
     grpc: [Counter; NAMES.len()],
     quic: [Counter; Quic::ALL.len()],
+    tunnels: [Counter; Tunnel::ALL.len()],
 }
 
 impl ListenerCounters {
@@ -347,6 +402,13 @@ impl ListenerCounters {
     /// The listener's HTTP/3 side did `event` with a datagram.
     pub(crate) fn quic(&self, event: Quic) {
         if let Some(counter) = self.quic.get(event as usize) {
+            counter.inc();
+        }
+    }
+
+    /// A tunnel of the listener's ended so.
+    pub(crate) fn tunnel(&self, ended: Tunnel) {
+        if let Some(counter) = self.tunnels.get(ended as usize) {
             counter.inc();
         }
     }
@@ -606,6 +668,20 @@ impl Metrics {
                 let labels = [("listener", listener.as_str()), ("event", event.name())];
                 let count = |shard: &ListenerCounters| {
                     shard.quic.get(event as usize).map_or(0, Counter::get)
+                };
+                scrape.sample(name, &labels, series.sum(count));
+            }
+        }
+        let name = "edgerush_listener_tunnels_total";
+        let help = "Connections of tcp and tls listeners, by how they ended: carried to \
+                    their close, closed idle or at the drain's bound, failed part way, or \
+                    never carried.";
+        scrape.family(name, Kind::Counter, help);
+        for (listener, series) in listeners() {
+            for ended in Tunnel::ALL {
+                let labels = [("listener", listener.as_str()), ("outcome", ended.name())];
+                let count = |shard: &ListenerCounters| {
+                    shard.tunnels.get(ended as usize).map_or(0, Counter::get)
                 };
                 scrape.sample(name, &labels, series.sum(count));
             }

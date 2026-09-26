@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Which rule a request was routed to: positions in the list of routes and in the route's
 /// list of rules.
@@ -76,6 +77,9 @@ pub struct CompiledListener {
     pub router: Router<RuleId>,
     /// Where a `tcp` or `tls` listener's connections go; `None` for an HTTP listener.
     pub l4: Option<L4>,
+    /// How long a tunnel of this listener's may carry nothing before it is closed: an hour
+    /// unless its config says otherwise. Only a `tcp` or `tls` listener has tunnels.
+    pub tunnel_idle: Duration,
 }
 
 /// How a passthrough listener's connections find their backends (17 in the docs).
@@ -360,6 +364,15 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
         if listener.http3.is_some() && listener.protocol != Protocol::Https {
             errors.push(Place::listener(name).problem(Problem::Http3NeedsTls));
         }
+        match (listener.protocol, listener.tunnel_idle_seconds) {
+            (Protocol::Http | Protocol::Https, Some(_)) => {
+                errors.push(Place::listener(name).problem(Problem::TunnelIdleUnwanted));
+            }
+            (_, Some(0)) => {
+                errors.push(Place::listener(name).problem(Problem::TunnelIdleZero));
+            }
+            _ => {}
+        }
         let validation = listener
             .tls
             .as_ref()
@@ -453,6 +466,9 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                 http3: listener.http3,
                 router: Router::new(matches.remove(name.as_str()).unwrap_or_default()),
                 l4: l4.remove(name.as_str()),
+                tunnel_idle: Duration::from_secs(
+                    listener.tunnel_idle_seconds.unwrap_or(TUNNEL_IDLE_SECONDS),
+                ),
             })
             .collect();
         Ok(Compiled {
@@ -467,6 +483,9 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
 
 /// The most backends a passthrough route has, as TCPRoute and TLSRoute allow.
 const MOST_BACKENDS: usize = 16;
+
+/// A tunnel's idle bound unless its listener's config says otherwise: an hour.
+const TUNNEL_IDLE_SECONDS: u64 = 3_600;
 
 /// How a protocol is written in a config.
 fn protocol_name(protocol: Protocol) -> &'static str {
@@ -1061,6 +1080,12 @@ pub enum Problem {
     /// HTTP/3 on a listener without TLS.
     #[error("`http3` is for protocol `https`")]
     Http3NeedsTls,
+    /// A tunnel's idle bound on a listener that makes no tunnels.
+    #[error("`tunnel_idle_seconds` is for protocols `tcp` and `tls`")]
+    TunnelIdleUnwanted,
+    /// A tunnel that could never carry anything.
+    #[error("`tunnel_idle_seconds` must be at least 1")]
+    TunnelIdleZero,
     /// A route for a listener that does not take its kind.
     #[error("a {kind} route cannot be for listener `{listener}`, which is `{protocol}`")]
     WrongListener {
@@ -1769,7 +1794,7 @@ upstreams: {{}}
             r#"
 listeners:
   web: { address: "[::]:80", protocol: http }
-  db: { address: "[::]:5432", protocol: tcp }
+  db: { address: "[::]:5432", protocol: tcp, tunnel_idle_seconds: 90 }
   sni: { address: "[::]:8443", protocol: tls }
 routes: []
 tcp_routes:
@@ -1808,6 +1833,15 @@ upstreams:
         assert_eq!(route("example.com"), None);
         assert_eq!(route("elsewhere.test"), None);
         assert!(listener(&compiled, "web").l4.is_none());
+        // A tunnel's idle bound, as said, or an hour.
+        assert_eq!(
+            listener(&compiled, "db").tunnel_idle,
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            listener(&compiled, "sni").tunnel_idle,
+            Duration::from_secs(3_600)
+        );
     }
 
     /// A route goes only to listeners of its kind, a `tcp` listener has exactly one, a
@@ -1933,6 +1967,23 @@ upstreams:
                 )
             ),
             ["route `a`: another route has the same name"]
+        );
+        // An idle bound for tunnels only a passthrough listener has, and never of nothing.
+        assert_eq!(
+            refused(
+                &format!(
+                    r#"{http}, w: {{ address: "[::]:4", protocol: http, tunnel_idle_seconds: 60 }}"#
+                ),
+                "routes: []"
+            ),
+            ["listener `w`: `tunnel_idle_seconds` is for protocols `tcp` and `tls`"]
+        );
+        assert_eq!(
+            refused(
+                r#"t: { address: "[::]:1", protocol: tcp, tunnel_idle_seconds: 0 }"#,
+                &format!("routes: []\ntcp_routes: [{}]", tcp_route("a", "t", up))
+            ),
+            ["listener `t`: `tunnel_idle_seconds` must be at least 1"]
         );
     }
 

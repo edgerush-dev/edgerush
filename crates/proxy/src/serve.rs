@@ -28,8 +28,10 @@ use crate::grpc::answer::{Answered as GrpcAnswered, Count, is_grpc_answer};
 use crate::grpc::call::Call;
 use crate::head::Forwarded;
 use crate::interim::Interim;
+use crate::l4::hello::{self, Hello};
+use crate::l4::tunnel::{Bounds as TunnelBounds, Carried, carry};
 use crate::linger::{self, Lent, linger};
-use crate::metrics::{Answer, Metrics, Socket, Stopped};
+use crate::metrics::{Answer, Metrics, Socket, Stopped, Tunnel};
 use crate::mirror;
 use crate::random::random;
 use crate::raw::{RawAnswer, RawHead};
@@ -38,11 +40,11 @@ use crate::request_body::{RequestBody, RequestBodyError};
 use crate::retry::budget::Budget;
 use crate::retry::replay::Tee;
 use crate::storage::Storage;
-use crate::timers::Timers;
+use crate::timers::{Alarm, Timers};
 use crate::tls::{self, Tls, TlsError};
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
-use crate::upstream::h1::blocks::{Blocks, SMALL, Sizes};
+use crate::upstream::h1::blocks::{Block, Blocks, SMALL, Sizes};
 use crate::upstream::h1::codec::{OutgoingFields, Sending};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, nothing_to_say};
 use crate::upstream::h1::pool::{Lease, Pool};
@@ -52,7 +54,9 @@ use crate::upstream::h2::pool::Limits as H2Limits;
 use crate::upstream::secure::{Secure, Socket as UpstreamSocket};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use edgerush_config::{Compiled, CompiledRetry, CompiledRule, UpstreamProtocol};
+use edgerush_config::{
+    Compiled, CompiledListener, CompiledRetry, CompiledRule, L4, UpstreamProtocol,
+};
 use edgerush_filters::HeaderModifier;
 use edgerush_router::Fields;
 use http::uri::{Authority, Scheme};
@@ -72,7 +76,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::Instant;
 
@@ -456,6 +460,12 @@ struct Snapshot {
 }
 
 impl Snapshot {
+    /// The compiled listener whose socket is at `position`, if the config still has it.
+    fn listener(&self, position: usize) -> Option<&CompiledListener> {
+        let at = self.listeners.get(position).copied().flatten()?;
+        self.config.listeners.get(at)
+    }
+
     fn new(
         config: Compiled,
         listeners: &[String],
@@ -472,14 +482,6 @@ impl Snapshot {
             .iter()
             .map(|name| config.listeners.iter().position(|l| l.name == *name))
             .collect();
-        // Passthrough listeners are in the model before the data plane can serve them
-        // (17, step 3): one would otherwise be served as plain HTTP.
-        if let Some(listener) = config.listeners.iter().find(|l| l.l4.is_some()) {
-            return Err(ProxyError::NotYet {
-                listener: listener.name.clone(),
-                what: "TCP and TLS passthrough",
-            });
-        }
         let tls = listeners
             .iter()
             .enumerate()
@@ -1033,15 +1035,20 @@ impl Worker {
         // Worth having, not worth refusing a connection over.
         let _unset = stream.set_nodelay(true);
         let deadlines = self.deadlines;
-        // The TLS of the config the connection came in under, which it keeps to its end.
-        let tls = self
-            .proxy
-            .current
-            .load()
-            .tls
-            .get(listener)
-            .cloned()
-            .flatten();
+        let (tls, passthrough) = {
+            let snapshot = self.proxy.current.load();
+            // The TLS of the config the connection came in under, which it keeps to its end.
+            let tls = snapshot.tls.get(listener).cloned().flatten();
+            // A `tcp` or `tls` listener's connections are carried, not served (17).
+            let passthrough = snapshot
+                .listener(listener)
+                .and_then(|compiled| compiled.l4.as_ref())
+                .map(|l4| matches!(l4, L4::Tls(_)));
+            (tls, passthrough)
+        };
+        if let Some(by_name) = passthrough {
+            return self.pass_through(listener, stream, by_name).await;
+        }
         let connection = Rc::new(Connection::open(self, listener));
         // Set when the engine hands over the first request, which is the end of the one
         // stretch its own deadlines do not cover.
@@ -1112,6 +1119,166 @@ impl Worker {
                 linger(stream, linger::QUIET, linger::MOST).await;
             }
         }
+    }
+
+    /// Carries a connection of a `tcp` or `tls` listener to a backend of its route, byte for
+    /// byte, and counts how it ended ([17 §4](../../docs/17-tcp-and-tls-passthrough.md)).
+    /// `by_name`: the route is the one whose hostnames cover the name the ClientHello asks
+    /// for, rather than the listener's one route.
+    async fn pass_through(self: Rc<Self>, listener: usize, mut client: TcpStream, by_name: bool) {
+        let connection = Connection::open(Rc::clone(&self), listener);
+        let ended = self.carry_through(listener, &mut client, by_name).await;
+        if let Some(counters) = self.proxy.metrics.listener(listener) {
+            counters.tunnel(ended);
+        }
+        drop(connection);
+    }
+
+    /// The tunnel, with a block of the worker's for each way, given back after.
+    async fn carry_through(
+        &self,
+        listener: usize,
+        client: &mut TcpStream,
+        by_name: bool,
+    ) -> Tunnel {
+        let taken = {
+            let mut blocks = self.blocks.borrow_mut();
+            match (blocks.take(), blocks.take()) {
+                (Ok(up), Ok(down)) => Some((up, down)),
+                (up, down) => {
+                    for block in [up, down].into_iter().flatten() {
+                        blocks.give(block);
+                    }
+                    None
+                }
+            }
+        };
+        let Some((mut up, mut down)) = taken else {
+            return Tunnel::Exhausted;
+        };
+        let ended = self
+            .carry_with(listener, client, by_name, &mut up, &mut down)
+            .await;
+        let mut blocks = self.blocks.borrow_mut();
+        blocks.give(up);
+        blocks.give(down);
+        ended
+    }
+
+    async fn carry_with(
+        &self,
+        listener: usize,
+        client: &mut TcpStream,
+        by_name: bool,
+        up: &mut Block,
+        down: &mut Block,
+    ) -> Tunnel {
+        // The name asked for, read into the block that carries the client's bytes on, so
+        // that what was read goes to the backend first and unchanged.
+        let name = if by_name {
+            match self.read_hello(client, up).await {
+                Ok(name) => Some(name),
+                Err(ended) => return ended,
+            }
+        } else {
+            None
+        };
+        // The route and a backend's endpoint, from the config in force now.
+        let (address, idle) = {
+            let snapshot = self.proxy.current.load();
+            let Some(compiled) = snapshot.listener(listener) else {
+                return Tunnel::Refused;
+            };
+            let route = match (&compiled.l4, name.as_deref()) {
+                (Some(L4::Tcp(route)), _) => Some(route),
+                (Some(L4::Tls(routes)), Some(name)) => routes.route(name),
+                _ => None,
+            };
+            let Some(route) = route else {
+                return Tunnel::Refused;
+            };
+            // A backend with no endpoint refuses its share of connections, as TLSRoute has
+            // it for a backend that cannot be used.
+            let Some(upstream) = route.backends.pick(random()) else {
+                return Tunnel::NoBackend;
+            };
+            let destinations = snapshot.destinations.of(upstream.0);
+            let healthy = |at: usize| destinations.get(at).is_some_and(|d| d.is_healthy());
+            let Some(identity) = pick_healthy(destinations.len(), random(), healthy)
+                .and_then(|at| snapshot.destinations.at(upstream.0, at))
+            else {
+                return Tunnel::NoBackend;
+            };
+            (identity.address(), compiled.tunnel_idle)
+        };
+        self.proxy.metrics.socket(Socket::Opened);
+        let Ok(mut backend) =
+            connect_within(self.limits.connect, TcpStream::connect(address)).await
+        else {
+            return Tunnel::ConnectFailed;
+        };
+        let _unset = backend.set_nodelay(true);
+        let bounds = TunnelBounds {
+            idle,
+            drain_within: self.deadlines.drain,
+        };
+        match carry(
+            client,
+            &mut backend,
+            up,
+            down,
+            bounds,
+            &self.timers,
+            &self.drain,
+        )
+        .await
+        {
+            Carried::Closed => Tunnel::Closed,
+            Carried::Idle => Tunnel::Idle,
+            Carried::Drained => Tunnel::Drained,
+            Carried::Failed => Tunnel::Failed,
+        }
+    }
+
+    /// Reads a TLS client's ClientHello into `into`, within the first-request deadline
+    /// and [`hello::LIMIT`], for the host name it asks for (17 §3).
+    async fn read_hello(&self, client: &mut TcpStream, into: &mut Block) -> Result<String, Tunnel> {
+        let mut alarm = Alarm::new(&self.timers, None);
+        let due = Instant::now() + self.deadlines.first_request;
+        std::future::poll_fn(|cx| {
+            loop {
+                match hello::read(into.data()) {
+                    Hello::Whole(Some(name)) => return Poll::Ready(Ok(name)),
+                    // Asking for no name, it asks for no route.
+                    Hello::Whole(None) | Hello::Refused(_) => {
+                        return Poll::Ready(Err(Tunnel::Refused));
+                    }
+                    Hello::More => {}
+                }
+                let mut read = ReadBuf::new(into.room());
+                if read.remaining() == 0 {
+                    return Poll::Ready(Err(Tunnel::Refused));
+                }
+                match Pin::new(&mut *client).poll_read(cx, &mut read) {
+                    Poll::Ready(Ok(())) => {
+                        let count = read.filled().len();
+                        // Gone before saying enough to be routed.
+                        if count == 0 {
+                            return Poll::Ready(Err(Tunnel::Refused));
+                        }
+                        into.arrived(count);
+                    }
+                    Poll::Ready(Err(_)) => return Poll::Ready(Err(Tunnel::Failed)),
+                    Poll::Pending => {
+                        if alarm.poll_until(cx, due).is_ready() {
+                            return Poll::Ready(Err(Tunnel::TooSlow));
+                        }
+                        return Poll::Pending;
+                    }
+                }
+            }
+        })
+        .await
     }
 
     /// Serves HTTP/3 on `socket`, the UDP socket of the listener at position `listener` of
@@ -2106,14 +2273,6 @@ pub enum ProxyError {
     /// BoringSSL could not give the keys the data plane makes at start.
     #[error("no random keys to be had: {0}")]
     Random(String),
-    /// A listener of a kind the data plane does not serve yet.
-    #[error("listener `{listener}`: {what} is not served yet")]
-    NotYet {
-        /// The listener's name.
-        listener: String,
-        /// What it asks for.
-        what: &'static str,
-    },
 }
 
 fn authority(endpoint: &SocketAddr) -> Result<Authority, ProxyError> {
@@ -3573,22 +3732,331 @@ upstreams:
             .await;
     }
 
-    /// A passthrough listener is refused until the data plane can serve one (17, step 3),
-    /// rather than served as plain HTTP.
-    #[test]
-    fn a_passthrough_listener_is_not_served_as_http() {
-        let yaml = r#"
-listeners: { db: { address: "127.0.0.1:0", protocol: tcp } }
-routes: []
-tcp_routes: [{ name: db, listeners: [db], backends: [{ upstream: up, weight: 1 }] }]
-upstreams: { up: { endpoints: ["127.0.0.1:9"] } }
-"#;
+    /// A worker serving `yaml`'s one listener, a passthrough one, with the short deadlines.
+    async fn passing(yaml: &str) -> (SocketAddr, Rc<Worker>) {
         let config: Config = serde_saphyr::from_str(yaml).unwrap();
-        let refused = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap_err();
-        assert_eq!(
-            refused.to_string(),
-            "listener `db`: TCP and TLS passthrough is not served yet"
+        let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+        let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _serving = serving(&worker, socket);
+        (front, worker)
+    }
+
+    /// A `tcp` listener `db` whose one route goes to `backend`, with `extra` in the
+    /// listener's settings.
+    fn tcp_to(backend: SocketAddr, extra: &str) -> String {
+        format!(
+            "listeners: {{ db: {{ address: \"127.0.0.1:0\", protocol: tcp{extra} }} }}\n\
+             routes: []\n\
+             tcp_routes: [{{ name: db, listeners: [db], backends: [{{ upstream: up, weight: 1 }}] }}]\n\
+             upstreams: {{ up: {{ endpoints: [\"{backend}\"] }} }}\n"
+        )
+    }
+
+    /// Whether the listener `listener` has counted one tunnel as ended by `outcome`, soon.
+    async fn tunnel_ended(worker: &Worker, listener: &str, outcome: &str) {
+        let line = format!(
+            "edgerush_listener_tunnels_total{{listener=\"{listener}\",outcome=\"{outcome}\"}} 1\n"
         );
+        until(|| worker.proxy().metrics().contains(&line)).await;
+    }
+
+    /// `reading`, which fails the test rather than hang it if the tunnel never passes an
+    /// end on.
+    async fn bounded<T>(reading: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), reading)
+            .await
+            .expect("the tunnel never ended")
+    }
+
+    /// A backend that reads what each connection sends until its end, answers with how
+    /// many bytes came and their sum, and closes.
+    async fn tallying_backend() -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            while let Ok((mut stream, _)) = socket.accept().await {
+                tokio::task::spawn_local(async move {
+                    let mut came = Vec::new();
+                    stream.read_to_end(&mut came).await.unwrap();
+                    let sum: u64 = came.iter().map(|&byte| u64::from(byte)).sum();
+                    let answer = format!("{} {sum}", came.len());
+                    stream.write_all(answer.as_bytes()).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                });
+            }
+        });
+        address
+    }
+
+    /// A backend that accepts and then says and reads nothing, for as long as the
+    /// connection lasts.
+    async fn quiet_backend() -> SocketAddr {
+        use tokio::io::AsyncReadExt;
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            while let Ok((mut stream, _)) = socket.accept().await {
+                tokio::task::spawn_local(async move {
+                    let mut rest = Vec::new();
+                    let _ended = stream.read_to_end(&mut rest).await;
+                });
+            }
+        });
+        address
+    }
+
+    /// A `tcp` listener's connection is carried to its route's backend and back, byte for
+    /// byte: the client's end is passed on, so that the backend knows it has everything
+    /// and answers, and the backend's end is passed back (17 §4).
+    #[tokio::test]
+    async fn a_tcp_tunnel_carries_bytes_both_ways_and_each_end() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let backend = tallying_backend().await;
+                let (front, worker) = passing(&tcp_to(backend, "")).await;
+                let mut client = TcpStream::connect(front).await.unwrap();
+                // Several blocks' worth, so that each way fills and empties many times.
+                let sent: Vec<u8> = (0..300_000_u32).map(|at| (at % 253) as u8).collect();
+                client.write_all(&sent).await.unwrap();
+                client.shutdown().await.unwrap();
+                let mut answer = String::new();
+                bounded(client.read_to_string(&mut answer)).await.unwrap();
+                let sum: u64 = sent.iter().map(|&byte| u64::from(byte)).sum();
+                assert_eq!(answer, format!("{} {sum}", sent.len()));
+                tunnel_ended(&worker, "db", "closed").await;
+            })
+            .await;
+    }
+
+    /// A backend that finishes first has its end passed back, and what the client sends
+    /// after it still goes on, until the client finishes too.
+    #[tokio::test]
+    async fn a_backend_that_finishes_first_still_hears_the_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let backend = socket.local_addr().unwrap();
+                let heard = Rc::new(RefCell::new(Vec::new()));
+                let hearing = Rc::clone(&heard);
+                tokio::task::spawn_local(async move {
+                    let (mut stream, _) = socket.accept().await.unwrap();
+                    stream.write_all(b"hello").await.unwrap();
+                    stream.shutdown().await.unwrap();
+                    let mut came = Vec::new();
+                    stream.read_to_end(&mut came).await.unwrap();
+                    *hearing.borrow_mut() = came;
+                });
+                let (front, worker) = passing(&tcp_to(backend, "")).await;
+                let mut client = TcpStream::connect(front).await.unwrap();
+                let mut said = Vec::new();
+                bounded(client.read_to_end(&mut said)).await.unwrap();
+                assert_eq!(said, b"hello");
+                client.write_all(b"and goodbye").await.unwrap();
+                client.shutdown().await.unwrap();
+                until(|| heard.borrow().as_slice() == b"and goodbye").await;
+                tunnel_ended(&worker, "db", "closed").await;
+            })
+            .await;
+    }
+
+    /// A tunnel that carries nothing either way for its listener's idle bound is closed.
+    #[tokio::test]
+    async fn an_idle_tunnel_is_closed_at_its_bound() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let backend = quiet_backend().await;
+                let (front, worker) = passing(&tcp_to(backend, ", tunnel_idle_seconds: 1")).await;
+                let mut client = TcpStream::connect(front).await.unwrap();
+                let took = closed_after(&mut client).await;
+                let bound = Duration::from_secs(1);
+                assert!(took + EARLY >= bound, "closed after {took:?}");
+                assert!(took < bound + SLACK, "closed after {took:?}");
+                tunnel_ended(&worker, "db", "idle").await;
+            })
+            .await;
+    }
+
+    /// A backend that cannot be reached, or an upstream with no endpoint, closes the
+    /// client's connection, counted by why.
+    #[tokio::test]
+    async fn a_tunnel_with_no_backend_to_reach_is_closed() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Bound, then let go: nothing listens there.
+                let gone = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .unwrap()
+                    .local_addr()
+                    .unwrap();
+                let (front, worker) = passing(&tcp_to(gone, "")).await;
+                let mut client = TcpStream::connect(front).await.unwrap();
+                // Refused at once on Linux; Windows tries again for two seconds or so. The
+                // connect bound is what holds either way.
+                let bound = H1Limits::default().connect;
+                assert!(closed_after(&mut client).await < bound + SLACK);
+                tunnel_ended(&worker, "db", "connect_failed").await;
+
+                let yaml = tcp_to(gone, "").replace(&format!("[\"{gone}\"]"), "[]");
+                let (front, worker) = passing(&yaml).await;
+                let mut client = TcpStream::connect(front).await.unwrap();
+                assert!(closed_after(&mut client).await < SLACK);
+                tunnel_ended(&worker, "db", "no_backend").await;
+            })
+            .await;
+    }
+
+    /// A TLS backend that, once its handshake is done, says `says` and closes.
+    async fn tls_backend(says: &'static str) -> SocketAddr {
+        use boring::pkey::PKey;
+        use boring::ssl::{SslAcceptor, SslMethod};
+        use boring::x509::X509;
+        use tokio::io::AsyncWriteExt;
+        let certificate = crate::tls::testing::certificate(&["backend.test"]);
+        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        acceptor
+            .set_certificate(&X509::from_pem(certificate.chain.as_bytes()).unwrap())
+            .unwrap();
+        acceptor
+            .set_private_key(&PKey::private_key_from_pem(certificate.key.as_bytes()).unwrap())
+            .unwrap();
+        let acceptor = Rc::new(acceptor.build());
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            while let Ok((stream, _)) = socket.accept().await {
+                let acceptor = Rc::clone(&acceptor);
+                tokio::task::spawn_local(async move {
+                    if let Ok(mut secured) = tokio_boring::accept(&acceptor, stream).await {
+                        let _said = secured.write_all(says.as_bytes()).await;
+                        let _closed = secured.shutdown().await;
+                    }
+                });
+            }
+        });
+        address
+    }
+
+    /// What a TLS client asking for `name` (or none) through `front` is told once its
+    /// handshake is done, or `None` if there was no handshake.
+    async fn told_over_tls(front: SocketAddr, name: Option<&str>) -> Option<String> {
+        use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
+        use tokio::io::AsyncReadExt;
+        let stream = TcpStream::connect(front).await.unwrap();
+        let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+        connector.set_verify(SslVerifyMode::NONE);
+        let mut config = connector.build().configure().unwrap();
+        config.set_use_server_name_indication(name.is_some());
+        config.set_verify_hostname(false);
+        let mut secured = bounded(tokio_boring::connect(
+            config,
+            name.unwrap_or("none.test"),
+            stream,
+        ))
+        .await
+        .ok()?;
+        let mut told = String::new();
+        let _ended = bounded(secured.read_to_string(&mut told)).await;
+        Some(told)
+    }
+
+    /// A `tls` listener's connection goes to the backend whose route's hostnames cover the
+    /// name its ClientHello asks for, the most specific first, and the handshake is the
+    /// backend's own: the ClientHello went on unchanged. A name no route has, or none at
+    /// all, is refused.
+    #[tokio::test]
+    async fn a_tls_tunnel_goes_where_the_name_asked_for_routes_it() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let exact = tls_backend("exact").await;
+                let wildcard = tls_backend("wildcard").await;
+                let yaml = format!(
+                    "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls }} }}\n\
+                     routes: []\n\
+                     tls_routes:\n\
+                     \x20 - {{ name: exact, listeners: [sni], hostnames: [{{ name: api.example.test, falls_through: true }}], backends: [{{ upstream: exact, weight: 1 }}] }}\n\
+                     \x20 - {{ name: rest, listeners: [sni], hostnames: [{{ name: \"*.example.test\", wildcard: any_labels, falls_through: true }}], backends: [{{ upstream: wildcard, weight: 1 }}] }}\n\
+                     upstreams: {{ exact: {{ endpoints: [\"{exact}\"] }}, wildcard: {{ endpoints: [\"{wildcard}\"] }} }}\n"
+                );
+                let (front, worker) = passing(&yaml).await;
+                assert_eq!(
+                    told_over_tls(front, Some("api.example.test")).await.as_deref(),
+                    Some("exact")
+                );
+                assert_eq!(
+                    told_over_tls(front, Some("WWW.Example.test")).await.as_deref(),
+                    Some("wildcard")
+                );
+                tunnel_ended(&worker, "sni", "closed").await;
+                assert_eq!(told_over_tls(front, Some("elsewhere.test")).await, None);
+                tunnel_ended(&worker, "sni", "refused").await;
+                assert_eq!(told_over_tls(front, None).await, None);
+                let line = "edgerush_listener_tunnels_total{listener=\"sni\",outcome=\"refused\"} 2\n";
+                until(|| worker.proxy().metrics().contains(line)).await;
+            })
+            .await;
+    }
+
+    /// A TLS client that has not sent its ClientHello within the first-request deadline is
+    /// let go of.
+    #[tokio::test]
+    async fn a_client_hello_that_never_comes_is_given_up_on() {
+        use tokio::io::AsyncWriteExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let backend = quiet_backend().await;
+                let yaml = format!(
+                    "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls }} }}\n\
+                     routes: []\n\
+                     tls_routes: [{{ name: a, listeners: [sni], hostnames: [{{ name: a.test, falls_through: true }}], backends: [{{ upstream: up, weight: 1 }}] }}]\n\
+                     upstreams: {{ up: {{ endpoints: [\"{backend}\"] }} }}\n"
+                );
+                let (front, worker) = passing(&yaml).await;
+                let mut client = TcpStream::connect(front).await.unwrap();
+                // The start of a handshake record, and then nothing.
+                client.write_all(&[22, 3, 1, 1, 0]).await.unwrap();
+                let took = closed_after(&mut client).await;
+                assert!(took + EARLY >= SHORT.first_request, "closed after {took:?}");
+                assert!(took < SHORT.first_request + SLACK, "closed after {took:?}");
+                tunnel_ended(&worker, "sni", "too_slow").await;
+            })
+            .await;
+    }
+
+    /// A tunnel carrying on when the worker drains is left the drain's bound, and then
+    /// closed; no new connection is taken meanwhile.
+    #[tokio::test]
+    async fn a_draining_worker_closes_tunnels_at_its_bound() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let backend = quiet_backend().await;
+                let (front, worker) = passing(&tcp_to(backend, "")).await;
+                let mut client = TcpStream::connect(front).await.unwrap();
+                until(|| {
+                    worker
+                        .proxy()
+                        .metrics()
+                        .contains("edgerush_listener_connections_active{listener=\"db\"} 1\n")
+                })
+                .await;
+                worker.drain();
+                let took = closed_after(&mut client).await;
+                assert!(took + EARLY >= SHORT.drain, "closed after {took:?}");
+                assert!(took < SHORT.drain + SLACK, "closed after {took:?}");
+                tunnel_ended(&worker, "db", "drained").await;
+            })
+            .await;
     }
 
     /// An HTTPS listener that serves HTTP/3 says so on its TCP answers, with the port its

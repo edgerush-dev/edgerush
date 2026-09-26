@@ -40,6 +40,12 @@ pub struct Listener {
     /// HTTP/3 as well, on the same port over UDP: for an `https` listener only.
     #[serde(default)]
     pub http3: Option<Http3>,
+    /// How long, in seconds, a `tcp` or `tls` listener's tunnel may carry nothing either
+    /// way before both its ends are closed (17 in the docs). An hour unless said otherwise,
+    /// as HAProxy's `timeout tunnel` is set in practice: what a tunnel carries (a database's
+    /// connection, a long poll) can be quiet for long. For those listeners only.
+    #[serde(default)]
+    pub tunnel_idle_seconds: Option<u64>,
 }
 
 /// An `https` listener's HTTP/3 (16 in the docs): the same routes and TLS, over QUIC.
