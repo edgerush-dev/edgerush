@@ -5,8 +5,9 @@
 //! task has read or written, and when a deadline comes. It hands on what quiche has for the
 //! streams, starts a task for each new request, gives the connection its spare IDs, and
 //! sends what quiche wants sent. Its deadlines, one alarm in the worker's timers for the
-//! soonest: quiche's own; the first request, 10 s from the first packet; the keep-alive,
-//! once no request is open; the drain's bound.
+//! soonest: quiche's own; the handshake, 10 s from the first packet, then the first
+//! request, 10 s from the handshake's end; the keep-alive, once no request is open; the
+//! drain's bound.
 //!
 //! A request whose head is malformed is reset with `H3_MESSAGE_ERROR`; one whose head is too
 //! large is answered 431; one on a stream past the GOAWAY sent is reset with
@@ -46,6 +47,8 @@ struct Driving {
     quiet_since: Option<Instant>,
     /// Still in its handshake, and counted as one.
     handshaking: bool,
+    /// When the handshake ended, from which the first request is timed.
+    established_at: Option<Instant>,
     /// The ID the client first chose, which finds the connection until the handshake is
     /// done.
     chosen: Vec<u8>,
@@ -110,6 +113,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
         asked: false,
         quiet_since: Some(accepted),
         handshaking: true,
+        established_at: None,
         chosen,
         ids: vec![first_id],
         seen: Seen::default(),
@@ -188,7 +192,14 @@ pub(crate) async fn drive<R, F, B, D, G>(
                 (None, None, None)
             } else {
                 (
-                    (!driving.asked).then(|| driving.accepted + settings.first_request),
+                    // The handshake, then the first request, each in its own time.
+                    (!driving.asked).then(|| {
+                        driving
+                            .established_at
+                            .map_or(driving.accepted + settings.handshake, |at| {
+                                at + settings.first_request
+                            })
+                    }),
                     driving
                         .quiet_since
                         .filter(|_| driving.asked)
@@ -352,6 +363,7 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
         table.remove(driving.chosen.as_slice());
         if driving.handshaking {
             driving.handshaking = false;
+            driving.established_at = Some(Instant::now());
             shared
                 .handshakes
                 .set(shared.handshakes.get().saturating_sub(1));

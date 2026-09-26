@@ -64,7 +64,11 @@ pub(crate) struct Settings {
     pub(crate) idle_timeout: Duration,
     /// How long a connection may stay with no request open before it is told to go.
     pub(crate) keep_alive: Duration,
-    /// How long a connection has, from its first packet, to send its first request.
+    /// How long a connection has, from its first packet, to finish its handshake.
+    pub(crate) handshake: Duration,
+    /// How long a connection has, from the end of its handshake, to send its first request:
+    /// a handshake slowed by loss, and its PTO backing off, leaves the request all of it
+    /// (16 §6), as NGINX and HAProxy time the two apart.
     pub(crate) first_request: Duration,
     /// How long a request's body, or the room for its answer, may be waited on with
     /// nothing coming.
@@ -93,6 +97,7 @@ impl Default for Settings {
             field_section: 128 << 10,
             idle_timeout: Duration::from_secs(30),
             keep_alive: Duration::from_secs(30),
+            handshake: Duration::from_secs(10),
             first_request: Duration::from_secs(10),
             stream_idle: Duration::from_secs(30),
             drain_within: Duration::from_secs(25),

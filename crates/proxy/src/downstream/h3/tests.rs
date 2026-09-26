@@ -396,6 +396,60 @@ fn a_connection_without_a_request_is_closed_at_its_deadline() {
     });
 }
 
+/// The time to the first request counts from the handshake's end, not from the first
+/// packet: a handshake slowed by loss leaves the request all of its time (16 §6).
+#[test]
+fn the_first_request_clock_starts_when_the_handshake_ends() {
+    locally(async {
+        let settings = Settings {
+            handshake: Duration::from_millis(2_000),
+            ..short()
+        };
+        let server = serving(settings, echo).await;
+        let mut client = Client::new(server.address, "a.test").await;
+        client.flush().await;
+        // The handshake takes longer than the first request is given.
+        tokio::time::sleep(settings.first_request + Duration::from_millis(200)).await;
+        client.until(|client| client.quic.is_established()).await;
+        let config = quiche::h3::Config::new().unwrap();
+        client.h3 =
+            Some(quiche::h3::Connection::with_transport(&mut client.quic, &config).unwrap());
+        tokio::time::sleep(settings.first_request / 2).await;
+        let answer = client.get("a.test", "/late").await;
+        assert_eq!(body_of(&answer), "GET /late 0 None");
+    });
+}
+
+/// A client that does not finish its handshake is closed at the handshake's bound, however
+/// long the first request is given after it.
+#[test]
+fn a_handshake_not_finished_in_time_is_closed() {
+    locally(async {
+        let settings = Settings {
+            handshake: Duration::from_millis(800),
+            first_request: Duration::from_millis(3_000),
+            ..short()
+        };
+        let server = serving(settings, echo).await;
+        let mut client = Client::new(server.address, "a.test").await;
+        client.flush().await;
+        let started = tokio::time::Instant::now();
+        while client.closed_by_server().is_none() {
+            assert!(
+                started.elapsed() < settings.first_request,
+                "not closed at the handshake's bound"
+            );
+            client.hear_for(Duration::from_millis(20)).await;
+        }
+        let took = started.elapsed();
+        assert!(
+            took >= settings.handshake - Duration::from_millis(50),
+            "{took:?}"
+        );
+        assert!(took <= settings.handshake + SLACK, "{took:?}");
+    });
+}
+
 /// A connection with no request open for its keep-alive time is told to go and closed.
 #[test]
 fn an_idle_connection_is_told_to_go_at_its_keep_alive_deadline() {

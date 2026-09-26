@@ -156,6 +156,19 @@ impl Client {
         }
     }
 
+    /// Hears the server for `span` without answering it: a handshake goes no further.
+    pub(crate) async fn hear_for(&mut self, span: Duration) {
+        let until = Instant::now() + span;
+        while Instant::now() < until {
+            self.turn(
+                until
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(20)),
+            )
+            .await;
+        }
+    }
+
     /// Reads what comes within `wait`, or quiche's own timeout if that is sooner.
     async fn turn(&mut self, wait: Duration) {
         let wait = self
