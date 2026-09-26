@@ -435,6 +435,10 @@ fn events(
                 }
                 seen.next = seen.next.max(id + 4);
                 match head::request(&list, head_limit) {
+                    // A head that ends the stream leaves no room for the body it declares.
+                    Ok(head) if !more_frames && head.length.is_some_and(|length| length > 0) => {
+                        shut(quic, id, code::MESSAGE_ERROR);
+                    }
                     Ok(head) => {
                         streams.insert(id, Slot::default());
                         found.push(Found {

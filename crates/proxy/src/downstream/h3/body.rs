@@ -8,9 +8,11 @@
 //!
 //! The body is held to the length its `Content-Length` declares: one that brings more, or
 //! ends with less, is malformed (RFC 9114 §4.1.2) and fails here, before the difference can
-//! reach an upstream that reads lengths.
+//! reach an upstream that reads lengths. So do malformed trailers. A malformed body has its
+//! stream reset with `H3_MESSAGE_ERROR`, as a malformed head has.
 
 use crate::downstream::h2::idle::Idle;
+use crate::downstream::h3::code;
 use crate::downstream::h3::conn::{Conn, Slot, State};
 use crate::downstream::h3::head::Refused;
 use crate::interim::Interim;
@@ -130,7 +132,7 @@ impl IncomingH3 {
                         .declared
                         .is_some_and(|declared| self.received > declared)
                     {
-                        return Poll::Ready(Some(Err(invalid(StreamError::Length))));
+                        return Poll::Ready(Some(Err(self.malformed(quic, StreamError::Length))));
                     }
                     self.idle.moved();
                     if let Some(interim) = &self.interim {
@@ -153,10 +155,15 @@ impl IncomingH3 {
             .declared
             .is_some_and(|declared| declared != self.received)
         {
-            return Poll::Ready(Some(Err(invalid(StreamError::Length))));
+            return Poll::Ready(Some(Err(self.malformed(quic, StreamError::Length))));
         }
         match slot.trailers.take() {
             Some(Ok(trailers)) => return Poll::Ready(Some(Ok(Frame::trailers(trailers)))),
+            Some(Err(refused @ Refused::Malformed(_))) => {
+                return Poll::Ready(Some(Err(
+                    self.malformed(quic, StreamError::Trailers(refused))
+                )));
+            }
             Some(Err(refused)) => {
                 return Poll::Ready(Some(Err(invalid(StreamError::Trailers(refused)))));
             }
@@ -167,6 +174,18 @@ impl IncomingH3 {
             return Poll::Ready(None);
         }
         self.wait(slot, *closed, cx, false)
+    }
+
+    /// Refuses a malformed body (RFC 9114 §4.1.2): the stream is reset both ways with
+    /// `H3_MESSAGE_ERROR`, as for a malformed head, and the read fails.
+    fn malformed(&self, quic: &mut quiche::Connection, error: StreamError) -> RequestBodyError {
+        // Fails only for a side already done.
+        let _reset =
+            quic.stream_shutdown(self.stream, quiche::Shutdown::Write, code::MESSAGE_ERROR);
+        let _stopped =
+            quic.stream_shutdown(self.stream, quiche::Shutdown::Read, code::MESSAGE_ERROR);
+        self.conn.stir();
+        invalid(error)
     }
 
     /// Waits for the driver to hand on more, or for the idle bound.

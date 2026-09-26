@@ -26,7 +26,7 @@ use bytes::Bytes;
 use http::{Request, Response};
 use http_body::{Body, Frame};
 use http_body_util::{BodyExt, Full, StreamBody};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::future::Future;
@@ -365,25 +365,94 @@ fn an_upload_and_its_trailers_reach_the_core() {
     });
 }
 
-/// A body is held to the length its head declared, both ways (RFC 9114 §4.1.2).
+/// The echo core, which also keeps what it would have said, for a stream reset before its
+/// answer could go.
+fn heard_echo(
+    heard: &Rc<RefCell<Vec<String>>>,
+) -> impl Fn(Request<RequestBody>, Interim) -> Answering + 'static {
+    let heard = Rc::clone(heard);
+    move |request, interim| {
+        let heard = Rc::clone(&heard);
+        Box::pin(async move {
+            let said = echo(request, interim)
+                .await
+                .into_response()
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes();
+            heard
+                .borrow_mut()
+                .push(String::from_utf8(said.to_vec()).unwrap());
+            Answered::Map(Response::new(Full::new(said)))
+        })
+    }
+}
+
+/// A body is held to the length its head declared, both ways, an empty DATA frame that ends
+/// the stream short of it included, and its trailers are held to the rules of a head: a
+/// body that breaks either is malformed (RFC 9114 §4.1.2). The core's read fails, and the
+/// stream is reset with H3_MESSAGE_ERROR, as HTTP/2's is with PROTOCOL_ERROR.
 #[test]
 fn a_body_that_is_not_the_length_declared_fails() {
     locally(async {
-        let server = serving(short(), echo).await;
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let server = serving(short(), heard_echo(&heard)).await;
         let mut client = Client::connect(server.address, "a.test").await;
-        for (declared, sent) in [("10", 11), ("10", 9)] {
+        // The length declared, the bytes sent, and the trailers after them.
+        type Case = (&'static str, usize, &'static [(&'static str, &'static str)]);
+        let cases: [Case; 4] = [
+            ("10", 11, &[]),
+            ("10", 9, &[]),
+            ("10", 0, &[]),
+            ("1", 1, &[("connection", "close")]),
+        ];
+        for (at, (declared, sent, trailers)) in cases.into_iter().enumerate() {
             let mut head = get("a.test", "/up");
             head[0].1 = "POST";
             head.push(("content-length", declared));
             let id = client.request(&head, false);
-            client.body(id, &vec![1; sent], true).await;
+            client.body(id, &vec![1; sent], trailers.is_empty()).await;
+            if !trailers.is_empty() {
+                client.trailers(id, trailers).await;
+            }
             let answer = client.answer(id).await;
-            assert!(
-                body_of(&answer).starts_with("invalid:"),
-                "{declared} declared, {sent} sent: {}",
-                body_of(&answer)
-            );
+            let case = format!("{declared} declared, {sent} sent, trailers {trailers:?}");
+            assert_eq!(answer.reset, Some(code::MESSAGE_ERROR), "{case}");
+            client.until(|_| heard.borrow().len() > at).await;
+            let said = heard.borrow()[at].clone();
+            assert!(said.starts_with("invalid:"), "{case}: {said}");
         }
+    });
+}
+
+/// A request whose head ends the stream while its `Content-Length` declares a body is
+/// malformed (RFC 9114 §4.1.2): reset with H3_MESSAGE_ERROR before the core sees it, as
+/// HTTP/2 resets one, and the connection goes on. A length of 0 declares none.
+#[test]
+fn a_request_whose_head_ends_it_but_declares_a_body_is_reset() {
+    locally(async {
+        let asked = Rc::new(Cell::new(0));
+        let counting = Rc::clone(&asked);
+        let server = serving(short(), move |request, interim| {
+            counting.set(counting.get() + 1);
+            echo(request, interim)
+        })
+        .await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let mut head = get("a.test", "/up");
+        head[0].1 = "POST";
+        head.push(("content-length", "10"));
+        let id = client.request(&head, true);
+        let answer = client.answer(id).await;
+        assert_eq!(answer.reset, Some(code::MESSAGE_ERROR));
+        assert!(answer.heads.is_empty());
+        assert_eq!(asked.get(), 0, "the core was asked");
+
+        head.last_mut().unwrap().1 = "0";
+        let id = client.request(&head, true);
+        assert_eq!(body_of(&client.answer(id).await), "POST /up 0 None");
     });
 }
 
