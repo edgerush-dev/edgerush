@@ -7980,6 +7980,14 @@ impl<F: BufFactory> Connection<F> {
         self.local_error.as_ref()
     }
 
+    /// EdgeRush: what the connection holds of what it received and the
+    /// application has not read, as an account of the memory a peer makes it
+    /// hold.
+    pub fn received_held(&self) -> Held {
+        let (bytes, pieces) = self.streams.received_held();
+        Held { bytes, pieces }
+    }
+
     /// Collects and returns statistics about the connection.
     #[inline]
     pub fn stats(&self) -> Stats {
@@ -9637,6 +9645,19 @@ impl std::fmt::Display for AddrTupleFmt {
 
         f.write_fmt(format_args!("src:{src} dst:{dst}"))
     }
+}
+
+/// EdgeRush: what a connection holds of what it received and the application
+/// has not read ([`received_held()`]).
+///
+/// [`received_held()`]: struct.Connection.html#method.received_held
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    /// The bytes.
+    pub bytes: usize,
+    /// The pieces they are held in, each in a buffer and a node of its own:
+    /// what they cost past their bytes grows with these.
+    pub pieces: usize,
 }
 
 /// Statistics about the connection.

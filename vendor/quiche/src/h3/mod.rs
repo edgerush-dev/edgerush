@@ -1802,6 +1802,14 @@ impl Connection {
         Ok(ret)
     }
 
+    /// EdgeRush: the bytes of the buffers the connection's streams read frames
+    /// into, as an account of the memory a peer makes it hold: a HEADERS frame
+    /// is held whole until it has all come, and its stream's buffer keeps that
+    /// capacity until the stream goes.
+    pub fn frame_buffers(&self) -> usize {
+        self.streams.values().map(stream::Stream::frame_buffer).sum()
+    }
+
     /// Returns whether the peer enabled HTTP/3 DATAGRAM frame support.
     ///
     /// Support is signalled by the peer's SETTINGS, so this method always
@@ -8141,6 +8149,48 @@ mod tests {
             settle(&mut s);
         }
         assert_eq!(s.server.streams.len(), settled);
+    }
+
+    /// EdgeRush: the buffers a connection's streams read frames into are
+    /// counted, a HEADERS frame that has come in part above all, which is held
+    /// until it is whole; and they go with the stream.
+    #[test]
+    fn a_head_that_has_come_in_part_is_counted() {
+        let (mut config, h3_config) = Session::default_configs().unwrap();
+        config.set_initial_max_stream_data_bidi_remote(10_000);
+        config.set_initial_max_data(100_000);
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+        s.handshake().unwrap();
+        let settled = s.server.frame_buffers();
+
+        // A HEADERS frame of 1,000 bytes, of which 500 have come.
+        let mut part = vec![0x01, 0x43, 0xe8];
+        part.extend([0; 500]);
+        assert_eq!(s.pipe.client.stream_send(0, &part, false), Ok(part.len()));
+        s.advance().ok();
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert!(
+            s.server.frame_buffers() >= settled + 1_000,
+            "{} after {settled}",
+            s.server.frame_buffers()
+        );
+
+        // Given up both ways, the stream goes, and its buffer with it.
+        s.pipe
+            .client
+            .stream_shutdown(0, crate::Shutdown::Write, 0x10c)
+            .unwrap();
+        s.advance().ok();
+        s.pipe
+            .server
+            .stream_shutdown(0, crate::Shutdown::Write, 0x10c)
+            .unwrap();
+        s.pipe
+            .server
+            .stream_shutdown(0, crate::Shutdown::Read, 0x10c)
+            .unwrap();
+        settle(&mut s);
+        assert_eq!(s.server.frame_buffers(), settled);
     }
 
     /// The client shuts down the stream's write direction, the server

@@ -723,6 +723,12 @@ impl Stream {
         self.local_finished
     }
 
+    /// EdgeRush: the capacity of the buffer frames are read into, which a
+    /// HEADERS frame grows to its length and which keeps its capacity after.
+    pub fn frame_buffer(&self) -> usize {
+        self.state_buf.capacity()
+    }
+
     pub fn increment_headers_received(&mut self) {
         self.headers_received_count =
             self.headers_received_count.saturating_add(1);

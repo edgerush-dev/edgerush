@@ -103,6 +103,16 @@ Every change is marked `EdgeRush:` in the source.
   (`src/h3/mod.rs`). A connection with no HTTP/3 keeps no such list.
   `a_request_stream_the_transport_lets_go_is_let_go_of` in `src/h3/mod.rs` and
   `streams_let_go_of_are_told_only_once_asked` in `src/tests.rs` cover it.
+- **What a connection holds for its peer is told.** `Connection::received_held()` says
+  what the streams hold of what they received and the application has not read: the bytes,
+  and the pieces they are held in (`Held`; a byte count kept by each stream's receive
+  buffer as data is stored, read and cleared, `src/stream/recv_buf.rs`, and the pieces
+  its tree's length). `h3::Connection::frame_buffers()` says the capacity of the buffers
+  its streams read frames into, a HEADERS frame held whole until it has all come. Both are
+  for the application's account of the memory a peer makes it hold; quiche keeps no
+  account of its own. `what_is_held_is_counted` in `src/stream/recv_buf.rs`,
+  `what_a_connection_holds_unread_is_counted` in `src/tests.rs` and
+  `a_head_that_has_come_in_part_is_counted` in `src/h3/mod.rs` cover it.
 
 ## Why
 
@@ -176,7 +186,14 @@ check if stream is completed so it can be freed"). A client that asks and cancel
 and again on one connection, grew the state without end: fifty such streams left fifty
 entries, each with the header buffer its HEADERS frame had grown.
 
-With all nine changes, quiche's own library tests pass (1,170 of 1,170, on Windows and
+**What is held, told.** A worker's connections together can hold far more than it has:
+16 MiB of window and 19 MiB of staged heads each, and 32,768 of them. EdgeRush charges
+what quiche holds for them to the worker's storage ledger, as it charges what HTTP/1 and
+HTTP/2 stage, and needs to know it. The pieces are told apart from the bytes because each
+costs a buffer and a node past its bytes: a peer that sends its data a byte a frame, in
+order, costs a hundred times what flow control counts.
+
+With all ten changes, quiche's own library tests pass (1,175 of 1,175, on Windows and
 Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`).
 The proxy's probe `several_streams_share_a_packet` in `crates/proxy/tests/h3_library.rs`
 fails against the published crate, as do its tests `an_answer_carries_the_ack_of_its_request`

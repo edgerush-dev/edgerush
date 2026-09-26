@@ -244,6 +244,15 @@ impl<F: BufFactory> StreamMap<F> {
         self.collected_news.as_mut()?.pop_front()
     }
 
+    /// EdgeRush: what the streams hold of what they received, not yet read:
+    /// the bytes, and the pieces they are held in.
+    pub(crate) fn received_held(&self) -> (usize, usize) {
+        self.streams.values().fold((0, 0), |(bytes, pieces), stream| {
+            let (held, in_pieces) = stream.recv.held();
+            (bytes + held, pieces + in_pieces)
+        })
+    }
+
     pub fn new(
         max_streams_bidi: u64, max_streams_uni: u64, max_stream_window: u64,
     ) -> Self {

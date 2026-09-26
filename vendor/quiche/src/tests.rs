@@ -11892,6 +11892,34 @@ fn a_stream_answered_before_its_request_ended_is_collected(
     assert!(pipe.server.streams.is_collected(0));
 }
 
+/// EdgeRush: what a connection holds of what it received, unread, is what its
+/// streams hold together, in bytes and in the pieces they are kept in.
+#[rstest]
+fn what_a_connection_holds_unread_is_counted(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    config.set_initial_max_data(1 << 20);
+    config.set_initial_max_stream_data_bidi_remote(1 << 20);
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.server.received_held(), Held::default());
+
+    assert_eq!(pipe.client.stream_send(0, &[1; 3_000], false), Ok(3_000));
+    assert_eq!(pipe.client.stream_send(4, b"hello", false), Ok(5));
+    assert_eq!(pipe.advance(), Ok(()));
+    let held = pipe.server.received_held();
+    assert_eq!(held.bytes, 3_005);
+    assert!(held.pieces >= 2, "{held:?}");
+
+    assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((3_000, false)));
+    assert_eq!(pipe.server.received_held(), Held {
+        bytes: 5,
+        pieces: 1
+    });
+}
+
 /// EdgeRush: the streams a connection lets go of are kept to be told only once
 /// something has asked to be told, as the HTTP/3 layer does: a connection
 /// nobody asks keeps no list of them.

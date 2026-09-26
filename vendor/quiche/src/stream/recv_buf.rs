@@ -80,6 +80,9 @@ pub struct RecvBuf {
 
     /// EdgeRush: the offsets of the data held, as runs with gaps between them.
     runs: RangeSet,
+
+    /// EdgeRush: the bytes held, not yet read.
+    held: usize,
 }
 
 impl RecvBuf {
@@ -208,10 +211,11 @@ impl RecvBuf {
             self.len = cmp::max(self.len, buf.max_off());
 
             if !self.drain {
-                // EdgeRush: counted in runs, gaps between them.
+                // EdgeRush: counted in runs, gaps between them, and in bytes.
                 if !buf.is_empty() {
                     self.runs.insert(buf.off()..buf.max_off());
                 }
+                self.held += buf.len();
                 self.data.insert(buf.max_off(), buf);
             } else {
                 // we are not storing any data, off == len
@@ -273,7 +277,7 @@ impl RecvBuf {
         // The stream was reset, so clear its data and return the error code
         // instead.
         if let Some(e) = self.error {
-            self.data.clear();
+            self.clear();
             return Err(Error::StreamReset(e));
         }
 
@@ -301,6 +305,8 @@ impl RecvBuf {
             }
 
             self.off += buf_len as u64;
+            // EdgeRush: read, and held no more.
+            self.held -= buf_len;
 
             len += buf_len;
             cap -= buf_len;
@@ -359,9 +365,7 @@ impl RecvBuf {
         // Clear all data already buffered.
         self.off = final_size;
 
-        self.data.clear();
-        // EdgeRush: and with it its runs.
-        self.runs = RangeSet::default();
+        self.clear();
 
         // In order to ensure the application is notified when the stream is
         // reset, enqueue a zero-length buffer at the final size offset.
@@ -406,9 +410,7 @@ impl RecvBuf {
 
         self.drain = true;
 
-        self.data.clear();
-        // EdgeRush: and with it its runs.
-        self.runs = RangeSet::default();
+        self.clear();
 
         let consumed = self.max_off() - self.off;
         self.off = self.max_off();
@@ -446,6 +448,19 @@ impl RecvBuf {
     /// Returns true if the stream is not storing incoming data.
     pub fn is_draining(&self) -> bool {
         self.drain
+    }
+
+    /// EdgeRush: the bytes held, not yet read, and how many pieces they are
+    /// held in.
+    pub fn held(&self) -> (usize, usize) {
+        (self.held, self.data.len())
+    }
+
+    /// EdgeRush: lets go of everything held, and of the account of it.
+    fn clear(&mut self) {
+        self.data.clear();
+        self.runs = RangeSet::default();
+        self.held = 0;
     }
 
     /// Returns true if the stream has data to be read.
@@ -1424,5 +1439,36 @@ mod tests {
         assert_eq!(recv.write(RangeBuf::from(b"a", 1, false)), Ok(()));
         assert!(recv.shutdown().is_ok());
         assert_eq!(recv.runs.len(), 0);
+    }
+
+    /// EdgeRush: what a stream holds unread is counted, in bytes and in the
+    /// pieces they are kept in: a piece comes with each write that brings new
+    /// bytes, and goes when it has all been read; what came twice is held
+    /// once; a reset or a shutdown lets go of it all.
+    #[rstest]
+    fn what_is_held_is_counted(#[values(true, false)] emit: bool) {
+        let mut recv = RecvBuf::new(u64::MAX, u64::MAX, u64::MAX);
+        assert_eq!(recv.held(), (0, 0));
+        assert_eq!(recv.write(RangeBuf::from(b"hello", 0, false)), Ok(()));
+        assert_eq!(recv.write(RangeBuf::from(b"world", 10, false)), Ok(()));
+        assert_eq!(recv.held(), (10, 2));
+        // Partly new: only its new part, ", w", is kept.
+        assert_eq!(recv.write(RangeBuf::from(b"lo, w", 3, false)), Ok(()));
+        assert_eq!(recv.held(), (13, 3));
+
+        // Read part way into a piece, then to the end of the first run.
+        assert_emit_discard(&mut recv, emit, 3, 3, false, None);
+        assert_eq!(recv.held(), (10, 3));
+        assert_emit_discard(&mut recv, emit, 32, 5, false, None);
+        assert_eq!(recv.held(), (5, 1));
+
+        assert_eq!(recv.write(RangeBuf::from(b"again", 20, false)), Ok(()));
+        assert!(recv.reset(0, 30).is_ok());
+        assert_eq!(recv.held().0, 0);
+
+        let mut recv = RecvBuf::new(u64::MAX, u64::MAX, u64::MAX);
+        assert_eq!(recv.write(RangeBuf::from(b"again", 5, false)), Ok(()));
+        assert!(recv.shutdown().is_ok());
+        assert_eq!(recv.held(), (0, 0));
     }
 }
