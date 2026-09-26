@@ -46,9 +46,10 @@ TLS=1 bench/run.sh handshakes [RATE] [FLOOD]
                                     # steady clients at RATE (10,000/s) beside FLOOD (256)
                                     # connections each made anew, a full handshake each;
                                     # variant ours-abN accepts N connections at a time
-bench/run.sh h3                     # HTTP/3 clients (H3=1): 4 connections x 100 streams,
+bench/run.sh h3 [RATE] [STREAMED]   # HTTP/3 clients (H3=1): 4 connections x 100 streams,
                                     # 256 connections, one hot connection, 8 MiB answers,
-                                    # and TLS HTTP/2 beside them
+                                    # and TLS HTTP/2 beside them; latency at RATE (25,000/s)
+                                    # and 8 MiB uploads at STREAMED (20/s)
 bench/run.sh passthrough CHURN [TLS_CHURN]
                                     # TCP and TLS passthrough (PASSTHROUGH=1): kept
                                     # connections at saturation, a connection a request at
@@ -185,6 +186,7 @@ worth as much as the care that went into the other side.
 | `streamed-answer-h2`, `streamed-request-h2` | oha over HTTP/2, 4 connections × 8 streams, `STREAMED` bytes each way | The body paths when HTTP/2 carries them: flow control and the server's staging, not only framing |
 | `saturation-h3`, `many-h3`, `hot-h3` | h2load over HTTP/3: 4 connections × 100 streams, 256 connections × 1, 1 connection × 256 | What HTTP/3 clients get, where a connection's packets all land on the worker that owns it ([16](../../docs/16-http3.md)) |
 | `streamed-answer-h3` | h2load over HTTP/3, 4 connections × 8 streams, `STREAMED` bytes back | The answer's path when QUIC carries it: datagrams, acknowledgements, the send buffer |
+| `latency-h3`, `streamed-request-h3` | h2load over HTTP/3 at a fixed rate (`--rps`, shared by 4 connections of 100 streams, or 8 for uploads), every request's time in `<scenario>.requests` (`--log-file`), read by `summary.py` for the percentiles | What an HTTP/3 client waits at a steady rate, and what an 8 MiB upload costs when QUIC carries it. oha's HTTP/3 client is not used: NGINX and HAProxy answered it with errors |
 | `saturation-tcp`, `saturation-tls` | h2load through a tunnel: HTTP/1 over a `tcp` listener (256 connections), HTTP/2 over TLS over a `tls` one (4 connections × 100 streams) | What carrying small messages both ways costs, nothing of them read ([17](../../docs/17-tcp-and-tls-passthrough.md)) |
 | `churn-tcp`, `churn-tls` | oha, a new connection for every request, a fixed rate, through each listener | What a tunnel costs to make: the accept, the ClientHello read and routed by name, the connection to the backend |
 | `streamed-tcp` | oha, `STREAMED` bytes back through the `tcp` listener | What carrying bulk costs |

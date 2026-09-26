@@ -384,6 +384,18 @@ oha_at() { # name, rate, url, options...
 latency_h1() { oha_at "$1" "$2" "$3" -c 256; }
 latency_h2() { oha_at "$1" "$2" "$3" --http2 -c 4 -p 100; }
 
+# A fixed rate over HTTP/3 by h2load, which every proxy's HTTP/3 takes (oha's does not),
+# shared by its connections, each request's time logged for summary.py's percentiles. h2load
+# keeps the rate while a connection has streams to spare, and the rate reached says if not.
+h3_at() { # name, rate, connections, streams, url, options...
+    local name=$1 rate=$2 clients=$3 streams=$4 url=$5
+    shift 5
+    measured "$name" "$H2LOAD3" --alpn-list=h3 -D "$DURATION" --warm-up-time=3 \
+        -t2 -c"$clients" -m"$streams" --rps=$((rate / clients)) \
+        --log-file="$OUT/$name.requests" --connect-to="$proxy_at" "$@" "$url"
+}
+latency_h3() { h3_at "$1" "$2" 4 100 "$3"; }
+
 # One connection carrying hundreds of streams, as a gRPC client's does: everything it asks
 # for lands on the one worker that owns it (15 §8).
 hot_h2() { # name, url, options...
@@ -896,8 +908,11 @@ passthrough)
 h3)
     # What HTTP/3 clients get (16 step 6): few hot connections, many connections, a single
     # hot one, and 8 MiB answers over a few connections' streams; HTTP/2 over TLS beside
-    # them, on the same proxy and port, to read them by.
+    # them, on the same proxy and port, to read them by. Then latency at RATE, and 8 MiB
+    # uploads at STREAMED a second, as the h2 mode measures HTTP/2's, by h2load at a fixed
+    # rate with each request's time logged.
     [ -x "$H2LOAD3" ] || { echo "no h2load with HTTP/3 at $H2LOAD3" >&2; exit 2; }
+    h3_rate=${2:-25000} streamed_rate=${3:-20}
     h3_runs() {
         h3load "$1.saturation-h3" -t2 -c4 -m100
         h3load "$1.many-h3" -t2 -c256 -m1
@@ -905,6 +920,8 @@ h3)
         saturation_h2 "$1.saturation-h2tls" "$proxy" --connect-to="$proxy_at"
         measured "$1.streamed-answer-h3" "$H2LOAD3" --alpn-list=h3 -t2 -c4 -m8 \
             -D "$DURATION" --warm-up-time=3 --connect-to="$proxy_at" "$proxy/big"
+        latency_h3 "$1.latency-h3" "$h3_rate" "$proxy"
+        h3_at "$1.streamed-request-h3" "$streamed_rate" 4 8 "$proxy/sink" -d "$run/big.bin"
     }
     each_variant h3_runs
     ;;

@@ -51,6 +51,24 @@ def oha(text):
     }
 
 
+def logged(path):
+    """Latency from h2load's --log-file, one request a line (start µs, status, µs taken), in
+    milliseconds: what a fixed rate by h2load reports, as oha's JSON does its own. A failed
+    stream, status -1, has no latency; it is counted among those not 2xx."""
+    took = sorted(
+        int(fields[2]) / 1000
+        for fields in (line.split("\t") for line in path.read_text().splitlines())
+        if len(fields) >= 3 and fields[1] != "-1" and fields[2].strip().isdigit()
+    )
+    if not took:
+        return {}
+
+    def at(share):
+        return took[min(len(took) - 1, int(share * len(took)))]
+
+    return {"p50": at(0.5), "p99": at(0.99), "p99.9": at(0.999)}
+
+
 def memory(text):
     """What idle connections cost: the lines bench/run.sh's idle_memory writes."""
     read = dict(
@@ -105,6 +123,9 @@ def main(directory):
             print(f"cannot read {out.name}", file=sys.stderr)
             continue
         stem = out.name[: -len(".out")]
+        requests = directory / f"{stem}.requests"
+        if requests.exists():
+            result.update(logged(requests))
         used = cpu(directory / f"{stem}.cpu-before", directory / f"{stem}.cpu-after")
         if used:
             result.update(used)
