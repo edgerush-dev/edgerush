@@ -13,7 +13,7 @@ use crate::downstream::h1::connection::Answered;
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h3::Settings;
 use crate::downstream::h3::code;
-use crate::downstream::h3::listener::{self, Secrets, Shared};
+use crate::downstream::h3::listener::{self, Forwarding, Secrets, Shared};
 use crate::downstream::h3::testing::{Client, get};
 use crate::drain::Drain;
 use crate::interim::Interim;
@@ -70,6 +70,22 @@ async fn serving(
     settings: Settings,
     respond: impl Fn(Request<RequestBody>, Interim) -> Answering + 'static,
 ) -> Server {
+    serving_as(
+        settings,
+        respond,
+        &Secrets::new().unwrap(),
+        Forwarding::group(1).remove(0),
+    )
+    .await
+}
+
+/// The same as the worker `forwarding` is the share of, among those `secrets` are shared by.
+async fn serving_as(
+    settings: Settings,
+    respond: impl Fn(Request<RequestBody>, Interim) -> Answering + 'static,
+    secrets: &Secrets,
+    forwarding: Forwarding,
+) -> Server {
     let tls = Arc::new(
         Tls::new(&edgerush_config::Tls {
             certificates: vec![certificate(&["a.test"])],
@@ -90,8 +106,8 @@ async fn serving(
         Shared::new(
             socket,
             settings,
-            &Secrets::new().unwrap(),
-            0,
+            secrets,
+            u16::try_from(forwarding.worker()).unwrap(),
             timers,
             Rc::clone(&drain),
         )
@@ -103,6 +119,7 @@ async fn serving(
         Rc::new(respond),
         Rc::new(|| HttpDate::from_unix(0)),
         || (),
+        forwarding,
     ));
     Server {
         address,
@@ -395,5 +412,38 @@ fn past_the_threshold_a_client_proves_its_address_first() {
         assert_eq!(first[0] & 0xf0, 0xf0, "{:#x}", first[0]);
         let answer = client.get("a.test", "/retried").await;
         assert_eq!(body_of(&answer), "GET /retried 0 None");
+    });
+}
+
+/// A client whose datagrams land on another worker's socket, from a new port as after a
+/// NAT rebinding, is served by its own connection all the same: the other worker reads the
+/// owner from the ID and hands each datagram over, once (16 §3).
+#[test]
+fn a_client_that_lands_on_another_worker_is_served_by_its_own() {
+    locally(async {
+        let secrets = Secrets::new().unwrap();
+        let mut group = Forwarding::group(2);
+        let other = group.remove(1);
+        let owner = group.remove(0);
+        let owner = serving_as(short(), echo, &secrets, owner).await;
+        let other = serving_as(short(), echo, &secrets, other).await;
+        let mut client = Client::connect(owner.address, "a.test").await;
+        assert_eq!(
+            body_of(&client.get("a.test", "/here").await),
+            "GET /here 0 None"
+        );
+
+        client.rebind().await;
+        client.send_to = Some(other.address);
+        let answer = client.get("a.test", "/astray").await;
+        assert_eq!(body_of(&answer), "GET /astray 0 None");
+        assert!(other.shared.forwarded.get() > 0, "nothing was forwarded");
+        assert_eq!(other.shared.dropped.get(), 0);
+        assert_eq!(
+            other.shared.connections.get(),
+            0,
+            "the other worker took it on"
+        );
+        assert_eq!(owner.shared.connections.get(), 1);
     });
 }

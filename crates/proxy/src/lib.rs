@@ -81,7 +81,7 @@ mod upstream;
 pub use hop_by_hop::ConnectionError;
 pub use host::HostError;
 pub use request::{Forward, Rejection, decide};
-pub use serve::{Proxy, ProxyError, Worker};
+pub use serve::{Forwarding, Proxy, ProxyError, Worker};
 pub use tls::TlsError;
 // What a worker will not go beyond. There is no configuration for these; what there
 // is, is one value per worker, which whoever makes the workers hands them.

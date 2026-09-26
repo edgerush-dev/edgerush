@@ -12,7 +12,7 @@
 //! the engine spawns for it stay on the one thread and need not be `Send`.
 
 use crate::balance::{Held, Loads};
-use edgerush_proxy::{H1Limits, Proxy};
+use edgerush_proxy::{Forwarding, H1Limits, Proxy};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -90,6 +90,12 @@ pub(crate) fn start(
         .map(|_| mpsc::channel::<HandedOver>(ON_THEIR_WAY))
         .unzip();
     let workers: Arc<[Sender<HandedOver>]> = workers.into();
+    // For every listener, the workers' shares of its QUIC inboxes: a datagram one worker
+    // receives for another's connection is handed to it (16 §3).
+    let listeners = sockets.first().map_or(0, Vec::len);
+    let mut forwarding: Vec<std::vec::IntoIter<Forwarding>> = (0..listeners)
+        .map(|_| Forwarding::group(sockets.len()).into_iter())
+        .collect();
 
     for (position, (sockets, handed_over)) in sockets.into_iter().zip(handed_over).enumerate() {
         let runtime = Builder::new_current_thread().enable_all().build()?;
@@ -100,8 +106,9 @@ pub(crate) fn start(
         let mut datagrams = Vec::new();
         for (listener, (tcp, udp)) in sockets.into_iter().enumerate() {
             streams.push(TcpListener::from_std(tcp)?);
-            if let Some(udp) = udp {
-                datagrams.push((listener, UdpSocket::from_std(udp)?));
+            let share = forwarding.get_mut(listener).and_then(Iterator::next);
+            if let (Some(udp), Some(share)) = (udp, share) {
+                datagrams.push((listener, UdpSocket::from_std(udp)?, share));
             }
         }
         let sockets = streams;
@@ -132,10 +139,10 @@ pub(crate) fn start(
                 for (listener, socket) in sockets.into_iter().enumerate() {
                     local.spawn_local(worker.clone().accept(listener, socket));
                 }
-                for (listener, socket) in datagrams {
+                for (listener, socket, share) in datagrams {
                     // Fails only for a socket with no address, or BoringSSL giving no keys:
                     // the listener's HTTP/3 is then not served, and its TCP still is.
-                    let serving = Rc::clone(&worker.plane).serve_h3(listener, socket);
+                    let serving = Rc::clone(&worker.plane).serve_h3(listener, socket, share);
                     local.spawn_local(async move {
                         let _served = serving.await;
                     });

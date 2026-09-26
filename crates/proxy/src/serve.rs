@@ -20,6 +20,7 @@ use crate::downstream::h1::connection::{self as h1, Answered};
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h1::deadlines::Bounds;
 use crate::downstream::h2;
+pub use crate::downstream::h3::listener::Forwarding;
 use crate::downstream::h3::{self, listener as h3_listener};
 use crate::drain::Drain;
 use crate::gathered::Gathered;
@@ -1086,7 +1087,9 @@ impl Worker {
     /// Serves HTTP/3 on `socket`, the UDP socket of the listener at position `listener` of
     /// [`Proxy::listeners`], until the worker drains and its last connection has gone
     /// ([16](../../docs/16-http3.md)). The listener's TLS is that of the config in force
-    /// when a connection comes.
+    /// when a connection comes. `forwarding` is this worker's share of the listener's
+    /// [`Forwarding`] group: where a datagram for another worker's connection is handed,
+    /// and where this worker's are handed to it.
     ///
     /// # Errors
     ///
@@ -1096,7 +1099,12 @@ impl Worker {
     /// # Panics
     ///
     /// Runs inside the worker's `LocalSet`, where every connection and request is a task.
-    pub async fn serve_h3(self: Rc<Self>, listener: usize, socket: UdpSocket) -> io::Result<()> {
+    pub async fn serve_h3(
+        self: Rc<Self>,
+        listener: usize,
+        socket: UdpSocket,
+        forwarding: Forwarding,
+    ) -> io::Result<()> {
         let deadlines = self.deadlines;
         let settings = h3::Settings {
             first_request: deadlines.first_request,
@@ -1133,7 +1141,7 @@ impl Worker {
         let date = Rc::new(move || dating.date.get());
         let opening = Rc::clone(&self);
         let opened = move || Connection::open(Rc::clone(&opening), listener);
-        h3_listener::serve(Rc::new(shared), tls, respond, date, opened).await;
+        h3_listener::serve(Rc::new(shared), tls, respond, date, opened, forwarding).await;
         Ok(())
     }
 
@@ -2777,7 +2785,8 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
         let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
-        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket));
+        let alone = Forwarding::group(1).remove(0);
+        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
         front
     }
 

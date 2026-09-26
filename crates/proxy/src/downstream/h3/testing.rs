@@ -59,6 +59,8 @@ pub(crate) struct Client {
     pub(crate) goaway: Option<u64>,
     /// Every datagram the server sent, in order.
     pub(crate) received: Vec<Vec<u8>>,
+    /// Where datagrams go instead of the server's address, when a test sends them astray.
+    pub(crate) send_to: Option<SocketAddr>,
 }
 
 impl Client {
@@ -88,6 +90,7 @@ impl Client {
             answers: HashMap::new(),
             goaway: None,
             received: Vec::new(),
+            send_to: None,
         }
     }
 
@@ -160,11 +163,18 @@ impl Client {
         loop {
             match self.quic.send(&mut out) {
                 Ok((len, info)) => {
-                    let _ = self.socket.send_to(&out[..len], info.to).await;
+                    let to = self.send_to.unwrap_or(info.to);
+                    let _ = self.socket.send_to(&out[..len], to).await;
                 }
                 Err(_) => return,
             }
         }
+    }
+
+    /// Goes on from a new port, as a NAT that rebinds the client moves it: quiche on this
+    /// side does not know, and the server sees a new address.
+    pub(crate) async fn rebind(&mut self) {
+        self.socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     }
 
     /// Sends `datagram` as it is.
