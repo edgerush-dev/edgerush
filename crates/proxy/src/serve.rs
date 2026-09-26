@@ -4851,6 +4851,10 @@ upstreams:
         let address = socket.local_addr().unwrap();
         let _accepting = tokio::task::spawn_local(async move {
             while let Ok((stream, _)) = socket.accept().await {
+                // As a real server's: with Nagle's algorithm on, the first answer's frames
+                // wait for the ACK of the handshake's, which Linux delays 40 ms and more,
+                // longer than a script that times a reset after its head allows.
+                stream.set_nodelay(true).unwrap();
                 let script = Rc::clone(&script);
                 let _serving = tokio::task::spawn_local(async move {
                     let Ok(mut connection) = ::h2::server::handshake(stream).await else {
