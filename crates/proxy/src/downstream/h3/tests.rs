@@ -200,9 +200,10 @@ fn an_answer_carries_the_ack_of_its_request() {
 }
 
 /// An answer slow in coming does not hold back its request's ACK, which goes alone before it
-/// once its wait is over (RFC 9000 §13.2.1). That the wait ends at 20 ms, by quiche's timer,
-/// is for quiche's own tests: here the client's probe would end it soon after, and a test
-/// on real time cannot tell the two apart without being flaky.
+/// once its wait is over (RFC 9000 §13.2.1). Only that it goes before the answer is held
+/// here. When the wait ends is for quiche's own tests: on real time, the client's probe may
+/// end it first (its PTO allows for the 25 ms the server may wait, and a coarse timer can
+/// be later than that), and then its ACK is a second datagram.
 #[test]
 fn a_slow_answer_does_not_hold_back_the_ack() {
     locally(async {
@@ -217,12 +218,13 @@ fn a_slow_answer_does_not_hold_back_the_ack() {
         client.for_a_while(Duration::from_millis(100)).await;
         let before = client.received.len();
         let id = client.request(&get("a.test", "/x"), true);
-        // Due in 20 ms, or once the client probes; the rest is slack for a loaded machine.
         client.for_a_while(Duration::from_millis(150)).await;
-        assert_eq!(client.received.len() - before, 1);
+        let acknowledged = client.received.len() - before;
+        assert!(acknowledged >= 1, "nothing came back in 150 ms");
+        assert!(!client.answers.contains_key(&id), "the answer came early");
         let answer = client.answer(id).await;
         assert_eq!(body_of(&answer), "GET /x 0 None");
-        assert_eq!(client.received.len() - before, 2);
+        assert!(client.received.len() - before > acknowledged);
     });
 }
 
