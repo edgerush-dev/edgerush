@@ -15,9 +15,14 @@ case "$TESTCASE" in
     # HTTP/3, and HTTP/0.9 over QUIC for the transport's cases, several of which the
     # runner sends under one of these names (loss and corruption as `transfer` and
     # `multiconnect`, for one).
-    http3 | handshake | transfer | multiconnect | chacha20 | keyupdate | resumption | versionnegotiation) ;;
+    http3 | handshake | transfer | multiconnect | chacha20 | keyupdate | resumption | versionnegotiation | retry) ;;
     *) exit 127 ;;
 esac
+# The retry case wants every client asked, not only past the threshold of handshakes.
+http3='{}'
+if [ "$TESTCASE" = retry ]; then
+    http3='{ force_retry: true }'
+fi
 
 cat >/tmp/nginx.conf <<'NGINX'
 # The runner's files in /www are readable by root only.
@@ -43,7 +48,7 @@ nginx -c /tmp/nginx.conf -e /logs/nginx.log -p /tmp/nginx-temp/
     echo '  web:'
     echo '    address: "[::]:443"'
     echo '    protocol: https'
-    echo '    http3: {}'
+    echo "    http3: $http3"
     echo '    tls:'
     echo '      certificates:'
     echo '        - chain: |'

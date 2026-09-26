@@ -1736,7 +1736,8 @@ upstreams: {}
     }
 
     /// An `https` listener may serve HTTP/3 as well, on the same port over UDP, and says so
-    /// to its TCP clients for a day unless it gives a lifetime of its own; no other may.
+    /// to its TCP clients for a day unless it gives a lifetime of its own; it asks clients
+    /// for a Retry only when told to. No other listener may.
     #[test]
     fn http3_is_for_https_listeners() {
         let with = |listener: &str| {
@@ -1753,7 +1754,8 @@ upstreams: {{}}
         assert_eq!(
             compiled.listeners[0].http3,
             Some(Http3 {
-                alt_svc_max_age: 86_400
+                alt_svc_max_age: 86_400,
+                force_retry: false,
             })
         );
         let compiled = compile(&with(&format!(
@@ -1761,6 +1763,17 @@ upstreams: {{}}
         )))
         .unwrap();
         assert_eq!(compiled.listeners[0].http3.unwrap().alt_svc_max_age, 60);
+        let compiled = compile(&with(&format!(
+            "{{ {https}, http3: {{ force_retry: true }} }}"
+        )))
+        .unwrap();
+        assert_eq!(
+            compiled.listeners[0].http3,
+            Some(Http3 {
+                alt_svc_max_age: 86_400,
+                force_retry: true,
+            })
+        );
         let compiled = compile(&with(&format!("{{ {https} }}"))).unwrap();
         assert_eq!(compiled.listeners[0].http3, None);
 

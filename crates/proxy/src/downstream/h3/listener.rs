@@ -293,19 +293,28 @@ struct Accepting {
     config: quiche::Config,
 }
 
-/// Serves the listener until the worker drains and its last connection is gone. `tls`
-/// says the listener's TLS of the config in force; `respond` answers each request; `date`
-/// dates an answer; `opened` is held by each connection for as long as it lives;
+/// What the config in force says a new connection to the listener is accepted with.
+pub(crate) struct InForce {
+    pub(crate) tls: Arc<Tls>,
+    /// Every client proves its address with a Retry first, however few handshakes are under
+    /// way.
+    pub(crate) force_retry: bool,
+}
+
+/// Serves the listener until the worker drains and its last connection is gone. `in_force`
+/// says what the config in force accepts a connection with, read at each client's first
+/// packet, so that a new config applies to the next; `respond` answers each request;
+/// `date` dates an answer; `opened` is held by each connection for as long as it lives;
 /// `forwarding` is this worker's share of the listener's inboxes.
 pub(crate) async fn serve<T, R, F, B, D, O, G>(
     shared: Rc<Shared>,
-    tls: T,
+    in_force: T,
     respond: Rc<R>,
     date: Rc<D>,
     opened: O,
     mut forwarding: Forwarding,
 ) where
-    T: Fn() -> Option<Arc<Tls>>,
+    T: Fn() -> Option<InForce>,
     R: Fn(Request<RequestBody>, Interim) -> F + 'static,
     F: Future<Output = Answered<B>> + 'static,
     B: Body<Data = Bytes> + 'static,
@@ -317,7 +326,7 @@ pub(crate) async fn serve<T, R, F, B, D, O, G>(
     let mut buffer = vec![0; DATAGRAM];
     let mut serving = Serving {
         shared: &shared,
-        tls: &tls,
+        in_force: &in_force,
         respond: &respond,
         date: &date,
         opened: &opened,
@@ -384,7 +393,7 @@ pub(crate) async fn serve<T, R, F, B, D, O, G>(
 /// What routing a datagram needs, for as long as the listener serves.
 struct Serving<'a, T, R, D, O> {
     shared: &'a Rc<Shared>,
-    tls: &'a T,
+    in_force: &'a T,
     respond: &'a Rc<R>,
     date: &'a Rc<D>,
     opened: &'a O,
@@ -395,7 +404,7 @@ struct Serving<'a, T, R, D, O> {
 
 impl<T, R, F, B, D, O, G> Serving<'_, T, R, D, O>
 where
-    T: Fn() -> Option<Arc<Tls>>,
+    T: Fn() -> Option<InForce>,
     R: Fn(Request<RequestBody>, Interim) -> F + 'static,
     F: Future<Output = Answered<B>> + 'static,
     B: Body<Data = Bytes> + 'static,
@@ -437,7 +446,7 @@ where
         if self.admitted >= shared.settings.admit_per_batch {
             return;
         }
-        let Some(conn) = admit(shared, self.tls, &mut self.accepting, datagram, from) else {
+        let Some(conn) = admit(shared, self.in_force, &mut self.accepting, datagram, from) else {
             return;
         };
         self.admitted += 1;
@@ -478,9 +487,9 @@ fn deliver(conn: &Rc<Conn>, datagram: &mut [u8], from: SocketAddr, to: SocketAdd
 
 /// A connection for `datagram`, a client's first, if it may have one; a Retry or a version
 /// negotiation sent back instead, where one is due.
-fn admit<T: Fn() -> Option<Arc<Tls>>>(
+fn admit<T: Fn() -> Option<InForce>>(
     shared: &Shared,
-    tls: &T,
+    in_force: &T,
     accepting: &mut Option<Accepting>,
     datagram: &mut [u8],
     from: SocketAddr,
@@ -504,6 +513,8 @@ fn admit<T: Fn() -> Option<Arc<Tls>>>(
     {
         return None;
     }
+    // A listener the config no longer gives TLS takes no one.
+    let in_force = in_force()?;
     // quiche's parser reads the token, which only an Initial carries.
     let header = quiche::Header::from_slice(datagram, id::LEN).ok()?;
     // The client's choice, or after a Retry the ID of this worker's it was sent to.
@@ -511,22 +522,23 @@ fn admit<T: Fn() -> Option<Arc<Tls>>>(
     let scid_of_client = header.scid.to_vec();
     let token = header.token.unwrap_or_default();
     let now = unix_now();
+    let must_prove = in_force.force_retry || shared.handshakes.get() >= shared.settings.retry_above;
     let mut retried = None;
     if !token.is_empty() {
         match token::validate(&shared.retry_key, now, from, &token) {
             Some(original) => retried = Some(original.to_vec()),
             // Not ours, or stale: as if there were none, unless a token is required.
-            None if shared.handshakes.get() >= shared.settings.retry_above => return None,
+            None if must_prove => return None,
             None => {}
         }
     }
-    if retried.is_none() && shared.handshakes.get() >= shared.settings.retry_above {
+    if retried.is_none() && must_prove {
         retry(shared, &scid_of_client, &dcid, now, from);
         return None;
     }
 
     let (scid, reset) = shared.issuer.borrow_mut().issue().ok()?;
-    let accepting = accepting_for(accepting, tls, &shared.settings)?;
+    let accepting = accepting_for(accepting, in_force.tls, &shared.settings)?;
     accepting.config.set_stateless_reset_token(Some(reset));
     let scid = quiche::ConnectionId::from_ref(&scid);
     let quic = match &retried {
@@ -556,13 +568,13 @@ fn admit<T: Fn() -> Option<Arc<Tls>>>(
     Some(conn)
 }
 
-/// The quiche configuration for the listener's TLS in force, made again if the TLS changed.
-fn accepting_for<'a, T: Fn() -> Option<Arc<Tls>>>(
+/// The quiche configuration for the listener's TLS in force, `current`, made again if the
+/// TLS changed.
+fn accepting_for<'a>(
     accepting: &'a mut Option<Accepting>,
-    tls: &T,
+    current: Arc<Tls>,
     settings: &Settings,
 ) -> Option<&'a mut Accepting> {
-    let current = tls()?;
     let stale = accepting
         .as_ref()
         .is_none_or(|kept| !Arc::ptr_eq(&kept.tls, &current));

@@ -1283,8 +1283,9 @@ impl Worker {
 
     /// Serves HTTP/3 on `socket`, the UDP socket of the listener at position `listener` of
     /// [`Proxy::listeners`], until the worker drains and its last connection has gone
-    /// ([16](../../docs/16-http3.md)). The listener's TLS is that of the config in force
-    /// when a connection comes. `forwarding` is this worker's share of the listener's
+    /// ([16](../../docs/16-http3.md)). The listener's TLS, and whether it has every client
+    /// prove its address first, are those of the config in force when a connection comes.
+    /// `forwarding` is this worker's share of the listener's
     /// [`Forwarding`] group: where a datagram for another worker's connection is handed,
     /// and where this worker's are handed to it.
     ///
@@ -1327,15 +1328,14 @@ impl Worker {
         )
         .map_err(io::Error::other)?;
         let reading = Rc::clone(&self);
-        let tls = move || {
-            reading
-                .proxy
-                .current
-                .load()
-                .tls
-                .get(listener)
-                .cloned()
-                .flatten()
+        let in_force = move || {
+            let snapshot = reading.proxy.current.load();
+            let tls = snapshot.tls.get(listener).cloned().flatten()?;
+            let force_retry = snapshot
+                .listener(listener)
+                .and_then(|listener| listener.http3)
+                .is_some_and(|http3| http3.force_retry);
+            Some(h3_listener::InForce { tls, force_retry })
         };
         let answering = Rc::clone(&self);
         let respond = Rc::new(move |request: Request<RequestBody>, interim| {
@@ -1345,7 +1345,7 @@ impl Worker {
         let date = Rc::new(move || dating.date.get());
         let opening = Rc::clone(&self);
         let opened = move || Connection::open(Rc::clone(&opening), listener);
-        h3_listener::serve(Rc::new(shared), tls, respond, date, opened, forwarding).await;
+        h3_listener::serve(Rc::new(shared), in_force, respond, date, opened, forwarding).await;
         Ok(())
     }
 
@@ -2991,6 +2991,15 @@ mod tests {
     /// A worker serving HTTP/3 for `upstream` on a UDP socket of its own, beside its TCP
     /// listener's configuration: an `https` listener with HTTP/3, for `a.test`.
     async fn serving_h3_worker(upstream: SocketAddr) -> SocketAddr {
+        let http3 = edgerush_config::Http3 {
+            alt_svc_max_age: 60,
+            force_retry: false,
+        };
+        serving_h3(&h3_config(upstream, http3)).await.0
+    }
+
+    /// A config for `upstream` whose `web` listener is `https`, for `a.test`, with `http3`.
+    fn h3_config(upstream: SocketAddr, http3: edgerush_config::Http3) -> edgerush_config::Config {
         let mut config = everything_config(upstream);
         let web = config.listeners.get_mut("web").unwrap();
         web.protocol = edgerush_config::Protocol::Https;
@@ -2998,17 +3007,53 @@ mod tests {
             certificates: vec![crate::tls::testing::certificate(&["a.test"])],
             client_validation: None,
         });
-        web.http3 = Some(edgerush_config::Http3 {
-            alt_svc_max_age: 60,
-        });
-        let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
-        let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+        web.http3 = Some(http3);
+        config
+    }
+
+    /// A worker serving `config`'s `web` listener over HTTP/3 on a UDP socket of its own,
+    /// and the proxy, for a test to give a new config.
+    async fn serving_h3(config: &edgerush_config::Config) -> (SocketAddr, Arc<Proxy>) {
+        let proxy = Arc::new(Proxy::new(compile(config).unwrap(), NonZeroUsize::MIN).unwrap());
+        let worker = Worker::with_deadlines(Arc::clone(&proxy), H1Limits::default(), SHORT);
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
         let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
         let alone = Forwarding::group(1).remove(0);
         let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
-        front
+        (front, proxy)
+    }
+
+    /// A listener whose config forces Retry has every client prove its address first,
+    /// however few handshakes are under way, and is served after; a config that stops
+    /// forcing it applies to the next client, with no new socket (16 §3).
+    #[tokio::test]
+    async fn an_http3_listener_forces_retry_as_the_config_in_force_says() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::downstream::h3::testing::Client;
+                // A long header whose type is Retry (RFC 9000 §17.2.5).
+                let retry = |datagram: &[u8]| datagram[0] & 0xf0 == 0xf0;
+                let (upstream, _) = counting_upstream().await;
+                let mut http3 = edgerush_config::Http3 {
+                    alt_svc_max_age: 60,
+                    force_retry: true,
+                };
+                let (front, proxy) = serving_h3(&h3_config(upstream, http3)).await;
+                let mut client = Client::connect(front, "a.test").await;
+                assert!(retry(&client.received[0]), "no Retry first");
+                assert_eq!(client.get("a.test", "/").await.final_status(), Some("200"));
+
+                http3.force_retry = false;
+                proxy
+                    .reload(compile(&h3_config(upstream, http3)).unwrap())
+                    .unwrap();
+                let mut client = Client::connect(front, "a.test").await;
+                assert!(!client.received.iter().any(|datagram| retry(datagram)));
+                assert_eq!(client.get("a.test", "/").await.final_status(), Some("200"));
+            })
+            .await;
     }
 
     /// An HTTP/3 request goes through the request core to an HTTP/1 upstream, and its
@@ -4080,6 +4125,7 @@ upstreams:
                     });
                     web.http3 = http3.then_some(edgerush_config::Http3 {
                         alt_svc_max_age: 60,
+                        force_retry: false,
                     });
                     let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
                     let worker =

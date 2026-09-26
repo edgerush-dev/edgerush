@@ -13,7 +13,7 @@ use crate::downstream::h1::connection::Answered;
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h3::Settings;
 use crate::downstream::h3::code;
-use crate::downstream::h3::listener::{self, Forwarding, Secrets, Shared};
+use crate::downstream::h3::listener::{self, Forwarding, InForce, Secrets, Shared};
 use crate::downstream::h3::testing::{Client, get};
 use crate::drain::Drain;
 use crate::interim::Interim;
@@ -128,7 +128,12 @@ where
     );
     tokio::task::spawn_local(listener::serve(
         Rc::clone(&shared),
-        move || Some(Arc::clone(&tls)),
+        move || {
+            Some(InForce {
+                tls: Arc::clone(&tls),
+                force_retry: false,
+            })
+        },
         Rc::new(respond),
         Rc::new(|| HttpDate::from_unix(0)),
         || (),

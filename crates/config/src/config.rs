@@ -57,6 +57,12 @@ pub struct Http3 {
     /// Envoy advertises it.
     #[serde(default = "Http3::day")]
     pub alt_svc_max_age: u32,
+    /// Whether every client is to prove its address with a Retry before its handshake
+    /// (RFC 9000 §8.1.2), as NGINX's `quic_retry` and HAProxy's `quic-force-retry` ask.
+    /// Otherwise only past a threshold of handshakes under way, since a Retry costs a round
+    /// trip. Off unless said.
+    #[serde(default)]
+    pub force_retry: bool,
 }
 
 impl Http3 {
