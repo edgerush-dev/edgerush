@@ -32,7 +32,10 @@ pid /tmp/nginx.pid;
 error_log /logs/nginx.log warn;
 events {}
 http {
-    access_log off;
+    # What EdgeRush asked for and was given, beside the runner's logs: HTTP/0.9 carries no
+    # status back to the client, so this is where an answer's is seen.
+    log_format asked '$msec $status $body_bytes_sent $request_time "$request"';
+    access_log /logs/nginx-access.log asked;
     keepalive_requests 1000000;
     server {
         listen 127.0.0.1:9000;
