@@ -11892,6 +11892,33 @@ fn a_stream_answered_before_its_request_ended_is_collected(
     assert!(pipe.server.streams.is_collected(0));
 }
 
+/// EdgeRush: the streams a connection lets go of are kept to be told only once
+/// something has asked to be told, as the HTTP/3 layer does: a connection
+/// nobody asks keeps no list of them.
+#[rstest]
+fn streams_let_go_of_are_told_only_once_asked(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    for (stream, told) in [(0, false), (4, true)] {
+        if told {
+            pipe.server.streams.tell_collected();
+        }
+        assert_eq!(pipe.client.stream_send(stream, b"a", true), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(pipe.server.stream_recv(stream, &mut buf), Ok((1, true)));
+        assert_eq!(pipe.server.stream_send(stream, b"b", true), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert!(pipe.server.streams.is_collected(stream));
+        let expected = told.then_some(stream);
+        assert_eq!(pipe.server.streams.collected_next(), expected);
+        assert_eq!(pipe.server.streams.collected_next(), None);
+    }
+}
+
 /// EdgeRush: a stream the peer stopped, whose receiving side then ends unread,
 /// is kept until the application has heard of the stop, as when an ACK
 /// completes a stream: the application learns of it first.

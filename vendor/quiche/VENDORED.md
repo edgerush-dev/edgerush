@@ -93,6 +93,16 @@ Every change is marked `EdgeRush:` in the source.
   `a_stream_answered_before_its_request_ended_is_collected` and
   `a_stopped_stream_ended_unread_is_kept_until_the_stop_is_heard` in `src/tests.rs` cover
   it.
+- **The HTTP/3 layer lets go of a stream the transport has let go of.** Its state for a
+  request stream went only when both sides finished through its own calls; for one reset
+  either way, stopped, or answered before the request was whole, it stayed until the
+  connection ended, with the capacity of its header buffer, up to the largest HEADERS
+  frame the stream had. The transport now keeps the streams it collects, once something
+  has asked it to (`StreamMap::tell_collected` and `collected_next`, `src/stream/mod.rs`),
+  and `h3::Connection::poll` asks, and forgets its state for each first thing
+  (`src/h3/mod.rs`). A connection with no HTTP/3 keeps no such list.
+  `a_request_stream_the_transport_lets_go_is_let_go_of` in `src/h3/mod.rs` and
+  `streams_let_go_of_are_told_only_once_asked` in `src/tests.rs` cover it.
 
 ## Why
 
@@ -161,7 +171,12 @@ the stream was then collected depended on the order the client's frames came in:
 acknowledgement of the answer's end first, and the stream stayed. A client with a hundred
 streams that met a hundred such answers had none left.
 
-With all eight changes, quiche's own library tests pass (1,167 of 1,167, on Windows and
+**The HTTP/3 state kept.** Upstream's own source says so where it would be freed ("TODO:
+check if stream is completed so it can be freed"). A client that asks and cancels, again
+and again on one connection, grew the state without end: fifty such streams left fifty
+entries, each with the header buffer its HEADERS frame had grown.
+
+With all nine changes, quiche's own library tests pass (1,170 of 1,170, on Windows and
 Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`).
 The proxy's probe `several_streams_share_a_packet` in `crates/proxy/tests/h3_library.rs`
 fails against the published crate, as do its tests `an_answer_carries_the_ack_of_its_request`

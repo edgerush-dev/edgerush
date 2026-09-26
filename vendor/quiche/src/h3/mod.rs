@@ -2117,6 +2117,17 @@ impl Connection {
             return Err(Error::Done);
         }
 
+        // EdgeRush: a stream the transport has let go of has nothing more to
+        // come, and its state here goes with it however the stream ended. Only
+        // one both sides finished through this layer's own calls went before,
+        // and a reset one stayed until the connection ended, the capacity of
+        // its header buffer with it. The transport tells of the streams it
+        // lets go only once asked, which a connection with no HTTP/3 never is.
+        conn.streams.tell_collected();
+        while let Some(stream_id) = conn.streams.collected_next() {
+            self.streams.remove(&stream_id);
+        }
+
         // Process control streams first.
         if let Some(stream_id) = self.peer_control_stream_id {
             match self.process_control_stream(conn, stream_id) {
@@ -8052,6 +8063,84 @@ mod tests {
         );
 
         assert_eq!(s.poll_server(), Err(Error::Done));
+    }
+
+    /// EdgeRush: carries what both sides have to send and hands on what both
+    /// have received, until neither has anything more.
+    fn settle(s: &mut Session) {
+        for _ in 0..3 {
+            s.advance().ok();
+            while s.poll_client().is_ok() {}
+            while s.poll_server().is_ok() {}
+        }
+    }
+
+    /// EdgeRush: a request stream's state is let go of once the transport has
+    /// let the stream go, however it ended: stopped by the client after a whole
+    /// request, reset by the client and then by the server, reset by the server
+    /// both ways, or answered whole before the request was and its reading
+    /// stopped. quiche kept all but a stream both sides finished through its
+    /// own calls until the connection ended, the capacity of its header buffer
+    /// with it.
+    #[test]
+    fn a_request_stream_the_transport_lets_go_is_let_go_of() {
+        let mut s = Session::new().unwrap();
+        s.handshake().unwrap();
+        let settled = s.server.streams.len();
+        for _ in 0..10 {
+            // Stopped by the client after a whole request.
+            let (stream, _) = s.send_request(true).unwrap();
+            while s.poll_server().is_ok() {}
+            s.pipe
+                .client
+                .stream_shutdown(stream, crate::Shutdown::Read, 0x10c)
+                .unwrap();
+            s.advance().ok();
+            assert_eq!(
+                s.pipe.server.stream_capacity(stream),
+                Err(crate::Error::StreamStopped(0x10c))
+            );
+            settle(&mut s);
+
+            // Reset by the client, then by the server.
+            let (stream, _) = s.send_request(false).unwrap();
+            while s.poll_server().is_ok() {}
+            s.pipe
+                .client
+                .stream_shutdown(stream, crate::Shutdown::Write, 0x10c)
+                .unwrap();
+            s.advance().ok();
+            while s.poll_server().is_ok() {}
+            s.pipe
+                .server
+                .stream_shutdown(stream, crate::Shutdown::Write, 0x10c)
+                .unwrap();
+            settle(&mut s);
+
+            // Reset by the server both ways.
+            let (stream, _) = s.send_request(false).unwrap();
+            while s.poll_server().is_ok() {}
+            s.pipe
+                .server
+                .stream_shutdown(stream, crate::Shutdown::Write, 0x10e)
+                .unwrap();
+            s.pipe
+                .server
+                .stream_shutdown(stream, crate::Shutdown::Read, 0x10e)
+                .unwrap();
+            settle(&mut s);
+
+            // Answered whole before the request was, its reading stopped.
+            let (stream, _) = s.send_request(false).unwrap();
+            while s.poll_server().is_ok() {}
+            s.send_response(stream, true).unwrap();
+            s.pipe
+                .server
+                .stream_shutdown(stream, crate::Shutdown::Read, 0x100)
+                .unwrap();
+            settle(&mut s);
+        }
+        assert_eq!(s.server.streams.len(), settled);
     }
 
     /// The client shuts down the stream's write direction, the server

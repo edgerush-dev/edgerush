@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::collections::hash_map;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 
 use intrusive_collections::intrusive_adapter;
 use intrusive_collections::KeyAdapter;
@@ -225,9 +226,24 @@ pub struct StreamMap<F: BufFactory = DefaultBufFactory> {
 
     /// Total number of bytes in send buffers across all streams.
     tx_buffered: usize,
+
+    /// EdgeRush: the streams collected since the HTTP/3 layer last asked,
+    /// kept once it has asked to be told of them.
+    collected_news: Option<VecDeque<u64>>,
 }
 
 impl<F: BufFactory> StreamMap<F> {
+    /// EdgeRush: keeps each stream collected from now on until it is asked
+    /// for, so that what keeps state of its own for a stream can let it go.
+    pub(crate) fn tell_collected(&mut self) {
+        self.collected_news.get_or_insert_with(VecDeque::new);
+    }
+
+    /// EdgeRush: the next stream collected since the last one asked for.
+    pub(crate) fn collected_next(&mut self) -> Option<u64> {
+        self.collected_news.as_mut()?.pop_front()
+    }
+
     pub fn new(
         max_streams_bidi: u64, max_streams_uni: u64, max_stream_window: u64,
     ) -> Self {
@@ -633,6 +649,11 @@ impl<F: BufFactory> StreamMap<F> {
         self.remove_flushable(&s.priority_key);
 
         self.collected.insert(stream_id);
+
+        // EdgeRush: told, if asked to tell.
+        if let Some(news) = &mut self.collected_news {
+            news.push_back(stream_id);
+        }
     }
 
     /// Creates an iterator over streams that have outstanding data to read.
