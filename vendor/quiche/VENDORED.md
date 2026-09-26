@@ -49,6 +49,12 @@ Every change is marked `EdgeRush:` in the source.
 - Three tests (five cases) after `connection_migration_zero_length_cid` in
   `src/tests.rs` cover both, beside quiche's own `path_probing_dos` and
   `path_event_queue_bounded_on_port_rotation`, which still pass.
+- **A RETIRE_CONNECTION_ID repeated for an ID already retired is ignored.** Removing a
+  connection ID refused when one ID was left before it looked for the ID, so the same
+  frame arriving again, once the ID was retired and before the application issued
+  another, closed the connection with PROTOCOL_VIOLATION (`src/cid.rs`, `remove`). It now
+  refuses only to remove the last ID, as it meant to. `a_repeated_retire_connection_id_is_ignored`
+  in `src/tests.rs` covers it.
 
 ## Why
 
@@ -80,7 +86,15 @@ path's packets lost within a round trip; here they are declared lost when the pe
 which RFC 9000 §9.4 leaves to the endpoint. A peer that moved on purpose, its old address
 still working, may have a few packets sent twice.
 
-With all three changes, quiche's own library tests pass (1,150 of 1,150, on Windows and
+**The repeated RETIRE_CONNECTION_ID.** Frames are sent again after a loss, and a peer may
+send one more than once anyway: quic-go's client, in quic-interop-runner's case of a lossy
+handshake, sent its first RETIRE_CONNECTION_ID in two packets that arrived together. The
+first retired the ID and the second closed the connection, on the second of fifty
+connections, before EdgeRush's driver had issued the replacement it issues once a turn.
+RFC 9000 §19.16 makes an error of retiring an ID never issued, or the one a packet was
+sent to, neither of which this was.
+
+With all four changes, quiche's own library tests pass (1,151 of 1,151, on Windows and
 Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`).
 The proxy's probe `several_streams_share_a_packet` in `crates/proxy/tests/h3_library.rs`
 fails against the published crate, as do its tests `an_answer_carries_the_ack_of_its_request`

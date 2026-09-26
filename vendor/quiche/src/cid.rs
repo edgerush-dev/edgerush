@@ -179,7 +179,7 @@ impl BoundedNonEmptyConnectionIdVecDeque {
 
     /// Removes the element in the collection having the provided `seq`.
     ///
-    /// If this method is called when there remains a single element in the
+    /// If this method is called to remove the single element left in the
     /// collection, this method raises an [`OutOfIdentifiers`].
     ///
     /// Returns `Some` if the element was in the collection and removed, or
@@ -187,15 +187,19 @@ impl BoundedNonEmptyConnectionIdVecDeque {
     ///
     /// [`OutOfIdentifiers`]: enum.Error.html#OutOfIdentifiers
     fn remove(&mut self, seq: u64) -> Result<Option<ConnectionIdEntry>> {
+        // EdgeRush: an element no longer here is nothing to remove, whatever
+        // is left; only removing the last one is refused. A peer's
+        // RETIRE_CONNECTION_ID sent again after a loss, once the ID was retired
+        // and before another was issued, closed the connection.
+        let Some(index) = self.inner.iter().position(|e| e.seq == seq) else {
+            return Ok(None);
+        };
+
         if self.inner.len() <= 1 {
             return Err(Error::OutOfIdentifiers);
         }
 
-        Ok(self
-            .inner
-            .iter()
-            .position(|e| e.seq == seq)
-            .and_then(|index| self.inner.remove(index)))
+        Ok(self.inner.remove(index))
     }
 
     /// Removes all elements in the collection with sequence numbers less than

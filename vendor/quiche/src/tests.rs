@@ -11745,6 +11745,43 @@ fn nat_rebinding_mid_transfer_resends_what_was_in_flight(
     assert_eq!(received, SIZE);
 }
 
+/// EdgeRush: a RETIRE_CONNECTION_ID for an ID already retired changes nothing,
+/// even when the ID it would leave is the last one: a frame sent again after a
+/// loss is no protocol violation. quic-go's client sent one twice during a
+/// lossy handshake, before the server had issued another ID, and the connection
+/// was closed with PROTOCOL_VIOLATION.
+#[test]
+fn a_repeated_retire_connection_id_is_ignored() {
+    let mut config = nat_config();
+    let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+    let first = pipe.server.source_id().into_owned();
+
+    // The client moves to the server's second ID and retires the first.
+    assert_eq!(pipe.client.retire_dcid(0), Ok(()));
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    assert_eq!(pipe.server.retired_scid_next(), Some(first));
+    assert_eq!(pipe.server.active_scids(), 1);
+
+    // The same frame again, in a packet of its own.
+    let frames = [frame::Frame::RetireConnectionId { seq_num: 0 }];
+    let mut buf = [0; 1500];
+    let written =
+        test_utils::encode_pkt(&mut pipe.client, Type::Short, &frames, &mut buf)
+            .unwrap();
+    let info = RecvInfo {
+        from: test_utils::Pipe::client_addr(),
+        to: test_utils::Pipe::server_addr(),
+    };
+    assert_eq!(pipe.server.recv(&mut buf[..written], info), Ok(written));
+
+    // The server goes on, with nothing to close. (The client made that packet
+    // by hand and could not take its ACK, so the pipe goes no further.)
+    assert!(pipe.server.local_error().is_none());
+    assert!(test_utils::emit_flight(&mut pipe.server).is_ok());
+    assert!(!pipe.server.is_draining() && !pipe.server.is_closed());
+}
+
 /// EdgeRush: a server's config for the NAT rebinding tests, which asks peers
 /// not to migrate, as EdgeRush does: a rebinding is not a migration of theirs.
 fn nat_config() -> Config {
