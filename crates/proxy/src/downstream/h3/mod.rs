@@ -121,6 +121,9 @@ impl Settings {
         config.set_max_connection_window(self.connection_window);
         // Rebinding is still followed (16 §3); a client is only asked not to move on purpose.
         config.set_disable_active_migration(true);
+        // An ACK alone waits for a second packet or for the answer it can go with, at most
+        // 20 ms, 5 short of the 25 ms advertised (16 §2, RFC 9000 §13.2).
+        config.enable_delayed_ack(true);
         Ok(config)
     }
 

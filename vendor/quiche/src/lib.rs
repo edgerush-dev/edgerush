@@ -605,6 +605,9 @@ pub struct Config {
     track_unknown_transport_params: Option<usize>,
 
     initial_rtt: Duration,
+
+    // EdgeRush: see `enable_delayed_ack()`.
+    delayed_ack: bool,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -683,6 +686,8 @@ impl Config {
 
             track_unknown_transport_params: None,
             initial_rtt: DEFAULT_INITIAL_RTT,
+
+            delayed_ack: false,
         })
     }
 
@@ -1250,6 +1255,25 @@ impl Config {
         self.disable_dcid_reuse = v;
     }
 
+    /// EdgeRush: configures whether an ACK alone may wait.
+    ///
+    /// When set to `true`, once the handshake is confirmed an ACK in the
+    /// application packet number space is sent at once only after a second
+    /// ack-eliciting packet has come since the last ACK, or after one that
+    /// came out of order or past a gap, or with other frames that are sent
+    /// anyway. Otherwise it waits until 5 ms short of the `max_ack_delay`
+    /// transport parameter has passed since the first ack-eliciting packet it
+    /// covers, which [`timeout_instant()`] then includes (RFC 9000 §13.2.1,
+    /// §13.2.2). The Initial and Handshake spaces never wait.
+    ///
+    /// The default value is `false`: an ACK is sent whenever there is one to
+    /// send.
+    ///
+    /// [`timeout_instant()`]: struct.Connection.html#method.timeout_instant
+    pub fn enable_delayed_ack(&mut self, v: bool) {
+        self.delayed_ack = v;
+    }
+
     /// Enables tracking unknown transport parameters.
     ///
     /// Specify the maximum number of bytes used to track unknown transport
@@ -1555,6 +1579,10 @@ where
     /// Whether the connection should prevent from reusing destination
     /// Connection IDs when the peer migrates.
     disable_dcid_reuse: bool,
+
+    /// EdgeRush: how long an ACK alone may wait, if it may
+    /// (`Config::enable_delayed_ack()`).
+    ack_delay: Option<Duration>,
 
     /// The number of streams reset by local.
     reset_stream_local_count: u64,
@@ -2206,6 +2234,17 @@ impl<F: BufFactory> Connection<F> {
             emit_dgram: true,
 
             disable_dcid_reuse: config.disable_dcid_reuse,
+
+            // 5 ms short of what the peer is told, for the timer's lateness,
+            // as HAProxy has it.
+            ack_delay: config.delayed_ack.then(|| {
+                Duration::from_millis(
+                    config
+                        .local_transport_params
+                        .max_ack_delay
+                        .saturating_sub(5),
+                )
+            }),
 
             reset_stream_local_count: 0,
             stopped_stream_local_count: 0,
@@ -3771,6 +3810,22 @@ impl<F: BufFactory> Connection<F> {
             self.pkt_num_spaces[epoch].largest_rx_pkt_time = now;
         }
 
+        // EdgeRush: what a delayed ACK waits on. An ack-eliciting packet
+        // below the largest received, or past a gap after it, is
+        // acknowledged at once (RFC 9000 §13.2.1).
+        if ack_elicited {
+            let space = &mut self.pkt_num_spaces[epoch];
+
+            if pn < space.largest_rx_pkt_num ||
+                pn > space.largest_rx_pkt_num + 1
+            {
+                space.ack_immediately = true;
+            }
+
+            space.ack_eliciting_since_ack += 1;
+            space.first_unacked_ack_eliciting.get_or_insert(now);
+        }
+
         self.pkt_num_spaces[epoch].recv_pkt_num.insert(pn);
 
         self.pkt_num_spaces[epoch].recv_pkt_need_ack.push_item(pn);
@@ -4138,7 +4193,7 @@ impl<F: BufFactory> Connection<F> {
 
         let mut b = octets::OctetsMut::with_slice(out);
 
-        let pkt_type = self.write_pkt_type(send_pid)?;
+        let pkt_type = self.write_pkt_type(send_pid, now)?;
 
         let max_dgram_len = if !self.dgram_send_queue.is_empty() {
             self.dgram_max_writable_len()
@@ -4239,6 +4294,8 @@ impl<F: BufFactory> Connection<F> {
 
                     frame::Frame::ACK { .. } => {
                         pkt_space.ack_elicited = true;
+                        // EdgeRush: an ACK that was lost does not wait again.
+                        pkt_space.ack_immediately = true;
                     },
 
                     frame::Frame::ResetStream {
@@ -4599,6 +4656,10 @@ impl<F: BufFactory> Connection<F> {
                 // available cwnd.
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     pkt_space.ack_elicited = false;
+                    // EdgeRush: nothing waits for an ACK any more.
+                    pkt_space.ack_eliciting_since_ack = 0;
+                    pkt_space.first_unacked_ack_eliciting = None;
+                    pkt_space.ack_immediately = false;
                 }
             }
         }
@@ -7093,7 +7154,13 @@ impl<F: BufFactory> Connection<F> {
                 .as_ref()
                 .map(|key_update| key_update.timer);
 
-            let timers = [self.idle_timer, path_timer, key_update_timer];
+            // EdgeRush: and when an ACK that waits is due.
+            let timers = [
+                self.idle_timer,
+                path_timer,
+                key_update_timer,
+                self.delayed_ack_timer(),
+            ];
 
             timers.iter().filter_map(|&x| x).min()
         }
@@ -8219,7 +8286,7 @@ impl<F: BufFactory> Connection<F> {
     }
 
     /// Selects the packet type for the next outgoing packet.
-    fn write_pkt_type(&self, send_pid: usize) -> Result<Type> {
+    fn write_pkt_type(&self, send_pid: usize, now: Instant) -> Result<Type> {
         // On error send packet in the latest epoch available, but only send
         // 1-RTT ones when the handshake is completed.
         if self
@@ -8265,7 +8332,11 @@ impl<F: BufFactory> Connection<F> {
             }
 
             // We are ready to send data for this packet number space.
-            if crypto_ctx.data_available() || pkt_space.ready() {
+            //
+            // EdgeRush: an ACK alone only once it is due.
+            if crypto_ctx.data_available() ||
+                (pkt_space.ready() && self.ack_due(epoch, now))
+            {
                 return Ok(Type::from_epoch(epoch));
             }
 
@@ -8325,6 +8396,38 @@ impl<F: BufFactory> Connection<F> {
         }
 
         Err(Error::Done)
+    }
+
+    /// EdgeRush: whether an ACK owed in `epoch` is to be sent now, alone if
+    /// need be (`Config::enable_delayed_ack()`).
+    fn ack_due(&self, epoch: packet::Epoch, now: Instant) -> bool {
+        let Some(delay) = self.ack_delay else {
+            return true;
+        };
+
+        if epoch != packet::Epoch::Application || !self.handshake_confirmed {
+            return true;
+        }
+
+        let space = &self.pkt_num_spaces[epoch];
+
+        space.ack_immediately ||
+            space.ack_eliciting_since_ack >= 2 ||
+            space
+                .first_unacked_ack_eliciting
+                .is_none_or(|first| now >= first + delay)
+    }
+
+    /// EdgeRush: when an ACK that waits is due, if one does.
+    fn delayed_ack_timer(&self) -> Option<Instant> {
+        let delay = self.ack_delay?;
+        let space = &self.pkt_num_spaces[packet::Epoch::Application];
+
+        if !space.ack_elicited {
+            return None;
+        }
+
+        space.first_unacked_ack_eliciting.map(|first| first + delay)
     }
 
     /// Returns the mutable stream with the given ID if it exists, or creates

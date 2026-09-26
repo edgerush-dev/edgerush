@@ -13322,3 +13322,152 @@ fn server_qlog() {
         panic!("expected Qlog event");
     }
 }
+
+/// EdgeRush: a pipe past its handshake and quiet, whose server delays ACKs
+/// with `max_ack_delay` at `max_ack_delay` ms, and whose client does not.
+fn delayed_ack_pipe(max_ack_delay: u64) -> test_utils::Pipe {
+    let mut client = test_utils::Pipe::default_config("cubic").unwrap();
+    let mut server = test_utils::Pipe::default_config("cubic").unwrap();
+    server.set_max_ack_delay(max_ack_delay);
+    server.enable_delayed_ack(true);
+
+    let mut pipe =
+        test_utils::Pipe::with_client_and_server_config(&mut client, &mut server)
+            .unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+    assert!(pipe.server.handshake_confirmed);
+
+    pipe
+}
+
+/// EdgeRush: one packet of stream data from the client, `data` on stream 0,
+/// delivered to the server.
+fn one_packet_to_server(pipe: &mut test_utils::Pipe, data: &[u8]) {
+    assert_eq!(pipe.client.stream_send(0, data, false), Ok(data.len()));
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    assert_eq!(flight.len(), 1);
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+}
+
+/// EdgeRush: the frames of every packet the server has to send.
+fn server_frames(pipe: &mut test_utils::Pipe) -> Vec<Vec<frame::Frame>> {
+    match test_utils::emit_flight(&mut pipe.server) {
+        Ok(flight) => flight
+            .into_iter()
+            .map(|(mut pkt, _)| {
+                test_utils::decode_pkt(&mut pipe.client, &mut pkt).unwrap()
+            })
+            .collect(),
+
+        Err(Error::Done) => Vec::new(),
+
+        Err(e) => panic!("server send: {e:?}"),
+    }
+}
+
+fn only_acks(frames: &[frame::Frame]) -> bool {
+    frames.iter().all(|f| matches!(f, frame::Frame::ACK { .. }))
+}
+
+#[test]
+/// EdgeRush: an ACK alone waits for a second ack-eliciting packet, and the
+/// timer says when it is due meanwhile.
+fn delayed_ack_waits_for_a_second_packet() {
+    let mut pipe = delayed_ack_pipe(25);
+
+    one_packet_to_server(&mut pipe, b"a");
+    assert!(server_frames(&mut pipe).is_empty());
+
+    let space = &pipe.server.pkt_num_spaces[packet::Epoch::Application];
+    let first = space.first_unacked_ack_eliciting.unwrap();
+    assert_eq!(
+        pipe.server.delayed_ack_timer(),
+        Some(first + Duration::from_millis(20))
+    );
+    assert!(pipe.server.timeout_instant() <= pipe.server.delayed_ack_timer());
+
+    one_packet_to_server(&mut pipe, b"b");
+    let packets = server_frames(&mut pipe);
+    assert_eq!(packets.len(), 1);
+    assert!(only_acks(&packets[0]));
+    assert_eq!(pipe.server.delayed_ack_timer(), None);
+
+    // Counted afresh from the ACK sent.
+    one_packet_to_server(&mut pipe, b"c");
+    assert!(server_frames(&mut pipe).is_empty());
+}
+
+#[test]
+/// EdgeRush: an ACK that waits goes with the next frames sent.
+fn delayed_ack_goes_with_what_is_sent() {
+    let mut pipe = delayed_ack_pipe(25);
+
+    one_packet_to_server(&mut pipe, b"a");
+    assert!(server_frames(&mut pipe).is_empty());
+
+    assert_eq!(pipe.server.stream_send(0, b"answer", true), Ok(6));
+    let packets = server_frames(&mut pipe);
+    assert_eq!(packets.len(), 1);
+    assert!(matches!(packets[0][0], frame::Frame::ACK { .. }));
+    assert!(packets[0]
+        .iter()
+        .any(|f| matches!(f, frame::Frame::Stream { stream_id: 0, .. })));
+    assert_eq!(pipe.server.delayed_ack_timer(), None);
+}
+
+#[test]
+/// EdgeRush: an ACK alone is sent once its delay is up.
+fn delayed_ack_is_sent_when_its_delay_is_up() {
+    // 6 ms advertised: the ACK waits 1 ms.
+    let mut pipe = delayed_ack_pipe(6);
+
+    one_packet_to_server(&mut pipe, b"a");
+    assert!(server_frames(&mut pipe).is_empty());
+
+    let due = pipe.server.timeout_instant().unwrap();
+    assert_eq!(Some(due), pipe.server.delayed_ack_timer());
+    std::thread::sleep(due.saturating_duration_since(Instant::now()));
+    pipe.server.on_timeout();
+
+    let packets = server_frames(&mut pipe);
+    assert_eq!(packets.len(), 1);
+    assert!(only_acks(&packets[0]));
+}
+
+#[test]
+/// EdgeRush: a packet past a gap, or below the largest received, is
+/// acknowledged at once (RFC 9000 §13.2.1).
+fn delayed_ack_does_not_wait_for_packets_out_of_order() {
+    let mut pipe = delayed_ack_pipe(25);
+
+    assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
+    let earlier = test_utils::emit_flight(&mut pipe.client).unwrap();
+    assert_eq!(pipe.client.stream_send(0, b"b", false), Ok(1));
+    let later = test_utils::emit_flight(&mut pipe.client).unwrap();
+
+    test_utils::process_flight(&mut pipe.server, later).unwrap();
+    let packets = server_frames(&mut pipe);
+    assert_eq!(packets.len(), 1);
+    assert!(only_acks(&packets[0]));
+
+    test_utils::process_flight(&mut pipe.server, earlier).unwrap();
+    let packets = server_frames(&mut pipe);
+    assert_eq!(packets.len(), 1);
+    assert!(only_acks(&packets[0]));
+}
+
+#[test]
+/// EdgeRush: without `enable_delayed_ack()`, an ACK is sent for every
+/// ack-eliciting packet, as quiche always has.
+fn delayed_ack_is_off_by_default() {
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    one_packet_to_server(&mut pipe, b"a");
+    let packets = server_frames(&mut pipe);
+    assert_eq!(packets.len(), 1);
+    assert!(only_acks(&packets[0]));
+    assert_eq!(pipe.server.delayed_ack_timer(), None);
+}

@@ -882,6 +882,15 @@ pub struct PktNumSpace {
 
     /// Track if a received packet is ack eliciting.
     pub ack_elicited: bool,
+
+    /// EdgeRush: ack-eliciting packets received since an ACK was last sent.
+    pub ack_eliciting_since_ack: u64,
+
+    /// EdgeRush: when the first of them came.
+    pub first_unacked_ack_eliciting: Option<Instant>,
+
+    /// EdgeRush: the next ACK is not to wait (RFC 9000 §13.2.1).
+    pub ack_immediately: bool,
 }
 
 impl PktNumSpace {
@@ -894,11 +903,17 @@ impl PktNumSpace {
             recv_pkt_need_ack: ranges::RangeSet::new(crate::MAX_ACK_RANGES),
             recv_pkt_num: PktNumWindow::default(),
             ack_elicited: false,
+            ack_eliciting_since_ack: 0,
+            first_unacked_ack_eliciting: None,
+            ack_immediately: false,
         }
     }
 
     pub fn clear(&mut self) {
         self.ack_elicited = false;
+        self.ack_eliciting_since_ack = 0;
+        self.first_unacked_ack_eliciting = None;
+        self.ack_immediately = false;
     }
 
     pub fn ready(&self) -> bool {

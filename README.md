@@ -77,7 +77,7 @@ crates/telemetry   metrics (`edgerush-telemetry`): counters sharded by thread, t
 bench              the macro benchmark: load generator, proxy and backend on one Linux machine
                    (bench/README.md)
 fuzz               fuzz targets (cargo-fuzz; not part of the workspace)
-vendor/quiche      quiche 0.30.0 with one change, built in place of the published crate
+vendor/quiche      quiche 0.30.0 with two changes, built in place of the published crate
                    (vendor/quiche/VENDORED.md; BSD-2-Clause, not part of the workspace)
 ```
 

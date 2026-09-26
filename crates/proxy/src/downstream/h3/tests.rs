@@ -183,6 +183,49 @@ fn many_requests_on_one_connection_are_each_answered() {
     });
 }
 
+/// A request answered at once gets one datagram back, the answer with the request's ACK in
+/// it: an ACK alone waits for something to go with (16 §2).
+#[test]
+fn an_answer_carries_the_ack_of_its_request() {
+    locally(async {
+        let server = serving(short(), echo).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        client.for_a_while(Duration::from_millis(100)).await;
+        let before = client.received.len();
+        let answer = client.get("a.test", "/x").await;
+        assert_eq!(body_of(&answer), "GET /x 0 None");
+        client.for_a_while(Duration::from_millis(100)).await;
+        assert_eq!(client.received.len() - before, 1);
+    });
+}
+
+/// An answer slow in coming does not hold back its request's ACK, which goes alone before it
+/// once its wait is over (RFC 9000 §13.2.1). That the wait ends at 20 ms, by quiche's timer,
+/// is for quiche's own tests: here the client's probe would end it soon after, and a test
+/// on real time cannot tell the two apart without being flaky.
+#[test]
+fn a_slow_answer_does_not_hold_back_the_ack() {
+    locally(async {
+        let server = serving(short(), |request, interim| -> Answering {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                echo(request, interim).await
+            })
+        })
+        .await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        client.for_a_while(Duration::from_millis(100)).await;
+        let before = client.received.len();
+        let id = client.request(&get("a.test", "/x"), true);
+        // Due in 20 ms, or once the client probes; the rest is slack for a loaded machine.
+        client.for_a_while(Duration::from_millis(150)).await;
+        assert_eq!(client.received.len() - before, 1);
+        let answer = client.answer(id).await;
+        assert_eq!(body_of(&answer), "GET /x 0 None");
+        assert_eq!(client.received.len() - before, 2);
+    });
+}
+
 /// A megabyte's upload, far past a single piece, reaches the core whole, and so does a
 /// client's trailers after it.
 #[test]
