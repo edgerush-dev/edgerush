@@ -47,6 +47,9 @@ pub(crate) struct Slot {
     pub(crate) finished: bool,
     /// The client reset its side of the stream, with this code.
     pub(crate) reset: Option<u64>,
+    /// The client asked for no more of the answer, with this code: quiche has reset the
+    /// server's side of the stream itself.
+    pub(crate) stopped: Option<u64>,
 }
 
 impl Slot {
@@ -112,10 +115,15 @@ impl Conn {
 /// A request stream's place in its connection, for as long as the stream's task runs.
 /// Dropping it takes the slot away and stops reading whatever the client still sends: an
 /// answer may be complete before its request is (RFC 9114 §4.1), and a task that ends
-/// early, however it ends, leaves nothing to pile up in quiche.
+/// early, however it ends, leaves nothing to pile up in quiche. A stream let go of without
+/// its answer whole has the answer's side reset too, so that the client does not wait for
+/// the rest and the stream ends both ways (§4.1.1): only then does quiche give the client
+/// its credit back.
 pub(crate) struct Stream {
     pub(crate) conn: Rc<Conn>,
     pub(crate) id: u64,
+    /// The answer went to quiche whole, its end included.
+    answered: bool,
 }
 
 impl Stream {
@@ -125,20 +133,43 @@ impl Stream {
         Self {
             conn: Rc::clone(conn),
             id,
+            answered: false,
         }
+    }
+
+    /// Lets the stream go with its answer whole, handed to quiche to its end: quiche sends
+    /// it, and sends it again, until the client has it.
+    pub(crate) fn answered(mut self) {
+        self.answered = true;
     }
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        use crate::downstream::h3::code;
+        let code = if self.answered {
+            code::NO_ERROR
+        } else {
+            code::REQUEST_CANCELLED
+        };
         self.conn.with(|state| {
             state.streams.remove(&self.id);
+            // One the client stopped, quiche has reset already, with the client's code.
+            if !self.answered
+                && !matches!(
+                    state.quic.stream_capacity(self.id),
+                    Err(quiche::Error::StreamStopped(_))
+                )
+            {
+                // Fails only for a side already done: reset by the answer's own failure.
+                let _reset = state
+                    .quic
+                    .stream_shutdown(self.id, quiche::Shutdown::Write, code);
+            }
             // Fails only for a side already done, which has nothing more to stop.
-            let _stopped = state.quic.stream_shutdown(
-                self.id,
-                quiche::Shutdown::Read,
-                crate::downstream::h3::code::NO_ERROR,
-            );
+            let _stopped = state
+                .quic
+                .stream_shutdown(self.id, quiche::Shutdown::Read, code);
         });
         self.conn.stir();
     }

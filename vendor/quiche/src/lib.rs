@@ -8623,8 +8623,6 @@ impl<F: BufFactory> Connection<F> {
                     Err(e) => return Err(e),
                 };
 
-                let was_writable = stream.is_writable();
-
                 let priority_key = Arc::clone(&stream.priority_key);
 
                 // Save the buffered length before stopping (stop clears the
@@ -8669,9 +8667,12 @@ impl<F: BufFactory> Connection<F> {
 
                     self.streams.insert_reset(stream_id, error_code, final_size);
 
-                    if !was_writable {
-                        self.streams.insert_writable(&priority_key);
-                    }
+                    // EdgeRush: marked writable whether or not it could be
+                    // written to before, so that the application hears of the
+                    // stop and the stream is not collected first: a stream
+                    // `stream_writable_next()` has returned is not in the set
+                    // however writable it is. Marking it twice changes nothing.
+                    self.streams.insert_writable(&priority_key);
 
                     self.stopped_stream_remote_count =
                         self.stopped_stream_remote_count.saturating_add(1);

@@ -47,6 +47,51 @@ struct Server {
     shared: Rc<Shared>,
 }
 
+impl Server {
+    /// quiche's counts for the one connection the server holds.
+    fn stats(&self) -> quiche::Stats {
+        let table = self.shared.table.borrow();
+        let conn = table.values().next().expect("a connection");
+        conn.with(|state| state.quic.stats())
+    }
+}
+
+/// A request core whose every exchange waits for ever, as one on a stalled upstream does,
+/// counting them: started, alive, and the most alive at once.
+#[derive(Clone, Default)]
+struct Exchanges {
+    started: Rc<Cell<usize>>,
+    alive: Rc<Cell<usize>>,
+    most: Rc<Cell<usize>>,
+}
+
+/// One exchange, counted alive until it is dropped.
+struct Alive(Exchanges);
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        self.0.alive.set(self.0.alive.get() - 1);
+    }
+}
+
+impl Exchanges {
+    fn core(&self) -> impl Fn(Request<RequestBody>, Interim) -> Answering + 'static {
+        let exchanges = self.clone();
+        move |_request, _interim| {
+            exchanges.started.set(exchanges.started.get() + 1);
+            exchanges.alive.set(exchanges.alive.get() + 1);
+            exchanges
+                .most
+                .set(exchanges.most.get().max(exchanges.alive.get()));
+            let alive = Alive(exchanges.clone());
+            Box::pin(async move {
+                let _alive = alive;
+                std::future::pending().await
+            })
+        }
+    }
+}
+
 /// Runs `test` on a `LocalSet`, as a worker's tasks run.
 fn locally<F: Future>(test: F) -> F::Output {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -376,6 +421,123 @@ fn a_request_the_client_resets_is_let_go_of() {
             .unwrap();
         client.for_a_while(Duration::from_millis(200)).await;
         assert!(dropped.get(), "the exchange outlived its request");
+    });
+}
+
+/// A client that stops reading an answer takes its exchange with it, whether or not its
+/// request was whole (RFC 9114 §4.1.1): nothing waits on an upstream for an answer nobody
+/// wants. quiche answers the STOP_SENDING with a RESET_STREAM of its own, with the client's
+/// code, and the server sends no second one.
+#[test]
+fn an_answer_the_client_stops_reading_is_given_up() {
+    locally(async {
+        let exchanges = Exchanges::default();
+        let server = serving(short(), exchanges.core()).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        for (asked, ended) in [(1, true), (2, false)] {
+            let id = client.request(&get("a.test", "/never"), ended);
+            client.until(|_| exchanges.started.get() == asked).await;
+            let resets = server.stats().reset_stream_count_local;
+            client
+                .quic
+                .stream_shutdown(id, quiche::Shutdown::Read, code::REQUEST_CANCELLED)
+                .unwrap();
+            client.until(|_| exchanges.alive.get() == 0).await;
+            assert_eq!(
+                server.stats().reset_stream_count_local,
+                resets + 1,
+                "request ended: {ended}"
+            );
+        }
+    });
+}
+
+/// However often a client asks and then stops reading, it holds no more exchanges at once
+/// than it has streams. quiche gives a stopped stream's credit back once its RESET_STREAM is
+/// acknowledged, so the exchange has to go with it, or the stream bound bounds nothing.
+#[test]
+fn a_client_that_asks_and_stops_again_and_again_holds_no_more_than_its_streams() {
+    locally(async {
+        let settings = Settings {
+            streams: 4,
+            ..short()
+        };
+        let exchanges = Exchanges::default();
+        let server = serving(settings, exchanges.core()).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let asks = 3 * usize::try_from(settings.streams).unwrap();
+        for asked in 1..=asks {
+            client
+                .until(|client| client.quic.peer_streams_left_bidi() > 0)
+                .await;
+            let id = client.request(&get("a.test", "/never"), true);
+            client.until(|_| exchanges.started.get() == asked).await;
+            client
+                .quic
+                .stream_shutdown(id, quiche::Shutdown::Read, code::REQUEST_CANCELLED)
+                .unwrap();
+        }
+        assert!(
+            exchanges.most.get() <= usize::try_from(settings.streams).unwrap(),
+            "{} exchanges at once",
+            exchanges.most.get()
+        );
+        client.until(|_| exchanges.alive.get() == 0).await;
+    });
+}
+
+/// A client that resets its request has the answer's side of the stream reset too, so that
+/// the stream ends both ways (RFC 9114 §4.1.1) and its credit comes back: however often it
+/// does so, it is never left without a stream.
+#[test]
+fn a_request_the_client_resets_has_its_answer_reset_too() {
+    locally(async {
+        let settings = Settings {
+            streams: 4,
+            ..short()
+        };
+        let exchanges = Exchanges::default();
+        let server = serving(settings, exchanges.core()).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let asks = 3 * usize::try_from(settings.streams).unwrap();
+        for asked in 1..=asks {
+            client
+                .until(|client| client.quic.peer_streams_left_bidi() > 0)
+                .await;
+            let id = client.request(&get("a.test", "/never"), false);
+            client.until(|_| exchanges.started.get() == asked).await;
+            client
+                .quic
+                .stream_shutdown(id, quiche::Shutdown::Write, code::REQUEST_CANCELLED)
+                .unwrap();
+            let answer = client.answer(id).await;
+            assert_eq!(answer.reset, Some(code::REQUEST_CANCELLED));
+        }
+        assert_eq!(exchanges.alive.get(), 0);
+    });
+}
+
+/// An answer the core gives without reading the upload, whole before its request is, ends
+/// the stream's sending side as any answer does and is not reset with the rest: only
+/// reading stops (RFC 9114 §4.1).
+#[test]
+fn an_answer_whole_before_its_upload_arrives_whole() {
+    locally(async {
+        const SIZE: usize = 100 << 10;
+        let server = serving(short(), |_request, _interim| -> Answering {
+            Box::pin(
+                async move { Answered::Map(Response::new(Full::new(Bytes::from(vec![7; SIZE])))) },
+            )
+        })
+        .await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let mut head = get("a.test", "/up");
+        head[0].1 = "POST";
+        let id = client.request(&head, false);
+        client.body(id, &[1; 1_000], false).await;
+        let answer = client.answer(id).await;
+        assert_eq!(answer.reset, None);
+        assert_eq!(answer.body.len(), SIZE);
     });
 }
 

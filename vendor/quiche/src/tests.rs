@@ -11782,6 +11782,39 @@ fn a_repeated_retire_connection_id_is_ignored() {
     assert!(!pipe.server.is_draining() && !pipe.server.is_closed());
 }
 
+/// EdgeRush: a stream the peer stops is reported by `stream_writable_next()`
+/// even when the application has already taken it from there once, while it
+/// could still be written to, and it is not collected before it is reported:
+/// the application hears of the STOP_SENDING before the stream's credit goes
+/// back to the peer.
+#[rstest]
+fn a_stream_stopped_after_it_was_taken_as_writable_is_reported(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // A request, whole.
+    assert_eq!(pipe.client.stream_send(0, b"hello", true), Ok(5));
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((5, true)));
+
+    // The server takes the stream as writable and writes nothing yet: its
+    // answer is waiting on something else.
+    assert_eq!(pipe.server.stream_writable_next(), Some(0));
+    assert_eq!(pipe.server.stream_writable_next(), None);
+
+    // The client stops the answer, and acknowledges the server's RESET_STREAM.
+    assert_eq!(pipe.client.stream_shutdown(0, Shutdown::Read, 42), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert!(!pipe.server.streams.is_collected(0));
+    assert_eq!(pipe.server.stream_writable_next(), Some(0));
+    assert_eq!(pipe.server.stream_capacity(0), Err(Error::StreamStopped(42)));
+    assert!(pipe.server.streams.is_collected(0));
+}
+
 /// EdgeRush: a client whose ClientHello comes again did not have the server's
 /// answer, which is sent again at once (RFC 9002 §6.2.3), and is enough for the
 /// client to finish its side of the handshake. No time passes here, so no PTO

@@ -139,7 +139,9 @@ pub(crate) async fn answer<R, F, B>(
     let answered = respond(request, interim).await;
     let (_, body) = answered.into_response().into_parts();
     let code = match send(&stream, body, &mut Idle::new(idle)).await {
-        Ok(()) | Err(Cut::Gone) => return,
+        Ok(()) => return stream.answered(),
+        // Reset as the stream goes, unless the client stopped it and quiche did.
+        Err(Cut::Gone) => return,
         Err(Cut::Failed) => code::INTERNAL_ERROR,
         Err(Cut::Stalled) => code::REQUEST_CANCELLED,
     };

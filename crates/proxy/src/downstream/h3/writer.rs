@@ -88,16 +88,17 @@ impl Responder {
         }
     }
 
-    /// Ready once the client has reset the stream, watching for it until then.
+    /// Ready once the client has reset the stream or stopped the answer, watching for it
+    /// until then.
     pub(crate) fn poll_reset(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         self.conn.with(|state| {
             let Some(slot) = state.streams.get_mut(&self.stream) else {
                 return Poll::Ready(());
             };
-            if slot.reset.is_some() || state.closed {
+            if slot.reset.is_some() || slot.stopped.is_some() || state.closed {
                 return Poll::Ready(());
             }
-            // Woken by the driver when the client resets, as a waiting writer is.
+            // Woken by the driver when the client resets or stops, as a waiting writer is.
             slot.writer = Some(cx.waker().clone());
             Poll::Pending
         })
@@ -314,12 +315,16 @@ impl Responder {
 
     /// Why the stream cannot be written to any more.
     fn stopped(&self) -> SendError {
-        self.conn.with(
-            |state| match state.streams.get(&self.stream).and_then(|slot| slot.reset) {
+        self.conn.with(|state| {
+            match state
+                .streams
+                .get(&self.stream)
+                .and_then(|slot| slot.reset.or(slot.stopped))
+            {
                 Some(code) => SendError::Reset(code),
                 None => SendError::Closed,
-            },
-        )
+            }
+        })
     }
 }
 

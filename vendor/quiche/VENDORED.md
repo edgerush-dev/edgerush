@@ -64,6 +64,16 @@ Every change is marked `EdgeRush:` in the source.
   `the_server_hello_goes_again_early_once_only` in `src/tests.rs` cover it. What sets it
   off, a repeat and nothing else, is not reached by quiche's client, whose ClientHello
   fits one packet.
+- **A stream the peer stops is always reported.** On a STOP_SENDING, quiche resets the
+  stream's sending side and marks the stream writable, so that `stream_writable_next()`
+  hands it to the application, which learns of the stop by writing (`StreamStopped`); the
+  stream is not collected while so marked. It marked the stream only if it had not been
+  writable before, but a stream `stream_writable_next()` has already returned is off that
+  set however writable it is. So the stop was never reported, the stream was collected
+  once its RESET_STREAM was acknowledged, and its credit went back to the peer. Now it is
+  marked either way (`src/lib.rs`, the STOP_SENDING frame's handling);
+  `a_stream_stopped_after_it_was_taken_as_writable_is_reported` in `src/tests.rs` covers
+  it.
 
 ## Why
 
@@ -111,12 +121,21 @@ CRYPTO data early "for a limited number of times per connection"; HAProxy does i
 a duplicate CRYPTO frame, which is what this does. What goes stays within the
 anti-amplification limit: a client's Initial is 1,200 bytes at least.
 
-With all five changes, quiche's own library tests pass (1,153 of 1,153, on Windows and
+**The stopped stream.** A client that stops reading an answer no longer wants it, and the
+gateway gives up the exchange behind it (RFC 9114 §4.1.1). EdgeRush's driver takes every
+stream quiche reports writable, so a stream the client stopped while its answer waited on
+an upstream was never reported: the exchange went on, and the stream's credit went back to
+the client, which could ask and stop again without end, past the stream bound that is
+meant to bound its exchanges.
+
+With all six changes, quiche's own library tests pass (1,155 of 1,155, on Windows and
 Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`).
 The proxy's probe `several_streams_share_a_packet` in `crates/proxy/tests/h3_library.rs`
 fails against the published crate, as do its tests `an_answer_carries_the_ack_of_its_request`
-(without delayed ACKs), `a_client_rebound_again_and_again_is_followed` and
-`a_client_rebound_during_a_large_answer_gets_it_whole` in
+(without delayed ACKs), `a_client_rebound_again_and_again_is_followed`,
+`a_client_rebound_during_a_large_answer_gets_it_whole`,
+`an_answer_the_client_stops_reading_is_given_up` and
+`a_client_that_asks_and_stops_again_and_again_holds_no_more_than_its_streams` in
 `crates/proxy/src/downstream/h3/tests.rs`.
 
 ## Moving to another version
@@ -124,5 +143,5 @@ fails against the published crate, as do its tests `an_answer_carries_the_ack_of
 Take the new version's published package (`cargo download`, or the registry's source
 under `~/.cargo/registry/src/`) and copy the same files. Then re-apply every change marked
 `EdgeRush:`, run quiche's tests as above, and run the proxy's probe and tests. If upstream
-has both by then, delete this directory and the `[patch.crates-io]` entries in
+has them all by then, delete this directory and the `[patch.crates-io]` entries in
 `Cargo.toml` and `fuzz/Cargo.toml`.

@@ -343,7 +343,17 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
             }));
         }
         while let Some(id) = quic.stream_writable_next() {
-            if let Some(writer) = streams.get_mut(&id).and_then(|slot| slot.writer.take()) {
+            let Some(slot) = streams.get_mut(&id) else {
+                continue;
+            };
+            // quiche reports a stream the client stopped as writable, at once and once. Its
+            // task is told whatever it waits on, so that the exchange goes with the answer
+            // nobody wants (RFC 9114 §4.1.1): quiche gives the client the stream's credit
+            // back once its RESET_STREAM is acknowledged.
+            if let Err(quiche::Error::StreamStopped(code)) = quic.stream_capacity(id) {
+                slot.stopped = Some(code);
+                slot.wake();
+            } else if let Some(writer) = slot.writer.take() {
                 writer.wake();
             }
         }
@@ -517,7 +527,7 @@ async fn answer<R, F, B, D>(
         answered.map(Some)
     })
     .await;
-    // Reset by the client, or the connection gone: nothing is to be sent.
+    // Reset or stopped by the client, or the connection gone: nothing is to be sent.
     let Some(answered) = answered else {
         return;
     };
@@ -536,12 +546,12 @@ async fn answer<R, F, B, D>(
         Err(SendError::H3(_)) => return responder.reset(code::INTERNAL_ERROR),
         Err(_) => return,
     }
-    if !end {
-        // However the sending ends, there is nobody left to tell: a stream whose answer
-        // failed has been reset already.
-        let _sent = responder.send_body(body).await;
+    // A body that failed has had its stream reset with its own code; one the client stopped
+    // or reset, or the connection took, is reset as the stream goes.
+    if !end && responder.send_body(body).await.is_err() {
+        return;
     }
-    drop(stream);
+    stream.answered();
 }
 
 #[cfg(test)]
