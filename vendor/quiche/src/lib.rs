@@ -615,6 +615,19 @@ fn is_reserved_version(version: u32) -> bool {
     version & RESERVED_VERSION_MASK == version
 }
 
+/// EdgeRush: whether a frame of the peer's has just completed `stream` with
+/// nothing left for the application to read, as when the application stopped
+/// reading, so that it is collected now: no read will come to collect it. One
+/// the peer stopped is kept until the application has heard of the stop, as
+/// when an ACK completes a stream.
+fn completed_unread<F: BufFactory>(
+    stream: &stream::Stream<F>, priority_key: &StreamPriorityKey,
+) -> bool {
+    let stop_unheard =
+        priority_key.writable.is_linked() && stream.send.is_stopped();
+    stream.is_complete() && !stream.is_readable() && !stop_unheard
+}
+
 impl Config {
     /// Creates a config object with the given version.
     ///
@@ -8581,7 +8594,11 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::FlowControl);
                 }
 
-                if !was_readable && stream.is_readable() {
+                let readable = stream.is_readable();
+                let local = stream.local;
+                let unread = completed_unread(stream, &priority_key);
+
+                if !was_readable && readable {
                     self.streams.insert_readable(&priority_key);
                 }
 
@@ -8592,6 +8609,10 @@ impl<F: BufFactory> Connection<F> {
 
                 self.reset_stream_remote_count =
                     self.reset_stream_remote_count.saturating_add(1);
+
+                if unread {
+                    self.streams.collect(stream_id, local);
+                }
             },
 
             frame::Frame::StopSending {
@@ -8778,7 +8799,11 @@ impl<F: BufFactory> Connection<F> {
 
                 stream.recv.write(data)?;
 
-                if !was_readable && stream.is_readable() {
+                let readable = stream.is_readable();
+                let local = stream.local;
+                let unread = completed_unread(stream, &priority_key);
+
+                if !was_readable && readable {
                     self.streams.insert_readable(&priority_key);
                 }
 
@@ -8790,6 +8815,10 @@ impl<F: BufFactory> Connection<F> {
                     // the received data as consumed, which might trigger a flow
                     // control update.
                     self.flow_control.add_consumed(max_off_delta);
+                }
+
+                if unread {
+                    self.streams.collect(stream_id, local);
                 }
             },
 

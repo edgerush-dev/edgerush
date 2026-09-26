@@ -82,6 +82,17 @@ Every change is marked `EdgeRush:` in the source.
   closes the connection with PROTOCOL_VIOLATION. Data in order is one run however many
   pieces it came in. Three tests at the end of `src/stream/recv_buf.rs` and
   `a_stream_sent_in_gapped_pieces_closes_the_connection` in `src/tests.rs` cover it.
+- **A stream completed by the peer while no longer read is collected.** quiche collects a
+  stream once both its sides are done, but looked for one only as an ACK came or the
+  application read. When a stream's sending side was done and acknowledged before the peer
+  ended its side, by a RESET_STREAM or a FIN, on a stream the application had stopped
+  reading, nothing looked again: the stream stayed, and its credit with it, until the
+  connection closed. Both frames' handling now collects a stream they complete with nothing
+  left to read (`completed_unread` in `src/lib.rs`), keeping one the peer stopped until the
+  application has heard of it, as the ACK's handling does.
+  `a_stream_answered_before_its_request_ended_is_collected` and
+  `a_stopped_stream_ended_unread_is_kept_until_the_stop_is_heard` in `src/tests.rs` cover
+  it.
 
 ## Why
 
@@ -144,7 +155,13 @@ connection. quinn closes a connection past 1,024 chunks a stream, Google's QUICH
 holds. A gap is a packet lost and not yet sent again, and no sender's congestion control
 keeps the 2,048 packets in flight that 1,024 gaps take on a path losing that much.
 
-With all seven changes, quiche's own library tests pass (1,161 of 1,161, on Windows and
+**The stream left uncollected.** A gateway answers before a request is whole when it need
+not read the rest, a 413 or a 401 to an upload, and stops reading (RFC 9114 §4.1). Whether
+the stream was then collected depended on the order the client's frames came in: its
+acknowledgement of the answer's end first, and the stream stayed. A client with a hundred
+streams that met a hundred such answers had none left.
+
+With all eight changes, quiche's own library tests pass (1,167 of 1,167, on Windows and
 Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`).
 The proxy's probe `several_streams_share_a_packet` in `crates/proxy/tests/h3_library.rs`
 fails against the published crate, as do its tests `an_answer_carries_the_ack_of_its_request`

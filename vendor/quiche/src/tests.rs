@@ -11849,6 +11849,77 @@ fn a_stream_sent_in_gapped_pieces_closes_the_connection(
     assert_eq!(error.error_code, 0xa);
 }
 
+/// EdgeRush: a stream whose sending side is done and acknowledged before its
+/// receiving side ends is collected when that side ends, by a RESET_STREAM or
+/// by a FIN: a server that answered before the request was whole, and stopped
+/// reading, lets the stream go, and the client has its credit back. quiche
+/// looked for a stream to collect only as an ACK came or the application read,
+/// and a stream no longer read never is.
+#[rstest]
+fn a_stream_answered_before_its_request_ended_is_collected(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    #[values(true, false)] reset: bool,
+) {
+    let mut buf = [0; 65535];
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // A request not yet whole.
+    assert_eq!(pipe.client.stream_send(0, b"hello", false), Ok(5));
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((5, false)));
+
+    // The answer, whole and acknowledged.
+    assert_eq!(pipe.server.stream_send(0, b"world", true), Ok(5));
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(pipe.client.stream_recv(0, &mut buf), Ok((5, true)));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // The server reads no more; the client ends its side.
+    assert_eq!(pipe.server.stream_shutdown(0, Shutdown::Read, 0), Ok(()));
+    if reset {
+        // quiche's client answers the STOP_SENDING with a RESET_STREAM.
+        assert_eq!(pipe.advance(), Ok(()));
+    } else {
+        // One that goes on to the end of its request instead.
+        let frames = [frame::Frame::Stream {
+            stream_id: 0,
+            data: <RangeBuf>::from(b"!", 5, true),
+        }];
+        assert!(pipe.send_pkt_to_server(Type::Short, &frames, &mut buf).is_ok());
+    }
+
+    assert!(pipe.server.streams.is_collected(0));
+}
+
+/// EdgeRush: a stream the peer stopped, whose receiving side then ends unread,
+/// is kept until the application has heard of the stop, as when an ACK
+/// completes a stream: the application learns of it first.
+#[rstest]
+fn a_stopped_stream_ended_unread_is_kept_until_the_stop_is_heard(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert_eq!(pipe.client.stream_send(0, b"hello", false), Ok(5));
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((5, false)));
+    assert_eq!(pipe.server.stream_writable_next(), Some(0));
+
+    // The server reads no more, and the client wants no answer: the client's
+    // STOP_SENDING and its RESET_STREAM, answering the server's, both come.
+    assert_eq!(pipe.server.stream_shutdown(0, Shutdown::Read, 0), Ok(()));
+    assert_eq!(pipe.client.stream_shutdown(0, Shutdown::Read, 42), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert!(!pipe.server.streams.is_collected(0));
+    assert_eq!(pipe.server.stream_writable_next(), Some(0));
+    assert_eq!(pipe.server.stream_capacity(0), Err(Error::StreamStopped(42)));
+    assert!(pipe.server.streams.is_collected(0));
+}
+
 /// EdgeRush: a client whose ClientHello comes again did not have the server's
 /// answer, which is sent again at once (RFC 9002 §6.2.3), and is enough for the
 /// client to finish its side of the handshake. No time passes here, so no PTO

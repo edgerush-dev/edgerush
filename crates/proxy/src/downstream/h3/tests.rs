@@ -824,6 +824,33 @@ fn an_answer_whole_before_its_upload_arrives_whole() {
     });
 }
 
+/// Answers whole before their uploads give their streams back once the client has ended its
+/// side, however many there are: a client of four streams is not left without one.
+#[test]
+fn answers_whole_before_their_uploads_give_their_streams_back() {
+    locally(async {
+        let settings = Settings {
+            streams: 4,
+            ..short()
+        };
+        let server = serving(settings, |_request, _interim| -> Answering {
+            Box::pin(async { Answered::Map(Response::new(Full::new(Bytes::from("early")))) })
+        })
+        .await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let mut head = get("a.test", "/up");
+        head[0].1 = "POST";
+        for _ in 0..3 * settings.streams {
+            client
+                .until(|client| client.quic.peer_streams_left_bidi() > 0)
+                .await;
+            let id = client.request(&head, false);
+            client.body(id, &[1; 1_000], false).await;
+            assert_eq!(body_of(&client.answer(id).await), "early");
+        }
+    });
+}
+
 /// A connection that sends no request is closed at its first-request deadline.
 #[test]
 fn a_connection_without_a_request_is_closed_at_its_deadline() {
