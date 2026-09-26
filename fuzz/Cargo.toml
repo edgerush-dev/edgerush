@@ -15,6 +15,9 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
+# BoringSSL's own server, the oracle the ClientHello reader is held to. Already here
+# through quiche, at the version the workspace uses.
+boring = "5.2"
 # A response head keeps the bytes it was read from, as the proxy's does.
 bytes = "1.12"
 edgerush-proxy = { path = "../crates/proxy", features = ["fuzzing"] }
@@ -126,6 +129,13 @@ bench = false
 [[bin]]
 name = "h3_head"
 path = "fuzz_targets/h3_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_hello"
+path = "fuzz_targets/tls_hello.rs"
 test = false
 doc = false
 bench = false

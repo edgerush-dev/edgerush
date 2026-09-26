@@ -73,6 +73,11 @@ harness = false
 required-features = ["fuzzing"]
 
 [[bench]]
+name = "l4"
+harness = false
+required-features = ["fuzzing"]
+
+[[bench]]
 name = "quic"
 harness = false
 required-features = ["fuzzing"]

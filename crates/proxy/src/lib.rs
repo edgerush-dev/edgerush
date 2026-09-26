@@ -40,6 +40,11 @@ pub mod hop_by_hop;
 mod hop_by_hop;
 pub mod host;
 mod interim;
+// Private, save when the fuzz targets are being built.
+#[cfg(feature = "fuzzing")]
+pub mod l4;
+#[cfg(not(feature = "fuzzing"))]
+mod l4;
 mod linger;
 mod metrics;
 mod mirror;

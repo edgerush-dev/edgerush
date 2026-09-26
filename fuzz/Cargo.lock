@@ -163,6 +163,7 @@ dependencies = [
 name = "edgerush-fuzz"
 version = "0.0.0"
 dependencies = [
+ "boring",
  "bytes",
  "edgerush-proxy",
  "edgerush-router",
