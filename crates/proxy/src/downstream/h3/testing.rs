@@ -74,11 +74,17 @@ pub(crate) struct Client {
 impl Client {
     /// A client of `server` asking for `name`, its handshake not yet begun.
     pub(crate) async fn new(server: SocketAddr, name: &str) -> Self {
-        Self::offering(server, name, quiche::h3::APPLICATION_PROTOCOL).await
+        Self::offering(server, name, quiche::h3::APPLICATION_PROTOCOL, |_| {}).await
     }
 
-    /// The same, offering `protocols` in its handshake.
-    async fn offering(server: SocketAddr, name: &str, protocols: &[&[u8]]) -> Self {
+    /// The same, offering `protocols` in its handshake, its transport set up as `configure`
+    /// says past the tests' own settings.
+    async fn offering(
+        server: SocketAddr,
+        name: &str,
+        protocols: &[&[u8]],
+        configure: impl FnOnce(&mut quiche::Config),
+    ) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let local = socket.local_addr().unwrap();
         let mut scid = [0; 16];
@@ -88,6 +94,7 @@ impl Client {
         // A head of a hundred kilobytes goes in one call or not at all: room for it from
         // the start, which a loopback has anyway.
         config.set_initial_congestion_window_packets(1_000);
+        configure(&mut config);
         let quic = quiche::connect(
             Some(name),
             &quiche::ConnectionId::from_ref(&scid),
@@ -113,7 +120,17 @@ impl Client {
 
     /// A client of `server` asking for `name`, through its handshake, speaking HTTP/3.
     pub(crate) async fn connect(server: SocketAddr, name: &str) -> Self {
-        let mut client = Self::new(server, name).await;
+        Self::connect_with(server, name, |_| {}).await
+    }
+
+    /// The same, its transport set up as `configure` says.
+    pub(crate) async fn connect_with(
+        server: SocketAddr,
+        name: &str,
+        configure: impl FnOnce(&mut quiche::Config),
+    ) -> Self {
+        let mut client =
+            Self::offering(server, name, quiche::h3::APPLICATION_PROTOCOL, configure).await;
         client.until(|client| client.quic.is_established()).await;
         let config = quiche::h3::Config::new().unwrap();
         client.h3 =
@@ -125,7 +142,7 @@ impl Client {
     /// A client of `server` asking for `name`, through its handshake, speaking HTTP/0.9 as
     /// quic-interop-runner's clients do.
     pub(crate) async fn connect_hq(server: SocketAddr, name: &str) -> Self {
-        let mut client = Self::offering(server, name, &[hq::ALPN]).await;
+        let mut client = Self::offering(server, name, &[hq::ALPN], |_| {}).await;
         client.until(|client| client.quic.is_established()).await;
         client
     }

@@ -16,7 +16,6 @@ use crate::downstream::h3::listener::Shared;
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::net::SocketAddr;
-use std::task::Context;
 
 /// The most datagrams one call may carry: Linux's `UDP_MAX_SEGMENTS`.
 const MOST_SEGMENTS: usize = 64;
@@ -30,6 +29,16 @@ pub(crate) struct Sending {
     gathered: RefCell<Vec<u8>>,
     /// How many datagrams one call may carry: 1 where the kernel does not cut them.
     segments: Cell<usize>,
+    /// The socket's buffer is full, as the tests say: a loopback's never fills.
+    #[cfg(test)]
+    pub(crate) full: Cell<bool>,
+    /// Sends refused while it was.
+    #[cfg(test)]
+    pub(crate) refused: Cell<usize>,
+    /// Sends the tests refuse as a full buffer would, with room come back before anyone
+    /// waits for it.
+    #[cfg(test)]
+    pub(crate) refuse_briefly: Cell<usize>,
 }
 
 impl Sending {
@@ -42,8 +51,40 @@ impl Sending {
             } else {
                 1
             }),
+            #[cfg(test)]
+            full: Cell::new(false),
+            #[cfg(test)]
+            refused: Cell::new(0),
+            #[cfg(test)]
+            refuse_briefly: Cell::new(0),
         }
     }
+}
+
+/// Whether the tests have this send find no room. A refusal while the socket is full clears
+/// tokio's readiness, as a real one does: there is room again only once the kernel says so.
+#[cfg(test)]
+fn refused(shared: &Shared) -> bool {
+    let sending = &shared.sending;
+    let briefly = sending.refuse_briefly.get();
+    if briefly > 0 {
+        sending.refuse_briefly.set(briefly - 1);
+        return true;
+    }
+    if !sending.full.get() {
+        return false;
+    }
+    sending.refused.set(sending.refused.get() + 1);
+    let _cleared = shared.socket.try_io(tokio::io::Interest::WRITABLE, || {
+        Err::<(), _>(io::Error::from(io::ErrorKind::WouldBlock))
+    });
+    true
+}
+
+/// Outside the tests, every send is tried.
+#[cfg(not(test))]
+const fn refused(_shared: &Shared) -> bool {
+    false
 }
 
 /// Datagrams quiche made that the socket had no room for, kept in order for the next
@@ -119,17 +160,12 @@ impl Gathering {
 }
 
 /// Sends what quiche wants sent, until it has nothing more or the socket has no room;
-/// what was left unsent before goes first. `datagram` is the largest quiche makes.
-pub(crate) fn flush(
-    conn: &Conn,
-    shared: &Shared,
-    datagram: usize,
-    unsent: &mut Unsent,
-    cx: &mut Context<'_>,
-) {
+/// what was left unsent before goes first. `datagram` is the largest quiche makes. What is
+/// left in `unsent` waits for the driver to find room.
+pub(crate) fn flush(conn: &Conn, shared: &Shared, datagram: usize, unsent: &mut Unsent) {
     while !unsent.is_empty() {
         let run = &unsent[0];
-        if !send(shared, &run.bytes, run.segment, run.to, cx) {
+        if !send(shared, &run.bytes, run.segment, run.to) {
             return;
         }
         unsent.remove(0);
@@ -151,13 +187,13 @@ pub(crate) fn flush(
         match gathering.admit(len, info.to, most, datagram) {
             Joins::Run => {}
             Joins::RunAndEnds { segment } => {
-                if !send_or_keep(shared, &gathered, segment, info.to, unsent, cx) {
+                if !send_or_keep(shared, &gathered, segment, info.to, unsent) {
                     return;
                 }
                 gathered.clear();
             }
             Joins::Next { segment, to } => {
-                if !send_or_keep(shared, &gathered[..start], segment, to, unsent, cx) {
+                if !send_or_keep(shared, &gathered[..start], segment, to, unsent) {
                     // The datagram that did not join is kept too, after the run.
                     unsent.push(Run {
                         bytes: gathered[start..].to_vec(),
@@ -174,7 +210,7 @@ pub(crate) fn flush(
     if let Some(to) = gathering.to
         && !gathered.is_empty()
     {
-        send_or_keep(shared, &gathered, gathering.segment, to, unsent, cx);
+        send_or_keep(shared, &gathered, gathering.segment, to, unsent);
     }
 }
 
@@ -185,9 +221,8 @@ fn send_or_keep(
     segment: usize,
     to: SocketAddr,
     unsent: &mut Unsent,
-    cx: &mut Context<'_>,
 ) -> bool {
-    if send(shared, bytes, segment, to, cx) {
+    if send(shared, bytes, segment, to) {
         return true;
     }
     unsent.push(Run {
@@ -198,26 +233,18 @@ fn send_or_keep(
     false
 }
 
-/// Sends a run: false if the socket has no room, which it then says when it has.
-fn send(
-    shared: &Shared,
-    bytes: &[u8],
-    segment: usize,
-    to: SocketAddr,
-    cx: &mut Context<'_>,
-) -> bool {
-    let sent = if bytes.len() > segment {
+/// Sends a run: false if the socket has no room.
+fn send(shared: &Shared, bytes: &[u8], segment: usize, to: SocketAddr) -> bool {
+    let sent = if refused(shared) {
+        Err(io::ErrorKind::WouldBlock.into())
+    } else if bytes.len() > segment {
         send_segmented(&shared.socket, bytes, segment, to)
     } else {
         shared.socket.try_send_to(bytes, to).map(drop)
     };
     match sent {
         Ok(()) => true,
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            // Ready at once only if room came meanwhile, which the next turn finds.
-            let _ready = shared.socket.poll_send_ready(cx);
-            false
-        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
         Err(error) if bytes.len() > segment && refused_segmenting(&error) => {
             // The kernel or the network card will not cut datagrams (quinn finds this the
             // same way): never ask again, and send these one at a time. Any the socket

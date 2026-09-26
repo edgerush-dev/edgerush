@@ -126,6 +126,10 @@ pub(crate) async fn drive<R, F, B, D, G>(
     };
     let mut alarm = Alarm::new(&shared.timers, None);
     let mut drain_heard = pin!(shared.drain.notified());
+    // Room in the socket, waited for when a flush leaves datagrams unsent. The socket is
+    // every connection's: tokio wakes each task waiting on `writable()`, where
+    // `poll_send_ready` keeps only the last task's waker.
+    let mut room = pin!(shared.socket.writable());
     let mut found = Vec::new();
     poll_fn(|cx| {
         conn.drive_with(cx.waker());
@@ -160,18 +164,23 @@ pub(crate) async fn drive<R, F, B, D, G>(
                         settings.stream_idle,
                     ));
                 }
-                flush(&conn, &shared, settings.datagram, &mut driving.unsent, cx);
+                flush(&conn, &shared, settings.datagram, &mut driving.unsent);
                 if driving.to_close && !driving.closing && driving.unsent.is_empty() {
                     conn.with(|state| {
                         // Fails only for a connection already closing.
                         let _closing = state.quic.close(true, code::NO_ERROR, b"");
                     });
                     driving.closing = true;
-                    flush(&conn, &shared, settings.datagram, &mut driving.unsent, cx);
+                    flush(&conn, &shared, settings.datagram, &mut driving.unsent);
                 }
                 if conn.with(|state| state.quic.is_closed()) {
                     return Poll::Ready(());
                 }
+            }
+            // What the socket had no room for goes once it has.
+            if !driving.unsent.is_empty() && room.as_mut().poll(cx).is_ready() {
+                room.set(shared.socket.writable());
+                continue;
             }
             let open = conn.with(|state| state.streams.len());
             let now = Instant::now();

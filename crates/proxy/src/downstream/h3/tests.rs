@@ -348,6 +348,123 @@ fn a_large_answer_arrives_whole() {
     });
 }
 
+/// A connection that finds no room in the socket goes on at once if room is back by the time
+/// it waits for it, as it may be: a wait that is over before it began is not lost. The client
+/// gives the server's retransmission a long wait, so that it does not rescue the answer.
+#[test]
+fn room_back_before_the_wait_is_not_missed() {
+    locally(async {
+        let settings = Settings {
+            keep_alive: Duration::from_secs(10),
+            ..short()
+        };
+        let server = serving(settings, echo).await;
+        let mut client = Client::connect_with(server.address, "a.test", |config| {
+            config.set_max_ack_delay(2_000);
+        })
+        .await;
+        client.for_a_while(Duration::from_millis(50)).await;
+        server.shared.sending.refuse_briefly.set(1);
+        let id = client.request(&get("a.test", "/x"), true);
+        client.flush().await;
+        let asked = tokio::time::Instant::now();
+        while !client
+            .answers
+            .get(&id)
+            .is_some_and(|answer| answer.finished)
+            && asked.elapsed() < Duration::from_millis(500)
+        {
+            client.hear_for(Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.shared.sending.refuse_briefly.get(), 0);
+        let answer = client.answers.get(&id).cloned().unwrap_or_default();
+        assert_eq!(
+            body_of(&answer),
+            "GET /x 0 None",
+            "left waiting: {answer:?}"
+        );
+    });
+}
+
+/// Connections that find no room in the socket they share all go on once it has some
+/// (16 §4): each waits for it on its own, where tokio keeps a single waker for
+/// `poll_send_ready` and a connection that waited there before another was forgotten. On
+/// Linux, where a send on the socket is what tells epoll it has room. The clients give the
+/// server's retransmission a long wait, so that it does not rescue a connection left
+/// waiting.
+#[cfg(target_os = "linux")]
+#[test]
+fn connections_that_found_no_room_all_go_on_when_there_is() {
+    locally(async {
+        let started = Rc::new(Cell::new(0));
+        let gate = Rc::new(Notify::new());
+        let (counting, opening) = (Rc::clone(&started), Rc::clone(&gate));
+        let settings = Settings {
+            keep_alive: Duration::from_secs(10),
+            ..short()
+        };
+        let server = serving(settings, move |request, interim| -> Answering {
+            counting.set(counting.get() + 1);
+            let gate = Rc::clone(&opening);
+            Box::pin(async move {
+                gate.notified().await;
+                echo(request, interim).await
+            })
+        })
+        .await;
+        let patient = |config: &mut quiche::Config| config.set_max_ack_delay(2_000);
+        let mut clients = [
+            Client::connect_with(server.address, "a.test", patient).await,
+            Client::connect_with(server.address, "a.test", patient).await,
+        ];
+        let mut ids = Vec::new();
+        for client in &mut clients {
+            ids.push(client.request(&get("a.test", "/x"), true));
+            client.flush().await;
+        }
+        clients[0].until(|_| started.get() == 2).await;
+        for client in &mut clients {
+            client.for_a_while(Duration::from_millis(50)).await;
+        }
+
+        // Both answers are made while the socket is full, and wait.
+        server.shared.sending.full.set(true);
+        gate.notify_waiters();
+        for client in &mut clients {
+            client.hear_for(Duration::from_millis(50)).await;
+        }
+        assert!(server.shared.sending.refused.get() >= 2);
+        assert!(clients.iter().all(|client| client.answers.is_empty()));
+
+        // Room again: the kernel says so to whoever asked.
+        server.shared.sending.full.set(false);
+        let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket2::SockRef::from(&server.shared.socket)
+            .send_to(b"room", &sink.local_addr().unwrap().into())
+            .unwrap();
+        let finished = |clients: &[Client]| {
+            clients
+                .iter()
+                .zip(&ids)
+                .all(|(client, id)| client.answers.get(id).is_some_and(|answer| answer.finished))
+        };
+        let room = tokio::time::Instant::now();
+        while !finished(&clients) && room.elapsed() < Duration::from_millis(500) {
+            for client in &mut clients {
+                client.hear_for(Duration::from_millis(10)).await;
+            }
+        }
+        for (client, id) in clients.iter().zip(&ids) {
+            let answer = client.answers.get(id).cloned().unwrap_or_default();
+            assert_eq!(
+                body_of(&answer),
+                "GET /x 0 None",
+                "left waiting: {answer:?}"
+            );
+        }
+    });
+}
+
 /// A megabyte's upload, far past a single piece, reaches the core whole, and so does a
 /// client's trailers after it.
 #[test]
