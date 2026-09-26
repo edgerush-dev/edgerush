@@ -64,7 +64,9 @@ pub(crate) struct Settings {
     pub(crate) idle_timeout: Duration,
     /// How long a connection may stay with no request open before it is told to go.
     pub(crate) keep_alive: Duration,
-    /// How long a connection has, from its first packet, to finish its handshake.
+    /// How long a connection has, from its first packet, to finish its handshake: as long
+    /// as its idle timeout, since under loss a handshake's retries back off past 10 s
+    /// (16 §6).
     pub(crate) handshake: Duration,
     /// How long a connection has, from the end of its handshake, to send its first request:
     /// a handshake slowed by loss, and its PTO backing off, leaves the request all of it
@@ -97,7 +99,7 @@ impl Default for Settings {
             field_section: 128 << 10,
             idle_timeout: Duration::from_secs(30),
             keep_alive: Duration::from_secs(30),
-            handshake: Duration::from_secs(10),
+            handshake: Duration::from_secs(30),
             first_request: Duration::from_secs(10),
             stream_idle: Duration::from_secs(30),
             drain_within: Duration::from_secs(25),

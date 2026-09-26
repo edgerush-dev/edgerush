@@ -5,7 +5,7 @@
 //! task has read or written, and when a deadline comes. It hands on what quiche has for the
 //! streams, starts a task for each new request, gives the connection its spare IDs, and
 //! sends what quiche wants sent. Its deadlines, one alarm in the worker's timers for the
-//! soonest: quiche's own; the handshake, 10 s from the first packet, then the first
+//! soonest: quiche's own; the handshake, 30 s from the first packet, then the first
 //! request, 10 s from the handshake's end; the keep-alive, once no request is open; the
 //! drain's bound.
 //!
