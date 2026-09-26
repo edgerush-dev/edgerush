@@ -28,6 +28,27 @@ Every change is marked `EdgeRush:` in the source.
   counted in `recv_single`, cleared where the ACK frame is written in `send_single`. The
   decision is `ack_due`, which `write_pkt_type` asks before it starts a packet for an ACK
   alone (`src/lib.rs`). Five tests at the end of `src/tests.rs` cover it.
+- **A server follows every NAT rebinding.** A server's paths are capped at its
+  `active_connection_id_limit`, two by default, and a new path found room only by dropping
+  one that held no Destination Connection ID. A path the peer has left keeps its ID, and
+  with a peer's zero-length IDs every path keeps sequence 0, so a client's second
+  rebinding found no room and everything from its new address was dropped. Now, when
+  there is no such path, a server drops one the peer migrated away from (`Path::left`,
+  set in `on_peer_migrated`), once the path it migrated to is validated
+  (`PathMap::remove_for_new_path`, called from `get_or_create_recv_path_id`). The dropped
+  path's own ID is retired, so the peer issues a fresh one; a zero-length ID, or one the
+  active path shares after a migration without a spare, stays.
+- **What was in flight to the address a peer left is sent again at once.** Loss recovery
+  is kept per path, and an ACK on the new path does not count towards loss on the old one,
+  so packets sent to the old address just before the move were found lost only by the old
+  path's PTO, a probe or two at each doubling: the gap in a download never closed. Now
+  `on_peer_migrated` also has the old path's recovery declare everything in flight on it
+  lost (`RecoveryOps::on_peer_left`, with a `lose_all` for each of the two recoveries,
+  `recovery/congestion` and `recovery/gcongestion`, accounted as their loss detection
+  accounts), and its frames go on the new path.
+- Three tests (five cases) after `connection_migration_zero_length_cid` in
+  `src/tests.rs` cover both, beside quiche's own `path_probing_dos` and
+  `path_event_queue_bounded_on_port_rotation`, which still pass.
 
 ## Why
 
@@ -46,11 +67,26 @@ upstream costs two packets back: the ACK at once, the answer after. With 256 con
 of one request each, that was 3.0 datagrams a request both ways for EdgeRush and for NGINX,
 and 2.1 for HAProxy, which lets the ACK wait for the answer (16 §2 in the docs).
 
-With both changes, quiche's own library tests pass (1,145 of 1,145, on Windows and Linux,
-with `cargo test --no-default-features --features boringssl-boring-crate --lib`). The
-proxy's probe `several_streams_share_a_packet` in `crates/proxy/tests/h3_library.rs` fails
-against the published crate, and its test `an_answer_carries_the_ack_of_its_request` in
-`crates/proxy/src/downstream/h3/tests.rs` fails without delayed ACKs.
+**Rebinding.** A client's NAT may give it a new port at any time, and does again and
+again on a long connection. quic-interop-runner's rebinding cases move the client every
+five seconds, and every client's download stalled: for good at the first move, the data in
+flight to the old address never sent again, and past the second, no room for its path.
+quinn and NGINX keep the current path and the one before it, and drop the older; HAProxy
+moves its one path. Only paths the peer left are dropped, and only once the path it moved
+to is validated, so what quiche's DoS tests guard still holds: a path the peer is probing
+is kept, and an attacker rotating source addresses cannot validate the paths it makes.
+quinn keeps one loss recovery for the connection, so an ACK on the new path finds the old
+path's packets lost within a round trip; here they are declared lost when the peer moves,
+which RFC 9000 §9.4 leaves to the endpoint. A peer that moved on purpose, its old address
+still working, may have a few packets sent twice.
+
+With all three changes, quiche's own library tests pass (1,150 of 1,150, on Windows and
+Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`).
+The proxy's probe `several_streams_share_a_packet` in `crates/proxy/tests/h3_library.rs`
+fails against the published crate, as do its tests `an_answer_carries_the_ack_of_its_request`
+(without delayed ACKs), `a_client_rebound_again_and_again_is_followed` and
+`a_client_rebound_during_a_large_answer_gets_it_whole` in
+`crates/proxy/src/downstream/h3/tests.rs`.
 
 ## Moving to another version
 

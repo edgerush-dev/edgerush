@@ -11592,6 +11592,271 @@ fn connection_migration_zero_length_cid(
     );
 }
 
+/// EdgeRush: a server follows a peer whose NAT rebinds it again and again, the
+/// peer none the wiser, at the default limit of two paths: with zero-length
+/// connection IDs, as quic-go's client uses, and with IDs of the peer's own.
+/// Some rebindings go back to an earlier port, which leaves the active path
+/// one the peer once left: it is never the path dropped.
+#[rstest]
+fn nat_rebinding_is_followed_every_time(
+    #[values(0, 16)] client_scid_len: usize,
+) {
+    let mut config = nat_config();
+    let mut pipe = pipe_with_exchanged_cids(&mut config, client_scid_len, 16, 1);
+    let first_scid = pipe.client.source_id().into_owned();
+    let mut retired = Vec::new();
+
+    for (at, port) in [1, 2, 1, 3, 1, 3, 4, 5].into_iter().enumerate() {
+        let stream = (at as u64 + 1) * 4;
+        rebind(&mut pipe, 40_000 + port, stream, client_scid_len, &mut retired);
+    }
+
+    // The ID of the path the server dropped first goes back to the client; a
+    // zero-length one has nothing to give back.
+    if client_scid_len > 0 {
+        assert!(retired.contains(&first_scid), "{retired:?}");
+    } else {
+        assert!(retired.is_empty(), "{retired:?}");
+    }
+}
+
+/// EdgeRush: a path dropped to make room keeps back an ID the active path
+/// shares. After a migration with no spare ID the active path uses the old
+/// path's; a probe from yet another address then drops the old path but
+/// leaves the active one in place, and it goes on with its ID.
+#[test]
+fn a_dropped_path_leaves_the_active_path_its_id() {
+    let mut config = nat_config();
+    let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+    let mut retired = Vec::new();
+    rebind(&mut pipe, 40_001, 4, 16, &mut retired);
+    rebind(&mut pipe, 40_002, 8, 16, &mut retired);
+    let active = pipe.server.paths.get_active().expect("no active");
+    let shared = active.active_dcid_seq;
+    assert_eq!(
+        pipe.server
+            .paths
+            .iter()
+            .filter(|(_, p)| p.active_dcid_seq == shared)
+            .count(),
+        2,
+        "the active path shares no ID"
+    );
+
+    // A probe alone, from a third address: it makes a path, but no migration.
+    let elsewhere = SocketAddr::from(([127, 0, 0, 1], 40_099));
+    assert!(pipe
+        .client
+        .probe_path(
+            test_utils::Pipe::client_addr(),
+            test_utils::Pipe::server_addr()
+        )
+        .is_ok());
+    let probe = test_utils::emit_flight(&mut pipe.client).expect("no probe");
+    for (mut pkt, info) in probe {
+        let info = RecvInfo {
+            from: elsewhere,
+            to: info.to,
+        };
+        let _ = pipe.server.recv(&mut pkt, info);
+    }
+    assert!(pipe
+        .server
+        .paths
+        .iter()
+        .any(|(_, p)| p.peer_addr() == elsewhere));
+    let seen = SocketAddr::from(([127, 0, 0, 1], 40_002));
+    assert_eq!(
+        pipe.server
+            .paths
+            .get_active()
+            .expect("no active")
+            .peer_addr(),
+        seen
+    );
+
+    // The active path still answers, with its ID.
+    let mut buf = [0; 16];
+    assert_eq!(pipe.client.stream_send(100, b"ping", true), Ok(4));
+    through_nat(&mut pipe, seen);
+    assert_eq!(pipe.server.stream_recv(100, &mut buf), Ok((4, true)));
+    assert_eq!(pipe.server.stream_send(100, b"pong", true), Ok(4));
+    through_nat(&mut pipe, seen);
+    assert_eq!(pipe.client.stream_recv(100, &mut buf), Ok((4, true)));
+}
+
+/// EdgeRush: what was in flight to the address a peer left when its NAT moved
+/// it is sent again on the new path at once, with either congestion
+/// controller: none of it will be acknowledged on the old path, and waiting for
+/// that path's PTO would send it a probe or two at a time. No time passes here,
+/// so no timer could.
+#[rstest]
+fn nat_rebinding_mid_transfer_resends_what_was_in_flight(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    const SIZE: usize = 200_000;
+
+    let mut config = nat_config();
+    assert_eq!(config.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+    config.set_initial_max_data(10_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+    let data = vec![7; SIZE];
+    let mut buf = [0; 16];
+
+    assert_eq!(pipe.client.stream_send(4, b"get", true), Ok(3));
+    through_nat(&mut pipe, test_utils::Pipe::client_addr());
+    assert_eq!(pipe.server.stream_recv(4, &mut buf), Ok((3, true)));
+
+    // A flight on its way, half of which reaches the client before its NAT
+    // moves it.
+    let mut offset = pipe.server.stream_send(4, &data, true).unwrap();
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    assert!(flight.len() >= 4, "{} packets", flight.len());
+    let half = flight.len() / 2;
+    for (mut pkt, info) in flight.into_iter().take(half) {
+        let info = RecvInfo {
+            from: info.from,
+            to: info.to,
+        };
+        assert!(pipe.client.recv(&mut pkt, info).is_ok());
+    }
+
+    let seen = SocketAddr::from(([127, 0, 0, 1], 40_001));
+    let mut received = 0;
+    let mut out = vec![0; 65_535];
+    for _ in 0..200 {
+        through_nat(&mut pipe, seen);
+
+        while let Ok((read, _)) = pipe.client.stream_recv(4, &mut out) {
+            received += read;
+        }
+
+        if received == SIZE {
+            break;
+        }
+
+        if offset < SIZE {
+            offset += pipe.server.stream_send(4, &data[offset..], true).unwrap_or(0);
+        }
+    }
+
+    assert_eq!(received, SIZE);
+}
+
+/// EdgeRush: a server's config for the NAT rebinding tests, which asks peers
+/// not to migrate, as EdgeRush does: a rebinding is not a migration of theirs.
+fn nat_config() -> Config {
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+    config
+        .load_cert_chain_from_pem_file("examples/cert.crt")
+        .unwrap();
+    config
+        .load_priv_key_from_pem_file("examples/cert.key")
+        .unwrap();
+    config
+        .set_application_protos(&[b"proto1", b"proto2"])
+        .unwrap();
+    config.verify_peer(false);
+    config.set_initial_max_data(100_000);
+    config.set_initial_max_stream_data_bidi_local(10_000);
+    config.set_initial_max_stream_data_bidi_remote(10_000);
+    config.set_initial_max_streams_bidi(100);
+    config.set_disable_active_migration(true);
+    config
+}
+
+/// EdgeRush: the client's NAT gives it `port`, and a request and its answer
+/// cross, on `stream`. Then the client replaces every ID retired, as real
+/// clients do, adding them to `retired`, so that the server has a spare one
+/// when it next drops a path.
+fn rebind(
+    pipe: &mut test_utils::Pipe, port: u16, stream: u64, client_scid_len: usize,
+    retired: &mut Vec<ConnectionId<'static>>,
+) {
+    let seen = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut buf = [0; 16];
+
+    assert_eq!(pipe.client.stream_send(stream, b"ping", true), Ok(4));
+    through_nat(pipe, seen);
+    assert_eq!(
+        pipe.server.stream_recv(stream, &mut buf),
+        Ok((4, true)),
+        "port {port}"
+    );
+    assert_eq!(
+        pipe.server
+            .paths
+            .get_active()
+            .expect("no active")
+            .peer_addr(),
+        seen,
+        "port {port}"
+    );
+
+    assert_eq!(pipe.server.stream_send(stream, b"pong", true), Ok(4));
+    through_nat(pipe, seen);
+    assert_eq!(
+        pipe.client.stream_recv(stream, &mut buf),
+        Ok((4, true)),
+        "port {port}"
+    );
+
+    while let Some(scid) = pipe.client.retired_scid_next() {
+        retired.push(scid);
+        let (cid, reset_token) =
+            test_utils::create_cid_and_reset_token(client_scid_len);
+        assert!(pipe.client.new_scid(&cid, reset_token, false).is_ok());
+    }
+    through_nat(pipe, seen);
+}
+
+/// EdgeRush: carries packets both ways through a NAT that shows the client to
+/// the server at `seen`, and drops what the server sends anywhere else, until
+/// neither side has more to send.
+fn through_nat(pipe: &mut test_utils::Pipe, seen: SocketAddr) {
+    let client_addr = test_utils::Pipe::client_addr();
+
+    for _ in 0..50 {
+        let mut moved = false;
+
+        if let Ok(flight) = test_utils::emit_flight(&mut pipe.client) {
+            moved = true;
+
+            for (mut pkt, info) in flight {
+                let info = RecvInfo {
+                    from: seen,
+                    to: info.to,
+                };
+                let _ = pipe.server.recv(&mut pkt, info);
+            }
+        }
+
+        if let Ok(flight) = test_utils::emit_flight(&mut pipe.server) {
+            moved = true;
+
+            for (mut pkt, info) in flight {
+                if info.to != seen {
+                    continue;
+                }
+
+                let info = RecvInfo {
+                    from: info.from,
+                    to: client_addr,
+                };
+                let _ = pipe.client.recv(&mut pkt, info);
+            }
+        }
+
+        if !moved {
+            return;
+        }
+    }
+
+    panic!("the peers never went quiet");
+}
+
 #[rstest]
 fn connection_migration_reordered_non_probing(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,

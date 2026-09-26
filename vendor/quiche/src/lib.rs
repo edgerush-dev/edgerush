@@ -9226,6 +9226,35 @@ impl<F: BufFactory> Connection<F> {
         // Automatically probes the new path.
         path.request_validation();
 
+        // EdgeRush: a server follows every new address its peer's NAT gives it.
+        // A full path map with no unused path in it refused the new path, and
+        // everything from the new address was dropped: a peer using zero-length
+        // IDs leaves every path its sequence 0, and one using IDs of its own
+        // leaves the old path its ID, so the second rebinding of any peer found
+        // no room at the default limit of two. Instead the path the peer
+        // migrated away from goes, once the path it migrated to is validated,
+        // as NGINX and quinn drop their previous path (the rest of the reasons
+        // are at `PathMap::remove_for_new_path()`). Its Destination Connection
+        // ID is retired, for the peer to issue a fresh one, unless it is
+        // zero-length or the active path shares it after a migration that had
+        // no spare. Done after the old path of a reused SCID was looked up
+        // above; the new path takes the slot freed.
+        if self.is_server {
+            if let Some(dropped) = self.paths.remove_for_new_path() {
+                if let Some(seq) = dropped.active_dcid_seq {
+                    let shared = self
+                        .paths
+                        .iter()
+                        .any(|(_, p)| p.active_dcid_seq == Some(seq));
+
+                    if !ids.zero_length_dcid() && !shared {
+                        // Fails only for an ID already retired.
+                        let _ = ids.retire_dcid(seq);
+                    }
+                }
+            }
+        }
+
         let pid = self.paths.insert_path(path, self.is_server)?;
 
         // Notify the application of CID reuse only after the path was
@@ -9325,6 +9354,24 @@ impl<F: BufFactory> Connection<F> {
         }
 
         self.set_active_path(new_pid, now)?;
+
+        // EdgeRush: a path the peer left may make room for its next one (see
+        // `PathMap::remove_for_new_path()`), and what is in flight on it is
+        // lost, to be sent again on the new one (see
+        // `RecoveryOps::on_peer_left()`).
+        let handshake_status = self.handshake_status();
+        let left = self.paths.get_mut(active_path_id)?;
+        left.left = true;
+
+        for &e in packet::Epoch::epochs(
+            packet::Epoch::Initial..=packet::Epoch::Application,
+        ) {
+            let (lost_packets, lost_bytes) =
+                left.recovery.on_peer_left(e, handshake_status, now);
+
+            self.lost_count += lost_packets;
+            self.lost_bytes += lost_bytes as u64;
+        }
 
         let no_spare_dcid =
             self.paths.get_mut(new_pid)?.active_dcid_seq.is_none();

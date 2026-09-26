@@ -540,6 +540,58 @@ fn a_client_that_lands_on_another_worker_is_served_by_its_own() {
     });
 }
 
+/// A client whose NAT rebinds it again and again, the client none the wiser, is followed to
+/// each new address (16 §3): quiche keeps two paths, and each new one takes the place of
+/// the one before. This client has no spare ID to give, so each new path shares the ID of
+/// the path it follows.
+#[test]
+fn a_client_rebound_again_and_again_is_followed() {
+    locally(async {
+        let server = serving(short(), echo).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        for rebinding in 0..5 {
+            client.rebind().await;
+            let path = format!("/{rebinding}");
+            let answer = client.get("a.test", &path).await;
+            assert_eq!(body_of(&answer), format!("GET {path} 0 None"));
+        }
+    });
+}
+
+/// A client rebound by its NAT while a large answer is on its way, the client none the
+/// wiser, still gets all of it: what was in flight to the old address is sent again to
+/// the new one.
+#[test]
+fn a_client_rebound_during_a_large_answer_gets_it_whole() {
+    locally(async {
+        const SIZE: usize = 4 << 20;
+        let server = serving(short(), |_request, _interim| -> Answering {
+            Box::pin(async move {
+                let body: Vec<u8> = (0..SIZE).map(|at| (at % 251) as u8).collect();
+                Answered::Map(Response::new(Full::new(Bytes::from(body))))
+            })
+        })
+        .await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let id = client.request(&get("a.test", "/big"), true);
+        client
+            .until(|client| {
+                client
+                    .answers
+                    .get(&id)
+                    .is_some_and(|answer| answer.body.len() > 256 << 10)
+            })
+            .await;
+        client.rebind().await;
+        // The client says something from its new address, as a client does whose
+        // acknowledgements are owed: nothing else would tell the server.
+        client.quic.send_ack_eliciting().unwrap();
+        client.flush().await;
+        let answer = client.answer(id).await;
+        assert_eq!(answer.body.len(), SIZE);
+    });
+}
+
 // HTTP/0.9 over QUIC, as quic-interop-runner's transport cases speak it (16 §8).
 
 /// A GET's line goes to the core as an HTTP/3 GET of the name the client asked for, and the

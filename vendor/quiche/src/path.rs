@@ -252,6 +252,11 @@ pub struct Path {
 
     /// Whether or not we should force eliciting of an ACK (e.g. via PING frame)
     pub needs_ack_eliciting: bool,
+
+    /// EdgeRush: whether the peer migrated away from this path, which a server
+    /// may then drop to make room for a new one. See
+    /// `PathMap::remove_for_new_path()`.
+    pub left: bool,
 }
 
 impl Path {
@@ -320,6 +325,7 @@ impl Path {
             failure_notified: false,
             migrating: false,
             needs_ack_eliciting: false,
+            left: false,
         }
     }
 
@@ -809,6 +815,42 @@ impl PathMap {
         self.notify_event(PathEvent::Closed(path.local_addr, path.peer_addr));
 
         Ok(())
+    }
+
+    /// EdgeRush: makes room for a server's new path where `insert_path()` could
+    /// not, the map being full with no unused path in it, by removing a path
+    /// the peer migrated away from, once the path it migrated to is validated.
+    /// A path the peer still probes is kept, as is every path while the active
+    /// one is unvalidated: a peer only rebound by its NAT answers from its new
+    /// address, and an attacker rotating source addresses does not, so it
+    /// cannot churn paths past the first. The removed path is returned, for the
+    /// connection to retire its Destination Connection ID. See
+    /// `Connection::get_or_create_recv_path_id()`.
+    pub fn remove_for_new_path(&mut self) -> Option<Path> {
+        if self.paths.len() < self.max_concurrent_paths ||
+            self.paths.iter().any(|(_, p)| p.unused())
+        {
+            return None;
+        }
+
+        let active = self.get_active_path_id().ok()?;
+
+        if !self.paths.get(active)?.validated() {
+            return None;
+        }
+
+        let (pid_to_remove, _) = self
+            .paths
+            .iter()
+            .find(|(pid, p)| *pid != active && p.left)?;
+
+        let path = self.paths.remove(pid_to_remove);
+        self.addrs_to_paths
+            .remove(&(path.local_addr, path.peer_addr));
+
+        self.notify_event(PathEvent::Closed(path.local_addr, path.peer_addr));
+
+        Some(path)
     }
 
     /// Records the provided `Path` and returns its assigned identifier.

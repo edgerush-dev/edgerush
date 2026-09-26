@@ -232,6 +232,16 @@ pub trait RecoveryOps {
     fn on_path_change(
         &mut self, epoch: packet::Epoch, now: Instant, _trace_id: &str,
     ) -> (usize, usize);
+    /// EdgeRush: the peer left the path this recovery is for. Everything in
+    /// flight on it is declared lost at once, for its frames to be sent again
+    /// on the path the peer moved to: none of it will be acknowledged here,
+    /// and an ACK on another path does not count towards loss on this one, so
+    /// otherwise only this path's PTO, a probe or two at each doubling, would
+    /// send it again. Returns the packets and bytes lost.
+    fn on_peer_left(
+        &mut self, epoch: packet::Epoch, handshake_status: HandshakeStatus,
+        now: Instant,
+    ) -> (usize, usize);
     fn loss_detection_timer(&self) -> Option<Instant>;
     fn cwnd(&self) -> usize;
     fn cwnd_available(&self) -> usize;

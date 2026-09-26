@@ -336,6 +336,58 @@ impl RecoveryEpoch {
         }
     }
 
+    /// EdgeRush: declares lost every packet not yet acked or lost, as
+    /// `detect_and_remove_lost_packets()` does those past its thresholds. See
+    /// `RecoveryOps::on_peer_left()`.
+    fn lose_all(&mut self, newly_lost: &mut Vec<Lost>) -> LossDetectionResult {
+        newly_lost.clear();
+        let mut lost_bytes = 0;
+        self.loss_time = None;
+        self.loss_probes = 0;
+        let mut pmtud_lost_bytes = 0;
+        let mut pmtud_lost_packets = SmallVec::new();
+
+        for SentPacket { pkt_num, status } in &mut self.sent_packets {
+            if let SentStatus::Sent {
+                in_flight,
+                sent_bytes,
+                frames,
+                is_pmtud_probe,
+                ..
+            } = status.lose()
+            {
+                self.lost_frames_ack.extend(frames);
+
+                if in_flight {
+                    self.pkts_in_flight -= 1;
+
+                    if is_pmtud_probe {
+                        pmtud_lost_bytes += sent_bytes;
+                        pmtud_lost_packets.push(*pkt_num);
+                        continue;
+                    }
+
+                    lost_bytes += sent_bytes;
+                }
+
+                newly_lost.push(Lost {
+                    packet_number: *pkt_num,
+                    bytes_lost: sent_bytes,
+                });
+            }
+        }
+
+        self.drain_acked_and_lost_packets();
+
+        LossDetectionResult {
+            lost_bytes,
+            lost_packets: newly_lost.len(),
+
+            pmtud_lost_bytes,
+            pmtud_lost_packets,
+        }
+    }
+
     /// Remove packets that were already handled from the front of the queue,
     /// but avoid removing packets from the middle of the queue to avoid
     /// compaction
@@ -1020,6 +1072,31 @@ impl RecoveryOps for GRecovery {
     ) -> (usize, usize) {
         let (lost_bytes, lost_packets) =
             self.detect_and_remove_lost_packets(epoch, now);
+
+        (lost_packets, lost_bytes)
+    }
+
+    fn on_peer_left(
+        &mut self, epoch: packet::Epoch, handshake_status: HandshakeStatus,
+        now: Instant,
+    ) -> (usize, usize) {
+        let lost = &mut self.lost_reuse;
+
+        let LossDetectionResult {
+            lost_bytes,
+            lost_packets,
+            pmtud_lost_bytes,
+            pmtud_lost_packets,
+        } = self.epochs[epoch].lose_all(lost);
+
+        self.bytes_in_flight
+            .saturating_subtract(lost_bytes + pmtud_lost_bytes, now);
+
+        for pkt in pmtud_lost_packets {
+            self.pacer.on_packet_neutered(pkt);
+        }
+
+        self.set_loss_detection_timer(handshake_status, now);
 
         (lost_packets, lost_bytes)
     }

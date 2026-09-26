@@ -302,6 +302,52 @@ impl RecoveryEpoch {
         }
     }
 
+    /// EdgeRush: declares lost every packet not yet acked or lost, as
+    /// `detect_lost_packets()` does those past its thresholds. See
+    /// `RecoveryOps::on_peer_left()`.
+    fn lose_all(&mut self, now: Instant) -> LossDetectionResult {
+        self.loss_time = None;
+        self.loss_probes = 0;
+
+        let mut lost_packets = 0;
+        let mut lost_bytes = 0;
+        let mut pmtud_lost_bytes = 0;
+        let mut largest_lost_pkt = None;
+
+        let unacked_iter = self
+            .sent_packets
+            .iter_mut()
+            .filter(|p| p.time_acked.is_none() && p.time_lost.is_none());
+
+        for unacked in unacked_iter {
+            self.lost_frames_ack.extend(unacked.frames.drain(..));
+
+            unacked.time_lost = Some(now);
+
+            if unacked.is_pmtud_probe {
+                pmtud_lost_bytes += unacked.size;
+                self.in_flight_count -= 1;
+
+                continue;
+            }
+
+            if unacked.in_flight {
+                lost_bytes += unacked.size;
+                largest_lost_pkt = Some(unacked.clone());
+                self.in_flight_count -= 1;
+            }
+
+            lost_packets += 1;
+        }
+
+        LossDetectionResult {
+            largest_lost_pkt,
+            lost_packets,
+            lost_bytes,
+            pmtud_lost_bytes,
+        }
+    }
+
     fn drain_acked_and_lost_packets(&mut self, loss_thresh: Instant) {
         // In order to avoid removing elements from the middle of the list
         // (which would require copying other elements to compact the list),
@@ -542,6 +588,14 @@ impl LegacyRecovery {
             epoch,
         );
 
+        self.account_losses(epoch, loss, now)
+    }
+
+    /// EdgeRush: what `detect_lost_packets()` did with the losses it found,
+    /// for `on_peer_left()` to do the same.
+    fn account_losses(
+        &mut self, epoch: Epoch, loss: LossDetectionResult, now: Instant,
+    ) -> (usize, usize) {
         if let Some(pkt) = loss.largest_lost_pkt {
             if !self.congestion.in_congestion_recovery(pkt.time_sent) {
                 (self.congestion.cc_ops.checkpoint)(&mut self.congestion);
@@ -872,6 +926,17 @@ impl RecoveryOps for LegacyRecovery {
     ) -> (usize, usize) {
         // Time threshold loss detection.
         self.detect_lost_packets(epoch, now, trace_id)
+    }
+
+    fn on_peer_left(
+        &mut self, epoch: Epoch, handshake_status: HandshakeStatus, now: Instant,
+    ) -> (usize, usize) {
+        let loss = self.epochs[epoch].lose_all(now);
+        let lost = self.account_losses(epoch, loss, now);
+
+        self.set_loss_detection_timer(handshake_status, now);
+
+        lost
     }
 
     fn loss_detection_timer(&self) -> Option<Instant> {
