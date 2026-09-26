@@ -17,7 +17,7 @@ use crate::downstream::h3::conn::{Conn, Slot, State};
 use crate::downstream::h3::head::Refused;
 use crate::interim::Interim;
 use crate::request_body::RequestBodyError;
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use http_body::{Body, Frame, SizeHint};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -125,7 +125,8 @@ impl IncomingH3 {
                 return Poll::Ready(Some(Err(other(StreamError::Closed))));
             };
             let mut piece = BytesMut::with_capacity(PIECE);
-            match h3.recv_body_buf(quic, self.stream, &mut piece) {
+            // quiche reads on while the buffer has room, which one that grows always has.
+            match h3.recv_body_buf(quic, self.stream, (&mut piece).limit(PIECE)) {
                 Ok(read) if read > 0 => {
                     self.received += read as u64;
                     if self

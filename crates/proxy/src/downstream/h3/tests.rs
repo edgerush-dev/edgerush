@@ -365,6 +365,31 @@ fn an_upload_and_its_trailers_reach_the_core() {
     });
 }
 
+/// An upload that waits in quiche is read out a piece of 16 KiB at a time, however much of
+/// it has come: what one read takes, and the credit it gives back, stay within a piece.
+#[test]
+fn an_upload_is_read_a_piece_at_a_time() {
+    locally(async {
+        let server = serving(short(), |mut request, _interim| -> Answering {
+            Box::pin(async move {
+                // Everything is in quiche by the time the first piece is read.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let frame = request.body_mut().frame().await.unwrap().unwrap();
+                let length = frame.into_data().unwrap().len();
+                Answered::Map(Response::new(Full::new(Bytes::from(length.to_string()))))
+            })
+        })
+        .await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let mut head = get("a.test", "/up");
+        head[0].1 = "POST";
+        let id = client.request(&head, false);
+        client.body(id, &vec![42; 64 << 10], true).await;
+        let answer = client.answer(id).await;
+        assert_eq!(body_of(&answer), (16 << 10).to_string());
+    });
+}
+
 /// The echo core, which also keeps what it would have said, for a stream reset before its
 /// answer could go.
 fn heard_echo(
