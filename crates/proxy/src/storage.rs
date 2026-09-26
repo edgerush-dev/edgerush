@@ -104,6 +104,16 @@ impl Storage {
         self.used.get()
     }
 
+    /// Whether a byte more would fit under the limit, memory freed since the last sweep
+    /// included. Asking charges nothing.
+    pub fn has_room(&self) -> bool {
+        let room = self.take(1, Ceiling::Limit).is_ok();
+        if room {
+            self.give(1);
+        }
+        room
+    }
+
     /// Reserves `bytes`, if they fit under the limit with everything already held.
     ///
     /// # Errors
@@ -280,6 +290,20 @@ mod tests {
         let _rest = storage.reserve(40).unwrap();
         assert_eq!(storage.used(), 100);
         assert!(storage.reserve(1).is_err());
+    }
+
+    /// A full account has no room for a byte more, and one below its limit has; asking
+    /// charges nothing.
+    #[test]
+    fn a_full_account_has_no_room() {
+        let storage = Storage::new(100);
+        assert!(storage.has_room());
+        let held = storage.reserve(100).unwrap();
+        assert!(!storage.has_room());
+        assert_eq!(storage.used(), 100);
+        drop(held);
+        assert!(storage.has_room());
+        assert_eq!(storage.used(), 0);
     }
 
     /// A count that would wrap is refused, not wrapped into a small number that fits.

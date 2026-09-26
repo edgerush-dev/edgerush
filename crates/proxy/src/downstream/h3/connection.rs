@@ -142,6 +142,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
             }
             if conn.take_stirred() || !driving.unsent.is_empty() {
                 turn(&conn, &shared, &mut driving, &mut found);
+                account(&conn, &shared);
                 for request in found.drain(..) {
                     driving.asked = true;
                     let stream = Stream::adopt(&conn, request.id);
@@ -248,6 +249,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
     })
     .await;
     // Closed: every stream's task learns it, and the connection's IDs find nothing more.
+    // Its charge goes when the last thing holding it lets go of it, with quiche's memory.
     conn.with(|state| {
         state.closed = true;
         for slot in state.streams.values_mut() {
@@ -273,6 +275,23 @@ pub(crate) async fn drive<R, F, B, D, G>(
         shared.ended.notify_one();
     }
     drop(opened);
+}
+
+/// Charges the worker what quiche holds for `conn` (16 §6). A worker that has run out closes
+/// its QUIC connection charged the most, which lets go of its charge at once, and tries
+/// again, until the charge fits or `conn` is the one closed. If none holds anything, the
+/// storage is the other protocols', and `conn`, which cannot be paid for, is closed.
+fn account(conn: &Rc<Conn>, shared: &Shared) {
+    while conn.charge(&shared.storage).is_err() {
+        let heaviest = shared
+            .table
+            .borrow()
+            .values()
+            .max_by_key(|held| held.charged())
+            .filter(|held| held.charged() > 0)
+            .cloned();
+        heaviest.as_ref().unwrap_or(conn).shed();
+    }
 }
 
 /// Closes the connection with nothing wrong, once the client has been told which requests

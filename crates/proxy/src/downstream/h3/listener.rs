@@ -27,6 +27,7 @@ use crate::quic::header::{self, Header, VERSION_1};
 use crate::quic::id::{self, Codec, IdError, Keys, Nonces};
 use crate::quic::token;
 use crate::request_body::RequestBody;
+use crate::storage::Storage;
 use crate::timers::Timers;
 use crate::tls::Tls;
 use bytes::Bytes;
@@ -231,6 +232,9 @@ pub(crate) struct Shared {
     retry_key: [u8; 32],
     pub(crate) timers: Rc<Timers>,
     pub(crate) drain: Rc<Drain>,
+    /// The worker's account of what it holds for requests, charged what quiche holds for
+    /// the listener's connections (16 §6).
+    pub(crate) storage: Rc<Storage>,
     /// Connections not yet through their handshake.
     pub(crate) handshakes: Cell<usize>,
     /// Connections held.
@@ -260,7 +264,12 @@ pub(crate) enum ListenerError {
 }
 
 impl Shared {
-    /// A listener on `socket`, as the `worker`th worker of those `secrets` are shared by.
+    /// A listener on `socket`, as the `worker`th worker of those `secrets` are shared by,
+    /// charging what its connections hold to `storage`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is the worker's, handed in once when the listener is made"
+    )]
     pub(crate) fn new(
         socket: UdpSocket,
         settings: Settings,
@@ -268,6 +277,7 @@ impl Shared {
         worker: u16,
         timers: Rc<Timers>,
         drain: Rc<Drain>,
+        storage: Rc<Storage>,
         count: Box<dyn Fn(Quic)>,
     ) -> Result<Self, ListenerError> {
         Ok(Self {
@@ -280,6 +290,7 @@ impl Shared {
             retry_key: secrets.retry,
             timers,
             drain,
+            storage,
             handshakes: Cell::new(0),
             connections: Cell::new(0),
             ended: tokio::sync::Notify::new(),
@@ -511,10 +522,12 @@ fn admit<T: Fn() -> Option<InForce>>(
         }
         return None;
     }
+    // A worker whose storage is full takes no one, as at its bound (16 §6).
     if !long.is_initial()
         || datagram.len() < INITIAL_DATAGRAM
         || shared.drain.is_on()
         || shared.connections.get() >= shared.settings.connections
+        || !shared.storage.has_room()
     {
         return None;
     }

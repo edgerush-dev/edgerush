@@ -37,6 +37,9 @@ pub(crate) mod code {
     pub(crate) const NO_ERROR: u64 = 0x100;
     /// The server failed: an answer broke off.
     pub(crate) const INTERNAL_ERROR: u64 = 0x102;
+    /// The client makes the server hold too much: a connection closed so that the worker
+    /// has room (16 §6).
+    pub(crate) const EXCESSIVE_LOAD: u64 = 0x107;
     /// Not processed at all, so a client may send it again (§4.1.1).
     pub(crate) const REQUEST_REJECTED: u64 = 0x10b;
     /// Given up after it was processed in part.

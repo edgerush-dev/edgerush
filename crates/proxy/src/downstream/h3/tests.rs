@@ -15,10 +15,11 @@ use crate::downstream::h3::Settings;
 use crate::downstream::h3::code;
 use crate::downstream::h3::conn::State;
 use crate::downstream::h3::listener::{self, Forwarding, InForce, Secrets, Shared};
-use crate::downstream::h3::testing::{Client, get};
+use crate::downstream::h3::testing::{Client, PATIENCE, get};
 use crate::drain::Drain;
 use crate::interim::Interim;
 use crate::request_body::{RequestBody, RequestBodyError};
+use crate::storage::{LIMIT, Storage};
 use crate::timers::Timers;
 use crate::tls::Tls;
 use crate::tls::testing::certificate;
@@ -140,12 +141,49 @@ where
     .await
 }
 
+/// The same for a worker whose storage is `storage`.
+async fn serving_in<F, B>(
+    settings: Settings,
+    storage: Rc<Storage>,
+    respond: impl Fn(Request<RequestBody>, Interim) -> F + 'static,
+) -> Server
+where
+    F: Future<Output = Answered<B>> + 'static,
+    B: Body<Data = Bytes> + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    serving_on(
+        settings,
+        respond,
+        &Secrets::new().unwrap(),
+        Forwarding::group(1).remove(0),
+        storage,
+    )
+    .await
+}
+
 /// The same as the worker `forwarding` is the share of, among those `secrets` are shared by.
 async fn serving_as<F, B>(
     settings: Settings,
     respond: impl Fn(Request<RequestBody>, Interim) -> F + 'static,
     secrets: &Secrets,
     forwarding: Forwarding,
+) -> Server
+where
+    F: Future<Output = Answered<B>> + 'static,
+    B: Body<Data = Bytes> + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    serving_on(settings, respond, secrets, forwarding, Storage::new(LIMIT)).await
+}
+
+/// The same, for a worker whose storage is `storage`.
+async fn serving_on<F, B>(
+    settings: Settings,
+    respond: impl Fn(Request<RequestBody>, Interim) -> F + 'static,
+    secrets: &Secrets,
+    forwarding: Forwarding,
+    storage: Rc<Storage>,
 ) -> Server
 where
     F: Future<Output = Answered<B>> + 'static,
@@ -176,6 +214,7 @@ where
             u16::try_from(forwarding.worker()).unwrap(),
             timers,
             Rc::clone(&drain),
+            storage,
             Box::new(|_| {}),
         )
         .unwrap(),
@@ -522,6 +561,144 @@ fn an_upload_and_its_trailers_reach_the_core() {
         client.trailers(id, &[("x-sum", "7")]).await;
         let answer = client.answer(id).await;
         assert_eq!(body_of(&answer), r#"POST /up 1048576 Some("7")"#);
+    });
+}
+
+/// The POST of a body that is to come.
+fn post(path: &str) -> Vec<(&str, &str)> {
+    let mut head = get("a.test", path);
+    head[0].1 = "POST";
+    head
+}
+
+/// A worker is charged what quiche holds for its connections — an upload not yet read, in
+/// bytes and 128 bytes more for each piece it is held in — until it is read, and what is
+/// left until the connection goes (16 §6).
+#[test]
+fn the_worker_is_charged_what_quiche_holds_for_it() {
+    locally(async {
+        const SIZE: usize = 100 << 10;
+        let storage = Storage::new(LIMIT);
+        let gate = Rc::new(Notify::new());
+        let opening = Rc::clone(&gate);
+        let server = serving_in(short(), Rc::clone(&storage), move |request, interim| {
+            let gate = Rc::clone(&opening);
+            Box::pin(async move {
+                gate.notified().await;
+                echo(request, interim).await
+            })
+        })
+        .await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let id = client.request(&post("/up"), false);
+        client.body(id, &vec![1; SIZE], true).await;
+        client.until(|_| storage.used() >= SIZE + 128).await;
+        let charged = storage.used();
+        assert!(charged < SIZE + (64 << 10), "{charged} charged");
+
+        // Read, it is quiche's no more.
+        gate.notify_one();
+        assert_eq!(
+            body_of(&client.answer(id).await),
+            format!("POST /up {SIZE} None")
+        );
+        client.until(|_| storage.used() < 4 << 10).await;
+
+        client.quic.close(true, code::NO_ERROR, b"").unwrap();
+        client.flush().await;
+        client.until(|_| storage.used() == 0).await;
+    });
+}
+
+/// A head that has come in part is charged as it comes: quiche holds its frame whole until
+/// it has all come.
+#[test]
+fn a_head_that_has_come_in_part_is_charged() {
+    locally(async {
+        let storage = Storage::new(LIMIT);
+        let server = serving_in(short(), Rc::clone(&storage), echo).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        client.for_a_while(Duration::from_millis(50)).await;
+        let before = storage.used();
+        // A HEADERS frame of 100 KiB, of which 50 KiB have come.
+        let mut part = vec![0x01, 0x80, 0x01, 0x90, 0x00];
+        part.extend(vec![0; 50 << 10]);
+        assert_eq!(client.quic.stream_send(0, &part, false), Ok(part.len()));
+        client.flush().await;
+        client
+            .until(|_| storage.used() >= before + (50 << 10))
+            .await;
+    });
+}
+
+/// A worker whose storage is full admits no new QUIC connection: its Initial is dropped, as
+/// at the connection bound, and the client comes in once there is room (16 §6).
+#[test]
+fn a_full_worker_admits_no_new_connection() {
+    locally(async {
+        let storage = Storage::new(1 << 20);
+        let server = serving_in(short(), Rc::clone(&storage), echo).await;
+        let full = storage.reserve(1 << 20).unwrap();
+        let mut client = Client::new(server.address, "a.test").await;
+        client.for_a_while(Duration::from_millis(300)).await;
+        assert!(!client.quic.is_established());
+        assert_eq!(server.shared.connections.get(), 0);
+
+        drop(full);
+        client.until(|client| client.quic.is_established()).await;
+    });
+}
+
+/// A connection that asks for nothing more is not closed while the worker's own answers take
+/// its storage past the limit, as they may (14 §8): only more is refused there.
+#[test]
+fn a_connection_asking_nothing_more_is_kept_past_the_limit() {
+    locally(async {
+        let storage = Storage::with_provision(1 << 20, 1 << 20);
+        let server = serving_in(short(), Rc::clone(&storage), echo).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        assert_eq!(
+            body_of(&client.get("a.test", "/one").await),
+            "GET /one 0 None"
+        );
+        client.for_a_while(Duration::from_millis(50)).await;
+        let _answers = storage
+            .reserve_answer((1 << 20) - storage.used() + 1)
+            .unwrap();
+        client.quic.send_ack_eliciting().unwrap();
+        client.for_a_while(Duration::from_millis(100)).await;
+        assert_eq!(client.closed_by_server(), None);
+    });
+}
+
+/// A worker that runs out closes its QUIC connection holding the most, with
+/// H3_EXCESSIVE_LOAD, and lets go of its charge at once: the connection that asked for
+/// more goes on (16 §6).
+#[test]
+fn a_worker_that_runs_out_closes_its_heaviest_connection() {
+    locally(async {
+        let storage = Storage::new(1 << 20);
+        let exchanges = Exchanges::default();
+        let server = serving_in(short(), Rc::clone(&storage), exchanges.core()).await;
+        let mut heavy = Client::connect(server.address, "a.test").await;
+        let mut light = Client::connect(server.address, "a.test").await;
+        let id = heavy.request(&post("/heavy"), false);
+        heavy.body(id, &vec![1; 700 << 10], false).await;
+        heavy.until(|_| storage.used() >= 700 << 10).await;
+
+        // Both driven, so that what the server's socket had no room for is sent again.
+        let id = light.request(&post("/light"), false);
+        light.body(id, &vec![1; 400 << 10], false).await;
+        let started = tokio::time::Instant::now();
+        while heavy.closed_by_server().is_none() {
+            assert!(started.elapsed() < PATIENCE, "the heaviest was not closed");
+            light.for_a_while(Duration::from_millis(20)).await;
+            heavy.for_a_while(Duration::from_millis(20)).await;
+        }
+        assert_eq!(heavy.closed_by_server(), Some((true, code::EXCESSIVE_LOAD)));
+        light.for_a_while(Duration::from_millis(100)).await;
+        assert_eq!(light.closed_by_server(), None);
+        assert!(storage.used() <= 1 << 20);
     });
 }
 

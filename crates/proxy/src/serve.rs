@@ -1324,6 +1324,7 @@ impl Worker {
             self.position,
             Rc::clone(&self.timers),
             Rc::clone(&self.drain),
+            Rc::clone(self.blocks.borrow().storage()),
             count,
         )
         .map_err(io::Error::other)?;

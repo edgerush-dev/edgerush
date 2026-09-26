@@ -8,11 +8,18 @@
 //! that its body has more, that its client reset it, that it can take more of its answer.
 
 use crate::downstream::h3::head::Refused;
+use crate::storage::{Charge, Exhausted, Storage};
 use http::HeaderMap;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::task::Waker;
+
+/// What each piece quiche holds received data in costs past its bytes: a 56-byte piece and
+/// its key in a slot of a tree node, the node's spare room shared out, and an allocation of
+/// its own of 32 bytes at the least (measured with quiche 0.30 on x86-64). A client that
+/// sends a byte a frame costs this much each.
+const PIECE: usize = 128;
 
 /// A connection, as its driver and its streams' tasks share it.
 pub(crate) struct Conn {
@@ -21,6 +28,12 @@ pub(crate) struct Conn {
     driver: RefCell<Option<Waker>>,
     /// Something has changed since the driver last looked.
     stirred: Cell<bool>,
+    /// What quiche holds for the connection, charged to the worker's storage (16 §6).
+    charge: RefCell<Option<Charge>>,
+    /// What that charge is.
+    charged: Cell<usize>,
+    /// Closed to make room for the rest: charged nothing from then on.
+    shed: Cell<bool>,
 }
 
 /// What the connection holds.
@@ -93,7 +106,66 @@ impl Conn {
             }),
             driver: RefCell::new(None),
             stirred: Cell::new(true),
+            charge: RefCell::new(None),
+            charged: Cell::new(0),
+            shed: Cell::new(false),
         })
+    }
+
+    /// Charges `storage` what quiche holds for the connection now: what it received that
+    /// has not been read, `PIECE` bytes more for each piece that is held in, and the HTTP/3
+    /// layer's frame buffers, a head held whole until it has all come.
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`] if the worker cannot pay for more; the charge is then as it was.
+    pub(crate) fn charge(&self, storage: &Rc<Storage>) -> Result<(), Exhausted> {
+        if self.shed.get() {
+            return Ok(());
+        }
+        let held = self.with(|state| {
+            let quiche::Held { bytes, pieces } = state.quic.received_held();
+            let frames = state
+                .h3
+                .as_ref()
+                .map_or(0, quiche::h3::Connection::frame_buffers);
+            bytes
+                .saturating_add(pieces.saturating_mul(PIECE))
+                .saturating_add(frames)
+        });
+        let charged = self.charged.get();
+        let mut charge = self.charge.borrow_mut();
+        match charge.as_mut() {
+            // Nothing asked for: past the limit, as the worker's own answers may take it,
+            // even nothing more would be refused.
+            _ if held == charged => {}
+            Some(charge) if held > charged => charge.grow(held - charged)?,
+            Some(charge) => charge.shrink(charged - held),
+            None => *charge = Some(storage.reserve(held)?),
+        }
+        self.charged.set(held);
+        Ok(())
+    }
+
+    /// What the connection is charged.
+    pub(crate) fn charged(&self) -> usize {
+        self.charged.get()
+    }
+
+    /// Closes the connection so that the worker has room for the rest, and lets go of its
+    /// charge at once: what quiche holds for it goes as the connection does, within its
+    /// closing period.
+    pub(crate) fn shed(&self) {
+        self.shed.set(true);
+        self.charge.borrow_mut().take();
+        self.charged.set(0);
+        self.with(|state| {
+            // Fails only for a connection already closing.
+            let _closing = state
+                .quic
+                .close(true, crate::downstream::h3::code::EXCESSIVE_LOAD, b"");
+        });
+        self.stir();
     }
 
     /// Does `work` with the connection. Never called across an await, and never from
