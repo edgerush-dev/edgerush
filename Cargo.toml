@@ -54,9 +54,10 @@ serde = { version = "1.0", features = ["derive"] }
 # YAML for the development harness and the command-line tools only. Reading only, no
 # optional extras; pure Rust with budgets against hostile input.
 serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
-# Socket options that neither std nor tokio can set before a socket is bound. Only the
-# binary binds sockets; tokio and hyper-util bring the crate in anyway. "all" is where
-# SO_REUSEPORT is.
+# Socket options that neither std nor tokio can set before a socket is bound, which only
+# the binary does, and the control message that has the kernel cut a run of QUIC
+# datagrams apart (the proxy crate, on Linux). tokio and hyper-util bring the crate in
+# anyway. "all" is where SO_REUSEPORT is.
 socket2 = { version = "0.6.5", features = ["all"] }
 regex = { version = "1.13", default-features = false, features = ["std", "perf"] }
 # Finding the line feeds of a head a vector at a time; regex brings it in already.

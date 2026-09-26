@@ -228,6 +228,35 @@ fn a_slow_answer_does_not_hold_back_the_ack() {
     });
 }
 
+/// Four megabytes back, thousands of datagrams, sent in runs the kernel cuts apart where it
+/// can (Linux), arrive whole and in order.
+#[test]
+fn a_large_answer_arrives_whole() {
+    locally(async {
+        const SIZE: usize = 4 << 20;
+        let server = serving(short(), |_request, _interim| -> Answering {
+            Box::pin(async move {
+                // A pattern that no two nearby datagrams share, so that a run cut wrong or
+                // out of order shows.
+                let body: Vec<u8> = (0..SIZE).map(|at| (at % 251) as u8).collect();
+                Answered::Map(Response::new(Full::new(Bytes::from(body))))
+            })
+        })
+        .await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let answer = client.get("a.test", "/big").await;
+        assert_eq!(answer.final_status(), Some("200"));
+        assert_eq!(answer.body.len(), SIZE);
+        assert!(
+            answer
+                .body
+                .iter()
+                .enumerate()
+                .all(|(at, &byte)| usize::from(byte) == at % 251)
+        );
+    });
+}
+
 /// A megabyte's upload, far past a single piece, reaches the core whole, and so does a
 /// client's trailers after it.
 #[test]

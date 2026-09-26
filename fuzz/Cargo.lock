@@ -193,6 +193,7 @@ dependencies = [
  "hyper-util",
  "memchr",
  "quiche",
+ "socket2",
  "thiserror",
  "tokio",
  "tokio-boring",

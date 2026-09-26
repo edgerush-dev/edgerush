@@ -19,6 +19,7 @@ use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h3::Settings;
 use crate::downstream::h3::conn::Conn;
 use crate::downstream::h3::connection::drive;
+use crate::downstream::h3::send::Sending;
 use crate::drain::Drain;
 use crate::interim::Interim;
 use crate::metrics::Quic;
@@ -238,6 +239,8 @@ pub(crate) struct Shared {
     pub(crate) forwarded: Cell<u64>,
     /// Datagrams dropped, the inbox they were for being full.
     pub(crate) dropped: Cell<u64>,
+    /// What its connections send through.
+    pub(crate) sending: Sending,
     /// Where what the listener does is counted.
     count: Box<dyn Fn(Quic)>,
 }
@@ -278,6 +281,7 @@ impl Shared {
             connections: Cell::new(0),
             forwarded: Cell::new(0),
             dropped: Cell::new(0),
+            sending: Sending::new(),
             count,
         })
     }

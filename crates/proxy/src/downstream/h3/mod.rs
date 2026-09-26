@@ -12,6 +12,7 @@ pub(crate) mod conn;
 pub(crate) mod connection;
 pub mod head;
 pub(crate) mod listener;
+pub(crate) mod send;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]

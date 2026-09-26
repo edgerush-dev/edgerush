@@ -19,6 +19,7 @@ use crate::downstream::h3::code;
 use crate::downstream::h3::conn::{Conn, Slot, State, Stream};
 use crate::downstream::h3::head::{self, Refused, RequestHead};
 use crate::downstream::h3::listener::Shared;
+use crate::downstream::h3::send::{Unsent, flush};
 use crate::downstream::h3::writer::{Responder, SendError};
 use crate::interim::Interim;
 use crate::request_body::RequestBody;
@@ -30,16 +31,11 @@ use http_body::Body;
 use quiche::h3::Event;
 use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
-use std::io;
-use std::net::SocketAddr;
 use std::pin::pin;
 use std::rc::Rc;
-use std::task::{Context, Poll};
+use std::task::Poll;
 use std::time::Duration;
 use tokio::time::Instant;
-
-/// A datagram quiche made that the socket had no room for, kept for its next chance.
-type Unsent = Option<(Vec<u8>, SocketAddr)>;
 
 /// What the driver keeps between its turns.
 struct Driving {
@@ -114,10 +110,9 @@ pub(crate) async fn drive<R, F, B, D, G>(
         drain_by: None,
         to_close: false,
         closing: false,
-        unsent: None,
+        unsent: Unsent::new(),
     };
     let mut alarm = Alarm::new(&shared.timers, None);
-    let mut out = vec![0; settings.datagram];
     let mut drain_heard = pin!(shared.drain.notified());
     let mut found = Vec::new();
     poll_fn(|cx| {
@@ -129,7 +124,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
                 driving.drain_by = Some(Instant::now() + settings.drain_within);
                 go_away(&conn, &mut driving);
             }
-            if conn.take_stirred() || driving.unsent.is_some() {
+            if conn.take_stirred() || !driving.unsent.is_empty() {
                 turn(&conn, &shared, &mut driving, &mut found);
                 for Found { id, head, ended } in found.drain(..) {
                     driving.asked = true;
@@ -143,14 +138,14 @@ pub(crate) async fn drive<R, F, B, D, G>(
                         settings.stream_idle,
                     ));
                 }
-                flush(&conn, &shared, &mut out, &mut driving.unsent, cx);
-                if driving.to_close && !driving.closing && driving.unsent.is_none() {
+                flush(&conn, &shared, settings.datagram, &mut driving.unsent, cx);
+                if driving.to_close && !driving.closing && driving.unsent.is_empty() {
                     conn.with(|state| {
                         // Fails only for a connection already closing.
                         let _closing = state.quic.close(true, code::NO_ERROR, b"");
                     });
                     driving.closing = true;
-                    flush(&conn, &shared, &mut out, &mut driving.unsent, cx);
+                    flush(&conn, &shared, settings.datagram, &mut driving.unsent, cx);
                 }
                 if conn.with(|state| state.quic.is_closed()) {
                     return Poll::Ready(());
@@ -419,41 +414,6 @@ fn too_large(quic: &mut quiche::Connection, h3: &mut quiche::h3::Connection, id:
         return;
     }
     let _stopped = quic.stream_shutdown(id, quiche::Shutdown::Read, code::NO_ERROR);
-}
-
-/// Sends what quiche wants sent, until it has nothing more or the socket has no room.
-fn flush(conn: &Conn, shared: &Shared, out: &mut [u8], unsent: &mut Unsent, cx: &mut Context<'_>) {
-    if let Some((datagram, to)) = unsent.take()
-        && !send(shared, &datagram, to, cx)
-    {
-        *unsent = Some((datagram, to));
-        return;
-    }
-    loop {
-        let made = conn.with(|state| state.quic.send(out));
-        let Ok((len, info)) = made else {
-            return;
-        };
-        let datagram = &out[..len];
-        if !send(shared, datagram, info.to, cx) {
-            *unsent = Some((datagram.to_vec(), info.to));
-            return;
-        }
-    }
-}
-
-/// Sends one datagram: false if the socket has no room, which it then says when it has.
-fn send(shared: &Shared, datagram: &[u8], to: SocketAddr, cx: &mut Context<'_>) -> bool {
-    match shared.socket.try_send_to(datagram, to) {
-        Ok(_) => true,
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            // Ready at once only if room came meanwhile, which the next turn finds.
-            let _ready = shared.socket.poll_send_ready(cx);
-            false
-        }
-        // Lost, as a datagram may be on any path: quiche sends it again.
-        Err(_) => true,
-    }
 }
 
 /// Sends what waits in `interim` to be passed on, and a `100` of the continue decision's

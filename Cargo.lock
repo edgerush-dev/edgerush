@@ -263,6 +263,7 @@ dependencies = [
  "proptest",
  "quiche",
  "serde-saphyr",
+ "socket2",
  "thiserror",
  "tokio",
  "tokio-boring",
