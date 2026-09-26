@@ -13,6 +13,7 @@ use crate::downstream::h1::connection::Answered;
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h3::Settings;
 use crate::downstream::h3::code;
+use crate::downstream::h3::conn::State;
 use crate::downstream::h3::listener::{self, Forwarding, InForce, Secrets, Shared};
 use crate::downstream::h3::testing::{Client, get};
 use crate::drain::Drain;
@@ -26,6 +27,7 @@ use http::{Request, Response};
 use http_body::{Body, Frame};
 use http_body_util::{BodyExt, Full, StreamBody};
 use std::cell::Cell;
+use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -34,6 +36,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use tokio::sync::Notify;
+use tokio_stream::StreamExt;
 
 /// How late a deadline may be seen to fire on a loaded machine.
 const SLACK: Duration = Duration::from_millis(600);
@@ -48,11 +52,16 @@ struct Server {
 }
 
 impl Server {
-    /// quiche's counts for the one connection the server holds.
-    fn stats(&self) -> quiche::Stats {
+    /// What `look` finds in the one connection the server holds.
+    fn connection<T>(&self, look: impl FnOnce(&mut State) -> T) -> T {
         let table = self.shared.table.borrow();
         let conn = table.values().next().expect("a connection");
-        conn.with(|state| state.quic.stats())
+        conn.with(look)
+    }
+
+    /// quiche's counts for the one connection the server holds.
+    fn stats(&self) -> quiche::Stats {
+        self.connection(|state| state.quic.stats())
     }
 }
 
@@ -242,6 +251,26 @@ fn many_requests_on_one_connection_are_each_answered() {
             let answer = client.answer(id).await;
             assert_eq!(body_of(&answer), format!("GET /{at} 0 None"));
         }
+    });
+}
+
+/// A connection's record of the answers on their way, which a drain waits for, forgets them
+/// as they arrive: however many a long-lived connection has answered, it holds no more than
+/// twice the streams the client may have open.
+#[test]
+fn the_answers_on_their_way_are_forgotten_as_they_arrive() {
+    locally(async {
+        let settings = Settings {
+            streams: 4,
+            ..short()
+        };
+        let server = serving(settings, echo).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        for at in 0..20 {
+            client.get("a.test", &format!("/{at}")).await;
+        }
+        let recorded = server.connection(|state| state.delivering.len());
+        assert!(recorded <= 2 * 4, "{recorded} recorded");
     });
 }
 
@@ -669,6 +698,192 @@ fn a_draining_connection_finishes_its_requests_then_closes() {
             !late.quic.is_established(),
             "a draining listener took a connection"
         );
+    });
+}
+
+/// An answer's body in pieces, each sent once its gate opens. A piece of no bytes sends
+/// nothing, so that the body's end goes alone.
+fn gated(
+    pieces: Vec<(Rc<Notify>, Option<Bytes>)>,
+) -> impl Body<Data = Bytes, Error = Infallible> + 'static {
+    StreamBody::new(
+        tokio_stream::iter(pieces)
+            .then(|(gate, piece)| async move {
+                gate.notified().await;
+                piece
+            })
+            .filter_map(|piece| piece.map(|bytes| Ok(Frame::data(bytes)))),
+    )
+}
+
+/// Which packet of a drained answer is lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Loss {
+    First,
+    Last,
+    EndAlone,
+}
+
+/// Draining, a connection closes once its answers have arrived, or at the drain's bound:
+/// closing ends what quiche would send again, so an answer's lost packet — its first, its
+/// last, or one carrying the stream's end alone — is sent again first (16 §4).
+#[test]
+fn a_draining_connection_closes_once_its_answers_have_arrived() {
+    const PART: usize = 4_000;
+    const TAIL: usize = 1_000;
+    for loss in [Loss::First, Loss::Last, Loss::EndAlone] {
+        locally(async move {
+            let gates = [Rc::new(Notify::new()), Rc::new(Notify::new())];
+            let mut pieces = vec![(Rc::clone(&gates[0]), Some(Bytes::from(vec![1; PART])))];
+            let whole = match loss {
+                Loss::First => PART,
+                Loss::Last => {
+                    pieces.push((Rc::clone(&gates[1]), Some(Bytes::from(vec![2; TAIL]))));
+                    PART + TAIL
+                }
+                Loss::EndAlone => {
+                    pieces.push((Rc::clone(&gates[1]), None));
+                    PART
+                }
+            };
+            let settings = Settings {
+                drain_within: Duration::from_secs(5),
+                ..short()
+            };
+            let server = serving(settings, move |_request, _interim| {
+                let pieces = pieces.clone();
+                async move { Answered::Map(Response::new(gated(pieces))) }
+            })
+            .await;
+            let mut client = Client::connect(server.address, "a.test").await;
+            let id = client.request(&get("a.test", "/drained"), true);
+            client.for_a_while(Duration::from_millis(100)).await;
+            server.drain.start();
+            client.until(|client| client.goaway.is_some()).await;
+            client.for_a_while(Duration::from_millis(50)).await;
+            if loss != Loss::First {
+                gates[0].notify_one();
+                client
+                    .until(|client| {
+                        client
+                            .answers
+                            .get(&id)
+                            .is_some_and(|answer| answer.body.len() == PART)
+                    })
+                    .await;
+                client.for_a_while(Duration::from_millis(50)).await;
+            }
+            client.lose_next = true;
+            gates[usize::from(loss != Loss::First)].notify_one();
+            client
+                .until(|client| {
+                    client.quic.is_closed()
+                        || client.quic.is_draining()
+                        || client
+                            .answers
+                            .get(&id)
+                            .is_some_and(|answer| answer.finished)
+                })
+                .await;
+            let answer = client.answers.get(&id).cloned().unwrap_or_default();
+            assert!(
+                answer.finished,
+                "{loss:?}: cut at {} bytes, closed with {:?}",
+                answer.body.len(),
+                client.closed_by_server()
+            );
+            assert_eq!(answer.body.len(), whole, "{loss:?}");
+            client
+                .until(|client| client.quic.is_closed() || client.quic.is_draining())
+                .await;
+            assert_eq!(client.closed_by_server(), Some((true, code::NO_ERROR)));
+            // Its last connection gone, the listener ends and lets its socket go.
+            client
+                .until(|_| Rc::strong_count(&server.shared) == 1)
+                .await;
+        });
+    }
+}
+
+/// Draining, a 431 the driver answered itself, with no task behind it, is waited for as any
+/// answer is.
+#[test]
+fn a_draining_connection_waits_for_its_431_too() {
+    locally(async {
+        let settings = Settings {
+            head_limit: 256,
+            field_section: 1 << 10,
+            drain_within: Duration::from_secs(5),
+            ..short()
+        };
+        let server = serving(settings, echo).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        client.for_a_while(Duration::from_millis(50)).await;
+        let large = "v".repeat(400);
+        let mut head = get("a.test", "/large");
+        head.push(("x-large", &large));
+        client.lose_next = true;
+        let id = client.request(&head, true);
+        client.until(|client| !client.lose_next).await;
+        server.drain.start();
+        client
+            .until(|client| {
+                client.quic.is_closed()
+                    || client.quic.is_draining()
+                    || client
+                        .answers
+                        .get(&id)
+                        .is_some_and(|answer| answer.finished)
+            })
+            .await;
+        let answer = client.answers.get(&id).cloned().unwrap_or_default();
+        assert_eq!(answer.final_status(), Some("431"));
+        assert!(answer.finished);
+    });
+}
+
+/// Draining, the listener reads its socket as it did before (16 §4): an upload under way
+/// is read, and echoed back, a piece at a time without waiting.
+#[test]
+fn a_draining_listener_reads_what_comes_at_once() {
+    locally(async {
+        let settings = Settings {
+            drain_within: Duration::from_secs(5),
+            ..short()
+        };
+        let server = serving(
+            settings,
+            |request: Request<RequestBody>, _interim| async move {
+                Answered::Map(Response::new(request.into_body()))
+            },
+        )
+        .await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let mut head = get("a.test", "/echo");
+        head[0].1 = "POST";
+        let id = client.request(&head, false);
+        let echoed = |client: &Client, length: usize| {
+            client
+                .answers
+                .get(&id)
+                .is_some_and(|answer| answer.body.len() == length)
+        };
+        client.body(id, b"0", false).await;
+        client.until(|client| echoed(client, 1)).await;
+        server.drain.start();
+        client.until(|client| client.goaway.is_some()).await;
+        let started = tokio::time::Instant::now();
+        for length in 2..=11 {
+            client.body(id, b"x", false).await;
+            client.until(|client| echoed(client, length)).await;
+        }
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(250),
+            "ten round trips took {took:?}"
+        );
+        client.body(id, b"", true).await;
+        assert_eq!(client.answer(id).await.body.len(), 11);
     });
 }
 

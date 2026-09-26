@@ -235,6 +235,9 @@ pub(crate) struct Shared {
     pub(crate) handshakes: Cell<usize>,
     /// Connections held.
     pub(crate) connections: Cell<usize>,
+    /// A connection ended while the worker drains: the listener looks whether it was the
+    /// last.
+    pub(crate) ended: tokio::sync::Notify,
     /// Datagrams handed to another worker's inbox.
     pub(crate) forwarded: Cell<u64>,
     /// Datagrams dropped, the inbox they were for being full.
@@ -279,6 +282,7 @@ impl Shared {
             drain,
             handshakes: Cell::new(0),
             connections: Cell::new(0),
+            ended: tokio::sync::Notify::new(),
             forwarded: Cell::new(0),
             dropped: Cell::new(0),
             sending: Sending::new(),
@@ -369,10 +373,16 @@ pub(crate) async fn serve<T, R, F, B, D, O, G>(
             tokio::task::yield_now().await;
             continue;
         }
+        let was_draining = shared.drain.is_on();
         let mut draining = std::pin::pin!(shared.drain.notified());
+        let mut ended = std::pin::pin!(shared.ended.notified());
         std::future::poll_fn(|cx| {
-            // Draining, the loop comes round to see whether the last connection went.
-            if shared.drain.poll_on(draining.as_mut(), cx).is_ready() {
+            // When draining starts, and each time a connection ends after, the loop comes
+            // round to see whether the last connection went.
+            if !was_draining && shared.drain.poll_on(draining.as_mut(), cx).is_ready() {
+                return Poll::Ready(());
+            }
+            if ended.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(());
             }
             if let Poll::Ready(Some(forwarded)) = forwarding.inbox.poll_recv(cx) {
@@ -382,11 +392,6 @@ pub(crate) async fn serve<T, R, F, B, D, O, G>(
             shared.socket.poll_recv_ready(cx).map(|_| ())
         })
         .await;
-        if shared.drain.is_on() {
-            // Woken now and then until the table empties: each connection's end is a turn
-            // of the worker's, and one more read costs nothing.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
     }
 }
 

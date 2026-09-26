@@ -30,8 +30,24 @@ pub(crate) struct State {
     pub(crate) h3: Option<quiche::h3::Connection>,
     /// The request streams whose tasks are running, by stream ID.
     pub(crate) streams: HashMap<u64, Slot>,
+    /// Streams whose answers went to quiche whole, until quiche lets them go: what a
+    /// draining connection waits to see acknowledged before it closes.
+    pub(crate) delivering: Vec<u64>,
     /// The connection has ended; nothing more will come on any stream.
     pub(crate) closed: bool,
+}
+
+impl State {
+    /// Forgets the answers that have arrived, or that the client stopped: quiche lets a
+    /// stream go once both its sides are done, its answer acknowledged. True once none is
+    /// left.
+    pub(crate) fn delivered(&mut self) -> bool {
+        let Self {
+            quic, delivering, ..
+        } = self;
+        delivering.retain(|&id| quic.stream_capacity(id).is_ok());
+        delivering.is_empty()
+    }
 }
 
 /// What one request stream's task waits on.
@@ -72,6 +88,7 @@ impl Conn {
                 quic,
                 h3: None,
                 streams: HashMap::new(),
+                delivering: Vec::new(),
                 closed: false,
             }),
             driver: RefCell::new(None),
@@ -154,6 +171,9 @@ impl Drop for Stream {
         };
         self.conn.with(|state| {
             state.streams.remove(&self.id);
+            if self.answered {
+                state.delivering.push(self.id);
+            }
             // One the client stopped, quiche has reset already, with the client's code.
             if !self.answered
                 && !matches!(

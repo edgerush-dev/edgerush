@@ -110,6 +110,7 @@ impl IncomingH3 {
             h3,
             streams,
             closed,
+            ..
         } = state;
         let Some(slot) = streams.get_mut(&self.stream) else {
             return Poll::Ready(Some(Err(other(StreamError::Closed))));

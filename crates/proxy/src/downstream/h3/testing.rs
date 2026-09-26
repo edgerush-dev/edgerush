@@ -62,6 +62,9 @@ pub(crate) struct Client {
     pub(crate) received: Vec<Vec<u8>>,
     /// Where datagrams go instead of the server's address, when a test sends them astray.
     pub(crate) send_to: Option<SocketAddr>,
+    /// The next datagram from the server is lost on its way: received, and never handed
+    /// to quiche.
+    pub(crate) lose_next: bool,
     /// The stream the next HTTP/0.9 request goes on.
     hq_next: u64,
     /// HTTP/0.9 answers are left unread, as by a client that takes no more.
@@ -102,6 +105,7 @@ impl Client {
             goaway: None,
             received: Vec::new(),
             send_to: None,
+            lose_next: false,
             hq_next: 0,
             hq_unread: false,
         }
@@ -179,6 +183,9 @@ impl Client {
         match tokio::time::timeout(wait, self.socket.recv_from(&mut buf)).await {
             Ok(Ok((len, from))) => {
                 self.received.push(buf[..len].to_vec());
+                if std::mem::take(&mut self.lose_next) {
+                    return;
+                }
                 let info = quiche::RecvInfo {
                     from,
                     to: self.local,

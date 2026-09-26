@@ -180,8 +180,13 @@ pub(crate) async fn drive<R, F, B, D, G>(
             } else {
                 driving.quiet_since = None;
             }
-            // Draining, a connection with nothing open goes at once.
-            if !driving.to_close && driving.drain_by.is_some() && open == 0 {
+            // Draining, a connection goes once nothing is open and every answer has arrived,
+            // or at the drain's bound: closing ends quiche's sending again of what was lost.
+            if !driving.to_close
+                && driving.drain_by.is_some()
+                && open == 0
+                && conn.with(State::delivered)
+            {
                 close(&conn, &mut driving);
                 continue;
             }
@@ -254,6 +259,10 @@ pub(crate) async fn drive<R, F, B, D, G>(
     shared
         .connections
         .set(shared.connections.get().saturating_sub(1));
+    if shared.drain.is_on() {
+        // Kept for the listener if it is not waiting: it looks at its next wait.
+        shared.ended.notify_one();
+    }
     drop(opened);
 }
 
@@ -287,9 +296,21 @@ fn go_away(conn: &Conn, driving: &mut Driving) {
 fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec<Found>) {
     let mut issued = Vec::new();
     let mut retired = Vec::new();
+    // quiche holds no more than `streams` of the client's streams at once, so pruned past
+    // twice that, the answers being delivered cost a lookup or two each.
+    let most_delivering = usize::try_from(shared.settings.streams)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(2);
     let established = conn.with(|state| {
+        if state.delivering.len() > most_delivering {
+            state.delivered();
+        }
         let State {
-            quic, h3, streams, ..
+            quic,
+            h3,
+            streams,
+            delivering,
+            ..
         } = state;
         let established = driving.handshaking && quic.is_established();
         // HTTP/3 only where the handshake agreed on it: the interop build offers HTTP/0.9
@@ -326,6 +347,7 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
                 quic,
                 h3,
                 streams,
+                delivering,
                 shared.settings.head_limit,
                 &mut driving.seen,
                 found,
@@ -381,11 +403,13 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
     }
 }
 
-/// Hands on what quiche's HTTP/3 layer has, stream by stream.
+/// Hands on what quiche's HTTP/3 layer has, stream by stream. A 431 the driver answers
+/// itself joins `delivering`, as a task's whole answer does.
 fn events(
     quic: &mut quiche::Connection,
     h3: &mut quiche::h3::Connection,
     streams: &mut std::collections::HashMap<u64, Slot>,
+    delivering: &mut Vec<u64>,
     head_limit: usize,
     seen: &mut Seen,
     found: &mut Vec<Found>,
@@ -421,7 +445,11 @@ fn events(
                             hq: false,
                         });
                     }
-                    Err(Refused::TooLarge) => too_large(quic, h3, id),
+                    Err(Refused::TooLarge) => {
+                        if too_large(quic, h3, id) {
+                            delivering.push(id);
+                        }
+                    }
                     Err(Refused::Malformed(_)) => shut(quic, id, code::MESSAGE_ERROR),
                 }
             }
@@ -458,17 +486,19 @@ fn shut(quic: &mut quiche::Connection, id: u64, code: u64) {
     let _stopped = quic.stream_shutdown(id, quiche::Shutdown::Read, code);
 }
 
-/// Answers 431 to a request whose head is past the limit, and reads no more of it.
-fn too_large(quic: &mut quiche::Connection, h3: &mut quiche::h3::Connection, id: u64) {
+/// Answers 431 to a request whose head is past the limit, and reads no more of it: true if
+/// the answer went, false if the stream was reset instead.
+fn too_large(quic: &mut quiche::Connection, h3: &mut quiche::h3::Connection, id: u64) -> bool {
     let status = StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE;
     let mut headers = http::HeaderMap::new();
     headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
     let fields = head::answer(&status, &headers);
     if h3.send_response(quic, id, &fields, true).is_err() {
         shut(quic, id, code::REQUEST_REJECTED);
-        return;
+        return false;
     }
     let _stopped = quic.stream_shutdown(id, quiche::Shutdown::Read, code::NO_ERROR);
+    true
 }
 
 /// Sends what waits in `interim` to be passed on, and a `100` of the continue decision's
@@ -586,6 +616,7 @@ mod tests {
             &mut pipe.server,
             &mut server,
             &mut streams,
+            &mut Vec::new(),
             64 << 10,
             &mut seen,
             &mut found,
