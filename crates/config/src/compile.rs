@@ -8,12 +8,12 @@ use crate::route::{
     ValuePredicate, Wildcard,
 };
 use crate::{
-    Config, HealthCheck, Http3, Keepalive, Probe, Protocol, Rule, Tls, UpstreamProtocol,
+    Backend, Config, HealthCheck, Http3, Keepalive, Probe, Protocol, Rule, Tls, UpstreamProtocol,
     UpstreamTls,
 };
 use edgerush_filters::{HeaderModifier, HeaderModifierError};
 use edgerush_router::{
-    HeaderPredicate, HeaderPredicateError, HeaderPredicates, HostClaim, HostPattern,
+    HeaderPredicate, HeaderPredicateError, HeaderPredicates, HostClaim, HostIndex, HostPattern,
     HostPatternError, PathPattern, PathPatternError, QueryPredicate, QueryPredicateError,
     QueryPredicates, RouteMatch, Router, WildcardLabels,
 };
@@ -74,6 +74,43 @@ pub struct CompiledListener {
     pub http3: Option<Http3>,
     /// Finds the rule a request belongs to, among the routes that are for this listener.
     pub router: Router<RuleId>,
+    /// Where a `tcp` or `tls` listener's connections go; `None` for an HTTP listener.
+    pub l4: Option<L4>,
+}
+
+/// How a passthrough listener's connections find their backends (17 in the docs).
+#[derive(Debug)]
+pub enum L4 {
+    /// Every connection to the listener's one TCP route.
+    Tcp(L4Route),
+    /// By the name the ClientHello asks for.
+    Tls(SniRouter),
+}
+
+/// A TCP or TLS route, compiled.
+#[derive(Debug, Clone)]
+pub struct L4Route {
+    /// Its name in the config.
+    pub name: String,
+    /// Where its connections go.
+    pub backends: WeightedBackends,
+}
+
+/// A `tls` listener's routes, by the hostnames they claim.
+#[derive(Debug)]
+pub struct SniRouter {
+    routes: Vec<L4Route>,
+    hosts: HostIndex<Vec<usize>>,
+}
+
+impl SniRouter {
+    /// The route for a ClientHello that asks for `name`, in lower case: the most specific
+    /// hostname that covers it, and among equally specific ones the route that came first.
+    #[must_use]
+    pub fn route(&self, name: &str) -> Option<&L4Route> {
+        let group = self.hosts.lookup(name).next()?;
+        self.routes.get(*group.first()?)
+    }
 }
 
 /// What a rule does with its requests.
@@ -312,10 +349,12 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             (Protocol::Https, None | Some(0)) => {
                 errors.push(Place::listener(name).problem(Problem::NoCertificate));
             }
-            (Protocol::Http, Some(_)) => {
+            // A passthrough listener presents nothing: the backend terminates TLS.
+            (Protocol::Http | Protocol::Tcp | Protocol::Tls, Some(_)) => {
                 errors.push(Place::listener(name).problem(Problem::TlsUnwanted));
             }
-            (Protocol::Https, Some(_)) | (Protocol::Http, None) => {}
+            (Protocol::Https, Some(_)) | (Protocol::Http | Protocol::Tcp | Protocol::Tls, None) => {
+            }
         }
         // QUIC is always TLS: there is no HTTP/3 in the clear (RFC 9114 §3.1).
         if listener.http3.is_some() && listener.protocol != Protocol::Https {
@@ -344,6 +383,16 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             errors.push(place.problem(Problem::DuplicateName));
         }
         let listeners = listeners_of(route, &matches, &place, &mut errors);
+        for listener in &listeners {
+            let protocol = config.listeners.get(*listener).map(|l| l.protocol);
+            if let Some(protocol @ (Protocol::Tcp | Protocol::Tls)) = protocol {
+                errors.push(place.problem(Problem::WrongListener {
+                    kind: "HTTP",
+                    listener: (*listener).to_owned(),
+                    protocol: protocol_name(protocol),
+                }));
+            }
+        }
         let hosts = host_claims(route, &place, &mut errors);
 
         let mut compiled_rules = Vec::new();
@@ -390,6 +439,8 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
         rules.push(compiled_rules);
     }
 
+    let mut l4 = l4_routes(config, &upstream_ids, &mut names, &mut errors);
+
     if errors.is_empty() {
         let listeners = config
             .listeners
@@ -401,6 +452,7 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                 tls: listener.tls.clone(),
                 http3: listener.http3,
                 router: Router::new(matches.remove(name.as_str()).unwrap_or_default()),
+                l4: l4.remove(name.as_str()),
             })
             .collect();
         Ok(Compiled {
@@ -411,6 +463,171 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
     } else {
         Err(errors)
     }
+}
+
+/// The most backends a passthrough route has, as TCPRoute and TLSRoute allow.
+const MOST_BACKENDS: usize = 16;
+
+/// How a protocol is written in a config.
+fn protocol_name(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Http => "http",
+        Protocol::Https => "https",
+        Protocol::Tcp => "tcp",
+        Protocol::Tls => "tls",
+    }
+}
+
+/// The TCP and TLS routes, compiled, by the listener they are for; every problem with
+/// them, and with the passthrough listeners they leave without a route, into `errors`.
+fn l4_routes<'a>(
+    config: &'a Config,
+    upstream_ids: &BTreeMap<&str, UpstreamId>,
+    names: &mut HashSet<&'a str>,
+    errors: &mut Vec<ConfigError>,
+) -> BTreeMap<&'a str, L4> {
+    let mut tcp: BTreeMap<&str, Vec<L4Route>> = BTreeMap::new();
+    for route in &config.tcp_routes {
+        let place = Place::route(&route.name);
+        if !names.insert(route.name.as_str()) {
+            errors.push(place.problem(Problem::DuplicateName));
+        }
+        let listeners = l4_listeners(config, &route.listeners, Protocol::Tcp, &place, errors);
+        let compiled = L4Route {
+            name: route.name.clone(),
+            backends: l4_backends(config, &route.backends, upstream_ids, &place, errors),
+        };
+        for listener in listeners {
+            tcp.entry(listener).or_default().push(compiled.clone());
+        }
+    }
+    let mut tls: BTreeMap<&str, (Vec<L4Route>, Vec<HostClaim<usize>>)> = BTreeMap::new();
+    for route in &config.tls_routes {
+        let place = Place::route(&route.name);
+        if !names.insert(route.name.as_str()) {
+            errors.push(place.problem(Problem::DuplicateName));
+        }
+        let listeners = l4_listeners(config, &route.listeners, Protocol::Tls, &place, errors);
+        if route.hostnames.is_empty() {
+            errors.push(place.problem(Problem::NoHostnames));
+        }
+        let claims: Vec<HostClaim<()>> = route
+            .hostnames
+            .iter()
+            .filter_map(|hostname| {
+                host_claim(hostname)
+                    .map_err(|problem| errors.push(place.problem(problem)))
+                    .ok()
+            })
+            .collect();
+        let compiled = L4Route {
+            name: route.name.clone(),
+            backends: l4_backends(config, &route.backends, upstream_ids, &place, errors),
+        };
+        for listener in listeners {
+            let (routes, hosts) = tls.entry(listener).or_default();
+            let at = routes.len();
+            routes.push(compiled.clone());
+            hosts.extend(claims.iter().map(|claim| HostClaim {
+                pattern: claim.pattern.clone(),
+                falls_through: claim.falls_through,
+                value: at,
+            }));
+        }
+    }
+
+    let mut compiled = BTreeMap::new();
+    for (name, listener) in &config.listeners {
+        match listener.protocol {
+            Protocol::Tcp => {
+                let mut routes = tcp.remove(name.as_str()).unwrap_or_default();
+                if routes.len() == 1 {
+                    if let Some(route) = routes.pop() {
+                        compiled.insert(name.as_str(), L4::Tcp(route));
+                    }
+                } else {
+                    errors.push(Place::listener(name).problem(Problem::TcpRoutes(routes.len())));
+                }
+            }
+            Protocol::Tls => {
+                let (routes, hosts) = tls.remove(name.as_str()).unwrap_or_default();
+                let hosts = HostIndex::new(hosts, |members: Vec<usize>| members);
+                compiled.insert(name.as_str(), L4::Tls(SniRouter { routes, hosts }));
+            }
+            Protocol::Http | Protocol::Https => {}
+        }
+    }
+    compiled
+}
+
+/// The listeners a passthrough route is for, each once, as far as they exist and are of
+/// the route's `kind`.
+fn l4_listeners<'a>(
+    config: &Config,
+    names: &'a [String],
+    kind: Protocol,
+    place: &Place,
+    errors: &mut Vec<ConfigError>,
+) -> Vec<&'a str> {
+    if names.is_empty() {
+        errors.push(place.problem(Problem::NoListeners));
+    }
+    let mut listeners: Vec<&str> = Vec::new();
+    for name in names {
+        match config.listeners.get(name) {
+            None => errors.push(place.problem(Problem::UnknownListener(name.clone()))),
+            Some(_) if listeners.contains(&name.as_str()) => {
+                errors.push(place.problem(Problem::ListenerTwice(name.clone())));
+            }
+            Some(listener) if listener.protocol != kind => {
+                errors.push(place.problem(Problem::WrongListener {
+                    kind: if kind == Protocol::Tcp { "TCP" } else { "TLS" },
+                    listener: name.clone(),
+                    protocol: protocol_name(listener.protocol),
+                }));
+            }
+            Some(_) => listeners.push(name),
+        }
+    }
+    listeners
+}
+
+/// A passthrough route's backends: 1 to 16, of upstreams that take plain bytes.
+fn l4_backends(
+    config: &Config,
+    backends: &[Backend],
+    upstream_ids: &BTreeMap<&str, UpstreamId>,
+    place: &Place,
+    errors: &mut Vec<ConfigError>,
+) -> WeightedBackends {
+    if backends.is_empty() {
+        errors.push(place.problem(Problem::NoBackends));
+    }
+    if backends.len() > MOST_BACKENDS {
+        errors.push(place.problem(Problem::TooManyBackends));
+    }
+    let mut resolved = Vec::with_capacity(backends.len());
+    for (at, backend) in backends.iter().enumerate() {
+        let place = Place {
+            backend: Some(at),
+            ..place.clone()
+        };
+        let Some(&id) = upstream_ids.get(backend.upstream.as_str()) else {
+            errors.push(place.problem(Problem::UnknownUpstream(backend.upstream.clone())));
+            continue;
+        };
+        let speaks_more = config
+            .upstreams
+            .get(&backend.upstream)
+            .is_some_and(|upstream| {
+                upstream.protocol != UpstreamProtocol::Http1 || upstream.tls.is_some()
+            });
+        if speaks_more {
+            errors.push(place.problem(Problem::PassthroughUpstream(backend.upstream.clone())));
+        }
+        resolved.push((id, backend.weight));
+    }
+    WeightedBackends::new(resolved)
 }
 
 /// What gRPC servers enforce by default between a client's PINGs: five minutes.
@@ -844,6 +1061,28 @@ pub enum Problem {
     /// HTTP/3 on a listener without TLS.
     #[error("`http3` is for protocol `https`")]
     Http3NeedsTls,
+    /// A route for a listener that does not take its kind.
+    #[error("a {kind} route cannot be for listener `{listener}`, which is `{protocol}`")]
+    WrongListener {
+        /// The route's kind.
+        kind: &'static str,
+        /// The listener named.
+        listener: String,
+        /// What the listener speaks.
+        protocol: &'static str,
+    },
+    /// A `tcp` listener without exactly one TCP route.
+    #[error("a `tcp` listener needs exactly one TCP route; it has {0}")]
+    TcpRoutes(usize),
+    /// More backends than a passthrough route may have.
+    #[error("a TCP or TLS route has at most 16 backends")]
+    TooManyBackends,
+    /// A passthrough route to an upstream spoken to in HTTP/2 or over TLS, which it cannot
+    /// be: a passthrough route carries bytes as they come.
+    #[error(
+        "upstream `{0}` is spoken to in HTTP/2 or over TLS, which a TCP or TLS route does not do"
+    )]
+    PassthroughUpstream(String),
     /// TLS to an upstream that trusts nobody.
     #[error("`tls` needs an authority to trust")]
     NoAuthority,
@@ -1515,6 +1754,186 @@ upstreams: {{}}
 "
         );
         assert!(serde_saphyr::from_str::<Config>(&yaml).is_err());
+    }
+
+    fn listener<'a>(compiled: &'a Compiled, name: &str) -> &'a CompiledListener {
+        compiled.listeners.iter().find(|l| l.name == name).unwrap()
+    }
+
+    /// A `tcp` listener's connections all go to its one route; a `tls` listener's by the
+    /// name asked for, the most specific hostname first and the first route among equals;
+    /// an HTTP listener has neither.
+    #[test]
+    fn passthrough_listeners_route_by_listener_and_by_name() {
+        let compiled = compile(&config(
+            r#"
+listeners:
+  web: { address: "[::]:80", protocol: http }
+  db: { address: "[::]:5432", protocol: tcp }
+  sni: { address: "[::]:8443", protocol: tls }
+routes: []
+tcp_routes:
+  - { name: db, listeners: [db], backends: [{ upstream: postgres, weight: 1 }] }
+tls_routes:
+  - name: api
+    listeners: [sni]
+    hostnames: [{ name: api.example.com, falls_through: true }]
+    backends: [{ upstream: api, weight: 1 }]
+  - name: rest
+    listeners: [sni]
+    hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: true }]
+    backends: [{ upstream: api, weight: 1 }]
+  - name: also-api
+    listeners: [sni]
+    hostnames: [{ name: api.example.com, falls_through: true }]
+    backends: [{ upstream: postgres, weight: 1 }]
+upstreams:
+  api: { endpoints: ["10.0.0.2:443"] }
+  postgres: { endpoints: ["10.0.0.1:5432"] }
+"#,
+        ))
+        .unwrap();
+        let Some(L4::Tcp(db)) = &listener(&compiled, "db").l4 else {
+            panic!("db is a tcp listener");
+        };
+        assert_eq!(db.name, "db");
+        assert_eq!(db.backends.pick(0), Some(UpstreamId(1)));
+        let Some(L4::Tls(sni)) = &listener(&compiled, "sni").l4 else {
+            panic!("sni is a tls listener");
+        };
+        let route = |name: &str| sni.route(name).map(|route| route.name.as_str());
+        assert_eq!(route("api.example.com"), Some("api"));
+        assert_eq!(route("www.example.com"), Some("rest"));
+        assert_eq!(route("a.b.example.com"), Some("rest"));
+        assert_eq!(route("example.com"), None);
+        assert_eq!(route("elsewhere.test"), None);
+        assert!(listener(&compiled, "web").l4.is_none());
+    }
+
+    /// A route goes only to listeners of its kind, a `tcp` listener has exactly one, a
+    /// passthrough listener presents no certificate, and a passthrough route has 1 to 16
+    /// backends that take plain bytes and a name no other route has.
+    #[test]
+    fn passthrough_routes_are_held_to_their_listeners_and_backends() {
+        let refused = |listeners: &str, routes: &str| -> Vec<String> {
+            let yaml = format!(
+                "listeners: {{ {listeners} }}\n{routes}\nupstreams: {{ up: {{ endpoints: [] }}, h2: {{ endpoints: [], protocol: http2 }} }}\n"
+            );
+            compile(&config(&yaml))
+                .err()
+                .unwrap_or_default()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        let tcp = r#"t: { address: "[::]:1", protocol: tcp }"#;
+        let tls = r#"s: { address: "[::]:2", protocol: tls }"#;
+        let http = r#"h: { address: "[::]:3", protocol: http }"#;
+        let tcp_route = |name: &str, listeners: &str, backends: &str| {
+            format!("{{ name: {name}, listeners: [{listeners}], backends: [{backends}] }}")
+        };
+        let tls_route = |name: &str, listeners: &str, hostnames: &str| {
+            format!(
+                "{{ name: {name}, listeners: [{listeners}], hostnames: [{hostnames}], backends: [{{ upstream: up, weight: 1 }}] }}"
+            )
+        };
+        let up = "{ upstream: up, weight: 1 }";
+        let a_test = "{ name: a.test, falls_through: true }";
+
+        assert_eq!(
+            refused(tcp, "routes: []"),
+            ["listener `t`: a `tcp` listener needs exactly one TCP route; it has 0"]
+        );
+        assert_eq!(
+            refused(
+                tcp,
+                &format!(
+                    "routes: []\ntcp_routes: [{}, {}]",
+                    tcp_route("a", "t", up),
+                    tcp_route("b", "t", up)
+                )
+            ),
+            ["listener `t`: a `tcp` listener needs exactly one TCP route; it has 2"]
+        );
+        assert_eq!(
+            refused(
+                &format!("{tcp}, {tls}"),
+                &format!("routes: []\ntcp_routes: [{}]", tcp_route("a", "t, s", up))
+            ),
+            ["route `a`: a TCP route cannot be for listener `s`, which is `tls`"]
+        );
+        assert_eq!(
+            refused(
+                &format!("{tls}, {http}"),
+                &format!("routes: []\ntls_routes: [{}]", tls_route("a", "h", a_test))
+            ),
+            ["route `a`: a TLS route cannot be for listener `h`, which is `http`"]
+        );
+        assert_eq!(
+            refused(
+                tcp,
+                &format!(
+                    "routes:\n  - {{ name: web, listeners: [t], hostnames: [{{ name: \"*\", falls_through: true }}], rules: [{{ matches: [{{ path: {{ prefix: / }} }}], backends: [{up}] }}] }}\ntcp_routes: [{}]",
+                    tcp_route("a", "t", up)
+                )
+            ),
+            ["route `web`: a HTTP route cannot be for listener `t`, which is `tcp`"]
+        );
+        assert_eq!(
+            refused(
+                tls,
+                &format!("routes: []\ntls_routes: [{}]", tls_route("a", "s", ""))
+            ),
+            ["route `a`: no hostnames; every host is the name `*`"]
+        );
+        assert_eq!(
+            refused(
+                tcp,
+                &format!("routes: []\ntcp_routes: [{}]", tcp_route("a", "t", ""))
+            ),
+            ["route `a`: no backends"]
+        );
+        let seventeen = vec![up; 17].join(", ");
+        assert_eq!(
+            refused(
+                tcp,
+                &format!(
+                    "routes: []\ntcp_routes: [{}]",
+                    tcp_route("a", "t", &seventeen)
+                )
+            ),
+            ["route `a`: a TCP or TLS route has at most 16 backends"]
+        );
+        assert_eq!(
+            refused(
+                tcp,
+                &format!(
+                    "routes: []\ntcp_routes: [{}]",
+                    tcp_route("a", "t", "{ upstream: h2, weight: 1 }")
+                )
+            ),
+            [
+                "route `a`, backends[0]: upstream `h2` is spoken to in HTTP/2 or over TLS, which a TCP or TLS route does not do"
+            ]
+        );
+        assert_eq!(
+            refused(
+                r#"t: { address: "[::]:1", protocol: tcp, tls: { certificates: [{ chain: C, key: K }] } }"#,
+                &format!("routes: []\ntcp_routes: [{}]", tcp_route("a", "t", up))
+            ),
+            ["listener `t`: `tls` is for protocol `https`"]
+        );
+        assert_eq!(
+            refused(
+                &format!("{tcp}, {tls}"),
+                &format!(
+                    "routes: []\ntcp_routes: [{}]\ntls_routes: [{}]",
+                    tcp_route("a", "t", up),
+                    tls_route("a", "s", a_test)
+                )
+            ),
+            ["route `a`: another route has the same name"]
+        );
     }
 
     /// TLS to an upstream names the server it expects and trusts at least one authority to

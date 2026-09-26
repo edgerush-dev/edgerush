@@ -21,7 +21,7 @@ mod route;
 pub use backends::{UpstreamId, WeightedBackends};
 pub use compile::{
     Compiled, CompiledListener, CompiledMirror, CompiledRetry, CompiledRule, CompiledUpstream,
-    ConfigError, Object, Place, Problem, RuleId, compile,
+    ConfigError, L4, L4Route, Object, Place, Problem, RuleId, SniRouter, compile,
 };
 pub use config::{
     Certificate, ClientValidation, Config, HealthCheck, Http3, Keepalive, Listener, Probe,
@@ -29,5 +29,5 @@ pub use config::{
 };
 pub use route::{
     Backend, Filter, Fraction, GrpcMethod, Header, HeaderChanges, Hostname, Match, Mirror,
-    PathMatch, Retry, Route, Rule, ValueMatch, ValuePredicate, Wildcard,
+    PathMatch, Retry, Route, Rule, TcpRoute, TlsRoute, ValueMatch, ValuePredicate, Wildcard,
 };

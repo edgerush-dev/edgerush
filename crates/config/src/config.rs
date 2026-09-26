@@ -1,6 +1,6 @@
 //! The whole of what a data plane is given to run.
 
-use crate::Route;
+use crate::{Route, TcpRoute, TlsRoute};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -14,6 +14,13 @@ pub struct Config {
     pub listeners: BTreeMap<String, Listener>,
     /// The routes, in order of precedence among otherwise equal matches.
     pub routes: Vec<Route>,
+    /// The routes of `tcp` listeners.
+    #[serde(default)]
+    pub tcp_routes: Vec<TcpRoute>,
+    /// The routes of `tls` listeners, in order of precedence among equally specific
+    /// hostnames.
+    #[serde(default)]
+    pub tls_routes: Vec<TlsRoute>,
     /// The upstreams that backends refer to, by name. They have no order.
     pub upstreams: BTreeMap<String, Upstream>,
 }
@@ -60,6 +67,11 @@ pub enum Protocol {
     Http,
     /// HTTP/1.1 and HTTP/2 over TLS, told apart by ALPN.
     Https,
+    /// Bytes, as they come, to the listener's one TCP route (17 in the docs).
+    Tcp,
+    /// TLS read as far as its ClientHello and no further, to the TLS route whose
+    /// hostnames cover the name the client asks for (SNI).
+    Tls,
 }
 
 /// The TLS a listener terminates.

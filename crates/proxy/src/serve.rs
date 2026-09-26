@@ -472,6 +472,14 @@ impl Snapshot {
             .iter()
             .map(|name| config.listeners.iter().position(|l| l.name == *name))
             .collect();
+        // Passthrough listeners are in the model before the data plane can serve them
+        // (17, step 3): one would otherwise be served as plain HTTP.
+        if let Some(listener) = config.listeners.iter().find(|l| l.l4.is_some()) {
+            return Err(ProxyError::NotYet {
+                listener: listener.name.clone(),
+                what: "TCP and TLS passthrough",
+            });
+        }
         let tls = listeners
             .iter()
             .enumerate()
@@ -2098,6 +2106,14 @@ pub enum ProxyError {
     /// BoringSSL could not give the keys the data plane makes at start.
     #[error("no random keys to be had: {0}")]
     Random(String),
+    /// A listener of a kind the data plane does not serve yet.
+    #[error("listener `{listener}`: {what} is not served yet")]
+    NotYet {
+        /// The listener's name.
+        listener: String,
+        /// What it asks for.
+        what: &'static str,
+    },
 }
 
 fn authority(endpoint: &SocketAddr) -> Result<Authority, ProxyError> {
@@ -3555,6 +3571,24 @@ upstreams:
                 }
             })
             .await;
+    }
+
+    /// A passthrough listener is refused until the data plane can serve one (17, step 3),
+    /// rather than served as plain HTTP.
+    #[test]
+    fn a_passthrough_listener_is_not_served_as_http() {
+        let yaml = r#"
+listeners: { db: { address: "127.0.0.1:0", protocol: tcp } }
+routes: []
+tcp_routes: [{ name: db, listeners: [db], backends: [{ upstream: up, weight: 1 }] }]
+upstreams: { up: { endpoints: ["127.0.0.1:9"] } }
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let refused = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "listener `db`: TCP and TLS passthrough is not served yet"
+        );
     }
 
     /// An HTTPS listener that serves HTTP/3 says so on its TCP answers, with the port its

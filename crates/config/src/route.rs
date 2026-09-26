@@ -20,6 +20,35 @@ pub struct Route {
     pub rules: Vec<Rule>,
 }
 
+/// A route for a `tcp` listener: every connection it takes goes to these backends, as
+/// Gateway API's TCPRoute has it (17 in the docs).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpRoute {
+    /// Unique among every kind of route.
+    pub name: String,
+    /// The names of the `tcp` listeners it is for. At least one.
+    pub listeners: Vec<String>,
+    /// Where connections go, in proportion to the weights: 1 to 16.
+    pub backends: Vec<Backend>,
+}
+
+/// A route for a `tls` listener: the connections whose ClientHello asks for a name its
+/// hostnames cover, as Gateway API's TLSRoute has it in passthrough mode.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsRoute {
+    /// Unique among every kind of route.
+    pub name: String,
+    /// The names of the `tls` listeners it is for. At least one.
+    pub listeners: Vec<String>,
+    /// The names served, matched against the SNI as a request's host is against an HTTP
+    /// route's. At least one.
+    pub hostnames: Vec<Hostname>,
+    /// Where connections go, in proportion to the weights: 1 to 16.
+    pub backends: Vec<Backend>,
+}
+
 /// A claim on hosts.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
