@@ -65,6 +65,8 @@ pub(crate) struct Client {
     /// The next datagram from the server is lost on its way: received, and never handed
     /// to quiche.
     pub(crate) lose_next: bool,
+    /// The largest datagram the path from the server carries: larger ones are lost on it.
+    pub(crate) path_carries: Option<usize>,
     /// The stream the next HTTP/0.9 request goes on.
     hq_next: u64,
     /// HTTP/0.9 answers are left unread, as by a client that takes no more.
@@ -113,6 +115,7 @@ impl Client {
             received: Vec::new(),
             send_to: None,
             lose_next: false,
+            path_carries: None,
             hq_next: 0,
             hq_unread: false,
         }
@@ -200,7 +203,9 @@ impl Client {
         match tokio::time::timeout(wait, self.socket.recv_from(&mut buf)).await {
             Ok(Ok((len, from))) => {
                 self.received.push(buf[..len].to_vec());
-                if std::mem::take(&mut self.lose_next) {
+                if std::mem::take(&mut self.lose_next)
+                    || self.path_carries.is_some_and(|most| len > most)
+                {
                     return;
                 }
                 let info = quiche::RecvInfo {

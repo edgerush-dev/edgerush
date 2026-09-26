@@ -465,6 +465,49 @@ fn connections_that_found_no_room_all_go_on_when_there_is() {
     });
 }
 
+/// An answer crosses a path that carries no datagram larger than 1,232 bytes, IPv6's
+/// minimum MTU of 1,280 less its headers, and so does the next after the client's NAT
+/// rebinds it: every datagram is of a size every path carries (16 §6).
+#[test]
+fn an_answer_crosses_a_path_of_the_smallest_mtu() {
+    locally(async {
+        const SIZE: usize = 64 << 10;
+        let server = serving(Settings::default(), |_request, _interim| -> Answering {
+            Box::pin(async { Answered::Map(Response::new(Full::new(Bytes::from(vec![42; SIZE])))) })
+        })
+        .await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        client.path_carries = Some(1_232);
+        for path in ["/first", "/rebound"] {
+            if path == "/rebound" {
+                client.rebind().await;
+            }
+            let id = client.request(&get("a.test", path), true);
+            client.flush().await;
+            let asked = tokio::time::Instant::now();
+            while !client
+                .answers
+                .get(&id)
+                .is_some_and(|answer| answer.finished)
+                && asked.elapsed() < Duration::from_secs(3)
+            {
+                client.for_a_while(Duration::from_millis(20)).await;
+            }
+            let answer = client.answers.get(&id).cloned().unwrap_or_default();
+            let lost = client
+                .received
+                .iter()
+                .filter(|datagram| datagram.len() > 1_232)
+                .count();
+            assert_eq!(
+                answer.body.len(),
+                SIZE,
+                "{path}: {lost} datagrams too large for the path"
+            );
+        }
+    });
+}
+
 /// A megabyte's upload, far past a single piece, reaches the core whole, and so does a
 /// client's trailers after it.
 #[test]

@@ -77,7 +77,10 @@ pub(crate) struct Settings {
     pub(crate) stream_idle: Duration,
     /// How long a draining connection's requests have to finish.
     pub(crate) drain_within: Duration,
-    /// The largest datagram sent: what nearly every path carries without fragmenting.
+    /// The largest datagram sent: what a path of IPv6's minimum MTU (1,280) carries, and so
+    /// every path, one a client's NAT rebinds it to included. There is no path-MTU
+    /// discovery: quiche's probes only a connection's first path, and never steps down on a
+    /// black hole (16 §6).
     pub(crate) datagram: usize,
     /// Connections a worker holds on the listener before it admits no more.
     pub(crate) connections: usize,
@@ -103,7 +106,7 @@ impl Default for Settings {
             first_request: Duration::from_secs(10),
             stream_idle: Duration::from_secs(30),
             drain_within: Duration::from_secs(25),
-            datagram: 1_350,
+            datagram: 1_232,
             connections: 32_768,
             retry_above: 1_024,
             batch: 64,
