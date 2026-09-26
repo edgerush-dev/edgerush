@@ -11782,6 +11782,56 @@ fn a_repeated_retire_connection_id_is_ignored() {
     assert!(!pipe.server.is_draining() && !pipe.server.is_closed());
 }
 
+/// EdgeRush: a client whose ClientHello comes again did not have the server's
+/// answer, which is sent again at once (RFC 9002 §6.2.3), and is enough for the
+/// client to finish its side of the handshake. No time passes here, so no PTO
+/// could send it.
+#[test]
+fn a_repeated_client_hello_brings_the_server_hello_again() {
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+
+    // The ClientHello reaches the server; its answer is lost.
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    assert!(test_utils::emit_flight(&mut pipe.server).is_ok());
+
+    repeat_client_hello(&mut pipe);
+    let again = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, again).unwrap();
+    assert!(pipe.client.is_established());
+}
+
+/// EdgeRush: the server's answer goes again early once for the connection; a
+/// ClientHello repeated after that is answered by an ACK alone, and quiche's
+/// PTO sees to the rest.
+#[test]
+fn the_server_hello_goes_again_early_once_only() {
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    assert!(test_utils::emit_flight(&mut pipe.server).is_ok());
+
+    // The answer sent again early is lost as well.
+    repeat_client_hello(&mut pipe);
+    assert!(test_utils::emit_flight(&mut pipe.server).is_ok());
+
+    repeat_client_hello(&mut pipe);
+    let ack = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, ack).unwrap();
+    assert!(!pipe.client.is_established());
+}
+
+/// EdgeRush: the client sends its ClientHello again, as its PTO would.
+fn repeat_client_hello(pipe: &mut test_utils::Pipe) {
+    let send = &mut pipe.client.crypto_ctx[packet::Epoch::Initial]
+        .crypto_stream
+        .send;
+    let written = send.off_back();
+    send.retransmit(0, written as usize);
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+}
+
 /// EdgeRush: a server's config for the NAT rebinding tests, which asks peers
 /// not to migrate, as EdgeRush does: a rebinding is not a migration of theirs.
 fn nat_config() -> Config {

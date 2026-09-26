@@ -55,6 +55,15 @@ Every change is marked `EdgeRush:` in the source.
   another, closed the connection with PROTOCOL_VIOLATION (`src/cid.rs`, `remove`). It now
   refuses only to remove the last ID, as it meant to. `a_repeated_retire_connection_id_is_ignored`
   in `src/tests.rs` covers it.
+- **A server's answer goes again at once when the ClientHello comes again.** A client's
+  Initial CRYPTO data that the server has already read means the client did not have the
+  answer. The first time, and only then, a server marks its unacknowledged Initial and
+  Handshake CRYPTO data to be sent again at once, rather than at its PTO (RFC 9002 §6.2.3,
+  as HAProxy does it; `Connection::handshake_sped_up`, in the CRYPTO frame's handling in
+  `src/lib.rs`). `a_repeated_client_hello_brings_the_server_hello_again` and
+  `the_server_hello_goes_again_early_once_only` in `src/tests.rs` cover it. What sets it
+  off, a repeat and nothing else, is not reached by quiche's client, whose ClientHello
+  fits one packet.
 
 ## Why
 
@@ -94,7 +103,15 @@ connections, before EdgeRush's driver had issued the replacement it issues once 
 RFC 9000 §19.16 makes an error of retiring an ID never issued, or the one a packet was
 sent to, neither of which this was.
 
-With all four changes, quiche's own library tests pass (1,151 of 1,151, on Windows and
+**The ServerHello sent again early.** quiche answered a client's repeated ClientHello with
+an ACK alone and sent its own ServerHello again only at its PTO, which doubles each time. In
+quic-interop-runner's cases of 30% loss and corruption, a ServerHello spoiled three times
+over took a handshake past ten seconds. RFC 9002 §6.2.3 lets an endpoint send unacknowledged
+CRYPTO data early "for a limited number of times per connection"; HAProxy does it once, on
+a duplicate CRYPTO frame, which is what this does. What goes stays within the
+anti-amplification limit: a client's Initial is 1,200 bytes at least.
+
+With all five changes, quiche's own library tests pass (1,153 of 1,153, on Windows and
 Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`).
 The proxy's probe `several_streams_share_a_packet` in `crates/proxy/tests/h3_library.rs`
 fails against the published crate, as do its tests `an_answer_carries_the_ack_of_its_request`

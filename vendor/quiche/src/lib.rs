@@ -1543,6 +1543,10 @@ where
     /// Whether the connection handshake has been confirmed.
     handshake_confirmed: bool,
 
+    /// EdgeRush: whether a server already sent its handshake data again early,
+    /// on a client's repeated Initial CRYPTO data (RFC 9002 §6.2.3).
+    handshake_sped_up: bool,
+
     /// Key phase bit used for outgoing protected packets.
     key_phase: bool,
 
@@ -2205,6 +2209,8 @@ impl<F: BufFactory> Connection<F> {
             handshake_done_acked: false,
 
             handshake_confirmed: false,
+
+            handshake_sped_up: false,
 
             key_phase: false,
 
@@ -8677,6 +8683,28 @@ impl<F: BufFactory> Connection<F> {
             frame::Frame::Crypto { data } => {
                 if data.max_off() >= MAX_CRYPTO_STREAM_OFFSET {
                     return Err(Error::CryptoBufferExceeded);
+                }
+
+                // EdgeRush: a client's Initial CRYPTO data seen already means it
+                // did not have the server's answer. That answer goes again at
+                // once, rather than at a PTO that doubles each time, once for
+                // the connection, as RFC 9002 §6.2.3 allows and HAProxy does:
+                // under loss a ServerHello lost two or three times otherwise
+                // outlived the client's patience.
+                if self.is_server &&
+                    epoch == packet::Epoch::Initial &&
+                    !self.handshake_sped_up &&
+                    data.max_off() <=
+                        self.crypto_ctx[epoch].crypto_stream.recv.off_front() &&
+                    self.crypto_ctx[epoch].crypto_stream.send.off_back() > 0
+                {
+                    self.handshake_sped_up = true;
+
+                    for e in [packet::Epoch::Initial, packet::Epoch::Handshake] {
+                        let send = &mut self.crypto_ctx[e].crypto_stream.send;
+                        let written = send.off_back();
+                        send.retransmit(0, written as usize);
+                    }
                 }
 
                 // Push the data to the stream so it can be re-ordered.
