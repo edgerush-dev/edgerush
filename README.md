@@ -77,10 +77,13 @@ crates/telemetry   metrics (`edgerush-telemetry`): counters sharded by thread, t
 bench              the macro benchmark: load generator, proxy and backend on one Linux machine
                    (bench/README.md)
 fuzz               fuzz targets (cargo-fuzz; not part of the workspace)
+vendor/quiche      quiche 0.30.0 with one change, built in place of the published crate
+                   (vendor/quiche/VENDORED.md; BSD-2-Clause, not part of the workspace)
 ```
 
 Crates are internal to this workspace and are not published.
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE). `vendor/quiche` is quiche's, under its own BSD 2-Clause
+licence ([vendor/quiche/COPYING](vendor/quiche/COPYING)).

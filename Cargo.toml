@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# A patched third-party crate, built as a dependency and never as one of ours: its code
+# is held to its own rules, not to the workspace's lints and checks.
+exclude = ["vendor/quiche"]
 
 [workspace.package]
 version = "0.0.0"
@@ -64,7 +67,8 @@ tokio-boring = "5.2"
 # QUIC and HTTP/3 to clients (16 §2), driven by a worker of ours: it does no I/O and keeps
 # no timers. Its TLS is the `boring` above, so there is one BoringSSL in the binary. It is
 # pre-1.0 and a minor release breaks, so it is pinned; moving it re-checks 16 §2 and the
-# probes in `crates/proxy/tests/h3_library.rs`. Only the proxy crate may depend on it.
+# probes in `crates/proxy/tests/h3_library.rs`. Only the proxy crate may depend on it. It
+# is built from `vendor/quiche`, patched (see `[patch.crates-io]` below).
 quiche = { version = "=0.30.0", default-features = false, features = ["boringssl-boring-crate"] }
 # Only what is used; tests add the multi-thread runtime and the macros for themselves.
 tokio = { version = "1.53", features = ["net", "rt", "time"] }
@@ -82,6 +86,13 @@ proptest = { version = "1.11", default-features = false, features = ["std"] }
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# quiche 0.30.0 as published, but for one change: it puts as many streams' STREAM frames in
+# a packet as fit, where the published crate puts one (16 §2). `vendor/quiche/VENDORED.md`
+# says what changed, why, and how to carry it to another version. `fuzz/Cargo.toml` names
+# it too, being a workspace of its own.
+[patch.crates-io]
+quiche = { path = "vendor/quiche" }
 
 # Callgrind attributes costs to functions by their symbols.
 [profile.bench]

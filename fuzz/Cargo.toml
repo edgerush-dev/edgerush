@@ -28,6 +28,10 @@ libfuzzer-sys = "0.4"
 # version the proxy pins.
 quiche = { version = "=0.30.0", default-features = false, features = ["boringssl-boring-crate"] }
 
+# The proxy's quiche, patched as the workspace's is (see its Cargo.toml).
+[patch.crates-io]
+quiche = { path = "../vendor/quiche" }
+
 [[bin]]
 name = "host_index"
 path = "fuzz_targets/host_index.rs"

@@ -817,5 +817,53 @@ fn qpack_encoder_instructions_are_dropped() {
     assert_eq!(names(&events), ["headers GET more=false", "finished"]);
 }
 
+/// Small answers on several streams go out in one packet, in the order they were written.
+/// The published quiche writes one stream's frame a packet; the vendored one fills the
+/// packet (`vendor/quiche/VENDORED.md`, 16 §2), and this is what says it still does.
+#[test]
+fn several_streams_share_a_packet() {
+    let (mut pipe, mut client, mut server) = h3_pipe();
+    let streams: Vec<u64> = (0..8)
+        .map(|_| {
+            client
+                .send_request(&mut pipe.client, &h3_headers(&get()), true)
+                .unwrap()
+        })
+        .collect();
+    pipe.advance();
+    pipe.server_events(&mut server);
+
+    for &stream in &streams {
+        server
+            .send_response(&mut pipe.server, stream, &status("200"), false)
+            .unwrap();
+        server
+            .send_body(&mut pipe.server, stream, b"hello", true)
+            .unwrap();
+    }
+    let mut buf = vec![0; 1_350];
+    let mut datagrams = Vec::new();
+    while let Ok((len, info)) = pipe.server.send(&mut buf) {
+        datagrams.push(Datagram {
+            bytes: buf[..len].to_vec(),
+            from: info.from,
+            to: info.to,
+        });
+    }
+    assert_eq!(datagrams.len(), 1);
+    for datagram in datagrams {
+        pipe.deliver_to_client(datagram);
+    }
+
+    let (events, error) = pipe.client_events(&mut client);
+    assert_eq!(error, None);
+    let answered: Vec<u64> = events
+        .iter()
+        .filter(|(_, event)| matches!(event, Event::Headers { .. }))
+        .map(|(stream, _)| *stream)
+        .collect();
+    assert_eq!(answered, streams);
+}
+
 // 17 bytes, the length 16 §3 gives server IDs, is within what QUIC allows and quiche takes.
 const _: () = assert!(ID_LEN <= quiche::MAX_CONN_ID_LEN);
