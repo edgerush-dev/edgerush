@@ -25,9 +25,10 @@
 #   bench/run.sh h3 [STREAMED]                HTTP/3 clients: few hot connections, many, one
 #                                             hot one, streamed bodies at STREAMED a second,
 #                                             and TLS HTTP/2 beside them to read them by
-#   bench/run.sh passthrough CHURN [STREAMED] TCP and TLS passthrough: kept connections at
-#                                             saturation, a connection a request at CHURN a
-#                                             second, and streamed answers
+#   bench/run.sh passthrough CHURN [TLS_CHURN] [STREAMED]
+#                                             TCP and TLS passthrough: kept connections at
+#                                             saturation, a connection a request at CHURN (and
+#                                             TLS_CHURN) a second, and streamed answers
 #   bench/run.sh summary DIR                  the table of a finished run
 #
 # UPSTREAM_H2=1 has the proxy speak HTTP/2 to the backend, by prior knowledge, many
@@ -218,6 +219,12 @@ start_proxy() { # variant
         mkdir -p "$run-proxy/tmp"
         if [ "$PASSTHROUGH" = 1 ]; then
             sed "s/WORKERS/$WORKERS/" "$here/nginx-stream.conf" >"$run-proxy/nginx.conf"
+            # Ubuntu builds the stream module apart (libnginx-mod-stream), and its own
+            # config loads it by a path relative to a prefix this run replaces.
+            local stream_module=/usr/lib/nginx/modules/ngx_stream_module.so
+            if [ -f "$stream_module" ]; then
+                sed -i "1i load_module $stream_module;" "$run-proxy/nginx.conf"
+            fi
         else
             sed "s/WORKERS/$WORKERS/" "$here/nginx-proxy.conf" >"$run-proxy/nginx.conf"
         fi
@@ -636,9 +643,9 @@ profile-body)
         exit 2
     }
     ;;
-ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3) ;;
+ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3 | passthrough) ;;
 *)
-    sed -n '2,32p' "$0" >&2
+    sed -n '2,36p' "$0" >&2
     exit 2
     ;;
 esac
@@ -871,14 +878,17 @@ passthrough)
     # the tls one), with a connection made for every request at CHURN a second (the
     # accept, the ClientHello read and the connection to the backend each time), and 8 MiB
     # answers at STREAMED a second.
-    churn_rate=${2:?rate for churn} streamed_rate=${3:-20}
+    # A TLS connection a request costs the client and the backend a handshake each, which
+    # the laptop's generator and backend keep up with at about 1,400 a second: TLS_CHURN is
+    # half of CHURN unless said.
+    churn_rate=${2:?rate for churn} tls_churn_rate=${3:-$((${2:-0} / 2))} streamed_rate=${4:-20}
     named=https://$host:8443/
     named_at=(--connect-to "$host:8443:127.0.0.1:8443" --insecure)
     passthrough_runs() {
         saturation_h1 "$1.saturation-tcp" "$proxy" --connect-to="$proxy_at"
         saturation_h2 "$1.saturation-tls" "$named" --connect-to=127.0.0.1:8443
         churn "$1.churn-tcp" "$churn_rate" "$proxy"
-        churn "$1.churn-tls" "$churn_rate" "$named" "${named_at[@]}"
+        churn "$1.churn-tls" "$tls_churn_rate" "$named" "${named_at[@]}"
         streamed_answer "$1.streamed-tcp" "$streamed_rate"
     }
     each_variant passthrough_runs
