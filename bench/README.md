@@ -76,6 +76,12 @@ tar xf nghttp2-1.68.0.tar.xz && cd nghttp2-1.68.0
 make -j"$(nproc)" && make install
 ```
 
+While HTTP/3 is measured the loopback's MTU is set to `LOOPBACK_MTU` (1500 by default,
+with sudo; `0` leaves it alone) and put back when the run ends. At the loopback's own
+64 KiB, NGINX's path-MTU discovery sends datagrams of about 44 KB — 188 of them for an
+8 MiB answer where a 1,500-byte path needs over 6,000 — and the scenarios would measure
+that rather than the proxies. `environment.txt` records the MTU a run had.
+
 Run every comparison at `IDLE_PER_DESTINATION=1024 IDLE_TOTAL=1024`: at the defaults a few
 hundred requests in flight keep EdgeRush opening upstream connections, and that is what
 gets measured.

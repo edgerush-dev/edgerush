@@ -70,6 +70,11 @@ repo=$(dirname "$here")
 [ "$H3" = 1 ] && TLS=1
 # h2load with HTTP/3: Ubuntu's is built without it (bench/README.md says how to build one).
 : "${H2LOAD3:=$HOME/tools/h2load3/bin/h2load}"
+# The loopback's MTU while HTTP/3 is measured (sudo). The loopback's own 64 KiB lets a QUIC
+# stack that discovers its path's MTU, as NGINX's does, send datagrams of 44 KB that no
+# Internet path carries, and its scenarios would measure that rather than the proxies:
+# 1,500 bytes is an Ethernet path's (16 §8). Put back when the run ends; 0 leaves it alone.
+: "${LOOPBACK_MTU:=1500}"
 : "${UPSTREAM_H2:=0}"
 : "${VARIANTS:=ours}" # and: ours-kernel nginx haproxy envoy kong
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
@@ -550,6 +555,7 @@ environment() {
         [ "$UPSTREAM_H2" = 1 ] && echo "upstream spoken to in HTTP/2 (prior knowledge)"
         h2load --version
         [ "$H3" = 1 ] && echo "HTTP/3 by $("$H2LOAD3" --version)"
+        [ "$H3" = 1 ] && echo "loopback MTU $(cat /sys/class/net/lo/mtu)"
         oha --version
         nginx -v 2>&1
         { command -v haproxy >/dev/null && haproxy -v | head -1; } || true
@@ -605,7 +611,15 @@ if command -v systemd-inhibit >/dev/null; then
 fi
 
 mkdir -p "$OUT"
-trap 'stop_proxy; stop_backend' EXIT
+loopback_mtu=
+restore_mtu() {
+    if [ -n "$loopback_mtu" ]; then sudo -n ip link set lo mtu "$loopback_mtu"; fi
+}
+trap 'stop_proxy; stop_backend; restore_mtu' EXIT
+if [ "$H3" = 1 ] && [ "$LOOPBACK_MTU" != 0 ]; then
+    loopback_mtu=$(cat /sys/class/net/lo/mtu)
+    sudo -n ip link set lo mtu "$LOOPBACK_MTU"
+fi
 environment
 start_backend
 case "$command" in
