@@ -11815,6 +11815,40 @@ fn a_stream_stopped_after_it_was_taken_as_writable_is_reported(
     assert!(pipe.server.streams.is_collected(0));
 }
 
+/// EdgeRush: a peer that sends a stream's data a byte at a time, a gap after
+/// each, has the connection closed with PROTOCOL_VIOLATION once the stream
+/// holds more than 1,024 runs of it (quinn closes past 1,024 chunks, Google's
+/// QUICHE past 10,000 ranges).
+#[rstest]
+fn a_stream_sent_in_gapped_pieces_closes_the_connection(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    // Room for the 2 KiB of offsets the runs take.
+    config.set_initial_max_data(1 << 20);
+    config.set_initial_max_stream_data_bidi_remote(1 << 20);
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    let mut sent = 0;
+    while pipe.server.local_error().is_none() && sent < 1_025 {
+        let frames: Vec<frame::Frame> = (sent..(sent + 100).min(1_025))
+            .map(|run| frame::Frame::Stream {
+                stream_id: 0,
+                data: <RangeBuf>::from(b"a", 2 * run + 1, false),
+            })
+            .collect();
+        sent += frames.len() as u64;
+        let _ = pipe.send_pkt_to_server(Type::Short, &frames, &mut buf);
+    }
+
+    assert_eq!(sent, 1_025);
+    let error = pipe.server.local_error().expect("the connection was kept");
+    assert!(!error.is_app);
+    assert_eq!(error.error_code, 0xa);
+}
+
 /// EdgeRush: a client whose ClientHello comes again did not have the server's
 /// answer, which is sent again at once (RFC 9002 §6.2.3), and is enough for the
 /// client to finish its side of the handshake. No time passes here, so no PTO

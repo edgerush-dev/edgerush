@@ -40,6 +40,14 @@ use crate::Result;
 use crate::flowcontrol;
 
 use crate::range_buf::RangeBuf;
+use crate::ranges::RangeSet;
+
+/// EdgeRush: the most runs of data, gaps between them, a stream holds before
+/// the connection is closed, quinn's bound on the chunks it keeps. A gap is a
+/// packet lost and not yet sent again, and a sender's congestion control keeps
+/// nothing like the 2,048 packets that many gaps take in flight on a path that
+/// loses so much.
+const MAX_RUNS: usize = 1_024;
 
 /// Receive-side stream buffer.
 ///
@@ -69,6 +77,9 @@ pub struct RecvBuf {
 
     /// Whether incoming data is validated but not buffered.
     drain: bool,
+
+    /// EdgeRush: the offsets of the data held, as runs with gaps between them.
+    runs: RangeSet,
 }
 
 impl RecvBuf {
@@ -197,11 +208,21 @@ impl RecvBuf {
             self.len = cmp::max(self.len, buf.max_off());
 
             if !self.drain {
+                // EdgeRush: counted in runs, gaps between them.
+                if !buf.is_empty() {
+                    self.runs.insert(buf.off()..buf.max_off());
+                }
                 self.data.insert(buf.max_off(), buf);
             } else {
                 // we are not storing any data, off == len
                 self.off = self.len;
             }
+        }
+
+        // EdgeRush: each run costs a buffer and a node however short it is, so
+        // flow control, which counts bytes, does not bound what runs cost.
+        if self.runs.len() > MAX_RUNS {
+            return Err(Error::TooManyGaps);
         }
 
         Ok(())
@@ -294,6 +315,11 @@ impl RecvBuf {
             entry.remove();
         }
 
+        // EdgeRush: what was read is held no more.
+        if len > 0 {
+            self.runs.remove_until(self.off - 1);
+        }
+
         // Update consumed bytes for flow control.
         self.flow_control.add_consumed(len as u64);
 
@@ -334,6 +360,8 @@ impl RecvBuf {
         self.off = final_size;
 
         self.data.clear();
+        // EdgeRush: and with it its runs.
+        self.runs = RangeSet::default();
 
         // In order to ensure the application is notified when the stream is
         // reset, enqueue a zero-length buffer at the final size offset.
@@ -379,6 +407,8 @@ impl RecvBuf {
         self.drain = true;
 
         self.data.clear();
+        // EdgeRush: and with it its runs.
+        self.runs = RangeSet::default();
 
         let consumed = self.max_off() - self.off;
         self.off = self.max_off();
@@ -1329,5 +1359,70 @@ mod tests {
 
         assert_emit_discard_done(&mut recv, true);
         assert_emit_discard_done(&mut recv, false);
+    }
+
+    /// EdgeRush: a receiver with every other byte of 2 KiB of data has 1,024
+    /// runs of it, gaps between them. That is as many as it keeps: one more
+    /// is refused. Each run costs a buffer and a node however short it is, so
+    /// flow control, which counts bytes, does not bound them.
+    #[test]
+    fn a_stream_keeps_at_most_1024_runs_of_data() {
+        let mut recv = RecvBuf::new(u64::MAX, u64::MAX, u64::MAX);
+        for run in 0..1_024 {
+            assert_eq!(recv.write(RangeBuf::from(b"a", 2 * run + 1, false)), Ok(()));
+        }
+        assert_eq!(
+            recv.write(RangeBuf::from(b"a", 2 * 1_024 + 1, false)),
+            Err(Error::TooManyGaps)
+        );
+    }
+
+    /// EdgeRush: data that comes in order is one run, however many pieces it
+    /// comes in and however long it waits to be read, and so is data that
+    /// comes in order after a gap.
+    #[test]
+    fn data_in_order_is_one_run_in_any_number_of_pieces() {
+        let mut recv = RecvBuf::new(u64::MAX, u64::MAX, u64::MAX);
+        for at in 0..5_000 {
+            assert_eq!(recv.write(RangeBuf::from(b"a", at, false)), Ok(()));
+        }
+        for at in 5_001..10_000 {
+            assert_eq!(recv.write(RangeBuf::from(b"a", at, false)), Ok(()));
+        }
+        assert_eq!(recv.runs.len(), 2);
+    }
+
+    /// EdgeRush: a run that fills a gap joins the runs either side of it,
+    /// reading forgets the runs it takes, and a reset or a shutdown forgets
+    /// them all.
+    #[rstest]
+    fn runs_join_and_are_forgotten(#[values(true, false)] emit: bool) {
+        let mut recv = RecvBuf::new(u64::MAX, u64::MAX, u64::MAX);
+        for run in 0..1_024 {
+            assert_eq!(recv.write(RangeBuf::from(b"a", 2 * run + 1, false)), Ok(()));
+        }
+        // Filling the gaps leaves one run from 0.
+        for gap in 0..1_024 {
+            assert_eq!(recv.write(RangeBuf::from(b"b", 2 * gap, false)), Ok(()));
+        }
+        assert_eq!(recv.runs.len(), 1);
+        for run in 0..1_023 {
+            let at = 4_096 + 2 * run;
+            assert_eq!(recv.write(RangeBuf::from(b"c", at, false)), Ok(()));
+        }
+        assert_eq!(recv.runs.len(), 1_024);
+
+        // Reading the first run makes room for another.
+        assert_emit_discard(&mut recv, emit, 2_048, 2_048, false, None);
+        assert_eq!(recv.runs.len(), 1_023);
+        assert_eq!(recv.write(RangeBuf::from(b"d", 8_192, false)), Ok(()));
+
+        assert!(recv.reset(0, 10_000).is_ok());
+        assert_eq!(recv.runs.len(), 0);
+
+        let mut recv = RecvBuf::new(u64::MAX, u64::MAX, u64::MAX);
+        assert_eq!(recv.write(RangeBuf::from(b"a", 1, false)), Ok(()));
+        assert!(recv.shutdown().is_ok());
+        assert_eq!(recv.runs.len(), 0);
     }
 }

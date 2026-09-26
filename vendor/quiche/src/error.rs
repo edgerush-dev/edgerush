@@ -115,6 +115,10 @@ pub enum Error {
 
     /// An invalid DCID was used when connecting to a remote peer.
     InvalidDcidInitialization,
+
+    /// EdgeRush: the peer sent a stream's data in more runs, gaps between
+    /// them, than the stream keeps.
+    TooManyGaps,
 }
 
 /// QUIC error codes sent on the wire.
@@ -227,6 +231,7 @@ impl Error {
             Error::InvalidAckRange => -21,
             Error::OptimisticAckDetected => -22,
             Error::InvalidDcidInitialization => -23,
+            Error::TooManyGaps => -24,
         }
     }
 }

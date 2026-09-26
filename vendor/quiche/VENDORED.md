@@ -74,6 +74,14 @@ Every change is marked `EdgeRush:` in the source.
   marked either way (`src/lib.rs`, the STOP_SENDING frame's handling);
   `a_stream_stopped_after_it_was_taken_as_writable_is_reported` in `src/tests.rs` covers
   it.
+- **A stream holds at most 1,024 runs of data.** A stream's receive buffer keeps what came
+  out of order as runs with gaps between them, each piece in a buffer and a tree node of
+  its own, and flow control bounds only their bytes. A `RangeSet` of what is held now
+  counts the runs (`RecvBuf::runs` in `src/stream/recv_buf.rs`, kept as data is stored,
+  read and cleared); past 1,024 a write fails with the new `Error::TooManyGaps`, which
+  closes the connection with PROTOCOL_VIOLATION. Data in order is one run however many
+  pieces it came in. Three tests at the end of `src/stream/recv_buf.rs` and
+  `a_stream_sent_in_gapped_pieces_closes_the_connection` in `src/tests.rs` cover it.
 
 ## Why
 
@@ -128,7 +136,15 @@ an upstream was never reported: the exchange went on, and the stream's credit we
 the client, which could ask and stop again without end, past the stream bound that is
 meant to bound its exchanges.
 
-With all six changes, quiche's own library tests pass (1,155 of 1,155, on Windows and
+**The runs.** A peer that sends a stream's data a byte at a time, a gap after each, makes
+a byte cost a buffer and a tree node, 100 bytes and more: every other byte of a 16 MiB
+connection window is some eight million of them, on the order of a gigabyte for one
+connection. quinn closes a connection past 1,024 chunks a stream, Google's QUICHE past
+10,000 ranges, with PROTOCOL_VIOLATION as here; NGINX bounds the frames a connection
+holds. A gap is a packet lost and not yet sent again, and no sender's congestion control
+keeps the 2,048 packets in flight that 1,024 gaps take on a path losing that much.
+
+With all seven changes, quiche's own library tests pass (1,161 of 1,161, on Windows and
 Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`).
 The proxy's probe `several_streams_share_a_packet` in `crates/proxy/tests/h3_library.rs`
 fails against the published crate, as do its tests `an_answer_carries_the_ack_of_its_request`
