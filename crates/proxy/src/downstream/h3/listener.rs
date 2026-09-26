@@ -120,7 +120,8 @@ impl Forwarding {
         self.inboxes.len()
     }
 
-    /// Which of them this share is.
+    /// Which of them this share is. Only tests ask: a worker's share is handed to it.
+    #[cfg(test)]
     pub(crate) fn worker(&self) -> usize {
         self.worker
     }
