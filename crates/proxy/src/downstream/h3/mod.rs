@@ -11,6 +11,9 @@ pub(crate) mod body;
 pub(crate) mod conn;
 pub(crate) mod connection;
 pub mod head;
+// HTTP/0.9 for quic-interop-runner: the interop image's, and the tests' (16 §8).
+#[cfg(any(test, feature = "interop"))]
+pub(crate) mod hq;
 pub(crate) mod listener;
 pub(crate) mod send;
 #[cfg(test)]
@@ -20,6 +23,13 @@ mod tests;
 pub(crate) mod writer;
 
 use std::time::Duration;
+
+/// The protocols a client may ask for over QUIC: HTTP/3, and in the interop build HTTP/0.9
+/// as quic-interop-runner speaks it.
+#[cfg(not(any(test, feature = "interop")))]
+const PROTOCOLS: &[&[u8]] = quiche::h3::APPLICATION_PROTOCOL;
+#[cfg(any(test, feature = "interop"))]
+const PROTOCOLS: &[&[u8]] = &[b"h3", hq::ALPN];
 
 /// HTTP/3's error codes that the server says (RFC 9114 §8.1).
 pub(crate) mod code {
@@ -104,7 +114,7 @@ impl Settings {
     ) -> Result<quiche::Config, quiche::Error> {
         let mut config =
             quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls)?;
-        config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
+        config.set_application_protos(PROTOCOLS)?;
         config.set_ticket_key(ticket_key)?;
         config
             .set_max_idle_timeout(u64::try_from(self.idle_timeout.as_millis()).unwrap_or(u64::MAX));

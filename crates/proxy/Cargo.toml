@@ -15,6 +15,9 @@ publish.workspace = true
 # differential target holds EdgeRush's own client against, and the only reason hyper is
 # built outside the tests.
 fuzzing = ["tokio/test-util", "dep:hyper", "dep:hyper-util", "hyper/client"]
+# HTTP/0.9 over QUIC (`hq-interop`) beside HTTP/3, which quic-interop-runner's transport
+# cases speak: for the interop image only, never a release (16 §8).
+interop = []
 
 [dependencies]
 arc-swap.workspace = true

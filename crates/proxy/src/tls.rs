@@ -40,8 +40,14 @@ const PROTOCOLS: &[u8] = b"\x02h2\x08http/1.1";
 /// The protocol a client that is to speak HTTP/2 was given.
 pub(crate) const H2: &[u8] = b"h2";
 
-/// What is offered over QUIC: HTTP/3, and nothing else (RFC 9114 §3.1).
+/// What is offered over QUIC: HTTP/3, and nothing else (RFC 9114 §3.1); in the interop
+/// build and the tests, HTTP/0.9 as quic-interop-runner speaks it after that (`h3::hq`).
+/// quiche is told the same (`h3::Settings`), but this is what decides: a certificate's
+/// context brings its own selection.
+#[cfg(not(any(test, feature = "interop")))]
 const QUIC_PROTOCOLS: &[u8] = b"\x02h3";
+#[cfg(any(test, feature = "interop"))]
+const QUIC_PROTOCOLS: &[u8] = b"\x02h3\x0ahq-interop";
 
 /// How long the key QUIC's tickets are sealed with is: BoringSSL's name, HMAC and AES
 /// keys together.

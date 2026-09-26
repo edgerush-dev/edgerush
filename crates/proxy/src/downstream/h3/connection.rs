@@ -60,6 +60,9 @@ struct Driving {
     /// The connection is closing: only quiche's own deadline is left to keep.
     closing: bool,
     unsent: Unsent,
+    /// What has come of each HTTP/0.9 request line not yet ended.
+    #[cfg(any(test, feature = "interop"))]
+    hq_lines: std::collections::HashMap<u64, Vec<u8>>,
 }
 
 /// The requests a connection has seen, as a GOAWAY counts them.
@@ -78,6 +81,9 @@ struct Found {
     id: u64,
     head: RequestHead,
     ended: bool,
+    /// Over HTTP/0.9, to be answered with the body alone.
+    #[cfg(any(test, feature = "interop"))]
+    hq: bool,
 }
 
 /// Drives `conn` until it closes. `chosen` is the ID the client first sent to; `opened`
@@ -111,6 +117,8 @@ pub(crate) async fn drive<R, F, B, D, G>(
         to_close: false,
         closing: false,
         unsent: Unsent::new(),
+        #[cfg(any(test, feature = "interop"))]
+        hq_lines: std::collections::HashMap::new(),
     };
     let mut alarm = Alarm::new(&shared.timers, None);
     let mut drain_heard = pin!(shared.drain.notified());
@@ -126,13 +134,23 @@ pub(crate) async fn drive<R, F, B, D, G>(
             }
             if conn.take_stirred() || !driving.unsent.is_empty() {
                 turn(&conn, &shared, &mut driving, &mut found);
-                for Found { id, head, ended } in found.drain(..) {
+                for request in found.drain(..) {
                     driving.asked = true;
-                    let stream = Stream::adopt(&conn, id);
+                    let stream = Stream::adopt(&conn, request.id);
+                    #[cfg(any(test, feature = "interop"))]
+                    if request.hq {
+                        let _detached = tokio::task::spawn_local(super::hq::answer(
+                            stream,
+                            request.head,
+                            Rc::clone(&respond),
+                            settings.stream_idle,
+                        ));
+                        continue;
+                    }
                     let _detached = tokio::task::spawn_local(answer(
                         stream,
-                        head,
-                        ended,
+                        request.head,
+                        request.ended,
                         Rc::clone(&respond),
                         Rc::clone(&date),
                         settings.stream_idle,
@@ -262,8 +280,10 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
         let State {
             quic, h3, streams, ..
         } = state;
-        let established = h3.is_none() && quic.is_established();
-        if established {
+        let established = driving.handshaking && quic.is_established();
+        // HTTP/3 only where the handshake agreed on it: the interop build offers HTTP/0.9
+        // as well.
+        if established && quic.application_proto() == b"h3" {
             match quiche::h3::Connection::with_transport(quic, &shared.h3) {
                 Ok(connection) => *h3 = Some(connection),
                 Err(_) => {
@@ -299,6 +319,17 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
                 &mut driving.seen,
                 found,
             );
+        }
+        #[cfg(any(test, feature = "interop"))]
+        if quic.is_established() && quic.application_proto() == super::hq::ALPN {
+            let mut asked = Vec::new();
+            super::hq::requests(quic, streams, &mut driving.hq_lines, &mut asked);
+            found.extend(asked.into_iter().map(|asked| Found {
+                id: asked.id,
+                head: asked.head,
+                ended: true,
+                hq: true,
+            }));
         }
         while let Some(id) = quic.stream_writable_next() {
             if let Some(writer) = streams.get_mut(&id).and_then(|slot| slot.writer.take()) {
@@ -364,6 +395,8 @@ fn events(
                             id,
                             head,
                             ended: !more_frames,
+                            #[cfg(any(test, feature = "interop"))]
+                            hq: false,
                         });
                     }
                     Err(Refused::TooLarge) => too_large(quic, h3, id),

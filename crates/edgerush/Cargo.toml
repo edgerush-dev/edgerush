@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# The quic-interop-runner image's build: its listeners speak HTTP/0.9 over QUIC as well.
+interop = ["edgerush-proxy/interop"]
+
 [dependencies]
 edgerush-config.workspace = true
 edgerush-proxy.workspace = true

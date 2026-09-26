@@ -9,6 +9,7 @@
     reason = "test set-up: the helpers fail a test the way the test would"
 )]
 
+use crate::downstream::h3::hq;
 use crate::h3_peer::client_config;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -61,16 +62,26 @@ pub(crate) struct Client {
     pub(crate) received: Vec<Vec<u8>>,
     /// Where datagrams go instead of the server's address, when a test sends them astray.
     pub(crate) send_to: Option<SocketAddr>,
+    /// The stream the next HTTP/0.9 request goes on.
+    hq_next: u64,
+    /// HTTP/0.9 answers are left unread, as by a client that takes no more.
+    pub(crate) hq_unread: bool,
 }
 
 impl Client {
     /// A client of `server` asking for `name`, its handshake not yet begun.
     pub(crate) async fn new(server: SocketAddr, name: &str) -> Self {
+        Self::offering(server, name, quiche::h3::APPLICATION_PROTOCOL).await
+    }
+
+    /// The same, offering `protocols` in its handshake.
+    async fn offering(server: SocketAddr, name: &str, protocols: &[&[u8]]) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let local = socket.local_addr().unwrap();
         let mut scid = [0; 16];
         boring::rand::rand_bytes(&mut scid).unwrap();
         let mut config = client_config();
+        config.set_application_protos(protocols).unwrap();
         // A head of a hundred kilobytes goes in one call or not at all: room for it from
         // the start, which a loopback has anyway.
         config.set_initial_congestion_window_packets(1_000);
@@ -91,6 +102,8 @@ impl Client {
             goaway: None,
             received: Vec::new(),
             send_to: None,
+            hq_next: 0,
+            hq_unread: false,
         }
     }
 
@@ -102,6 +115,14 @@ impl Client {
         client.h3 =
             Some(quiche::h3::Connection::with_transport(&mut client.quic, &config).unwrap());
         client.flush().await;
+        client
+    }
+
+    /// A client of `server` asking for `name`, through its handshake, speaking HTTP/0.9 as
+    /// quic-interop-runner's clients do.
+    pub(crate) async fn connect_hq(server: SocketAddr, name: &str) -> Self {
+        let mut client = Self::offering(server, name, &[hq::ALPN]).await;
+        client.until(|client| client.quic.is_established()).await;
         client
     }
 
@@ -195,6 +216,10 @@ impl Client {
     }
 
     fn events(&mut self) {
+        if self.quic.application_proto() == hq::ALPN {
+            self.hq_events();
+            return;
+        }
         let Some(h3) = self.h3.as_mut() else {
             return;
         };
@@ -234,6 +259,41 @@ impl Client {
                 Err(_) => return,
             }
         }
+    }
+
+    /// Reads each stream as an HTTP/0.9 client does: its bytes are the answer, and its end
+    /// the answer's.
+    fn hq_events(&mut self) {
+        if self.hq_unread {
+            return;
+        }
+        let readable: Vec<u64> = self.quic.readable().collect();
+        let mut buf = vec![0; 65_535];
+        for id in readable {
+            let answer = self.answers.entry(id).or_default();
+            loop {
+                match self.quic.stream_recv(id, &mut buf) {
+                    Ok((read, fin)) => {
+                        answer.body.extend_from_slice(&buf[..read]);
+                        answer.finished |= fin;
+                    }
+                    Err(quiche::Error::StreamReset(code)) => {
+                        answer.reset = Some(code);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    /// Sends `line` on a new stream, ending the stream with it if `end`, as an HTTP/0.9
+    /// client asks.
+    pub(crate) fn hq_request(&mut self, line: &[u8], end: bool) -> u64 {
+        let id = self.hq_next;
+        self.hq_next += 4;
+        assert_eq!(self.quic.stream_send(id, line, end).unwrap(), line.len());
+        id
     }
 
     /// Sends a request with `fields`, ending the stream with its head if `end`.

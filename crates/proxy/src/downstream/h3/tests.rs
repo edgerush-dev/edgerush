@@ -23,8 +23,10 @@ use crate::tls::Tls;
 use crate::tls::testing::certificate;
 use bytes::Bytes;
 use http::{Request, Response};
-use http_body_util::{BodyExt, Full};
+use http_body::{Body, Frame};
+use http_body_util::{BodyExt, Full, StreamBody};
 use std::cell::Cell;
+use std::error::Error as StdError;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -66,10 +68,15 @@ fn short() -> Settings {
 }
 
 /// Serves a listener for `a.test` with `settings`, answering each request with `respond`.
-async fn serving(
+async fn serving<F, B>(
     settings: Settings,
-    respond: impl Fn(Request<RequestBody>, Interim) -> Answering + 'static,
-) -> Server {
+    respond: impl Fn(Request<RequestBody>, Interim) -> F + 'static,
+) -> Server
+where
+    F: Future<Output = Answered<B>> + 'static,
+    B: Body<Data = Bytes> + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
     serving_as(
         settings,
         respond,
@@ -80,12 +87,17 @@ async fn serving(
 }
 
 /// The same as the worker `forwarding` is the share of, among those `secrets` are shared by.
-async fn serving_as(
+async fn serving_as<F, B>(
     settings: Settings,
-    respond: impl Fn(Request<RequestBody>, Interim) -> Answering + 'static,
+    respond: impl Fn(Request<RequestBody>, Interim) -> F + 'static,
     secrets: &Secrets,
     forwarding: Forwarding,
-) -> Server {
+) -> Server
+where
+    F: Future<Output = Answered<B>> + 'static,
+    B: Body<Data = Bytes> + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
     let tls = Arc::new(
         Tls::new(&edgerush_config::Tls {
             certificates: vec![certificate(&["a.test"])],
@@ -330,7 +342,7 @@ fn a_request_the_client_resets_is_let_go_of() {
     locally(async {
         let dropped = Rc::new(Cell::new(false));
         let seen = Rc::clone(&dropped);
-        let server = serving(short(), move |_request, _interim| {
+        let server = serving(short(), move |_request, _interim| -> Answering {
             struct Flag(Rc<Cell<bool>>);
             impl Drop for Flag {
                 fn drop(&mut self) {
@@ -520,5 +532,193 @@ fn a_client_that_lands_on_another_worker_is_served_by_its_own() {
             "the other worker took it on"
         );
         assert_eq!(owner.shared.connections.get(), 1);
+    });
+}
+
+// HTTP/0.9 over QUIC, as quic-interop-runner's transport cases speak it (16 §8).
+
+/// A GET's line goes to the core as an HTTP/3 GET of the name the client asked for, and the
+/// answer's body comes back alone, then the stream's end.
+#[test]
+fn an_hq_get_is_answered_with_its_body_alone() {
+    locally(async {
+        let server = serving(short(), |request, _interim| -> Answering {
+            let said = format!(
+                "{} {} {:?}",
+                request.method(),
+                request.uri(),
+                request.version()
+            );
+            Box::pin(async move { Answered::Map(Response::new(Full::new(Bytes::from(said)))) })
+        })
+        .await;
+        let mut client = Client::connect_hq(server.address, "a.test").await;
+        let id = client.hq_request(b"GET /x?y=1\r\n", true);
+        let answer = client.answer(id).await;
+        assert!(answer.finished);
+        assert!(answer.heads.is_empty());
+        assert_eq!(body_of(&answer), "GET https://a.test/x?y=1 HTTP/3.0");
+    });
+}
+
+/// Requests on many streams at once are each answered on their own, and a line may come in
+/// pieces, end with a bare line feed, or end with its stream.
+#[test]
+fn hq_requests_are_answered_however_their_lines_come() {
+    locally(async {
+        let server = serving(short(), echo).await;
+        let mut client = Client::connect_hq(server.address, "a.test").await;
+        let ids: Vec<u64> = (0..20)
+            .map(|at| client.hq_request(format!("GET /{at}\r\n").as_bytes(), true))
+            .collect();
+        for (at, id) in ids.into_iter().enumerate() {
+            let answer = client.answer(id).await;
+            assert_eq!(body_of(&answer), format!("GET /{at} 0 None"));
+        }
+
+        let split = client.hq_request(b"GET /sp", false);
+        client.for_a_while(Duration::from_millis(100)).await;
+        assert!(
+            !client.answers.contains_key(&split),
+            "half a line was taken"
+        );
+        client.quic.stream_send(split, b"lit\n", true).unwrap();
+        assert_eq!(body_of(&client.answer(split).await), "GET /split 0 None");
+
+        let bare = client.hq_request(b"GET /bare", true);
+        assert_eq!(body_of(&client.answer(bare).await), "GET /bare 0 None");
+    });
+}
+
+/// A line that is not a GET of a path, or that runs on past any path's length, has its
+/// stream reset as a malformed HTTP/3 request's is, and the connection goes on.
+#[test]
+fn a_malformed_hq_request_is_reset() {
+    locally(async {
+        let server = serving(short(), echo).await;
+        let mut client = Client::connect_hq(server.address, "a.test").await;
+        for line in [
+            b"POST /x\r\n".as_slice(),
+            b"GET x\r\n",
+            b"GET /a b\r\n",
+            b"GET /x HTTP/1.0\r\n",
+            b"GET\r\n",
+            b"\r\n",
+            b"",
+        ] {
+            let id = client.hq_request(line, true);
+            let answer = client.answer(id).await;
+            let shown = String::from_utf8_lossy(line);
+            assert_eq!(answer.reset, Some(code::MESSAGE_ERROR), "{shown:?}");
+            assert!(answer.body.is_empty(), "{shown:?}");
+        }
+        // Not ended, and past any path's length: refused without waiting for the rest.
+        let long = [b"GET /".as_slice(), &[b'a'; 9 << 10]].concat();
+        let id = client.hq_request(&long, false);
+        assert_eq!(client.answer(id).await.reset, Some(code::MESSAGE_ERROR));
+
+        let id = client.hq_request(b"GET /after\r\n", true);
+        assert_eq!(body_of(&client.answer(id).await), "GET /after 0 None");
+    });
+}
+
+/// Four megabytes back, far past what quiche takes at once, arrive whole and in order: the
+/// answer is sent as the stream makes room.
+#[test]
+fn a_large_hq_answer_arrives_whole() {
+    locally(async {
+        const SIZE: usize = 4 << 20;
+        let server = serving(short(), |_request, _interim| -> Answering {
+            Box::pin(async move {
+                let body: Vec<u8> = (0..SIZE).map(|at| (at % 251) as u8).collect();
+                Answered::Map(Response::new(Full::new(Bytes::from(body))))
+            })
+        })
+        .await;
+        let mut client = Client::connect_hq(server.address, "a.test").await;
+        let id = client.hq_request(b"GET /big\r\n", true);
+        let answer = client.answer(id).await;
+        assert!(answer.finished);
+        assert_eq!(answer.body.len(), SIZE);
+        assert!(
+            answer
+                .body
+                .iter()
+                .enumerate()
+                .all(|(at, &byte)| usize::from(byte) == at % 251)
+        );
+    });
+}
+
+/// An answer whose body fails part way has its stream reset, never ended as if it were
+/// whole.
+#[test]
+fn an_hq_answer_that_fails_is_reset() {
+    locally(async {
+        let server = serving(short(), |_request, _interim| async {
+            let pieces = [
+                Ok(Frame::data(Bytes::from_static(b"half"))),
+                Err(std::io::Error::other("the upstream went")),
+            ];
+            Answered::Map(Response::new(StreamBody::new(tokio_stream::iter(pieces))))
+        })
+        .await;
+        let mut client = Client::connect_hq(server.address, "a.test").await;
+        let id = client.hq_request(b"GET /cut\r\n", true);
+        let answer = client.answer(id).await;
+        assert_eq!(answer.reset, Some(code::INTERNAL_ERROR));
+        assert!(!answer.finished);
+    });
+}
+
+/// A client that takes none of its answer for the stream's idle bound, once the stream's
+/// window is full, has the stream reset.
+#[test]
+fn an_hq_answer_the_client_takes_none_of_is_reset() {
+    locally(async {
+        // Twice the client's stream window, which is all it grants while it reads nothing.
+        const SIZE: usize = 8 << 20;
+        let settings = short();
+        let server = serving(settings, |_request, _interim| -> Answering {
+            Box::pin(
+                async move { Answered::Map(Response::new(Full::new(Bytes::from(vec![7; SIZE])))) },
+            )
+        })
+        .await;
+        let mut client = Client::connect_hq(server.address, "a.test").await;
+        client.hq_unread = true;
+        let id = client.hq_request(b"GET /big\r\n", true);
+        client
+            .until(|client| client.received.iter().map(Vec::len).sum::<usize>() >= 4 << 20)
+            .await;
+        client.for_a_while(settings.stream_idle + SLACK).await;
+        client.hq_unread = false;
+        let answer = client.answer(id).await;
+        assert_eq!(answer.reset, Some(code::REQUEST_CANCELLED));
+        assert!(answer.body.len() < SIZE);
+    });
+}
+
+/// An HTTP/0.9 connection with no request open is closed at its keep-alive deadline, with
+/// no GOAWAY before it: HTTP/0.9 has none.
+#[test]
+fn an_idle_hq_connection_is_closed_at_its_keep_alive_deadline() {
+    locally(async {
+        let settings = short();
+        let server = serving(settings, echo).await;
+        let mut client = Client::connect_hq(server.address, "a.test").await;
+        let id = client.hq_request(b"GET /\r\n", true);
+        client.answer(id).await;
+        let started = tokio::time::Instant::now();
+        client
+            .until(|client| client.quic.is_closed() || client.quic.is_draining())
+            .await;
+        let took = started.elapsed();
+        assert!(
+            took >= settings.keep_alive - Duration::from_millis(50),
+            "{took:?}"
+        );
+        assert!(took <= settings.keep_alive + SLACK, "{took:?}");
+        assert_eq!(client.closed_by_server(), Some((true, code::NO_ERROR)));
     });
 }
