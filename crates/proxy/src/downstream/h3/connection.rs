@@ -32,7 +32,7 @@ use http_body::Body;
 use quiche::h3::Event;
 use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
@@ -157,7 +157,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
                         continue;
                     }
                     conn.asked();
-                    let _detached = tokio::task::spawn_local(answer(
+                    let _detached = tokio::task::spawn_local(request_task(
                         stream,
                         request.head,
                         request.ended,
@@ -564,6 +564,28 @@ fn send_interim(responder: &mut Responder, interim: &Interim) {
     }
 }
 
+/// A request's task: its answer, boxed. The answer's future is as large as its largest
+/// state, the exchange's included, several kilobytes; a task holds its future inline and
+/// moves all of it as the task is made and as it finishes. Boxed once here, what the task
+/// holds and moves is a pointer.
+fn request_task<R, F, B, D>(
+    stream: Stream,
+    head: RequestHead,
+    ended: bool,
+    respond: Rc<R>,
+    date: Rc<D>,
+    idle: Duration,
+) -> Pin<Box<impl Future<Output = ()>>>
+where
+    R: Fn(Request<RequestBody>, Interim) -> F,
+    F: Future<Output = Answered<B>>,
+    B: Body<Data = Bytes>,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    D: Fn() -> HttpDate,
+{
+    Box::pin(answer(stream, head, ended, respond, date, idle))
+}
+
 /// Answers one request.
 async fn answer<R, F, B, D>(
     stream: Stream,
@@ -677,5 +699,33 @@ mod tests {
         taken.sort_unstable();
         assert_eq!(taken, [first, second]);
         assert_eq!(seen.next, second + 4);
+    }
+
+    /// What a future `make` returns takes, without one being made.
+    fn size_of_made<A, F>(_make: impl FnOnce(A) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    /// A request's task holds a pointer to its answer's future, not the future itself, which
+    /// the task would copy whole as it is made and as it finishes (16 §4).
+    #[test]
+    fn a_request_task_holds_its_answer_boxed() {
+        type Respond = fn(
+            Request<RequestBody>,
+            Interim,
+        ) -> std::future::Ready<Answered<http_body_util::Full<Bytes>>>;
+        type Date = fn() -> HttpDate;
+        type Asked = (Stream, RequestHead, Rc<Respond>, Rc<Date>);
+        let task = size_of_made(|(stream, head, respond, date): Asked| {
+            request_task(stream, head, true, respond, date, Duration::ZERO)
+        });
+        let answer = size_of_made(|(stream, head, respond, date): Asked| {
+            answer(stream, head, true, respond, date, Duration::ZERO)
+        });
+        assert_eq!(
+            task,
+            std::mem::size_of::<usize>(),
+            "a request's task holds {task} bytes; its answer's future is {answer}"
+        );
     }
 }
