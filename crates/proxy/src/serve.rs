@@ -6203,13 +6203,15 @@ upstreams:
             .await;
     }
 
-    /// A worker whose one rule goes to `up` at `primary` and mirrors every request to each
-    /// of `mirrors`: a name, where it is (nowhere, if not given) and what it speaks.
+    /// A worker whose one rule goes to `up` at `primary`, speaking what it says, and mirrors
+    /// every request to each of `mirrors`: a name, where it is (nowhere, if not given) and
+    /// what it speaks.
     async fn serving_mirroring_worker(
-        primary: SocketAddr,
+        (primary, speaking): (SocketAddr, UpstreamProtocol),
         mirrors: &[(&str, Option<SocketAddr>, UpstreamProtocol)],
     ) -> (SocketAddr, Rc<Worker>) {
         let mut config = everything_config(primary);
+        config.upstreams.get_mut("up").unwrap().protocol = speaking;
         for &(name, at, protocol) in mirrors {
             let mut upstream = config.upstreams["up"].clone();
             upstream.endpoints = at.into_iter().collect();
@@ -6280,7 +6282,7 @@ upstreams:
                 });
                 let shadow_h2 = scripted_h2_upstream(script).await;
                 let (front, worker) = serving_mirroring_worker(
-                    primary,
+                    (primary, UpstreamProtocol::Http1),
                     &[
                         ("shadow", Some(shadow), UpstreamProtocol::Http1),
                         ("shadow-h2", Some(shadow_h2), UpstreamProtocol::Http2),
@@ -6308,6 +6310,69 @@ upstreams:
             .await;
     }
 
+    /// A body that says it has ended with its last frame, as an HTTP/2 client's does, is
+    /// sent to an HTTP/2 upstream without its end ever being asked for: its copy goes whole
+    /// all the same, ended as the request was, not cut off as if the request went.
+    #[tokio::test]
+    async fn a_mirror_gets_the_whole_of_a_body_that_ends_with_its_last_frame() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // What each upstream was sent, and how it ended.
+                let seen = Rc::new(RefCell::new(Vec::new()));
+                let reading = |name: &'static str, status: u16| -> Script {
+                    let seeing = Rc::clone(&seen);
+                    Rc::new(move |request, mut respond| {
+                        let seeing = Rc::clone(&seeing);
+                        Box::pin(async move {
+                            let mut body = request.into_body();
+                            let mut all = Vec::new();
+                            let ended = loop {
+                                match body.data().await {
+                                    Some(Ok(chunk)) => {
+                                        let _ = body.flow_control().release_capacity(chunk.len());
+                                        all.extend_from_slice(&chunk);
+                                    }
+                                    Some(Err(error)) => break Err(error.to_string()),
+                                    None => break Ok(()),
+                                }
+                            };
+                            seeing.borrow_mut().push((name, all, ended));
+                            let answer = Response::builder().status(status).body(()).unwrap();
+                            let _ = respond.send_response(answer, true);
+                        })
+                    })
+                };
+                let primary = scripted_h2_upstream(reading("primary", 200)).await;
+                let shadow = scripted_h2_upstream(reading("shadow", 503)).await;
+                let (front, _worker) = serving_mirroring_worker(
+                    (primary, UpstreamProtocol::Http2),
+                    &[("shadow", Some(shadow), UpstreamProtocol::Http2)],
+                )
+                .await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::builder()
+                    .method(Method::POST)
+                    .uri("http://a.test/")
+                    .body(())
+                    .unwrap();
+                let (answer, mut upload) = send.send_request(request, false).unwrap();
+                upload.send_data(Bytes::from_static(b"hi"), true).unwrap();
+                assert_eq!(within(answer).await.unwrap().status(), StatusCode::OK);
+                until(|| seen.borrow().len() == 2).await;
+                let mut seen = seen.borrow().clone();
+                seen.sort();
+                assert_eq!(
+                    seen,
+                    vec![
+                        ("primary", b"hi".to_vec(), Ok(())),
+                        ("shadow", b"hi".to_vec(), Ok(())),
+                    ]
+                );
+            })
+            .await;
+    }
+
     /// A mirror that stops reading is given up on once it is too far behind; the request
     /// goes on at its own upstream's pace, whole.
     #[tokio::test]
@@ -6318,7 +6383,7 @@ upstreams:
                 let (primary, sent) = statuses_upstream(vec![200]).await;
                 let (shadow, asked) = unread_h2_upstream().await;
                 let (front, worker) = serving_mirroring_worker(
-                    primary,
+                    (primary, UpstreamProtocol::Http1),
                     &[("shadow", Some(shadow), UpstreamProtocol::Http2)],
                 )
                 .await;
@@ -6349,7 +6414,7 @@ upstreams:
                 let (primary, sent) = statuses_upstream(vec![200]).await;
                 let (shadow, copied) = statuses_upstream(vec![200]).await;
                 let (front, worker) = serving_mirroring_worker(
-                    primary,
+                    (primary, UpstreamProtocol::Http1),
                     &[
                         ("nowhere", None, UpstreamProtocol::Http1),
                         ("shadow", Some(shadow), UpstreamProtocol::Http1),

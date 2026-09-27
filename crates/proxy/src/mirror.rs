@@ -115,6 +115,14 @@ impl Body for Tee {
     ) -> Poll<Option<Result<Frame<Bytes>, RequestBodyError>>> {
         let this = self.get_mut();
         let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        // A body may say it has ended with its last frame, and whatever sends it may stop
+        // there without asking for the end, as the HTTP/2 writer does: its copies end with
+        // that frame, or the request's own end would leave them given up on.
+        let ended = match &polled {
+            Poll::Ready(None) => true,
+            Poll::Ready(Some(Ok(_))) => this.inner.is_end_stream(),
+            Poll::Ready(Some(Err(_))) | Poll::Pending => false,
+        };
         for queue in &this.queues {
             let mut queue = queue.borrow_mut();
             if queue.given_up {
@@ -134,14 +142,14 @@ impl Body for Tee {
                         queue.put(Copied::Trailers(trailers.clone()));
                     }
                 }
-                Poll::Ready(None) => {
-                    queue.ended = true;
-                    if let Some(waker) = queue.waiting.take() {
-                        waker.wake();
-                    }
-                }
                 Poll::Ready(Some(Err(_))) => queue.give_up(),
-                Poll::Pending => {}
+                Poll::Ready(None) | Poll::Pending => {}
+            }
+            if ended && !queue.given_up {
+                queue.ended = true;
+                if let Some(waker) = queue.waiting.take() {
+                    waker.wake();
+                }
             }
         }
         polled
@@ -309,6 +317,30 @@ mod tests {
         drop(tee);
         assert!(read(copy).await.is_err());
         assert!(!kept.fell_behind(), "not the mirror's doing");
+    }
+
+    /// A body may say it has ended with its last frame, and whatever sends it may stop
+    /// there without asking for the end, as the HTTP/2 writer does: its copies end whole,
+    /// not given up on as if the request went.
+    #[tokio::test]
+    async fn a_body_that_says_it_has_ended_ends_its_copies_whole() {
+        let bodies = [
+            (vec![data(b"ab"), data(b"cd")], (b"abcd".to_vec(), None)),
+            (
+                vec![data(b"ab"), Frame::trailers(trailers())],
+                (b"ab".to_vec(), Some(trailers())),
+            ),
+        ];
+        for (frames, whole) in bodies {
+            let (mut tee, mut copies) = Tee::new(body(frames), 1);
+            let (copy, kept) = copies.pop().unwrap();
+            while !tee.is_end_stream() {
+                let _sent = tee.frame().await;
+            }
+            drop(tee);
+            assert_eq!(read(copy).await.unwrap(), whole);
+            assert!(!kept.fell_behind());
+        }
     }
 
     #[tokio::test]
