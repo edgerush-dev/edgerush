@@ -34,6 +34,7 @@ use crate::head::Head as _;
 use crate::interim::Interim;
 use crate::raw::{RawAnswer, RawHead};
 use crate::request_body::{RequestBody, RequestBodyError};
+use crate::slots::Slots;
 use crate::storage::{Charge, Storage};
 use crate::timers::{Alarm, Timers};
 use crate::upstream::h1::H1Limits;
@@ -872,6 +873,11 @@ impl FinalHead {
 /// Serves `socket` until the connection ends, handing each request to `respond` as its raw
 /// head and its body, and says how it ended. The caller closes the socket, lingering where
 /// bytes may still be arriving.
+///
+/// Each request's future runs in a slot lent by `slots` for as long as the request does, not
+/// inside this future (14 §3): a connection waiting for its first or next request holds no
+/// room for one.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve<S, R, F, B>(
     socket: S,
     settings: Settings,
@@ -880,6 +886,7 @@ pub(crate) async fn serve<S, R, F, B>(
     date: impl Fn() -> HttpDate,
     drain: &Drain,
     mut respond: R,
+    slots: &Slots<F>,
 ) -> Ended
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1003,14 +1010,14 @@ where
         // The answer, with both directions kept moving while it is worked out.
         let answer = {
             let mut responding =
-                std::pin::pin!(respond(head, RequestBody::Ours(body), interim.clone()));
+                slots.start(|| respond(head, RequestBody::Ours(body), interim.clone()));
             poll_fn(|context| -> Poll<Result<Answered<B>, Stop>> {
                 connection.inbound.borrow_mut().heard_by(context);
                 loop {
                     if connection.spent() {
                         return connection.yield_turn(context);
                     }
-                    if let Poll::Ready(response) = responding.as_mut().poll(context) {
+                    if let Poll::Ready(response) = Pin::new(&mut responding).poll(context) {
                         return Poll::Ready(Ok(response));
                     }
                     // What the upstream said in the meantime that the client is to hear, and
@@ -1300,6 +1307,7 @@ mod tests {
     {
         let never = Drain::default();
         let timers = Timers::new();
+        let slots = Slots::default();
         timers
             .driving(super::serve(
                 socket,
@@ -1312,6 +1320,7 @@ mod tests {
                     let answering = respond(Request::from_parts(head.into_parts(), body), interim);
                     async move { Answered::Map(answering.await) }
                 },
+                &slots,
             ))
             .await
     }
@@ -2871,6 +2880,7 @@ mod tests {
                 date,
                 &Drain::default(),
                 answering,
+                &Slots::default(),
             ),
         )
         .await
@@ -2996,5 +3006,115 @@ mod tests {
                 assert!(!received.contains("100 Continue"), "{received}");
             }
         }
+    }
+
+    /// Says when it is dropped, as a request's future holding it is.
+    struct Flag(Rc<Cell<bool>>);
+
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    /// The driver over `server` with the slots `slots`, the core answering each request with
+    /// `respond`.
+    async fn serve_in<R, F>(server: tokio::io::DuplexStream, slots: &Slots<F>, respond: R) -> Ended
+    where
+        R: FnMut(RawHead, RequestBody, Interim) -> F,
+        F: Future<Output = Answered<Answer>>,
+    {
+        let never = Drain::default();
+        let timers = Timers::new();
+        timers
+            .driving(super::serve(
+                server,
+                settings(),
+                blocks(),
+                Rc::clone(&timers),
+                date,
+                &never,
+                respond,
+                slots,
+            ))
+            .await
+    }
+
+    /// A request's future runs in a slot the connection is lent, not inside the connection's
+    /// own future, and the slot is given back once the answer is taken: a connection waiting
+    /// for its next request holds none (14 §3).
+    #[tokio::test]
+    async fn a_connection_waiting_for_its_next_request_holds_no_slot() {
+        let slots = Slots::default();
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let respond = |_: RawHead, _: RequestBody, _: Interim| {
+            // The request is in a slot while it runs, and none is left free.
+            assert_eq!(slots.free(), 0, "the request is not in a slot");
+            async {
+                Answered::Map(Response::new(Answer::Full(Full::new(Bytes::from_static(
+                    b"ok",
+                )))))
+            }
+        };
+        let asking = async {
+            for _ in 0..2 {
+                client.write_all(GET).await.unwrap();
+                let mut received = Vec::new();
+                while !received.ends_with(b"\r\n\r\nok") {
+                    let mut more = [0; 1024];
+                    let read = client.read(&mut more).await.unwrap();
+                    assert_ne!(read, 0, "closed before the answer: {received:?}");
+                    received.extend_from_slice(&more[..read]);
+                }
+                // Answered, and waiting for the next request: the slot is free again —
+                // the one slot, the second request having taken the one the first gave back.
+                assert_eq!(slots.free(), 1);
+            }
+            client.shutdown().await.unwrap();
+        };
+        let (ended, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(serve_in(server, &slots, respond), asking)
+        })
+        .await
+        .unwrap();
+        assert_eq!(ended, Ended::Closed);
+    }
+
+    /// A request its client leaves before it is answered is dropped where it stands, as a
+    /// future held inline would be, and its slot is given back.
+    #[tokio::test]
+    async fn a_request_given_up_is_dropped_and_gives_its_slot_back() {
+        let slots = Slots::default();
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let dropped = Rc::new(Cell::new(false));
+        let asked = Cell::new(false);
+        let respond = |_: RawHead, _: RequestBody, _: Interim| {
+            asked.set(true);
+            let flag = Flag(Rc::clone(&dropped));
+            async move {
+                let _held = flag;
+                std::future::pending::<Answered<Answer>>().await
+            }
+        };
+        let leaving = async {
+            client.write_all(GET).await.unwrap();
+            // The request is in the core's hands before the client goes.
+            while !asked.get() {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(slots.free(), 0, "the request is not in a slot");
+            client.shutdown().await.unwrap();
+        };
+        let (ended, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(serve_in(server, &slots, respond), leaving)
+        })
+        .await
+        .unwrap();
+        assert_eq!(ended, Ended::Gone);
+        assert!(
+            dropped.get(),
+            "the request's future outlived the connection"
+        );
+        assert_eq!(slots.free(), 1);
     }
 }

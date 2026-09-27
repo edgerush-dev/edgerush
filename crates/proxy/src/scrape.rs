@@ -13,6 +13,7 @@ use crate::head::Head;
 use crate::linger::linger;
 use crate::raw::RawHead;
 use crate::serve::{ACCEPT_PAUSE, Proxy, is_about_one_connection, unix_now};
+use crate::slots::Slots;
 use crate::storage::Storage;
 use crate::timers::Timers;
 use crate::upstream::h1::H1Limits;
@@ -77,8 +78,19 @@ impl Proxy {
                 // How it ended is the scraper's business; the socket is closed either way.
                 // Scraping goes on while the data plane drains: that is when it is watched.
                 let never = crate::drain::Drain::default();
-                let _ended =
-                    h1::serve(&mut stream, settings, blocks, timers, date, &never, respond).await;
+                // Scrapes are too few for slots of the worker's to be worth keeping.
+                let slots = Slots::default();
+                let _ended = h1::serve(
+                    &mut stream,
+                    settings,
+                    blocks,
+                    timers,
+                    date,
+                    &never,
+                    respond,
+                    &slots,
+                )
+                .await;
                 // Closed without a reset, so that one taking an answer with it is not
                 // possible even with a request body left unread.
                 linger(

@@ -64,6 +64,11 @@ mod request_body;
 mod retry;
 mod scrape;
 mod serve;
+// Private, save when the fuzz targets and benchmarks are being built.
+#[cfg(feature = "fuzzing")]
+pub mod slots;
+#[cfg(not(feature = "fuzzing"))]
+mod slots;
 // Private, save when the fuzz targets are being built, for the blocks `upstream` lends.
 #[cfg(feature = "fuzzing")]
 pub mod storage;

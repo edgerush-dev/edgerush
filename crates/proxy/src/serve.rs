@@ -39,6 +39,7 @@ use crate::request::decide;
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::retry::budget::Budget;
 use crate::retry::replay::Tee;
+use crate::slots::{Slots, WorkerSlots};
 use crate::storage::Storage;
 use crate::timers::{Alarm, Timers};
 use crate::tls::{self, Tls, TlsError};
@@ -348,6 +349,9 @@ pub struct Worker {
     /// Its number among the data plane's workers, which the QUIC connection IDs it issues
     /// carry (16 §3).
     position: u16,
+    /// Where its HTTP/1 connections run their requests' futures, lent for as long as a
+    /// request runs, so that no connection holds room for one while it waits (14 §3).
+    slots: WorkerSlots,
 }
 
 /// Serves `socket`, a connection of `ours` that speaks HTTP/1, with our own server (14).
@@ -378,6 +382,7 @@ where
         asking.set(true);
         Rc::clone(&ours.worker).handle_head(listener, head, body, Some(interim))
     };
+    let slots = slots_for(&worker.slots, &respond);
     let _ended = h1::serve(
         socket,
         settings,
@@ -386,8 +391,19 @@ where
         || worker.date.get(),
         &worker.drain,
         respond,
+        &slots,
     )
     .await;
+}
+
+/// The worker's slots for the futures `respond` makes: named by the closure, as the futures'
+/// own type cannot be.
+fn slots_for<R, F>(slots: &WorkerSlots, _respond: &R) -> Rc<Slots<F>>
+where
+    R: FnMut(RawHead, RequestBody, Interim) -> F,
+    F: Future + 'static,
+{
+    slots.of()
 }
 
 /// Serves `socket`, a connection of `ours` that speaks HTTP/2, over h2 (15 step 2).
@@ -769,6 +785,7 @@ impl Worker {
             body_limits: Rc::new(limits),
             me: Weak::clone(me),
             position,
+            slots: WorkerSlots::default(),
         })
     }
 
@@ -839,6 +856,7 @@ impl Worker {
             let swept = self.pool.borrow_mut().sweep(&self.limits);
             // And what a burst left parked of the blocks, down to what a quiet worker keeps.
             self.blocks.borrow_mut().sweep();
+            self.slots.sweep();
             self.h2.sweep();
             let metrics = &self.proxy.metrics;
             for _discarded in 0..swept {

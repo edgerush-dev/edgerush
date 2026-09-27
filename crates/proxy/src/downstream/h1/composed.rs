@@ -25,6 +25,7 @@ use super::reference as request_reference;
 use crate::interim::{Channel, Interim};
 use crate::raw::RawHead;
 use crate::request_body::RequestBody;
+use crate::slots::Slots;
 use crate::storage::{LIMIT, Storage};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Blocks, Sizes};
@@ -281,6 +282,7 @@ async fn composed(client: Vec<ClientStep>, core: Core, pipe: usize) -> Run {
         async move {
             let never = crate::drain::Drain::default();
             let timers = crate::timers::Timers::new();
+            let slots = Slots::default();
             let ended = timers
                 .driving(serve(
                     far,
@@ -290,6 +292,7 @@ async fn composed(client: Vec<ClientStep>, core: Core, pipe: usize) -> Run {
                     || HttpDate::from_unix(0),
                     &never,
                     respond,
+                    &slots,
                 ))
                 .await;
             // The socket is gone with the driver: what it wrote is all there is.
