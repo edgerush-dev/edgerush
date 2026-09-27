@@ -102,6 +102,12 @@ impl Body for Tee {
             Poll::Ready(None) => recording.ended = true,
             _ => {}
         }
+        // A body may say it has ended with its last frame, and whatever sends it may stop
+        // there without asking for the end, as the HTTP/2 writer does: it is whole with that
+        // frame.
+        if matches!(polled, Poll::Ready(Some(Ok(_)))) && this.inner.is_end_stream() {
+            recording.ended = true;
+        }
         polled
     }
 
@@ -223,6 +229,29 @@ mod tests {
         let (tee, recorded) = Tee::new(RequestBody::Replayed(inner));
         let _sent = read(tee).await;
         assert!(recorded.replay().is_some());
+    }
+
+    /// A body may say it has ended with its last frame, and whatever sends it may stop
+    /// there without asking for the end, as the HTTP/2 writer does: it is kept whole all
+    /// the same, and can be sent again.
+    #[tokio::test]
+    async fn a_body_that_says_it_has_ended_is_kept_whole() {
+        let bodies = [
+            (vec![data(b"ab"), data(b"cd")], (b"abcd".to_vec(), None)),
+            (
+                vec![data(b"ab"), Frame::trailers(trailers())],
+                (b"ab".to_vec(), Some(trailers())),
+            ),
+        ];
+        for (frames, whole) in bodies {
+            let (mut tee, recorded) = Tee::new(RequestBody::Replayed(Replayed::of(frames)));
+            while !tee.is_end_stream() {
+                let _sent = tee.frame().await;
+            }
+            drop(tee);
+            let again = recorded.replay().expect("kept whole");
+            assert_eq!(read(again).await, whole);
+        }
     }
 
     #[tokio::test]

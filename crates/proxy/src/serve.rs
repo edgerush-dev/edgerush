@@ -5889,6 +5889,56 @@ upstreams:
             .await;
     }
 
+    /// A body that says it has ended with its last frame, as an HTTP/2 client's does, is
+    /// sent to an HTTP/2 upstream without its end ever being asked for: refused unprocessed
+    /// once all of it has gone, it is sent once more all the same. The upstream reads the
+    /// whole body before it refuses, so that none of it is still to go when it does.
+    #[tokio::test]
+    async fn a_body_that_ends_with_its_last_frame_is_sent_once_more_when_refused() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let bodies = Rc::new(RefCell::new(Vec::new()));
+                let taking = Rc::clone(&bodies);
+                let script: Script = Rc::new(move |request, mut respond| {
+                    let taking = Rc::clone(&taking);
+                    Box::pin(async move {
+                        let mut body = request.into_body();
+                        let mut all = Vec::new();
+                        while let Some(Ok(chunk)) = body.data().await {
+                            let _ = body.flow_control().release_capacity(chunk.len());
+                            all.extend_from_slice(&chunk);
+                        }
+                        let first = taking.borrow().is_empty();
+                        taking.borrow_mut().push(all);
+                        if first {
+                            respond.send_reset(::h2::Reason::REFUSED_STREAM);
+                        } else {
+                            let _ = respond.send_response(ok_head(), true);
+                        }
+                    })
+                });
+                let upstream = scripted_h2_upstream(script).await;
+                let (front, worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::builder()
+                    .method(Method::POST)
+                    .uri("http://a.test/")
+                    .body(())
+                    .unwrap();
+                let (answer, mut upload) = send.send_request(request, false).unwrap();
+                upload.send_data(Bytes::from_static(b"hi"), true).unwrap();
+                assert_eq!(within(answer).await.unwrap().status(), StatusCode::OK);
+                assert_eq!(*bodies.borrow(), vec![b"hi".to_vec(), b"hi".to_vec()]);
+                let scrape = worker.proxy().metrics();
+                assert!(
+                    scrape.contains("edgerush_upstream_retries_total{upstream=\"up\"} 1\n"),
+                    "{scrape}"
+                );
+            })
+            .await;
+    }
+
     /// A request left above the last stream an upstream's GOAWAY accepted was never
     /// processed either, and goes once more — on another connection, the first going.
     #[tokio::test]
