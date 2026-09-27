@@ -14,12 +14,14 @@
 //! connection, and nothing more on it is a request.
 
 use std::cell::Cell;
+use std::future::{Future, poll_fn};
 use std::io;
+use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 
@@ -149,10 +151,9 @@ pub(crate) async fn linger(mut stream: TcpStream, quiet: Duration, most: Duratio
     // not, it is what tells the client the answer is over.
     let _unsent = stream.shutdown().await;
     let until = Instant::now() + most;
-    let mut discarded = [0; 4096];
     loop {
         let wait = (Instant::now() + quiet).min(until);
-        match tokio::time::timeout_at(wait, stream.read(&mut discarded)).await {
+        match tokio::time::timeout_at(wait, discard(&mut stream)).await {
             Ok(Ok(read)) if read > 0 => {}
             // Closed, failed, quiet for too long, or out of time.
             _ => return,
@@ -160,9 +161,25 @@ pub(crate) async fn linger(mut stream: TcpStream, quiet: Duration, most: Duratio
     }
 }
 
+/// Reads what has arrived on `stream` and throws it away; says how much there was.
+///
+/// Into a buffer that lives only while a read is tried, not across the wait for one: a
+/// buffer held across it would be in the connection's task for as long as the task lived,
+/// as its largest state, whether or not the connection ever lingered (14 §3).
+fn discard(stream: &mut TcpStream) -> impl Future<Output = io::Result<usize>> + '_ {
+    poll_fn(move |context| {
+        let mut discarded = [MaybeUninit::<u8>::uninit(); 4096];
+        let mut read = ReadBuf::uninit(&mut discarded);
+        Pin::new(&mut *stream)
+            .poll_read(context, &mut read)
+            .map_ok(|()| read.filled().len())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
     /// A connected pair: the client's end, and the server's as it was accepted.
@@ -245,6 +262,16 @@ mod tests {
         linger(server, Duration::from_millis(500), most).await;
         let took = started.elapsed();
         assert!(took >= most && took < Duration::from_secs(5), "{took:?}");
+    }
+
+    /// A lingering close holds no buffer while it waits for the client (14 §3): as small as
+    /// a lingering can be, and far smaller than the 4 KiB it reads into.
+    #[tokio::test]
+    async fn a_lingering_close_holds_no_buffer_while_it_waits() {
+        let (_client, server) = pair().await;
+        let lingering = linger(server, QUIET, MOST);
+        let size = std::mem::size_of_val(&lingering);
+        assert!(size < 1024, "{size} bytes");
     }
 
     /// Lent to something that drops it, the connection comes back, and reads and writes
