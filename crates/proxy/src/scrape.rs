@@ -46,11 +46,11 @@ impl Proxy {
             Sizes::within(&limits, SMALL),
             Storage::new(limits.storage),
         )));
-        let settings = h1::Settings {
-            limits,
+        let settings = Rc::new(h1::Settings {
+            limits: Rc::new(limits),
             bounds: Bounds::default(),
             budget: h1::Budget::default(),
-        };
+        });
         // The scrapes' own deadlines, waited on for as long as this serves.
         let timers = Timers::new();
         let _timing = tokio::task::spawn_local(Rc::clone(&timers).run());
@@ -67,6 +67,7 @@ impl Proxy {
             let proxy = Arc::clone(&self);
             let blocks = Rc::clone(&blocks);
             let timers = Rc::clone(&timers);
+            let settings = Rc::clone(&settings);
             tokio::task::spawn_local(async move {
                 // Dated as each answer is written: scrapes are too few for a worker's
                 // cached date to be worth keeping here.
@@ -82,7 +83,7 @@ impl Proxy {
                 let slots = Slots::default();
                 let _ended = h1::serve(
                     &mut stream,
-                    settings,
+                    &settings,
                     blocks,
                     timers,
                     date,

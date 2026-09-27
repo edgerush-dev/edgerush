@@ -352,29 +352,18 @@ pub struct Worker {
     /// Where its HTTP/1 connections run their requests' futures, lent for as long as a
     /// request runs, so that no connection holds room for one while it waits (14 §3).
     slots: WorkerSlots,
+    /// What its HTTP/1 connections are held to, which each borrows rather than copies.
+    h1: h1::Settings,
 }
 
 /// Serves `socket`, a connection of `ours` that speaks HTTP/1, with our own server (14).
 /// `asking` is set when the first request is handed over.
-async fn serve_h1<S>(ours: Rc<Connection>, asking: Rc<Cell<bool>>, deadlines: Deadlines, socket: S)
+async fn serve_h1<S>(ours: Rc<Connection>, asking: Rc<Cell<bool>>, socket: S)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let worker = Rc::clone(&ours.worker);
     let listener = ours.listener;
-    let settings = h1::Settings {
-        limits: worker.limits,
-        bounds: Bounds {
-            first_request: deadlines.first_request,
-            // 14 §8's ten seconds for a head once it has begun, never longer than the wait
-            // for it to begin.
-            next_head: Bounds::default().next_head.min(deadlines.next_request),
-            keep_alive: deadlines.next_request,
-            idle: deadlines.idle,
-            ..Bounds::default()
-        },
-        budget: h1::Budget::default(),
-    };
     // The connection is kept by this for as long as it is served; each request's future
     // owns only a handle on the worker. It is that future itself, not one wrapped around
     // it, so that it is not moved into another on every request.
@@ -385,7 +374,7 @@ where
     let slots = slots_for(&worker.slots, &respond);
     let _ended = h1::serve(
         socket,
-        settings,
+        &worker.h1,
         Rc::clone(&worker.blocks),
         Rc::clone(&worker.timers),
         || worker.date.get(),
@@ -424,7 +413,7 @@ async fn serve_tls(
         serve_h2(ours, asking, deadlines, secured).await;
     } else {
         // An answer's pieces sealed as one record, not one each.
-        serve_h1(ours, asking, deadlines, Gathered::new(secured)).await;
+        serve_h1(ours, asking, Gathered::new(secured)).await;
     }
 }
 
@@ -788,6 +777,20 @@ impl Worker {
     }
 
     fn made(proxy: Arc<Proxy>, limits: H1Limits, deadlines: Deadlines, position: u16) -> Rc<Self> {
+        let body_limits = Rc::new(limits);
+        let h1 = h1::Settings {
+            limits: Rc::clone(&body_limits),
+            bounds: Bounds {
+                first_request: deadlines.first_request,
+                // 14 §8's ten seconds for a head once it has begun, never longer than the
+                // wait for it to begin.
+                next_head: Bounds::default().next_head.min(deadlines.next_request),
+                keep_alive: deadlines.next_request,
+                idle: deadlines.idle,
+                ..Bounds::default()
+            },
+            budget: h1::Budget::default(),
+        };
         Rc::new_cyclic(|me| Self {
             proxy,
             pool: Rc::new(RefCell::new(Pool::default())),
@@ -804,10 +807,11 @@ impl Worker {
             h2: H2Client::new(h2_settings(&limits)),
             budgets: RefCell::new(HashMap::new()),
             accepted: Cell::new(0),
-            body_limits: Rc::new(limits),
+            body_limits,
             me: Weak::clone(me),
             position,
             slots: WorkerSlots::default(),
+            h1,
         })
     }
 
@@ -1106,7 +1110,7 @@ impl Worker {
                 // Told apart by our own detector.
                 None => match detect(lent).await {
                     Ok(Some((Protocol::Http1, replay))) => {
-                        serve_h1(ours, ours_asking, deadlines, replay).await;
+                        serve_h1(ours, ours_asking, replay).await;
                     }
                     Ok(Some((Protocol::Http2, replay))) => {
                         Box::pin(serve_h2(ours, ours_asking, deadlines, replay)).await;
@@ -2426,7 +2430,7 @@ mod tests {
     #[test]
     fn a_connection_is_no_larger_than_plain_http1_needs() {
         use crate::downstream::detect::Replay;
-        type Plain = (Rc<Connection>, Rc<Cell<bool>>, Deadlines, Replay<Lent>);
+        type Plain = (Rc<Connection>, Rc<Cell<bool>>, Replay<Lent>);
         type Secured = (
             Rc<Connection>,
             Rc<Cell<bool>>,
@@ -2438,9 +2442,7 @@ mod tests {
         let connection = size_of_made(|(worker, stream): (Rc<Worker>, TcpStream)| {
             worker.serve_connection(0, stream)
         });
-        let plain = size_of_made(|(ours, asking, deadlines, socket): Plain| {
-            serve_h1(ours, asking, deadlines, socket)
-        });
+        let plain = size_of_made(|(ours, asking, socket): Plain| serve_h1(ours, asking, socket));
         let tls = size_of_made(|(ours, asking, deadlines, tls, socket): Secured| {
             serve_tls(ours, asking, deadlines, tls, socket)
         });

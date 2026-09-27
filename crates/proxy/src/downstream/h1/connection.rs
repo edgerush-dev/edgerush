@@ -118,11 +118,13 @@ impl Default for ReadSize {
     }
 }
 
-/// What a connection is held to.
-#[derive(Debug, Clone, Copy)]
+/// What a connection is held to: one for a worker's connections, which each borrow it
+/// rather than hold a copy (14 §3).
+#[derive(Debug, Clone)]
 pub(crate) struct Settings {
-    /// The bounds on what a client sends, shared with the upstream side.
-    pub limits: H1Limits,
+    /// The bounds on what a client sends, shared with the upstream side, and with the body
+    /// of each request, which outlives any borrow.
+    pub limits: Rc<H1Limits>,
     /// The connection's deadlines.
     pub bounds: Bounds,
     /// What one turn of the connection's task may do.
@@ -207,7 +209,7 @@ struct Inbound {
     /// The request being served's interim answers and continue decision, which its body
     /// tells when it is asked for and when the client sends it unasked (14 §5).
     interim: Option<Interim>,
-    limits: H1Limits,
+    limits: Rc<H1Limits>,
 }
 
 impl Inbound {
@@ -421,7 +423,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     /// A connection accepted now, reading into blocks lent from `blocks`.
     fn new(
         socket: S,
-        settings: Settings,
+        settings: &Settings,
         blocks: Rc<RefCell<Blocks>>,
         timers: &Rc<Timers>,
     ) -> Self {
@@ -438,7 +440,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 waker: None,
                 interim: None,
                 driver: None,
-                limits: settings.limits,
+                limits: Rc::clone(&settings.limits),
             })),
             queued: VecDeque::new(),
             queued_bytes: 0,
@@ -880,7 +882,7 @@ impl FinalHead {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve<S, R, F, B>(
     socket: S,
-    settings: Settings,
+    settings: &Settings,
     blocks: Rc<RefCell<Blocks>>,
     timers: Rc<Timers>,
     date: impl Fn() -> HttpDate,
@@ -894,7 +896,7 @@ where
     F: Future<Output = Answered<B>>,
     B: Body<Data = Bytes> + Unpin,
 {
-    let limits = settings.limits;
+    let limits: &H1Limits = &settings.limits;
     let mut connection = Connection::new(socket, settings, blocks, &timers);
     let mut draining = std::pin::pin!(drain.notified());
 
@@ -908,7 +910,7 @@ where
                 }
                 let found = {
                     let inbound = connection.inbound.borrow();
-                    reader.read(unread(&inbound.input), &limits)
+                    reader.read(unread(&inbound.input), limits)
                 };
                 match found {
                     Err(error) => return Poll::Ready(Err(Err(error))),
@@ -1311,7 +1313,7 @@ mod tests {
         timers
             .driving(super::serve(
                 socket,
-                settings,
+                &settings,
                 blocks,
                 Rc::clone(&timers),
                 date,
@@ -1426,7 +1428,7 @@ mod tests {
 
     fn settings() -> Settings {
         Settings {
-            limits: H1Limits::default(),
+            limits: Rc::new(H1Limits::default()),
             bounds: Bounds::default(),
             budget: Budget::default(),
         }
@@ -2545,7 +2547,7 @@ mod tests {
     async fn one_read_takes_at_most_a_block() {
         let (mut client, server) = tokio::io::duplex(1 << 20);
         client.write_all(&vec![b'x'; 256 * 1024]).await.unwrap();
-        let mut connection = Connection::new(server, settings(), blocks(), &Timers::new());
+        let mut connection = Connection::new(server, &settings(), blocks(), &Timers::new());
         // Room for far more than a block, as a grown block has.
         {
             let mut inbound = connection.inbound.borrow_mut();
@@ -2874,7 +2876,7 @@ mod tests {
             Duration::from_secs(10),
             super::serve(
                 server,
-                settings(),
+                &settings(),
                 blocks,
                 Timers::new(),
                 date,
@@ -3029,7 +3031,7 @@ mod tests {
         timers
             .driving(super::serve(
                 server,
-                settings(),
+                &settings(),
                 blocks(),
                 Rc::clone(&timers),
                 date,

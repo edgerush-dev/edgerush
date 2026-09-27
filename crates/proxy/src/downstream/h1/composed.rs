@@ -244,7 +244,7 @@ async fn composed(client: Vec<ClientStep>, core: Core, pipe: usize) -> Run {
         Rc::clone(&storage),
     )));
     let settings = Settings {
-        limits: H1Limits::default(),
+        limits: Rc::new(H1Limits::default()),
         bounds: Bounds::default(),
         budget: Budget::default(),
     };
@@ -286,7 +286,7 @@ async fn composed(client: Vec<ClientStep>, core: Core, pipe: usize) -> Run {
             let ended = timers
                 .driving(serve(
                     far,
-                    settings,
+                    &settings,
                     Rc::clone(&blocks),
                     Rc::clone(&timers),
                     || HttpDate::from_unix(0),
