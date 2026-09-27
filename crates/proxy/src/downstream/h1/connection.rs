@@ -28,7 +28,7 @@ use super::outbound::{OnFailure, Outbound};
 use super::writer::{
     Asked, BodyFramer, Content, Delimited, WriteError, Written, write_head, write_interim,
 };
-use crate::drain::Drain;
+use crate::drain::{Drain, Heard};
 use crate::h1::{BodyReader, CodecError, Framing, Piece};
 use crate::head::Head as _;
 use crate::interim::Interim;
@@ -393,6 +393,16 @@ impl From<Stop> for Ended {
     }
 }
 
+/// A request whose head has been read, as the connection hands it on.
+struct Begun {
+    head: RawHead,
+    asked: Asked,
+    /// Whether the request lets the connection be kept, as far as it says.
+    persistent: bool,
+    interim: Interim,
+    body: IncomingBody,
+}
+
 /// The connection's socket, what it has queued to write, and its deadlines.
 struct Connection<S> {
     socket: S,
@@ -737,6 +747,193 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         Ok(true)
     }
 
+    /// Reads a request's head, from what is already here and then from the socket. Says
+    /// how the connection ended instead, if it did, or the error a head is refused for.
+    async fn read_head(
+        &mut self,
+        limits: &H1Limits,
+        drain: &Drain,
+        mut draining: Pin<&mut Heard<'_>>,
+    ) -> Result<(RequestHead, usize), Result<Ended, RequestError>> {
+        let mut reader = HeadReader::default();
+        poll_fn(|context| {
+            loop {
+                if self.spent() {
+                    return self.yield_turn(context);
+                }
+                let found = {
+                    let inbound = self.inbound.borrow();
+                    reader.read(unread(&inbound.input), limits)
+                };
+                match found {
+                    Err(error) => return Poll::Ready(Err(Err(error))),
+                    Ok(Head::Read { head, consumed }) => {
+                        return Poll::Ready(Ok((head, consumed)));
+                    }
+                    Ok(Head::More) => {}
+                }
+                let (ended, failed, empty) = {
+                    let inbound = self.inbound.borrow();
+                    (inbound.ended, inbound.failed, !inbound.holds_any())
+                };
+                if ended || failed {
+                    // Between requests a close is the client's to make; part way through a
+                    // head it is a request that never came.
+                    return Poll::Ready(Err(Ok(if empty && !failed {
+                        Ended::Closed
+                    } else {
+                        Ended::Gone
+                    })));
+                }
+                // The head's own bound, plus a read's worth, is all it may hold. A worker
+                // that cannot pay for a block to read it into closes the connection before
+                // the request reaches the core, so no upstream is asked (14 §8).
+                let read = match self.poll_read(context, limits.head + READ, false) {
+                    Ok(read) => read,
+                    Err(stop) => return Poll::Ready(Err(Ok(stop.into()))),
+                };
+                if !read {
+                    if let Err(Stop::TimedOut(clock)) = self.poll_deadline(context) {
+                        return Poll::Ready(Err(Ok(Ended::TimedOut(clock))));
+                    }
+                    // Draining, and nothing of a next request here: it is closed rather
+                    // than waited on (03 §10). A head begun is read and answered, closing.
+                    if empty && drain.poll_on(draining.as_mut(), context).is_ready() {
+                        return Poll::Ready(Err(Ok(Ended::Closed)));
+                    }
+                    return self.wait();
+                }
+            }
+        })
+        .await
+    }
+
+    /// Takes over a request whose head was read to `consumed`: cuts the head's bytes out of
+    /// the input, works out how its body is framed, and sets up the body's reader and the
+    /// request's interim answers. Nothing here is awaited, so nothing it works with outlives
+    /// it in the connection's future (14 §3).
+    ///
+    /// # Errors
+    ///
+    /// The head's framing, when it is one no request may have.
+    fn begin(&mut self, head: RequestHead, consumed: usize) -> Result<Begun, RequestError> {
+        self.deadlines.head_read();
+        self.outbound.reset();
+        // The head's bytes, cut out of the block they were read into rather than copied:
+        // its fields are read out of them from here on, and they stay paid for through the
+        // block for as long as the request holds them (14 §6, §8). Everything the head said
+        // was in what was read, so there is a block to cut them from.
+        let bytes = {
+            let mut inbound = self.inbound.borrow_mut();
+            let inbound = &mut *inbound;
+            let bytes = inbound
+                .input
+                .as_mut()
+                .map(|block| block.cut_frame(0..consumed, consumed))
+                .unwrap_or_default();
+            give_back_if_empty(&mut inbound.input, &inbound.blocks);
+            bytes
+        };
+        let arrived = arrival(&head, &head.fields.view(&bytes))?;
+
+        let RequestHead {
+            method,
+            target,
+            version,
+            fields,
+            content_length: _,
+        } = head;
+        let head = RawHead::new(method, target, version, bytes, fields);
+        let asked = Asked {
+            head: head.method() == Method::HEAD,
+            version,
+            trailers: takes_trailers(&head),
+        };
+        let (reader, left) = match arrived.framing {
+            Framing::None | Framing::Length(0) => (None, None),
+            Framing::Length(length) => (Some(BodyReader::new(arrived.framing)), Some(length)),
+            framing => (Some(BodyReader::new(framing)), None),
+        };
+        let interim = Interim::listened(expects_continue(&head), version, reader.is_none());
+        {
+            let mut inbound = self.inbound.borrow_mut();
+            inbound.interim = Some(interim.clone());
+            inbound.reader = reader;
+        }
+        let body = IncomingBody {
+            inbound: Rc::clone(&self.inbound),
+            left,
+            done: false,
+        };
+        Ok(Begun {
+            head,
+            asked,
+            persistent: arrived.persistent,
+            interim,
+            body,
+        })
+    }
+
+    /// Queues the final head of `answered`, after what the upstream said before it, and
+    /// hands back its body and how the head framed it. `persistent`: whether the request and
+    /// the data plane let the connection be kept. Nothing here is awaited, as for
+    /// [`Connection::begin`].
+    ///
+    /// # Errors
+    ///
+    /// How the connection ended, when the head could not be queued.
+    fn answer_head<B: Body>(
+        &mut self,
+        interim: &Interim,
+        answered: Answered<B>,
+        asked: Asked,
+        persistent: bool,
+        date: &HttpDate,
+    ) -> Result<(B, Written), Ended> {
+        // A local `100` not yet queued is never sent now: the answer says what it would have
+        // (14 §5). What the upstream said before its final answer still goes first, in the
+        // order it came.
+        interim.final_head();
+        self.queue_interim(interim, asked)?;
+        let (final_head, body) = match answered {
+            Answered::Raw(answer, body) => (FinalHead::Raw(answer), body),
+            Answered::Map(response) => {
+                let (parts, body) = response.into_parts();
+                (FinalHead::Map(parts), body)
+            }
+        };
+        let content = if body.is_end_stream() {
+            Content::Empty
+        } else {
+            match body.size_hint().exact() {
+                Some(length) => Content::Length(length),
+                None => Content::Unknown,
+            }
+        };
+        // The connection is kept only if the request was read to its end by the time its
+        // answer began; an upload still arriving is closed, lingering, rather than read
+        // as the next request.
+        let persistent = persistent && {
+            let inbound = self.inbound.borrow();
+            inbound.reader.is_none() && !inbound.ended && !inbound.failed
+        };
+        let mut head = Vec::with_capacity(512);
+        // Only an interim status is refused, and the core returns none.
+        let written = final_head
+            .write(&mut head, content, asked, persistent, date)
+            .map_err(|_| Ended::Gone)?;
+        let length = head.len();
+        // The data plane's own answer is written from the provision, so that a worker that
+        // has run out can still say so; one it forwards is paid for like anything else.
+        let queued = if final_head.is_local() {
+            self.queue_answer(head)
+        } else {
+            self.queue_built(head)
+        };
+        queued.and_then(|()| self.outbound.final_head(length).map_err(|_| Stop::Gone))?;
+        Ok((body, written))
+    }
+
     /// Checks the one deadline that is next.
     ///
     /// Every request moves it sooner, from the wait between requests to the reading of a
@@ -901,216 +1098,97 @@ where
     let mut draining = std::pin::pin!(drain.notified());
 
     loop {
+        // A local is kept in the connection's future across every await while it is in
+        // scope, even once its value has been moved out of it. So each step's outcome is
+        // taken apart in a block of its own, and only what the next step needs leaves it
+        // (14 §3).
+        //
         // The head, from what is already here and then from the socket.
-        let mut reader = HeadReader::default();
-        let read = poll_fn(|context| {
-            loop {
-                if connection.spent() {
-                    return connection.yield_turn(context);
-                }
-                let found = {
-                    let inbound = connection.inbound.borrow();
-                    reader.read(unread(&inbound.input), limits)
-                };
-                match found {
-                    Err(error) => return Poll::Ready(Err(Err(error))),
-                    Ok(Head::Read { head, consumed }) => {
-                        return Poll::Ready(Ok((head, consumed)));
-                    }
-                    Ok(Head::More) => {}
-                }
-                let (ended, failed, empty) = {
-                    let inbound = connection.inbound.borrow();
-                    (inbound.ended, inbound.failed, !inbound.holds_any())
-                };
-                if ended || failed {
-                    // Between requests a close is the client's to make; part way through a
-                    // head it is a request that never came.
-                    return Poll::Ready(Err(Ok(if empty && !failed {
-                        Ended::Closed
-                    } else {
-                        Ended::Gone
-                    })));
-                }
-                // The head's own bound, plus a read's worth, is all it may hold. A worker
-                // that cannot pay for a block to read it into closes the connection before
-                // the request reaches the core, so no upstream is asked (14 §8).
-                let read = match connection.poll_read(context, limits.head + READ, false) {
-                    Ok(read) => read,
-                    Err(stop) => return Poll::Ready(Err(Ok(stop.into()))),
-                };
-                if !read {
-                    if let Err(Stop::TimedOut(clock)) = connection.poll_deadline(context) {
-                        return Poll::Ready(Err(Ok(Ended::TimedOut(clock))));
-                    }
-                    // Draining, and nothing of a next request here: it is closed rather
-                    // than waited on (03 §10). A head begun is read and answered, closing.
-                    if empty && drain.poll_on(draining.as_mut(), context).is_ready() {
-                        return Poll::Ready(Err(Ok(Ended::Closed)));
-                    }
-                    return connection.wait();
-                }
-            }
-        })
-        .await;
-        let (head, consumed) = match read {
-            Ok(read) => read,
-            Err(Ok(ended)) => return ended,
-            Err(Err(error)) => return refuse(&mut connection, error, &date).await,
+        let (head, consumed) = 'read: {
+            // Matched where it is read, so that only the error is held while the refusal
+            // is written.
+            let error = match connection.read_head(limits, drain, draining.as_mut()).await {
+                Ok(read) => break 'read read,
+                Err(Ok(ended)) => return ended,
+                Err(Err(error)) => error,
+            };
+            return refuse(&mut connection, error, &date).await;
         };
-        connection.deadlines.head_read();
-        connection.outbound.reset();
-        // The head's bytes, cut out of the block they were read into rather than copied:
-        // its fields are read out of them from here on, and they stay paid for through the
-        // block for as long as the request holds them (14 §6, §8). Everything the head said
-        // was in what was read, so there is a block to cut them from.
-        let bytes = {
-            let mut inbound = connection.inbound.borrow_mut();
-            let inbound = &mut *inbound;
-            let bytes = inbound
-                .input
-                .as_mut()
-                .map(|block| block.cut_frame(0..consumed, consumed))
-                .unwrap_or_default();
-            give_back_if_empty(&mut inbound.input, &inbound.blocks);
-            bytes
-        };
-        let arrived = match arrival(&head, &head.fields.view(&bytes)) {
-            Ok(arrived) => arrived,
-            Err(error) => return refuse(&mut connection, error, &date).await,
-        };
-
-        let RequestHead {
-            method,
-            target,
-            version,
-            fields,
-            content_length: _,
-        } = head;
-        let head = RawHead::new(method, target, version, bytes, fields);
-        let asked = Asked {
-            head: head.method() == Method::HEAD,
-            version,
-            trailers: takes_trailers(&head),
-        };
-        let (reader, left) = match arrived.framing {
-            Framing::None | Framing::Length(0) => (None, None),
-            Framing::Length(length) => (Some(BodyReader::new(arrived.framing)), Some(length)),
-            framing => (Some(BodyReader::new(framing)), None),
-        };
-        let interim = Interim::listened(expects_continue(&head), version, reader.is_none());
-        {
-            let mut inbound = connection.inbound.borrow_mut();
-            inbound.interim = Some(interim.clone());
-            inbound.reader = reader;
-        }
-        let body = IncomingBody {
-            inbound: Rc::clone(&connection.inbound),
-            left,
-            done: false,
+        let Begun {
+            head,
+            asked,
+            persistent,
+            interim,
+            body,
+        } = 'begun: {
+            let error = match connection.begin(head, consumed) {
+                Ok(begun) => break 'begun begun,
+                Err(error) => error,
+            };
+            return refuse(&mut connection, error, &date).await;
         };
         // The answer, with both directions kept moving while it is worked out.
-        let answer = {
-            let mut responding =
-                slots.start(|| respond(head, RequestBody::Ours(body), interim.clone()));
-            poll_fn(|context| -> Poll<Result<Answered<B>, Stop>> {
-                connection.inbound.borrow_mut().heard_by(context);
-                loop {
-                    if connection.spent() {
-                        return connection.yield_turn(context);
-                    }
-                    if let Poll::Ready(response) = Pin::new(&mut responding).poll(context) {
-                        return Poll::Ready(Ok(response));
-                    }
-                    // What the upstream said in the meantime that the client is to hear, and
-                    // a `100` of the coordinator's own, in the order they came.
-                    let mut moved = connection.queue_interim(&interim, asked)?;
-                    moved |= connection.poll_write_queued(context)?;
-                    let (wanted, body_done) = {
-                        let inbound = connection.inbound.borrow();
-                        (inbound.wanted, inbound.reader.is_none())
-                    };
-                    connection
-                        .deadlines
-                        .body_waited_on(now(), wanted && !body_done);
-                    // Read for the body when it asks; once it is whole, read on only to
-                    // hear a client that goes, keeping what arrives for the next request
-                    // up to the read-ahead bound.
-                    let room = if body_done { READ_AHEAD } else { limits.head };
-                    if (wanted || body_done) && connection.poll_read(context, room, !body_done)? {
-                        moved = true;
-                        connection.deadlines.body_moved(now());
-                        let inbound = connection.inbound.borrow();
-                        if inbound.ended && inbound.reader.is_none() {
-                            // A request whose client closes is given up: there is
-                            // nobody to answer.
-                            return Poll::Ready(Err(Stop::Gone));
+        let response = {
+            let answer = {
+                let mut responding =
+                    slots.start(|| respond(head, RequestBody::Ours(body), interim.clone()));
+                poll_fn(|context| -> Poll<Result<Answered<B>, Stop>> {
+                    connection.inbound.borrow_mut().heard_by(context);
+                    loop {
+                        if connection.spent() {
+                            return connection.yield_turn(context);
+                        }
+                        if let Poll::Ready(response) = Pin::new(&mut responding).poll(context) {
+                            return Poll::Ready(Ok(response));
+                        }
+                        // What the upstream said in the meantime that the client is to hear, and
+                        // a `100` of the coordinator's own, in the order they came.
+                        let mut moved = connection.queue_interim(&interim, asked)?;
+                        moved |= connection.poll_write_queued(context)?;
+                        let (wanted, body_done) = {
+                            let inbound = connection.inbound.borrow();
+                            (inbound.wanted, inbound.reader.is_none())
+                        };
+                        connection
+                            .deadlines
+                            .body_waited_on(now(), wanted && !body_done);
+                        // Read for the body when it asks; once it is whole, read on only to
+                        // hear a client that goes, keeping what arrives for the next request
+                        // up to the read-ahead bound.
+                        let room = if body_done { READ_AHEAD } else { limits.head };
+                        if (wanted || body_done)
+                            && connection.poll_read(context, room, !body_done)?
+                        {
+                            moved = true;
+                            connection.deadlines.body_moved(now());
+                            let inbound = connection.inbound.borrow();
+                            if inbound.ended && inbound.reader.is_none() {
+                                // A request whose client closes is given up: there is
+                                // nobody to answer.
+                                return Poll::Ready(Err(Stop::Gone));
+                            }
+                        }
+                        if !moved {
+                            connection.poll_deadline(context)?;
+                            return connection.wait();
                         }
                     }
-                    if !moved {
-                        connection.poll_deadline(context)?;
-                        return connection.wait();
-                    }
-                }
-            })
-            .await
-        };
-        let response = match answer {
-            Ok(response) => response,
-            Err(stop) => return stop.into(),
-        };
-        // A local `100` not yet queued is never sent now: the answer says what it would have
-        // (14 §5). What the upstream said before its final answer still goes first, in the
-        // order it came.
-        interim.final_head();
-        if let Err(stop) = connection.queue_interim(&interim, asked) {
-            return stop.into();
-        }
-
-        let (final_head, mut body) = match response {
-            Answered::Raw(answer, body) => (FinalHead::Raw(answer), body),
-            Answered::Map(response) => {
-                let (parts, body) = response.into_parts();
-                (FinalHead::Map(parts), body)
+                })
+                .await
+            };
+            match answer {
+                Ok(response) => response,
+                Err(stop) => return stop.into(),
             }
         };
-        let content = if body.is_end_stream() {
-            Content::Empty
-        } else {
-            match body.size_hint().exact() {
-                Some(length) => Content::Length(length),
-                None => Content::Unknown,
-            }
-        };
-        // The connection is kept only if the request was read to its end by the time its
-        // answer began; an upload still arriving is closed, lingering, rather than read
-        // as the next request.
-        let persistent = arrived.persistent && !drain.is_on() && {
-            let inbound = connection.inbound.borrow();
-            inbound.reader.is_none() && !inbound.ended && !inbound.failed
-        };
-        let mut head = Vec::with_capacity(512);
-        let written = match final_head.write(&mut head, content, asked, persistent, &date()) {
-            Ok(written) => written,
-            // Only an interim status is refused, and the core returns none.
-            Err(_) => return Ended::Gone,
-        };
-        let length = head.len();
-        // The data plane's own answer is written from the provision, so that a worker that
-        // has run out can still say so; one it forwards is paid for like anything else.
-        let queued = if final_head.is_local() {
-            connection.queue_answer(head)
-        } else {
-            connection.queue_built(head)
-        };
-        if let Err(stop) = queued.and_then(|()| {
-            connection
-                .outbound
-                .final_head(length)
-                .map_err(|_| Stop::Gone)
-        }) {
-            return stop.into();
-        }
+        // Kept only if the data plane is not draining, as well as what the request and the
+        // connection say (`answer_head`).
+        let persistent = persistent && !drain.is_on();
+        let (mut body, written) =
+            match connection.answer_head(&interim, response, asked, persistent, &date()) {
+                Ok(answering) => answering,
+                Err(ended) => return ended,
+            };
 
         let mut framer = BodyFramer::new(written.delimited);
         let mut body_left = written.delimited != Delimited::Nothing;
@@ -3118,5 +3196,39 @@ mod tests {
             "the request's future outlived the connection"
         );
         assert_eq!(slots.free(), 1);
+    }
+
+    /// What a future `make` returns takes, without one being made.
+    fn size_of_made<A, F>(_make: impl FnOnce(A) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    /// Between requests the driver holds its connection and little else (14 §3): a request's
+    /// future is in its slot, and what each step works with is taken apart before the next
+    /// wait, not held beside the connection until the loop comes round.
+    #[test]
+    fn the_driver_holds_little_beside_its_connection() {
+        type Respond = fn(RawHead, RequestBody, Interim) -> std::future::Ready<Answered<Answer>>;
+        type Driving = (
+            tokio::io::DuplexStream,
+            &'static Settings,
+            Rc<RefCell<Blocks>>,
+            Rc<Timers>,
+            &'static Drain,
+            Respond,
+            &'static Slots<std::future::Ready<Answered<Answer>>>,
+        );
+        let driver = size_of_made(
+            |(socket, settings, blocks, timers, drain, respond, slots): Driving| {
+                super::serve(
+                    socket, settings, blocks, timers, date, drain, respond, slots,
+                )
+            },
+        );
+        let connection = std::mem::size_of::<Connection<tokio::io::DuplexStream>>();
+        assert!(
+            driver <= connection + 768,
+            "{driver} bytes, its connection {connection}"
+        );
     }
 }
