@@ -479,7 +479,25 @@ fn events(
                         shut(quic, id, code::MESSAGE_ERROR);
                     }
                     Ok(head) => {
-                        streams.insert(id, Slot::default());
+                        // A stop that came before the head, its packet lost and sent again,
+                        // was told of with no slot to hear it, and is not told again. quiche
+                        // may have let the stream go since, both its sides done: a side of
+                        // ours can be done before the head is seen only by the client's
+                        // stop, whose code went with it.
+                        let stopped = match quic.stream_capacity(id) {
+                            Err(quiche::Error::StreamStopped(code)) => Some(code),
+                            Err(quiche::Error::InvalidStreamState(_)) => {
+                                Some(code::REQUEST_CANCELLED)
+                            }
+                            _ => None,
+                        };
+                        streams.insert(
+                            id,
+                            Slot {
+                                stopped,
+                                ..Slot::default()
+                            },
+                        );
                         found.push(Found {
                             id,
                             head,

@@ -967,6 +967,61 @@ fn half_the_requests_given_up_early_is_a_rapid_reset() {
     });
 }
 
+/// A request the client stopped before the server had seen its head is given up all the
+/// same: its exchange goes, and it counts towards a rapid reset. quiche tells of a stop
+/// once, and here before the stream has a task to tell: the stop came with the head, or
+/// the head's packet was lost and sent again after it. By the time the head is read,
+/// quiche has let go of a stream the head ended, both its sides done, and still holds one
+/// whose body is to follow.
+#[test]
+fn a_request_stopped_before_its_head_was_seen_is_given_up() {
+    for (ended, head_lost) in [(true, false), (true, true), (false, true)] {
+        locally(stopped_before_its_head(ended, head_lost));
+    }
+}
+
+/// The client stops a request whose head `ended` the stream or had a body to follow: in
+/// the same flush as the head, or after the head's packet was lost, which then goes again.
+async fn stopped_before_its_head(ended: bool, head_lost: bool) {
+    // The server's own deadlines, not the tests' short ones: a lost head goes again at the
+    // client's loss timer, which a loaded machine stretches past a short first-request one.
+    let settings = Settings {
+        reset_judged_after: 1,
+        ..Settings::default()
+    };
+    let exchanges = Exchanges::default();
+    let server = serving(settings, exchanges.core()).await;
+    let mut client = Client::connect(server.address, "a.test").await;
+    let lost = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let method = if ended { "GET" } else { "POST" };
+    let head = [
+        (":method", method),
+        (":scheme", "https"),
+        (":authority", "a.test"),
+        (":path", "/"),
+    ];
+    let id = client.request(&head, ended);
+    if head_lost {
+        client.send_to = Some(lost.local_addr().unwrap());
+        client.flush().await;
+        client.send_to = None;
+    }
+    client
+        .quic
+        .stream_shutdown(id, quiche::Shutdown::Read, code::REQUEST_CANCELLED)
+        .unwrap();
+    client
+        .until(|client| client.closed_by_server().is_some())
+        .await;
+    let case = format!("ended: {ended}, head lost: {head_lost}");
+    assert_eq!(
+        client.closed_by_server(),
+        Some((true, code::EXCESSIVE_LOAD)),
+        "{case}"
+    );
+    assert_eq!(exchanges.alive.get(), 0, "the exchange went on; {case}");
+}
+
 /// A request given up while its answer's head waits for room to be sent is given up early
 /// too: a client that grants an answer no room and then cancels is judged as one that
 /// cancels at once.
