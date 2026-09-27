@@ -1586,7 +1586,10 @@ fn past_the_threshold_a_client_proves_its_address_first() {
 
 /// A client whose datagrams land on another worker's socket, from a new port as after a
 /// NAT rebinding, is served by its own connection all the same: the other worker reads the
-/// owner from the ID and hands each datagram over, once (16 §3).
+/// owner from the ID and hands each datagram over, once (16 §3). A NAT rebinds a client
+/// most often once it has been quiet: this one, for a second. The workers keep their own
+/// deadlines, not the tests' short ones: one that closed the connection meanwhile would
+/// tell only the address the client had left.
 #[test]
 fn a_client_that_lands_on_another_worker_is_served_by_its_own() {
     locally(async {
@@ -1594,14 +1597,15 @@ fn a_client_that_lands_on_another_worker_is_served_by_its_own() {
         let mut group = Forwarding::group(2);
         let other = group.remove(1);
         let owner = group.remove(0);
-        let owner = serving_as(short(), echo, &secrets, owner).await;
-        let other = serving_as(short(), echo, &secrets, other).await;
+        let owner = serving_as(Settings::default(), echo, &secrets, owner).await;
+        let other = serving_as(Settings::default(), echo, &secrets, other).await;
         let mut client = Client::connect(owner.address, "a.test").await;
         assert_eq!(
             body_of(&client.get("a.test", "/here").await),
             "GET /here 0 None"
         );
 
+        tokio::time::sleep(Duration::from_secs(1)).await;
         client.rebind().await;
         client.send_to = Some(other.address);
         let answer = client.get("a.test", "/astray").await;
