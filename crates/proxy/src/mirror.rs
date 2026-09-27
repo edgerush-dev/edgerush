@@ -7,7 +7,9 @@
 //! than let it slow the request or hold more: nginx reads the whole body before its mirrors
 //! start, and Envoy lets a backed-up mirror push back on the client, and neither is what a
 //! copy is for. A copy goes no faster than the request's own upstream reads, and when the
-//! request is given up on before its body ends, so are its copies.
+//! request is given up on before its body ends, so are its copies. Whoever sends a copy
+//! is told at once that it was given up on ([`Kept::given_up`]), not only when it next
+//! reads it.
 
 use crate::request_body::{RequestBody, RequestBodyError};
 use bytes::Bytes;
@@ -42,7 +44,10 @@ struct Queue {
     given_up: bool,
     /// It was given up on for falling behind, and not because the request went.
     fell_behind: bool,
+    /// The copy's reader, waiting for a frame.
     waiting: Option<Waker>,
+    /// Whoever waits to be told the copy was given up on.
+    watching: Option<Waker>,
 }
 
 impl Queue {
@@ -50,7 +55,10 @@ impl Queue {
         self.given_up = true;
         self.frames.clear();
         self.behind = 0;
-        if let Some(waker) = self.waiting.take() {
+        for waker in [self.waiting.take(), self.watching.take()]
+            .into_iter()
+            .flatten()
+        {
             waker.wake();
         }
     }
@@ -82,6 +90,20 @@ impl Kept {
     /// Whether the mirror fell too far behind and was given up on.
     pub(crate) fn fell_behind(&self) -> bool {
         self.0.borrow().fell_behind
+    }
+
+    /// Ready once the copy is given up on, for falling behind or because the request went,
+    /// whether or not anything is reading it — its reader may be waiting on something else,
+    /// such as room its upstream will never give. Never, for a copy that goes whole.
+    pub(crate) fn given_up(&self) -> impl Future<Output = ()> + '_ {
+        std::future::poll_fn(|cx| {
+            let mut queue = self.0.borrow_mut();
+            if queue.given_up {
+                return Poll::Ready(());
+            }
+            queue.watching = Some(cx.waker().clone());
+            Poll::Pending
+        })
     }
 }
 
@@ -317,6 +339,70 @@ mod tests {
         drop(tee);
         assert!(read(copy).await.is_err());
         assert!(!kept.fell_behind(), "not the mirror's doing");
+    }
+
+    /// A waker that remembers being woken.
+    #[derive(Default)]
+    struct Woken(std::sync::atomic::AtomicBool);
+
+    impl std::task::Wake for Woken {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Woken {
+        fn was(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Whoever holds what became of a copy is told the moment it is given up on, for
+    /// falling behind or because the request went, though nothing is reading the copy: its
+    /// reader may be waiting on something else — room its upstream will never give — and
+    /// would wait there until its own bound. A copy that goes whole is never given up on.
+    #[tokio::test]
+    async fn a_copy_given_up_on_is_known_to_be_at_once_read_or_not() {
+        let woken = std::sync::Arc::new(Woken::default());
+        let waker = Waker::from(std::sync::Arc::clone(&woken));
+        let mut cx = Context::from_waker(&waker);
+
+        // Too far behind: its reader took the first frame and turned to something else.
+        let big = Bytes::from(vec![b'x'; MOST_BEHIND + 1]);
+        let (mut tee, mut copies) = Tee::new(body(vec![data(b"a"), Frame::data(big)]), 1);
+        let (mut copy, kept) = copies.pop().unwrap();
+        let _first = tee.frame().await;
+        let _taken = copy.frame().await;
+        let mut told = std::pin::pin!(kept.given_up());
+        assert!(told.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(read(&mut tee).await.unwrap().0.len(), MOST_BEHIND + 1);
+        assert!(woken.was(), "a copy too far behind was given up on untold");
+        assert!(told.as_mut().poll(&mut cx).is_ready());
+        assert!(kept.fell_behind());
+
+        // The request went before its body ended.
+        let woken = std::sync::Arc::new(Woken::default());
+        let waker = Waker::from(std::sync::Arc::clone(&woken));
+        let mut cx = Context::from_waker(&waker);
+        let (mut tee, mut copies) = Tee::new(body(vec![data(b"ab"), data(b"cd")]), 1);
+        let (_copy, kept) = copies.pop().unwrap();
+        let _first = tee.frame().await;
+        let mut told = std::pin::pin!(kept.given_up());
+        assert!(told.as_mut().poll(&mut cx).is_pending());
+        drop(tee);
+        assert!(
+            woken.was(),
+            "a copy of a request that went was given up on untold"
+        );
+        assert!(told.as_mut().poll(&mut cx).is_ready());
+        assert!(!kept.fell_behind());
+
+        // Whole, and not read at all.
+        let (tee, mut copies) = Tee::new(body(vec![data(b"ab"), data(b"cd")]), 1);
+        let (_copy, kept) = copies.pop().unwrap();
+        assert_eq!(read(tee).await.unwrap().0, b"abcd");
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(std::pin::pin!(kept.given_up()).poll(&mut cx).is_pending());
     }
 
     /// A body may say it has ended with its last frame, and whatever sends it may stop

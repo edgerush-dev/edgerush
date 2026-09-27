@@ -1770,28 +1770,45 @@ impl Worker {
                     others: None,
                     mirrors: Vec::new(),
                 };
-                let answered = worker
-                    .attempt(
-                        &directed,
-                        &mirror.endpoint,
-                        &parts,
-                        &nominated,
-                        sending,
-                        RequestBody::Copy(copy),
-                        admitted,
-                        None,
-                        None,
-                    )
-                    .await;
-                // Read to its end, so that its connection can carry another request.
-                let mut body = match answered {
-                    Ok(Answered::Raw(_, body)) => body,
-                    Ok(Answered::Map(response)) => response.into_body(),
-                    Err(_) => Body::Empty,
-                };
-                while let Some(Ok(_)) =
-                    std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+                // A copy given up on is let go of at once, its exchange and place with it:
+                // what sends it may be waiting for room its upstream will never give, and
+                // would learn of it only at its idle bound.
                 {
+                    let mut copying = pin!(async {
+                        let answered = worker
+                            .attempt(
+                                &directed,
+                                &mirror.endpoint,
+                                &parts,
+                                &nominated,
+                                sending,
+                                RequestBody::Copy(copy),
+                                admitted,
+                                None,
+                                None,
+                            )
+                            .await;
+                        // Read to its end, so that its connection can carry another request.
+                        let mut body = match answered {
+                            Ok(Answered::Raw(_, body)) => body,
+                            Ok(Answered::Map(response)) => response.into_body(),
+                            Err(_) => Body::Empty,
+                        };
+                        while let Some(Ok(_)) =
+                            std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+                        {
+                        }
+                    });
+                    let mut given_up = pin!(kept.given_up());
+                    std::future::poll_fn(|cx| {
+                        if copying.as_mut().poll(cx).is_ready()
+                            || given_up.as_mut().poll(cx).is_ready()
+                        {
+                            return Poll::Ready(());
+                        }
+                        Poll::Pending
+                    })
+                    .await;
                 }
                 if kept.fell_behind()
                     && let Some(upstream) = worker.proxy.metrics.upstream(mirror.upstream_slot)
@@ -6374,9 +6391,12 @@ upstreams:
     }
 
     /// A mirror that stops reading is given up on once it is too far behind; the request
-    /// goes on at its own upstream's pace, whole.
+    /// goes on at its own upstream's pace, whole. The rest of the body waits for the copy's
+    /// head to reach the mirror: sent whole, it can be past the bound before the copy has
+    /// begun, and a copy given up on then is never sent at all.
     #[tokio::test]
     async fn a_mirror_that_stops_reading_never_holds_the_request_up() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -6388,17 +6408,85 @@ upstreams:
                 )
                 .await;
                 let size = 1 << 20;
-                let mut request = format!(
-                    "POST / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\ncontent-length: {size}\r\n\r\n"
-                )
-                .into_bytes();
-                request.resize(request.len() + size, b'x');
-                let answer = h1_answer(front, &request).await;
+                let mut client = TcpStream::connect(front).await.unwrap();
+                let head = format!(
+                    "POST / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\ncontent-length: {size}\r\n\r\nx"
+                );
+                client.write_all(head.as_bytes()).await.unwrap();
+                until(|| asked.borrow().len() == 1).await;
+                client.write_all(&vec![b'x'; size - 1]).await.unwrap();
+                let mut answer = Vec::new();
+                let _ended = within(client.read_to_end(&mut answer)).await;
+                let answer = String::from_utf8_lossy(&answer);
                 assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
                 assert_eq!(sent.borrow()[0].len(), size);
-                assert_eq!(asked.borrow().len(), 1, "the mirror was not sent a copy");
                 let line = "edgerush_upstream_mirrors_given_up_total{upstream=\"shadow\",reason=\"behind\"} 1\n";
                 until(|| worker.proxy().metrics().contains(line)).await;
+            })
+            .await;
+    }
+
+    /// A mirror given up on while it waits for room its upstream will never give — its
+    /// window spent, the request's body going on without it — lets go of its exchange at
+    /// once: its stream is reset and it is counted then, not held with its place until its
+    /// idle bound, 30 s, runs out. Whether a copy is waiting there when it is given up on is
+    /// a race in a request sent whole; this one's body is sent in two, the mirror's window
+    /// spent in between.
+    #[tokio::test]
+    async fn a_mirror_given_up_on_while_it_waits_for_room_lets_go_at_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (primary, sent) = statuses_upstream(vec![200]).await;
+                // Takes what comes and never gives the room back: h2's first window's
+                // worth, and no more.
+                let window = 65_535;
+                let taken = Rc::new(std::cell::Cell::new(0));
+                let let_go = Rc::new(std::cell::Cell::new(false));
+                let (taking, letting_go) = (Rc::clone(&taken), Rc::clone(&let_go));
+                let script: Script = Rc::new(move |request, respond| {
+                    let (taking, letting_go) = (Rc::clone(&taking), Rc::clone(&letting_go));
+                    Box::pin(async move {
+                        let _unanswered = respond;
+                        let mut body = request.into_body();
+                        while let Some(Ok(chunk)) = body.data().await {
+                            taking.set(taking.get() + chunk.len());
+                        }
+                        letting_go.set(true);
+                    })
+                });
+                let shadow = scripted_h2_upstream(script).await;
+                let (front, worker) = serving_mirroring_worker(
+                    (primary, UpstreamProtocol::Http1),
+                    &[("shadow", Some(shadow), UpstreamProtocol::Http2)],
+                )
+                .await;
+                let size = 1 << 20;
+                let mut client = TcpStream::connect(front).await.unwrap();
+                let head = format!(
+                    "POST / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\ncontent-length: {size}\r\n\r\n"
+                );
+                client.write_all(head.as_bytes()).await.unwrap();
+                // A piece at a time, each well within its bound and taken before the next,
+                // until its window is spent with a byte of the last still in hand: it waits
+                // for room. Sent whole, the body is past its bound before its copy begins.
+                let piece = 16 * 1024;
+                let mut given = 0;
+                while given <= window {
+                    client.write_all(&vec![b'x'; piece]).await.unwrap();
+                    given += piece;
+                    until(|| taken.get() == given.min(window)).await;
+                }
+                // The rest takes it past its bound while it waits.
+                client.write_all(&vec![b'x'; size - given]).await.unwrap();
+                let mut answer = Vec::new();
+                let _ended = within(client.read_to_end(&mut answer)).await;
+                let answer = String::from_utf8_lossy(&answer);
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+                assert_eq!(sent.borrow()[0].len(), size);
+                let line = "edgerush_upstream_mirrors_given_up_total{upstream=\"shadow\",reason=\"behind\"} 1\n";
+                until(|| let_go.get() && worker.proxy().metrics().contains(line)).await;
             })
             .await;
     }
