@@ -111,6 +111,13 @@ repo=$(dirname "$here")
 # 1,500 bytes is an Ethernet path's (16 §8). Put back when the run ends; 0 leaves it alone.
 : "${LOOPBACK_MTU:=1500}"
 : "${UPSTREAM_H2:=0}"
+# The CPUs' idle states (bench/residency.py): the policies every variant takes turns under,
+# `normal` (every state the driver has) or the deepest state allowed by name, on every CPU
+# (`C1E`), on the proxy's cores alone (`C1E-proxy`) or on every other core (`C1E-others`).
+# How long each CPU spent in which state is written down for every measurement
+# (RESIDENCY=1), what the OS asked for and, where perf counts it, what the hardware did.
+: "${IDLE:=normal}"
+: "${RESIDENCY:=1}"
 : "${VARIANTS:=ours}" # and: ours-kernel nginx haproxy envoy kong
 : "${OUT:=$here/results/$(date +%Y%m%d-%H%M%S)}"
 
@@ -207,7 +214,8 @@ stop_backend() {
     [ -f "$run/nginx.pid" ] && kill "$(cat "$run/nginx.pid")" 2>/dev/null || true
 }
 
-start_proxy() { # variant
+start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an idle policy
+    set -- "${1%%@*}"
     local daemon=
     # Given unquoted below, so that it is two flags and their values rather than one
     # long argument. Only the variants that are EdgeRush are given it.
@@ -369,8 +377,9 @@ cpu() { # file
 
 # What the proxy holds while a measurement runs, every half second: the resident memory of
 # all its processes, in KiB (NGINX's workers included; pages they share counted in each).
-# With COUNT=1, also its instructions and cycles over a window inside the load. The watchers
-# run on the generator's CPUs, as the clock sampler does.
+# With COUNT=1, also its instructions and cycles over a window inside the load; with
+# RESIDENCY=1, the CPUs' idle states over that window. The watchers run on the generator's
+# CPUs, as the clock sampler does.
 watchers=
 watch_proxy() { # name
     watchers=
@@ -390,6 +399,16 @@ watch_proxy() { # name
                 -e instructions:u,instructions:k,cycles:u,cycles:k -- sleep "$((DURATION - 4))"
             echo "# window $((DURATION - 4))" >&2
         ) >/dev/null 2>"$OUT/$1.stat" &
+        watchers="$watchers $!"
+    fi
+    if [ "$RESIDENCY" = 1 ] && [ "$DURATION" -ge 8 ]; then
+        # The same window: each CPU's idle states, and the hardware's counts where perf has
+        # them, raw, into `<name>.idle` (JSON).
+        (
+            sleep 2
+            taskset -c "$GEN_CPUS" python3 "$here/residency.py" window "$((DURATION - 4))" \
+                "$OUT/$1.idle" "$PROXY_CPUS"
+        ) >/dev/null 2>>"$OUT/residency.log" &
         watchers="$watchers $!"
     fi
 }
@@ -709,12 +728,22 @@ busy_idle_memory() { # name, count
 }
 
 each_variant() { # function, that is given: prefix of the names
+    local policies
+    read -ra policies <<<"$IDLE"
+    local count=${#policies[@]} rep turn policy label
     for rep in $(seq "$REPS"); do
-        for variant in $VARIANTS; do
-            start_proxy "$variant"
-            "$1" "$variant.$rep"
-            stop_proxy
-            sleep 5 # let it cool, and the sockets of the run go
+        # The policies in a new order each repetition, so that what drifts is shared out.
+        for turn in $(seq 0 $((count - 1))); do
+            policy=${policies[$(((turn + rep - 1) % count))]}
+            set_idle "$policy"
+            for variant in $VARIANTS; do
+                label=$variant
+                [ "$policy" = normal ] || label="$variant@$policy"
+                start_proxy "$variant"
+                "$1" "$label.$rep"
+                stop_proxy
+                sleep 5 # let it cool, and the sockets of the run go
+            done
         done
     done
 }
@@ -737,9 +766,9 @@ carrying_runs() {
     slow_upstream "$1.slow-upstream" "$slow_rate"
     cancelled "$1.cancelled" "$slow_rate"
     idle_memory "$1.idle-memory"
-    case "$1" in
+    case "${1%%[.@]*}" in
     # Only EdgeRush is asked to take a config over while it serves.
-    nginx.* | haproxy.* | envoy.* | kong.*) ;;
+    nginx | haproxy | envoy | kong) ;;
     *) reload_under_load "$1.reload" "$h1_rate" ;;
     esac
 }
@@ -752,6 +781,14 @@ environment() {
         lscpu | grep -E 'Model name|MHz'
         echo "governor $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)," \
             "no_turbo $(cat /sys/devices/system/cpu/intel_pstate/no_turbo)"
+        local cpuidle=/sys/devices/system/cpu/cpuidle
+        echo "idle driver $(cat $cpuidle/current_driver 2>/dev/null)," \
+            "governor $(cat $cpuidle/current_governor_ro $cpuidle/current_governor 2>/dev/null | head -1);" \
+            "states $(cat /sys/devices/system/cpu/cpu0/cpuidle/state*/name 2>/dev/null | tr '\n' ' ')"
+        local disabled
+        disabled=$(awk '$2 == 1 { print $1 }' "$idle_saved" |
+            sed 's#/sys/devices/system/cpu/##; s#/cpuidle/#:#; s#/disable##' | tr '\n' ' ')
+        echo "idle policies: $IDLE; disabled when the run began: ${disabled:-none}"
         echo "proxy on $PROXY_CPUS ($WORKERS workers), generator on $GEN_CPUS," \
             "backend on $BACKEND_CPUS, ${DURATION}s, $REPS repetitions"
         echo "idle upstream connections: $IDLE_PER_DESTINATION per destination," \
@@ -822,12 +859,33 @@ loopback_mtu=
 restore_mtu() {
     if [ -n "$loopback_mtu" ]; then sudo -n ip link set lo mtu "$loopback_mtu"; fi
 }
-trap 'stop_proxy; stop_backend; restore_mtu' EXIT
+# The idle states as the run found them, put back however it ends; a policy is applied for
+# the turns taken under it (each_variant), and modes that take no turns run under the first.
+idle_saved=$run-idle-saved
+python3 "$here/residency.py" save >"$idle_saved"
+set_idle() { # policy
+    local path value
+    python3 "$here/residency.py" plan "$1" "$PROXY_CPUS" | while read -r path value; do
+        [ "$(cat "$path")" = "$value" ] || echo "$value" | sudo -n tee "$path" >/dev/null
+    done
+}
+restore_idle() {
+    local path value
+    while read -r path value; do
+        [ "$(cat "$path")" = "$value" ] || echo "$value" | sudo -n tee "$path" >/dev/null
+    done <"$idle_saved"
+}
+trap 'stop_proxy; stop_backend; restore_mtu; restore_idle' EXIT
+trap 'exit 1' INT TERM HUP
+for policy in $IDLE; do
+    python3 "$here/residency.py" plan "$policy" "$PROXY_CPUS" >/dev/null
+done
 if [ "$H3" = 1 ] && [ "$LOOPBACK_MTU" != 0 ]; then
     loopback_mtu=$(cat /sys/class/net/lo/mtu)
     sudo -n ip link set lo mtu "$LOOPBACK_MTU"
 fi
 environment
+set_idle "${IDLE%% *}"
 start_backend
 case "$command" in
 ceiling)

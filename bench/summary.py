@@ -10,6 +10,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import residency
+
 TICKS_PER_SECOND = 100  # of /proc/<pid>/task/<tid>/stat, on every Linux we run on
 
 
@@ -171,6 +173,12 @@ def spent(directory, stem, result):
     rss = directory / f"{stem}.rss"
     if rss.exists():
         result.update(resident(rss))
+    idle = directory / f"{stem}.idle"
+    if idle.exists():
+        try:
+            result.update(residency.proxy_view(json.loads(idle.read_text())))
+        except (ValueError, KeyError):
+            print(f"cannot read {idle.name}", file=sys.stderr)
     clock = directory / f"{stem}.freq"
     samples = [int(line) for line in clock.read_text().split()] if clock.exists() else []
     if samples:
@@ -270,6 +278,32 @@ def main(directory):
             cells.append(cell)
         threads = "; ".join(result.get("threads", "") for result in results)
         print(f"| {scenario} | {model} | {len(results)} | " + " | ".join(cells) + f" | {threads} |")
+
+    if any("window" in result for results in runs.values() for result in results):
+        # Where the CPUs idled over each measurement's window: the hardware's residency as a
+        # share of TSC (C0 is the proxy's CPUs', CC6 and CC7 its cores' and the others' on
+        # average, PC the package's), the idle entries a second of the proxy's CPUs, and the
+        # deepest state the OS asked for there with its share of the window (per run).
+        print()
+        idle_columns = [
+            "proxy_c0", "proxy_cc6", "proxy_cc7", "other_cc6", "other_cc7", "pc2", "pc3",
+            "pc6_plus", "proxy_entries",
+        ]
+        idle_titles = [
+            "proxy C0 %", "proxy CC6 %", "proxy CC7 %", "others CC6 %", "others CC7 %",
+            "PC2 %", "PC3 %", "PC6+ %", "proxy idle entries/s",
+        ]
+        print("| scenario | variant | runs | " + " | ".join(idle_titles) + " | OS asked, deepest |")
+        print("|---|---|---|" + "---|" * (len(idle_columns) + 1))
+        for (scenario, model), results in sorted(runs.items()):
+            if not any("window" in result for result in results):
+                continue
+            cells = []
+            for column in idle_columns:
+                values = [result[column] for result in results if result.get(column) is not None]
+                cells.append(f"{statistics.median(values):,.0f}" if values else "")
+            asked = "; ".join(result.get("proxy_deepest_asked", "") for result in results)
+            print(f"| {scenario} | {model} | {len(results)} | " + " | ".join(cells) + f" | {asked} |")
 
     if held:
         # Not a row of the table: what a connection costs while nothing happens on it is

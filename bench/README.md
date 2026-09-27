@@ -70,7 +70,7 @@ Results go to `bench/results/<time>/` (not committed): the raw output of every
 measurement, the proxy's CPU time around it, `environment.txt`, and the table that
 `summary` prints. Settings are environment variables — `PROXY_CPUS`, `WORKERS`,
 `GEN_CPUS`, `BACKEND_CPUS`, `DURATION`, `REPS`, `VARIANTS`, `IDLE_PER_DESTINATION`,
-`IDLE_TOTAL`, `OUT`; the defaults are for a machine with 4 cores and 8 threads where CPUs
+`IDLE_TOTAL`, `IDLE`, `RESIDENCY`, `OUT`; the defaults are for a machine with 4 cores and 8 threads where CPUs
 *n* and *n+4* are one core.
 
 Every measurement also writes down the proxy's resident memory every half second, all its
@@ -78,6 +78,30 @@ processes summed (`<scenario>.rss`; the table's *RSS peak*). `COUNT=1` (with `DU
 8 s or more) counts, with `perf stat` over every process of the proxy, the instructions and
 cycles in user and kernel mode from 2 s into the load for `DURATION - 4` seconds, and the
 table divides them by the rate: *k instr/req* and *k cycles/req*.
+
+**Idle states.** `IDLE` names the idle policies every variant takes turns under, in a new
+order each repetition: `normal` (the default: every state the idle driver has) or the
+deepest state allowed, by its name in `/sys/devices/system/cpu/cpu*/cpuidle/state*/name`
+— `C1E` on every CPU, `C1E-proxy` on the proxy's cores alone, `C1E-others` on every other
+core. A core idles no deeper than its shallowest thread, so a scope takes whole cores, and
+states are compared by exit latency. `IDLE="normal C1E"` measures both, and a variant
+under a policy other than `normal` is named for it in the table (`ours@C1E`); keep
+`normal` in every run, as the baseline. Modes that take no turns (`instructions`,
+`profile-body`) run under the first policy. The states are set through sysfs (sudo) and
+put back as the run found them however it ends; `environment.txt` records the driver, its
+states, the policies and anything disabled before the run began.
+
+With `RESIDENCY=1` (the default; `DURATION` of 8 s or more) each measurement writes, over
+COUNT's window, `<scenario>.idle`: raw, what sysfs has for every CPU and state (entries,
+time, whether disabled) at both ends of the window, each end timed on the monotonic clock,
+and where perf counts them the hardware's residency counters (`cstate_core` C3/C6/C7 per
+core, `cstate_pkg` C2–C10 per package, TSC and MPERF per CPU). The OS's shares are of the
+window's monotonic length, the hardware's of TSC. A second table gives, per scenario and
+variant: C0 on the proxy's CPUs (MPERF), CC6 and CC7 on its cores and on the others, the
+package's PC2, PC3 and PC6 or deeper, idle entries a second on the proxy's CPUs, and the
+deepest state the OS asked for there with its share. What the OS asks for is what a policy
+permits; the counters say what the hardware did (on the laptop, PC3 at the deepest however
+deep the state asked). `bench/residency.py` does the planning, the reading and the sums.
 
 `H3=1`, which `h3` sets and which is `TLS=1` as well, has EdgeRush, NGINX (`listen ...
 quic`) and HAProxy (`bind quic4@...`) serve HTTP/3 on the proxy's port over UDP beside
@@ -258,6 +282,12 @@ small filter chain (request and response header changes): `proxy.yaml`.
   (through `sudo`), since a desktop left alone suspends itself in the middle of a run.
 - **The frequency is fixed** (`prepare`): with turbo on, a laptop's clock follows its
   temperature. Absolute numbers are lower for it.
+- **Idle states are part of what is measured, not noise.** At low rates the time a request
+  waits for a core to wake is a share of its latency, and it depends on how often each
+  process wakes the others: on the laptop, keeping every core out of states deeper than
+  C1E cut EdgeRush's HTTP/3 median at 1,000 a second from 0.77 to 0.21 ms, and NGINX's
+  from 0.22 to 0.15 (16 §8). Read low-rate latency under `normal` and under a constrained
+  policy together, from the same run, with the residency table beside them.
 - **CPUs are pinned** with `taskset`, and the generator is kept off the proxy's cores —
   hyper-threads of one core are one core's worth of cache.
 - Besides throughput and latency the table has the proxy's **CPU time per request** and
