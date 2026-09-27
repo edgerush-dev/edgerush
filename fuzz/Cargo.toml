@@ -34,6 +34,7 @@ quiche = { version = "=0.30.0", default-features = false, features = ["boringssl
 # The proxy's quiche, patched as the workspace's is (see its Cargo.toml).
 [patch.crates-io]
 quiche = { path = "../vendor/quiche" }
+h2 = { path = "../vendor/h2" }
 
 [[bin]]
 name = "host_index"

@@ -52,6 +52,11 @@ pub(crate) struct Settings {
     pub(crate) send_buffer: usize,
     /// How long a connection may stay with no stream open before it is told to go.
     pub(crate) keep_alive: Duration,
+    /// How long a connection stays with no stream open before it gives back the buffers
+    /// h2 reads, writes and decodes header blocks in, some 28 KiB, to make them again when
+    /// a stream comes (14 §3). Not at once: a client asking one request at a time would
+    /// pay for three allocations a request, and a read more.
+    pub(crate) release_after: Duration,
     /// How long a connection told to go has to finish before it is closed regardless.
     pub(crate) closing: Duration,
     /// How long a stream's body, or the room to send its answer, may be waited on with
@@ -73,6 +78,7 @@ impl Default for Settings {
             header_list: 64 * 1024,
             send_buffer: 400 * 1024,
             keep_alive: Duration::from_secs(30),
+            release_after: Duration::from_secs(1),
             closing: Duration::from_secs(10),
             idle: Duration::from_secs(30),
             reset_judged_after: 500,
@@ -168,8 +174,32 @@ pub(crate) async fn serve<S, R, F, B, D>(
     let Ok(mut connection) = settings.builder().handshake::<_, Outgoing>(socket).await else {
         return;
     };
+    drive(&mut connection, settings, storage, date, drain, respond).await;
+}
+
+/// Drives `connection`, once handshaken, until it ends, as [`serve`] says.
+async fn drive<S, R, F, B, D>(
+    connection: &mut ::h2::server::Connection<S, Outgoing>,
+    settings: Settings,
+    storage: Rc<Storage>,
+    date: Rc<D>,
+    drain: &Drain,
+    respond: Rc<R>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+    R: Fn(Request<RequestBody>, Interim) -> F + 'static,
+    F: Future<Output = Answered<B>> + 'static,
+    B: Body<Data = Bytes> + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    D: Fn() -> HttpDate + 'static,
+{
     let streams = Rc::new(Streams::default());
-    let mut idle = std::pin::pin!(tokio::time::sleep(settings.keep_alive));
+    // One timer for the two things a connection with no stream open waits for (`quiet`).
+    let mut idle_since = Instant::now();
+    let mut released = false;
+    let mut idle = std::pin::pin!(tokio::time::sleep_until(
+        quiet(idle_since, released, &settings).1
+    ));
     let mut idle_from_now = false;
     let mut drain_heard = std::pin::pin!(drain.notified());
     let mut out_of_time = std::pin::pin!(tokio::time::sleep(settings.drain_within));
@@ -190,11 +220,22 @@ pub(crate) async fn serve<S, R, F, B, D>(
             }
             if streams.open.get() == 0 {
                 if idle_from_now {
-                    idle.as_mut().reset(Instant::now() + settings.keep_alive);
+                    idle_since = Instant::now();
+                    released = false;
+                    idle.as_mut()
+                        .reset(quiet(idle_since, released, &settings).1);
                     idle_from_now = false;
                 }
-                if idle.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(Next::Idle);
+                while idle.as_mut().poll(cx).is_ready() {
+                    match quiet(idle_since, released, &settings).0 {
+                        Quiet::Close => return Poll::Ready(Next::Idle),
+                        Quiet::Release => {
+                            connection.release_buffers();
+                            released = true;
+                            idle.as_mut()
+                                .reset(quiet(idle_since, released, &settings).1);
+                        }
+                    }
                 }
             } else {
                 idle_from_now = true;
@@ -262,6 +303,26 @@ pub(crate) async fn serve<S, R, F, B, D>(
     connection.graceful_shutdown();
     let _closing =
         tokio::time::timeout(settings.closing, poll_fn(|cx| connection.poll_closed(cx))).await;
+}
+
+/// What a connection with no stream open waits for next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Quiet {
+    /// To give back its buffers (14 §3).
+    Release,
+    /// To be told to go.
+    Close,
+}
+
+/// What a connection with no stream open since `since` waits for next, and when: its
+/// buffers go at its release time unless `released` already, and it at its keep-alive
+/// time. A release time no shorter than the keep-alive never comes.
+fn quiet(since: Instant, released: bool, settings: &Settings) -> (Quiet, Instant) {
+    if released || settings.release_after >= settings.keep_alive {
+        (Quiet::Close, since + settings.keep_alive)
+    } else {
+        (Quiet::Release, since + settings.release_after)
+    }
 }
 
 /// What the driver was woken for.
@@ -371,8 +432,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::downstream::h2::testing::{LONG, locally, post, serving, wire, within};
-    use http_body_util::BodyExt;
+    use crate::downstream::h2::testing::{
+        LONG, locally, locally_paused, post, serving, wire, within,
+    };
+    use http_body_util::{BodyExt, Full};
 
     /// A stream whose upload nobody reads holds at most its stream window of the connection
     /// window, so another stream on the same connection uploads megabytes past it: 16 MiB
@@ -407,6 +470,118 @@ mod tests {
             let uploaded = within(BodyExt::collect(body)).await.unwrap();
             assert_eq!(uploaded.to_bytes().len(), 4 << 20);
             drop(never_read);
+        });
+    }
+
+    /// With no stream open, a connection gives back its buffers at its release time, then is
+    /// told to go at its keep-alive time; once they are back, only the second is waited for.
+    #[test]
+    fn a_quiet_connection_gives_its_buffers_back_then_goes() {
+        let settings = Settings {
+            release_after: Duration::from_secs(1),
+            keep_alive: Duration::from_secs(30),
+            ..Settings::default()
+        };
+        let since = Instant::now();
+        assert_eq!(
+            quiet(since, false, &settings),
+            (Quiet::Release, since + Duration::from_secs(1))
+        );
+        assert_eq!(
+            quiet(since, true, &settings),
+            (Quiet::Close, since + Duration::from_secs(30))
+        );
+    }
+
+    /// A release time no shorter than the keep-alive never comes: the connection goes first.
+    #[test]
+    fn a_release_after_the_keep_alive_never_comes() {
+        let since = Instant::now();
+        for release_after in [Duration::from_secs(30), Duration::from_secs(60)] {
+            let settings = Settings {
+                release_after,
+                keep_alive: Duration::from_secs(30),
+                ..Settings::default()
+            };
+            assert_eq!(
+                quiet(since, false, &settings),
+                (Quiet::Close, since + Duration::from_secs(30))
+            );
+        }
+    }
+
+    /// A connection quiet past its release time has given its buffers back, and not before;
+    /// and it serves the next stream as any other: one whose header block refers to what the
+    /// first put in the HPACK table, with a body and an answer larger than a read buffer.
+    #[test]
+    fn a_quiet_connection_gives_its_buffers_back_and_serves_on() {
+        const BODY: usize = 40_000;
+        locally_paused(async {
+            let (near, far) = wire();
+            let settings = Settings {
+                release_after: Duration::from_millis(100),
+                keep_alive: LONG,
+                ..Settings::default()
+            };
+            let (client, server) = tokio::join!(
+                ::h2::client::handshake(far),
+                settings.builder().handshake::<_, Outgoing>(near)
+            );
+            let (mut send, client) = client.unwrap();
+            tokio::task::spawn_local(client);
+            let mut connection = server.unwrap();
+            let respond = Rc::new(|request: Request<RequestBody>, _: Interim| async move {
+                let uploaded = request.into_body().collect().await.unwrap().to_bytes();
+                Answered::Map(Response::new(Full::new(uploaded)))
+            });
+            let date = Rc::new(|| HttpDate::from_unix(0));
+            let (drain, storage) = (Drain::default(), Storage::new(crate::storage::LIMIT));
+            let long = "a long header, Huffman-coded ".repeat(40);
+            // Driven while `waited` passes after a stream, then let go of to be looked at.
+            for (round, waited) in [(0u8, 50), (1, 500), (2, 500)] {
+                let asking = async {
+                    let request = http::Request::builder()
+                        .method("POST")
+                        .uri("http://example.test/up")
+                        .header("x-long", long.as_str())
+                        .body(())
+                        .unwrap();
+                    let (answer, mut body) = send.send_request(request, false).unwrap();
+                    let upload = Bytes::from(vec![round; BODY]);
+                    body.send_data(upload.clone(), true).unwrap();
+                    let mut answer = within(answer).await.unwrap().into_body();
+                    let mut received = Vec::new();
+                    while let Some(data) = within(answer.data()).await {
+                        let data = data.unwrap();
+                        let _ = answer.flow_control().release_capacity(data.len());
+                        received.extend_from_slice(&data);
+                    }
+                    assert!(received == upload, "round {round}");
+                    tokio::time::sleep(Duration::from_millis(waited)).await;
+                };
+                let driving = drive(
+                    &mut connection,
+                    settings,
+                    Rc::clone(&storage),
+                    Rc::clone(&date),
+                    &drain,
+                    Rc::clone(&respond),
+                );
+                tokio::select! {
+                    () = driving => panic!("the connection ended"),
+                    () = asking => {}
+                }
+                let held = connection.buffer_capacity();
+                if waited < 100 {
+                    assert!(
+                        held > 16 * 1024,
+                        "round {round}: {held} held before its time"
+                    );
+                } else {
+                    // Room for a frame's header, which a poll that read nothing made again.
+                    assert!(held <= 16, "round {round}: {held} held after its time");
+                }
+            }
         });
     }
 }

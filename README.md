@@ -79,6 +79,8 @@ bench              the macro benchmark: load generator, proxy and backend on one
 fuzz               fuzz targets (cargo-fuzz; not part of the workspace)
 vendor/quiche      quiche 0.30.0 with two changes, built in place of the published crate
                    (vendor/quiche/VENDORED.md; BSD-2-Clause, not part of the workspace)
+vendor/h2          h2 0.4.19 with one addition, built in place of the published crate
+                   (vendor/h2/VENDORED.md; MIT, not part of the workspace)
 ```
 
 Crates are internal to this workspace and are not published.
@@ -86,4 +88,5 @@ Crates are internal to this workspace and are not published.
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE). `vendor/quiche` is quiche's, under its own BSD 2-Clause
-licence ([vendor/quiche/COPYING](vendor/quiche/COPYING)).
+licence ([vendor/quiche/COPYING](vendor/quiche/COPYING)), and `vendor/h2` is h2's, under its
+own MIT licence ([vendor/h2/LICENSE](vendor/h2/LICENSE)).

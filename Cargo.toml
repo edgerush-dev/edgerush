@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 # A patched third-party crate, built as a dependency and never as one of ours: its code
 # is held to its own rules, not to the workspace's lints and checks.
-exclude = ["vendor/quiche"]
+exclude = ["vendor/quiche", "vendor/h2"]
 
 [workspace.package]
 version = "0.0.0"
@@ -95,6 +95,10 @@ codegen-units = 1
 # workspace of its own.
 [patch.crates-io]
 quiche = { path = "vendor/quiche" }
+# h2 0.4.19 as published, but for one addition (14 §3): a server connection can give back
+# the buffers it reads, writes and decodes header blocks in while it has nothing in them,
+# and makes them again when next needed. `vendor/h2/VENDORED.md` says what changed and why.
+h2 = { path = "vendor/h2" }
 
 # Callgrind attributes costs to functions by their symbols.
 [profile.bench]

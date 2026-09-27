@@ -1281,3 +1281,155 @@ async fn locally_reset_streams_are_remembered_up_to_a_count() {
         "only the third was forgotten"
     );
 }
+
+/// EdgeRush's vendored h2 (`vendor/h2/VENDORED.md`, 14 §3): a server connection with nothing
+/// in its buffers gives them back — what it reads frames into, writes them from and decodes
+/// Huffman-coded strings in — and makes them again for the next request. That request is
+/// served as though they had never gone: its header block refers to what the first put in
+/// the HPACK table, and its body and its answer are larger than a read buffer.
+#[tokio::test]
+async fn a_server_connection_gives_back_its_buffers_and_serves_on() {
+    const BODY: usize = 40_000;
+    let (near, far) = wire();
+    // Asked to give its buffers back, the server says what they held and hold.
+    let (asked, mut asking) = mpsc::unbounded_channel::<()>();
+    let (told, mut capacities) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut connection = server::Builder::new()
+            .handshake::<_, Bytes>(near)
+            .await
+            .unwrap();
+        loop {
+            tokio::select! {
+                // Accepting first: whatever the client sent is read before a release.
+                biased;
+                next = connection.accept() => {
+                    let Some(Ok((request, mut respond))) = next else { return };
+                    tokio::spawn(async move {
+                        let long = request.headers()["x-long"].len();
+                        let mut body = request.into_body();
+                        let mut read = 0;
+                        while let Some(data) = body.data().await {
+                            let data = data.unwrap();
+                            read += data.len();
+                            let _ = body.flow_control().release_capacity(data.len());
+                        }
+                        let mut sending = respond.send_response(Response::new(()), false).unwrap();
+                        let answer = format!("{long} {read} ").into_bytes();
+                        let mut all = answer.clone();
+                        all.resize(BODY, b'a');
+                        sending.send_data(Bytes::from(all), true).unwrap();
+                    });
+                }
+                command = asking.recv() => {
+                    let Some(()) = command else { return };
+                    let before = connection.buffer_capacity();
+                    connection.release_buffers();
+                    told.send((before, connection.buffer_capacity())).unwrap();
+                }
+            }
+        }
+    });
+
+    let (mut send, connection) = client::handshake(far).await.unwrap();
+    tokio::spawn(connection);
+    let long = "Huffman-coded where it is shorter ".repeat(60);
+    for round in 0..2 {
+        let request = Request::builder()
+            .uri("http://example.com/up")
+            .method("POST")
+            .version(Version::HTTP_2)
+            .header("x-long", long.as_str())
+            .body(())
+            .unwrap();
+        let (response, mut body) = send.send_request(request, false).unwrap();
+        body.send_data(Bytes::from(vec![b'u'; BODY]), true).unwrap();
+        let mut answer = within(response).await.unwrap().into_body();
+        let mut received = Vec::new();
+        while let Some(data) = within(answer.data()).await {
+            let data = data.unwrap();
+            let _ = answer.flow_control().release_capacity(data.len());
+            received.extend_from_slice(&data);
+        }
+        assert_eq!(received.len(), BODY, "round {round}");
+        assert!(
+            received.starts_with(format!("{} {BODY} ", long.len()).as_bytes()),
+            "round {round}: {:?}",
+            String::from_utf8_lossy(&received[..32])
+        );
+
+        asked.send(()).unwrap();
+        let (before, after) = within(capacities.recv()).await.unwrap();
+        // They were there, made again in the second round: the write buffer at its 16 KiB
+        // and what is left of the others, which frames and strings are cut from.
+        assert!(before > 16 * 1024, "round {round}: {before} before");
+        assert_eq!(after, 0, "round {round}: {after} after, {before} before");
+    }
+}
+
+/// And what is waiting in them is never given back with them: a server that asks to give
+/// its buffers back every time it is polled, over a pipe so narrow that every read and write
+/// is part of a frame, still carries a 40 KB upload, a 40 KB answer and header blocks split
+/// across frames, both ways, byte for byte. An answer's body goes around the write buffer,
+/// but its head goes through it.
+#[tokio::test]
+async fn a_server_connection_keeps_what_waits_in_its_buffers() {
+    const BODY: usize = 40_000;
+    let (near, far) = tokio::io::duplex(1024);
+    tokio::spawn(async move {
+        let mut connection = server::Builder::new()
+            .handshake::<_, Bytes>(near)
+            .await
+            .unwrap();
+        while let Some(Ok((request, mut respond))) = poll_fn(|cx| {
+            connection.release_buffers();
+            connection.poll_accept(cx)
+        })
+        .await
+        {
+            tokio::spawn(async move {
+                let long = request.headers()["x-long"].clone();
+                let mut body = request.into_body();
+                let mut read = Vec::new();
+                while let Some(data) = body.data().await {
+                    let data = data.unwrap();
+                    let _ = body.flow_control().release_capacity(data.len());
+                    read.extend_from_slice(&data);
+                }
+                let mut head = Response::new(());
+                head.headers_mut().insert("x-long", long);
+                let mut sending = respond.send_response(head, false).unwrap();
+                sending.send_data(Bytes::from(read), true).unwrap();
+            });
+        }
+    });
+
+    let (mut send, connection) = client::handshake(far).await.unwrap();
+    tokio::spawn(connection);
+    // Past a frame, so that the header block goes as HEADERS and CONTINUATION.
+    let long: String = (0..20_000)
+        .map(|at| char::from(b'a' + (at % 26) as u8))
+        .collect();
+    let upload: Vec<u8> = (0..BODY).map(|at| (at % 251) as u8).collect();
+    let request = Request::builder()
+        .uri("http://example.com/up")
+        .method("POST")
+        .version(Version::HTTP_2)
+        .header("x-long", long.as_str())
+        .body(())
+        .unwrap();
+    let (response, mut body) = send.send_request(request, false).unwrap();
+    body.send_data(Bytes::from(upload.clone()), true).unwrap();
+    let (head, mut answer) = within(response).await.unwrap().into_parts();
+    assert!(
+        head.headers["x-long"] == long.as_str(),
+        "the answer's long header"
+    );
+    let mut received = Vec::new();
+    while let Some(data) = within(answer.data()).await {
+        let data = data.unwrap();
+        let _ = answer.flow_control().release_capacity(data.len());
+        received.extend_from_slice(&data);
+    }
+    assert!(received == upload, "{} bytes came back", received.len());
+}
