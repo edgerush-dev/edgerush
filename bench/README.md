@@ -49,7 +49,13 @@ TLS=1 bench/run.sh handshakes [RATE] [FLOOD]
 bench/run.sh h3 [RATE] [STREAMED]   # HTTP/3 clients (H3=1): 4 connections x 100 streams,
                                     # 256 connections, one hot connection, 8 MiB answers,
                                     # and TLS HTTP/2 beside them; latency at RATE (25,000/s)
-                                    # and 8 MiB uploads at STREAMED (20/s)
+                                    # and 8 MiB uploads at STREAMED (20/s); what H3_HELD
+                                    # (1,000) connections held open cost
+bench/run.sh h3latency [RATE...]    # HTTP/3 latency at each RATE (5,000, 12,500, 25,000/s):
+                                    # in h2load's bursts, evenly, and evenly with curl beside
+bench/run.sh mixed [RATE...]        # HTTP/1 and HTTP/2 over TLS and HTTP/3 against one
+                                    # proxy at once, each at RATE (5,000, 10,000/s); then
+                                    # each as fast as it goes
 bench/run.sh passthrough CHURN [TLS_CHURN]
                                     # TCP and TLS passthrough (PASSTHROUGH=1): kept
                                     # connections at saturation, a connection a request at
@@ -67,6 +73,12 @@ measurement, the proxy's CPU time around it, `environment.txt`, and the table th
 `IDLE_TOTAL`, `OUT`; the defaults are for a machine with 4 cores and 8 threads where CPUs
 *n* and *n+4* are one core.
 
+Every measurement also writes down the proxy's resident memory every half second, all its
+processes summed (`<scenario>.rss`; the table's *RSS peak*). `COUNT=1` (with `DURATION` of
+8 s or more) counts, with `perf stat` over every process of the proxy, the instructions and
+cycles in user and kernel mode from 2 s into the load for `DURATION - 4` seconds, and the
+table divides them by the rate: *k instr/req* and *k cycles/req*.
+
 `H3=1`, which `h3` sets and which is `TLS=1` as well, has EdgeRush, NGINX (`listen ...
 quic`) and HAProxy (`bind quic4@...`) serve HTTP/3 on the proxy's port over UDP beside
 TCP. Its generator is h2load built with HTTP/3, at `H2LOAD3` (`~/tools/h2load3/bin/h2load`
@@ -80,6 +92,20 @@ tar xf nghttp2-1.68.0.tar.xz && cd nghttp2-1.68.0
 ./configure --prefix="$HOME/tools/h2load3" --enable-app --enable-http3     --disable-python-bindings --with-libngtcp2 --with-libnghttp3
 make -j"$(nproc)" && make install
 ```
+
+h2load's `--rps` timer fires at most every 10 ms (`std::max(0.01, 1. / config.rps)` in
+`src/h2load.cc`), so each connection sends a hundredth of its rate at once. The same build
+with `0.01` made `0.001`, at `H2LOAD3_SMOOTH` (`~/tools/h2load3-smooth/bin/h2load`), sends
+it a millisecond apart, as oha does HTTP/1 and HTTP/2; `h3latency` and `mixed` use it where
+it is there. It also leaves out `NGTCP2_WRITE_STREAM_FLAG_PADDING` in
+`src/h2load_quic.cc`: h2load pads every packet to full size, and with a request a packet
+that is 1,444 bytes on the wire for a 9-byte request, which NGINX takes for a flood after a
+few thousand requests and closes the connection with NO_ERROR ("QUIC flood detected",
+logged at `info`), leaving h2load that connection short. Browsers do not pad their 1-RTT
+packets. `h3latency` also runs curl with HTTP/3 beside the load, at `CURL3`
+(`~/tools/curl3/bin/curl`), built with `./configure --prefix="$HOME/tools/curl3"
+--with-openssl --with-ngtcp2 --with-nghttp3 --with-nghttp2 --disable-ldap --without-libpsl
+--disable-docs` against the same libraries.
 
 `PASSTHROUGH=1`, which `passthrough` sets, has the proxies carry connections rather than
 serve them: EdgeRush with `passthrough.yaml` (a `tcp` listener on 8080 and a `tls` one on
@@ -105,9 +131,10 @@ gets measured.
 self-signed ECDSA P-256 certificate made for the run — for `saturation`, `latency`
 (whose churn is then a full handshake for every request), `h2`, `grpc` and `handshakes`.
 `UPSTREAM_H2=1` has the proxy speak HTTP/2 to the backend by prior knowledge: EdgeRush
-and HAProxy, as NGINX cannot proxy to an HTTP/2 upstream. Compare with other runs at the
-same `IDLE_PER_DESTINATION` and `IDLE_TOTAL`: at 8 and 256 a few hundred clients make
-EdgeRush open upstream connections all the time, which NGINX's `keepalive 1024` does not.
+and HAProxy. NGINX's proxy cannot, but its gRPC proxy (`grpc_pass`) does, and the `grpc`
+mode gives that the gRPC service. Compare with other runs at the same
+`IDLE_PER_DESTINATION` and `IDLE_TOTAL`: at 8 and 256 a few hundred clients make EdgeRush
+open upstream connections all the time, which NGINX's `keepalive 1024` does not.
 
 `IDLE_PER_DESTINATION` and `IDLE_TOTAL` are the bounds of
 [13 §7](../../docs/13-http1-upstream.md) on how many idle upstream connections a worker
@@ -164,7 +191,9 @@ the upload-loop change can affect answers without changing the response-copy cod
 That is a hypothesis to isolate, not an explanation established by the macro rerun.
 
 `VARIANTS` names what is run, in turns: `ours` — EdgeRush, the default —, `ours-kernel`
-— the same without balancing connections at accept — (EdgeRush, `proxy.yaml`); then `nginx`
+— the same without balancing connections at accept —, `ours-pgo` — a profile-guided build
+of it at `EDGERUSH_PGO` ([12](../../docs/12-open-questions.md), item 8) — (EdgeRush,
+`proxy.yaml`); then `nginx`
 (`nginx-proxy.conf`), `haproxy` (`haproxy.cfg`), `envoy` (`envoy.yaml`) and `kong`
 (`kong.yml`, without a database). The configs ask for the same
 thing — the same hosts and rules, the same header changes on
@@ -186,7 +215,10 @@ worth as much as the care that went into the other side.
 | `streamed-answer-h2`, `streamed-request-h2` | oha over HTTP/2, 4 connections × 8 streams, `STREAMED` bytes each way | The body paths when HTTP/2 carries them: flow control and the server's staging, not only framing |
 | `saturation-h3`, `many-h3`, `hot-h3` | h2load over HTTP/3: 4 connections × 100 streams, 256 connections × 1, 1 connection × 256 | What HTTP/3 clients get, where a connection's packets all land on the worker that owns it ([16](../../docs/16-http3.md)) |
 | `streamed-answer-h3` | h2load over HTTP/3, 4 connections × 8 streams, `STREAMED` bytes back | The answer's path when QUIC carries it: datagrams, acknowledgements, the send buffer |
-| `latency-h3`, `streamed-request-h3` | h2load over HTTP/3 at a set rate (`--rps`, shared by 4 connections of 100 streams, or 8 for uploads), every request's time in `<scenario>.requests` (`--log-file`), read by `summary.py` for the percentiles. Not an even rate: h2load's timer fires at most every 10 ms, so each connection sends a hundredth of its rate at once | What an HTTP/3 client waits under bursts of requests, and what an 8 MiB upload costs when QUIC carries it. oha's HTTP/3 client is not used: NGINX and HAProxy answered it with errors. `bench/run.sh h3latency RATE...` runs `latency-h3` alone at several rates |
+| `latency-h3`, `streamed-request-h3` | h2load over HTTP/3 at a set rate (`--rps`, shared by 4 connections of 100 streams, or 8 for uploads), every request's time in `<scenario>.requests` (`--log-file`), read by `summary.py` for the percentiles. Not an even rate: h2load's timer fires at most every 10 ms, so each connection sends a hundredth of its rate at once | What an HTTP/3 client waits under bursts of requests, and what an 8 MiB upload costs when QUIC carries it. oha's HTTP/3 client is not used: NGINX and HAProxy answered it with errors |
+| `latency-h3-R`, `latency-h3s-R`, `latency-h3c-R` | `h3latency`: `latency-h3` at R a second; the same by `H2LOAD3_SMOOTH`, evenly; and that again with curl beside it, a request every 10 ms on one connection (`<scenario>.probe`, the table's *curl* columns) | Whether a gap in latency grows with the load, as queueing does, or stays at any rate, as a delay of its own does; whether it is the bursts'; and a second client's measure of the same proxy |
+| `held-h3-N` | `N` HTTP/3 connections by h2load, a request every ten seconds on each, on a proxy started afresh | What an HTTP/3 connection costs held open, beside `idle-h2-N` and `idle-memory` |
+| `mixed-R-h1`, `-h2`, `-h3`, `-all` | `mixed`: h2load (`H2LOAD3_SMOOTH` where it is there) over TLS, HTTP/1 (64 connections) and HTTP/2 (4 × 100), and over HTTP/3 (4 × 100), each at R a second against one proxy at once, every request's time logged; `mixed-closed-*` each as fast as it goes. h2load rather than oha because the three share `GEN_CPUS`, and oha's cost there put tens of milliseconds into every proxy's HTTP/1 and HTTP/2 tail | Each protocol's latency while the others load the same workers; `-all` is what the proxy spent on the three together, at their summed rate |
 | `saturation-tcp`, `saturation-tls` | h2load through a tunnel: HTTP/1 over a `tcp` listener (256 connections), HTTP/2 over TLS over a `tls` one (4 connections × 100 streams) | What carrying small messages both ways costs, nothing of them read ([17](../../docs/17-tcp-and-tls-passthrough.md)) |
 | `churn-tcp`, `churn-tls` | oha, a new connection for every request, a fixed rate, through each listener | What a tunnel costs to make: the accept, the ClientHello read and routed by name, the connection to the backend |
 | `streamed-tcp` | oha, `STREAMED` bytes back through the `tcp` listener | What carrying bulk costs |

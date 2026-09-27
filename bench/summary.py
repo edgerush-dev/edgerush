@@ -76,7 +76,27 @@ def memory(text):
     )
     if "per_connection_bytes" not in read:
         return None
-    return {key: int(value) for key, value in read.items()}
+    return {key: value if key == "kind" else int(value) for key, value in read.items()}
+
+
+def probed(path):
+    """What curl's one request every 10 ms beside the load took (run.sh's probe_h3), in
+    milliseconds, and how many connections it made to take them: one, unless it lost it."""
+    took, connects = [], 0
+    for line in path.read_text().splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        connects += int(fields[0])
+        took.append(float(fields[2]) * 1000)
+    if not took:
+        return {}
+    took.sort()
+    return {
+        "probe_p50": took[len(took) // 2],
+        "probe_p99": took[min(len(took) - 1, int(0.99 * len(took)))],
+        "probe_connects": connects,
+    }
 
 
 def cpu(before, after):
@@ -101,6 +121,75 @@ def cpu(before, after):
     return {"cpus": busy, "threads": "/".join(str(share) for share in shares if share)}
 
 
+def counts(path, rate):
+    """What a request cost the proxy in instructions and cycles, user and kernel apart, in
+    thousands: COUNT=1's perf stat over a window inside the load, whose length run.sh adds as
+    its last line, by the rate the load kept."""
+    counted = {}
+    window = None
+    for line in path.read_text().splitlines():
+        if line.startswith("# window"):
+            window = float(line.split()[2])
+            continue
+        fields = line.split(",")
+        if line.startswith("#") or len(fields) < 3:
+            continue
+        try:
+            counted[fields[2]] = float(fields[0])
+        except ValueError:
+            continue
+    if not (window and rate):
+        return {}
+
+    def per_request(event):
+        return counted[event] / window / rate / 1000 if event in counted else None
+
+    cycles = [per_request(event) for event in ("cycles:u", "cycles:k")]
+    return {
+        "instructions_user": per_request("instructions:u"),
+        "instructions_kernel": per_request("instructions:k"),
+        "cycles": sum(cycles) if all(value is not None for value in cycles) else None,
+    }
+
+
+def resident(path):
+    """The most the proxy held while the load was on, in MiB: its resident memory, all its
+    processes summed, sampled every half second."""
+    samples = [int(line) for line in path.read_text().split() if line.isdigit()]
+    return {"rss_peak": max(samples) / 1024} if samples else {}
+
+
+def spent(directory, stem, result):
+    """What the measurement `stem` cost the proxy and held, beside what the client saw."""
+    used = cpu(directory / f"{stem}.cpu-before", directory / f"{stem}.cpu-after")
+    if used and result["rate"]:
+        result.update(used)
+        result["cpu_per_request"] = used["cpus"] / result["rate"] * 1e6
+    stat = directory / f"{stem}.stat"
+    if stat.exists():
+        result.update(counts(stat, result["rate"]))
+    rss = directory / f"{stem}.rss"
+    if rss.exists():
+        result.update(resident(rss))
+    clock = directory / f"{stem}.freq"
+    samples = [int(line) for line in clock.read_text().split()] if clock.exists() else []
+    if samples:
+        result["mhz"] = statistics.fmean(samples) / 1000
+    return result
+
+
+def runs_of(directory, stem):
+    """One generator's result, read again for the whole it was part of."""
+    out = directory / f"{stem}.out"
+    if not out.exists():
+        return None
+    text = out.read_text()
+    try:
+        return oha(text) if text.lstrip().startswith("{") else h2load(text)
+    except (ValueError, KeyError):
+        return None
+
+
 def middle(values):
     return statistics.median(values), min(values), max(values)
 
@@ -112,7 +201,7 @@ def main(directory):
         subject, _, scenario = out.name[: -len(".out")].rpartition(".")
         model = subject.rsplit(".", 1)[0] if subject.rsplit(".", 1)[-1].isdigit() else subject
         text = out.read_text()
-        if text.startswith("connections "):
+        if "per_connection_bytes" in text:
             held[(scenario, model)] = memory(text)
             continue
         try:
@@ -126,19 +215,38 @@ def main(directory):
         requests = directory / f"{stem}.requests"
         if requests.exists():
             result.update(logged(requests))
-        used = cpu(directory / f"{stem}.cpu-before", directory / f"{stem}.cpu-after")
-        if used:
-            result.update(used)
-            result["cpu_per_request"] = used["cpus"] / result["rate"] * 1e6
-        clock = directory / f"{stem}.freq"
-        samples = [int(line) for line in clock.read_text().split()] if clock.exists() else []
-        if samples:
-            result["mhz"] = statistics.fmean(samples) / 1000
-        runs[(scenario, model)].append(result)
+        probe = directory / f"{stem}.probe"
+        if probe.exists():
+            result.update(probed(probe))
+        runs[(scenario, model)].append(spent(directory, stem, result))
+
+    # A mixed load's three generators are a row each; what the proxy spent on all of them is
+    # `<name>-all`, a row of its own at the rate of the three together.
+    for before in sorted(directory.glob("*-all.cpu-before")):
+        stem = before.name[: -len(".cpu-before")]
+        parts = [runs_of(directory, stem[: -len("all")] + protocol) for protocol in ("h1", "h2", "h3")]
+        if not all(parts):
+            continue
+        subject, _, scenario = stem.rpartition(".")
+        model = subject.rsplit(".", 1)[0] if subject.rsplit(".", 1)[-1].isdigit() else subject
+        result = {
+            "requests": sum(part["requests"] for part in parts),
+            "rate": sum(part["rate"] for part in parts),
+            "bad": sum(part["bad"] for part in parts),
+        }
+        runs[(scenario, model)].append(spent(directory, stem, result))
 
     print((directory / "environment.txt").read_text())
-    columns = ["rate", "bad", "p50", "p99", "p99.9", "cpus", "cpu_per_request", "mhz"]
-    titles = ["req/s", "not 2xx", "p50 ms", "p99 ms", "p99.9 ms", "CPUs busy", "CPU µs/req", "MHz"]
+    columns = [
+        "rate", "bad", "p50", "p99", "p99.9", "probe_p50", "probe_p99", "cpus",
+        "cpu_per_request", "instructions_user", "instructions_kernel", "cycles", "rss_peak",
+        "mhz",
+    ]
+    titles = [
+        "req/s", "not 2xx", "p50 ms", "p99 ms", "p99.9 ms", "curl p50 ms", "curl p99 ms",
+        "CPUs busy", "CPU µs/req", "k instr/req user", "k instr/req kernel", "k cycles/req",
+        "RSS peak MiB", "MHz",
+    ]
     print("| scenario | variant | runs | " + " | ".join(titles) + " | threads' share % |")
     print("|---|---|---|" + "---|" * (len(columns) + 1))
     for (scenario, model), results in sorted(runs.items()):
@@ -153,7 +261,9 @@ def main(directory):
                 cells.append("")
                 continue
             median, low, high = middle(values)
-            digits = 0 if column in ("rate", "bad", "mhz") else 2
+            digits = 0 if column in ("rate", "bad", "mhz", "rss_peak") else 2
+            if column.startswith("instructions") or column == "cycles":
+                digits = 1
             cell = f"{median:,.{digits}f}"
             if len(values) > 1 and low != high:
                 cell += f" ({low:,.{digits}f}–{high:,.{digits}f})"

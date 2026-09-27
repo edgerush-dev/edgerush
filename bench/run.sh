@@ -24,9 +24,14 @@
 #                                             variant: ours-abN accepts N at a time
 #   bench/run.sh h3 [STREAMED]                HTTP/3 clients: few hot connections, many, one
 #                                             hot one, streamed bodies at STREAMED a second,
-#                                             and TLS HTTP/2 beside them to read them by
+#                                             and TLS HTTP/2 beside them to read them by;
+#                                             what H3_HELD connections held open cost
 #   bench/run.sh h3latency [RATE...]          HTTP/3 latency at each RATE a second (5000 12500
-#                                             25000 unless said), in h2load's 10 ms bursts
+#                                             25000 unless said), in h2load's 10 ms bursts and
+#                                             evenly where H2LOAD3_SMOOTH is, with curl
+#                                             beside it where CURL3 is
+#   bench/run.sh mixed [RATE...]              HTTP/1 and HTTP/2 over TLS and HTTP/3 at once:
+#                                             each at RATE a second, then as fast as each goes
 #   bench/run.sh passthrough CHURN [TLS_CHURN] [STREAMED]
 #                                             TCP and TLS passthrough: kept connections at
 #                                             saturation, a connection a request at CHURN (and
@@ -34,7 +39,7 @@
 #   bench/run.sh summary DIR                  the table of a finished run
 #
 # UPSTREAM_H2=1 has the proxy speak HTTP/2 to the backend, by prior knowledge, many
-# requests on each connection: EdgeRush and HAProxy (NGINX's proxy cannot).
+# requests on each connection: EdgeRush and HAProxy; NGINX by its gRPC proxy, in grpc.
 #
 # TLS=1 has clients reach the proxy over TLS — EdgeRush, NGINX and HAProxy, with one
 # self-signed ECDSA P-256 certificate — for saturation, latency and h2. Its churn is a
@@ -74,7 +79,24 @@ repo=$(dirname "$here")
 : "${H3:=0}"
 [ "${1:-}" = h3 ] && H3=1
 [ "${1:-}" = h3latency ] && H3=1
+[ "${1:-}" = mixed ] && H3=1
 [ "$H3" = 1 ] && TLS=1
+# COUNT=1 counts, over every process of the proxy, the instructions and cycles each
+# measurement costs, user and kernel apart (perf stat): from 2 s into the load, for
+# DURATION - 4 seconds, so that it sees neither end of it; a request's share is by the rates.
+: "${COUNT:=0}"
+# h2load with HTTP/3 whose request timer may fire every millisecond rather than every ten,
+# and which does not pad every packet (bench/README.md): an even rate, where H2LOAD3's comes
+# in bursts. h3latency measures with both when it is there, and mixed with it.
+: "${H2LOAD3_SMOOTH:=$HOME/tools/h2load3-smooth/bin/h2load}"
+# curl with HTTP/3 (bench/README.md): h3latency's second client, a request every 10 ms on one
+# connection beside the load, where it is there.
+: "${CURL3:=$HOME/tools/curl3/bin/curl}"
+# How many HTTP/3 connections the h3 mode holds open, a request every ten seconds on each, to
+# weigh what one costs.
+: "${H3_HELD:=1000}"
+# The profile-guided build of EdgeRush that the ours-pgo variant runs.
+: "${EDGERUSH_PGO:=}"
 # PASSTHROUGH=1, which `passthrough` sets, has the proxies carry connections rather than
 # serve them (17 step 4): passthrough.yaml for EdgeRush, NGINX's stream module
 # (nginx-stream.conf), HAProxy in mode tcp (haproxy-tcp.cfg). The backend answers on a TLS
@@ -111,6 +133,8 @@ proxy=$scheme://$host:8080/
 proxy_at=127.0.0.1:8080
 tls=$run/tls
 proxy_pid=
+# Set by the grpc mode: NGINX's gRPC proxy is given the gRPC service.
+grpc_pass=0
 
 start_backend() {
     # One left over from another run would answer in its place, from whatever config it
@@ -215,7 +239,9 @@ start_proxy() { # variant
             -e "$run-direct/error.log" 2>>"$OUT/proxy.log" &
         ;;
     nginx)
-        if [ "$UPSTREAM_H2" = 1 ]; then
+        # NGINX's proxy speaks HTTP/1.1 to its upstreams; its gRPC proxy speaks HTTP/2, and
+        # the grpc mode gives the gRPC service to that.
+        if [ "$UPSTREAM_H2" = 1 ] && [ "$grpc_pass" != 1 ]; then
             echo "NGINX cannot proxy to an HTTP/2 upstream: leave it out of UPSTREAM_H2 runs" >&2
             exit 2
         fi
@@ -230,6 +256,11 @@ start_proxy() { # variant
             fi
         else
             sed "s/WORKERS/$WORKERS/" "$here/nginx-proxy.conf" >"$run-proxy/nginx.conf"
+        fi
+        if [ "$grpc_pass" = 1 ]; then
+            sed -i "s#^        location / {#        location /bench.Echo/ {\n            grpc_pass grpc://backend;\n        }\n&#" \
+                "$run-proxy/nginx.conf"
+            grep -q 'grpc_pass grpc://backend' "$run-proxy/nginx.conf"
         fi
         if [ "$TLS" = 1 ]; then
             sed -i "s#listen 127.0.0.1:8080#listen 127.0.0.1:8080 ssl#;
@@ -281,6 +312,12 @@ start_proxy() { # variant
             --workers "$WORKERS" $idle ${METRICS:+--metrics "$METRICS"} \
             2>>"$OUT/proxy.log" &
         ;;
+    ours-pgo)
+        # The same source built with a profile of its own work (12, item 8): EDGERUSH_PGO.
+        [ -x "$EDGERUSH_PGO" ] || { echo "ours-pgo needs EDGERUSH_PGO, a PGO build" >&2; exit 2; }
+        taskset -c "$PROXY_CPUS" "$EDGERUSH_PGO" proxy --config "$config" \
+            --workers "$WORKERS" $idle 2>>"$OUT/proxy.log" &
+        ;;
     ours-ab*)
         # EdgeRush accepting N connections before its other work goes first: ours-ab1.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
@@ -330,6 +367,41 @@ cpu() { # file
     } >"$1"
 }
 
+# What the proxy holds while a measurement runs, every half second: the resident memory of
+# all its processes, in KiB (NGINX's workers included; pages they share counted in each).
+# With COUNT=1, also its instructions and cycles over a window inside the load. The watchers
+# run on the generator's CPUs, as the clock sampler does.
+watchers=
+watch_proxy() { # name
+    watchers=
+    [ -n "$proxy_pid" ] || return 0
+    local pids
+    pids=$(echo "$proxy_pid" $(pgrep -P "$proxy_pid") | tr ' ' ',')
+    taskset -c "$GEN_CPUS" bash -c 'while sleep 0.5; do
+        awk "/^VmRSS:/ { kib += \$2 } END { print kib }" $(printf "/proc/%s/status " ${0//,/ }) 2>/dev/null
+    done' "$pids" >"$OUT/$1.rss" &
+    watchers=$!
+    if [ "$COUNT" = 1 ] && [ "$DURATION" -ge 8 ]; then
+        # perf's count comes on stderr, into a file of this user's rather than one perf makes
+        # as root, so that the window's length can follow it.
+        (
+            sleep 2
+            sudo -n perf stat -x, -p "$pids" \
+                -e instructions:u,instructions:k,cycles:u,cycles:k -- sleep "$((DURATION - 4))"
+            echo "# window $((DURATION - 4))" >&2
+        ) >/dev/null 2>"$OUT/$1.stat" &
+        watchers="$watchers $!"
+    fi
+}
+unwatch_proxy() {
+    [ -n "$watchers" ] || return 0
+    local first=${watchers%% *}
+    kill "$first" 2>/dev/null || true
+    # The counter ends by itself, inside the load; it is waited for, not stopped.
+    wait $watchers 2>/dev/null || true
+    watchers=
+}
+
 measured() { # name, command...
     local name=$1
     shift
@@ -340,14 +412,44 @@ measured() { # name, command...
         cat $(printf "/sys/devices/system/cpu/cpu%s/cpufreq/scaling_cur_freq " ${0//,/ })
     done' "$PROXY_CPUS" >"$OUT/$name.freq" 2>/dev/null &
     local sampler=$!
+    watch_proxy "$name"
     local status=0
     taskset -c "$GEN_CPUS" "$@" >"$OUT/$name.out" 2>"$OUT/$name.err" || status=$?
     kill "$sampler" 2>/dev/null || true
     wait "$sampler" 2>/dev/null || true
+    unwatch_proxy
     cpu "$OUT/$name.cpu-after"
     if [ "$status" -ne 0 ]; then
         echo "failed: $name" >&2
         return "$status"
+    fi
+    echo "done: $name"
+}
+
+# Three generators at once, one a protocol, each the row of its own (`<name>-h1` and so
+# on); what the proxy spent and held over the whole goes to `<name>-all`. The commands are
+# split on spaces, so nothing in them may hold one.
+mixed_once() { # name, HTTP/1 command, HTTP/2 command, HTTP/3 command
+    local name=$1 status=0
+    shift
+    cpu "$OUT/$name-all.cpu-before"
+    watch_proxy "$name-all"
+    local protocol pids=
+    for protocol in h1 h2 h3; do
+        # shellcheck disable=SC2086
+        taskset -c "$GEN_CPUS" $1 >"$OUT/$name-$protocol.out" 2>"$OUT/$name-$protocol.err" &
+        pids="$pids $!"
+        shift
+    done
+    local pid
+    for pid in $pids; do
+        wait "$pid" || status=$?
+    done
+    unwatch_proxy
+    cpu "$OUT/$name-all.cpu-after"
+    if [ "$status" -ne 0 ]; then
+        echo "failed: $name" >&2
+        return 0
     fi
     echo "done: $name"
 }
@@ -393,14 +495,55 @@ latency_h2() { oha_at "$1" "$2" "$3" --http2 -c 4 -p 100; }
 # an even rate: h2load's timer fires at most every 10 ms, so each connection sends a hundredth
 # of its rate at once, in bursts, where oha's HTTP/1 and HTTP/2 rates come a millisecond
 # apart (16 §8).
-h3_at() { # name, rate, connections, streams, url, options...
+h3_at() { # name, rate, connections, streams, url, options...; H3GEN may name the h2load
     local name=$1 rate=$2 clients=$3 streams=$4 url=$5
     shift 5
-    measured "$name" "$H2LOAD3" --alpn-list=h3 -D "$DURATION" --warm-up-time=3 \
+    measured "$name" "${H3GEN:-$H2LOAD3}" --alpn-list=h3 -D "$DURATION" --warm-up-time=3 \
         -t2 -c"$clients" -m"$streams" --rps=$((rate / clients)) \
         --log-file="$OUT/$name.requests" --connect-to="$proxy_at" "$@" "$url"
 }
 latency_h3() { h3_at "$1" "$2" 4 100 "$3"; }
+
+# One client's view beside a load: curl asking once every 10 ms on one HTTP/3 connection,
+# from the end of h2load's warm-up to a second before its end, each request's times in
+# `<name>.probe` (connections made, time to first byte, total). A second generator's
+# measure of the same proxy, to read h2load's by.
+probe_h3() { # name
+    sleep 3
+    taskset -c "$GEN_CPUS" "$CURL3" -sk --http3-only --rate 100/s --out-null \
+        --connect-to "$host:8080:$proxy_at" \
+        -w '%{num_connects} %{time_starttransfer} %{time_total}\n' \
+        "${proxy}?probe=[1-$(((DURATION - 1) * 100))]" >"$OUT/$1.probe" 2>"$OUT/$1.probe-err"
+}
+
+# What HTTP/3 connections cost held open: COUNT of them on a proxy started afresh, a request
+# every ten seconds on each, weighed once they are all up and have asked once.
+held_h3() { # name, count
+    local name=$1 count=$2
+    stop_proxy
+    start_proxy "${name%%.*}"
+    sleep 1
+    local quiet
+    quiet=$(python3 "$here/rss.py" "$proxy_pid")
+    taskset -c "$GEN_CPUS" "$H2LOAD3" --alpn-list=h3 -t2 -c"$count" -m1 --rps=0.1 -D 15 \
+        --connect-to="$proxy_at" "$proxy" >"$OUT/$name.load" 2>&1 &
+    local load=$!
+    sleep 11
+    local held
+    held=$(python3 "$here/rss.py" "$proxy_pid")
+    wait "$load" || true
+    {
+        echo "kind h3"
+        echo "connections $count"
+        # h2load's count of the requests answered, one or two a connection: that all of
+        # them were up.
+        echo "answered $(awk '/^requests:/ { print $8 + 0 }' "$OUT/$name.load")"
+        echo "rss_quiet_kb $quiet"
+        echo "rss_held_kb $held"
+        echo "per_connection_bytes $(( (held - quiet) * 1024 / count ))"
+    } >"$OUT/$name.out"
+    echo "done: $name"
+}
 
 # One connection carrying hundreds of streams, as a gRPC client's does: everything it asks
 # for lands on the one worker that owns it (15 §8).
@@ -661,9 +804,9 @@ profile-body)
         exit 2
     }
     ;;
-ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3 | h3latency | passthrough) ;;
+ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3 | h3latency | mixed | passthrough) ;;
 *)
-    sed -n '2,38p' "$0" >&2
+    sed -n '2,43p' "$0" >&2
     exit 2
     ;;
 esac
@@ -713,20 +856,34 @@ instructions)
     # What a worker's instructions go on, and how many of them one request takes. Sampled
     # on `instructions:u` rather than on time, so a share here is a share of the work
     # rather than of the wait; `perf stat` beside it gives the total to divide by the
-    # requests that were served.
+    # requests that were served. HTTP/1 and HTTP/2 at saturation, over TLS with TLS=1, and
+    # HTTP/3 (4 connections × 100 streams) as well with H3=1.
+    loads="h1 h2"
+    [ "$H3" = 1 ] && loads="h1 h2 h3"
     for variant in $VARIANTS; do
         start_proxy "$variant"
-        sudo -n perf record -q -e instructions:u -F 3999 -p "$proxy_pid"             -o "$OUT/$variant.perf.data" -- sleep "$DURATION" &
-        recorder=$!
-        sudo -n perf stat -e instructions:u,instructions:k,cycles -x, -p "$proxy_pid"             -o "$OUT/$variant.stat" -- sleep "$DURATION" &
-        counter=$!
-        saturation_h1 "$variant.instructions" "$proxy" --connect-to="$proxy_at"
-        wait "$recorder" "$counter" 2>/dev/null || true
-        sudo -n chown "$(id -u)" "$OUT/$variant.perf.data" 2>/dev/null || true
-        perf report -i "$OUT/$variant.perf.data" --stdio --no-children -s sym             --percent-limit 0 2>/dev/null | python3 "$here/buckets.py"             >"$OUT/$variant.parts" || true
+        for load in $loads; do
+            sudo -n perf record -q -e instructions:u -F 3999 -p "$proxy_pid" \
+                -o "$OUT/$variant.$load.perf.data" -- sleep "$DURATION" &
+            recorder=$!
+            sudo -n perf stat -e instructions:u,instructions:k,cycles -x, -p "$proxy_pid" \
+                -o "$OUT/$variant.$load.stat" -- sleep "$DURATION" &
+            counter=$!
+            case "$load" in
+            h1) saturation_h1 "$variant.instructions-h1" "$proxy" --connect-to="$proxy_at" ;;
+            h2) saturation_h2 "$variant.instructions-h2" "$proxy" --connect-to="$proxy_at" ;;
+            h3) h3load "$variant.instructions-h3" -t2 -c4 -m100 ;;
+            esac
+            wait "$recorder" "$counter" 2>/dev/null || true
+            sudo -n chown "$(id -u)" "$OUT/$variant.$load.perf.data" 2>/dev/null || true
+            perf report -i "$OUT/$variant.$load.perf.data" --stdio --no-children -s sym \
+                --percent-limit 0 2>/dev/null | python3 "$here/buckets.py" \
+                >"$OUT/$variant.$load.parts" || true
+            echo "== $variant $load =="
+            cat "$OUT/$variant.$load.parts"
+            sleep 2
+        done
         stop_proxy
-        echo "== $variant =="
-        cat "$OUT/$variant.parts"
         sleep 5
     done
     exit
@@ -794,6 +951,8 @@ grpc)
     # few connections with many calls on each, and one hot connection (15 §8). Best with
     # UPSTREAM_H2=1, which is how a gRPC backend is spoken to.
     grpc_call=(-d "$run/grpc.bin" -H "content-type: application/grpc" -H "te: trailers")
+    # NGINX in it too, by its gRPC proxy, which speaks HTTP/2 to the backend.
+    grpc_pass=1
     grpc_runs() {
         saturation_h2 "$1.saturation-grpc" "${proxy}bench.Echo/Call" --connect-to="$proxy_at" \
             "${grpc_call[@]}"
@@ -923,9 +1082,49 @@ h3latency)
         local rate
         for rate in $rates; do
             latency_h3 "$1.latency-h3-$rate" "$rate" "$proxy"
+            # The same rate evenly, where the smooth h2load is: latency-h3s; and again with
+            # curl's one client beside it, where that is: latency-h3c.
+            if [ -x "$H2LOAD3_SMOOTH" ]; then
+                H3GEN=$H2LOAD3_SMOOTH latency_h3 "$1.latency-h3s-$rate" "$rate" "$proxy"
+                if [ -x "$CURL3" ]; then
+                    probe_h3 "$1.latency-h3c-$rate" &
+                    local probe=$!
+                    H3GEN=$H2LOAD3_SMOOTH latency_h3 "$1.latency-h3c-$rate" "$rate" "$proxy"
+                    wait "$probe" || true
+                fi
+            fi
         done
     }
     each_variant h3latency_runs
+    ;;
+mixed)
+    # HTTP/1 and HTTP/2 over TLS and HTTP/3 against one proxy at once, as an edge that
+    # browsers reach is served. Open loop at each RATE a second for each protocol (5,000 and
+    # 10,000 unless said), each protocol's latency its own row; then closed loop, each as
+    # fast as it goes, to see how the proxy shares itself among them. The three generators
+    # share GEN_CPUS, so the open loop is h2load for all three — far lighter than oha, one
+    # timer and one measure of latency for all — the smooth one where it is there, every
+    # request's time logged. `<name>-all` is what the proxy spent on the three together.
+    rates="${*:2}"
+    rates=${rates:-5000 10000}
+    mixed_gen=$H2LOAD3
+    [ -x "$H2LOAD3_SMOOTH" ] && mixed_gen=$H2LOAD3_SMOOTH
+    mixed_runs() {
+        local rate name
+        for rate in $rates; do
+            name="$1.mixed-$rate"
+            mixed_once "$name" \
+                "$mixed_gen --h1 -D $DURATION --warm-up-time=3 -t1 -c64 -m1 --rps=$((rate / 64)) --log-file=$OUT/$name-h1.requests --connect-to=$proxy_at $proxy" \
+                "$mixed_gen -D $DURATION --warm-up-time=3 -t1 -c4 -m100 --rps=$((rate / 4)) --log-file=$OUT/$name-h2.requests --connect-to=$proxy_at $proxy" \
+                "$mixed_gen --alpn-list=h3 -D $DURATION --warm-up-time=3 -t1 -c4 -m100 --rps=$((rate / 4)) --log-file=$OUT/$name-h3.requests --connect-to=$proxy_at $proxy"
+        done
+        name="$1.mixed-closed"
+        mixed_once "$name" \
+            "h2load --h1 -c256 -m1 -t1 -D $DURATION --warm-up-time=3 --connect-to=$proxy_at $proxy" \
+            "h2load -c4 -m100 -t1 -D $DURATION --warm-up-time=3 --connect-to=$proxy_at $proxy" \
+            "$H2LOAD3 --alpn-list=h3 -c4 -m100 -t1 -D $DURATION --warm-up-time=3 --connect-to=$proxy_at $proxy"
+    }
+    each_variant mixed_runs
     ;;
 h3)
     # What HTTP/3 clients get (16 step 6): few hot connections, many connections, a single
@@ -944,6 +1143,8 @@ h3)
             -D "$DURATION" --warm-up-time=3 --connect-to="$proxy_at" "$proxy/big"
         latency_h3 "$1.latency-h3" "$h3_rate" "$proxy"
         h3_at "$1.streamed-request-h3" "$streamed_rate" 4 8 "$proxy/sink" -d "$run/big.bin"
+        # Last: it starts the proxy afresh.
+        held_h3 "$1.held-h3-$H3_HELD" "$H3_HELD"
     }
     each_variant h3_runs
     ;;
