@@ -406,6 +406,28 @@ where
     slots.of()
 }
 
+/// Serves `socket`, a connection of `ours` secured with `tls`, as whichever of HTTP/1 and
+/// HTTP/2 the handshake agrees on (ALPN).
+async fn serve_tls(
+    ours: Rc<Connection>,
+    asking: Rc<Cell<bool>>,
+    deadlines: Deadlines,
+    tls: &Tls,
+    socket: Lent,
+) {
+    // A handshake that fails has nobody to tell but the client, whom BoringSSL has sent its
+    // alert.
+    let Ok(secured) = tokio_boring::accept(tls.acceptor(), socket).await else {
+        return;
+    };
+    if secured.ssl().selected_alpn_protocol() == Some(tls::H2) {
+        serve_h2(ours, asking, deadlines, secured).await;
+    } else {
+        // An answer's pieces sealed as one record, not one each.
+        serve_h1(ours, asking, deadlines, Gathered::new(secured)).await;
+    }
+}
+
 /// Serves `socket`, a connection of `ours` that speaks HTTP/2, over h2 (15 step 2).
 /// `asking` is set when the first request is handed over.
 async fn serve_h2<S>(ours: Rc<Connection>, asking: Rc<Cell<bool>>, deadlines: Deadlines, socket: S)
@@ -1075,6 +1097,10 @@ impl Worker {
         // Lent rather than given, so that it comes back once the engine is done with it.
         let (lent, back) = Lent::new(stream);
         // Each served by our own server: HTTP/1 by the one of 14, HTTP/2 over h2 (15 step 2).
+        // A task is as large as its future's largest state, from accept to close, whatever
+        // the connection turns out to be (14 §3). So only plain HTTP/1, which waits between
+        // requests holding little, is served inline; HTTP/2 and TLS, which hold much more
+        // anyway, are boxed once when the connection is found to be one of them.
         let serving = async move {
             match tls {
                 // Told apart by our own detector.
@@ -1083,25 +1109,12 @@ impl Worker {
                         serve_h1(ours, ours_asking, deadlines, replay).await;
                     }
                     Ok(Some((Protocol::Http2, replay))) => {
-                        serve_h2(ours, ours_asking, deadlines, replay).await;
+                        Box::pin(serve_h2(ours, ours_asking, deadlines, replay)).await;
                     }
                     // Closed having said nothing, or failed before saying enough.
                     Ok(None) | Err(_) => {}
                 },
-                // Told apart by what the handshake agreed on (ALPN).
-                Some(tls) => {
-                    // A handshake that fails has nobody to tell but the client, whom
-                    // BoringSSL has sent its alert.
-                    let Ok(secured) = tokio_boring::accept(tls.acceptor(), lent).await else {
-                        return;
-                    };
-                    if secured.ssl().selected_alpn_protocol() == Some(tls::H2) {
-                        serve_h2(ours, ours_asking, deadlines, secured).await;
-                    } else {
-                        // An answer's pieces sealed as one record, not one each.
-                        serve_h1(ours, ours_asking, deadlines, Gathered::new(secured)).await;
-                    }
-                }
+                Some(tls) => Box::pin(serve_tls(ours, ours_asking, deadlines, &tls, lent)).await,
             }
         };
         // From accept to the first request, whichever server takes the connection: the
@@ -2398,6 +2411,47 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::rc::Rc;
     use std::time::Duration;
+
+    /// What a future `make` returns takes, without one being made.
+    fn size_of_made<A, F>(_make: impl FnOnce(A) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    /// A connection's task is as large as its future, from accept to close, whatever the
+    /// connection turns out to be (14 §3). HTTP/2 and TLS hold far more than plain HTTP/1
+    /// does waiting between requests, and are boxed once a connection is found to be one of
+    /// them: the future is no larger than plain HTTP/1 needs, and what serving any
+    /// connection holds besides — its first request's deadline, the detector, its
+    /// deadlines and handles on it — which is well under what either would add.
+    #[test]
+    fn a_connection_is_no_larger_than_plain_http1_needs() {
+        use crate::downstream::detect::Replay;
+        type Plain = (Rc<Connection>, Rc<Cell<bool>>, Deadlines, Replay<Lent>);
+        type Secured = (
+            Rc<Connection>,
+            Rc<Cell<bool>>,
+            Deadlines,
+            &'static Tls,
+            Lent,
+        );
+        type Http2 = (Rc<Connection>, Rc<Cell<bool>>, Deadlines, Replay<Lent>);
+        let connection = size_of_made(|(worker, stream): (Rc<Worker>, TcpStream)| {
+            worker.serve_connection(0, stream)
+        });
+        let plain = size_of_made(|(ours, asking, deadlines, socket): Plain| {
+            serve_h1(ours, asking, deadlines, socket)
+        });
+        let tls = size_of_made(|(ours, asking, deadlines, tls, socket): Secured| {
+            serve_tls(ours, asking, deadlines, tls, socket)
+        });
+        let h2 = size_of_made(|(ours, asking, deadlines, socket): Http2| {
+            serve_h2(ours, asking, deadlines, socket)
+        });
+        assert!(
+            connection <= plain + 768,
+            "{connection} bytes; plain HTTP/1 {plain}, TLS {tls}, HTTP/2 {h2}"
+        );
+    }
 
     /// A connect that never completes is given up on at the limit and not before, and one
     /// that completes inside it is kept (linkerd2-proxy tests its connect timeout the same
