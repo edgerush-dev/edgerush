@@ -1620,13 +1620,18 @@ fn a_client_that_lands_on_another_worker_is_served_by_its_own() {
 /// A client whose NAT rebinds it again and again, the client none the wiser, is followed to
 /// each new address (16 §3): quiche keeps two paths, and each new one takes the place of
 /// the one before. This client has no spare ID to give, so each new path shares the ID of
-/// the path it follows.
+/// the path it follows. A NAT rebinds a client most often once it has been quiet: once
+/// here, for a second. The server keeps its own deadlines, not the tests' short ones: one
+/// that closed the connection meanwhile would tell only the address the client had left.
 #[test]
 fn a_client_rebound_again_and_again_is_followed() {
     locally(async {
-        let server = serving(short(), echo).await;
+        let server = serving(Settings::default(), echo).await;
         let mut client = Client::connect(server.address, "a.test").await;
         for rebinding in 0..5 {
+            if rebinding == 2 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             client.rebind().await;
             let path = format!("/{rebinding}");
             let answer = client.get("a.test", &path).await;
