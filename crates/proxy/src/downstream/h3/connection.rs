@@ -156,6 +156,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
                         ));
                         continue;
                     }
+                    conn.asked();
                     let _detached = tokio::task::spawn_local(answer(
                         stream,
                         request.head,
@@ -181,6 +182,16 @@ pub(crate) async fn drive<R, F, B, D, G>(
             // What the socket had no room for goes once it has.
             if !driving.unsent.is_empty() && room.as_mut().poll(cx).is_ready() {
                 room.set(shared.socket.writable());
+                continue;
+            }
+            // A rapid reset (CVE-2023-44487) is closed, as HTTP/2 closes one (15 §3).
+            if !driving.closing && conn.resetting(settings.reset_judged_after) {
+                conn.with(|state| {
+                    // Fails only for a connection already closing.
+                    let _closing = state.quic.close(true, code::EXCESSIVE_LOAD, b"");
+                });
+                driving.closing = true;
+                conn.stir();
                 continue;
             }
             let open = conn.with(|state| state.streams.len());
@@ -591,6 +602,9 @@ async fn answer<R, F, B, D>(
     .await;
     // Reset or stopped by the client, or the connection gone: nothing is to be sent.
     let Some(answered) = answered else {
+        if responder.given_up() {
+            stream.conn.given_up_early();
+        }
         return;
     };
     interim.final_head();
@@ -602,11 +616,17 @@ async fn answer<R, F, B, D>(
         head.headers.insert(DATE, now);
     }
     let end = body.is_end_stream();
-    match responder.final_head(&head, end).await {
-        Ok(()) => {}
-        Err(SendError::TimedOut) => return responder.reset(code::REQUEST_CANCELLED),
-        Err(SendError::H3(_)) => return responder.reset(code::INTERNAL_ERROR),
-        Err(_) => return,
+    if let Err(error) = responder.final_head(&head, end).await {
+        // Given up before the head had room: the stream may be quiche's no more, and its
+        // error say only that.
+        if responder.given_up() {
+            return stream.conn.given_up_early();
+        }
+        match error {
+            SendError::TimedOut => return responder.reset(code::REQUEST_CANCELLED),
+            SendError::H3(_) => return responder.reset(code::INTERNAL_ERROR),
+            _ => return,
+        }
     }
     // A body that failed has had its stream reset with its own code; one the client stopped
     // or reset, or the connection took, is reset as the stream goes.

@@ -884,6 +884,194 @@ fn a_request_the_client_resets_is_let_go_of() {
     });
 }
 
+/// A rapid reset (CVE-2023-44487): requests asked and given up at once, each let settle so
+/// that the server gives the stream back. Once the connection has had its judged number of
+/// requests, half or more of them given up before their answer's head, it is closed with
+/// H3_EXCESSIVE_LOAD, as HTTP/2 closes one with ENHANCE_YOUR_CALM (15 §3).
+#[test]
+fn a_rapid_reset_is_cut_off_by_its_share_of_early_resets() {
+    locally(async {
+        let settings = Settings {
+            reset_judged_after: 50,
+            ..short()
+        };
+        let exchanges = Exchanges::default();
+        let server = serving(settings, exchanges.core()).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let mut cut_off = None;
+        for asked in 1..=100 {
+            client
+                .until(|client| {
+                    client.quic.peer_streams_left_bidi() > 0 || client.closed_by_server().is_some()
+                })
+                .await;
+            if client.closed_by_server().is_some() {
+                cut_off = Some(asked - 1);
+                break;
+            }
+            let id = client.request(&get("a.test", "/held"), false);
+            client.until(|_| exchanges.started.get() == asked).await;
+            for side in [quiche::Shutdown::Write, quiche::Shutdown::Read] {
+                client
+                    .quic
+                    .stream_shutdown(id, side, code::REQUEST_CANCELLED)
+                    .unwrap();
+            }
+            client.for_a_while(Duration::from_millis(5)).await;
+        }
+        let asked = cut_off.expect("never cut off");
+        assert!((50..=55).contains(&asked), "cut off after {asked} requests");
+        assert_eq!(
+            client.closed_by_server(),
+            Some((true, code::EXCESSIVE_LOAD))
+        );
+    });
+}
+
+/// Half given up early is enough: a client that has every other request answered, and gives
+/// up the rest, is closed once it has had the judged number.
+#[test]
+fn half_the_requests_given_up_early_is_a_rapid_reset() {
+    locally(async {
+        let settings = Settings {
+            reset_judged_after: 50,
+            ..short()
+        };
+        let server = serving(settings, |request, interim| -> Answering {
+            if request.uri().path() == "/held" {
+                return Box::pin(std::future::pending());
+            }
+            echo(request, interim)
+        })
+        .await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        for asked in 1..=50 {
+            if asked % 2 == 1 {
+                client.get("a.test", "/").await;
+                continue;
+            }
+            let id = client.request(&get("a.test", "/held"), true);
+            client.for_a_while(Duration::from_millis(5)).await;
+            client
+                .quic
+                .stream_shutdown(id, quiche::Shutdown::Read, code::REQUEST_CANCELLED)
+                .unwrap();
+        }
+        client
+            .until(|client| client.closed_by_server().is_some())
+            .await;
+        assert_eq!(
+            client.closed_by_server(),
+            Some((true, code::EXCESSIVE_LOAD))
+        );
+    });
+}
+
+/// A request given up while its answer's head waits for room to be sent is given up early
+/// too: a client that grants an answer no room and then cancels is judged as one that
+/// cancels at once.
+#[test]
+fn a_request_given_up_before_its_head_had_room_counts_as_early() {
+    locally(async {
+        let settings = Settings {
+            reset_judged_after: 10,
+            ..short()
+        };
+        let server = serving(settings, echo).await;
+        let mut client = Client::connect_with(server.address, "a.test", |config| {
+            // No room on the streams it opens for any answer.
+            config.set_initial_max_stream_data_bidi_local(0);
+        })
+        .await;
+        for _ in 0..10 {
+            let id = client.request(&get("a.test", "/"), true);
+            client.for_a_while(Duration::from_millis(20)).await;
+            assert!(!client.answers.contains_key(&id), "the head went");
+            client
+                .quic
+                .stream_shutdown(id, quiche::Shutdown::Read, code::REQUEST_CANCELLED)
+                .unwrap();
+        }
+        client
+            .until(|client| client.closed_by_server().is_some())
+            .await;
+        assert_eq!(
+            client.closed_by_server(),
+            Some((true, code::EXCESSIVE_LOAD))
+        );
+    });
+}
+
+/// An answer the server gives up, its head given no room for the stream's idle bound, is not
+/// given up by the client, and does not count towards the rule.
+#[test]
+fn an_answer_the_server_gives_up_is_not_counted_against_the_client() {
+    locally(async {
+        let settings = Settings {
+            reset_judged_after: 2,
+            ..short()
+        };
+        let server = serving(settings, echo).await;
+        let mut client = Client::connect_with(server.address, "a.test", |config| {
+            config.set_initial_max_stream_data_bidi_local(0);
+        })
+        .await;
+        let ids = [
+            client.request(&get("a.test", "/"), true),
+            client.request(&get("a.test", "/"), true),
+        ];
+        client
+            .until(|client| {
+                ids.iter().all(|id| {
+                    client
+                        .answers
+                        .get(id)
+                        .is_some_and(|answer| answer.reset.is_some())
+                })
+            })
+            .await;
+        client.for_a_while(Duration::from_millis(100)).await;
+        assert_ne!(
+            client.closed_by_server(),
+            Some((true, code::EXCESSIVE_LOAD))
+        );
+    });
+}
+
+/// A client that gives up a request now and then — one in ten — is nowhere near the rule,
+/// and keeps its connection.
+#[test]
+fn a_client_that_cancels_now_and_then_keeps_its_connection() {
+    locally(async {
+        let settings = Settings {
+            reset_judged_after: 50,
+            ..short()
+        };
+        let server = serving(settings, |request, interim| -> Answering {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                echo(request, interim).await
+            })
+        })
+        .await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        for asked in 0..100 {
+            let id = client.request(&get("a.test", "/"), true);
+            if asked % 10 == 0 {
+                client.flush().await;
+                client
+                    .quic
+                    .stream_shutdown(id, quiche::Shutdown::Read, code::REQUEST_CANCELLED)
+                    .unwrap();
+                client.for_a_while(Duration::from_millis(5)).await;
+            } else {
+                client.answer(id).await;
+            }
+        }
+        assert_eq!(client.closed_by_server(), None);
+    });
+}
+
 /// A client that stops reading an answer takes its exchange with it, whether or not its
 /// request was whole (RFC 9114 §4.1.1): nothing waits on an upstream for an answer nobody
 /// wants. quiche answers the STOP_SENDING with a RESET_STREAM of its own, with the client's

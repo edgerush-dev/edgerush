@@ -104,6 +104,17 @@ impl Responder {
         })
     }
 
+    /// Whether the client gave the stream up, resetting it or stopping the answer, rather
+    /// than the connection going under it.
+    pub(crate) fn given_up(&self) -> bool {
+        self.conn.with(|state| {
+            state
+                .streams
+                .get(&self.stream)
+                .is_some_and(|slot| slot.reset.is_some() || slot.stopped.is_some())
+        })
+    }
+
     /// Sends an interim head, before the final one only. One the stream has no room for
     /// is not sent: an interim head says nothing the final one will not.
     pub(crate) fn interim(&mut self, head: &Response<()>) -> Result<(), SendError> {

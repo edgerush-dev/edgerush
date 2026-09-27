@@ -34,6 +34,10 @@ pub(crate) struct Conn {
     charged: Cell<usize>,
     /// Closed to make room for the rest: charged nothing from then on.
     shed: Cell<bool>,
+    /// Requests the connection has had.
+    requests: Cell<u64>,
+    /// Of those, the ones the client gave up before their answer's head was sent.
+    given_up: Cell<u64>,
 }
 
 /// What the connection holds.
@@ -109,7 +113,28 @@ impl Conn {
             charge: RefCell::new(None),
             charged: Cell::new(0),
             shed: Cell::new(false),
+            requests: Cell::new(0),
+            given_up: Cell::new(0),
         })
+    }
+
+    /// Counts a request the connection has had.
+    pub(crate) fn asked(&self) {
+        self.requests.set(self.requests.get() + 1);
+    }
+
+    /// Counts a request the client gave up, reset or stopped, before its answer's head was
+    /// sent.
+    pub(crate) fn given_up_early(&self) {
+        self.given_up.set(self.given_up.get() + 1);
+    }
+
+    /// Whether the connection is a rapid reset (CVE-2023-44487): at least `after` requests,
+    /// half or more of them given up by the client before their answer's head was sent.
+    /// HTTP/2's rule and its numbers, which are Envoy's (15 §3).
+    pub(crate) fn resetting(&self, after: u64) -> bool {
+        let requests = self.requests.get();
+        requests >= after && self.given_up.get().saturating_mul(2) >= requests
     }
 
     /// Charges `storage` what quiche holds for the connection now: what it received that

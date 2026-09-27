@@ -91,6 +91,9 @@ pub(crate) struct Settings {
     pub(crate) retry_above: usize,
     /// Datagrams read before everything else the worker has gets a turn.
     pub(crate) batch: usize,
+    /// How many requests a connection must have had before its share given up early is
+    /// judged: HTTP/2's number (15 §3).
+    pub(crate) reset_judged_after: u64,
     /// New connections admitted in one batch, as TCP's accept is paced (03 §3).
     pub(crate) admit_per_batch: usize,
 }
@@ -113,6 +116,7 @@ impl Default for Settings {
             connections: 32_768,
             retry_above: 1_024,
             batch: 64,
+            reset_judged_after: 500,
             admit_per_batch: 16,
         }
     }
