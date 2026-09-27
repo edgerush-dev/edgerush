@@ -25,6 +25,8 @@
 #   bench/run.sh h3 [STREAMED]                HTTP/3 clients: few hot connections, many, one
 #                                             hot one, streamed bodies at STREAMED a second,
 #                                             and TLS HTTP/2 beside them to read them by
+#   bench/run.sh h3latency [RATE...]          HTTP/3 latency at each RATE a second (5000 12500
+#                                             25000 unless said), in h2load's 10 ms bursts
 #   bench/run.sh passthrough CHURN [TLS_CHURN] [STREAMED]
 #                                             TCP and TLS passthrough: kept connections at
 #                                             saturation, a connection a request at CHURN (and
@@ -71,6 +73,7 @@ repo=$(dirname "$here")
 : "${TLS:=0}"
 : "${H3:=0}"
 [ "${1:-}" = h3 ] && H3=1
+[ "${1:-}" = h3latency ] && H3=1
 [ "$H3" = 1 ] && TLS=1
 # PASSTHROUGH=1, which `passthrough` sets, has the proxies carry connections rather than
 # serve them (17 step 4): passthrough.yaml for EdgeRush, NGINX's stream module
@@ -384,9 +387,12 @@ oha_at() { # name, rate, url, options...
 latency_h1() { oha_at "$1" "$2" "$3" -c 256; }
 latency_h2() { oha_at "$1" "$2" "$3" --http2 -c 4 -p 100; }
 
-# A fixed rate over HTTP/3 by h2load, which every proxy's HTTP/3 takes (oha's does not),
-# shared by its connections, each request's time logged for summary.py's percentiles. h2load
-# keeps the rate while a connection has streams to spare, and the rate reached says if not.
+# A rate over HTTP/3 by h2load, which every proxy's HTTP/3 takes (oha's does not), shared by
+# its connections, each request's time logged for summary.py's percentiles. h2load keeps the
+# rate while a connection has streams to spare, and the rate reached says if not. It is not
+# an even rate: h2load's timer fires at most every 10 ms, so each connection sends a hundredth
+# of its rate at once, in bursts, where oha's HTTP/1 and HTTP/2 rates come a millisecond
+# apart (16 §8).
 h3_at() { # name, rate, connections, streams, url, options...
     local name=$1 rate=$2 clients=$3 streams=$4 url=$5
     shift 5
@@ -655,9 +661,9 @@ profile-body)
         exit 2
     }
     ;;
-ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3 | passthrough) ;;
+ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3 | h3latency | passthrough) ;;
 *)
-    sed -n '2,36p' "$0" >&2
+    sed -n '2,38p' "$0" >&2
     exit 2
     ;;
 esac
@@ -904,6 +910,22 @@ passthrough)
         streamed_answer "$1.streamed-tcp" "$streamed_rate"
     }
     each_variant passthrough_runs
+    ;;
+h3latency)
+    # HTTP/3 latency at each RATE (5,000, 12,500 and 25,000 a second unless said), 4
+    # connections of 100 streams, in h2load's 10 ms bursts (h3_at): whether a gap between
+    # the proxies grows with the load, as queueing does, or stays at any rate, as a delay of
+    # its own does (16 step 6).
+    [ -x "$H2LOAD3" ] || { echo "no h2load with HTTP/3 at $H2LOAD3" >&2; exit 2; }
+    rates="${*:2}"
+    rates=${rates:-5000 12500 25000}
+    h3latency_runs() {
+        local rate
+        for rate in $rates; do
+            latency_h3 "$1.latency-h3-$rate" "$rate" "$proxy"
+        done
+    }
+    each_variant h3latency_runs
     ;;
 h3)
     # What HTTP/3 clients get (16 step 6): few hot connections, many connections, a single
