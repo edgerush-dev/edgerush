@@ -105,6 +105,10 @@ pub trait Head {
     /// [`Rejection::Edits`] if the head cannot take the change.
     fn set_host(&mut self, host: &HeaderValue) -> Result<(), Rejection>;
 
+    /// Its fields as they stand, as a header map of their own: what a mirror placed before
+    /// a change is sent (18 §5 in the docs).
+    fn to_map(&self) -> HeaderMap;
+
     /// The version it came in.
     fn version(&self) -> Version;
 }
@@ -174,6 +178,10 @@ impl Head for Parts {
     fn set_host(&mut self, host: &HeaderValue) -> Result<(), Rejection> {
         self.headers.insert(HOST, host.clone());
         Ok(())
+    }
+
+    fn to_map(&self) -> HeaderMap {
+        self.headers.clone()
     }
 
     fn version(&self) -> Version {

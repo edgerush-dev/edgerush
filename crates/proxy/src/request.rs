@@ -17,9 +17,12 @@
 use crate::head::Head;
 use crate::hop_by_hop::ConnectionError;
 use crate::host::{HostError, bare_host};
-use edgerush_config::{Compiled, CompiledListener, CompiledRule, Outcome, Protocol, UpstreamId};
+use edgerush_config::{
+    Compiled, CompiledListener, CompiledRule, Outcome, Protocol, Step, UpstreamId,
+};
 use edgerush_filters::{Requested, Scheme, UrlRewrite};
 use edgerush_router::{NormaliseError, RequestParts, normalise_path};
+use http::header::HeaderMap;
 use http::uri::PathAndQuery;
 use http::{HeaderValue, StatusCode, Uri, Version};
 use std::borrow::Cow;
@@ -46,7 +49,7 @@ pub struct Redirected<'a> {
 }
 
 /// Where a request goes.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Forward<'a> {
     /// The rule the request belongs to, for what is still to be done to its response. A
     /// request that is still under way when the config changes keeps its rule, and only
@@ -54,6 +57,27 @@ pub struct Forward<'a> {
     pub rule: &'a Arc<CompiledRule>,
     /// The upstream chosen among the rule's backends: its position in the snapshot's list.
     pub upstream: UpstreamId,
+    /// The rule's mirrors that take a copy of this request, in the rule's order.
+    pub mirrors: Vec<Mirroring>,
+}
+
+/// A mirror that takes a copy of a request.
+#[derive(Debug, Clone)]
+pub struct Mirroring {
+    /// Its position among the rule's mirrors.
+    pub mirror: usize,
+    /// The request as it stood at the mirror's place, before a change after it; none for a
+    /// mirror with no change after it, which is sent the request as it goes upstream.
+    pub own: Option<Copied>,
+}
+
+/// A request as it stood at a mirror's place among its rule's filters.
+#[derive(Debug, Clone)]
+pub struct Copied {
+    /// Its target.
+    pub target: Uri,
+    /// Its fields.
+    pub fields: HeaderMap,
 }
 
 /// Why a request goes nowhere, and is answered here.
@@ -103,15 +127,18 @@ impl Rejection {
 /// upstream is to see: the normalised path, a `Host` field that names the host that was
 /// routed on, the cookie string in one piece, no hop-by-hop headers, and the rule's changes
 /// to the headers, and the rule's rewrite of path and host, which is made from the
-/// normalised path and never routes again. A request its rule redirects is answered with
+/// normalised path and never routes again. The rule's changes are made in the order its
+/// filters are written, and a mirror of the rule's placed before one of them takes a copy
+/// of the request as it stands there. A request its rule redirects is answered with
 /// the `Location` made from
 /// what was routed on — the listener's scheme, the host, the normalised path, the query —
 /// and its head is left as routing left it.
 ///
-/// `random` chooses among weighted backends and should be uniform over `u64`; passing it
-/// in keeps the core deterministic. A request in the usual form — origin-form target, a
-/// path already normal — is decided without allocating, except as the rule's header
-/// changes do.
+/// `random` is drawn from once to choose among weighted backends, and once for each of
+/// the rule's mirrors, whether it takes this request; it should be uniform over `u64`, and
+/// passing it in keeps the core deterministic. A request in the usual form — origin-form
+/// target, a path already normal — is decided without allocating, except as the rule's
+/// header changes do, and a copy for a mirror placed before one.
 ///
 /// # Errors
 ///
@@ -122,7 +149,7 @@ pub fn decide<'a, H: Head>(
     snapshot: &'a Compiled,
     listener: &CompiledListener,
     head: &mut H,
-    random: u64,
+    random: &mut impl FnMut() -> u64,
 ) -> Result<Decision<'a>, Rejection> {
     let found = head.survey();
     if found.cookie_fields > 1 {
@@ -199,7 +226,21 @@ pub fn decide<'a, H: Head>(
             }));
         }
     };
-    let upstream = backends.pick(random).ok_or(Rejection::NoBackend)?;
+    let upstream = backends.pick(random()).ok_or(Rejection::NoBackend)?;
+    // Which of the rule's mirrors take this request, drawn here, where what each is sent
+    // is made: only a mirror that takes it has a copy made. A rule without mirrors draws
+    // nothing and holds nothing for them.
+    let mut mirrors = Vec::new();
+    if !rule.mirrors.is_empty() {
+        for (at, mirror) in rule.mirrors.iter().enumerate() {
+            if mirror.takes(random()) {
+                mirrors.push(Mirroring {
+                    mirror: at,
+                    own: None,
+                });
+            }
+        }
+    }
 
     // Whatever can still fail comes before the target and the rest of the headers change.
     // A query with no path before it (`http://a?q=1`) is read as the path `/`, and is
@@ -209,35 +250,74 @@ pub fn decide<'a, H: Head>(
         .path_and_query()
         .is_some_and(|target| target.as_str().starts_with('?'));
     // A rewrite's path is made from the normalised one routed on, and is normal itself.
-    let rewritten = rule
+    let mut rewritten = rule
         .rewrite
         .as_ref()
         .and_then(UrlRewrite::path)
         .map(|change| {
             let mut rewritten = String::with_capacity(path.len());
             change.write(&path, &mut rewritten);
-            rewritten
-        });
-    let target = match (rewritten, path) {
-        (Some(rewritten), _) => Some(with_path(head.uri(), rewritten)?),
-        (None, Cow::Owned(path)) => Some(with_path(head.uri(), path)?),
-        (None, Cow::Borrowed(path)) if pathless => Some(with_path(head.uri(), path.to_owned())?),
-        (None, Cow::Borrowed(_)) => None,
+            with_path(head.uri(), rewritten)
+        })
+        .transpose()?;
+    // The normalised target is what goes upstream unless a rewrite takes its place; with
+    // one, it is made only for a copy that stands before the rewrite.
+    let copied_before_rewrite = || {
+        rule.steps
+            .iter()
+            .take_while(|step| **step != Step::Rewrite)
+            .any(|step| {
+                matches!(step, Step::Copy(at) if mirrors.iter().any(|taken| taken.mirror == *at))
+            })
+    };
+    let target = if rewritten.is_none() || copied_before_rewrite() {
+        match path {
+            Cow::Owned(path) => Some(with_path(head.uri(), path)?),
+            Cow::Borrowed(path) if pathless => Some(with_path(head.uri(), path.to_owned())?),
+            Cow::Borrowed(_) => None,
+        }
+    } else {
+        None
     };
 
+    // What every copy has: the normal target, no hop-by-hop headers.
     if let Some(target) = target {
         head.set_uri(target);
-    }
-    if let Some(host) = rule.rewrite.as_ref().and_then(UrlRewrite::host) {
-        head.set_host(host)?;
     }
     if found.hop_by_hop {
         head.strip_request()?;
     }
-    if let Some(changes) = &rule.request_headers {
-        head.apply(changes)?;
+    // Then the rule's changes, in its order, and the copies made between them.
+    for step in &rule.steps {
+        match *step {
+            Step::Rewrite => {
+                if let Some(target) = rewritten.take() {
+                    head.set_uri(target);
+                }
+                if let Some(host) = rule.rewrite.as_ref().and_then(UrlRewrite::host) {
+                    head.set_host(host)?;
+                }
+            }
+            Step::RequestHeaders => {
+                if let Some(changes) = &rule.request_headers {
+                    head.apply(changes)?;
+                }
+            }
+            Step::Copy(at) => {
+                if let Some(taken) = mirrors.iter_mut().find(|taken| taken.mirror == at) {
+                    taken.own = Some(Copied {
+                        target: head.uri().clone(),
+                        fields: head.to_map(),
+                    });
+                }
+            }
+        }
     }
-    Ok(Decision::Forward(Forward { rule, upstream }))
+    Ok(Decision::Forward(Forward {
+        rule,
+        upstream,
+        mirrors,
+    }))
 }
 
 /// The same target with another path.
@@ -367,7 +447,7 @@ upstreams:
     fn decide_on<H: Head>(listener: &str, head: &mut H, random: u64) -> Result<String, Rejection> {
         let shop = shop();
         let listener = shop.listeners.iter().find(|l| l.name == listener).unwrap();
-        decide(&shop, listener, head, random).map(|decision| {
+        decide(&shop, listener, head, &mut || random).map(|decision| {
             let forward = forwarding(decision);
             shop.upstream(forward.upstream).unwrap().name.clone()
         })
@@ -421,7 +501,7 @@ upstreams:
         let shop = shop();
         let web = shop.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut head = head("/cart", &[("host", "shop.example.com")]);
-        let forward = forwarding(decide(&shop, web, &mut head, 0).unwrap());
+        let forward = forwarding(decide(&shop, web, &mut head, &mut || 0).unwrap());
         assert!(forward.rule.request_headers.is_some());
         assert_eq!(shop.upstream(forward.upstream).unwrap().name, "cart");
     }
@@ -449,7 +529,7 @@ upstreams:
         let config: Config = serde_saphyr::from_str(MOVED).unwrap();
         let moved = compile(&config).unwrap();
         let web = moved.listeners.iter().find(|l| l.name == "web").unwrap();
-        match decide(&moved, web, head, 0).unwrap() {
+        match decide(&moved, web, head, &mut || 0).unwrap() {
             Decision::Redirect(redirected) => Some((
                 redirected.status,
                 redirected.location.to_str().unwrap().to_owned(),
@@ -526,7 +606,7 @@ upstreams:
             .iter()
             .find(|l| l.name == "web")
             .unwrap();
-        forwarding(decide(&rewritten, web, &mut head, 0).unwrap());
+        forwarding(decide(&rewritten, web, &mut head, &mut || 0).unwrap());
         head
     }
 
@@ -567,6 +647,101 @@ upstreams:
         assert_eq!(h2.uri.path(), "/host/a");
     }
 
+    const MIRRORED: &str = r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http }
+routes:
+  - name: mirrored
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: /a } }]
+        filters:
+          - { type: request_mirror, upstream: first, fraction: { numerator: 1, denominator: 1 } }
+          - { type: request_header_modifier, set: [{ name: x-changed, value: "1" }] }
+          - { type: request_mirror, upstream: second, fraction: { numerator: 1, denominator: 2 } }
+          - { type: url_rewrite, host: one.example.org, path: { replace_prefix: /api } }
+          - { type: request_mirror, upstream: third, fraction: { numerator: 1, denominator: 1 } }
+        forward: { backends: [{ upstream: up, weight: 1 }] }
+upstreams:
+  up: { endpoints: ["127.0.0.1:9000"] }
+  first: { endpoints: ["127.0.0.1:9001"] }
+  second: { endpoints: ["127.0.0.1:9002"] }
+  third: { endpoints: ["127.0.0.1:9003"] }
+"#;
+
+    /// What a copy says: its target, its `Host`, and whether it has `x-changed`.
+    type Seen = (String, String, bool);
+
+    /// The mirrors that take a request to `web` of [`MIRRORED`], drawn from `draws` after
+    /// the backend's draw: each with what its copy says, if it has one.
+    fn mirrored<H: Head>(mut head: H, draws: &[u64]) -> Vec<(usize, Option<Seen>)> {
+        let config: Config = serde_saphyr::from_str(MIRRORED).unwrap();
+        let mirrored = compile(&config).unwrap();
+        let web = mirrored.listeners.iter().find(|l| l.name == "web").unwrap();
+        let mut draws = std::iter::once(0).chain(draws.iter().copied());
+        let forward =
+            forwarding(decide(&mirrored, web, &mut head, &mut || draws.next().unwrap()).unwrap());
+        forward
+            .mirrors
+            .into_iter()
+            .map(|mirroring| {
+                let own = mirroring.own.map(|copied| {
+                    (
+                        copied.target.to_string(),
+                        copied.fields["host"].to_str().unwrap().to_owned(),
+                        copied.fields.contains_key("x-changed"),
+                    )
+                });
+                (mirroring.mirror, own)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_mirror_is_sent_the_request_as_it_stands_at_its_place() {
+        let copy =
+            |target: &str, host: &str, changed| Some((target.to_owned(), host.to_owned(), changed));
+        let target = "/a/./b?c=d";
+        let fields = [
+            ("host", "shop.example.com"),
+            ("connection", "x-hop"),
+            ("x-hop", "1"),
+        ];
+        // Every mirror takes it: the first before any change, the second after the header
+        // change, the third after both, as the upstream.
+        assert_eq!(
+            mirrored(head(target, &fields), &[0, 0, 0]),
+            [
+                (0, copy("/a/b?c=d", "shop.example.com", false)),
+                (1, copy("/a/b?c=d", "shop.example.com", true)),
+                (2, None),
+            ]
+        );
+        // The second's share is one in two, and this draw is not in it: no copy is made.
+        assert_eq!(
+            mirrored(head(target, &fields), &[0, 1, 0]),
+            [(0, copy("/a/b?c=d", "shop.example.com", false)), (2, None)]
+        );
+        // A raw head's copies are its map's.
+        let sent = format!(
+            "GET {target} HTTP/1.1\r\nHost: shop.example.com\r\nConnection: x-hop\r\nx-hop: 1\r\n\r\n"
+        );
+        let (map, raw) = both_heads(sent.as_bytes()).unwrap();
+        assert_eq!(mirrored(raw, &[0, 0, 0]), mirrored(map, &[0, 0, 0]));
+        // What every copy has lost: what was about the client's connection.
+        let config: Config = serde_saphyr::from_str(MIRRORED).unwrap();
+        let compiled = compile(&config).unwrap();
+        let web = compiled.listeners.iter().find(|l| l.name == "web").unwrap();
+        let mut request = head(target, &fields);
+        let forward = forwarding(decide(&compiled, web, &mut request, &mut || 0).unwrap());
+        let first = forward.mirrors[0].own.as_ref().unwrap();
+        assert!(!first.fields.contains_key("x-hop"));
+        assert!(!first.fields.contains_key("connection"));
+        assert_eq!(request.uri, "/api/b?c=d");
+        assert_eq!(request.headers["host"], "one.example.org");
+    }
+
     #[test]
     fn a_request_that_cannot_be_routed_is_rejected_before_any_redirect() {
         let config: Config = serde_saphyr::from_str(MOVED).unwrap();
@@ -574,12 +749,12 @@ upstreams:
         let web = moved.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut ambiguous = head("/old/%2e%2e/admin", &[("host", "shop.example.com")]);
         assert!(matches!(
-            decide(&moved, web, &mut ambiguous, 0),
+            decide(&moved, web, &mut ambiguous, &mut || 0),
             Err(Rejection::Path(_))
         ));
         let mut hostless = head("/old/a", &[]);
         assert!(matches!(
-            decide(&moved, web, &mut hostless, 0),
+            decide(&moved, web, &mut hostless, &mut || 0),
             Err(Rejection::Host(_))
         ));
     }
@@ -861,7 +1036,7 @@ upstreams:
         let chained = compile(&config).unwrap();
         let web = chained.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut request = head("/cart", &fields);
-        decide(&chained, web, &mut request, 0).unwrap();
+        decide(&chained, web, &mut request, &mut || 0).unwrap();
         let credentials: Vec<_> = request
             .headers
             .get_all("proxy-authorization")

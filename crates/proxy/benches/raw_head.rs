@@ -148,9 +148,10 @@ fn by_raw(snapshot: Compiled, head: Bytes) -> (Compiled, Option<RawHead>, bool) 
     };
     let mut raw = raw;
     let forwarded = match (snapshot.listeners.first(), raw.as_mut()) {
-        (Some(listener), Some(head)) => {
-            decide(black_box(&snapshot), listener, head, 0x9E37_79B9_7F4A_7C15).is_ok()
-        }
+        (Some(listener), Some(head)) => decide(black_box(&snapshot), listener, head, &mut || {
+            0x9E37_79B9_7F4A_7C15
+        })
+        .is_ok(),
         _ => false,
     };
     (snapshot, raw, forwarded)
@@ -209,9 +210,10 @@ fn by_map(snapshot: Compiled, head: Bytes) -> (Compiled, Option<Parts>, bool) {
     };
     let mut parts = parts;
     let forwarded = match (snapshot.listeners.first(), parts.as_mut()) {
-        (Some(listener), Some(head)) => {
-            decide(black_box(&snapshot), listener, head, 0x9E37_79B9_7F4A_7C15).is_ok()
-        }
+        (Some(listener), Some(head)) => decide(black_box(&snapshot), listener, head, &mut || {
+            0x9E37_79B9_7F4A_7C15
+        })
+        .is_ok(),
         _ => false,
     };
     (snapshot, parts, forwarded)
@@ -233,7 +235,7 @@ fn decided_raw(sent: &Bytes) -> RawHead {
     );
     let snapshot = shop();
     let listener = snapshot.listeners.first().expect("a listener");
-    decide(&snapshot, listener, &mut head, 0).expect("decided");
+    decide(&snapshot, listener, &mut head, &mut || 0).expect("decided");
     head
 }
 
@@ -254,7 +256,7 @@ fn decided_map(sent: &Bytes) -> Parts {
     parts.headers = headers;
     let snapshot = shop();
     let listener = snapshot.listeners.first().expect("a listener");
-    decide(&snapshot, listener, &mut parts, 0).expect("decided");
+    decide(&snapshot, listener, &mut parts, &mut || 0).expect("decided");
     parts
 }
 

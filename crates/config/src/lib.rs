@@ -21,7 +21,7 @@ mod route;
 pub use backends::{UpstreamId, WeightedBackends};
 pub use compile::{
     Compiled, CompiledListener, CompiledMirror, CompiledRetry, CompiledRule, CompiledUpstream,
-    ConfigError, L4, L4Route, Object, Outcome, Place, Problem, RuleId, SniRouter, compile,
+    ConfigError, L4, L4Route, Object, Outcome, Place, Problem, RuleId, SniRouter, Step, compile,
 };
 pub use config::{
     Certificate, ClientValidation, Config, HealthCheck, Http3, Keepalive, Listener, Probe,

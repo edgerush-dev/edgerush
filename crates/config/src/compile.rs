@@ -130,6 +130,9 @@ pub struct CompiledRule {
     pub response_headers: Option<HeaderModifier>,
     /// Another host, path or both for the upstream, if the rule asks for them.
     pub rewrite: Option<edgerush_filters::UrlRewrite>,
+    /// The changes to a request on its way, in the order its filters are written, and
+    /// where in it a mirror copies the request (18 §5).
+    pub steps: Box<[Step]>,
     /// What becomes of its requests.
     pub outcome: Outcome,
     /// Where copies of its requests go, if anywhere.
@@ -145,6 +148,23 @@ impl CompiledRule {
             Outcome::Redirect(_) => None,
         }
     }
+}
+
+/// One of the changes to a request on its way, in the order the rule's filters are
+/// written. The rewrite and the header changes touch different things — the header changes
+/// may not name `Host`, the rewrite changes only the target and `Host` — so the order
+/// between them changes nothing; what it does change is what a mirror placed between them
+/// is sent (18 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// The rule's rewrite.
+    Rewrite,
+    /// The rule's changes to the request's headers.
+    RequestHeaders,
+    /// The mirror at this position among the rule's is sent the request as it stands here.
+    /// Only a mirror with a change after it has a step: any other is sent the request as
+    /// it goes upstream.
+    Copy(usize),
 }
 
 /// What becomes of a rule's requests.
@@ -471,12 +491,14 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                 request_headers,
                 response_headers,
                 rewrite,
+                steps,
                 mirrors,
             } = filters(rule, &upstream_ids, &place, &mut errors);
             compiled_rules.push(Arc::new(CompiledRule {
                 request_headers,
                 response_headers,
                 rewrite,
+                steps,
                 outcome: outcome(rule, &upstream_ids, &place, &mut errors),
                 mirrors,
             }));
@@ -901,6 +923,7 @@ struct Filters {
     request_headers: Option<HeaderModifier>,
     response_headers: Option<HeaderModifier>,
     rewrite: Option<edgerush_filters::UrlRewrite>,
+    steps: Box<[Step]>,
     mirrors: Vec<CompiledMirror>,
 }
 
@@ -915,6 +938,7 @@ fn filters(
     let mut rewrite = None;
     let mut rewrites = 0;
     let mut mirrors = Vec::new();
+    let mut steps = Vec::new();
     let redirects = rule.redirect.is_some();
     for (at, filter) in rule.filters.iter().enumerate() {
         let place = Place {
@@ -952,6 +976,7 @@ fn filters(
                 if let Some(upstream) = upstream
                     && numerator > 0
                 {
+                    steps.push(Step::Copy(mirrors.len()));
                     mirrors.push(CompiledMirror {
                         upstream,
                         numerator,
@@ -966,7 +991,10 @@ fn filters(
                     errors.push(place.problem(Problem::FilterTwice("url_rewrite")));
                 }
                 match url_rewrite(rule, asked) {
-                    Ok(compiled) => rewrite = compiled,
+                    Ok(compiled) => {
+                        rewrite = compiled;
+                        steps.push(Step::Rewrite);
+                    }
                     Err(problem) => errors.push(place.problem(problem)),
                 }
                 continue;
@@ -987,15 +1015,38 @@ fn filters(
             Ok(modifier) if redirects && modifier.names(&http::header::LOCATION) => {
                 errors.push(place.problem(Problem::RedirectLocation));
             }
-            Ok(modifier) => *slot = Some(modifier),
+            Ok(modifier) => {
+                *slot = Some(modifier);
+                if kind == "request_header_modifier" {
+                    steps.push(Step::RequestHeaders);
+                }
+            }
             Err(reason) => errors.push(place.problem(Problem::HeaderModifier(reason))),
         }
     }
     let kept = |modifier: Option<HeaderModifier>| modifier.filter(|modifier| !modifier.is_empty());
+    let request_headers = kept(request);
+    // What is not there takes no step, and a copy with no change after it is the request
+    // as it goes upstream, which needs no head of its own.
+    steps.retain(|step| match step {
+        Step::Rewrite => rewrite.is_some(),
+        Step::RequestHeaders => request_headers.is_some(),
+        Step::Copy(_) => true,
+    });
+    let last_change = steps
+        .iter()
+        .rposition(|step| !matches!(step, Step::Copy(_)));
+    let mut at = 0;
+    steps.retain(|step| {
+        let keep = !matches!(step, Step::Copy(_)) || last_change.is_some_and(|last| at < last);
+        at += 1;
+        keep
+    });
     Filters {
-        request_headers: kept(request),
+        request_headers,
         response_headers: kept(response),
         rewrite,
+        steps: steps.into(),
         mirrors,
     }
 }
@@ -1861,6 +1912,64 @@ upstreams:
                  a `redirect`: nothing goes upstream",
             ]
         );
+    }
+
+    /// A rule's changes to its requests keep the order they are written in, with a copy
+    /// where a mirror stands before one of them, and none where nothing changes after it.
+    #[test]
+    fn a_rules_changes_and_its_mirrors_copies_keep_their_order() {
+        let mirror =
+            "{ type: request_mirror, upstream: u, fraction: { numerator: 1, denominator: 1 } }";
+        let headers = "{ type: request_header_modifier, set: [{ name: x-a, value: \"1\" }] }";
+        let nothing = "{ type: request_header_modifier }";
+        let rewrite = "{ type: url_rewrite, host: a.example }";
+        let never =
+            "{ type: request_mirror, upstream: u, fraction: { numerator: 0, denominator: 1 } }";
+        let steps_of = |filters: &[&str]| {
+            let yaml = format!(
+                r#"
+listeners:
+  web: {{ address: "[::]:8080", protocol: http }}
+routes:
+  - name: a
+    listeners: [web]
+    hostnames: [{{ name: "*", falls_through: true }}]
+    rules:
+      - matches: [{{ path: {{ prefix: / }} }}]
+        filters: [{}]
+        forward: {{ backends: [{{ upstream: u, weight: 1 }}] }}
+upstreams:
+  u: {{ endpoints: [] }}
+"#,
+                filters.join(", ")
+            );
+            let compiled = compile(&config(&yaml)).unwrap();
+            compiled
+                .rule(RuleId { route: 0, rule: 0 })
+                .unwrap()
+                .steps
+                .to_vec()
+        };
+        use Step::{Copy, RequestHeaders, Rewrite};
+        assert_eq!(
+            steps_of(&[mirror, headers, mirror, rewrite, mirror]),
+            [Copy(0), RequestHeaders, Copy(1), Rewrite]
+        );
+        assert_eq!(
+            steps_of(&[rewrite, mirror, headers]),
+            [Rewrite, Copy(0), RequestHeaders]
+        );
+        assert_eq!(
+            steps_of(&[headers, rewrite, mirror]),
+            [RequestHeaders, Rewrite]
+        );
+        // A change that changes nothing, or a mirror that copies nothing, takes no step.
+        assert_eq!(steps_of(&[mirror, nothing]), []);
+        assert_eq!(
+            steps_of(&[never, mirror, headers]),
+            [Copy(0), RequestHeaders]
+        );
+        assert_eq!(steps_of(&[]), []);
     }
 
     /// The problems of a config with these rules, one route of them on `web`.

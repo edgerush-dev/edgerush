@@ -133,7 +133,7 @@ fn request_core(snapshot: Compiled, mut head: Parts) -> (Compiled, Parts, bool) 
             black_box(&snapshot),
             listener,
             black_box(&mut head),
-            0x9E37_79B9_7F4A_7C15,
+            &mut || 0x9E37_79B9_7F4A_7C15,
         )
         .is_ok(),
         None => false,

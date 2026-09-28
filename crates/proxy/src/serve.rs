@@ -1723,12 +1723,24 @@ impl Worker {
         };
         // Credentials bound to the client's connection are not the mirror's to use, and
         // without them the copy would not be the request.
-        if crate::upstream::auth::carries_credentials(head.outgoing()) {
-            for mirror in &mirrors {
-                given_up(mirror.upstream_slot, |counters| {
-                    &counters.mirrors_credentials
-                });
-            }
+        use crate::upstream::auth::carries_credentials;
+        let upstream_carries = carries_credentials(head.outgoing());
+        let mirrors: Vec<Mirrored> = mirrors
+            .into_iter()
+            .filter(|mirror| {
+                let bound = mirror
+                    .fields
+                    .as_ref()
+                    .map_or(upstream_carries, carries_credentials);
+                if bound {
+                    given_up(mirror.upstream_slot, |counters| {
+                        &counters.mirrors_credentials
+                    });
+                }
+                !bound
+            })
+            .collect();
+        if mirrors.is_empty() {
             return body;
         }
         let Some(worker) = self.me.upgrade() else {
@@ -1747,22 +1759,37 @@ impl Worker {
         if placed.is_empty() {
             return body;
         }
-        let mut headers = HeaderMap::new();
-        head.outgoing().each_field(|name, value| {
-            if let (Ok(name), Ok(value)) =
-                (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
-            {
-                headers.append(name, value);
-            }
-        });
-        // Nobody is there to be told to go on: a copy is sent without asking.
-        headers.remove(http::header::EXPECT);
+        // The request as it goes upstream, for the copies of it; made only if one is.
+        let mut going = None;
         let (tee, copies) = mirror::Tee::new(body, placed.len());
-        for ((mirror, admitted), (copy, kept)) in placed.into_iter().zip(copies) {
+        for ((mut mirror, admitted), (copy, kept)) in placed.into_iter().zip(copies) {
+            let headers = match mirror.fields.take() {
+                // A copy made before the changes after it, and so before what the rest of
+                // the way does: its `Trailer` says only what will come.
+                Some(mut own) => {
+                    crate::h1::filter_declaration(&mut own, nominated);
+                    own
+                }
+                None => going
+                    .get_or_insert_with(|| {
+                        let mut headers = HeaderMap::new();
+                        head.outgoing().each_field(|name, value| {
+                            if let (Ok(name), Ok(value)) =
+                                (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+                            {
+                                headers.append(name, value);
+                            }
+                        });
+                        headers
+                    })
+                    .clone(),
+            };
             let (mut parts, ()) = Request::new(()).into_parts();
             parts.method = head.method().clone();
             parts.uri = mirror.target;
-            parts.headers = headers.clone();
+            parts.headers = headers;
+            // Nobody is there to be told to go on: a copy is sent without asking.
+            parts.headers.remove(http::header::EXPECT);
             let nominated = nominated.to_vec();
             let worker = Rc::clone(&worker);
             let _copying = tokio::task::spawn_local(async move {
@@ -2083,7 +2110,7 @@ impl Proxy {
             .flatten()
             .and_then(|position| snapshot.config.listeners.get(position))
             .ok_or(Answer::NoRoute)?;
-        let forward = match decide(&snapshot.config, listener, head, random())? {
+        let forward = match decide(&snapshot.config, listener, head, &mut random)? {
             Decision::Forward(forward) => forward,
             Decision::Redirect(redirected) => {
                 return Ok(Directing::Redirect(Redirect {
@@ -2124,10 +2151,16 @@ impl Proxy {
             counters.requests.inc();
         }
         let mut mirrors = Vec::new();
-        for mirror in &forward.rule.mirrors {
-            if !mirror.takes(random()) {
+        // The mirrors that take this request were drawn with it, and a copy made for each
+        // placed before a change (18 §5).
+        for mirroring in forward.mirrors {
+            let Some(mirror) = forward.rule.mirrors.get(mirroring.mirror) else {
                 continue;
-            }
+            };
+            let (target, fields) = match mirroring.own {
+                Some(copied) => (copied.target, Some(copied.fields)),
+                None => (head.uri().clone(), None),
+            };
             let upstream = mirror.upstream.0;
             let Some(&slot) = snapshot.upstream_slots.get(upstream) else {
                 continue;
@@ -2140,7 +2173,7 @@ impl Proxy {
             })
             .and_then(|at| {
                 let authority = snapshot.endpoints.get(upstream)?.get(at)?;
-                Some((at_endpoint(head.uri(), authority)?, destinations.get(at)?))
+                Some((at_endpoint(&target, authority)?, destinations.get(at)?))
             });
             let counters = self.metrics.upstream(slot);
             let Some((target, destination)) = found else {
@@ -2156,6 +2189,7 @@ impl Proxy {
                 upstream_slot: slot,
                 endpoint: Arc::clone(destination),
                 target,
+                fields,
             });
         }
         let kept = forward.rule.response_headers.is_some() || forward.rule.retry().is_some();
@@ -2212,6 +2246,9 @@ struct Mirrored {
     upstream_slot: usize,
     endpoint: Arc<ReuseIdentity>,
     target: Uri,
+    /// The fields as they stood at the mirror's place, before a change after it; none for
+    /// a copy of the request as it goes upstream.
+    fields: Option<HeaderMap>,
 }
 
 impl Directed {
@@ -4781,6 +4818,95 @@ upstreams:
         (front, worker)
     }
 
+    /// An HTTP/1 upstream answering its first request `first` and the rest `200`, one
+    /// request to a connection, and every head it was sent, in lower case.
+    fn recording_upstream(first: &'static str) -> (SocketAddr, Rc<RefCell<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let address = socket.local_addr().unwrap();
+        let socket = TcpListener::from_std(socket).unwrap();
+        let heads = Rc::new(RefCell::new(Vec::<String>::new()));
+        let seen = Rc::clone(&heads);
+        let _accepting = tokio::task::spawn_local(async move {
+            while let Ok((mut stream, _)) = socket.accept().await {
+                let mut read = Vec::new();
+                let mut chunk = [0; 4096];
+                while !read.windows(4).any(|four| four == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => read.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let status = if seen.borrow().is_empty() {
+                    first
+                } else {
+                    "200 OK"
+                };
+                seen.borrow_mut()
+                    .push(String::from_utf8_lossy(&read).to_lowercase());
+                let answer =
+                    format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                let _ = stream.write_all(answer.as_bytes()).await;
+            }
+        });
+        (address, heads)
+    }
+
+    /// A mirror is sent the request as it stands at its place in the rule's filters: one
+    /// before the rewrite, the path and host routed on; one after it, the rewritten ones,
+    /// as the upstream is (18 §5).
+    #[tokio::test]
+    async fn a_mirror_is_sent_the_request_as_it_stands_at_its_place() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (primary, sent) = recording_upstream("200 OK");
+                let (before, copied_before) = recording_upstream("200 OK");
+                let (after, copied_after) = recording_upstream("200 OK");
+                let mut config = everything_config(primary);
+                let mut copy = config.upstreams["up"].clone();
+                copy.endpoints = vec![before];
+                config.upstreams.insert("before".to_owned(), copy.clone());
+                copy.endpoints = vec![after];
+                config.upstreams.insert("after".to_owned(), copy);
+                let filters = [
+                    "{ type: request_mirror, upstream: before, fraction: { numerator: 1, denominator: 1 } }",
+                    "{ type: url_rewrite, host: one.example.org, path: { replace_prefix: /api } }",
+                    "{ type: request_mirror, upstream: after, fraction: { numerator: 1, denominator: 1 } }",
+                ];
+                for filter in filters {
+                    config.routes[0].rules[0]
+                        .filters
+                        .push(serde_saphyr::from_str(filter).unwrap());
+                }
+                let (front, _worker) = serving_config(&config).await;
+
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                until(|| copied_before.borrow().len() == 1 && copied_after.borrow().len() == 1)
+                    .await;
+                let rewritten = |head: &str| {
+                    head.starts_with("get /api/a/b?c=d http/1.1\r\n")
+                        && head.contains("\r\nhost: one.example.org\r\n")
+                };
+                assert!(rewritten(&sent.borrow()[0]), "{:?}", sent.borrow());
+                assert!(rewritten(&copied_after.borrow()[0]), "{:?}", copied_after.borrow());
+                let routed_on = &copied_before.borrow()[0];
+                assert!(
+                    routed_on.starts_with("get /a/b?c=d http/1.1\r\n"),
+                    "{routed_on}"
+                );
+                assert!(
+                    routed_on.contains("\r\nhost: shop.example.com\r\n"),
+                    "{routed_on}"
+                );
+                // The rest of the request is the request's.
+                assert!(routed_on.contains("\r\naccept: */*\r\n"), "{routed_on}");
+            })
+            .await;
+    }
+
     /// `everything_config`, its one rule rewriting to `one.example.org` and under `/api`.
     fn rewriting_config(upstream: SocketAddr) -> Config {
         let mut config = everything_config(upstream);
@@ -4819,39 +4945,10 @@ upstreams:
     /// request sent again: the rewrite is made once, before the first (18 §4).
     #[tokio::test]
     async fn every_try_is_sent_the_rewritten_path_and_host() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                // 503 to the first request, 200 to the rest; every head kept.
-                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let upstream = socket.local_addr().unwrap();
-                let heads = Rc::new(RefCell::new(Vec::<String>::new()));
-                let seen = Rc::clone(&heads);
-                let _accepting = tokio::task::spawn_local(async move {
-                    while let Ok((mut stream, _)) = socket.accept().await {
-                        let mut read = Vec::new();
-                        let mut chunk = [0; 4096];
-                        while !read.windows(4).any(|four| four == b"\r\n\r\n") {
-                            match stream.read(&mut chunk).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => read.extend_from_slice(&chunk[..n]),
-                            }
-                        }
-                        let first = seen.borrow().is_empty();
-                        seen.borrow_mut()
-                            .push(String::from_utf8_lossy(&read).to_lowercase());
-                        let status = if first {
-                            "503 Service Unavailable"
-                        } else {
-                            "200 OK"
-                        };
-                        let answer = format!(
-                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                        );
-                        let _ = stream.write_all(answer.as_bytes()).await;
-                    }
-                });
+                let (upstream, heads) = recording_upstream("503 Service Unavailable");
                 let mut config = rewriting_config(upstream);
                 config.routes[0].rules[0]
                     .forward

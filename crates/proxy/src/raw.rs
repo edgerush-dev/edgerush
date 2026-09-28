@@ -241,6 +241,19 @@ impl Head for RawHead {
             .map_err(|_| Rejection::Edits)
     }
 
+    fn to_map(&self) -> HeaderMap {
+        let mut map = HeaderMap::with_capacity(self.lines.len());
+        for (name, value) in self.fields().iter() {
+            // Every line was read as a field, and every edit made as one.
+            if let (Ok(name), Ok(value)) =
+                (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+            {
+                map.append(name, value);
+            }
+        }
+        map
+    }
+
     fn version(&self) -> Version {
         self.version
     }
