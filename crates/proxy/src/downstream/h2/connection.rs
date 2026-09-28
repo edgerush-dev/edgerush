@@ -27,6 +27,7 @@ use http_body::Body;
 use std::cell::{Cell, RefCell};
 use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 use std::time::Duration;
@@ -279,24 +280,15 @@ async fn drive<S, R, F, B, D>(
             }
         };
         streams.seen.set(streams.seen.get() + 1);
-        let open = Open::new(&streams);
-        let (storage, date, respond) = (Rc::clone(&storage), Rc::clone(&date), Rc::clone(&respond));
-        let idle = settings.idle;
-        let _detached = tokio::task::spawn_local(async move {
-            let answered = answer(
-                request,
-                Responder::new(send),
-                &*respond,
-                &storage,
-                &*date,
-                idle,
-            )
-            .await;
-            if answered == Ended::ResetEarly {
-                open.0.premature.set(open.0.premature.get() + 1);
-            }
-            drop(open);
-        });
+        let _detached = tokio::task::spawn_local(stream_task(
+            request,
+            Responder::new(send),
+            Open::new(&streams),
+            Rc::clone(&respond),
+            Rc::clone(&storage),
+            Rc::clone(&date),
+            settings.idle,
+        ));
     }
     // Idle for its keep-alive time: told to go, gracefully — a request already on its way is
     // still taken — and given its closing time to finish before the socket goes regardless.
@@ -365,6 +357,35 @@ fn send_interim(responder: &mut Responder, interim: &Interim) {
         *head.status_mut() = StatusCode::CONTINUE;
         let _sent = responder.interim(head);
     }
+}
+
+/// A stream's task: its answer, boxed, counted open while it lives. The answer's future is
+/// as large as its largest state, the exchange's included, several kilobytes; a task holds
+/// its future inline and moves all of it as the task is made and as it finishes. Boxed once
+/// here, what the task holds and moves is a pointer.
+fn stream_task<R, F, B, D>(
+    request: Request<::h2::RecvStream>,
+    responder: Responder,
+    open: Open,
+    respond: Rc<R>,
+    storage: Rc<Storage>,
+    date: Rc<D>,
+    idle: Duration,
+) -> Pin<Box<impl Future<Output = ()>>>
+where
+    R: Fn(Request<RequestBody>, Interim) -> F,
+    F: Future<Output = Answered<B>>,
+    B: Body<Data = Bytes>,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    D: Fn() -> HttpDate,
+{
+    Box::pin(async move {
+        let answered = answer(request, responder, &*respond, &storage, &*date, idle).await;
+        if answered == Ended::ResetEarly {
+            open.0.premature.set(open.0.premature.get() + 1);
+        }
+        drop(open);
+    })
 }
 
 /// Answers one stream.
@@ -436,6 +457,43 @@ mod tests {
         LONG, locally, locally_paused, post, serving, wire, within,
     };
     use http_body_util::{BodyExt, Full};
+
+    /// What a future `make` returns takes, without one being made.
+    fn size_of_made<A, F>(_make: impl FnOnce(A) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    /// A stream's task holds a pointer to its answer's future, not the future itself, which
+    /// the task would copy whole as it is made and as it finishes (14 §3).
+    #[test]
+    fn a_stream_task_holds_its_answer_boxed() {
+        type Respond =
+            fn(Request<RequestBody>, Interim) -> std::future::Ready<Answered<Full<Bytes>>>;
+        type Date = fn() -> HttpDate;
+        type Asked = (
+            Request<::h2::RecvStream>,
+            Responder,
+            Open,
+            Rc<Respond>,
+            Rc<Storage>,
+            Rc<Date>,
+        );
+        let task = size_of_made(
+            |(request, responder, open, respond, storage, date): Asked| {
+                stream_task(request, responder, open, respond, storage, date, LONG)
+            },
+        );
+        let answer = size_of_made(
+            |(request, responder, _, respond, storage, date): Asked| async move {
+                answer(request, responder, &*respond, &storage, &*date, LONG).await
+            },
+        );
+        assert_eq!(
+            task,
+            std::mem::size_of::<usize>(),
+            "a stream's task holds {task} bytes; its answer's future is {answer}"
+        );
+    }
 
     /// A stream whose upload nobody reads holds at most its stream window of the connection
     /// window, so another stream on the same connection uploads megabytes past it: 16 MiB
