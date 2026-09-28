@@ -11,6 +11,7 @@
 
 use crate::downstream::h3::hq;
 use crate::h3_peer::client_config;
+use crate::stall::Watch;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -71,6 +72,9 @@ pub(crate) struct Client {
     hq_next: u64,
     /// HTTP/0.9 answers are left unread, as by a client that takes no more.
     pub(crate) hq_unread: bool,
+    /// The longest the client went between turns, for a failure to say whether the machine
+    /// stood the test still.
+    pub(crate) stalls: Watch,
 }
 
 impl Client {
@@ -118,6 +122,7 @@ impl Client {
             path_carries: None,
             hq_next: 0,
             hq_unread: false,
+            stalls: Watch::default(),
         }
     }
 
@@ -160,7 +165,8 @@ impl Client {
             }
             assert!(
                 started.elapsed() < PATIENCE,
-                "waited for something that never happened"
+                "waited for something that never happened{}",
+                self.stalls.note()
             );
             self.turn(Duration::from_millis(20)).await;
         }
@@ -195,6 +201,7 @@ impl Client {
 
     /// Reads what comes within `wait`, or quiche's own timeout if that is sooner.
     async fn turn(&mut self, wait: Duration) {
+        self.stalls.tick();
         let wait = self
             .quic
             .timeout()
@@ -369,7 +376,8 @@ impl Client {
             }
             assert!(
                 started.elapsed() < PATIENCE,
-                "the server never took the body"
+                "the server never took the body{}",
+                self.stalls.note()
             );
             self.flush().await;
             self.turn(Duration::from_millis(20)).await;

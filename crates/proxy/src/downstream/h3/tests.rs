@@ -472,7 +472,17 @@ fn connections_that_found_no_room_all_go_on_when_there_is() {
         for client in &mut clients {
             client.hear_for(Duration::from_millis(50)).await;
         }
-        assert!(server.shared.sending.refused.get() >= 2);
+        let stalls = |clients: &[Client]| {
+            clients
+                .iter()
+                .map(|client| client.stalls.note())
+                .collect::<String>()
+        };
+        assert!(
+            server.shared.sending.refused.get() >= 2,
+            "the answers were not made while the socket was full{}",
+            stalls(&clients)
+        );
         assert!(clients.iter().all(|client| client.answers.is_empty()));
 
         // Room again: the kernel says so to whoever asked.
@@ -498,7 +508,8 @@ fn connections_that_found_no_room_all_go_on_when_there_is() {
             assert_eq!(
                 body_of(&answer),
                 "GET /x 0 None",
-                "left waiting: {answer:?}"
+                "left waiting: {answer:?}{}",
+                client.stalls.note()
             );
         }
     });
@@ -1733,6 +1744,35 @@ fn a_client_rebound_during_a_large_answer_gets_it_whole() {
     });
 }
 
+/// The client notes a stretch in which the test did not run while it waited, for a failure
+/// to say that the machine stood it still rather than that the server did nothing.
+#[test]
+fn the_client_notes_a_stall_while_it_waits() {
+    locally(async {
+        let server = serving(short(), echo).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let id = client.request(&get("a.test", "/x"), true);
+        let stood = Cell::new(false);
+        client
+            .until(|client| {
+                // The thread put to sleep once mid-wait, as a stalled machine would hold it.
+                if !stood.replace(true) {
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+                client
+                    .answers
+                    .get(&id)
+                    .is_some_and(|answer| answer.finished)
+            })
+            .await;
+        let pause = client.stalls.longest().expect("no stall noted");
+        assert!(pause.gap >= Duration::from_millis(400), "{pause:?}");
+        if cfg!(target_os = "linux") {
+            assert!(client.stalls.note().contains("stood still"), "{pause:?}");
+        }
+    });
+}
+
 // HTTP/0.9 over QUIC, as quic-interop-runner's transport cases speak it (16 §8).
 
 /// A GET's line goes to the core as an HTTP/3 GET of the name the client asked for, and the
@@ -1836,7 +1876,13 @@ fn a_large_hq_answer_arrives_whole() {
         let mut client = Client::connect_hq(server.address, "a.test").await;
         let id = client.hq_request(b"GET /big\r\n", true);
         let answer = client.answer(id).await;
-        assert!(answer.finished);
+        assert!(
+            answer.finished,
+            "reset {:?} after {} bytes{}",
+            answer.reset,
+            answer.body.len(),
+            client.stalls.note()
+        );
         assert_eq!(answer.body.len(), SIZE);
         assert!(
             answer

@@ -40,6 +40,9 @@ pub mod hop_by_hop;
 mod hop_by_hop;
 pub mod host;
 mod interim;
+// Whether a failed test waited on the code or on a machine that stood it still.
+#[cfg(test)]
+mod stall;
 // Private, save when the fuzz targets are being built.
 #[cfg(feature = "fuzzing")]
 pub mod l4;
