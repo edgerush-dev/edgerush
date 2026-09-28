@@ -66,46 +66,70 @@ pub(crate) fn forward<H: Head>(
     client: &Client,
 ) -> Result<(), Rejection> {
     let forwarding = &listener.forwarding;
-    let trusted = forwarding.trusted_proxies.trusts(client.address);
-    if !trusted && !forwarding.trusted_only_headers.is_empty() {
-        head.remove_where(|name| forwarding.trusted_only_headers.matches(name))?;
-    }
-    let forwarded_for = if trusted {
-        let found = client_address(
-            client.address,
-            head.fields().values(&FORWARDED_FOR),
-            &forwarding.trusted_proxies,
-        );
-        if found == client.address {
-            client.value.clone()
-        } else {
-            address_value(found)
-        }
+    // QUIC is always over TLS, and only an `https` listener serves it.
+    let proto = proto_value(listener.protocol == Protocol::Https);
+    if forwarding.trusted_proxies.trusts(client.address) {
+        from_trusted_proxy(head, listener, client, proto)?;
     } else {
-        client.value.clone()
-    };
-    head.set_field(FORWARDED_FOR, forwarded_for)?;
-    if !trusted || !has(head, &FORWARDED_PROTO) {
-        // QUIC is always over TLS, and only an `https` listener serves it.
-        head.set_field(
-            FORWARDED_PROTO,
-            proto_value(listener.protocol == Protocol::Https),
-        )?;
-    }
-    if !trusted || !has(head, &FORWARDED_HOST) {
-        match head.host_value() {
-            Some(host) => head.set_field(FORWARDED_HOST, host)?,
-            // No host to give, and the request is refused for it as it is routed; what
-            // the client said is not left meanwhile.
-            None if !trusted => {
-                head.remove_where(|name| {
-                    name.eq_ignore_ascii_case(FORWARDED_HOST.as_str().as_bytes())
-                })?;
-            }
-            None => {}
+        // One pass over the names takes off what the client said of forwarding and what only
+        // a trusted proxy may send; what the gateway says is then added, with nothing of
+        // the same name left to look for.
+        let only = &forwarding.trusted_only_headers;
+        head.remove_where(|name| is_the_gateways(name) || only.matches(name))?;
+        head.append_field(FORWARDED_FOR, client.value.clone())?;
+        head.append_field(FORWARDED_PROTO, proto)?;
+        // No host to give, the request is refused for it as it is routed.
+        if let Some(host) = head.host_value() {
+            head.append_field(FORWARDED_HOST, host)?;
         }
     }
     head.append_field(VIA, via_value(head.version()))
+}
+
+/// The same for a request from a trusted proxy: the client its chain names, and its scheme
+/// and host as it said them, or the gateway's where it said none.
+fn from_trusted_proxy<H: Head>(
+    head: &mut H,
+    listener: &CompiledListener,
+    client: &Client,
+    proto: HeaderValue,
+) -> Result<(), Rejection> {
+    let found = client_address(
+        client.address,
+        head.fields().values(&FORWARDED_FOR),
+        &listener.forwarding.trusted_proxies,
+    );
+    let forwarded_for = if found == client.address {
+        client.value.clone()
+    } else {
+        address_value(found)
+    };
+    head.set_field(FORWARDED_FOR, forwarded_for)?;
+    if !has(head, &FORWARDED_PROTO) {
+        head.append_field(FORWARDED_PROTO, proto)?;
+    }
+    if !has(head, &FORWARDED_HOST)
+        && let Some(host) = head.host_value()
+    {
+        head.append_field(FORWARDED_HOST, host)?;
+    }
+    Ok(())
+}
+
+/// Whether `name`, in whatever case, is one of the three the gateway says itself.
+fn is_the_gateways(name: &[u8]) -> bool {
+    const FRONT: &[u8] = b"x-forwarded-";
+    // Nearly every name is ruled out by its first byte.
+    name.first()
+        .is_some_and(|first| first.eq_ignore_ascii_case(&b'x'))
+        && name
+            .get(..FRONT.len())
+            .is_some_and(|front| front.eq_ignore_ascii_case(FRONT))
+        && name.get(FRONT.len()..).is_some_and(|rest| {
+            rest.eq_ignore_ascii_case(b"for")
+                || rest.eq_ignore_ascii_case(b"proto")
+                || rest.eq_ignore_ascii_case(b"host")
+        })
 }
 
 /// Whether `head` has a field called `name`.

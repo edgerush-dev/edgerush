@@ -162,6 +162,12 @@ enum Entry {
 
 impl Entry {
     fn matches(&self, name: &[u8]) -> bool {
+        // The first byte first: every request's every name is asked about, and that alone
+        // rules out nearly all of them. An entry is never empty, and is in lower case.
+        let (Self::Whole(entry) | Self::Front(entry)) = self;
+        if name.first().map(u8::to_ascii_lowercase) != entry.first().copied() {
+            return false;
+        }
         match self {
             Self::Whole(whole) => name.eq_ignore_ascii_case(whole),
             Self::Front(front) => name
