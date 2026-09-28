@@ -16,6 +16,7 @@ use crate::downstream::h3::code;
 use crate::downstream::h3::conn::{Slot, Stream};
 use crate::downstream::h3::connection::stopped_already;
 use crate::downstream::h3::head::{self, RequestHead};
+use crate::forwarding::Client;
 use crate::interim::Interim;
 use crate::request_body::RequestBody;
 use bytes::Bytes;
@@ -133,10 +134,11 @@ fn refuse(quic: &mut quiche::Connection, id: u64) {
 pub(crate) async fn answer<R, F, B>(
     stream: Stream,
     head: RequestHead,
+    client: Rc<Client>,
     respond: Rc<R>,
     idle: Duration,
 ) where
-    R: Fn(Request<RequestBody>, Interim) -> F,
+    R: Fn(Request<RequestBody>, Interim, Rc<Client>) -> F,
     F: Future<Output = Answered<B>>,
     B: Body<Data = Bytes>,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
@@ -144,7 +146,7 @@ pub(crate) async fn answer<R, F, B>(
     let interim = Interim::listened(false, Version::HTTP_3, true);
     let body = IncomingH3::new(Rc::clone(&stream.conn), stream.id, None, true, idle);
     let request = Request::from_parts(head.parts, RequestBody::H3(body));
-    let mut answering = pin!(respond(request, interim));
+    let mut answering = pin!(respond(request, interim, client));
     // Stopped by the client, or the connection gone: the exchange goes with the answer
     // nobody will take, as an HTTP/3 one does.
     let Some(answered) = poll_fn(|cx| {

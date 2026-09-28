@@ -23,6 +23,7 @@ use crate::downstream::h2;
 pub use crate::downstream::h3::listener::Forwarding;
 use crate::downstream::h3::{self, listener as h3_listener};
 use crate::drain::Drain;
+use crate::forwarding::Client;
 use crate::gathered::Gathered;
 use crate::grpc::answer::{Answered as GrpcAnswered, Count, is_grpc_answer};
 use crate::grpc::call::Call;
@@ -383,7 +384,7 @@ pub struct Worker {
 
 /// Serves `socket`, a connection of `ours` that speaks HTTP/1, with our own server (14).
 /// `asking` is set when the first request is handed over.
-async fn serve_h1<S>(ours: Rc<Connection>, asking: Rc<Cell<bool>>, socket: S)
+async fn serve_h1<S>(ours: Rc<Connection>, client: Rc<Client>, asking: Rc<Cell<bool>>, socket: S)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -394,7 +395,7 @@ where
     // it, so that it is not moved into another on every request.
     let respond = move |head: RawHead, body, interim| {
         asking.set(true);
-        Rc::clone(&ours.worker).handle_head(listener, head, body, Some(interim))
+        Rc::clone(&ours.worker).handle_head(listener, Rc::clone(&client), head, body, Some(interim))
     };
     let slots = slots_for(&worker.slots, &respond);
     let _ended = h1::serve(
@@ -424,6 +425,7 @@ where
 /// HTTP/2 the handshake agrees on (ALPN).
 async fn serve_tls(
     ours: Rc<Connection>,
+    client: Rc<Client>,
     asking: Rc<Cell<bool>>,
     deadlines: Deadlines,
     tls: &Tls,
@@ -435,17 +437,22 @@ async fn serve_tls(
         return;
     };
     if secured.ssl().selected_alpn_protocol() == Some(tls::H2) {
-        serve_h2(ours, asking, deadlines, secured).await;
+        serve_h2(ours, client, asking, deadlines, secured).await;
     } else {
         // An answer's pieces sealed as one record, not one each.
-        serve_h1(ours, asking, Gathered::new(secured)).await;
+        serve_h1(ours, client, asking, Gathered::new(secured)).await;
     }
 }
 
 /// Serves `socket`, a connection of `ours` that speaks HTTP/2, over h2 (15 step 2).
 /// `asking` is set when the first request is handed over.
-async fn serve_h2<S>(ours: Rc<Connection>, asking: Rc<Cell<bool>>, deadlines: Deadlines, socket: S)
-where
+async fn serve_h2<S>(
+    ours: Rc<Connection>,
+    client: Rc<Client>,
+    asking: Rc<Cell<bool>>,
+    deadlines: Deadlines,
+    socket: S,
+) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let worker = Rc::clone(&ours.worker);
@@ -455,7 +462,7 @@ where
     let date = Rc::new(move || dating.date.get());
     let respond = Rc::new(move |request: Request<RequestBody>, interim| {
         asking.set(true);
-        Rc::clone(&ours.worker).handle(listener, request, Some(interim))
+        Rc::clone(&ours.worker).handle(listener, Rc::clone(&client), request, Some(interim))
     });
     let settings = h2::connection::Settings {
         keep_alive: deadlines.next_request,
@@ -1107,6 +1114,8 @@ impl Worker {
     pub async fn serve_connection(self: Rc<Self>, listener: usize, stream: TcpStream) {
         // Worth having, not worth refusing a connection over.
         let _unset = stream.set_nodelay(true);
+        // Gone only if the client already is.
+        let peer = stream.peer_addr();
         let deadlines = self.deadlines;
         let (tls, passthrough) = {
             let snapshot = self.proxy.current.load();
@@ -1123,6 +1132,11 @@ impl Worker {
             return self.pass_through(listener, stream, by_name).await;
         }
         let connection = Rc::new(Connection::open(self, listener));
+        let Ok(peer) = peer else {
+            return;
+        };
+        // Who the upstream is told the client is, written once for all its requests.
+        let client = Rc::new(Client::new(peer.ip()));
         // Set when the engine hands over the first request, which is the end of the one
         // stretch its own deadlines do not cover.
         let asked = Rc::new(Cell::new(false));
@@ -1139,15 +1153,17 @@ impl Worker {
                 // Told apart by our own detector.
                 None => match detect(lent).await {
                     Ok(Some((Protocol::Http1, replay))) => {
-                        serve_h1(ours, ours_asking, replay).await;
+                        serve_h1(ours, client, ours_asking, replay).await;
                     }
                     Ok(Some((Protocol::Http2, replay))) => {
-                        Box::pin(serve_h2(ours, ours_asking, deadlines, replay)).await;
+                        Box::pin(serve_h2(ours, client, ours_asking, deadlines, replay)).await;
                     }
                     // Closed having said nothing, or failed before saying enough.
                     Ok(None) | Err(_) => {}
                 },
-                Some(tls) => Box::pin(serve_tls(ours, ours_asking, deadlines, &tls, lent)).await,
+                Some(tls) => {
+                    Box::pin(serve_tls(ours, client, ours_asking, deadlines, &tls, lent)).await;
+                }
             }
         };
         // From accept to the first request, whichever server takes the connection: the
@@ -1403,9 +1419,11 @@ impl Worker {
             Some(h3_listener::InForce { tls, force_retry })
         };
         let answering = Rc::clone(&self);
-        let respond = Rc::new(move |request: Request<RequestBody>, interim| {
-            Rc::clone(&answering).handle(listener, request, Some(interim))
-        });
+        let respond = Rc::new(
+            move |request: Request<RequestBody>, interim, client: Rc<Client>| {
+                Rc::clone(&answering).handle(listener, client, request, Some(interim))
+            },
+        );
         let dating = Rc::clone(&self);
         let date = Rc::new(move || dating.date.get());
         let opening = Rc::clone(&self);
@@ -1423,11 +1441,12 @@ impl Worker {
     fn handle(
         self: Rc<Self>,
         listener: usize,
+        client: Rc<Client>,
         request: Request<RequestBody>,
         interim: Option<Interim>,
     ) -> impl Future<Output = Answered<Body>> {
         let (head, body) = request.into_parts();
-        self.handle_head(listener, head, body, interim)
+        self.handle_head(listener, client, head, body, interim)
     }
 
     /// The same for a request's head of whatever kind: a map, or the raw head our own
@@ -1435,12 +1454,15 @@ impl Worker {
     async fn handle_head<H: Forwarded>(
         self: Rc<Self>,
         listener: usize,
+        client: Rc<Client>,
         head: H,
         body: RequestBody,
         interim: Option<Interim>,
     ) -> Answered<Body> {
         let came_in = Instant::now();
-        let mut answered = self.respond_to(listener, head, body, interim).await;
+        let mut answered = self
+            .respond_to(listener, &client, head, body, interim)
+            .await;
         self.proxy.advertise(listener, &mut answered);
         if let Some(counters) = self.proxy.metrics.listener(listener) {
             let took = u64::try_from(came_in.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1452,6 +1474,7 @@ impl Worker {
     async fn respond_to<H: Forwarded>(
         &self,
         listener: usize,
+        client: &Client,
         mut head: H,
         body: RequestBody,
         interim: Option<Interim>,
@@ -1475,7 +1498,7 @@ impl Worker {
         // from and everything it named looks like an ordinary field, so a trailer of that
         // name would travel on ([13 §4](../../docs/13-http1-upstream.md)).
         let nominated = crate::hop_by_hop::nominated(head.outgoing());
-        let mut directed = match self.proxy.direct(listener, &mut head) {
+        let mut directed = match self.proxy.direct(listener, client, &mut head) {
             Ok(Directing::Upstream(directed)) => directed,
             Ok(Directing::Redirect(redirect)) => {
                 return self.proxy.redirect(listener, redirect, call).into();
@@ -2166,7 +2189,12 @@ impl Proxy {
     /// on one snapshot, which is let go of before anything is waited for; what is kept for
     /// the response is the rule, and only if it has something to do to the response, and
     /// the slot of the upstream's counters.
-    fn direct<H: Forwarded>(&self, listener: usize, head: &mut H) -> Result<Directing, Answer> {
+    fn direct<H: Forwarded>(
+        &self,
+        listener: usize,
+        client: &Client,
+        head: &mut H,
+    ) -> Result<Directing, Answer> {
         let snapshot = self.current.load();
         let listener = snapshot
             .listeners
@@ -2175,7 +2203,7 @@ impl Proxy {
             .flatten()
             .and_then(|position| snapshot.config.listeners.get(position))
             .ok_or(Answer::NoRoute)?;
-        let forward = match decide(&snapshot.config, listener, head, &mut random)? {
+        let forward = match decide(&snapshot.config, listener, head, client, &mut random)? {
             Decision::Forward(forward) => forward,
             Decision::Redirect(redirected) => {
                 return Ok(Directing::Redirect(Redirect {
@@ -2721,24 +2749,33 @@ mod tests {
     #[test]
     fn a_connection_is_no_larger_than_plain_http1_needs() {
         use crate::downstream::detect::Replay;
-        type Plain = (Rc<Connection>, Rc<Cell<bool>>, Replay<Lent>);
+        type Plain = (Rc<Connection>, Rc<Client>, Rc<Cell<bool>>, Replay<Lent>);
         type Secured = (
             Rc<Connection>,
+            Rc<Client>,
             Rc<Cell<bool>>,
             Deadlines,
             &'static Tls,
             Lent,
         );
-        type Http2 = (Rc<Connection>, Rc<Cell<bool>>, Deadlines, Replay<Lent>);
+        type Http2 = (
+            Rc<Connection>,
+            Rc<Client>,
+            Rc<Cell<bool>>,
+            Deadlines,
+            Replay<Lent>,
+        );
         let connection = size_of_made(|(worker, stream): (Rc<Worker>, TcpStream)| {
             worker.serve_connection(0, stream)
         });
-        let plain = size_of_made(|(ours, asking, socket): Plain| serve_h1(ours, asking, socket));
-        let tls = size_of_made(|(ours, asking, deadlines, tls, socket): Secured| {
-            serve_tls(ours, asking, deadlines, tls, socket)
+        let plain = size_of_made(|(ours, client, asking, socket): Plain| {
+            serve_h1(ours, client, asking, socket)
         });
-        let h2 = size_of_made(|(ours, asking, deadlines, socket): Http2| {
-            serve_h2(ours, asking, deadlines, socket)
+        let tls = size_of_made(|(ours, client, asking, deadlines, tls, socket): Secured| {
+            serve_tls(ours, client, asking, deadlines, tls, socket)
+        });
+        let h2 = size_of_made(|(ours, client, asking, deadlines, socket): Http2| {
+            serve_h2(ours, client, asking, deadlines, socket)
         });
         assert!(
             connection <= plain + 768,
@@ -3578,7 +3615,7 @@ mod tests {
                 let yaml = format!(
                     r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http }}
+  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }} }}
 routes:
   - name: everything
     listeners: [web]
@@ -5089,6 +5126,145 @@ upstreams:
             .await;
     }
 
+    /// `everything_config`, its `web` listener trusting `trusted` and taking off the control
+    /// plane's default trusted-only headers from anyone else.
+    fn forwarding_config(upstream: SocketAddr, trusted: &[&str]) -> Config {
+        let mut config = everything_config(upstream);
+        config.listeners.get_mut("web").unwrap().forwarding = Some(edgerush_config::Forwarding {
+            trusted_proxies: trusted.iter().map(|range| (*range).to_owned()).collect(),
+            trusted_only_headers: ["Forwarded", "X-Real-IP", "X-Forwarded-*"]
+                .map(str::to_owned)
+                .to_vec(),
+        });
+        config
+    }
+
+    /// Over HTTP/1.1 and HTTP/2 alike, the upstream is told who the client is — the peer of
+    /// the connection, which no proxy in front vouched for — and not what the client said
+    /// of it; the scheme and host it asked for; and that it came through the gateway.
+    #[tokio::test]
+    async fn the_upstream_is_told_who_the_client_is_whatever_it_spoke() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, heads) = recording_upstream("200 OK");
+                let (front, _worker) = serving_config(&forwarding_config(upstream, &[])).await;
+
+                let answer = h1_answer(
+                    front,
+                    b"GET /a HTTP/1.1\r\nhost: shop.example.com:8080\r\nconnection: close\r\n\
+                      x-forwarded-for: 10.9.9.9\r\nx-forwarded-proto: https\r\n\
+                      forwarded: for=10.9.9.9\r\nx-real-ip: 10.9.9.9\r\nvia: 1.0 cdn\r\n\r\n",
+                )
+                .await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                let head = heads.borrow()[0].clone();
+                for line in [
+                    "\r\nx-forwarded-for: 127.0.0.1\r\n",
+                    "\r\nx-forwarded-proto: http\r\n",
+                    "\r\nx-forwarded-host: shop.example.com:8080\r\n",
+                    "\r\nvia: 1.0 cdn\r\n",
+                    "\r\nvia: 1.1 edgerush\r\n",
+                ] {
+                    assert!(head.contains(line), "{line:?} in {head}");
+                }
+                for gone in ["10.9.9.9", "forwarded:", "x-real-ip", "https"] {
+                    assert!(!head.contains(gone), "{gone:?} in {head}");
+                }
+
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::get("http://shop.example.com/b")
+                    .header("x-forwarded-for", "10.9.9.9")
+                    .body(())
+                    .unwrap();
+                let (answer, _) = send.send_request(request, true).unwrap();
+                assert_eq!(within(answer).await.unwrap().status(), StatusCode::OK);
+                let head = heads.borrow()[1].clone();
+                for line in [
+                    "\r\nx-forwarded-for: 127.0.0.1\r\n",
+                    "\r\nx-forwarded-proto: http\r\n",
+                    "\r\nx-forwarded-host: shop.example.com\r\n",
+                    "\r\nvia: 2 edgerush\r\n",
+                ] {
+                    assert!(head.contains(line), "{line:?} in {head}");
+                }
+                assert!(!head.contains("10.9.9.9"), "{head}");
+            })
+            .await;
+    }
+
+    /// A proxy in front that the listener trusts names the client, and says what scheme and
+    /// host the client asked for.
+    #[tokio::test]
+    async fn a_trusted_proxy_in_front_names_the_client() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, heads) = recording_upstream("200 OK");
+                let config = forwarding_config(upstream, &["127.0.0.0/8"]);
+                let (front, _worker) = serving_config(&config).await;
+
+                let answer = h1_answer(
+                    front,
+                    b"GET /a HTTP/1.1\r\nhost: internal:8080\r\nconnection: close\r\n\
+                      x-forwarded-for: 1.2.3.4, 198.51.100.9\r\nx-forwarded-proto: https\r\n\
+                      x-forwarded-host: shop.example.com\r\n\r\n",
+                )
+                .await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                let head = heads.borrow()[0].clone();
+                for line in [
+                    "\r\nx-forwarded-for: 198.51.100.9\r\n",
+                    "\r\nx-forwarded-proto: https\r\n",
+                    "\r\nx-forwarded-host: shop.example.com\r\n",
+                ] {
+                    assert!(head.contains(line), "{line:?} in {head}");
+                }
+                assert!(!head.contains("1.2.3.4"), "{head}");
+            })
+            .await;
+    }
+
+    /// Over HTTP/3 the client is the peer of the path its requests came on, and the scheme
+    /// `https`.
+    #[tokio::test]
+    async fn the_upstream_is_told_who_an_http3_client_is() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::downstream::h3::testing::{Client, get};
+                let (upstream, heads) = recording_upstream("200 OK");
+                let http3 = edgerush_config::Http3 {
+                    alt_svc_max_age: 60,
+                    force_retry: false,
+                };
+                let mut config = h3_config(upstream, http3);
+                config.listeners.get_mut("web").unwrap().forwarding =
+                    forwarding_config(upstream, &[]).listeners["web"]
+                        .forwarding
+                        .clone();
+                let (front, _) = serving_h3(&config).await;
+                let mut client = Client::connect(front, "a.test").await;
+
+                let mut fields = get("a.test", "/c");
+                fields.push(("x-forwarded-for", "10.9.9.9"));
+                let id = client.request(&fields, true);
+                let answer = client.answer(id).await;
+                assert_eq!(answer.final_status(), Some("200"));
+                let head = heads.borrow()[0].clone();
+                for line in [
+                    "\r\nx-forwarded-for: 127.0.0.1\r\n",
+                    "\r\nx-forwarded-proto: https\r\n",
+                    "\r\nx-forwarded-host: a.test\r\n",
+                    "\r\nvia: 3 edgerush\r\n",
+                ] {
+                    assert!(head.contains(line), "{line:?} in {head}");
+                }
+                assert!(!head.contains("10.9.9.9"), "{head}");
+            })
+            .await;
+    }
+
     /// `everything_config`, its one rule rewriting to `one.example.org` and under `/api`.
     fn rewriting_config(upstream: SocketAddr) -> Config {
         let mut config = everything_config(upstream);
@@ -5146,7 +5322,13 @@ upstreams:
                 for head in heads.iter() {
                     assert!(head.starts_with("get /api/a/b?c=d http/1.1\r\n"), "{head}");
                     assert!(head.contains("\r\nhost: one.example.org\r\n"), "{head}");
-                    assert!(!head.contains("shop.example.com"), "{head}");
+                    // The host the client asked for is where the upstream is told of it, and
+                    // nowhere else.
+                    assert!(
+                        head.contains("\r\nx-forwarded-host: shop.example.com\r\n"),
+                        "{head}"
+                    );
+                    assert_eq!(head.matches("shop.example.com").count(), 1, "{head}");
                 }
             })
             .await;
@@ -9320,7 +9502,7 @@ upstreams:
         let yaml = format!(
             r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http }}
+  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }} }}
 routes:
   - name: everything
     listeners: [web]
@@ -9560,7 +9742,9 @@ upstreams:
     fn config_with(listeners: &[&str]) -> Compiled {
         let mut yaml = String::from("routes: []\nupstreams: {}\nlisteners:\n");
         for (at, name) in listeners.iter().enumerate() {
-            yaml += &format!("  {name}: {{ address: \"127.0.0.1:{at}\", protocol: http }}\n");
+            yaml += &format!(
+                "  {name}: {{ address: \"127.0.0.1:{at}\", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }} }}\n"
+            );
         }
         let config: Config = serde_saphyr::from_str(&yaml).unwrap();
         compile(&config).unwrap()

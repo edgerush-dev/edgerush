@@ -213,7 +213,7 @@ async fn proxy_to(upstream: SocketAddr) -> SocketAddr {
     let yaml = format!(
         r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http }}
+  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }} }}
 routes:
   - name: echo
     listeners: [web]

@@ -209,9 +209,13 @@ pub(crate) fn is_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
+/// Whether a connection option names what the gateway tells the upstream: the host, who the
+/// client is (`X-Forwarded-*`), and that the request came through it (`Via`), which the
+/// gateway adds to whatever the client's said (RFC 9110 §7.6.3).
 fn is_protected(option: &[u8]) -> bool {
     const FORWARDED: &[u8] = b"x-forwarded-";
     option.eq_ignore_ascii_case(b"host")
+        || option.eq_ignore_ascii_case(b"via")
         || option
             .get(..FORWARDED.len())
             .is_some_and(|start| start.eq_ignore_ascii_case(FORWARDED))
@@ -223,7 +227,7 @@ pub enum ConnectionError {
     /// A connection option that is not a token.
     #[error("Connection header is not a list of tokens")]
     Malformed,
-    /// A connection option that names `Host` or an `X-Forwarded-*` header.
+    /// A connection option that names `Host`, `Via` or an `X-Forwarded-*` header.
     #[error("Connection header names a header that must reach the upstream")]
     Protected,
 }
@@ -587,6 +591,8 @@ mod tests {
             "x-forwarded-for",
             "X-Forwarded-Host",
             "x-forwarded-",
+            "Via",
+            "keep-alive, via",
         ] {
             let headers = headers(&[("connection", connection)]);
             assert_eq!(
@@ -599,7 +605,7 @@ mod tests {
         assert_eq!(check_connection(&second), Err(ConnectionError::Protected));
 
         // Near misses name other headers.
-        for connection in ["hosts", "x-forwarded", "forwarded"] {
+        for connection in ["hosts", "x-forwarded", "forwarded", "vias"] {
             let headers = headers(&[("connection", connection)]);
             assert_eq!(check_connection(&headers), Ok(()), "{connection}");
         }

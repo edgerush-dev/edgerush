@@ -12,8 +12,11 @@
 //! answered with a `Location` made from what was routed on. What the
 //! request said about the connection it came in on is taken off ([`crate::hop_by_hop`])
 //! before the rule's own changes to the headers. A cookie string that came in pieces, as
-//! HTTP/2 allows, is put together before anything looks at it ([`crate::cookies`]).
+//! HTTP/2 allows, is put together before anything looks at it ([`crate::cookies`]). What
+//! the upstream is told of the client — `X-Forwarded-*` and `Via` — is made before routing,
+//! so that a rule reads what the upstream will ([`crate::forwarding`]).
 
+use crate::forwarding::{Client, forward};
 use crate::head::Head;
 use crate::hop_by_hop::ConnectionError;
 use crate::host::{HostError, bare_host};
@@ -123,10 +126,10 @@ impl Rejection {
     }
 }
 
-/// Decides where a request that came in on `listener` goes, and makes its head what the
-/// upstream is to see: the normalised path, a `Host` field that names the host that was
-/// routed on, the cookie string in one piece, no hop-by-hop headers, and the rule's changes
-/// to the headers, and the rule's rewrite of path and host, which is made from the
+/// Decides where a request from `client` that came in on `listener` goes, and makes its
+/// head what the upstream is to see: the normalised path, a `Host` field that names the host
+/// that was routed on, the cookie string in one piece, what the upstream is told of the
+/// client, no hop-by-hop headers, and the rule's changes to the headers, and the rule's rewrite of path and host, which is made from the
 /// normalised path and never routes again. The rule's changes are made in the order its
 /// filters are written, and a mirror of the rule's placed before one of them takes a copy
 /// of the request as it stands there. A request its rule redirects is answered with
@@ -143,12 +146,14 @@ impl Rejection {
 /// # Errors
 ///
 /// Returns a [`Rejection`] for a request to answer locally. Its target is then as it came;
-/// of its headers, a cookie string that came in pieces may be whole and the `Host` field
-/// may have been made to agree with the target, as both are before anything is matched.
+/// of its headers, a cookie string that came in pieces may be whole, the `Host` field may
+/// have been made to agree with the target, and what the upstream is told of the client
+/// may have been made, as all three are before anything is matched.
 pub fn decide<'a, H: Head>(
     snapshot: &'a Compiled,
     listener: &CompiledListener,
     head: &mut H,
+    client: &Client,
     random: &mut impl FnMut() -> u64,
 ) -> Result<Decision<'a>, Rejection> {
     let found = head.survey();
@@ -180,6 +185,9 @@ pub fn decide<'a, H: Head>(
         }
     }
     head.agree_host()?;
+    // Before routing, so that a rule's predicates read what the upstream will be told, and
+    // before the host is borrowed from the head for routing.
+    forward(head, listener, client)?;
     let host = match (named, head.uri().authority()) {
         (Some(length), Some(authority)) => {
             authority.as_str().get(..length).ok_or(HostError::Invalid)?
@@ -344,13 +352,19 @@ mod tests {
     use http::{Method, Request};
     use proptest::prelude::*;
 
+    /// A client that is no trusted proxy.
+    fn peer() -> Client {
+        Client::new("203.0.113.7".parse().unwrap())
+    }
+
     const SHOP: &str = r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http }
-  admin: { address: "[::]:9090", protocol: http }
+  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] } }
+  admin: { address: "[::]:9090", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] } }
+  secure: { address: "[::]:8443", protocol: https, tls: { certificates: [{ chain: "C", key: "K" }] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] } }
 routes:
   - name: shop
-    listeners: [web]
+    listeners: [web, secure]
     hostnames:
       - { name: shop.example.com, falls_through: true }
     rules:
@@ -378,6 +392,21 @@ routes:
       - matches:
           - path: { prefix: /account }
             headers: [{ name: Cookie, value: { exact: "a=1; b=2" } }]
+        forward:
+          backends:
+            - { upstream: search, weight: 1 }
+      - matches:
+          - path: { prefix: /plain }
+            headers: [{ name: X-Forwarded-Proto, value: { exact: http } }]
+        forward:
+          backends:
+            - { upstream: search, weight: 1 }
+      - matches:
+          - path: { prefix: /told }
+        filters:
+          - type: request_header_modifier
+            set: [{ name: X-Forwarded-For, value: 192.0.2.1 }]
+            remove: [via]
         forward:
           backends:
             - { upstream: search, weight: 1 }
@@ -445,9 +474,19 @@ upstreams:
 
     /// Decides on the named listener; the name of the upstream, or the rejection.
     fn decide_on<H: Head>(listener: &str, head: &mut H, random: u64) -> Result<String, Rejection> {
+        decide_from(&peer(), listener, head, random)
+    }
+
+    /// The same, for a request from `client`.
+    fn decide_from<H: Head>(
+        client: &Client,
+        listener: &str,
+        head: &mut H,
+        random: u64,
+    ) -> Result<String, Rejection> {
         let shop = shop();
         let listener = shop.listeners.iter().find(|l| l.name == listener).unwrap();
-        decide(&shop, listener, head, &mut || random).map(|decision| {
+        decide(&shop, listener, head, client, &mut || random).map(|decision| {
             let forward = forwarding(decision);
             shop.upstream(forward.upstream).unwrap().name.clone()
         })
@@ -455,6 +494,211 @@ upstreams:
 
     fn upstream_for(target: &str, fields: &[(&str, &str)]) -> Result<String, Rejection> {
         decide_on("web", &mut head(target, fields), 0)
+    }
+
+    /// Every value of `name`, as text.
+    fn values_of(fields: &impl Fields, name: &str) -> Vec<String> {
+        fields
+            .values(&http::HeaderName::from_bytes(name.as_bytes()).unwrap())
+            .map(|value| String::from_utf8(value.to_vec()).unwrap())
+            .collect()
+    }
+
+    /// A client the `web` listener trusts to say who its own clients are.
+    fn load_balancer() -> Client {
+        Client::new("10.1.0.5".parse().unwrap())
+    }
+
+    /// What a client says of forwarding, and what it may not.
+    const SAID: &[u8] = b"GET /cart HTTP/1.1\r\nHost: shop.example.com\r\nX-Forwarded-For: 10.0.0.1\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: admin.example.com\r\nForwarded: for=10.0.0.1\r\nX-Real-IP: 10.0.0.1\r\nX-Forwarded-Port: 443\r\nX-Forwarded-Prefix: /admin\r\nx_forwarded_for: 10.0.0.2\r\nVia: 1.0 cdn\r\nAccept: */*\r\n\r\n";
+
+    /// A peer that is no trusted proxy is the client. What it said of forwarding is not
+    /// passed on: `X-Forwarded-For`, `-Proto` and `-Host` say the gateway's own, and the
+    /// listener's trusted-only headers go. `Via` has the gateway's entry after the client's.
+    /// A name spelled otherwise (`x_forwarded_for`) is another header, left as it is. Both
+    /// kinds of head come to the same.
+    #[test]
+    fn an_untrusted_peer_is_the_client_and_what_it_says_of_forwarding_is_not_passed_on() {
+        let (mut map, mut raw) = both_heads(SAID).unwrap();
+        assert_eq!(decide_on("web", &mut map, 0).as_deref(), Ok("cart"));
+        assert_eq!(decide_on("web", &mut raw, 0).as_deref(), Ok("cart"));
+        let edited = raw.fields();
+        for (name, expected) in [
+            ("x-forwarded-for", vec!["203.0.113.7"]),
+            ("x-forwarded-proto", vec!["http"]),
+            ("x-forwarded-host", vec!["shop.example.com"]),
+            ("via", vec!["1.0 cdn", "1.1 edgerush"]),
+            ("forwarded", vec![]),
+            ("x-real-ip", vec![]),
+            ("x-forwarded-port", vec![]),
+            ("x-forwarded-prefix", vec![]),
+            ("x_forwarded_for", vec!["10.0.0.2"]),
+            ("accept", vec!["*/*"]),
+        ] {
+            assert_eq!(values_of(&map.headers, name), expected, "{name}, map");
+            assert_eq!(values_of(&edited, name), expected, "{name}, raw");
+        }
+
+        // With no trusted-only headers, the gateway's own three are still its own.
+        let mut request = head(
+            "/status",
+            &[
+                ("host", "status.example.com:9090"),
+                ("x-forwarded-for", "10.0.0.1"),
+                ("x-forwarded-proto", "https"),
+                ("x-forwarded-host", "admin.example.com"),
+                ("x-forwarded-port", "443"),
+            ],
+        );
+        assert_eq!(decide_on("admin", &mut request, 0).as_deref(), Ok("admin"));
+        assert_eq!(
+            values_of(&request.headers, "x-forwarded-for"),
+            ["203.0.113.7"]
+        );
+        assert_eq!(values_of(&request.headers, "x-forwarded-proto"), ["http"]);
+        // As the client wrote it, the port with it.
+        assert_eq!(
+            values_of(&request.headers, "x-forwarded-host"),
+            ["status.example.com:9090"]
+        );
+        assert_eq!(values_of(&request.headers, "x-forwarded-port"), ["443"]);
+    }
+
+    /// A trusted proxy's chain names the client: the first address from the right that is
+    /// not a trusted proxy's, and only that is passed on. What it said of the scheme and the
+    /// host is kept, and so is what only it may send.
+    #[test]
+    fn a_trusted_proxy_names_the_client_and_what_it_says_is_kept() {
+        let (mut map, mut raw) = both_heads(SAID).unwrap();
+        let client = load_balancer();
+        assert_eq!(
+            decide_from(&client, "web", &mut map, 0).as_deref(),
+            Ok("cart")
+        );
+        assert_eq!(
+            decide_from(&client, "web", &mut raw, 0).as_deref(),
+            Ok("cart")
+        );
+        let edited = raw.fields();
+        for (name, expected) in [
+            // 10.0.0.1 is inside the trusted range: every entry trusted, the leftmost.
+            ("x-forwarded-for", vec!["10.0.0.1"]),
+            ("x-forwarded-proto", vec!["https"]),
+            ("x-forwarded-host", vec!["admin.example.com"]),
+            ("forwarded", vec!["for=10.0.0.1"]),
+            ("x-real-ip", vec!["10.0.0.1"]),
+            ("x-forwarded-prefix", vec!["/admin"]),
+        ] {
+            assert_eq!(values_of(&map.headers, name), expected, "{name}, map");
+            assert_eq!(values_of(&edited, name), expected, "{name}, raw");
+        }
+
+        // The load balancer example: a forged entry, then the one the balancer added.
+        let mut request = head(
+            "/cart",
+            &[
+                ("host", "shop.example.com"),
+                ("x-forwarded-for", "1.2.3.4, 198.51.100.9"),
+            ],
+        );
+        assert_eq!(
+            decide_from(&client, "web", &mut request, 0).as_deref(),
+            Ok("cart")
+        );
+        assert_eq!(
+            values_of(&request.headers, "x-forwarded-for"),
+            ["198.51.100.9"]
+        );
+        // Saying nothing, it is the client; the scheme and host are then the gateway's.
+        let mut request = head("/cart", &[("host", "shop.example.com")]);
+        assert_eq!(
+            decide_from(&client, "web", &mut request, 0).as_deref(),
+            Ok("cart")
+        );
+        assert_eq!(values_of(&request.headers, "x-forwarded-for"), ["10.1.0.5"]);
+        assert_eq!(values_of(&request.headers, "x-forwarded-proto"), ["http"]);
+        assert_eq!(
+            values_of(&request.headers, "x-forwarded-host"),
+            ["shop.example.com"]
+        );
+    }
+
+    /// An IPv4 client of a dual-stack socket is told as IPv4, and trusted as it.
+    #[test]
+    fn a_client_is_told_in_one_form() {
+        let mapped = Client::new("::ffff:10.1.0.5".parse().unwrap());
+        let mut request = head(
+            "/cart",
+            &[
+                ("host", "shop.example.com"),
+                ("x-forwarded-for", "198.51.100.9"),
+            ],
+        );
+        assert_eq!(
+            decide_from(&mapped, "web", &mut request, 0).as_deref(),
+            Ok("cart")
+        );
+        assert_eq!(
+            values_of(&request.headers, "x-forwarded-for"),
+            ["198.51.100.9"]
+        );
+        let mapped = Client::new("::ffff:203.0.113.7".parse().unwrap());
+        let mut request = head("/cart", &[("host", "shop.example.com")]);
+        assert_eq!(
+            decide_from(&mapped, "web", &mut request, 0).as_deref(),
+            Ok("cart")
+        );
+        assert_eq!(
+            values_of(&request.headers, "x-forwarded-for"),
+            ["203.0.113.7"]
+        );
+    }
+
+    /// A rule's predicates read what the upstream will be told, not what the client said;
+    /// and a rule's own changes come after, and may change it.
+    #[test]
+    fn a_rule_reads_what_the_upstream_is_told_and_may_change_it() {
+        let said = [("host", "shop.example.com"), ("x-forwarded-proto", "https")];
+        assert_eq!(upstream_for("/plain", &said).as_deref(), Ok("search"));
+        // From a trusted proxy that said `https`, the rule is not for it.
+        let mut request = head("/plain", &said);
+        assert_eq!(
+            decide_from(&load_balancer(), "web", &mut request, 0).as_deref(),
+            Ok("fallback")
+        );
+
+        let mut request = head("/told", &[("host", "shop.example.com")]);
+        assert_eq!(decide_on("web", &mut request, 0).as_deref(), Ok("search"));
+        assert_eq!(
+            values_of(&request.headers, "x-forwarded-for"),
+            ["192.0.2.1"]
+        );
+        assert!(values_of(&request.headers, "via").is_empty());
+    }
+
+    /// The scheme is the listener's, and `Via` names the version the request came in.
+    #[test]
+    fn the_scheme_and_version_are_those_the_request_came_by() {
+        let mut request = head("/cart", &[("host", "shop.example.com")]);
+        assert_eq!(decide_on("secure", &mut request, 0).as_deref(), Ok("cart"));
+        assert_eq!(values_of(&request.headers, "x-forwarded-proto"), ["https"]);
+        let mut request = Request::builder()
+            .uri("https://shop.example.com/cart")
+            .version(http::Version::HTTP_2)
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(decide_on("secure", &mut request, 0).as_deref(), Ok("cart"));
+        assert_eq!(values_of(&request.headers, "via"), ["2 edgerush"]);
+        assert_eq!(
+            values_of(&request.headers, "x-forwarded-host"),
+            ["shop.example.com"]
+        );
+        let mut request = head("/cart", &[("host", "shop.example.com")]);
+        request.version = http::Version::HTTP_10;
+        assert_eq!(decide_on("admin", &mut request, 0), Err(Rejection::NoRoute));
+        assert_eq!(values_of(&request.headers, "via"), ["1.0 edgerush"]);
     }
 
     #[test]
@@ -501,14 +745,14 @@ upstreams:
         let shop = shop();
         let web = shop.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut head = head("/cart", &[("host", "shop.example.com")]);
-        let forward = forwarding(decide(&shop, web, &mut head, &mut || 0).unwrap());
+        let forward = forwarding(decide(&shop, web, &mut head, &peer(), &mut || 0).unwrap());
         assert!(forward.rule.request_headers.is_some());
         assert_eq!(shop.upstream(forward.upstream).unwrap().name, "cart");
     }
 
     const MOVED: &str = r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http }
+  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] } }
 routes:
   - name: moved
     listeners: [web]
@@ -529,7 +773,7 @@ upstreams:
         let config: Config = serde_saphyr::from_str(MOVED).unwrap();
         let moved = compile(&config).unwrap();
         let web = moved.listeners.iter().find(|l| l.name == "web").unwrap();
-        match decide(&moved, web, head, &mut || 0).unwrap() {
+        match decide(&moved, web, head, &peer(), &mut || 0).unwrap() {
             Decision::Redirect(redirected) => Some((
                 redirected.status,
                 redirected.location.to_str().unwrap().to_owned(),
@@ -573,7 +817,7 @@ upstreams:
 
     const REWRITTEN: &str = r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http }
+  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] } }
 routes:
   - name: rewritten
     listeners: [web]
@@ -606,7 +850,7 @@ upstreams:
             .iter()
             .find(|l| l.name == "web")
             .unwrap();
-        forwarding(decide(&rewritten, web, &mut head, &mut || 0).unwrap());
+        forwarding(decide(&rewritten, web, &mut head, &peer(), &mut || 0).unwrap());
         head
     }
 
@@ -649,7 +893,7 @@ upstreams:
 
     const MIRRORED: &str = r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http }
+  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] } }
 routes:
   - name: mirrored
     listeners: [web]
@@ -680,8 +924,12 @@ upstreams:
         let mirrored = compile(&config).unwrap();
         let web = mirrored.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut draws = std::iter::once(0).chain(draws.iter().copied());
-        let forward =
-            forwarding(decide(&mirrored, web, &mut head, &mut || draws.next().unwrap()).unwrap());
+        let forward = forwarding(
+            decide(&mirrored, web, &mut head, &peer(), &mut || {
+                draws.next().unwrap()
+            })
+            .unwrap(),
+        );
         forward
             .mirrors
             .into_iter()
@@ -734,10 +982,13 @@ upstreams:
         let compiled = compile(&config).unwrap();
         let web = compiled.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut request = head(target, &fields);
-        let forward = forwarding(decide(&compiled, web, &mut request, &mut || 0).unwrap());
+        let forward = forwarding(decide(&compiled, web, &mut request, &peer(), &mut || 0).unwrap());
         let first = forward.mirrors[0].own.as_ref().unwrap();
         assert!(!first.fields.contains_key("x-hop"));
         assert!(!first.fields.contains_key("connection"));
+        // And what every copy is told of the client, as the upstream is.
+        assert_eq!(first.fields["x-forwarded-for"], "203.0.113.7");
+        assert_eq!(first.fields["via"], "1.1 edgerush");
         assert_eq!(request.uri, "/api/b?c=d");
         assert_eq!(request.headers["host"], "one.example.org");
     }
@@ -749,12 +1000,12 @@ upstreams:
         let web = moved.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut ambiguous = head("/old/%2e%2e/admin", &[("host", "shop.example.com")]);
         assert!(matches!(
-            decide(&moved, web, &mut ambiguous, &mut || 0),
+            decide(&moved, web, &mut ambiguous, &peer(), &mut || 0),
             Err(Rejection::Path(_))
         ));
         let mut hostless = head("/old/a", &[]);
         assert!(matches!(
-            decide(&moved, web, &mut hostless, &mut || 0),
+            decide(&moved, web, &mut hostless, &peer(), &mut || 0),
             Err(Rejection::Host(_))
         ));
     }
@@ -1036,7 +1287,7 @@ upstreams:
         let chained = compile(&config).unwrap();
         let web = chained.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut request = head("/cart", &fields);
-        decide(&chained, web, &mut request, &mut || 0).unwrap();
+        decide(&chained, web, &mut request, &peer(), &mut || 0).unwrap();
         let credentials: Vec<_> = request
             .headers
             .get_all("proxy-authorization")
@@ -1109,7 +1360,19 @@ upstreams:
         assert_eq!(decide_on("web", &mut request, 0).as_deref(), Ok("cart"));
         let mut names: Vec<&str> = request.headers.keys().map(|name| name.as_str()).collect();
         names.sort_unstable();
-        assert_eq!(names, ["accept", "host", "te", "x-gateway"]);
+        assert_eq!(
+            names,
+            [
+                "accept",
+                "host",
+                "te",
+                "via",
+                "x-forwarded-for",
+                "x-forwarded-host",
+                "x-forwarded-proto",
+                "x-gateway"
+            ]
+        );
         assert_eq!(request.headers.get("te").unwrap(), "trailers");
     }
 
@@ -1301,6 +1564,14 @@ upstreams:
                 "Trailer",
                 "authorization",
                 "Expect",
+                "x-forwarded-for",
+                "X-Forwarded-Proto",
+                "x-forwarded-host",
+                "X-Forwarded-Port",
+                "forwarded",
+                "X-Real-IP",
+                "Via",
+                "x_forwarded_for",
             ]),
             prop::sample::select(vec![
                 "5",
@@ -1327,6 +1598,12 @@ upstreams:
                 "x-debug",
                 "host",
                 "x hop",
+                "10.1.0.5",
+                "1.2.3.4, 198.51.100.9",
+                "198.51.100.9, unknown",
+                "https",
+                "for=1.2.3.4",
+                "1.1 cdn",
             ]),
         )
     }
@@ -1349,6 +1626,14 @@ upstreams:
             "expect",
             "content-length",
             "transfer-encoding",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-forwarded-host",
+            "x-forwarded-port",
+            "forwarded",
+            "x-real-ip",
+            "via",
+            "x_forwarded_for",
         ]
         .into_iter()
         .map(http::HeaderName::from_static)
@@ -1375,7 +1660,9 @@ upstreams:
             fields in prop::collection::vec(raw_field(), 0..8),
             listener in prop::sample::select(vec!["web", "web", "admin"]),
             random in 0..10u64,
+            from_proxy in any::<bool>(),
         ) {
+            let client = if from_proxy { load_balancer() } else { peer() };
             let mut sent = format!("GET {target} HTTP/1.1\r\n").into_bytes();
             if let Some(host) = host {
                 sent.extend_from_slice(format!("Host: {host}\r\n").as_bytes());
@@ -1393,8 +1680,8 @@ upstreams:
                 crate::hop_by_hop::is_chunked_request(&raw),
                 crate::hop_by_hop::is_chunked_request(&map.headers)
             );
-            let by_map = decide_on(listener, &mut map, random);
-            let by_raw = decide_on(listener, &mut raw, random);
+            let by_map = decide_from(&client, listener, &mut map, random);
+            let by_raw = decide_from(&client, listener, &mut raw, random);
             prop_assert_eq!(&by_raw, &by_map);
             prop_assert_eq!(raw.uri(), map.uri());
             // And what the rest of the way does to a head that is going.
@@ -1419,7 +1706,7 @@ upstreams:
                 use crate::head::Forwarded;
                 let decided = {
                     let (_, mut fresh) = both_heads(&sent).unwrap();
-                    let _ = decide_on(listener, &mut fresh, random);
+                    let _ = decide_from(&client, listener, &mut fresh, random);
                     if by_map.is_ok() {
                         let _ = fresh.filter_declaration(&nominated);
                         if crate::upstream::auth::carries_credentials(&fresh) {
@@ -1550,7 +1837,8 @@ upstreams:
     }
 
     /// What the core does not change is left as it came: a head whose `Host` already says
-    /// what its target names, with nothing else to do, is copied whole.
+    /// what its target names, with nothing else to do but tell the upstream of the client,
+    /// is copied whole, and what it is told follows.
     #[test]
     fn a_raw_head_the_core_leaves_alone_is_copied_whole() {
         let sent = b"GET http://shop.example.com/account HTTP/1.1\r\nHost: shop.example.com\r\nCookie: a=1; b=2\r\nAccept: */*\r\n\r\n";
@@ -1558,6 +1846,22 @@ upstreams:
         assert_eq!(decide_on("web", &mut raw, 0).as_deref(), Ok("search"));
         let pieces: Vec<_> = raw.pieces(&[]).collect();
         let section = b"GET http://shop.example.com/account HTTP/1.1\r\n".len()..sent.len() - 2;
-        assert_eq!(pieces, [crate::fields::Piece::Copy(section)]);
+        assert_eq!(pieces.first(), Some(&crate::fields::Piece::Copy(section)));
+        let added: Vec<(&str, &[u8])> = pieces[1..]
+            .iter()
+            .map(|piece| match piece {
+                crate::fields::Piece::Field(name, value) => (name.as_str(), value.as_bytes()),
+                crate::fields::Piece::Copy(span) => panic!("a second run {span:?}"),
+            })
+            .collect();
+        assert_eq!(
+            added,
+            [
+                ("x-forwarded-for", b"203.0.113.7".as_slice()),
+                ("x-forwarded-proto", b"http"),
+                ("x-forwarded-host", b"shop.example.com"),
+                ("via", b"1.1 edgerush"),
+            ]
+        );
     }
 }

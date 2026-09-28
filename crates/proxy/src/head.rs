@@ -109,6 +109,31 @@ pub trait Head {
     /// a change is sent (18 §5 in the docs).
     fn to_map(&self) -> HeaderMap;
 
+    /// Takes off every field whose name, in whatever case it came, `unwanted` picks.
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection::Edits`] if the head cannot take the change.
+    fn remove_where(&mut self, unwanted: impl FnMut(&[u8]) -> bool) -> Result<(), Rejection>;
+
+    /// Gives `name` this one value, in place of every one it had.
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection::Edits`] if the head cannot take the change.
+    fn set_field(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), Rejection>;
+
+    /// Adds a value to `name`, after every one it has.
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection::Edits`] if the head cannot take the change.
+    fn append_field(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), Rejection>;
+
+    /// The first `Host` field's value, as a value of its own: without a copy where the head
+    /// can share what holds it.
+    fn host_value(&self) -> Option<HeaderValue>;
+
     /// The version it came in.
     fn version(&self) -> Version;
 }
@@ -182,6 +207,35 @@ impl Head for Parts {
 
     fn to_map(&self) -> HeaderMap {
         self.headers.clone()
+    }
+
+    fn remove_where(&mut self, mut unwanted: impl FnMut(&[u8]) -> bool) -> Result<(), Rejection> {
+        // A map has no way to drop entries as it is walked; the names are gathered first,
+        // which allocates only when there is one.
+        let gone: Vec<HeaderName> = self
+            .headers
+            .keys()
+            .filter(|name| unwanted(name.as_str().as_bytes()))
+            .cloned()
+            .collect();
+        for name in gone {
+            self.headers.remove(name);
+        }
+        Ok(())
+    }
+
+    fn set_field(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), Rejection> {
+        self.headers.insert(name, value);
+        Ok(())
+    }
+
+    fn append_field(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), Rejection> {
+        self.headers.append(name, value);
+        Ok(())
+    }
+
+    fn host_value(&self) -> Option<HeaderValue> {
+        self.headers.get(HOST).cloned()
     }
 
     fn version(&self) -> Version {

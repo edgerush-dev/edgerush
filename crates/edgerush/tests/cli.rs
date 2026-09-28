@@ -121,7 +121,7 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
 
     // A listener that is new is told of and not bound, and what can be reloaded is.
     let more = config("127.0.0.1:0", "up", Some(one))
-        + "  api: { address: \"127.0.0.1:1\", protocol: http }\n";
+        + "  api: { address: \"127.0.0.1:1\", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] } }\n";
     std::fs::write(&file, more)?;
     harness.wait_for("config reloaded");
     harness.wait_for("warning: listener \"api\" is new");
@@ -310,7 +310,7 @@ routes:
           - path: {{ prefix: / }}
         forward: {{ backends: [{{ upstream: {backend}, weight: 1 }}] }}
 listeners:
-  web: {{ address: "{listen}", protocol: http }}
+  web: {{ address: "{listen}", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }} }}
 "#
     )
 }

@@ -745,7 +745,9 @@ mod tests {
     fn listeners(listeners: &[(&str, &str)]) -> Compiled {
         let mut yaml = String::from("routes: []\nupstreams: {}\nlisteners:\n");
         for (name, address) in listeners {
-            yaml += &format!("  {name}: {{ address: \"{address}\", protocol: http }}\n");
+            yaml += &format!(
+                "  {name}: {{ address: \"{address}\", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }} }}\n"
+            );
         }
         let config: Config = serde_saphyr::from_str(&yaml).unwrap();
         compile(&config).unwrap()

@@ -20,7 +20,6 @@
 use bytes::Bytes;
 use edgerush_config::{Compiled, Config, compile};
 use edgerush_filters::HeaderModifier;
-use edgerush_proxy::decide;
 use edgerush_proxy::fields::FieldLines;
 use edgerush_proxy::head::Head;
 use edgerush_proxy::hop_by_hop::{nominated, strip_response};
@@ -28,6 +27,7 @@ use edgerush_proxy::raw::{RawAnswer, RawHead};
 use edgerush_proxy::upstream::auth::challenges;
 use edgerush_proxy::upstream::h1::H1Limits;
 use edgerush_proxy::upstream::h1::codec::{Sending, filter_declaration, head_len, write_head};
+use edgerush_proxy::{Client, decide};
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::request::Parts;
 use http::{Method, Request, StatusCode, Uri};
@@ -36,7 +36,7 @@ use std::hint::black_box;
 
 const SHOP: &str = r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http }
+  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] } }
 routes:
   - name: shop
     listeners: [web]
@@ -63,6 +63,11 @@ upstreams:
   cart-canary: { endpoints: ["127.0.0.1:9003"] }
   pages: { endpoints: ["127.0.0.1:9004"] }
 "#;
+
+/// A client that is no trusted proxy, as most are.
+fn peer() -> Client {
+    Client::new("203.0.113.7".parse().expect("an address"))
+}
 
 fn shop() -> Compiled {
     let config: Config = serde_saphyr::from_str(SHOP).expect("valid YAML");
@@ -107,24 +112,28 @@ fn sent_with(target: &str, host: Option<&str>, more: &[(&'static str, &'static s
 #[library_benchmark]
 #[benches::requests(
     args = [
-        (shop(), sent("/pages/about?lang=en", Some("shop.example.com"))),
-        (shop(), sent("/cart/items?page=3", Some("shop.example.com"))),
-        (shop(), sent("/pages/./a/../about?lang=en", Some("shop.example.com"))),
-        (shop(), sent("http://shop.example.com/pages/about?lang=en", Some("shop.example.com"))),
-        (shop(), sent_with(
+        (shop(), peer(), sent("/pages/about?lang=en", Some("shop.example.com"))),
+        (shop(), peer(), sent("/cart/items?page=3", Some("shop.example.com"))),
+        (shop(), peer(), sent("/pages/./a/../about?lang=en", Some("shop.example.com"))),
+        (shop(), peer(), sent("http://shop.example.com/pages/about?lang=en", Some("shop.example.com"))),
+        (shop(), peer(), sent_with(
             "/pages/about?lang=en",
             Some("shop.example.com"),
             &[("connection", "keep-alive"), ("keep-alive", "timeout=5"), ("te", "trailers")]
         )),
-        (shop(), sent_with(
+        (shop(), peer(), sent_with(
             "http://shop.example.com/pages.Pages/About",
             Some("shop.example.com"),
             &[("te", "trailers"), ("content-type", "application/grpc")]
         )),
-        (shop(), sent("/pages/about", Some("other.example.org"))),
+        (shop(), peer(), sent("/pages/about", Some("other.example.org"))),
     ]
 )]
-fn by_raw(snapshot: Compiled, head: Bytes) -> (Compiled, Option<RawHead>, bool) {
+fn by_raw(
+    snapshot: Compiled,
+    client: Client,
+    head: Bytes,
+) -> (Compiled, Client, Option<RawHead>, bool) {
     let mut room = [httparse::EMPTY_HEADER; 32];
     let mut request = httparse::Request::new(&mut room);
     let parsed = request.parse(black_box(&head));
@@ -148,36 +157,44 @@ fn by_raw(snapshot: Compiled, head: Bytes) -> (Compiled, Option<RawHead>, bool) 
     };
     let mut raw = raw;
     let forwarded = match (snapshot.listeners.first(), raw.as_mut()) {
-        (Some(listener), Some(head)) => decide(black_box(&snapshot), listener, head, &mut || {
-            0x9E37_79B9_7F4A_7C15
-        })
+        (Some(listener), Some(head)) => decide(
+            black_box(&snapshot),
+            listener,
+            head,
+            black_box(&client),
+            &mut || 0x9E37_79B9_7F4A_7C15,
+        )
         .is_ok(),
         _ => false,
     };
-    (snapshot, raw, forwarded)
+    (snapshot, client, raw, forwarded)
 }
 
 #[library_benchmark]
 #[benches::requests(
     args = [
-        (shop(), sent("/pages/about?lang=en", Some("shop.example.com"))),
-        (shop(), sent("/cart/items?page=3", Some("shop.example.com"))),
-        (shop(), sent("/pages/./a/../about?lang=en", Some("shop.example.com"))),
-        (shop(), sent("http://shop.example.com/pages/about?lang=en", Some("shop.example.com"))),
-        (shop(), sent_with(
+        (shop(), peer(), sent("/pages/about?lang=en", Some("shop.example.com"))),
+        (shop(), peer(), sent("/cart/items?page=3", Some("shop.example.com"))),
+        (shop(), peer(), sent("/pages/./a/../about?lang=en", Some("shop.example.com"))),
+        (shop(), peer(), sent("http://shop.example.com/pages/about?lang=en", Some("shop.example.com"))),
+        (shop(), peer(), sent_with(
             "/pages/about?lang=en",
             Some("shop.example.com"),
             &[("connection", "keep-alive"), ("keep-alive", "timeout=5"), ("te", "trailers")]
         )),
-        (shop(), sent_with(
+        (shop(), peer(), sent_with(
             "http://shop.example.com/pages.Pages/About",
             Some("shop.example.com"),
             &[("te", "trailers"), ("content-type", "application/grpc")]
         )),
-        (shop(), sent("/pages/about", Some("other.example.org"))),
+        (shop(), peer(), sent("/pages/about", Some("other.example.org"))),
     ]
 )]
-fn by_map(snapshot: Compiled, head: Bytes) -> (Compiled, Option<Parts>, bool) {
+fn by_map(
+    snapshot: Compiled,
+    client: Client,
+    head: Bytes,
+) -> (Compiled, Client, Option<Parts>, bool) {
     let mut room = [httparse::EMPTY_HEADER; 32];
     let mut request = httparse::Request::new(&mut room);
     let parsed = request.parse(black_box(&head));
@@ -210,13 +227,17 @@ fn by_map(snapshot: Compiled, head: Bytes) -> (Compiled, Option<Parts>, bool) {
     };
     let mut parts = parts;
     let forwarded = match (snapshot.listeners.first(), parts.as_mut()) {
-        (Some(listener), Some(head)) => decide(black_box(&snapshot), listener, head, &mut || {
-            0x9E37_79B9_7F4A_7C15
-        })
+        (Some(listener), Some(head)) => decide(
+            black_box(&snapshot),
+            listener,
+            head,
+            black_box(&client),
+            &mut || 0x9E37_79B9_7F4A_7C15,
+        )
         .is_ok(),
         _ => false,
     };
-    (snapshot, parts, forwarded)
+    (snapshot, client, parts, forwarded)
 }
 
 /// A request decided on as a raw head, ready to be written upstream.
@@ -235,7 +256,7 @@ fn decided_raw(sent: &Bytes) -> RawHead {
     );
     let snapshot = shop();
     let listener = snapshot.listeners.first().expect("a listener");
-    decide(&snapshot, listener, &mut head, &mut || 0).expect("decided");
+    decide(&snapshot, listener, &mut head, &peer(), &mut || 0).expect("decided");
     head
 }
 
@@ -256,7 +277,7 @@ fn decided_map(sent: &Bytes) -> Parts {
     parts.headers = headers;
     let snapshot = shop();
     let listener = snapshot.listeners.first().expect("a listener");
-    decide(&snapshot, listener, &mut parts, &mut || 0).expect("decided");
+    decide(&snapshot, listener, &mut parts, &peer(), &mut || 0).expect("decided");
     parts
 }
 

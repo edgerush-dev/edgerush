@@ -9,7 +9,7 @@
 //! canonical form — no shorthand, and no defaults that choose behaviour. What is missing is
 //! an error, not "everything".
 //!
-//! So far: listeners, with the TLS they terminate, routes with their rules, header filters and weighted backends, and
+//! So far: listeners, with the TLS they terminate and what they tell upstreams of a client, routes with their rules, header filters and weighted backends, and
 //! upstreams ([`Config`]), and their compilation ([`compile`]) into a router per listener
 //! and what each rule does and leads to ([`Compiled`]).
 
@@ -20,13 +20,13 @@ mod route;
 
 pub use backends::{UpstreamId, WeightedBackends};
 pub use compile::{
-    Compiled, CompiledListener, CompiledMirror, CompiledRetry, CompiledRule, CompiledTimeouts,
-    CompiledUpstream, ConfigError, L4, L4Route, Object, Outcome, Place, Problem, RuleId, SniRouter,
-    Step, Timeout, compile,
+    Compiled, CompiledForwarding, CompiledListener, CompiledMirror, CompiledRetry, CompiledRule,
+    CompiledTimeouts, CompiledUpstream, ConfigError, L4, L4Route, Object, Outcome, Place, Problem,
+    RuleId, SniRouter, Step, Timeout, compile,
 };
 pub use config::{
-    Certificate, ClientValidation, Config, HealthCheck, Http3, Keepalive, Listener, Probe,
-    Protocol, Tls, Upstream, UpstreamProtocol, UpstreamTls,
+    Certificate, ClientValidation, Config, Forwarding, HealthCheck, Http3, Keepalive, Listener,
+    Probe, Protocol, Tls, Upstream, UpstreamProtocol, UpstreamTls,
 };
 pub use route::{
     Backend, Filter, Forward, Fraction, GrpcMethod, Header, HeaderChanges, Hostname, Match, Mirror,

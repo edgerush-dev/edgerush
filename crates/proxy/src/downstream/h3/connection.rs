@@ -22,6 +22,7 @@ use crate::downstream::h3::head::{self, Refused, RequestHead};
 use crate::downstream::h3::listener::Shared;
 use crate::downstream::h3::send::{Unsent, flush};
 use crate::downstream::h3::writer::{Responder, SendError};
+use crate::forwarding::Client;
 use crate::interim::Interim;
 use crate::request_body::RequestBody;
 use crate::timers::Alarm;
@@ -32,6 +33,7 @@ use http_body::Body;
 use quiche::h3::Event;
 use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
+use std::net::{IpAddr, Ipv6Addr};
 use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::task::Poll;
@@ -57,6 +59,9 @@ struct Driving {
     seen: Seen,
     /// When a draining connection is closed regardless.
     drain_by: Option<Instant>,
+    /// The client its requests are from, as the upstream is told: the peer of the path in
+    /// use when they came, made again only when the path's peer changes.
+    client: Option<Rc<Client>>,
     /// To be closed once what is queued has gone: the GOAWAY above all, which quiche would
     /// drop if the connection were closed with it still queued.
     to_close: bool,
@@ -99,7 +104,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
     date: Rc<D>,
     opened: G,
 ) where
-    R: Fn(Request<RequestBody>, Interim) -> F + 'static,
+    R: Fn(Request<RequestBody>, Interim, Rc<Client>) -> F + 'static,
     F: Future<Output = Answered<B>> + 'static,
     B: Body<Data = Bytes> + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
@@ -118,6 +123,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
         ids: vec![first_id],
         seen: Seen::default(),
         drain_by: None,
+        client: None,
         to_close: false,
         closing: false,
         unsent: Unsent::new(),
@@ -143,7 +149,14 @@ pub(crate) async fn drive<R, F, B, D, G>(
             if conn.take_stirred() || !driving.unsent.is_empty() {
                 turn(&conn, &shared, &mut driving, &mut found);
                 account(&conn, &shared);
+                let client = if found.is_empty() {
+                    None
+                } else {
+                    Some(client_now(&conn, &mut driving.client))
+                };
                 for request in found.drain(..) {
+                    // Made above whenever there is a request.
+                    let Some(client) = &client else { break };
                     driving.asked = true;
                     let stream = Stream::adopt(&conn, request.id);
                     #[cfg(any(test, feature = "interop"))]
@@ -151,6 +164,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
                         let _detached = tokio::task::spawn_local(super::hq::answer(
                             stream,
                             request.head,
+                            Rc::clone(client),
                             Rc::clone(&respond),
                             settings.stream_idle,
                         ));
@@ -161,6 +175,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
                         stream,
                         request.head,
                         request.ended,
+                        Rc::clone(client),
                         Rc::clone(&respond),
                         Rc::clone(&date),
                         settings.stream_idle,
@@ -583,6 +598,32 @@ fn send_interim(responder: &mut Responder, interim: &Interim) {
     }
 }
 
+/// Who the requests found now are from: the peer of the path the connection is using,
+/// which may not be the one it began on (RFC 9000 §9). The client last made is kept while
+/// that peer stays the same, so that it is not written out again for every request.
+fn client_now(conn: &Conn, made: &mut Option<Rc<Client>>) -> Rc<Client> {
+    let peer = conn
+        .with(|state| {
+            state
+                .quic
+                .path_stats()
+                .find(|path| path.active)
+                .map(|path| path.peer_addr.ip())
+        })
+        // A connection that has a request has a path in use; were it ever without one, the
+        // upstream is told of no address rather than of a wrong one.
+        .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+        .to_canonical();
+    match made {
+        Some(client) if client.address() == peer => Rc::clone(client),
+        _ => {
+            let client = Rc::new(Client::new(peer));
+            *made = Some(Rc::clone(&client));
+            client
+        }
+    }
+}
+
 /// A request's task: its answer, boxed. The answer's future is as large as its largest
 /// state, the exchange's included, several kilobytes; a task holds its future inline and
 /// moves all of it as the task is made and as it finishes. Boxed once here, what the task
@@ -591,18 +632,19 @@ fn request_task<R, F, B, D>(
     stream: Stream,
     head: RequestHead,
     ended: bool,
+    client: Rc<Client>,
     respond: Rc<R>,
     date: Rc<D>,
     idle: Duration,
 ) -> Pin<Box<impl Future<Output = ()>>>
 where
-    R: Fn(Request<RequestBody>, Interim) -> F,
+    R: Fn(Request<RequestBody>, Interim, Rc<Client>) -> F,
     F: Future<Output = Answered<B>>,
     B: Body<Data = Bytes>,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     D: Fn() -> HttpDate,
 {
-    Box::pin(answer(stream, head, ended, respond, date, idle))
+    Box::pin(answer(stream, head, ended, client, respond, date, idle))
 }
 
 /// Answers one request.
@@ -610,11 +652,12 @@ async fn answer<R, F, B, D>(
     stream: Stream,
     head: RequestHead,
     ended: bool,
+    client: Rc<Client>,
     respond: Rc<R>,
     date: Rc<D>,
     idle: Duration,
 ) where
-    R: Fn(Request<RequestBody>, Interim) -> F,
+    R: Fn(Request<RequestBody>, Interim, Rc<Client>) -> F,
     F: Future<Output = Answered<B>>,
     B: Body<Data = Bytes>,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
@@ -630,7 +673,7 @@ async fn answer<R, F, B, D>(
         .heard_by(interim.clone());
     let request = Request::from_parts(head.parts, RequestBody::H3(body));
     let mut responder = Responder::new(Rc::clone(&stream.conn), stream.id, idle);
-    let mut answering = pin!(respond(request, interim.clone()));
+    let mut answering = pin!(respond(request, interim.clone(), client));
     let answered = poll_fn(|cx| {
         if responder.poll_reset(cx).is_ready() {
             return Poll::Ready(None);
@@ -732,14 +775,15 @@ mod tests {
         type Respond = fn(
             Request<RequestBody>,
             Interim,
+            Rc<Client>,
         ) -> std::future::Ready<Answered<http_body_util::Full<Bytes>>>;
         type Date = fn() -> HttpDate;
-        type Asked = (Stream, RequestHead, Rc<Respond>, Rc<Date>);
-        let task = size_of_made(|(stream, head, respond, date): Asked| {
-            request_task(stream, head, true, respond, date, Duration::ZERO)
+        type Asked = (Stream, RequestHead, Rc<Client>, Rc<Respond>, Rc<Date>);
+        let task = size_of_made(|(stream, head, client, respond, date): Asked| {
+            request_task(stream, head, true, client, respond, date, Duration::ZERO)
         });
-        let answer = size_of_made(|(stream, head, respond, date): Asked| {
-            answer(stream, head, true, respond, date, Duration::ZERO)
+        let answer = size_of_made(|(stream, head, client, respond, date): Asked| {
+            answer(stream, head, true, client, respond, date, Duration::ZERO)
         });
         assert_eq!(
             task,

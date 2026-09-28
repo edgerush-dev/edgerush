@@ -241,6 +241,38 @@ impl Head for RawHead {
             .map_err(|_| Rejection::Edits)
     }
 
+    fn remove_where(&mut self, unwanted: impl FnMut(&[u8]) -> bool) -> Result<(), Rejection> {
+        let view = self.lines.view(&self.head);
+        self.overlay.remove_where(&view, unwanted);
+        Ok(())
+    }
+
+    fn set_field(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), Rejection> {
+        let view = self.lines.view(&self.head);
+        self.overlay
+            .set(&view, name, value)
+            .map_err(|_| Rejection::Edits)
+    }
+
+    fn append_field(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), Rejection> {
+        self.overlay
+            .append(name, value)
+            .map_err(|_| Rejection::Edits)
+    }
+
+    fn host_value(&self) -> Option<HeaderValue> {
+        let value = self.fields().values_of(&HOST).next()?;
+        // A line of the head is shared with it; a value the core put in its place is not
+        // in the head's bytes, and is copied.
+        let within = self.head.as_ptr_range();
+        let at = value.as_ptr_range();
+        if !value.is_empty() && within.start <= at.start && at.end <= within.end {
+            HeaderValue::from_maybe_shared(self.head.slice_ref(value)).ok()
+        } else {
+            HeaderValue::from_bytes(value).ok()
+        }
+    }
+
     fn to_map(&self) -> HeaderMap {
         let mut map = HeaderMap::with_capacity(self.lines.len());
         for (name, value) in self.fields().iter() {

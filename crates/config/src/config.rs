@@ -46,6 +46,26 @@ pub struct Listener {
     /// connection, a long poll) can be quiet for long. For those listeners only.
     #[serde(default)]
     pub tunnel_idle_seconds: Option<u64>,
+    /// What an `http` or `https` listener, which must have it, tells its upstreams of a
+    /// request's client; no other may.
+    #[serde(default)]
+    pub forwarding: Option<Forwarding>,
+}
+
+/// What an HTTP listener tells its upstreams of a request's client (03 §11 in the docs):
+/// who it trusts to say who their clients are, and which headers only they may send. Both
+/// are always written out, an empty list included, since both decide who a request is
+/// taken to come from.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Forwarding {
+    /// The proxies whose `X-Forwarded-For` is believed, as ranges of their addresses:
+    /// `10.0.0.0/8`, `192.0.2.1/32` for one. Empty, no one's is.
+    pub trusted_proxies: Vec<String>,
+    /// Headers taken off a request that did not come from a trusted proxy: names, or the
+    /// front of one followed by `*` (`X-Forwarded-*`), matched whatever their case. The
+    /// control plane's default is `Forwarded`, `X-Real-IP` and `X-Forwarded-*`.
+    pub trusted_only_headers: Vec<String>,
 }
 
 /// An `https` listener's HTTP/3 (16 in the docs): the same routes and TLS, over QUIC.

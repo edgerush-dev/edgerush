@@ -32,7 +32,7 @@ fn proxy_to(upstream: SocketAddr) -> SocketAddr {
     let yaml = format!(
         r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http }}
+  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }} }}
 routes:
   - name: everything
     listeners: [web]
@@ -389,7 +389,8 @@ fn request_line() -> Vec<Case> {
     let long_target = format!("GET /{} HTTP/1.1\r\nHost: a\r\n\r\n", "a".repeat(9_000));
     vec![
         case("a plain request", "all", b"GET / HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(200)], Open)
-            .seen(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"),
+            // As it came, and then what the upstream is told of the client (03 §11).
+            .seen(b"GET / HTTP/1.1\r\nHost: a\r\nx-forwarded-for: 127.0.0.1\r\nx-forwarded-proto: http\r\nx-forwarded-host: a\r\nvia: 1.1 edgerush\r\n\r\n"),
         case("a space in the method", "hyper server.rs:2669", b"GE T / HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Closed),
         case("a delimiter in the method", "Envoy integration_test.cc:1232", b"GE(T / HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Closed),
         case("a method of our own", "Envoy codec_impl_test.cc:1329 (refuses it by default); a method is any token (RFC 9110 §9.1)", b"BAD / HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(200)], Open)
@@ -751,7 +752,7 @@ fn lengths() -> Vec<Case> {
             .seen(b"content-length: 3\r\n\r\nabc"),
         case("a body on HEAD", "HAProxy h1_to_h1.vtc:208", b"HEAD / HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabc", &[Headed(200)], Open),
         case("POST with no framing", "HAProxy h1_to_h1.vtc:237; linkerd2-proxy transparency.rs:1025", b"POST / HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(200)], Open)
-            .seen(b"POST / HTTP/1.1\r\nHost: a\r\n\r\n")
+            .seen(b"POST / HTTP/1.1\r\nHost: a\r\nx-forwarded-for: 127.0.0.1\r\nx-forwarded-proto: http\r\nx-forwarded-host: a\r\nvia: 1.1 edgerush\r\n\r\n")
             .unseen("transfer-encoding"),
         case("what follows a closing request", "HAProxy h1_to_h1.vtc:170", b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\nthis is not sent\r\n\r\n", &[Is(200)], Closed),
         case("bytes after a request with no body", "Envoy codec_impl_test.cc:4517", b"POST / HTTP/1.1\r\nHost: a\r\n\r\nfoo", &[Is(200)], Open)

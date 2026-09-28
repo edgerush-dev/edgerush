@@ -21,6 +21,7 @@ use crate::downstream::h3::conn::Conn;
 use crate::downstream::h3::connection::drive;
 use crate::downstream::h3::send::Sending;
 use crate::drain::Drain;
+use crate::forwarding::Client;
 use crate::interim::Interim;
 use crate::metrics::Quic;
 use crate::quic::header::{self, Header, VERSION_1};
@@ -330,7 +331,7 @@ pub(crate) async fn serve<T, R, F, B, D, O, G>(
     mut forwarding: Forwarding,
 ) where
     T: Fn() -> Option<InForce>,
-    R: Fn(Request<RequestBody>, Interim) -> F + 'static,
+    R: Fn(Request<RequestBody>, Interim, Rc<Client>) -> F + 'static,
     F: Future<Output = Answered<B>> + 'static,
     B: Body<Data = Bytes> + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
@@ -421,7 +422,7 @@ struct Serving<'a, T, R, D, O> {
 impl<T, R, F, B, D, O, G> Serving<'_, T, R, D, O>
 where
     T: Fn() -> Option<InForce>,
-    R: Fn(Request<RequestBody>, Interim) -> F + 'static,
+    R: Fn(Request<RequestBody>, Interim, Rc<Client>) -> F + 'static,
     F: Future<Output = Answered<B>> + 'static,
     B: Body<Data = Bytes> + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,

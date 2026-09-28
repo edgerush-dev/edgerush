@@ -12,6 +12,7 @@
 
 mod cookies;
 mod drain;
+mod forwarding;
 mod gathered;
 mod grpc;
 // Private, save when the fuzz targets are being built, as `upstream` is below.
@@ -91,6 +92,7 @@ pub mod upstream;
 #[cfg(not(feature = "fuzzing"))]
 mod upstream;
 
+pub use forwarding::Client;
 pub use hop_by_hop::ConnectionError;
 pub use host::HostError;
 pub use request::{Copied, Decision, Forward, Mirroring, Redirected, Rejection, decide};

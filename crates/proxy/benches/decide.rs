@@ -14,7 +14,7 @@
 )]
 
 use edgerush_config::{Compiled, Config, compile};
-use edgerush_proxy::decide;
+use edgerush_proxy::{Client, decide};
 use http::Request;
 use http::request::Parts;
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
@@ -22,7 +22,7 @@ use std::hint::black_box;
 
 const SHOP: &str = r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http }
+  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] } }
 routes:
   - name: shop
     listeners: [web]
@@ -59,6 +59,11 @@ upstreams:
   cart-canary: { endpoints: ["127.0.0.1:9003"] }
   pages: { endpoints: ["127.0.0.1:9004"] }
 "#;
+
+/// A client that is no trusted proxy, as most are.
+fn peer() -> Client {
+    Client::new("203.0.113.7".parse().expect("an address"))
+}
 
 fn shop() -> Compiled {
     let config: Config = serde_saphyr::from_str(SHOP).expect("valid YAML");
@@ -105,12 +110,17 @@ fn head_with(target: &str, host: Option<&str>, more: &[(&'static str, &'static s
 
 // The config and the head are handed back so that dropping them is not measured.
 #[library_benchmark]
-#[bench::usual_form(shop(), head("/pages/about?lang=en", Some("shop.example.com")))]
-#[bench::with_header_changes(shop(), head("/cart/items?page=3", Some("shop.example.com")))]
-#[bench::path_to_normalise(shop(), head("/pages/./a/../about?lang=en", Some("shop.example.com")))]
-#[bench::host_in_the_target(shop(), h2_head("http://shop.example.com/pages/about?lang=en", &[]))]
+#[bench::usual_form(shop(), peer(), head("/pages/about?lang=en", Some("shop.example.com")))]
+#[bench::with_header_changes(shop(), peer(), head("/cart/items?page=3", Some("shop.example.com")))]
+#[bench::path_to_normalise(
+    shop(),
+    peer(),
+    head("/pages/./a/../about?lang=en", Some("shop.example.com"))
+)]
+#[bench::host_in_the_target(shop(), peer(), h2_head("http://shop.example.com/pages/about?lang=en", &[]))]
 #[bench::connection_header(
     shop(),
+    peer(),
     head_with(
         "/pages/about?lang=en",
         Some("shop.example.com"),
@@ -119,26 +129,40 @@ fn head_with(target: &str, host: Option<&str>, more: &[(&'static str, &'static s
 )]
 #[bench::grpc_says_te_trailers(
     shop(),
+    peer(),
     h2_head(
         "http://shop.example.com/pages.Pages/About",
         &[("te", "trailers"), ("content-type", "application/grpc")]
     )
 )]
-#[bench::no_route(shop(), head("/pages/about", Some("other.example.org")))]
-#[bench::rewritten(shop(), head("/api/orders/42?expand=items", Some("shop.example.com")))]
-#[bench::redirected(shop(), head("/old/orders/42?expand=items", Some("shop.example.com")))]
-fn request_core(snapshot: Compiled, mut head: Parts) -> (Compiled, Parts, bool) {
+#[bench::no_route(shop(), peer(), head("/pages/about", Some("other.example.org")))]
+#[bench::rewritten(
+    shop(),
+    peer(),
+    head("/api/orders/42?expand=items", Some("shop.example.com"))
+)]
+#[bench::redirected(
+    shop(),
+    peer(),
+    head("/old/orders/42?expand=items", Some("shop.example.com"))
+)]
+fn request_core(
+    snapshot: Compiled,
+    client: Client,
+    mut head: Parts,
+) -> (Compiled, Client, Parts, bool) {
     let forwarded = match snapshot.listeners.first() {
         Some(listener) => decide(
             black_box(&snapshot),
             listener,
             black_box(&mut head),
+            black_box(&client),
             &mut || 0x9E37_79B9_7F4A_7C15,
         )
         .is_ok(),
         None => false,
     };
-    (snapshot, head, forwarded)
+    (snapshot, client, head, forwarded)
 }
 
 library_benchmark_group!(name = core; benchmarks = request_core);

@@ -227,7 +227,8 @@ where
                 force_retry: false,
             })
         },
-        Rc::new(respond),
+        // Who the client is, the request core's to act on, is nothing these cores look at.
+        Rc::new(move |request, interim, _client| respond(request, interim)),
         Rc::new(|| HttpDate::from_unix(0)),
         || (),
         forwarding,

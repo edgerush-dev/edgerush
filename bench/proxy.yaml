@@ -2,7 +2,9 @@
 # on the one that is measured a small filter chain — headers changed on the way in and on
 # the way out. Requests are for `bench.example.com`.
 listeners:
-  web: { address: "127.0.0.1:8080", protocol: http }
+  # The control plane's defaults: no proxy trusted, the forwarding headers only one may
+  # send taken off.
+  web: { address: "127.0.0.1:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] } }
 
 routes:
   - name: bench

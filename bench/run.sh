@@ -201,11 +201,11 @@ config, tls, h3 = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 chain = json.dumps(open(f"{tls}/cert.pem").read())
 key = json.dumps(open(f"{tls}/key.pem").read())
 text = open(config).read()
-plain = 'web: { address: "127.0.0.1:8080", protocol: http }'
+plain = 'web: { address: "127.0.0.1:8080", protocol: http, '
 assert plain in text
-http3 = ", http3: {}" if h3 else ""
+http3 = "http3: {}, " if h3 else ""
 text = text.replace(plain, 'web: { address: "127.0.0.1:8080", protocol: https, '
-                    f'tls: {{ certificates: [{{ chain: {chain}, key: {key} }}] }}{http3} }}')
+                    f'tls: {{ certificates: [{{ chain: {chain}, key: {key} }}] }}, {http3}')
 open(config, "w").write(text)
 PY
 }

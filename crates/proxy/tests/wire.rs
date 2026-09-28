@@ -48,7 +48,7 @@ async fn proxy_to_with_filters(upstream: SocketAddr, filters: &str) -> SocketAdd
     let yaml = format!(
         r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http }}
+  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }} }}
 routes:
   - name: everything
     listeners: [web]
