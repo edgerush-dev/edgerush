@@ -3266,7 +3266,7 @@ routes:
         filters:
           - type: request_header_modifier
             remove: [expect]
-        backends: [{{ upstream: up, weight: 1 }}]
+        forward: {{ backends: [{{ upstream: up, weight: 1 }}] }}
 upstreams:
   up: {{ endpoints: ["{upstream}"] }}
 "#
@@ -6009,7 +6009,7 @@ upstreams:
     ) -> (SocketAddr, Rc<Worker>) {
         let mut config = everything_config(upstream);
         config.upstreams.get_mut("up").unwrap().protocol = protocol;
-        config.routes[0].rules[0].retry = Some(retry);
+        config.routes[0].rules[0].forward.retry = Some(retry);
         let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
         let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7900,7 +7900,7 @@ routes:
     rules:
       - matches:
           - path: {{ prefix: / }}
-        backends: [{{ upstream: up, weight: 1 }}]
+        forward: {{ backends: [{{ upstream: up, weight: 1 }}] }}
 upstreams:
   up: {{ endpoints: ["{upstream}"] }}
 "#

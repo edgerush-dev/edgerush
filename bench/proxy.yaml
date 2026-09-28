@@ -13,11 +13,11 @@ routes:
       - matches:
           - path: { exact: /health }
           - path: { prefix: /static }
-        backends: [{ upstream: nowhere, weight: 1 }]
+        forward: { backends: [{ upstream: nowhere, weight: 1 }] }
       - matches:
           - path: { prefix: /api/v1 }
             method: POST
-        backends: [{ upstream: nowhere, weight: 1 }]
+        forward: { backends: [{ upstream: nowhere, weight: 1 }] }
       - matches:
           - path: { prefix: / }
         filters:
@@ -28,7 +28,7 @@ routes:
           - type: response_header_modifier
             set: [{ name: x-served-by, value: edgerush }]
             remove: [server]
-        backends: [{ upstream: backend, weight: 1 }]
+        forward: { backends: [{ upstream: backend, weight: 1 }] }
   - name: others
     listeners: [web]
     hostnames:
@@ -37,7 +37,7 @@ routes:
     rules:
       - matches:
           - path: { prefix: / }
-        backends: [{ upstream: nowhere, weight: 1 }]
+        forward: { backends: [{ upstream: nowhere, weight: 1 }] }
 
 upstreams:
   backend: { endpoints: ["127.0.0.1:9000"] }

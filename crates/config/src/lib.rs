@@ -28,6 +28,6 @@ pub use config::{
     Protocol, Tls, Upstream, UpstreamProtocol, UpstreamTls,
 };
 pub use route::{
-    Backend, Filter, Fraction, GrpcMethod, Header, HeaderChanges, Hostname, Match, Mirror,
+    Backend, Filter, Forward, Fraction, GrpcMethod, Header, HeaderChanges, Hostname, Match, Mirror,
     PathMatch, Retry, Route, Rule, TcpRoute, TlsRoute, ValueMatch, ValuePredicate, Wildcard,
 };

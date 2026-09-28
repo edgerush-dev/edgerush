@@ -205,7 +205,7 @@ const GRPC_CODES: [&str; 17] = [
 const MOST_ATTEMPTS: u32 = 5;
 
 fn retry(rule: &Rule, place: &Place, errors: &mut Vec<ConfigError>) -> Option<CompiledRetry> {
-    let retry = rule.retry.as_ref()?;
+    let retry = rule.forward.retry.as_ref()?;
     let mut problems = Vec::new();
     if retry.attempts == 0 || retry.attempts > MOST_ATTEMPTS {
         problems.push(Problem::RetryAttempts(retry.attempts));
@@ -948,10 +948,11 @@ fn backends(
     place: &Place,
     errors: &mut Vec<ConfigError>,
 ) -> WeightedBackends {
-    if rule.backends.is_empty() {
+    if rule.forward.backends.is_empty() {
         errors.push(place.problem(Problem::NoBackends));
     }
     let resolved = rule
+        .forward
         .backends
         .iter()
         .enumerate()
@@ -1002,7 +1003,8 @@ pub struct Place {
     pub matching: Option<usize>,
     /// The filter's position in the rule, if the problem is in a filter.
     pub filter: Option<usize>,
-    /// The backend's position in the rule, if the problem is in a backend.
+    /// The backend's position among the rule's (or passthrough route's), if the problem is
+    /// in a backend.
     pub backend: Option<usize>,
 }
 
@@ -1053,8 +1055,11 @@ impl fmt::Display for Place {
         if let Some(filter) = self.filter {
             write!(f, ", filters[{filter}]")?;
         }
-        if let Some(backend) = self.backend {
-            write!(f, ", backends[{backend}]")?;
+        // A rule's backends are its `forward`'s; a passthrough route's are its own.
+        match (self.rule, self.backend) {
+            (Some(_), Some(backend)) => write!(f, ", forward.backends[{backend}]")?,
+            (None, Some(backend)) => write!(f, ", backends[{backend}]")?,
+            (_, None) => {}
         }
         Ok(())
     }
@@ -1318,9 +1323,10 @@ routes:
           - path: { prefix: /cart }
             headers: [{ name: X-Beta, value: { exact: "on" } }]
             query: [{ name: tenant, value: { regex: "[a-z]+" } }]
-        backends:
-          - { upstream: checkout, weight: 9 }
-          - { upstream: checkout-canary, weight: 1 }
+        forward:
+          backends:
+            - { upstream: checkout, weight: 9 }
+            - { upstream: checkout-canary, weight: 1 }
       - matches:
           - path: { regex: "/orders/[0-9]+" }
           - path: { prefix: / }
@@ -1330,13 +1336,13 @@ routes:
             remove: [x-debug]
           - type: response_header_modifier
             add: [{ name: cache-control, value: no-store }]
-        backends: [{ upstream: web, weight: 1 }]
+        forward: { backends: [{ upstream: web, weight: 1 }] }
   - name: everything-else
     listeners: [web]
     hostnames: [{ name: "*", falls_through: true }]
     rules:
       - matches: [{ path: { prefix: / } }]
-        backends: [{ upstream: web, weight: 1 }]
+        forward: { backends: [{ upstream: web, weight: 1 }] }
 upstreams:
   web: { endpoints: ["127.0.0.1:9000"] }
   checkout: { endpoints: ["127.0.0.1:9001", "[::1]:9001"] }
@@ -1469,11 +1475,11 @@ routes:
   - name: older
     listeners: [web]
     hostnames: [{ name: a.example.com, falls_through: true }]
-    rules: [{ matches: [{ path: { prefix: /api } }], backends: [{ upstream: u, weight: 1 }] }]
+    rules: [{ matches: [{ path: { prefix: /api } }], forward: { backends: [{ upstream: u, weight: 1 }] } }]
   - name: younger
     listeners: [web]
     hostnames: [{ name: a.example.com, falls_through: true }]
-    rules: [{ matches: [{ path: { prefix: /api } }], backends: [{ upstream: u, weight: 1 }] }]
+    rules: [{ matches: [{ path: { prefix: /api } }], forward: { backends: [{ upstream: u, weight: 1 }] } }]
 upstreams: { u: { endpoints: [] } }
 "#;
         let compiled = compile(&config(twins)).unwrap();
@@ -1488,11 +1494,11 @@ routes:
   - name: wildcard
     listeners: [web]
     hostnames: [{ name: "*.example.com", wildcard: one_label, falls_through: false }]
-    rules: [{ matches: [{ path: { prefix: /shared } }], backends: [{ upstream: u, weight: 1 }] }]
+    rules: [{ matches: [{ path: { prefix: /shared } }], forward: { backends: [{ upstream: u, weight: 1 }] } }]
   - name: exact
     listeners: [web]
     hostnames: [{ name: a.example.com, wildcard: any_labels, falls_through: false }]
-    rules: [{ matches: [{ path: { prefix: /own } }], backends: [{ upstream: u, weight: 1 }] }]
+    rules: [{ matches: [{ path: { prefix: /own } }], forward: { backends: [{ upstream: u, weight: 1 }] } }]
 upstreams: { u: { endpoints: [] } }
 "#;
         let compiled = compile(&config(ingress_style)).unwrap();
@@ -1531,16 +1537,17 @@ routes:
           - { type: request_header_modifier, set: [{ name: x-a, value: "1" }] }
           - { type: response_header_modifier, set: [{ name: x-a, value: "1" }], remove: [X-A] }
           - { type: request_header_modifier, add: [{ name: "x y", value: "1" }] }
-        backends: []
+        forward: { backends: [] }
       - matches:
           - path: { prefix: /ok }
           - path: { exact: no-slash }
             method: get
             headers: [{ name: "x y", value: { exact: "1" } }]
             query: [{ name: "", value: { regex: "(" } }]
-        backends:
-          - { upstream: web, weight: 1 }
-          - { upstream: wbe, weight: 1 }
+        forward:
+          backends:
+            - { upstream: web, weight: 1 }
+            - { upstream: wbe, weight: 1 }
 upstreams:
   web: { endpoints: [] }
 "#;
@@ -1574,7 +1581,7 @@ upstreams:
                 "route `a`, rules[1], matches[1]: header `x y`: invalid header name",
                 "route `a`, rules[1], matches[1]: query parameter ``: query parameter name is \
                  empty",
-                "route `a`, rules[1], backends[1]: there is no upstream `wbe`",
+                "route `a`, rules[1], forward.backends[1]: there is no upstream `wbe`",
             ]
         );
     }
@@ -1598,18 +1605,42 @@ upstreams:
         // compiling holds it to (`a_match_says_its_path_or_its_grpc_method`).
         let rule =
             |rule: &str| format!("[{{ name: a, listeners: [], hostnames: [], rules: [{rule}] }}]");
-        assert!(parse(&rule("{ matches: [], backends: [] }")).is_ok());
-        assert!(parse(&rule("{ matches: [], backends: [{ upstream: u }] }")).is_err());
+        assert!(parse(&rule("{ matches: [], forward: { backends: [] } }")).is_ok());
+        assert!(
+            parse(&rule(
+                "{ matches: [], forward: { backends: [{ upstream: u }] } }"
+            ))
+            .is_err()
+        );
         assert!(parse(&rule("{ matches: [] }")).is_err());
+        // Backends and a retry are forwarding's, and said inside `forward` only.
+        assert!(parse(&rule("{ matches: [], backends: [] }")).is_err());
+        assert!(
+            parse(&rule(
+                "{ matches: [], forward: { backends: [] }, retry: { attempts: 1 } }"
+            ))
+            .is_err()
+        );
         // Misspelt keys are errors, not silence.
+        assert!(
+            parse(&rule(
+                "{ matches: [], forward: { backends: [], retries: {} } }"
+            ))
+            .is_err()
+        );
         assert!(
             parse("[{ name: a, listeners: [], hostnames: [], rules: [], rulez: [] }]").is_err()
         );
-        assert!(parse(&rule("{ matches: [], backends: [], filter: [] }")).is_err());
+        assert!(
+            parse(&rule(
+                "{ matches: [], forward: { backends: [] }, filter: [] }"
+            ))
+            .is_err()
+        );
         // A filter is of a kind the model knows and has no keys it does not.
         let filter = |filter: &str| {
             rule(&format!(
-                "{{ matches: [], filters: [{filter}], backends: [] }}"
+                "{{ matches: [], filters: [{filter}], forward: {{ backends: [] }} }}"
             ))
         };
         assert!(parse(&filter("{ type: request_header_modifier }")).is_ok());
@@ -1623,7 +1654,12 @@ upstreams:
             ))
             .is_err()
         );
-        assert!(parse(&rule("{ matches: [{ path: { glob: /a } }], backends: [] }")).is_err());
+        assert!(
+            parse(&rule(
+                "{ matches: [{ path: { glob: /a } }], forward: { backends: [] } }"
+            ))
+            .is_err()
+        );
         // An endpoint is an address, not a name.
         let upstream = |endpoint: &str| {
             let yaml = format!(
@@ -1920,7 +1956,7 @@ upstreams:
             refused(
                 tcp,
                 &format!(
-                    "routes:\n  - {{ name: web, listeners: [t], hostnames: [{{ name: \"*\", falls_through: true }}], rules: [{{ matches: [{{ path: {{ prefix: / }} }}], backends: [{up}] }}] }}\ntcp_routes: [{}]",
+                    "routes:\n  - {{ name: web, listeners: [t], hostnames: [{{ name: \"*\", falls_through: true }}], rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: [{up}] }} }}] }}\ntcp_routes: [{}]",
                     tcp_route("a", "t", up)
                 )
             ),
@@ -2060,7 +2096,7 @@ routes:
   - name: r
     listeners: [web]
     hostnames: [{{ name: "*", falls_through: true }}]
-    rules: [{{ matches: [{matching}], backends: [{{ upstream: u, weight: 1 }}] }}]
+    rules: [{{ matches: [{matching}], forward: {{ backends: [{{ upstream: u, weight: 1 }}] }} }}]
 upstreams: {{ u: {{ endpoints: [] }} }}
 "#
             );
@@ -2108,11 +2144,11 @@ routes:
     hostnames: [{ name: "*", falls_through: true }]
     rules:
       - matches: [{ grpc: { method: Do } }]
-        backends: [{ upstream: u, weight: 1 }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
       - matches: [{ grpc: { service: pkg.Svc } }]
-        backends: [{ upstream: u, weight: 1 }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
       - matches: [{ grpc: { service: pkg.Svc, method: Do } }]
-        backends: [{ upstream: u, weight: 1 }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
 upstreams: { u: { endpoints: [] } }
 "#,
         ))
@@ -2216,7 +2252,7 @@ routes:
   - name: r
     listeners: [web]
     hostnames: [{{ name: "*", falls_through: true }}]
-    rules: [{{ matches: [{{ path: {{ prefix: / }} }}], backends: [{{ upstream: u, weight: 1 }}], filters: [{mirror}] }}]
+    rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}] }}, filters: [{mirror}] }}]
 upstreams: {{ u: {{ endpoints: [] }}, shadow: {{ endpoints: [] }} }}
 "#
             );
@@ -2280,7 +2316,7 @@ routes:
   - name: r
     listeners: [web]
     hostnames: [{{ name: "*", falls_through: true }}]
-    rules: [{{ matches: [{{ path: {{ prefix: / }} }}], backends: [{{ upstream: u, weight: 1 }}], retry: {retry} }}]
+    rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}], retry: {retry} }} }}]
 upstreams: {{ u: {{ endpoints: [] }} }}
 "#
             );
@@ -2360,11 +2396,11 @@ routes:
   - name: site
     listeners: [public]
     hostnames: [{ name: "*", falls_through: true }]
-    rules: [{ matches: [{ path: { prefix: / } }], backends: [{ upstream: u, weight: 1 }] }]
+    rules: [{ matches: [{ path: { prefix: / } }], forward: { backends: [{ upstream: u, weight: 1 }] } }]
   - name: metrics
     listeners: [internal, public]
     hostnames: [{ name: metrics.internal, falls_through: true }]
-    rules: [{ matches: [{ path: { prefix: / } }], backends: [{ upstream: u, weight: 1 }] }]
+    rules: [{ matches: [{ path: { prefix: / } }], forward: { backends: [{ upstream: u, weight: 1 }] } }]
 upstreams: { u: { endpoints: [] } }
 "#;
         let compiled = compile(&config(two)).unwrap();

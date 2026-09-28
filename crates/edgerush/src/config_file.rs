@@ -167,7 +167,7 @@ routes:
     rules:
       - matches:
           - path: { prefix: / }
-        backends: [{ upstream: gone, weight: 1 }]
+        forward: { backends: [{ upstream: gone, weight: 1 }] }
 upstreams: {}
 "#;
         let rejected = Scratch::new("problems", yaml).open().unwrap_err();

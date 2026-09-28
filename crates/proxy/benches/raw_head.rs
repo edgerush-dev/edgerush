@@ -49,13 +49,15 @@ routes:
           - type: request_header_modifier
             set: [{ name: X-Gateway, value: edgerush }]
             remove: [x-debug]
-        backends:
-          - { upstream: cart, weight: 9 }
-          - { upstream: cart-canary, weight: 1 }
+        forward:
+          backends:
+            - { upstream: cart, weight: 9 }
+            - { upstream: cart-canary, weight: 1 }
       - matches:
           - path: { prefix: / }
-        backends:
-          - { upstream: pages, weight: 1 }
+        forward:
+          backends:
+            - { upstream: pages, weight: 1 }
 upstreams:
   cart: { endpoints: ["127.0.0.1:9002"] }
   cart-canary: { endpoints: ["127.0.0.1:9003"] }

@@ -220,7 +220,7 @@ routes:
     hostnames: [{{ name: "*", falls_through: true }}]
     rules:
       - matches: [{{ grpc: {{ service: test.Echo }} }}]
-        backends: [{{ upstream: echo, weight: 1 }}]
+        forward: {{ backends: [{{ upstream: echo, weight: 1 }}] }}
 upstreams:
   echo: {{ endpoints: ["{upstream}"], protocol: http2 }}
 "#

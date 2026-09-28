@@ -271,7 +271,7 @@ routes:
     rules:
       - matches:
           - path: { prefix: / }
-        backends: [{ upstream: nowhere, weight: 1 }]
+        forward: { backends: [{ upstream: nowhere, weight: 1 }] }
 upstreams:
   nowhere: { endpoints: [] }
 "#;

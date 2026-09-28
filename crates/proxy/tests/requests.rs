@@ -41,7 +41,7 @@ routes:
     rules:
       - matches:
           - path: {{ prefix: / }}
-        backends: [{{ upstream: up, weight: 1 }}]
+        forward: {{ backends: [{{ upstream: up, weight: 1 }}] }}
 upstreams:
   up: {{ endpoints: ["{upstream}"] }}
 "#

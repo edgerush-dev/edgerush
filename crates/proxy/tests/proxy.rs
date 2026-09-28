@@ -207,8 +207,9 @@ fn everything_to(listeners: &[(&str, SocketAddr)], config: &str) -> String {
         filters:
           - type: response_header_modifier
             set: [{{ name: x-config, value: "{config}" }}]
-        backends:
-          - {{ upstream: {listener}, weight: 1 }}
+        forward:
+          backends:
+            - {{ upstream: {listener}, weight: 1 }}
 "#
         );
     }
@@ -243,24 +244,29 @@ routes:
           - type: response_header_modifier
             add: [{{ name: X-Served-By, value: edgerush }}]
             remove: [x-powered-by]
-        backends:
-          - {{ upstream: cart, weight: 1 }}
+        forward:
+          backends:
+            - {{ upstream: cart, weight: 1 }}
       - matches:
           - path: {{ exact: /closed }}
-        backends:
-          - {{ upstream: cart, weight: 0 }}
+        forward:
+          backends:
+            - {{ upstream: cart, weight: 0 }}
       - matches:
           - path: {{ exact: /empty }}
-        backends:
-          - {{ upstream: empty, weight: 1 }}
+        forward:
+          backends:
+            - {{ upstream: empty, weight: 1 }}
       - matches:
           - path: {{ exact: /dead }}
-        backends:
-          - {{ upstream: dead, weight: 1 }}
+        forward:
+          backends:
+            - {{ upstream: dead, weight: 1 }}
       - matches:
           - path: {{ prefix: / }}
-        backends:
-          - {{ upstream: pages, weight: 1 }}
+        forward:
+          backends:
+            - {{ upstream: pages, weight: 1 }}
 upstreams:
   cart: {{ endpoints: ["{cart}"] }}
   dead: {{ endpoints: ["{dead}"] }}
@@ -465,12 +471,14 @@ routes:
       - matches:
           - path: {{ prefix: / }}
             headers: [{{ name: Host, value: {{ exact: evil.example }} }}]
-        backends:
-          - {{ upstream: evil, weight: 1 }}
+        forward:
+          backends:
+            - {{ upstream: evil, weight: 1 }}
       - matches:
           - path: {{ prefix: / }}
-        backends:
-          - {{ upstream: rest, weight: 1 }}
+        forward:
+          backends:
+            - {{ upstream: rest, weight: 1 }}
 upstreams:
   evil: {{ endpoints: ["{evil}"] }}
   rest: {{ endpoints: ["{rest}"] }}
@@ -577,8 +585,9 @@ routes:
     rules:
       - matches:
           - path: {{ prefix: / }}
-        backends:
-          - {{ upstream: any, weight: 1 }}
+        forward:
+          backends:
+            - {{ upstream: any, weight: 1 }}
 upstreams:
   any: {{ endpoints: ["{any_host}"] }}
 "#
@@ -620,8 +629,9 @@ routes:
     rules:
       - matches:
           - path: {{ prefix: / }}
-        backends:
-          - {{ upstream: web, weight: 1 }}
+        forward:
+          backends:
+            - {{ upstream: web, weight: 1 }}
   - name: admin
     listeners: [admin]
     hostnames:
@@ -629,8 +639,9 @@ routes:
     rules:
       - matches:
           - path: {{ prefix: /status }}
-        backends:
-          - {{ upstream: admin, weight: 1 }}
+        forward:
+          backends:
+            - {{ upstream: admin, weight: 1 }}
 upstreams:
   admin: {{ endpoints: ["{admin}"] }}
   web: {{ endpoints: ["{one}", "{two}"] }}
@@ -1074,7 +1085,7 @@ fn routed_to(upstreams: &[(&str, SocketAddr)]) -> String {
     for (name, _) in upstreams {
         yaml += &format!(
             "      - matches:\n          - path: {{ prefix: /{name} }}\n        \
-             backends: [{{ upstream: {name}, weight: 1 }}]\n"
+             forward: {{ backends: [{{ upstream: {name}, weight: 1 }}] }}\n"
         );
     }
     yaml += "upstreams:\n";

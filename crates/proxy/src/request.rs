@@ -217,23 +217,27 @@ routes:
           - type: request_header_modifier
             set: [{ name: X-Gateway, value: edgerush }]
             remove: [x-debug]
-        backends:
-          - { upstream: cart, weight: 9 }
-          - { upstream: cart-canary, weight: 1 }
+        forward:
+          backends:
+            - { upstream: cart, weight: 9 }
+            - { upstream: cart-canary, weight: 1 }
       - matches:
           - path: { exact: /closed }
-        backends:
-          - { upstream: cart, weight: 0 }
+        forward:
+          backends:
+            - { upstream: cart, weight: 0 }
       - matches:
           - path: { prefix: /search }
             query: [{ name: q, value: { exact: "a b" } }]
-        backends:
-          - { upstream: search, weight: 1 }
+        forward:
+          backends:
+            - { upstream: search, weight: 1 }
       - matches:
           - path: { prefix: /account }
             headers: [{ name: Cookie, value: { exact: "a=1; b=2" } }]
-        backends:
-          - { upstream: search, weight: 1 }
+        forward:
+          backends:
+            - { upstream: search, weight: 1 }
   - name: everything-else
     listeners: [web]
     hostnames:
@@ -242,12 +246,14 @@ routes:
       - matches:
           - path: { prefix: /tenant }
             headers: [{ name: Host, value: { exact: tenant.example.net } }]
-        backends:
-          - { upstream: search, weight: 1 }
+        forward:
+          backends:
+            - { upstream: search, weight: 1 }
       - matches:
           - path: { prefix: / }
-        backends:
-          - { upstream: fallback, weight: 1 }
+        forward:
+          backends:
+            - { upstream: fallback, weight: 1 }
   - name: admin
     listeners: [admin]
     hostnames:
@@ -255,8 +261,9 @@ routes:
     rules:
       - matches:
           - path: { prefix: /status }
-        backends:
-          - { upstream: admin, weight: 1 }
+        forward:
+          backends:
+            - { upstream: admin, weight: 1 }
 upstreams:
   admin: { endpoints: ["127.0.0.1:9001"] }
   cart: { endpoints: ["127.0.0.1:9002"] }

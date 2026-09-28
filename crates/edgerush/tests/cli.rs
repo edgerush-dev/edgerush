@@ -308,7 +308,7 @@ routes:
     rules:
       - matches:
           - path: {{ prefix: / }}
-        backends: [{{ upstream: {backend}, weight: 1 }}]
+        forward: {{ backends: [{{ upstream: {backend}, weight: 1 }}] }}
 listeners:
   web: {{ address: "{listen}", protocol: http }}
 "#

@@ -74,7 +74,8 @@ pub enum Wildcard {
     AnyLabels,
 }
 
-/// A rule: the requests it is for, what is done to them on the way, and where they go.
+/// A rule: the requests it is for, what is done to them on the way, and what becomes of
+/// them.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
@@ -83,6 +84,14 @@ pub struct Rule {
     /// What is done to a request and its response. Each kind of filter at most once.
     #[serde(default)]
     pub filters: Vec<Filter>,
+    /// Where its requests go.
+    pub forward: Forward,
+}
+
+/// A rule's requests sent on to its backends.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Forward {
     /// Where requests go, in proportion to the weights. At least one.
     pub backends: Vec<Backend>,
     /// Sending a request again when its answer says to; none is never.
