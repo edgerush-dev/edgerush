@@ -110,7 +110,7 @@ fn sent_with(target: &str, host: Option<&str>, more: &[(&'static str, &'static s
         (shop(), sent("/pages/about?lang=en", Some("shop.example.com"))),
         (shop(), sent("/cart/items?page=3", Some("shop.example.com"))),
         (shop(), sent("/pages/./a/../about?lang=en", Some("shop.example.com"))),
-        (shop(), sent("http://shop.example.com/pages/about?lang=en", None)),
+        (shop(), sent("http://shop.example.com/pages/about?lang=en", Some("shop.example.com"))),
         (shop(), sent_with(
             "/pages/about?lang=en",
             Some("shop.example.com"),
@@ -118,7 +118,7 @@ fn sent_with(target: &str, host: Option<&str>, more: &[(&'static str, &'static s
         )),
         (shop(), sent_with(
             "http://shop.example.com/pages.Pages/About",
-            None,
+            Some("shop.example.com"),
             &[("te", "trailers"), ("content-type", "application/grpc")]
         )),
         (shop(), sent("/pages/about", Some("other.example.org"))),
@@ -162,7 +162,7 @@ fn by_raw(snapshot: Compiled, head: Bytes) -> (Compiled, Option<RawHead>, bool) 
         (shop(), sent("/pages/about?lang=en", Some("shop.example.com"))),
         (shop(), sent("/cart/items?page=3", Some("shop.example.com"))),
         (shop(), sent("/pages/./a/../about?lang=en", Some("shop.example.com"))),
-        (shop(), sent("http://shop.example.com/pages/about?lang=en", None)),
+        (shop(), sent("http://shop.example.com/pages/about?lang=en", Some("shop.example.com"))),
         (shop(), sent_with(
             "/pages/about?lang=en",
             Some("shop.example.com"),
@@ -170,7 +170,7 @@ fn by_raw(snapshot: Compiled, head: Bytes) -> (Compiled, Option<RawHead>, bool) 
         )),
         (shop(), sent_with(
             "http://shop.example.com/pages.Pages/About",
-            None,
+            Some("shop.example.com"),
             &[("te", "trailers"), ("content-type", "application/grpc")]
         )),
         (shop(), sent("/pages/about", Some("other.example.org"))),

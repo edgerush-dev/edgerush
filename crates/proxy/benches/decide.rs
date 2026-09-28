@@ -70,6 +70,14 @@ fn head(target: &str, host: Option<&str>) -> Parts {
     head_with(target, host, &[])
 }
 
+/// The same over HTTP/2: the host in the target, as `:authority`, and no `Host` field. (An
+/// HTTP/1.1 request without one is refused, whatever its target says: RFC 9112 §3.2.)
+fn h2_head(target: &str, more: &[(&'static str, &'static str)]) -> Parts {
+    let mut head = head_with(target, None, more);
+    head.version = http::Version::HTTP_2;
+    head
+}
+
 fn head_with(target: &str, host: Option<&str>, more: &[(&'static str, &'static str)]) -> Parts {
     let fields = [
         (
@@ -100,7 +108,7 @@ fn head_with(target: &str, host: Option<&str>, more: &[(&'static str, &'static s
 #[bench::usual_form(shop(), head("/pages/about?lang=en", Some("shop.example.com")))]
 #[bench::with_header_changes(shop(), head("/cart/items?page=3", Some("shop.example.com")))]
 #[bench::path_to_normalise(shop(), head("/pages/./a/../about?lang=en", Some("shop.example.com")))]
-#[bench::host_in_the_target(shop(), head("http://shop.example.com/pages/about?lang=en", None))]
+#[bench::host_in_the_target(shop(), h2_head("http://shop.example.com/pages/about?lang=en", &[]))]
 #[bench::connection_header(
     shop(),
     head_with(
@@ -111,9 +119,8 @@ fn head_with(target: &str, host: Option<&str>, more: &[(&'static str, &'static s
 )]
 #[bench::grpc_says_te_trailers(
     shop(),
-    head_with(
+    h2_head(
         "http://shop.example.com/pages.Pages/About",
-        None,
         &[("te", "trailers"), ("content-type", "application/grpc")]
     )
 )]
