@@ -282,6 +282,7 @@
 //! [`send_response()`]: struct.Connection.html#method.send_response
 //! [`send_body()`]: struct.Connection.html#method.send_body
 
+use std::borrow::Cow;
 use std::collections::hash_map;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -728,8 +729,12 @@ where
 }
 
 /// An owned name-value pair representing a raw HTTP header.
+///
+/// EdgeRush: a name or value the QPACK decoder takes from the static table is
+/// the table's own bytes, borrowed; anything else is owned. A field sent as a
+/// static entry, or a name sent as a reference to one, costs no allocation.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Header(Vec<u8>, Vec<u8>);
+pub struct Header(Cow<'static, [u8]>, Cow<'static, [u8]>);
 
 fn try_print_as_readable(hdr: &[u8], f: &mut fmt::Formatter) -> fmt::Result {
     match std::str::from_utf8(hdr) {
@@ -753,7 +758,7 @@ impl Header {
     ///
     /// Both `name` and `value` will be cloned.
     pub fn new(name: &[u8], value: &[u8]) -> Self {
-        Self(name.to_vec(), value.to_vec())
+        Self(Cow::Owned(name.to_vec()), Cow::Owned(value.to_vec()))
     }
 }
 

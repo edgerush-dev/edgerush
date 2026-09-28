@@ -24,6 +24,8 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::borrow::Cow;
+
 use super::Error;
 use super::Result;
 
@@ -174,7 +176,9 @@ impl Decoder {
                         (name.len() + value.len()) as u64,
                     )?;
 
-                    let hdr = Header::new(name, value);
+                    // EdgeRush: the table's own bytes, not copies of them.
+                    let hdr =
+                        Header(Cow::Borrowed(name), Cow::Borrowed(value));
                     out.push(hdr);
                 },
 
@@ -217,7 +221,7 @@ impl Decoder {
 
                     // Instead of calling Header::new(), create Header directly
                     // from `name` and `value`.
-                    let hdr = Header(name, value);
+                    let hdr = Header(Cow::Owned(name), Cow::Owned(value));
                     out.push(hdr);
                 },
 
@@ -246,8 +250,9 @@ impl Decoder {
                     size_tracker.on_field_part_decoded(value.len() as u64)?;
 
                     // Instead of calling Header::new(), create Header directly
-                    // from `value`, but clone `name` as it is just a reference.
-                    let hdr = Header(name.to_vec(), value);
+                    // from `value`. EdgeRush: and `name` borrowed from the
+                    // static table rather than cloned.
+                    let hdr = Header(Cow::Borrowed(name), Cow::Owned(value));
                     out.push(hdr);
                 },
 
@@ -491,5 +496,35 @@ mod tests {
             Decoder::new().decode(&encoded_literal, 57),
             Err(Error::HeaderListTooLarge),
         );
+    }
+
+    /// EdgeRush: a field from the static table, and the name of one that
+    /// refers to it, are the table's own bytes, borrowed rather than copied
+    /// into allocations of their own; a literal is the field's own.
+    #[test]
+    fn static_fields_are_borrowed_from_the_table() {
+        // QPACK header block:
+        //   [0x00, 0x00]  required insert count=0, base=0
+        //   [0xd1]        Indexed, S=1 (static), index=17 (:method GET)
+        //   [0x50]        LiteralWithNameRef, S=1, name_idx=0 (:authority)
+        //   [0x01, 0x61]  value: non-huffman, length=1, 'a'
+        //   [0x21, 0x78]  Literal, name: non-huffman, length=1, 'x'
+        //   [0x01, 0x62]  value: non-huffman, length=1, 'b'
+        let encoded =
+            [0x00, 0x00, 0xd1, 0x50, 0x01, 0x61, 0x21, 0x78, 0x01, 0x62];
+
+        let list = Decoder::new().decode(&encoded, u64::MAX).unwrap();
+
+        assert_eq!(list, [
+            Header::new(b":method", b"GET"),
+            Header::new(b":authority", b"a"),
+            Header::new(b"x", b"b"),
+        ]);
+        assert!(matches!(list[0].0, Cow::Borrowed(_)));
+        assert!(matches!(list[0].1, Cow::Borrowed(_)));
+        assert!(matches!(list[1].0, Cow::Borrowed(_)));
+        assert!(matches!(list[1].1, Cow::Owned(_)));
+        assert!(matches!(list[2].0, Cow::Owned(_)));
+        assert!(matches!(list[2].1, Cow::Owned(_)));
     }
 }

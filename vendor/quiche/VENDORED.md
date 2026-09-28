@@ -113,6 +113,15 @@ Every change is marked `EdgeRush:` in the source.
   account of its own. `what_is_held_is_counted` in `src/stream/recv_buf.rs`,
   `what_a_connection_holds_unread_is_counted` in `src/tests.rs` and
   `a_head_that_has_come_in_part_is_counted` in `src/h3/mod.rs` cover it.
+- **A field from QPACK's static table is not copied.** `h3::Header` held its name and
+  value as two `Vec`s, and the decoder copied into them even what it took from the static
+  table: a request's `:method GET` and `:scheme https`, and the names of the `:authority`,
+  `:path` and other fields it sends as references to the table, each an allocation of a
+  few bytes. `Header` now holds each as a `Cow<'static, [u8]>`, borrowed where the decoder
+  takes it from the table and owned otherwise (`src/h3/mod.rs`, `Decoder::decode` in
+  `src/h3/qpack/decoder.rs`). Its API is as it was: `Header::new` still copies, and
+  `name()` and `value()` still give slices. `static_fields_are_borrowed_from_the_table`
+  at the end of `src/h3/qpack/decoder.rs` covers it.
 
 ## Why
 
@@ -193,7 +202,7 @@ HTTP/2 stage, and needs to know it. The pieces are told apart from the bytes bec
 costs a buffer and a node past its bytes: a peer that sends its data a byte a frame, in
 order, costs a hundred times what flow control counts.
 
-With all ten changes, quiche's own library tests pass (1,175 of 1,175, on Windows and
+With all eleven changes, quiche's own library tests pass (1,176 of 1,176, on Windows and
 Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`).
 The proxy's probe `several_streams_share_a_packet` in `crates/proxy/tests/h3_library.rs`
 fails against the published crate, as do its tests `an_answer_carries_the_ack_of_its_request`
