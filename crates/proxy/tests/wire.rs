@@ -259,10 +259,11 @@ async fn a_body_of_unknown_length_is_chunked_in_both_directions() {
     assert_eq!(client.chunked_body().await, "2\r\nhi\r\n0\r\n\r\n");
 }
 
-/// A client's trailers reach the upstream ([13 §5](../../../docs/13-http1-upstream.md));
-/// hyper's client puts none on the wire.
+/// A client's trailers do not reach the upstream: the body does, ended where they were
+/// ([03 §11](../../../docs/03-data-plane.md)). A trailer can carry a name the head's own
+/// was taken off for, and some backends read trailers as headers.
 #[tokio::test]
-async fn a_requests_trailers_reach_the_upstream() {
+async fn a_requests_trailers_do_not_reach_the_upstream() {
     let (saw, mut seen) = reporter();
     let upstream = raw_upstream(move |mut wire| {
         let saw = saw.clone();
@@ -278,23 +279,19 @@ async fn a_requests_trailers_reach_the_upstream() {
     client
         .write(concat!(
             "POST /up HTTP/1.1\r\nhost: a.test\r\ntransfer-encoding: chunked\r\nte: trailers\r\n",
-            "\r\n5\r\nhello\r\n0\r\nx-sent: yes\r\n\r\n"
+            "\r\n5\r\nhello\r\n0\r\nx-forwarded-for: 10.9.9.9\r\n\r\n"
         ))
         .await;
 
     let body = within(seen.recv()).await.unwrap();
-    assert_eq!(body, "5\r\nhello\r\n0\r\nx-sent: yes\r\n\r\n");
+    assert_eq!(body, "5\r\nhello\r\n0\r\n\r\n");
 }
 
-/// A field the request's own `Connection` named is hop-by-hop for that hop, so it may not
-/// travel on — as a trailer no more than as a header, and no more as a name declared in
-/// `Trailer` than as the field itself ([13 §4](../../../docs/13-http1-upstream.md)).
-///
-/// The names have to be read before routing strips the `Connection` that held them:
-/// afterwards there is nothing left to read them from, and everything it named looks like
-/// an ordinary field.
+/// A request's trailers go no further than the gateway, and neither does its `Trailer`
+/// declaration, which would name what will not follow: not a field the request's own
+/// `Connection` named, and not one it did not ([03 §11](../../../docs/03-data-plane.md)).
 #[tokio::test]
-async fn a_trailer_the_requests_connection_named_does_not_travel_on() {
+async fn a_requests_trailers_and_their_declaration_do_not_travel_on() {
     let (saw, mut seen) = reporter();
     let upstream = raw_upstream(move |mut wire| {
         let saw = saw.clone();
@@ -321,13 +318,11 @@ async fn a_trailer_the_requests_connection_named_does_not_travel_on() {
         !sent.to_ascii_lowercase().contains("x-secret"),
         "a field the request's own Connection named crossed the hop:\n{sent}"
     );
-    // What the `Connection` did not name is untouched: the trailer travels and the
-    // declaration still names it.
-    assert!(sent.contains("x-keep: fine"), "{sent}");
-    assert!(
-        sent.to_ascii_lowercase().contains("trailer: x-keep"),
-        "{sent}"
-    );
+    // Nor what it did not name, as a trailer or as a name declared.
+    let lowered = sent.to_ascii_lowercase();
+    assert!(!lowered.contains("x-keep"), "{sent}");
+    assert!(!lowered.contains("\r\ntrailer:"), "{sent}");
+    assert!(sent.ends_with("5\r\nhello\r\n0\r\n\r\n"), "{sent}");
 }
 
 /// An answer's fields reach the client as the upstream wrote them: the case of each name,
@@ -2516,11 +2511,10 @@ async fn an_http2_request_that_ends_with_an_empty_frame_is_ended_in_chunks() {
     assert!(seen.ends_with("\r\n\r\n0\r\n\r\n"), "{seen}");
 }
 
-/// An HTTP/2 request that says its length and then sends trailers is carried whole and
-/// answered (linkerd2-proxy #15414, where one hung). A length cannot carry trailers on
-/// HTTP/1.1, so EdgeRush frames it in chunks with the length removed and the trailers
-/// after the last chunk (13 §4); hyper's client keeps the length and drops
-/// the trailers, which is the request-trailer difference in 13 §5.
+/// An HTTP/2 request that says its length and then sends trailers is carried and answered
+/// (linkerd2-proxy #15414, where one hung). Its body is framed in chunks, with the length
+/// removed, as every HTTP/2 body is (13 §4); its trailers go no further than the gateway
+/// (03 §11), and the chunks end where they were.
 #[tokio::test]
 async fn an_http2_request_with_a_length_and_trailers_is_carried() {
     let (saw, mut seen) = reporter();
@@ -2568,10 +2562,7 @@ async fn an_http2_request_with_a_length_and_trailers_is_carried() {
     let seen = within(seen.recv()).await.unwrap().to_ascii_lowercase();
     assert!(!seen.contains("content-length"), "{seen}");
     assert!(seen.contains("transfer-encoding: chunked\r\n"), "{seen}");
-    assert!(
-        seen.ends_with("\r\n\r\n5\r\nhello\r\n0\r\nx-t: 1\r\n\r\n"),
-        "{seen}"
-    );
+    assert!(seen.ends_with("\r\n\r\n5\r\nhello\r\n0\r\n\r\n"), "{seen}");
 }
 
 /// An answer of trailers and no data reaches an HTTP/2 client as HEADERS and trailers,

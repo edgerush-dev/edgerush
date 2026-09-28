@@ -266,9 +266,22 @@ pub(crate) struct IncomingBody {
     /// For a counted body, how much of it is still to come.
     left: Option<u64>,
     done: bool,
+    /// Whether its trailers are handed over; the request core wants none (03 §11), and
+    /// a server's own tests all of them.
+    trailers_wanted: bool,
 }
 
 impl IncomingBody {
+    /// Has its trailers read to their end and not handed over.
+    pub(crate) fn drop_trailers(&mut self) {
+        self.trailers_wanted = false;
+    }
+
+    /// Whether its trailers are handed over.
+    pub(crate) fn wants_trailers(&self) -> bool {
+        self.trailers_wanted
+    }
+
     fn failed(error: CodecError) -> RequestBodyError {
         let incomplete = matches!(error, CodecError::Truncated | CodecError::BodyShort);
         let cause = Box::new(error);
@@ -864,6 +877,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             inbound: Rc::clone(&self.inbound),
             left,
             done: false,
+            trailers_wanted: true,
         };
         Ok(Begun {
             head,

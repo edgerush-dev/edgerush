@@ -60,6 +60,9 @@ pub(crate) struct IncomingH3 {
     ended: bool,
     idle: Idle,
     interim: Option<Interim>,
+    /// Whether its trailers are handed over; the request core wants none (03 §11), and
+    /// a server's own tests all of them.
+    trailers_wanted: bool,
 }
 
 impl std::fmt::Debug for IncomingH3 {
@@ -73,6 +76,16 @@ impl std::fmt::Debug for IncomingH3 {
 }
 
 impl IncomingH3 {
+    /// Has its trailers read to their end and not handed over.
+    pub(crate) fn drop_trailers(&mut self) {
+        self.trailers_wanted = false;
+    }
+
+    /// Whether its trailers are handed over.
+    pub(crate) fn wants_trailers(&self) -> bool {
+        self.trailers_wanted
+    }
+
     /// The body of stream `stream` of `conn`, whose head declared `declared` and ended the
     /// stream if `ended`; its reader waits `idle` at the most with nothing coming.
     pub(crate) fn new(
@@ -91,6 +104,7 @@ impl IncomingH3 {
             ended,
             idle: Idle::new(idle),
             interim: None,
+            trailers_wanted: true,
         }
     }
 

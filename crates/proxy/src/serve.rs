@@ -1476,9 +1476,12 @@ impl Worker {
         listener: usize,
         client: &Client,
         mut head: H,
-        body: RequestBody,
+        mut body: RequestBody,
         interim: Option<Interim>,
     ) -> Answered<Body> {
+        // A request's trailers go no further than the gateway (03 §11): its body ends
+        // where they would come, for the upstream, a retry and a mirror alike.
+        body.drop_trailers();
         // How the body is to be sent on, worked out from what arrived and before `direct`
         // takes the hop-by-hop fields off it — and before the body itself is touched,
         // because the path is chosen while there is still nothing to undo.
@@ -1505,14 +1508,6 @@ impl Worker {
             }
             Err(answer) => return self.proxy.answer_to(listener, answer, call).into(),
         };
-        // A name it gave is not declared onwards either: the declaration says what the
-        // trailers will hold, and it will not hold that.
-        if let Err(rejection) = head.filter_declaration(&nominated) {
-            return self
-                .proxy
-                .answer_to(listener, rejection.into(), call)
-                .into();
-        }
         let timing = Timing::of(call, directed.rule.as_deref());
 
         // Credentials can bind the upstream socket to this client, even when the
@@ -1831,11 +1826,8 @@ impl Worker {
         for ((mut mirror, admitted), (copy, kept)) in placed.into_iter().zip(copies) {
             let headers = match mirror.fields.take() {
                 // A copy made before the changes after it, and so before what the rest of
-                // the way does: its `Trailer` says only what will come.
-                Some(mut own) => {
-                    crate::h1::filter_declaration(&mut own, nominated);
-                    own
-                }
+                // the way does.
+                Some(own) => own,
                 None => going
                     .get_or_insert_with(|| {
                         let mut headers = HeaderMap::new();
@@ -5768,14 +5760,16 @@ upstreams:
             .await;
     }
 
-    /// Trailers travel both ways between an HTTP/2 client and an HTTP/2 upstream, as gRPC's
-    /// status does.
+    /// An HTTP/2 upstream's trailers reach an HTTP/2 client, as gRPC's status does; the
+    /// client's own go no further than the gateway (03 §11), and its body ends where they
+    /// would have been.
     #[tokio::test]
-    async fn trailers_travel_both_ways_through_to_an_http2_upstream() {
+    async fn an_answers_trailers_travel_and_a_requests_do_not_through_an_http2_upstream() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let heard = Rc::new(RefCell::new(None::<http::HeaderMap>));
+                // What the upstream heard after the body: `Some(None)` for no trailers.
+                let heard = Rc::new(RefCell::new(None::<Option<http::HeaderMap>>));
                 let hearing = Rc::clone(&heard);
                 let script: Script = Rc::new(move |request, mut respond| {
                     let hearing = Rc::clone(&hearing);
@@ -5783,7 +5777,7 @@ upstreams:
                         let mut body = request.into_body();
                         let _ = read_all(&mut body).await;
                         let trailers = std::future::poll_fn(|cx| body.poll_trailers(cx)).await;
-                        *hearing.borrow_mut() = trailers.ok().flatten();
+                        *hearing.borrow_mut() = Some(trailers.ok().flatten());
                         let Ok(mut sending) = respond.send_response(ok_head(), false) else {
                             return;
                         };
@@ -5825,7 +5819,11 @@ upstreams:
                     .expect("no trailers");
                 assert_eq!(trailers["grpc-status"], "0");
                 until(|| heard.borrow().is_some()).await;
-                assert_eq!(heard.borrow().as_ref().unwrap()["x-checksum"], "abc");
+                assert_eq!(
+                    heard.borrow().as_ref(),
+                    Some(&None),
+                    "request trailers went up"
+                );
             })
             .await;
     }

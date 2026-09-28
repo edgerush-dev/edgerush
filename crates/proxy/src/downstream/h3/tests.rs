@@ -576,6 +576,28 @@ fn an_upload_and_its_trailers_reach_the_core() {
     });
 }
 
+/// A body whose trailers the core does not want still reads them, to the message's end,
+/// and ends where they were (03 §11).
+#[test]
+fn an_upload_whose_trailers_are_dropped_ends_where_they_were() {
+    locally(async {
+        let server = serving(short(), |request: Request<RequestBody>, interim| {
+            let (head, mut body) = request.into_parts();
+            body.drop_trailers();
+            echo(Request::from_parts(head, body), interim)
+        })
+        .await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let mut head = get("a.test", "/up");
+        head[0].1 = "POST";
+        let id = client.request(&head, false);
+        client.body(id, &vec![7; 1 << 16], false).await;
+        client.trailers(id, &[("x-sum", "7")]).await;
+        let answer = client.answer(id).await;
+        assert_eq!(body_of(&answer), "POST /up 65536 None");
+    });
+}
+
 /// The POST of a body that is to come.
 fn post(path: &str) -> Vec<(&str, &str)> {
     let mut head = get("a.test", path);

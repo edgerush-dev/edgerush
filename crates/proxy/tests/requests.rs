@@ -801,8 +801,11 @@ fn codings() -> Vec<Case> {
             .unseen(";a=b"),
         case("whitespace around a chunk extension", "hyper decode.rs:741; RFC 9112 §7.1.1 (BWS)", b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1 ; a=b\r\nq\r\n0\r\n\r\n", &[Is(200)], Open),
         case("trailers, then the next request", "HAProxy http_transfer_encoding.vtc:275; hyper server.rs:3441", b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTE: trailers\r\n\r\n5\r\nhello\r\n0\r\nx-t: 1\r\nX-T2: \tv2\t \r\n\r\nGET /next HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(200), Is(200)], Open)
-            .seen(b"0\r\nx-t: 1\r\nx-t2: v2\r\n\r\n")
-            .seen(b"GET /next HTTP/1.1\r\n"),
+            // Read to their end, and not passed on (03 §11).
+            .seen(b"5\r\nhello\r\n0\r\n\r\n")
+            .seen(b"GET /next HTTP/1.1\r\n")
+            .unseen("x-t: 1")
+            .unseen("x-t2"),
         case("trailers that framing and routing forbid", "HAProxy http_transfer_encoding.vtc:344 refuses them", b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTE: trailers\r\n\r\n0\r\ncontent-length: 5\r\nhost: evil\r\n\r\n", &[Is(200)], Open)
             .seen(b"\r\n\r\n0\r\n\r\n")
             .unseen("evil"),

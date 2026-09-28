@@ -295,6 +295,11 @@ pub fn decide<'a, H: Head>(
     if found.hop_by_hop {
         head.strip_request()?;
     }
+    // A request's trailers go no further than the gateway (03 §11), and nor does the
+    // declaration of what they would hold.
+    if found.trailer {
+        head.remove_where(|name| name.eq_ignore_ascii_case(b"trailer"))?;
+    }
     // Then the rule's changes, in its order, and the copies made between them.
     for step in &rule.steps {
         match *step {
@@ -674,6 +679,21 @@ upstreams:
             ["192.0.2.1"]
         );
         assert!(values_of(&request.headers, "via").is_empty());
+    }
+
+    /// A request's `Trailer` declaration goes with the trailers it declares, which go no
+    /// further than the gateway; that it accepts trailers in its answer stays.
+    #[test]
+    fn a_requests_declaration_of_trailers_goes_no_further() {
+        let sent = b"POST /cart HTTP/1.1\r\nHost: shop.example.com\r\nTrailer: x-sum\r\nTE: trailers\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let (mut map, mut raw) = both_heads(sent).unwrap();
+        assert_eq!(decide_on("web", &mut map, 0).as_deref(), Ok("cart"));
+        assert_eq!(decide_on("web", &mut raw, 0).as_deref(), Ok("cart"));
+        let edited = raw.fields();
+        assert!(values_of(&map.headers, "trailer").is_empty());
+        assert!(values_of(&edited, "trailer").is_empty());
+        assert_eq!(values_of(&map.headers, "te"), ["trailers"]);
+        assert_eq!(values_of(&edited, "te"), ["trailers"]);
     }
 
     /// The scheme is the listener's, and `Via` names the version the request came in.
@@ -1688,7 +1708,6 @@ upstreams:
             if by_map.is_ok() {
                 use crate::head::Forwarded;
                 use crate::upstream::auth::carries_credentials;
-                prop_assert_eq!(raw.filter_declaration(&nominated), map.filter_declaration(&nominated));
                 prop_assert_eq!(carries_credentials(&raw), carries_credentials(&map.headers));
                 if carries_credentials(&raw) {
                     prop_assert_eq!(raw.close_connection(), map.close_connection());
@@ -1707,11 +1726,8 @@ upstreams:
                 let decided = {
                     let (_, mut fresh) = both_heads(&sent).unwrap();
                     let _ = decide_from(&client, listener, &mut fresh, random);
-                    if by_map.is_ok() {
-                        let _ = fresh.filter_declaration(&nominated);
-                        if crate::upstream::auth::carries_credentials(&fresh) {
-                            let _ = fresh.close_connection();
-                        }
+                    if by_map.is_ok() && crate::upstream::auth::carries_credentials(&fresh) {
+                        let _ = fresh.close_connection();
                     }
                     fresh.into_parts()
                 };

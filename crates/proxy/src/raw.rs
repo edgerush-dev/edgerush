@@ -136,6 +136,8 @@ impl Head for RawHead {
         for (name, value) in self.fields().iter() {
             if name.eq_ignore_ascii_case(b"cookie") {
                 found.cookie_fields += 1;
+            } else if name.eq_ignore_ascii_case(b"trailer") {
+                found.trailer = true;
             } else if name.eq_ignore_ascii_case(b"te") && value == b"trailers" {
                 plain_te_fields += 1;
             } else if is_hop_by_hop_name(name) {
@@ -300,11 +302,6 @@ impl Forwarded for RawHead {
 
     fn onward(&mut self) {
         self.version = Version::HTTP_11;
-    }
-
-    fn filter_declaration(&mut self, nominated: &[HeaderName]) -> Result<(), Rejection> {
-        filter_declaration(self.lines.view(&self.head), &mut self.overlay, nominated)
-            .map_err(|_| Rejection::Edits)
     }
 
     fn close_connection(&mut self) -> Result<(), Rejection> {

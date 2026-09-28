@@ -16,7 +16,7 @@ use crate::request::Rejection;
 use crate::upstream::h1::codec::OutgoingFields;
 use edgerush_filters::HeaderModifier;
 use edgerush_router::Fields;
-use http::header::{CONNECTION, COOKIE, HOST, HeaderMap, HeaderName, HeaderValue, TE};
+use http::header::{CONNECTION, COOKIE, HOST, HeaderMap, HeaderName, HeaderValue, TE, TRAILER};
 use http::request::Parts;
 use http::{Method, Uri, Version};
 
@@ -27,6 +27,8 @@ pub struct Survey {
     pub hop_by_hop: bool,
     /// How many `Cookie` fields there are.
     pub cookie_fields: usize,
+    /// Whether it declares trailers (`Trailer`), which go no further than the gateway.
+    pub trailer: bool,
 }
 
 /// A request's head, as the request core reads and changes it.
@@ -257,14 +259,6 @@ pub(crate) trait Forwarded: Head {
     /// connection it came in on.
     fn onward(&mut self);
 
-    /// Takes out of its `Trailer` declaration what will not arrive
-    /// ([`crate::h1::filter_declaration`]).
-    ///
-    /// # Errors
-    ///
-    /// [`Rejection::Edits`] if the head cannot take the change.
-    fn filter_declaration(&mut self, nominated: &[HeaderName]) -> Result<(), Rejection>;
-
     /// Has the upstream close the connection after it: `Connection: close`, in place of
     /// any it has.
     ///
@@ -287,11 +281,6 @@ impl Forwarded for Parts {
         self.extensions.clear();
     }
 
-    fn filter_declaration(&mut self, nominated: &[HeaderName]) -> Result<(), Rejection> {
-        crate::h1::filter_declaration(&mut self.headers, nominated);
-        Ok(())
-    }
-
     fn close_connection(&mut self) -> Result<(), Rejection> {
         self.headers
             .insert(CONNECTION, HeaderValue::from_static("close"));
@@ -309,6 +298,8 @@ pub(crate) fn survey(headers: &HeaderMap) -> Survey {
     for (name, value) in headers {
         if *name == COOKIE {
             found.cookie_fields += 1;
+        } else if *name == TRAILER {
+            found.trailer = true;
         } else if *name == TE && value == "trailers" {
             // What every gRPC client says, and already the one form in which `TE` is
             // forwarded: on its own there is nothing to take off only to put it back.

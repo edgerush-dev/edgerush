@@ -80,6 +80,31 @@ impl RequestBodyError {
     }
 }
 
+impl RequestBody {
+    /// Has the body end where its trailers would come: a request's trailers go no further
+    /// than the gateway (03 §11). They are still read, to the end of the message. For the
+    /// body as its server handed it over; one kept or copied is made from it after.
+    pub(crate) fn drop_trailers(&mut self) {
+        match self {
+            Self::Ours(body) => body.drop_trailers(),
+            Self::H2(body) => body.drop_trailers(),
+            Self::H3(body) => body.drop_trailers(),
+            Self::Recorded(_) | Self::Replayed(_) | Self::Mirrored(_) | Self::Copy(_) => {}
+        }
+    }
+}
+
+/// `polled`, ended at a trailers frame the body does not hand over.
+fn trailers_if(
+    wanted: bool,
+    polled: Poll<Option<Result<Frame<Bytes>, RequestBodyError>>>,
+) -> Poll<Option<Result<Frame<Bytes>, RequestBodyError>>> {
+    match polled {
+        Poll::Ready(Some(Ok(frame))) if !wanted && frame.is_trailers() => Poll::Ready(None),
+        polled => polled,
+    }
+}
+
 impl Body for RequestBody {
     type Data = Bytes;
     type Error = RequestBodyError;
@@ -89,9 +114,9 @@ impl Body for RequestBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, RequestBodyError>>> {
         match self.get_mut() {
-            Self::Ours(body) => Pin::new(body).poll_frame(cx),
-            Self::H2(body) => Pin::new(body).poll_frame(cx),
-            Self::H3(body) => Pin::new(body).poll_frame(cx),
+            Self::Ours(body) => trailers_if(body.wants_trailers(), Pin::new(body).poll_frame(cx)),
+            Self::H2(body) => trailers_if(body.wants_trailers(), Pin::new(body).poll_frame(cx)),
+            Self::H3(body) => trailers_if(body.wants_trailers(), Pin::new(body).poll_frame(cx)),
             Self::Recorded(body) => Pin::new(&mut **body).poll_frame(cx),
             Self::Replayed(body) => Pin::new(body).poll_frame(cx),
             Self::Mirrored(body) => Pin::new(&mut **body).poll_frame(cx),

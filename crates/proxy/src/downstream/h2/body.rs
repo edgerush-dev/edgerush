@@ -35,9 +35,22 @@ pub(crate) struct IncomingH2 {
     /// Told when the body is wanted and nothing is here, and when the client sent some
     /// without waiting: what decides a `100` of our own (14 §5).
     interim: Option<Interim>,
+    /// Whether its trailers are handed over; the request core wants none (03 §11), and
+    /// a server's own tests all of them.
+    trailers_wanted: bool,
 }
 
 impl IncomingH2 {
+    /// Has its trailers read to their end and not handed over.
+    pub(crate) fn drop_trailers(&mut self) {
+        self.trailers_wanted = false;
+    }
+
+    /// Whether its trailers are handed over.
+    pub(crate) fn wants_trailers(&self) -> bool {
+        self.trailers_wanted
+    }
+
     /// The body of a request h2 accepted, which may keep its reader waiting for `idle`
     /// at the most.
     pub(crate) fn new(stream: ::h2::RecvStream, idle: Duration) -> Self {
@@ -47,6 +60,7 @@ impl IncomingH2 {
             data_done: false,
             idle: Idle::new(idle),
             interim: None,
+            trailers_wanted: true,
         }
     }
 
