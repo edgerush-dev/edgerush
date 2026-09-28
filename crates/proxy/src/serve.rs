@@ -1589,6 +1589,7 @@ impl Worker {
         interim: Option<Interim>,
         timing: Timing,
     ) -> Result<Answered<Body>, Answer> {
+        let timing = timing.for_try();
         if endpoint.protocol() == UpstreamProtocol::Http2 {
             return self
                 .respond_by_h2(
@@ -1609,7 +1610,7 @@ impl Worker {
         ));
         let answered = by_deadline(&self.timers, timing.deadline, exchanged)
             .await
-            .unwrap_or(Err(Answer::DeadlineExceeded));
+            .unwrap_or(Err(timing.lapsed()));
 
         let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
         let (mut answer, body) = match answered {
@@ -1945,10 +1946,16 @@ impl Worker {
                 }
             },
         ));
-        let Some(exchanged) = by_deadline(&self.timers, timing.deadline, exchanging).await else {
-            return Err(Answer::DeadlineExceeded);
-        };
         let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
+        let Some(exchanged) = by_deadline(&self.timers, timing.deadline, exchanging).await else {
+            let lapsed = timing.lapsed();
+            if lapsed == Answer::UpstreamTimedOut
+                && let Some(upstream) = upstream
+            {
+                upstream.failures.inc();
+            }
+            return Err(lapsed);
+        };
         let (parts, answer) = match exchanged {
             Ok(exchanged) => exchanged,
             Err(error) => {
@@ -2357,6 +2364,11 @@ struct Timing {
     /// Whether the rule's own timeouts bound the wait for an answer's head, in place of
     /// the fixed clocks for it.
     head_by_rule: bool,
+    /// How long each try may take to its answer's head: the rule's `backend_request`.
+    per_try: Option<Duration>,
+    /// Whether `deadline` is a try's rather than the request's: set for a try whose own
+    /// clock runs out first.
+    try_first: bool,
 }
 
 impl Timing {
@@ -2366,15 +2378,17 @@ impl Timing {
         deadline: None,
         told: None,
         head_by_rule: false,
+        per_try: None,
+        try_first: false,
     };
 
     /// A request's, from its gRPC call if it is one and its rule if it has one. No clock
     /// is read for a rule that states no timeout.
     fn of(call: Option<Call>, rule: Option<&CompiledRule>) -> Self {
         let called = call.and_then(|call| call.deadline());
-        let request = rule
-            .and_then(CompiledRule::timeouts)
-            .and_then(|timeouts| timeouts.request);
+        let timeouts = rule.and_then(CompiledRule::timeouts);
+        let request = timeouts.and_then(|timeouts| timeouts.request);
+        let backend_request = timeouts.and_then(|timeouts| timeouts.backend_request);
         let ruled = match request {
             Some(Timeout::After(after)) => Some(Instant::now() + after),
             Some(Timeout::Off) | None => None,
@@ -2386,7 +2400,43 @@ impl Timing {
         Self {
             deadline,
             told: called.and(deadline),
-            head_by_rule: request.is_some(),
+            head_by_rule: request.is_some() || backend_request.is_some(),
+            per_try: match backend_request {
+                Some(Timeout::After(after)) => Some(after),
+                Some(Timeout::Off) | None => None,
+            },
+            try_first: false,
+        }
+    }
+
+    /// A try's, starting now: held to the earlier of the request's deadline and its own
+    /// clock, which runs from its start — connecting and waiting for a place included — to
+    /// its answer's head. An upstream is told the earlier too: it is all it will be waited
+    /// for.
+    fn for_try(self) -> Self {
+        let Some(per_try) = self.per_try else {
+            return self;
+        };
+        let ends = Instant::now() + per_try;
+        if self.deadline.is_some_and(|deadline| deadline <= ends) {
+            return self;
+        }
+        Self {
+            deadline: Some(ends),
+            told: self.told.map(|told| told.min(ends)),
+            try_first: true,
+            ..self
+        }
+    }
+
+    /// What a try is answered with when its deadline passes before its answer's head: the
+    /// upstream out of time if the try's own clock ran out, the request's deadline passed
+    /// if that did.
+    fn lapsed(self) -> Answer {
+        if self.try_first {
+            Answer::UpstreamTimedOut
+        } else {
+            Answer::DeadlineExceeded
         }
     }
 }
@@ -6887,6 +6937,15 @@ upstreams:
     fn request_timeout(ms: u64) -> edgerush_config::Timeouts {
         edgerush_config::Timeouts {
             request_ms: Some(ms),
+            backend_request_ms: None,
+        }
+    }
+
+    /// A rule's `backend_request` timeout of `ms` milliseconds, and `request` if it says one.
+    fn try_timeout(ms: u64, request: Option<u64>) -> edgerush_config::Timeouts {
+        edgerush_config::Timeouts {
+            request_ms: request,
+            backend_request_ms: Some(ms),
         }
     }
 
@@ -7146,6 +7205,218 @@ upstreams:
                 .await;
                 let answer = h1_answer(front, CLOSING_GET).await;
                 assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+            })
+            .await;
+    }
+
+    /// A try that has no head within the rule's `backend_request` timeout is out of time:
+    /// `504`, counted as the upstream failing, as a try that ran out the fixed clocks is.
+    #[tokio::test]
+    async fn a_try_past_its_backend_request_timeout_is_answered_504() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _asked) = upstream_silent_at_first(usize::MAX, true).await;
+                let (front, worker) = serving_worker_timed(
+                    upstream,
+                    UpstreamProtocol::Http1,
+                    try_timeout(300, None),
+                    H1Limits::default(),
+                )
+                .await;
+                let started = Instant::now();
+                let answer = h1_answer(front, CLOSING_GET).await;
+                let took = started.elapsed();
+                assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+                assert!(
+                    took >= Duration::from_millis(300) - EARLY
+                        && took < Duration::from_millis(300) + SLACK,
+                    "{took:?}"
+                );
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_listener_local_answers_total{listener=\"web\",reason=\"upstream_timed_out\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+                let line = "edgerush_upstream_failures_total{upstream=\"up\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+            })
+            .await;
+    }
+
+    /// A stated `backend_request` timeout takes the place of the fixed clocks for an
+    /// answer's head, as a `request` timeout does.
+    #[tokio::test]
+    async fn a_backend_request_timeout_takes_the_place_of_the_fixed_head_clocks() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let upstream =
+                    upstream_answering(Duration::from_millis(600), 2, 2, Duration::ZERO).await;
+                let (front, _worker) = serving_worker_timed(
+                    upstream,
+                    UpstreamProtocol::Http1,
+                    try_timeout(3000, None),
+                    head_clocks_short(),
+                )
+                .await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+            })
+            .await;
+    }
+
+    /// Gateway API's conformance case: a retry of two attempts that names no status, each
+    /// try given 300 ms. Two slow tries and then a quick one are answered by the third;
+    /// three slow ones are out of time, and nothing is tried a fourth time.
+    #[tokio::test]
+    async fn tries_past_their_backend_request_timeout_are_sent_again_under_on_timeout() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for (slow, status) in [(2, "200"), (3, "504")] {
+                    let (upstream, asked) = upstream_silent_at_first(slow, true).await;
+                    let retry = edgerush_config::Retry {
+                        on_timeout: true,
+                        ..retrying(2, &[], &[], 1)
+                    };
+                    let (front, _worker) = serving_worker_forwarding(
+                        upstream,
+                        UpstreamProtocol::Http1,
+                        H1Limits::default(),
+                        |forward| {
+                            forward.timeouts = Some(try_timeout(300, None));
+                            forward.retry = Some(retry);
+                        },
+                    )
+                    .await;
+                    let answer = h1_answer(front, CLOSING_GET).await;
+                    assert!(
+                        answer.starts_with(&format!("HTTP/1.1 {status} ")),
+                        "{slow}: {answer}"
+                    );
+                    assert_eq!(asked.get(), 3, "{slow}");
+                }
+            })
+            .await;
+    }
+
+    /// The `request` timeout takes in every try: when it passes, the try in hand is given
+    /// up and no other is started, however many the retry had left. What ends it is the
+    /// request's deadline, not the upstream's.
+    #[tokio::test]
+    async fn the_request_timeout_ends_the_tries_however_many_are_left() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, asked) = upstream_silent_at_first(usize::MAX, true).await;
+                let retry = edgerush_config::Retry {
+                    on_timeout: true,
+                    ..retrying(5, &[], &[], 1)
+                };
+                let (front, worker) = serving_worker_forwarding(
+                    upstream,
+                    UpstreamProtocol::Http1,
+                    H1Limits::default(),
+                    |forward| {
+                        forward.timeouts = Some(try_timeout(300, Some(500)));
+                        forward.retry = Some(retry);
+                    },
+                )
+                .await;
+                let started = Instant::now();
+                let answer = h1_answer(front, CLOSING_GET).await;
+                let took = started.elapsed();
+                assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+                assert!(took < Duration::from_millis(500) + SLACK, "{took:?}");
+                assert_eq!(asked.get(), 2);
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_listener_local_answers_total{listener=\"web\",reason=\"deadline_exceeded\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+            })
+            .await;
+    }
+
+    /// A try's clock stops at its answer's head: an answer that takes longer than the
+    /// `backend_request` timeout to stream arrives whole.
+    #[tokio::test]
+    async fn a_backend_request_timeout_stops_at_the_head() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let upstream =
+                    upstream_answering(Duration::ZERO, 1000, 100, Duration::from_millis(100)).await;
+                let (front, _worker) = serving_worker_timed(
+                    upstream,
+                    UpstreamProtocol::Http1,
+                    try_timeout(300, None),
+                    H1Limits::default(),
+                )
+                .await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+                let (_, body) = answer.split_once("\r\n\r\n").unwrap();
+                assert_eq!(body.len(), 1000);
+            })
+            .await;
+    }
+
+    /// An HTTP/2 upstream is held to a `backend_request` timeout the same way, counted as
+    /// the upstream failing.
+    #[tokio::test]
+    async fn a_backend_request_timeout_holds_for_an_http2_upstream() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let upstream = scripted_h2_upstream(never_answering()).await;
+                let (front, worker) = serving_worker_timed(
+                    upstream,
+                    UpstreamProtocol::Http2,
+                    try_timeout(300, None),
+                    H1Limits::default(),
+                )
+                .await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_listener_local_answers_total{listener=\"web\",reason=\"upstream_timed_out\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+                let line = "edgerush_upstream_failures_total{upstream=\"up\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+            })
+            .await;
+    }
+
+    /// A gRPC call's upstream is told the time its try has, when that is less than the
+    /// call has left: it is all the upstream will be waited for. A call that said no
+    /// `grpc-timeout` is told nothing.
+    #[tokio::test]
+    async fn a_grpc_call_s_upstream_is_told_the_time_its_try_has() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, noted) = grpc_timeouts_noted().await;
+                let (front, _worker) = serving_worker_timed(
+                    upstream,
+                    UpstreamProtocol::Http2,
+                    try_timeout(300, None),
+                    H1Limits::default(),
+                )
+                .await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                for timeout in [None, Some("10S")] {
+                    let (answer, _) = send
+                        .send_request(grpc_call("/pkg.Svc/Do", timeout), true)
+                        .unwrap();
+                    assert_eq!(
+                        grpc_outcome(answer).await,
+                        (StatusCode::OK, "4".to_owned(), true)
+                    );
+                }
+                let noted = noted.borrow();
+                assert_eq!(noted.len(), 2);
+                assert_eq!(noted[0], None);
+                let sent = noted[1].as_deref().unwrap();
+                let left = crate::grpc::timeout::parse(sent.as_bytes()).unwrap();
+                assert!(left <= Duration::from_millis(300), "{sent}");
             })
             .await;
     }

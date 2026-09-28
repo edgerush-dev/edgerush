@@ -173,6 +173,13 @@ pub struct Timeouts {
     /// and all; `0` for no limit at all.
     #[serde(default)]
     pub request_ms: Option<u64>,
+    /// Milliseconds a try may take, from its start — connecting, and waiting for a place on
+    /// an HTTP/2 connection, included — to its answer's head; `0` for no limit at all. No
+    /// more than `request_ms`. A try that runs out of it is sent again under a retry's
+    /// `on_timeout`. It stops at the head, not the answer's end: the answer streams to the
+    /// client as the client takes it, and a slow client is not the backend running late.
+    #[serde(default)]
+    pub backend_request_ms: Option<u64>,
 }
 
 /// When a request is sent again, and how often (Gateway API's HTTPRoute retry, with

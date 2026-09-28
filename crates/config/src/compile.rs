@@ -165,6 +165,8 @@ impl CompiledRule {
 pub struct CompiledTimeouts {
     /// From the request's head arriving to its answer's end.
     pub request: Option<Timeout>,
+    /// From a try's start to its answer's head.
+    pub backend_request: Option<Timeout>,
 }
 
 /// A timeout a rule states.
@@ -299,9 +301,22 @@ fn timeouts(
     let timeouts = forward.timeouts.as_ref()?;
     let compiled = CompiledTimeouts {
         request: timeouts.request_ms.map(Timeout::of_ms),
+        backend_request: timeouts.backend_request_ms.map(Timeout::of_ms),
     };
     if compiled == CompiledTimeouts::default() {
         errors.push(place.problem(Problem::TimeoutsEmpty));
+        return None;
+    }
+    // Gateway API's rule: the request's timeout takes in every try's, so none is longer. A
+    // request of no limit bounds nothing, and a try of none is bounded by the request's.
+    if let (Some(request @ 1..), Some(backend_request)) =
+        (timeouts.request_ms, timeouts.backend_request_ms)
+        && backend_request > request
+    {
+        errors.push(place.problem(Problem::BackendRequestOverRequest {
+            backend_request,
+            request,
+        }));
         return None;
     }
     Some(compiled)
@@ -316,13 +331,16 @@ fn retry(forward: &Forward, place: &Place, errors: &mut Vec<ConfigError>) -> Opt
     if retry.http_statuses.is_empty() && retry.grpc_statuses.is_empty() && !retry.on_timeout {
         problems.push(Problem::RetryOnNothing);
     }
-    // A stated `request` takes the fixed clocks' place, so a try has no clock of its own
-    // left: the request's running out ends it, and leaves nothing to try again with.
-    let request_stated = forward
-        .timeouts
-        .as_ref()
-        .is_some_and(|timeouts| timeouts.request_ms.is_some());
-    if retry.on_timeout && request_stated {
+    // A try's clock is its `backend_request_ms`, or the fixed clocks where the rule states
+    // no timeout. A timeout stated takes the fixed clocks' place, so with no try's clock
+    // among them only the request's own deadline ends a try, and leaves nothing to try
+    // again with.
+    let try_has_a_clock = forward.timeouts.as_ref().is_none_or(|timeouts| {
+        timeouts
+            .backend_request_ms
+            .is_some_and(|backend_request| backend_request > 0)
+    });
+    if retry.on_timeout && !try_has_a_clock {
         problems.push(Problem::RetryOnTimeoutNever);
     }
     for status in &retry.http_statuses {
@@ -1448,6 +1466,14 @@ pub enum Problem {
     /// `timeouts` stated with nothing in it.
     #[error("`timeouts` states no timeout")]
     TimeoutsEmpty,
+    /// A try given longer than the request it is a try of.
+    #[error("`backend_request_ms` is {backend_request}: no more than `request_ms`, {request}")]
+    BackendRequestOverRequest {
+        /// What a try was given; `0` is no limit.
+        backend_request: u64,
+        /// What the request was given.
+        request: u64,
+    },
     /// A retry for an HTTP status that is not a failure.
     #[error("`retry` on status {0}: only 4xx and 5xx")]
     RetryStatus(u16),
@@ -3050,13 +3076,32 @@ upstreams: {{ u: {{ endpoints: [] }} }}
             with(", timeouts: { request_ms: 1500 }").unwrap(),
             Some(CompiledTimeouts {
                 request: Some(Timeout::After(std::time::Duration::from_millis(1500))),
+                backend_request: None,
             })
         );
+        assert_eq!(
+            with(", timeouts: { request_ms: 1500, backend_request_ms: 500 }").unwrap(),
+            Some(CompiledTimeouts {
+                request: Some(Timeout::After(std::time::Duration::from_millis(1500))),
+                backend_request: Some(Timeout::After(std::time::Duration::from_millis(500))),
+            })
+        );
+        // A try may take no longer than the request it is a try of: Gateway API's own rule,
+        // which a request of no limit at all does not bound.
+        assert!(
+            with(", timeouts: { request_ms: 500, backend_request_ms: 1500 }").unwrap_err()[0]
+                .ends_with("`backend_request_ms` is 1500: no more than `request_ms`, 500")
+        );
+        assert!(with(", timeouts: { request_ms: 500, backend_request_ms: 500 }").is_ok());
+        assert!(with(", timeouts: { request_ms: 0, backend_request_ms: 1500 }").is_ok());
+        assert!(with(", timeouts: { request_ms: 1500, backend_request_ms: 0 }").is_ok());
+        assert!(with(", timeouts: { backend_request_ms: 1500 }").is_ok());
         // Gateway API's `0s`: that clock is off.
         assert_eq!(
             with(", timeouts: { request_ms: 0 }").unwrap(),
             Some(CompiledTimeouts {
                 request: Some(Timeout::Off),
+                backend_request: None,
             })
         );
         // One spelling: `timeouts` saying nothing is its absence written another way.
@@ -3065,14 +3110,31 @@ upstreams: {{ u: {{ endpoints: [] }} }}
             serde_saphyr::from_str::<crate::Timeouts>("{ request: 10 }").is_err(),
             "an unknown field"
         );
-        // With `request` stated and nothing for a try, a try has no clock of its own to run
-        // out: the request's is the one that ends it, and then nothing is left to try with.
+        // A try's clock is `backend_request_ms`, or the fixed clocks where the rule states no
+        // timeout at all. With neither — `request` alone, or a `backend_request_ms` of none —
+        // nothing ends a try but the request's own deadline, and then nothing is left to try
+        // with.
         let retry =
             "retry: { attempts: 1, on_timeout: true, backoff_base_ms: 25, backoff_max_ms: 250 }";
-        for request in ["1500", "0"] {
+        for timeouts in [
+            "request_ms: 1500",
+            "request_ms: 0",
+            "backend_request_ms: 0",
+            "request_ms: 1500, backend_request_ms: 0",
+        ] {
             assert!(
-                with(&format!(", timeouts: {{ request_ms: {request} }}, {retry}")).unwrap_err()[0]
-                    .ends_with("`on_timeout` with no clock of a try's own to run out")
+                with(&format!(", timeouts: {{ {timeouts} }}, {retry}")).unwrap_err()[0]
+                    .ends_with("`on_timeout` with no clock of a try's own to run out"),
+                "{timeouts}"
+            );
+        }
+        for timeouts in [
+            "backend_request_ms: 500",
+            "request_ms: 1500, backend_request_ms: 500",
+        ] {
+            assert!(
+                with(&format!(", timeouts: {{ {timeouts} }}, {retry}")).is_ok(),
+                "{timeouts}"
             );
         }
         assert!(
