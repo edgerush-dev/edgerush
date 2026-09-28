@@ -52,6 +52,13 @@ pub(crate) enum ExchangeError {
         /// The time allowed.
         limit: Duration,
     },
+    /// The upstream gave the request's body no room for the idle bound while it was being
+    /// sent, before any answer. The client's own body stopping is [`Self::RequestBody`].
+    #[error("the upstream gave the request's body no room for {limit:?}")]
+    Idle {
+        /// The time a body may wait for room.
+        limit: Duration,
+    },
     /// The request's own body failed while it was being sent, before any answer.
     #[error("the request's body failed")]
     RequestBody(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -268,8 +275,16 @@ impl Attempt<'_> {
                     upload = None;
                     // The body failed on its way in: the stream has been reset, and the
                     // answer is the client's doing, not the upstream's.
-                    if let Err(SendError::Body(cause)) = sent {
-                        return Poll::Ready(Err(ExchangeError::RequestBody(cause)));
+                    match sent {
+                        Err(SendError::Body(cause)) => {
+                            return Poll::Ready(Err(ExchangeError::RequestBody(cause)));
+                        }
+                        // The upstream's window stayed shut: the sender has reset the
+                        // stream, and what the answer would say of that is not the cause.
+                        Err(SendError::TimedOut) => {
+                            return Poll::Ready(Err(ExchangeError::Idle { limit: bounds.idle }));
+                        }
+                        _ => {}
                     }
                 }
                 Pin::new(&mut response).poll(cx).map_err(ExchangeError::H2)

@@ -207,6 +207,8 @@ pub struct CompiledRetry {
     pub http_statuses: Vec<u16>,
     /// gRPC statuses that send a call again, one bit for each by its number.
     pub grpc_statuses: u32,
+    /// Whether a try that ran out of time before its answer's head is sent again.
+    pub on_timeout: bool,
     /// The wait before the first retry.
     pub backoff_base: std::time::Duration,
     /// The most a wait may double to.
@@ -258,7 +260,7 @@ fn retry(forward: &Forward, place: &Place, errors: &mut Vec<ConfigError>) -> Opt
     if retry.attempts == 0 || retry.attempts > MOST_ATTEMPTS {
         problems.push(Problem::RetryAttempts(retry.attempts));
     }
-    if retry.http_statuses.is_empty() && retry.grpc_statuses.is_empty() {
+    if retry.http_statuses.is_empty() && retry.grpc_statuses.is_empty() && !retry.on_timeout {
         problems.push(Problem::RetryOnNothing);
     }
     for status in &retry.http_statuses {
@@ -281,6 +283,7 @@ fn retry(forward: &Forward, place: &Place, errors: &mut Vec<ConfigError>) -> Opt
         attempts: retry.attempts,
         http_statuses: retry.http_statuses.clone(),
         grpc_statuses: grpc,
+        on_timeout: retry.on_timeout,
         backoff_base: std::time::Duration::from_millis(retry.backoff_base_ms),
         backoff_max: std::time::Duration::from_millis(retry.backoff_max_ms),
     });
@@ -1373,7 +1376,7 @@ pub enum Problem {
     #[error("`retry.attempts` is {0}: from 1 to 5")]
     RetryAttempts(u32),
     /// A retry for no answer at all.
-    #[error("`retry` names no status to send a request again for")]
+    #[error("`retry` names no status and no timeout to send a request again for")]
     RetryOnNothing,
     /// A retry for an HTTP status that is not a failure.
     #[error("`retry` on status {0}: only 4xx and 5xx")]
@@ -2888,15 +2891,32 @@ upstreams: {{ u: {{ endpoints: [] }} }}
                 })
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
-        let retry = with("{ attempts: 2, http_statuses: [502, 503], grpc_statuses: [UNAVAILABLE], backoff_base_ms: 25, backoff_max_ms: 250 }")
+        let retry = with("{ attempts: 2, http_statuses: [502, 503], grpc_statuses: [UNAVAILABLE], on_timeout: false, backoff_base_ms: 25, backoff_max_ms: 250 }")
             .unwrap()
             .unwrap();
         assert!(retry.on_status(503) && !retry.on_status(500));
         assert!(retry.on_grpc(14) && !retry.on_grpc(13) && !retry.on_grpc(99));
+        assert!(!retry.on_timeout);
         assert_eq!(retry.backoff_base, std::time::Duration::from_millis(25));
 
+        // A timeout is a reason of its own: a retry for nothing else is one that can happen.
+        let retry =
+            with("{ attempts: 1, on_timeout: true, backoff_base_ms: 25, backoff_max_ms: 250 }")
+                .unwrap()
+                .unwrap();
+        assert!(retry.on_timeout && !retry.on_status(502));
+
+        // Stated, whichever way: nothing is implied.
+        assert!(
+            serde_saphyr::from_str::<crate::Retry>(
+                "{ attempts: 1, http_statuses: [503], backoff_base_ms: 25, backoff_max_ms: 250 }"
+            )
+            .is_err(),
+            "`on_timeout` is stated"
+        );
+
         let problems = |retry: &str| with(retry).unwrap_err();
-        let base = "backoff_base_ms: 25, backoff_max_ms: 250";
+        let base = "on_timeout: false, backoff_base_ms: 25, backoff_max_ms: 250";
         assert!(
             problems(&format!("{{ attempts: 0, http_statuses: [503], {base} }}"))[0]
                 .ends_with("`retry.attempts` is 0: from 1 to 5")
@@ -2907,7 +2927,7 @@ upstreams: {{ u: {{ endpoints: [] }} }}
         );
         assert!(
             problems(&format!("{{ attempts: 1, {base} }}"))[0]
-                .ends_with("names no status to send a request again for")
+                .ends_with("names no status and no timeout to send a request again for")
         );
         assert!(
             problems(&format!("{{ attempts: 1, http_statuses: [200], {base} }}"))[0]
@@ -2925,7 +2945,7 @@ upstreams: {{ u: {{ endpoints: [] }} }}
         );
         assert!(
             problems(
-                "{ attempts: 1, http_statuses: [503], backoff_base_ms: 300, backoff_max_ms: 250 }"
+                "{ attempts: 1, http_statuses: [503], on_timeout: false, backoff_base_ms: 300, backoff_max_ms: 250 }"
             )[0]
             .ends_with("no more than its most")
         );

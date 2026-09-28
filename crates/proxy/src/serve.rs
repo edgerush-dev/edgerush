@@ -47,7 +47,7 @@ use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Block, Blocks, SMALL, Sizes};
 use crate::upstream::h1::codec::{OutgoingFields, Sending};
-use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, nothing_to_say};
+use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, Stalled, nothing_to_say};
 use crate::upstream::h1::pool::{Lease, Pool};
 use crate::upstream::h2::client::{Client as H2Client, PlaceError, Settings as H2Settings};
 use crate::upstream::h2::exchange::{self as h2_exchange, Bounds as H2Bounds};
@@ -1925,11 +1925,13 @@ impl Worker {
                         Answer::BodyTimedOut
                     }
                     h2_exchange::ExchangeError::RequestBody(_) => Answer::BadBody,
+                    h2_exchange::ExchangeError::TooSlow { .. }
+                    | h2_exchange::ExchangeError::Idle { .. } => Answer::UpstreamTimedOut,
                     _ => Answer::UpstreamFailed,
                 };
                 // Waiting for a place, or the client's own body, is not the upstream
                 // failing.
-                if answer == Answer::UpstreamFailed
+                if matches!(answer, Answer::UpstreamFailed | Answer::UpstreamTimedOut)
                     && let Some(upstream) = upstream
                 {
                     upstream.failures.inc();
@@ -2002,6 +2004,13 @@ impl Worker {
                         Answer::BodyTimedOut
                     }
                     ExchangeError::RequestBody(_) => Answer::BadBody,
+                    // Only what the upstream was to do before its head. The client's own
+                    // upload stopping is not the upstream out of time.
+                    ExchangeError::TooSlow { .. }
+                    | ExchangeError::Idle {
+                        waiting: Stalled::Upstream | Stalled::Answer,
+                        ..
+                    } => Answer::UpstreamTimedOut,
                     _ => Answer::UpstreamFailed,
                 });
             }
@@ -2289,8 +2298,11 @@ async fn by_deadline<F: Future>(
 }
 
 /// Whether an outcome is one the rule's retry sends a request again for: an answer whose
-/// status it names, a gRPC call whose trailers-only head carries a status it names, or an
-/// upstream that could not be reached or answered nothing, as a `502`.
+/// status it names, a gRPC call whose trailers-only head carries a status it names, an
+/// upstream that could not be reached or answered nothing, as a `502`, or a try that ran
+/// out of time before its head, if the rule says `on_timeout` (and not as a `502`: a rule
+/// that sends a request again for an upstream it cannot reach may not want to for one that
+/// is slow).
 fn wants_again(retry: &CompiledRetry, outcome: &Result<Answered<Body>, Answer>) -> bool {
     match outcome {
         Ok(Answered::Raw(answer, _)) => retry.on_status(answer.status().as_u16()),
@@ -2301,6 +2313,7 @@ fn wants_again(retry: &CompiledRetry, outcome: &Result<Answered<Body>, Answer>) 
                 })
         }
         Err(Answer::UpstreamFailed) => retry.on_status(502),
+        Err(Answer::UpstreamTimedOut) => retry.on_timeout,
         Err(_) => false,
     }
 }
@@ -6300,6 +6313,7 @@ upstreams:
             attempts,
             http_statuses: statuses.to_vec(),
             grpc_statuses: grpc.iter().map(|&name| name.to_owned()).collect(),
+            on_timeout: false,
             backoff_base_ms: backoff_ms,
             backoff_max_ms: backoff_ms,
         }
@@ -6311,15 +6325,26 @@ upstreams:
         protocol: UpstreamProtocol,
         retry: edgerush_config::Retry,
     ) -> (SocketAddr, Rc<Worker>) {
+        serving_worker_with(upstream, protocol, Some(retry), H1Limits::default()).await
+    }
+
+    /// A worker for `up` at `upstream` in `protocol`, whose one rule retries as `retry`
+    /// says if it says anything, with `limits` as its bounds.
+    async fn serving_worker_with(
+        upstream: SocketAddr,
+        protocol: UpstreamProtocol,
+        retry: Option<edgerush_config::Retry>,
+        limits: H1Limits,
+    ) -> (SocketAddr, Rc<Worker>) {
         let mut config = everything_config(upstream);
         config.upstreams.get_mut("up").unwrap().protocol = protocol;
         config.routes[0].rules[0]
             .forward
             .as_mut()
             .expect("the rule forwards")
-            .retry = Some(retry);
+            .retry = retry;
         let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
-        let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+        let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = socket.local_addr().unwrap();
         let _serving = serving(&worker, socket);
@@ -6434,6 +6459,303 @@ upstreams:
                 );
             })
             .await;
+    }
+
+    /// An HTTP/1 upstream that leaves the first `silent` requests it is sent unanswered,
+    /// each holding its connection until the proxy lets go of it, and answers every one
+    /// after them `200`; and how many requests it was sent. `reading` is whether the silent
+    /// ones are read at all, or their bytes left in the socket. Bounded: nothing is held for
+    /// longer than ten seconds, so that a test whose deadline is missing fails rather than
+    /// hangs.
+    async fn upstream_silent_at_first(
+        silent: usize,
+        reading: bool,
+    ) -> (SocketAddr, Rc<Cell<usize>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let asked = Rc::new(Cell::new(0_usize));
+        let counting = Rc::clone(&asked);
+        let _accepting = tokio::task::spawn_local(async move {
+            while let Ok((mut stream, _)) = socket.accept().await {
+                let counting = Rc::clone(&counting);
+                let _serving = tokio::task::spawn_local(async move {
+                    let held = Duration::from_secs(10);
+                    let mut read = Vec::new();
+                    let mut chunk = [0; 16 * 1024];
+                    // A head is waited for even by an upstream that then reads no more.
+                    while !read.windows(4).any(|four| four == b"\r\n\r\n") {
+                        match tokio::time::timeout(held, stream.read(&mut chunk)).await {
+                            Ok(Ok(n)) if n > 0 => read.extend_from_slice(&chunk[..n]),
+                            _ => return,
+                        }
+                    }
+                    let turn = counting.get();
+                    counting.set(turn + 1);
+                    if turn < silent {
+                        if reading {
+                            // Until the proxy lets go of the connection.
+                            let _held = tokio::time::timeout(held, async {
+                                while matches!(stream.read(&mut chunk).await, Ok(n) if n > 0) {}
+                            })
+                            .await;
+                        } else {
+                            tokio::time::sleep(held).await;
+                        }
+                        return;
+                    }
+                    let answer =
+                        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        (address, asked)
+    }
+
+    /// Bounds short enough for a test to wait out, whichever hop's clock it means to run
+    /// out: nothing else is short.
+    fn quick(limits: impl FnOnce(&mut H1Limits)) -> H1Limits {
+        let mut quick = H1Limits::default();
+        limits(&mut quick);
+        quick
+    }
+
+    /// An upstream that never answers, with its head deadline run out, is answered `504`
+    /// rather than `502`, and counted as the upstream failing and as what it was.
+    #[tokio::test]
+    async fn an_http1_upstream_that_never_answers_is_answered_504() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, asked) = upstream_silent_at_first(usize::MAX, true).await;
+                let limits = quick(|limits| limits.final_head = Duration::from_millis(300));
+                let (front, worker) =
+                    serving_worker_with(upstream, UpstreamProtocol::Http1, None, limits).await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+                assert_eq!(asked.get(), 1);
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_listener_local_answers_total{listener=\"web\",reason=\"upstream_timed_out\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+                let line = "edgerush_upstream_failures_total{upstream=\"up\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+            })
+            .await;
+    }
+
+    /// An answer that stops coming before its head, for the idle bound, is the same: `504`.
+    #[tokio::test]
+    async fn an_http1_upstream_that_goes_quiet_before_its_head_is_answered_504() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _asked) = upstream_silent_at_first(usize::MAX, true).await;
+                let limits = quick(|limits| limits.idle = Duration::from_millis(300));
+                let (front, worker) =
+                    serving_worker_with(upstream, UpstreamProtocol::Http1, None, limits).await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_upstream_failures_total{upstream=\"up\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+            })
+            .await;
+    }
+
+    /// An upstream that stops taking a request's body, while the request is still going out
+    /// and nothing has been answered, is `504` too: the write-idle clock, and not the
+    /// client's, ran out.
+    #[tokio::test]
+    async fn an_http1_upstream_that_stops_taking_the_upload_is_answered_504() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _asked) = upstream_silent_at_first(usize::MAX, false).await;
+                let limits = quick(|limits| limits.idle = Duration::from_millis(300));
+                let (front, _worker) =
+                    serving_worker_with(upstream, UpstreamProtocol::Http1, None, limits).await;
+                // More than the two sockets' buffers hold, so that the write blocks.
+                let size = 64 * 1024 * 1024;
+                let head = format!(
+                    "POST / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\ncontent-length: {size}\r\n\r\n"
+                );
+                let (mut read, mut write) = TcpStream::connect(front).await.unwrap().into_split();
+                let _uploading = tokio::task::spawn_local(async move {
+                    let _sent = write.write_all(head.as_bytes()).await;
+                    let chunk = vec![b'x'; 64 * 1024];
+                    for _ in 0..size / chunk.len() {
+                        if write.write_all(&chunk).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                let mut answer = Vec::new();
+                let _ended = within(read.read_to_end(&mut answer)).await;
+                let answer = String::from_utf8_lossy(&answer);
+                assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+            })
+            .await;
+    }
+
+    /// The same for HTTP/2 upstream: no head within its deadline is `504`.
+    #[tokio::test]
+    async fn an_http2_upstream_that_never_answers_is_answered_504() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let upstream = scripted_h2_upstream(never_answering()).await;
+                let limits = quick(|limits| limits.final_head = Duration::from_millis(300));
+                let (front, worker) = serving_worker_to_h2(upstream, limits).await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_listener_local_answers_total{listener=\"web\",reason=\"upstream_timed_out\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+                let line = "edgerush_upstream_failures_total{upstream=\"up\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+            })
+            .await;
+    }
+
+    /// A gRPC call whose upstream never answers ends with `DEADLINE_EXCEEDED`, in its head:
+    /// nothing had been said. Not `UNAVAILABLE`, which is what would be sent again.
+    #[tokio::test]
+    async fn a_grpc_call_to_an_upstream_that_never_answers_is_deadline_exceeded() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let upstream = scripted_h2_upstream(never_answering()).await;
+                let limits = quick(|limits| limits.final_head = Duration::from_millis(300));
+                let (front, _worker) = serving_worker_to_h2(upstream, limits).await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let (answer, _) = send
+                    .send_request(grpc_call("/pkg.Svc/Do", None), true)
+                    .unwrap();
+                assert_eq!(
+                    grpc_outcome(answer).await,
+                    (StatusCode::OK, "4".to_owned(), true)
+                );
+            })
+            .await;
+    }
+
+    /// An HTTP/2 upstream that gives a request's body no room for the idle bound, with no
+    /// answer yet, is `504`: it is the upstream not taking the upload, not the client.
+    #[tokio::test]
+    async fn an_http2_upstream_that_stops_taking_the_upload_is_answered_504() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Never reads the body, so that the room it gave runs out.
+                let upstream = scripted_h2_upstream(never_answering()).await;
+                let limits = quick(|limits| limits.idle = Duration::from_millis(300));
+                let (front, _worker) = serving_worker_to_h2(upstream, limits).await;
+                // More than a stream's initial window of 64 KiB.
+                let size = 512 * 1024;
+                let head = format!(
+                    "POST / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\ncontent-length: {size}\r\n\r\n"
+                );
+                let (mut read, mut write) = TcpStream::connect(front).await.unwrap().into_split();
+                let _uploading = tokio::task::spawn_local(async move {
+                    let _sent = write.write_all(head.as_bytes()).await;
+                    let _sent = write.write_all(&vec![b'x'; size]).await;
+                });
+                let mut answer = Vec::new();
+                let _ended = within(read.read_to_end(&mut answer)).await;
+                let answer = String::from_utf8_lossy(&answer);
+                assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+            })
+            .await;
+    }
+
+    /// An HTTP/2 upstream that holds every stream and says nothing for a while, then lets
+    /// go: bounded, so that a deadline that never runs fails the test rather than hanging it.
+    fn never_answering() -> Script {
+        Rc::new(|_request, respond| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                drop(respond);
+            })
+        })
+    }
+
+    /// A try that ran out of time before its head is sent again when the rule says
+    /// `on_timeout`, and goes to the next; that one answers.
+    #[tokio::test]
+    async fn a_try_that_ran_out_of_time_is_sent_again_when_the_rule_says_so() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, asked) = upstream_silent_at_first(1, true).await;
+                let retry = edgerush_config::Retry {
+                    on_timeout: true,
+                    ..retrying(1, &[], &[], 1)
+                };
+                let limits = quick(|limits| limits.final_head = Duration::from_millis(300));
+                let (front, worker) =
+                    serving_worker_with(upstream, UpstreamProtocol::Http1, Some(retry), limits)
+                        .await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+                assert_eq!(asked.get(), 2);
+                let scrape = worker.proxy().metrics();
+                assert!(
+                    scrape.contains("edgerush_upstream_retries_total{upstream=\"up\"} 1\n"),
+                    "{scrape}"
+                );
+            })
+            .await;
+    }
+
+    /// Without `on_timeout`, a `502` in the rule's statuses does not cover a try that ran
+    /// out of time: it is answered `504`, and nothing is sent again.
+    #[tokio::test]
+    async fn a_502_does_not_stand_for_a_try_that_ran_out_of_time() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, asked) = upstream_silent_at_first(1, true).await;
+                let limits = quick(|limits| limits.final_head = Duration::from_millis(300));
+                let (front, worker) = serving_worker_with(
+                    upstream,
+                    UpstreamProtocol::Http1,
+                    Some(retrying(2, &[502], &[], 1)),
+                    limits,
+                )
+                .await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+                assert_eq!(asked.get(), 1);
+                let scrape = worker.proxy().metrics();
+                assert!(
+                    scrape.contains("edgerush_upstream_retries_total{upstream=\"up\"} 0\n"),
+                    "{scrape}"
+                );
+            })
+            .await;
+    }
+
+    /// What `wants_again` says of an upstream that ran out of time or could not be reached:
+    /// the first is `on_timeout`'s, the second `502`'s, and neither is the other's.
+    #[test]
+    fn a_timed_out_try_is_wanted_again_only_under_on_timeout() {
+        let retry = |statuses: Vec<u16>, on_timeout| CompiledRetry {
+            attempts: 1,
+            http_statuses: statuses,
+            grpc_statuses: 0,
+            on_timeout,
+            backoff_base: Duration::from_millis(1),
+            backoff_max: Duration::from_millis(1),
+        };
+        let timed_out = Err(Answer::UpstreamTimedOut);
+        let unreached = Err(Answer::UpstreamFailed);
+        assert!(wants_again(&retry(vec![], true), &timed_out));
+        assert!(!wants_again(&retry(vec![], true), &unreached));
+        assert!(!wants_again(&retry(vec![502, 504], false), &timed_out));
+        assert!(wants_again(&retry(vec![502], false), &unreached));
     }
 
     /// A body past what is kept goes on as it came, and is not sent again.

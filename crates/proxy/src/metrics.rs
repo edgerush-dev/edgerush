@@ -227,6 +227,10 @@ pub(crate) enum Answer {
     NoBackend,
     NoEndpoints,
     UpstreamFailed,
+    /// A try ran out of time before its answer's head: the upstream's own clocks for a head,
+    /// or for what it was sent or would say, not a gRPC call's deadline
+    /// ([13 §7](../../docs/13-http1-upstream.md)). The upstream's failing, and counted so.
+    UpstreamTimedOut,
     /// This worker already has as many exchanges in hand as it will take.
     TooBusy,
     /// This worker could not pay for the storage an exchange needed
@@ -256,7 +260,7 @@ pub(crate) enum Answer {
 }
 
 impl Answer {
-    const ALL: [Self; 18] = [
+    const ALL: [Self; 19] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -265,6 +269,7 @@ impl Answer {
         Self::NoBackend,
         Self::NoEndpoints,
         Self::UpstreamFailed,
+        Self::UpstreamTimedOut,
         Self::TooBusy,
         Self::Exhausted,
         Self::Edits,
@@ -293,7 +298,7 @@ impl Answer {
             | Self::QueueFull
             | Self::QueueTimedOut => StatusCode::SERVICE_UNAVAILABLE,
             Self::ConnectionAuth => StatusCode::NOT_IMPLEMENTED,
-            Self::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
+            Self::DeadlineExceeded | Self::UpstreamTimedOut => StatusCode::GATEWAY_TIMEOUT,
             Self::UpstreamFailed => StatusCode::BAD_GATEWAY,
             Self::BodyTimedOut => StatusCode::REQUEST_TIMEOUT,
             // A redirect's own status, one of five, takes its place.
@@ -311,6 +316,7 @@ impl Answer {
             Self::NoBackend => "no_backend",
             Self::NoEndpoints => "no_endpoints",
             Self::UpstreamFailed => "upstream_failed",
+            Self::UpstreamTimedOut => "upstream_timed_out",
             Self::TooBusy => "too_busy",
             Self::Exhausted => "exhausted",
             Self::Edits => "edits",
@@ -357,6 +363,10 @@ impl Answer {
                 "the call's messages stopped arriving",
             ),
             Self::DeadlineExceeded => (Code::DeadlineExceeded, "the call's deadline passed"),
+            Self::UpstreamTimedOut => (
+                Code::DeadlineExceeded,
+                "the upstream did not answer in time",
+            ),
             Self::Redirected => (
                 Code::Unimplemented,
                 "the route answers with a redirect, which a call cannot follow",
@@ -924,6 +934,16 @@ mod tests {
         }
         assert_eq!(Answer::NoEndpoints.status(), 503);
         assert_eq!(Answer::UpstreamFailed.status(), 502);
+    }
+
+    /// A try that ran out of time is a gateway timeout, and a call's deadline exceeded: not
+    /// the `UNAVAILABLE` of an upstream that could not be reached, which is what would be
+    /// sent again.
+    #[test]
+    fn a_try_that_ran_out_of_time_is_a_504() {
+        assert_eq!(Answer::UpstreamTimedOut.status(), 504);
+        assert_eq!(Answer::UpstreamTimedOut.label(), "upstream_timed_out");
+        assert_eq!(Answer::UpstreamTimedOut.grpc().0, Code::DeadlineExceeded);
     }
 
     #[test]

@@ -170,13 +170,18 @@ pub struct Retry {
     /// Times a request may be sent again, beyond the first.
     pub attempts: u32,
     /// HTTP statuses that send it again. `502` also stands for an upstream that could not
-    /// be reached or answered nothing.
+    /// be reached or answered nothing; a try that ran out of time is `on_timeout`'s, not
+    /// `502`'s.
     #[serde(default)]
     pub http_statuses: Vec<u16>,
     /// gRPC statuses, by gRPC's names (`UNAVAILABLE`), that send a call again when the
     /// answer's head carries them.
     #[serde(default)]
     pub grpc_statuses: Vec<String>,
+    /// Whether a try that ran out of time before its answer's head is sent again: the
+    /// upstream's fixed clocks for a head, or for the request's upload or the answer to
+    /// go on, running out. Stated whichever way, so that a config says what it does.
+    pub on_timeout: bool,
     /// Milliseconds before the first retry; each after it waits twice as long, and as much
     /// again at random.
     pub backoff_base_ms: u64,
