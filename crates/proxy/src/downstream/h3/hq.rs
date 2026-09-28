@@ -14,6 +14,7 @@ use crate::downstream::h2::idle::Idle;
 use crate::downstream::h3::body::IncomingH3;
 use crate::downstream::h3::code;
 use crate::downstream::h3::conn::{Slot, Stream};
+use crate::downstream::h3::connection::stopped_already;
 use crate::downstream::h3::head::{self, RequestHead};
 use crate::interim::Interim;
 use crate::request_body::RequestBody;
@@ -89,7 +90,14 @@ pub(crate) fn requests(
             let line = &line[..ended.unwrap_or(line.len())];
             match head_of(line, &authority) {
                 Some(head) => {
-                    streams.insert(id, Slot::default());
+                    let stopped = stopped_already(quic, id);
+                    streams.insert(
+                        id,
+                        Slot {
+                            stopped,
+                            ..Slot::default()
+                        },
+                    );
                     asked.push(Asked { id, head });
                 }
                 None => refuse(quic, id),
@@ -136,7 +144,19 @@ pub(crate) async fn answer<R, F, B>(
     let interim = Interim::listened(false, Version::HTTP_3, true);
     let body = IncomingH3::new(Rc::clone(&stream.conn), stream.id, None, true, idle);
     let request = Request::from_parts(head.parts, RequestBody::H3(body));
-    let answered = respond(request, interim).await;
+    let mut answering = pin!(respond(request, interim));
+    // Stopped by the client, or the connection gone: the exchange goes with the answer
+    // nobody will take, as an HTTP/3 one does.
+    let Some(answered) = poll_fn(|cx| {
+        if poll_gone(&stream, cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        answering.as_mut().poll(cx).map(Some)
+    })
+    .await
+    else {
+        return;
+    };
     let (_, body) = answered.into_response().into_parts();
     let code = match send(&stream, body, &mut Idle::new(idle)).await {
         Ok(()) => return stream.answered(),
@@ -200,6 +220,23 @@ async fn write(stream: &Stream, data: &[u8], fin: bool, idle: &mut Idle) -> Resu
         }
     })
     .await
+}
+
+/// Ready once the client has stopped the stream or the connection has gone; until then the
+/// driver wakes the task when either happens, as it wakes one waiting for room.
+fn poll_gone(stream: &Stream, cx: &mut Context<'_>) -> Poll<()> {
+    stream.conn.with(|state| {
+        if state.closed {
+            return Poll::Ready(());
+        }
+        match state.streams.get_mut(&stream.id) {
+            Some(slot) if slot.stopped.is_none() => {
+                slot.writer = Some(cx.waker().clone());
+                Poll::Pending
+            }
+            _ => Poll::Ready(()),
+        }
+    })
 }
 
 /// Waits for the driver to say the stream has room, for the idle bound at the most.

@@ -479,22 +479,10 @@ fn events(
                         shut(quic, id, code::MESSAGE_ERROR);
                     }
                     Ok(head) => {
-                        // A stop that came before the head, its packet lost and sent again,
-                        // was told of with no slot to hear it, and is not told again. quiche
-                        // may have let the stream go since, both its sides done: a side of
-                        // ours can be done before the head is seen only by the client's
-                        // stop, whose code went with it.
-                        let stopped = match quic.stream_capacity(id) {
-                            Err(quiche::Error::StreamStopped(code)) => Some(code),
-                            Err(quiche::Error::InvalidStreamState(_)) => {
-                                Some(code::REQUEST_CANCELLED)
-                            }
-                            _ => None,
-                        };
                         streams.insert(
                             id,
                             Slot {
-                                stopped,
+                                stopped: stopped_already(quic, id),
                                 ..Slot::default()
                             },
                         );
@@ -538,6 +526,19 @@ fn events(
             // The client's GOAWAY concerns pushes, which the server makes none of.
             Event::GoAway => {}
         }
+    }
+}
+
+/// The code of a stop the client sent on stream `id` before its request was seen, for the
+/// stream's slot to hold as it is made. Such a stop was told of with no slot to hear it,
+/// and is not told again. quiche may have let the stream go since, both its sides done: a
+/// side of ours can be done before the request is seen only by the client's stop, whose
+/// code went with it.
+pub(super) fn stopped_already(quic: &mut quiche::Connection, id: u64) -> Option<u64> {
+    match quic.stream_capacity(id) {
+        Err(quiche::Error::StreamStopped(code)) => Some(code),
+        Err(quiche::Error::InvalidStreamState(_)) => Some(code::REQUEST_CANCELLED),
+        _ => None,
     }
 }
 

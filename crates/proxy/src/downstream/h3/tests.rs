@@ -1897,6 +1897,45 @@ fn an_hq_answer_the_client_takes_none_of_is_reset() {
     });
 }
 
+/// An HTTP/0.9 request the client stops is given up at once, as an HTTP/3 one is: its
+/// exchange goes rather than running on until the answer finds no one to take it. The stop
+/// may come once the line has been seen, or before: with the line in one flush, or after
+/// the line's packet was lost, which then goes again.
+#[test]
+fn a_stopped_hq_request_lets_its_exchange_go() {
+    for (line_seen, line_lost) in [(true, false), (false, false), (false, true)] {
+        locally(stopped_hq_request(line_seen, line_lost));
+    }
+}
+
+/// The client stops an HTTP/0.9 request once the core has it if `line_seen`, else in the
+/// same flush as its line, or after the line's packet was lost if `line_lost`.
+async fn stopped_hq_request(line_seen: bool, line_lost: bool) {
+    // The server's own deadlines, not the tests' short ones: a lost line goes again at the
+    // client's loss timer, which a loaded machine stretches past a short first-request one.
+    let exchanges = Exchanges::default();
+    let server = serving(Settings::default(), exchanges.core()).await;
+    let mut client = Client::connect_hq(server.address, "a.test").await;
+    let lost = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let id = client.hq_request(b"GET /\r\n", true);
+    if line_seen {
+        let started = exchanges.started.clone();
+        client.until(move |_| started.get() == 1).await;
+    } else if line_lost {
+        client.send_to = Some(lost.local_addr().unwrap());
+        client.flush().await;
+        client.send_to = None;
+    }
+    client
+        .quic
+        .stream_shutdown(id, quiche::Shutdown::Read, code::REQUEST_CANCELLED)
+        .unwrap();
+    let (started, alive) = (exchanges.started.clone(), exchanges.alive.clone());
+    client
+        .until(move |_| started.get() == 1 && alive.get() == 0)
+        .await;
+}
+
 /// An HTTP/0.9 connection with no request open is closed at its keep-alive deadline, with
 /// no GOAWAY before it: HTTP/0.9 has none.
 #[test]
