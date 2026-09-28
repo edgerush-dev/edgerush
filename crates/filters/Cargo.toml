@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# The slow reference implementations, for the fuzz targets. Never for the binary.
+reference = []
+
 [dependencies]
 edgerush-router.workspace = true
 http.workspace = true
@@ -22,6 +26,10 @@ harness = false
 
 [[bench]]
 name = "redirect"
+harness = false
+
+[[bench]]
+name = "forwarding"
 harness = false
 
 [lints]

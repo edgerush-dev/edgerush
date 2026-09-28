@@ -5,8 +5,10 @@
 //! config snapshot, already validated, and applying one never fails.
 //!
 //! So far: header modification ([`HeaderModifier`]), changes to a path ([`PathModifier`]),
-//! redirects ([`Redirect`]) and rewrites ([`UrlRewrite`]).
+//! redirects ([`Redirect`]), rewrites ([`UrlRewrite`]), and what an upstream is told of
+//! the client ([`forwarding`]).
 
+pub mod forwarding;
 mod header_modifier;
 mod path_modifier;
 mod redirect;

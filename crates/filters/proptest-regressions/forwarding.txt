@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 264f6f317482a9907eab12b4a51f7865b3080b61230d66300b3dff8d32b6aaa6 # shrinks to peer = 10.0.0.1, values = ["10.0.0.0, 10.0.0.1"], trust_2001 = false
+cc b206f8c131dc12421be6c7491f02c2eb6cbfbbcd466da1528bdb7956b47a6345 # shrinks to peer = 10.0.0.1, values = ["10.0.0.0, unknown, 10.0.0.2"], trust_2001 = false

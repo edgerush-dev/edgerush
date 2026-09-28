@@ -20,6 +20,7 @@ cargo-fuzz = true
 boring = "5.2"
 # A response head keeps the bytes it was read from, as the proxy's does.
 bytes = "1.12"
+edgerush-filters = { path = "../crates/filters", features = ["reference"] }
 edgerush-proxy = { path = "../crates/proxy", features = ["fuzzing"] }
 edgerush-router = { path = "../crates/router", features = ["reference"] }
 # The reading of a request's host is compared with this crate's own.
@@ -137,6 +138,13 @@ bench = false
 [[bin]]
 name = "tls_hello"
 path = "fuzz_targets/tls_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "forwarded_for"
+path = "fuzz_targets/forwarded_for.rs"
 test = false
 doc = false
 bench = false
