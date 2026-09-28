@@ -15,12 +15,33 @@
 use crate::head::Head;
 use crate::hop_by_hop::ConnectionError;
 use crate::host::{HostError, bare_host};
-use edgerush_config::{Compiled, CompiledListener, CompiledRule, UpstreamId};
+use edgerush_config::{Compiled, CompiledListener, CompiledRule, Outcome, Protocol, UpstreamId};
+use edgerush_filters::{Requested, Scheme};
 use edgerush_router::{NormaliseError, RequestParts, normalise_path};
 use http::uri::PathAndQuery;
-use http::{StatusCode, Uri, Version};
+use http::{HeaderValue, StatusCode, Uri, Version};
 use std::borrow::Cow;
 use std::sync::Arc;
+
+/// What becomes of a request.
+#[derive(Debug, Clone)]
+pub enum Decision<'a> {
+    /// It goes to an upstream.
+    Forward(Forward<'a>),
+    /// It is answered with a redirect, and nothing goes upstream.
+    Redirect(Redirected<'a>),
+}
+
+/// A request answered with a redirect.
+#[derive(Debug, Clone)]
+pub struct Redirected<'a> {
+    /// The rule the request belongs to, for its changes to the answer's headers.
+    pub rule: &'a Arc<CompiledRule>,
+    /// The status to answer with.
+    pub status: StatusCode,
+    /// Where the client is sent.
+    pub location: HeaderValue,
+}
 
 /// Where a request goes.
 #[derive(Debug, Clone, Copy)]
@@ -79,7 +100,9 @@ impl Rejection {
 /// Decides where a request that came in on `listener` goes, and makes its head what the
 /// upstream is to see: the normalised path, a `Host` field that names the host that was
 /// routed on, the cookie string in one piece, no hop-by-hop headers, and the rule's changes
-/// to the headers.
+/// to the headers. A request its rule redirects is answered with the `Location` made from
+/// what was routed on — the listener's scheme, the host, the normalised path, the query —
+/// and its head is left as routing left it.
 ///
 /// `random` chooses among weighted backends and should be uniform over `u64`; passing it
 /// in keeps the core deterministic. A request in the usual form — origin-form target, a
@@ -96,7 +119,7 @@ pub fn decide<'a, H: Head>(
     listener: &CompiledListener,
     head: &mut H,
     random: u64,
-) -> Result<Forward<'a>, Rejection> {
+) -> Result<Decision<'a>, Rejection> {
     let found = head.survey();
     if found.cookie_fields > 1 {
         // Before routing, so that rules and the upstream read the same cookie string.
@@ -150,7 +173,29 @@ pub fn decide<'a, H: Head>(
     };
     // A router only ever yields rules of the snapshot it was compiled into.
     let rule = snapshot.rule(id).ok_or(Rejection::NoBackend)?;
-    let upstream = rule.backends.pick(random).ok_or(Rejection::NoBackend)?;
+    let backends = match &rule.outcome {
+        Outcome::Forward { backends, .. } => backends,
+        Outcome::Redirect(redirect) => {
+            let scheme = match listener.protocol {
+                Protocol::Https => Scheme::Https,
+                Protocol::Http | Protocol::Tcp | Protocol::Tls => Scheme::Http,
+            };
+            let location = redirect
+                .location(&Requested {
+                    scheme,
+                    host,
+                    path: &path,
+                    query: head.uri().query(),
+                })
+                .map_err(|_| Rejection::Target)?;
+            return Ok(Decision::Redirect(Redirected {
+                rule,
+                status: redirect.status(),
+                location,
+            }));
+        }
+    };
+    let upstream = backends.pick(random).ok_or(Rejection::NoBackend)?;
 
     // Whatever can still fail comes before the target and the rest of the headers change.
     // A query with no path before it (`http://a?q=1`) is read as the path `/`, and is
@@ -174,7 +219,7 @@ pub fn decide<'a, H: Head>(
     if let Some(changes) = &rule.request_headers {
         head.apply(changes)?;
     }
-    Ok(Forward { rule, upstream })
+    Ok(Decision::Forward(Forward { rule, upstream }))
 }
 
 /// The same target with another path.
@@ -285,12 +330,22 @@ upstreams:
         request.body(()).unwrap().into_parts().0
     }
 
+    /// Where a request forwarded goes.
+    fn forwarding(decision: Decision<'_>) -> Forward<'_> {
+        match decision {
+            Decision::Forward(forward) => forward,
+            Decision::Redirect(redirected) => panic!("redirected to {:?}", redirected.location),
+        }
+    }
+
     /// Decides on the named listener; the name of the upstream, or the rejection.
     fn decide_on<H: Head>(listener: &str, head: &mut H, random: u64) -> Result<String, Rejection> {
         let shop = shop();
         let listener = shop.listeners.iter().find(|l| l.name == listener).unwrap();
-        decide(&shop, listener, head, random)
-            .map(|forward| shop.upstream(forward.upstream).unwrap().name.clone())
+        decide(&shop, listener, head, random).map(|decision| {
+            let forward = forwarding(decision);
+            shop.upstream(forward.upstream).unwrap().name.clone()
+        })
     }
 
     fn upstream_for(target: &str, fields: &[(&str, &str)]) -> Result<String, Rejection> {
@@ -341,9 +396,91 @@ upstreams:
         let shop = shop();
         let web = shop.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut head = head("/cart", &[("host", "shop.example.com")]);
-        let forward = decide(&shop, web, &mut head, 0).unwrap();
+        let forward = forwarding(decide(&shop, web, &mut head, 0).unwrap());
         assert!(forward.rule.request_headers.is_some());
         assert_eq!(shop.upstream(forward.upstream).unwrap().name, "cart");
+    }
+
+    const MOVED: &str = r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http }
+routes:
+  - name: moved
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: /old } }]
+        redirect: { status: 301, path: { replace_prefix: /new }, query: keep }
+      - matches: [{ path: { prefix: /secure } }]
+        redirect: { status: 308, scheme: https, query: drop }
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: pages, weight: 1 }] }
+upstreams:
+  pages: { endpoints: ["127.0.0.1:9000"] }
+"#;
+
+    /// What a request to `web` of [`MOVED`] is redirected with: status and `Location`.
+    fn redirected<H: Head>(head: &mut H) -> Option<(StatusCode, String)> {
+        let config: Config = serde_saphyr::from_str(MOVED).unwrap();
+        let moved = compile(&config).unwrap();
+        let web = moved.listeners.iter().find(|l| l.name == "web").unwrap();
+        match decide(&moved, web, head, 0).unwrap() {
+            Decision::Redirect(redirected) => Some((
+                redirected.status,
+                redirected.location.to_str().unwrap().to_owned(),
+            )),
+            Decision::Forward(_) => None,
+        }
+    }
+
+    #[test]
+    fn a_redirect_is_made_from_what_was_routed_on_and_the_head_is_left_alone() {
+        // The normalised path, and the query as it came.
+        let target = "/old/./a%61?x=%2f&y";
+        let mut request = head(target, &[("host", "Shop.Example.com:8080")]);
+        assert_eq!(
+            redirected(&mut request),
+            Some((StatusCode::MOVED_PERMANENTLY, "/new/aa?x=%2f&y".to_owned()))
+        );
+        assert_eq!(request.uri, target);
+        assert!(request.headers.contains_key("host"));
+
+        // A stated scheme: the host routed on, in lower case, and its default port.
+        let mut request = head("/secure/p?q", &[("host", "Shop.Example.com:8080")]);
+        assert_eq!(
+            redirected(&mut request),
+            Some((
+                StatusCode::PERMANENT_REDIRECT,
+                "https://shop.example.com/secure/p".to_owned()
+            ))
+        );
+        // Over HTTP/2 the host is `:authority`'s.
+        let mut h2 = head("http://h2.example.com/secure", &[]);
+        h2.version = http::Version::HTTP_2;
+        assert_eq!(
+            redirected(&mut h2).map(|(_, location)| location).as_deref(),
+            Some("https://h2.example.com/secure")
+        );
+        // Whatever the rule does not redirect is forwarded as ever.
+        let mut request = head("/elsewhere", &[("host", "shop.example.com")]);
+        assert_eq!(redirected(&mut request), None);
+    }
+
+    #[test]
+    fn a_request_that_cannot_be_routed_is_rejected_before_any_redirect() {
+        let config: Config = serde_saphyr::from_str(MOVED).unwrap();
+        let moved = compile(&config).unwrap();
+        let web = moved.listeners.iter().find(|l| l.name == "web").unwrap();
+        let mut ambiguous = head("/old/%2e%2e/admin", &[("host", "shop.example.com")]);
+        assert!(matches!(
+            decide(&moved, web, &mut ambiguous, 0),
+            Err(Rejection::Path(_))
+        ));
+        let mut hostless = head("/old/a", &[]);
+        assert!(matches!(
+            decide(&moved, web, &mut hostless, 0),
+            Err(Rejection::Host(_))
+        ));
     }
 
     #[test]

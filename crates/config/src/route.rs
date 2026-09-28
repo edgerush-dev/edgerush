@@ -84,8 +84,69 @@ pub struct Rule {
     /// What is done to a request and its response. Each kind of filter at most once.
     #[serde(default)]
     pub filters: Vec<Filter>,
-    /// Where its requests go.
-    pub forward: Forward,
+    /// Its requests sent on to its backends. A rule says this or `redirect`: one of the
+    /// two, never both.
+    #[serde(default)]
+    pub forward: Option<Forward>,
+    /// Its requests answered with a redirect, said in place of `forward`.
+    #[serde(default)]
+    pub redirect: Option<Redirect>,
+}
+
+/// A redirect (Gateway API's `RequestRedirect`): the client is sent elsewhere, and nothing
+/// goes upstream. The `Location` holds what is said here and only what it needs besides:
+/// relative when none of scheme, host and port is said, and otherwise absolute, the scheme
+/// unsaid taken from the listener and the host from the request.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Redirect {
+    /// 301, 302, 303, 307 or 308.
+    pub status: u16,
+    /// The scheme to send the client to.
+    #[serde(default)]
+    pub scheme: Option<Scheme>,
+    /// The host to send the client to: a DNS name in lower case.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// The port to send the client to; written only if it is not its scheme's default.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// The path to send the client to, made from the request's.
+    #[serde(default)]
+    pub path: Option<PathChange>,
+    /// Whether the request's query goes with it.
+    pub query: Query,
+}
+
+/// A scheme a redirect sends a client to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scheme {
+    /// `http`.
+    Http,
+    /// `https`.
+    Https,
+}
+
+/// What becomes of a request's query when it is redirected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Query {
+    /// It goes with it, byte for byte.
+    Keep,
+    /// It is left out.
+    Drop,
+}
+
+/// A change to a request's path.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathChange {
+    /// The whole path becomes this.
+    ReplaceFull(String),
+    /// The rule's one match, a prefix, is replaced by this, by whole segments; it may be
+    /// empty.
+    ReplacePrefix(String),
 }
 
 /// A rule's requests sent on to its backends.

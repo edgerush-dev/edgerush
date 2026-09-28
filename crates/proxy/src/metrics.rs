@@ -251,10 +251,12 @@ pub(crate) enum Answer {
     /// A gRPC call's deadline passed before its answer began
     /// ([15 §6](../../docs/15-http2-and-grpc.md)).
     DeadlineExceeded,
+    /// The request's rule redirects it ([18](../../docs/18-redirects-and-rewrites.md)).
+    Redirected,
 }
 
 impl Answer {
-    const ALL: [Self; 17] = [
+    const ALL: [Self; 18] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -272,6 +274,7 @@ impl Answer {
         Self::QueueTimedOut,
         Self::ConnectionAuth,
         Self::DeadlineExceeded,
+        Self::Redirected,
     ];
 
     /// The status that is answered with.
@@ -293,6 +296,8 @@ impl Answer {
             Self::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
             Self::UpstreamFailed => StatusCode::BAD_GATEWAY,
             Self::BodyTimedOut => StatusCode::REQUEST_TIMEOUT,
+            // A redirect's own status, one of five, takes its place.
+            Self::Redirected => StatusCode::FOUND,
         }
     }
 
@@ -315,6 +320,7 @@ impl Answer {
             Self::QueueTimedOut => "upstream_queue_timeout",
             Self::ConnectionAuth => "connection_auth",
             Self::DeadlineExceeded => "deadline_exceeded",
+            Self::Redirected => "redirected",
         }
     }
 
@@ -351,6 +357,10 @@ impl Answer {
                 "the call's messages stopped arriving",
             ),
             Self::DeadlineExceeded => (Code::DeadlineExceeded, "the call's deadline passed"),
+            Self::Redirected => (
+                Code::Unimplemented,
+                "the route answers with a redirect, which a call cannot follow",
+            ),
         }
     }
 }

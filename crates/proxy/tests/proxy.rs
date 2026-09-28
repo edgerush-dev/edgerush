@@ -455,6 +455,138 @@ async fn what_cannot_be_placed_is_answered_here() {
     assert_eq!(send(elsewhere).await.0, StatusCode::NOT_FOUND);
 }
 
+/// A shop some of whose pages have moved, beside a rule that forwards; the proxy, where it
+/// listens, and how many requests reached the upstream.
+async fn moved() -> (Arc<Proxy>, SocketAddr, Arc<AtomicUsize>) {
+    let (pages, reached) = counted_upstream("pages").await;
+    let yaml = format!(
+        r#"
+listeners:
+  web: {{ address: "127.0.0.1:0", protocol: http }}
+routes:
+  - name: moved
+    listeners: [web]
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: /old }}
+        filters:
+          - type: response_header_modifier
+            set: [{{ name: cache-control, value: no-store }}]
+        redirect: {{ status: 301, path: {{ replace_prefix: /new }}, query: keep }}
+      - matches:
+          - path: {{ prefix: /secure }}
+        redirect: {{ status: 308, scheme: https, query: drop }}
+      - matches:
+          - path: {{ prefix: / }}
+        forward: {{ backends: [{{ upstream: pages, weight: 1 }}] }}
+upstreams:
+  pages: {{ endpoints: ["{pages}"] }}
+"#
+    );
+    let (proxy, addresses) = reloadable_proxy(&yaml).await;
+    (proxy, addresses["web"], reached)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redirect_is_answered_here_over_either_protocol() {
+    let (proxy, web, reached) = moved().await;
+    for version in [Version::HTTP_11, Version::HTTP_2] {
+        let mut old = get(web, "/old/./a%61?x=%2f&y");
+        *old.version_mut() = version;
+        let (status, headers, body) = send(old).await;
+        assert_eq!(status, StatusCode::MOVED_PERMANENTLY, "{version:?}");
+        assert_eq!(headers["location"], "/new/aa?x=%2f&y", "{version:?}");
+        assert_eq!(headers["cache-control"], "no-store", "{version:?}");
+        assert_eq!(body, "", "{version:?}");
+
+        let mut secure = get(web, "/secure/p?q=1");
+        *secure.version_mut() = version;
+        let (status, headers, _) = send(secure).await;
+        assert_eq!(status, StatusCode::PERMANENT_REDIRECT, "{version:?}");
+        // The host routed on: over HTTP/2 the client's `:authority`, the address it dialled.
+        let host = if version == Version::HTTP_2 {
+            "127.0.0.1".to_owned()
+        } else {
+            "shop.example.com".to_owned()
+        };
+        assert_eq!(
+            headers["location"],
+            format!("https://{host}/secure/p").as_str(),
+            "{version:?}"
+        );
+        assert!(!headers.contains_key("cache-control"), "{version:?}");
+    }
+    // Nothing went upstream, and each redirect is counted as the gateway's own answer.
+    assert_eq!(reached.load(Ordering::SeqCst), 0);
+    let answers = "edgerush_listener_local_answers_total{listener=\"web\",reason=\"redirected\"}";
+    assert_eq!(sample(&proxy.metrics(), answers), 4);
+    let (status, _, _) = send(get(web, "/elsewhere")).await;
+    assert_eq!(status, 200);
+    assert_eq!(reached.load(Ordering::SeqCst), 1);
+}
+
+/// No gRPC client follows a redirect: a call that reaches one is answered as one, as with
+/// the gateway's other answers (15 §6).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grpc_call_that_meets_a_redirect_is_told_so_as_a_call() {
+    let (_, web, reached) = moved().await;
+    let mut call = request(Method::POST, web, "/old/pkg.Service/Method")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(Empty::new().boxed())
+        .unwrap();
+    *call.version_mut() = Version::HTTP_2;
+    let (status, headers, _) = send(call).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["grpc-status"], "12");
+    assert!(!headers.contains_key("location"));
+    assert_eq!(reached.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redirect_has_no_body_and_leaves_the_connection_as_the_gateways_answers_do() {
+    let (_, web, reached) = moved().await;
+    // A connection goes on after a redirect, as after any answer without a body.
+    let answer = raw(
+        web,
+        "GET /old/a HTTP/1.1\r\nHost: shop.example.com\r\n\r\n\
+         HEAD /old/b HTTP/1.1\r\nHost: shop.example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let heads: Vec<&str> = answer
+        .split("\r\n\r\n")
+        .filter(|head| !head.is_empty())
+        .collect();
+    assert_eq!(heads.len(), 2, "{answer}");
+    for (head, to) in heads.iter().zip(["/new/a", "/new/b"]) {
+        assert!(head.starts_with("HTTP/1.1 301 "), "{answer}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&format!("\r\nlocation: {to}")),
+            "{answer}"
+        );
+    }
+    // The GET's answer says it has no body; the HEAD's may say nothing (RFC 9110 §8.6).
+    assert!(
+        heads[0]
+            .to_ascii_lowercase()
+            .contains("\r\ncontent-length: 0"),
+        "{answer}"
+    );
+    // A body left unread ends the connection, and what was left is never read as a request.
+    let answer = raw(
+        web,
+        "POST /old/a HTTP/1.1\r\nHost: shop.example.com\r\nContent-Length: 38\r\n\r\n\
+         GET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n",
+    )
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 301 "), "{answer}");
+    assert_eq!(answer.matches("HTTP/1.1").count(), 1, "{answer}");
+    assert_eq!(reached.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_has_one_host_for_everything_that_looks_at_it() {
     let (evil, rest) = (upstream("evil").await, upstream("rest").await);

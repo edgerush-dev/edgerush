@@ -104,6 +104,14 @@ impl HeaderModifier {
         self.set.is_empty() && self.add.is_empty() && self.remove.is_empty()
     }
 
+    /// Whether any of the three names `name`.
+    #[must_use]
+    pub fn names(&self, name: &HeaderName) -> bool {
+        self.remove.contains(name)
+            || self.set.iter().any(|(named, _)| named == name)
+            || self.add.iter().any(|(named, _)| named == name)
+    }
+
     /// Carries out the changes. Allocates only as what is edited does to hold what is
     /// added; names and values are shared with the modifier, not copied.
     pub fn apply<E: Edit + ?Sized>(&self, headers: &mut E) {
@@ -285,6 +293,17 @@ mod tests {
                 ("x-set", "s")
             ])
         );
+    }
+
+    #[test]
+    fn a_modifier_says_which_headers_it_names_whatever_their_case() {
+        let modifier =
+            HeaderModifier::new([("X-Set", "1")], [("x-add", "2")], ["X-Remove"]).unwrap();
+        for named in ["x-set", "x-add", "x-remove"] {
+            assert!(modifier.names(&HeaderName::from_static(named)), "{named}");
+        }
+        assert!(!modifier.names(&header::LOCATION));
+        assert!(!HeaderModifier::default().names(&header::LOCATION));
     }
 
     #[test]

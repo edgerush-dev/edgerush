@@ -35,7 +35,7 @@ use crate::metrics::{Answer, Metrics, Socket, Stopped, Tunnel};
 use crate::mirror;
 use crate::random::random;
 use crate::raw::{RawAnswer, RawHead};
-use crate::request::decide;
+use crate::request::{Decision, decide};
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::retry::budget::Budget;
 use crate::retry::replay::Tee;
@@ -1447,7 +1447,10 @@ impl Worker {
         // name would travel on ([13 §4](../../docs/13-http1-upstream.md)).
         let nominated = crate::hop_by_hop::nominated(head.outgoing());
         let mut directed = match self.proxy.direct(listener, &mut head) {
-            Ok(directed) => directed,
+            Ok(Directing::Upstream(directed)) => directed,
+            Ok(Directing::Redirect(redirect)) => {
+                return self.proxy.redirect(listener, redirect, call).into();
+            }
             Err(answer) => return self.proxy.answer_to(listener, answer, call).into(),
         };
         // A name it gave is not declared onwards either: the declaration says what the
@@ -1492,7 +1495,7 @@ impl Worker {
             let mirrors = std::mem::take(&mut directed.mirrors);
             self.mirror(mirrors, &head, &nominated, sending, body)
         };
-        let retry = directed.rule.as_ref().and_then(|rule| rule.retry.as_ref());
+        let retry = directed.rule.as_ref().and_then(|rule| rule.retry());
         let outcome = match retry {
             // Only a rule that asks pays for keeping the body and the loop around it.
             // Boxed: a future is as big as its biggest state, and every request would
@@ -2043,12 +2046,35 @@ impl Proxy {
         response
     }
 
+    /// A redirect's answer: its status, its `Location` and no body, with its rule's changes to
+    /// the answer's headers; counted among the data plane's own. A gRPC call is answered as
+    /// one, as it is with the data plane's other answers
+    /// ([15 §6](../../docs/15-http2-and-grpc.md)): no gRPC client follows a redirect.
+    fn redirect(&self, listener: usize, redirect: Redirect, call: Option<Call>) -> Response<Body> {
+        if call.is_some() {
+            return self.answer_to(listener, Answer::Redirected, call);
+        }
+        let mut response = self.answer(listener, Answer::Redirected);
+        *response.status_mut() = redirect.status;
+        response
+            .headers_mut()
+            .insert(http::header::LOCATION, redirect.location);
+        if let Some(changes) = redirect
+            .rule
+            .as_ref()
+            .and_then(|rule| rule.response_headers.as_ref())
+        {
+            changes.apply(response.headers_mut());
+        }
+        response
+    }
+
     /// Makes the head of a request that came in on a listener's socket the head of the
     /// request to send, target included, or says what to answer instead. All of it is done
     /// on one snapshot, which is let go of before anything is waited for; what is kept for
     /// the response is the rule, and only if it has something to do to the response, and
     /// the slot of the upstream's counters.
-    fn direct<H: Forwarded>(&self, listener: usize, head: &mut H) -> Result<Directed, Answer> {
+    fn direct<H: Forwarded>(&self, listener: usize, head: &mut H) -> Result<Directing, Answer> {
         let snapshot = self.current.load();
         let listener = snapshot
             .listeners
@@ -2057,7 +2083,20 @@ impl Proxy {
             .flatten()
             .and_then(|position| snapshot.config.listeners.get(position))
             .ok_or(Answer::NoRoute)?;
-        let forward = decide(&snapshot.config, listener, head, random())?;
+        let forward = match decide(&snapshot.config, listener, head, random())? {
+            Decision::Forward(forward) => forward,
+            Decision::Redirect(redirected) => {
+                return Ok(Directing::Redirect(Redirect {
+                    rule: redirected
+                        .rule
+                        .response_headers
+                        .is_some()
+                        .then(|| Arc::clone(redirected.rule)),
+                    status: redirected.status,
+                    location: redirected.location,
+                }));
+            }
+        };
         // An upstream the snapshot does not have is not known to happen.
         let upstream = forward.upstream.0;
         let endpoints = snapshot.endpoints.get(upstream).ok_or(Answer::NoBackend)?;
@@ -2119,23 +2158,39 @@ impl Proxy {
                 target,
             });
         }
-        let kept = forward.rule.response_headers.is_some() || forward.rule.retry.is_some();
+        let kept = forward.rule.response_headers.is_some() || forward.rule.retry().is_some();
         // Only a request that may be sent again keeps where else it could go.
-        let others = forward.rule.retry.as_ref().map(|_| {
+        let others = forward.rule.retry().map(|_| {
             endpoints
                 .iter()
                 .cloned()
                 .zip(destinations.iter().map(Arc::clone))
                 .collect()
         });
-        Ok(Directed {
+        Ok(Directing::Upstream(Directed {
             rule: kept.then(|| Arc::clone(forward.rule)),
             upstream_slot,
             endpoint: Arc::clone(identity),
             others,
             mirrors,
-        })
+        }))
     }
+}
+
+/// What becomes of a request, decided on one snapshot.
+enum Directing {
+    /// It goes upstream.
+    Upstream(Directed),
+    /// It is answered with a redirect.
+    Redirect(Redirect),
+}
+
+/// What a redirected request keeps of the snapshot it was decided on.
+struct Redirect {
+    /// The rule, only if it changes the answer's headers.
+    rule: Option<Arc<CompiledRule>>,
+    status: StatusCode,
+    location: http::HeaderValue,
 }
 
 /// What a request keeps of the snapshot it was directed on.
@@ -3114,6 +3169,56 @@ mod tests {
         let alone = Forwarding::group(1).remove(0);
         let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
         (front, proxy)
+    }
+
+    /// A redirect is answered over HTTP/3 as over TCP, and a scheme it does not state is the
+    /// listener's, `https` (18 §3).
+    #[tokio::test]
+    async fn a_redirect_is_answered_over_http3_with_the_listeners_scheme() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::downstream::h3::testing::{Answer, Client};
+                let field = |answer: &Answer, name: &str| {
+                    answer.heads.last().and_then(|head| {
+                        head.iter()
+                            .find(|(field, _)| field == name)
+                            .map(|(_, value)| value.clone())
+                    })
+                };
+                let (upstream, opened) = counting_upstream().await;
+                let http3 = edgerush_config::Http3 {
+                    alt_svc_max_age: 60,
+                    force_retry: false,
+                };
+                let mut config = h3_config(upstream, http3);
+                let redirects = [
+                    "matches: [{ path: { prefix: /old } }]\n\
+                     redirect: { status: 301, path: { replace_prefix: /new }, query: keep }",
+                    "matches: [{ path: { prefix: /away } }]\n\
+                     redirect: { status: 302, host: www.example.org, query: drop }",
+                ];
+                for (at, rule) in redirects.into_iter().enumerate() {
+                    config.routes[0]
+                        .rules
+                        .insert(at, serde_saphyr::from_str(rule).unwrap());
+                }
+                let (front, _) = serving_h3(&config).await;
+                let mut client = Client::connect(front, "a.test").await;
+
+                let moved = client.get("a.test", "/old/a?x=1").await;
+                assert_eq!(moved.final_status(), Some("301"));
+                assert_eq!(field(&moved, "location").as_deref(), Some("/new/a?x=1"));
+                assert!(moved.body.is_empty());
+                let away = client.get("a.test", "/away/b?y").await;
+                assert_eq!(away.final_status(), Some("302"));
+                assert_eq!(
+                    field(&away, "location").as_deref(),
+                    Some("https://www.example.org/away/b")
+                );
+                assert_eq!(opened.load(Ordering::SeqCst), 0);
+            })
+            .await;
     }
 
     /// A listener whose config forces Retry has every client prove its address first,
@@ -6009,7 +6114,11 @@ upstreams:
     ) -> (SocketAddr, Rc<Worker>) {
         let mut config = everything_config(upstream);
         config.upstreams.get_mut("up").unwrap().protocol = protocol;
-        config.routes[0].rules[0].forward.retry = Some(retry);
+        config.routes[0].rules[0]
+            .forward
+            .as_mut()
+            .expect("the rule forwards")
+            .retry = Some(retry);
         let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
         let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();

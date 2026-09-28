@@ -4,14 +4,16 @@
 
 use crate::backends::{UpstreamId, WeightedBackends};
 use crate::route::{
-    Filter, Fraction, GrpcMethod, HeaderChanges, Hostname, Match, PathMatch, Route, ValueMatch,
-    ValuePredicate, Wildcard,
+    Filter, Forward, Fraction, GrpcMethod, HeaderChanges, Hostname, Match, PathChange, PathMatch,
+    Query, Redirect, Route, Scheme, ValueMatch, ValuePredicate, Wildcard,
 };
 use crate::{
     Backend, Config, HealthCheck, Http3, Keepalive, Probe, Protocol, Rule, Tls, UpstreamProtocol,
     UpstreamTls,
 };
-use edgerush_filters::{HeaderModifier, HeaderModifierError};
+use edgerush_filters::{
+    HeaderModifier, HeaderModifierError, PathModifier, PathModifierError, RedirectError,
+};
 use edgerush_router::{
     HeaderPredicate, HeaderPredicateError, HeaderPredicates, HostClaim, HostIndex, HostPattern,
     HostPatternError, PathPattern, PathPatternError, QueryPredicate, QueryPredicateError,
@@ -125,12 +127,35 @@ pub struct CompiledRule {
     pub request_headers: Option<HeaderModifier>,
     /// Changes to the response's headers before it goes to the client, if there are any.
     pub response_headers: Option<HeaderModifier>,
-    /// Where they go.
-    pub backends: WeightedBackends,
-    /// When a request is sent again, if ever.
-    pub retry: Option<CompiledRetry>,
+    /// What becomes of its requests.
+    pub outcome: Outcome,
     /// Where copies of its requests go, if anywhere.
     pub mirrors: Vec<CompiledMirror>,
+}
+
+impl CompiledRule {
+    /// When a request is sent again, if ever: never, for a rule that does not forward.
+    #[must_use]
+    pub fn retry(&self) -> Option<&CompiledRetry> {
+        match &self.outcome {
+            Outcome::Forward { retry, .. } => retry.as_ref(),
+            Outcome::Redirect(_) => None,
+        }
+    }
+}
+
+/// What becomes of a rule's requests.
+#[derive(Debug)]
+pub enum Outcome {
+    /// They are sent on to its backends.
+    Forward {
+        /// Where they go.
+        backends: WeightedBackends,
+        /// When a request is sent again, if ever.
+        retry: Option<CompiledRetry>,
+    },
+    /// They are answered with a redirect, and nothing goes upstream.
+    Redirect(edgerush_filters::Redirect),
 }
 
 /// A rule's mirror, checked: where the copies go, and how many of the requests.
@@ -204,8 +229,8 @@ const GRPC_CODES: [&str; 17] = [
 /// multiplier more than a remedy.
 const MOST_ATTEMPTS: u32 = 5;
 
-fn retry(rule: &Rule, place: &Place, errors: &mut Vec<ConfigError>) -> Option<CompiledRetry> {
-    let retry = rule.forward.retry.as_ref()?;
+fn retry(forward: &Forward, place: &Place, errors: &mut Vec<ConfigError>) -> Option<CompiledRetry> {
+    let retry = forward.retry.as_ref()?;
     let mut problems = Vec::new();
     if retry.attempts == 0 || retry.attempts > MOST_ATTEMPTS {
         problems.push(Problem::RetryAttempts(retry.attempts));
@@ -444,8 +469,7 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             compiled_rules.push(Arc::new(CompiledRule {
                 request_headers,
                 response_headers,
-                backends: backends(rule, &upstream_ids, &place, &mut errors),
-                retry: retry(rule, &place, &mut errors),
+                outcome: outcome(rule, &upstream_ids, &place, &mut errors),
                 mirrors,
             }));
         }
@@ -877,11 +901,22 @@ fn filters(
     let mut request = None;
     let mut response = None;
     let mut mirrors = Vec::new();
+    let redirects = rule.redirect.is_some();
     for (at, filter) in rule.filters.iter().enumerate() {
         let place = Place {
             filter: Some(at),
             ..place.clone()
         };
+        // Beside a redirect nothing goes upstream, for a change to the request to act on
+        // or a mirror to copy.
+        let upstream_only = match filter {
+            Filter::RequestMirror(_) => Some("request_mirror"),
+            Filter::RequestHeaderModifier(_) => Some("request_header_modifier"),
+            Filter::ResponseHeaderModifier(_) => None,
+        };
+        if let Some(kind) = upstream_only.filter(|_| redirects) {
+            errors.push(place.problem(Problem::BesideRedirect(kind)));
+        }
         let (slot, changes, kind) = match filter {
             Filter::RequestMirror(mirror) => {
                 let upstream = upstream_ids.get(mirror.upstream.as_str()).copied();
@@ -921,6 +956,11 @@ fn filters(
             errors.push(place.problem(Problem::FilterTwice(kind)));
         }
         match header_modifier(changes) {
+            // A redirect's `Location` is its own: set, it would be another; added, a second,
+            // which a `Location` cannot have (RFC 9110 §10.2.2).
+            Ok(modifier) if redirects && modifier.names(&http::header::LOCATION) => {
+                errors.push(place.problem(Problem::RedirectLocation));
+            }
             Ok(modifier) => *slot = Some(modifier),
             Err(reason) => errors.push(place.problem(Problem::HeaderModifier(reason))),
         }
@@ -942,17 +982,109 @@ fn header_modifier(changes: &HeaderChanges) -> Result<HeaderModifier, HeaderModi
     )
 }
 
-fn backends(
+/// What becomes of a rule's requests: it says `forward` or `redirect`, one and not both.
+fn outcome(
     rule: &Rule,
     upstream_ids: &BTreeMap<&str, UpstreamId>,
     place: &Place,
     errors: &mut Vec<ConfigError>,
+) -> Outcome {
+    // What a rule in error compiles to, thrown away with the errors.
+    let nowhere = || Outcome::Forward {
+        backends: WeightedBackends::new(std::iter::empty()),
+        retry: None,
+    };
+    match (&rule.forward, &rule.redirect) {
+        (Some(forward), None) => Outcome::Forward {
+            backends: backends(forward, upstream_ids, place, errors),
+            retry: retry(forward, place, errors),
+        },
+        (None, Some(redirect)) => {
+            redirect_of(rule, redirect, place, errors).map_or_else(nowhere, Outcome::Redirect)
+        }
+        (None, None) => {
+            errors.push(place.problem(Problem::NoOutcome));
+            nowhere()
+        }
+        (Some(_), Some(_)) => {
+            errors.push(place.problem(Problem::ForwardAndRedirect));
+            nowhere()
+        }
+    }
+}
+
+fn redirect_of(
+    rule: &Rule,
+    redirect: &Redirect,
+    place: &Place,
+    errors: &mut Vec<ConfigError>,
+) -> Option<edgerush_filters::Redirect> {
+    let path = match &redirect.path {
+        Some(change) => match path_modifier(rule, change) {
+            Ok(path) => path,
+            Err(problem) => {
+                errors.push(place.problem(problem));
+                None
+            }
+        },
+        None => None,
+    };
+    let scheme = redirect.scheme.map(|scheme| match scheme {
+        Scheme::Http => edgerush_filters::Scheme::Http,
+        Scheme::Https => edgerush_filters::Scheme::Https,
+    });
+    let query = match redirect.query {
+        Query::Keep => edgerush_filters::Query::Keep,
+        Query::Drop => edgerush_filters::Query::Drop,
+    };
+    edgerush_filters::Redirect::new(
+        redirect.status,
+        scheme,
+        redirect.host.as_deref(),
+        redirect.port,
+        path,
+        query,
+    )
+    .map_err(|reason| errors.push(place.problem(Problem::Redirect(reason))))
+    .ok()
+}
+
+/// A change to the path of the rule's requests. `None` where the rule's prefix is no
+/// pattern, which is reported with its match.
+fn path_modifier(rule: &Rule, change: &PathChange) -> Result<Option<PathModifier>, Problem> {
+    let modifier = match change {
+        PathChange::ReplaceFull(path) => PathModifier::full(path),
+        PathChange::ReplacePrefix(replacement) => {
+            // The prefix replaced is known when the config is compiled: the rule has one
+            // match, and that a prefix, as Gateway API's validation has it.
+            let [
+                Match {
+                    path: Some(PathMatch::Prefix(prefix)),
+                    ..
+                },
+            ] = rule.matches.as_slice()
+            else {
+                return Err(Problem::ReplacePrefixMatch);
+            };
+            let Ok(prefix) = PathPattern::prefix(prefix) else {
+                return Ok(None);
+            };
+            PathModifier::prefix(&prefix, replacement)
+        }
+    };
+    modifier.map(Some).map_err(Problem::PathChange)
+}
+
+fn backends(
+    forward: &Forward,
+    upstream_ids: &BTreeMap<&str, UpstreamId>,
+    place: &Place,
+    errors: &mut Vec<ConfigError>,
 ) -> WeightedBackends {
-    if rule.forward.backends.is_empty() {
+    if forward.backends.is_empty() {
         errors.push(place.problem(Problem::NoBackends));
     }
-    let resolved = rule
-        .forward
+    let resolved = forward
         .backends
         .iter()
         .enumerate()
@@ -1210,6 +1342,27 @@ pub enum Problem {
     /// The rule sends its requests nowhere.
     #[error("no backends")]
     NoBackends,
+    /// The rule says nothing of what becomes of its requests.
+    #[error("a rule needs `forward` or `redirect`")]
+    NoOutcome,
+    /// The rule says both.
+    #[error("a rule has `forward` or `redirect`, not both")]
+    ForwardAndRedirect,
+    /// The redirect is not valid.
+    #[error("{0}")]
+    Redirect(RedirectError),
+    /// The change to the path is not valid.
+    #[error("{0}")]
+    PathChange(PathModifierError),
+    /// A prefix to replace that the rule's matches do not give.
+    #[error("`replace_prefix` needs the rule to have exactly one match, and that a prefix")]
+    ReplacePrefixMatch,
+    /// A filter that acts on what goes upstream, beside a redirect.
+    #[error("`{0}` has nothing to act on beside a `redirect`: nothing goes upstream")]
+    BesideRedirect(&'static str),
+    /// A change to the response's `Location` beside a redirect, which makes its own.
+    #[error("a `redirect` makes the `location` header; `response_header_modifier` cannot name it")]
+    RedirectLocation,
     /// The backend names an upstream the config does not have.
     #[error("there is no upstream `{0}`")]
     UnknownUpstream(String),
@@ -1383,7 +1536,10 @@ upstreams:
         let rule = compiled.rule(RuleId { route: 0, rule: 0 }).unwrap();
         let picked: Vec<&str> = (0..10)
             .map(|point| {
-                let upstream = rule.backends.pick(point).unwrap();
+                let Outcome::Forward { backends, .. } = &rule.outcome else {
+                    panic!("the rule forwards");
+                };
+                let upstream = backends.pick(point).unwrap();
                 compiled.upstream(upstream).unwrap().name.as_str()
             })
             .collect();
@@ -1586,6 +1742,148 @@ upstreams:
         );
     }
 
+    /// The problems of a config with these rules, one route of them on `web`.
+    fn rule_problems(rules: &str) -> Vec<String> {
+        let yaml = format!(
+            r#"
+listeners:
+  web: {{ address: "[::]:8080", protocol: http }}
+routes:
+  - name: a
+    listeners: [web]
+    hostnames: [{{ name: "*", falls_through: true }}]
+    rules:
+{rules}
+upstreams:
+  u: {{ endpoints: [] }}
+"#
+        );
+        compile(&config(&yaml))
+            .err()
+            .map_or_else(Vec::new, |errors| {
+                errors.iter().map(ToString::to_string).collect()
+            })
+    }
+
+    #[test]
+    fn a_rule_forwards_or_redirects_one_and_not_both() {
+        let problems = rule_problems(
+            "      - matches: [{ path: { prefix: /neither } }]
+      - matches: [{ path: { prefix: /both } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+        redirect: { status: 301, query: keep }
+      - matches: [{ path: { prefix: /forward } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+      - matches: [{ path: { prefix: /redirect } }]
+        redirect: { status: 301, query: keep }",
+        );
+        assert_eq!(
+            problems,
+            [
+                "route `a`, rules[0]: a rule needs `forward` or `redirect`",
+                "route `a`, rules[1]: a rule has `forward` or `redirect`, not both",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_redirect_compiles_to_what_it_states() {
+        let compiled = compile(&config(
+            r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http }
+routes:
+  - name: a
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: /old } }]
+        filters:
+          - { type: response_header_modifier, set: [{ name: cache-control, value: no-store }] }
+        redirect:
+          status: 308
+          scheme: https
+          host: www.example.org
+          port: 8443
+          path: { replace_prefix: /new }
+          query: drop
+upstreams: {}
+"#,
+        ))
+        .unwrap();
+        let rule = compiled.rule(RuleId { route: 0, rule: 0 }).unwrap();
+        let Outcome::Redirect(redirect) = &rule.outcome else {
+            panic!("the rule redirects");
+        };
+        assert_eq!(redirect.status(), http::StatusCode::PERMANENT_REDIRECT);
+        let location = redirect
+            .location(&edgerush_filters::Requested {
+                scheme: edgerush_filters::Scheme::Http,
+                host: "shop.example.com",
+                path: "/old/a",
+                query: Some("b=1"),
+            })
+            .unwrap();
+        assert_eq!(location, "https://www.example.org:8443/new/a");
+        assert!(rule.retry().is_none());
+        assert!(rule.response_headers.is_some());
+    }
+
+    #[test]
+    fn every_redirect_problem_is_reported_with_its_place() {
+        let problems = rule_problems(
+            r#"      - matches: [{ path: { prefix: /a } }]
+        redirect: { status: 200, host: Example.org, port: 0, query: keep }
+      - matches: [{ path: { prefix: /a } }, { path: { prefix: /b } }]
+        redirect: { status: 301, path: { replace_prefix: /c }, query: keep }
+      - matches: [{ path: { exact: /a } }]
+        redirect: { status: 301, path: { replace_prefix: /c }, query: keep }
+      - matches: [{ path: { exact: /a } }]
+        redirect: { status: 301, path: { replace_full: "/c?d" }, query: keep }
+      - matches: [{ path: { prefix: /a } }]
+        redirect: { status: 301, path: { replace_prefix: "//evil.example" }, query: keep }
+      - matches: [{ path: { prefix: /a } }]
+        filters:
+          - { type: request_header_modifier, set: [{ name: x-a, value: "1" }] }
+          - { type: request_mirror, upstream: u, fraction: { numerator: 1, denominator: 1 } }
+          - { type: response_header_modifier, add: [{ name: Location, value: /elsewhere }] }
+        redirect: { status: 302, query: keep }"#,
+        );
+        assert_eq!(
+            problems,
+            [
+                "route `a`, rules[0]: redirect status 200: 301, 302, 303, 307 or 308",
+                "route `a`, rules[1]: `replace_prefix` needs the rule to have exactly one \
+                 match, and that a prefix",
+                "route `a`, rules[2]: `replace_prefix` needs the rule to have exactly one \
+                 match, and that a prefix",
+                "route `a`, rules[3]: replacement holds a `?` or `#`: a path cannot",
+                "route `a`, rules[4]: replacement: path contains an empty segment (`//`)",
+                "route `a`, rules[5], filters[0]: `request_header_modifier` has nothing to \
+                 act on beside a `redirect`: nothing goes upstream",
+                "route `a`, rules[5], filters[1]: `request_mirror` has nothing to act on \
+                 beside a `redirect`: nothing goes upstream",
+                "route `a`, rules[5], filters[2]: a `redirect` makes the `location` header; \
+                 `response_header_modifier` cannot name it",
+            ]
+        );
+        // The host and port of rule 0 are refused too, once its status is not.
+        let problems = rule_problems(
+            "      - matches: [{ path: { prefix: /a } }]
+        redirect: { status: 301, host: Example.org, query: keep }
+      - matches: [{ path: { prefix: /a } }]
+        redirect: { status: 301, port: 0, query: keep }",
+        );
+        assert_eq!(
+            problems,
+            [
+                "route `a`, rules[0]: redirect host `Example.org` is not a DNS name in lower \
+                 case",
+                "route `a`, rules[1]: redirect port 0: from 1 to 65535",
+            ]
+        );
+    }
+
     #[test]
     fn there_is_no_shorthand_and_nothing_unknown_is_let_through() {
         let parse = |routes: &str| {
@@ -1612,7 +1910,37 @@ upstreams:
             ))
             .is_err()
         );
-        assert!(parse(&rule("{ matches: [] }")).is_err());
+        // Saying neither `forward` nor `redirect` is for compiling to refuse
+        // (`a_rule_forwards_or_redirects_one_and_not_both`).
+        assert!(parse(&rule("{ matches: [] }")).is_ok());
+        // A redirect always states its status and what becomes of the query, and nothing
+        // it does not know.
+        assert!(
+            parse(&rule(
+                "{ matches: [], redirect: { status: 301, query: keep } }"
+            ))
+            .is_ok()
+        );
+        assert!(parse(&rule("{ matches: [], redirect: { status: 301 } }")).is_err());
+        assert!(parse(&rule("{ matches: [], redirect: { query: keep } }")).is_err());
+        assert!(
+            parse(&rule(
+                "{ matches: [], redirect: { status: 301, query: keep, scheme: ftp } }"
+            ))
+            .is_err()
+        );
+        assert!(
+            parse(&rule(
+                "{ matches: [], redirect: { status: 301, query: keep, path: /a } }"
+            ))
+            .is_err()
+        );
+        assert!(
+            parse(&rule(
+                "{ matches: [], redirect: { status: 301, query: keep, hostname: a.example } }"
+            ))
+            .is_err()
+        );
         // Backends and a retry are forwarding's, and said inside `forward` only.
         assert!(parse(&rule("{ matches: [], backends: [] }")).is_err());
         assert!(
@@ -2325,8 +2653,8 @@ upstreams: {{ u: {{ endpoints: [] }} }}
                     compiled
                         .rule(RuleId { route: 0, rule: 0 })
                         .unwrap()
-                        .retry
-                        .clone()
+                        .retry()
+                        .cloned()
                 })
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
