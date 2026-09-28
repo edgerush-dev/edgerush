@@ -148,6 +148,41 @@ impl CompiledRule {
             Outcome::Redirect(_) => None,
         }
     }
+
+    /// The timeouts the rule states, if it states any: none leaves its requests to the
+    /// data plane's fixed clocks.
+    #[must_use]
+    pub fn timeouts(&self) -> Option<&CompiledTimeouts> {
+        match &self.outcome {
+            Outcome::Forward { timeouts, .. } => timeouts.as_ref(),
+            Outcome::Redirect(_) => None,
+        }
+    }
+}
+
+/// A rule's timeouts, checked. Each is `None` when it is not stated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompiledTimeouts {
+    /// From the request's head arriving to its answer's end.
+    pub request: Option<Timeout>,
+}
+
+/// A timeout a rule states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Timeout {
+    /// None at all: Gateway API's `0s`.
+    Off,
+    /// This long.
+    After(std::time::Duration),
+}
+
+impl Timeout {
+    fn of_ms(ms: u64) -> Self {
+        match ms {
+            0 => Self::Off,
+            ms => Self::After(std::time::Duration::from_millis(ms)),
+        }
+    }
 }
 
 /// One of the changes to a request on its way, in the order the rule's filters are
@@ -174,6 +209,8 @@ pub enum Outcome {
     Forward {
         /// Where they go.
         backends: WeightedBackends,
+        /// How long they may take, if the rule says.
+        timeouts: Option<CompiledTimeouts>,
         /// When a request is sent again, if ever.
         retry: Option<CompiledRetry>,
     },
@@ -254,6 +291,22 @@ const GRPC_CODES: [&str; 17] = [
 /// multiplier more than a remedy.
 const MOST_ATTEMPTS: u32 = 5;
 
+fn timeouts(
+    forward: &Forward,
+    place: &Place,
+    errors: &mut Vec<ConfigError>,
+) -> Option<CompiledTimeouts> {
+    let timeouts = forward.timeouts.as_ref()?;
+    let compiled = CompiledTimeouts {
+        request: timeouts.request_ms.map(Timeout::of_ms),
+    };
+    if compiled == CompiledTimeouts::default() {
+        errors.push(place.problem(Problem::TimeoutsEmpty));
+        return None;
+    }
+    Some(compiled)
+}
+
 fn retry(forward: &Forward, place: &Place, errors: &mut Vec<ConfigError>) -> Option<CompiledRetry> {
     let retry = forward.retry.as_ref()?;
     let mut problems = Vec::new();
@@ -262,6 +315,15 @@ fn retry(forward: &Forward, place: &Place, errors: &mut Vec<ConfigError>) -> Opt
     }
     if retry.http_statuses.is_empty() && retry.grpc_statuses.is_empty() && !retry.on_timeout {
         problems.push(Problem::RetryOnNothing);
+    }
+    // A stated `request` takes the fixed clocks' place, so a try has no clock of its own
+    // left: the request's running out ends it, and leaves nothing to try again with.
+    let request_stated = forward
+        .timeouts
+        .as_ref()
+        .is_some_and(|timeouts| timeouts.request_ms.is_some());
+    if retry.on_timeout && request_stated {
+        problems.push(Problem::RetryOnTimeoutNever);
     }
     for status in &retry.http_statuses {
         // An answer that succeeded, or one still to come, is nothing to try again for.
@@ -1095,11 +1157,13 @@ fn outcome(
     // What a rule in error compiles to, thrown away with the errors.
     let nowhere = || Outcome::Forward {
         backends: WeightedBackends::new(std::iter::empty()),
+        timeouts: None,
         retry: None,
     };
     match (&rule.forward, &rule.redirect) {
         (Some(forward), None) => Outcome::Forward {
             backends: backends(forward, upstream_ids, place, errors),
+            timeouts: timeouts(forward, place, errors),
             retry: retry(forward, place, errors),
         },
         (None, Some(redirect)) => {
@@ -1378,6 +1442,12 @@ pub enum Problem {
     /// A retry for no answer at all.
     #[error("`retry` names no status and no timeout to send a request again for")]
     RetryOnNothing,
+    /// A retry for a try that runs out of time, where no clock of a try's own runs.
+    #[error("`retry` says `on_timeout` with no clock of a try's own to run out")]
+    RetryOnTimeoutNever,
+    /// `timeouts` stated with nothing in it.
+    #[error("`timeouts` states no timeout")]
+    TimeoutsEmpty,
     /// A retry for an HTTP status that is not a failure.
     #[error("`retry` on status {0}: only 4xx and 5xx")]
     RetryStatus(u16),
@@ -2948,6 +3018,66 @@ upstreams: {{ u: {{ endpoints: [] }} }}
                 "{ attempts: 1, http_statuses: [503], on_timeout: false, backoff_base_ms: 300, backoff_max_ms: 250 }"
             )[0]
             .ends_with("no more than its most")
+        );
+    }
+
+    #[test]
+    fn a_rule_states_its_timeouts_or_leaves_them_to_the_fixed_clocks() {
+        let with = |forward: &str| {
+            let yaml = format!(
+                r#"
+listeners: {{ web: {{ address: "[::]:80", protocol: http }} }}
+routes:
+  - name: r
+    listeners: [web]
+    hostnames: [{{ name: "*", falls_through: true }}]
+    rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}]{forward} }} }}]
+upstreams: {{ u: {{ endpoints: [] }} }}
+"#
+            );
+            compile(&config(&yaml))
+                .map(|compiled| {
+                    compiled
+                        .rule(RuleId { route: 0, rule: 0 })
+                        .unwrap()
+                        .timeouts()
+                        .cloned()
+                })
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        assert_eq!(with("").unwrap(), None, "unstated: the fixed clocks");
+        assert_eq!(
+            with(", timeouts: { request_ms: 1500 }").unwrap(),
+            Some(CompiledTimeouts {
+                request: Some(Timeout::After(std::time::Duration::from_millis(1500))),
+            })
+        );
+        // Gateway API's `0s`: that clock is off.
+        assert_eq!(
+            with(", timeouts: { request_ms: 0 }").unwrap(),
+            Some(CompiledTimeouts {
+                request: Some(Timeout::Off),
+            })
+        );
+        // One spelling: `timeouts` saying nothing is its absence written another way.
+        assert!(with(", timeouts: {}").unwrap_err()[0].ends_with("`timeouts` states no timeout"));
+        assert!(
+            serde_saphyr::from_str::<crate::Timeouts>("{ request: 10 }").is_err(),
+            "an unknown field"
+        );
+        // With `request` stated and nothing for a try, a try has no clock of its own to run
+        // out: the request's is the one that ends it, and then nothing is left to try with.
+        let retry =
+            "retry: { attempts: 1, on_timeout: true, backoff_base_ms: 25, backoff_max_ms: 250 }";
+        for request in ["1500", "0"] {
+            assert!(
+                with(&format!(", timeouts: {{ request_ms: {request} }}, {retry}")).unwrap_err()[0]
+                    .ends_with("`on_timeout` with no clock of a try's own to run out")
+            );
+        }
+        assert!(
+            with(&format!(", {retry}")).is_ok(),
+            "the fixed clocks are a try's"
         );
     }
 

@@ -155,9 +155,24 @@ pub enum PathChange {
 pub struct Forward {
     /// Where requests go, in proportion to the weights. At least one.
     pub backends: Vec<Backend>,
+    /// How long its requests may take; none leaves them to the data plane's fixed clocks.
+    #[serde(default)]
+    pub timeouts: Option<Timeouts>,
     /// Sending a request again when its answer says to; none is never.
     #[serde(default)]
     pub retry: Option<Retry>,
+}
+
+/// How long a rule's requests may take (Gateway API's HTTPRoute `timeouts`). A timeout
+/// stated takes the place of the data plane's fixed clocks for an answer's head; the idle
+/// clocks, which find data that stopped flowing, run whatever is stated. At least one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Timeouts {
+    /// Milliseconds from the request's head arriving to its answer's end, upload, retries
+    /// and all; `0` for no limit at all.
+    #[serde(default)]
+    pub request_ms: Option<u64>,
 }
 
 /// When a request is sent again, and how often (Gateway API's HTTPRoute retry, with

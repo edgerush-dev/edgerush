@@ -236,6 +236,10 @@ pub struct Exchange<S> {
     /// The one timer for every deadline of the exchange, and then of its answer's body:
     /// made once an exchange rather than once a wait, and moved rather than made again.
     alarm: Alarm,
+    /// Whether what bounds the wait for the answer's head is the rule's own timeouts,
+    /// kept by whoever waits on the exchange, in place of the head deadline and the
+    /// answer's idle clock before the head ([03 §6](../../../../docs/03-data-plane.md)).
+    head_bounded_elsewhere: bool,
 }
 
 impl<S> Exchange<S> {
@@ -394,7 +398,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             head_left: 0,
             head_sent: None,
             alarm: Alarm::new(&timers, None),
+            head_bounded_elsewhere: false,
         }
+    }
+
+    /// Leaves the wait for the answer's head to the rule's own timeouts, which the caller
+    /// keeps: neither the head deadline nor the answer's idle clock runs before the head.
+    /// The clocks for the upload, and the answer's once its head has come, run as ever:
+    /// they find data that stopped flowing, which no timeout of a rule's is for.
+    pub(crate) fn head_bounded_elsewhere(mut self) -> Self {
+        self.head_bounded_elsewhere = true;
+        self
     }
 
     /// Sends the request and reads back the answer's head, both at once.
@@ -650,7 +664,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             return Waits::default();
         };
         Waits {
-            final_head: Some(sent + limits.final_head),
+            final_head: (!self.head_bounded_elsewhere).then_some(sent + limits.final_head),
             continuing: continuing.then_some(sent + limits.continue_wait),
         }
     }
@@ -900,8 +914,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         }
 
         // Nothing moved, so what is left is to say what is being waited for and see
-        // whether that wait has gone on too long.
-        let waiting = self.waiting_on(upload, pushed);
+        // whether that wait has gone on too long. Before the head, which this is, the
+        // answer is waited for as long as the rule allows, where the rule says.
+        let mut waiting = self.waiting_on(upload, pushed);
+        waiting.answer &= !self.head_bounded_elsewhere;
         if let Some(stalled) = clocks.expired(cx, waiting, idle, &mut self.alarm, waits) {
             return Poll::Ready(Err(ExchangeError::Idle {
                 after: idle,

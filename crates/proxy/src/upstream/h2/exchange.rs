@@ -80,8 +80,9 @@ type Upload = Pin<Box<dyn Future<Output = Result<(), SendError>>>>;
 /// [13 §7]: ../../../../docs/13-http1-upstream.md
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Bounds {
-    /// From the request's head sent to the answer's final head.
-    pub(crate) final_head: Duration,
+    /// From the request's head sent to the answer's final head; none where the rule's own
+    /// timeouts bound the wait instead ([03 §6](../../../../docs/03-data-plane.md)).
+    pub(crate) final_head: Option<Duration>,
     /// How long a body, in either direction, may be waited on with nothing moving.
     pub(crate) idle: Duration,
     /// How long a body held back for `100 Continue` waits for it.
@@ -244,56 +245,55 @@ impl Attempt<'_> {
             .then(|| Box::pin(tokio::time::sleep(bounds.continue_wait)));
         let mut may_send = channel.may_poll_upload();
         let (mut heads, mut bytes) = (0, 0);
-        let answered = tokio::time::timeout(
-            bounds.final_head,
-            poll_fn(|cx| {
-                // Interim answers first, as h2 has them asked for, in the order they came.
-                while let Poll::Ready(Some(interim)) = response.poll_informational(cx) {
-                    let (interim, ()) = interim.map_err(ExchangeError::H2)?.into_parts();
-                    heads += 1;
-                    bytes += list_size(&interim.headers);
-                    if heads > bounds.interim_heads || bytes > bounds.interim_bytes {
-                        return Poll::Ready(Err(ExchangeError::Interim {
-                            heads: bounds.interim_heads,
-                            bytes: bounds.interim_bytes,
-                        }));
+        let waiting = poll_fn(|cx| {
+            // Interim answers first, as h2 has them asked for, in the order they came.
+            while let Poll::Ready(Some(interim)) = response.poll_informational(cx) {
+                let (interim, ()) = interim.map_err(ExchangeError::H2)?.into_parts();
+                heads += 1;
+                bytes += list_size(&interim.headers);
+                if heads > bounds.interim_heads || bytes > bounds.interim_bytes {
+                    return Poll::Ready(Err(ExchangeError::Interim {
+                        heads: bounds.interim_heads,
+                        bytes: bounds.interim_bytes,
+                    }));
+                }
+                channel.upstream_interim(interim.status, interim.headers);
+                may_send = channel.may_poll_upload();
+            }
+            if let Some(wait) = continue_wait.as_mut()
+                && wait.as_mut().poll(cx).is_ready()
+            {
+                continue_wait = None;
+                channel.wait_expired();
+                may_send = channel.may_poll_upload();
+            }
+            if may_send
+                && let Some(sending) = upload.as_mut()
+                && let Poll::Ready(sent) = sending.as_mut().poll(cx)
+            {
+                upload = None;
+                // The body failed on its way in: the stream has been reset, and the
+                // answer is the client's doing, not the upstream's.
+                match sent {
+                    Err(SendError::Body(cause)) => {
+                        return Poll::Ready(Err(ExchangeError::RequestBody(cause)));
                     }
-                    channel.upstream_interim(interim.status, interim.headers);
-                    may_send = channel.may_poll_upload();
-                }
-                if let Some(wait) = continue_wait.as_mut()
-                    && wait.as_mut().poll(cx).is_ready()
-                {
-                    continue_wait = None;
-                    channel.wait_expired();
-                    may_send = channel.may_poll_upload();
-                }
-                if may_send
-                    && let Some(sending) = upload.as_mut()
-                    && let Poll::Ready(sent) = sending.as_mut().poll(cx)
-                {
-                    upload = None;
-                    // The body failed on its way in: the stream has been reset, and the
-                    // answer is the client's doing, not the upstream's.
-                    match sent {
-                        Err(SendError::Body(cause)) => {
-                            return Poll::Ready(Err(ExchangeError::RequestBody(cause)));
-                        }
-                        // The upstream's window stayed shut: the sender has reset the
-                        // stream, and what the answer would say of that is not the cause.
-                        Err(SendError::TimedOut) => {
-                            return Poll::Ready(Err(ExchangeError::Idle { limit: bounds.idle }));
-                        }
-                        _ => {}
+                    // The upstream's window stayed shut: the sender has reset the
+                    // stream, and what the answer would say of that is not the cause.
+                    Err(SendError::TimedOut) => {
+                        return Poll::Ready(Err(ExchangeError::Idle { limit: bounds.idle }));
                     }
+                    _ => {}
                 }
-                Pin::new(&mut response).poll(cx).map_err(ExchangeError::H2)
-            }),
-        )
-        .await
-        .map_err(|_| ExchangeError::TooSlow {
-            limit: bounds.final_head,
-        })??;
+            }
+            Pin::new(&mut response).poll(cx).map_err(ExchangeError::H2)
+        });
+        let answered = match bounds.final_head {
+            Some(limit) => tokio::time::timeout(limit, waiting)
+                .await
+                .map_err(|_| ExchangeError::TooSlow { limit })??,
+            None => waiting.await?,
+        };
         channel.final_head();
         // Held back for a `100` that never came, and not wanted now the final answer has:
         // never sent. It goes, resetting the stream, when the answer does.

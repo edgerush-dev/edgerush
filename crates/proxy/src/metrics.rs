@@ -252,8 +252,9 @@ pub(crate) enum Answer {
     /// Connection-bound credentials (NTLM, Negotiate) for an HTTP/2 upstream, where they
     /// would authenticate every client's streams ([15 §5](../../docs/15-http2-and-grpc.md)).
     ConnectionAuth,
-    /// A gRPC call's deadline passed before its answer began
-    /// ([15 §6](../../docs/15-http2-and-grpc.md)).
+    /// The request's deadline passed before its answer began: its rule's `request` timeout
+    /// or a gRPC call's own ([03 §6](../../docs/03-data-plane.md),
+    /// [15 §6](../../docs/15-http2-and-grpc.md)).
     DeadlineExceeded,
     /// The request's rule redirects it ([18](../../docs/18-redirects-and-rewrites.md)).
     Redirected,

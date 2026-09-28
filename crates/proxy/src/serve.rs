@@ -56,7 +56,7 @@ use crate::upstream::secure::{Secure, Socket as UpstreamSocket};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use edgerush_config::{
-    Compiled, CompiledListener, CompiledRetry, CompiledRule, L4, UpstreamProtocol,
+    Compiled, CompiledListener, CompiledRetry, CompiledRule, L4, Timeout, UpstreamProtocol,
 };
 use edgerush_filters::HeaderModifier;
 use edgerush_router::Fields;
@@ -142,8 +142,19 @@ enum Body {
     H2(Box<h2_exchange::Answer>, Admitted, Watch),
     /// A gRPC call's answer, ended by one status whatever becomes of it (15 §6).
     Grpc(Box<GrpcAnswered<Body, Called>>),
+    /// An answer held to its request's deadline (03 §6).
+    Timed(Box<Timed>),
     /// An answer of the data plane's own. It has no body, and never will have one.
     Empty,
+}
+
+/// An answer held to its request's deadline: cut off, as a body that failed, if the
+/// deadline passes before its end. The client has its head, so this is all that is left to
+/// tell it with: HTTP/1 closes the connection, HTTP/2 and HTTP/3 reset the stream.
+struct Timed {
+    body: Body,
+    deadline: Instant,
+    alarm: Alarm,
 }
 
 /// Where a gRPC call's status is counted: its listener's.
@@ -223,6 +234,8 @@ enum BodyError {
     Ours(#[from] ExchangeError),
     #[error("the HTTP/2 upstream's answer could not be read")]
     H2(#[source] RequestBodyError),
+    #[error("the request's deadline passed before its answer's end")]
+    DeadlinePassed,
 }
 
 impl HttpBody for Body {
@@ -263,6 +276,16 @@ impl HttpBody for Body {
                 })
             }
             Self::Grpc(answered) => Pin::new(&mut **answered).poll_frame(context),
+            Self::Timed(timed) => {
+                // Looked at first, whatever the body has ready: an answer that keeps coming
+                // must not keep its deadline from being seen.
+                if timed.alarm.poll_until(context, timed.deadline).is_ready() {
+                    // Let go of now, and the upstream's connection or stream with it.
+                    timed.body = Self::Empty;
+                    return Poll::Ready(Some(Err(BodyError::DeadlinePassed)));
+                }
+                Pin::new(&mut timed.body).poll_frame(context)
+            }
             Self::Empty => Poll::Ready(None),
         }
     }
@@ -272,6 +295,7 @@ impl HttpBody for Body {
             Self::Ours(ours, ..) => ours.is_end_stream(),
             Self::H2(answer, ..) => answer.is_end_stream(),
             Self::Grpc(answered) => answered.is_end_stream(),
+            Self::Timed(timed) => timed.body.is_end_stream(),
             Self::Empty => true,
         }
     }
@@ -281,6 +305,7 @@ impl HttpBody for Body {
             Self::Ours(ours, ..) => ours.size_hint(),
             Self::H2(answer, ..) => answer.size_hint(),
             Self::Grpc(answered) => answered.size_hint(),
+            Self::Timed(timed) => timed.body.size_hint(),
             Self::Empty => SizeHint::with_exact(0),
         }
     }
@@ -948,6 +973,7 @@ impl Worker {
         sending: Sending,
         body: B,
         interim: Option<Interim>,
+        head_by_rule: bool,
     ) -> Result<(RawAnswer, Box<H1Body<UpstreamSocket, B>>), ExchangeError>
     where
         F: OutgoingFields + ?Sized,
@@ -1003,6 +1029,9 @@ impl Worker {
         let mut exchange = Exchange::new(socket, Rc::clone(&self.blocks), Rc::clone(&self.timers));
         if let Some(interim) = interim {
             exchange = exchange.heard_by(interim);
+        }
+        if head_by_rule {
+            exchange = exchange.head_bounded_elsewhere();
         }
         let (answer, rest) = exchange
             .send(method, uri, headers, nominated, sending, body, &self.limits)
@@ -1461,6 +1490,7 @@ impl Worker {
                 .answer_to(listener, rejection.into(), call)
                 .into();
         }
+        let timing = Timing::of(call, directed.rule.as_deref());
 
         // Credentials can bind the upstream socket to this client, even when the
         // response is successful. Decide after rule filters and before the client
@@ -1502,14 +1532,16 @@ impl Worker {
             // otherwise carry room for the retry loop's.
             Some(retry) => {
                 Box::pin(self.with_retries(
-                    &directed, &mut head, &nominated, sending, body, admitted, interim, call, retry,
+                    &directed, &mut head, &nominated, sending, body, admitted, interim, timing,
+                    retry,
                 ))
                 .await
             }
             None => {
                 let endpoint = Arc::clone(&directed.endpoint);
                 self.attempt(
-                    &directed, &endpoint, &head, &nominated, sending, body, admitted, interim, call,
+                    &directed, &endpoint, &head, &nominated, sending, body, admitted, interim,
+                    timing,
                 )
                 .await
             }
@@ -1526,11 +1558,14 @@ impl Worker {
                     proxy: Arc::clone(&self.proxy),
                     listener,
                 };
-                let deadline = call.and_then(|call| call.deadline());
-                let answered = GrpcAnswered::counted(body, &parts.headers, deadline, called);
+                let answered = GrpcAnswered::counted(body, &parts.headers, timing.deadline, called);
                 Answered::Map(Response::from_parts(parts, Body::Grpc(Box::new(answered))))
             }
-            Ok(answered) => answered,
+            // Any other answer is cut off where its deadline passes, as one that failed.
+            Ok(answered) => match timing.deadline {
+                Some(deadline) => timed(answered, deadline, &self.timers),
+                None => answered,
+            },
             Err(answer) => self.proxy.answer_to(listener, answer, call).into(),
         }
     }
@@ -1552,20 +1587,27 @@ impl Worker {
         body: RequestBody,
         admitted: Admitted,
         interim: Option<Interim>,
-        call: Option<Call>,
+        timing: Timing,
     ) -> Result<Answered<Body>, Answer> {
         if endpoint.protocol() == UpstreamProtocol::Http2 {
             return self
                 .respond_by_h2(
-                    directed, endpoint, head, sending, body, admitted, interim, call,
+                    directed, endpoint, head, sending, body, admitted, interim, timing,
                 )
                 .await;
         }
-        let deadline = call.and_then(|call| call.deadline());
         let exchanged = pin!(self.by_ours(
-            directed, endpoint, head, nominated, sending, body, admitted, interim,
+            directed,
+            endpoint,
+            head,
+            nominated,
+            sending,
+            body,
+            admitted,
+            interim,
+            timing.head_by_rule,
         ));
-        let answered = by_deadline(deadline, exchanged)
+        let answered = by_deadline(&self.timers, timing.deadline, exchanged)
             .await
             .unwrap_or(Err(Answer::DeadlineExceeded));
 
@@ -1614,7 +1656,7 @@ impl Worker {
 
     /// Tries, and tries again while the rule's retry says to, the budget allows and the
     /// body was kept whole (03 §6). Each try goes to an endpoint drawn afresh; each waits
-    /// its backoff first; none goes past a gRPC call's deadline. What decides is the
+    /// its backoff first; none goes past the request's deadline. What decides is the
     /// answer's head alone — its status, or a gRPC status a trailers-only head carries —
     /// so nothing of an answer has gone to the client when a request is sent again.
     #[expect(
@@ -1630,10 +1672,10 @@ impl Worker {
         body: RequestBody,
         admitted: Admitted,
         interim: Option<Interim>,
-        call: Option<Call>,
+        timing: Timing,
         retry: &CompiledRetry,
     ) -> Result<Answered<Body>, Answer> {
-        let deadline = call.and_then(|call| call.deadline());
+        let deadline = timing.deadline;
         let (tee, recorded) = Tee::new(body);
         let mut body = RequestBody::Recorded(Box::new(tee));
         let mut admitted = admitted;
@@ -1655,7 +1697,7 @@ impl Worker {
                     body,
                     admitted,
                     interim.take(),
-                    call,
+                    timing,
                 )
                 .await;
             if tried >= retry.attempts || !wants_again(retry, &outcome) {
@@ -1815,7 +1857,7 @@ impl Worker {
                                 RequestBody::Copy(copy),
                                 admitted,
                                 None,
-                                None,
+                                Timing::FIXED,
                             )
                             .await;
                         // Read to its end, so that its connection can carry another request.
@@ -1875,12 +1917,11 @@ impl Worker {
         body: RequestBody,
         admitted: Admitted,
         interim: Option<Interim>,
-        call: Option<Call>,
+        timing: Timing,
     ) -> Result<Answered<Body>, Answer> {
-        let deadline = call.and_then(|call| call.deadline());
         let storage = Rc::clone(self.blocks.borrow().storage());
         let bounds = H2Bounds {
-            final_head: self.limits.final_head,
+            final_head: (!timing.head_by_rule).then_some(self.limits.final_head),
             idle: self.limits.idle,
             continue_wait: self.limits.continue_wait,
             interim_heads: self.limits.interim_heads,
@@ -1897,14 +1938,14 @@ impl Worker {
             &storage,
             interim,
             bounds,
-            deadline,
+            timing.told,
             || {
                 if let Some(upstream) = self.proxy.metrics.upstream(directed.upstream_slot) {
                     upstream.retries.inc();
                 }
             },
         ));
-        let Some(exchanged) = by_deadline(deadline, exchanging).await else {
+        let Some(exchanged) = by_deadline(&self.timers, timing.deadline, exchanging).await else {
             return Err(Answer::DeadlineExceeded);
         };
         let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
@@ -1976,6 +2017,7 @@ impl Worker {
         body: RequestBody,
         admitted: Admitted,
         interim: Option<Interim>,
+        head_by_rule: bool,
     ) -> Result<(RawAnswer, Body), Answer> {
         let answer = match self
             .through_h1(
@@ -1987,6 +2029,7 @@ impl Worker {
                 sending,
                 body,
                 interim,
+                head_by_rule,
             )
             .await
         {
@@ -2201,7 +2244,9 @@ impl Proxy {
                 fields,
             });
         }
-        let kept = forward.rule.response_headers.is_some() || forward.rule.retry().is_some();
+        let kept = forward.rule.response_headers.is_some()
+            || forward.rule.retry().is_some()
+            || forward.rule.timeouts().is_some();
         // Only a request that may be sent again keeps where else it could go.
         let others = forward.rule.retry().map(|_| {
             endpoints
@@ -2274,27 +2319,95 @@ impl Directed {
     }
 }
 
-/// `exchange`'s outcome, or nothing if `deadline` comes first. The
-/// exchange is pinned by the caller, where it is, and not moved into a future of its own
-/// here: a future moved into another keeps its room in both, and these are the biggest
-/// part of a request's.
+/// `exchange`'s outcome, or nothing if `deadline` comes first, kept in the worker's
+/// `timers`. The exchange is pinned by the caller, where it is, and not moved into a
+/// future of its own here: a future moved into another keeps its room in both, and these
+/// are the biggest part of a request's.
 async fn by_deadline<F: Future>(
+    timers: &Rc<Timers>,
     deadline: Option<Instant>,
     mut exchange: Pin<&mut F>,
 ) -> Option<F::Output> {
     let Some(deadline) = deadline else {
         return Some(exchange.await);
     };
-    // Boxed: only a gRPC call that set a deadline has one, and the rest should not carry
-    // room for it.
-    let mut expiry = Box::pin(tokio::time::sleep_until(deadline));
+    // Boxed: only a request with a deadline has one, and the rest should not carry room
+    // for it.
+    let mut alarm = Box::new(Alarm::new(timers, None));
     std::future::poll_fn(|cx| {
         if let Poll::Ready(outcome) = exchange.as_mut().poll(cx) {
             return Poll::Ready(Some(outcome));
         }
-        expiry.as_mut().poll(cx).map(|()| None)
+        alarm.poll_until(cx, deadline).map(|()| None)
     })
     .await
+}
+
+/// What a request is held to in time ([03 §6](../../docs/03-data-plane.md)), worked out
+/// once its rule is known.
+#[derive(Debug, Clone, Copy)]
+struct Timing {
+    /// When it is out of time: the earlier of its rule's `request` timeout, counted from
+    /// when it is routed, a moment after its head came, and a gRPC call's own deadline.
+    deadline: Option<Instant>,
+    /// The deadline an upstream is told of as `grpc-timeout`. Only a call that said one
+    /// has one told on, as the time left of the earlier of the two: a rule's timeout is
+    /// not the client's to have sent.
+    told: Option<Instant>,
+    /// Whether the rule's own timeouts bound the wait for an answer's head, in place of
+    /// the fixed clocks for it.
+    head_by_rule: bool,
+}
+
+impl Timing {
+    /// Held to the fixed clocks alone, as a mirror's copy is: nothing waits on it, and
+    /// nobody's deadline is its.
+    const FIXED: Self = Self {
+        deadline: None,
+        told: None,
+        head_by_rule: false,
+    };
+
+    /// A request's, from its gRPC call if it is one and its rule if it has one. No clock
+    /// is read for a rule that states no timeout.
+    fn of(call: Option<Call>, rule: Option<&CompiledRule>) -> Self {
+        let called = call.and_then(|call| call.deadline());
+        let request = rule
+            .and_then(CompiledRule::timeouts)
+            .and_then(|timeouts| timeouts.request);
+        let ruled = match request {
+            Some(Timeout::After(after)) => Some(Instant::now() + after),
+            Some(Timeout::Off) | None => None,
+        };
+        let deadline = match (called, ruled) {
+            (Some(called), Some(ruled)) => Some(called.min(ruled)),
+            (called, ruled) => called.or(ruled),
+        };
+        Self {
+            deadline,
+            told: called.and(deadline),
+            head_by_rule: request.is_some(),
+        }
+    }
+}
+
+/// `answered`, its body cut off, as a body that failed, if it is still coming at
+/// `deadline`. An answer with nothing to come is left as it is: it has nothing to cut.
+fn timed(answered: Answered<Body>, deadline: Instant, timers: &Rc<Timers>) -> Answered<Body> {
+    let wrap = |body: Body| {
+        if body.is_end_stream() {
+            return body;
+        }
+        Body::Timed(Box::new(Timed {
+            body,
+            deadline,
+            alarm: Alarm::new(timers, None),
+        }))
+    };
+    match answered {
+        Answered::Raw(answer, body) => Answered::Raw(answer, wrap(body)),
+        Answered::Map(response) => Answered::Map(response.map(wrap)),
+    }
 }
 
 /// Whether an outcome is one the rule's retry sends a request again for: an answer whose
@@ -6336,13 +6449,25 @@ upstreams:
         retry: Option<edgerush_config::Retry>,
         limits: H1Limits,
     ) -> (SocketAddr, Rc<Worker>) {
+        serving_worker_forwarding(upstream, protocol, limits, |forward| forward.retry = retry).await
+    }
+
+    /// A worker for `up` at `upstream` in `protocol`, whose one rule's forwarding is as
+    /// `change` leaves it, with `limits` as its bounds.
+    async fn serving_worker_forwarding(
+        upstream: SocketAddr,
+        protocol: UpstreamProtocol,
+        limits: H1Limits,
+        change: impl FnOnce(&mut edgerush_config::Forward),
+    ) -> (SocketAddr, Rc<Worker>) {
         let mut config = everything_config(upstream);
         config.upstreams.get_mut("up").unwrap().protocol = protocol;
-        config.routes[0].rules[0]
-            .forward
-            .as_mut()
-            .expect("the rule forwards")
-            .retry = retry;
+        change(
+            config.routes[0].rules[0]
+                .forward
+                .as_mut()
+                .expect("the rule forwards"),
+        );
         let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
         let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6756,6 +6881,371 @@ upstreams:
         assert!(!wants_again(&retry(vec![], true), &unreached));
         assert!(!wants_again(&retry(vec![502, 504], false), &timed_out));
         assert!(wants_again(&retry(vec![502], false), &unreached));
+    }
+
+    /// A rule's `request` timeout of `ms` milliseconds, `0` for none.
+    fn request_timeout(ms: u64) -> edgerush_config::Timeouts {
+        edgerush_config::Timeouts {
+            request_ms: Some(ms),
+        }
+    }
+
+    /// A worker for `up` at `upstream` in `protocol`, whose one rule states `timeouts`,
+    /// with `limits` as its bounds.
+    async fn serving_worker_timed(
+        upstream: SocketAddr,
+        protocol: UpstreamProtocol,
+        timeouts: edgerush_config::Timeouts,
+        limits: H1Limits,
+    ) -> (SocketAddr, Rc<Worker>) {
+        serving_worker_forwarding(upstream, protocol, limits, |forward| {
+            forward.timeouts = Some(timeouts);
+        })
+        .await
+    }
+
+    /// An HTTP/1 upstream that answers each request `delay` after its head has come: a
+    /// head saying `length` bytes, then those bytes `each` at a time, `gap` apart, one
+    /// request to a connection. Bounded: it stops at a connection that takes no more, and
+    /// the slowest answer a test asks of it is a few seconds long.
+    async fn upstream_answering(
+        delay: Duration,
+        length: usize,
+        each: usize,
+        gap: Duration,
+    ) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let _accepting = tokio::task::spawn_local(async move {
+            while let Ok((mut stream, _)) = socket.accept().await {
+                let _serving = tokio::task::spawn_local(async move {
+                    let mut read = Vec::new();
+                    let mut chunk = [0; 16 * 1024];
+                    while !read.windows(4).any(|four| four == b"\r\n\r\n") {
+                        match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk))
+                            .await
+                        {
+                            Ok(Ok(n)) if n > 0 => read.extend_from_slice(&chunk[..n]),
+                            _ => return,
+                        }
+                    }
+                    tokio::time::sleep(delay).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let mut left = length;
+                    while left > 0 {
+                        let now = each.min(left);
+                        if stream.write_all(&vec![b'x'; now]).await.is_err() {
+                            return;
+                        }
+                        left -= now;
+                        tokio::time::sleep(gap).await;
+                    }
+                });
+            }
+        });
+        address
+    }
+
+    /// Bounds whose clocks for an answer's head run out after 200 ms: what a rule's stated
+    /// timeouts are to take the place of.
+    fn head_clocks_short() -> H1Limits {
+        quick(|limits| {
+            limits.final_head = Duration::from_millis(200);
+            limits.idle = Duration::from_millis(200);
+        })
+    }
+
+    /// A rule's `request` timeout ends a request whose answer's head has not come: `504`,
+    /// counted as the deadline it is and not as the upstream failing, at the timeout and
+    /// not at the fixed head deadline's 60 seconds.
+    #[tokio::test]
+    async fn a_request_timeout_answers_504_when_no_head_has_come() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _asked) = upstream_silent_at_first(usize::MAX, true).await;
+                let (front, worker) = serving_worker_timed(
+                    upstream,
+                    UpstreamProtocol::Http1,
+                    request_timeout(300),
+                    H1Limits::default(),
+                )
+                .await;
+                let started = Instant::now();
+                let answer = h1_answer(front, CLOSING_GET).await;
+                let took = started.elapsed();
+                assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+                assert!(
+                    took >= Duration::from_millis(300) - EARLY
+                        && took < Duration::from_millis(300) + SLACK,
+                    "{took:?}"
+                );
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_listener_local_answers_total{listener=\"web\",reason=\"deadline_exceeded\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+                let line = "edgerush_upstream_failures_total{upstream=\"up\"} 0\n";
+                assert!(scrape.contains(line), "{scrape}");
+            })
+            .await;
+    }
+
+    /// A stated `request` timeout takes the place of the fixed clocks for an answer's head:
+    /// an upstream that thinks for longer than they allow, and less than the rule does, is
+    /// answered. Unstated, the same upstream is out of time (the tests of `on_timeout`).
+    #[tokio::test]
+    async fn a_request_timeout_takes_the_place_of_the_fixed_head_clocks() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let upstream =
+                    upstream_answering(Duration::from_millis(600), 2, 2, Duration::ZERO).await;
+                let (front, _worker) = serving_worker_timed(
+                    upstream,
+                    UpstreamProtocol::Http1,
+                    request_timeout(3000),
+                    head_clocks_short(),
+                )
+                .await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+            })
+            .await;
+    }
+
+    /// Gateway API's `0s`: no timeout at all, and none of the fixed clocks for the head in
+    /// its place.
+    #[tokio::test]
+    async fn a_request_timeout_of_zero_waits_for_the_head_as_long_as_it_takes() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let upstream =
+                    upstream_answering(Duration::from_millis(600), 2, 2, Duration::ZERO).await;
+                let (front, _worker) = serving_worker_timed(
+                    upstream,
+                    UpstreamProtocol::Http1,
+                    request_timeout(0),
+                    head_clocks_short(),
+                )
+                .await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+            })
+            .await;
+    }
+
+    /// An answer still coming when the `request` timeout passes is cut off: its head has
+    /// gone, so the connection closes short of the length it said. It was moving all the
+    /// while, so no idle clock is what ended it.
+    #[tokio::test]
+    async fn an_answer_still_coming_at_the_request_timeout_is_cut_off() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let upstream =
+                    upstream_answering(Duration::ZERO, 1000, 10, Duration::from_millis(50)).await;
+                let (front, _worker) = serving_worker_timed(
+                    upstream,
+                    UpstreamProtocol::Http1,
+                    request_timeout(400),
+                    H1Limits::default(),
+                )
+                .await;
+                let started = Instant::now();
+                let answer = h1_answer(front, CLOSING_GET).await;
+                let took = started.elapsed();
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+                let (_, body) = answer.split_once("\r\n\r\n").unwrap();
+                assert!(!body.is_empty() && body.len() < 1000, "{}", body.len());
+                assert!(took < Duration::from_millis(400) + SLACK, "{took:?}");
+            })
+            .await;
+    }
+
+    /// Over HTTP/2 the same is the stream reset, `INTERNAL_ERROR` as for any answer that
+    /// failed after its head: the connection and its other streams carry on.
+    #[tokio::test]
+    async fn an_http2_answer_still_coming_at_the_request_timeout_is_reset() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let upstream =
+                    upstream_answering(Duration::ZERO, 1000, 10, Duration::from_millis(50)).await;
+                let (front, _worker) = serving_worker_timed(
+                    upstream,
+                    UpstreamProtocol::Http1,
+                    request_timeout(400),
+                    H1Limits::default(),
+                )
+                .await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::get("http://a.test/").body(()).unwrap();
+                let (answer, _) = send.send_request(request, true).unwrap();
+                let answer = within(answer).await.unwrap();
+                assert_eq!(answer.status(), StatusCode::OK);
+                let mut body = answer.into_body();
+                let ended = within(async {
+                    loop {
+                        match body.data().await {
+                            Some(Ok(chunk)) => {
+                                let _ = body.flow_control().release_capacity(chunk.len());
+                            }
+                            Some(Err(error)) => return Some(error),
+                            None => return None,
+                        }
+                    }
+                })
+                .await
+                .expect("the answer ended as though whole");
+                assert_eq!(
+                    ended.reason(),
+                    Some(::h2::Reason::INTERNAL_ERROR),
+                    "{ended:?}"
+                );
+            })
+            .await;
+    }
+
+    /// An HTTP/2 upstream is held to the rule's `request` timeout the same way: `504` when
+    /// no head has come by then, and none of the fixed clocks for the head in its place.
+    #[tokio::test]
+    async fn a_request_timeout_holds_for_an_http2_upstream() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let upstream = scripted_h2_upstream(never_answering()).await;
+                let (front, _worker) = serving_worker_timed(
+                    upstream,
+                    UpstreamProtocol::Http2,
+                    request_timeout(300),
+                    H1Limits::default(),
+                )
+                .await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+
+                let thinking: Script = Rc::new(|_request, mut respond| {
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        let _sent = respond.send_response(ok_head(), true);
+                    })
+                });
+                let upstream = scripted_h2_upstream(thinking).await;
+                let (front, _worker) = serving_worker_timed(
+                    upstream,
+                    UpstreamProtocol::Http2,
+                    request_timeout(3000),
+                    head_clocks_short(),
+                )
+                .await;
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+            })
+            .await;
+    }
+
+    /// An HTTP/2 upstream that notes the `grpc-timeout` of each request it is sent, and
+    /// answers none of them.
+    async fn grpc_timeouts_noted() -> (SocketAddr, Rc<RefCell<Vec<Option<String>>>>) {
+        let noted = Rc::new(RefCell::new(Vec::new()));
+        let noting = Rc::clone(&noted);
+        let script: Script = Rc::new(move |request, respond| {
+            noting.borrow_mut().push(
+                request
+                    .headers()
+                    .get("grpc-timeout")
+                    .map(|timeout| timeout.to_str().unwrap().to_owned()),
+            );
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                drop(respond);
+            })
+        });
+        (scripted_h2_upstream(script).await, noted)
+    }
+
+    /// A gRPC call is held to the earlier of its own deadline and its rule's: ended with
+    /// `DEADLINE_EXCEEDED` when the rule's comes first. The upstream is told the time left
+    /// of that deadline when the call said a `grpc-timeout`, and nothing when it did not:
+    /// a rule's timeout is not the client's to have sent.
+    #[tokio::test]
+    async fn a_grpc_call_is_held_to_the_earlier_of_its_deadline_and_its_rules() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, noted) = grpc_timeouts_noted().await;
+                let (front, _worker) = serving_worker_timed(
+                    upstream,
+                    UpstreamProtocol::Http2,
+                    request_timeout(300),
+                    H1Limits::default(),
+                )
+                .await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                for timeout in [None, Some("10S")] {
+                    let (answer, _) = send
+                        .send_request(grpc_call("/pkg.Svc/Do", timeout), true)
+                        .unwrap();
+                    assert_eq!(
+                        grpc_outcome(answer).await,
+                        (StatusCode::OK, "4".to_owned(), true)
+                    );
+                }
+                let noted = noted.borrow();
+                assert_eq!(noted.len(), 2);
+                assert_eq!(noted[0], None);
+                let sent = noted[1].as_deref().unwrap();
+                let left = crate::grpc::timeout::parse(sent.as_bytes()).unwrap();
+                assert!(left <= Duration::from_millis(300), "{sent}");
+            })
+            .await;
+    }
+
+    /// A gRPC call whose answer is still coming at its rule's `request` timeout ends as
+    /// one past its deadline does: trailers with `DEADLINE_EXCEEDED`.
+    #[tokio::test]
+    async fn a_grpc_answer_still_coming_at_the_request_timeout_ends_exceeded() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let script: Script = Rc::new(|_request, mut respond| {
+                    Box::pin(async move {
+                        let Ok(mut sending) = respond.send_response(grpc_head(), false) else {
+                            return;
+                        };
+                        for _ in 0..60 {
+                            let message = Bytes::from_static(b"\0\0\0\0\x01x");
+                            if sending.send_data(message, false).is_err() {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    })
+                });
+                let upstream = scripted_h2_upstream(script).await;
+                let (front, _worker) = serving_worker_timed(
+                    upstream,
+                    UpstreamProtocol::Http2,
+                    request_timeout(400),
+                    H1Limits::default(),
+                )
+                .await;
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let (answer, _) = send
+                    .send_request(grpc_call("/pkg.Svc/Do", None), true)
+                    .unwrap();
+                assert_eq!(
+                    grpc_outcome(answer).await,
+                    (StatusCode::OK, "4".to_owned(), false)
+                );
+            })
+            .await;
     }
 
     /// A body past what is kept goes on as it came, and is not sent again.
@@ -8729,6 +9219,7 @@ upstreams:
                             Sending::None,
                             http_body_util::Empty::<Bytes>::new(),
                             None,
+                            false,
                         )
                         .await
                         .unwrap();
