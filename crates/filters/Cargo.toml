@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+edgerush-router.workspace = true
 http.workspace = true
 thiserror.workspace = true
 
@@ -17,6 +18,10 @@ proptest.workspace = true
 
 [[bench]]
 name = "header_modifier"
+harness = false
+
+[[bench]]
+name = "redirect"
 harness = false
 
 [lints]

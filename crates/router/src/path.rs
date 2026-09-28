@@ -99,6 +99,20 @@ impl PathPattern {
         })
     }
 
+    /// The pattern in its canonical form: an exact path as it is matched; a prefix
+    /// without its trailing slash, so that the root prefix is the empty string; a regular
+    /// expression as it was written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.path
+    }
+
+    /// Whether this is a prefix pattern.
+    #[must_use]
+    pub fn is_prefix(&self) -> bool {
+        matches!(self.kind, Kind::Prefix)
+    }
+
     /// Whether the request path falls under this pattern.
     ///
     /// `path` is the normalised path alone, without the query string. Anything that does

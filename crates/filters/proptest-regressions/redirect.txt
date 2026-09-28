@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8f3f891f7671c4fb031150567222fa2420dcce95ba13a3844031dfcd359254b6 # shrinks to listener = Http, stated_scheme = None, stated_host = None, stated_port = None, host = "Shop.Example.com", path = "/", query = None, keep = false
+cc bf10397306bd1fbff1c9c82905caefb70bf8b4cc90f24963c81da6b1deff2bb2 # shrinks to listener = Http, stated_scheme = None, stated_host = None, stated_port = Some(1), host = "Shop.Example.com", path = "/", query = None, keep = false
