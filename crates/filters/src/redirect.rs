@@ -229,7 +229,7 @@ impl Redirect {
 /// A DNS name as Gateway API's `PreciseHostname` has it: labels of lower-case letters,
 /// digits and inner hyphens, 63 bytes at most, 253 in all; and not an IPv4 address, which
 /// the pattern alone would let through.
-fn is_precise_host(host: &str) -> bool {
+pub(crate) fn is_precise_host(host: &str) -> bool {
     let label = |label: &str| {
         let bytes = label.as_bytes();
         (1..=63).contains(&bytes.len())

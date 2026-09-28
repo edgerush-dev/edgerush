@@ -194,6 +194,21 @@ pub enum Filter {
     ResponseHeaderModifier(HeaderChanges),
     /// Sends a copy of the request to another upstream too, and throws its answer away.
     RequestMirror(Mirror),
+    /// Sends the upstream another host, another path or both.
+    UrlRewrite(UrlRewrite),
+}
+
+/// A rewrite (Gateway API's `URLRewrite`): what the upstream is sent in place of what the
+/// request was routed on. At least one of the two.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UrlRewrite {
+    /// The `Host` the upstream is sent: a DNS name in lower case, with no port.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// The path the upstream is sent, made from the request's.
+    #[serde(default)]
+    pub path: Option<PathChange>,
 }
 
 /// A copy of some share of a rule's requests, sent to another upstream (Gateway API's

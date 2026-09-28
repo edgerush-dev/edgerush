@@ -4771,6 +4771,108 @@ upstreams:
             .await;
     }
 
+    /// A worker serving `config`, on a socket of its own.
+    async fn serving_config(config: &Config) -> (SocketAddr, Rc<Worker>) {
+        let proxy = Proxy::new(compile(config).unwrap(), NonZeroUsize::MIN).unwrap();
+        let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _serving = serving(&worker, socket);
+        (front, worker)
+    }
+
+    /// `everything_config`, its one rule rewriting to `one.example.org` and under `/api`.
+    fn rewriting_config(upstream: SocketAddr) -> Config {
+        let mut config = everything_config(upstream);
+        let rewrite =
+            "{ type: url_rewrite, host: one.example.org, path: { replace_prefix: /api } }";
+        config.routes[0].rules[0]
+            .filters
+            .push(serde_saphyr::from_str(rewrite).unwrap());
+        config
+    }
+
+    /// An HTTP/2 upstream is sent the rewritten path, and the rewritten host as its
+    /// `:authority` (18 §4).
+    #[tokio::test]
+    async fn an_http2_upstream_is_sent_the_rewritten_path_and_host() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, seen, _gate) = h2_upstream(UpstreamH2::default()).await;
+                let mut config = rewriting_config(upstream);
+                config.upstreams.get_mut("up").unwrap().protocol = UpstreamProtocol::Http2;
+                let (front, _worker) = serving_config(&config).await;
+
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                let requests = seen.requests.borrow();
+                let (request, _) = &requests[0];
+                assert_eq!(request.uri().authority().unwrap(), "one.example.org");
+                assert_eq!(request.uri().path_and_query().unwrap(), "/api/a/b?c=d");
+                assert!(request.headers().get("host").is_none());
+            })
+            .await;
+    }
+
+    /// An HTTP/1.1 upstream is sent the rewritten path and `Host`, and so on every try of a
+    /// request sent again: the rewrite is made once, before the first (18 §4).
+    #[tokio::test]
+    async fn every_try_is_sent_the_rewritten_path_and_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // 503 to the first request, 200 to the rest; every head kept.
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upstream = socket.local_addr().unwrap();
+                let heads = Rc::new(RefCell::new(Vec::<String>::new()));
+                let seen = Rc::clone(&heads);
+                let _accepting = tokio::task::spawn_local(async move {
+                    while let Ok((mut stream, _)) = socket.accept().await {
+                        let mut read = Vec::new();
+                        let mut chunk = [0; 4096];
+                        while !read.windows(4).any(|four| four == b"\r\n\r\n") {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => read.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let first = seen.borrow().is_empty();
+                        seen.borrow_mut()
+                            .push(String::from_utf8_lossy(&read).to_lowercase());
+                        let status = if first {
+                            "503 Service Unavailable"
+                        } else {
+                            "200 OK"
+                        };
+                        let answer = format!(
+                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(answer.as_bytes()).await;
+                    }
+                });
+                let mut config = rewriting_config(upstream);
+                config.routes[0].rules[0]
+                    .forward
+                    .as_mut()
+                    .expect("the rule forwards")
+                    .retry = Some(retrying(1, &[503], &[], 1));
+                let (front, _worker) = serving_config(&config).await;
+
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                let heads = heads.borrow();
+                assert_eq!(heads.len(), 2, "{heads:?}");
+                for head in heads.iter() {
+                    assert!(head.starts_with("get /api/a/b?c=d http/1.1\r\n"), "{head}");
+                    assert!(head.contains("\r\nhost: one.example.org\r\n"), "{head}");
+                    assert!(!head.contains("shop.example.com"), "{head}");
+                }
+            })
+            .await;
+    }
+
     /// Requests share a connection up to its stream cap; past it another is opened, and no
     /// more than needed.
     #[tokio::test]

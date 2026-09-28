@@ -30,5 +30,5 @@ pub use config::{
 pub use route::{
     Backend, Filter, Forward, Fraction, GrpcMethod, Header, HeaderChanges, Hostname, Match, Mirror,
     PathChange, PathMatch, Query, Redirect, Retry, Route, Rule, Scheme, TcpRoute, TlsRoute,
-    ValueMatch, ValuePredicate, Wildcard,
+    UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
 };

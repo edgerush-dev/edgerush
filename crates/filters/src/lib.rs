@@ -4,13 +4,15 @@
 //! A pure crate: filters work on plain `http` types and do no I/O. They are built once per
 //! config snapshot, already validated, and applying one never fails.
 //!
-//! So far: header modification ([`HeaderModifier`]), changes to a path ([`PathModifier`])
-//! and redirects ([`Redirect`]).
+//! So far: header modification ([`HeaderModifier`]), changes to a path ([`PathModifier`]),
+//! redirects ([`Redirect`]) and rewrites ([`UrlRewrite`]).
 
 mod header_modifier;
 mod path_modifier;
 mod redirect;
+mod rewrite;
 
 pub use header_modifier::{Edit, HeaderModifier, HeaderModifierError, MOST_PER_LIST, RESERVED};
 pub use path_modifier::{MOST_BYTES, PathModifier, PathModifierError};
 pub use redirect::{Query, Redirect, RedirectError, Requested, Scheme};
+pub use rewrite::{RewriteError, UrlRewrite};

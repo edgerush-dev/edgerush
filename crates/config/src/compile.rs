@@ -5,7 +5,7 @@
 use crate::backends::{UpstreamId, WeightedBackends};
 use crate::route::{
     Filter, Forward, Fraction, GrpcMethod, HeaderChanges, Hostname, Match, PathChange, PathMatch,
-    Query, Redirect, Route, Scheme, ValueMatch, ValuePredicate, Wildcard,
+    Query, Redirect, Route, Scheme, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
 };
 use crate::{
     Backend, Config, HealthCheck, Http3, Keepalive, Probe, Protocol, Rule, Tls, UpstreamProtocol,
@@ -13,6 +13,7 @@ use crate::{
 };
 use edgerush_filters::{
     HeaderModifier, HeaderModifierError, PathModifier, PathModifierError, RedirectError,
+    RewriteError,
 };
 use edgerush_router::{
     HeaderPredicate, HeaderPredicateError, HeaderPredicates, HostClaim, HostIndex, HostPattern,
@@ -127,6 +128,8 @@ pub struct CompiledRule {
     pub request_headers: Option<HeaderModifier>,
     /// Changes to the response's headers before it goes to the client, if there are any.
     pub response_headers: Option<HeaderModifier>,
+    /// Another host, path or both for the upstream, if the rule asks for them.
+    pub rewrite: Option<edgerush_filters::UrlRewrite>,
     /// What becomes of its requests.
     pub outcome: Outcome,
     /// Where copies of its requests go, if anywhere.
@@ -464,11 +467,16 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                     }
                 }
             }
-            let (request_headers, response_headers, mirrors) =
-                filters(rule, &upstream_ids, &place, &mut errors);
+            let Filters {
+                request_headers,
+                response_headers,
+                rewrite,
+                mirrors,
+            } = filters(rule, &upstream_ids, &place, &mut errors);
             compiled_rules.push(Arc::new(CompiledRule {
                 request_headers,
                 response_headers,
+                rewrite,
                 outcome: outcome(rule, &upstream_ids, &place, &mut errors),
                 mirrors,
             }));
@@ -888,18 +896,24 @@ fn grpc_path(grpc: &GrpcMethod) -> Result<PathPattern, Problem> {
 }
 
 /// The rule's header modifiers, for the request and for the response, and its mirrors.
+/// A rule's filters, each kind checked.
+struct Filters {
+    request_headers: Option<HeaderModifier>,
+    response_headers: Option<HeaderModifier>,
+    rewrite: Option<edgerush_filters::UrlRewrite>,
+    mirrors: Vec<CompiledMirror>,
+}
+
 fn filters(
     rule: &Rule,
     upstream_ids: &BTreeMap<&str, UpstreamId>,
     place: &Place,
     errors: &mut Vec<ConfigError>,
-) -> (
-    Option<HeaderModifier>,
-    Option<HeaderModifier>,
-    Vec<CompiledMirror>,
-) {
+) -> Filters {
     let mut request = None;
     let mut response = None;
+    let mut rewrite = None;
+    let mut rewrites = 0;
     let mut mirrors = Vec::new();
     let redirects = rule.redirect.is_some();
     for (at, filter) in rule.filters.iter().enumerate() {
@@ -912,6 +926,7 @@ fn filters(
         let upstream_only = match filter {
             Filter::RequestMirror(_) => Some("request_mirror"),
             Filter::RequestHeaderModifier(_) => Some("request_header_modifier"),
+            Filter::UrlRewrite(_) => Some("url_rewrite"),
             Filter::ResponseHeaderModifier(_) => None,
         };
         if let Some(kind) = upstream_only.filter(|_| redirects) {
@@ -945,6 +960,17 @@ fn filters(
                 }
                 continue;
             }
+            Filter::UrlRewrite(asked) => {
+                rewrites += 1;
+                if rewrites > 1 {
+                    errors.push(place.problem(Problem::FilterTwice("url_rewrite")));
+                }
+                match url_rewrite(rule, asked) {
+                    Ok(compiled) => rewrite = compiled,
+                    Err(problem) => errors.push(place.problem(problem)),
+                }
+                continue;
+            }
             Filter::RequestHeaderModifier(changes) => {
                 (&mut request, changes, "request_header_modifier")
             }
@@ -966,7 +992,30 @@ fn filters(
         }
     }
     let kept = |modifier: Option<HeaderModifier>| modifier.filter(|modifier| !modifier.is_empty());
-    (kept(request), kept(response), mirrors)
+    Filters {
+        request_headers: kept(request),
+        response_headers: kept(response),
+        rewrite,
+        mirrors,
+    }
+}
+
+/// A rule's rewrite. `None` where the rule's prefix is no pattern, which is reported with
+/// its match.
+fn url_rewrite(
+    rule: &Rule,
+    asked: &UrlRewrite,
+) -> Result<Option<edgerush_filters::UrlRewrite>, Problem> {
+    let path = match &asked.path {
+        Some(change) => match path_modifier(rule, change)? {
+            Some(path) => Some(path),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    edgerush_filters::UrlRewrite::new(asked.host.as_deref(), path)
+        .map(Some)
+        .map_err(Problem::Rewrite)
 }
 
 fn header_modifier(changes: &HeaderChanges) -> Result<HeaderModifier, HeaderModifierError> {
@@ -1354,6 +1403,9 @@ pub enum Problem {
     /// The change to the path is not valid.
     #[error("{0}")]
     PathChange(PathModifierError),
+    /// The rewrite is not valid.
+    #[error("{0}")]
+    Rewrite(RewriteError),
     /// A prefix to replace that the rule's matches do not give.
     #[error("`replace_prefix` needs the rule to have exactly one match, and that a prefix")]
     ReplacePrefixMatch,
@@ -1738,6 +1790,75 @@ upstreams:
                 "route `a`, rules[1], matches[1]: query parameter ``: query parameter name is \
                  empty",
                 "route `a`, rules[1], forward.backends[1]: there is no upstream `wbe`",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rewrite_compiles_onto_its_rule_and_every_problem_is_placed() {
+        let compiled = compile(&config(
+            r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http }
+routes:
+  - name: a
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: /prefix/one } }]
+        filters:
+          - { type: url_rewrite, host: one.example.org, path: { replace_prefix: /one } }
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+upstreams:
+  u: { endpoints: [] }
+"#,
+        ))
+        .unwrap();
+        let rewritten = compiled.rule(RuleId { route: 0, rule: 0 }).unwrap();
+        let rewrite = rewritten.rewrite.as_ref().unwrap();
+        assert_eq!(rewrite.host().unwrap(), "one.example.org");
+        let mut path = String::new();
+        rewrite.path().unwrap().write("/prefix/one/two", &mut path);
+        assert_eq!(path, "/one/two");
+        assert!(
+            compiled
+                .rule(RuleId { route: 0, rule: 1 })
+                .unwrap()
+                .rewrite
+                .is_none()
+        );
+
+        let problems = rule_problems(
+            r#"      - matches: [{ path: { prefix: /a } }]
+        filters:
+          - { type: url_rewrite }
+          - { type: url_rewrite, host: One.example.org }
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+      - matches: [{ path: { exact: /a } }]
+        filters: [{ type: url_rewrite, path: { replace_prefix: /b } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+      - matches: [{ path: { prefix: /a } }]
+        filters: [{ type: url_rewrite, path: { replace_full: "/b/../c" } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+      - matches: [{ path: { prefix: /a } }]
+        filters: [{ type: url_rewrite, path: { replace_full: /b } }]
+        redirect: { status: 301, query: keep }"#,
+        );
+        assert_eq!(
+            problems,
+            [
+                "route `a`, rules[0], filters[0]: `url_rewrite` needs a `host`, a `path` or both",
+                "route `a`, rules[0], filters[1]: a rule may have one `url_rewrite`",
+                "route `a`, rules[0], filters[1]: rewrite host `One.example.org` is not a DNS \
+                 name in lower case",
+                "route `a`, rules[1], filters[0]: `replace_prefix` needs the rule to have \
+                 exactly one match, and that a prefix",
+                "route `a`, rules[2], filters[0]: replacement: path contains a `.` or `..` \
+                 segment",
+                "route `a`, rules[3], filters[0]: `url_rewrite` has nothing to act on beside \
+                 a `redirect`: nothing goes upstream",
             ]
         );
     }

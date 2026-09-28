@@ -234,6 +234,13 @@ impl Head for RawHead {
         apply(self.lines.view(&self.head), &mut self.overlay, changes).map_err(|_| Rejection::Edits)
     }
 
+    fn set_host(&mut self, host: &HeaderValue) -> Result<(), Rejection> {
+        let view = self.lines.view(&self.head);
+        self.overlay
+            .set(&view, HOST, host.clone())
+            .map_err(|_| Rejection::Edits)
+    }
+
     fn version(&self) -> Version {
         self.version
     }

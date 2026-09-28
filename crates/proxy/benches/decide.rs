@@ -1,6 +1,6 @@
 //! Instruction counts for the request core: everything between a request's head and the
 //! choice of its upstream — host, path normalisation, routing, hop-by-hop headers, header
-//! changes, backend.
+//! changes, a rewrite, backend — or of a redirect.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-proxy`, see the repository README.
 
@@ -39,6 +39,16 @@ routes:
           backends:
             - { upstream: cart, weight: 9 }
             - { upstream: cart-canary, weight: 1 }
+      - matches:
+          - path: { prefix: /api }
+        filters:
+          - { type: url_rewrite, host: api.internal, path: { replace_prefix: /v2 } }
+        forward:
+          backends:
+            - { upstream: pages, weight: 1 }
+      - matches:
+          - path: { prefix: /old }
+        redirect: { status: 301, path: { replace_prefix: /new }, query: keep }
       - matches:
           - path: { prefix: / }
         forward:
@@ -108,6 +118,8 @@ fn head_with(target: &str, host: Option<&str>, more: &[(&'static str, &'static s
     )
 )]
 #[bench::no_route(shop(), head("/pages/about", Some("other.example.org")))]
+#[bench::rewritten(shop(), head("/api/orders/42?expand=items", Some("shop.example.com")))]
+#[bench::redirected(shop(), head("/old/orders/42?expand=items", Some("shop.example.com")))]
 fn request_core(snapshot: Compiled, mut head: Parts) -> (Compiled, Parts, bool) {
     let forwarded = match snapshot.listeners.first() {
         Some(listener) => decide(

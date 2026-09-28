@@ -7,7 +7,9 @@
 //! the target names it, the `Host` field is made to say the same before anything is
 //! matched, so that a request has one host for every predicate and for the upstream. The
 //! path is normalised once, and the same normal form is matched and forwarded. Whatever is
-//! routed on is what the upstream gets to see: the head is rewritten to say it. What the
+//! routed on is what the upstream gets to see — the head is rewritten to say it — unless the
+//! rule rewrites it, after routing, to another path or host. A rule that redirects is
+//! answered with a `Location` made from what was routed on. What the
 //! request said about the connection it came in on is taken off ([`crate::hop_by_hop`])
 //! before the rule's own changes to the headers. A cookie string that came in pieces, as
 //! HTTP/2 allows, is put together before anything looks at it ([`crate::cookies`]).
@@ -16,7 +18,7 @@ use crate::head::Head;
 use crate::hop_by_hop::ConnectionError;
 use crate::host::{HostError, bare_host};
 use edgerush_config::{Compiled, CompiledListener, CompiledRule, Outcome, Protocol, UpstreamId};
-use edgerush_filters::{Requested, Scheme};
+use edgerush_filters::{Requested, Scheme, UrlRewrite};
 use edgerush_router::{NormaliseError, RequestParts, normalise_path};
 use http::uri::PathAndQuery;
 use http::{HeaderValue, StatusCode, Uri, Version};
@@ -100,7 +102,9 @@ impl Rejection {
 /// Decides where a request that came in on `listener` goes, and makes its head what the
 /// upstream is to see: the normalised path, a `Host` field that names the host that was
 /// routed on, the cookie string in one piece, no hop-by-hop headers, and the rule's changes
-/// to the headers. A request its rule redirects is answered with the `Location` made from
+/// to the headers, and the rule's rewrite of path and host, which is made from the
+/// normalised path and never routes again. A request its rule redirects is answered with
+/// the `Location` made from
 /// what was routed on — the listener's scheme, the host, the normalised path, the query —
 /// and its head is left as routing left it.
 ///
@@ -204,14 +208,28 @@ pub fn decide<'a, H: Head>(
         .uri()
         .path_and_query()
         .is_some_and(|target| target.as_str().starts_with('?'));
-    let target = match path {
-        Cow::Owned(path) => Some(with_path(head.uri(), path)?),
-        Cow::Borrowed(path) if pathless => Some(with_path(head.uri(), path.to_owned())?),
-        Cow::Borrowed(_) => None,
+    // A rewrite's path is made from the normalised one routed on, and is normal itself.
+    let rewritten = rule
+        .rewrite
+        .as_ref()
+        .and_then(UrlRewrite::path)
+        .map(|change| {
+            let mut rewritten = String::with_capacity(path.len());
+            change.write(&path, &mut rewritten);
+            rewritten
+        });
+    let target = match (rewritten, path) {
+        (Some(rewritten), _) => Some(with_path(head.uri(), rewritten)?),
+        (None, Cow::Owned(path)) => Some(with_path(head.uri(), path)?),
+        (None, Cow::Borrowed(path)) if pathless => Some(with_path(head.uri(), path.to_owned())?),
+        (None, Cow::Borrowed(_)) => None,
     };
 
     if let Some(target) = target {
         head.set_uri(target);
+    }
+    if let Some(host) = rule.rewrite.as_ref().and_then(UrlRewrite::host) {
+        head.set_host(host)?;
     }
     if found.hop_by_hop {
         head.strip_request()?;
@@ -280,6 +298,13 @@ routes:
       - matches:
           - path: { prefix: /account }
             headers: [{ name: Cookie, value: { exact: "a=1; b=2" } }]
+        forward:
+          backends:
+            - { upstream: search, weight: 1 }
+      - matches:
+          - path: { prefix: /v1 }
+        filters:
+          - { type: url_rewrite, host: api.internal, path: { replace_prefix: /api } }
         forward:
           backends:
             - { upstream: search, weight: 1 }
@@ -464,6 +489,82 @@ upstreams:
         // Whatever the rule does not redirect is forwarded as ever.
         let mut request = head("/elsewhere", &[("host", "shop.example.com")]);
         assert_eq!(redirected(&mut request), None);
+    }
+
+    const REWRITTEN: &str = r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http }
+routes:
+  - name: rewritten
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: /prefix/one } }]
+        filters: [{ type: url_rewrite, path: { replace_prefix: /one } }]
+        forward: { backends: [{ upstream: up, weight: 1 }] }
+      - matches: [{ path: { prefix: /strip-prefix } }]
+        filters: [{ type: url_rewrite, path: { replace_prefix: / } }]
+        forward: { backends: [{ upstream: up, weight: 1 }] }
+      - matches: [{ path: { prefix: /full/one } }]
+        filters: [{ type: url_rewrite, path: { replace_full: /one } }]
+        forward: { backends: [{ upstream: up, weight: 1 }] }
+      - matches: [{ path: { prefix: /host } }]
+        filters: [{ type: url_rewrite, host: one.example.org }]
+        forward: { backends: [{ upstream: up, weight: 1 }] }
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: up, weight: 1 }] }
+upstreams:
+  up: { endpoints: ["127.0.0.1:9000"] }
+"#;
+
+    /// Decides on `web` of [`REWRITTEN`], and gives the head as it goes upstream.
+    fn rewritten<H: Head>(mut head: H) -> H {
+        let config: Config = serde_saphyr::from_str(REWRITTEN).unwrap();
+        let rewritten = compile(&config).unwrap();
+        let web = rewritten
+            .listeners
+            .iter()
+            .find(|l| l.name == "web")
+            .unwrap();
+        forwarding(decide(&rewritten, web, &mut head, 0).unwrap());
+        head
+    }
+
+    /// Gateway API's `httproute-rewrite-path` cases, and what normalising and the query add.
+    #[test]
+    fn a_rewrite_changes_the_path_the_upstream_is_sent() {
+        let cases = [
+            ("/prefix/one/two", "/one/two"),
+            ("/prefix/one/./tw%6f?x=%2f&y", "/one/two?x=%2f&y"),
+            ("/strip-prefix/three", "/three"),
+            ("/strip-prefix", "/"),
+            ("/strip-prefix?q", "/?q"),
+            ("/full/one/two", "/one"),
+            ("/full/one/two?keep=1", "/one?keep=1"),
+            ("/elsewhere/./a", "/elsewhere/a"),
+        ];
+        for (target, sent) in cases {
+            let went = rewritten(head(target, &[("host", "shop.example.com")]));
+            assert_eq!(went.uri, sent, "{target}");
+            assert_eq!(went.headers["host"], "shop.example.com", "{target}");
+        }
+    }
+
+    /// Gateway API's `httproute-rewrite-host`: the upstream is sent the new host, over
+    /// HTTP/2 too, whose `:authority` the `Host` field was made to agree with.
+    #[test]
+    fn a_rewrite_changes_the_host_the_upstream_is_sent() {
+        let sent = rewritten(head("/host/a?b", &[("host", "Shop.Example.com:8080")]));
+        assert_eq!(sent.headers.get_all("host").iter().count(), 1);
+        assert_eq!(sent.headers["host"], "one.example.org");
+        assert_eq!(sent.uri, "/host/a?b");
+
+        let mut h2 = head("http://shop.example.com/host/a", &[]);
+        h2.version = http::Version::HTTP_2;
+        let h2 = rewritten(h2);
+        assert_eq!(h2.headers["host"], "one.example.org");
+        // The target's authority is the endpoint's by the time it is sent (`at_endpoint`).
+        assert_eq!(h2.uri.path(), "/host/a");
     }
 
     #[test]
@@ -1088,6 +1189,7 @@ upstreams:
                 "/cart/items", "/account", "/tenant/x", "/search?q=a%20b", "/pages/./a/../b",
                 "/status", "/closed", "http://shop.example.com/cart",
                 "http://tenant.example.net/tenant/y", "http://Shop.Example.com:80/account",
+                "/v1/./users?page=2", "http://shop.example.com/v1",
             ]),
             // Most requests name a host that routes, so that what is done after routing is
             // reached; the rest may name any, or none.

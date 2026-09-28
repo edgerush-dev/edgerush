@@ -97,6 +97,14 @@ pub trait Head {
     /// [`Rejection::Edits`] if the head cannot take them.
     fn apply(&mut self, changes: &HeaderModifier) -> Result<(), Rejection>;
 
+    /// Gives the `Host` field this one value: a rewrite's host, which the upstream is sent
+    /// (and an HTTP/2 upstream's `:authority` is made from).
+    ///
+    /// # Errors
+    ///
+    /// [`Rejection::Edits`] if the head cannot take the change.
+    fn set_host(&mut self, host: &HeaderValue) -> Result<(), Rejection>;
+
     /// The version it came in.
     fn version(&self) -> Version;
 }
@@ -160,6 +168,11 @@ impl Head for Parts {
 
     fn apply(&mut self, changes: &HeaderModifier) -> Result<(), Rejection> {
         changes.apply(&mut self.headers);
+        Ok(())
+    }
+
+    fn set_host(&mut self, host: &HeaderValue) -> Result<(), Rejection> {
+        self.headers.insert(HOST, host.clone());
         Ok(())
     }
 
