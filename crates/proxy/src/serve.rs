@@ -2054,6 +2054,12 @@ impl Worker {
                         Answer::BodyTimedOut
                     }
                     ExchangeError::RequestBody(_) => Answer::BadBody,
+                    // The client's upload stopping, seen by the exchange's clock for it
+                    // rather than the body's own: the same client, as slow either way.
+                    ExchangeError::Idle {
+                        waiting: Stalled::Client,
+                        ..
+                    } => Answer::BodyTimedOut,
                     // Only what the upstream was to do before its head. The client's own
                     // upload stopping is not the upstream out of time.
                     ExchangeError::TooSlow { .. }
@@ -6770,6 +6776,38 @@ upstreams:
                 let _ended = within(read.read_to_end(&mut answer)).await;
                 let answer = String::from_utf8_lossy(&answer);
                 assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+            })
+            .await;
+    }
+
+    /// A client whose upload stops while its request is going upstream is the client
+    /// being slow, whichever clock sees it first: `408`, and not counted as the upstream
+    /// failing. Here the exchange's own clock for the request's body runs out before the
+    /// client connection's does.
+    #[tokio::test]
+    async fn an_upload_the_client_stops_is_the_clients_whichever_clock_sees_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _asked) = upstream_silent_at_first(usize::MAX, true).await;
+                // Shorter than the client connection's idle bound (`SHORT`, 500 ms).
+                let limits = quick(|limits| limits.idle = Duration::from_millis(200));
+                let (front, worker) =
+                    serving_worker_with(upstream, UpstreamProtocol::Http1, None, limits).await;
+                let (mut read, mut write) = TcpStream::connect(front).await.unwrap().into_split();
+                write
+                    .write_all(b"POST / HTTP/1.1\r\nhost: a.test\r\ncontent-length: 1000\r\n\r\nten bytes!")
+                    .await
+                    .unwrap();
+                let mut answer = Vec::new();
+                let _ended = within(read.read_to_end(&mut answer)).await;
+                drop(write);
+                let answer = String::from_utf8_lossy(&answer);
+                assert!(answer.starts_with("HTTP/1.1 408 "), "{answer}");
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_upstream_failures_total{upstream=\"up\"} 0\n";
+                assert!(scrape.contains(line), "{scrape}");
             })
             .await;
     }
