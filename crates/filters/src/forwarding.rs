@@ -388,7 +388,10 @@ pub fn address_value(address: IpAddr) -> HeaderValue {
 /// `https`.
 #[must_use]
 pub fn proto_value(secure: bool) -> HeaderValue {
-    HeaderValue::from_static(if secure { "https" } else { "http" })
+    // Constants: `from_static` checks every byte each time it runs outside one.
+    const HTTP: HeaderValue = HeaderValue::from_static("http");
+    const HTTPS: HeaderValue = HeaderValue::from_static("https");
+    if secure { HTTPS } else { HTTP }
 }
 
 /// What the gateway adds to `Via` for a request that came in with `version`
@@ -396,13 +399,18 @@ pub fn proto_value(secure: bool) -> HeaderValue {
 /// gateway's pseudonym.
 #[must_use]
 pub fn via_value(version: Version) -> HeaderValue {
-    HeaderValue::from_static(match version {
-        Version::HTTP_09 => "0.9 edgerush",
-        Version::HTTP_10 => "1.0 edgerush",
-        Version::HTTP_2 => "2 edgerush",
-        Version::HTTP_3 => "3 edgerush",
-        _ => "1.1 edgerush",
-    })
+    const HTTP_09: HeaderValue = HeaderValue::from_static("0.9 edgerush");
+    const HTTP_10: HeaderValue = HeaderValue::from_static("1.0 edgerush");
+    const HTTP_11: HeaderValue = HeaderValue::from_static("1.1 edgerush");
+    const HTTP_2: HeaderValue = HeaderValue::from_static("2 edgerush");
+    const HTTP_3: HeaderValue = HeaderValue::from_static("3 edgerush");
+    match version {
+        Version::HTTP_09 => HTTP_09,
+        Version::HTTP_10 => HTTP_10,
+        Version::HTTP_2 => HTTP_2,
+        Version::HTTP_3 => HTTP_3,
+        _ => HTTP_11,
+    }
 }
 
 /// Why a listener's forwarding cannot be built.

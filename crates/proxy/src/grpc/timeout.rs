@@ -17,6 +17,9 @@ const DIGITS: usize = 8;
 /// The largest value eight digits hold.
 const MOST: u128 = 99_999_999;
 
+/// The longest timeout that can be said: more than eight digits of hours.
+const LONGEST: HeaderValue = HeaderValue::from_static("99999999H");
+
 /// The time a `grpc-timeout` value gives, or `None` for one that is not a timeout.
 pub(crate) fn parse(value: &[u8]) -> Option<Duration> {
     let (&unit, digits) = value.split_last()?;
@@ -53,12 +56,11 @@ pub(crate) fn format(left: Duration) -> HeaderValue {
     for (size, unit) in UNITS {
         let amount = nanos.div_ceil(size);
         if amount <= MOST {
-            return HeaderValue::from_str(&format!("{amount}{unit}"))
-                .unwrap_or(HeaderValue::from_static("99999999H"));
+            return HeaderValue::from_str(&format!("{amount}{unit}")).unwrap_or(LONGEST);
         }
     }
     // More than eight digits of hours: as long as can be said.
-    HeaderValue::from_static("99999999H")
+    LONGEST
 }
 
 #[cfg(test)]

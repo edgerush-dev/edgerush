@@ -282,8 +282,7 @@ impl Forwarded for Parts {
     }
 
     fn close_connection(&mut self) -> Result<(), Rejection> {
-        self.headers
-            .insert(CONNECTION, HeaderValue::from_static("close"));
+        self.headers.insert(CONNECTION, crate::hop_by_hop::CLOSE);
         Ok(())
     }
 }

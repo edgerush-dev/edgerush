@@ -33,6 +33,13 @@ use http::header::{
     TRANSFER_ENCODING, UPGRADE,
 };
 
+/// `TE: trailers`, the one form in which `TE` is forwarded. Constants: `from_static`
+/// checks every byte each time it runs outside one.
+pub(crate) const TE_TRAILERS: HeaderValue = HeaderValue::from_static("trailers");
+
+/// `Connection: close`.
+pub(crate) const CLOSE: HeaderValue = HeaderValue::from_static("close");
+
 /// The headers that go whether `Connection` names them or not.
 pub(crate) const HOP_BY_HOP: [HeaderName; 9] = [
     CONNECTION,
@@ -141,7 +148,7 @@ pub(crate) fn strip_request(headers: &mut HeaderMap) {
         .any(|option| option.eq_ignore_ascii_case(b"trailers"));
     strip(headers);
     if accepts_trailers {
-        headers.insert(TE, HeaderValue::from_static("trailers"));
+        headers.insert(TE, TE_TRAILERS);
     }
 }
 

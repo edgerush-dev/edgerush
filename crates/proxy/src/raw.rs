@@ -226,7 +226,7 @@ impl Head for RawHead {
         strip(view, &mut self.overlay);
         if accepts_trailers {
             self.overlay
-                .set(&view, TE, HeaderValue::from_static("trailers"))
+                .set(&view, TE, crate::hop_by_hop::TE_TRAILERS)
                 .map_err(|_| Rejection::Edits)?;
         }
         Ok(())
@@ -307,7 +307,7 @@ impl Forwarded for RawHead {
     fn close_connection(&mut self) -> Result<(), Rejection> {
         let view = self.lines.view(&self.head);
         self.overlay
-            .set(&view, CONNECTION, HeaderValue::from_static("close"))
+            .set(&view, CONNECTION, crate::hop_by_hop::CLOSE)
             .map_err(|_| Rejection::Edits)
     }
 }
