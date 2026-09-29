@@ -152,6 +152,9 @@ impl TrustedProxies {
 pub struct HeaderNames {
     /// Lower case; a front ends where its `*` was.
     entries: Box<[Entry]>,
+    /// The first bytes the entries begin with, in either case, a bit each: every name of
+    /// every request is asked about, and one look here rules out nearly all of them.
+    firsts: [u64; 4],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,12 +165,6 @@ enum Entry {
 
 impl Entry {
     fn matches(&self, name: &[u8]) -> bool {
-        // The first byte first: every request's every name is asked about, and that alone
-        // rules out nearly all of them. An entry is never empty, and is in lower case.
-        let (Self::Whole(entry) | Self::Front(entry)) = self;
-        if name.first().map(u8::to_ascii_lowercase) != entry.first().copied() {
-            return false;
-        }
         match self {
             Self::Whole(whole) => name.eq_ignore_ascii_case(whole),
             Self::Front(front) => name
@@ -240,15 +237,32 @@ impl HeaderNames {
         if read.len() > MOST_ENTRIES {
             return Err(ForwardingError::TooMany(read.len()));
         }
-        Ok(Self {
-            entries: read.into_iter().map(|(entry, _)| entry).collect(),
-        })
+        let entries: Box<[Entry]> = read.into_iter().map(|(entry, _)| entry).collect();
+        let mut firsts = [0; 4];
+        for entry in &entries {
+            let (Entry::Whole(bytes) | Entry::Front(bytes)) = entry;
+            if let Some(&first) = bytes.first() {
+                for byte in [first, first.to_ascii_uppercase()] {
+                    if let Some(word) = firsts.get_mut(usize::from(byte / 64)) {
+                        *word |= 1 << (byte % 64);
+                    }
+                }
+            }
+        }
+        Ok(Self { entries, firsts })
     }
 
     /// Whether `name`, in whatever case, is one of these.
     #[must_use]
+    #[inline]
     pub fn matches(&self, name: &[u8]) -> bool {
-        self.entries.iter().any(|entry| entry.matches(name))
+        let Some(&first) = name.first() else {
+            return false;
+        };
+        self.firsts
+            .get(usize::from(first / 64))
+            .is_some_and(|word| word & (1 << (first % 64)) != 0)
+            && self.entries.iter().any(|entry| entry.matches(name))
     }
 
     /// Whether there are none.
