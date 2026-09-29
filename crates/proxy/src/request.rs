@@ -1720,6 +1720,45 @@ upstreams:
                 prop_assert_eq!(from_raw, from_map, "{}", name);
             }
 
+            // A map with what the core adds kept beside it, as our HTTP/2 and HTTP/3 servers'
+            // heads are, is decided on as the map is, field for field.
+            {
+                use crate::head::Forwarded;
+                use crate::map_head::MapHead;
+                use crate::upstream::auth::carries_credentials;
+                use crate::upstream::h1::codec::OutgoingFields;
+                let (parts, _) = both_heads(&sent).unwrap();
+                let mut beside = MapHead::new(parts);
+                let by_beside = decide_from(&client, listener, &mut beside, random);
+                prop_assert_eq!(&by_beside, &by_map);
+                prop_assert_eq!(beside.uri(), map.uri());
+                if by_map.is_ok() && carries_credentials(beside.outgoing()) {
+                    prop_assert_eq!(beside.close_connection(), Ok(()));
+                }
+                let fields = beside.fields();
+                for name in every_name() {
+                    let from_beside: Vec<&[u8]> = fields.values(&name).collect();
+                    let from_map: Vec<&[u8]> = Fields::values(&map.headers, &name).collect();
+                    prop_assert_eq!(from_beside, from_map, "{}", name);
+                }
+                prop_assert_eq!(beside.to_map(), map.headers.clone());
+                // What is written of it is what is written of the map, in whatever order.
+                let lines = |written: Vec<u8>| {
+                    let mut lines: Vec<Vec<u8>> = written
+                        .split(|&byte| byte == b'\n')
+                        .map(<[u8]>::to_vec)
+                        .collect();
+                    lines.sort();
+                    lines
+                };
+                let mut from_beside = Vec::new();
+                beside.outgoing().write_fields(&mut from_beside);
+                let mut from_map = Vec::new();
+                map.headers.write_fields(&mut from_map);
+                prop_assert_eq!(beside.outgoing().written_len(), from_beside.len());
+                prop_assert_eq!(lines(from_beside), lines(from_map));
+            }
+
             // Made into `http`'s parts, for a client that takes those, it is the map.
             {
                 use crate::head::Forwarded;

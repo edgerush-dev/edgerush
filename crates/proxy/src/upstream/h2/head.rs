@@ -58,16 +58,16 @@ pub(crate) fn request<F: OutgoingFields + ?Sized>(
         .build()
         .map_err(|_| HeadError::BadAuthority)?;
 
-    let mut headers = match fields.as_map() {
+    let mut headers = match fields.shared_count() {
         // Each name and value shared, not read and checked again, and room made once for
         // all of them (and a length) rather than as they come.
-        Some(map) => {
-            let mut headers = HeaderMap::with_capacity(map.len() + 1);
-            for (name, value) in map {
+        Some(count) => {
+            let mut headers = HeaderMap::with_capacity(count + 1);
+            fields.each_shared(|name, value| {
                 if travels(name.as_str().as_bytes(), value.as_bytes()) {
                     headers.append(name.clone(), value.clone());
                 }
-            }
+            });
             headers
         }
         None => {

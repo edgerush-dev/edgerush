@@ -479,10 +479,17 @@ pub trait OutgoingFields: edgerush_router::Fields {
     /// hop that sends them as something other than lines. The framing fields included.
     fn each_field(&self, visit: impl FnMut(&[u8], &[u8]));
 
-    /// The fields as a header map, where that is what holds them: a hop that sends a map
-    /// can then share each name and value rather than read it again.
-    fn as_map(&self) -> Option<&HeaderMap> {
+    /// How many fields there are, where they are held as names and values that can be
+    /// shared ([`OutgoingFields::each_shared`]); `None` where they are not.
+    fn shared_count(&self) -> Option<usize> {
         None
+    }
+
+    /// Hands every field to `visit` as a name and value to share, in order, where
+    /// [`OutgoingFields::shared_count`] says there are some: a hop that sends a map then
+    /// shares them rather than reading each again.
+    fn each_shared(&self, visit: impl FnMut(&HeaderName, &HeaderValue)) {
+        let _nothing = visit;
     }
 }
 
@@ -512,13 +519,19 @@ impl OutgoingFields for HeaderMap {
         }
     }
 
-    fn as_map(&self) -> Option<&HeaderMap> {
-        Some(self)
+    fn shared_count(&self) -> Option<usize> {
+        Some(self.len())
+    }
+
+    fn each_shared(&self, mut visit: impl FnMut(&HeaderName, &HeaderValue)) {
+        for (name, value) in self {
+            visit(name, value);
+        }
     }
 }
 
 /// Whether the head writer writes this field itself.
-fn is_framing(name: &HeaderName) -> bool {
+pub(crate) fn is_framing(name: &HeaderName) -> bool {
     name == http::header::CONTENT_LENGTH || name == http::header::TRANSFER_ENCODING
 }
 

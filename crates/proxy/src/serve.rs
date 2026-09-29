@@ -32,6 +32,7 @@ use crate::interim::Interim;
 use crate::l4::hello::{self, Hello};
 use crate::l4::tunnel::{Bounds as TunnelBounds, Carried, carry};
 use crate::linger::{self, Lent, linger};
+use crate::map_head::MapHead;
 use crate::metrics::{Answer, Metrics, Socket, Stopped, Tunnel};
 use crate::mirror;
 use crate::random::random;
@@ -1446,6 +1447,8 @@ impl Worker {
         interim: Option<Interim>,
     ) -> impl Future<Output = Answered<Body>> {
         let (head, body) = request.into_parts();
+        // What the core adds is kept beside the map, in room the worker lends (14 §6).
+        let head = MapHead::lent(head, &self.blocks);
         self.handle_head(listener, client, head, body, interim)
     }
 

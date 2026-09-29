@@ -2,7 +2,11 @@
 //! choice of its upstream — host, path normalisation, routing, hop-by-hop headers, header
 //! changes, a rewrite, backend — or of a redirect.
 //!
-//! Linux only (valgrind): `cargo bench -p edgerush-proxy`, see the repository README.
+//! The head is a map with what the core adds kept beside it, as our HTTP/2 and HTTP/3 servers
+//! hand heads over.
+//!
+//! Linux only (valgrind): `cargo bench -p edgerush-proxy --features fuzzing --bench decide`,
+//! see the repository README.
 
 #![allow(
     clippy::expect_used,
@@ -14,11 +18,16 @@
 )]
 
 use edgerush_config::{Compiled, Config, compile};
+use edgerush_proxy::map_head::MapHead;
+use edgerush_proxy::storage::{LIMIT, Storage};
+use edgerush_proxy::upstream::h1::blocks::{Blocks, Sizes};
 use edgerush_proxy::{Client, decide};
 use http::Request;
 use http::request::Parts;
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
+use std::cell::RefCell;
 use std::hint::black_box;
+use std::rc::Rc;
 
 const SHOP: &str = r#"
 listeners:
@@ -71,6 +80,17 @@ fn shop() -> Compiled {
 }
 
 /// A request with a browser's worth of headers.
+/// `parts` as our HTTP/2 and HTTP/3 servers hand a head over: what the core adds kept beside
+/// the map, in room lent by the worker's blocks, which have some to lend.
+fn mapped(parts: Parts) -> MapHead {
+    let blocks = Rc::new(RefCell::new(Blocks::new(
+        Sizes::default(),
+        Storage::new(LIMIT),
+    )));
+    blocks.borrow_mut().give_edits(Vec::with_capacity(8));
+    MapHead::lent(parts, &blocks)
+}
+
 fn head(target: &str, host: Option<&str>) -> Parts {
     head_with(target, host, &[])
 }
@@ -110,47 +130,59 @@ fn head_with(target: &str, host: Option<&str>, more: &[(&'static str, &'static s
 
 // The config and the head are handed back so that dropping them is not measured.
 #[library_benchmark]
-#[bench::usual_form(shop(), peer(), head("/pages/about?lang=en", Some("shop.example.com")))]
-#[bench::with_header_changes(shop(), peer(), head("/cart/items?page=3", Some("shop.example.com")))]
+#[bench::usual_form(
+    shop(),
+    peer(),
+    mapped(head("/pages/about?lang=en", Some("shop.example.com")))
+)]
+#[bench::with_header_changes(
+    shop(),
+    peer(),
+    mapped(head("/cart/items?page=3", Some("shop.example.com")))
+)]
 #[bench::path_to_normalise(
     shop(),
     peer(),
-    head("/pages/./a/../about?lang=en", Some("shop.example.com"))
+    mapped(head("/pages/./a/../about?lang=en", Some("shop.example.com")))
 )]
-#[bench::host_in_the_target(shop(), peer(), h2_head("http://shop.example.com/pages/about?lang=en", &[]))]
+#[bench::host_in_the_target(shop(), peer(), mapped(h2_head("http://shop.example.com/pages/about?lang=en", &[])))]
 #[bench::connection_header(
     shop(),
     peer(),
-    head_with(
+    mapped(head_with(
         "/pages/about?lang=en",
         Some("shop.example.com"),
         &[("connection", "keep-alive"), ("keep-alive", "timeout=5"), ("te", "trailers")]
-    )
+    ))
 )]
 #[bench::grpc_says_te_trailers(
     shop(),
     peer(),
-    h2_head(
+    mapped(h2_head(
         "http://shop.example.com/pages.Pages/About",
         &[("te", "trailers"), ("content-type", "application/grpc")]
-    )
+    ))
 )]
-#[bench::no_route(shop(), peer(), head("/pages/about", Some("other.example.org")))]
+#[bench::no_route(
+    shop(),
+    peer(),
+    mapped(head("/pages/about", Some("other.example.org")))
+)]
 #[bench::rewritten(
     shop(),
     peer(),
-    head("/api/orders/42?expand=items", Some("shop.example.com"))
+    mapped(head("/api/orders/42?expand=items", Some("shop.example.com")))
 )]
 #[bench::redirected(
     shop(),
     peer(),
-    head("/old/orders/42?expand=items", Some("shop.example.com"))
+    mapped(head("/old/orders/42?expand=items", Some("shop.example.com")))
 )]
 fn request_core(
     snapshot: Compiled,
     client: Client,
-    mut head: Parts,
-) -> (Compiled, Client, Parts, bool) {
+    mut head: MapHead,
+) -> (Compiled, Client, MapHead, bool) {
     let forwarded = match snapshot.listeners.first() {
         Some(listener) => decide(
             black_box(&snapshot),
