@@ -97,6 +97,7 @@ mod tunnel;
 pub mod upstream;
 #[cfg(not(feature = "fuzzing"))]
 mod upstream;
+mod websocket;
 
 pub use forwarding::Client;
 pub use hop_by_hop::ConnectionError;

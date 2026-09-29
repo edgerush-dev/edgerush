@@ -206,6 +206,11 @@ pub fn write_interim(
 /// Writes the final head of an answer, and says how its body goes out and whether the
 /// connection closes after it.
 ///
+/// A WebSocket's 101 is the last head of a connection that is a tunnel after it
+/// ([19 §2](../../../../docs/19-websocket.md)): it has no body and never closes as HTTP
+/// does. A head that carries `Upgrade` — the 101, or a 426 that offers WebSocket — has its
+/// `Connection` name `upgrade`, as RFC 9110 §7.8 asks of whoever sends one.
+///
 /// `persistent` is whether the connection may carry another request as far as everything
 /// but this answer's own framing goes: what the request said, and anything the caller
 /// knows that ends the connection. `date` is written where the head has no `Date` of its
@@ -213,7 +218,8 @@ pub fn write_interim(
 ///
 /// # Errors
 ///
-/// An informational status, which [`write_interim`] writes.
+/// An informational status other than 101, which [`write_interim`] writes, or a 101 to a
+/// client that does not speak HTTP/1.1.
 pub fn write_head<F: AnswerFields + ?Sized>(
     out: &mut Vec<u8>,
     status: StatusCode,
@@ -223,12 +229,18 @@ pub fn write_head<F: AnswerFields + ?Sized>(
     persistent: bool,
     date: &HttpDate,
 ) -> Result<Written, WriteError> {
-    if status.is_informational() {
+    let switching = status == StatusCode::SWITCHING_PROTOCOLS;
+    if status.is_informational() && !switching {
         return Err(WriteError::Status);
     }
+    if switching && asked.version != Version::HTTP_11 {
+        return Err(WriteError::InterimToHttp10);
+    }
     // A 204 and a 304 end at their heads whatever they say, and so does any answer to
-    // HEAD; 205 is not among them, and says so with a length of nothing.
-    let bodyless_status = status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED;
+    // HEAD; 205 is not among them, and says so with a length of nothing. So does a 101,
+    // after which the connection speaks another protocol.
+    let bodyless_status =
+        status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED || switching;
     let bodyless = bodyless_status || asked.head;
     let delimited = if bodyless {
         Delimited::Nothing
@@ -242,7 +254,11 @@ pub fn write_head<F: AnswerFields + ?Sized>(
             },
         }
     };
-    let closes = !persistent || delimited == Delimited::Close;
+    let closes = !switching && (!persistent || delimited == Delimited::Close);
+    // Only a 101 or a 426 carries `Upgrade` by the time an answer is written: every other
+    // has had it taken off, so no other is looked through for it.
+    let upgrade = (switching || status == StatusCode::UPGRADE_REQUIRED)
+        && headers.values(&header::UPGRADE).next().is_some();
 
     status_line(out, status);
     let dated = headers.write_fields(out);
@@ -276,8 +292,14 @@ pub fn write_head<F: AnswerFields + ?Sized>(
         Delimited::Close => {}
     }
     // Only what the version does not already say (RFC 9112 §9.3, §9.6), as hyper, HAProxy
-    // and Envoy do.
-    if closes && asked.version == Version::HTTP_11 {
+    // and Envoy do, and `upgrade` wherever `Upgrade` is.
+    if upgrade {
+        if closes && asked.version == Version::HTTP_11 {
+            out.extend_from_slice(b"connection: upgrade, close\r\n");
+        } else {
+            out.extend_from_slice(b"connection: upgrade\r\n");
+        }
+    } else if closes && asked.version == Version::HTTP_11 {
         out.extend_from_slice(b"connection: close\r\n");
     } else if !closes && asked.version == Version::HTTP_10 {
         out.extend_from_slice(b"connection: keep-alive\r\n");
@@ -590,6 +612,63 @@ mod tests {
         assert!(text.contains("trailer: x-sum\r\n"), "{text}");
         let (text, _) = head(200, &declared, Content::Length(3), ELEVEN, true);
         assert!(!text.contains("trailer"), "{text}");
+    }
+
+    /// A WebSocket's 101 is the last head of the connection (19 §2): no framing, no close,
+    /// and `Connection` naming the `Upgrade` it carries. Only to HTTP/1.1, which alone has
+    /// an upgrade.
+    #[test]
+    fn a_101_ends_the_http_of_its_connection_and_says_upgrade() {
+        let switched = fields(&[
+            ("upgrade", "websocket"),
+            ("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+        ]);
+        for persistent in [true, false] {
+            let (text, written) = head(101, &switched, Content::Empty, ELEVEN, persistent);
+            assert_eq!(
+                text,
+                format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\
+                     sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+                     connection: upgrade\r\n{DATED}\r\n"
+                )
+            );
+            assert_eq!(written.delimited, Delimited::Nothing);
+            assert!(!written.closes);
+        }
+        let ten = Asked {
+            version: Version::HTTP_10,
+            ..ELEVEN
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            write_head(
+                &mut out,
+                StatusCode::SWITCHING_PROTOCOLS,
+                &switched,
+                Content::Empty,
+                ten,
+                false,
+                &date()
+            ),
+            Err(WriteError::InterimToHttp10)
+        );
+    }
+
+    /// A 426 that offers WebSocket names `upgrade` in its `Connection`, beside a `close`
+    /// where there is one (RFC 9110 §7.8).
+    #[test]
+    fn a_426_that_offers_an_upgrade_says_so_in_its_connection() {
+        let offer = fields(&[("upgrade", "websocket")]);
+        let (text, _) = head(426, &offer, Content::Empty, ELEVEN, true);
+        assert!(text.contains("\r\nconnection: upgrade\r\n"), "{text}");
+        let (text, _) = head(426, &offer, Content::Empty, ELEVEN, false);
+        assert!(
+            text.contains("\r\nconnection: upgrade, close\r\n"),
+            "{text}"
+        );
+        let (text, _) = head(426, &HeaderMap::new(), Content::Empty, ELEVEN, true);
+        assert!(!text.contains("connection:"), "{text}");
     }
 
     #[test]

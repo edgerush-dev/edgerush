@@ -60,8 +60,16 @@ pub struct Forward<'a> {
     pub rule: &'a Arc<CompiledRule>,
     /// The upstream chosen among the rule's backends: its position in the snapshot's list.
     pub upstream: UpstreamId,
-    /// The rule's mirrors that take a copy of this request, in the rule's order.
+    /// The rule's mirrors that take a copy of this request, in the rule's order. None of
+    /// them is sent one for a WebSocket handshake, which a mirror could only ever be sent
+    /// the handshake of, never the messages; each is drawn all the same, so that what it
+    /// did not get can be counted ([19 §5](../../../docs/19-websocket.md)).
     pub mirrors: Vec<Mirroring>,
+    /// The key an HTTP/1.1 WebSocket handshake came with: set for a request the gateway
+    /// carries as one ([19 §2](../../../docs/19-websocket.md)). Its `Upgrade` has been taken
+    /// off with the other hop-by-hop fields all the same; what goes upstream in their place
+    /// is for whoever sends it.
+    pub websocket: Option<HeaderValue>,
 }
 
 /// A mirror that takes a copy of a request.
@@ -202,6 +210,14 @@ pub fn decide<'a, H: Head>(
     if found.hop_by_hop {
         head.check_connection(id.is_some())?;
     }
+    // Read before the hop-by-hop fields come off, as they must for everything else: an
+    // `Upgrade` is one, and the only WebSocket the gateway carries says it (19 §2).
+    let websocket = if found.hop_by_hop {
+        crate::websocket::handshake(head.version(), head.method(), &head.fields())
+            .map(|key| key.value())
+    } else {
+        None
+    };
     // What routing reads of the head is let go of before anything in it changes.
     let id = {
         let fields = head.fields();
@@ -320,7 +336,7 @@ pub fn decide<'a, H: Head>(
                     head.apply(changes)?;
                 }
             }
-            Step::Copy(at) => {
+            Step::Copy(at) if websocket.is_none() => {
                 if let Some(taken) = mirrors.iter_mut().find(|taken| taken.mirror == at) {
                     taken.own = Some(Copied {
                         target: head.uri().clone(),
@@ -328,12 +344,15 @@ pub fn decide<'a, H: Head>(
                     });
                 }
             }
+            // A handshake's mirrors are sent nothing, so nothing is copied for them.
+            Step::Copy(_) => {}
         }
     }
     Ok(Decision::Forward(Forward {
         rule,
         upstream,
         mirrors,
+        websocket,
     }))
 }
 

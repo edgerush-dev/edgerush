@@ -498,11 +498,11 @@ async fn an_interim_response_is_passed_on() {
     assert_eq!(client.body(2).await, "ok");
 }
 
-/// **A limitation, not a promise.** A 426 reaches the client without the `Upgrade` that
-/// [RFC 9110 §15.5.22](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.5.22) says
-/// it MUST carry: `Upgrade` is hop-by-hop and always taken off, and this proxy upgrades no
-/// connection, so naming a protocol to the client would offer what the gateway cannot do.
-/// The answer itself is still forwarded, status and body as they came (03 §11).
+/// A 426 that asks for a protocol the gateway cannot switch to reaches the client without
+/// the `Upgrade` that [RFC 9110 §15.5.22](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.5.22)
+/// says it MUST carry: `Upgrade` is hop-by-hop, and naming a protocol to the client would
+/// offer what the gateway cannot do. The answer itself is still forwarded, status and body
+/// as they came (03 §11). One that asks for WebSocket keeps it (`tests/websocket.rs`).
 #[tokio::test]
 async fn a_426_is_forwarded_without_its_upgrade() {
     let upstream = raw_upstream(move |mut wire| async move {
@@ -527,11 +527,11 @@ async fn a_426_is_forwarded_without_its_upgrade() {
     assert_eq!(client.body(4).await, "plea");
 }
 
-/// A 101 to a request that did not ask to switch — none can have asked, since `Upgrade`
-/// is taken off every request — is answered 502. Passing it on would hand
-/// the client a switch it never asked for and tunnel whatever the upstream said next,
-/// which this slice does not do ([13 §1](../../../docs/13-http1-upstream.md);
-/// linkerd2-proxy's `http1_upgrade_not_requested` tests the same).
+/// A 101 to a request that did not ask to switch — one that is no WebSocket handshake,
+/// whose `Upgrade` is taken off — is answered 502. Passing it on would hand the client a
+/// switch it never asked for and tunnel whatever the upstream said next
+/// ([19 §2](../../../docs/19-websocket.md); linkerd2-proxy's
+/// `http1_upgrade_not_requested` tests the same).
 #[tokio::test]
 async fn a_101_nobody_asked_for_is_answered_502() {
     let (upstream, accepts) = hostile_first(|mut wire| async move {

@@ -332,6 +332,9 @@ pub enum Asked {
     Anything,
     /// HEAD: the head describes a body that is not sent.
     Head,
+    /// A WebSocket handshake ([19 §2](../../../../docs/19-websocket.md)): a 101 is its final
+    /// answer, after which the connection speaks WebSocket and no more HTTP.
+    Upgrade,
 }
 
 /// What follows a head, and whether anything may follow that.
@@ -364,9 +367,19 @@ pub fn delivery(head: &ResponseHead, asked: Asked) -> Result<Delivery, CodecErro
         |framing| !closing && head.version == Version::HTTP_11 && framing != Framing::UntilClose;
 
     let status = head.status.as_u16();
-    // 101 hands the connection to another protocol, and this speaks none.
+    // 101 hands the connection to another protocol: only to the one a handshake asked for,
+    // with nothing of HTTP after it, and never on a connection that asked for none.
     if status == 101 {
-        return Err(CodecError::Upgrade);
+        if asked != Asked::Upgrade {
+            return Err(CodecError::Upgrade);
+        }
+        if chunked || head.content_length.is_some() {
+            return Err(CodecError::BodyForbidden);
+        }
+        return Ok(Delivery {
+            framing: Framing::None,
+            persistent: false,
+        });
     }
     // Nothing follows these, and nothing may claim to: a length or a coding here is a
     // sender describing a body it may not send, which the next reader may go looking for.
@@ -1614,6 +1627,45 @@ mod tests {
             Ok(Delivery {
                 framing: Framing::UntilClose,
                 persistent: false
+            })
+        );
+    }
+
+    /// A handshake's 101 is its final answer, with nothing of HTTP after it: no body, and
+    /// never another exchange (19 §2). One that claims a body, or speaks HTTP/1.0, which
+    /// has no 1xx, is refused as any interim head would be.
+    #[test]
+    fn a_handshakes_101_ends_the_http_of_its_connection() {
+        let head = head_of(b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\r\n");
+        assert_eq!(
+            delivery(&head, Asked::Upgrade),
+            Ok(Delivery {
+                framing: Framing::None,
+                persistent: false
+            })
+        );
+        for claimed in ["content-length: 0\r\n", "transfer-encoding: chunked\r\n"] {
+            let bytes = format!("HTTP/1.1 101 Switching Protocols\r\n{claimed}\r\n");
+            assert_eq!(
+                delivery(&head_of(bytes.as_bytes()), Asked::Upgrade),
+                Err(CodecError::BodyForbidden),
+                "{claimed}"
+            );
+        }
+        let head = head_of(b"HTTP/1.0 101 Switching Protocols\r\n\r\n");
+        assert_eq!(
+            delivery(&head, Asked::Upgrade),
+            Err(CodecError::InterimOnHttp10)
+        );
+        // Any other answer to a handshake is an ordinary one.
+        assert_eq!(
+            delivery(
+                &head_of(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 2\r\n\r\n"),
+                Asked::Upgrade
+            ),
+            Ok(Delivery {
+                framing: Framing::Length(2),
+                persistent: true
             })
         );
     }

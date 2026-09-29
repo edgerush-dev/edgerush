@@ -183,6 +183,8 @@ pub struct CompiledTimeouts {
     pub request: Option<Timeout>,
     /// From a try's start to its answer's head.
     pub backend_request: Option<Timeout>,
+    /// How long a WebSocket may carry nothing, once its upgrade is made.
+    pub tunnel_idle: Option<std::time::Duration>,
 }
 
 /// A timeout a rule states.
@@ -318,9 +320,18 @@ fn timeouts(
     let compiled = CompiledTimeouts {
         request: timeouts.request_ms.map(Timeout::of_ms),
         backend_request: timeouts.backend_request_ms.map(Timeout::of_ms),
+        tunnel_idle: timeouts
+            .tunnel_idle_ms
+            .map(std::time::Duration::from_millis),
     };
     if compiled == CompiledTimeouts::default() {
         errors.push(place.problem(Problem::TimeoutsEmpty));
+        return None;
+    }
+    // An idle bound that never runs out would keep a peer that has gone, with no FIN or
+    // reset to say so, until the data plane drains: "never" is written as a long bound.
+    if timeouts.tunnel_idle_ms == Some(0) {
+        errors.push(place.problem(Problem::TunnelIdleNever));
         return None;
     }
     // Gateway API's rule: the request's timeout takes in every try's, so none is longer. A
@@ -352,9 +363,13 @@ fn retry(forward: &Forward, place: &Place, errors: &mut Vec<ConfigError>) -> Opt
     // among them only the request's own deadline ends a try, and leaves nothing to try
     // again with.
     let try_has_a_clock = forward.timeouts.as_ref().is_none_or(|timeouts| {
-        timeouts
-            .backend_request_ms
-            .is_some_and(|backend_request| backend_request > 0)
+        match (timeouts.request_ms, timeouts.backend_request_ms) {
+            // Only a WebSocket's idle bound stated: the fixed clocks still hold.
+            (None, None) => true,
+            (_, backend_request) => {
+                backend_request.is_some_and(|backend_request| backend_request > 0)
+            }
+        }
     });
     if retry.on_timeout && !try_has_a_clock {
         problems.push(Problem::RetryOnTimeoutNever);
@@ -1540,6 +1555,9 @@ pub enum Problem {
     /// `timeouts` stated with nothing in it.
     #[error("`timeouts` states no timeout")]
     TimeoutsEmpty,
+    /// A WebSocket's idle bound of nothing, which would never close one whose peer has gone.
+    #[error("`tunnel_idle_ms` is 0: at least 1")]
+    TunnelIdleNever,
     /// A try given longer than the request it is a try of.
     #[error("`backend_request_ms` is {backend_request}: no more than `request_ms`, {request}")]
     BackendRequestOverRequest {
@@ -3297,6 +3315,7 @@ upstreams: {{ u: {{ endpoints: [] }} }}
             Some(CompiledTimeouts {
                 request: Some(Timeout::After(std::time::Duration::from_millis(1500))),
                 backend_request: None,
+                tunnel_idle: None,
             })
         );
         assert_eq!(
@@ -3304,6 +3323,7 @@ upstreams: {{ u: {{ endpoints: [] }} }}
             Some(CompiledTimeouts {
                 request: Some(Timeout::After(std::time::Duration::from_millis(1500))),
                 backend_request: Some(Timeout::After(std::time::Duration::from_millis(500))),
+                tunnel_idle: None,
             })
         );
         // A try may take no longer than the request it is a try of: Gateway API's own rule,
@@ -3322,10 +3342,25 @@ upstreams: {{ u: {{ endpoints: [] }} }}
             Some(CompiledTimeouts {
                 request: Some(Timeout::Off),
                 backend_request: None,
+                tunnel_idle: None,
             })
         );
         // One spelling: `timeouts` saying nothing is its absence written another way.
         assert!(with(", timeouts: {}").unwrap_err()[0].ends_with("`timeouts` states no timeout"));
+        // A WebSocket's idle bound, alone: the fixed clocks still bound the handshake.
+        assert_eq!(
+            with(", timeouts: { tunnel_idle_ms: 300000 }").unwrap(),
+            Some(CompiledTimeouts {
+                request: None,
+                backend_request: None,
+                tunnel_idle: Some(std::time::Duration::from_secs(300)),
+            })
+        );
+        assert!(with(", timeouts: { tunnel_idle_ms: 1 }").is_ok());
+        assert!(
+            with(", timeouts: { tunnel_idle_ms: 0 }").unwrap_err()[0]
+                .ends_with("`tunnel_idle_ms` is 0: at least 1")
+        );
         assert!(
             serde_saphyr::from_str::<crate::Timeouts>("{ request: 10 }").is_err(),
             "an unknown field"
@@ -3360,6 +3395,10 @@ upstreams: {{ u: {{ endpoints: [] }} }}
         assert!(
             with(&format!(", {retry}")).is_ok(),
             "the fixed clocks are a try's"
+        );
+        assert!(
+            with(&format!(", timeouts: {{ tunnel_idle_ms: 60000 }}, {retry}")).is_ok(),
+            "an idle bound alone leaves the fixed clocks a try's"
         );
     }
 

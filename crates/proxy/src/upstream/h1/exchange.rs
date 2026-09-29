@@ -23,7 +23,7 @@ use crate::storage::{Charge, Exhausted};
 use crate::timers::{Alarm, Timers};
 use bytes::Bytes;
 use edgerush_router::Fields;
-use http::{HeaderMap, HeaderName, Method, Uri};
+use http::{HeaderMap, HeaderName, Method, StatusCode, Uri};
 use http_body::{Body, Frame, SizeHint};
 use std::cell::RefCell;
 use std::error::Error as StdError;
@@ -240,6 +240,9 @@ pub struct Exchange<S> {
     /// kept by whoever waits on the exchange, in place of the head deadline and the
     /// answer's idle clock before the head ([03 §6](../../../../docs/03-data-plane.md)).
     head_bounded_elsewhere: bool,
+    /// Whether the request is a WebSocket handshake, whose 101 is its final answer
+    /// ([19 §2](../../../../docs/19-websocket.md)).
+    upgrading: bool,
 }
 
 impl<S> Exchange<S> {
@@ -399,7 +402,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             head_sent: None,
             alarm: Alarm::new(&timers, None),
             head_bounded_elsewhere: false,
+            upgrading: false,
         }
+    }
+
+    /// Sends a WebSocket handshake, whose 101 is taken as its final answer rather than
+    /// refused ([19 §2](../../../../docs/19-websocket.md)).
+    pub(crate) fn upgrading(mut self) -> Self {
+        self.upgrading = true;
+        self
     }
 
     /// Leaves the wait for the answer's head to the rule's own timeouts, which the caller
@@ -604,9 +615,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             // one here and something else may read as one next; a 101 is a protocol this
             // does not speak. Neither may be waved through for being on the way to
             // something else ([13 §4](../../../docs/13-http1-upstream.md)).
-            let mut delivery = delivery(&head, Asked::from(method))?;
+            let asked = if self.upgrading {
+                Asked::Upgrade
+            } else {
+                Asked::from(method)
+            };
+            let mut delivery = delivery(&head, asked)?;
+            // A handshake's 101 is its final answer: the connection is the new protocol's
+            // from the byte after it.
+            let switching = self.upgrading && head.status == StatusCode::SWITCHING_PROTOCOLS;
 
-            if head.status.is_informational() {
+            if head.status.is_informational() && !switching {
                 // A 1.1 interim head is persistent unless it says close; 1.0 ones are
                 // refused before this. Read before its hop-by-hop fields come off.
                 close_said |= !delivery.persistent;
@@ -1086,6 +1105,12 @@ impl<S, B> H1Body<S, B> {
         })
     }
 
+    /// Keeps the connection from going back to its pool whatever the answer says: for a
+    /// request that may have bound it to its client.
+    pub(crate) fn not_kept(&mut self) {
+        self.persistent = false;
+    }
+
     /// Puts the connection back if it has earned its way, now that the body is over.
     ///
     /// Done when the body ends rather than when whoever holds it lets go: a body that is
@@ -1099,6 +1124,25 @@ impl<S, B> H1Body<S, B> {
         if let Some(kept) = self.take_if_reusable() {
             kept.put_back(&limits);
         }
+    }
+
+    /// The connection a WebSocket handshake's 101 switched, and what was read past the 101
+    /// — the first of what the backend sends in its new protocol — for a tunnel to carry
+    /// ([19 §2](../../../../docs/19-websocket.md)). None if the handshake had not all gone
+    /// out: RFC 9110 §7.8 has a client send its whole request before the new protocol
+    /// begins, and a connection with some of it still to go is out of step. Never a way
+    /// back into a pool.
+    pub(crate) fn into_switched(mut self) -> Option<(S, Option<Block>)> {
+        let rest = self.rest.take()?;
+        if !rest.upload_finished() {
+            return None;
+        }
+        let mut exchange = rest.exchange;
+        // Everything staged has gone, so the staging buffer goes back.
+        exchange.outgoing.clear();
+        exchange.give_back_staging_if_empty();
+        let leftover = exchange.incoming.take();
+        Some((exchange.socket, leftover))
     }
 
     /// What is left of the connection whatever state it is in, for a caller that means to

@@ -462,12 +462,14 @@ pub(crate) struct UpstreamCounters {
     /// Retries a rule's retry wanted for a body not kept whole.
     pub(crate) retries_unkept: Counter,
     /// Copies a mirror to this upstream did not get, by why: no place for them on the
-    /// worker, fallen too far behind, no endpoint to send them to, or credentials bound to
-    /// the client's connection.
+    /// worker, fallen too far behind, no endpoint to send them to, credentials bound to
+    /// the client's connection, or a WebSocket handshake, of which a mirror could never be
+    /// sent more than the handshake.
     pub(crate) mirrors_busy: Counter,
     pub(crate) mirrors_behind: Counter,
     pub(crate) mirrors_nowhere: Counter,
     pub(crate) mirrors_credentials: Counter,
+    pub(crate) mirrors_upgrade: Counter,
 }
 
 impl UpstreamCounters {
@@ -812,6 +814,7 @@ impl Metrics {
                     "credentials",
                     series.sum(|shard| shard.mirrors_credentials.get()),
                 ),
+                ("upgrade", series.sum(|shard| shard.mirrors_upgrade.get())),
             ] {
                 scrape.sample(name, &[("upstream", upstream), ("reason", reason)], count);
             }

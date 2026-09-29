@@ -1,12 +1,14 @@
 //! Two connections carried to each other byte for byte, both ways at once: an L4
-//! listener's connection and its backend ([17 §4](../../../docs/17-tcp-and-tls-passthrough.md)).
+//! listener's connection and its backend ([17 §4](../../../docs/17-tcp-and-tls-passthrough.md)),
+//! or a WebSocket's client and backend once the upgrade is made
+//! ([19 §5](../../../docs/19-websocket.md)).
 //!
 //! Each way reads into a block of the worker's and writes what it read on before it reads
 //! again, so a side that stops taking bytes stops the other from sending more than a block
 //! ahead. **A way holds a block only while bytes are on their way**: it takes one to read
 //! into, and gives it back as soon as everything in it has been written on, or as soon as
 //! a read finds nothing. An idle tunnel holds no buffer at all, which is what lets a worker
-//! hold as many quiet tunnels as it has connections for. The blocks come from the
+//! hold as many quiet WebSockets as it has connections for. The blocks come from the
 //! worker's free list, so taking and giving one is a push and a pop.
 //!
 //! A side's end is passed on as a half-close (`shutdown(Write)`), and the other way goes on
@@ -18,6 +20,7 @@
 use crate::drain::Drain;
 use crate::timers::{Alarm, Timers};
 use crate::upstream::h1::blocks::{Block, Blocks};
+use crate::upstream::secure::Socket;
 use std::cell::RefCell;
 use std::future::poll_fn;
 use std::pin::{Pin, pin};
@@ -61,6 +64,19 @@ pub(crate) struct Bounds {
     pub(crate) idle: Duration,
     /// How long it may go on once the worker drains.
     pub(crate) drain_within: Duration,
+}
+
+/// A WebSocket's backend, once its upgrade is made (19 §2): the connection its 101 came on,
+/// what was read past the 101, and what the tunnel is held to. The request core hands it to
+/// the server that wrote the 101, which carries it to its client.
+#[derive(Debug)]
+pub(crate) struct Switched {
+    /// The backend's connection.
+    pub(crate) backend: Socket,
+    /// What the backend sent after its 101, which goes to the client first.
+    pub(crate) leftover: Option<Block>,
+    /// The rule's idle bound, and the worker's drain bound.
+    pub(crate) bounds: Bounds,
 }
 
 /// One way through the tunnel.
@@ -273,7 +289,7 @@ mod tests {
         assert_eq!(read, bytes);
     }
 
-    /// A tunnel holds a block only while bytes are on their way (17 §4): two tunnels on a
+    /// A tunnel holds a block only while bytes are on their way (19 §5): two tunnels on a
     /// worker that can pay for one block between them carry bytes each way in turn, each
     /// quiet while the other carries. One that kept a block while quiet would leave the
     /// other none.

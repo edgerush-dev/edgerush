@@ -44,7 +44,7 @@ use crate::slots::{Slots, WorkerSlots};
 use crate::storage::Storage;
 use crate::timers::{Alarm, Timers};
 use crate::tls::{self, Tls, TlsError};
-use crate::tunnel::{Bounds as TunnelBounds, carry};
+use crate::tunnel::{Bounds as TunnelBounds, Switched, carry};
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Block, Blocks, SMALL, Sizes};
@@ -55,6 +55,7 @@ use crate::upstream::h2::client::{Client as H2Client, PlaceError, Settings as H2
 use crate::upstream::h2::exchange::{self as h2_exchange, Bounds as H2Bounds};
 use crate::upstream::h2::pool::Limits as H2Limits;
 use crate::upstream::secure::{Secure, Socket as UpstreamSocket};
+use crate::websocket::{self, Key};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use edgerush_config::{
@@ -400,7 +401,7 @@ where
         Rc::clone(&ours.worker).handle_head(listener, Rc::clone(&client), head, body, Some(interim))
     };
     let slots = slots_for(&worker.slots, &respond);
-    let _ended = h1::serve(
+    let ended = h1::serve(
         socket,
         &worker.h1,
         Rc::clone(&worker.blocks),
@@ -411,6 +412,12 @@ where
         &slots,
     )
     .await;
+    // A WebSocket's tunnel is counted as an L4 listener's are, by how it ended (19 §5).
+    if let h1::Ended::Switched(carried) = ended
+        && let Some(counters) = worker.proxy.metrics.listener(listener)
+    {
+        counters.tunnel(carried.into());
+    }
 }
 
 /// The worker's slots for the futures `respond` makes: named by the closure, as the futures'
@@ -983,6 +990,7 @@ impl Worker {
         body: B,
         interim: Option<Interim>,
         head_by_rule: bool,
+        upgrading: bool,
     ) -> Result<(RawAnswer, Box<H1Body<UpstreamSocket, B>>), ExchangeError>
     where
         F: OutgoingFields + ?Sized,
@@ -1041,6 +1049,9 @@ impl Worker {
         }
         if head_by_rule {
             exchange = exchange.head_bounded_elsewhere();
+        }
+        if upgrading {
+            exchange = exchange.upgrading();
         }
         let (answer, rest) = exchange
             .send(method, uri, headers, nominated, sending, body, &self.limits)
@@ -1529,6 +1540,24 @@ impl Worker {
             }
         }
 
+        // What asks the backend to switch is the gateway's own, its key included: in place
+        // of the client's `Upgrade`, `Connection` (a `close` for credentials among it: a
+        // refused handshake's connection is kept from the pool instead) and key (19 §2).
+        if let Some(handshake) = &directed.websocket {
+            let asked = head
+                .set_field(http::header::UPGRADE, websocket::WEBSOCKET)
+                .and_then(|()| head.set_field(http::header::CONNECTION, websocket::UPGRADE_OPTION))
+                .and_then(|()| {
+                    head.set_field(http::header::SEC_WEBSOCKET_KEY, handshake.ours.value())
+                });
+            if let Err(rejection) = asked {
+                return self
+                    .proxy
+                    .answer_to(listener, rejection.into(), call)
+                    .into();
+            }
+        }
+
         // Before either client looks for a connection or opens one: a place is what
         // entitles a request to a connection, so it is taken before one is sought. The same
         // bound whichever client carries the request, so that the two are compared doing
@@ -1659,11 +1688,30 @@ impl Worker {
             .rule
             .as_ref()
             .and_then(|rule| rule.response_headers.as_ref());
+        // Read before the hop-by-hop fields come off: RFC 9110 §15.5.22 has a 426 name the
+        // protocol it wants, and WebSocket is one the gateway can switch to (19 §2).
+        let offers = answer.status() == StatusCode::UPGRADE_REQUIRED
+            && directed.upgradable
+            && websocket::offered(&answer);
         let edited = answer.filter_declaration(&nominated).and_then(|()| {
             answer.strip();
             changes.map_or(Ok(()), |changes| answer.apply(changes))
         });
-        if edited.is_err() {
+        // A 101 says it switched to WebSocket, with the Accept of the client's own key; the
+        // backend's was of the gateway's.
+        let upgraded = match &directed.websocket {
+            Some(handshake) if answer.status() == StatusCode::SWITCHING_PROTOCOLS => answer
+                .set_field(http::header::UPGRADE, websocket::WEBSOCKET)
+                .and_then(|()| {
+                    answer.set_field(
+                        http::header::SEC_WEBSOCKET_ACCEPT,
+                        handshake.client.accept_value(),
+                    )
+                }),
+            _ if offers => answer.set_field(http::header::UPGRADE, websocket::WEBSOCKET),
+            _ => Ok(()),
+        };
+        if edited.is_err() || upgraded.is_err() {
             return Err(Answer::Edits);
         }
         // Written in this hop's version and not the upstream's: "Intermediaries that
@@ -1856,6 +1904,8 @@ impl Worker {
                     endpoint: Arc::clone(&mirror.endpoint),
                     others: None,
                     mirrors: Vec::new(),
+                    websocket: None,
+                    upgradable: false,
                 };
                 // A copy given up on is let go of at once, its exchange and place with it:
                 // what sends it may be waiting for room its upstream will never give, and
@@ -2040,6 +2090,9 @@ impl Worker {
         interim: Option<Interim>,
         head_by_rule: bool,
     ) -> Result<(RawAnswer, Body), Answer> {
+        // The server that read a handshake takes its backend from here once the 101 is
+        // answered.
+        let listening = directed.websocket.as_ref().and(interim.clone());
         let answer = match self
             .through_h1(
                 endpoint,
@@ -2051,6 +2104,7 @@ impl Worker {
                 body,
                 interim,
                 head_by_rule,
+                directed.websocket.is_some(),
             )
             .await
         {
@@ -2086,6 +2140,16 @@ impl Worker {
             }
         };
         let (read, mut body) = answer;
+        if let Some(handshake) = &directed.websocket {
+            if read.status() == StatusCode::SWITCHING_PROTOCOLS {
+                return self.switch(read, *body, handshake, listening);
+            }
+            // A refused handshake's connection could carry another request, but not one
+            // whose credentials may have bound it to this client (13 §6).
+            if crate::upstream::auth::carries_credentials(head.outgoing()) {
+                body.not_kept();
+            }
+        }
         // Nothing need ever poll an empty body, so its connection would otherwise sit
         // until the body object was dropped.
         if body.is_end_stream() {
@@ -2098,6 +2162,33 @@ impl Worker {
             upstream: directed.upstream_slot,
         };
         Ok((read, Body::Ours(body, admitted, watch)))
+    }
+
+    /// A handshake's 101 (19 §2). Only one that says it switched to the WebSocket asked for,
+    /// with the Accept of the gateway's own key, is taken: its connection goes to the server
+    /// that read the handshake, left with its interim channel, and the 101 goes on with
+    /// nothing after it. Any other is the backend failing, and its connection is closed.
+    fn switch(
+        &self,
+        read: RawAnswer,
+        body: H1Body<UpstreamSocket, RequestBody>,
+        handshake: &Handshake,
+        listening: Option<Interim>,
+    ) -> Result<(RawAnswer, Body), Answer> {
+        let switched = listening.filter(|_| websocket::switched(&read, &handshake.ours));
+        let Some((interim, (backend, leftover))) = switched.zip(body.into_switched()) else {
+            self.proxy.metrics.stopped(Stopped::Codec);
+            return Err(Answer::UpstreamFailed);
+        };
+        interim.switch(Switched {
+            backend,
+            leftover,
+            bounds: TunnelBounds {
+                idle: handshake.idle,
+                drain_within: self.deadlines.drain,
+            },
+        });
+        Ok((read, Body::Empty))
     }
 }
 
@@ -2242,7 +2333,26 @@ impl Proxy {
 
         let target = at_endpoint(head.uri(), endpoint).ok_or(Answer::BadTarget)?;
         head.set_uri(target);
+        let upgradable = head.version() == Version::HTTP_11;
         head.onward();
+        // A handshake goes on as one to a backend spoken to in HTTP/1.1; to one spoken to in
+        // HTTP/2 it goes as the plain request its `Upgrade` already left it (19 §4).
+        let websocket = forward
+            .websocket
+            .as_ref()
+            .filter(|_| identity.protocol() == UpstreamProtocol::Http1)
+            .and_then(|key| Key::read(key.as_bytes()))
+            .and_then(|client| {
+                Some(Handshake {
+                    client,
+                    ours: Key::of(unguessable()?),
+                    idle: forward
+                        .rule
+                        .timeouts()
+                        .and_then(|timeouts| timeouts.tunnel_idle)
+                        .unwrap_or(TUNNEL_IDLE),
+                })
+            });
         if let Some(counters) = self.metrics.upstream(upstream_slot) {
             counters.requests.inc();
         }
@@ -2261,6 +2371,13 @@ impl Proxy {
             let Some(&slot) = snapshot.upstream_slots.get(upstream) else {
                 continue;
             };
+            // A mirror could only ever be sent a WebSocket's handshake, never its messages.
+            if forward.websocket.is_some() {
+                if let Some(counters) = self.metrics.upstream(slot) {
+                    counters.mirrors_upgrade.inc();
+                }
+                continue;
+            }
             let destinations = snapshot.destinations.of(upstream);
             let found = pick_healthy(destinations.len(), random(), |at| {
                 destinations
@@ -2305,6 +2422,8 @@ impl Proxy {
             endpoint: Arc::clone(identity),
             others,
             mirrors,
+            websocket,
+            upgradable,
         }))
     }
 }
@@ -2337,7 +2456,27 @@ struct Directed {
     others: Option<Vec<(Authority, Arc<ReuseIdentity>)>>,
     /// Where the copies of it go, for a request its rule mirrors.
     mirrors: Vec<Mirrored>,
+    /// For a WebSocket handshake carried to an HTTP/1.1 backend (19 §2).
+    websocket: Option<Handshake>,
+    /// Whether its client spoke HTTP/1.1, which alone has `Upgrade`: a 426 that offers
+    /// WebSocket says so to it, and to no other (19 §2).
+    upgradable: bool,
 }
+
+/// A WebSocket handshake as the gateway carries it (19 §2).
+struct Handshake {
+    /// The key the client sent, whose Accept its 101 carries.
+    client: Key,
+    /// The key the gateway sent the backend in its place, whose Accept the backend's 101
+    /// must carry: one the client never saw, so that a 101 the backend hands back for it
+    /// cannot pass.
+    ours: Key,
+    /// How long the tunnel may carry nothing: the rule's, or an hour.
+    idle: Duration,
+}
+
+/// A WebSocket's idle bound where its rule states none (19 §5).
+const TUNNEL_IDLE: Duration = Duration::from_secs(3600);
 
 /// Where one copy of a request goes: drawn with the request, from the same snapshot.
 struct Mirrored {
@@ -7398,6 +7537,7 @@ upstreams:
         edgerush_config::Timeouts {
             request_ms: Some(ms),
             backend_request_ms: None,
+            tunnel_idle_ms: None,
         }
     }
 
@@ -7406,6 +7546,7 @@ upstreams:
         edgerush_config::Timeouts {
             request_ms: request,
             backend_request_ms: Some(ms),
+            tunnel_idle_ms: None,
         }
     }
 
@@ -9951,6 +10092,7 @@ upstreams:
                             http_body_util::Empty::<Bytes>::new(),
                             None,
                             false,
+                            false,
                         )
                         .await
                         .unwrap();
@@ -10138,5 +10280,138 @@ upstreams:
             ),
             "{scrape}"
         );
+    }
+
+    /// A backend over TLS as `certificate` says that speaks WebSocket as far as the
+    /// handshake goes: a 101 with the Accept of the key it was sent and `hello` after it,
+    /// then everything it reads sent back until its peer closes.
+    async fn tls_websocket_backend(certificate: &edgerush_config::Certificate) -> SocketAddr {
+        use boring::pkey::PKey;
+        use boring::ssl::{SslAcceptor, SslMethod};
+        use boring::x509::X509;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        builder
+            .set_certificate(&X509::from_pem(certificate.chain.as_bytes()).unwrap())
+            .unwrap();
+        builder
+            .set_private_key(&PKey::private_key_from_pem(certificate.key.as_bytes()).unwrap())
+            .unwrap();
+        let acceptor = Rc::new(builder.build());
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let _accepting = tokio::task::spawn_local(async move {
+            while let Ok((stream, _)) = socket.accept().await {
+                let acceptor = Rc::clone(&acceptor);
+                let _serving = tokio::task::spawn_local(async move {
+                    let Ok(mut secured) = tokio_boring::accept(&acceptor, stream).await else {
+                        return;
+                    };
+                    let mut head = Vec::new();
+                    let mut byte = [0; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match secured.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => head.push(byte[0]),
+                        }
+                    }
+                    let head = String::from_utf8(head).unwrap();
+                    let key = head
+                        .split("\r\n")
+                        .find_map(|line| line.strip_prefix("sec-websocket-key: "))
+                        .and_then(|key| Key::read(key.as_bytes()))
+                        .unwrap();
+                    let accept = String::from_utf8(key.accept().to_vec()).unwrap();
+                    let switched = format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\
+                         connection: upgrade\r\nsec-websocket-accept: {accept}\r\n\r\nhello"
+                    );
+                    if secured.write_all(switched.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let mut bytes = [0; 1024];
+                    loop {
+                        match secured.read(&mut bytes).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => {
+                                if secured.write_all(&bytes[..read]).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    let _ = secured.write_all(b"bye").await;
+                    let _ = secured.shutdown().await;
+                });
+            }
+        });
+        address
+    }
+
+    /// A WebSocket is carried as it is in plaintext when both of its connections are TLS
+    /// ones: the client's to an `https` listener and the gateway's to a backend it verifies
+    /// (19 §5).
+    #[tokio::test]
+    async fn a_websocket_is_carried_over_tls_on_both_sides() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::tls::testing::certificate;
+                let server = certificate(&["backend.test"]);
+                let upstream = tls_websocket_backend(&server).await;
+                let mut config = everything_config(upstream);
+                config.upstreams.get_mut("up").unwrap().tls =
+                    Some(trusting("backend.test", &server));
+                let web = config.listeners.get_mut("web").unwrap();
+                web.protocol = edgerush_config::Protocol::Https;
+                web.tls = Some(edgerush_config::Tls {
+                    certificates: vec![certificate(&["a.test"])],
+                    client_validation: None,
+                });
+                let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+                let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = serving(&worker, socket);
+
+                let mut client = tls_client(front, "a.test", Some(b"\x08http/1.1"), |_| {})
+                    .await
+                    .unwrap();
+                client
+                    .write_all(
+                        b"GET /chat HTTP/1.1\r\nhost: a.test\r\nupgrade: websocket\r\n\
+                          connection: upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                          sec-websocket-version: 13\r\n\r\nearly",
+                    )
+                    .await
+                    .unwrap();
+                let mut said = Vec::new();
+                let mut bytes = [0; 1024];
+                while !said.ends_with(b"helloearly") {
+                    let read = within(client.read(&mut bytes)).await.unwrap();
+                    assert_ne!(read, 0, "{}", String::from_utf8_lossy(&said));
+                    said.extend_from_slice(&bytes[..read]);
+                }
+                let said = String::from_utf8(said).unwrap();
+                assert!(
+                    said.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+                    "{said}"
+                );
+                assert!(
+                    said.contains("\r\nsec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"),
+                    "{said}"
+                );
+                client.write_all(b"ping").await.unwrap();
+                let mut echoed = [0; 4];
+                within(client.read_exact(&mut echoed)).await.unwrap();
+                assert_eq!(&echoed, b"ping");
+                client.shutdown().await.unwrap();
+                let mut rest = Vec::new();
+                let _ended = within(client.read_to_end(&mut rest)).await;
+                assert_eq!(rest, b"bye");
+                tunnel_ended(&worker, "web", "closed").await;
+            })
+            .await;
     }
 }

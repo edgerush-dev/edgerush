@@ -13,8 +13,14 @@
 //!
 //! What waits here is bounded by the exchange's own interim limits (13 §7), and the server
 //! takes it in the same turn it polls the answer in. Worker-local, never `Send`.
+//!
+//! A WebSocket's 101 is an informational answer too, and the last this channel carries: the
+//! request core leaves the backend's switched connection here, and the server that writes
+//! the 101 takes it and carries the two to each other
+//! ([19 §2](../../docs/19-websocket.md)).
 
 use crate::downstream::h1::continuing::{Coordinator, Expectation, Relay};
+use crate::tunnel::Switched;
 use http::{HeaderMap, StatusCode, Version};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -51,6 +57,9 @@ pub(crate) struct State {
     coordinator: Option<Coordinator>,
     /// Interim answers to pass on, in the order they came, their hop-by-hop fields off.
     forwarded: VecDeque<(StatusCode, HeaderMap)>,
+    /// A WebSocket's backend, once its 101 has been answered, for the server to carry.
+    /// Boxed: rare, and every exchange holds a channel of its own.
+    switched: Option<Box<Switched>>,
 }
 
 impl State {
@@ -62,6 +71,7 @@ impl State {
             listened,
             coordinator: None,
             forwarded: VecDeque::new(),
+            switched: None,
         }
     }
 
@@ -138,6 +148,23 @@ impl Interim {
     /// A local `100` to write, if one is wanted. At most one per request.
     pub(crate) fn take_local_continue(&self) -> bool {
         self.0.borrow_mut().with(Coordinator::take_local_continue)
+    }
+
+    // What the request core tells the server.
+
+    /// The backend of a WebSocket whose 101 is the answer, for the server to carry to its
+    /// client once it has written the 101.
+    pub(crate) fn switch(&self, switched: Switched) {
+        self.0.borrow_mut().switched = Some(Box::new(switched));
+    }
+
+    /// The backend a 101 switched, once.
+    pub(crate) fn take_switched(&self) -> Option<Switched> {
+        self.0
+            .borrow_mut()
+            .switched
+            .take()
+            .map(|switched| *switched)
     }
 }
 

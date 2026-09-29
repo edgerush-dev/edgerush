@@ -180,6 +180,11 @@ pub struct Timeouts {
     /// client as the client takes it, and a slow client is not the backend running late.
     #[serde(default)]
     pub backend_request_ms: Option<u64>,
+    /// Milliseconds a WebSocket may carry nothing either way once its upgrade is made,
+    /// before it is closed ([19 §5](../../../../docs/19-websocket.md)); at least 1, and an
+    /// hour when not stated. Not Gateway API's: it has no such field.
+    #[serde(default)]
+    pub tunnel_idle_ms: Option<u64>,
 }
 
 /// When a request is sent again, and how often (Gateway API's HTTPRoute retry, with

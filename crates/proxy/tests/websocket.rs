@@ -1,0 +1,733 @@
+//! WebSocket over HTTP/1.1, on the wire on both sides
+//! ([19](../../../docs/19-websocket.md)).
+//!
+//! The backend here is a socket the test writes to, so that it can answer a handshake the
+//! way a real one does and the ways a broken or hostile one might: a 101 for another key,
+//! for another protocol, or none at all. The client is raw for the same reason.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test set-up: the helpers around the tests fail them the way the tests would"
+)]
+
+use edgerush_config::{Config, compile};
+use edgerush_proxy::{Proxy, Worker};
+use std::future::Future;
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+
+/// RFC 6455 §1.3's example key, and the Accept a server that read it answers with.
+const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+const ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+
+/// A handshake for `/chat`, as a browser sends it.
+fn handshake() -> String {
+    format!(
+        "GET /chat HTTP/1.1\r\nhost: chat.test\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\
+         sec-websocket-key: {KEY}\r\nsec-websocket-version: 13\r\norigin: https://chat.test\r\n\r\n"
+    )
+}
+
+/// A test that waits for what never comes should fail, not hang.
+async fn within<T>(future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(10), future)
+        .await
+        .expect("timed out")
+}
+
+/// A gateway whose one rule sends everything to `upstream`, the rule's `forward` given
+/// `extra` and the config `upstreams` besides; and the data plane, for its metrics.
+fn gateway(upstream: SocketAddr, extra: &str, upstreams: &str) -> (SocketAddr, Arc<Proxy>) {
+    let yaml = format!(
+        r#"
+listeners:
+  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+routes:
+  - name: everything
+    listeners: [web]
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: / }}
+{extra}
+upstreams:
+  up: {{ endpoints: ["{upstream}"] }}
+{upstreams}
+"#
+    );
+    let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+    let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let address = socket.local_addr().unwrap();
+    let serving = Arc::clone(&proxy);
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let entered = runtime.enter();
+        let socket = TcpListener::from_std(socket).unwrap();
+        let worker = Worker::new(serving);
+        local.spawn_local(std::rc::Rc::clone(&worker).maintain());
+        local.spawn_local(worker.serve(0, socket));
+        drop(entered);
+        runtime.block_on(local);
+    });
+    (address, proxy)
+}
+
+/// The plain rule: everything forwarded to `up`.
+const FORWARD: &str = "        forward: { backends: [{ upstream: up, weight: 1 }] }";
+
+/// A backend that is a socket and nothing more: every connection it accepts is handed to
+/// `answer`. Says where it listens, and counts the connections it has accepted.
+fn backend<F, Fut>(answer: F) -> (SocketAddr, Arc<AtomicUsize>)
+where
+    F: Fn(Wire) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let address = socket.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let socket = TcpListener::from_std(socket).unwrap();
+            loop {
+                let (stream, _) = socket.accept().await.unwrap();
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(answer(Wire::new(stream)));
+            }
+        });
+    });
+    (address, accepted)
+}
+
+/// One end of a connection, read and written as bytes.
+struct Wire {
+    stream: TcpStream,
+    buffered: Vec<u8>,
+}
+
+impl Wire {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            buffered: Vec::new(),
+        }
+    }
+
+    async fn to(address: SocketAddr) -> Self {
+        Self::new(TcpStream::connect(address).await.unwrap())
+    }
+
+    async fn write(&mut self, bytes: &str) {
+        self.stream.write_all(bytes.as_bytes()).await.unwrap();
+    }
+
+    /// Ends this side's sending, as a WebSocket's clean close ends its TCP connection.
+    async fn finish(&mut self) {
+        self.stream.shutdown().await.unwrap();
+    }
+
+    /// Reads up to and including the empty line that ends a head.
+    async fn head(&mut self) -> String {
+        let head = self.until(b"\r\n\r\n").await.expect("a whole head");
+        String::from_utf8(head).unwrap()
+    }
+
+    /// Reads exactly `count` bytes.
+    async fn exactly(&mut self, count: usize) -> String {
+        while self.buffered.len() < count {
+            assert!(self.more().await, "the connection ended early");
+        }
+        let rest = self.buffered.split_off(count);
+        String::from_utf8(std::mem::replace(&mut self.buffered, rest)).unwrap()
+    }
+
+    /// Reads until `mark`, and returns everything up to and including it; `None` if the
+    /// connection ended first.
+    async fn until(&mut self, mark: &[u8]) -> Option<Vec<u8>> {
+        loop {
+            if let Some(at) = self
+                .buffered
+                .windows(mark.len())
+                .position(|window| window == mark)
+            {
+                let rest = self.buffered.split_off(at + mark.len());
+                return Some(std::mem::replace(&mut self.buffered, rest));
+            }
+            if !self.more().await {
+                return None;
+            }
+        }
+    }
+
+    /// Everything that arrives until the connection ends, however it ends.
+    async fn rest(&mut self) -> String {
+        let mut bytes = [0; 4096];
+        loop {
+            match within(self.stream.read(&mut bytes)).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => self.buffered.extend_from_slice(&bytes[..read]),
+            }
+        }
+        String::from_utf8_lossy(&std::mem::take(&mut self.buffered)).into_owned()
+    }
+
+    /// Reads whatever has arrived. False when the peer has closed.
+    async fn more(&mut self) -> bool {
+        let mut bytes = [0; 4096];
+        let read = within(self.stream.read(&mut bytes)).await.unwrap_or(0);
+        self.buffered.extend_from_slice(&bytes[..read]);
+        read > 0
+    }
+}
+
+/// The value of the first field `name` in `head`, which is in lower case.
+fn field<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.split("\r\n").skip(1).find_map(|line| {
+        let (field, value) = line.split_once(':')?;
+        field.eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+/// The Accept a server that read `key` answers with (RFC 6455 §4.2.2).
+fn accept_of(key: &str) -> String {
+    let mut hashed = key.as_bytes().to_vec();
+    hashed.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    base64(&boring::sha::sha1(&hashed))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for group in bytes.chunks(3) {
+        let at = |index: usize| u32::from(group.get(index).copied().unwrap_or(0));
+        let joined = at(0) << 16 | at(1) << 8 | at(2);
+        for place in 0..4 {
+            out.push(if place <= group.len() {
+                char::from(ALPHABET[((joined >> (18 - 6 * place)) & 0x3f) as usize])
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+/// A backend that speaks WebSocket as far as the handshake goes: it tells `saw` the head it
+/// was sent, answers with a 101 carrying the Accept of the key in it and `hello` in the same
+/// write, then sends back everything it reads until the gateway's side closes, and closes.
+fn echoing(saw: mpsc::UnboundedSender<String>) -> (SocketAddr, Arc<AtomicUsize>) {
+    backend(move |mut wire| {
+        let saw = saw.clone();
+        async move {
+            let head = wire.head().await;
+            let accept = accept_of(field(&head, "sec-websocket-key").unwrap_or_default());
+            let _told = saw.send(head);
+            wire.write(&format!(
+                "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\
+                 connection: Upgrade\r\nsec-websocket-accept: {accept}\r\n\
+                 sec-websocket-protocol: chat\r\n\r\nhello"
+            ))
+            .await;
+            let mut bytes = [0; 4096];
+            let mut first = true;
+            loop {
+                let read = match within(wire.stream.read(&mut bytes)).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                let mut said = String::from_utf8_lossy(&bytes[..read]).into_owned();
+                if first {
+                    // What the client sent before it heard the 101 comes first.
+                    let _told = saw.send(format!("first: {said}"));
+                    first = false;
+                    said = format!("[{said}]");
+                }
+                wire.stream.write_all(said.as_bytes()).await.unwrap();
+            }
+            wire.write("bye").await;
+            wire.finish().await;
+        }
+    })
+}
+
+/// The value of one sample of the data plane's metrics, by its whole name and labels.
+fn sample(proxy: &Proxy, series: &str) -> Option<u64> {
+    proxy.metrics().lines().find_map(|line| {
+        line.strip_prefix(series)
+            .and_then(|rest| rest.trim().parse().ok())
+    })
+}
+
+/// Waits a little for `series` to reach `value`: a tunnel is counted as it ends, which is
+/// after its last byte has gone.
+async fn counted(proxy: &Proxy, series: &str, value: u64) {
+    let began = Instant::now();
+    while sample(proxy, series) != Some(value) {
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "{series} is {:?}, not {value}",
+            sample(proxy, series)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_websocket_is_carried_both_ways_once_its_101_has_gone() {
+    let (saw, mut seen) = mpsc::unbounded_channel();
+    let (upstream, accepted) = echoing(saw);
+    let (address, proxy) = gateway(upstream, FORWARD, "");
+    let mut client = Wire::to(address).await;
+    // Bytes after the handshake, sent before the 101 could have come: RFC 6455 has a client
+    // wait, but nothing of them may be lost or read as HTTP.
+    client.write(&format!("{}early", handshake())).await;
+
+    // What the backend was asked: the gateway's own handshake, not the client's key.
+    let asked = within(seen.recv()).await.unwrap();
+    assert!(asked.starts_with("GET /chat HTTP/1.1\r\n"), "{asked}");
+    assert_eq!(field(&asked, "upgrade"), Some("websocket"), "{asked}");
+    assert_eq!(field(&asked, "connection"), Some("upgrade"), "{asked}");
+    let ours = field(&asked, "sec-websocket-key").unwrap();
+    assert_ne!(ours, KEY, "the client's key went on");
+    assert_eq!(ours.len(), 24, "{asked}");
+    assert_eq!(
+        field(&asked, "sec-websocket-version"),
+        Some("13"),
+        "{asked}"
+    );
+    assert_eq!(
+        field(&asked, "origin"),
+        Some("https://chat.test"),
+        "{asked}"
+    );
+    assert!(field(&asked, "x-forwarded-for").is_some(), "{asked}");
+
+    let head = within(client.head()).await;
+    assert!(
+        head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "{head}"
+    );
+    assert_eq!(field(&head, "upgrade"), Some("websocket"), "{head}");
+    assert_eq!(field(&head, "connection"), Some("upgrade"), "{head}");
+    assert_eq!(field(&head, "sec-websocket-accept"), Some(ACCEPT), "{head}");
+    assert_eq!(
+        field(&head, "sec-websocket-protocol"),
+        Some("chat"),
+        "{head}"
+    );
+    assert!(field(&head, "x-request-id").is_some(), "{head}");
+    assert!(field(&head, "content-length").is_none(), "{head}");
+    assert!(field(&head, "transfer-encoding").is_none(), "{head}");
+    // What the backend sent with its 101 comes first.
+    assert_eq!(within(client.exactly(5)).await, "hello");
+    assert_eq!(within(seen.recv()).await.unwrap(), "first: early");
+    assert_eq!(within(client.exactly(7)).await, "[early]");
+
+    client.write("ping").await;
+    assert_eq!(within(client.exactly(4)).await, "ping");
+    // A clean end is passed on, and the backend's own goes back.
+    client.finish().await;
+    assert_eq!(client.rest().await, "bye");
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    counted(
+        &proxy,
+        r#"edgerush_listener_tunnels_total{listener="web",outcome="closed"}"#,
+        1,
+    )
+    .await;
+    assert_eq!(
+        sample(
+            &proxy,
+            r#"edgerush_listener_responses_total{listener="web",class="1xx"}"#
+        ),
+        Some(1)
+    );
+}
+
+/// A backend that fetches URLs for its clients can be made to hand back a 101 an attacker
+/// wrote, and a gateway that switched on it would give the client a raw pipe past routing
+/// (19 §2). The client picks its own key and can work out the Accept of it, so a 101 is
+/// held to the Accept of the gateway's key, which the client never saw.
+#[tokio::test]
+async fn a_101_carrying_the_accept_of_the_clients_key_is_refused() {
+    let (saw, mut seen) = mpsc::unbounded_channel();
+    let (upstream, _) = backend(move |mut wire| {
+        let saw = saw.clone();
+        async move {
+            let _head = wire.head().await;
+            wire.write(&format!(
+                "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\
+                 connection: upgrade\r\nsec-websocket-accept: {ACCEPT}\r\n\r\nTUNNELLED"
+            ))
+            .await;
+            // What the gateway sent after the 101, until it closed the connection.
+            let _told = saw.send(within(wire.rest()).await);
+        }
+    });
+    let (address, proxy) = gateway(upstream, FORWARD, "");
+    let mut client = Wire::to(address).await;
+    client.write(&handshake()).await;
+
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    assert!(field(&head, "upgrade").is_none(), "{head}");
+    let length: usize = field(&head, "content-length").unwrap().parse().unwrap();
+    assert!(!within(client.exactly(length)).await.contains("TUNNELLED"));
+    // The backend's connection is closed rather than kept or tunnelled: what the client
+    // sends now is no WebSocket message of the backend's.
+    client
+        .write("GET /x HTTP/1.1\r\nhost: chat.test\r\n\r\n")
+        .await;
+    assert_eq!(
+        within(seen.recv()).await.unwrap(),
+        "",
+        "sent on after the 101"
+    );
+    assert_eq!(
+        sample(
+            &proxy,
+            r#"edgerush_listener_tunnels_total{listener="web",outcome="closed"}"#
+        ),
+        Some(0)
+    );
+}
+
+/// A 101 that does not say it switched to WebSocket, with the Accept of the gateway's key,
+/// is the backend failing: 502, and the connection it came on closed.
+#[tokio::test]
+async fn a_101_that_is_not_the_switch_asked_for_is_answered_502() {
+    for (why, answer) in [
+        (
+            "another protocol",
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: h2c\r\nconnection: upgrade\r\nsec-websocket-accept: {accept}\r\n\r\n",
+        ),
+        (
+            "no Connection naming upgrade",
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nsec-websocket-accept: {accept}\r\n\r\n",
+        ),
+        (
+            "no Accept",
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: upgrade\r\n\r\n",
+        ),
+        (
+            "a body",
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-accept: {accept}\r\ncontent-length: 2\r\n\r\nhi",
+        ),
+    ] {
+        let (upstream, _) = backend(move |mut wire| async move {
+            let head = wire.head().await;
+            let accept = accept_of(field(&head, "sec-websocket-key").unwrap());
+            wire.write(&answer.replace("{accept}", &accept)).await;
+            let _closed = within(wire.rest()).await;
+        });
+        let (address, _) = gateway(upstream, FORWARD, "");
+        let mut client = Wire::to(address).await;
+        client.write(&handshake()).await;
+        let head = within(client.head()).await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{why}: {head}");
+    }
+}
+
+/// A refused handshake is an ordinary answer (19 §2): the client's connection goes on as
+/// HTTP, and the backend's goes back to the pool.
+#[tokio::test]
+async fn a_refused_handshake_leaves_both_connections_to_carry_requests() {
+    let (saw, mut seen) = mpsc::unbounded_channel();
+    let (upstream, accepted) = backend(move |mut wire| {
+        let saw = saw.clone();
+        async move {
+            let _told = saw.send(wire.head().await);
+            wire.write("HTTP/1.1 403 Forbidden\r\ncontent-length: 2\r\n\r\nno")
+                .await;
+            if let Some(next) = wire.until(b"\r\n\r\n").await {
+                let _told = saw.send(String::from_utf8(next).unwrap());
+                wire.write("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+            let _closed = within(wire.rest()).await;
+        }
+    });
+    let (address, _) = gateway(upstream, FORWARD, "");
+    let mut client = Wire::to(address).await;
+    client.write(&handshake()).await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    assert!(field(&head, "upgrade").is_none(), "{head}");
+    assert_eq!(within(client.exactly(2)).await, "no");
+
+    client
+        .write("GET /next HTTP/1.1\r\nhost: chat.test\r\n\r\n")
+        .await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(within(client.exactly(2)).await, "ok");
+    let asked = within(seen.recv()).await.unwrap();
+    assert_eq!(field(&asked, "upgrade"), Some("websocket"), "{asked}");
+    let next = within(seen.recv()).await.unwrap();
+    assert!(next.starts_with("GET /next "), "{next}");
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "the backend's was not reused"
+    );
+}
+
+/// What follows a refused handshake on the client's connection is read as requests and
+/// routed like any other, never carried to the backend as bytes: a proxy that switched on
+/// the handshake alone let a refused one carry requests past routing (WebSocket smuggling,
+/// Varnish and Envoy to 1.8). And a 426 that asks for WebSocket says so to the client, the
+/// one protocol the gateway can switch to (RFC 9110 §15.5.22).
+#[tokio::test]
+async fn requests_after_a_refused_handshake_are_routed_not_tunnelled() {
+    let (saw, mut seen) = mpsc::unbounded_channel();
+    let (upstream, _) = backend(move |mut wire| {
+        let saw = saw.clone();
+        async move {
+            let _head = wire.head().await;
+            wire.write(concat!(
+                "HTTP/1.1 426 Upgrade Required\r\nupgrade: h2c, websocket\r\n",
+                "connection: upgrade\r\nsec-websocket-version: 13\r\n",
+                "content-length: 0\r\n\r\n"
+            ))
+            .await;
+            let next = wire.head().await;
+            let _told = saw.send(next);
+            wire.write("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await;
+            let _closed = within(wire.rest()).await;
+        }
+    });
+    let (address, _) = gateway(upstream, FORWARD, "");
+    let mut client = Wire::to(address).await;
+    client
+        .write(&format!(
+            "{}GET /admin HTTP/1.1\r\nhost: chat.test\r\nx-forwarded-for: 10.9.9.9\r\n\r\n",
+            handshake().replace("version: 13", "version: 8")
+        ))
+        .await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 426"), "{head}");
+    assert_eq!(field(&head, "upgrade"), Some("websocket"), "{head}");
+    assert_eq!(field(&head, "connection"), Some("upgrade"), "{head}");
+    assert_eq!(field(&head, "sec-websocket-version"), Some("13"), "{head}");
+
+    // The next request went through the gateway as a request: its forwarding fields are
+    // the gateway's, not what the client wrote.
+    let next = within(seen.recv()).await.unwrap();
+    assert!(next.starts_with("GET /admin HTTP/1.1\r\n"), "{next}");
+    assert_eq!(field(&next, "x-forwarded-for"), Some("127.0.0.1"), "{next}");
+    assert!(field(&next, "via").is_some(), "{next}");
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+}
+
+/// A 426 that asks for no protocol the gateway can switch to reaches the client without
+/// `Upgrade`: naming one would offer what the gateway cannot do.
+#[tokio::test]
+async fn a_426_for_another_protocol_is_forwarded_without_its_upgrade() {
+    let (upstream, _) = backend(|mut wire| async move {
+        let _head = wire.head().await;
+        wire.write(concat!(
+            "HTTP/1.1 426 Upgrade Required\r\nupgrade: h2c\r\n",
+            "content-length: 4\r\n\r\nplea"
+        ))
+        .await;
+        let _closed = within(wire.rest()).await;
+    });
+    let (address, _) = gateway(upstream, FORWARD, "");
+    let mut client = Wire::to(address).await;
+    client
+        .write("GET /up HTTP/1.1\r\nhost: a.test\r\n\r\n")
+        .await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 426"), "{head}");
+    assert!(field(&head, "upgrade").is_none(), "{head}");
+    assert!(field(&head, "connection").is_none(), "{head}");
+    assert_eq!(within(client.exactly(4)).await, "plea");
+}
+
+/// What falls short of a handshake is served as a plain request, its `Upgrade` taken off
+/// (RFC 9110 §7.8); the backend refuses it as it sees fit.
+#[tokio::test]
+async fn what_falls_short_of_a_handshake_goes_as_a_plain_request() {
+    let (saw, mut seen) = mpsc::unbounded_channel();
+    let (upstream, _) = backend(move |mut wire| {
+        let saw = saw.clone();
+        async move {
+            while let Some(head) = wire.until(b"\r\n\r\n").await {
+                let head = String::from_utf8(head).unwrap();
+                if let Some(length) = field(&head, "content-length") {
+                    let _body = wire.exactly(length.parse().unwrap()).await;
+                }
+                let _told = saw.send(head);
+                wire.write("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            }
+        }
+    });
+    let (address, _) = gateway(upstream, FORWARD, "");
+    let good = handshake();
+    for (why, request) in [
+        ("POST", good.replacen("GET", "POST", 1)),
+        (
+            "no key",
+            good.replace(&format!("sec-websocket-key: {KEY}\r\n"), ""),
+        ),
+        ("a short key", good.replace(KEY, "dGhlIHNhbXBsZQ==")),
+        ("h2c", good.replace("upgrade: websocket", "upgrade: h2c")),
+        (
+            "no Connection naming it",
+            good.replace("connection: Upgrade", "connection: keep-alive"),
+        ),
+        (
+            "a body",
+            good.replace("\r\n\r\n", "\r\ncontent-length: 2\r\n\r\nhi"),
+        ),
+    ] {
+        let mut client = Wire::to(address).await;
+        client.write(&request).await;
+        let asked = within(seen.recv()).await.unwrap();
+        assert!(field(&asked, "upgrade").is_none(), "{why}: {asked}");
+        assert!(field(&asked, "connection").is_none(), "{why}: {asked}");
+        let head = within(client.head()).await;
+        assert!(head.starts_with("HTTP/1.1 400"), "{why}: {head}");
+    }
+    // HTTP/1.0 has no upgrade: RFC 9110 §7.8 has a server ignore one.
+    let mut client = Wire::to(address).await;
+    client.write(&good.replace("HTTP/1.1", "HTTP/1.0")).await;
+    let asked = within(seen.recv()).await.unwrap();
+    assert!(field(&asked, "upgrade").is_none(), "HTTP/1.0: {asked}");
+}
+
+/// A rule's `request_ms` is for the handshake, not the WebSocket: it runs until the 101,
+/// then stops (19 §5).
+#[tokio::test]
+async fn a_rules_request_timeout_runs_until_the_101_and_not_after() {
+    let slow = "        forward: { backends: [{ upstream: up, weight: 1 }], timeouts: { request_ms: 300 } }";
+    // A backend that never answers the handshake is out of time.
+    let (upstream, _) = backend(|mut wire| async move {
+        let _head = wire.head().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+    let (address, _) = gateway(upstream, slow, "");
+    let mut client = Wire::to(address).await;
+    let began = Instant::now();
+    client.write(&handshake()).await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 504"), "{head}");
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        began.elapsed()
+    );
+
+    // One that answers is not cut off at the same bound once the switch is made.
+    let (saw, _seen) = mpsc::unbounded_channel();
+    let (upstream, _) = echoing(saw);
+    let (address, _) = gateway(upstream, slow, "");
+    let mut client = Wire::to(address).await;
+    client.write(&handshake()).await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert_eq!(within(client.exactly(5)).await, "hello");
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    client.write("still").await;
+    assert_eq!(within(client.exactly(7)).await, "[still]");
+}
+
+/// An open WebSocket that carries nothing either way for its rule's `tunnel_idle_ms` is
+/// closed, and counted as idle (19 §5).
+#[tokio::test]
+async fn a_quiet_websocket_is_closed_at_its_rules_idle_bound() {
+    let quiet = "        forward: { backends: [{ upstream: up, weight: 1 }], timeouts: { tunnel_idle_ms: 300 } }";
+    let (saw, _seen) = mpsc::unbounded_channel();
+    let (upstream, _) = echoing(saw);
+    let (address, proxy) = gateway(upstream, quiet, "");
+    let mut client = Wire::to(address).await;
+    client.write(&handshake()).await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert_eq!(within(client.exactly(5)).await, "hello");
+    // Traffic keeps it open past its bound.
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        client.write("tick").await;
+    }
+    assert_eq!(within(client.exactly(18)).await, "[tick]tickticktick");
+    let began = Instant::now();
+    // Then quiet: closed at the bound, not sooner and not much later.
+    assert_eq!(client.rest().await, "");
+    let after = began.elapsed();
+    assert!(
+        after >= Duration::from_millis(250) && after < Duration::from_secs(3),
+        "{after:?}"
+    );
+    counted(
+        &proxy,
+        r#"edgerush_listener_tunnels_total{listener="web",outcome="idle"}"#,
+        1,
+    )
+    .await;
+}
+
+/// A mirror could only ever be sent a WebSocket's handshake, never its messages, so it is
+/// sent nothing, and what it did not get is counted (19 §5).
+#[tokio::test]
+async fn a_handshake_is_not_mirrored() {
+    let (mirrored, mut copies) = mpsc::unbounded_channel();
+    let (mirror, _) = backend(move |mut wire| {
+        let mirrored = mirrored.clone();
+        async move {
+            let head = wire.head().await;
+            let _told = mirrored.send(head);
+            wire.write("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    let (saw, _seen) = mpsc::unbounded_channel();
+    let (upstream, _) = echoing(saw);
+    let rule = "        filters: [{ type: request_mirror, upstream: copy, fraction: { numerator: 1, denominator: 1 } }]\n        forward: { backends: [{ upstream: up, weight: 1 }] }";
+    let (address, proxy) = gateway(
+        upstream,
+        rule,
+        &format!("  copy: {{ endpoints: [\"{mirror}\"] }}"),
+    );
+    let mut client = Wire::to(address).await;
+    client.write(&handshake()).await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    counted(
+        &proxy,
+        r#"edgerush_upstream_mirrors_given_up_total{upstream="copy",reason="upgrade"}"#,
+        1,
+    )
+    .await;
+    // A plain request on another connection is mirrored as ever, and is the first copy.
+    let mut plain = Wire::to(address).await;
+    plain
+        .write("GET /plain HTTP/1.1\r\nhost: chat.test\r\n\r\n")
+        .await;
+    let copy = within(copies.recv()).await.unwrap();
+    assert!(copy.starts_with("GET /plain "), "{copy}");
+}
