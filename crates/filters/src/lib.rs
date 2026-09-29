@@ -5,13 +5,14 @@
 //! config snapshot, already validated, and applying one never fails.
 //!
 //! So far: header modification ([`HeaderModifier`]), changes to a path ([`PathModifier`]),
-//! redirects ([`Redirect`]), rewrites ([`UrlRewrite`]), and what an upstream is told of
-//! the client ([`forwarding`]).
+//! redirects ([`Redirect`]), rewrites ([`UrlRewrite`]), what an upstream is told of the
+//! client ([`forwarding`]), and a request's ID ([`request_id`]).
 
 pub mod forwarding;
 mod header_modifier;
 mod path_modifier;
 mod redirect;
+pub mod request_id;
 mod rewrite;
 
 pub use header_modifier::{Edit, HeaderModifier, HeaderModifierError, MOST_PER_LIST, RESERVED};
