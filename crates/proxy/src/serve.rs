@@ -3610,7 +3610,7 @@ mod tests {
                 let yaml = format!(
                     r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }} }}
+  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
 routes:
   - name: everything
     listeners: [web]
@@ -9503,7 +9503,7 @@ upstreams:
         let yaml = format!(
             r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }} }}
+  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
 routes:
   - name: everything
     listeners: [web]
@@ -9744,7 +9744,7 @@ upstreams:
         let mut yaml = String::from("routes: []\nupstreams: {}\nlisteners:\n");
         for (at, name) in listeners.iter().enumerate() {
             yaml += &format!(
-                "  {name}: {{ address: \"127.0.0.1:{at}\", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }} }}\n"
+                "  {name}: {{ address: \"127.0.0.1:{at}\", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
             );
         }
         let config: Config = serde_saphyr::from_str(&yaml).unwrap();

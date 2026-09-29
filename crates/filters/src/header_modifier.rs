@@ -11,7 +11,14 @@
 //! and the framing of the message on it, which the gateway makes anew on either side: a
 //! `Transfer-Encoding` or `Content-Length` out of step with the body that is really sent is
 //! how requests are smuggled. The spec is silent on all of this.
+//!
+//! Nor may a modifier name `X-Request-ID` ([`request_id::HEADER`](crate::request_id::HEADER)),
+//! whether or not its listener makes the IDs: a request is to be known by one ID to the
+//! upstream, the client and the gateway, and a rule that changed it for one of them would
+//! take that away. Only a rule's renaming of the header, which keeps its value, is to be
+//! allowed, and there is none yet.
 
+use crate::request_id;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 
 /// The headers no modifier may set, add or remove.
@@ -138,6 +145,9 @@ impl Named {
         if RESERVED.contains(&parsed) {
             return Err(HeaderModifierError::Reserved(parsed.to_string()));
         }
+        if parsed == request_id::HEADER {
+            return Err(HeaderModifierError::RequestId);
+        }
         if self.0.contains(&parsed) {
             return Err(HeaderModifierError::NamedTwice(parsed.to_string()));
         }
@@ -173,6 +183,9 @@ pub enum HeaderModifierError {
     /// One of the gateway's own headers ([`RESERVED`]).
     #[error("header `{0}` is the gateway's own and cannot be modified")]
     Reserved(String),
+    /// `X-Request-ID`, which carries the request's ID.
+    #[error("header `x-request-id` carries the request's ID, which a rule cannot change")]
+    RequestId,
     /// Not something a header could have as its value.
     #[error("the value for header `{0}` is not a header value")]
     InvalidValue(String),
@@ -391,6 +404,28 @@ mod tests {
         for name in [":authority", ":path"] {
             let invalid = Err(HeaderModifierError::InvalidName(name.to_owned()));
             assert_eq!(HeaderModifier::new([], [], [name]), invalid, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_request_id_is_changed_by_no_modifier() {
+        for name in ["x-request-id", "X-Request-ID"] {
+            let refused = Err(HeaderModifierError::RequestId);
+            assert_eq!(
+                HeaderModifier::new([(name, "1")], [], []),
+                refused,
+                "{name}"
+            );
+            assert_eq!(
+                HeaderModifier::new([], [(name, "1")], []),
+                refused,
+                "{name}"
+            );
+            assert_eq!(HeaderModifier::new([], [], [name]), refused, "{name}");
+        }
+        // Names that only look like it are anyone's.
+        for name in ["x-request-ids", "request-id", "x-correlation-id"] {
+            assert!(HeaderModifier::new([(name, "1")], [], []).is_ok(), "{name}");
         }
     }
 

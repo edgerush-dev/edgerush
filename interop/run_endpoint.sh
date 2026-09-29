@@ -52,6 +52,7 @@ nginx -c /tmp/nginx.conf -e /logs/nginx.log -p /tmp/nginx-temp/
     echo '    address: "[::]:443"'
     echo '    protocol: https'
     echo '    forwarding: { trusted_proxies: [], trusted_only_headers: [] }'
+    echo '    request_id: generate'
     echo "    http3: $http3"
     echo '    tls:'
     echo '      certificates:'

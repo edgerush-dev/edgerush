@@ -158,7 +158,7 @@ mod tests {
     fn every_problem_of_a_config_is_told() {
         let yaml = r#"
 listeners:
-  web: { address: "127.0.0.1:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] } }
+  web: { address: "127.0.0.1:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: shop
     listeners: [web, nowhere]

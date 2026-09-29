@@ -36,7 +36,7 @@ use std::hint::black_box;
 
 const SHOP: &str = r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] } }
+  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }, request_id: generate }
 routes:
   - name: shop
     listeners: [web]

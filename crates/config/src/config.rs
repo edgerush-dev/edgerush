@@ -50,6 +50,21 @@ pub struct Listener {
     /// request's client; no other may.
     #[serde(default)]
     pub forwarding: Option<Forwarding>,
+    /// Whether an `http` or `https` listener, which must say, gives each request an ID of
+    /// its own; no other may.
+    #[serde(default)]
+    pub request_id: Option<RequestId>,
+}
+
+/// What an HTTP listener does with `X-Request-ID` (08 §3 in the docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestId {
+    /// Every request gets an ID the gateway makes, in place of any it came with, whoever
+    /// sent it; the answer tells the client the same ID, in place of any the upstream gave.
+    Generate,
+    /// The header is left as it is, both ways: a proxy in front can give the ID.
+    Pass,
 }
 
 /// What an HTTP listener tells its upstreams of a request's client (03 §11 in the docs):

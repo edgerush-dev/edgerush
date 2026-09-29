@@ -10,7 +10,11 @@
 //! secure generator, as a client that is shown its own ID must not be able to work out
 //! anyone else's.
 
-use http::header::HeaderValue;
+use http::header::{HeaderName, HeaderValue};
+
+/// The header that carries the ID, to the upstream and back to the client. No rule may
+/// change it: the upstream, the client and the gateway are to know a request by one ID.
+pub const HEADER: HeaderName = HeaderName::from_static("x-request-id");
 
 /// How many random bytes an ID is made from. Six of their 80 bits are not used: the version
 /// and the variant take their place.

@@ -262,7 +262,7 @@ mod tests {
     ) -> (SocketAddr, Arc<Loads>) {
         let yaml = r#"
 listeners:
-  web: { address: "127.0.0.1:0", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] } }
+  web: { address: "127.0.0.1:0", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: everything
     listeners: [web]
