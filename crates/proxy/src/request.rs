@@ -1504,15 +1504,22 @@ upstreams:
     }
 
     proptest! {
-        /// The path that is forwarded is the normal form of the one that came, and nothing
-        /// else about the target changes: rewriting never fails on what normalising yields.
+        /// The path that is forwarded is the normal form of the one that came — under `/v1`,
+        /// the `shop` route's rule rewrites that to `/api` — and nothing else about the
+        /// target changes: rewriting never fails on what normalising yields.
         #[test]
         fn whatever_is_forwarded_has_the_normal_path_and_the_rest_as_it_came(target in target()) {
             let mut head = head("/", &[("host", "shop.example.com")]);
             head.uri = target.clone();
             match (decide_on("web", &mut head, 0), normalise_path(target.path())) {
                 (Ok(_), Ok(normal)) => {
-                    prop_assert_eq!(head.uri.path(), &*normal);
+                    let forwarded = match normal.strip_prefix("/v1") {
+                        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                            format!("/api{rest}")
+                        }
+                        _ => normal.into_owned(),
+                    };
+                    prop_assert_eq!(head.uri.path(), forwarded);
                     prop_assert_eq!(head.uri.query(), target.query());
                     prop_assert_eq!(head.uri.scheme(), target.scheme());
                     prop_assert_eq!(head.uri.authority(), target.authority());
