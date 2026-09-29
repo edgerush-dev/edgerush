@@ -2092,7 +2092,7 @@ impl Worker {
     ) -> Result<(RawAnswer, Body), Answer> {
         // The server that read a handshake takes its backend from here once the 101 is
         // answered.
-        let listening = directed.websocket.as_ref().and(interim.clone());
+        let listening = directed.websocket.as_ref().and_then(|_| interim.clone());
         let answer = match self
             .through_h1(
                 endpoint,
@@ -2343,7 +2343,7 @@ impl Proxy {
             .filter(|_| identity.protocol() == UpstreamProtocol::Http1)
             .and_then(|key| Key::read(key.as_bytes()))
             .and_then(|client| {
-                Some(Handshake {
+                Some(Box::new(Handshake {
                     client,
                     ours: Key::of(unguessable()?),
                     idle: forward
@@ -2351,7 +2351,7 @@ impl Proxy {
                         .timeouts()
                         .and_then(|timeouts| timeouts.tunnel_idle)
                         .unwrap_or(TUNNEL_IDLE),
-                })
+                }))
             });
         if let Some(counters) = self.metrics.upstream(upstream_slot) {
             counters.requests.inc();
@@ -2456,8 +2456,9 @@ struct Directed {
     others: Option<Vec<(Authority, Arc<ReuseIdentity>)>>,
     /// Where the copies of it go, for a request its rule mirrors.
     mirrors: Vec<Mirrored>,
-    /// For a WebSocket handshake carried to an HTTP/1.1 backend (19 §2).
-    websocket: Option<Handshake>,
+    /// For a WebSocket handshake carried to an HTTP/1.1 backend (19 §2). Boxed: rare, and
+    /// every request's future holds this across its waits.
+    websocket: Option<Box<Handshake>>,
     /// Whether its client spoke HTTP/1.1, which alone has `Upgrade`: a 426 that offers
     /// WebSocket says so to it, and to no other (19 §2).
     upgradable: bool,

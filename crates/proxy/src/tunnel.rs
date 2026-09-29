@@ -196,8 +196,9 @@ where
     T: AsyncWrite + Unpin,
 {
     loop {
-        // What has been read goes on before anything more is read, and the block goes back
-        // the moment it has.
+        // What has been read goes on before anything more is read. The block it came in is
+        // then read into again, and goes back if the read finds nothing: a way that is busy
+        // keeps one block, and a quiet one none.
         if let Some(block) = way.block.as_mut() {
             while !block.is_empty() {
                 match Pin::new(&mut *to).poll_write(cx, block.data()) {
@@ -209,11 +210,12 @@ where
                     Poll::Pending => return Poll::Pending,
                 }
             }
-            if let Some(block) = way.block.take() {
+        }
+        let spare = way.block.take();
+        if way.ended {
+            if let Some(block) = spare {
                 blocks.borrow_mut().give(block);
             }
-        }
-        if way.ended {
             return match Pin::new(&mut *to).poll_shutdown(cx) {
                 Poll::Ready(Ok(())) => {
                     way.shut = true;
@@ -223,7 +225,21 @@ where
                 Poll::Pending => Poll::Pending,
             };
         }
-        let Ok(mut block) = blocks.borrow_mut().take() else {
+        // One whose memory went with a frame cut from it — a client's head — has no room
+        // left, and is traded for one that has.
+        let lent = match spare {
+            Some(mut block) => {
+                if block.room().is_empty() {
+                    let mut blocks = blocks.borrow_mut();
+                    blocks.give(block);
+                    blocks.take()
+                } else {
+                    Ok(block)
+                }
+            }
+            None => blocks.borrow_mut().take(),
+        };
+        let Ok(mut block) = lent else {
             return Poll::Ready(Err(Stopped::Exhausted));
         };
         let mut read = ReadBuf::new(block.room());
