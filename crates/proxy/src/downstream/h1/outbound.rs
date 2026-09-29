@@ -87,6 +87,12 @@ impl Outbound {
         Ok(())
     }
 
+    /// Where the final head is among the heads not yet wholly accepted, which are queued
+    /// one piece each and in this order; `None` if it is not queued or has all gone.
+    pub fn final_position(&self) -> Option<usize> {
+        self.heads.iter().position(|&(kind, _)| kind == Kind::Final)
+    }
+
     /// Whether the queued final head could still be replaced: not one byte of it gone.
     pub fn can_replace_final(&self) -> bool {
         self.final_queued && !self.committed

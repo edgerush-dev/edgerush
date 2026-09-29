@@ -27,12 +27,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// A proxy whose one listener sends every request to `upstream`, served by a worker on a
-/// thread of its own.
+/// thread of its own. It passes request IDs through rather than make them, so that what
+/// the upstream is sent is the same bytes every run; the IDs a listener makes are the
+/// proxy crate's own tests' to check.
 fn proxy_to(upstream: SocketAddr) -> SocketAddr {
     let yaml = format!(
         r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: pass }}
 routes:
   - name: everything
     listeners: [web]

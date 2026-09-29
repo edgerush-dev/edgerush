@@ -265,8 +265,8 @@ impl Head for MapHead {
         std::str::from_utf8(field).map_err(|_| HostError::Invalid)
     }
 
-    fn check_connection(&self) -> Result<(), ConnectionError> {
-        hop_by_hop::check_connection_values(self.values(&CONNECTION))
+    fn check_connection(&self, id: bool) -> Result<(), ConnectionError> {
+        hop_by_hop::check_connection_values(self.values(&CONNECTION), id)
     }
 
     fn strip_request(&mut self) -> Result<(), Rejection> {

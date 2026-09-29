@@ -40,8 +40,9 @@ use crate::timers::{Alarm, Timers};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Block, Blocks};
 use bytes::{Buf, Bytes};
+use edgerush_filters::request_id;
 use edgerush_router::Fields;
-use http::{HeaderMap, Method, Response, StatusCode, Version};
+use http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Version};
 use http_body::{Body, Frame, SizeHint};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -598,6 +599,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     /// Drops what is queued and has not begun to go, and with it what it was charged: all
     /// of it, or all but the rest of a head part-written, which must be finished before
     /// anything else follows it.
+    /// The final head, as it was queued, if none of it has gone.
+    fn queued_final_head(&self) -> Option<&[u8]> {
+        let at = self.outbound.final_position()?;
+        self.queued.get(at).map(|(bytes, _, _)| bytes.as_ref())
+    }
+
     fn discard_queued(&mut self, keep_front: bool) {
         let keep = usize::from(keep_front);
         while self.queued.len() > keep {
@@ -1310,23 +1317,35 @@ where
 /// Ends a connection whose answer's body failed. Before any byte of the final head has
 /// gone the answer can still be put right: what is queued is dropped — all but the rest of
 /// an informational head part-written, which must be finished first — and the client is
-/// answered 502 in its place, the connection closing after it. After, the answer is the
-/// upstream's, and the client is left with a message it can tell is unfinished (14 §4).
+/// answered 502 in its place, the connection closing after it, with the request's ID the
+/// head it replaces carried (08 §3). After, the answer is the upstream's, and the client is
+/// left with a message it can tell is unfinished (14 §4).
 async fn replace_or_cut<S: AsyncRead + AsyncWrite + Unpin>(
     connection: &mut Connection<S>,
     asked: Asked,
     date: &impl Fn() -> HttpDate,
 ) -> Ended {
-    match connection.outbound.on_failure() {
+    let keep_front = match connection.outbound.on_failure() {
         OnFailure::Close => return Ended::Cut,
-        OnFailure::Answer => connection.discard_queued(false),
-        OnFailure::FinishThenAnswer(_) => connection.discard_queued(true),
+        OnFailure::Answer => false,
+        OnFailure::FinishThenAnswer(_) => true,
+    };
+    // Read back out of the head being thrown away, rather than noted as every answer's
+    // head is written: only an answer that fails here pays for it.
+    let mut fields = HeaderMap::new();
+    if let Some(id) = connection
+        .queued_final_head()
+        .and_then(|head| field_in(head, request_id::HEADER.as_str().as_bytes()))
+        .and_then(|id| HeaderValue::from_bytes(id).ok())
+    {
+        fields.insert(request_id::HEADER, id);
     }
+    connection.discard_queued(keep_front);
     let mut head = Vec::with_capacity(128);
     if write_head(
         &mut head,
         StatusCode::BAD_GATEWAY,
-        &HeaderMap::new(),
+        &fields,
         Content::Empty,
         asked,
         false,
@@ -1343,6 +1362,22 @@ async fn replace_or_cut<S: AsyncRead + AsyncWrite + Unpin>(
         Ok(()) => Ended::Answered,
         Err(stop) => stop.into(),
     }
+}
+
+/// The value of the first `name` field in `head`, a head this server wrote: its status
+/// line, then one field to a line, each line ended by CRLF, then an empty line.
+fn field_in<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    head.split(|&byte| byte == b'\n')
+        .skip(1)
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let colon = line.iter().position(|&byte| byte == b':')?;
+            let (field, value) = line.split_at(colon);
+            field
+                .eq_ignore_ascii_case(name)
+                .then(|| value.get(1..).unwrap_or_default().trim_ascii())
+        })
 }
 
 /// Answers a request refused before it reached the core, and ends the connection.
@@ -2203,6 +2238,56 @@ mod tests {
                 assert!(!received.contains(" 200 "), "{received:?}");
             }
         }
+    }
+
+    /// The 502 put in place of an answer whose body failed tells the client the request's
+    /// ID the answer carried (08 §3); an answer without one gives it none.
+    #[tokio::test]
+    async fn a_502_in_place_of_an_answer_keeps_its_request_id() {
+        const ID: &str = "0199e8a4-7c1b-7d2e-9a57-3f1c2b4d5e6f";
+        for id in [Some(ID), None] {
+            let failing = move |_: Request<RequestBody>, _: Interim| async move {
+                let mut response = Response::new(Failing { pending: 0 });
+                // Among others, and in a case of its own, as a head written anew has it.
+                let headers = response.headers_mut();
+                headers.insert("x-before", HeaderValue::from_static("a: b"));
+                if let Some(id) = id {
+                    headers.insert("x-request-id", HeaderValue::from_static(id));
+                }
+                headers.insert("x-after", HeaderValue::from_static("x-request-id: no"));
+                response
+            };
+            let (mut client, server) = tokio::io::duplex(1 << 16);
+            client.write_all(GET).await.unwrap();
+            let serving = serve(server, settings(), blocks(), date, failing);
+            let received = tokio::time::timeout(Duration::from_secs(10), async {
+                serving.await;
+                let mut received = Vec::new();
+                client.read_to_end(&mut received).await.unwrap();
+                String::from_utf8(received).unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(
+                received.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+                "{received:?}"
+            );
+            let told = received.contains(&format!("\r\nx-request-id: {ID}\r\n"));
+            assert_eq!(told, id.is_some(), "{received:?}");
+            assert!(!received.contains("x-before"), "{received:?}");
+            assert!(!received.contains(": no"), "{received:?}");
+        }
+    }
+
+    #[test]
+    fn a_field_is_found_in_a_written_head_by_its_name_alone() {
+        let head = b"HTTP/1.1 200 OK\r\nx-a: x-request-id: 1\r\nX-Request-ID:  2 \r\n\
+                     x-request-id: 3\r\n\r\nx-request-id: 4\r\n";
+        assert_eq!(field_in(head, b"x-request-id"), Some(&b"2"[..]));
+        assert_eq!(field_in(head, b"x-b"), None);
+        // Not past the head's end, nor in its status line.
+        let status_and_after = b"HTTP/1.1 200 x-b: 1\r\n\r\nx-b: 2\r\n";
+        assert_eq!(field_in(status_and_after, b"x-b"), None);
     }
 
     /// An answer that drives the upload as it goes, as an upstream answer does before the

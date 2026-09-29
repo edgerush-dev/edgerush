@@ -143,6 +143,9 @@ impl Rejection {
 /// target, a path already normal — is decided without allocating, except as the rule's
 /// header changes do, and a copy for a mirror placed before one.
 ///
+/// `id` is the request's ID, if its listener gives one (08 §3): the upstream is told it in
+/// place of any the request came with, and a `Connection` that names it is refused.
+///
 /// # Errors
 ///
 /// Returns a [`Rejection`] for a request to answer locally. Its target is then as it came;
@@ -155,6 +158,7 @@ pub fn decide<'a, H: Head>(
     head: &mut H,
     client: &Client,
     random: &mut impl FnMut() -> u64,
+    id: Option<&HeaderValue>,
 ) -> Result<Decision<'a>, Rejection> {
     let found = head.survey();
     if found.cookie_fields > 1 {
@@ -187,7 +191,7 @@ pub fn decide<'a, H: Head>(
     head.agree_host()?;
     // Before routing, so that a rule's predicates read what the upstream will be told, and
     // before the host is borrowed from the head for routing.
-    forward(head, listener, client)?;
+    forward(head, listener, client, id)?;
     let host = match (named, head.uri().authority()) {
         (Some(length), Some(authority)) => {
             authority.as_str().get(..length).ok_or(HostError::Invalid)?
@@ -196,7 +200,7 @@ pub fn decide<'a, H: Head>(
     };
     let path = normalise_path(head.uri().path())?;
     if found.hop_by_hop {
-        head.check_connection()?;
+        head.check_connection(id.is_some())?;
     }
     // What routing reads of the head is let go of before anything in it changes.
     let id = {
@@ -491,7 +495,7 @@ upstreams:
     ) -> Result<String, Rejection> {
         let shop = shop();
         let listener = shop.listeners.iter().find(|l| l.name == listener).unwrap();
-        decide(&shop, listener, head, client, &mut || random).map(|decision| {
+        decide(&shop, listener, head, client, &mut || random, None).map(|decision| {
             let forward = forwarding(decision);
             shop.upstream(forward.upstream).unwrap().name.clone()
         })
@@ -567,6 +571,149 @@ upstreams:
             ["status.example.com:9090"]
         );
         assert_eq!(values_of(&request.headers, "x-forwarded-port"), ["443"]);
+    }
+
+    /// An ID a listener that generates them gave a request.
+    const ID_TEXT: &str = "0199e8a4-7c1b-7d2e-9a57-3f1c2b4d5e6f";
+    /// The same, as a header's value.
+    const ID: HeaderValue = HeaderValue::from_static(ID_TEXT);
+
+    /// Decides on the named listener of `snapshot`, the request given `id`; the name of the
+    /// upstream, or the rejection.
+    fn decide_with_id<H: Head>(
+        snapshot: &Compiled,
+        client: &Client,
+        listener: &str,
+        head: &mut H,
+        id: Option<&HeaderValue>,
+    ) -> Result<String, Rejection> {
+        let listener = snapshot
+            .listeners
+            .iter()
+            .find(|l| l.name == listener)
+            .unwrap();
+        decide(snapshot, listener, head, client, &mut || 0, id).map(|decision| {
+            let forward = forwarding(decision);
+            snapshot.upstream(forward.upstream).unwrap().name.clone()
+        })
+    }
+
+    /// A request given an ID carries it, and no other: whatever it came with is gone, from a
+    /// trusted proxy too (08 §3). Both kinds of head come to the same.
+    #[test]
+    fn a_request_given_an_id_carries_it_and_no_other() {
+        const SENT: &[u8] = b"GET /cart HTTP/1.1\r\nHost: shop.example.com\r\nX-Request-ID: mine\r\nAccept: */*\r\nx-request-id: also-mine\r\n\r\n";
+        let shop = shop();
+        for client in [peer(), load_balancer()] {
+            let (mut map, mut raw) = both_heads(SENT).unwrap();
+            for upstream in [
+                decide_with_id(&shop, &client, "web", &mut map, Some(&ID)),
+                decide_with_id(&shop, &client, "web", &mut raw, Some(&ID)),
+            ] {
+                assert_eq!(upstream.as_deref(), Ok("cart"));
+            }
+            let id = ID_TEXT;
+            assert_eq!(values_of(&map.headers, "x-request-id"), [id]);
+            assert_eq!(values_of(&raw.fields(), "x-request-id"), [id]);
+            assert_eq!(values_of(&raw.fields(), "accept"), ["*/*"]);
+        }
+    }
+
+    /// A request given no ID — its listener passes the header through — keeps whatever it
+    /// came with, as it came.
+    #[test]
+    fn a_request_given_no_id_keeps_its_own() {
+        const SENT: &[u8] = b"GET /cart HTTP/1.1\r\nHost: shop.example.com\r\nX-Request-ID: mine\r\nx-request-id: also-mine\r\n\r\n";
+        let shop = shop();
+        for client in [peer(), load_balancer()] {
+            let (mut map, mut raw) = both_heads(SENT).unwrap();
+            assert!(decide_with_id(&shop, &client, "web", &mut map, None).is_ok());
+            assert!(decide_with_id(&shop, &client, "web", &mut raw, None).is_ok());
+            assert_eq!(
+                values_of(&map.headers, "x-request-id"),
+                ["mine", "also-mine"]
+            );
+            assert_eq!(
+                values_of(&raw.fields(), "x-request-id"),
+                ["mine", "also-mine"]
+            );
+        }
+    }
+
+    /// A listener whose trusted-only headers take in `X-Request-ID` takes a client's off and
+    /// still gives the request its own; a listener that passes IDs through then passes on
+    /// only a trusted proxy's.
+    #[test]
+    fn trusted_only_headers_take_a_clients_id_and_never_the_gateways() {
+        let snapshot = compile(
+            &serde_saphyr::from_str::<Config>(
+                r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: ["X-*"] }, request_id: generate }
+routes:
+  - name: shop
+    listeners: [web]
+    hostnames: [{ name: shop.example.com, falls_through: false }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: cart, weight: 1 }] }
+upstreams:
+  cart: { endpoints: ["10.0.0.1:80"] }
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let sent = || {
+            head(
+                "/",
+                &[("host", "shop.example.com"), ("x-request-id", "mine")],
+            )
+        };
+        let id = ID_TEXT;
+        for (client, given, expected) in [
+            (peer(), Some(&ID), vec![id]),
+            (load_balancer(), Some(&ID), vec![id]),
+            (peer(), None, vec![]),
+            (load_balancer(), None, vec!["mine"]),
+        ] {
+            let mut request = sent();
+            assert!(decide_with_id(&snapshot, &client, "web", &mut request, given).is_ok());
+            assert_eq!(
+                values_of(&request.headers, "x-request-id"),
+                expected,
+                "{given:?}"
+            );
+        }
+    }
+
+    /// A client's `Connection` may not have the gateway take off the ID it gave the request,
+    /// any more than what it says of forwarding; where the gateway gives none, the header
+    /// is the client's, and goes as the client asked.
+    #[test]
+    fn a_connection_that_names_the_id_is_refused_only_where_the_gateway_gives_one() {
+        let shop = shop();
+        let sent = || {
+            head(
+                "/cart",
+                &[
+                    ("host", "shop.example.com"),
+                    ("connection", "X-Request-ID"),
+                    ("x-request-id", "mine"),
+                ],
+            )
+        };
+        let mut request = sent();
+        assert_eq!(
+            decide_with_id(&shop, &peer(), "web", &mut request, Some(&ID)),
+            Err(Rejection::Connection(ConnectionError::Protected))
+        );
+        let mut request = sent();
+        assert_eq!(
+            decide_with_id(&shop, &peer(), "web", &mut request, None).as_deref(),
+            Ok("cart")
+        );
+        assert!(values_of(&request.headers, "x-request-id").is_empty());
     }
 
     /// A trusted proxy's chain names the client: the first address from the right that is
@@ -765,7 +912,7 @@ upstreams:
         let shop = shop();
         let web = shop.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut head = head("/cart", &[("host", "shop.example.com")]);
-        let forward = forwarding(decide(&shop, web, &mut head, &peer(), &mut || 0).unwrap());
+        let forward = forwarding(decide(&shop, web, &mut head, &peer(), &mut || 0, None).unwrap());
         assert!(forward.rule.request_headers.is_some());
         assert_eq!(shop.upstream(forward.upstream).unwrap().name, "cart");
     }
@@ -793,7 +940,7 @@ upstreams:
         let config: Config = serde_saphyr::from_str(MOVED).unwrap();
         let moved = compile(&config).unwrap();
         let web = moved.listeners.iter().find(|l| l.name == "web").unwrap();
-        match decide(&moved, web, head, &peer(), &mut || 0).unwrap() {
+        match decide(&moved, web, head, &peer(), &mut || 0, None).unwrap() {
             Decision::Redirect(redirected) => Some((
                 redirected.status,
                 redirected.location.to_str().unwrap().to_owned(),
@@ -870,7 +1017,7 @@ upstreams:
             .iter()
             .find(|l| l.name == "web")
             .unwrap();
-        forwarding(decide(&rewritten, web, &mut head, &peer(), &mut || 0).unwrap());
+        forwarding(decide(&rewritten, web, &mut head, &peer(), &mut || 0, None).unwrap());
         head
     }
 
@@ -945,9 +1092,14 @@ upstreams:
         let web = mirrored.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut draws = std::iter::once(0).chain(draws.iter().copied());
         let forward = forwarding(
-            decide(&mirrored, web, &mut head, &peer(), &mut || {
-                draws.next().unwrap()
-            })
+            decide(
+                &mirrored,
+                web,
+                &mut head,
+                &peer(),
+                &mut || draws.next().unwrap(),
+                None,
+            )
             .unwrap(),
         );
         forward
@@ -1002,7 +1154,8 @@ upstreams:
         let compiled = compile(&config).unwrap();
         let web = compiled.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut request = head(target, &fields);
-        let forward = forwarding(decide(&compiled, web, &mut request, &peer(), &mut || 0).unwrap());
+        let forward =
+            forwarding(decide(&compiled, web, &mut request, &peer(), &mut || 0, None).unwrap());
         let first = forward.mirrors[0].own.as_ref().unwrap();
         assert!(!first.fields.contains_key("x-hop"));
         assert!(!first.fields.contains_key("connection"));
@@ -1020,12 +1173,12 @@ upstreams:
         let web = moved.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut ambiguous = head("/old/%2e%2e/admin", &[("host", "shop.example.com")]);
         assert!(matches!(
-            decide(&moved, web, &mut ambiguous, &peer(), &mut || 0),
+            decide(&moved, web, &mut ambiguous, &peer(), &mut || 0, None),
             Err(Rejection::Path(_))
         ));
         let mut hostless = head("/old/a", &[]);
         assert!(matches!(
-            decide(&moved, web, &mut hostless, &peer(), &mut || 0),
+            decide(&moved, web, &mut hostless, &peer(), &mut || 0, None),
             Err(Rejection::Host(_))
         ));
     }
@@ -1307,7 +1460,7 @@ upstreams:
         let chained = compile(&config).unwrap();
         let web = chained.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut request = head("/cart", &fields);
-        decide(&chained, web, &mut request, &peer(), &mut || 0).unwrap();
+        decide(&chained, web, &mut request, &peer(), &mut || 0, None).unwrap();
         let credentials: Vec<_> = request
             .headers
             .get_all("proxy-authorization")

@@ -26,6 +26,7 @@
 // this is API.
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
 
+use edgerush_filters::request_id;
 use edgerush_router::Fields;
 use http::HeaderMap;
 use http::header::{
@@ -100,26 +101,29 @@ pub(crate) fn is_hop_by_hop(name: &HeaderName) -> bool {
     )
 }
 
-/// Checks what a request's `Connection` names, before anything is taken off on its word.
-pub(crate) fn check_connection(headers: &HeaderMap) -> Result<(), ConnectionError> {
+/// Checks what a request's `Connection` names, before anything is taken off on its word;
+/// `id` if the gateway gave the request an ID of its own.
+pub(crate) fn check_connection(headers: &HeaderMap, id: bool) -> Result<(), ConnectionError> {
     check_connection_values(
         headers
             .get_all(CONNECTION)
             .iter()
             .map(HeaderValue::as_bytes),
+        id,
     )
 }
 
 /// The same, given the values of the `Connection` fields.
 pub(crate) fn check_connection_values<'a>(
     values: impl Iterator<Item = &'a [u8]>,
+    id: bool,
 ) -> Result<(), ConnectionError> {
     for value in values {
         for option in options_of(value) {
             if !option.iter().copied().all(is_token_byte) {
                 return Err(ConnectionError::Malformed);
             }
-            if is_protected(option) {
+            if is_protected(option) || (id && is_request_id(option)) {
                 return Err(ConnectionError::Protected);
             }
         }
@@ -216,9 +220,10 @@ pub(crate) fn is_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
-/// Whether a connection option names what the gateway tells the upstream: the host, who the
-/// client is (`X-Forwarded-*`), and that the request came through it (`Via`), which the
-/// gateway adds to whatever the client's said (RFC 9110 §7.6.3).
+/// Whether a connection option names what the gateway always tells the upstream: the host,
+/// who the client is (`X-Forwarded-*`), and that the request came through it (`Via`), which
+/// the gateway adds to whatever the client's said (RFC 9110 §7.6.3). The request's ID is
+/// the gateway's too where it gives one, and only there: elsewhere it is the client's own.
 fn is_protected(option: &[u8]) -> bool {
     const FORWARDED: &[u8] = b"x-forwarded-";
     option.eq_ignore_ascii_case(b"host")
@@ -228,13 +233,19 @@ fn is_protected(option: &[u8]) -> bool {
             .is_some_and(|start| start.eq_ignore_ascii_case(FORWARDED))
 }
 
+/// Whether a connection option names `X-Request-ID`.
+fn is_request_id(option: &[u8]) -> bool {
+    option.eq_ignore_ascii_case(request_id::HEADER.as_str().as_bytes())
+}
+
 /// Why a request's `Connection` header is not acted on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ConnectionError {
     /// A connection option that is not a token.
     #[error("Connection header is not a list of tokens")]
     Malformed,
-    /// A connection option that names `Host`, `Via` or an `X-Forwarded-*` header.
+    /// A connection option that names `Host`, `Via`, an `X-Forwarded-*` header, or the ID the
+    /// gateway gave the request.
     #[error("Connection header names a header that must reach the upstream")]
     Protected,
 }
@@ -585,9 +596,11 @@ mod tests {
             "",
         ] {
             let headers = headers(&[("connection", connection)]);
-            assert_eq!(check_connection(&headers), Ok(()), "{connection:?}");
+            for id in [false, true] {
+                assert_eq!(check_connection(&headers, id), Ok(()), "{connection:?}");
+            }
         }
-        assert_eq!(check_connection(&HeaderMap::new()), Ok(()));
+        assert_eq!(check_connection(&HeaderMap::new(), true), Ok(()));
     }
 
     #[test]
@@ -602,19 +615,38 @@ mod tests {
             "keep-alive, via",
         ] {
             let headers = headers(&[("connection", connection)]);
+            for id in [false, true] {
+                assert_eq!(
+                    check_connection(&headers, id),
+                    Err(ConnectionError::Protected),
+                    "{connection}"
+                );
+            }
+        }
+        let second = headers(&[("connection", "close"), ("connection", "x-forwarded-proto")]);
+        assert_eq!(
+            check_connection(&second, false),
+            Err(ConnectionError::Protected)
+        );
+
+        // Near misses name other headers.
+        for connection in ["hosts", "x-forwarded", "forwarded", "vias", "x-request-ids"] {
+            let headers = headers(&[("connection", connection)]);
+            assert_eq!(check_connection(&headers, true), Ok(()), "{connection}");
+        }
+    }
+
+    #[test]
+    fn a_connection_header_that_names_the_gateways_id_is_not_acted_on() {
+        for connection in ["x-request-id", "close, X-Request-ID"] {
+            let headers = headers(&[("connection", connection)]);
             assert_eq!(
-                check_connection(&headers),
+                check_connection(&headers, true),
                 Err(ConnectionError::Protected),
                 "{connection}"
             );
-        }
-        let second = headers(&[("connection", "close"), ("connection", "x-forwarded-proto")]);
-        assert_eq!(check_connection(&second), Err(ConnectionError::Protected));
-
-        // Near misses name other headers.
-        for connection in ["hosts", "x-forwarded", "forwarded", "vias"] {
-            let headers = headers(&[("connection", connection)]);
-            assert_eq!(check_connection(&headers), Ok(()), "{connection}");
+            // Where the gateway gives no ID, the header is the client's to take off.
+            assert_eq!(check_connection(&headers, false), Ok(()), "{connection}");
         }
     }
 
@@ -630,7 +662,7 @@ mod tests {
         ] {
             let headers = headers(&[("connection", connection)]);
             assert_eq!(
-                check_connection(&headers),
+                check_connection(&headers, true),
                 Err(ConnectionError::Malformed),
                 "{connection}"
             );

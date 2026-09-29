@@ -239,8 +239,8 @@ impl Head for RawHead {
         std::str::from_utf8(field).map_err(|_| HostError::Invalid)
     }
 
-    fn check_connection(&self) -> Result<(), ConnectionError> {
-        hop_by_hop::check_connection_values(self.fields().values(&CONNECTION))
+    fn check_connection(&self, id: bool) -> Result<(), ConnectionError> {
+        hop_by_hop::check_connection_values(self.fields().values(&CONNECTION), id)
     }
 
     fn strip_request(&mut self) -> Result<(), Rejection> {
@@ -449,6 +449,16 @@ impl RawAnswer {
     /// gateway takes comes to.
     pub fn apply(&mut self, changes: &HeaderModifier) -> Result<(), OverlayFull> {
         apply(self.lines.view(&self.head), &mut self.overlay, changes)
+    }
+
+    /// Gives `name` the one value `value`, in place of every one it had.
+    ///
+    /// # Errors
+    ///
+    /// [`OverlayFull`] if the field cannot be added.
+    pub fn set_field(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), OverlayFull> {
+        let view = self.lines.view(&self.head);
+        self.overlay.set(&view, name, value)
     }
 
     /// The answer as `http`'s parts, in this hop's version, for a server that takes those:

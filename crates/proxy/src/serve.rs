@@ -35,7 +35,7 @@ use crate::linger::{self, Lent, linger};
 use crate::map_head::MapHead;
 use crate::metrics::{Answer, Metrics, Socket, Stopped, Tunnel};
 use crate::mirror;
-use crate::random::random;
+use crate::random::{random, unguessable};
 use crate::raw::{RawAnswer, RawHead};
 use crate::request::{Decision, decide};
 use crate::request_body::{RequestBody, RequestBodyError};
@@ -58,9 +58,10 @@ use crate::upstream::secure::{Secure, Socket as UpstreamSocket};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use edgerush_config::{
-    Compiled, CompiledListener, CompiledRetry, CompiledRule, L4, Timeout, UpstreamProtocol,
+    Compiled, CompiledListener, CompiledRetry, CompiledRule, L4, RequestId, Timeout,
+    UpstreamProtocol,
 };
-use edgerush_filters::HeaderModifier;
+use edgerush_filters::{HeaderModifier, request_id};
 use edgerush_router::Fields;
 use http::uri::{Authority, Scheme};
 use http::{
@@ -1463,10 +1464,15 @@ impl Worker {
         interim: Option<Interim>,
     ) -> Answered<Body> {
         let came_in = Instant::now();
+        // First, so that every answer the core gives, its own included, carries it.
+        let id = self.proxy.request_id(listener);
         let mut answered = self
-            .respond_to(listener, &client, head, body, interim)
+            .respond_to(listener, &client, head, body, interim, id.as_ref())
             .await;
         self.proxy.advertise(listener, &mut answered);
+        if let Some(id) = id {
+            tell_id(&mut answered, id);
+        }
         if let Some(counters) = self.proxy.metrics.listener(listener) {
             let took = u64::try_from(came_in.elapsed().as_nanos()).unwrap_or(u64::MAX);
             counters.responded(answered.status(), took);
@@ -1481,6 +1487,7 @@ impl Worker {
         mut head: H,
         mut body: RequestBody,
         interim: Option<Interim>,
+        id: Option<&HeaderValue>,
     ) -> Answered<Body> {
         // A request's trailers go no further than the gateway (03 §11): its body ends
         // where they would come, for the upstream, a retry and a mirror alike.
@@ -1504,7 +1511,7 @@ impl Worker {
         // from and everything it named looks like an ordinary field, so a trailer of that
         // name would travel on ([13 §4](../../docs/13-http1-upstream.md)).
         let nominated = crate::hop_by_hop::nominated(head.outgoing());
-        let mut directed = match self.proxy.direct(listener, client, &mut head) {
+        let mut directed = match self.proxy.direct(listener, client, &mut head, id) {
             Ok(Directing::Upstream(directed)) => directed,
             Ok(Directing::Redirect(redirect)) => {
                 return self.proxy.redirect(listener, redirect, call).into();
@@ -2126,6 +2133,17 @@ impl Proxy {
         }
     }
 
+    /// An ID for a request that came in on `listener`, if it gives its requests one (08 §3 in
+    /// the docs). Worked out once, so that a config that changes while the request is
+    /// served cannot have it told one ID and not the other.
+    fn request_id(&self, listener: usize) -> Option<HeaderValue> {
+        let snapshot = self.current.load();
+        if snapshot.listener(listener)?.request_id != RequestId::Generate {
+            return None;
+        }
+        Some(request_id::value(unix_millis(), unguessable()?))
+    }
+
     fn answer_to(&self, listener: usize, answer: Answer, call: Option<Call>) -> Response<Body> {
         let mut response = self.answer(listener, answer);
         if call.is_some() {
@@ -2189,6 +2207,7 @@ impl Proxy {
         listener: usize,
         client: &Client,
         head: &mut H,
+        id: Option<&HeaderValue>,
     ) -> Result<Directing, Answer> {
         let snapshot = self.current.load();
         let listener = snapshot
@@ -2198,7 +2217,7 @@ impl Proxy {
             .flatten()
             .and_then(|position| snapshot.config.listeners.get(position))
             .ok_or(Answer::NoRoute)?;
-        let forward = match decide(&snapshot.config, listener, head, client, &mut random)? {
+        let forward = match decide(&snapshot.config, listener, head, client, &mut random, id)? {
             Decision::Forward(forward) => forward,
             Decision::Redirect(redirected) => {
                 return Ok(Directing::Redirect(Redirect {
@@ -2695,6 +2714,29 @@ pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs())
+}
+
+/// Milliseconds since the Unix epoch, for a request's ID: read for each, since the date the
+/// worker keeps is of whole seconds.
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Tells the client the request's ID on `answered`, in place of any the upstream gave.
+fn tell_id<B>(answered: &mut Answered<B>, id: HeaderValue) {
+    match answered {
+        // An overlay holds as many fields as a rule adds and more; this is one.
+        Answered::Raw(answer, _) => {
+            let _set = answer.set_field(request_id::HEADER, id);
+        }
+        Answered::Map(response) => {
+            response.headers_mut().insert(request_id::HEADER, id);
+        }
+    }
 }
 
 /// Whether a failure to accept is the failure of the one connection that was next in line,
@@ -5256,6 +5298,214 @@ upstreams:
                     assert!(head.contains(line), "{line:?} in {head}");
                 }
                 assert!(!head.contains("10.9.9.9"), "{head}");
+            })
+            .await;
+    }
+
+    /// Every `x-request-id` in `text`, a head or answer in lower case, as the value it holds.
+    fn request_ids(text: &str) -> Vec<String> {
+        text.split("\r\n")
+            .filter_map(|line| line.strip_prefix("x-request-id: "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Whether `id` is a request ID as the gateway makes them: a UUIDv7 in lower case.
+    fn is_uuid7(id: &str) -> bool {
+        let bytes = id.as_bytes();
+        bytes.len() == 36
+            && bytes.iter().enumerate().all(|(at, &byte)| match at {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+            })
+            && bytes[14] == b'7'
+            && b"89ab".contains(&bytes[19])
+    }
+
+    /// A listener that generates IDs gives every request its own, in place of whatever the
+    /// client sent, and tells the client the same one, in place of whatever the upstream
+    /// answered with (08 §3); over HTTP/1.1 and HTTP/2 alike.
+    #[tokio::test]
+    async fn a_request_and_its_client_are_told_one_id_whatever_it_spoke() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, heads) = recording_upstream("200 OK\r\nx-request-id: theirs");
+                let (front, _worker) = serving_config(&everything_config(upstream)).await;
+
+                let answer = h1_answer(
+                    front,
+                    b"GET /a HTTP/1.1\r\nhost: shop.example.com\r\nconnection: close\r\n\
+                      x-request-id: mine\r\nX-Request-ID: again\r\n\r\n",
+                )
+                .await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                let told = request_ids(&answer);
+                assert_eq!(told.len(), 1, "{answer}");
+                assert!(is_uuid7(&told[0]), "{answer}");
+                let head = heads.borrow()[0].clone();
+                assert_eq!(request_ids(&head), told, "{head}");
+
+                // `theirs` is the second upstream answer's only as the first one's.
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::get("http://shop.example.com/b")
+                    .header("x-request-id", "mine")
+                    .body(())
+                    .unwrap();
+                let (answer, _) = send.send_request(request, true).unwrap();
+                let answer = within(answer).await.unwrap();
+                assert_eq!(answer.status(), StatusCode::OK);
+                let values: Vec<_> = answer.headers().get_all("x-request-id").iter().collect();
+                assert_eq!(values.len(), 1, "{:?}", answer.headers());
+                let id = values[0].to_str().unwrap();
+                assert!(is_uuid7(id), "{id}");
+                assert_ne!(id, told[0]);
+                let head = heads.borrow()[1].clone();
+                assert_eq!(request_ids(&head), [id], "{head}");
+            })
+            .await;
+    }
+
+    /// The gateway's own answers carry an ID too, each its own: a 404 for no rule, a 400 for
+    /// a host that is none, a 502 for an upstream that cannot be reached, a redirect, and a
+    /// gRPC call answered with a status (08 §3).
+    #[tokio::test]
+    async fn the_gateways_own_answers_are_told_their_ids() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (_held, refusing) = refusing();
+                let mut config = everything_config(refusing);
+                config.routes[0].rules = [
+                    "matches: [{ path: { prefix: /old } }]\n\
+                     redirect: { status: 301, path: { replace_prefix: /new }, query: keep }",
+                    "matches: [{ path: { prefix: /up } }]\n\
+                     forward: { backends: [{ upstream: up, weight: 1 }] }",
+                ]
+                .into_iter()
+                .map(|rule| serde_saphyr::from_str(rule).unwrap())
+                .collect();
+                let (front, _worker) = serving_config(&config).await;
+
+                let mut ids = Vec::new();
+                for (request, status) in [
+                    (
+                        &b"GET /none HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\n\r\n"[..],
+                        "404",
+                    ),
+                    (
+                        b"GET /up HTTP/1.1\r\nhost: a!test\r\nconnection: close\r\n\r\n",
+                        "400",
+                    ),
+                    (
+                        b"GET /up HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\n\r\n",
+                        "502",
+                    ),
+                    (
+                        b"GET /old HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\n\r\n",
+                        "301",
+                    ),
+                ] {
+                    let answer = h1_answer(front, request).await;
+                    assert!(
+                        answer.starts_with(&format!("HTTP/1.1 {status} ")),
+                        "{answer}"
+                    );
+                    let told = request_ids(&answer);
+                    assert_eq!(told.len(), 1, "{answer}");
+                    assert!(is_uuid7(&told[0]), "{answer}");
+                    ids.extend(told);
+                }
+
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let (answer, _) = send.send_request(grpc_call("/none", None), true).unwrap();
+                let answer = within(answer).await.unwrap();
+                assert!(answer.headers().contains_key("grpc-status"));
+                let id = answer.headers()["x-request-id"]
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                assert!(is_uuid7(&id), "{id}");
+                ids.push(id);
+
+                ids.sort();
+                ids.dedup();
+                assert_eq!(ids.len(), 5, "{ids:?}");
+            })
+            .await;
+    }
+
+    /// A listener that passes IDs through leaves `X-Request-ID` as it is both ways: the
+    /// client's reaches the upstream, the upstream's reaches the client, and the gateway's
+    /// own answers carry none.
+    #[tokio::test]
+    async fn a_listener_that_passes_ids_leaves_them_as_they_are() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, heads) = recording_upstream("200 OK\r\nx-request-id: theirs");
+                let mut config = everything_config(upstream);
+                config.listeners.get_mut("web").unwrap().request_id =
+                    Some(edgerush_config::RequestId::Pass);
+                config.routes[0].rules[0].matches[0] =
+                    serde_saphyr::from_str("path: { prefix: /up }").unwrap();
+                let (front, _worker) = serving_config(&config).await;
+
+                let answer = h1_answer(
+                    front,
+                    b"GET /up HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\n\
+                      x-request-id: mine\r\n\r\n",
+                )
+                .await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                assert_eq!(request_ids(&answer), ["theirs"], "{answer}");
+                let head = heads.borrow()[0].clone();
+                assert_eq!(request_ids(&head), ["mine"], "{head}");
+
+                let answer = h1_answer(
+                    front,
+                    b"GET /none HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\n\
+                      x-request-id: mine\r\n\r\n",
+                )
+                .await;
+                assert!(answer.starts_with("HTTP/1.1 404 "), "{answer}");
+                assert!(request_ids(&answer).is_empty(), "{answer}");
+            })
+            .await;
+    }
+
+    /// Over HTTP/3 as over TCP: the request and its client are told one ID, the gateway's.
+    #[tokio::test]
+    async fn an_http3_request_and_its_client_are_told_one_id() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::downstream::h3::testing::{Client, get};
+                let (upstream, heads) = recording_upstream("200 OK\r\nx-request-id: theirs");
+                let http3 = edgerush_config::Http3 {
+                    alt_svc_max_age: 60,
+                    force_retry: false,
+                };
+                let (front, _) = serving_h3(&h3_config(upstream, http3)).await;
+                let mut client = Client::connect(front, "a.test").await;
+
+                let mut fields = get("a.test", "/c");
+                fields.push(("x-request-id", "mine"));
+                let stream = client.request(&fields, true);
+                let answer = client.answer(stream).await;
+                assert_eq!(answer.final_status(), Some("200"));
+                let told: Vec<String> = answer
+                    .heads
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .filter(|(name, _)| name == "x-request-id")
+                    .map(|(_, value)| value.clone())
+                    .collect();
+                assert_eq!(told.len(), 1, "{:?}", answer.heads);
+                assert!(is_uuid7(&told[0]), "{told:?}");
+                let head = heads.borrow()[0].clone();
+                assert_eq!(request_ids(&head), told, "{head}");
             })
             .await;
     }

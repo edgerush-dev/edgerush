@@ -22,12 +22,16 @@ use edgerush_proxy::map_head::MapHead;
 use edgerush_proxy::storage::{LIMIT, Storage};
 use edgerush_proxy::upstream::h1::blocks::{Blocks, Sizes};
 use edgerush_proxy::{Client, decide};
-use http::Request;
 use http::request::Parts;
+use http::{HeaderValue, Request};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::cell::RefCell;
 use std::hint::black_box;
 use std::rc::Rc;
+
+/// The ID a listener that generates them gives the request, made beforehand: making one is
+/// the filters crate's `request_id` benchmark.
+const ID: HeaderValue = HeaderValue::from_static("0199e8a4-7c1b-7d2e-9a57-3f1c2b4d5e6f");
 
 const SHOP: &str = r#"
 listeners:
@@ -190,6 +194,7 @@ fn request_core(
             black_box(&mut head),
             black_box(&client),
             &mut || 0x9E37_79B9_7F4A_7C15,
+            Some(&ID),
         )
         .is_ok(),
         None => false,

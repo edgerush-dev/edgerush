@@ -9,12 +9,16 @@
 //! chain, so that a backend that reads its first entry reads the client. `Via` gets the
 //! gateway's entry after whatever came before it (RFC 9110 §7.6.3).
 //!
-//! A rule's own changes to the headers come after, and may change any of these.
+//! A request given an ID (08 §3) has it in `X-Request-ID`, in place of whatever it came
+//! with, from a trusted proxy too.
+//!
+//! A rule's own changes to the headers come after, and may change any of these but the ID.
 
 use crate::head::Head;
 use crate::request::Rejection;
 use edgerush_config::{CompiledListener, Protocol};
 use edgerush_filters::forwarding::{address_value, client_address, proto_value, via_value};
+use edgerush_filters::request_id;
 use edgerush_router::Fields;
 use http::header::{HeaderName, HeaderValue, VIA};
 use std::net::IpAddr;
@@ -54,7 +58,7 @@ impl Client {
 }
 
 /// Makes `head`, of a request from `client` that came in on `listener`, say what the
-/// upstream is to be told of the client.
+/// upstream is to be told of the client, and carry `id` if the request was given one.
 ///
 /// # Errors
 ///
@@ -64,18 +68,28 @@ pub(crate) fn forward<H: Head>(
     head: &mut H,
     listener: &CompiledListener,
     client: &Client,
+    id: Option<&HeaderValue>,
 ) -> Result<(), Rejection> {
     let forwarding = &listener.forwarding;
     // QUIC is always over TLS, and only an `https` listener serves it.
     let proto = proto_value(listener.protocol == Protocol::Https);
     if forwarding.trusted_proxies.trusts(client.address) {
         from_trusted_proxy(head, listener, client, proto)?;
+        if let Some(id) = id {
+            head.set_field(request_id::HEADER, id.clone())?;
+        }
     } else {
-        // One pass over the names takes off what the client said of forwarding and what only
-        // a trusted proxy may send; what the gateway says is then added, with nothing of
-        // the same name left to look for.
+        // One pass over the names takes off what the client said of forwarding, its ID if
+        // the gateway gives one, and what only a trusted proxy may send; what the gateway
+        // says is then added, with nothing of the same name left to look for.
         let only = &forwarding.trusted_only_headers;
-        head.remove_where(|name| is_the_gateways(name) || only.matches(name))?;
+        let ids = id.is_some();
+        head.remove_where(|name| {
+            is_the_gateways(name) || (ids && is_request_id(name)) || only.matches(name)
+        })?;
+        if let Some(id) = id {
+            head.append_field(request_id::HEADER, id.clone())?;
+        }
         head.append_field(FORWARDED_FOR, client.value.clone())?;
         head.append_field(FORWARDED_PROTO, proto)?;
         // No host to give, the request is refused for it as it is routed.
@@ -130,6 +144,11 @@ fn is_the_gateways(name: &[u8]) -> bool {
                 || rest.eq_ignore_ascii_case(b"proto")
                 || rest.eq_ignore_ascii_case(b"host")
         })
+}
+
+/// Whether `name`, in whatever case, is `X-Request-ID`.
+fn is_request_id(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(request_id::HEADER.as_str().as_bytes())
 }
 
 /// Whether `head` has a field called `name`.

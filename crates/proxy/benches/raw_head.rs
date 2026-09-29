@@ -19,7 +19,7 @@
 
 use bytes::Bytes;
 use edgerush_config::{Compiled, Config, compile};
-use edgerush_filters::HeaderModifier;
+use edgerush_filters::{HeaderModifier, request_id};
 use edgerush_proxy::fields::FieldLines;
 use edgerush_proxy::head::Head;
 use edgerush_proxy::hop_by_hop::{nominated, strip_response};
@@ -33,6 +33,10 @@ use http::request::Parts;
 use http::{Method, Request, StatusCode, Uri};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
+
+/// The ID a listener that generates them gives the request, made beforehand: making one is
+/// the filters crate's `request_id` benchmark.
+const ID: HeaderValue = HeaderValue::from_static("0199e8a4-7c1b-7d2e-9a57-3f1c2b4d5e6f");
 
 const SHOP: &str = r#"
 listeners:
@@ -163,6 +167,7 @@ fn by_raw(
             head,
             black_box(&client),
             &mut || 0x9E37_79B9_7F4A_7C15,
+            Some(&ID),
         )
         .is_ok(),
         _ => false,
@@ -233,6 +238,7 @@ fn by_map(
             head,
             black_box(&client),
             &mut || 0x9E37_79B9_7F4A_7C15,
+            Some(&ID),
         )
         .is_ok(),
         _ => false,
@@ -256,7 +262,15 @@ fn decided_raw(sent: &Bytes) -> RawHead {
     );
     let snapshot = shop();
     let listener = snapshot.listeners.first().expect("a listener");
-    decide(&snapshot, listener, &mut head, &peer(), &mut || 0).expect("decided");
+    decide(
+        &snapshot,
+        listener,
+        &mut head,
+        &peer(),
+        &mut || 0,
+        Some(&ID),
+    )
+    .expect("decided");
     head
 }
 
@@ -277,7 +291,15 @@ fn decided_map(sent: &Bytes) -> Parts {
     parts.headers = headers;
     let snapshot = shop();
     let listener = snapshot.listeners.first().expect("a listener");
-    decide(&snapshot, listener, &mut parts, &peer(), &mut || 0).expect("decided");
+    decide(
+        &snapshot,
+        listener,
+        &mut parts,
+        &peer(),
+        &mut || 0,
+        Some(&ID),
+    )
+    .expect("decided");
     parts
 }
 
@@ -386,7 +408,9 @@ fn answer_raw(
             let applied = changes
                 .as_ref()
                 .is_none_or(|changes| raw.apply(changes).is_ok());
-            (declared && applied).then_some(raw)
+            // The request's ID, told the client as a generating listener does.
+            let told = raw.set_field(request_id::HEADER, ID).is_ok();
+            (declared && applied && told).then_some(raw)
         }
         _ => None,
     };
@@ -426,6 +450,8 @@ fn answer_map(
             if let Some(changes) = &changes {
                 changes.apply(&mut headers);
             }
+            // The request's ID, told the client as a generating listener does.
+            headers.insert(request_id::HEADER, ID);
             Some(headers)
         }
         _ => None,

@@ -82,8 +82,8 @@ pub trait Head {
     /// # Errors
     ///
     /// A [`ConnectionError`] if it names something that is no option, or a header the
-    /// gateway keeps.
-    fn check_connection(&self) -> Result<(), ConnectionError>;
+    /// gateway keeps: `X-Request-ID` among them if the gateway gave the request its `id`.
+    fn check_connection(&self, id: bool) -> Result<(), ConnectionError>;
 
     /// Takes the hop-by-hop headers off; `TE: trailers` stays if it was said.
     ///
@@ -188,8 +188,8 @@ impl Head for Parts {
         host::host_field(&self.headers)
     }
 
-    fn check_connection(&self) -> Result<(), ConnectionError> {
-        hop_by_hop::check_connection(&self.headers)
+    fn check_connection(&self, id: bool) -> Result<(), ConnectionError> {
+        hop_by_hop::check_connection(&self.headers, id)
     }
 
     fn strip_request(&mut self) -> Result<(), Rejection> {
