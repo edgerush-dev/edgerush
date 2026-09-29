@@ -856,7 +856,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             fields,
             content_length: _,
         } = head;
-        let head = RawHead::new(method, target, version, bytes, fields);
+        let head = RawHead::lent(
+            method,
+            target,
+            version,
+            bytes,
+            fields,
+            &self.inbound.borrow().blocks,
+        );
         let asked = Asked {
             head: head.method() == Method::HEAD,
             version,

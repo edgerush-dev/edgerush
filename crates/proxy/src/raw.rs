@@ -14,6 +14,7 @@ use crate::head::{Forwarded, Head, Survey};
 use crate::hop_by_hop::{self, ConnectionError, is_hop_by_hop_name, options_of};
 use crate::host::HostError;
 use crate::request::Rejection;
+use crate::upstream::h1::blocks::Blocks;
 use crate::upstream::h1::codec::OutgoingFields;
 use bytes::Bytes;
 use edgerush_filters::{Edit, HeaderModifier};
@@ -24,6 +25,8 @@ use http::header::{CONNECTION, COOKIE, DATE, HOST, HeaderName, HeaderValue, TE, 
 #[cfg(any(test, feature = "fuzzing"))]
 use http::request::Parts;
 use http::{HeaderMap, Method, Response, StatusCode, Uri, Version, response};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// A request's head as our own server read it: its method and target, the bytes of the
 /// head, where each field line lies in them, and an overlay of what the core changes. Its
@@ -37,10 +40,14 @@ pub struct RawHead {
     head: Bytes,
     lines: FieldLines,
     overlay: Overlay,
+    /// Where the overlay's room came from, and goes back to when the head is done with.
+    lent_by: Option<Rc<RefCell<Blocks>>>,
 }
 
 impl RawHead {
-    /// The head in `head`, whose field lines `lines` says where they are.
+    /// The head in `head`, whose field lines `lines` says where they are. For tests,
+    /// benchmarks and fuzz targets: our own server's heads are [`RawHead::lent`].
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn new(method: Method, uri: Uri, version: Version, head: Bytes, lines: FieldLines) -> Self {
         Self {
             method,
@@ -49,6 +56,29 @@ impl RawHead {
             head,
             lines,
             overlay: Overlay::default(),
+            lent_by: None,
+        }
+    }
+
+    /// The same, its edits made in room lent by `blocks` and given back when it is dropped:
+    /// our own server's heads, which would otherwise make that room for every request.
+    pub fn lent(
+        method: Method,
+        uri: Uri,
+        version: Version,
+        head: Bytes,
+        lines: FieldLines,
+        blocks: &Rc<RefCell<Blocks>>,
+    ) -> Self {
+        let room = blocks.borrow_mut().take_edits();
+        Self {
+            method,
+            uri,
+            version,
+            head,
+            lines,
+            overlay: Overlay::in_room(room),
+            lent_by: Some(Rc::clone(blocks)),
         }
     }
 
@@ -326,11 +356,23 @@ impl RawHead {
             }
         }
         let (mut parts, ()) = Request::new(()).into_parts();
-        parts.method = self.method;
-        parts.uri = self.uri;
+        parts.method = self.method.clone();
+        parts.uri = self.uri.clone();
         parts.version = self.version;
         parts.headers = headers;
         parts
+    }
+}
+
+impl Drop for RawHead {
+    fn drop(&mut self) {
+        // Given back unless the blocks are in use, as they never are when a request ends;
+        // then the room is only let go of.
+        if let Some(blocks) = &self.lent_by
+            && let Ok(mut blocks) = blocks.try_borrow_mut()
+        {
+            blocks.give_edits(self.overlay.take_room());
+        }
     }
 }
 
@@ -545,6 +587,53 @@ impl Edit for Editing<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Our own server's heads make their edits in room the worker's blocks lend, and give
+    /// it back, emptied, when they are done: the next head has it without making it again.
+    #[test]
+    fn a_heads_room_for_edits_is_lent_and_given_back() {
+        let blocks = Rc::new(RefCell::new(Blocks::new(
+            crate::upstream::h1::blocks::Sizes::default(),
+            crate::storage::Storage::new(crate::storage::LIMIT),
+        )));
+        let sent = b"GET / HTTP/1.1\r\nhost: a\r\n\r\n";
+        let lent = || {
+            let mut room = [httparse::EMPTY_HEADER; 4];
+            let mut request = httparse::Request::new(&mut room);
+            assert!(request.parse(sent).unwrap().is_complete());
+            let lines = FieldLines::new(sent, request.headers).unwrap();
+            RawHead::lent(
+                Method::GET,
+                Uri::from_static("/"),
+                Version::HTTP_11,
+                Bytes::from_static(sent),
+                lines,
+                &blocks,
+            )
+        };
+        let mut first = lent();
+        for n in 0..5 {
+            let name = HeaderName::from_bytes(format!("x-{n}").as_bytes()).unwrap();
+            first
+                .append_field(name, HeaderValue::from_static("v"))
+                .unwrap();
+        }
+        drop(first);
+        let given = blocks.borrow_mut().take_edits();
+        assert!(given.is_empty());
+        let room = given.capacity();
+        assert!(room >= 5, "{room}");
+        blocks.borrow_mut().give_edits(given);
+
+        let second = lent();
+        assert_eq!(
+            second.fields().iter().count(),
+            1,
+            "nothing of the first is left"
+        );
+        drop(second);
+        assert_eq!(blocks.borrow_mut().take_edits().capacity(), room);
+    }
 
     /// An overlay that can take no more refuses the request, rather than dropping a change
     /// or panicking: no config the gateway accepts gets it there, so this drives it there.

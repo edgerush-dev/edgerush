@@ -41,6 +41,7 @@
 use super::H1Limits;
 use crate::storage::{Charge, Exhausted, Storage};
 use bytes::{Buf, Bytes, BytesMut};
+use http::{HeaderName, HeaderValue};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -318,6 +319,10 @@ pub struct Blocks {
     /// Free buffers for what is waiting to be written, empty and with their room made, each
     /// with the charge for its capacity.
     staging: Vec<(Vec<u8>, Charge)>,
+    /// Free lists for the fields a request's head adds, empty and with their room made: a
+    /// head read by our own server adds some to nearly every request, and would otherwise
+    /// make one for each. Small (a few fields each), so not paid for against `storage`.
+    edits: Vec<Vec<(HeaderName, HeaderValue)>>,
     sizes: Sizes,
     /// What every block made here is paid for against.
     storage: Rc<Storage>,
@@ -331,6 +336,7 @@ impl Blocks {
             small: Vec::new(),
             large: Vec::new(),
             staging: Vec::new(),
+            edits: Vec::new(),
             sizes,
             storage,
         }
@@ -490,6 +496,21 @@ impl Blocks {
         buffer.clear();
         if self.staging.len() < self.sizes.parked {
             self.staging.push((buffer, charge));
+        }
+    }
+
+    /// A list for the fields a head adds, empty: one given back before, or a new one, which
+    /// holds nothing until something is added.
+    pub fn take_edits(&mut self) -> Vec<(HeaderName, HeaderValue)> {
+        self.edits.pop().unwrap_or_default()
+    }
+
+    /// Takes a list of added fields back, to be lent again, emptied; or drops it, when there
+    /// are already enough or it never had any room.
+    pub fn give_edits(&mut self, mut edits: Vec<(HeaderName, HeaderValue)>) {
+        edits.clear();
+        if edits.capacity() > 0 && self.edits.len() < self.sizes.parked {
+            self.edits.push(edits);
         }
     }
 

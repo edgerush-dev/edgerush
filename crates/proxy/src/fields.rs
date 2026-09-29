@@ -361,6 +361,22 @@ pub struct Overlay {
 }
 
 impl Overlay {
+    /// An overlay that adds its fields to `room`, a list of them with nothing in it: its
+    /// room is used rather than made again.
+    #[must_use]
+    pub fn in_room(mut room: Vec<(HeaderName, HeaderValue)>) -> Self {
+        room.clear();
+        Self {
+            removed: 0,
+            added: room,
+        }
+    }
+
+    /// Gives up the list its fields were added to, for another overlay's use.
+    pub fn take_room(&mut self) -> Vec<(HeaderName, HeaderValue)> {
+        std::mem::take(&mut self.added)
+    }
+
     /// Takes out every field called `name`: the head's lines, whatever the case of their
     /// name, and anything added under it before.
     pub fn remove(&mut self, view: &View<'_>, name: &HeaderName) {
