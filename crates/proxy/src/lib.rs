@@ -97,6 +97,10 @@ mod tunnel;
 pub mod upstream;
 #[cfg(not(feature = "fuzzing"))]
 mod upstream;
+// Private, save when the fuzz targets are being built, for its frame reader.
+#[cfg(feature = "fuzzing")]
+pub mod websocket;
+#[cfg(not(feature = "fuzzing"))]
 mod websocket;
 
 pub use forwarding::Client;

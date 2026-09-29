@@ -8,7 +8,13 @@
 //! the client (a reflected 101) must not be able to pass with the client's key; it cannot
 //! with one the client never saw.
 //!
-//! Nothing here does I/O: the key's randomness is passed in.
+//! Nothing here does I/O: the key's randomness is passed in. [`frames`] follows a stream
+//! once it is switched.
+
+#[cfg(feature = "fuzzing")]
+pub mod frames;
+#[cfg(not(feature = "fuzzing"))]
+pub(crate) mod frames;
 
 use edgerush_router::Fields;
 use http::header::{CONNECTION, CONTENT_LENGTH, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY};

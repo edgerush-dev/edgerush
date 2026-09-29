@@ -106,5 +106,10 @@ name = "timers"
 harness = false
 required-features = ["fuzzing"]
 
+[[bench]]
+name = "websocket"
+harness = false
+required-features = ["fuzzing"]
+
 [lints]
 workspace = true

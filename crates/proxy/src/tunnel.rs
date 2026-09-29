@@ -18,9 +18,11 @@
 //! its bound is up, or when the worker has no storage for a block to read into.
 
 use crate::drain::Drain;
+use crate::random::{random, unguessable};
 use crate::timers::{Alarm, Timers};
 use crate::upstream::h1::blocks::{Block, Blocks};
 use crate::upstream::secure::Socket;
+use crate::websocket::frames::{Frames, GOING_AWAY, going_away_masked};
 use std::cell::RefCell;
 use std::future::poll_fn;
 use std::pin::{Pin, pin};
@@ -57,14 +59,21 @@ impl From<Carried> for crate::metrics::Tunnel {
     }
 }
 
-/// What a tunnel is held to.
+/// What a tunnel is held to, and how it ends when the worker drains.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Bounds {
     /// How long it may carry nothing either way.
     pub(crate) idle: Duration,
     /// How long it may go on once the worker drains.
     pub(crate) drain_within: Duration,
+    /// Whether it carries a WebSocket, whose frames are followed both ways so that a drain
+    /// can close it with a Close frame each way (19 §6).
+    pub(crate) websocket: bool,
 }
+
+/// How long a draining WebSocket's close is left for the Close replies: its moment falls in
+/// the drain bound less this (19 §6).
+const REPLIES: Duration = Duration::from_secs(5);
 
 /// A WebSocket's backend, once its upgrade is made (19 §2): the connection its 101 came on,
 /// what was read past the 101, and what the tunnel is held to. The request core hands it to
@@ -87,15 +96,51 @@ struct Way {
     ended: bool,
     /// And that end has been passed on.
     shut: bool,
+    /// For a WebSocket, where the frames of what this way reads begin.
+    frames: Option<Frames>,
+    /// A Close of the gateway's that this way owes its far side.
+    close: Close,
+    /// Whether its far side is the backend, whose Close from the gateway is masked.
+    to_backend: bool,
+}
+
+/// Where a way is with a Close frame of the gateway's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Close {
+    /// None is owed.
+    None,
+    /// One is owed at the next frame boundary.
+    Wanted,
+    /// It is being written: its bytes, how long it is and how much has gone.
+    Writing([u8; 8], u8, u8),
+    /// It has gone: what this way reads from now on is followed, not passed on.
+    Sent,
 }
 
 impl Way {
-    fn new(block: Option<Block>) -> Self {
+    fn new(block: Option<Block>, websocket: bool, to_backend: bool) -> Self {
+        let frames = websocket.then(|| {
+            let mut frames = Frames::new();
+            if let Some(block) = &block {
+                frames.read(block.data());
+            }
+            frames
+        });
         Self {
             block,
             ended: false,
             shut: false,
+            frames,
+            close: Close::None,
+            to_backend,
         }
+    }
+
+    /// Whether this way is where it may take a Close frame: nothing of its own in hand, and
+    /// what it has passed on ending with a frame.
+    fn at_boundary(&self) -> bool {
+        self.block.as_ref().is_none_or(Block::is_empty)
+            && self.frames.as_ref().is_some_and(Frames::at_boundary)
     }
 }
 
@@ -107,9 +152,28 @@ enum Stopped {
     Exhausted,
 }
 
+/// Where a WebSocket is with a drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Draining {
+    /// Not draining.
+    No,
+    /// Its Close frames go at this moment.
+    At(Instant),
+    /// They are owed, or have gone, each way; done once both replies are in.
+    Closing,
+    /// Left to end by itself or at the bound: already closing, or not one to close.
+    Left,
+}
+
 /// Carries `client` to `backend` and back until the tunnel ends. `up` may already hold
 /// bytes the client sent and `down` bytes the backend sent, which go first. Every block is
 /// back with `blocks` when it returns.
+///
+/// A WebSocket (`bounds.websocket`) is closed on drain as 19 §6 has it: at a moment drawn
+/// in the drain bound less five seconds, each side is sent a Close 1001 at its next frame
+/// boundary — the backend's masked, as a client's must be — and nothing more of the other's;
+/// once both have answered with their own Close, the tunnel ends. One already closing is
+/// left to finish, and one whose frames could not be followed is closed bare.
 #[expect(
     clippy::too_many_arguments,
     reason = "each is a different thing the tunnel needs, and a struct to hold them would \
@@ -129,49 +193,95 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut up = Way::new(up);
-    let mut down = Way::new(down);
+    let mut up = Way::new(up, bounds.websocket, true);
+    let mut down = Way::new(down, bounds.websocket, false);
     let mut alarm = Alarm::new(timers, None);
     let mut heard = pin!(drain.notified());
     let mut last = Instant::now();
     let mut drain_by = None;
+    let mut draining = Draining::No;
     let carried = poll_fn(|cx| {
-        let mut moved = false;
-        for (way, from_client) in [(&mut up, true), (&mut down, false)] {
-            if way.shut {
-                continue;
+        loop {
+            let mut moved = false;
+            for (way, from_client) in [(&mut up, true), (&mut down, false)] {
+                if way.shut {
+                    continue;
+                }
+                let pumped = if from_client {
+                    pump(client, backend, way, blocks, &mut moved, cx)
+                } else {
+                    pump(backend, client, way, blocks, &mut moved, cx)
+                };
+                match pumped {
+                    Poll::Ready(Err(Stopped::Failed)) => return Poll::Ready(Carried::Failed),
+                    Poll::Ready(Err(Stopped::Exhausted)) => {
+                        return Poll::Ready(Carried::Exhausted);
+                    }
+                    Poll::Ready(Ok(())) | Poll::Pending => {}
+                }
             }
-            let pumped = if from_client {
-                pump(client, backend, way, blocks, &mut moved, cx)
-            } else {
-                pump(backend, client, way, blocks, &mut moved, cx)
-            };
-            match pumped {
-                Poll::Ready(Err(Stopped::Failed)) => return Poll::Ready(Carried::Failed),
-                Poll::Ready(Err(Stopped::Exhausted)) => return Poll::Ready(Carried::Exhausted),
-                Poll::Ready(Ok(())) | Poll::Pending => {}
+            if up.shut && down.shut {
+                return Poll::Ready(if draining == Draining::Closing {
+                    Carried::Drained
+                } else {
+                    Carried::Closed
+                });
             }
+            // Both Closes gone, and both answered: the WebSocket is closed as RFC 6455 has
+            // it, and its connections go with it.
+            if draining == Draining::Closing
+                && up.close == Close::Sent
+                && down.close == Close::Sent
+                && up.frames.as_ref().is_some_and(Frames::closing)
+                && down.frames.as_ref().is_some_and(Frames::closing)
+            {
+                return Poll::Ready(Carried::Drained);
+            }
+            if moved {
+                last = Instant::now();
+            }
+            if drain_by.is_none() && drain.poll_on(heard.as_mut(), cx).is_ready() {
+                let now = Instant::now();
+                drain_by = Some(now + bounds.drain_within);
+                if bounds.websocket {
+                    draining = Draining::At(now + spread(bounds.drain_within));
+                }
+            }
+            if let Draining::At(moment) = draining
+                && Instant::now() >= moment
+            {
+                draining = close_at_boundaries(&mut up, &mut down);
+                match draining {
+                    // Not one that can be closed with a frame: closed bare, now.
+                    Draining::No => return Poll::Ready(Carried::Drained),
+                    // Its Closes may go at once: round again to write them.
+                    Draining::Closing => continue,
+                    Draining::At(_) | Draining::Left => {}
+                }
+            }
+            let idle_by = last + bounds.idle;
+            let mut due = drain_by.map_or(idle_by, |drain_by: Instant| drain_by.min(idle_by));
+            if let Draining::At(moment) = draining {
+                due = due.min(moment);
+            }
+            if alarm.poll_until(cx, due).is_ready() {
+                if let Draining::At(moment) = draining
+                    && moment <= due
+                {
+                    // The moment came, as the timers tell it, which may be a little before
+                    // the clock does: it is taken as come, and acted on.
+                    draining = Draining::At(Instant::now());
+                    continue;
+                }
+                let drained = drain_by.is_some_and(|drain_by| drain_by <= idle_by);
+                return Poll::Ready(if drained {
+                    Carried::Drained
+                } else {
+                    Carried::Idle
+                });
+            }
+            return Poll::Pending;
         }
-        if up.shut && down.shut {
-            return Poll::Ready(Carried::Closed);
-        }
-        if moved {
-            last = Instant::now();
-        }
-        if drain_by.is_none() && drain.poll_on(heard.as_mut(), cx).is_ready() {
-            drain_by = Some(Instant::now() + bounds.drain_within);
-        }
-        let idle_by = last + bounds.idle;
-        let due = drain_by.map_or(idle_by, |drain_by: Instant| drain_by.min(idle_by));
-        if alarm.poll_until(cx, due).is_ready() {
-            let drained = drain_by.is_some_and(|drain_by| drain_by <= idle_by);
-            return Poll::Ready(if drained {
-                Carried::Drained
-            } else {
-                Carried::Idle
-            });
-        }
-        Poll::Pending
     })
     .await;
     let mut blocks = blocks.borrow_mut();
@@ -179,6 +289,49 @@ where
         blocks.give(block);
     }
     carried
+}
+
+/// When, within a drain bound of `drain_within`, a WebSocket is closed: drawn evenly in all
+/// but the last five seconds of it, so that its clients come back to the other pods spread
+/// out rather than all at once, and have those seconds to answer (19 §6).
+fn spread(drain_within: Duration) -> Duration {
+    let window = drain_within.saturating_sub(REPLIES);
+    let millis = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+    if millis == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_millis(random() % millis)
+}
+
+/// Owes each side a Close at its next frame boundary, unless the WebSocket is closing
+/// already (a Close has gone by either way), which is left to finish, or cannot be followed
+/// either way, which is closed bare: `Draining::No` says so.
+fn close_at_boundaries(up: &mut Way, down: &mut Way) -> Draining {
+    let (Some(upward), Some(downward)) = (up.frames.as_ref(), down.frames.as_ref()) else {
+        return Draining::No;
+    };
+    if upward.lost() || downward.lost() {
+        return Draining::No;
+    }
+    if upward.closing() || downward.closing() {
+        return Draining::Left;
+    }
+    up.close = Close::Wanted;
+    down.close = Close::Wanted;
+    Draining::Closing
+}
+
+/// The Close frame a way owes: to the backend masked, as a client's frames are, with a
+/// mask no one can guess (RFC 6455 §5.3); to the client as it is.
+fn close_frame(to_backend: bool) -> ([u8; 8], u8) {
+    if to_backend {
+        let mask = unguessable::<4>().unwrap_or([0x5a; 4]);
+        (going_away_masked(mask), 8)
+    } else {
+        let mut frame = [0; 8];
+        frame[..4].copy_from_slice(&GOING_AWAY);
+        (frame, 4)
+    }
 }
 
 /// Moves what `from` sends on to `to`, as far as both allow now. Ready once `from` has
@@ -211,11 +364,37 @@ where
                 }
             }
         }
-        let spare = way.block.take();
-        if way.ended {
-            if let Some(block) = spare {
-                blocks.borrow_mut().give(block);
+        let mut spare = way.block.take();
+        // What is rare gives it back first: a Close to write, or an end to pass on.
+        if (way.close != Close::None || way.ended)
+            && let Some(block) = spare.take()
+        {
+            blocks.borrow_mut().give(block);
+        }
+        // A Close of the gateway's, once what has gone on ends with a frame.
+        if way.close == Close::Wanted && way.at_boundary() {
+            let (frame, length) = close_frame(way.to_backend);
+            way.close = Close::Writing(frame, length, 0);
+        }
+        if let Close::Writing(frame, length, written) = way.close {
+            let rest = &frame[usize::from(written)..usize::from(length)];
+            match Pin::new(&mut *to).poll_write(cx, rest) {
+                Poll::Ready(Ok(0) | Err(_)) => return Poll::Ready(Err(Stopped::Failed)),
+                Poll::Ready(Ok(more)) => {
+                    // Never more than the eight bytes asked for.
+                    let written = written.saturating_add(u8::try_from(more).unwrap_or(length));
+                    way.close = if written >= length {
+                        Close::Sent
+                    } else {
+                        Close::Writing(frame, length, written)
+                    };
+                    *moved = true;
+                    continue;
+                }
+                Poll::Pending => return Poll::Pending,
             }
+        }
+        if way.ended {
             return match Pin::new(&mut *to).poll_shutdown(cx) {
                 Poll::Ready(Ok(())) => {
                     way.shut = true;
@@ -244,12 +423,46 @@ where
         };
         let mut read = ReadBuf::new(block.room());
         let polled = Pin::new(&mut *from).poll_read(cx, &mut read);
-        let count = read.filled().len();
+        let arrived = read.filled();
+        let count = arrived.len();
+        // What of it goes on: all of it, but for a WebSocket owed a Close, only as far as
+        // the frame boundary it goes at, and after its Close, none. Whatever is not passed
+        // on is still followed, for the Close that answers the gateway's.
+        let mut boundary = None;
+        let kept = match (&mut way.frames, way.close) {
+            (None, _) => count,
+            (Some(frames), Close::Sent) => {
+                frames.read(arrived);
+                0
+            }
+            (Some(frames), Close::Wanted) => match frames.until_boundary(arrived) {
+                Some(at) => {
+                    frames.read(&arrived[at..]);
+                    boundary = Some(at);
+                    at
+                }
+                None => count,
+            },
+            (Some(frames), Close::None | Close::Writing(..)) => {
+                frames.read(arrived);
+                count
+            }
+        };
         match polled {
             Poll::Ready(Ok(())) if count > 0 => {
-                block.arrived(count);
-                way.block = Some(block);
                 *moved = true;
+                if kept > 0 {
+                    block.arrived(kept);
+                    way.block = Some(block);
+                } else {
+                    blocks.borrow_mut().give(block);
+                }
+                // A Close owed at a boundary in what was read goes right after what was
+                // kept of it, as the loop comes round.
+                if boundary.is_some() {
+                    let (frame, length) = close_frame(way.to_backend);
+                    way.close = Close::Writing(frame, length, 0);
+                }
             }
             Poll::Ready(Ok(())) => {
                 blocks.borrow_mut().give(block);
@@ -273,15 +486,25 @@ mod tests {
     use crate::storage::Storage;
     use crate::upstream::h1::blocks::{SMALL, Sizes};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+    use tokio::time::Instant;
 
     const BOUNDS: Bounds = Bounds {
         idle: Duration::from_secs(60),
         drain_within: Duration::from_secs(60),
+        websocket: false,
     };
 
     /// A test that waits for what never comes should fail, not hang.
     async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
         tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .expect("timed out")
+    }
+
+    /// The same for a test on a stopped clock that waits through a drain, whose bound is
+    /// 25 seconds of it: a minute of the clock, which costs no time at all.
+    async fn within_drain<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(60), future)
             .await
             .expect("timed out")
     }
@@ -420,5 +643,241 @@ mod tests {
         )))
         .await;
         assert_eq!(carried, Carried::Exhausted);
+    }
+
+    const WEBSOCKET: Bounds = Bounds {
+        idle: Duration::from_secs(3600),
+        drain_within: Duration::from_secs(25),
+        websocket: true,
+    };
+
+    /// The tunnel, and then both of its connections closed, as a server drops them.
+    async fn carried_and_closed(
+        mut client: DuplexStream,
+        mut backend: DuplexStream,
+        blocks: &RefCell<Blocks>,
+        timers: &Rc<Timers>,
+        drain: &Drain,
+    ) -> Carried {
+        carry(
+            &mut client,
+            &mut backend,
+            None,
+            None,
+            blocks,
+            WEBSOCKET,
+            timers,
+            drain,
+        )
+        .await
+    }
+
+    /// A text frame as a client sends it, masked.
+    fn from_client(text: &[u8]) -> Vec<u8> {
+        let mask = [1, 2, 3, 4];
+        let mut frame = vec![0x81, 0x80 | u8::try_from(text.len()).unwrap()];
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            text.iter()
+                .zip(mask.iter().cycle())
+                .map(|(byte, key)| byte ^ key),
+        );
+        frame
+    }
+
+    /// A text frame as a server sends it.
+    fn from_server(text: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0x81, u8::try_from(text.len()).unwrap()];
+        frame.extend_from_slice(text);
+        frame
+    }
+
+    async fn exactly(from: &mut DuplexStream, count: usize) -> Vec<u8> {
+        let mut read = vec![0; count];
+        from.read_exact(&mut read).await.unwrap();
+        read
+    }
+
+    /// The status code of a Close frame read from `from`, unmasked if it is masked, and
+    /// whether it was.
+    async fn close_read(from: &mut DuplexStream) -> (u16, bool) {
+        let head = exactly(from, 2).await;
+        assert_eq!(head[0], 0x88, "not a Close: {head:?}");
+        let masked = head[1] & 0x80 != 0;
+        assert_eq!(head[1] & 0x7f, 2, "{head:?}");
+        let mask = if masked {
+            exactly(from, 4).await
+        } else {
+            vec![0; 4]
+        };
+        let code = exactly(from, 2).await;
+        (
+            u16::from_be_bytes([code[0] ^ mask[0], code[1] ^ mask[1]]),
+            masked,
+        )
+    }
+
+    /// A draining worker closes a WebSocket as RFC 6455 does: each side is sent a Close
+    /// 1001 — the backend's masked — at a moment in the drain bound less five seconds, the
+    /// frames under way before it going first; each answers with its own, which goes no
+    /// further; and the tunnel ends then, well inside the bound (19 §6).
+    #[tokio::test(start_paused = true)]
+    async fn a_draining_websocket_is_closed_with_going_away_both_ways() {
+        let timers = Timers::new();
+        let drain = Drain::default();
+        let blocks = blocks_within(4 * SMALL);
+        let ((client, backend), (mut client_side, mut backend_side)) = ends();
+        let began = Instant::now();
+        let (carried, ended) = within_drain(timers.driving(async {
+            let carrying = carried_and_closed(client, backend, &blocks, &timers, &drain);
+            let talking = async {
+                moved(&mut client_side, &mut backend_side, &from_client(b"hi")).await;
+                moved(&mut backend_side, &mut client_side, &from_server(b"hello")).await;
+                drain.start();
+                assert_eq!(close_read(&mut client_side).await, (1001, false));
+                assert_eq!(close_read(&mut backend_side).await, (1001, true));
+                // Each answers; neither answer is passed on.
+                client_side
+                    .write_all(&going_away_masked([7, 7, 7, 7]))
+                    .await
+                    .unwrap();
+                backend_side.write_all(&GOING_AWAY).await.unwrap();
+                let (mut to_client, mut to_backend) = (Vec::new(), Vec::new());
+                client_side.read_to_end(&mut to_client).await.unwrap();
+                backend_side.read_to_end(&mut to_backend).await.unwrap();
+                assert_eq!(to_client, b"", "the backend's answer went on");
+                assert_eq!(to_backend, b"", "the client's answer went on");
+                began.elapsed()
+            };
+            tokio::join!(carrying, talking)
+        }))
+        .await;
+        assert_eq!(carried, Carried::Drained);
+        assert!(ended < Duration::from_secs(21), "{ended:?}");
+    }
+
+    /// A Close goes only where a frame ends: one the backend is part way through sending
+    /// when the moment comes is finished first, and what comes after it goes nowhere.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_waits_for_the_frame_under_way() {
+        let timers = Timers::new();
+        let drain = Drain::default();
+        let blocks = blocks_within(4 * SMALL);
+        let ((client, backend), (mut client_side, mut backend_side)) = ends();
+        let (carried, ()) = within_drain(timers.driving(async {
+            let carrying = carried_and_closed(client, backend, &blocks, &timers, &drain);
+            let talking = async {
+                let frame = from_server(b"a long message");
+                moved(&mut backend_side, &mut client_side, &frame[..6]).await;
+                drain.start();
+                // Past every moment the drain can draw: the Close is owed, and waits.
+                tokio::time::sleep(Duration::from_secs(21)).await;
+                let (_, masked) = close_read(&mut backend_side).await;
+                assert!(masked);
+                let mut rest = frame[6..].to_vec();
+                rest.extend(from_server(b"never sent"));
+                backend_side.write_all(&rest).await.unwrap();
+                assert_eq!(
+                    exactly(&mut client_side, frame.len() - 6).await,
+                    &frame[6..]
+                );
+                assert_eq!(close_read(&mut client_side).await, (1001, false));
+                client_side
+                    .write_all(&going_away_masked([1, 1, 1, 1]))
+                    .await
+                    .unwrap();
+                backend_side.write_all(&GOING_AWAY).await.unwrap();
+                let mut to_client = Vec::new();
+                client_side.read_to_end(&mut to_client).await.unwrap();
+                assert_eq!(to_client, b"", "a frame after the Close went on");
+            };
+            tokio::join!(carrying, talking)
+        }))
+        .await;
+        assert_eq!(carried, Carried::Drained);
+    }
+
+    /// A WebSocket one side is already closing is sent no second Close: it is left to
+    /// finish, and closed at the drain bound if it has not.
+    #[tokio::test(start_paused = true)]
+    async fn a_websocket_already_closing_is_left_to_finish() {
+        let timers = Timers::new();
+        let drain = Drain::default();
+        let blocks = blocks_within(4 * SMALL);
+        let ((client, backend), (mut client_side, mut backend_side)) = ends();
+        let began = Instant::now();
+        let (carried, ()) = within_drain(timers.driving(async {
+            let carrying = carried_and_closed(client, backend, &blocks, &timers, &drain);
+            let talking = async {
+                let close = going_away_masked([3, 3, 3, 3]);
+                moved(&mut client_side, &mut backend_side, &close).await;
+                drain.start();
+                let mut to_backend = Vec::new();
+                backend_side.read_to_end(&mut to_backend).await.unwrap();
+                assert_eq!(to_backend, b"", "a second Close");
+            };
+            tokio::join!(carrying, talking)
+        }))
+        .await;
+        assert_eq!(carried, Carried::Drained);
+        assert!(
+            began.elapsed() >= Duration::from_secs(25),
+            "{:?}",
+            began.elapsed()
+        );
+    }
+
+    /// A stream whose frames could not be followed is closed bare at its moment: no Close
+    /// frame goes into what might be the middle of one.
+    #[tokio::test(start_paused = true)]
+    async fn a_websocket_that_cannot_be_followed_is_closed_bare() {
+        let timers = Timers::new();
+        let drain = Drain::default();
+        let blocks = blocks_within(4 * SMALL);
+        let ((client, backend), (mut client_side, mut backend_side)) = ends();
+        let mut unfollowable = vec![0x82, 127];
+        unfollowable.extend_from_slice(&(1_u64 << 63).to_be_bytes());
+        let began = Instant::now();
+        let (carried, ()) = within_drain(timers.driving(async {
+            let carrying = carried_and_closed(client, backend, &blocks, &timers, &drain);
+            let talking = async {
+                moved(&mut backend_side, &mut client_side, &unfollowable).await;
+                drain.start();
+                let mut to_client = Vec::new();
+                client_side.read_to_end(&mut to_client).await.unwrap();
+                assert_eq!(to_client, b"", "a Close went into the stream");
+            };
+            tokio::join!(carrying, talking)
+        }))
+        .await;
+        assert_eq!(carried, Carried::Drained);
+        // At its moment, not left for the bound.
+        assert!(
+            began.elapsed() < Duration::from_secs(21),
+            "{:?}",
+            began.elapsed()
+        );
+    }
+
+    /// A drain's closes are spread over all but its last five seconds.
+    #[test]
+    fn moments_are_spread_over_the_drain() {
+        let moments: Vec<Duration> = (0..1000).map(|_| spread(Duration::from_secs(25))).collect();
+        assert!(
+            moments
+                .iter()
+                .all(|moment| *moment < Duration::from_secs(20))
+        );
+        assert!(
+            moments
+                .iter()
+                .any(|moment| *moment < Duration::from_secs(5))
+        );
+        assert!(
+            moments
+                .iter()
+                .any(|moment| *moment > Duration::from_secs(15))
+        );
+        assert_eq!(spread(Duration::from_secs(5)), Duration::ZERO);
     }
 }

@@ -148,3 +148,10 @@ path = "fuzz_targets/forwarded_for.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "websocket_frames"
+path = "fuzz_targets/websocket_frames.rs"
+test = false
+doc = false
+bench = false

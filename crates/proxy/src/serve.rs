@@ -1273,6 +1273,7 @@ impl Worker {
         let bounds = TunnelBounds {
             idle,
             drain_within: self.deadlines.drain,
+            websocket: false,
         };
         carry(
             client,
@@ -2186,6 +2187,7 @@ impl Worker {
             bounds: TunnelBounds {
                 idle: handshake.idle,
                 drain_within: self.deadlines.drain,
+                websocket: true,
             },
         });
         Ok((read, Body::Empty))
@@ -10412,6 +10414,121 @@ upstreams:
                 let _ended = within(client.read_to_end(&mut rest)).await;
                 assert_eq!(rest, b"bye");
                 tunnel_ended(&worker, "web", "closed").await;
+            })
+            .await;
+    }
+
+    /// A plaintext backend that speaks WebSocket as far as the handshake and the close go:
+    /// a 101 with the Accept of the key it was sent, then it reads until a Close frame
+    /// comes, answers it with a Close of its own, and says everything it read once the
+    /// gateway has closed its connection.
+    async fn closing_websocket_backend(
+        saw: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    ) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let _accepting = tokio::task::spawn_local(async move {
+            while let Ok((mut stream, _)) = socket.accept().await {
+                let saw = saw.clone();
+                let _serving = tokio::task::spawn_local(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => head.push(byte[0]),
+                        }
+                    }
+                    let head = String::from_utf8(head).unwrap();
+                    let key = head
+                        .split("\r\n")
+                        .find_map(|line| line.strip_prefix("sec-websocket-key: "))
+                        .and_then(|key| Key::read(key.as_bytes()))
+                        .unwrap();
+                    let accept = String::from_utf8(key.accept().to_vec()).unwrap();
+                    let switched = format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\
+                         connection: upgrade\r\nsec-websocket-accept: {accept}\r\n\r\n"
+                    );
+                    stream.write_all(switched.as_bytes()).await.unwrap();
+                    let mut read = Vec::new();
+                    let mut bytes = [0; 1024];
+                    let mut answered = false;
+                    loop {
+                        match stream.read(&mut bytes).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(count) => read.extend_from_slice(&bytes[..count]),
+                        }
+                        if !answered && read.first() == Some(&0x88) {
+                            answered = true;
+                            // 1000, "Normal Closure", as a server answers a Close.
+                            let _ = stream.write_all(&[0x88, 0x02, 0x03, 0xe8]).await;
+                        }
+                    }
+                    let _ = saw.send(read);
+                });
+            }
+        });
+        address
+    }
+
+    /// A draining worker closes an open WebSocket with a Close 1001 each way, takes both
+    /// answers, and counts it drained (19 §6). With the short deadlines' bound of under
+    /// five seconds, its moment is at once.
+    #[tokio::test]
+    async fn a_draining_worker_closes_websockets_with_going_away() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (saw, mut seen) = tokio::sync::mpsc::unbounded_channel();
+                let upstream = closing_websocket_backend(saw).await;
+                let proxy = Proxy::new(
+                    compile(&everything_config(upstream)).unwrap(),
+                    NonZeroUsize::MIN,
+                )
+                .unwrap();
+                let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = serving(&worker, socket);
+
+                let mut client = TcpStream::connect(front).await.unwrap();
+                client
+                    .write_all(
+                        b"GET /chat HTTP/1.1\r\nhost: a.test\r\nupgrade: websocket\r\n\
+                          connection: upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                          sec-websocket-version: 13\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    within(client.read_exact(&mut byte)).await.unwrap();
+                    head.push(byte[0]);
+                }
+                assert!(head.starts_with(b"HTTP/1.1 101 "));
+
+                worker.drain();
+                let mut close = [0; 4];
+                within(client.read_exact(&mut close)).await.unwrap();
+                assert_eq!(close, [0x88, 0x02, 0x03, 0xe9], "not a Close 1001");
+                // The client answers, masked, as a client must.
+                client
+                    .write_all(&[0x88, 0x82, 0, 0, 0, 0, 0x03, 0xe9])
+                    .await
+                    .unwrap();
+                let mut rest = Vec::new();
+                let _closed = within(client.read_to_end(&mut rest)).await;
+                assert_eq!(rest, b"", "the backend's answer went on");
+                let heard = within(seen.recv()).await.unwrap();
+                assert_eq!(heard.len(), 8, "{heard:?}");
+                assert_eq!(&heard[..2], &[0x88, 0x82], "{heard:?}");
+                let code = [heard[6] ^ heard[2], heard[7] ^ heard[3]];
+                assert_eq!(u16::from_be_bytes(code), 1001);
+                tunnel_ended(&worker, "web", "drained").await;
             })
             .await;
     }
