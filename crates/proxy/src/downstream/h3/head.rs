@@ -37,13 +37,18 @@ pub struct RequestHead {
     pub length: Option<u64>,
 }
 
+/// How many fields the request core adds to a request's head (03 §11 in the docs).
+const ADDED_BY_THE_CORE: usize = 5;
+
 /// The request `fields` make, measured against `limit` by RFC 9114 §4.2.2's measure.
 pub fn request<F: NameValue>(fields: &[F], limit: usize) -> Result<RequestHead, Refused> {
     let mut method = None;
     let mut scheme = None;
     let mut authority = None;
     let mut path = None;
-    let mut headers = HeaderMap::with_capacity(fields.len());
+    // Room for what the request core adds as well, so that the map does not grow to take
+    // it: `Host` from `:authority`, `X-Forwarded-For`, `-Proto` and `-Host`, and `Via`.
+    let mut headers = HeaderMap::with_capacity(fields.len() + ADDED_BY_THE_CORE);
     let mut size = 0_usize;
     let mut regular = false;
     for field in fields {
