@@ -7,7 +7,7 @@
 //! treat one as a malformed request; `TE` may say `trailers` and nothing else; and the
 //! body's length is said as it will be sent, not as it was said on the way in.
 
-use crate::upstream::h1::codec::{OutgoingFields, Sending};
+use crate::upstream::h1::codec::{HeldField, OutgoingFields, Sending};
 use http::header::{CONTENT_LENGTH, TE};
 use http::uri::{Authority, PathAndQuery, Scheme};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri, Version};
@@ -70,18 +70,30 @@ pub(crate) fn request<F: OutgoingFields + ?Sized>(
             });
             headers
         }
+        // The lines read and checked again; what was added on the way shared, as it was
+        // added.
         None => {
             let mut headers = HeaderMap::new();
             let mut failed = false;
-            fields.each_field(|name, value| {
-                if failed || !travels(name, value) {
+            fields.each_outgoing(|field| {
+                if failed {
                     return;
                 }
-                match (HeaderName::from_bytes(name), HeaderValue::from_bytes(value)) {
-                    (Ok(name), Ok(value)) => {
-                        headers.append(name, value);
+                match field {
+                    HeldField::Line(name, value) if travels(name, value) => {
+                        match (HeaderName::from_bytes(name), HeaderValue::from_bytes(value)) {
+                            (Ok(name), Ok(value)) => {
+                                headers.append(name, value);
+                            }
+                            _ => failed = true,
+                        }
                     }
-                    _ => failed = true,
+                    HeldField::Added(name, value)
+                        if travels(name.as_str().as_bytes(), value.as_bytes()) =>
+                    {
+                        headers.append(name.clone(), value.clone());
+                    }
+                    HeldField::Line(..) | HeldField::Added(..) => {}
                 }
             });
             if failed {
@@ -166,6 +178,66 @@ mod tests {
         fn each_field(&self, visit: impl FnMut(&[u8], &[u8])) {
             self.0.each_field(visit);
         }
+    }
+
+    /// Fields held as lines with others added on the way, as a raw head holds them.
+    struct LinesAndAdded(HeaderMap, Vec<(HeaderName, HeaderValue)>);
+
+    impl edgerush_router::Fields for LinesAndAdded {
+        fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
+            let added = self.1.iter().filter(move |(added, _)| added == name);
+            self.0
+                .get_all(name)
+                .iter()
+                .chain(added.map(|(_, value)| value))
+                .map(HeaderValue::as_bytes)
+        }
+    }
+
+    impl OutgoingFields for LinesAndAdded {
+        fn written_len(&self) -> usize {
+            self.0.written_len()
+        }
+
+        fn write_fields(&self, out: &mut Vec<u8>) {
+            self.0.write_fields(out);
+        }
+
+        fn each_field(&self, mut visit: impl FnMut(&[u8], &[u8])) {
+            self.each_outgoing(|field| match field {
+                HeldField::Line(name, value) => visit(name, value),
+                HeldField::Added(name, value) => visit(name.as_str().as_bytes(), value.as_bytes()),
+            });
+        }
+
+        fn each_outgoing(&self, mut visit: impl FnMut(HeldField<'_>)) {
+            for (name, value) in &self.0 {
+                visit(HeldField::Line(name.as_str().as_bytes(), value.as_bytes()));
+            }
+            for (name, value) in &self.1 {
+                visit(HeldField::Added(name, value));
+            }
+        }
+    }
+
+    /// What was added on the way goes as it was added, its flags kept — a request's ID
+    /// never indexed — and held to what HTTP/2 lets through as the lines are.
+    #[test]
+    fn what_was_added_goes_as_it_was_added() {
+        let mut id = HeaderValue::from_static("0199e8a4-7c1b-7d2e-9a57-3f1c2b4d5e6f");
+        id.set_sensitive(true);
+        let fields = LinesAndAdded(
+            fields(&[("host", "a.test"), ("accept", "*/*")]),
+            vec![
+                (HeaderName::from_static("x-request-id"), id.clone()),
+                (http::header::CONNECTION, HeaderValue::from_static("close")),
+            ],
+        );
+        let sent_as = head(&Method::GET, &target("/"), &fields, Sending::None).unwrap();
+        assert_eq!(sent_as.headers()["x-request-id"], id);
+        assert!(sent_as.headers()["x-request-id"].is_sensitive());
+        assert_eq!(sent_as.headers()["accept"], "*/*");
+        assert!(!sent_as.headers().contains_key("connection"));
     }
 
     #[test]

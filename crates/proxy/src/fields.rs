@@ -497,10 +497,16 @@ impl<'a> Edited<'a> {
     /// Every field as edited, a name as it arrived or was added and a value: the lines
     /// kept, in their order, then what was added.
     pub fn iter(&self) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + use<'a> {
-        let (view, overlay) = (self.view, self.overlay);
-        let removed = overlay.removed;
-        let kept = view
-            .lines
+        let added = self
+            .added()
+            .map(|(name, value)| (name.as_str().as_bytes(), value.as_bytes()));
+        self.kept().chain(added)
+    }
+
+    /// The lines kept, in their order: a name as it arrived and a value.
+    pub fn kept(&self) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + use<'a> {
+        let (view, removed) = (self.view, self.overlay.removed);
+        view.lines
             .lines
             .iter()
             .enumerate()
@@ -510,12 +516,14 @@ impl<'a> Edited<'a> {
                     bytes(view.head, line.start..line.name_end),
                     view.value(line),
                 )
-            });
-        let added = overlay
-            .added
-            .iter()
-            .map(|(name, value)| (name.as_str().as_bytes(), value.as_bytes()));
-        kept.chain(added)
+            })
+    }
+
+    /// What was added, in its order, as the names and values it was added as: for a hop
+    /// that takes those, which then keeps a value's flags (a sensitive one never indexed)
+    /// and does not check it again.
+    pub fn added(&self) -> impl Iterator<Item = (&'a HeaderName, &'a HeaderValue)> + use<'a> {
+        self.overlay.added.iter().map(|(name, value)| (name, value))
     }
 }
 

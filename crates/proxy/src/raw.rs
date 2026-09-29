@@ -15,7 +15,7 @@ use crate::hop_by_hop::{self, ConnectionError, is_hop_by_hop_name, options_of};
 use crate::host::HostError;
 use crate::request::Rejection;
 use crate::upstream::h1::blocks::Blocks;
-use crate::upstream::h1::codec::OutgoingFields;
+use crate::upstream::h1::codec::{HeldField, OutgoingFields};
 use bytes::Bytes;
 use edgerush_filters::{Edit, HeaderModifier};
 use edgerush_router::Fields;
@@ -136,6 +136,16 @@ impl OutgoingFields for RawHead {
     fn each_field(&self, mut visit: impl FnMut(&[u8], &[u8])) {
         for (name, value) in self.fields().iter() {
             visit(name, value);
+        }
+    }
+
+    fn each_outgoing(&self, mut visit: impl FnMut(HeldField<'_>)) {
+        let fields = self.fields();
+        for (name, value) in fields.kept() {
+            visit(HeldField::Line(name, value));
+        }
+        for (name, value) in fields.added() {
+            visit(HeldField::Added(name, value));
         }
     }
 }
@@ -462,17 +472,22 @@ impl RawAnswer {
     }
 
     /// The answer as `http`'s parts, in this hop's version, for a server that takes those:
-    /// HTTP/2's.
+    /// HTTP/2's. What was added goes over as it was added, its flags kept (a request's ID
+    /// never indexed) and not checked again.
     pub fn into_parts(self) -> response::Parts {
-        let mut headers = HeaderMap::with_capacity(self.lines.len());
-        for (name, value) in self.fields().iter() {
-            // Every line was found to be a field when it was read, and every field added
-            // was made one, so nothing here is left out.
+        let fields = self.fields();
+        let mut headers = HeaderMap::with_capacity(self.lines.len() + fields.added().count());
+        for (name, value) in fields.kept() {
+            // Every line was found to be a field when it was read, so nothing here is left
+            // out.
             if let (Ok(name), Ok(value)) =
                 (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
             {
                 headers.append(name, value);
             }
+        }
+        for (name, value) in fields.added() {
+            headers.append(name.clone(), value.clone());
         }
         let (mut parts, ()) = Response::new(()).into_parts();
         parts.status = self.status;
@@ -671,6 +686,83 @@ mod tests {
             assert_eq!(raw.apply(&sixteen), Ok(()));
         }
         assert_eq!(raw.apply(&sixteen), Err(Rejection::Edits));
+    }
+
+    /// A request's ID as the core gives it: never indexed.
+    fn sensitive_id() -> HeaderValue {
+        let mut id = HeaderValue::from_static("0199e8a4-7c1b-7d2e-9a57-3f1c2b4d5e6f");
+        id.set_sensitive(true);
+        id
+    }
+
+    /// An answer made a map keeps what was added as it was added: a value never to be
+    /// indexed stays so, and what arrived is read as it was.
+    #[test]
+    fn an_answer_made_a_map_keeps_what_was_added_as_it_was() {
+        let sent =
+            b"HTTP/1.1 200 OK\r\nvia: 1.1 a\r\nx-request-id: theirs\r\ncontent-length: 0\r\n\r\n";
+        let (_, mut raw) = both_answers(sent).unwrap();
+        raw.set_field(HeaderName::from_static("x-request-id"), sensitive_id())
+            .unwrap();
+        let parts = raw.into_parts();
+        let ids: Vec<&HeaderValue> = parts.headers.get_all("x-request-id").iter().collect();
+        assert_eq!(ids, [&sensitive_id()]);
+        assert!(ids[0].is_sensitive());
+        assert_eq!(parts.headers["via"], "1.1 a");
+        assert!(!parts.headers["via"].is_sensitive());
+        assert_eq!(parts.headers["content-length"], "0");
+    }
+
+    /// A raw head hands its fields on as it holds them: the lines kept, as they arrived,
+    /// then what was added, as it was added.
+    #[test]
+    fn a_raw_head_hands_on_its_lines_then_what_was_added() {
+        let sent = b"GET / HTTP/1.1\r\nhost: a\r\nx-request-id: mine\r\nvia: 1.0 cdn\r\n\r\n";
+        let mut room = [httparse::EMPTY_HEADER; 8];
+        let mut request = httparse::Request::new(&mut room);
+        assert!(request.parse(sent).unwrap().is_complete());
+        let lines = FieldLines::new(sent, request.headers).unwrap();
+        let mut raw = RawHead::new(
+            Method::GET,
+            Uri::from_static("/"),
+            Version::HTTP_11,
+            Bytes::from_static(sent),
+            lines,
+        );
+        raw.set_field(HeaderName::from_static("x-request-id"), sensitive_id())
+            .unwrap();
+        raw.append_field(http::header::VIA, HeaderValue::from_static("1.1 edgerush"))
+            .unwrap();
+        let mut handed = Vec::new();
+        raw.each_outgoing(|field| {
+            handed.push(match field {
+                HeldField::Line(name, value) => (
+                    "line",
+                    String::from_utf8(name.to_vec()).unwrap(),
+                    String::from_utf8(value.to_vec()).unwrap(),
+                    false,
+                ),
+                HeldField::Added(name, value) => (
+                    "added",
+                    name.to_string(),
+                    value.to_str().unwrap().to_owned(),
+                    value.is_sensitive(),
+                ),
+            });
+        });
+        let expected = [
+            ("line", "host", "a", false),
+            ("line", "via", "1.0 cdn", false),
+            (
+                "added",
+                "x-request-id",
+                "0199e8a4-7c1b-7d2e-9a57-3f1c2b4d5e6f",
+                true,
+            ),
+            ("added", "via", "1.1 edgerush", false),
+        ]
+        .map(|(kind, name, value, sensitive)| (kind, name.to_owned(), value.to_owned(), sensitive));
+        assert_eq!(handed, expected);
     }
 
     /// An upstream's answer as our own client reads it, and the header map the same bytes

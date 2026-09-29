@@ -464,6 +464,16 @@ fn origin_form(uri: &Uri) -> &str {
         .map_or("/", http::uri::PathAndQuery::as_str)
 }
 
+/// A field of a request's head as it is held: a line, its name as it arrived and its value,
+/// or a field added on the way, as the name and value it was added as.
+#[derive(Debug, Clone, Copy)]
+pub enum HeldField<'a> {
+    /// A line.
+    Line(&'a [u8], &'a [u8]),
+    /// A field added.
+    Added(&'a HeaderName, &'a HeaderValue),
+}
+
 /// The fields of a request as they are to go upstream, whatever holds them: a header map,
 /// or a raw head's lines with its edits ([14 §6](../../../docs/14-downstream-server.md)).
 /// Read by name as any fields are, and written by the head writer without their
@@ -478,6 +488,13 @@ pub trait OutgoingFields: edgerush_router::Fields {
     /// Hands every field to `visit`, its name as it arrived and its value, in order: for a
     /// hop that sends them as something other than lines. The framing fields included.
     fn each_field(&self, visit: impl FnMut(&[u8], &[u8]));
+
+    /// Hands every field to `visit` in order, each as it is held ([`HeldField`]): a hop that
+    /// sends a map then shares what was added on the way, keeping its flags (a sensitive
+    /// value never indexed) and not checking it again. By default every field is a line.
+    fn each_outgoing(&self, mut visit: impl FnMut(HeldField<'_>)) {
+        self.each_field(|name, value| visit(HeldField::Line(name, value)));
+    }
 
     /// How many fields there are, where they are held as names and values that can be
     /// shared ([`OutgoingFields::each_shared`]); `None` where they are not.

@@ -63,13 +63,18 @@ pub fn text(unix_ms: u64, random: [u8; RANDOM_BYTES]) -> [u8; LENGTH] {
     text
 }
 
-/// The same ID as a header's value.
+/// The same ID as a header's value, marked sensitive: HPACK then sends it as a literal never
+/// indexed (RFC 7541 §6.2.3). Every ID is new, so indexing one would only push out of the
+/// table entries that other fields are sent by, and a connection's table would be searched
+/// through every ID before it for one that never matches.
 #[must_use]
 pub fn value(unix_ms: u64, random: [u8; RANDOM_BYTES]) -> HeaderValue {
     // Hexadecimal digits and hyphens are all a value may hold, so the nil UUID is never
     // given: it is there only because the conversion's type allows a failure.
-    HeaderValue::from_bytes(&text(unix_ms, random))
-        .unwrap_or_else(|_| HeaderValue::from_static("00000000-0000-0000-0000-000000000000"))
+    let mut value = HeaderValue::from_bytes(&text(unix_ms, random))
+        .unwrap_or_else(|_| HeaderValue::from_static("00000000-0000-0000-0000-000000000000"));
+    value.set_sensitive(true);
+    value
 }
 
 #[cfg(test)]
@@ -133,10 +138,11 @@ mod tests {
     }
 
     #[test]
-    fn the_value_is_the_text() {
+    fn the_value_is_the_text_and_never_indexed() {
         let random = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let value = value(1_759_142_400_000, random);
         assert_eq!(value.as_bytes(), text(1_759_142_400_000, random));
+        assert!(value.is_sensitive());
     }
 
     proptest! {
