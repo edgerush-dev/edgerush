@@ -90,6 +90,7 @@ pub mod timers;
 #[cfg(not(feature = "fuzzing"))]
 mod timers;
 mod tls;
+mod tunnel;
 // Private, save when the fuzz targets are being built: they are a crate of their own and
 // cannot otherwise reach what they drive.
 #[cfg(feature = "fuzzing")]

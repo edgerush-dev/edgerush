@@ -30,7 +30,6 @@ use crate::grpc::call::Call;
 use crate::head::Forwarded;
 use crate::interim::Interim;
 use crate::l4::hello::{self, Hello};
-use crate::l4::tunnel::{Bounds as TunnelBounds, Carried, carry};
 use crate::linger::{self, Lent, linger};
 use crate::map_head::MapHead;
 use crate::metrics::{Answer, Metrics, Socket, Stopped, Tunnel};
@@ -45,6 +44,7 @@ use crate::slots::{Slots, WorkerSlots};
 use crate::storage::Storage;
 use crate::timers::{Alarm, Timers};
 use crate::tls::{self, Tls, TlsError};
+use crate::tunnel::{Bounds as TunnelBounds, carry};
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Block, Blocks, SMALL, Sizes};
@@ -1216,87 +1216,46 @@ impl Worker {
         drop(connection);
     }
 
-    /// The tunnel, with a block of the worker's for each way, given back after.
+    /// The tunnel. A `tls` listener reads the ClientHello into a block of the worker's,
+    /// which then carries the client's bytes on, so that what was read goes to the backend
+    /// first and unchanged; the tunnel gives it back once it has.
     async fn carry_through(
         &self,
         listener: usize,
         client: &mut TcpStream,
         by_name: bool,
     ) -> Tunnel {
-        let taken = {
-            let mut blocks = self.blocks.borrow_mut();
-            match (blocks.take(), blocks.take()) {
-                (Ok(up), Ok(down)) => Some((up, down)),
-                (up, down) => {
-                    for block in [up, down].into_iter().flatten() {
-                        blocks.give(block);
-                    }
-                    None
+        let (name, hello) = if by_name {
+            let Ok(mut block) = self.blocks.borrow_mut().take() else {
+                return Tunnel::Exhausted;
+            };
+            match self.read_hello(client, &mut block).await {
+                Ok(name) => (Some(name), Some(block)),
+                Err(ended) => {
+                    self.blocks.borrow_mut().give(block);
+                    return ended;
                 }
             }
-        };
-        let Some((mut up, mut down)) = taken else {
-            return Tunnel::Exhausted;
-        };
-        let ended = self
-            .carry_with(listener, client, by_name, &mut up, &mut down)
-            .await;
-        let mut blocks = self.blocks.borrow_mut();
-        blocks.give(up);
-        blocks.give(down);
-        ended
-    }
-
-    async fn carry_with(
-        &self,
-        listener: usize,
-        client: &mut TcpStream,
-        by_name: bool,
-        up: &mut Block,
-        down: &mut Block,
-    ) -> Tunnel {
-        // The name asked for, read into the block that carries the client's bytes on, so
-        // that what was read goes to the backend first and unchanged.
-        let name = if by_name {
-            match self.read_hello(client, up).await {
-                Ok(name) => Some(name),
-                Err(ended) => return ended,
-            }
         } else {
-            None
+            (None, None)
         };
-        // The route and a backend's endpoint, from the config in force now.
-        let (address, idle) = {
-            let snapshot = self.proxy.current.load();
-            let Some(compiled) = snapshot.listener(listener) else {
-                return Tunnel::Refused;
-            };
-            let route = match (&compiled.l4, name.as_deref()) {
-                (Some(L4::Tcp(route)), _) => Some(route),
-                (Some(L4::Tls(routes)), Some(name)) => routes.route(name),
-                _ => None,
-            };
-            let Some(route) = route else {
-                return Tunnel::Refused;
-            };
-            // A backend with no endpoint refuses its share of connections, as TLSRoute has
-            // it for a backend that cannot be used.
-            let Some(upstream) = route.backends.pick(random()) else {
-                return Tunnel::NoBackend;
-            };
-            let destinations = snapshot.destinations.of(upstream.0);
-            let healthy = |at: usize| destinations.get(at).is_some_and(|d| d.is_healthy());
-            let Some(identity) = pick_healthy(destinations.len(), random(), healthy)
-                .and_then(|at| snapshot.destinations.at(upstream.0, at))
-            else {
-                return Tunnel::NoBackend;
-            };
-            (identity.address(), compiled.tunnel_idle)
+        let routed = self.pass_route(listener, name.as_deref());
+        let (address, idle) = match routed {
+            Ok(routed) => routed,
+            Err(ended) => {
+                if let Some(block) = hello {
+                    self.blocks.borrow_mut().give(block);
+                }
+                return ended;
+            }
         };
         self.proxy.metrics.socket(Socket::Opened);
         let Ok(mut backend) =
             connect_within(self.limits.connect, TcpStream::connect(address)).await
         else {
+            if let Some(block) = hello {
+                self.blocks.borrow_mut().give(block);
+            }
             return Tunnel::ConnectFailed;
         };
         let _unset = backend.set_nodelay(true);
@@ -1304,22 +1263,52 @@ impl Worker {
             idle,
             drain_within: self.deadlines.drain,
         };
-        match carry(
+        carry(
             client,
             &mut backend,
-            up,
-            down,
+            hello,
+            None,
+            &self.blocks,
             bounds,
             &self.timers,
             &self.drain,
         )
         .await
-        {
-            Carried::Closed => Tunnel::Closed,
-            Carried::Idle => Tunnel::Idle,
-            Carried::Drained => Tunnel::Drained,
-            Carried::Failed => Tunnel::Failed,
-        }
+        .into()
+    }
+
+    /// The route of a connection of a `tcp` or `tls` listener, from the config in force now,
+    /// and a backend's endpoint: its address, and the listener's idle bound.
+    fn pass_route(
+        &self,
+        listener: usize,
+        name: Option<&str>,
+    ) -> Result<(SocketAddr, Duration), Tunnel> {
+        let snapshot = self.proxy.current.load();
+        let Some(compiled) = snapshot.listener(listener) else {
+            return Err(Tunnel::Refused);
+        };
+        let route = match (&compiled.l4, name) {
+            (Some(L4::Tcp(route)), _) => Some(route),
+            (Some(L4::Tls(routes)), Some(name)) => routes.route(name),
+            _ => None,
+        };
+        let Some(route) = route else {
+            return Err(Tunnel::Refused);
+        };
+        // A backend with no endpoint refuses its share of connections, as TLSRoute has
+        // it for a backend that cannot be used.
+        let Some(upstream) = route.backends.pick(random()) else {
+            return Err(Tunnel::NoBackend);
+        };
+        let destinations = snapshot.destinations.of(upstream.0);
+        let healthy = |at: usize| destinations.get(at).is_some_and(|d| d.is_healthy());
+        let Some(identity) = pick_healthy(destinations.len(), random(), healthy)
+            .and_then(|at| snapshot.destinations.at(upstream.0, at))
+        else {
+            return Err(Tunnel::NoBackend);
+        };
+        Ok((identity.address(), compiled.tunnel_idle))
     }
 
     /// Reads a TLS client's ClientHello into `into`, within the first-request deadline
