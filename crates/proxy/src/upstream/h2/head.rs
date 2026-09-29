@@ -58,22 +58,38 @@ pub(crate) fn request<F: OutgoingFields + ?Sized>(
         .build()
         .map_err(|_| HeadError::BadAuthority)?;
 
-    let mut headers = HeaderMap::new();
-    let mut failed = false;
-    fields.each_field(|name, value| {
-        if failed || !travels(name, value) {
-            return;
-        }
-        match (HeaderName::from_bytes(name), HeaderValue::from_bytes(value)) {
-            (Ok(name), Ok(value)) => {
-                headers.append(name, value);
+    let mut headers = match fields.as_map() {
+        // Each name and value shared, not read and checked again, and room made once for
+        // all of them (and a length) rather than as they come.
+        Some(map) => {
+            let mut headers = HeaderMap::with_capacity(map.len() + 1);
+            for (name, value) in map {
+                if travels(name.as_str().as_bytes(), value.as_bytes()) {
+                    headers.append(name.clone(), value.clone());
+                }
             }
-            _ => failed = true,
+            headers
         }
-    });
-    if failed {
-        return Err(HeadError::BadField);
-    }
+        None => {
+            let mut headers = HeaderMap::new();
+            let mut failed = false;
+            fields.each_field(|name, value| {
+                if failed || !travels(name, value) {
+                    return;
+                }
+                match (HeaderName::from_bytes(name), HeaderValue::from_bytes(value)) {
+                    (Ok(name), Ok(value)) => {
+                        headers.append(name, value);
+                    }
+                    _ => failed = true,
+                }
+            });
+            if failed {
+                return Err(HeadError::BadField);
+            }
+            headers
+        }
+    };
     if let Sending::Length(length) = sending {
         headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
     }
@@ -127,6 +143,29 @@ mod tests {
 
     fn target(uri: &str) -> Uri {
         uri.parse().unwrap()
+    }
+
+    /// Fields that are not held as a header map, as a raw head's are not: read one by one.
+    struct Lines(HeaderMap);
+
+    impl edgerush_router::Fields for Lines {
+        fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
+            self.0.get_all(name).iter().map(HeaderValue::as_bytes)
+        }
+    }
+
+    impl OutgoingFields for Lines {
+        fn written_len(&self) -> usize {
+            self.0.written_len()
+        }
+
+        fn write_fields(&self, out: &mut Vec<u8>) {
+            self.0.write_fields(out);
+        }
+
+        fn each_field(&self, visit: impl FnMut(&[u8], &[u8])) {
+            self.0.each_field(visit);
+        }
     }
 
     #[test]
@@ -256,6 +295,11 @@ mod tests {
                 );
             }
             let sent_as = head(&Method::GET, &target("/"), &sent, Sending::None).unwrap();
+            // A map's fields are shared, where other fields are read one by one: the same
+            // head either way, order and all.
+            let read = head(&Method::GET, &target("/"), &Lines(sent.clone()), Sending::None)
+                .unwrap();
+            prop_assert!(sent_as.headers().iter().eq(read.headers().iter()));
             for (name, value) in sent_as.headers() {
                 prop_assert!(travels(name.as_str().as_bytes(), value.as_bytes()), "{name}");
             }

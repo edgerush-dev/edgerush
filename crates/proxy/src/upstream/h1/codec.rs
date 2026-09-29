@@ -478,6 +478,12 @@ pub trait OutgoingFields: edgerush_router::Fields {
     /// Hands every field to `visit`, its name as it arrived and its value, in order: for a
     /// hop that sends them as something other than lines. The framing fields included.
     fn each_field(&self, visit: impl FnMut(&[u8], &[u8]));
+
+    /// The fields as a header map, where that is what holds them: a hop that sends a map
+    /// can then share each name and value rather than read it again.
+    fn as_map(&self) -> Option<&HeaderMap> {
+        None
+    }
 }
 
 impl OutgoingFields for HeaderMap {
@@ -504,6 +510,10 @@ impl OutgoingFields for HeaderMap {
         for (name, value) in self {
             visit(name.as_str().as_bytes(), value.as_bytes());
         }
+    }
+
+    fn as_map(&self) -> Option<&HeaderMap> {
+        Some(self)
     }
 }
 
