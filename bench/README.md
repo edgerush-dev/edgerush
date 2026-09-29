@@ -221,7 +221,10 @@ of it at `EDGERUSH_PGO` ([12](../../docs/12-open-questions.md), item 8) — (Edg
 (`nginx-proxy.conf`), `haproxy` (`haproxy.cfg`), `envoy` (`envoy.yaml`) and `kong`
 (`kong.yml`, without a database). The configs ask for the same
 thing — the same hosts and rules, the same header changes on
-request and response, HTTP/1.1 and cleartext HTTP/2 on one port, keep-alive connections to
+request and response, the same forwarding headers (what a client says of forwarding taken
+off; `X-Forwarded-For`, `-Host`, `-Proto` and a `Via` entry set, as EdgeRush's listener does
+by default; not yet in `envoy.yaml` and `kong.yml`), HTTP/1.1 and cleartext HTTP/2 on one
+port, keep-alive connections to
 the backend that any client's request may use, no access log — and each proxy gets
 `WORKERS` workers on `PROXY_CPUS`. Where they cannot be the same it is said at the top of
 the config. A config for another proxy is a change to review like code: a comparison is
