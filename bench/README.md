@@ -223,7 +223,10 @@ of it at `EDGERUSH_PGO` ([12](../../docs/12-open-questions.md), item 8) — (Edg
 thing — the same hosts and rules, the same header changes on
 request and response, the same forwarding headers (what a client says of forwarding taken
 off; `X-Forwarded-For`, `-Host`, `-Proto` and a `Via` entry set, as EdgeRush's listener does
-by default; not yet in `envoy.yaml` and `kong.yml`), HTTP/1.1 and cleartext HTTP/2 on one
+by default; not yet in `envoy.yaml` and `kong.yml`), the same request ID (the client's
+replaced, the proxy's own on the request and on every answer, the upstream's replaced;
+NGINX's is 32 hexadecimal digits rather than a UUIDv7; not yet in `envoy.yaml` and
+`kong.yml`), HTTP/1.1 and cleartext HTTP/2 on one
 port, keep-alive connections to
 the backend that any client's request may use, no access log — and each proxy gets
 `WORKERS` workers on `PROXY_CPUS`. Where they cannot be the same it is said at the top of
