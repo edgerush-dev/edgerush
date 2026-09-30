@@ -6,10 +6,11 @@
 //! Each way reads into a block of the worker's and writes what it read on before it reads
 //! again, so a side that stops taking bytes stops the other from sending more than a block
 //! ahead. **A way holds a block only while bytes are on their way**: it takes one to read
-//! into, and gives it back as soon as everything in it has been written on, or as soon as
-//! a read finds nothing. An idle tunnel holds no buffer at all, which is what lets a worker
-//! hold as many quiet WebSockets as it has connections for. The blocks come from the
-//! worker's free list, so taking and giving one is a push and a pop.
+//! into, reads into it again once everything in it has been written on, and gives it back
+//! once the tunnel has carried nothing for a second. An idle tunnel holds no buffer at all,
+//! which is what lets a worker hold as many quiet WebSockets as it has connections for.
+//! The blocks come from the worker's free list, so taking and giving one is a push and a
+//! pop.
 //!
 //! A side's end is passed on as a half-close (`shutdown(Write)`), and the other way goes on
 //! until it ends too: a protocol that says "that is all I have" and then waits for the
@@ -25,6 +26,7 @@ use crate::upstream::secure::Socket;
 use crate::websocket::frames::{Frames, GOING_AWAY, going_away_masked};
 use std::cell::RefCell;
 use std::future::poll_fn;
+use std::mem::MaybeUninit;
 use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::task::{Context, Poll};
@@ -74,6 +76,17 @@ pub(crate) struct Bounds {
 /// How long a draining WebSocket's close is left for the Close replies: its moment falls in
 /// the drain bound less this (19 §6).
 const REPLIES: Duration = Duration::from_secs(5);
+
+/// How long a tunnel that carried nothing either way keeps the blocks it last read into
+/// before it gives them back. Not at once: a tunnel carrying a request and its answer at a
+/// time would take and give a block each way for every one, which cost passthrough some
+/// 0.7k instructions a request; our HTTP/2 server keeps its buffers for as long before it
+/// gives them back, for the same reason (15 §3).
+const RELEASE_AFTER: Duration = Duration::from_secs(1);
+
+/// The room on the stack a way reads into when it holds no block: enough for most of what
+/// a quiet tunnel wakes to, a WebSocket message or a ping, whole.
+const PROBE: usize = 1024;
 
 /// A WebSocket's backend, once its upgrade is made (19 §2): the connection its 101 came on,
 /// what was read past the 101, and what the tunnel is held to. The request core hands it to
@@ -200,17 +213,24 @@ where
     let mut last = Instant::now();
     let mut drain_by = None;
     let mut draining = Draining::No;
+    let mut releasing = false;
+    // Until when a read that finds nothing keeps its block: a second after bytes last moved,
+    // and not at all before any have.
+    let mut keep_until: Option<Instant> = None;
     let carried = poll_fn(|cx| {
         loop {
             let mut moved = false;
+            // Past its release time, a read that finds nothing gives its block back.
+            let quiet = releasing || keep_until.is_none_or(|until| Instant::now() >= until);
+            releasing = false;
             for (way, from_client) in [(&mut up, true), (&mut down, false)] {
                 if way.shut {
                     continue;
                 }
                 let pumped = if from_client {
-                    pump(client, backend, way, blocks, &mut moved, cx)
+                    pump(client, backend, way, blocks, quiet, &mut moved, cx)
                 } else {
-                    pump(backend, client, way, blocks, &mut moved, cx)
+                    pump(backend, client, way, blocks, quiet, &mut moved, cx)
                 };
                 match pumped {
                     Poll::Ready(Err(Stopped::Failed)) => return Poll::Ready(Carried::Failed),
@@ -239,6 +259,7 @@ where
             }
             if moved {
                 last = Instant::now();
+                keep_until = Some(last + RELEASE_AFTER);
             }
             if drain_by.is_none() && drain.poll_on(heard.as_mut(), cx).is_ready() {
                 let now = Instant::now();
@@ -259,12 +280,27 @@ where
                     Draining::At(_) | Draining::Left => {}
                 }
             }
+            // Blocks kept while nothing moves go back at the release time, when the ways'
+            // reads, finding nothing, give them back.
+            let holding = [&up, &down]
+                .iter()
+                .any(|way| way.block.as_ref().is_some_and(Block::is_empty));
+            let release_by = keep_until.filter(|_| holding);
             let idle_by = last + bounds.idle;
             let mut due = drain_by.map_or(idle_by, |drain_by: Instant| drain_by.min(idle_by));
             if let Draining::At(moment) = draining {
                 due = due.min(moment);
             }
+            if let Some(release_by) = release_by {
+                due = due.min(release_by);
+            }
             if alarm.poll_until(cx, due).is_ready() {
+                if release_by.is_some_and(|release_by| release_by <= due) {
+                    // The release time came, as the timers tell it, which may be a little
+                    // before the clock does: round again, the ways' reads now giving back.
+                    releasing = true;
+                    continue;
+                }
                 if let Draining::At(moment) = draining
                     && moment <= due
                 {
@@ -335,12 +371,15 @@ fn close_frame(to_backend: bool) -> ([u8; 8], u8) {
 }
 
 /// Moves what `from` sends on to `to`, as far as both allow now. Ready once `from` has
-/// ended and `to` has been told; `moved` is set if any byte went.
+/// ended and `to` has been told; `moved` is set if any byte went. `quiet`: the tunnel has
+/// carried nothing for its release time, and a read that finds nothing gives its block
+/// back rather than keep it for the next.
 fn pump<F, T>(
     from: &mut F,
     to: &mut T,
     way: &mut Way,
     blocks: &RefCell<Blocks>,
+    quiet: bool,
     moved: &mut bool,
     cx: &mut Context<'_>,
 ) -> Poll<Result<(), Stopped>>
@@ -348,6 +387,9 @@ where
     F: AsyncRead + Unpin,
     T: AsyncWrite + Unpin,
 {
+    // Whether this way carried anything in this turn, which makes it busy whatever the
+    // tunnel was before.
+    let mut carried = false;
     loop {
         // What has been read goes on before anything more is read. The block it came in is
         // then read into again, and goes back if the read finds nothing: a way that is busy
@@ -359,6 +401,7 @@ where
                     Poll::Ready(Ok(written)) => {
                         block.consume(written);
                         *moved = true;
+                        carried = true;
                     }
                     Poll::Pending => return Poll::Pending,
                 }
@@ -404,65 +447,57 @@ where
                 Poll::Pending => Poll::Pending,
             };
         }
+        // Into the block the way holds, if it holds one. Otherwise into a little room on the
+        // stack first: a read that finds nothing — what most wakes of a quiet tunnel come
+        // to — takes no block at all, and one is taken only for bytes that have come, so
+        // that a worker short of storage does not end its quiet tunnels for waking them.
+        let Some(mut block) = spare else {
+            let mut probe = [MaybeUninit::<u8>::uninit(); PROBE];
+            let mut read = ReadBuf::uninit(&mut probe);
+            match Pin::new(&mut *from).poll_read(cx, &mut read) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(_)) => return Poll::Ready(Err(Stopped::Failed)),
+                Poll::Ready(Ok(())) => {}
+            }
+            let arrived = read.filled();
+            if arrived.is_empty() {
+                way.ended = true;
+                continue;
+            }
+            let Ok(mut block) = blocks.borrow_mut().take() else {
+                return Poll::Ready(Err(Stopped::Exhausted));
+            };
+            let (kept, boundary) = follow(way, arrived);
+            // A block has room for far more than the probe holds.
+            if let Some(room) = block.room().get_mut(..kept) {
+                room.copy_from_slice(&arrived[..kept]);
+                block.arrived(kept);
+            }
+            carried = true;
+            *moved = true;
+            arrived_in(way, block, boundary, blocks);
+            continue;
+        };
         // One whose memory went with a frame cut from it — a client's head — has no room
         // left, and is traded for one that has.
-        let lent = match spare {
-            Some(mut block) => {
-                if block.room().is_empty() {
-                    let mut blocks = blocks.borrow_mut();
-                    blocks.give(block);
-                    blocks.take()
-                } else {
-                    Ok(block)
-                }
-            }
-            None => blocks.borrow_mut().take(),
-        };
-        let Ok(mut block) = lent else {
-            return Poll::Ready(Err(Stopped::Exhausted));
-        };
+        if block.room().is_empty() {
+            let mut blocks = blocks.borrow_mut();
+            blocks.give(block);
+            block = match blocks.take() {
+                Ok(block) => block,
+                Err(_) => return Poll::Ready(Err(Stopped::Exhausted)),
+            };
+        }
         let mut read = ReadBuf::new(block.room());
         let polled = Pin::new(&mut *from).poll_read(cx, &mut read);
-        let arrived = read.filled();
-        let count = arrived.len();
-        // What of it goes on: all of it, but for a WebSocket owed a Close, only as far as
-        // the frame boundary it goes at, and after its Close, none. Whatever is not passed
-        // on is still followed, for the Close that answers the gateway's.
-        let mut boundary = None;
-        let kept = match (&mut way.frames, way.close) {
-            (None, _) => count,
-            (Some(frames), Close::Sent) => {
-                frames.read(arrived);
-                0
-            }
-            (Some(frames), Close::Wanted) => match frames.until_boundary(arrived) {
-                Some(at) => {
-                    frames.read(&arrived[at..]);
-                    boundary = Some(at);
-                    at
-                }
-                None => count,
-            },
-            (Some(frames), Close::None | Close::Writing(..)) => {
-                frames.read(arrived);
-                count
-            }
-        };
+        let count = read.filled().len();
         match polled {
             Poll::Ready(Ok(())) if count > 0 => {
+                let (kept, boundary) = follow(way, &block.room()[..count]);
+                block.arrived(kept);
+                carried = true;
                 *moved = true;
-                if kept > 0 {
-                    block.arrived(kept);
-                    way.block = Some(block);
-                } else {
-                    blocks.borrow_mut().give(block);
-                }
-                // A Close owed at a boundary in what was read goes right after what was
-                // kept of it, as the loop comes round.
-                if boundary.is_some() {
-                    let (frame, length) = close_frame(way.to_backend);
-                    way.close = Close::Writing(frame, length, 0);
-                }
+                arrived_in(way, block, boundary, blocks);
             }
             Poll::Ready(Ok(())) => {
                 blocks.borrow_mut().give(block);
@@ -472,11 +507,57 @@ where
                 blocks.borrow_mut().give(block);
                 return Poll::Ready(Err(Stopped::Failed));
             }
+            // Kept for the next read, until the tunnel has been quiet a while.
             Poll::Pending => {
-                blocks.borrow_mut().give(block);
+                if carried || !quiet {
+                    way.block = Some(block);
+                } else {
+                    blocks.borrow_mut().give(block);
+                }
                 return Poll::Pending;
             }
         }
+    }
+}
+
+/// How much of `arrived`, just read, goes on: all of it, but for a WebSocket owed a Close
+/// only as far as the frame boundary the Close goes at — that boundary said too — and after
+/// its Close none. Whatever does not go on is still followed, for the Close that answers
+/// the gateway's.
+fn follow(way: &mut Way, arrived: &[u8]) -> (usize, Option<usize>) {
+    let count = arrived.len();
+    match (&mut way.frames, way.close) {
+        (None, _) => (count, None),
+        (Some(frames), Close::Sent) => {
+            frames.read(arrived);
+            (0, None)
+        }
+        (Some(frames), Close::Wanted) => match frames.until_boundary(arrived) {
+            Some(at) => {
+                frames.read(&arrived[at..]);
+                (at, Some(at))
+            }
+            None => (count, None),
+        },
+        (Some(frames), Close::None | Close::Writing(..)) => {
+            frames.read(arrived);
+            (count, None)
+        }
+    }
+}
+
+/// Puts what was kept of a read on `way` to be written — the block is given back if none
+/// was — and, where the read held the boundary a Close is owed at, has the Close written
+/// right after it, as the loop comes round.
+fn arrived_in(way: &mut Way, block: Block, boundary: Option<usize>, blocks: &RefCell<Blocks>) {
+    if block.is_empty() {
+        blocks.borrow_mut().give(block);
+    } else {
+        way.block = Some(block);
+    }
+    if boundary.is_some() {
+        let (frame, length) = close_frame(way.to_backend);
+        way.close = Close::Writing(frame, length, 0);
     }
 }
 
@@ -528,18 +609,19 @@ mod tests {
         assert_eq!(read, bytes);
     }
 
-    /// A tunnel holds a block only while bytes are on their way (19 §5): two tunnels on a
-    /// worker that can pay for one block between them carry bytes each way in turn, each
-    /// quiet while the other carries. One that kept a block while quiet would leave the
-    /// other none.
-    #[tokio::test]
+    /// A tunnel gives its blocks back once it has been quiet for a second (19 §5): two
+    /// tunnels on a worker that can pay for one tunnel's blocks carry bytes both ways in
+    /// turn, each quiet for longer than that while the other carries. One that kept its
+    /// blocks while quiet would leave the other none.
+    #[tokio::test(start_paused = true)]
     async fn a_quiet_tunnel_holds_no_block() {
         let timers = Timers::new();
         let drain = Drain::default();
-        let blocks = blocks_within(SMALL);
+        let blocks = blocks_within(2 * SMALL);
         let ((mut one, mut one_backend), (mut one_client, mut one_far)) = ends();
         let ((mut two, mut two_backend), (mut two_client, mut two_far)) = ends();
-        let carried = within(timers.driving(async {
+        let quiet = RELEASE_AFTER + Duration::from_millis(100);
+        let carried = within_drain(timers.driving(async {
             let first = carry(
                 &mut one,
                 &mut one_backend,
@@ -564,9 +646,11 @@ mod tests {
                 for round in 0..3_u8 {
                     let said = [round; 1000];
                     moved(&mut one_client, &mut one_far, &said).await;
-                    moved(&mut two_far, &mut two_client, &said).await;
                     moved(&mut one_far, &mut one_client, &said).await;
+                    tokio::time::sleep(quiet).await;
+                    moved(&mut two_far, &mut two_client, &said).await;
                     moved(&mut two_client, &mut two_far, &said).await;
+                    tokio::time::sleep(quiet).await;
                 }
                 for end in [&mut one_client, &mut one_far, &mut two_client, &mut two_far] {
                     end.shutdown().await.unwrap();
@@ -578,7 +662,43 @@ mod tests {
         .await;
         assert_eq!(carried, (Carried::Closed, Carried::Closed));
         // And every block is back.
-        assert_eq!(blocks.borrow().parked(), 1);
+        assert_eq!(blocks.borrow().parked(), 2);
+    }
+
+    /// A busy tunnel keeps a block each way between reads rather than give it back and
+    /// take one again for every read; it gives them back a second after the last byte.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_tunnel_keeps_its_blocks_until_it_is_quiet() {
+        let timers = Timers::new();
+        let drain = Drain::default();
+        let blocks = blocks_within(4 * SMALL);
+        let ((mut client, mut backend), (mut client_side, mut backend_side)) = ends();
+        let carried = within_drain(timers.driving(async {
+            let carrying = carry(
+                &mut client,
+                &mut backend,
+                None,
+                None,
+                &blocks,
+                BOUNDS,
+                &timers,
+                &drain,
+            );
+            let talking = async {
+                moved(&mut client_side, &mut backend_side, b"ping").await;
+                moved(&mut backend_side, &mut client_side, b"pong").await;
+                assert_eq!(blocks.borrow().parked(), 0, "given back while busy");
+                tokio::time::sleep(RELEASE_AFTER / 2).await;
+                assert_eq!(blocks.borrow().parked(), 0, "given back too soon");
+                tokio::time::sleep(RELEASE_AFTER).await;
+                assert_eq!(blocks.borrow().parked(), 2, "kept while quiet");
+                client_side.shutdown().await.unwrap();
+                backend_side.shutdown().await.unwrap();
+            };
+            tokio::join!(carrying, talking)
+        }))
+        .await;
+        assert_eq!(carried.0, Carried::Closed);
     }
 
     /// Bytes already read go first, each way, before anything more is read.
@@ -620,6 +740,37 @@ mod tests {
         .await;
         assert_eq!(carried.0, Carried::Closed);
         assert_eq!(carried.1, (b"early-late".to_vec(), b"hello".to_vec()));
+    }
+
+    /// A read that finds nothing needs no block: a worker with no storage left at all
+    /// still carries a tunnel with nothing to carry to its end, and does not end it as
+    /// exhausted for being woken.
+    #[tokio::test]
+    async fn a_tunnel_with_nothing_to_carry_needs_no_block() {
+        let timers = Timers::new();
+        let drain = Drain::default();
+        let blocks = blocks_within(0);
+        let ((mut client, mut backend), (mut client_side, mut backend_side)) = ends();
+        let carried = within(timers.driving(async {
+            let carrying = carry(
+                &mut client,
+                &mut backend,
+                None,
+                None,
+                &blocks,
+                BOUNDS,
+                &timers,
+                &drain,
+            );
+            let ending = async {
+                tokio::task::yield_now().await;
+                client_side.shutdown().await.unwrap();
+                backend_side.shutdown().await.unwrap();
+            };
+            tokio::join!(carrying, ending).0
+        }))
+        .await;
+        assert_eq!(carried, Carried::Closed);
     }
 
     /// A worker that cannot pay for a block to read into ends the tunnel, saying so, rather
