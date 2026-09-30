@@ -1,0 +1,13 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e8d89a7b9fe301b31cbb8317d0e478ed05092f5f948b938eb4f7c5d1e2cedbf2 # shrinks to (endpoints, already) = (Endpoints { serves: [false, false], in_flight: [0, 1], share: [Share(65536), Share(65536)] }, [1, 0]), seed = 0
+cc 546f4f86a35061c0f77ab3c065065231699ffd70b1976e4a456b76570f24415b # shrinks to (endpoints, already) = (Endpoints { serves: [true, true], in_flight: [0, 1], share: [Share(65536), Share(65536)] }, [0, 1]), seed = 0
+cc 19f7126c393adee74df01d0fc5081c624a4d56f05b53e0cf3f34dc415ced7820 # shrinks to (endpoints, already) = (Endpoints { serves: [false], in_flight: [0], share: [Share(65536)] }, []), start = 0, seed = 0
+cc aca5e10ed8bc49809fe790f7be7f0555e3f305bfb58897d76e595fba97c48eb4 # shrinks to (endpoints, already) = (Endpoints { serves: [false], in_flight: [0], share: [Share(65536)] }, []), seed = 0
+cc 9d77a4f9f1070231dbad1bfed0a513396008bc75368e6715967ea13245d73078 # shrinks to (mut endpoints, already) = (Endpoints { serves: [false], in_flight: [0], share: [Share(65536)] }, []), start = 0, seed = 0
+cc a1a7486d18ee099fb0eebf858c8506d27783d3f63984056f030e3ee4a7078685 # shrinks to (mut endpoints, already) = (Endpoints { serves: [false], in_flight: [0], share: [Share(65536)] }, []), seed = 0
+cc 48d0c2c87891ac51724f8cdc5f3a3fa94fb611d03a7dca6901f7126328f5ad99 # shrinks to (endpoints, already) = (Endpoints { serves: [true, false], in_flight: [0, 0], share: [Share(0), Share(65536)] }, []), start = 0, seed = 0

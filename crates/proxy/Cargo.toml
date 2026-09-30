@@ -72,6 +72,11 @@ tokio = { workspace = true, features = [
 ] }
 
 [[bench]]
+name = "balance"
+harness = false
+required-features = ["fuzzing"]
+
+[[bench]]
 name = "decide"
 harness = false
 required-features = ["fuzzing"]

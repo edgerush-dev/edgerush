@@ -10,6 +10,11 @@
 //! thread that serves, which forwards to upstreams over HTTP/1.1 on connections of its
 //! own and never leaves the thread it was made on.
 
+// Private, save when the fuzz targets and benchmarks are being built.
+#[cfg(feature = "fuzzing")]
+pub mod balance;
+#[cfg(not(feature = "fuzzing"))]
+mod balance;
 mod cookies;
 mod drain;
 mod forwarding;
