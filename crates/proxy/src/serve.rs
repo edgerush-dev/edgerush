@@ -36,7 +36,7 @@ use crate::metrics::{Answer, Metrics, Socket, Stopped, Tunnel};
 use crate::mirror;
 use crate::random::{random, unguessable};
 use crate::raw::{RawAnswer, RawHead};
-use crate::request::{Decision, decide};
+use crate::request::{Decision, Opening, decide};
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::retry::budget::Budget;
 use crate::retry::replay::Tee;
@@ -44,7 +44,7 @@ use crate::slots::{Slots, WorkerSlots};
 use crate::storage::Storage;
 use crate::timers::{Alarm, Timers};
 use crate::tls::{self, Tls, TlsError};
-use crate::tunnel::{Bounds as TunnelBounds, Switched, carry};
+use crate::tunnel::{Backend, Bounds as TunnelBounds, Carried, Switched, carry};
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Block, Blocks, SMALL, Sizes};
@@ -52,7 +52,7 @@ use crate::upstream::h1::codec::{OutgoingFields, Sending};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, Stalled, nothing_to_say};
 use crate::upstream::h1::pool::{Lease, Pool};
 use crate::upstream::h2::client::{Client as H2Client, PlaceError, Settings as H2Settings};
-use crate::upstream::h2::exchange::{self as h2_exchange, Bounds as H2Bounds};
+use crate::upstream::h2::exchange::{self as h2_exchange, Bounds as H2Bounds, Connected};
 use crate::upstream::h2::pool::Limits as H2Limits;
 use crate::upstream::secure::{Secure, Socket as UpstreamSocket};
 use crate::websocket::{self, Key};
@@ -401,7 +401,7 @@ where
         Rc::clone(&ours.worker).handle_head(listener, Rc::clone(&client), head, body, Some(interim))
     };
     let slots = slots_for(&worker.slots, &respond);
-    let ended = h1::serve(
+    let _ended = h1::serve(
         socket,
         &worker.h1,
         Rc::clone(&worker.blocks),
@@ -412,12 +412,6 @@ where
         &slots,
     )
     .await;
-    // A WebSocket's tunnel is counted as an L4 listener's are, by how it ended (19 §5).
-    if let h1::Ended::Switched(carried) = ended
-        && let Some(counters) = worker.proxy.metrics.listener(listener)
-    {
-        counters.tunnel(carried.into());
-    }
 }
 
 /// The worker's slots for the futures `respond` makes: named by the closure, as the futures'
@@ -1545,12 +1539,26 @@ impl Worker {
         // of the client's `Upgrade`, `Connection` (a `close` for credentials among it: a
         // refused handshake's connection is kept from the pool instead) and key (19 §2).
         if let Some(handshake) = &directed.websocket {
-            let asked = head
-                .set_field(http::header::UPGRADE, websocket::WEBSOCKET)
-                .and_then(|()| head.set_field(http::header::CONNECTION, websocket::UPGRADE_OPTION))
-                .and_then(|()| {
-                    head.set_field(http::header::SEC_WEBSOCKET_KEY, handshake.ours.value())
-                });
+            let asked = match &handshake.toward {
+                // An extended CONNECT to an HTTP/1.1 backend is RFC 6455's GET (19 §3).
+                Toward::Upgrade(ours) => {
+                    if head.method() != Method::GET {
+                        head.set_method(Method::GET);
+                    }
+                    head.set_field(http::header::UPGRADE, websocket::WEBSOCKET)
+                        .and_then(|()| {
+                            head.set_field(http::header::CONNECTION, websocket::UPGRADE_OPTION)
+                        })
+                        .and_then(|()| {
+                            head.set_field(http::header::SEC_WEBSOCKET_KEY, ours.value())
+                        })
+                }
+                // An extended CONNECT has no key (RFC 8441 §5); its method is the
+                // exchange's to write.
+                Toward::Connect => head.remove_where(|name| {
+                    name.eq_ignore_ascii_case(http::header::SEC_WEBSOCKET_KEY.as_str().as_bytes())
+                }),
+            };
             if let Err(rejection) = asked {
                 return self
                     .proxy
@@ -1638,9 +1646,24 @@ impl Worker {
     ) -> Result<Answered<Body>, Answer> {
         let timing = timing.for_try();
         if endpoint.protocol() == UpstreamProtocol::Http2 {
+            if let Some(handshake) = directed.websocket.as_deref() {
+                return self
+                    .connect_by_h2(
+                        directed, endpoint, head, handshake, admitted, interim, timing,
+                    )
+                    .await;
+            }
             return self
                 .respond_by_h2(
-                    directed, endpoint, head, sending, body, admitted, interim, timing,
+                    directed,
+                    endpoint,
+                    head,
+                    head.method(),
+                    sending,
+                    body,
+                    admitted,
+                    interim,
+                    timing,
                 )
                 .await;
         }
@@ -1700,20 +1723,23 @@ impl Worker {
         });
         // A 101 says it switched to WebSocket, with the Accept of the client's own key; the
         // backend's was of the gateway's.
-        let upgraded = match &directed.websocket {
-            Some(handshake) if answer.status() == StatusCode::SWITCHING_PROTOCOLS => answer
+        let handshake = directed.websocket.as_deref();
+        let upgraded = match handshake.and_then(|handshake| handshake.client.as_ref()) {
+            Some(client) if answer.status() == StatusCode::SWITCHING_PROTOCOLS => answer
                 .set_field(http::header::UPGRADE, websocket::WEBSOCKET)
                 .and_then(|()| {
-                    answer.set_field(
-                        http::header::SEC_WEBSOCKET_ACCEPT,
-                        handshake.client.accept_value(),
-                    )
+                    answer.set_field(http::header::SEC_WEBSOCKET_ACCEPT, client.accept_value())
                 }),
             _ if offers => answer.set_field(http::header::UPGRADE, websocket::WEBSOCKET),
             _ => Ok(()),
         };
         if edited.is_err() || upgraded.is_err() {
             return Err(Answer::Edits);
+        }
+        // An extended CONNECT's client is told of the switch with a 200 (RFC 8441 §5), and
+        // must never be told 2xx of anything else: to a CONNECT that opens the tunnel.
+        if handshake.is_some_and(|handshake| handshake.client.is_none()) {
+            return connected_answer(answer.status(), answer.into_parts(), body);
         }
         // Written in this hop's version and not the upstream's: "Intermediaries that
         // process HTTP messages ... MUST send their own HTTP-version in forwarded messages"
@@ -1979,6 +2005,7 @@ impl Worker {
         directed: &Directed,
         endpoint: &Arc<ReuseIdentity>,
         head: &H,
+        method: &Method,
         sending: Sending,
         body: RequestBody,
         admitted: Admitted,
@@ -1986,17 +2013,11 @@ impl Worker {
         timing: Timing,
     ) -> Result<Answered<Body>, Answer> {
         let storage = Rc::clone(self.blocks.borrow().storage());
-        let bounds = H2Bounds {
-            final_head: (!timing.head_by_rule).then_some(self.limits.final_head),
-            idle: self.limits.idle,
-            continue_wait: self.limits.continue_wait,
-            interim_heads: self.limits.interim_heads,
-            interim_bytes: self.limits.interim_bytes,
-        };
+        let bounds = self.h2_bounds(timing);
         let exchanging = pin!(h2_exchange::exchange(
             &self.h2,
             endpoint,
-            head.method(),
+            method,
             head.uri(),
             head.outgoing(),
             sending,
@@ -2021,37 +2042,7 @@ impl Worker {
             }
             return Err(lapsed);
         };
-        let (parts, answer) = match exchanged {
-            Ok(exchanged) => exchanged,
-            Err(error) => {
-                let answer = match error {
-                    h2_exchange::ExchangeError::Place(PlaceError::Full) => Answer::QueueFull,
-                    h2_exchange::ExchangeError::Place(PlaceError::TimedOut) => {
-                        Answer::QueueTimedOut
-                    }
-                    h2_exchange::ExchangeError::RequestBody(cause)
-                        if matches!(
-                            cause.downcast_ref::<RequestBodyError>(),
-                            Some(RequestBodyError::TimedOut)
-                        ) =>
-                    {
-                        Answer::BodyTimedOut
-                    }
-                    h2_exchange::ExchangeError::RequestBody(_) => Answer::BadBody,
-                    h2_exchange::ExchangeError::TooSlow { .. }
-                    | h2_exchange::ExchangeError::Idle { .. } => Answer::UpstreamTimedOut,
-                    _ => Answer::UpstreamFailed,
-                };
-                // Waiting for a place, or the client's own body, is not the upstream
-                // failing.
-                if matches!(answer, Answer::UpstreamFailed | Answer::UpstreamTimedOut)
-                    && let Some(upstream) = upstream
-                {
-                    upstream.failures.inc();
-                }
-                return Err(answer);
-            }
-        };
+        let (parts, answer) = exchanged.map_err(|error| h2_failed(error, upstream))?;
         if let Some(upstream) = upstream {
             upstream.responded(parts.status);
         }
@@ -2176,12 +2167,29 @@ impl Worker {
         handshake: &Handshake,
         listening: Option<Interim>,
     ) -> Result<(RawAnswer, Body), Answer> {
-        let switched = listening.filter(|_| websocket::switched(&read, &handshake.ours));
+        let Toward::Upgrade(ours) = &handshake.toward else {
+            return Err(Answer::UpstreamFailed);
+        };
+        let switched = listening.filter(|_| websocket::switched(&read, ours));
         let Some((interim, (backend, leftover))) = switched.zip(body.into_switched()) else {
             self.proxy.metrics.stopped(Stopped::Codec);
             return Err(Answer::UpstreamFailed);
         };
-        interim.switch(Switched {
+        interim.switch(self.switched(Backend::Socket(backend), leftover, handshake));
+        Ok((read, Body::Empty))
+    }
+
+    /// A switched WebSocket's backend, with what its tunnel needs of this worker, and its
+    /// end counted among its listener's tunnels.
+    fn switched(
+        &self,
+        backend: Backend,
+        leftover: Option<Block>,
+        handshake: &Handshake,
+    ) -> Switched {
+        let proxy = Arc::clone(&self.proxy);
+        let listener = handshake.listener;
+        Switched {
             backend,
             leftover,
             bounds: TunnelBounds {
@@ -2189,9 +2197,185 @@ impl Worker {
                 drain_within: self.deadlines.drain,
                 websocket: true,
             },
-        });
-        Ok((read, Body::Empty))
+            blocks: Rc::clone(&self.blocks),
+            timers: Rc::clone(&self.timers),
+            drain: Rc::clone(&self.drain),
+            ended: Box::new(move |carried: Carried| {
+                if let Some(counters) = proxy.metrics.listener(listener) {
+                    counters.tunnel(carried.into());
+                }
+            }),
+        }
     }
+
+    /// A WebSocket handshake to an HTTP/2 backend: an extended CONNECT if the connection
+    /// announces them, and otherwise the plain request it came as, a GET (19 §4).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a different thing the exchange needs, as for `through_h1`"
+    )]
+    async fn connect_by_h2<H: Forwarded>(
+        &self,
+        directed: &Directed,
+        endpoint: &Arc<ReuseIdentity>,
+        head: &H,
+        handshake: &Handshake,
+        admitted: Admitted,
+        interim: Option<Interim>,
+        timing: Timing,
+    ) -> Result<Answered<Body>, Answer> {
+        let storage = Rc::clone(self.blocks.borrow().storage());
+        let bounds = self.h2_bounds(timing);
+        let connecting = pin!(h2_exchange::connect(
+            &self.h2,
+            endpoint,
+            head.uri(),
+            head.outgoing(),
+            &storage,
+            bounds,
+        ));
+        let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
+        let Some(connected) = by_deadline(&self.timers, timing.deadline, connecting).await else {
+            let lapsed = timing.lapsed();
+            if lapsed == Answer::UpstreamTimedOut
+                && let Some(upstream) = upstream
+            {
+                upstream.failures.inc();
+            }
+            return Err(lapsed);
+        };
+        let (mut parts, body) = match connected.map_err(|error| h2_failed(error, upstream))? {
+            Connected::NotOffered => {
+                let answered = self
+                    .respond_by_h2(
+                        directed,
+                        endpoint,
+                        head,
+                        &Method::GET,
+                        Sending::None,
+                        RequestBody::None,
+                        admitted,
+                        interim,
+                        timing,
+                    )
+                    .await?;
+                return match (&handshake.client, answered) {
+                    (None, Answered::Map(response)) => {
+                        let (parts, body) = response.into_parts();
+                        connected_answer(parts.status, parts, body)
+                    }
+                    (_, answered) => Ok(answered),
+                };
+            }
+            Connected::Switched(parts, stream) => {
+                let Some(interim) = interim else {
+                    return Err(Answer::UpstreamFailed);
+                };
+                interim.switch(self.switched(Backend::H2(stream), None, handshake));
+                (parts, Body::Empty)
+            }
+            Connected::Refused(parts, answer) => {
+                let watch = Watch {
+                    proxy: Arc::clone(&self.proxy),
+                    upstream: directed.upstream_slot,
+                };
+                (parts, Body::H2(Box::new(answer), admitted, watch))
+            }
+        };
+        if let Some(upstream) = upstream {
+            upstream.responded(parts.status);
+        }
+        let switched = parts.status.is_success();
+        let headers = &mut parts.headers;
+        let nominated = crate::hop_by_hop::nominated(&*headers);
+        crate::h1::filter_declaration(headers, &nominated);
+        crate::hop_by_hop::strip_response(headers);
+        if let Some(changes) = directed
+            .rule
+            .as_ref()
+            .and_then(|rule| rule.response_headers.as_ref())
+        {
+            changes.apply(headers);
+        }
+        // To an HTTP/1.1 client, the switch is its 101, with the Accept of its own key.
+        if switched && let Some(client) = &handshake.client {
+            parts.status = StatusCode::SWITCHING_PROTOCOLS;
+            parts
+                .headers
+                .insert(http::header::UPGRADE, websocket::WEBSOCKET);
+            parts
+                .headers
+                .insert(http::header::SEC_WEBSOCKET_ACCEPT, client.accept_value());
+        } else if switched {
+            parts.status = StatusCode::OK;
+        }
+        Ok(Answered::Map(Response::from_parts(parts, body)))
+    }
+
+    /// What an HTTP/2 exchange is held to, for a try held to `timing`.
+    fn h2_bounds(&self, timing: Timing) -> H2Bounds {
+        H2Bounds {
+            final_head: (!timing.head_by_rule).then_some(self.limits.final_head),
+            idle: self.limits.idle,
+            continue_wait: self.limits.continue_wait,
+            interim_heads: self.limits.interim_heads,
+            interim_bytes: self.limits.interim_bytes,
+        }
+    }
+}
+
+/// What an HTTP/2 exchange that failed is answered with, counted against `upstream` where
+/// it was the upstream's failing: waiting for a place, or the client's own body, is not.
+fn h2_failed(
+    error: h2_exchange::ExchangeError,
+    upstream: Option<&crate::metrics::UpstreamCounters>,
+) -> Answer {
+    let answer = match error {
+        h2_exchange::ExchangeError::Place(PlaceError::Full) => Answer::QueueFull,
+        h2_exchange::ExchangeError::Place(PlaceError::TimedOut) => Answer::QueueTimedOut,
+        h2_exchange::ExchangeError::RequestBody(cause)
+            if matches!(
+                cause.downcast_ref::<RequestBodyError>(),
+                Some(RequestBodyError::TimedOut)
+            ) =>
+        {
+            Answer::BodyTimedOut
+        }
+        h2_exchange::ExchangeError::RequestBody(_) => Answer::BadBody,
+        h2_exchange::ExchangeError::TooSlow { .. } | h2_exchange::ExchangeError::Idle { .. } => {
+            Answer::UpstreamTimedOut
+        }
+        _ => Answer::UpstreamFailed,
+    };
+    if matches!(answer, Answer::UpstreamFailed | Answer::UpstreamTimedOut)
+        && let Some(upstream) = upstream
+    {
+        upstream.failures.inc();
+    }
+    answer
+}
+
+/// An extended CONNECT's answer, from its backend's (19 §3, §4): a switch, 101 from an
+/// HTTP/1.1 backend, is told as 200 (RFC 8441 §5), with no Accept, which has no key to be of;
+/// any other 2xx is answered 502 — to a CONNECT every 2xx opens the tunnel (RFC 9110
+/// §9.3.6), and a page the backend served in place of the switch would be read as
+/// WebSocket frames — and the backend's answer dropped, its connection with it; anything
+/// else goes as it came.
+fn connected_answer(
+    status: StatusCode,
+    mut parts: http::response::Parts,
+    body: Body,
+) -> Result<Answered<Body>, Answer> {
+    if status == StatusCode::SWITCHING_PROTOCOLS {
+        parts.status = StatusCode::OK;
+        parts.headers.remove(http::header::SEC_WEBSOCKET_ACCEPT);
+        parts.headers.remove(http::header::UPGRADE);
+        return Ok(Answered::Map(Response::from_parts(parts, body)));
+    }
+    if status.is_success() {
+        return Err(Answer::UpstreamFailed);
+    }
+    Ok(Answered::Map(Response::from_parts(parts, body)))
 }
 
 impl Proxy {
@@ -2292,6 +2476,7 @@ impl Proxy {
         id: Option<&HeaderValue>,
     ) -> Result<Directing, Answer> {
         let snapshot = self.current.load();
+        let came_on = listener;
         let listener = snapshot
             .listeners
             .get(listener)
@@ -2337,24 +2522,28 @@ impl Proxy {
         head.set_uri(target);
         let upgradable = head.version() == Version::HTTP_11;
         head.onward();
-        // A handshake goes on as one to a backend spoken to in HTTP/1.1; to one spoken to in
-        // HTTP/2 it goes as the plain request its `Upgrade` already left it (19 §4).
-        let websocket = forward
-            .websocket
-            .as_ref()
-            .filter(|_| identity.protocol() == UpstreamProtocol::Http1)
-            .and_then(|key| Key::read(key.as_bytes()))
-            .and_then(|client| {
-                Some(Box::new(Handshake {
-                    client,
-                    ours: Key::of(unguessable()?),
-                    idle: forward
-                        .rule
-                        .timeouts()
-                        .and_then(|timeouts| timeouts.tunnel_idle)
-                        .unwrap_or(TUNNEL_IDLE),
-                }))
-            });
+        // A handshake goes on as HTTP/1.1's upgrade to a backend spoken to in HTTP/1.1, and
+        // as an extended CONNECT to one spoken to in HTTP/2 (19 §2, §4).
+        let websocket = forward.websocket.as_ref().and_then(|opening| {
+            let client = match opening {
+                Opening::Upgrade(key) => Some(Key::read(key.as_bytes())?),
+                Opening::Connect => None,
+            };
+            let toward = match identity.protocol() {
+                UpstreamProtocol::Http1 => Toward::Upgrade(Key::of(unguessable()?)),
+                UpstreamProtocol::Http2 => Toward::Connect,
+            };
+            Some(Box::new(Handshake {
+                client,
+                toward,
+                idle: forward
+                    .rule
+                    .timeouts()
+                    .and_then(|timeouts| timeouts.tunnel_idle)
+                    .unwrap_or(TUNNEL_IDLE),
+                listener: came_on,
+            }))
+        });
         if let Some(counters) = self.metrics.upstream(upstream_slot) {
             counters.requests.inc();
         }
@@ -2466,16 +2655,27 @@ struct Directed {
     upgradable: bool,
 }
 
-/// A WebSocket handshake as the gateway carries it (19 §2).
+/// A WebSocket handshake as the gateway carries it (19 §2 to §4).
 struct Handshake {
-    /// The key the client sent, whose Accept its 101 carries.
-    client: Key,
-    /// The key the gateway sent the backend in its place, whose Accept the backend's 101
-    /// must carry: one the client never saw, so that a 101 the backend hands back for it
-    /// cannot pass.
-    ours: Key,
+    /// The key an HTTP/1.1 client sent, whose Accept its 101 carries; none for an extended
+    /// CONNECT, which has none and is answered 200.
+    client: Option<Key>,
+    /// How it goes to the backend.
+    toward: Toward,
     /// How long the tunnel may carry nothing: the rule's, or an hour.
     idle: Duration,
+    /// The listener it came in on, whose tunnels it is counted among.
+    listener: usize,
+}
+
+/// How a WebSocket handshake goes to its backend.
+enum Toward {
+    /// To one spoken to in HTTP/1.1: a GET that asks to upgrade, with a key of the gateway's
+    /// own, whose Accept its 101 must carry — one the client never saw, so that a 101 the
+    /// backend hands back for it cannot pass.
+    Upgrade(Key),
+    /// To one spoken to in HTTP/2: an extended CONNECT, if its connection announces them.
+    Connect,
 }
 
 /// A WebSocket's idle bound where its rule states none (19 §5).
@@ -10528,6 +10728,77 @@ upstreams:
                 assert_eq!(&heard[..2], &[0x88, 0x82], "{heard:?}");
                 let code = [heard[6] ^ heard[2], heard[7] ^ heard[3]];
                 assert_eq!(u16::from_be_bytes(code), 1001);
+                tunnel_ended(&worker, "web", "drained").await;
+            })
+            .await;
+    }
+
+    /// The same over HTTP/2: the Close frames go inside the stream's DATA frames, the
+    /// connection's graceful GOAWAY lets the stream finish, and the tunnel ends drained
+    /// once both answers are in (19 §6).
+    #[tokio::test]
+    async fn a_draining_worker_closes_http2_websockets_with_going_away() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (saw, mut seen) = tokio::sync::mpsc::unbounded_channel();
+                let upstream = closing_websocket_backend(saw).await;
+                let proxy = Proxy::new(
+                    compile(&everything_config(upstream)).unwrap(),
+                    NonZeroUsize::MIN,
+                )
+                .unwrap();
+                let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = serving(&worker, socket);
+
+                let stream = TcpStream::connect(front).await.unwrap();
+                let (send, connection) = ::h2::client::handshake(stream).await.unwrap();
+                let _driving = tokio::task::spawn_local(async move {
+                    let _ended = connection.await;
+                });
+                let mut send = within(send.ready()).await.unwrap();
+                until(|| send.is_extended_connect_protocol_enabled()).await;
+                let mut request = Request::builder()
+                    .method(Method::CONNECT)
+                    .uri("http://a.test/chat")
+                    .header("sec-websocket-version", "13")
+                    .body(())
+                    .unwrap();
+                request
+                    .extensions_mut()
+                    .insert(::h2::ext::Protocol::from_static("websocket"));
+                let (response, mut stream) = send.send_request(request, false).unwrap();
+                let response = within(response).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let mut body = response.into_body();
+
+                worker.drain();
+                let mut heard = Vec::new();
+                while heard.len() < 4 {
+                    let data = within(body.data()).await.unwrap().unwrap();
+                    let _released = body.flow_control().release_capacity(data.len());
+                    heard.extend_from_slice(&data);
+                }
+                assert_eq!(heard, [0x88, 0x02, 0x03, 0xe9], "not a Close 1001");
+                stream
+                    .send_data(
+                        Bytes::from_static(&[0x88, 0x82, 0, 0, 0, 0, 0x03, 0xe9]),
+                        false,
+                    )
+                    .unwrap();
+                // Nothing more comes, and the stream ends.
+                let mut rest = Vec::new();
+                while let Some(data) = within(body.data()).await {
+                    match data {
+                        Ok(data) => rest.extend_from_slice(&data),
+                        Err(_) => break,
+                    }
+                }
+                assert_eq!(rest, b"", "the backend's answer went on");
+                let backend_heard = within(seen.recv()).await.unwrap();
+                assert_eq!(&backend_heard[..2], &[0x88, 0x82], "{backend_heard:?}");
                 tunnel_ended(&worker, "web", "drained").await;
             })
             .await;

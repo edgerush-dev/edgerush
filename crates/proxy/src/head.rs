@@ -47,6 +47,14 @@ pub trait Head {
     /// Puts another target in place of this one.
     fn set_uri(&mut self, uri: Uri);
 
+    /// Puts another method in place of this one: an extended CONNECT's `GET` for an
+    /// HTTP/1.1 backend, or the other way round ([19 §3](../../../docs/19-websocket.md)).
+    fn set_method(&mut self, method: Method);
+
+    /// The protocol an extended CONNECT asks for, `:protocol` (RFC 8441 §4, RFC 9220): none
+    /// for any other request, and for every request of HTTP/1's.
+    fn protocol(&self) -> Option<&str>;
+
     /// Its fields.
     fn fields(&self) -> Self::Fields<'_>;
 
@@ -153,6 +161,16 @@ impl Head for Parts {
 
     fn set_uri(&mut self, uri: Uri) {
         self.uri = uri;
+    }
+
+    fn set_method(&mut self, method: Method) {
+        self.method = method;
+    }
+
+    fn protocol(&self) -> Option<&str> {
+        self.extensions
+            .get::<::h2::ext::Protocol>()
+            .map(::h2::ext::Protocol::as_str)
     }
 
     fn fields(&self) -> &HeaderMap {

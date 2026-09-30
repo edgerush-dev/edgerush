@@ -37,7 +37,7 @@ use crate::request_body::{RequestBody, RequestBodyError};
 use crate::slots::Slots;
 use crate::storage::{Charge, Storage};
 use crate::timers::{Alarm, Timers};
-use crate::tunnel::{Carried, Switched, carry};
+use crate::tunnel::{Carried, Switched};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Block, Blocks};
 use bytes::{Buf, Bytes};
@@ -980,14 +980,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         }
     }
 
-    /// The socket, what has been read from it and not handed on, and the blocks that came
-    /// from: for a tunnel that takes the connection over once its 101 has gone.
-    fn into_tunnel(self) -> (S, Option<Block>, Rc<RefCell<Blocks>>) {
-        let mut inbound = self.inbound.borrow_mut();
-        let input = inbound.input.take();
-        let blocks = Rc::clone(&inbound.blocks);
-        drop(inbound);
-        (self.socket, input, blocks)
+    /// The socket, and what has been read from it and not handed on: for a tunnel that
+    /// takes the connection over once its 101 has gone.
+    fn into_tunnel(self) -> (S, Option<Block>) {
+        let input = self.inbound.borrow_mut().input.take();
+        (self.socket, input)
     }
 
     /// Writes what is queued until nothing is, keeping the deadlines.
@@ -1239,7 +1236,7 @@ where
         if switching {
             drop(body);
             let switched = interim.take_switched();
-            return Box::pin(switch(connection, switched, &timers, drain)).await;
+            return Box::pin(switch(connection, switched)).await;
         }
 
         let mut framer = BodyFramer::new(written.delimited);
@@ -1343,34 +1340,16 @@ where
 async fn switch<S: AsyncRead + AsyncWrite + Unpin>(
     mut connection: Connection<S>,
     switched: Option<Switched>,
-    timers: &Rc<Timers>,
-    drain: &Drain,
 ) -> Ended {
     if let Err(stop) = connection.flush().await {
         return stop.into();
     }
     // Only a core that switched a backend answers 101.
-    let Some(Switched {
-        backend: mut switched,
-        leftover,
-        bounds,
-    }) = switched
-    else {
+    let Some(switched) = switched else {
         return Ended::Gone;
     };
-    let (mut socket, input, blocks) = connection.into_tunnel();
-    let carried = carry(
-        &mut socket,
-        &mut switched,
-        input,
-        leftover,
-        &blocks,
-        bounds,
-        timers,
-        drain,
-    )
-    .await;
-    Ended::Switched(carried)
+    let (mut socket, input) = connection.into_tunnel();
+    Ended::Switched(switched.carry(&mut socket, input).await)
 }
 
 /// Ends a connection whose answer's body failed. Before any byte of the final head has

@@ -15,7 +15,8 @@
 use super::client::{Client, Place, PlaceError};
 use super::head::{self, HeadError};
 use crate::downstream::h2::body::IncomingH2;
-use crate::downstream::h2::writer::{SendError, send_body};
+use crate::downstream::h2::writer::{Outgoing, SendError, send_body};
+use crate::h2_stream::H2Stream;
 use crate::interim::{Channel, Interim};
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::retry::replay::Tee;
@@ -307,6 +308,69 @@ impl Attempt<'_> {
             _place: place,
         };
         Ok((parts, answer))
+    }
+}
+
+/// What an extended CONNECT for a WebSocket came to ([19 §4](../../../../docs/19-websocket.md)).
+pub(crate) enum Connected {
+    /// The backend said yes (any 2xx: RFC 9110 §9.3.6): the answer's head, and its stream,
+    /// which is the WebSocket's from here on.
+    Switched(Parts, H2Stream),
+    /// It said something else: an ordinary answer.
+    Refused(Parts, Answer),
+    /// Its connection does not announce extended CONNECT (RFC 8441 §3): it is not sent one.
+    NotOffered,
+}
+
+/// Asks `destination` for a WebSocket at `target` with an extended CONNECT (RFC 8441), its
+/// fields `fields`, once a connection's SETTINGS say it takes them; `bounds.final_head`
+/// bounds the whole of it, the wait for the SETTINGS included. The stream is not ended: its
+/// DATA frames are the WebSocket's.
+///
+/// # Errors
+///
+/// An [`ExchangeError`] for whatever stopped the request before its answer's head.
+pub(crate) async fn connect<F: OutgoingFields + ?Sized>(
+    client: &Rc<Client>,
+    destination: &Arc<ReuseIdentity>,
+    target: &Uri,
+    fields: &F,
+    storage: &Rc<Storage>,
+    bounds: Bounds,
+) -> Result<Connected, ExchangeError> {
+    let mut request = head::request(&Method::CONNECT, target, fields, Sending::None)?;
+    request
+        .extensions_mut()
+        .insert(::h2::ext::Protocol::from_static("websocket"));
+    let connecting = async {
+        let mut place = client.place(destination).await?;
+        place.settled().await;
+        if !place.sender().is_extended_connect_protocol_enabled() {
+            return Ok(Connected::NotOffered);
+        }
+        let sender = place.sender();
+        poll_fn(|cx| sender.poll_ready(cx)).await?;
+        let (response, mut send) = sender.send_request(request, false)?;
+        let (parts, recv) = response.await?.into_parts();
+        if parts.status.is_success() {
+            let stream = H2Stream::new(send, recv, Rc::clone(storage), Some(place));
+            return Ok(Connected::Switched(parts, stream));
+        }
+        // Nothing more goes up: its end is sent, and its answer read as any other's.
+        let _ended = send.send_data(Outgoing::empty(), true);
+        let answer = Answer {
+            body: IncomingH2::new(recv, bounds.idle),
+            upload: None,
+            abandoned: false,
+            _place: place,
+        };
+        Ok(Connected::Refused(parts, answer))
+    };
+    match bounds.final_head {
+        Some(limit) => tokio::time::timeout(limit, connecting)
+            .await
+            .map_err(|_| ExchangeError::TooSlow { limit })?,
+        None => connecting.await,
     }
 }
 

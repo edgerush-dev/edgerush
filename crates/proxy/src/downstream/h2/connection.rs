@@ -17,12 +17,13 @@ use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h2::body::IncomingH2;
 use crate::downstream::h2::writer::{Outgoing, Responder, send_body};
 use crate::drain::Drain;
+use crate::h2_stream::H2Stream;
 use crate::interim::Interim;
 use crate::request_body::RequestBody;
 use crate::storage::Storage;
 use bytes::Bytes;
 use http::header::{DATE, HeaderValue};
-use http::{Request, Response, StatusCode, Version};
+use http::{Method, Request, Response, StatusCode, Version};
 use http_body::Body;
 use std::cell::{Cell, RefCell};
 use std::error::Error as StdError;
@@ -150,7 +151,12 @@ impl Settings {
             .max_concurrent_reset_streams(50)
             .reset_stream_duration(std::time::Duration::from_secs(1))
             .max_pending_accept_reset_streams(20)
-            .max_local_error_reset_streams(Some(1024));
+            .max_local_error_reset_streams(Some(1024))
+            // WebSocket over HTTP/2 (RFC 8441), announced from the first SETTINGS: h2 has
+            // no way to take it back, and RFC 8441 §3 forbids it ([19 §3]).
+            //
+            // [19 §3]: ../../../../../docs/19-websocket.md
+            .enable_connect_protocol();
         builder
     }
 }
@@ -410,8 +416,21 @@ where
         Version::HTTP_2,
         request.body().is_end_stream(),
     );
-    let request =
-        request.map(|body| RequestBody::H2(IncomingH2::new(body, idle).heard_by(interim.clone())));
+    // An extended CONNECT's stream is a WebSocket's once it is answered, not a body: it is
+    // kept here, to be carried, and the request goes to the core with none (19 §3).
+    let connect = request.method() == Method::CONNECT
+        && request.extensions().get::<::h2::ext::Protocol>().is_some();
+    let (request, kept) = if connect {
+        let (parts, received) = request.into_parts();
+        (
+            Request::from_parts(parts, RequestBody::None),
+            Some(received),
+        )
+    } else {
+        let request = request
+            .map(|body| RequestBody::H2(IncomingH2::new(body, idle).heard_by(interim.clone())));
+        (request, None)
+    };
     let mut answering = std::pin::pin!(respond(request, interim.clone()));
     let answered = poll_fn(|cx| {
         if responder.poll_reset(cx).is_ready() {
@@ -437,11 +456,19 @@ where
     {
         head.headers.insert(DATE, now);
     }
-    let end = body.is_end_stream();
+    // A WebSocket the core switched: the stream stays open after its 200, and is carried.
+    let switched = interim.take_switched().zip(kept);
+    let end = body.is_end_stream() && switched.is_none();
     // A head h2 refuses is not sent, and the stream is reset when its responder goes.
     let Ok(mut stream) = responder.final_head(Response::from_parts(head, ()), end) else {
         return Ended::Otherwise;
     };
+    if let Some((switched, received)) = switched {
+        drop(body);
+        let mut tunnel = H2Stream::new(stream, received, Rc::clone(storage), None);
+        let _carried = switched.carry(&mut tunnel, None).await;
+        return Ended::Otherwise;
+    }
     if !end {
         // However the sending ends, there is nobody left to tell: a reset stream or a
         // failed body has been reset already.

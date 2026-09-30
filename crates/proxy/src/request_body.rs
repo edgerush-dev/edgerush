@@ -43,6 +43,10 @@ pub(crate) enum RequestBody {
     Mirrored(Box<mirror::Tee>),
     /// A mirror's copy.
     Copy(mirror::Copy),
+    /// None at all, whatever the client's stream goes on to carry: an extended CONNECT's,
+    /// whose stream is a WebSocket's once it is answered
+    /// ([19 §3](../../../docs/19-websocket.md)).
+    None,
 }
 
 /// What a server reported going wrong, kept as the cause of a [`RequestBodyError`] without
@@ -89,7 +93,11 @@ impl RequestBody {
             Self::Ours(body) => body.drop_trailers(),
             Self::H2(body) => body.drop_trailers(),
             Self::H3(body) => body.drop_trailers(),
-            Self::Recorded(_) | Self::Replayed(_) | Self::Mirrored(_) | Self::Copy(_) => {}
+            Self::Recorded(_)
+            | Self::Replayed(_)
+            | Self::Mirrored(_)
+            | Self::Copy(_)
+            | Self::None => {}
         }
     }
 }
@@ -121,6 +129,7 @@ impl Body for RequestBody {
             Self::Replayed(body) => Pin::new(body).poll_frame(cx),
             Self::Mirrored(body) => Pin::new(&mut **body).poll_frame(cx),
             Self::Copy(body) => Pin::new(body).poll_frame(cx),
+            Self::None => Poll::Ready(None),
         }
     }
 
@@ -133,6 +142,7 @@ impl Body for RequestBody {
             Self::Replayed(body) => body.is_end_stream(),
             Self::Mirrored(body) => body.is_end_stream(),
             Self::Copy(body) => body.is_end_stream(),
+            Self::None => true,
         }
     }
 
@@ -145,6 +155,7 @@ impl Body for RequestBody {
             Self::Replayed(body) => body.size_hint(),
             Self::Mirrored(body) => body.size_hint(),
             Self::Copy(body) => body.size_hint(),
+            Self::None => SizeHint::with_exact(0),
         }
     }
 }

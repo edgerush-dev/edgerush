@@ -27,7 +27,7 @@ use edgerush_filters::{Requested, Scheme, UrlRewrite};
 use edgerush_router::{NormaliseError, RequestParts, normalise_path};
 use http::header::HeaderMap;
 use http::uri::PathAndQuery;
-use http::{HeaderValue, StatusCode, Uri, Version};
+use http::{HeaderValue, Method, StatusCode, Uri, Version};
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -65,11 +65,21 @@ pub struct Forward<'a> {
     /// the handshake of, never the messages; each is drawn all the same, so that what it
     /// did not get can be counted ([19 §5](../../../docs/19-websocket.md)).
     pub mirrors: Vec<Mirroring>,
-    /// The key an HTTP/1.1 WebSocket handshake came with: set for a request the gateway
-    /// carries as one ([19 §2](../../../docs/19-websocket.md)). Its `Upgrade` has been taken
-    /// off with the other hop-by-hop fields all the same; what goes upstream in their place
-    /// is for whoever sends it.
-    pub websocket: Option<HeaderValue>,
+    /// How a WebSocket's opening handshake came, for a request the gateway carries as one
+    /// ([19 §2, §3](../../../docs/19-websocket.md)). An HTTP/1.1 one's `Upgrade` has been
+    /// taken off with the other hop-by-hop fields all the same; what goes upstream in their
+    /// place is for whoever sends it.
+    pub websocket: Option<Opening>,
+}
+
+/// A WebSocket's opening handshake, as its client sent it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Opening {
+    /// HTTP/1.1's upgrade (RFC 6455 §4), with the `Sec-WebSocket-Key` the client sent.
+    Upgrade(HeaderValue),
+    /// An extended CONNECT for `websocket` over HTTP/2 or HTTP/3 (RFC 8441, RFC 9220),
+    /// which has no key.
+    Connect,
 }
 
 /// A mirror that takes a copy of a request.
@@ -116,6 +126,10 @@ pub enum Rejection {
     /// hold. Not reachable from a config the gateway accepts (14 §6).
     #[error("request head cannot take its changes")]
     Edits,
+    /// An extended CONNECT for a protocol other than WebSocket, which is all the gateway
+    /// carries (RFC 9220 §3: a server "SHOULD respond ... with a 501").
+    #[error("extended CONNECT for a protocol not carried")]
+    Protocol,
 }
 
 impl Rejection {
@@ -130,6 +144,7 @@ impl Rejection {
             }
             Self::NoRoute => StatusCode::NOT_FOUND,
             Self::NoBackend | Self::Edits => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Protocol => StatusCode::NOT_IMPLEMENTED,
         }
     }
 }
@@ -169,6 +184,18 @@ pub fn decide<'a, H: Head>(
     id: Option<&HeaderValue>,
 ) -> Result<Decision<'a>, Rejection> {
     let found = head.survey();
+    // An extended CONNECT is for WebSocket or for nothing the gateway carries: it cannot be
+    // served as a plain request, as an HTTP/1 upgrade can, since without its protocol it
+    // asks for nothing (19 §4).
+    let connect = match head.protocol() {
+        Some(protocol) if head.method() == Method::CONNECT => {
+            if !protocol.eq_ignore_ascii_case("websocket") {
+                return Err(Rejection::Protocol);
+            }
+            true
+        }
+        _ => false,
+    };
     if found.cookie_fields > 1 {
         // Before routing, so that rules and the upstream read the same cookie string.
         head.join_cookies()?;
@@ -212,9 +239,11 @@ pub fn decide<'a, H: Head>(
     }
     // Read before the hop-by-hop fields come off, as they must for everything else: an
     // `Upgrade` is one, and the only WebSocket the gateway carries says it (19 §2).
-    let websocket = if found.hop_by_hop {
+    let websocket = if connect {
+        Some(Opening::Connect)
+    } else if found.hop_by_hop {
         crate::websocket::handshake(head.version(), head.method(), &head.fields())
-            .map(|key| key.value())
+            .map(|key| Opening::Upgrade(key.value()))
     } else {
         None
     };

@@ -41,14 +41,14 @@ pub(crate) struct Outgoing {
 }
 
 impl Outgoing {
-    fn charged(bytes: Bytes, charge: Charge) -> Self {
+    pub(crate) fn charged(bytes: Bytes, charge: Charge) -> Self {
         Self {
             bytes,
             _charge: Some(charge),
         }
     }
 
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             bytes: Bytes::new(),
             _charge: None,

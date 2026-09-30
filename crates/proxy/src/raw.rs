@@ -165,6 +165,14 @@ impl Head for RawHead {
         self.uri = uri;
     }
 
+    fn set_method(&mut self, method: Method) {
+        self.method = method;
+    }
+
+    fn protocol(&self) -> Option<&str> {
+        None
+    }
+
     fn fields(&self) -> Edited<'_> {
         self.overlay.edited(self.view())
     }

@@ -258,10 +258,13 @@ pub(crate) enum Answer {
     DeadlineExceeded,
     /// The request's rule redirects it ([18](../../docs/18-redirects-and-rewrites.md)).
     Redirected,
+    /// An extended CONNECT for a protocol other than WebSocket
+    /// ([19 §4](../../docs/19-websocket.md)).
+    UnknownProtocol,
 }
 
 impl Answer {
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 20] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -281,6 +284,7 @@ impl Answer {
         Self::ConnectionAuth,
         Self::DeadlineExceeded,
         Self::Redirected,
+        Self::UnknownProtocol,
     ];
 
     /// The status that is answered with.
@@ -298,7 +302,7 @@ impl Answer {
             | Self::Exhausted
             | Self::QueueFull
             | Self::QueueTimedOut => StatusCode::SERVICE_UNAVAILABLE,
-            Self::ConnectionAuth => StatusCode::NOT_IMPLEMENTED,
+            Self::ConnectionAuth | Self::UnknownProtocol => StatusCode::NOT_IMPLEMENTED,
             Self::DeadlineExceeded | Self::UpstreamTimedOut => StatusCode::GATEWAY_TIMEOUT,
             Self::UpstreamFailed => StatusCode::BAD_GATEWAY,
             Self::BodyTimedOut => StatusCode::REQUEST_TIMEOUT,
@@ -328,6 +332,7 @@ impl Answer {
             Self::ConnectionAuth => "connection_auth",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::Redirected => "redirected",
+            Self::UnknownProtocol => "unknown_protocol",
         }
     }
 
@@ -372,6 +377,7 @@ impl Answer {
                 Code::Unimplemented,
                 "the route answers with a redirect, which a call cannot follow",
             ),
+            Self::UnknownProtocol => (Code::Unimplemented, "no protocol but WebSocket is carried"),
         }
     }
 }
@@ -386,6 +392,7 @@ impl From<Rejection> for Answer {
             Rejection::NoRoute => Self::NoRoute,
             Rejection::NoBackend => Self::NoBackend,
             Rejection::Edits => Self::Edits,
+            Rejection::Protocol => Self::UnknownProtocol,
         }
     }
 }

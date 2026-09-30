@@ -12,6 +12,7 @@
     reason = "test set-up: the helpers around the tests fail them the way the tests would"
 )]
 
+use bytes::Bytes;
 use edgerush_config::{Config, compile};
 use edgerush_proxy::{Proxy, Worker};
 use std::future::Future;
@@ -730,4 +731,517 @@ async fn a_handshake_is_not_mirrored() {
         .await;
     let copy = within(copies.recv()).await.unwrap();
     assert!(copy.starts_with("GET /plain "), "{copy}");
+}
+
+// ---- HTTP/2: extended CONNECT (RFC 8441), 19 §3 and §4 ----
+
+/// A client of the gateway over HTTP/2 with prior knowledge, once the gateway's SETTINGS
+/// have been heard; says whether they announced extended CONNECT.
+async fn h2_client(address: SocketAddr) -> (h2::client::SendRequest<Bytes>, bool) {
+    let socket = TcpStream::connect(address).await.unwrap();
+    let (send, connection) = h2::client::handshake(socket).await.unwrap();
+    tokio::spawn(async move {
+        let _ended = connection.await;
+    });
+    let mut send = within(send.ready()).await.unwrap();
+    // SETTINGS come first, but are read as the connection's task runs.
+    let mut announced = false;
+    for _ in 0..200 {
+        announced = send.is_extended_connect_protocol_enabled();
+        if announced {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        send = within(send.ready()).await.unwrap();
+    }
+    (send, announced)
+}
+
+/// An extended CONNECT for `protocol` at `/chat`, as a browser sends one over HTTP/2.
+fn connect_for(protocol: &str) -> http::Request<()> {
+    let mut request = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri("http://chat.test/chat")
+        .header("sec-websocket-version", "13")
+        .header("origin", "https://chat.test")
+        .body(())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(h2::ext::Protocol::from(protocol));
+    request
+}
+
+/// Everything received on `body` until its end.
+async fn all_of(body: &mut h2::RecvStream) -> Vec<u8> {
+    let mut received = Vec::new();
+    while let Some(data) = within(body.data()).await {
+        let data = data.unwrap();
+        let _released = body.flow_control().release_capacity(data.len());
+        received.extend_from_slice(&data);
+    }
+    received
+}
+
+/// The next `count` bytes received on `body`.
+async fn next_of(body: &mut h2::RecvStream, count: usize, kept: &mut Vec<u8>) -> Vec<u8> {
+    while kept.len() < count {
+        let data = within(body.data())
+            .await
+            .expect("the stream ended")
+            .unwrap();
+        let _released = body.flow_control().release_capacity(data.len());
+        kept.extend_from_slice(&data);
+    }
+    let rest = kept.split_off(count);
+    std::mem::replace(kept, rest)
+}
+
+/// An HTTP/2 client's WebSocket is carried to an HTTP/1.1 backend as RFC 6455's handshake,
+/// with a key of the gateway's own: the client is told 200 with no Accept, and its stream
+/// carries the bytes both ways, END_STREAM each way a half-close (RFC 8441 §5).
+#[tokio::test]
+async fn an_http2_websocket_is_carried_to_an_http1_backend() {
+    let (saw, mut seen) = mpsc::unbounded_channel();
+    let (upstream, _) = echoing(saw);
+    let (address, proxy) = gateway(upstream, FORWARD, "");
+    let (mut send, announced) = h2_client(address).await;
+    assert!(announced, "extended CONNECT was not announced");
+    let (response, mut stream) = send.send_request(connect_for("websocket"), false).unwrap();
+    let response = within(response).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.headers().get("sec-websocket-accept").is_none());
+    assert!(response.headers().get("upgrade").is_none());
+
+    let asked = within(seen.recv()).await.unwrap();
+    assert!(asked.starts_with("GET /chat HTTP/1.1\r\n"), "{asked}");
+    assert_eq!(field(&asked, "upgrade"), Some("websocket"), "{asked}");
+    assert_eq!(field(&asked, "connection"), Some("upgrade"), "{asked}");
+    assert_eq!(
+        field(&asked, "sec-websocket-key").map(str::len),
+        Some(24),
+        "{asked}"
+    );
+    assert_eq!(
+        field(&asked, "sec-websocket-version"),
+        Some("13"),
+        "{asked}"
+    );
+
+    let mut body = response.into_body();
+    let mut kept = Vec::new();
+    assert_eq!(next_of(&mut body, 5, &mut kept).await, b"hello");
+    stream
+        .send_data(Bytes::from_static(b"ping"), false)
+        .unwrap();
+    assert_eq!(next_of(&mut body, 6, &mut kept).await, b"[ping]");
+    stream.send_data(Bytes::new(), true).unwrap();
+    let mut rest = kept;
+    rest.extend(all_of(&mut body).await);
+    assert_eq!(rest, b"bye");
+    counted(
+        &proxy,
+        r#"edgerush_listener_tunnels_total{listener="web",outcome="closed"}"#,
+        1,
+    )
+    .await;
+    assert_eq!(
+        sample(
+            &proxy,
+            r#"edgerush_listener_responses_total{listener="web",class="2xx"}"#
+        ),
+        Some(1)
+    );
+}
+
+/// A backend that answers an extended CONNECT's handshake with a page, 200, has not
+/// switched, and to a CONNECT every 2xx opens the tunnel (RFC 9110 §9.3.6): the client is
+/// told 502, not 200.
+#[tokio::test]
+async fn a_page_in_place_of_the_switch_is_answered_502_to_an_http2_client() {
+    let (upstream, _) = backend(|mut wire| async move {
+        let _head = wire.head().await;
+        wire.write("HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\n<html>hi</html>")
+            .await;
+        let _closed = within(wire.rest()).await;
+    });
+    let (address, _) = gateway(upstream, FORWARD, "");
+    let (mut send, _) = h2_client(address).await;
+    let (response, _stream) = send.send_request(connect_for("websocket"), false).unwrap();
+    let response = within(response).await.unwrap();
+    assert_eq!(response.status(), 502);
+}
+
+/// An extended CONNECT for a protocol other than WebSocket is answered 501 (RFC 9220 §3),
+/// and nothing goes upstream.
+#[tokio::test]
+async fn an_extended_connect_for_another_protocol_is_answered_501() {
+    let (upstream, accepted) = backend(|mut wire| async move {
+        let _head = wire.head().await;
+    });
+    let (address, _) = gateway(upstream, FORWARD, "");
+    let (mut send, _) = h2_client(address).await;
+    let (response, _stream) = send
+        .send_request(connect_for("webtransport"), false)
+        .unwrap();
+    let response = within(response).await.unwrap();
+    assert_eq!(response.status(), 501);
+    assert_eq!(accepted.load(Ordering::SeqCst), 0);
+}
+
+/// What an HTTP/2 backend was asked, as the test's backend saw it.
+#[derive(Debug)]
+struct Asked {
+    method: http::Method,
+    protocol: Option<String>,
+    path: String,
+    headers: http::HeaderMap,
+}
+
+/// A backend spoken to in HTTP/2 that announces extended CONNECT if `announces`. It tells
+/// `saw` what each request asked; a CONNECT for `websocket` is answered 200 and its stream
+/// then carries `hello`, what it is sent back in brackets the first time, and `bye` once
+/// the gateway ends its side. Anything else is answered 426.
+fn h2_backend(
+    announces: bool,
+    saw: mpsc::UnboundedSender<Asked>,
+) -> (SocketAddr, Arc<AtomicUsize>) {
+    backend(move |wire| {
+        let saw = saw.clone();
+        async move {
+            let mut builder = h2::server::Builder::new();
+            if announces {
+                builder.enable_connect_protocol();
+            }
+            let Ok(mut connection) = builder.handshake::<_, Bytes>(wire.stream).await else {
+                return;
+            };
+            while let Some(Ok((request, mut respond))) = connection.accept().await {
+                let (parts, mut body) = request.into_parts();
+                let asked = Asked {
+                    protocol: parts
+                        .extensions
+                        .get::<h2::ext::Protocol>()
+                        .map(|protocol| protocol.as_str().to_owned()),
+                    method: parts.method,
+                    path: parts.uri.path().to_owned(),
+                    headers: parts.headers,
+                };
+                let websocket = asked.method == http::Method::CONNECT
+                    && asked.protocol.as_deref() == Some("websocket");
+                let _told = saw.send(asked);
+                if !websocket {
+                    let refusal = http::Response::builder().status(426).body(()).unwrap();
+                    if let Ok(mut sending) = respond.send_response(refusal, false) {
+                        let _sent = sending.send_data(Bytes::from_static(b"no"), true);
+                    }
+                    continue;
+                }
+                let ok = http::Response::builder().status(200).body(()).unwrap();
+                let Ok(mut sending) = respond.send_response(ok, false) else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    let _sent = sending.send_data(Bytes::from_static(b"hello"), false);
+                    let mut first = true;
+                    while let Some(Ok(data)) = body.data().await {
+                        let _released = body.flow_control().release_capacity(data.len());
+                        let echo = if first {
+                            first = false;
+                            format!("[{}]", String::from_utf8_lossy(&data))
+                        } else {
+                            String::from_utf8_lossy(&data).into_owned()
+                        };
+                        let _sent = sending.send_data(Bytes::from(echo), false);
+                    }
+                    let _sent = sending.send_data(Bytes::from_static(b"bye"), true);
+                });
+            }
+        }
+    })
+}
+
+/// The config's upstreams line for `up` spoken to in HTTP/2 at `address`.
+fn h2_upstream(address: SocketAddr) -> String {
+    format!("  up2: {{ endpoints: [\"{address}\"], protocol: http2 }}")
+}
+
+const FORWARD_H2: &str = "        forward: { backends: [{ upstream: up2, weight: 1 }] }";
+
+/// An HTTP/1.1 client's WebSocket to an HTTP/2 backend goes as an extended CONNECT, with
+/// no key; the backend's 200 becomes the client's 101, with the Accept of the client's own
+/// key, and the stream carries the bytes.
+#[tokio::test]
+async fn an_http1_websocket_is_carried_to_an_http2_backend() {
+    let (saw, mut seen) = mpsc::unbounded_channel();
+    let (h2, _) = h2_backend(true, saw);
+    let (unused, _) = backend(|_| async {});
+    let (address, proxy) = gateway(unused, FORWARD_H2, &h2_upstream(h2));
+    let mut client = Wire::to(address).await;
+    client.write(&format!("{}early", handshake())).await;
+    let head = within(client.head()).await;
+    assert!(
+        head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "{head}"
+    );
+    assert_eq!(field(&head, "upgrade"), Some("websocket"), "{head}");
+    assert_eq!(field(&head, "connection"), Some("upgrade"), "{head}");
+    assert_eq!(field(&head, "sec-websocket-accept"), Some(ACCEPT), "{head}");
+
+    let asked = within(seen.recv()).await.unwrap();
+    assert_eq!(asked.method, http::Method::CONNECT);
+    assert_eq!(asked.protocol.as_deref(), Some("websocket"));
+    assert_eq!(asked.path, "/chat");
+    assert!(
+        asked.headers.get("sec-websocket-key").is_none(),
+        "{asked:?}"
+    );
+    assert_eq!(asked.headers["sec-websocket-version"], "13");
+
+    assert_eq!(within(client.exactly(5)).await, "hello");
+    assert_eq!(within(client.exactly(7)).await, "[early]");
+    client.write("ping").await;
+    assert_eq!(within(client.exactly(4)).await, "ping");
+    client.finish().await;
+    assert_eq!(client.rest().await, "bye");
+    counted(
+        &proxy,
+        r#"edgerush_listener_tunnels_total{listener="web",outcome="closed"}"#,
+        1,
+    )
+    .await;
+}
+
+/// HTTP/2 both sides: the extended CONNECT goes on as one, and the 200 comes back as one.
+#[tokio::test]
+async fn an_http2_websocket_is_carried_to_an_http2_backend() {
+    let (saw, mut seen) = mpsc::unbounded_channel();
+    let (h2, _) = h2_backend(true, saw);
+    let (unused, _) = backend(|_| async {});
+    let (address, _) = gateway(unused, FORWARD_H2, &h2_upstream(h2));
+    let (mut send, _) = h2_client(address).await;
+    let (response, mut stream) = send.send_request(connect_for("websocket"), false).unwrap();
+    let response = within(response).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let asked = within(seen.recv()).await.unwrap();
+    assert_eq!(asked.protocol.as_deref(), Some("websocket"));
+    let mut body = response.into_body();
+    let mut kept = Vec::new();
+    assert_eq!(next_of(&mut body, 5, &mut kept).await, b"hello");
+    stream
+        .send_data(Bytes::from_static(b"ping"), false)
+        .unwrap();
+    assert_eq!(next_of(&mut body, 6, &mut kept).await, b"[ping]");
+    stream.send_data(Bytes::new(), true).unwrap();
+    let mut rest = kept;
+    rest.extend(all_of(&mut body).await);
+    assert_eq!(rest, b"bye");
+}
+
+/// An HTTP/2 backend whose connection does not announce extended CONNECT is not sent one:
+/// the handshake goes as the plain GET it came as, and its answer goes back as it came —
+/// but for a 2xx to an HTTP/2 client, which a CONNECT would take for the switch.
+#[tokio::test]
+async fn an_http2_backend_that_does_not_announce_it_is_sent_a_plain_request() {
+    let (saw, mut seen) = mpsc::unbounded_channel();
+    let (h2, _) = h2_backend(false, saw);
+    let (unused, _) = backend(|_| async {});
+    let (address, _) = gateway(unused, FORWARD_H2, &h2_upstream(h2));
+    let mut client = Wire::to(address).await;
+    client.write(&handshake()).await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 426"), "{head}");
+    let asked = within(seen.recv()).await.unwrap();
+    assert_eq!(asked.method, http::Method::GET);
+    assert_eq!(asked.protocol, None);
+
+    let (mut send, _) = h2_client(address).await;
+    let (response, _stream) = send.send_request(connect_for("websocket"), false).unwrap();
+    let response = within(response).await.unwrap();
+    assert_eq!(response.status(), 426);
+    let asked = within(seen.recv()).await.unwrap();
+    assert_eq!(asked.method, http::Method::GET);
+}
+
+/// A socket whose first write waits `delay`: an HTTP/2 server on it sends its SETTINGS late.
+struct Late {
+    stream: TcpStream,
+    delay: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl tokio::io::AsyncRead for Late {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Late {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if let Some(delay) = self.delay.as_mut() {
+            std::task::ready!(delay.as_mut().poll(cx));
+            self.delay = None;
+        }
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+/// The pool lets a new connection's first stream go before the peer's SETTINGS are heard
+/// (15 §3); a WebSocket waits for them, and does not take a connection that has yet to say
+/// it takes extended CONNECT for one that does not (19 §4).
+#[tokio::test]
+async fn a_websocket_waits_for_an_http2_backends_settings() {
+    let (saw, mut seen) = mpsc::unbounded_channel();
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let late = socket.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let socket = TcpListener::from_std(socket).unwrap();
+            loop {
+                let (stream, _) = socket.accept().await.unwrap();
+                let saw = saw.clone();
+                tokio::spawn(async move {
+                    let late = Late {
+                        stream,
+                        delay: Some(Box::pin(tokio::time::sleep(Duration::from_millis(300)))),
+                    };
+                    let mut builder = h2::server::Builder::new();
+                    builder.enable_connect_protocol();
+                    let Ok(mut connection) = builder.handshake::<_, Bytes>(late).await else {
+                        return;
+                    };
+                    while let Some(Ok((request, mut respond))) = connection.accept().await {
+                        let _told = saw.send(
+                            request
+                                .extensions()
+                                .get::<h2::ext::Protocol>()
+                                .map(|protocol| protocol.as_str().to_owned()),
+                        );
+                        let ok = http::Response::builder().status(200).body(()).unwrap();
+                        let _sending = respond.send_response(ok, false);
+                    }
+                });
+            }
+        });
+    });
+    let (unused, _) = backend(|_| async {});
+    let (address, _) = gateway(unused, FORWARD_H2, &h2_upstream(late));
+    let mut client = Wire::to(address).await;
+    client.write(&handshake()).await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert_eq!(
+        within(seen.recv()).await.unwrap().as_deref(),
+        Some("websocket"),
+        "the handshake went as a plain request"
+    );
+}
+
+/// A reset ends a WebSocket's tunnel both ways: an HTTP/2 client that resets its stream has
+/// the backend's connection closed, and a backend whose connection fails has the client's
+/// stream reset; each is counted as a tunnel that failed.
+#[tokio::test]
+async fn resets_end_an_http2_websocket_both_ways() {
+    let (saw, mut seen) = mpsc::unbounded_channel();
+    let (upstream, _) = backend(move |mut wire| {
+        let saw = saw.clone();
+        async move {
+            let head = wire.head().await;
+            let accept = accept_of(field(&head, "sec-websocket-key").unwrap_or_default());
+            wire.write(&format!(
+                "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\
+                 connection: Upgrade\r\nsec-websocket-accept: {accept}\r\n\r\nhello"
+            ))
+            .await;
+            // A path that fails: the backend's connection reset under the WebSocket, once
+            // the client has been carried to it.
+            if head.starts_with("GET /fail ") {
+                let _heard = wire.until(b"x").await;
+                let _unset = wire.stream.set_zero_linger();
+                drop(wire);
+                return;
+            }
+            let _told = saw.send(within(wire.rest()).await);
+            // Held open: a reset closes it from the gateway's side, not a half-close
+            // that waits for this one's end.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    });
+    let (address, proxy) = gateway(upstream, FORWARD, "");
+
+    let (mut send, _) = h2_client(address).await;
+    let (response, mut stream) = send.send_request(connect_for("websocket"), false).unwrap();
+    let response = within(response).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body();
+    let mut kept = Vec::new();
+    assert_eq!(next_of(&mut body, 5, &mut kept).await, b"hello");
+    let began = Instant::now();
+    stream.send_reset(h2::Reason::CANCEL);
+    // The backend's connection is closed, with nothing more sent on it, and the tunnel
+    // is over at once, not once the backend has closed its side too.
+    assert_eq!(within(seen.recv()).await.unwrap(), "");
+    counted(
+        &proxy,
+        r#"edgerush_listener_tunnels_total{listener="web",outcome="failed"}"#,
+        1,
+    )
+    .await;
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        began.elapsed()
+    );
+
+    let mut failing = connect_for("websocket");
+    *failing.uri_mut() = "http://chat.test/fail".parse().unwrap();
+    let (response, mut stream) = send.send_request(failing, false).unwrap();
+    let response = within(response).await.unwrap();
+    assert_eq!(response.status(), 200);
+    stream.send_data(Bytes::from_static(b"x"), false).unwrap();
+    let mut body = response.into_body();
+    let mut ended = Ok(());
+    while let Some(data) = within(body.data()).await {
+        if let Err(error) = data {
+            ended = Err(error);
+            break;
+        }
+    }
+    let reason = ended
+        .expect_err("the stream ended as if the backend had")
+        .reason();
+    assert_eq!(reason, Some(h2::Reason::CANCEL));
+    counted(
+        &proxy,
+        r#"edgerush_listener_tunnels_total{listener="web",outcome="failed"}"#,
+        2,
+    )
+    .await;
 }

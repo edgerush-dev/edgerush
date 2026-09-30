@@ -26,6 +26,7 @@ pub mod fields;
 #[cfg(not(feature = "fuzzing"))]
 mod fields;
 mod h1;
+mod h2_stream;
 mod health;
 // A scripted HTTP/2 peer, for tests here and for the probes in `tests/h2_library.rs`.
 #[cfg(test)]
@@ -106,7 +107,7 @@ mod websocket;
 pub use forwarding::Client;
 pub use hop_by_hop::ConnectionError;
 pub use host::HostError;
-pub use request::{Copied, Decision, Forward, Mirroring, Redirected, Rejection, decide};
+pub use request::{Copied, Decision, Forward, Mirroring, Opening, Redirected, Rejection, decide};
 pub use serve::{Forwarding, Proxy, ProxyError, Worker};
 pub use tls::TlsError;
 // What a worker will not go beyond. There is no configuration for these; what there

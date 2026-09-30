@@ -215,6 +215,14 @@ impl Head for MapHead {
         self.parts.uri = uri;
     }
 
+    fn set_method(&mut self, method: Method) {
+        self.parts.method = method;
+    }
+
+    fn protocol(&self) -> Option<&str> {
+        self.parts.protocol()
+    }
+
     fn fields(&self) -> MapFields<'_> {
         self.view()
     }

@@ -19,6 +19,7 @@
 //! its bound is up, or when the worker has no storage for a block to read into.
 
 use crate::drain::Drain;
+use crate::h2_stream::H2Stream;
 use crate::random::{random, unguessable};
 use crate::timers::{Alarm, Timers};
 use crate::upstream::h1::blocks::{Block, Blocks};
@@ -88,17 +89,113 @@ const RELEASE_AFTER: Duration = Duration::from_secs(1);
 /// a quiet tunnel wakes to, a WebSocket message or a ping, whole.
 const PROBE: usize = 1024;
 
-/// A WebSocket's backend, once its upgrade is made (19 §2): the connection its 101 came on,
-/// what was read past the 101, and what the tunnel is held to. The request core hands it to
-/// the server that wrote the 101, which carries it to its client.
-#[derive(Debug)]
+/// A WebSocket's backend, once its upgrade is made (19 §2, §4): the connection its 101 came
+/// on, or the HTTP/2 stream its extended CONNECT was answered on; what was read past the
+/// 101; what the tunnel is held to; and the worker's parts the tunnel needs. The request
+/// core leaves it with the request's interim channel, and the server that wrote the answer
+/// — a 101, or an extended CONNECT's 200 — carries it to its client, from a task of its own
+/// if the server runs one a stream.
 pub(crate) struct Switched {
-    /// The backend's connection.
-    pub(crate) backend: Socket,
+    /// The backend's side.
+    pub(crate) backend: Backend,
     /// What the backend sent after its 101, which goes to the client first.
     pub(crate) leftover: Option<Block>,
     /// The rule's idle bound, and the worker's drain bound.
     pub(crate) bounds: Bounds,
+    pub(crate) blocks: Rc<RefCell<Blocks>>,
+    pub(crate) timers: Rc<Timers>,
+    pub(crate) drain: Rc<Drain>,
+    /// Told how the tunnel ended, which counts it as its listener's.
+    pub(crate) ended: Box<dyn FnOnce(Carried)>,
+}
+
+impl std::fmt::Debug for Switched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Switched")
+            .field("backend", &self.backend)
+            .field("bounds", &self.bounds)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Switched {
+    /// Carries `client` to the backend until the tunnel ends, what the client sent after its
+    /// handshake (`early`) going first, and counts how it ended.
+    pub(crate) async fn carry<C>(self, client: &mut C, early: Option<Block>) -> Carried
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
+        let Self {
+            mut backend,
+            leftover,
+            bounds,
+            blocks,
+            timers,
+            drain,
+            ended,
+        } = self;
+        let carried = carry(
+            client,
+            &mut backend,
+            early,
+            leftover,
+            &blocks,
+            bounds,
+            &timers,
+            &drain,
+        )
+        .await;
+        ended(carried);
+        carried
+    }
+}
+
+/// A WebSocket's backend side: a connection spoken to in HTTP/1.1, or a stream of one in
+/// HTTP/2.
+#[derive(Debug)]
+pub(crate) enum Backend {
+    Socket(Socket),
+    H2(H2Stream),
+}
+
+impl AsyncRead for Backend {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Socket(socket) => Pin::new(socket).poll_read(cx, buf),
+            Self::H2(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Backend {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Socket(socket) => Pin::new(socket).poll_write(cx, buf),
+            Self::H2(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Socket(socket) => Pin::new(socket).poll_flush(cx),
+            Self::H2(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Socket(socket) => Pin::new(socket).poll_shutdown(cx),
+            Self::H2(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
 }
 
 /// One way through the tunnel.

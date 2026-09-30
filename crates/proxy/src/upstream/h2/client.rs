@@ -12,7 +12,7 @@ use super::pool::{Action, ConnectionId, Failure, Limits, Pool, Taken, WaiterId};
 use crate::downstream::h2::writer::Outgoing;
 use crate::upstream::destination::ReuseIdentity;
 use ::h2::client::{Connection, SendRequest};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::poll_fn;
 use std::net::SocketAddr;
@@ -104,6 +104,17 @@ struct Link {
     send: RefCell<Option<SendRequest<Outgoing>>>,
     /// Wakes the connection's task when the pool lets it go.
     released: Notify,
+    /// The peer's SETTINGS have been heard: what it announced can be read off the handle.
+    settled: Cell<bool>,
+    /// Wakes whoever waits for them.
+    heard: Notify,
+}
+
+impl Link {
+    fn settle(&self) {
+        self.settled.set(true);
+        self.heard.notify_waiters();
+    }
 }
 
 /// One worker's HTTP/2 client.
@@ -149,6 +160,23 @@ impl Place {
     /// What the stream is opened with.
     pub(crate) fn sender(&mut self) -> &mut SendRequest<Outgoing> {
         &mut self.send
+    }
+
+    /// Once the peer's SETTINGS have been heard on the place's connection. The pool lets a
+    /// connection's first stream go before then (15 §3); what the peer announced, such as
+    /// extended CONNECT, is known only after ([19 §4](../../../../docs/19-websocket.md)).
+    pub(crate) async fn settled(&self) {
+        let Some(link) = self.client.links.borrow().get(&self.id).cloned() else {
+            return;
+        };
+        loop {
+            // Made before the look, so that a settling in between is not missed.
+            let heard = link.heard.notified();
+            if link.settled.get() {
+                return;
+            }
+            heard.await;
+        }
     }
 }
 
@@ -404,6 +432,8 @@ impl Client {
             key,
             send: RefCell::new(Some(send.clone())),
             released: Notify::new(),
+            settled: Cell::new(false),
+            heard: Notify::new(),
         });
         self.links.borrow_mut().insert(id, Rc::clone(&link));
         self.event(|pool, now, actions| pool.opened(key, id, peer, now, actions));
@@ -440,6 +470,7 @@ impl Client {
         if !settling {
             let peer = u32::try_from(limit).unwrap_or(u32::MAX);
             self.event(|pool, at, actions| pool.settled(key, id, peer, at, actions));
+            link.settle();
         }
         let keepalive = self
             .destinations
@@ -502,6 +533,7 @@ impl Client {
                         limit = watching.current_max_send_streams();
                         let peer = u32::try_from(limit).unwrap_or(u32::MAX);
                         self.event(|pool, at, actions| pool.settled(key, id, peer, at, actions));
+                        link.settle();
                     }
                 }
             }
