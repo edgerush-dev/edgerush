@@ -131,7 +131,7 @@ pub(crate) async fn exchange<F: OutgoingFields + ?Sized>(
     deadline: Option<tokio::time::Instant>,
     mut retrying: impl FnMut(),
 ) -> Result<(Parts, Answer), ExchangeError> {
-    let first = head::request(method, target, fields, sending)?;
+    let first = head::request(method, target, fields, sending, destination.scheme())?;
     let mut channel = interim.map_or_else(Channel::unheard, Channel::Listened);
     let nothing_to_send = matches!(sending, Sending::None | Sending::Length(0));
     channel.begin(expects_continue(fields), nothing_to_send);
@@ -151,7 +151,7 @@ pub(crate) async fn exchange<F: OutgoingFields + ?Sized>(
         // a retry only when one happens, so no request pays for a copy it does not use.
         let request = match head.take() {
             Some(head) => head,
-            None => head::request(method, target, fields, sending)?,
+            None => head::request(method, target, fields, sending, destination.scheme())?,
         };
         let attempt = Attempt {
             client,
@@ -338,7 +338,13 @@ pub(crate) async fn connect<F: OutgoingFields + ?Sized>(
     storage: &Rc<Storage>,
     bounds: Bounds,
 ) -> Result<Connected, ExchangeError> {
-    let mut request = head::request(&Method::CONNECT, target, fields, Sending::None)?;
+    let mut request = head::request(
+        &Method::CONNECT,
+        target,
+        fields,
+        Sending::None,
+        destination.scheme(),
+    )?;
     request
         .extensions_mut()
         .insert(::h2::ext::Protocol::from_static("websocket"));

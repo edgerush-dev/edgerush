@@ -110,6 +110,17 @@ impl ReuseIdentity {
         self.secure.as_ref()
     }
 
+    /// The scheme a request to it names in HTTP/2's `:scheme`: `https` over TLS, `http`
+    /// otherwise. The request is the gateway's own, and says `https` only when it is
+    /// secured (RFC 9110 §4.2.2); what the client used goes in `X-Forwarded-Proto`.
+    pub(crate) fn scheme(&self) -> http::uri::Scheme {
+        if self.secure.is_some() {
+            http::uri::Scheme::HTTPS
+        } else {
+            http::uri::Scheme::HTTP
+        }
+    }
+
     /// PINGs on its HTTP/2 connections, if any.
     pub(crate) fn keepalive(&self) -> Option<Keepalive> {
         self.keepalive

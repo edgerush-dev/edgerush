@@ -27,8 +27,8 @@ pub(crate) enum HeadError {
     BadField,
 }
 
-/// The head of a request for `target` to be sent over HTTP/2 without TLS, its fields
-/// `fields` and its body sent as `sending` says.
+/// The head of a request for `target` to be sent over HTTP/2 to a destination whose
+/// scheme is `scheme`, its fields `fields` and its body sent as `sending` says.
 ///
 /// # Errors
 ///
@@ -38,6 +38,7 @@ pub(crate) fn request<F: OutgoingFields + ?Sized>(
     target: &Uri,
     fields: &F,
     sending: Sending,
+    scheme: Scheme,
 ) -> Result<Request<()>, HeadError> {
     // What the client asked for, in `:authority`: an intermediary builds it from the
     // request it forwards (RFC 9113 §8.3.1), and the core has made sure there is exactly
@@ -52,7 +53,7 @@ pub(crate) fn request<F: OutgoingFields + ?Sized>(
         .cloned()
         .unwrap_or_else(|| PathAndQuery::from_static("/"));
     let uri = Uri::builder()
-        .scheme(Scheme::HTTP)
+        .scheme(scheme)
         .authority(authority)
         .path_and_query(path)
         .build()
@@ -138,9 +139,34 @@ fn travels(name: &[u8], value: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::request as head;
     use super::*;
     use proptest::prelude::*;
+
+    /// The head for a destination reached without TLS.
+    fn head<F: OutgoingFields + ?Sized>(
+        method: &Method,
+        target: &Uri,
+        fields: &F,
+        sending: Sending,
+    ) -> Result<Request<()>, HeadError> {
+        request(method, target, fields, sending, Scheme::HTTP)
+    }
+
+    #[test]
+    fn the_scheme_is_the_destinations() {
+        let fields = fields(&[("host", "shop.example.com")]);
+        let target = target("http://10.0.0.1:8443/a");
+        for scheme in [Scheme::HTTP, Scheme::HTTPS] {
+            let sent_as = request(
+                &Method::GET,
+                &target,
+                &fields,
+                Sending::None,
+                scheme.clone(),
+            );
+            assert_eq!(sent_as.unwrap().uri().scheme(), Some(&scheme));
+        }
+    }
 
     fn fields(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();

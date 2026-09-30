@@ -10,6 +10,7 @@ use crate::upstream::destination::ReuseIdentity;
 use crate::upstream::secure::Socket;
 use bytes::{Buf, Bytes};
 use edgerush_config::{HealthCheck, Probe, UpstreamProtocol};
+use http::uri::Scheme;
 use http::{Request, StatusCode};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,10 +42,14 @@ async fn probe(destination: &ReuseIdentity, probe: &Probe) -> Option<bool> {
             secure.source().server_name.clone(),
         ),
     };
+    // As a request's own: `https` exactly when the probe is secured.
+    let scheme = destination.scheme();
     Some(match (probe, destination.protocol()) {
         (Probe::Http { path }, UpstreamProtocol::Http1) => http1(socket, path, &authority).await?,
-        (Probe::Http { path }, UpstreamProtocol::Http2) => http2(socket, path, &authority).await?,
-        (Probe::Grpc { service }, _) => grpc(socket, service, &authority).await?,
+        (Probe::Http { path }, UpstreamProtocol::Http2) => {
+            http2(socket, &scheme, path, &authority).await?
+        }
+        (Probe::Grpc { service }, _) => grpc(socket, &scheme, service, &authority).await?,
     })
 }
 
@@ -70,9 +75,9 @@ async fn http1(mut socket: Socket, path: &str, authority: &str) -> Option<bool> 
 }
 
 /// `GET` over HTTP/2 by prior knowledge, or by what TLS agreed on: a 2xx passes.
-async fn http2(socket: Socket, path: &str, authority: &str) -> Option<bool> {
+async fn http2(socket: Socket, scheme: &Scheme, path: &str, authority: &str) -> Option<bool> {
     let mut send = handshake(socket).await?;
-    let asked = Request::get(format!("http://{authority}{path}"))
+    let asked = Request::get(format!("{scheme}://{authority}{path}"))
         .header("user-agent", "edgerush-health")
         .body(())
         .ok()?;
@@ -82,14 +87,16 @@ async fn http2(socket: Socket, path: &str, authority: &str) -> Option<bool> {
 }
 
 /// `grpc.health.v1.Health/Check` for `service`: `SERVING`, with `grpc-status` 0, passes.
-async fn grpc(socket: Socket, service: &str, authority: &str) -> Option<bool> {
+async fn grpc(socket: Socket, scheme: &Scheme, service: &str, authority: &str) -> Option<bool> {
     let mut send = handshake(socket).await?;
-    let asked = Request::post(format!("http://{authority}/grpc.health.v1.Health/Check"))
-        .header("content-type", "application/grpc")
-        .header("te", "trailers")
-        .header("user-agent", "edgerush-health")
-        .body(())
-        .ok()?;
+    let asked = Request::post(format!(
+        "{scheme}://{authority}/grpc.health.v1.Health/Check"
+    ))
+    .header("content-type", "application/grpc")
+    .header("te", "trailers")
+    .header("user-agent", "edgerush-health")
+    .body(())
+    .ok()?;
     let (answer, mut sending) = send.send_request(asked, false).ok()?;
     sending.send_data(check_request(service), true).ok()?;
     let answer = answer.await.ok()?;

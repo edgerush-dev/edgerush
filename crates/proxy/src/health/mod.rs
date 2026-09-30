@@ -21,7 +21,7 @@
 //! newly set aside it counts, as it finds it: the workers that set endpoints aside, over
 //! either protocol or in a tunnel, have no one place to count it in.
 
-mod probe;
+pub(crate) mod probe;
 
 use crate::random::random;
 use crate::serve::Proxy;

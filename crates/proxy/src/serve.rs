@@ -5544,6 +5544,8 @@ upstreams:
                     let (request, _) = &requests[0];
                     assert_eq!(request.version(), Version::HTTP_2);
                     assert_eq!(request.method(), Method::GET);
+                    // Reached without TLS: `http`, whatever the client used.
+                    assert_eq!(request.uri().scheme_str(), Some("http"));
                     assert_eq!(request.uri().authority().unwrap(), "shop.example.com");
                     assert_eq!(request.uri().path_and_query().unwrap(), "/a/b?c=d");
                     assert!(request.headers().get("connection").is_none());
@@ -6757,7 +6759,30 @@ upstreams:
                         let Ok(mut connection) = ::h2::server::handshake(secured).await else {
                             return;
                         };
-                        while let Some(Ok((_request, mut respond))) = connection.accept().await {
+                        while let Some(Ok((request, mut respond))) = connection.accept().await {
+                            // A request for another scheme is not this server's to answer
+                            // (RFC 9110 §15.5.20), as a backend that checks it has it; its
+                            // health service says so too.
+                            let https = request.uri().scheme_str() == Some("https");
+                            if request.uri().path() == "/grpc.health.v1.Health/Check" {
+                                let _ = read_all(&mut request.into_body()).await;
+                                let Ok(mut sending) = respond.send_response(grpc_head(), false)
+                                else {
+                                    continue;
+                                };
+                                let status = if https { 1 } else { 2 };
+                                let message = [0, 0, 0, 0, 2, 0x08, status];
+                                let _ = sending.send_data(Bytes::copy_from_slice(&message), false);
+                                let mut trailers = http::HeaderMap::new();
+                                trailers.insert("grpc-status", HeaderValue::from_static("0"));
+                                let _ = sending.send_trailers(trailers);
+                                continue;
+                            }
+                            if !https {
+                                let misdirected = Response::builder().status(421).body(()).unwrap();
+                                let _ = respond.send_response(misdirected, true);
+                                continue;
+                            }
                             if let Ok(mut sending) = respond.send_response(ok_head(), false) {
                                 let _ = sending.send_data(Bytes::from_static(b"ok"), true);
                             }
@@ -6850,7 +6875,7 @@ upstreams:
 
     /// An upstream reached over TLS is spoken to in HTTP/1.1 or in HTTP/2, as configured,
     /// once its certificate is found to be the named server's and vouched for by a trusted
-    /// authority.
+    /// authority. In HTTP/2 its requests say `https`, which it answers only for.
     #[tokio::test]
     async fn an_upstream_is_reached_over_tls_in_either_protocol() {
         let local = tokio::task::LocalSet::new();
@@ -6873,6 +6898,39 @@ upstreams:
                         );
                         assert!(answer.contains("ok"), "{answer}");
                     }
+                }
+            })
+            .await;
+    }
+
+    /// An HTTP/2 upstream reached over TLS is probed as it is sent requests, asking for
+    /// `https`: its HTTP and gRPC health checks both pass one that answers only for that.
+    #[tokio::test]
+    async fn an_http2_upstream_over_tls_is_probed_for_https() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let certificate = crate::tls::testing::certificate(&["backend.test"]);
+                let upstream = tls_upstream(&certificate, Agrees::Either).await;
+                let probes = [
+                    healthz(),
+                    edgerush_config::Probe::Grpc {
+                        service: String::new(),
+                    },
+                ];
+                for probe in probes {
+                    let mut config = everything_config(upstream);
+                    let up = config.upstreams.get_mut("up").unwrap();
+                    up.protocol = UpstreamProtocol::Http2;
+                    up.tls = Some(trusting("backend.test", &certificate));
+                    up.health_check = Some(every_second_by(probe.clone()));
+                    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+                    let destination = proxy.checked().next().unwrap();
+                    let check = destination.health_check().unwrap();
+                    assert!(
+                        crate::health::probe::passes(&destination, check).await,
+                        "{probe:?}"
+                    );
                 }
             })
             .await;
