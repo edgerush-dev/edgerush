@@ -16,7 +16,9 @@
 //!   kept with the probability of its [`Share`] and otherwise drawn again or passed over, so
 //!   that its part follows the ramp whatever the load. After [`REFUSALS`] refusals the one in
 //!   hand is kept: when most of what may be taken is ramping, refusing for ever would only
-//!   spin. An upstream of one endpoint never ramps.
+//!   spin. `p2c`'s second candidate is kept or not the once, and one refused leaves the
+//!   first to go alone: drawn from all but the first, it would otherwise be the one other
+//!   endpoint of an upstream of two every time. An upstream of one endpoint never ramps.
 //!
 //! What the common case costs — every endpoint serving, none ramping, a first try — is one
 //! look at each endpoint drawn: no endpoint is counted, and no list is made, unless one drawn
@@ -224,6 +226,16 @@ impl<C: Candidates, R: FnMut() -> u64> Pick<'_, C, R> {
         }
         Some(at)
     }
+
+    /// [`Self::draw`], kept only if slow start keeps it the once: `None` if refused. For
+    /// `p2c`'s second candidate, whose draw leaves the first out: drawn again while refused,
+    /// an upstream of two would draw the other every time, and the cap would keep it, so a
+    /// ramping endpoint would be in every comparison and win all it is the less busy in.
+    fn draw_kept(&mut self, besides: Option<usize>) -> Option<usize> {
+        let at = self.draw(besides)?;
+        let share = self.candidates.share(at);
+        (share == Share::FULL || share.keeps(self.random())).then_some(at)
+    }
 }
 
 /// `random` brought into `0..slots`; `None` if there are no slots.
@@ -242,7 +254,8 @@ fn skip(at: usize, besides: Option<usize>) -> usize {
 
 /// `p2c`: two different endpoints that may be taken, drawn at random, and of them the one
 /// with fewer exchanges in flight; the first drawn on a tie. The one that may be taken if
-/// there is only one; `None` only if there are no endpoints.
+/// there is only one, and the first if slow start refuses the second; `None` only if there
+/// are no endpoints.
 ///
 /// Two *different* endpoints: two draws that may land on the same one would give the busier
 /// of two pods a quarter of the requests (Envoy says so of its own).
@@ -261,7 +274,8 @@ pub fn p2c(
     if candidates.count() == 1 {
         return Some(first);
     }
-    let Some(second) = pick.draw_ramped(Some(first)) else {
+    // A second refused by slow start leaves the first to go alone.
+    let Some(second) = pick.draw_kept(Some(first)) else {
         return Some(first);
     };
     if candidates.in_flight(second) < candidates.in_flight(first) {
@@ -633,6 +647,21 @@ mod tests {
     }
 
     #[test]
+    fn a_ramping_endpoint_less_busy_than_its_one_other_still_follows_its_ramp() {
+        // Two endpoints, one old and busy, one at a tenth and idle: the second draw can land
+        // only on the other, so were it drawn again until kept, the idle one would be in
+        // every comparison and win them all. It is the second candidate with the probability
+        // of its share, and the first about 9.2% of the time (drawn again while refused,
+        // eight times at most): 9.2% + 90.8% × 10%, about 18.2% of the picks.
+        let mut two = Endpoints::serving(2);
+        two.in_flight = vec![100, 0];
+        two.share[1] = Share::of(6_554);
+        let mut random = generator(17);
+        let counts = tally(2, 100_000, || p2c(&two, &Tried::default(), &mut random));
+        assert!((17_500..=19_000).contains(&counts[1]), "{counts:?}");
+    }
+
+    #[test]
     fn when_everything_may_be_refused_a_pick_is_still_made() {
         let mut three = Endpoints::serving(3);
         three.share = vec![Share::of(0); 3];
@@ -737,11 +766,14 @@ mod tests {
             let allowed = may_take(&endpoints, &already);
             let busiest = allowed.iter().copied().max_by_key(|&at| endpoints.in_flight[at]).unwrap();
             let strictly = allowed.iter().filter(|&&at| endpoints.in_flight[at] == endpoints.in_flight[busiest]).count() == 1;
+            // A second candidate slow start refuses leaves the first to go alone, the busiest
+            // too: only where nothing else it could be compared with ramps is it never taken.
+            let others_full = allowed.iter().all(|&at| at == busiest || endpoints.share[at] == Share::FULL);
             let mut random = generator(seed);
             for _ in 0..50 {
                 let at = p2c(&endpoints, &tried(&already), &mut random).unwrap();
                 prop_assert!(allowed.contains(&at), "{at} not in {allowed:?}");
-                if allowed.len() > 1 && strictly {
+                if allowed.len() > 1 && strictly && others_full {
                     prop_assert_ne!(at, busiest);
                 }
             }
