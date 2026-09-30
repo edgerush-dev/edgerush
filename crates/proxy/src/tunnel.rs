@@ -475,6 +475,11 @@ fn close_frame(to_backend: bool) -> ([u8; 8], u8) {
 /// ended and `to` has been told; `moved` is set if any byte went. `quiet`: the tunnel has
 /// carried nothing for its release time, and a read that finds nothing gives its block
 /// back rather than keep it for the next.
+///
+/// The way's block is read into and written from where it lies: this runs a few times for
+/// every exchange a tunnel carries, and moving the block in and out of the way each time
+/// cost passthrough a thousand instructions a request. What is rare — no block to be had, a
+/// Close to write, an end to pass on, frames to follow — is done apart.
 fn pump<F, T>(
     from: &mut F,
     to: &mut T,
@@ -508,116 +513,73 @@ where
                 }
             }
         }
-        let mut spare = way.block.take();
-        // What is rare gives it back first: a Close to write, or an end to pass on.
-        if (way.close != Close::None || way.ended)
-            && let Some(block) = spare.take()
-        {
-            blocks.borrow_mut().give(block);
-        }
-        // A Close of the gateway's, once what has gone on ends with a frame.
-        if way.close == Close::Wanted && way.at_boundary() {
-            let (frame, length) = close_frame(way.to_backend);
-            way.close = Close::Writing(frame, length, 0);
-        }
-        if let Close::Writing(frame, length, written) = way.close {
-            let rest = &frame[usize::from(written)..usize::from(length)];
-            match Pin::new(&mut *to).poll_write(cx, rest) {
-                Poll::Ready(Ok(0) | Err(_)) => return Poll::Ready(Err(Stopped::Failed)),
-                Poll::Ready(Ok(more)) => {
-                    // Never more than the eight bytes asked for.
-                    let written = written.saturating_add(u8::try_from(more).unwrap_or(length));
-                    way.close = if written >= length {
-                        Close::Sent
-                    } else {
-                        Close::Writing(frame, length, written)
-                    };
-                    *moved = true;
-                    continue;
-                }
+        if way.close != Close::None || way.ended {
+            match closing(to, way, blocks, moved, cx) {
+                Poll::Ready(Ok(true)) => continue,
+                Poll::Ready(Ok(false)) => {}
+                Poll::Ready(Err(stopped)) => return Poll::Ready(Err(stopped)),
                 Poll::Pending => return Poll::Pending,
             }
+            if way.shut {
+                return Poll::Ready(Ok(()));
+            }
         }
-        if way.ended {
-            return match Pin::new(&mut *to).poll_shutdown(cx) {
-                Poll::Ready(Ok(())) => {
-                    way.shut = true;
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Err(_)) => Poll::Ready(Err(Stopped::Failed)),
-                Poll::Pending => Poll::Pending,
-            };
-        }
-        // Into the block the way holds, or one taken to read into. A worker with none to
-        // give reads into a little room on the stack instead: a read that finds nothing —
-        // what most wakes of a quiet tunnel come to — needs no block, and a worker short of
-        // storage does not end its quiet tunnels merely for waking them.
-        let spare = match spare {
-            Some(block) => Some(block),
-            None => blocks.borrow_mut().take().ok(),
-        };
-        let Some(mut block) = spare else {
-            let mut probe = [MaybeUninit::<u8>::uninit(); PROBE];
-            let mut read = ReadBuf::uninit(&mut probe);
-            match Pin::new(&mut *from).poll_read(cx, &mut read) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(_)) => return Poll::Ready(Err(Stopped::Failed)),
-                Poll::Ready(Ok(())) => {}
-            }
-            let arrived = read.filled();
-            if arrived.is_empty() {
-                way.ended = true;
-                continue;
-            }
-            let Ok(mut block) = blocks.borrow_mut().take() else {
-                return Poll::Ready(Err(Stopped::Exhausted));
-            };
-            let (kept, boundary) = follow(way, arrived);
-            // A block has room for far more than the probe holds.
-            if let Some(room) = block.room().get_mut(..kept) {
-                room.copy_from_slice(&arrived[..kept]);
-                block.arrived(kept);
-            }
-            carried = true;
-            *moved = true;
-            arrived_in(way, block, boundary, blocks);
-            continue;
-        };
         // One whose memory went with a frame cut from it — a client's head — has no room
         // left, and is traded for one that has.
-        if block.room().is_empty() {
-            let mut blocks = blocks.borrow_mut();
-            blocks.give(block);
-            block = match blocks.take() {
-                Ok(block) => block,
+        if way
+            .block
+            .as_mut()
+            .is_some_and(|block| block.room().is_empty())
+        {
+            give_back(way, blocks);
+            match blocks.borrow_mut().take() {
+                Ok(fresh) => way.block = Some(fresh),
                 Err(_) => return Poll::Ready(Err(Stopped::Exhausted)),
-            };
+            }
         }
+        // Into the block the way holds, or one taken to read into. A worker with none to
+        // give reads into a little room on the stack instead.
+        let block = match &mut way.block {
+            Some(block) => block,
+            held @ None => {
+                let taken = blocks.borrow_mut().take();
+                match taken {
+                    Ok(block) => held.insert(block),
+                    Err(_) => match probe(from, way, blocks, cx) {
+                        Poll::Ready(Ok(read)) => {
+                            carried |= read;
+                            *moved |= read;
+                            continue;
+                        }
+                        Poll::Ready(Err(stopped)) => return Poll::Ready(Err(stopped)),
+                        Poll::Pending => return Poll::Pending,
+                    },
+                }
+            }
+        };
         let mut read = ReadBuf::new(block.room());
         let polled = Pin::new(&mut *from).poll_read(cx, &mut read);
         let count = read.filled().len();
         match polled {
             Poll::Ready(Ok(())) if count > 0 => {
-                let (kept, boundary) = follow(way, &block.room()[..count]);
-                block.arrived(kept);
                 carried = true;
                 *moved = true;
-                arrived_in(way, block, boundary, blocks);
+                if way.frames.is_none() {
+                    block.arrived(count);
+                } else {
+                    followed(way, count);
+                }
             }
-            Poll::Ready(Ok(())) => {
-                blocks.borrow_mut().give(block);
-                way.ended = true;
-            }
+            // Its block goes back as the end is passed on.
+            Poll::Ready(Ok(())) => way.ended = true,
             Poll::Ready(Err(_)) => {
-                blocks.borrow_mut().give(block);
+                give_back(way, blocks);
                 return Poll::Ready(Err(Stopped::Failed));
             }
             // Kept for the next read, until the tunnel has been quiet a while.
             Poll::Pending => {
-                if carried || !quiet {
-                    way.block = Some(block);
-                } else {
-                    blocks.borrow_mut().give(block);
+                if !carried && quiet {
+                    give_back(way, blocks);
                 }
                 return Poll::Pending;
             }
@@ -625,13 +587,125 @@ where
     }
 }
 
+/// Gives the way's block back, if it holds one.
+fn give_back(way: &mut Way, blocks: &RefCell<Blocks>) {
+    if let Some(block) = way.block.take() {
+        blocks.borrow_mut().give(block);
+    }
+}
+
+/// What is rare on a way, once what it read has gone on: a Close of the gateway's to write,
+/// once what has gone on ends with a frame, and an end to pass on. The way's block, empty,
+/// goes back first. Ready with `true` if the Close moved on and the way should go round
+/// again, with `false` if the way reads on — or has shut, and is done.
+#[cold]
+fn closing<T>(
+    to: &mut T,
+    way: &mut Way,
+    blocks: &RefCell<Blocks>,
+    moved: &mut bool,
+    cx: &mut Context<'_>,
+) -> Poll<Result<bool, Stopped>>
+where
+    T: AsyncWrite + Unpin,
+{
+    give_back(way, blocks);
+    if way.close == Close::Wanted && way.at_boundary() {
+        let (frame, length) = close_frame(way.to_backend);
+        way.close = Close::Writing(frame, length, 0);
+    }
+    if let Close::Writing(frame, length, written) = way.close {
+        let rest = &frame[usize::from(written)..usize::from(length)];
+        return match Pin::new(&mut *to).poll_write(cx, rest) {
+            Poll::Ready(Ok(0) | Err(_)) => Poll::Ready(Err(Stopped::Failed)),
+            Poll::Ready(Ok(more)) => {
+                // Never more than the eight bytes asked for.
+                let written = written.saturating_add(u8::try_from(more).unwrap_or(length));
+                way.close = if written >= length {
+                    Close::Sent
+                } else {
+                    Close::Writing(frame, length, written)
+                };
+                *moved = true;
+                Poll::Ready(Ok(true))
+            }
+            Poll::Pending => Poll::Pending,
+        };
+    }
+    if way.ended {
+        return match Pin::new(&mut *to).poll_shutdown(cx) {
+            Poll::Ready(Ok(())) => {
+                way.shut = true;
+                Poll::Ready(Ok(false))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(Stopped::Failed)),
+            Poll::Pending => Poll::Pending,
+        };
+    }
+    Poll::Ready(Ok(false))
+}
+
+/// A read with no block to read into, as a worker short of storage has none to give: into
+/// a little room on the stack. A read that finds nothing — what most wakes of a quiet
+/// tunnel come to — needs no block, and a worker short of storage does not end its quiet
+/// tunnels merely for waking them; what did arrive needs one. Ready with whether anything
+/// was carried.
+#[cold]
+#[inline(never)]
+fn probe<F>(
+    from: &mut F,
+    way: &mut Way,
+    blocks: &RefCell<Blocks>,
+    cx: &mut Context<'_>,
+) -> Poll<Result<bool, Stopped>>
+where
+    F: AsyncRead + Unpin,
+{
+    let mut probe = [MaybeUninit::<u8>::uninit(); PROBE];
+    let mut read = ReadBuf::uninit(&mut probe);
+    match Pin::new(&mut *from).poll_read(cx, &mut read) {
+        Poll::Pending => return Poll::Pending,
+        Poll::Ready(Err(_)) => return Poll::Ready(Err(Stopped::Failed)),
+        Poll::Ready(Ok(())) => {}
+    }
+    let arrived = read.filled();
+    if arrived.is_empty() {
+        way.ended = true;
+        return Poll::Ready(Ok(false));
+    }
+    let Ok(mut block) = blocks.borrow_mut().take() else {
+        return Poll::Ready(Err(Stopped::Exhausted));
+    };
+    let (kept, boundary) = follow(&mut way.frames, way.close, arrived);
+    // A block has room for far more than the probe holds.
+    if let Some(room) = block.room().get_mut(..kept) {
+        room.copy_from_slice(&arrived[..kept]);
+        block.arrived(kept);
+    }
+    way.block = Some(block);
+    kept_in(way, boundary);
+    Poll::Ready(Ok(true))
+}
+
+/// A WebSocket's read of `count` bytes, just made into the way's block, followed: as much of
+/// it as goes on is kept (19 §6).
+#[cold]
+fn followed(way: &mut Way, count: usize) {
+    let Some(block) = way.block.as_mut() else {
+        return;
+    };
+    let (kept, boundary) = follow(&mut way.frames, way.close, &block.room()[..count]);
+    block.arrived(kept);
+    kept_in(way, boundary);
+}
+
 /// How much of `arrived`, just read, goes on: all of it, but for a WebSocket owed a Close
 /// only as far as the frame boundary the Close goes at — that boundary said too — and after
 /// its Close none. Whatever does not go on is still followed, for the Close that answers
 /// the gateway's.
-fn follow(way: &mut Way, arrived: &[u8]) -> (usize, Option<usize>) {
+fn follow(frames: &mut Option<Frames>, close: Close, arrived: &[u8]) -> (usize, Option<usize>) {
     let count = arrived.len();
-    match (&mut way.frames, way.close) {
+    match (frames, close) {
         (None, _) => (count, None),
         (Some(frames), Close::Sent) => {
             frames.read(arrived);
@@ -651,15 +725,10 @@ fn follow(way: &mut Way, arrived: &[u8]) -> (usize, Option<usize>) {
     }
 }
 
-/// Puts what was kept of a read on `way` to be written — the block is given back if none
-/// was — and, where the read held the boundary a Close is owed at, has the Close written
-/// right after it, as the loop comes round.
-fn arrived_in(way: &mut Way, block: Block, boundary: Option<usize>, blocks: &RefCell<Blocks>) {
-    if block.is_empty() {
-        blocks.borrow_mut().give(block);
-    } else {
-        way.block = Some(block);
-    }
+/// Where what was kept of a read held the boundary a Close is owed at, has the Close written
+/// right after it, as the loop comes round. A read that kept nothing is one owed or past a
+/// Close, whose block goes back as the Close is dealt with.
+fn kept_in(way: &mut Way, boundary: Option<usize>) {
     if boundary.is_some() {
         let (frame, length) = close_frame(way.to_backend);
         way.close = Close::Writing(frame, length, 0);
@@ -943,6 +1012,86 @@ mod tests {
         )))
         .await;
         assert_eq!(carried, Carried::Exhausted);
+    }
+
+    /// A way whose side has ended gives its block back as the end is passed on, while the
+    /// other way goes on: a tunnel half closed for as long as its other side talks holds
+    /// nothing for the half that is done.
+    #[tokio::test(start_paused = true)]
+    async fn a_way_that_has_ended_holds_no_block() {
+        let timers = Timers::new();
+        let drain = Drain::default();
+        // One block's worth: the worker's only block, parked when no way holds it.
+        let blocks = blocks_within(SMALL);
+        let ((mut client, mut backend), (mut client_side, mut backend_side)) = ends();
+        let carried = within_drain(timers.driving(async {
+            let tunnel = carry(
+                &mut client,
+                &mut backend,
+                None,
+                None,
+                &blocks,
+                BOUNDS,
+                &timers,
+                &drain,
+            );
+            let talking = async {
+                client_side.write_all(b"x").await.unwrap();
+                client_side.shutdown().await.unwrap();
+                assert_eq!(exactly(&mut backend_side, 1).await, b"x");
+                let mut end = [0; 1];
+                assert_eq!(backend_side.read(&mut end).await.unwrap(), 0);
+                // Quiet past the release time, the backend's way has given its block back
+                // too; the client's, which ended, never keeps one.
+                tokio::time::sleep(RELEASE_AFTER + Duration::from_millis(100)).await;
+                assert_eq!(blocks.borrow().parked(), 1, "a block is still held");
+                backend_side.shutdown().await.unwrap();
+            };
+            tokio::join!(tunnel, talking).0
+        }))
+        .await;
+        assert_eq!(carried, Carried::Closed);
+    }
+
+    /// A block handed over with no room left — its memory gone with a frame cut from it,
+    /// as a client's head is — is traded for one with room before the way reads again,
+    /// rather than read into and taken for the end of the client's bytes.
+    #[tokio::test]
+    async fn a_block_with_no_room_is_traded_for_one_with_room() {
+        let timers = Timers::new();
+        let drain = Drain::default();
+        let blocks = blocks_within(crate::storage::LIMIT);
+        let mut early = blocks.borrow_mut().take().unwrap();
+        let size = early.room().len();
+        early.room().fill(b'h');
+        early.arrived(size);
+        let _head = early.cut_frame(0..size, size);
+        assert!(early.room().is_empty());
+        let ((mut client, mut backend), (mut client_side, mut backend_side)) = ends();
+        // Waiting when the tunnel starts, so that its first read finds them: a read into no
+        // room at all is answered at once, as a socket's is, with nothing.
+        client_side.write_all(b"more").await.unwrap();
+        let carried = within(timers.driving(async {
+            let tunnel = carry(
+                &mut client,
+                &mut backend,
+                Some(early),
+                None,
+                &blocks,
+                BOUNDS,
+                &timers,
+                &drain,
+            );
+            let talking = async {
+                assert_eq!(exactly(&mut backend_side, 4).await, b"more");
+                for end in [&mut client_side, &mut backend_side] {
+                    end.shutdown().await.unwrap();
+                }
+            };
+            tokio::join!(tunnel, talking).0
+        }))
+        .await;
+        assert_eq!(carried, Carried::Closed);
     }
 
     const WEBSOCKET: Bounds = Bounds {
