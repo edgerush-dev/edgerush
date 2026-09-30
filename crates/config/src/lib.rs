@@ -20,13 +20,13 @@ mod route;
 
 pub use backends::{UpstreamId, WeightedBackends};
 pub use compile::{
-    Compiled, CompiledForwarding, CompiledListener, CompiledMirror, CompiledRetry, CompiledRule,
-    CompiledTimeouts, CompiledUpstream, ConfigError, L4, L4Route, Object, Outcome, Place, Problem,
-    RuleId, SniRouter, Step, Timeout, compile,
+    Compiled, CompiledDataPlane, CompiledForwarding, CompiledListener, CompiledMirror,
+    CompiledRetry, CompiledRule, CompiledTimeouts, CompiledUpstream, ConfigError, L4, L4Route,
+    Object, Outcome, Place, Problem, RuleId, SniRouter, Step, Timeout, compile,
 };
 pub use config::{
-    Certificate, ClientValidation, Config, Forwarding, HealthCheck, Http3, Keepalive, Listener,
-    LoadBalancer, Probe, Protocol, RequestId, SlowStart, Tls, Upstream, UpstreamProtocol,
+    Certificate, ClientValidation, Config, DataPlane, Forwarding, HealthCheck, Http3, Keepalive,
+    Listener, LoadBalancer, Probe, Protocol, RequestId, SlowStart, Tls, Upstream, UpstreamProtocol,
     UpstreamTls,
 };
 pub use route::{

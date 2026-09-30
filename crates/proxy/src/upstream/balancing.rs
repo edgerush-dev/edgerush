@@ -133,7 +133,7 @@ impl Candidates for Seen<'_> {
     fn serves(&self, at: usize) -> bool {
         self.destinations
             .get(at)
-            .is_some_and(|destination| destination.is_healthy())
+            .is_some_and(|destination| destination.serves())
     }
 
     fn in_flight(&self, at: usize) -> u32 {

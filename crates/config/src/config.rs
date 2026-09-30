@@ -23,6 +23,22 @@ pub struct Config {
     pub tls_routes: Vec<TlsRoute>,
     /// The upstreams that backends refer to, by name. They have no order.
     pub upstreams: BTreeMap<String, Upstream>,
+    /// The data plane's own settings; left out, each has its value.
+    #[serde(default)]
+    pub data_plane: DataPlane,
+}
+
+/// The whole data plane's own settings ([07 §1](../../../docs/07-config-and-dsl.md)):
+/// bounds rather than behaviour, each with its value when left out. The control plane fills
+/// them from the `DataPlane` resource; they reload with the rest of the config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataPlane {
+    /// Milliseconds an endpoint that could not be connected to is set aside before a
+    /// connect probe may bring it back ([03 §6](../../../docs/03-data-plane.md)); 5,000
+    /// when left out, and at least 1.
+    #[serde(default)]
+    pub set_aside_ms: Option<u64>,
 }
 
 /// A place where requests come in. Hostnames are to come; until a listener can be told

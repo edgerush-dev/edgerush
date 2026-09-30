@@ -12,17 +12,26 @@
 //! HAProxy's `rise` and `fall` and Envoy's thresholds count them: so many failures make a
 //! serving endpoint unhealthy, so many passes make it serve again. At most [`AT_ONCE`]
 //! probes are out at a time, and never two for one endpoint.
+//!
+//! It also brings back an endpoint that a worker set aside because a try could not connect
+//! to it, whether or not the endpoint is checked: once it has waited the data plane's
+//! `set_aside_ms`, a TCP connect to it is tried, and one that gets through takes it back
+//! while one that does not starts its wait again. No request is the trial. What it finds
+//! newly set aside it counts, as it finds it: the workers that set endpoints aside, over
+//! either protocol or in a tunnel, have no one place to count it in.
 
 mod probe;
 
 use crate::random::random;
 use crate::serve::Proxy;
 use crate::upstream::destination::ReuseIdentity;
+use crate::upstream::h1::H1Limits;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::time::Instant;
 
 /// The most probes out at once.
@@ -44,9 +53,12 @@ struct Tracked {
 /// own, in a `LocalSet`.
 pub(crate) async fn check(proxy: Arc<Proxy>) {
     let tracked: Rc<RefCell<HashMap<u64, Tracked>>> = Rc::default();
+    // What is set aside, by key: whether a connect probe of it is out.
+    let aside: Rc<RefCell<HashMap<u64, bool>>> = Rc::default();
     let out = Rc::new(Cell::new(0_usize));
     loop {
         tokio::time::sleep(TICK).await;
+        reconnect(&proxy, &aside, &out);
         let now = Instant::now();
         let current: Vec<Arc<ReuseIdentity>> = proxy.checked().collect();
         {
@@ -104,6 +116,48 @@ pub(crate) async fn check(proxy: Arc<Proxy>) {
                 }
             });
         }
+    }
+}
+
+/// Counts what is newly set aside, and tries a connect to each endpoint set aside that has
+/// waited its time, with no more than [`AT_ONCE`] probes out in all.
+fn reconnect(proxy: &Arc<Proxy>, aside: &Rc<RefCell<HashMap<u64, bool>>>, out: &Rc<Cell<usize>>) {
+    let (current, wait) = proxy.set_aside();
+    let mut known = aside.borrow_mut();
+    known.retain(|key, _| current.iter().any(|destination| destination.key() == *key));
+    for destination in current {
+        let key = destination.key();
+        let probing = known.entry(key).or_insert_with(|| {
+            proxy.count_set_aside(&destination);
+            false
+        });
+        let due = destination
+            .set_aside_for()
+            .is_some_and(|waited| waited >= wait);
+        if *probing || !due || out.get() >= AT_ONCE {
+            continue;
+        }
+        *probing = true;
+        out.set(out.get() + 1);
+        let (aside, out) = (Rc::clone(aside), Rc::clone(out));
+        let _probing = tokio::task::spawn_local(async move {
+            // The bound a worker's try has to connect in.
+            let connect = TcpStream::connect(destination.address());
+            let through = tokio::time::timeout(H1Limits::default().connect, connect)
+                .await
+                .is_ok_and(|connected| connected.is_ok());
+            out.set(out.get() - 1);
+            if through {
+                destination.bring_back();
+                // Set aside again later, it is new again, and counted.
+                aside.borrow_mut().remove(&key);
+            } else {
+                destination.wait_again();
+                if let Some(probing) = aside.borrow_mut().get_mut(&key) {
+                    *probing = false;
+                }
+            }
+        });
     }
 }
 

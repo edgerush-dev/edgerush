@@ -485,6 +485,9 @@ pub(crate) struct UpstreamCounters {
     pub(crate) mirrors_nowhere: Counter,
     pub(crate) mirrors_credentials: Counter,
     pub(crate) mirrors_upgrade: Counter,
+    /// Endpoints set aside because a try could not connect to them (03 §6), counted by the
+    /// health checker as it finds them.
+    pub(crate) set_asides: Counter,
 }
 
 impl UpstreamCounters {
@@ -629,12 +632,13 @@ impl Metrics {
     }
 
     /// The scrape: the listeners by their names, and the upstreams of the current config
-    /// by theirs, each with the slot it has.
+    /// by theirs, each with the slot it has; and, for the upstreams of the current config,
+    /// how many of their endpoints pass their checks and how many are set aside.
     pub(crate) fn render(
         &self,
         listeners: &[String],
         upstreams: &[(&str, usize)],
-        healthy: &[(&str, usize)],
+        endpoints: &[(&str, usize, usize)],
     ) -> String {
         let mut scrape = Exposition::new();
         let listeners = || listeners.iter().zip(&self.listeners);
@@ -835,11 +839,26 @@ impl Metrics {
             }
         }
 
+        let name = "edgerush_upstream_set_asides_total";
+        let help = "Endpoints set aside because a try could not connect to them.";
+        scrape.family(name, Kind::Counter, help);
+        for (upstream, series) in upstreams() {
+            let labels = [("upstream", upstream)];
+            scrape.sample(name, &labels, series.sum(|shard| shard.set_asides.get()));
+        }
+
         let name = "edgerush_upstream_healthy_endpoints";
         let help = "Endpoints the health checks, if any, say serve.";
         scrape.family(name, Kind::Gauge, help);
-        for (upstream, serving) in healthy {
+        for (upstream, serving, _) in endpoints {
             scrape.sample(name, &[("upstream", upstream)], *serving as u64);
+        }
+
+        let name = "edgerush_upstream_set_aside_endpoints";
+        let help = "Endpoints set aside until a connect probe gets through.";
+        scrape.family(name, Kind::Gauge, help);
+        for (upstream, _, aside) in endpoints {
+            scrape.sample(name, &[("upstream", upstream)], *aside as u64);
         }
 
         let name = "edgerush_upstream_exchanges_stopped_total";

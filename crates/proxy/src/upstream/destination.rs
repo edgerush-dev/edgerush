@@ -18,7 +18,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// The bit of [`ReuseIdentity`]'s standing that says its probes fail: the top one, which
+/// milliseconds since the process started will not reach.
+const UNHEALTHY: u64 = 1 << 63;
 
 /// Milliseconds since the first time anything asked, plus one: what a ramp's start is kept
 /// as, so that the health checker's thread and every worker's read one clock, and 0 can
@@ -61,10 +65,13 @@ pub struct ReuseIdentity {
     keepalive: Option<Keepalive>,
     /// How its endpoint is probed, if it is.
     health_check: Option<HealthCheck>,
-    /// Whether its last probes say it serves; set by the health checker, read when an
-    /// endpoint is picked. Healthy until a probe says otherwise, as HAProxy and Pingora
-    /// start a server.
-    healthy: AtomicBool,
+    /// Whether it may be picked, in one word so that a pick reads it in one look: 0 when it
+    /// may. [`UNHEALTHY`] when its last probes say it does not serve, set by the health
+    /// checker — healthy until a probe says otherwise, as HAProxy and Pingora start a
+    /// server. Below that, when it was set aside, as [`now`] tells it, because a try could
+    /// not connect to it (03 §6): set by the worker whose try it was, and cleared by the
+    /// checker once a connect probe gets through.
+    standing: AtomicU64,
     /// Set when a config without this destination is published. Nothing retired is ever
     /// kept or taken out again; an exchange already under way finishes as it is.
     retired: AtomicBool,
@@ -80,6 +87,11 @@ impl ReuseIdentity {
     /// connection costs no hashing of names and no building of addresses.
     pub fn key(&self) -> u64 {
         self.key
+    }
+
+    /// The name of the upstream it belongs to.
+    pub(crate) fn upstream(&self) -> &str {
+        &self.upstream
     }
 
     /// Where to connect for it.
@@ -107,14 +119,57 @@ impl ReuseIdentity {
         self.health_check.as_ref()
     }
 
-    /// Whether it is to be picked: its probes, if any, say it serves.
+    /// Whether it is to be picked: its probes, if any, say it serves, and it is not set
+    /// aside.
+    pub(crate) fn serves(&self) -> bool {
+        self.standing.load(Ordering::Relaxed) == 0
+    }
+
+    /// Whether its probes, if any, say it serves.
     pub(crate) fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed)
+        self.standing.load(Ordering::Relaxed) & UNHEALTHY == 0
     }
 
     /// What the health checker has found.
     pub(crate) fn set_healthy(&self, healthy: bool) {
-        self.healthy.store(healthy, Ordering::Relaxed);
+        if healthy {
+            self.standing.fetch_and(!UNHEALTHY, Ordering::Relaxed);
+        } else {
+            self.standing.fetch_or(UNHEALTHY, Ordering::Relaxed);
+        }
+    }
+
+    /// Sets it aside, now: a try could not connect to it. Whether this is what set it
+    /// aside; one already set aside keeps when that was.
+    pub(crate) fn set_aside(&self) -> bool {
+        let now = now() & !UNHEALTHY;
+        self.standing
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |standing| {
+                (standing & !UNHEALTHY == 0).then_some(standing | now)
+            })
+            .is_ok()
+    }
+
+    /// How long it has been set aside, or waited since its last connect probe failed; none
+    /// when it is not set aside.
+    pub(crate) fn set_aside_for(&self) -> Option<Duration> {
+        let since = self.standing.load(Ordering::Relaxed) & !UNHEALTHY;
+        (since != 0).then(|| Duration::from_millis(now().saturating_sub(since)))
+    }
+
+    /// Starts its wait again: a connect probe did not get through.
+    pub(crate) fn wait_again(&self) {
+        let now = now() & !UNHEALTHY;
+        let _unless_brought_back =
+            self.standing
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |standing| {
+                    (standing & !UNHEALTHY != 0).then_some((standing & UNHEALTHY) | now)
+                });
+    }
+
+    /// Takes it back: a connect probe got through.
+    pub(crate) fn bring_back(&self) {
+        self.standing.fetch_and(UNHEALTHY, Ordering::Relaxed);
     }
 
     /// Whether this destination is gone from the running config. Checked when a
@@ -241,7 +296,7 @@ impl Destinations {
                                         secure: secure.get(position).cloned().flatten(),
                                         keepalive: upstream.keepalive,
                                         health_check: upstream.health_check.clone(),
-                                        healthy: AtomicBool::new(true),
+                                        standing: AtomicU64::new(0),
                                         retired: AtomicBool::new(false),
                                         ramping_since: AtomicU64::new(0),
                                     });
@@ -312,6 +367,53 @@ mod tests {
         }
         let config: Config = serde_saphyr::from_str(&yaml).unwrap();
         compile(&config).unwrap()
+    }
+
+    /// Health and being set aside share a word and never overwrite each other: a pick takes
+    /// only a destination that is neither unhealthy nor set aside; the checker's findings
+    /// neither set it aside nor bring it back, and bringing it back leaves its health as it
+    /// was (03 §6).
+    #[test]
+    fn health_and_being_set_aside_are_each_their_own() {
+        let destinations = Destinations::reconcile(
+            &config(&[("web", &["127.0.0.1:1"])]),
+            &Destinations::default(),
+            &Keys::default(),
+            &[],
+        );
+        let destination = destinations.at(0, 0).unwrap();
+        assert!(destination.serves() && destination.set_aside_for().is_none());
+
+        assert!(destination.set_aside());
+        assert!(!destination.set_aside(), "one already set aside keeps when");
+        assert!(!destination.serves() && destination.is_healthy());
+        assert!(destination.set_aside_for().is_some());
+
+        destination.set_healthy(false);
+        destination.set_healthy(true);
+        assert!(
+            !destination.serves(),
+            "passing its checks does not bring it back"
+        );
+
+        destination.set_healthy(false);
+        destination.wait_again();
+        assert!(destination.set_aside_for().is_some() && !destination.is_healthy());
+        destination.bring_back();
+        assert!(destination.set_aside_for().is_none());
+        assert!(
+            !destination.is_healthy(),
+            "brought back as unhealthy as it was"
+        );
+        assert!(!destination.serves());
+
+        destination.set_healthy(true);
+        assert!(destination.serves());
+        destination.wait_again();
+        assert!(
+            destination.set_aside_for().is_none(),
+            "waiting again sets nothing aside"
+        );
     }
 
     /// The keys of every destination, in order.

@@ -48,6 +48,20 @@ pub struct Compiled {
     /// By position of the route, then of the rule. Each is shared on its own, so that a
     /// request can hold on to its rule without holding on to the whole config.
     rules: Vec<Vec<Arc<CompiledRule>>>,
+    /// The data plane's own settings.
+    pub data_plane: CompiledDataPlane,
+}
+
+/// The data plane's own settings, each at the value it runs with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompiledDataPlane {
+    /// How long an endpoint that could not be connected to waits for its connect probe.
+    pub set_aside: Duration,
+}
+
+impl CompiledDataPlane {
+    /// What `set_aside_ms` is when left out.
+    const SET_ASIDE: Duration = Duration::from_secs(5);
 }
 
 impl Compiled {
@@ -454,6 +468,15 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             slow_start: upstream.slow_start,
         })
         .collect();
+    let data_plane = CompiledDataPlane {
+        set_aside: config
+            .data_plane
+            .set_aside_ms
+            .map_or(CompiledDataPlane::SET_ASIDE, Duration::from_millis),
+    };
+    if config.data_plane.set_aside_ms == Some(0) {
+        errors.push(Place::of(Object::DataPlane).problem(Problem::SetAsideNever));
+    }
     for (name, upstream) in &config.upstreams {
         if upstream
             .slow_start
@@ -686,6 +709,7 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             listeners,
             upstreams,
             rules,
+            data_plane,
         })
     } else {
         Err(errors)
@@ -1392,6 +1416,8 @@ pub enum Object {
     Route(String),
     /// The upstream of this name.
     Upstream(String),
+    /// The data plane's own settings.
+    DataPlane,
 }
 
 /// A place in a config: a listener, or a route, a rule in it, a match or a backend in the
@@ -1448,6 +1474,7 @@ impl fmt::Display for Place {
             Object::Listener(name) => write!(f, "listener `{name}`")?,
             Object::Route(name) => write!(f, "route `{name}`")?,
             Object::Upstream(name) => write!(f, "upstream `{name}`")?,
+            Object::DataPlane => write!(f, "the data plane")?,
         }
         if let Some(rule) = self.rule {
             write!(f, ", rules[{rule}]")?;
@@ -1549,6 +1576,9 @@ pub enum Problem {
     /// A slow start over no time at all, which is none: left out is how none is said.
     #[error("`slow_start.window_ms` is 0: at least 1, or no `slow_start`")]
     SlowStartNever,
+    /// An endpoint set aside for no time at all, which would probe it without pause.
+    #[error("`set_aside_ms` is 0: at least 1, or left out for 5,000")]
+    SetAsideNever,
     /// A health check with an interval, timeout or threshold of nothing.
     #[error("`health_check` needs an interval, a timeout and thresholds of at least one")]
     HealthCheckZero,
@@ -3140,6 +3170,34 @@ upstreams: { u: { load_balancer: p2c, endpoints: [] } }
         assert!(
             refused[0].ends_with("`slow_start.window_ms` is 0: at least 1, or no `slow_start`")
         );
+    }
+
+    /// The data plane's own settings are bounds, each with its value when left out: an
+    /// endpoint that cannot be connected to waits 5 s for its probe unless the config says
+    /// otherwise, and never no time at all (07 §1).
+    #[test]
+    fn the_data_plane_sets_how_long_an_endpoint_is_set_aside() {
+        let with = |data_plane: &str| {
+            let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{}}\n{data_plane}");
+            compile(&config(&yaml))
+                .map(|compiled| compiled.data_plane.set_aside)
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        assert_eq!(with(""), Ok(Duration::from_secs(5)));
+        assert_eq!(with("data_plane: {}\n"), Ok(Duration::from_secs(5)));
+        assert_eq!(
+            with("data_plane: { set_aside_ms: 250 }\n"),
+            Ok(Duration::from_millis(250))
+        );
+        let refused = with("data_plane: { set_aside_ms: 0 }\n").unwrap_err();
+        assert_eq!(
+            refused,
+            ["the data plane: `set_aside_ms` is 0: at least 1, or left out for 5,000"]
+        );
+        let unknown: Result<Config, _> = serde_saphyr::from_str(
+            "listeners: {}\nroutes: []\nupstreams: {}\ndata_plane: { set_aside: 5 }\n",
+        );
+        assert!(unknown.is_err());
     }
 
     /// A health check says everything it does, and nothing that cannot work.

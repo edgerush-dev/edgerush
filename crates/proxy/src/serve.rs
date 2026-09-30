@@ -755,23 +755,27 @@ impl Proxy {
             .zip(&snapshot.upstream_slots)
             .map(|(upstream, slot)| (upstream.name.as_str(), *slot))
             .collect();
-        // Read where the health checker writes it, at the moment of the scrape.
-        let healthy: Vec<(&str, usize)> = snapshot
+        // Read where the health checker and the workers write it, at the moment of the
+        // scrape.
+        let endpoints: Vec<(&str, usize, usize)> = snapshot
             .config
             .upstreams
             .iter()
             .enumerate()
             .map(|(position, upstream)| {
-                let serving = snapshot
-                    .destinations
-                    .of(position)
-                    .iter()
-                    .filter(|destination| destination.is_healthy())
-                    .count();
-                (upstream.name.as_str(), serving)
+                let destinations = snapshot.destinations.of(position);
+                let count = |which: fn(&ReuseIdentity) -> bool| {
+                    destinations
+                        .iter()
+                        .filter(|destination| which(destination))
+                        .count()
+                };
+                let serving = count(ReuseIdentity::is_healthy);
+                let aside = count(|destination| destination.set_aside_for().is_some());
+                (upstream.name.as_str(), serving, aside)
             })
             .collect();
-        self.metrics.render(&self.listeners, &upstreams, &healthy)
+        self.metrics.render(&self.listeners, &upstreams, &endpoints)
     }
 
     /// Probes the endpoints of every upstream that asks for health checks, for as long as
@@ -780,6 +784,28 @@ impl Proxy {
     /// `LocalSet`: the probes must still run when the workers are saturated.
     pub async fn check_health(self: Arc<Self>) {
         crate::health::check(self).await;
+    }
+
+    /// The destinations of the running config that are set aside, and how long each waits
+    /// for its connect probe: the data plane's `set_aside_ms`.
+    pub(crate) fn set_aside(&self) -> (Vec<Arc<ReuseIdentity>>, Duration) {
+        let snapshot = self.current.load();
+        let aside = snapshot
+            .destinations
+            .all()
+            .filter(|destination| destination.set_aside_for().is_some())
+            .map(Arc::clone)
+            .collect();
+        (aside, snapshot.config.data_plane.set_aside)
+    }
+
+    /// Counts `destination` as set aside, for its upstream. For the health checker, as it
+    /// finds one: it takes a lock, which is why no worker counts it.
+    pub(crate) fn count_set_aside(&self, destination: &ReuseIdentity) {
+        let slot = self.metrics.upstream_slot(destination.upstream());
+        if let Some(counters) = self.metrics.upstream(slot) {
+            counters.set_asides.inc();
+        }
     }
 
     /// The destinations of the running config whose endpoints are probed.
@@ -1049,9 +1075,13 @@ impl Worker {
             None => {
                 self.proxy.metrics.socket(Socket::Opened);
                 let secure = identity.secure().cloned();
+                // Whether TCP got through: only a connect that did not is the endpoint set
+                // aside for, not a handshake that failed after it (03 §6).
+                let connected = Cell::new(false);
                 // One bound for the connection and its handshake together.
                 let opening = async {
                     let socket = TcpStream::connect(identity.address()).await?;
+                    connected.set(true);
                     // Worth having, not worth refusing an upstream over.
                     let _unset = socket.set_nodelay(true);
                     match secure {
@@ -1062,8 +1092,11 @@ impl Worker {
                             .map(|secured| UpstreamSocket::Secured(Gathered::new(secured))),
                     }
                 };
-                let socket = connect_within(self.limits.connect, opening).await?;
-                (socket, Instant::now())
+                let opened = connect_within(self.limits.connect, opening).await;
+                if opened.is_err() && !connected.get() {
+                    identity.set_aside();
+                }
+                (opened?, Instant::now())
             }
         };
 
@@ -1276,7 +1309,7 @@ impl Worker {
         };
         let routed = self.pass_route(listener, name.as_deref());
         // Held until the tunnel closes: it is load on its backend for as long as it is open.
-        let (address, idle, _counted) = match routed {
+        let (endpoint, idle, _counted) = match routed {
             Ok(routed) => routed,
             Err(ended) => {
                 if let Some(block) = hello {
@@ -1286,9 +1319,10 @@ impl Worker {
             }
         };
         self.proxy.metrics.socket(Socket::Opened);
-        let Ok(mut backend) =
-            connect_within(self.limits.connect, TcpStream::connect(address)).await
-        else {
+        let connected = connect_within(self.limits.connect, TcpStream::connect(endpoint.address()));
+        let Ok(mut backend) = connected.await else {
+            // Nothing but TCP here: whatever stopped it is the endpoint's to be set aside for.
+            endpoint.set_aside();
             if let Some(block) = hello {
                 self.blocks.borrow_mut().give(block);
             }
@@ -1315,12 +1349,12 @@ impl Worker {
     }
 
     /// The route of a connection of a `tcp` or `tls` listener, from the config in force now,
-    /// and a backend's endpoint: its address, and the listener's idle bound.
+    /// and a backend's endpoint, and the listener's idle bound.
     fn pass_route(
         &self,
         listener: usize,
         name: Option<&str>,
-    ) -> Result<(SocketAddr, Duration, InFlight), Tunnel> {
+    ) -> Result<(Arc<ReuseIdentity>, Duration, InFlight), Tunnel> {
         let snapshot = self.proxy.current.load();
         let Some(compiled) = snapshot.listener(listener) else {
             return Err(Tunnel::Refused);
@@ -1346,7 +1380,7 @@ impl Worker {
         else {
             return Err(Tunnel::NoBackend);
         };
-        Ok((identity.address(), compiled.tunnel_idle, counted))
+        Ok((Arc::clone(identity), compiled.tunnel_idle, counted))
     }
 
     /// Reads a TLS client's ClientHello into `into`, within the first-request deadline
@@ -4894,6 +4928,11 @@ upstreams:
                 let bound = H1Limits::default().connect;
                 assert!(closed_after(&mut client).await < bound + SLACK);
                 tunnel_ended(&worker, "db", "connect_failed").await;
+                // Set aside for it, as any try that cannot connect sets its endpoint aside.
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_upstream_set_aside_endpoints{upstream=\"up\"} 1
+";
+                assert!(scrape.contains(line), "{scrape}");
 
                 let yaml = tcp_to(gone, "").replace(&format!("[\"{gone}\"]"), "[]");
                 let (front, worker) = passing(&yaml).await;
@@ -7580,6 +7619,10 @@ upstreams:
                     let retried = counted(&scrape, "edgerush_upstream_retries_total{upstream=\"up\"}");
                     let failed = counted(&scrape, "edgerush_upstream_failures_total{upstream=\"up\"}");
                     assert!(retried >= 1 && retried == failed, "{protocol:?}: {scrape}");
+                    // And the endpoint is set aside for it, whichever protocol tried.
+                    let line = "edgerush_upstream_set_aside_endpoints{upstream=\"up\"} 1
+";
+                    assert!(scrape.contains(line), "{protocol:?}: {scrape}");
 
                     let (front, worker) = serving_worker_with(
                         nowhere,
@@ -7631,6 +7674,9 @@ upstreams:
                     let failed =
                         counted(&scrape, "edgerush_upstream_failures_total{upstream=\"up\"}");
                     assert!(retried >= 1 && retried == failed, "{protocol:?}: {scrape}");
+                    // TCP got through: a handshake that failed after it sets nothing aside.
+                    let line = "edgerush_upstream_set_aside_endpoints{upstream=\"up\"} 0\n";
+                    assert!(scrape.contains(line), "{protocol:?}: {scrape}");
                 }
             })
             .await;
@@ -9416,6 +9462,83 @@ upstreams:
                         .contains("x-upstream: shaky\r\n");
                 }
                 assert!(answered_by_shaky, "a healthy endpoint got nothing");
+            })
+            .await;
+    }
+
+    /// An endpoint a try could not connect to is set aside for every request after it, with
+    /// no check configured, and counted; once it takes connections again, a connect probe
+    /// after the data plane's `set_aside_ms` brings it back (03 §6).
+    #[tokio::test]
+    async fn an_endpoint_that_cannot_be_connected_to_is_set_aside_until_a_probe_gets_through() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let (held, nowhere) = refusing();
+                let (answering, _) = statuses_upstream(vec![200]).await;
+                let mut config = everything_config(nowhere);
+                let up = config.upstreams.get_mut("up").unwrap();
+                up.endpoints = vec![nowhere, answering];
+                config.data_plane.set_aside_ms = Some(200);
+                let proxy =
+                    Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+                let _checking = tokio::task::spawn_local(Arc::clone(&proxy).check_health());
+                let worker = Worker::with_deadlines(proxy, H1Limits::default(), SHORT);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = serving(&worker, socket);
+
+                // Drawn at random, the endpoint that refuses is drawn before long, and its
+                // request is answered 502: no retry is stated.
+                let mut refused = false;
+                for _ in 0..50 {
+                    let answer = h1_answer(front, CLOSING_GET).await;
+                    if answer.starts_with("HTTP/1.1 502 ") {
+                        refused = true;
+                        break;
+                    }
+                }
+                assert!(refused, "the endpoint that refuses was never drawn");
+                for _ in 0..30 {
+                    let answer = h1_answer(front, CLOSING_GET).await;
+                    assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+                }
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_upstream_set_aside_endpoints{upstream=\"up\"} 1\n";
+                assert!(scrape.contains(line), "{scrape}");
+                until(|| {
+                    worker
+                        .proxy()
+                        .metrics()
+                        .contains("edgerush_upstream_set_asides_total{upstream=\"up\"} 1\n")
+                })
+                .await;
+
+                // It takes connections again, and says who it is.
+                let listening = held.listen(64).unwrap();
+                let _answering = tokio::task::spawn_local(async move {
+                    while let Ok((mut stream, _)) = listening.accept().await {
+                        let mut head = [0; 1024];
+                        let _read = stream.read(&mut head).await;
+                        let answer = b"HTTP/1.1 200 OK\r\nx-upstream: back\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+                        let _written = stream.write_all(answer).await;
+                    }
+                });
+                let mut back = false;
+                for _ in 0..200 {
+                    let answer = h1_answer(front, CLOSING_GET).await;
+                    assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+                    if answer.contains("x-upstream: back\r\n") {
+                        back = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(back, "the endpoint was never brought back");
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_upstream_set_aside_endpoints{upstream=\"up\"} 0\n";
+                assert!(scrape.contains(line), "{scrape}");
             })
             .await;
     }

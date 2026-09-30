@@ -390,13 +390,16 @@ impl Client {
     /// until it ends.
     async fn dial(self: Rc<Self>, key: u64, id: ConnectionId, address: SocketAddr) {
         let settings = self.settings;
-        let secure = self
-            .destinations
-            .borrow()
-            .get(&key)
+        let destination = self.destinations.borrow().get(&key).cloned();
+        let secure = destination
+            .as_ref()
             .and_then(|destination| destination.secure().cloned());
+        // Whether TCP got through: only a connect that did not is the endpoint set aside
+        // for, not a handshake that failed after it (03 §6).
+        let connected = Cell::new(false);
         let opening = async {
             let socket = TcpStream::connect(address).await.ok()?;
+            connected.set(true);
             // Worth having, not worth refusing an upstream over.
             let _unset = socket.set_nodelay(true);
             Some(match secure {
@@ -405,6 +408,11 @@ impl Client {
             })
         };
         let Ok(Some(transport)) = tokio::time::timeout(settings.connect, opening).await else {
+            if !connected.get()
+                && let Some(destination) = destination
+            {
+                destination.set_aside();
+            }
             self.event(|pool, now, actions| pool.failed(key, id, now, actions));
             return;
         };
