@@ -21,7 +21,7 @@ The runner wants Python 3.13 at most (pyshark breaks on 3.14) and tshark 4.5 or 
 In its checkout, add EdgeRush to `implementations_quic.json`:
 
 ```json
-"edgerush": { "image": "edgerush-qns:latest", "url": "https://github.com/lstyles/edgerush", "role": "server" }
+"edgerush": { "image": "edgerush-qns:latest", "url": "https://github.com/edgerush-dev/edgerush", "role": "server" }
 ```
 
 then run clients against it, all cases or some:
