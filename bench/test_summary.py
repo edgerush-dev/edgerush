@@ -1,5 +1,5 @@
-"""The run table reads what run.sh writes: idle memory, curl's probe, perf's counts and a
-mixed load's whole."""
+"""The run table reads what run.sh writes: idle memory, curl's probe, perf's counts, a
+mixed load's whole and wsbench's line."""
 
 import contextlib
 import io
@@ -82,6 +82,17 @@ class Mixed(unittest.TestCase):
             row = next(line for line in printed.splitlines() if "mixed-5000-all" in line)
             self.assertIn("| 6,000 |", row)
             self.assertIn("| 0.90 | 150.00 |", row)
+
+
+class WsBench(unittest.TestCase):
+    def test_wsbenchs_line_is_a_row_of_messages_and_their_latency(self):
+        with tempfile.TemporaryDirectory() as name:
+            directory = pathlib.Path(name)
+            (directory / "ours.1.ws-busy.out").write_text(
+                '{"wsbench": "echo", "messages": 1000, "failed": 3, "seconds": 10, '
+                '"rate": 100.0, "p50": 0.25, "p99": 1.5, "p99.9": null}\n')
+            row = next(line for line in table(directory).splitlines() if "ws-busy" in line)
+            self.assertIn("| 100 | 3 | 0.25 | 1.50 |", row)
 
 
 if __name__ == "__main__":

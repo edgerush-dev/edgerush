@@ -12,12 +12,14 @@ What each connection does first is the fourth argument:
   the proxy's keep-alive deadline, so that a long run holds them the whole time; one the
   proxy closes anyway is opened again;
 - `h2`: one request over cleartext HTTP/2 with prior knowledge, answered, and then nothing
-  more: what an idle HTTP/2 connection costs.
+  more: what an idle HTTP/2 connection costs;
+- `websocket`: a WebSocket handshake at `/ws`, switched, and then nothing more: what an open
+  WebSocket costs while no message moves (a tunnel, and its backend's connection).
 
 Says `ready` on its standard output once they are all answered, or all open, and then waits
 to be killed.
 
-    bench/idle.py 127.0.0.1:8080 bench.example.com 10000 [one-request|large-head|silent|refreshed]
+    bench/idle.py 127.0.0.1:8080 bench.example.com 10000 [one-request|large-head|silent|refreshed|h2|websocket]
 """
 
 import socket
@@ -25,6 +27,9 @@ import sys
 import time
 
 READY = b"HTTP/1.1 "
+SWITCHED = b"HTTP/1.1 101 "
+# Any key will do: the backend answers whichever it is sent (RFC 6455 §4.1).
+WEBSOCKET_KEY = "dGhlIHNhbXBsZSBub25jZQ=="
 H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 # Within the proxy's 30-second keep-alive deadline, with room to spare.
 REFRESH = 20
@@ -101,8 +106,8 @@ def h2_answer(connection) -> bytes:
                 return head
 
 
-def opened(address, port, request, http2=False):
-    """A connection, asked once and answered."""
+def opened(address, port, request, http2=False, expect=READY):
+    """A connection, asked once and answered with a head that starts with `expect`."""
     connection = socket.create_connection((address, int(port)), timeout=30)
     if request is not None:
         connection.sendall(request)
@@ -113,7 +118,7 @@ def opened(address, port, request, http2=False):
                 raise ConnectionError("stream 1 ended without a head")
         else:
             head = answer(connection)
-            if not head.startswith(READY):
+            if not head.startswith(expect):
                 raise ConnectionError(f"unexpected answer: {head[:40]!r}")
     return connection
 
@@ -127,10 +132,15 @@ def main() -> int:
     request = (
         f"GET / HTTP/1.1\r\nhost: {host}\r\nconnection: keep-alive\r\n{padding}\r\n".encode()
     )
-    asked = None if kind == "silent" else h2_request(host) if kind == "h2" else request
+    handshake = (
+        f"GET /ws HTTP/1.1\r\nhost: {host}\r\nupgrade: websocket\r\nconnection: upgrade\r\n"
+        f"sec-websocket-version: 13\r\nsec-websocket-key: {WEBSOCKET_KEY}\r\n\r\n".encode()
+    )
+    asked = {"silent": None, "h2": h2_request(host), "websocket": handshake}.get(kind, request)
+    expect = SWITCHED if kind == "websocket" else READY
 
     try:
-        held = [opened(address, port, asked, http2=kind == "h2") for _ in range(many)]
+        held = [opened(address, port, asked, kind == "h2", expect) for _ in range(many)]
     except (OSError, ConnectionError) as error:
         print(error, file=sys.stderr)
         return 1

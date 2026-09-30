@@ -53,6 +53,26 @@ def oha(text):
     }
 
 
+def wsbench(result):
+    """bench/wsbench's line: messages echoed, and their latency in milliseconds."""
+    return {
+        "requests": result["messages"] + result["failed"],
+        "rate": result["rate"],
+        "bad": result["failed"],
+        "p50": result["p50"],
+        "p99": result["p99"],
+        "p99.9": result["p99.9"],
+    }
+
+
+def generator(text):
+    """Whichever generator's output `text` is: oha's JSON, wsbench's, or h2load's."""
+    if not text.lstrip().startswith("{"):
+        return h2load(text)
+    result = json.loads(text)
+    return wsbench(result) if "wsbench" in result else oha(text)
+
+
 def logged(path):
     """Latency from h2load's --log-file, one request a line (start µs, status, µs taken), in
     milliseconds: what a fixed rate by h2load reports, as oha's JSON does its own. A failed
@@ -193,7 +213,7 @@ def runs_of(directory, stem):
         return None
     text = out.read_text()
     try:
-        return oha(text) if text.lstrip().startswith("{") else h2load(text)
+        return generator(text)
     except (ValueError, KeyError):
         return None
 
@@ -213,7 +233,7 @@ def main(directory):
             held[(scenario, model)] = memory(text)
             continue
         try:
-            result = oha(text) if text.lstrip().startswith("{") else h2load(text)
+            result = generator(text)
         except (ValueError, KeyError):
             result = None
         if result is None:

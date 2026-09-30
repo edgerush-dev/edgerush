@@ -4,7 +4,7 @@ import socket
 import threading
 import unittest
 
-from idle import answer, h2_answer, h2_frame, h2_request
+from idle import SWITCHED, answer, h2_answer, h2_frame, h2_request, opened
 
 
 def served(*pieces):
@@ -92,6 +92,30 @@ class H2Answer(unittest.TestCase):
             with self.assertRaises(ConnectionError):
                 h2_answer(connection)
             connection.close()
+
+
+class WebSocket(unittest.TestCase):
+    def test_a_websocket_is_held_once_switched_and_anything_else_is_an_error(self):
+        listener = socket.create_server(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        answers = [
+            b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+        ]
+
+        def serve():
+            for answered in answers:
+                connection, _ = listener.accept()
+                connection.recv(4096)
+                connection.sendall(answered)
+                connection.close()
+
+        threading.Thread(target=serve).start()
+        switched = opened("127.0.0.1", port, b"GET /ws HTTP/1.1\r\n\r\n", expect=SWITCHED)
+        switched.close()
+        with self.assertRaises(ConnectionError):
+            opened("127.0.0.1", port, b"GET /ws HTTP/1.1\r\n\r\n", expect=SWITCHED)
+        listener.close()
 
 
 if __name__ == "__main__":

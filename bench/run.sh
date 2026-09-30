@@ -36,6 +36,11 @@
 #                                             TCP and TLS passthrough: kept connections at
 #                                             saturation, a connection a request at CHURN (and
 #                                             TLS_CHURN) a second, and streamed answers
+#   bench/run.sh websocket [RATE] [CHURN]     WebSocket over HTTP/1.1 upgrades, to an echo
+#                                             backend: busy connections, messages at RATE
+#                                             a second, large messages, a connection a
+#                                             message at CHURN a second, and what open ones
+#                                             cost held idle (without TLS)
 #   bench/run.sh summary DIR                  the table of a finished run
 #
 # UPSTREAM_H2=1 has the proxy speak HTTP/2 to the backend, by prior knowledge, many
@@ -103,6 +108,14 @@ repo=$(dirname "$here")
 # port as well, 9443, for the tls listener at 8443 to carry clients to by name.
 : "${PASSTHROUGH:=0}"
 [ "${1:-}" = passthrough ] && PASSTHROUGH=1
+# WEBSOCKET=1, which `websocket` sets, has bench/wsbench be the backend in NGINX's place: it
+# answers requests 200 and WebSocket handshakes with a 101, and echoes every message. NGINX
+# the proxy is told to pass the upgrade on, as its documentation has it; HAProxy and
+# EdgeRush do so by themselves. WSBENCH is its binary
+# (cargo build --release --manifest-path bench/wsbench/Cargo.toml).
+: "${WEBSOCKET:=0}"
+[ "${1:-}" = websocket ] && WEBSOCKET=1
+: "${WSBENCH:=$here/wsbench/target/release/wsbench}"
 # h2load with HTTP/3: Ubuntu's is built without it (bench/README.md says how to build one).
 : "${H2LOAD3:=$HOME/tools/h2load3/bin/h2load}"
 # The loopback's MTU while HTTP/3 is measured (sudo). The loopback's own 64 KiB lets a QUIC
@@ -176,8 +189,19 @@ start_backend() {
             "$here/nginx.conf" >"$backend_conf"
         grep -q 'listen 127.0.0.1:9443 ssl' "$backend_conf"
     fi
-    taskset -c "$BACKEND_CPUS" nginx -p "$run/" -c "$backend_conf" -e "$run/error.log"
+    if [ "$WEBSOCKET" = 1 ]; then
+        [ -x "$WSBENCH" ] || { echo "no wsbench at $WSBENCH: build it first" >&2; exit 2; }
+        taskset -c "$BACKEND_CPUS" "$WSBENCH" serve 127.0.0.1:9000 \
+            --threads "$(cpus_in "$BACKEND_CPUS")" 2>>"$run/wsbench.log" &
+        echo $! >"$run/wsbench.pid"
+    else
+        taskset -c "$BACKEND_CPUS" nginx -p "$run/" -c "$backend_conf" -e "$run/error.log"
+    fi
     await "$backend"
+}
+
+cpus_in() { # list: how many CPUs a comma-separated list names
+    echo "$1" | tr ',' '\n' | wc -l
 }
 
 # The certificate every variant presents, made once.
@@ -212,6 +236,10 @@ PY
 
 stop_backend() {
     [ -f "$run/nginx.pid" ] && kill "$(cat "$run/nginx.pid")" 2>/dev/null || true
+    if [ -f "$run/wsbench.pid" ]; then
+        kill "$(cat "$run/wsbench.pid")" 2>/dev/null || true
+        rm -f "$run/wsbench.pid"
+    fi
 }
 
 start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an idle policy
@@ -264,6 +292,14 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
             fi
         else
             sed "s/WORKERS/$WORKERS/" "$here/nginx-proxy.conf" >"$run-proxy/nginx.conf"
+        fi
+        if [ "$WEBSOCKET" = 1 ]; then
+            # The upgrade passed on (NGINX's WebSocket proxying), and a tunnel's idle bound
+            # of an hour, as EdgeRush's is by default.
+            sed -i 's#^        proxy_set_header Connection "";#        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_read_timeout 3600s;\n        proxy_send_timeout 3600s;#;
+                s#^http {#http {\n    map $http_upgrade $connection_upgrade {\n        default upgrade;\n        "" "";\n    }#' \
+                "$run-proxy/nginx.conf"
+            grep -q 'proxy_set_header Connection $connection_upgrade;' "$run-proxy/nginx.conf"
         fi
         if [ "$grpc_pass" = 1 ]; then
             sed -i "s#^        location / {#        location /bench.Echo/ {\n            grpc_pass grpc://backend;\n        }\n&#" \
@@ -800,6 +836,8 @@ environment() {
         [ "$H3" = 1 ] && echo "loopback MTU $(cat /sys/class/net/lo/mtu)"
         [ "$PASSTHROUGH" = 1 ] && echo "passthrough: tcp at 8080 to the backend's 9000," \
             "tls at 8443 to its 9443 by name"
+        [ "$WEBSOCKET" = 1 ] && echo "websocket: wsbench at 9000 answers and echoes;" \
+            "$(sha256sum "$WSBENCH" | cut -c1-12)"
         oha --version
         nginx -v 2>&1
         { command -v haproxy >/dev/null && haproxy -v | head -1; } || true
@@ -841,9 +879,9 @@ profile-body)
         exit 2
     }
     ;;
-ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3 | h3latency | mixed | passthrough) ;;
+ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3 | h3latency | mixed | passthrough | websocket) ;;
 *)
-    sed -n '2,43p' "$0" >&2
+    sed -n '2,48p' "$0" >&2
     exit 2
     ;;
 esac
@@ -1127,6 +1165,37 @@ passthrough)
         streamed_answer "$1.streamed-tcp" "$streamed_rate"
     }
     each_variant passthrough_runs
+    ;;
+websocket)
+    # WebSocket over HTTP/1.1 upgrades (19 step 5), by bench/wsbench against its own echo:
+    # 256 connections kept busy, a 64-byte message and its echo at a time on each (busy);
+    # RATE messages a second spread over 256 connections, each timed from when it was due
+    # (paced); 16 KiB messages over 16 connections (large); a connection for every message
+    # at CHURN a second, timed from when it was due to its echo (churn: the handshake, the
+    # message, and a Close each way after); and, without TLS, what open WebSockets cost held
+    # idle, at IDLE_COUNTS.
+    ws_rate=${2:-25000} churn_rate=${3:-1000}
+    ws_url=ws://$proxy_at/ws
+    [ "$TLS" = 1 ] && ws_url=wss://$proxy_at/ws
+    wsload() { # name, command, options...
+        local name=$1 command=$2
+        shift 2
+        measured "$name" "$WSBENCH" "$command" "$ws_url" --host "$host" --seconds "$DURATION" \
+            --threads "$(cpus_in "$GEN_CPUS")" "$@"
+    }
+    websocket_runs() {
+        wsload "$1.ws-busy" echo --connections 256
+        wsload "$1.ws-paced" echo --connections 256 --rate "$ws_rate"
+        wsload "$1.ws-large" echo --connections 16 --size 16384
+        wsload "$1.ws-churn" churn --rate "$churn_rate"
+        if [ "$TLS" != 1 ]; then
+            local count
+            for count in $IDLE_COUNTS; do
+                idle_memory "$1.ws-idle-$count" websocket "$count"
+            done
+        fi
+    }
+    each_variant websocket_runs
     ;;
 h3latency)
     # HTTP/3 latency at each RATE (5,000, 12,500 and 25,000 a second unless said), 4

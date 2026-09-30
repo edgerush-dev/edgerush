@@ -1,0 +1,22 @@
+# WebSocket load for the macro benchmark (bench/README.md): an echo backend, and clients
+# that keep connections busy, hold a rate of messages, or open a connection for each one.
+# A package of its own, outside the workspace, as fuzz/ is: nothing in EdgeRush depends on
+# it, and it takes BoringSSL for its TLS clients, which only the proxy crate may.
+[package]
+name = "wsbench"
+description = "WebSocket load for EdgeRush's macro benchmark"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+# All three already in EdgeRush's tree, at the versions it uses.
+boring = "5.2"
+tokio = { version = "1.53", features = ["io-util", "net", "rt-multi-thread", "time"] }
+tokio-boring = "5.2"
+
+[profile.release]
+debug = 1

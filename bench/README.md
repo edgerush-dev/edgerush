@@ -17,7 +17,9 @@ is not used; it is also one of the proxies under test), `haproxy`, `envoy` and `
 those variants (none of them as a service),
 `h2load` (`nghttp2-client`), [`oha`](https://github.com/hatoo/oha)
 (`cargo install oha --locked`), `python3`, `curl`, `taskset`, and a release build:
-`cargo build --release -p edgerush`.
+`cargo build --release -p edgerush`. The `websocket` mode also needs
+[`wsbench`](wsbench/src/main.rs), this directory's own WebSocket load generator and echo
+backend: `cargo build --release --manifest-path bench/wsbench/Cargo.toml`.
 
 ## Running it
 
@@ -60,6 +62,12 @@ bench/run.sh passthrough CHURN [TLS_CHURN]
                                     # TCP and TLS passthrough (PASSTHROUGH=1): kept
                                     # connections at saturation, a connection a request at
                                     # CHURN (TLS_CHURN) a second, 8 MiB answers
+bench/run.sh websocket [RATE] [CHURN]
+                                    # WebSocket over HTTP/1.1 upgrades, wsbench the backend
+                                    # (it echoes): 256 busy connections, RATE (25,000)
+                                    # messages a second over 256, 16 KiB messages, a
+                                    # connection a message at CHURN (1,000) a second, and
+                                    # without TLS what open ones cost held idle
 bench/run.sh summary bench/results/<run>
 bench/window.sh [RTTS] [VARIANTS]   # HTTP/2 uploads over a delayed path, by stream window
                                     # and against NGINX: the client in a network namespace
