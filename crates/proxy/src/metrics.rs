@@ -226,6 +226,11 @@ pub(crate) enum Answer {
     NoRoute,
     NoBackend,
     NoEndpoints,
+    /// No connection to the endpoint could be opened: refused, reset or out of time while
+    /// connecting, or a TLS handshake that failed. Nothing of the request was sent
+    /// ([03 §6](../../docs/03-data-plane.md)).
+    Unreachable,
+    /// The upstream failed once connected: an answer that could not be read, or none.
     UpstreamFailed,
     /// A try ran out of time before its answer's head: the upstream's own clocks for a head,
     /// or for what it was sent or would say, not a gRPC call's deadline
@@ -264,7 +269,7 @@ pub(crate) enum Answer {
 }
 
 impl Answer {
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 21] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -272,6 +277,7 @@ impl Answer {
         Self::NoRoute,
         Self::NoBackend,
         Self::NoEndpoints,
+        Self::Unreachable,
         Self::UpstreamFailed,
         Self::UpstreamTimedOut,
         Self::TooBusy,
@@ -304,7 +310,7 @@ impl Answer {
             | Self::QueueTimedOut => StatusCode::SERVICE_UNAVAILABLE,
             Self::ConnectionAuth | Self::UnknownProtocol => StatusCode::NOT_IMPLEMENTED,
             Self::DeadlineExceeded | Self::UpstreamTimedOut => StatusCode::GATEWAY_TIMEOUT,
-            Self::UpstreamFailed => StatusCode::BAD_GATEWAY,
+            Self::Unreachable | Self::UpstreamFailed => StatusCode::BAD_GATEWAY,
             Self::BodyTimedOut => StatusCode::REQUEST_TIMEOUT,
             // A redirect's own status, one of five, takes its place.
             Self::Redirected => StatusCode::FOUND,
@@ -320,6 +326,7 @@ impl Answer {
             Self::NoRoute => "no_route",
             Self::NoBackend => "no_backend",
             Self::NoEndpoints => "no_endpoints",
+            Self::Unreachable => "upstream_unreachable",
             Self::UpstreamFailed => "upstream_failed",
             Self::UpstreamTimedOut => "upstream_timed_out",
             Self::TooBusy => "too_busy",
@@ -358,7 +365,8 @@ impl Answer {
             Self::NoBackend | Self::NoEndpoints => {
                 (Code::Unavailable, "no upstream can serve the call")
             }
-            Self::UpstreamFailed => (Code::Unavailable, "the upstream could not be reached"),
+            Self::Unreachable => (Code::Unavailable, "the upstream could not be reached"),
+            Self::UpstreamFailed => (Code::Unavailable, "the upstream failed to answer"),
             Self::TooBusy | Self::QueueFull | Self::QueueTimedOut => (
                 Code::Unavailable,
                 "the gateway is too busy to take the call",

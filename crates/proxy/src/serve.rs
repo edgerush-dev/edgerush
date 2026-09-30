@@ -187,8 +187,8 @@ async fn connect_within<S>(
     opening: impl Future<Output = io::Result<S>>,
 ) -> Result<S, ExchangeError> {
     match tokio::time::timeout(limit, opening).await {
-        Ok(socket) => Ok(socket?),
-        Err(_) => Err(ExchangeError::Io(io::ErrorKind::TimedOut.into())),
+        Ok(socket) => socket.map_err(ExchangeError::Unconnected),
+        Err(_) => Err(ExchangeError::Unconnected(io::ErrorKind::TimedOut.into())),
     }
 }
 
@@ -200,7 +200,7 @@ async fn connect_within<S>(
 fn why_stopped(error: &ExchangeError) -> Stopped {
     match error {
         ExchangeError::Codec(_) => Stopped::Codec,
-        ExchangeError::Io(_) => Stopped::Io,
+        ExchangeError::Unconnected(_) | ExchangeError::Io(_) => Stopped::Io,
         ExchangeError::RequestBody(_) => Stopped::RequestBody,
         ExchangeError::Closed => Stopped::Closed,
         ExchangeError::Unsolicited => Stopped::Unsolicited,
@@ -2173,6 +2173,7 @@ impl Worker {
                         waiting: Stalled::Upstream | Stalled::Answer,
                         ..
                     } => Answer::UpstreamTimedOut,
+                    ExchangeError::Unconnected(_) => Answer::Unreachable,
                     _ => Answer::UpstreamFailed,
                 });
             }
@@ -2383,6 +2384,8 @@ fn h2_failed(
     let answer = match error {
         h2_exchange::ExchangeError::Place(PlaceError::Full) => Answer::QueueFull,
         h2_exchange::ExchangeError::Place(PlaceError::TimedOut) => Answer::QueueTimedOut,
+        // Waiting for a place, the request was never sent.
+        h2_exchange::ExchangeError::Place(PlaceError::Unreachable) => Answer::Unreachable,
         h2_exchange::ExchangeError::RequestBody(cause)
             if matches!(
                 cause.downcast_ref::<RequestBodyError>(),
@@ -2397,8 +2400,10 @@ fn h2_failed(
         }
         _ => Answer::UpstreamFailed,
     };
-    if matches!(answer, Answer::UpstreamFailed | Answer::UpstreamTimedOut)
-        && let Some(upstream) = upstream
+    if matches!(
+        answer,
+        Answer::Unreachable | Answer::UpstreamFailed | Answer::UpstreamTimedOut
+    ) && let Some(upstream) = upstream
     {
         upstream.failures.inc();
     }
@@ -2931,6 +2936,9 @@ fn wants_again(retry: &CompiledRetry, outcome: &Result<Answered<Body>, Answer>) 
                     retry.on_grpc(crate::grpc::status::code_of(status.as_bytes()))
                 })
         }
+        // Nothing of the request reached the endpoint: any retry at all sends it on
+        // (GEP-1731).
+        Err(Answer::Unreachable) => true,
         Err(Answer::UpstreamFailed) => retry.on_status(502),
         Err(Answer::UpstreamTimedOut) => retry.on_timeout,
         Err(_) => false,
@@ -3228,7 +3236,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&failed, ExchangeError::Io(error) if error.kind() == io::ErrorKind::TimedOut),
+            matches!(&failed, ExchangeError::Unconnected(error) if error.kind() == io::ErrorKind::TimedOut),
             "{failed}"
         );
         assert_eq!(started.elapsed(), limit);
@@ -3242,7 +3250,7 @@ mod tests {
         let refused = async { Err::<(), _>(io::Error::from(io::ErrorKind::ConnectionRefused)) };
         let failed = connect_within(limit, refused).await.unwrap_err();
         assert!(
-            matches!(&failed, ExchangeError::Io(error) if error.kind() == io::ErrorKind::ConnectionRefused),
+            matches!(&failed, ExchangeError::Unconnected(error) if error.kind() == io::ErrorKind::ConnectionRefused),
             "{failed}"
         );
     }
@@ -7522,6 +7530,161 @@ upstreams:
             .await;
     }
 
+    /// `up` at `endpoints`, each in turn, spoken to in `protocol`, with its one rule
+    /// retrying once for a `503` and nothing else it names.
+    fn in_turn_retrying_503(
+        endpoints: Vec<SocketAddr>,
+        protocol: UpstreamProtocol,
+    ) -> edgerush_config::Config {
+        let mut config = everything_config(endpoints[0]);
+        let up = config.upstreams.get_mut("up").unwrap();
+        up.protocol = protocol;
+        up.endpoints = endpoints;
+        up.load_balancer = edgerush_config::LoadBalancer::RoundRobin;
+        config.routes[0].rules[0]
+            .forward
+            .as_mut()
+            .expect("the rule forwards")
+            .retry = Some(retrying(1, &[503], &[], 1));
+        config
+    }
+
+    /// A try that could not connect is sent to another endpoint under any stated retry,
+    /// whatever statuses it names, as Gateway API asks (GEP-1731): nothing of the request
+    /// reached the first. In either protocol; and counted as the upstream failing, and as
+    /// what it was, when there is no retry to send it on.
+    #[tokio::test]
+    async fn a_stated_retry_sends_a_try_that_could_not_connect_elsewhere() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (_held, nowhere) = refusing();
+                let (h1, _) = statuses_upstream(vec![200]).await;
+                let (h2, _, _) = h2_upstream(UpstreamH2::default()).await;
+                for (protocol, answering) in [
+                    (UpstreamProtocol::Http1, h1),
+                    (UpstreamProtocol::Http2, h2),
+                ] {
+                    let config = in_turn_retrying_503(vec![nowhere, answering], protocol);
+                    let (front, worker) = serving_config(&config).await;
+                    // Each endpoint in turn, a retry's turn among them: most first tries
+                    // are to the one that refuses, and each is sent on.
+                    for _ in 0..4 {
+                        let answer = h1_answer(front, CLOSING_GET).await;
+                        assert!(
+                            answer.starts_with("HTTP/1.1 200 OK\r\n"),
+                            "{protocol:?}: {answer}"
+                        );
+                    }
+                    let scrape = worker.proxy().metrics();
+                    let retried = counted(&scrape, "edgerush_upstream_retries_total{upstream=\"up\"}");
+                    let failed = counted(&scrape, "edgerush_upstream_failures_total{upstream=\"up\"}");
+                    assert!(retried >= 1 && retried == failed, "{protocol:?}: {scrape}");
+
+                    let (front, worker) = serving_worker_with(
+                        nowhere,
+                        protocol,
+                        None,
+                        H1Limits::default(),
+                    )
+                    .await;
+                    let answer = h1_answer(front, CLOSING_GET).await;
+                    assert!(answer.starts_with("HTTP/1.1 502 "), "{protocol:?}: {answer}");
+                    let scrape = worker.proxy().metrics();
+                    let line = "edgerush_listener_local_answers_total{listener=\"web\",reason=\"upstream_unreachable\"} 1\n";
+                    assert!(scrape.contains(line), "{protocol:?}: {scrape}");
+                    let line = "edgerush_upstream_failures_total{upstream=\"up\"} 1\n";
+                    assert!(scrape.contains(line), "{protocol:?}: {scrape}");
+                }
+            })
+            .await;
+    }
+
+    /// A TLS handshake that fails is a try that could not connect, as GEP-1731 names it:
+    /// nothing of the request was sent, and a stated retry sends it to another endpoint.
+    #[tokio::test]
+    async fn a_stated_retry_sends_a_try_whose_handshake_failed_elsewhere() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::tls::testing::certificate;
+                let server = certificate(&["backend.test"]);
+                // The same name, on a certificate nobody trusts.
+                let stranger = certificate(&["backend.test"]);
+                let trusted = tls_upstream(&server, Agrees::Either).await;
+                let untrusted = tls_upstream(&stranger, Agrees::Either).await;
+                for protocol in [UpstreamProtocol::Http1, UpstreamProtocol::Http2] {
+                    let mut config = in_turn_retrying_503(vec![untrusted, trusted], protocol);
+                    config.upstreams.get_mut("up").unwrap().tls =
+                        Some(trusting("backend.test", &server));
+                    let (front, worker) = serving_config(&config).await;
+                    for _ in 0..4 {
+                        let answer = h1_answer(front, CLOSING_GET).await;
+                        assert!(
+                            answer.starts_with("HTTP/1.1 200 OK\r\n"),
+                            "{protocol:?}: {answer}"
+                        );
+                    }
+                    let scrape = worker.proxy().metrics();
+                    let retried =
+                        counted(&scrape, "edgerush_upstream_retries_total{upstream=\"up\"}");
+                    let failed =
+                        counted(&scrape, "edgerush_upstream_failures_total{upstream=\"up\"}");
+                    assert!(retried >= 1 && retried == failed, "{protocol:?}: {scrape}");
+                }
+            })
+            .await;
+    }
+
+    /// The value of the one series of `scrape` named `series`, labels and all.
+    fn counted(scrape: &str, series: &str) -> u64 {
+        scrape
+            .lines()
+            .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("no {series} in {scrape}"))
+    }
+
+    /// An endpoint that took the connection, and the request with it, may have acted on the
+    /// request before closing without a word: that is not a try that could not connect, and
+    /// a retry that names no `502` does not send it again.
+    #[tokio::test]
+    async fn a_try_that_connected_is_sent_again_only_for_what_its_retry_names() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use tokio::io::AsyncReadExt;
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let closing = socket.local_addr().unwrap();
+                let _accepting = tokio::task::spawn_local(async move {
+                    while let Ok((mut stream, _)) = socket.accept().await {
+                        // The request's head read, and the connection closed on it.
+                        let mut head = [0; 1024];
+                        let _read = stream.read(&mut head).await;
+                    }
+                });
+                let (answering, _) = statuses_upstream(vec![200]).await;
+                let config =
+                    in_turn_retrying_503(vec![closing, answering], UpstreamProtocol::Http1);
+                let (front, worker) = serving_config(&config).await;
+                let mut failed = 0;
+                for _ in 0..4 {
+                    let answer = h1_answer(front, CLOSING_GET).await;
+                    if answer.starts_with("HTTP/1.1 502 ") {
+                        failed += 1;
+                    } else {
+                        assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                    }
+                }
+                // Each endpoint in turn, and nothing sent again to take a turn.
+                assert_eq!(failed, 2);
+                let scrape = worker.proxy().metrics();
+                let line = "edgerush_upstream_retries_total{upstream=\"up\"} 0\n";
+                assert!(scrape.contains(line), "{scrape}");
+            })
+            .await;
+    }
+
     /// An HTTP/1 upstream that leaves the first `silent` requests it is sent unanswered,
     /// each holding its connection until the proxy lets go of it, and answers every one
     /// after them `200`; and how many requests it was sent. `reading` is whether the silent
@@ -7849,6 +8012,27 @@ upstreams:
         assert!(!wants_again(&retry(vec![], true), &unreached));
         assert!(!wants_again(&retry(vec![502, 504], false), &timed_out));
         assert!(wants_again(&retry(vec![502], false), &unreached));
+    }
+
+    /// A try that could not connect is wanted again under any retry at all, whatever it
+    /// names (GEP-1731); one that connected and then failed only under a `502`.
+    #[test]
+    fn a_try_that_could_not_connect_is_wanted_again_under_any_retry() {
+        let retry = |statuses: Vec<u16>, on_timeout| CompiledRetry {
+            attempts: 1,
+            http_statuses: statuses,
+            grpc_statuses: 0,
+            on_timeout,
+            backoff_base: Duration::from_millis(1),
+            backoff_max: Duration::from_millis(1),
+        };
+        let unconnected = Err(Answer::Unreachable);
+        assert!(wants_again(&retry(vec![503], false), &unconnected));
+        assert!(wants_again(&retry(vec![], true), &unconnected));
+        assert!(!wants_again(
+            &retry(vec![503], false),
+            &Err(Answer::UpstreamFailed)
+        ));
     }
 
     /// A rule's `request` timeout of `ms` milliseconds, `0` for none.

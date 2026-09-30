@@ -188,16 +188,17 @@ pub struct Timeouts {
 }
 
 /// When a request is sent again, and how often (Gateway API's HTTPRoute retry, with
-/// gRPC's statuses beside HTTP's). Decided on an answer's head alone: once a head has gone
-/// to the client, the request is not sent again. Within a budget of the upstream's, and
-/// only for a body small enough to be kept.
+/// gRPC's statuses beside HTTP's). A try that could not connect is sent again whatever is
+/// named, as Gateway API asks: nothing of it reached the endpoint. Otherwise decided on an
+/// answer's head alone: once a head has gone to the client, the request is not sent again.
+/// Within a budget of the upstream's, and only for a body small enough to be kept.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Retry {
     /// Times a request may be sent again, beyond the first.
     pub attempts: u32,
-    /// HTTP statuses that send it again. `502` also stands for an upstream that could not
-    /// be reached or answered nothing; a try that ran out of time is `on_timeout`'s, not
+    /// HTTP statuses that send it again. `502` also stands for an upstream that connected
+    /// and answered nothing; a try that ran out of time is `on_timeout`'s, not
     /// `502`'s.
     #[serde(default)]
     pub http_statuses: Vec<u16>,
