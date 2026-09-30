@@ -9468,7 +9468,8 @@ upstreams:
 
     /// An endpoint a try could not connect to is set aside for every request after it, with
     /// no check configured, and counted; once it takes connections again, a connect probe
-    /// after the data plane's `set_aside_ms` brings it back (03 §6).
+    /// after the data plane's `set_aside_ms` brings it back, ramping up where its upstream
+    /// has a slow start, as everything that joins the draw does (03 §6).
     #[tokio::test]
     async fn an_endpoint_that_cannot_be_connected_to_is_set_aside_until_a_probe_gets_through() {
         let local = tokio::task::LocalSet::new();
@@ -9480,6 +9481,7 @@ upstreams:
                 let mut config = everything_config(nowhere);
                 let up = config.upstreams.get_mut("up").unwrap();
                 up.endpoints = vec![nowhere, answering];
+                up.slow_start = Some(edgerush_config::SlowStart { window_ms: 60_000 });
                 config.data_plane.set_aside_ms = Some(200);
                 let proxy =
                     Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
@@ -9525,20 +9527,28 @@ upstreams:
                         let _written = stream.write_all(answer).await;
                     }
                 });
+                until(|| {
+                    worker
+                        .proxy()
+                        .metrics()
+                        .contains("edgerush_upstream_set_aside_endpoints{upstream=\"up\"} 0\n")
+                })
+                .await;
+                let snapshot = worker.proxy().current.load();
+                let returned = snapshot.destinations.at(0, 0).unwrap();
+                assert_eq!(returned.address(), nowhere);
+                assert!(returned.is_ramping(), "brought back without a ramp");
+                // At a tenth of its share to begin with, but taking requests.
                 let mut back = false;
-                for _ in 0..200 {
+                for _ in 0..400 {
                     let answer = h1_answer(front, CLOSING_GET).await;
                     assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
                     if answer.contains("x-upstream: back\r\n") {
                         back = true;
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                assert!(back, "the endpoint was never brought back");
-                let scrape = worker.proxy().metrics();
-                let line = "edgerush_upstream_set_aside_endpoints{upstream=\"up\"} 0\n";
-                assert!(scrape.contains(line), "{scrape}");
+                assert!(back, "the endpoint brought back was never sent a request");
             })
             .await;
     }

@@ -15,8 +15,9 @@
 //!
 //! It also brings back an endpoint that a worker set aside because a try could not connect
 //! to it, whether or not the endpoint is checked: once it has waited the data plane's
-//! `set_aside_ms`, a TCP connect to it is tried, and one that gets through takes it back
-//! while one that does not starts its wait again. No request is the trial. What it finds
+//! `set_aside_ms`, a TCP connect to it is tried, and one that gets through takes it back,
+//! ramping up as anything that joins the draw does, while one that does not starts its wait
+//! again. No request is the trial. What it finds
 //! newly set aside it counts, as it finds it: the workers that set endpoints aside, over
 //! either protocol or in a tunnel, have no one place to count it in.
 
@@ -149,6 +150,8 @@ fn reconnect(proxy: &Arc<Proxy>, aside: &Rc<RefCell<HashMap<u64, bool>>>, out: &
             out.set(out.get() - 1);
             if through {
                 destination.bring_back();
+                // Back in the draw: a slow start for it, if its upstream has one (03 §6).
+                destination.start_ramp();
                 // Set aside again later, it is new again, and counted.
                 aside.borrow_mut().remove(&key);
             } else {

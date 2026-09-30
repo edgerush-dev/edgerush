@@ -76,8 +76,9 @@ pub struct ReuseIdentity {
     /// kept or taken out again; an exchange already under way finishes as it is.
     retired: AtomicBool,
     /// When its slow start began, as [`now`] tells it; 0 when it is not ramping. Set when
-    /// it is added beside an endpoint its upstream keeps, and when it passes its checks
-    /// again after failing them (03 §6); cleared by the first pick after its ramp is over,
+    /// it is added beside an endpoint its upstream keeps, when it passes its checks again
+    /// after failing them, and when a connect probe brings it back from being set aside
+    /// (03 §6); cleared by the first pick after its ramp is over,
     /// so that an endpoint done ramping reads no clock.
     ramping_since: AtomicU64,
 }
