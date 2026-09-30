@@ -9420,10 +9420,10 @@ upstreams:
             .await;
     }
 
-    /// When fewer than half the endpoints pass, their health is set aside: requests go on
+    /// When fewer than half the endpoints pass, their health is ignored: requests go on
     /// to all of them rather than being answered 503.
     #[tokio::test]
-    async fn with_most_endpoints_failing_their_health_is_set_aside() {
+    async fn with_most_endpoints_failing_their_health_is_ignored() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -9443,7 +9443,7 @@ upstreams:
                     assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
                     unhealthy_answered |= !answer.contains("x-upstream: three\r\n");
                 }
-                assert!(unhealthy_answered, "health was not set aside below half");
+                assert!(unhealthy_answered, "health was not ignored below half");
             })
             .await;
     }

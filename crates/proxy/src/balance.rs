@@ -7,7 +7,7 @@
 //! caller's generator. Both balancers share three rules:
 //!
 //! - **Health**: an endpoint failing its checks is not taken, unless fewer than half serve,
-//!   when health is set aside and any may be (Envoy's panic threshold at its default): probes
+//!   when health is ignored and any may be (Envoy's panic threshold at its default): probes
 //!   that fail most of an upstream are likelier wrong, or about to put the rest under a load
 //!   that fails them too, than a reason to answer every request 503.
 //! - **Tried**: a retry takes no endpoint already tried, unless every one health allows has
@@ -123,9 +123,9 @@ impl Tried {
 #[derive(Debug, Clone, Copy)]
 struct Rule {
     /// Fewer than half serve: any may be taken, whatever its checks say.
-    health_aside: bool,
+    health_ignored: bool,
     /// Every endpoint health allows has been tried: any of them may be taken again.
-    tried_aside: bool,
+    tried_ignored: bool,
     /// How many may be taken.
     count: usize,
 }
@@ -134,25 +134,26 @@ impl Rule {
     fn of(candidates: &impl Candidates, tried: &Tried) -> Self {
         let endpoints = candidates.count();
         let serving = (0..endpoints).filter(|&at| candidates.serves(at)).count();
-        let health_aside = serving * 2 < endpoints;
-        let allowed = if health_aside { endpoints } else { serving };
+        let health_ignored = serving * 2 < endpoints;
+        let allowed = if health_ignored { endpoints } else { serving };
         let untried = if tried.is_empty() {
             allowed
         } else {
             (0..endpoints)
-                .filter(|&at| (health_aside || candidates.serves(at)) && !tried.contains(at))
+                .filter(|&at| (health_ignored || candidates.serves(at)) && !tried.contains(at))
                 .count()
         };
-        let tried_aside = untried == 0;
+        let tried_ignored = untried == 0;
         Self {
-            health_aside,
-            tried_aside,
-            count: if tried_aside { allowed } else { untried },
+            health_ignored,
+            tried_ignored,
+            count: if tried_ignored { allowed } else { untried },
         }
     }
 
     fn allows(&self, candidates: &impl Candidates, tried: &Tried, at: usize) -> bool {
-        (self.health_aside || candidates.serves(at)) && (self.tried_aside || !tried.contains(at))
+        (self.health_ignored || candidates.serves(at))
+            && (self.tried_ignored || !tried.contains(at))
     }
 }
 
@@ -553,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn health_is_set_aside_below_half_serving() {
+    fn health_is_ignored_below_half_serving() {
         // One of three serves: any may be taken.
         let mostly_failing = Endpoints::with_health(&[false, true, false]);
         let mut random = generator(9);
