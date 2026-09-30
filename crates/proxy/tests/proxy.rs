@@ -1734,3 +1734,37 @@ async fn a_mirrors_copy_counts_against_the_mirrors_backend() {
         }
     }
 }
+
+/// An endpoint a reload adds beside two its upstream keeps starts its slow start (03 §6):
+/// an hour into a ramp of an hour, it counts for a tenth of the others, and takes about one
+/// request in twenty-one where it would otherwise take one in three — but it does take some,
+/// from the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_endpoint_added_by_a_reload_ramps_up_slowly() {
+    let kept = [upstream("kept").await, upstream("kept").await];
+    let added = upstream("added").await;
+    let slow = |yaml: String| {
+        yaml.replace(
+            "  web: { load_balancer: p2c,",
+            "  web: { load_balancer: p2c, slow_start: { window_ms: 3600000 },",
+        )
+    };
+    let (proxy, listeners) = reloadable_proxy(&slow(balanced(&kept, "p2c", false))).await;
+    proxy
+        .reload(compiled(&slow(balanced(
+            &[kept[0], kept[1], added],
+            "p2c",
+            false,
+        ))))
+        .unwrap();
+    let mut to_added = 0;
+    for _ in 0..300 {
+        let (status, headers, _) = send(get(listeners["web"], "/")).await;
+        assert_eq!(status, StatusCode::OK);
+        if headers["x-upstream"] == "added" {
+            to_added += 1;
+        }
+    }
+    // About 14 of 300; a third would be 100.
+    assert!((1..=40).contains(&to_added), "{to_added} of 300");
+}

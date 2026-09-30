@@ -48,6 +48,8 @@ pub(crate) struct Balancing {
 #[derive(Debug)]
 pub(crate) struct Upstream {
     balancer: LoadBalancer,
+    /// Its slow start's window in milliseconds, if it has one.
+    window: Option<u64>,
     /// What each endpoint's destination is filed under, by position: how a new config finds
     /// the counts and the turn it keeps.
     keys: Box<[u64]>,
@@ -100,6 +102,7 @@ impl Balancing {
                 });
                 Rc::new(Upstream {
                     balancer: upstream.load_balancer,
+                    window: upstream.slow_start.map(|slow_start| slow_start.window_ms),
                     keys,
                     counts,
                     round_robin: Cell::new(round_robin),
@@ -119,6 +122,7 @@ impl Balancing {
 struct Seen<'a> {
     destinations: &'a [Arc<ReuseIdentity>],
     counts: &'a [Rc<Cell<u32>>],
+    window: Option<u64>,
 }
 
 impl Candidates for Seen<'_> {
@@ -136,8 +140,10 @@ impl Candidates for Seen<'_> {
         self.counts.get(at).map_or(0, |count| count.get())
     }
 
-    fn share(&self, _at: usize) -> Share {
-        Share::FULL
+    fn share(&self, at: usize) -> Share {
+        self.destinations
+            .get(at)
+            .map_or(Share::FULL, |destination| destination.share(self.window))
     }
 }
 
@@ -153,6 +159,7 @@ impl Upstream {
         let seen = Seen {
             destinations,
             counts: &self.counts,
+            window: self.window,
         };
         let at = match self.balancer {
             LoadBalancer::P2c => balance::p2c(&seen, tried, &mut random),

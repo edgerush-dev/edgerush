@@ -9,7 +9,7 @@ use crate::route::{
 };
 use crate::{
     Backend, Config, Forwarding, HealthCheck, Http3, Keepalive, LoadBalancer, Probe, Protocol,
-    RequestId, Rule, Tls, UpstreamProtocol, UpstreamTls,
+    RequestId, Rule, SlowStart, Tls, UpstreamProtocol, UpstreamTls,
 };
 use edgerush_filters::forwarding::{ForwardingError, HeaderNames, TrustedProxies};
 use edgerush_filters::{
@@ -419,6 +419,8 @@ pub struct CompiledUpstream {
     pub health_check: Option<HealthCheck>,
     /// Which endpoint takes each exchange.
     pub load_balancer: LoadBalancer,
+    /// A new or recovered endpoint's ramp, if any.
+    pub slow_start: Option<SlowStart>,
 }
 
 /// Compiles a config. The order of the routes, then of the rules, then of a rule's matches
@@ -449,9 +451,16 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             keepalive: upstream.keepalive,
             health_check: upstream.health_check.clone(),
             load_balancer: upstream.load_balancer,
+            slow_start: upstream.slow_start,
         })
         .collect();
     for (name, upstream) in &config.upstreams {
+        if upstream
+            .slow_start
+            .is_some_and(|slow_start| slow_start.window_ms == 0)
+        {
+            errors.push(Place::upstream(name).problem(Problem::SlowStartNever));
+        }
         if let Some(check) = &upstream.health_check {
             let problem = if check.interval_seconds == 0
                 || check.timeout_seconds == 0
@@ -1537,6 +1546,9 @@ pub enum Problem {
     /// A keepalive interval or timeout of nothing.
     #[error("`keepalive` needs an interval and a timeout of at least a second")]
     KeepaliveZero,
+    /// A slow start over no time at all, which is none: left out is how none is said.
+    #[error("`slow_start.window_ms` is 0: at least 1, or no `slow_start`")]
+    SlowStartNever,
     /// A health check with an interval, timeout or threshold of nothing.
     #[error("`health_check` needs an interval, a timeout and thresholds of at least one")]
     HealthCheckZero,
@@ -3107,6 +3119,27 @@ upstreams: { u: { load_balancer: p2c, endpoints: [] } }
         // Random is no longer a choice, and least-request is spelled `p2c`.
         assert!(parsed("{ load_balancer: random, endpoints: [] }").is_err());
         assert!(parsed("{ load_balancer: least_request, endpoints: [] }").is_err());
+    }
+
+    /// Slow start states its window, of at least a millisecond; left out, there is none.
+    #[test]
+    fn slow_start_states_a_window_of_at_least_a_millisecond() {
+        let with = |upstream: &str| {
+            let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{ u: {upstream} }}\n");
+            compile(&config(&yaml))
+                .map(|compiled| compiled.upstreams[0].slow_start)
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        assert_eq!(with("{ load_balancer: p2c, endpoints: [] }"), Ok(None));
+        assert_eq!(
+            with("{ load_balancer: p2c, endpoints: [], slow_start: { window_ms: 30000 } }"),
+            Ok(Some(SlowStart { window_ms: 30_000 }))
+        );
+        let refused = with("{ load_balancer: p2c, endpoints: [], slow_start: { window_ms: 0 } }")
+            .unwrap_err();
+        assert!(
+            refused[0].ends_with("`slow_start.window_ms` is 0: at least 1, or no `slow_start`")
+        );
     }
 
     /// A health check says everything it does, and nothing that cannot work.

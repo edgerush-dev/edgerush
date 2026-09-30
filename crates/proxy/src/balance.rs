@@ -46,15 +46,23 @@ impl Share {
     pub const FULL: Self = Self(1 << 16);
 
     /// `parts` 65,536ths of a full share, at most all of it.
-    #[cfg_attr(
-        not(any(test, feature = "fuzzing")),
-        expect(
-            dead_code,
-            reason = "a ramping share is worked out once slow start is built"
-        )
-    )]
     pub fn of(parts: u32) -> Self {
         Self(parts.min(Self::FULL.0))
+    }
+
+    /// Where slow start has an endpoint `elapsed` milliseconds into a ramp of `window`: a
+    /// tenth of a full share at its start, rising linearly to all of it at its end (Envoy's
+    /// curve at its defaults). The tenth at the start is so that a pod just ready is used at
+    /// once, if lightly, rather than hardly at all for the first part of the window.
+    pub fn ramped(elapsed: u64, window: u64) -> Self {
+        if elapsed >= window {
+            return Self::FULL;
+        }
+        let full = u128::from(Self::FULL.0);
+        let floor = full.div_ceil(10);
+        // Below `window`, so below `full` and within a `u32`.
+        let parts = floor + (full - floor) * u128::from(elapsed) / u128::from(window);
+        Self::of(u32::try_from(parts).unwrap_or(Self::FULL.0))
     }
 
     /// Whether an endpoint of this share, drawn, is kept, given a number uniform over `u64`.
@@ -200,6 +208,10 @@ impl<C: Candidates, R: FnMut() -> u64> Pick<'_, C, R> {
     /// at most.
     fn draw_ramped(&mut self, besides: Option<usize>) -> Option<usize> {
         let mut at = self.draw(besides)?;
+        // One endpoint never ramps: there is nothing to send its share to instead.
+        if self.candidates.count() == 1 {
+            return Some(at);
+        }
         for _ in 0..REFUSALS {
             let share = self.candidates.share(at);
             if share == Share::FULL || share.keeps(self.random()) {
@@ -643,6 +655,30 @@ mod tests {
     }
 
     #[test]
+    fn a_ramp_rises_linearly_from_a_tenth_to_all() {
+        assert_eq!(Share::ramped(0, 30_000), Share::of(6_554));
+        assert_eq!(Share::ramped(15_000, 30_000), Share::of(6_554 + 58_982 / 2));
+        assert_eq!(Share::ramped(29_999, 30_000), Share::of(65_534));
+        assert_eq!(Share::ramped(30_000, 30_000), Share::FULL);
+        assert_eq!(Share::ramped(u64::MAX, 30_000), Share::FULL);
+        assert_eq!(Share::ramped(u64::MAX - 1, u64::MAX), Share::of(65_535));
+        assert_eq!(Share::ramped(0, 1), Share::of(6_554));
+    }
+
+    #[test]
+    fn one_endpoint_draws_nothing_for_its_ramp() {
+        let mut one = Endpoints::serving(1);
+        one.share[0] = Share::of(0);
+        let mut drawn = 0;
+        let mut random = || {
+            drawn += 1;
+            0
+        };
+        assert_eq!(p2c(&one, &Tried::default(), &mut random), Some(0));
+        assert_eq!(drawn, 1, "the one draw of which endpoint");
+    }
+
+    #[test]
     fn tried_holds_a_first_try_and_five_retries() {
         let mut all = Tried::default();
         for at in 0..8 {
@@ -677,6 +713,19 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn a_ramp_never_falls_and_never_passes_all(
+            window in 1_u64..,
+            elapsed in any::<u64>(),
+            later in any::<u64>(),
+        ) {
+            let now = Share::ramped(elapsed, window);
+            let then = Share::ramped(elapsed.saturating_add(later), window);
+            prop_assert!(now.0 <= then.0);
+            prop_assert!(then.0 <= Share::FULL.0);
+            prop_assert!(now.0 >= 6_554);
+        }
+
         #[test]
         fn p2c_takes_only_what_the_reference_allows_and_never_the_strictly_busiest(
             (endpoints, already) in endpoints(),

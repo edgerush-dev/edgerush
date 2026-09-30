@@ -11,12 +11,23 @@
 //! So a destination is named by a key of its own, given out once and never again, and a
 //! reload keeps that key only where the destination really is the same one.
 
+use crate::balance::Share;
 use crate::upstream::secure::Secure;
 use edgerush_config::{Compiled, HealthCheck, Keepalive, UpstreamProtocol, UpstreamTls};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
+
+/// Milliseconds since the first time anything asked, plus one: what a ramp's start is kept
+/// as, so that the health checker's thread and every worker's read one clock, and 0 can
+/// mean no ramp at all.
+fn now() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let since = EPOCH.get_or_init(Instant::now).elapsed().as_millis();
+    u64::try_from(since).unwrap_or(u64::MAX - 1) + 1
+}
 
 /// Hands out destination keys. One per process; a key it has given out is never given
 /// again, so a key held past the life of what it named cannot come to name something else.
@@ -57,6 +68,11 @@ pub struct ReuseIdentity {
     /// Set when a config without this destination is published. Nothing retired is ever
     /// kept or taken out again; an exchange already under way finishes as it is.
     retired: AtomicBool,
+    /// When its slow start began, as [`now`] tells it; 0 when it is not ramping. Set when
+    /// it is added beside an endpoint its upstream keeps, and when it passes its checks
+    /// again after failing them (03 §6); cleared by the first pick after its ramp is over,
+    /// so that an endpoint done ramping reads no clock.
+    ramping_since: AtomicU64,
 }
 
 impl ReuseIdentity {
@@ -110,6 +126,39 @@ impl ReuseIdentity {
 
     fn retire(&self) {
         self.retired.store(true, Ordering::Release);
+    }
+
+    /// Starts its slow start now.
+    pub(crate) fn start_ramp(&self) {
+        self.ramping_since.store(now(), Ordering::Relaxed);
+    }
+
+    /// Its share under a slow start of `window` milliseconds, none for an upstream without
+    /// one. Reads the clock only while it is ramping.
+    pub(crate) fn share(&self, window: Option<u64>) -> Share {
+        let Some(window) = window else {
+            return Share::FULL;
+        };
+        let since = self.ramping_since.load(Ordering::Relaxed);
+        if since == 0 {
+            return Share::FULL;
+        }
+        let elapsed = now().saturating_sub(since);
+        if elapsed >= window {
+            // Over: once, whichever worker sees it first. A ramp begun again meanwhile is
+            // left as it is.
+            let _over =
+                self.ramping_since
+                    .compare_exchange(since, 0, Ordering::Relaxed, Ordering::Relaxed);
+            return Share::FULL;
+        }
+        Share::ramped(elapsed, window)
+    }
+
+    /// Whether it is ramping, as far as anything has yet looked.
+    #[cfg(test)]
+    pub(crate) fn is_ramping(&self) -> bool {
+        self.ramping_since.load(Ordering::Relaxed) != 0
     }
 }
 
@@ -165,7 +214,9 @@ impl Destinations {
             .iter()
             .enumerate()
             .map(|(position, upstream)| {
-                upstream
+                let mut kept_any = false;
+                let mut added = Vec::new();
+                let destinations: Vec<Arc<ReuseIdentity>> = upstream
                     .endpoints
                     .iter()
                     .map(|address| {
@@ -182,7 +233,7 @@ impl Destinations {
                             ))
                             .map_or_else(
                                 || {
-                                    Arc::new(ReuseIdentity {
+                                    let made = Arc::new(ReuseIdentity {
                                         key: keys.next(),
                                         upstream: upstream.name.as_str().into(),
                                         address: *address,
@@ -192,12 +243,27 @@ impl Destinations {
                                         health_check: upstream.health_check.clone(),
                                         healthy: AtomicBool::new(true),
                                         retired: AtomicBool::new(false),
-                                    })
+                                        ramping_since: AtomicU64::new(0),
+                                    });
+                                    added.push(Arc::clone(&made));
+                                    made
                                 },
-                                Arc::clone,
+                                |kept| {
+                                    kept_any = true;
+                                    Arc::clone(kept)
+                                },
                             )
                     })
-                    .collect()
+                    .collect();
+                // Slow start is for an endpoint added beside one its upstream keeps: an
+                // upstream whose endpoints are all new, at start or all replaced at once,
+                // ramps none, since every one would ramp alike (03 §6).
+                if kept_any {
+                    for endpoint in &added {
+                        endpoint.start_ramp();
+                    }
+                }
+                destinations
             })
             .collect();
 
@@ -251,6 +317,78 @@ mod tests {
     /// The keys of every destination, in order.
     fn keys_of(destinations: &Destinations) -> Vec<u64> {
         destinations.0.iter().flatten().map(|d| d.key()).collect()
+    }
+
+    /// Which endpoints of the upstream at `upstream` are ramping, by position.
+    fn ramping(destinations: &Destinations, upstream: usize) -> Vec<bool> {
+        destinations
+            .of(upstream)
+            .iter()
+            .map(|destination| destination.is_ramping())
+            .collect()
+    }
+
+    /// An endpoint added beside one its upstream keeps ramps; none ramps at start, nor in an
+    /// upstream whose endpoints are all replaced at once, where each would ramp alike
+    /// (03 §6).
+    #[test]
+    fn an_endpoint_added_beside_one_kept_ramps_and_no_other() {
+        let keys = Keys::default();
+        let first = Destinations::reconcile(
+            &config(&[("web", &["127.0.0.1:1"]), ("new", &[])]),
+            &Destinations::default(),
+            &keys,
+            &[],
+        );
+        assert_eq!(ramping(&first, 1), [false]);
+        let grown = Destinations::reconcile(
+            &config(&[
+                ("web", &["127.0.0.1:1", "127.0.0.1:2"]),
+                ("new", &["127.0.0.1:9"]),
+            ]),
+            &first,
+            &keys,
+            &[],
+        );
+        assert_eq!(ramping(&grown, 1), [false, true]);
+        // An upstream that had none has kept none.
+        assert_eq!(ramping(&grown, 0), [false]);
+        let replaced = Destinations::reconcile(
+            &config(&[
+                ("web", &["127.0.0.1:3", "127.0.0.1:4"]),
+                ("new", &["127.0.0.1:9"]),
+            ]),
+            &grown,
+            &keys,
+            &[],
+        );
+        assert_eq!(ramping(&replaced, 1), [false, false]);
+    }
+
+    /// A ramping endpoint's share rises with its window, reads the clock only while it
+    /// ramps, and is full again, for good, once the window is over.
+    #[test]
+    fn a_ramp_is_over_once_its_window_is() {
+        let keys = Keys::default();
+        let destinations = Destinations::reconcile(
+            &config(&[("web", &["127.0.0.1:1"])]),
+            &Destinations::default(),
+            &keys,
+            &[],
+        );
+        let endpoint = destinations.at(0, 0).unwrap();
+        assert_eq!(endpoint.share(Some(60_000)), Share::FULL);
+        endpoint.start_ramp();
+        // No slow start, no ramp, whatever was stamped.
+        assert_eq!(endpoint.share(None), Share::FULL);
+        let early = endpoint.share(Some(3_600_000));
+        assert_ne!(early, Share::FULL);
+        assert!(early == Share::ramped(0, 3_600_000) || early == Share::ramped(1, 3_600_000));
+        assert!(endpoint.is_ramping());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(endpoint.share(Some(2)), Share::FULL);
+        assert!(!endpoint.is_ramping());
+        assert_eq!(endpoint.share(Some(3_600_000)), Share::FULL);
     }
 
     #[test]

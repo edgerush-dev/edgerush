@@ -121,6 +121,10 @@ fn record(entry: &mut Tracked, passed: bool) {
         check.unhealthy_threshold,
     );
     entry.against = against;
+    // Back from failing its checks: a slow start for it, if its upstream has one (03 §6).
+    if healthy && !entry.destination.is_healthy() {
+        entry.destination.start_ramp();
+    }
     entry.destination.set_healthy(healthy);
 }
 
@@ -147,7 +151,40 @@ fn unit() -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::turn;
+    use super::{Tracked, record, turn};
+    use crate::upstream::destination::{Destinations, Keys};
+    use edgerush_config::{Config, compile};
+    use tokio::time::Instant;
+
+    /// An endpoint that passes its checks again after failing them starts a slow start; one
+    /// that merely goes on passing does not (03 §6).
+    #[test]
+    fn passing_again_after_failing_starts_a_ramp() {
+        let yaml = "listeners: {}\nroutes: []\nupstreams:\n  web: { load_balancer: p2c, endpoints: [\"127.0.0.1:1\"], health_check: { interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 2, unhealthy_threshold: 2, probe: { http: { path: / } } } }\n";
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let compiled = compile(&config).unwrap();
+        let destinations =
+            Destinations::reconcile(&compiled, &Destinations::default(), &Keys::default(), &[]);
+        let mut entry = Tracked {
+            destination: std::sync::Arc::clone(destinations.at(0, 0).unwrap()),
+            next: Instant::now(),
+            against: 0,
+            probing: false,
+        };
+        for passed in [true, true, true, false, false] {
+            record(&mut entry, passed);
+            assert!(!entry.destination.is_ramping());
+        }
+        assert!(!entry.destination.is_healthy());
+        record(&mut entry, true);
+        assert!(
+            !entry.destination.is_ramping(),
+            "one pass is not yet healthy"
+        );
+        record(&mut entry, true);
+        assert!(entry.destination.is_healthy());
+        assert!(entry.destination.is_ramping());
+    }
 
     /// Results count in a row: so many failures turn a healthy endpoint, so many passes an
     /// unhealthy one, and one result the other way starts the count again.

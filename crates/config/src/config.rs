@@ -186,6 +186,10 @@ pub struct Upstream {
     pub health_check: Option<HealthCheck>,
     /// Which endpoint takes each exchange. Always stated: it chooses behaviour.
     pub load_balancer: LoadBalancer,
+    /// A new or recovered endpoint's ramp to its full share; none is every endpoint at its
+    /// full share from the start.
+    #[serde(default)]
+    pub slow_start: Option<SlowStart>,
 }
 
 /// How an upstream's endpoint is chosen for an exchange ([03 §6](../../../docs/03-data-plane.md)).
@@ -197,6 +201,16 @@ pub enum LoadBalancer {
     P2c,
     /// Each endpoint in turn.
     RoundRobin,
+}
+
+/// Slow start ([03 §6](../../../docs/03-data-plane.md)): an endpoint added to an upstream
+/// that keeps an endpoint it had, or passing its checks again after failing them, takes a
+/// share rising linearly from a tenth of a full one to all of it over the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlowStart {
+    /// How long the ramp takes, in milliseconds; at least 1.
+    pub window_ms: u64,
 }
 
 /// An active check of an upstream's endpoints. Everything is stated: how often, how long a
