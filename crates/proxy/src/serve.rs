@@ -1607,7 +1607,8 @@ impl Worker {
         // What asks the backend to switch is the gateway's own, its key included: in place
         // of the client's `Upgrade`, `Connection` (a `close` for credentials among it: a
         // refused handshake's connection is kept from the pool instead) and key (19 §2).
-        if let Some(handshake) = &directed.websocket {
+        if let Some(handshake) = &mut directed.websocket {
+            handshake.server.clone_from(&interim);
             let asked = match &handshake.toward {
                 // An extended CONNECT to an HTTP/1.1 backend is RFC 6455's GET (19 §3).
                 Toward::Upgrade(ours) => {
@@ -2162,9 +2163,6 @@ impl Worker {
         interim: Option<Interim>,
         head_by_rule: bool,
     ) -> Result<(RawAnswer, Body), Answer> {
-        // The server that read a handshake takes its backend from here once the 101 is
-        // answered.
-        let listening = directed.websocket.as_ref().and_then(|_| interim.clone());
         let answer = match self
             .through_h1(
                 endpoint,
@@ -2215,7 +2213,7 @@ impl Worker {
         let (read, mut body) = answer;
         if let Some(handshake) = &directed.websocket {
             if read.status() == StatusCode::SWITCHING_PROTOCOLS {
-                return self.switch(read, *body, handshake, listening, admitted.count());
+                return self.switch(read, *body, handshake, admitted.count());
             }
             // A refused handshake's connection could carry another request, but not one
             // whose credentials may have bound it to this client (13 §6).
@@ -2246,13 +2244,15 @@ impl Worker {
         read: RawAnswer,
         body: H1Body<UpstreamSocket, RequestBody>,
         handshake: &Handshake,
-        listening: Option<Interim>,
         counted: Option<InFlight>,
     ) -> Result<(RawAnswer, Body), Answer> {
         let Toward::Upgrade(ours) = &handshake.toward else {
             return Err(Answer::UpstreamFailed);
         };
-        let switched = listening.filter(|_| websocket::switched(&read, ours));
+        let switched = handshake
+            .server
+            .as_ref()
+            .filter(|_| websocket::switched(&read, ours));
         let Some((interim, (backend, leftover))) = switched.zip(body.into_switched()) else {
             self.proxy.metrics.stopped(Stopped::Codec);
             return Err(Answer::UpstreamFailed);
@@ -2352,7 +2352,7 @@ impl Worker {
                 };
             }
             Connected::Switched(parts, stream) => {
-                let Some(interim) = interim else {
+                let Some(interim) = &handshake.server else {
                     return Err(Answer::UpstreamFailed);
                 };
                 let counted = admitted.count();
@@ -2630,6 +2630,7 @@ impl Proxy {
                     .and_then(|timeouts| timeouts.tunnel_idle)
                     .unwrap_or(TUNNEL_IDLE),
                 listener: came_on,
+                server: None,
             }))
         });
         if let Some(counters) = self.metrics.upstream(upstream_slot) {
@@ -2759,6 +2760,10 @@ struct Handshake {
     idle: Duration,
     /// The listener it came in on, whose tunnels it is counted among.
     listener: usize,
+    /// The channel of the server that read it, where a switched backend is left for it to
+    /// carry. Held here and not taken as a try's informational channel is, which only the
+    /// first try has: any try may be the one that switches.
+    server: Option<Interim>,
 }
 
 /// How a WebSocket handshake goes to its backend.

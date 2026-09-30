@@ -1307,3 +1307,116 @@ async fn an_open_http2_websocket_counts_against_its_backend() {
         }
     }
 }
+
+/// A rule forwarding everything to `up`, trying twice more on a failed exchange (502) or a
+/// 503.
+const FORWARD_RETRIED: &str = "        forward: { backends: [{ upstream: up, weight: 1 }], retry: { attempts: 2, http_statuses: [502, 503], grpc_statuses: [], on_timeout: false, backoff_base_ms: 1, backoff_max_ms: 1 } }";
+
+/// Any try of a handshake may be the one that switches, not only the first (19 §5): here
+/// the backend fails the first, refuses the second with a 503 and switches on the third,
+/// and the client is carried to that one.
+#[tokio::test]
+async fn a_handshake_tried_again_is_carried_once_it_switches() {
+    let tries = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&tries);
+    let (upstream, accepted) = backend(move |mut wire| {
+        let counting = Arc::clone(&counting);
+        async move {
+            let head = wire.head().await;
+            match counting.fetch_add(1, Ordering::SeqCst) {
+                // The connection closed with nothing said: a failed exchange.
+                0 => {}
+                1 => {
+                    wire.write("HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                }
+                _ => {
+                    let accept = accept_of(field(&head, "sec-websocket-key").unwrap_or_default());
+                    wire.write(&format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\
+                         connection: Upgrade\r\nsec-websocket-accept: {accept}\r\n\r\nhello"
+                    ))
+                    .await;
+                    let heard = wire.until(b"ping").await;
+                    assert!(heard.is_some(), "the client was not carried here");
+                    wire.write("pong").await;
+                    let _rest = wire.rest().await;
+                }
+            }
+        }
+    });
+    let (address, proxy) = gateway(upstream, FORWARD_RETRIED, "");
+    let mut client = Wire::to(address).await;
+    client.write(&handshake()).await;
+    let head = within(client.head()).await;
+    assert!(
+        head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "{head}"
+    );
+    assert_eq!(field(&head, "sec-websocket-accept"), Some(ACCEPT), "{head}");
+    assert_eq!(within(client.exactly(5)).await, "hello");
+    client.write("ping").await;
+    assert_eq!(within(client.exactly(4)).await, "pong");
+    assert_eq!(tries.load(Ordering::SeqCst), 3);
+    assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    client.finish().await;
+    counted(
+        &proxy,
+        r#"edgerush_listener_tunnels_total{listener="web",outcome="closed"}"#,
+        1,
+    )
+    .await;
+}
+
+/// The same for a backend spoken to in HTTP/2: its first extended CONNECT is refused with
+/// a 503, and the second, on the same connection, opens the tunnel.
+#[tokio::test]
+async fn a_handshake_tried_again_is_carried_to_an_http2_backend_once_it_switches() {
+    let tries = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&tries);
+    let (h2, _) = backend(move |wire| {
+        let counting = Arc::clone(&counting);
+        async move {
+            let mut builder = h2::server::Builder::new();
+            builder.enable_connect_protocol();
+            let Ok(mut connection) = builder.handshake::<_, Bytes>(wire.stream).await else {
+                return;
+            };
+            while let Some(Ok((request, mut respond))) = connection.accept().await {
+                if counting.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let refusal = http::Response::builder().status(503).body(()).unwrap();
+                    let _sent = respond.send_response(refusal, true);
+                    continue;
+                }
+                let mut body = request.into_body();
+                let ok = http::Response::builder().status(200).body(()).unwrap();
+                let Ok(mut sending) = respond.send_response(ok, false) else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    let _sent = sending.send_data(Bytes::from_static(b"hello"), false);
+                    while let Some(Ok(data)) = body.data().await {
+                        let _released = body.flow_control().release_capacity(data.len());
+                        let _sent = sending.send_data(data, false);
+                    }
+                    let _sent = sending.send_data(Bytes::new(), true);
+                });
+            }
+        }
+    });
+    let (unused, _) = backend(|_| async {});
+    let retried = FORWARD_RETRIED.replace("upstream: up,", "upstream: up2,");
+    let (address, _) = gateway(unused, &retried, &h2_upstream(h2));
+    let mut client = Wire::to(address).await;
+    client.write(&handshake()).await;
+    let head = within(client.head()).await;
+    assert!(
+        head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "{head}"
+    );
+    assert_eq!(field(&head, "sec-websocket-accept"), Some(ACCEPT), "{head}");
+    assert_eq!(within(client.exactly(5)).await, "hello");
+    client.write("ping").await;
+    assert_eq!(within(client.exactly(4)).await, "ping");
+    assert_eq!(tries.load(Ordering::SeqCst), 2);
+}
