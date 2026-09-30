@@ -2028,3 +2028,168 @@ fn an_idle_hq_connection_is_closed_at_its_keep_alive_deadline() {
         assert_eq!(client.closed_by_server(), Some((true, code::NO_ERROR)));
     });
 }
+
+/// How long an HTTP/3 WebSocket's tunnel may carry nothing either way, in these tests.
+const TUNNEL_IDLE: Duration = Duration::from_millis(200);
+
+/// How a WebSocket's tunnel ended, and when.
+type Ending = Rc<Cell<Option<(crate::tunnel::Carried, std::time::Instant)>>>;
+
+/// Serves a listener whose every request is taken for a WebSocket carried to the backend
+/// at `backend`, held to [`TUNNEL_IDLE`], and opens one from a client: the server, the
+/// client, the stream, and how its tunnel ends.
+async fn websocket_to(backend: SocketAddr) -> (Server, Client, u64, Ending) {
+    use crate::tunnel::{Backend, Bounds, Switched};
+    use crate::upstream::h1::blocks::{Blocks, Sizes};
+    let ended: Ending = Rc::new(Cell::new(None));
+    let told = Rc::clone(&ended);
+    let server = serving(Settings::default(), move |_, interim| {
+        let told = Rc::clone(&told);
+        async move {
+            let socket = tokio::net::TcpStream::connect(backend).await.unwrap();
+            let timers = Timers::new();
+            tokio::task::spawn_local(Rc::clone(&timers).run());
+            interim.switch(Switched {
+                backend: Backend::Socket(crate::upstream::secure::Socket::Plain(socket)),
+                leftover: None,
+                bounds: Bounds {
+                    idle: TUNNEL_IDLE,
+                    drain_within: PATIENCE,
+                    websocket: true,
+                },
+                blocks: Rc::new(RefCell::new(Blocks::new(
+                    Sizes::default(),
+                    Storage::new(LIMIT),
+                ))),
+                timers,
+                drain: Rc::new(Drain::default()),
+                ended: Box::new(move |carried| {
+                    told.set(Some((carried, std::time::Instant::now())));
+                }),
+                counted: None,
+            });
+            Answered::Map(Response::new(Full::new(Bytes::new())))
+        }
+    })
+    .await;
+    let mut client = Client::connect(server.address, "a.test").await;
+    let id = client.request(
+        &[
+            (":method", "CONNECT"),
+            (":protocol", "websocket"),
+            (":scheme", "https"),
+            (":authority", "a.test"),
+            (":path", "/chat"),
+        ],
+        false,
+    );
+    client
+        .until(|client| {
+            client
+                .answers
+                .get(&id)
+                .is_some_and(|answer| answer.final_status().is_some())
+        })
+        .await;
+    (server, client, id, ended)
+}
+
+/// A WebSocket frame of one byte, as a server sends it.
+const FROM_SERVER: &[u8] = b"\x81\x01x";
+/// The same as a client sends it, masked.
+const FROM_CLIENT: &[u8] = b"\x81\x81\0\0\0\0x";
+/// How many frames the busy side of a tunnel sends, one every 40 ms: three idle bounds'
+/// worth.
+const FRAMES: usize = 15;
+
+/// An HTTP/3 WebSocket is idle only when nothing moves either way (19 §5). One whose
+/// backend sends every 40 ms is not closed while it does, however quiet its client, and is
+/// closed as idle one bound after the backend stops.
+#[test]
+fn an_h3_websocket_the_backend_talks_on_is_not_idle() {
+    locally(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let backend = tokio::task::spawn_local(async move {
+            let (mut peer, _) = socket.accept().await.unwrap();
+            for _ in 0..FRAMES {
+                peer.write_all(FROM_SERVER).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            let stopped = std::time::Instant::now();
+            // Held open, so that the tunnel's end is its own idle bound.
+            let mut rest = Vec::new();
+            let _read = tokio::time::timeout(PATIENCE, peer.read_to_end(&mut rest)).await;
+            stopped
+        });
+        let (_server, mut client, id, ended) = websocket_to(address).await;
+        client.until(|_| ended.get().is_some()).await;
+        let (carried, at) = ended.get().unwrap();
+        let stopped = backend.await.unwrap();
+        assert_eq!(carried, crate::tunnel::Carried::Idle);
+        assert!(
+            at >= stopped,
+            "ended {:?} before the backend stopped",
+            stopped - at
+        );
+        assert!(at - stopped < TUNNEL_IDLE + SLACK, "{:?}", at - stopped);
+        assert_eq!(client.answers[&id].body.len(), FROM_SERVER.len() * FRAMES);
+    });
+}
+
+/// The same the other way: one whose client sends every 40 ms, to a backend that says
+/// nothing, is closed as idle one bound after the client stops.
+#[test]
+fn an_h3_websocket_the_client_talks_on_is_not_idle() {
+    locally(async {
+        use tokio::io::AsyncReadExt;
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let backend = tokio::task::spawn_local(async move {
+            let (mut peer, _) = socket.accept().await.unwrap();
+            let mut heard = Vec::new();
+            let _read = tokio::time::timeout(PATIENCE, peer.read_to_end(&mut heard)).await;
+            heard.len()
+        });
+        let (_server, mut client, id, ended) = websocket_to(address).await;
+        for _ in 0..FRAMES {
+            client.body(id, FROM_CLIENT, false).await;
+            client.for_a_while(Duration::from_millis(40)).await;
+        }
+        let stopped = std::time::Instant::now();
+        client.until(|_| ended.get().is_some()).await;
+        let (carried, at) = ended.get().unwrap();
+        assert_eq!(carried, crate::tunnel::Carried::Idle);
+        assert!(
+            at >= stopped,
+            "ended {:?} before the client stopped",
+            stopped - at
+        );
+        assert!(at - stopped < TUNNEL_IDLE + SLACK, "{:?}", at - stopped);
+        assert_eq!(backend.await.unwrap(), FROM_CLIENT.len() * FRAMES);
+    });
+}
+
+/// One that carries nothing either way is closed as idle, by the tunnel, at its bound: not
+/// failed by a clock of one side's.
+#[test]
+fn a_quiet_h3_websocket_is_closed_as_idle() {
+    locally(async {
+        use tokio::io::AsyncReadExt;
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let _backend = tokio::task::spawn_local(async move {
+            let (mut peer, _) = socket.accept().await.unwrap();
+            let mut heard = Vec::new();
+            let _read = tokio::time::timeout(PATIENCE, peer.read_to_end(&mut heard)).await;
+        });
+        let began = std::time::Instant::now();
+        let (_server, mut client, _, ended) = websocket_to(address).await;
+        client.until(|_| ended.get().is_some()).await;
+        let (carried, at) = ended.get().unwrap();
+        assert_eq!(carried, crate::tunnel::Carried::Idle);
+        assert!(at - began >= TUNNEL_IDLE, "{:?}", at - began);
+        assert!(at - began < TUNNEL_IDLE + SLACK, "{:?}", at - began);
+    });
+}

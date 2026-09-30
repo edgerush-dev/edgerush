@@ -108,6 +108,14 @@ impl IncomingH3 {
         }
     }
 
+    /// The same with no inactivity clock of its own: an upgraded stream's reader, whose
+    /// tunnel's clock counts both ways ([19 §5](../../../../../docs/19-websocket.md)).
+    #[must_use]
+    pub(crate) fn unwatched(mut self) -> Self {
+        self.idle = Idle::unwatched();
+        self
+    }
+
     /// The same, telling `interim` what the continue decision needs to know.
     #[must_use]
     pub(crate) fn heard_by(mut self, interim: Interim) -> Self {

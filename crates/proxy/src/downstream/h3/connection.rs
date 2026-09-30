@@ -732,9 +732,11 @@ async fn answer<R, F, B, D>(
     }
     if let Some(switched) = switched {
         drop(body);
-        let idle = switched.bounds.idle;
-        responder.idle_for(idle);
-        let incoming = IncomingH3::new(Rc::clone(&stream.conn), stream.id, None, ended, idle);
+        responder.idle_for(switched.bounds.idle);
+        // The tunnel's clock, which counts both ways, is the reader's: its own would run out
+        // on a WebSocket whose client is quiet while its backend talks (19 §5).
+        let incoming =
+            IncomingH3::new(Rc::clone(&stream.conn), stream.id, None, ended, idle).unwatched();
         let mut tunnel = H3Stream::new(incoming, responder);
         // Closed by both ends is whole; anything else resets the stream as it goes.
         if switched.carry(&mut tunnel, None).await == Carried::Closed {
