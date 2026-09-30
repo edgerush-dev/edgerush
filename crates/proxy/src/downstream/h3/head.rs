@@ -47,6 +47,7 @@ pub fn request<F: NameValue>(fields: &[F], limit: usize) -> Result<RequestHead, 
     let mut scheme = None;
     let mut authority = None;
     let mut path = None;
+    let mut protocol = None;
     // Room for what the request core adds as well, so that the map does not grow to take
     // it: `Host` from `:authority`, `X-Forwarded-For`, `-Proto` and `-Host`, `Via`, and
     // `X-Request-ID`.
@@ -66,7 +67,8 @@ pub fn request<F: NameValue>(fields: &[F], limit: usize) -> Result<RequestHead, 
                 b"scheme" => &mut scheme,
                 b"authority" => &mut authority,
                 b"path" => &mut path,
-                // `:protocol` is extended CONNECT's, which is not announced (RFC 9220 §3).
+                // Extended CONNECT's, which every connection announces (RFC 9220 §3).
+                b"protocol" => &mut protocol,
                 _ => {
                     return Err(Refused::Malformed(
                         "a pseudo-header a request does not have",
@@ -101,7 +103,25 @@ pub fn request<F: NameValue>(fields: &[F], limit: usize) -> Result<RequestHead, 
                 ))
         })
         .transpose()?;
-    let uri = if method == Method::CONNECT {
+    // RFC 9220 §3, as RFC 8441 §4: `:protocol` only on a CONNECT, which then has the
+    // `:scheme` and `:path` a plain one may not, and names what it asks for.
+    let protocol = protocol
+        .map(|protocol| {
+            if method != Method::CONNECT {
+                return Err(Refused::Malformed(
+                    "`:protocol` on a request other than CONNECT",
+                ));
+            }
+            std::str::from_utf8(protocol)
+                .ok()
+                .filter(|protocol| {
+                    !protocol.is_empty() && protocol.bytes().all(crate::hop_by_hop::is_token_byte)
+                })
+                .map(::h2::ext::Protocol::from)
+                .ok_or(Refused::Malformed("a `:protocol` that is not a token"))
+        })
+        .transpose()?;
+    let uri = if method == Method::CONNECT && protocol.is_none() {
         // RFC 9114 §4.4: the authority to connect to, and neither a scheme nor a path.
         if scheme.is_some() || path.is_some() {
             return Err(Refused::Malformed("CONNECT with `:scheme` or `:path`"));
@@ -149,11 +169,19 @@ pub fn request<F: NameValue>(fields: &[F], limit: usize) -> Result<RequestHead, 
     };
     let length = content_length(&headers)?;
 
+    if protocol.is_some() && uri.authority().is_none() {
+        return Err(Refused::Malformed(
+            "an extended CONNECT without `:authority`",
+        ));
+    }
     let (mut parts, ()) = http::Request::new(()).into_parts();
     parts.method = method;
     parts.uri = uri;
     parts.version = Version::HTTP_3;
     parts.headers = headers;
+    if let Some(protocol) = protocol {
+        parts.extensions.insert(protocol);
+    }
     Ok(RequestHead { parts, length })
 }
 
@@ -404,9 +432,49 @@ mod tests {
                 &[
                     (":method", "GET"),
                     (":protocol", "websocket"),
+                    (":scheme", "https"),
+                    (":authority", "a"),
                     (":path", "/"),
                 ],
-                "a pseudo-header a request does not have",
+                "`:protocol` on a request other than CONNECT",
+            ),
+            (
+                &[
+                    (":method", "CONNECT"),
+                    (":protocol", "websocket"),
+                    (":scheme", "https"),
+                    (":authority", "a"),
+                ],
+                "no `:path`",
+            ),
+            (
+                &[
+                    (":method", "CONNECT"),
+                    (":protocol", "websocket"),
+                    (":authority", "a"),
+                    (":path", "/chat"),
+                ],
+                "no `:scheme`",
+            ),
+            (
+                &[
+                    (":method", "CONNECT"),
+                    (":protocol", "web socket"),
+                    (":scheme", "https"),
+                    (":authority", "a"),
+                    (":path", "/chat"),
+                ],
+                "a `:protocol` that is not a token",
+            ),
+            (
+                &[
+                    (":method", "CONNECT"),
+                    (":protocol", "websocket"),
+                    (":scheme", "https"),
+                    (":path", "/chat"),
+                    ("host", "a"),
+                ],
+                "an extended CONNECT without `:authority`",
             ),
             (
                 &[
@@ -526,6 +594,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(head.parts.uri.path(), "*");
+    }
+
+    /// An extended CONNECT (RFC 9220 §3) names its protocol, and the scheme and path a
+    /// plain one may not.
+    #[test]
+    fn an_extended_connect_names_its_protocol_scheme_and_path() {
+        let head = request(
+            &fields(&[
+                (":method", "CONNECT"),
+                (":protocol", "websocket"),
+                (":scheme", "https"),
+                (":authority", "a.test"),
+                (":path", "/chat"),
+                ("sec-websocket-version", "13"),
+            ]),
+            LIMIT,
+        )
+        .unwrap();
+        assert_eq!(head.parts.method, Method::CONNECT);
+        assert_eq!(head.parts.uri, "https://a.test/chat");
+        let protocol = head.parts.extensions.get::<::h2::ext::Protocol>().unwrap();
+        assert_eq!(protocol.as_str(), "websocket");
     }
 
     #[test]

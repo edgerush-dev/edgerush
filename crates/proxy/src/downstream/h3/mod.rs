@@ -16,6 +16,7 @@ pub mod head;
 pub(crate) mod hq;
 pub(crate) mod listener;
 pub(crate) mod send;
+pub(crate) mod stream;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
@@ -159,6 +160,10 @@ impl Settings {
     pub(crate) fn h3(&self) -> Result<quiche::h3::Config, quiche::h3::Error> {
         let mut config = quiche::h3::Config::new()?;
         config.set_max_field_section_size(self.field_section);
+        // WebSocket over HTTP/3 (RFC 9220), announced to every client ([19 §3]).
+        //
+        // [19 §3]: ../../../../../docs/19-websocket.md
+        config.enable_extended_connect(true);
         Ok(config)
     }
 }

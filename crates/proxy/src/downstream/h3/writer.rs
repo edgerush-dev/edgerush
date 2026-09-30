@@ -175,6 +175,40 @@ impl Responder {
         sent
     }
 
+    /// Waits for room no longer than `idle` at a time from here on: a tunnel's own idle
+    /// bound, in place of an answer's ([19 §5](../../../../../docs/19-websocket.md)).
+    pub(crate) fn idle_for(&mut self, idle: Duration) {
+        self.idle = Idle::new(idle);
+    }
+
+    /// Sends what of `data` the stream takes now, after the final head, and says how much;
+    /// with `end`, the stream's end once all of it has gone (`data` empty: the end alone).
+    /// Waits for room when the stream takes nothing.
+    pub(crate) fn poll_data(
+        &mut self,
+        cx: &mut Context<'_>,
+        data: &[u8],
+        end: bool,
+    ) -> Poll<Result<usize, SendError>> {
+        let written = self.conn.with(|state| {
+            let (quic, h3) = streams_of(state)?;
+            match h3.send_body(quic, self.stream, data, end) {
+                Ok(written) => Ok(Some(written)),
+                Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => Ok(None),
+                Err(error) => Err(SendError::from(error)),
+            }
+        });
+        match written {
+            Err(error) => Poll::Ready(Err(error)),
+            Ok(Some(written)) if written > 0 || data.is_empty() => {
+                self.idle.moved();
+                self.conn.stir();
+                Poll::Ready(Ok(written))
+            }
+            Ok(_) => self.wait(cx),
+        }
+    }
+
     /// Resets the stream's sending side with `code`, and stops reading it.
     pub(crate) fn reset(&self, code: u64) {
         self.conn.with(|state| {

@@ -21,14 +21,16 @@ use crate::downstream::h3::conn::{Conn, Slot, State, Stream};
 use crate::downstream::h3::head::{self, Refused, RequestHead};
 use crate::downstream::h3::listener::Shared;
 use crate::downstream::h3::send::{Unsent, flush};
+use crate::downstream::h3::stream::H3Stream;
 use crate::downstream::h3::writer::{Responder, SendError};
 use crate::forwarding::Client;
 use crate::interim::Interim;
 use crate::request_body::RequestBody;
 use crate::timers::Alarm;
+use crate::tunnel::Carried;
 use bytes::Bytes;
 use http::header::{DATE, HeaderValue};
-use http::{Request, Response, StatusCode, Version};
+use http::{Method, Request, Response, StatusCode, Version};
 use http_body::Body;
 use quiche::h3::Event;
 use std::error::Error as StdError;
@@ -669,9 +671,19 @@ async fn answer<R, F, B, D>(
         Version::HTTP_3,
         ended,
     );
-    let body = IncomingH3::new(Rc::clone(&stream.conn), stream.id, head.length, ended, idle)
-        .heard_by(interim.clone());
-    let request = Request::from_parts(head.parts, RequestBody::H3(body));
+    // An extended CONNECT's stream is a WebSocket's once it is answered, not a body: the
+    // request goes to the core with none, and the stream is read by the tunnel (19 §3).
+    let connect = head.parts.method == Method::CONNECT
+        && head.parts.extensions.get::<::h2::ext::Protocol>().is_some();
+    let body = if connect {
+        RequestBody::None
+    } else {
+        RequestBody::H3(
+            IncomingH3::new(Rc::clone(&stream.conn), stream.id, head.length, ended, idle)
+                .heard_by(interim.clone()),
+        )
+    };
+    let request = Request::from_parts(head.parts, body);
     let mut responder = Responder::new(Rc::clone(&stream.conn), stream.id, idle);
     let mut answering = pin!(respond(request, interim.clone(), client));
     let answered = poll_fn(|cx| {
@@ -699,7 +711,13 @@ async fn answer<R, F, B, D>(
     {
         head.headers.insert(DATE, now);
     }
-    let end = body.is_end_stream();
+    // A WebSocket the core switched: the stream stays open after its 200, and is carried.
+    let switched = if connect {
+        interim.take_switched()
+    } else {
+        None
+    };
+    let end = body.is_end_stream() && switched.is_none();
     if let Err(error) = responder.final_head(&head, end).await {
         // Given up before the head had room: the stream may be quiche's no more, and its
         // error say only that.
@@ -711,6 +729,18 @@ async fn answer<R, F, B, D>(
             SendError::H3(_) => return responder.reset(code::INTERNAL_ERROR),
             _ => return,
         }
+    }
+    if let Some(switched) = switched {
+        drop(body);
+        let idle = switched.bounds.idle;
+        responder.idle_for(idle);
+        let incoming = IncomingH3::new(Rc::clone(&stream.conn), stream.id, None, ended, idle);
+        let mut tunnel = H3Stream::new(incoming, responder);
+        // Closed by both ends is whole; anything else resets the stream as it goes.
+        if switched.carry(&mut tunnel, None).await == Carried::Closed {
+            stream.answered();
+        }
+        return;
     }
     // A body that failed has had its stream reset with its own code; one the client stopped
     // or reset, or the connection took, is reset as the stream goes.
