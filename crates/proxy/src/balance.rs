@@ -28,6 +28,8 @@
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
 
 #[cfg(test)]
+mod dead_pod;
+#[cfg(test)]
 mod simulation;
 
 /// How often an endpoint in slow start may be refused, for one pick, before the one in hand

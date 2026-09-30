@@ -48,10 +48,11 @@ struct Outcome {
     during_stall: usize,
 }
 
-struct Random(u64);
+/// A small generator of the simulations' own: the same seed, the same run.
+pub(super) struct Random(pub(super) u64);
 
 impl Random {
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mixed = (self.0 ^ (self.0 >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         let mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -59,7 +60,7 @@ impl Random {
     }
 
     /// Exponentially distributed, of mean `mean`.
-    fn exponential(&mut self, mean: f64) -> f64 {
+    pub(super) fn exponential(&mut self, mean: f64) -> f64 {
         // Uniform over (0, 1]: never zero, whose logarithm has no end.
         let uniform = ((self.next() >> 11) + 1) as f64 / (1_u64 << 53) as f64;
         -uniform.ln() * mean
