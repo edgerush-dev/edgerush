@@ -22,16 +22,6 @@
 //! look at each endpoint drawn: no endpoint is counted, and no list is made, unless one drawn
 //! may not be taken.
 
-// Reached only by its own tests until the workers pick with it (03 §6, step 3). An
-// expectation and not an allowance, so that the day a caller appears the compiler says this
-// line has served its purpose.
-#![cfg_attr(
-    not(any(test, feature = "fuzzing")),
-    expect(
-        dead_code,
-        reason = "reached only by its own tests until the workers pick with it"
-    )
-)]
 // What is here is `pub` so that the benchmarks, which are a crate of their own, can name it.
 // The module is public only when they are being built, so in an ordinary build none of this
 // is API.
@@ -56,6 +46,13 @@ impl Share {
     pub const FULL: Self = Self(1 << 16);
 
     /// `parts` 65,536ths of a full share, at most all of it.
+    #[cfg_attr(
+        not(any(test, feature = "fuzzing")),
+        expect(
+            dead_code,
+            reason = "a ramping share is worked out once slow start is built"
+        )
+    )]
     pub fn of(parts: u32) -> Self {
         Self(parts.min(Self::FULL.0))
     }
@@ -260,7 +257,7 @@ pub fn p2c(
 }
 
 /// `round_robin`, for one upstream in one worker: each endpoint that may be taken in turn.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct RoundRobin {
     /// Where the next turn starts looking: one past the endpoint last taken. An endpoint
     /// passed over gives its turn to none: the next one taken is the next that may be, and

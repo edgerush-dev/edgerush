@@ -9,6 +9,7 @@
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
 
 pub mod auth;
+pub(crate) mod balancing;
 pub mod destination;
 pub mod h1;
 pub(crate) mod secure;

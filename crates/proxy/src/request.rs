@@ -501,11 +501,11 @@ routes:
           backends:
             - { upstream: admin, weight: 1 }
 upstreams:
-  admin: { endpoints: ["127.0.0.1:9001"] }
-  cart: { endpoints: ["127.0.0.1:9002"] }
-  cart-canary: { endpoints: ["127.0.0.1:9003"] }
-  fallback: { endpoints: [] }
-  search: { endpoints: ["127.0.0.1:9004"] }
+  admin: { load_balancer: p2c, endpoints: ["127.0.0.1:9001"] }
+  cart: { load_balancer: p2c, endpoints: ["127.0.0.1:9002"] }
+  cart-canary: { load_balancer: p2c, endpoints: ["127.0.0.1:9003"] }
+  fallback: { load_balancer: p2c, endpoints: [] }
+  search: { load_balancer: p2c, endpoints: ["127.0.0.1:9004"] }
 "#;
 
     fn shop() -> Compiled {
@@ -706,7 +706,7 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: cart, weight: 1 }] }
 upstreams:
-  cart: { endpoints: ["10.0.0.1:80"] }
+  cart: { load_balancer: p2c, endpoints: ["10.0.0.1:80"] }
 "#,
             )
             .unwrap(),
@@ -980,7 +980,7 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: pages, weight: 1 }] }
 upstreams:
-  pages: { endpoints: ["127.0.0.1:9000"] }
+  pages: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }
 "#;
 
     /// What a request to `web` of [`MOVED`] is redirected with: status and `Location`.
@@ -1053,7 +1053,7 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: up, weight: 1 }] }
 upstreams:
-  up: { endpoints: ["127.0.0.1:9000"] }
+  up: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }
 "#;
 
     /// Decides on `web` of [`REWRITTEN`], and gives the head as it goes upstream.
@@ -1123,10 +1123,10 @@ routes:
           - { type: request_mirror, upstream: third, fraction: { numerator: 1, denominator: 1 } }
         forward: { backends: [{ upstream: up, weight: 1 }] }
 upstreams:
-  up: { endpoints: ["127.0.0.1:9000"] }
-  first: { endpoints: ["127.0.0.1:9001"] }
-  second: { endpoints: ["127.0.0.1:9002"] }
-  third: { endpoints: ["127.0.0.1:9003"] }
+  up: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }
+  first: { load_balancer: p2c, endpoints: ["127.0.0.1:9001"] }
+  second: { load_balancer: p2c, endpoints: ["127.0.0.1:9002"] }
+  third: { load_balancer: p2c, endpoints: ["127.0.0.1:9003"] }
 "#;
 
     /// What a copy says: its target, its `Host`, and whether it has `x-changed`.

@@ -222,7 +222,7 @@ routes:
       - matches: [{{ grpc: {{ service: test.Echo }} }}]
         forward: {{ backends: [{{ upstream: echo, weight: 1 }}] }}
 upstreams:
-  echo: {{ endpoints: ["{upstream}"], protocol: http2 }}
+  echo: {{ load_balancer: p2c, endpoints: ["{upstream}"], protocol: http2 }}
 "#
     );
     let config: Config = serde_saphyr::from_str(&yaml).unwrap();

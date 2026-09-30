@@ -63,9 +63,9 @@ routes:
           backends:
             - { upstream: pages, weight: 1 }
 upstreams:
-  cart: { endpoints: ["127.0.0.1:9002"] }
-  cart-canary: { endpoints: ["127.0.0.1:9003"] }
-  pages: { endpoints: ["127.0.0.1:9004"] }
+  cart: { load_balancer: p2c, endpoints: ["127.0.0.1:9002"] }
+  cart-canary: { load_balancer: p2c, endpoints: ["127.0.0.1:9003"] }
+  pages: { load_balancer: p2c, endpoints: ["127.0.0.1:9004"] }
 "#;
 
 /// A client that is no trusted proxy, as most are.

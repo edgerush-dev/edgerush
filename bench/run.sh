@@ -175,7 +175,7 @@ start_backend() {
     cp "$here/proxy.yaml" "$config"
     [ "$TLS" = 1 ] && secure
     if [ "$UPSTREAM_H2" = 1 ]; then
-        sed -i 's#backend: { endpoints: \["127.0.0.1:9000"\] }#backend: { endpoints: ["127.0.0.1:9000"], protocol: http2 }#' "$config"
+        sed -i 's#backend: { load_balancer: p2c, endpoints: \["127.0.0.1:9000"\] }#backend: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"], protocol: http2 }#' "$config"
         grep -q 'protocol: http2' "$config"
     fi
     local backend_conf=$here/nginx.conf

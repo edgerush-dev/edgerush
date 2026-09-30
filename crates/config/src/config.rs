@@ -184,6 +184,19 @@ pub struct Upstream {
     /// none is every endpoint taken as healthy.
     #[serde(default)]
     pub health_check: Option<HealthCheck>,
+    /// Which endpoint takes each exchange. Always stated: it chooses behaviour.
+    pub load_balancer: LoadBalancer,
+}
+
+/// How an upstream's endpoint is chosen for an exchange ([03 §6](../../../docs/03-data-plane.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalancer {
+    /// Two different endpoints drawn at random, and the one with fewer exchanges in flight:
+    /// the power of two choices. Steers away from an endpoint that stalls.
+    P2c,
+    /// Each endpoint in turn.
+    RoundRobin,
 }
 
 /// An active check of an upstream's endpoints. Everything is stated: how often, how long a

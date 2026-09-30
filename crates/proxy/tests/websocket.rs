@@ -61,7 +61,7 @@ routes:
           - path: {{ prefix: / }}
 {extra}
 upstreams:
-  up: {{ endpoints: ["{upstream}"] }}
+  up: {{ load_balancer: p2c, endpoints: ["{upstream}"] }}
 {upstreams}
 "#
     );
@@ -712,7 +712,7 @@ async fn a_handshake_is_not_mirrored() {
     let (address, proxy) = gateway(
         upstream,
         rule,
-        &format!("  copy: {{ endpoints: [\"{mirror}\"] }}"),
+        &format!("  copy: {{ load_balancer: p2c, endpoints: [\"{mirror}\"] }}"),
     );
     let mut client = Wire::to(address).await;
     client.write(&handshake()).await;
@@ -963,7 +963,7 @@ fn h2_backend(
 
 /// The config's upstreams line for `up` spoken to in HTTP/2 at `address`.
 fn h2_upstream(address: SocketAddr) -> String {
-    format!("  up2: {{ endpoints: [\"{address}\"], protocol: http2 }}")
+    format!("  up2: {{ load_balancer: p2c, endpoints: [\"{address}\"], protocol: http2 }}")
 }
 
 const FORWARD_H2: &str = "        forward: { backends: [{ upstream: up2, weight: 1 }] }";
@@ -1244,4 +1244,66 @@ async fn resets_end_an_http2_websocket_both_ways() {
         2,
     )
     .await;
+}
+
+/// A rule forwarding everything to `pair`.
+const FORWARD_PAIR: &str = "        forward: { backends: [{ upstream: pair, weight: 1 }] }";
+
+/// An open WebSocket is load on its backend for as long as it is open (03 §6): with every
+/// one held, `p2c` sends each new one to the backend with fewer, so after every second one
+/// both have as many. Were an open WebSocket not counted, each would go either way.
+#[tokio::test]
+async fn an_open_websocket_counts_against_its_backend() {
+    let (saw, _seen) = mpsc::unbounded_channel();
+    let (a, at_a) = echoing(saw.clone());
+    let (b, at_b) = echoing(saw);
+    let (unused, _) = backend(|_| async {});
+    let pair = format!("  pair: {{ load_balancer: p2c, endpoints: [\"{a}\", \"{b}\"] }}");
+    let (address, _proxy) = gateway(unused, FORWARD_PAIR, &pair);
+    let mut held = Vec::new();
+    for opened in 1..=20 {
+        let mut client = Wire::to(address).await;
+        client.write(&handshake()).await;
+        let head = within(client.head()).await;
+        assert!(head.starts_with("HTTP/1.1 101 "), "{head}");
+        assert_eq!(within(client.exactly(5)).await, "hello");
+        held.push(client);
+        if opened % 2 == 0 {
+            let (a, b) = (at_a.load(Ordering::SeqCst), at_b.load(Ordering::SeqCst));
+            assert_eq!(a, b, "after {opened}");
+        }
+    }
+}
+
+/// The same for WebSockets carried as extended CONNECTs to HTTP/2 backends, each a stream
+/// of a connection the backend's others share.
+#[tokio::test]
+async fn an_open_http2_websocket_counts_against_its_backend() {
+    let (saw_a, mut seen_a) = mpsc::unbounded_channel();
+    let (saw_b, mut seen_b) = mpsc::unbounded_channel();
+    let (a, _) = h2_backend(true, saw_a);
+    let (b, _) = h2_backend(true, saw_b);
+    let (unused, _) = backend(|_| async {});
+    let pair =
+        format!("  pair: {{ load_balancer: p2c, endpoints: [\"{a}\", \"{b}\"], protocol: http2 }}");
+    let (address, _proxy) = gateway(unused, FORWARD_PAIR, &pair);
+    let (mut asked_a, mut asked_b) = (0, 0);
+    let mut held = Vec::new();
+    for opened in 1..=20 {
+        let mut client = Wire::to(address).await;
+        client.write(&handshake()).await;
+        let head = within(client.head()).await;
+        assert!(head.starts_with("HTTP/1.1 101 "), "{head}");
+        assert_eq!(within(client.exactly(5)).await, "hello");
+        held.push(client);
+        while seen_a.try_recv().is_ok() {
+            asked_a += 1;
+        }
+        while seen_b.try_recv().is_ok() {
+            asked_b += 1;
+        }
+        if opened % 2 == 0 {
+            assert_eq!(asked_a, asked_b, "after {opened}");
+        }
+    }
 }

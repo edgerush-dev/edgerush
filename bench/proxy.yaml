@@ -42,5 +42,5 @@ routes:
         forward: { backends: [{ upstream: nowhere, weight: 1 }] }
 
 upstreams:
-  backend: { endpoints: ["127.0.0.1:9000"] }
-  nowhere: { endpoints: [] }
+  backend: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }
+  nowhere: { load_balancer: p2c, endpoints: [] }

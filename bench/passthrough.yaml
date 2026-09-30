@@ -20,5 +20,5 @@ tls_routes:
     backends: [{ upstream: secure-backend, weight: 1 }]
 
 upstreams:
-  backend: { endpoints: ["127.0.0.1:9000"] }
-  secure-backend: { endpoints: ["127.0.0.1:9443"] }
+  backend: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }
+  secure-backend: { load_balancer: p2c, endpoints: ["127.0.0.1:9443"] }

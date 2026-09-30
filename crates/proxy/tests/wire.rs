@@ -60,7 +60,7 @@ routes:
         forward: {{ backends: [{{ upstream: up, weight: 1 }}] }}
 {filters}
 upstreams:
-  up: {{ endpoints: ["{upstream}"] }}
+  up: {{ load_balancer: p2c, endpoints: ["{upstream}"] }}
 "#
     );
     let config: Config = serde_saphyr::from_str(&yaml).unwrap();

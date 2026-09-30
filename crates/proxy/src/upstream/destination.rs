@@ -239,7 +239,10 @@ mod tests {
         let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
         for (name, addresses) in upstreams {
             let listed: Vec<String> = addresses.iter().map(|a| format!("\"{a}\"")).collect();
-            yaml += &format!("  {name}: {{ endpoints: [{}] }}\n", listed.join(", "));
+            yaml += &format!(
+                "  {name}: {{ load_balancer: p2c, endpoints: [{}] }}\n",
+                listed.join(", ")
+            );
         }
         let config: Config = serde_saphyr::from_str(&yaml).unwrap();
         compile(&config).unwrap()

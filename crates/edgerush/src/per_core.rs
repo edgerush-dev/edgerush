@@ -273,7 +273,7 @@ routes:
           - path: { prefix: / }
         forward: { backends: [{ upstream: nowhere, weight: 1 }] }
 upstreams:
-  nowhere: { endpoints: [] }
+  nowhere: { load_balancer: p2c, endpoints: [] }
 "#;
         let config: Config = serde_saphyr::from_str(yaml).unwrap();
         let workers = NonZeroUsize::new(count).unwrap();

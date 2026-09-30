@@ -299,7 +299,7 @@ fn config(listen: &str, backend: &str, up: Option<SocketAddr>) -> String {
     let endpoints = up.map(|up| format!("\"{up}\"")).unwrap_or_default();
     format!(
         r#"upstreams:
-  up: {{ endpoints: [{endpoints}] }}
+  up: {{ load_balancer: p2c, endpoints: [{endpoints}] }}
 routes:
   - name: everything
     listeners: [web]

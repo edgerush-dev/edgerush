@@ -22,6 +22,7 @@ use crate::drain::Drain;
 use crate::h2_stream::H2Stream;
 use crate::random::{random, unguessable};
 use crate::timers::{Alarm, Timers};
+use crate::upstream::balancing::InFlight;
 use crate::upstream::h1::blocks::{Block, Blocks};
 use crate::upstream::secure::Socket;
 use crate::websocket::frames::{Frames, GOING_AWAY, going_away_masked};
@@ -107,6 +108,9 @@ pub(crate) struct Switched {
     pub(crate) drain: Rc<Drain>,
     /// Told how the tunnel ended, which counts it as its listener's.
     pub(crate) ended: Box<dyn FnOnce(Carried)>,
+    /// The handshake's count at its endpoint, held until the tunnel closes: a WebSocket is
+    /// load on its backend for as long as it is open (03 §6).
+    pub(crate) counted: Option<InFlight>,
 }
 
 impl std::fmt::Debug for Switched {
@@ -133,6 +137,7 @@ impl Switched {
             timers,
             drain,
             ended,
+            counted,
         } = self;
         let carried = carry(
             client,
@@ -145,6 +150,8 @@ impl Switched {
             &drain,
         )
         .await;
+        // Load on its backend no longer.
+        drop(counted);
         ended(carried);
         carried
     }

@@ -68,7 +68,7 @@ nginx -c /tmp/nginx.conf -e /logs/nginx.log -p /tmp/nginx-temp/
     echo '      - matches: [{ path: { prefix: / } }]'
     echo '        backends: [{ upstream: origin, weight: 1 }]'
     echo 'upstreams:'
-    echo '  origin: { endpoints: ["127.0.0.1:9000"] }'
+    echo '  origin: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }'
 } >/tmp/config.yaml
 
 # Two workers, so that a client that rebinds may land on the other one's socket and be

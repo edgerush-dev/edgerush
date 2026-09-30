@@ -217,7 +217,7 @@ fn everything_to(listeners: &[(&str, SocketAddr)], config: &str) -> String {
     }
     yaml += "upstreams:\n";
     for (listener, upstream) in listeners {
-        yaml += &format!("  {listener}: {{ endpoints: [\"{upstream}\"] }}\n");
+        yaml += &format!("  {listener}: {{ load_balancer: p2c, endpoints: [\"{upstream}\"] }}\n");
     }
     yaml
 }
@@ -270,10 +270,10 @@ routes:
           backends:
             - {{ upstream: pages, weight: 1 }}
 upstreams:
-  cart: {{ endpoints: ["{cart}"] }}
-  dead: {{ endpoints: ["{dead}"] }}
-  empty: {{ endpoints: [] }}
-  pages: {{ endpoints: ["{pages}"] }}
+  cart: {{ load_balancer: p2c, endpoints: ["{cart}"] }}
+  dead: {{ load_balancer: p2c, endpoints: ["{dead}"] }}
+  empty: {{ load_balancer: p2c, endpoints: [] }}
+  pages: {{ load_balancer: p2c, endpoints: ["{pages}"] }}
 "#
     );
     proxy(&yaml).await["web"]
@@ -484,7 +484,7 @@ routes:
           - path: {{ prefix: / }}
         forward: {{ backends: [{{ upstream: pages, weight: 1 }}] }}
 upstreams:
-  pages: {{ endpoints: ["{pages}"] }}
+  pages: {{ load_balancer: p2c, endpoints: ["{pages}"] }}
 "#
     );
     let (proxy, addresses) = reloadable_proxy(&yaml).await;
@@ -614,8 +614,8 @@ routes:
           backends:
             - {{ upstream: rest, weight: 1 }}
 upstreams:
-  evil: {{ endpoints: ["{evil}"] }}
-  rest: {{ endpoints: ["{rest}"] }}
+  evil: {{ load_balancer: p2c, endpoints: ["{evil}"] }}
+  rest: {{ load_balancer: p2c, endpoints: ["{rest}"] }}
 "#
     );
     let proxy = proxy(&yaml).await["web"];
@@ -723,7 +723,7 @@ routes:
           backends:
             - {{ upstream: any, weight: 1 }}
 upstreams:
-  any: {{ endpoints: ["{any_host}"] }}
+  any: {{ load_balancer: p2c, endpoints: ["{any_host}"] }}
 "#
     );
     let proxy = self::proxy(&yaml).await["web"];
@@ -777,8 +777,8 @@ routes:
           backends:
             - {{ upstream: admin, weight: 1 }}
 upstreams:
-  admin: {{ endpoints: ["{admin}"] }}
-  web: {{ endpoints: ["{one}", "{two}"] }}
+  admin: {{ load_balancer: p2c, endpoints: ["{admin}"] }}
+  web: {{ load_balancer: p2c, endpoints: ["{one}", "{two}"] }}
 "#
     );
     let listeners = proxy(&yaml).await;
@@ -1224,7 +1224,7 @@ fn routed_to(upstreams: &[(&str, SocketAddr)]) -> String {
     }
     yaml += "upstreams:\n";
     for (name, address) in upstreams {
-        yaml += &format!("  {name}: {{ endpoints: [\"{address}\"] }}\n");
+        yaml += &format!("  {name}: {{ load_balancer: p2c, endpoints: [\"{address}\"] }}\n");
     }
     yaml
 }
@@ -1593,5 +1593,144 @@ async fn two_hundred_streams_on_one_connection_are_all_answered() {
         assert_eq!(status, StatusCode::OK);
         let seen = String::from_utf8(body.to_vec()).unwrap();
         assert!(seen.starts_with(&format!("GET /n/{n} ")), "{seen}");
+    }
+}
+
+/// A config whose one rule sends everything to `web`, of `endpoints` balanced by
+/// `balancer`, and sends a request up to twice more if it is answered 502 when `retry` is
+/// set.
+fn balanced(endpoints: &[SocketAddr], balancer: &str, retry: bool) -> String {
+    let listed: Vec<String> = endpoints.iter().map(|at| format!("\"{at}\"")).collect();
+    let retry = if retry {
+        ", retry: { attempts: 2, http_statuses: [502], on_timeout: false, backoff_base_ms: 1, backoff_max_ms: 1 }"
+    } else {
+        ""
+    };
+    format!(
+        "listeners:\n  web: {{ address: \"127.0.0.1:0\", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n\
+         routes:\n  - name: everything\n    listeners: [web]\n    hostnames:\n      - {{ name: \"*\", falls_through: true }}\n    rules:\n      \
+         - matches:\n          - path: {{ prefix: / }}\n        forward: {{ backends: [{{ upstream: web, weight: 1 }}]{retry} }}\n\
+         upstreams:\n  web: {{ load_balancer: {balancer}, endpoints: [{}] }}\n",
+        listed.join(", ")
+    )
+}
+
+/// `p2c` sends a pod that has stopped answering almost nothing more once it holds a request:
+/// its count stays up while the other's comes back down (03 §6). Picked at random, it would
+/// be sent half of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn p2c_keeps_away_from_a_pod_that_has_stopped_answering() {
+    let mut stalled = hanging_upstream().await;
+    let answering = upstream("answering").await;
+    let listeners = proxy(&balanced(&[stalled.address, answering], "p2c", false)).await;
+
+    let mut held = Vec::new();
+    for _ in 0..20 {
+        let asking = tokio::spawn(send(get(listeners["web"], "/hang")));
+        // Answered at once by the pod that answers; still waiting after this long, held by
+        // the one that does not — and left waiting, so that it stays in flight.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if asking.is_finished() {
+            let (status, headers, _) = asking.await.unwrap();
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(headers["x-upstream"], "answering");
+        } else {
+            held.push(asking);
+        }
+    }
+    let mut asked = 0;
+    while stalled.asked.try_recv().is_ok() {
+        asked += 1;
+    }
+    assert_eq!(asked, held.len());
+    // The first to land there, and at most a tie or two while an answer's count was still
+    // coming off: random would have sent ten.
+    assert!(
+        (1..=3).contains(&asked),
+        "the stalled pod was sent {asked} of 20"
+    );
+}
+
+/// `round_robin` takes each endpoint in turn: nine requests to three endpoints are three
+/// each, whichever the worker started at (03 §6).
+#[tokio::test(flavor = "multi_thread")]
+async fn round_robin_gives_each_endpoint_its_turn() {
+    let endpoints = [
+        upstream("one").await,
+        upstream("two").await,
+        upstream("three").await,
+    ];
+    let listeners = proxy(&balanced(&endpoints, "round_robin", false)).await;
+    let mut served: BTreeMap<String, usize> = BTreeMap::new();
+    for _ in 0..9 {
+        let (status, headers, _) = send(get(listeners["web"], "/")).await;
+        assert_eq!(status, StatusCode::OK);
+        *served
+            .entry(headers["x-upstream"].to_str().unwrap().to_owned())
+            .or_default() += 1;
+    }
+    let expected: BTreeMap<String, usize> = [("one", 3), ("three", 3), ("two", 3)]
+        .map(|(name, n)| (name.to_owned(), n))
+        .into();
+    assert_eq!(served, expected);
+}
+
+/// A retry keeps away from every endpoint that has failed it (03 §6): with two of three
+/// endpoints answering nothing, two retries always reach the third. Drawn afresh, a
+/// request would end on one of the silent two about one time in five.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_keeps_away_from_the_endpoints_that_failed_it() {
+    let silent = [dead_endpoint().await, dead_endpoint().await];
+    let answering = upstream("answering").await;
+    for balancer in ["p2c", "round_robin"] {
+        let endpoints = [silent[0], silent[1], answering];
+        let listeners = proxy(&balanced(&endpoints, balancer, true)).await;
+        for _ in 0..30 {
+            let (status, headers, _) = send(get(listeners["web"], "/")).await;
+            assert_eq!(status, StatusCode::OK, "{balancer}");
+            assert_eq!(headers["x-upstream"], "answering");
+        }
+    }
+}
+
+/// A mirror's copy is load on the mirror's backend like any exchange (03 §6): with the
+/// mirror's two endpoints holding every copy unanswered, `p2c` sends each copy to the one
+/// with fewer, so after every second request both have as many.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mirrors_copy_counts_against_the_mirrors_backend() {
+    let mut one = hanging_upstream().await;
+    let mut two = hanging_upstream().await;
+    let primary = upstream("primary").await;
+    let yaml = balanced(&[primary], "p2c", false)
+        .replace(
+            "        forward:",
+            "        filters: [{ type: request_mirror, upstream: shadow, fraction: { numerator: 1, denominator: 1 } }]\n        forward:",
+        )
+        + &format!(
+            "  shadow: {{ load_balancer: p2c, endpoints: [\"{}\", \"{}\"] }}\n",
+            one.address, two.address
+        );
+    let listeners = proxy(&yaml).await;
+    let (mut at_one, mut at_two) = (0, 0);
+    for sent in 1..=20 {
+        let (status, headers, _) = send(get(listeners["web"], "/hang")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["x-upstream"], "primary");
+        // The copy reaches its endpoint after the request's own answer, or about then.
+        within(async {
+            while at_one + at_two < sent {
+                while one.asked.try_recv().is_ok() {
+                    at_one += 1;
+                }
+                while two.asked.try_recv().is_ok() {
+                    at_two += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        if sent % 2 == 0 {
+            assert_eq!(at_one, at_two, "after {sent}");
+        }
     }
 }

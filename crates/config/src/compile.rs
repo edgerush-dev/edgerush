@@ -8,8 +8,8 @@ use crate::route::{
     Query, Redirect, Route, Scheme, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
 };
 use crate::{
-    Backend, Config, Forwarding, HealthCheck, Http3, Keepalive, Probe, Protocol, RequestId, Rule,
-    Tls, UpstreamProtocol, UpstreamTls,
+    Backend, Config, Forwarding, HealthCheck, Http3, Keepalive, LoadBalancer, Probe, Protocol,
+    RequestId, Rule, Tls, UpstreamProtocol, UpstreamTls,
 };
 use edgerush_filters::forwarding::{ForwardingError, HeaderNames, TrustedProxies};
 use edgerush_filters::{
@@ -417,6 +417,8 @@ pub struct CompiledUpstream {
     pub keepalive: Option<Keepalive>,
     /// Probes of its endpoints, if any.
     pub health_check: Option<HealthCheck>,
+    /// Which endpoint takes each exchange.
+    pub load_balancer: LoadBalancer,
 }
 
 /// Compiles a config. The order of the routes, then of the rules, then of a rule's matches
@@ -446,6 +448,7 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             tls: upstream.tls.clone(),
             keepalive: upstream.keepalive,
             health_check: upstream.health_check.clone(),
+            load_balancer: upstream.load_balancer,
         })
         .collect();
     for (name, upstream) in &config.upstreams {
@@ -1791,9 +1794,9 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: web, weight: 1 }] }
 upstreams:
-  web: { endpoints: ["127.0.0.1:9000"] }
-  checkout: { endpoints: ["127.0.0.1:9001", "[::1]:9001"] }
-  checkout-canary: { endpoints: [] }
+  web: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }
+  checkout: { load_balancer: p2c, endpoints: ["127.0.0.1:9001", "[::1]:9001"] }
+  checkout-canary: { load_balancer: p2c, endpoints: [] }
 "#;
 
     #[test]
@@ -1955,7 +1958,7 @@ routes:
     listeners: [web]
     hostnames: [{ name: a.example.com, falls_through: true }]
     rules: [{ matches: [{ path: { prefix: /api } }], forward: { backends: [{ upstream: u, weight: 1 }] } }]
-upstreams: { u: { endpoints: [] } }
+upstreams: { u: { load_balancer: p2c, endpoints: [] } }
 "#;
         let compiled = compile(&config(twins)).unwrap();
         assert_eq!(route(&compiled, "a.example.com", "/api/x"), Some((0, 0)));
@@ -1974,7 +1977,7 @@ routes:
     listeners: [web]
     hostnames: [{ name: a.example.com, wildcard: any_labels, falls_through: false }]
     rules: [{ matches: [{ path: { prefix: /own } }], forward: { backends: [{ upstream: u, weight: 1 }] } }]
-upstreams: { u: { endpoints: [] } }
+upstreams: { u: { load_balancer: p2c, endpoints: [] } }
 "#;
         let compiled = compile(&config(ingress_style)).unwrap();
         assert_eq!(route(&compiled, "b.example.com", "/shared"), Some((0, 0)));
@@ -2024,7 +2027,7 @@ routes:
             - { upstream: web, weight: 1 }
             - { upstream: wbe, weight: 1 }
 upstreams:
-  web: { endpoints: [] }
+  web: { load_balancer: p2c, endpoints: [] }
 "#;
         let errors: Vec<String> = compile(&config(broken))
             .err()
@@ -2079,7 +2082,7 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: u, weight: 1 }] }
 upstreams:
-  u: { endpoints: [] }
+  u: { load_balancer: p2c, endpoints: [] }
 "#,
         ))
         .unwrap();
@@ -2155,7 +2158,7 @@ routes:
         filters: [{}]
         forward: {{ backends: [{{ upstream: u, weight: 1 }}] }}
 upstreams:
-  u: {{ endpoints: [] }}
+  u: {{ load_balancer: p2c, endpoints: [] }}
 "#,
                 filters.join(", ")
             );
@@ -2201,7 +2204,7 @@ routes:
     rules:
 {rules}
 upstreams:
-  u: {{ endpoints: [] }}
+  u: {{ load_balancer: p2c, endpoints: [] }}
 "#
         );
         compile(&config(&yaml))
@@ -2437,7 +2440,7 @@ upstreams: {}
         // An endpoint is an address, not a name.
         let upstream = |endpoint: &str| {
             let yaml = format!(
-                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ endpoints: [\"{endpoint}\"] }} }}\n"
+                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: [\"{endpoint}\"] }} }}\n"
             );
             serde_saphyr::from_str::<Config>(&yaml).map(|_| ())
         };
@@ -2449,18 +2452,18 @@ upstreams: {}
             serde_saphyr::from_str::<Config>(&yaml).map(|config| config.upstreams["u"].protocol)
         };
         assert_eq!(
-            spoken("{ endpoints: [] }").unwrap(),
+            spoken("{ load_balancer: p2c, endpoints: [] }").unwrap(),
             UpstreamProtocol::Http1
         );
         assert_eq!(
-            spoken("{ endpoints: [], protocol: http1 }").unwrap(),
+            spoken("{ load_balancer: p2c, endpoints: [], protocol: http1 }").unwrap(),
             UpstreamProtocol::Http1
         );
         assert_eq!(
-            spoken("{ endpoints: [], protocol: http2 }").unwrap(),
+            spoken("{ load_balancer: p2c, endpoints: [], protocol: http2 }").unwrap(),
             UpstreamProtocol::Http2
         );
-        assert!(spoken("{ endpoints: [], protocol: h2c }").is_err());
+        assert!(spoken("{ load_balancer: p2c, endpoints: [], protocol: h2c }").is_err());
         assert!(upstream("localhost:80").is_err());
         assert!(upstream("10.0.0.1").is_err());
 
@@ -2636,8 +2639,8 @@ tls_routes:
     hostnames: [{ name: api.example.com, falls_through: true }]
     backends: [{ upstream: postgres, weight: 1 }]
 upstreams:
-  api: { endpoints: ["10.0.0.2:443"] }
-  postgres: { endpoints: ["10.0.0.1:5432"] }
+  api: { load_balancer: p2c, endpoints: ["10.0.0.2:443"] }
+  postgres: { load_balancer: p2c, endpoints: ["10.0.0.1:5432"] }
 "#,
         ))
         .unwrap();
@@ -2674,7 +2677,7 @@ upstreams:
     fn passthrough_routes_are_held_to_their_listeners_and_backends() {
         let refused = |listeners: &str, routes: &str| -> Vec<String> {
             let yaml = format!(
-                "listeners: {{ {listeners} }}\n{routes}\nupstreams: {{ up: {{ endpoints: [] }}, h2: {{ endpoints: [], protocol: http2 }} }}\n"
+                "listeners: {{ {listeners} }}\n{routes}\nupstreams: {{ up: {{ load_balancer: p2c, endpoints: [] }}, h2: {{ load_balancer: p2c, endpoints: [], protocol: http2 }} }}\n"
             );
             compile(&config(&yaml))
                 .err()
@@ -2937,7 +2940,7 @@ upstreams: {}
     fn tls_to_an_upstream_names_its_server_and_whom_to_trust() {
         let with = |tls: &str| {
             config(&format!(
-                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ endpoints: [], tls: {tls} }} }}\n"
+                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: [], tls: {tls} }} }}\n"
             ))
         };
         let compiled = compile(&with(
@@ -2976,7 +2979,7 @@ upstreams: {}
             );
         }
         // Both are said.
-        let yaml = "listeners: {}\nroutes: []\nupstreams: { u: { endpoints: [], tls: { server_name: a.b } } }\n";
+        let yaml = "listeners: {}\nroutes: []\nupstreams: { u: { load_balancer: p2c, endpoints: [], tls: { server_name: a.b } } }\n";
         assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
     }
 
@@ -2992,7 +2995,7 @@ routes:
     listeners: [web]
     hostnames: [{{ name: "*", falls_through: true }}]
     rules: [{{ matches: [{matching}], forward: {{ backends: [{{ upstream: u, weight: 1 }}] }} }}]
-upstreams: {{ u: {{ endpoints: [] }} }}
+upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
 "#
             );
             compile(&config(&yaml))
@@ -3044,7 +3047,7 @@ routes:
         forward: { backends: [{ upstream: u, weight: 1 }] }
       - matches: [{ grpc: { service: pkg.Svc, method: Do } }]
         forward: { backends: [{ upstream: u, weight: 1 }] }
-upstreams: { u: { endpoints: [] } }
+upstreams: { u: { load_balancer: p2c, endpoints: [] } }
 "#,
         ))
         .unwrap();
@@ -3067,18 +3070,43 @@ upstreams: { u: { endpoints: [] } }
                 .map(|compiled| compiled.upstreams[0].keepalive)
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
-        let ok = with("{ endpoints: [], protocol: http2, keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false } }")
+        let ok = with("{ load_balancer: p2c, endpoints: [], protocol: http2, keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false } }")
             .unwrap()
             .unwrap();
         assert_eq!(ok.interval_seconds, 300);
-        assert!(with("{ endpoints: [], protocol: http2, keepalive: { interval_seconds: 10, timeout_seconds: 5, without_calls: true, backend_allows_short_intervals: true } }").is_ok());
+        assert!(with("{ load_balancer: p2c, endpoints: [], protocol: http2, keepalive: { interval_seconds: 10, timeout_seconds: 5, without_calls: true, backend_allows_short_intervals: true } }").is_ok());
         let problem = |upstream: &str| with(upstream).unwrap_err()[0].clone();
-        assert!(problem("{ endpoints: [], keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false } }")
+        assert!(problem("{ load_balancer: p2c, endpoints: [], keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false } }")
             .ends_with("`keepalive` is for an upstream spoken to in HTTP/2"));
-        assert!(problem("{ endpoints: [], protocol: http2, keepalive: { interval_seconds: 60, timeout_seconds: 20, without_calls: false } }")
+        assert!(problem("{ load_balancer: p2c, endpoints: [], protocol: http2, keepalive: { interval_seconds: 60, timeout_seconds: 20, without_calls: false } }")
             .contains("more often than the 300 s gRPC servers take"));
-        assert!(problem("{ endpoints: [], protocol: http2, keepalive: { interval_seconds: 0, timeout_seconds: 20, without_calls: false, backend_allows_short_intervals: true } }")
+        assert!(problem("{ load_balancer: p2c, endpoints: [], protocol: http2, keepalive: { interval_seconds: 0, timeout_seconds: 20, without_calls: false, backend_allows_short_intervals: true } }")
             .ends_with("needs an interval and a timeout of at least a second"));
+    }
+
+    /// An upstream always says how its endpoints are chosen, and says it one way.
+    #[test]
+    fn an_upstream_states_its_load_balancer() {
+        let parsed = |upstream: &str| {
+            let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{ u: {upstream} }}\n");
+            serde_saphyr::from_str::<Config>(&yaml)
+        };
+        let balancer = |upstream: &str| {
+            compile(&parsed(upstream).unwrap()).unwrap().upstreams[0].load_balancer
+        };
+        assert_eq!(
+            balancer("{ load_balancer: p2c, endpoints: [] }"),
+            LoadBalancer::P2c
+        );
+        assert_eq!(
+            balancer("{ load_balancer: round_robin, endpoints: [] }"),
+            LoadBalancer::RoundRobin
+        );
+        // None is not "whatever the data plane likes": the control plane says which.
+        assert!(parsed("{ endpoints: [] }").is_err());
+        // Random is no longer a choice, and least-request is spelled `p2c`.
+        assert!(parsed("{ load_balancer: random, endpoints: [] }").is_err());
+        assert!(parsed("{ load_balancer: least_request, endpoints: [] }").is_err());
     }
 
     /// A health check says everything it does, and nothing that cannot work.
@@ -3092,7 +3120,7 @@ upstreams: { u: { endpoints: [] } }
         };
         let check = |fields: &str| {
             format!(
-                "{{ endpoints: [], protocol: http1, health_check: {{ interval_seconds: 5, timeout_seconds: 2, healthy_threshold: 2, unhealthy_threshold: 3, {fields} }} }}"
+                "{{ load_balancer: p2c, endpoints: [], protocol: http1, health_check: {{ interval_seconds: 5, timeout_seconds: 2, healthy_threshold: 2, unhealthy_threshold: 3, {fields} }} }}"
             )
         };
         let http = with(&check("probe: { http: { path: /healthz } }"))
@@ -3131,7 +3159,7 @@ upstreams: { u: { endpoints: [] } }
             .ends_with("thresholds of at least one")
         );
         // Nothing is left to a default.
-        let missing = "{ endpoints: [], health_check: { interval_seconds: 5, timeout_seconds: 2, probe: { http: { path: / } } } }";
+        let missing = "{ load_balancer: p2c, endpoints: [], health_check: { interval_seconds: 5, timeout_seconds: 2, probe: { http: { path: / } } } }";
         let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{ u: {missing} }}\n");
         assert!(serde_saphyr::from_str::<Config>(&yaml).is_err());
     }
@@ -3148,7 +3176,7 @@ routes:
     listeners: [web]
     hostnames: [{{ name: "*", falls_through: true }}]
     rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}] }}, filters: [{mirror}] }}]
-upstreams: {{ u: {{ endpoints: [] }}, shadow: {{ endpoints: [] }} }}
+upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }}, shadow: {{ load_balancer: p2c, endpoints: [] }} }}
 "#
             );
             compile(&config(&yaml))
@@ -3212,7 +3240,7 @@ routes:
     listeners: [web]
     hostnames: [{{ name: "*", falls_through: true }}]
     rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}], retry: {retry} }} }}]
-upstreams: {{ u: {{ endpoints: [] }} }}
+upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
 "#
             );
             compile(&config(&yaml))
@@ -3296,7 +3324,7 @@ routes:
     listeners: [web]
     hostnames: [{{ name: "*", falls_through: true }}]
     rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}]{forward} }} }}]
-upstreams: {{ u: {{ endpoints: [] }} }}
+upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
 "#
             );
             compile(&config(&yaml))
@@ -3430,7 +3458,7 @@ routes:
     listeners: [internal, public]
     hostnames: [{ name: metrics.internal, falls_through: true }]
     rules: [{ matches: [{ path: { prefix: / } }], forward: { backends: [{ upstream: u, weight: 1 }] } }]
-upstreams: { u: { endpoints: [] } }
+upstreams: { u: { load_balancer: p2c, endpoints: [] } }
 "#;
         let compiled = compile(&config(two)).unwrap();
         let names: Vec<&str> = compiled.listeners.iter().map(|l| l.name.as_str()).collect();

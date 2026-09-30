@@ -15,6 +15,7 @@
 //! `Send`. That is what lets a worker own things a thread cannot share —
 //! the pool of upstream connections to come, above all.
 
+use crate::balance::Tried;
 use crate::downstream::detect::{Protocol, detect};
 use crate::downstream::h1::connection::{self as h1, Answered};
 use crate::downstream::h1::date::HttpDate;
@@ -45,6 +46,7 @@ use crate::storage::Storage;
 use crate::timers::{Alarm, Timers};
 use crate::tls::{self, Tls, TlsError};
 use crate::tunnel::{Backend, Bounds as TunnelBounds, Carried, Switched, carry};
+use crate::upstream::balancing::{self, Balancing, InFlight};
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Block, Blocks, SMALL, Sizes};
@@ -369,6 +371,8 @@ pub struct Worker {
     h2: Rc<H2Client>,
     /// Its retry budgets, by upstream slot: a worker's own, as its connections are.
     budgets: RefCell<HashMap<usize, Budget>>,
+    /// What it has in flight to each endpoint, and whose turn it is (03 §6).
+    balancing: RefCell<Balancing>,
     /// Connections accepted since everything else last had a turn.
     accepted: Cell<usize>,
     /// Its limits again, for the bodies of answers to share rather than copy.
@@ -485,11 +489,29 @@ async fn serve_h2<S>(
 /// failed, or a client that stopped reading — release it without being told to
 /// ([13 §7](../../docs/13-http1-upstream.md)).
 #[derive(Debug)]
-struct Admitted(Rc<Cell<usize>>);
+struct Admitted {
+    exchanges: Rc<Cell<usize>>,
+    /// The exchange's count at its endpoint, which goes where the place goes: with the
+    /// answer's body to its end (03 §6).
+    counted: Option<InFlight>,
+}
+
+impl Admitted {
+    /// The place, holding the exchange's count at the endpoint it was sent to as well.
+    fn counting(mut self, counted: Option<InFlight>) -> Self {
+        self.counted = counted;
+        self
+    }
+
+    /// The count, for a tunnel to hold once the place is let go of.
+    fn count(&mut self) -> Option<InFlight> {
+        self.counted.take()
+    }
+}
 
 impl Drop for Admitted {
     fn drop(&mut self) {
-        self.0.set(self.0.get().saturating_sub(1));
+        self.exchanges.set(self.exchanges.get().saturating_sub(1));
     }
 }
 
@@ -497,6 +519,9 @@ impl Drop for Admitted {
 #[derive(Debug)]
 struct Snapshot {
     config: Compiled,
+    /// Which config this is, counting from the first: what tells a worker its balancing
+    /// state is for an earlier one.
+    generation: u64,
     /// By position in [`Proxy::listeners`]: where this config has the listener of that
     /// name, if it has one. No request looks a listener up by its name.
     listeners: Vec<Option<usize>>,
@@ -607,6 +632,7 @@ impl Snapshot {
         let destinations = Destinations::reconcile(&config, previous_destinations, keys, &secure);
         Ok(Self {
             config,
+            generation: previous.map_or(0, |previous| previous.generation + 1),
             listeners,
             endpoints,
             upstream_slots,
@@ -841,6 +867,7 @@ impl Worker {
             drain: Rc::new(Drain::default()),
             h2: H2Client::new(h2_settings(&limits)),
             budgets: RefCell::new(HashMap::new()),
+            balancing: RefCell::default(),
             accepted: Cell::new(0),
             body_limits,
             me: Weak::clone(me),
@@ -956,7 +983,10 @@ impl Worker {
             return None;
         }
         self.in_flight.set(in_hand + 1);
-        Some(Admitted(Rc::clone(&self.in_flight)))
+        Some(Admitted {
+            exchanges: Rc::clone(&self.in_flight),
+            counted: None,
+        })
     }
 
     /// Sends a request by EdgeRush's own path and returns the answer's head and body.
@@ -1245,7 +1275,8 @@ impl Worker {
             (None, None)
         };
         let routed = self.pass_route(listener, name.as_deref());
-        let (address, idle) = match routed {
+        // Held until the tunnel closes: it is load on its backend for as long as it is open.
+        let (address, idle, _counted) = match routed {
             Ok(routed) => routed,
             Err(ended) => {
                 if let Some(block) = hello {
@@ -1289,7 +1320,7 @@ impl Worker {
         &self,
         listener: usize,
         name: Option<&str>,
-    ) -> Result<(SocketAddr, Duration), Tunnel> {
+    ) -> Result<(SocketAddr, Duration, InFlight), Tunnel> {
         let snapshot = self.proxy.current.load();
         let Some(compiled) = snapshot.listener(listener) else {
             return Err(Tunnel::Refused);
@@ -1308,13 +1339,14 @@ impl Worker {
             return Err(Tunnel::NoBackend);
         };
         let destinations = snapshot.destinations.of(upstream.0);
-        let healthy = |at: usize| destinations.get(at).is_some_and(|d| d.is_healthy());
-        let Some(identity) = pick_healthy(destinations.len(), random(), healthy)
-            .and_then(|at| snapshot.destinations.at(upstream.0, at))
+        let picked = balance_of(&self.balancing, &snapshot, upstream.0)
+            .and_then(|balance| balance.pick(destinations, &Tried::default()));
+        let Some((identity, counted)) = picked
+            .and_then(|(at, counted)| Some((snapshot.destinations.at(upstream.0, at)?, counted)))
         else {
             return Err(Tunnel::NoBackend);
         };
-        Ok((identity.address(), compiled.tunnel_idle))
+        Ok((identity.address(), compiled.tunnel_idle, counted))
     }
 
     /// Reads a TLS client's ClientHello into `into`, within the first-request deadline
@@ -1506,7 +1538,10 @@ impl Worker {
         // from and everything it named looks like an ordinary field, so a trailer of that
         // name would travel on ([13 §4](../../docs/13-http1-upstream.md)).
         let nominated = crate::hop_by_hop::nominated(head.outgoing());
-        let mut directed = match self.proxy.direct(listener, client, &mut head, id) {
+        let mut directed = match self
+            .proxy
+            .direct(listener, client, &mut head, id, &self.balancing)
+        {
             Ok(Directing::Upstream(directed)) => directed,
             Ok(Directing::Redirect(redirect)) => {
                 return self.proxy.redirect(listener, redirect, call).into();
@@ -1574,6 +1609,7 @@ impl Worker {
         let Some(admitted) = self.admit() else {
             return self.proxy.answer_to(listener, Answer::TooBusy, call).into();
         };
+        let admitted = admitted.counting(directed.counted.take());
         let body = if directed.mirrors.is_empty() {
             body
         } else {
@@ -1778,7 +1814,12 @@ impl Worker {
             budget.deposit(Instant::now());
         });
         let upstream = || self.proxy.metrics.upstream(directed.upstream_slot);
-        let mut tried = 0;
+        let mut retried = 0;
+        // Where the tries have gone, for the next to keep away from (03 §6).
+        let mut tried = Tried::default();
+        if let Some(others) = directed.others.as_deref() {
+            tried.add(others.first);
+        }
         loop {
             let outcome = self
                 .attempt(
@@ -1793,7 +1834,7 @@ impl Worker {
                     timing,
                 )
                 .await;
-            if tried >= retry.attempts || !wants_again(retry, &outcome) {
+            if retried >= retry.attempts || !wants_again(retry, &outcome) {
                 return outcome;
             }
             let Some(replayed) = recorded.replay() else {
@@ -1810,7 +1851,7 @@ impl Worker {
                 }
                 return outcome;
             }
-            let wait = backoff(retry, tried);
+            let wait = backoff(retry, retried);
             if deadline.is_some_and(|deadline| Instant::now() + wait >= deadline) {
                 return outcome;
             }
@@ -1819,9 +1860,10 @@ impl Worker {
             let Some(next) = self.admit() else {
                 return outcome;
             };
-            let Some((target, drawn)) = directed.draw(head.uri()) else {
+            let Some((target, drawn, at, counted)) = directed.draw(head.uri(), &tried) else {
                 return outcome;
             };
+            tried.add(at);
             drop(outcome);
             tokio::time::sleep(wait).await;
             if let Some(upstream) = upstream() {
@@ -1830,8 +1872,8 @@ impl Worker {
             head.set_uri(target);
             endpoint = drawn;
             body = RequestBody::Replayed(replayed);
-            admitted = next;
-            tried += 1;
+            admitted = next.counting(Some(counted));
+            retried += 1;
         }
     }
 
@@ -1883,8 +1925,11 @@ impl Worker {
         };
         let placed: Vec<_> = mirrors
             .into_iter()
-            .filter_map(|mirror| match self.admit() {
-                Some(admitted) => Some((mirror, admitted)),
+            .filter_map(|mut mirror| match self.admit() {
+                Some(admitted) => {
+                    let counted = mirror.counted.take();
+                    Some((mirror, admitted.counting(counted)))
+                }
                 None => {
                     given_up(mirror.upstream_slot, |counters| &counters.mirrors_busy);
                     None
@@ -1929,6 +1974,7 @@ impl Worker {
                     rule: None,
                     upstream_slot: mirror.upstream_slot,
                     endpoint: Arc::clone(&mirror.endpoint),
+                    counted: None,
                     others: None,
                     mirrors: Vec::new(),
                     websocket: None,
@@ -2078,7 +2124,7 @@ impl Worker {
         nominated: &[HeaderName],
         sending: Sending,
         body: RequestBody,
-        admitted: Admitted,
+        mut admitted: Admitted,
         interim: Option<Interim>,
         head_by_rule: bool,
     ) -> Result<(RawAnswer, Body), Answer> {
@@ -2134,7 +2180,7 @@ impl Worker {
         let (read, mut body) = answer;
         if let Some(handshake) = &directed.websocket {
             if read.status() == StatusCode::SWITCHING_PROTOCOLS {
-                return self.switch(read, *body, handshake, listening);
+                return self.switch(read, *body, handshake, listening, admitted.count());
             }
             // A refused handshake's connection could carry another request, but not one
             // whose credentials may have bound it to this client (13 §6).
@@ -2166,6 +2212,7 @@ impl Worker {
         body: H1Body<UpstreamSocket, RequestBody>,
         handshake: &Handshake,
         listening: Option<Interim>,
+        counted: Option<InFlight>,
     ) -> Result<(RawAnswer, Body), Answer> {
         let Toward::Upgrade(ours) = &handshake.toward else {
             return Err(Answer::UpstreamFailed);
@@ -2175,7 +2222,7 @@ impl Worker {
             self.proxy.metrics.stopped(Stopped::Codec);
             return Err(Answer::UpstreamFailed);
         };
-        interim.switch(self.switched(Backend::Socket(backend), leftover, handshake));
+        interim.switch(self.switched(Backend::Socket(backend), leftover, handshake, counted));
         Ok((read, Body::Empty))
     }
 
@@ -2186,6 +2233,7 @@ impl Worker {
         backend: Backend,
         leftover: Option<Block>,
         handshake: &Handshake,
+        counted: Option<InFlight>,
     ) -> Switched {
         let proxy = Arc::clone(&self.proxy);
         let listener = handshake.listener;
@@ -2205,6 +2253,7 @@ impl Worker {
                     counters.tunnel(carried.into());
                 }
             }),
+            counted,
         }
     }
 
@@ -2220,7 +2269,7 @@ impl Worker {
         endpoint: &Arc<ReuseIdentity>,
         head: &H,
         handshake: &Handshake,
-        admitted: Admitted,
+        mut admitted: Admitted,
         interim: Option<Interim>,
         timing: Timing,
     ) -> Result<Answered<Body>, Answer> {
@@ -2271,7 +2320,8 @@ impl Worker {
                 let Some(interim) = interim else {
                     return Err(Answer::UpstreamFailed);
                 };
-                interim.switch(self.switched(Backend::H2(stream), None, handshake));
+                let counted = admitted.count();
+                interim.switch(self.switched(Backend::H2(stream), None, handshake, counted));
                 (parts, Body::Empty)
             }
             Connected::Refused(parts, answer) => {
@@ -2474,6 +2524,7 @@ impl Proxy {
         client: &Client,
         head: &mut H,
         id: Option<&HeaderValue>,
+        balancing: &RefCell<Balancing>,
     ) -> Result<Directing, Answer> {
         let snapshot = self.current.load();
         let came_on = listener;
@@ -2506,12 +2557,10 @@ impl Proxy {
             .get(upstream)
             .ok_or(Answer::NoBackend)?;
         let destinations = snapshot.destinations.of(upstream);
-        let at = pick_healthy(destinations.len(), random(), |at| {
-            destinations
-                .get(at)
-                .is_some_and(|destination| destination.is_healthy())
-        })
-        .ok_or(Answer::NoEndpoints)?;
+        let balance = balance_of(balancing, &snapshot, upstream).ok_or(Answer::NoEndpoints)?;
+        let (at, counted) = balance
+            .pick(destinations, &Tried::default())
+            .ok_or(Answer::NoEndpoints)?;
         let endpoint = endpoints.get(at).ok_or(Answer::NoEndpoints)?;
         let identity = snapshot
             .destinations
@@ -2570,17 +2619,17 @@ impl Proxy {
                 continue;
             }
             let destinations = snapshot.destinations.of(upstream);
-            let found = pick_healthy(destinations.len(), random(), |at| {
-                destinations
-                    .get(at)
-                    .is_some_and(|destination| destination.is_healthy())
-            })
-            .and_then(|at| {
+            let found = balance_of(balancing, &snapshot, upstream).and_then(|balance| {
+                let (at, counted) = balance.pick(destinations, &Tried::default())?;
                 let authority = snapshot.endpoints.get(upstream)?.get(at)?;
-                Some((at_endpoint(&target, authority)?, destinations.get(at)?))
+                Some((
+                    at_endpoint(&target, authority)?,
+                    destinations.get(at)?,
+                    counted,
+                ))
             });
             let counters = self.metrics.upstream(slot);
-            let Some((target, destination)) = found else {
+            let Some((target, destination, counted)) = found else {
                 if let Some(counters) = counters {
                     counters.mirrors_nowhere.inc();
                 }
@@ -2592,6 +2641,7 @@ impl Proxy {
             mirrors.push(Mirrored {
                 upstream_slot: slot,
                 endpoint: Arc::clone(destination),
+                counted: Some(counted),
                 target,
                 fields,
             });
@@ -2601,16 +2651,18 @@ impl Proxy {
             || forward.rule.timeouts().is_some();
         // Only a request that may be sent again keeps where else it could go.
         let others = forward.rule.retry().map(|_| {
-            endpoints
-                .iter()
-                .cloned()
-                .zip(destinations.iter().map(Arc::clone))
-                .collect()
+            Box::new(Others {
+                authorities: endpoints.clone(),
+                destinations: destinations.to_vec(),
+                balance,
+                first: at,
+            })
         });
         Ok(Directing::Upstream(Directed {
             rule: kept.then(|| Arc::clone(forward.rule)),
             upstream_slot,
             endpoint: Arc::clone(identity),
+            counted: Some(counted),
             others,
             mirrors,
             websocket,
@@ -2642,9 +2694,11 @@ struct Directed {
     /// The endpoint this request was directed to, taken from the same snapshot as the
     /// route so that no reload can come between the two.
     endpoint: Arc<ReuseIdentity>,
-    /// Every endpoint of the upstream, for a request its rule may send again: each try
-    /// draws afresh.
-    others: Option<Vec<(Authority, Arc<ReuseIdentity>)>>,
+    /// Its count at that endpoint, until the place its exchange is given takes it.
+    counted: Option<InFlight>,
+    /// Every endpoint of the upstream, for a request its rule may send again. Boxed: only
+    /// such a request has it.
+    others: Option<Box<Others>>,
     /// Where the copies of it go, for a request its rule mirrors.
     mirrors: Vec<Mirrored>,
     /// For a WebSocket handshake carried to an HTTP/1.1 backend (19 §2). Boxed: rare, and
@@ -2681,10 +2735,25 @@ enum Toward {
 /// A WebSocket's idle bound where its rule states none (19 §5).
 const TUNNEL_IDLE: Duration = Duration::from_secs(3600);
 
+/// Where else a request its rule may send again can go: every endpoint of its upstream, of
+/// the snapshot it was directed on, and the worker's balancing of them (03 §6).
+struct Others {
+    /// By position of the endpoint: where to connect, in the form a target takes.
+    authorities: Vec<Authority>,
+    /// By position of the endpoint.
+    destinations: Vec<Arc<ReuseIdentity>>,
+    balance: Rc<balancing::Upstream>,
+    /// Where the first try went.
+    first: usize,
+}
+
 /// Where one copy of a request goes: drawn with the request, from the same snapshot.
 struct Mirrored {
     upstream_slot: usize,
     endpoint: Arc<ReuseIdentity>,
+    /// Its count at that endpoint, until the place its exchange is given takes it: a copy
+    /// is load on the mirror's backend like any exchange (03 §6).
+    counted: Option<InFlight>,
     target: Uri,
     /// The fields as they stood at the mirror's place, before a change after it; none for
     /// a copy of the request as it goes upstream.
@@ -2692,16 +2761,24 @@ struct Mirrored {
 }
 
 impl Directed {
-    /// An endpoint drawn afresh for another try, and the target at it.
-    fn draw(&self, target: &Uri) -> Option<(Uri, Arc<ReuseIdentity>)> {
-        let others = self.others.as_ref()?;
-        let at = pick_healthy(others.len(), random(), |at| {
-            others
-                .get(at)
-                .is_some_and(|(_, destination)| destination.is_healthy())
-        })?;
-        let (authority, destination) = others.get(at)?;
-        Some((at_endpoint(target, authority)?, Arc::clone(destination)))
+    /// The endpoint for another try, which keeps away from those in `tried`, as the
+    /// upstream's balancer picks it: the target at it, its destination, its position and its
+    /// count.
+    fn draw(
+        &self,
+        target: &Uri,
+        tried: &Tried,
+    ) -> Option<(Uri, Arc<ReuseIdentity>, usize, InFlight)> {
+        let others = self.others.as_deref()?;
+        let (at, counted) = others.balance.pick(&others.destinations, tried)?;
+        let authority = others.authorities.get(at)?;
+        let destination = others.destinations.get(at)?;
+        Some((
+            at_endpoint(target, authority)?,
+            Arc::clone(destination),
+            at,
+            counted,
+        ))
     }
 }
 
@@ -2979,31 +3056,20 @@ fn authority(endpoint: &SocketAddr) -> Result<Authority, ProxyError> {
     Authority::try_from(endpoint.to_string()).map_err(|_| ProxyError::Endpoint(*endpoint))
 }
 
-/// One of the endpoints, each as likely as any other; `None` if there are none.
-fn pick_at(endpoints: usize, random: u64) -> Option<usize> {
-    let count = u64::try_from(endpoints).ok()?;
-    usize::try_from(random.checked_rem(count)?).ok()
-}
-
-/// One of the endpoints that `healthy` says serve, each as likely as any other — unless
-/// fewer than half of them do, when their health is set aside and any may be picked:
-/// Envoy's panic threshold, at its default of half. Probes that fail most of an upstream
-/// are more likely wrong themselves, or about to put the rest under a load that fails them
-/// too, than a reason to answer every request 503.
-///
-/// Costs one look when the endpoint first drawn serves, which is the usual case.
-fn pick_healthy(endpoints: usize, random: u64, healthy: impl Fn(usize) -> bool) -> Option<usize> {
-    let first = pick_at(endpoints, random)?;
-    if healthy(first) {
-        return Some(first);
-    }
-    let serving = (0..endpoints).filter(|at| healthy(*at)).count();
-    if serving * 2 < endpoints {
-        return Some(first);
-    }
-    // Another draw, among those that serve.
-    let nth = pick_at(serving, random / endpoints as u64)?;
-    (0..endpoints).filter(|at| healthy(*at)).nth(nth)
+/// The worker's balancing state for the upstream at `upstream` of `snapshot`, made for it
+/// first if it was made for an earlier config.
+fn balance_of(
+    balancing: &RefCell<Balancing>,
+    snapshot: &Snapshot,
+    upstream: usize,
+) -> Option<Rc<balancing::Upstream>> {
+    let mut balancing = balancing.borrow_mut();
+    balancing.refresh(
+        snapshot.generation,
+        &snapshot.config,
+        &snapshot.destinations,
+    );
+    balancing.upstream(upstream).cloned()
 }
 
 /// The same path and query, at the endpoint: the form in which the client is told where to
@@ -3997,7 +4063,7 @@ routes:
             remove: [expect]
         forward: {{ backends: [{{ upstream: up, weight: 1 }}] }}
 upstreams:
-  up: {{ endpoints: ["{upstream}"] }}
+  up: {{ load_balancer: p2c, endpoints: ["{upstream}"] }}
 "#
                 );
                 let config: Config = serde_saphyr::from_str(&yaml).unwrap();
@@ -4616,7 +4682,7 @@ upstreams:
             "listeners: {{ db: {{ address: \"127.0.0.1:0\", protocol: tcp{extra} }} }}\n\
              routes: []\n\
              tcp_routes: [{{ name: db, listeners: [db], backends: [{{ upstream: up, weight: 1 }}] }}]\n\
-             upstreams: {{ up: {{ endpoints: [\"{backend}\"] }} }}\n"
+             upstreams: {{ up: {{ load_balancer: p2c, endpoints: [\"{backend}\"] }} }}\n"
         )
     }
 
@@ -4672,6 +4738,56 @@ upstreams:
             }
         });
         address
+    }
+
+    /// A backend that says `name` to every connection as it accepts it, and then reads
+    /// until the connection ends.
+    async fn naming_backend(name: &'static str) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            while let Ok((mut stream, _)) = socket.accept().await {
+                tokio::task::spawn_local(async move {
+                    stream.write_all(name.as_bytes()).await.unwrap();
+                    let mut rest = Vec::new();
+                    let _ended = stream.read_to_end(&mut rest).await;
+                });
+            }
+        });
+        address
+    }
+
+    /// A tunnel is load on its backend for as long as it is open (03 §6): with every tunnel
+    /// held, `p2c` sends each new one to the backend with fewer, so after every second one
+    /// both have as many. Were an open tunnel not counted, each would go either way.
+    #[tokio::test]
+    async fn an_open_tunnel_counts_against_its_backend() {
+        use tokio::io::AsyncReadExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let a = naming_backend("a").await;
+                let b = naming_backend("b").await;
+                let yaml = tcp_to(a, "").replace(
+                    &format!("endpoints: [\"{a}\"]"),
+                    &format!("endpoints: [\"{a}\", \"{b}\"]"),
+                );
+                let (front, _worker) = passing(&yaml).await;
+                let mut held = Vec::new();
+                let mut went = std::collections::BTreeMap::new();
+                for opened in 1..=20 {
+                    let mut client = TcpStream::connect(front).await.unwrap();
+                    let mut name = [0; 1];
+                    bounded(client.read_exact(&mut name)).await.unwrap();
+                    *went.entry(name[0]).or_insert(0) += 1;
+                    held.push(client);
+                    if opened % 2 == 0 {
+                        assert_eq!(went[&b'a'], went[&b'b'], "after {opened}: {went:?}");
+                    }
+                }
+            })
+            .await;
     }
 
     /// A `tcp` listener's connection is carried to its route's backend and back, byte for
@@ -4851,7 +4967,7 @@ upstreams:
                      tls_routes:\n\
                      \x20 - {{ name: exact, listeners: [sni], hostnames: [{{ name: api.example.test, falls_through: true }}], backends: [{{ upstream: exact, weight: 1 }}] }}\n\
                      \x20 - {{ name: rest, listeners: [sni], hostnames: [{{ name: \"*.example.test\", wildcard: any_labels, falls_through: true }}], backends: [{{ upstream: wildcard, weight: 1 }}] }}\n\
-                     upstreams: {{ exact: {{ endpoints: [\"{exact}\"] }}, wildcard: {{ endpoints: [\"{wildcard}\"] }} }}\n"
+                     upstreams: {{ exact: {{ load_balancer: p2c, endpoints: [\"{exact}\"] }}, wildcard: {{ load_balancer: p2c, endpoints: [\"{wildcard}\"] }} }}\n"
                 );
                 let (front, worker) = passing(&yaml).await;
                 assert_eq!(
@@ -4885,7 +5001,7 @@ upstreams:
                     "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls }} }}\n\
                      routes: []\n\
                      tls_routes: [{{ name: a, listeners: [sni], hostnames: [{{ name: a.test, falls_through: true }}], backends: [{{ upstream: up, weight: 1 }}] }}]\n\
-                     upstreams: {{ up: {{ endpoints: [\"{backend}\"] }} }}\n"
+                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: [\"{backend}\"] }} }}\n"
                 );
                 let (front, worker) = passing(&yaml).await;
                 let mut client = TcpStream::connect(front).await.unwrap();
@@ -10097,7 +10213,7 @@ routes:
           - path: {{ prefix: / }}
         forward: {{ backends: [{{ upstream: up, weight: 1 }}] }}
 upstreams:
-  up: {{ endpoints: ["{upstream}"] }}
+  up: {{ load_balancer: p2c, endpoints: ["{upstream}"] }}
 "#
         );
         serde_saphyr::from_str(&yaml).unwrap()
@@ -10171,7 +10287,7 @@ upstreams:
     fn upstreams(named: &[(&str, &str)]) -> Compiled {
         let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
         for (name, address) in named {
-            yaml += &format!("  {name}: {{ endpoints: [\"{address}\"] }}\n");
+            yaml += &format!("  {name}: {{ load_balancer: p2c, endpoints: [\"{address}\"] }}\n");
         }
         let config: Config = serde_saphyr::from_str(&yaml).unwrap();
         compile(&config).unwrap()
@@ -10335,39 +10451,6 @@ upstreams:
         compile(&config).unwrap()
     }
 
-    proptest::proptest! {
-        /// An endpoint is picked from those that serve while at least half do, and from
-        /// all of them when fewer do; never from nowhere.
-        #[test]
-        fn a_pick_follows_health_down_to_the_panic_threshold(
-            health in proptest::collection::vec(proptest::bool::ANY, 0..12),
-            random in proptest::num::u64::ANY,
-        ) {
-            let picked = pick_healthy(health.len(), random, |at| health[at]);
-            let serving = health.iter().filter(|healthy| **healthy).count();
-            match picked {
-                None => proptest::prop_assert!(health.is_empty()),
-                Some(at) => {
-                    proptest::prop_assert!(at < health.len());
-                    if serving * 2 >= health.len() {
-                        proptest::prop_assert!(health[at], "an unhealthy pick above the threshold");
-                    }
-                }
-            }
-        }
-    }
-
-    /// Every endpoint that serves can be picked, whichever the first draw lands on.
-    #[test]
-    fn every_serving_endpoint_can_be_picked() {
-        let health = [false, true, false, true, true];
-        let mut seen = std::collections::BTreeSet::new();
-        for random in 0..100 {
-            seen.insert(pick_healthy(health.len(), random, |at| health[at]).unwrap());
-        }
-        assert_eq!(seen, std::collections::BTreeSet::from([1, 3, 4]));
-    }
-
     #[test]
     fn a_snapshot_knows_where_it_has_the_listeners_that_have_sockets() {
         let sockets = ["admin".to_owned(), "web".to_owned()];
@@ -10406,18 +10489,6 @@ upstreams:
     fn an_endpoint_is_written_as_a_target_would_have_it() {
         assert_eq!(authorities(&["127.0.0.1:80"]), ["127.0.0.1:80"]);
         assert_eq!(authorities(&["[2001:db8::7]:8080"]), ["[2001:db8::7]:8080"]);
-    }
-
-    #[test]
-    fn every_endpoint_gets_its_turn() {
-        let picked: Vec<usize> = (0..4).map(|random| pick_at(3, random).unwrap()).collect();
-        assert_eq!(picked, [0, 1, 2, 0]);
-        assert_eq!(pick_at(3, u64::MAX).unwrap(), 0);
-    }
-
-    #[test]
-    fn no_endpoints_is_nowhere_to_connect() {
-        assert_eq!(pick_at(0, 7), None);
     }
 
     #[test]

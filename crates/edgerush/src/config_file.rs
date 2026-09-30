@@ -93,7 +93,8 @@ mod tests {
     use super::*;
 
     const NOTHING: &str = "listeners: {}\nroutes: []\nupstreams: {}\n";
-    const ONE_UPSTREAM: &str = "listeners: {}\nroutes: []\nupstreams: { web: { endpoints: [] } }\n";
+    const ONE_UPSTREAM: &str =
+        "listeners: {}\nroutes: []\nupstreams: { web: { load_balancer: p2c, endpoints: [] } }\n";
 
     /// A file of the test's own in the system's temporary directory, gone with the test.
     struct Scratch(PathBuf);

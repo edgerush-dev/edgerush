@@ -280,7 +280,10 @@ mod tests {
         let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
         for (name, addresses) in upstreams {
             let listed: Vec<String> = addresses.iter().map(|a| format!("\"{a}\"")).collect();
-            yaml += &format!("  {name}: {{ endpoints: [{}] }}\n", listed.join(", "));
+            yaml += &format!(
+                "  {name}: {{ load_balancer: p2c, endpoints: [{}] }}\n",
+                listed.join(", ")
+            );
         }
         let config: Config = serde_saphyr::from_str(&yaml).unwrap();
         Destinations::reconcile(
@@ -503,7 +506,7 @@ mod tests {
         let _after = Destinations::reconcile(
             &compile(
                 &serde_saphyr::from_str::<Config>(
-                    "listeners: {}\nroutes: []\nupstreams:\n  a: { endpoints: [\"127.0.0.1:1\"] }\n",
+                    "listeners: {}\nroutes: []\nupstreams:\n  a: { load_balancer: p2c, endpoints: [\"127.0.0.1:1\"] }\n",
                 )
                 .unwrap(),
             )
@@ -545,7 +548,7 @@ mod tests {
         for round in 0..64u16 {
             let address = format!("127.0.0.1:{}", round + 1);
             let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
-            yaml += &format!("  web: {{ endpoints: [\"{address}\"] }}\n");
+            yaml += &format!("  web: {{ load_balancer: p2c, endpoints: [\"{address}\"] }}\n");
             let config: Config = serde_saphyr::from_str(&yaml).unwrap();
             previous = Destinations::reconcile(&compile(&config).unwrap(), &previous, &keys, &[]);
 
