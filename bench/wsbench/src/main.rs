@@ -408,7 +408,13 @@ async fn waited(due: Instant) -> Instant {
     Instant::now()
 }
 
+/// A connection that has made its handshake, and what came after the 101's head.
+type Opened = (Box<dyn Io>, Vec<u8>);
+
 /// `connections` kept busy for `seconds`, or sending `rate` messages a second among them.
+/// All of them are open, their handshakes made, before the clock starts: what is timed is
+/// messages, and a handshake that took long would otherwise be the latency of the first
+/// messages due while it was made.
 async fn echo(
     target: Arc<Target>,
     connections: u64,
@@ -416,15 +422,26 @@ async fn echo(
     size: usize,
     rate: Option<f64>,
 ) -> Tally {
+    let opening: Vec<_> = (0..connections)
+        .map(|index| {
+            let target = Arc::clone(&target);
+            tokio::spawn(async move { timeout(STALL, target.open(index)).await.ok()?.ok() })
+        })
+        .collect();
+    let mut opened = Vec::with_capacity(opening.len());
+    for connection in opening {
+        opened.push(connection.await.ok().flatten());
+    }
     let start = Instant::now();
     let deadline = start + Duration::from_secs_f64(seconds);
     let every = rate.map(|rate| Duration::from_secs_f64(connections as f64 / rate));
-    let running: Vec<_> = (0..connections)
-        .map(|index| {
-            let target = Arc::clone(&target);
+    let running: Vec<_> = opened
+        .into_iter()
+        .zip(0..connections)
+        .map(|(connection, index)| {
             // The first of each connection's messages spread over the first interval.
             let first = every.map(|every| start + every.mul_f64(index as f64 / connections as f64));
-            tokio::spawn(busy(target, index, size, deadline, first.zip(every)))
+            tokio::spawn(busy(connection, index, size, deadline, first.zip(every)))
         })
         .collect();
     let mut tally = Tally::default();
@@ -440,14 +457,14 @@ async fn echo(
 /// One connection of `echo`: a message at a time until `deadline`, when each is due if
 /// `schedule` says, and then a Close each way.
 async fn busy(
-    target: Arc<Target>,
+    connection: Option<Opened>,
     index: u64,
     size: usize,
     deadline: Instant,
     schedule: Option<(Instant, Duration)>,
 ) -> Tally {
     let mut tally = Tally::default();
-    let Ok(Ok((mut io, mut buffer))) = timeout(STALL, target.open(index)).await else {
+    let Some((mut io, mut buffer)) = connection else {
         tally.failed += 1;
         return tally;
     };
@@ -619,6 +636,39 @@ mod tests {
             assert_eq!(waited(passed).await, passed);
             let due = Instant::now() + Duration::from_millis(5);
             assert!(waited(due).await > due);
+        });
+    }
+
+    /// Connections are open before the clock starts: a backend that takes 300 ms to answer
+    /// each handshake adds nothing to the latency of messages sent at a rate.
+    #[test]
+    fn a_slow_handshake_is_not_a_messages_latency() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        answer(stream).await
+                    });
+                }
+            });
+            let target = Arc::new(Target {
+                address,
+                host: "bench.example.com".to_owned(),
+                path: "/ws".to_owned(),
+                tls: None,
+            });
+            let paced = echo(target, 4, 0.5, 64, Some(100.0)).await;
+            assert_eq!(paced.failed, 0);
+            let slowest = paced.took.iter().max().copied().unwrap_or(0);
+            assert!(slowest < 100_000, "a message took {slowest} µs");
         });
     }
 
