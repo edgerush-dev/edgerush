@@ -318,8 +318,12 @@ where
         loop {
             let mut moved = false;
             // Past its release time, a read that finds nothing gives its block back.
-            let quiet = releasing || keep_until.is_none_or(|until| Instant::now() >= until);
-            releasing = false;
+            // A read that finds nothing keeps its block only while the tunnel is busy: bytes
+            // moved within the release time, which the alarm ends. No clock is read for it.
+            if std::mem::take(&mut releasing) {
+                keep_until = None;
+            }
+            let quiet = keep_until.is_none();
             for (way, from_client) in [(&mut up, true), (&mut down, false)] {
                 if way.shut {
                     continue;
@@ -544,10 +548,14 @@ where
                 Poll::Pending => Poll::Pending,
             };
         }
-        // Into the block the way holds, if it holds one. Otherwise into a little room on the
-        // stack first: a read that finds nothing — what most wakes of a quiet tunnel come
-        // to — takes no block at all, and one is taken only for bytes that have come, so
-        // that a worker short of storage does not end its quiet tunnels for waking them.
+        // Into the block the way holds, or one taken to read into. A worker with none to
+        // give reads into a little room on the stack instead: a read that finds nothing —
+        // what most wakes of a quiet tunnel come to — needs no block, and a worker short of
+        // storage does not end its quiet tunnels merely for waking them.
+        let spare = match spare {
+            Some(block) => Some(block),
+            None => blocks.borrow_mut().take().ok(),
+        };
         let Some(mut block) = spare else {
             let mut probe = [MaybeUninit::<u8>::uninit(); PROBE];
             let mut read = ReadBuf::uninit(&mut probe);
@@ -837,6 +845,50 @@ mod tests {
         .await;
         assert_eq!(carried.0, Carried::Closed);
         assert_eq!(carried.1, (b"early-late".to_vec(), b"hello".to_vec()));
+    }
+
+    /// A tunnel that has carried nothing holds no block, however often it is woken: a read
+    /// that finds nothing gives back the block it took.
+    #[tokio::test]
+    async fn a_tunnel_that_has_carried_nothing_holds_no_block() {
+        let timers = Timers::new();
+        let drain = Drain::default();
+        // Room for one block: none is left to lend if the tunnel kept the one it read into.
+        let blocks = blocks_within(SMALL);
+        let ((mut client, mut backend), (mut client_side, mut backend_side)) = ends();
+        let carried = within(timers.driving(async {
+            let carrying = carry(
+                &mut client,
+                &mut backend,
+                None,
+                None,
+                &blocks,
+                BOUNDS,
+                &timers,
+                &drain,
+            );
+            let watching = async {
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+                let lent = blocks.borrow_mut().take();
+                let free = lent.is_ok();
+                if let Ok(block) = lent {
+                    blocks.borrow_mut().give(block);
+                }
+                client_side.shutdown().await.unwrap();
+                backend_side.shutdown().await.unwrap();
+                free
+            };
+            tokio::join!(carrying, watching)
+        }))
+        .await;
+        assert_eq!(carried.0, Carried::Closed);
+        // What was taken to read into went back when the reads found nothing.
+        assert!(
+            carried.1,
+            "a block was kept by a tunnel that carried nothing"
+        );
     }
 
     /// A read that finds nothing needs no block: a worker with no storage left at all
