@@ -255,6 +255,9 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     // Before a socket is opened, as every socket is an open file.
     let open_files = crate::limits::raise_open_files();
     let connections = crate::limits::connections_per_worker(open_files, workers);
+    let memory = crate::limits::memory();
+    let mut limits = limits;
+    limits.storage = crate::limits::storage_per_worker(memory, workers);
     // One worker is alone on every listener's port and needs nothing of the kernel; it is
     // from the second on that they share one, which is what SO_REUSEPORT is for.
     let port = if workers == NonZeroUsize::MIN {
@@ -338,6 +341,13 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     say(
         stderr,
         format_args!("{}", crate::limits::described(open_files, connections)),
+    );
+    say(
+        stderr,
+        format_args!(
+            "{}",
+            crate::limits::described_memory(memory, limits.storage)
+        ),
     );
 
     // Until told to stop; `stopping` is still held here, so the channel cannot close.

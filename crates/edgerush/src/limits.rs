@@ -1,5 +1,5 @@
-//! The open files the process may hold, and the connections that allows each worker
-//! ([03 §9] in the docs).
+//! The open files and the memory the process may hold, and what that allows each worker:
+//! connections, and storage for requests ([03 §9] in the docs).
 //!
 //! A container is given the open-file limits of whatever starts it, and under containerd
 //! 2.x that is a soft limit of 1,024 with a hard limit of 524,288: about a thousand
@@ -12,10 +12,28 @@
 //! cap — where the fair share between listeners and the pause that costs nothing are —
 //! rather than at the descriptors running out, where accepting fails and is tried again.
 //!
+//! A pod's memory limit is enforced by the kernel through its cgroup: at `memory.max` the
+//! OOM killer ends the process, every connection with it, and at `memory.high`, where one
+//! is set, the pod is throttled with reclaim. A worker's storage for requests is a fixed
+//! number that knows nothing of either, so it is sized from the lower of the two as the
+//! process starts, as Envoy Gateway sizes Envoy's heap from the pod's limit: half of it,
+//! shared among the workers, for what the storage account counts, and half for what it does
+//! not — connection and TLS state, the kernel's socket buffers, what the allocator keeps.
+//! Never more than a worker's own bound, which is also what it has without a limit.
+//!
 //! [03 §9]: ../../../docs/03-data-plane.md
 
 use crate::per_core::CONNECTIONS_PER_WORKER;
+use edgerush_proxy::H1Limits;
 use std::num::NonZeroUsize;
+
+/// The least storage a worker is given, however small the limit: room for 128 heads of the
+/// largest size, so that no limit leaves a worker unable to read a request.
+const STORAGE_FLOOR: usize = 8 * 1024 * 1024;
+
+/// Where the pod's limit is read, in a cgroup namespace or not.
+#[cfg(target_os = "linux")]
+const CGROUPS: &str = "/sys/fs/cgroup";
 
 /// Open files kept for what is not a client's connection: the listening sockets, the
 /// scrape's, the health checker's probes, files. Never more than half of a small limit.
@@ -101,6 +119,115 @@ pub(crate) fn connections_per_worker(open_files: OpenFiles, workers: NonZeroUsiz
     usize::try_from(each)
         .unwrap_or(usize::MAX)
         .clamp(1, CONNECTIONS_PER_WORKER)
+}
+
+/// What memory the pod may use, as its cgroup says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Memory {
+    /// No limit, or none that could be read: no cgroup v2, a platform without cgroups, or
+    /// `max` in both files.
+    NoLimit,
+    /// The lower of `memory.max` and `memory.high`, and which of them it is.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only Linux has cgroups to read")
+    )]
+    Limit { bytes: u64, from: &'static str },
+}
+
+/// The pod's memory limit, read from the process's own cgroup (Linux, cgroup v2).
+#[cfg(target_os = "linux")]
+pub(crate) fn memory() -> Memory {
+    let Ok(cgroups) = std::fs::read_to_string("/proc/self/cgroup") else {
+        return Memory::NoLimit;
+    };
+    let Some(own) = cgroup_of(&cgroups) else {
+        return Memory::NoLimit;
+    };
+    let directory = std::path::Path::new(CGROUPS).join(own.trim_start_matches('/'));
+    let read = |file: &str| {
+        std::fs::read_to_string(directory.join(file))
+            .ok()
+            .and_then(|written| limit_in(&written))
+    };
+    lower(read("memory.max"), read("memory.high"))
+}
+
+/// There are no cgroups to read.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn memory() -> Memory {
+    Memory::NoLimit
+}
+
+/// The process's cgroup v2 path in what `/proc/self/cgroup` says: the line `0::<path>`,
+/// `/` inside a cgroup namespace. None where there is no cgroup v2.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only Linux has cgroups to read")
+)]
+fn cgroup_of(cgroups: &str) -> Option<&str> {
+    cgroups.lines().find_map(|line| line.strip_prefix("0::"))
+}
+
+/// The limit a cgroup's `memory.max` or `memory.high` says, none for `max`. What cannot be
+/// read is taken as no limit, never as a small one.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only Linux has cgroups to read")
+)]
+fn limit_in(written: &str) -> Option<u64> {
+    written.trim().parse().ok()
+}
+
+/// The lower of the two limits that are there, and which it is.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only Linux has cgroups to read")
+)]
+fn lower(max: Option<u64>, high: Option<u64>) -> Memory {
+    match (max, high) {
+        (None, None) => Memory::NoLimit,
+        (Some(bytes), None) => Memory::Limit {
+            bytes,
+            from: "memory.max",
+        },
+        (Some(max), Some(high)) if max <= high => Memory::Limit {
+            bytes: max,
+            from: "memory.max",
+        },
+        (_, Some(bytes)) => Memory::Limit {
+            bytes,
+            from: "memory.high",
+        },
+    }
+}
+
+/// What each of `workers` may hold for requests under `memory`: half of the limit shared
+/// out, never more than a worker's own bound nor less than [`STORAGE_FLOOR`].
+pub(crate) fn storage_per_worker(memory: Memory, workers: NonZeroUsize) -> usize {
+    let ceiling = H1Limits::default().storage;
+    let Memory::Limit { bytes, .. } = memory else {
+        return ceiling;
+    };
+    let workers = u64::try_from(workers.get()).unwrap_or(u64::MAX);
+    let each = bytes / 2 / workers;
+    usize::try_from(each)
+        .unwrap_or(usize::MAX)
+        .clamp(STORAGE_FLOOR.min(ceiling), ceiling)
+}
+
+/// What the start says of the pod's memory and the storage it allows each worker.
+pub(crate) fn described_memory(memory: Memory, storage: usize) -> String {
+    let each = format!("{} MiB storage a worker", storage / (1024 * 1024));
+    match memory {
+        Memory::NoLimit => format!("memory: no limit; {each}"),
+        Memory::Limit { bytes, from } => {
+            format!(
+                "memory: limit {} MiB ({from}); {each}",
+                bytes / (1024 * 1024)
+            )
+        }
+    }
 }
 
 /// What the start says of the open files and the connections they allow each worker.
@@ -209,6 +336,111 @@ mod tests {
             described(OpenFiles::NoLimit, 32_768),
             "32768 connections a worker"
         );
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn limited(bytes: u64) -> Memory {
+        Memory::Limit {
+            bytes,
+            from: "memory.max",
+        }
+    }
+
+    #[test]
+    fn the_cgroup_is_the_v2_line_of_proc_self_cgroup() {
+        // In a cgroup namespace, as a pod's container is.
+        assert_eq!(cgroup_of("0::/\n"), Some("/"));
+        assert_eq!(
+            cgroup_of("0::/kubepods.slice/kubepods-pod1.slice/cri-containerd-2.scope\n"),
+            Some("/kubepods.slice/kubepods-pod1.slice/cri-containerd-2.scope")
+        );
+        // Hybrid hierarchies list v1 controllers before it.
+        assert_eq!(
+            cgroup_of("12:memory:/docker/abc\n0::/docker/abc\n"),
+            Some("/docker/abc")
+        );
+        // cgroup v1 only: no limit is read.
+        assert_eq!(cgroup_of("4:memory:/docker/abc\n"), None);
+        assert_eq!(cgroup_of(""), None);
+    }
+
+    #[test]
+    fn a_limit_is_a_number_and_max_or_anything_else_is_none() {
+        assert_eq!(limit_in("536870912\n"), Some(512 * MIB));
+        assert_eq!(limit_in("max\n"), None);
+        assert_eq!(limit_in(""), None);
+        assert_eq!(limit_in("-1\n"), None);
+    }
+
+    #[test]
+    fn the_limit_is_the_lower_of_max_and_high() {
+        assert_eq!(lower(None, None), Memory::NoLimit);
+        assert_eq!(lower(Some(GIB), None), limited(GIB));
+        assert_eq!(
+            lower(Some(GIB), Some(900 * MIB)),
+            Memory::Limit {
+                bytes: 900 * MIB,
+                from: "memory.high"
+            }
+        );
+        assert_eq!(lower(Some(GIB), Some(2 * GIB)), limited(GIB));
+        assert_eq!(
+            lower(None, Some(GIB)),
+            Memory::Limit {
+                bytes: GIB,
+                from: "memory.high"
+            }
+        );
+    }
+
+    const GIB: u64 = 1024 * MIB;
+
+    #[test]
+    fn storage_is_half_the_limit_shared_out_within_the_floor_and_the_ceiling() {
+        let ceiling = H1Limits::default().storage;
+        assert_eq!(storage_per_worker(Memory::NoLimit, workers(4)), ceiling);
+        // 512 MiB, 4 workers: 64 MiB each.
+        assert_eq!(storage_per_worker(limited(512 * MIB), workers(4)), 64 << 20);
+        // 2 GiB, 4 workers: 256 MiB each, the ceiling.
+        assert_eq!(storage_per_worker(limited(2 * GIB), workers(4)), ceiling);
+        // 8 GiB, 4 workers: still the ceiling.
+        assert_eq!(storage_per_worker(limited(8 * GIB), workers(4)), ceiling);
+        // 64 MiB, 16 workers: 2 MiB each, raised to the floor.
+        assert_eq!(
+            storage_per_worker(limited(64 * MIB), workers(16)),
+            STORAGE_FLOOR
+        );
+        assert_eq!(storage_per_worker(limited(0), workers(1)), STORAGE_FLOOR);
+    }
+
+    #[test]
+    fn the_start_says_what_the_pod_may_use_and_what_each_worker_may_hold() {
+        assert_eq!(
+            described_memory(limited(512 * MIB), 64 << 20),
+            "memory: limit 512 MiB (memory.max); 64 MiB storage a worker"
+        );
+        assert_eq!(
+            described_memory(Memory::NoLimit, 256 << 20),
+            "memory: no limit; 256 MiB storage a worker"
+        );
+    }
+
+    /// What is read from the process's own cgroup agrees with its files, read by hand.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_pods_limit_is_what_its_cgroup_files_say() {
+        let cgroups = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        let expected = cgroup_of(&cgroups).map_or(Memory::NoLimit, |own| {
+            let directory = std::path::Path::new(CGROUPS).join(own.trim_start_matches('/'));
+            let file = |name: &str| {
+                std::fs::read_to_string(directory.join(name))
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u64>().ok())
+            };
+            lower(file("memory.max"), file("memory.high"))
+        });
+        assert_eq!(memory(), expected);
     }
 
     /// The soft limit is the hard limit once it has been raised, or as near as the kernel
