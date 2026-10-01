@@ -14,15 +14,19 @@ What each connection does first is the fourth argument:
 - `h2`: one request over cleartext HTTP/2 with prior knowledge, answered, and then nothing
   more: what an idle HTTP/2 connection costs;
 - `websocket`: a WebSocket handshake at `/ws`, switched, and then nothing more: what an open
-  WebSocket costs while no message moves (a tunnel, and its backend's connection).
+  WebSocket costs while no message moves (a tunnel, and its backend's connection);
+- `tls` and `tls-h2`: `one-request` and `h2` over TLS, to a listener that speaks it (the
+  bench's certificate is not checked), HTTP/2 asked for by ALPN: what an idle TLS
+  connection costs, which a pod's memory pays for too.
 
 Says `ready` on its standard output once they are all answered, or all open, and then waits
 to be killed.
 
-    bench/idle.py 127.0.0.1:8080 bench.example.com 10000 [one-request|large-head|silent|refreshed|h2|websocket]
+    bench/idle.py 127.0.0.1:8080 bench.example.com 10000 [one-request|large-head|silent|refreshed|h2|websocket|tls|tls-h2]
 """
 
 import socket
+import ssl
 import sys
 import time
 
@@ -64,12 +68,12 @@ def h2_frame(kind: int, flags: int, stream: int, payload: bytes) -> bytes:
     return len(payload).to_bytes(3, "big") + bytes([kind, flags]) + stream.to_bytes(4, "big") + payload
 
 
-def h2_request(host: str) -> bytes:
+def h2_request(host: str, scheme: str = "http") -> bytes:
     """A client's preface, empty SETTINGS and a GET on stream 1 that ends it.
 
     The header block is literal fields without indexing or Huffman coding (RFC 7541
     §6.2.2), each name and value under 127 bytes so that its length is one byte."""
-    fields = [(":method", "GET"), (":scheme", "http"), (":authority", host), (":path", "/")]
+    fields = [(":method", "GET"), (":scheme", scheme), (":authority", host), (":path", "/")]
     block = b"".join(
         b"\x00" + bytes([len(name)]) + name.encode() + bytes([len(value)]) + value.encode()
         for name, value in fields
@@ -106,9 +110,16 @@ def h2_answer(connection) -> bytes:
                 return head
 
 
-def opened(address, port, request, http2=False, expect=READY):
-    """A connection, asked once and answered with a head that starts with `expect`."""
+def opened(address, port, request, http2=False, expect=READY, tls=None):
+    """A connection, asked once and answered with a head that starts with `expect`; over
+    TLS to the name `tls`, if it is given."""
     connection = socket.create_connection((address, int(port)), timeout=30)
+    if tls is not None:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        context.set_alpn_protocols(["h2"] if http2 else ["http/1.1"])
+        connection = context.wrap_socket(connection, server_hostname=tls)
     if request is not None:
         connection.sendall(request)
         # Read the answer so that the exchange is over and the upstream connection is
@@ -136,11 +147,18 @@ def main() -> int:
         f"GET /ws HTTP/1.1\r\nhost: {host}\r\nupgrade: websocket\r\nconnection: upgrade\r\n"
         f"sec-websocket-version: 13\r\nsec-websocket-key: {WEBSOCKET_KEY}\r\n\r\n".encode()
     )
-    asked = {"silent": None, "h2": h2_request(host), "websocket": handshake}.get(kind, request)
+    asked = {
+        "silent": None,
+        "h2": h2_request(host),
+        "tls-h2": h2_request(host, "https"),
+        "websocket": handshake,
+    }.get(kind, request)
     expect = SWITCHED if kind == "websocket" else READY
+    http2 = kind in ("h2", "tls-h2")
+    tls = host if kind in ("tls", "tls-h2") else None
 
     try:
-        held = [opened(address, port, asked, kind == "h2", expect) for _ in range(many)]
+        held = [opened(address, port, asked, http2, expect, tls) for _ in range(many)]
     except (OSError, ConnectionError) as error:
         print(error, file=sys.stderr)
         return 1
