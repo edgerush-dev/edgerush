@@ -11,7 +11,7 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_proxy::places::Places;
+use edgerush_proxy::places::{Place, Places};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::cell::Cell;
 use std::hint::black_box;
@@ -23,39 +23,33 @@ const EXCHANGES: usize = 100;
 /// Upstreams the config has, and the exchanges go to in turn.
 const UPSTREAMS: usize = 8;
 
-// A worker with room: what nearly every exchange meets.
-#[library_benchmark]
-fn with_room() -> usize {
-    let places = Places::new(1024);
-    let mut taken = 0;
-    for exchange in 0..EXCHANGES {
-        if let Ok(place) = places.take(black_box(exchange % UPSTREAMS), UPSTREAMS) {
-            taken += black_box(&place).places_held();
-        }
-    }
-    taken
+/// A worker's places, with `held` of them held, spread over the upstreams.
+fn holding(held: usize) -> (Rc<Places>, Vec<Place>) {
+    // As many slots as the data plane's metrics have.
+    let places = Places::new(1024, 4096);
+    let taken = (0..held)
+        .filter_map(|at| places.take(at % UPSTREAMS, UPSTREAMS).ok())
+        .collect();
+    (places, taken)
 }
 
-// A worker short of places, every exchange counted against its upstream's share.
+// The places are handed back so that dropping them is not measured.
 #[library_benchmark]
-fn short_of_places() -> usize {
-    let places = Places::new(1024);
-    let _held: Vec<_> = (0..900)
-        .filter_map(|held| places.take(held % UPSTREAMS, UPSTREAMS).ok())
-        .collect();
+#[bench::with_room(holding(0))]
+#[bench::short_of_places(holding(900))]
+fn take_and_give_back(worker: (Rc<Places>, Vec<Place>)) -> ((Rc<Places>, Vec<Place>), usize) {
     let mut taken = 0;
     for exchange in 0..EXCHANGES {
-        if let Ok(place) = places.take(black_box(exchange % UPSTREAMS), UPSTREAMS) {
-            taken += black_box(&place).places_held();
-        }
+        let place = worker.0.take(black_box(exchange % UPSTREAMS), UPSTREAMS);
+        taken += usize::from(black_box(&place).is_ok());
     }
-    taken
+    (worker, taken)
 }
 
 // The count alone, as every exchange took its place before.
 #[library_benchmark]
-fn one_count() -> usize {
-    let held = Rc::new(Cell::new(0_usize));
+#[bench::with_room(Rc::new(Cell::new(0)))]
+fn one_count(held: Rc<Cell<usize>>) -> (Rc<Cell<usize>>, usize) {
     let mut taken = 0;
     for _ in 0..EXCHANGES {
         let in_hand = held.get();
@@ -66,22 +60,11 @@ fn one_count() -> usize {
             place.set(place.get() - 1);
         }
     }
-    taken
-}
-
-/// What a place is asked in the benchmarks, so that taking one is not optimised away.
-trait Held {
-    fn places_held(&self) -> usize;
-}
-
-impl Held for edgerush_proxy::places::Place {
-    fn places_held(&self) -> usize {
-        1
-    }
+    (held, taken)
 }
 
 library_benchmark_group!(
     name = places;
-    benchmarks = with_room, short_of_places, one_count
+    benchmarks = take_and_give_back, one_count
 );
 main!(library_benchmark_groups = places);

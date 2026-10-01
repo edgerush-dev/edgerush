@@ -884,7 +884,7 @@ impl Worker {
                 Storage::new(limits.storage),
             ))),
             timers: Timers::new(),
-            places: Places::new(limits.exchanges),
+            places: Places::new(limits.exchanges, crate::metrics::UPSTREAM_SLOTS),
             limits,
             deadlines,
             date: Cell::new(HttpDate::from_unix(unix_now())),

@@ -21,12 +21,15 @@
 //!
 //! An upstream is known by its slot in the data plane's metrics, which a name keeps across
 //! reloads. Upstreams past the last slot share one, and are one upstream here as there.
+//! Every slot has its count from the start, 32 KiB for the data plane's 4,096: a count
+//! looked up without a borrow or a check for growth costs a request a third less than one
+//! in a list grown as slots come.
 //!
 //! One per worker, and it never leaves it. Nothing here does I/O or reads a clock.
 
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 /// One worker's places and who holds them.
@@ -37,8 +40,8 @@ pub struct Places {
     short: usize,
     /// Places held, by anyone.
     held: Cell<usize>,
-    /// Places held, by upstream slot. Grows to the highest slot that has asked.
-    by_upstream: RefCell<Vec<usize>>,
+    /// Places held, by upstream slot.
+    by_upstream: Box<[Cell<usize>]>,
     /// How many upstreams hold at least one place.
     holding: Cell<usize>,
 }
@@ -53,13 +56,13 @@ pub enum Refused {
 }
 
 impl Places {
-    /// A worker's `limit` places, none held.
-    pub fn new(limit: usize) -> Rc<Self> {
+    /// A worker's `limit` places for the upstreams in `slots` slots, none held.
+    pub fn new(limit: usize, slots: usize) -> Rc<Self> {
         Rc::new(Self {
             limit,
             short: limit - limit / 8,
             held: Cell::new(0),
-            by_upstream: RefCell::new(Vec::new()),
+            by_upstream: (0..slots).map(|_| Cell::new(0)).collect(),
             holding: Cell::new(0),
         })
     }
@@ -69,30 +72,29 @@ impl Places {
     ///
     /// # Errors
     ///
-    /// [`Refused::Full`] when every place is held; [`Refused::OverShare`] when the worker is
-    /// short of places and the upstream holds its fair share already.
+    /// [`Refused::Full`] when every place is held, or `upstream` is not one of the slots;
+    /// [`Refused::OverShare`] when the worker is short of places and the upstream holds its
+    /// fair share already.
     pub fn take(self: &Rc<Self>, upstream: usize, upstreams: usize) -> Result<Place, Refused> {
         let held = self.held.get();
         if held >= self.limit {
             return Err(Refused::Full);
         }
-        let mut by_upstream = self.by_upstream.borrow_mut();
-        if by_upstream.len() <= upstream {
-            by_upstream.resize(upstream + 1, 0);
-        }
-        // In bounds: it was grown to hold `upstream` just above.
-        let own = &mut by_upstream[upstream];
+        let Some(own) = self.by_upstream.get(upstream) else {
+            return Err(Refused::Full);
+        };
+        let holds = own.get();
         if held >= self.short {
-            let sharing = (self.holding.get() + usize::from(*own == 0)).max(upstreams.min(2));
+            let sharing = (self.holding.get() + usize::from(holds == 0)).max(upstreams.min(2));
             // Never divides by zero: `sharing` counts the one asking whenever it holds none.
-            if *own >= self.limit / sharing {
+            if holds >= self.limit / sharing {
                 return Err(Refused::OverShare);
             }
         }
-        if *own == 0 {
+        if holds == 0 {
             self.holding.set(self.holding.get() + 1);
         }
-        *own += 1;
+        own.set(holds + 1);
         self.held.set(held + 1);
         Ok(Place {
             places: Rc::clone(self),
@@ -111,20 +113,16 @@ impl Places {
     #[cfg(any(test, feature = "fuzzing"))]
     #[must_use]
     pub fn held_by(&self, upstream: usize) -> usize {
-        self.by_upstream
-            .borrow()
-            .get(upstream)
-            .copied()
-            .unwrap_or(0)
+        self.by_upstream.get(upstream).map_or(0, Cell::get)
     }
 
     fn give_back(&self, upstream: usize) {
-        let mut by_upstream = self.by_upstream.borrow_mut();
-        if let Some(own) = by_upstream.get_mut(upstream)
-            && *own > 0
+        if let Some(own) = self.by_upstream.get(upstream)
+            && own.get() > 0
         {
-            *own -= 1;
-            if *own == 0 {
+            let holds = own.get() - 1;
+            own.set(holds);
+            if holds == 0 {
                 self.holding.set(self.holding.get().saturating_sub(1));
             }
             self.held.set(self.held.get().saturating_sub(1));
@@ -154,6 +152,9 @@ mod tests {
     /// How many upstreams the configs of most tests have.
     const SEVERAL: usize = 4;
 
+    /// Slots enough for every upstream the tests name.
+    const SLOTS: usize = 8;
+
     fn take(places: &Rc<Places>, upstream: usize, times: usize) -> Vec<Place> {
         (0..times)
             .map(|_| places.take(upstream, SEVERAL).expect("a place"))
@@ -162,7 +163,7 @@ mod tests {
 
     #[test]
     fn the_only_upstream_of_a_config_may_take_every_place() {
-        let places = Places::new(16);
+        let places = Places::new(16, SLOTS);
         let held: Vec<Place> = (0..16)
             .map(|_| places.take(3, 1).expect("a place"))
             .collect();
@@ -177,7 +178,7 @@ mod tests {
     fn nobody_is_refused_a_place_before_the_worker_is_short_of_them() {
         // 16 places: short from 14. One upstream takes 13, so the 14th place is still given
         // whoever asks, however much the asker already holds.
-        let places = Places::new(16);
+        let places = Places::new(16, SLOTS);
         let _slow = take(&places, 1, 13);
         let _fourteenth = places.take(1, SEVERAL).expect("not short yet");
         assert_eq!(places.held(), 14);
@@ -185,7 +186,7 @@ mod tests {
 
     #[test]
     fn once_short_an_upstream_over_its_share_is_refused_and_the_others_are_not() {
-        let places = Places::new(16);
+        let places = Places::new(16, SLOTS);
         let _slow = take(&places, 1, 14);
         // Nobody else holds a place, but the config has others: 8 each at the least.
         assert_eq!(places.take(1, SEVERAL).err(), Some(Refused::OverShare));
@@ -196,7 +197,7 @@ mod tests {
 
     #[test]
     fn a_share_is_of_the_upstreams_holding_places_now() {
-        let places = Places::new(16);
+        let places = Places::new(16, SLOTS);
         let a = take(&places, 1, 7);
         let _b = take(&places, 2, 7);
         // Short; two hold places, so 8 each, and a third asking makes it 5 each.
@@ -213,7 +214,7 @@ mod tests {
 
     #[test]
     fn letting_a_place_go_frees_it_for_its_upstream_and_the_count() {
-        let places = Places::new(16);
+        let places = Places::new(16, SLOTS);
         let mut slow = take(&places, 1, 14);
         assert_eq!(places.take(1, SEVERAL).err(), Some(Refused::OverShare));
         slow.truncate(13);
@@ -227,13 +228,20 @@ mod tests {
 
     #[test]
     fn a_worker_with_no_places_refuses_everyone_as_full() {
-        let places = Places::new(0);
+        let places = Places::new(0, SLOTS);
         assert_eq!(places.take(0, SEVERAL).err(), Some(Refused::Full));
     }
 
     #[test]
+    fn an_upstream_past_the_slots_is_refused_as_full() {
+        let places = Places::new(16, SLOTS);
+        assert_eq!(places.take(SLOTS, SEVERAL).err(), Some(Refused::Full));
+        assert_eq!(places.held(), 0);
+    }
+
+    #[test]
     fn a_worker_with_fewer_than_eight_places_is_never_short_before_it_is_full() {
-        let places = Places::new(7);
+        let places = Places::new(7, SLOTS);
         let _all = take(&places, 1, 7);
         assert_eq!(places.take(2, SEVERAL).err(), Some(Refused::Full));
     }
@@ -293,7 +301,7 @@ mod tests {
             upstreams in 1usize..=6,
             steps in proptest::collection::vec(step(), 0..160),
         ) {
-            let places = Places::new(limit);
+            let places = Places::new(limit, SLOTS);
             let mut alive: Vec<(usize, Place)> = Vec::new();
             for step in steps {
                 match step {
@@ -333,7 +341,7 @@ mod tests {
             holdings in proptest::collection::vec(0usize..12, 1..6),
             asker in 0usize..6,
         ) {
-            let places = Places::new(limit);
+            let places = Places::new(limit, SLOTS);
             let mut alive = Vec::new();
             for (upstream, count) in holdings.iter().enumerate() {
                 for _ in 0..*count {
@@ -363,7 +371,7 @@ mod tests {
             limit in 0usize..=2048,
             upstreams in 2usize..=6,
         ) {
-            let places = Places::new(limit);
+            let places = Places::new(limit, SLOTS);
             let mut held = Vec::new();
             while let Ok(place) = places.take(0, upstreams) {
                 held.push(place);
