@@ -35,6 +35,7 @@ use crate::linger::{self, Lent, linger};
 use crate::map_head::MapHead;
 use crate::metrics::{Answer, Metrics, Socket, Stopped, Tunnel};
 use crate::mirror;
+use crate::places::{Place, Places, Refused};
 use crate::random::{random, unguessable};
 use crate::raw::{RawAnswer, RawHead};
 use crate::request::{Decision, Opening, decide};
@@ -357,9 +358,10 @@ pub struct Worker {
     blocks: Rc<RefCell<Blocks>>,
     /// Every deadline the worker keeps ([03 §2](../../docs/03-data-plane.md)).
     timers: Rc<Timers>,
-    /// How many exchanges this worker has in hand. Its own, like everything else here:
-    /// no worker waits on another to find out whether it may take a request.
-    in_flight: Rc<Cell<usize>>,
+    /// The places for exchanges this worker has, and which upstreams hold them
+    /// ([03 §9](../../docs/03-data-plane.md)). Its own, like everything else here: no worker
+    /// waits on another to find out whether it may take a request.
+    places: Rc<Places>,
     limits: H1Limits,
     deadlines: Deadlines,
     /// The time an answer is dated with, which the worker's sweep keeps current so that
@@ -490,7 +492,9 @@ async fn serve_h2<S>(
 /// ([13 §7](../../docs/13-http1-upstream.md)).
 #[derive(Debug)]
 struct Admitted {
-    exchanges: Rc<Cell<usize>>,
+    /// The place itself, which goes back to the worker, and to its upstream's count, when
+    /// this is dropped.
+    _place: Place,
     /// The exchange's count at its endpoint, which goes where the place goes: with the
     /// answer's body to its end (03 §6).
     counted: Option<InFlight>,
@@ -506,12 +510,6 @@ impl Admitted {
     /// The count, for a tunnel to hold once the place is let go of.
     fn count(&mut self) -> Option<InFlight> {
         self.counted.take()
-    }
-}
-
-impl Drop for Admitted {
-    fn drop(&mut self) {
-        self.exchanges.set(self.exchanges.get().saturating_sub(1));
     }
 }
 
@@ -886,7 +884,7 @@ impl Worker {
                 Storage::new(limits.storage),
             ))),
             timers: Timers::new(),
-            in_flight: Rc::new(Cell::new(0)),
+            places: Places::new(limits.exchanges),
             limits,
             deadlines,
             date: Cell::new(HttpDate::from_unix(unix_now())),
@@ -982,7 +980,7 @@ impl Worker {
             let storage = self.blocks.borrow().storage().used();
             metrics
                 .worker()
-                .holding(self.in_flight.get(), self.idle_connections(), storage);
+                .holding(self.places.held(), self.idle_connections(), storage);
         }
     }
 
@@ -999,20 +997,23 @@ impl Worker {
         self.h2.connections()
     }
 
-    /// Takes a place among the exchanges this worker has in hand, if one is going.
+    /// Takes a place among the exchanges this worker has in hand for one with the upstream
+    /// in `upstream`, if one is going to it: none once every place is held, and none for
+    /// an upstream that holds its fair share once the worker is short of them
+    /// ([03 §9](../../docs/03-data-plane.md)). `upstreams` is how many the config it was
+    /// directed by has.
     ///
     /// Nothing waits here. A request arriving at a worker that is already full is
     /// answered, because holding it would cost the very memory the bound is for.
-    fn admit(&self) -> Option<Admitted> {
-        let in_hand = self.in_flight.get();
-        if in_hand >= self.limits.exchanges {
-            return None;
+    fn admit(&self, upstream: usize, upstreams: usize) -> Result<Admitted, Answer> {
+        match self.places.take(upstream, upstreams) {
+            Ok(place) => Ok(Admitted {
+                _place: place,
+                counted: None,
+            }),
+            Err(Refused::Full) => Err(Answer::TooBusy),
+            Err(Refused::OverShare) => Err(Answer::OverShare),
         }
-        self.in_flight.set(in_hand + 1);
-        Some(Admitted {
-            exchanges: Rc::clone(&self.in_flight),
-            counted: None,
-        })
     }
 
     /// Sends a request by EdgeRush's own path and returns the answer's head and body.
@@ -1641,15 +1642,23 @@ impl Worker {
         // entitles a request to a connection, so it is taken before one is sought. The same
         // bound whichever client carries the request, so that the two are compared doing
         // the same work ([14 §2](../../docs/14-downstream-server.md)).
-        let Some(admitted) = self.admit() else {
-            return self.proxy.answer_to(listener, Answer::TooBusy, call).into();
+        let admitted = match self.admit(directed.upstream_slot, directed.upstreams) {
+            Ok(admitted) => admitted,
+            Err(refused) => return self.proxy.answer_to(listener, refused, call).into(),
         };
         let admitted = admitted.counting(directed.counted.take());
         let body = if directed.mirrors.is_empty() {
             body
         } else {
             let mirrors = std::mem::take(&mut directed.mirrors);
-            self.mirror(mirrors, &head, &nominated, sending, body)
+            self.mirror(
+                mirrors,
+                directed.upstreams,
+                &head,
+                &nominated,
+                sending,
+                body,
+            )
         };
         let retry = directed.rule.as_ref().and_then(|rule| rule.retry());
         let outcome = match retry {
@@ -1892,7 +1901,7 @@ impl Worker {
             }
             // A place for the next try before this one's is given back with its answer:
             // a worker at its bound keeps the answer it has rather than lose it.
-            let Some(next) = self.admit() else {
+            let Ok(next) = self.admit(directed.upstream_slot, directed.upstreams) else {
                 return outcome;
             };
             let Some((target, drawn, at, counted)) = directed.draw(head.uri(), &tried) else {
@@ -1920,6 +1929,7 @@ impl Worker {
     fn mirror<H: Forwarded>(
         &self,
         mirrors: Vec<Mirrored>,
+        upstreams: usize,
         head: &H,
         nominated: &[HeaderName],
         sending: Sending,
@@ -1960,16 +1970,18 @@ impl Worker {
         };
         let placed: Vec<_> = mirrors
             .into_iter()
-            .filter_map(|mut mirror| match self.admit() {
-                Some(admitted) => {
-                    let counted = mirror.counted.take();
-                    Some((mirror, admitted.counting(counted)))
-                }
-                None => {
-                    given_up(mirror.upstream_slot, |counters| &counters.mirrors_busy);
-                    None
-                }
-            })
+            .filter_map(
+                |mut mirror| match self.admit(mirror.upstream_slot, upstreams) {
+                    Ok(admitted) => {
+                        let counted = mirror.counted.take();
+                        Some((mirror, admitted.counting(counted)))
+                    }
+                    Err(_) => {
+                        given_up(mirror.upstream_slot, |counters| &counters.mirrors_busy);
+                        None
+                    }
+                },
+            )
             .collect();
         if placed.is_empty() {
             return body;
@@ -2008,6 +2020,7 @@ impl Worker {
                 let directed = Directed {
                     rule: None,
                     upstream_slot: mirror.upstream_slot,
+                    upstreams,
                     endpoint: Arc::clone(&mirror.endpoint),
                     counted: None,
                     others: None,
@@ -2701,6 +2714,7 @@ impl Proxy {
         Ok(Directing::Upstream(Directed {
             rule: kept.then(|| Arc::clone(forward.rule)),
             upstream_slot,
+            upstreams: snapshot.upstream_slots.len(),
             endpoint: Arc::clone(identity),
             counted: Some(counted),
             others,
@@ -2731,6 +2745,9 @@ struct Redirect {
 struct Directed {
     rule: Option<Arc<CompiledRule>>,
     upstream_slot: usize,
+    /// How many upstreams the snapshot has, which a share of the worker's places is
+    /// counted against ([03 §9](../../docs/03-data-plane.md)).
+    upstreams: usize,
     /// The endpoint this request was directed to, taken from the same snapshot as the
     /// route so that no reload can come between the two.
     endpoint: Arc<ReuseIdentity>,
@@ -4242,12 +4259,12 @@ upstreams:
                     h2_get(&mut peer, n * 2 + 1, "/held").await;
                 }
                 until(|| held.borrow().len() == 20).await;
-                assert_eq!(worker.in_flight.get(), 20);
+                assert_eq!(worker.places.held(), 20);
                 for n in 0..20u32 {
                     peer.send(&h2_peer::rst_stream(n * 2 + 1, code::CANCEL))
                         .await;
                 }
-                until(|| worker.in_flight.get() == 0).await;
+                until(|| worker.places.held() == 0).await;
             })
             .await;
     }
@@ -9791,9 +9808,88 @@ upstreams:
             // failure gives its place back like any other ending, and the worker
             // takes requests again.
             held.borrow_mut().clear();
-            until(|| worker.in_flight.get() == 0).await;
+            until(|| worker.places.held() == 0).await;
             assert_eq!(status_of(front, "/ok").await, StatusCode::OK);
         }));
+    }
+
+    /// An upstream that stops answering does not take every place a worker has: once the
+    /// worker is short of them, the upstream that holds more than its share is refused and
+    /// the healthy one beside it is still served, though it held no place when the slow one
+    /// filled up. Its places come back as its exchanges end, and it is served again
+    /// ([03 §9](../../docs/03-data-plane.md)).
+    #[test]
+    fn an_upstream_that_stops_answering_leaves_the_last_places_to_the_others() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let (slow, held) = scripted_upstream().await;
+            let (healthy, _) = scripted_upstream().await;
+            let config = compile(&slow_and_healthy_config(slow, healthy)).unwrap();
+            let proxy = Arc::new(Proxy::new(config, NonZeroUsize::MIN).unwrap());
+            // Short of places from 14 of 16.
+            let limits = H1Limits {
+                exchanges: 16,
+                ..H1Limits::default()
+            };
+            let worker = Worker::with_limits(proxy, limits);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+
+            for _ in 0..14 {
+                let _parked = tokio::task::spawn_local(async move {
+                    let _never = status_of(front, "/slow/silent").await;
+                });
+            }
+            until(|| held.borrow().len() == 14).await;
+            assert_eq!(worker.places.held(), 14);
+
+            // Bounded: a worker that took it would hold it for as long as the upstream says
+            // nothing, which is for ever.
+            let refused =
+                tokio::time::timeout(Duration::from_secs(5), status_of(front, "/slow/silent"))
+                    .await
+                    .unwrap_or_else(|_| panic!("took a fifteenth place for the slow upstream"));
+            assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(status_of(front, "/ok").await, StatusCode::OK);
+            let scrape = worker.proxy().metrics();
+            assert!(scrape.contains("reason=\"over_share\"} 1"), "{scrape}");
+            assert!(scrape.contains("reason=\"too_busy\"} 0"), "{scrape}");
+
+            held.borrow_mut().clear();
+            until(|| worker.places.held() == 0).await;
+            assert_eq!(status_of(front, "/slow/ok").await, StatusCode::OK);
+        }));
+    }
+
+    /// Requests under `/slow` to `slow`, and the rest to `healthy`.
+    fn slow_and_healthy_config(slow: SocketAddr, healthy: SocketAddr) -> Config {
+        let yaml = format!(
+            r#"
+listeners:
+  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+routes:
+  - name: everything
+    listeners: [web]
+    hostnames:
+      - {{ name: "*", falls_through: true }}
+    rules:
+      - matches:
+          - path: {{ prefix: /slow }}
+        forward: {{ backends: [{{ upstream: slow, weight: 1 }}] }}
+      - matches:
+          - path: {{ prefix: / }}
+        forward: {{ backends: [{{ upstream: healthy, weight: 1 }}] }}
+upstreams:
+  slow: {{ load_balancer: p2c, endpoints: ["{slow}"] }}
+  healthy: {{ load_balancer: p2c, endpoints: ["{healthy}"] }}
+"#
+        );
+        serde_saphyr::from_str(&yaml).unwrap()
     }
 
     /// Every way out of an exchange gives its place back, whichever client carried it: an
@@ -9824,7 +9920,7 @@ upstreams:
                 let case = case.to_owned();
                 async move {
                     tokio::time::timeout(Duration::from_secs(10), async {
-                        while worker.in_flight.get() != 0 {
+                        while worker.places.held() != 0 {
                             tokio::task::yield_now().await;
                         }
                     })
@@ -9856,7 +9952,7 @@ upstreams:
                 .await
                 .expect("no answer");
             assert!(read.unwrap() > 0, "closed before answering");
-            assert_eq!(worker.in_flight.get(), 1, "not in hand while answering");
+            assert_eq!(worker.places.held(), 1, "not in hand while answering");
             drop(client);
             given_back(&worker, "a client that stopped reading").await;
 
@@ -9874,7 +9970,7 @@ upstreams:
             let mut client = TcpStream::connect(front).await.unwrap();
             client.write_all(&asking("/silent")).await.unwrap();
             until(|| held.borrow().len() == 1).await;
-            assert_eq!(worker.in_flight.get(), 1, "not in hand while waiting");
+            assert_eq!(worker.places.held(), 1, "not in hand while waiting");
             drop(client);
             given_back(&worker, "a client that went").await;
         }));
@@ -10068,7 +10164,7 @@ upstreams:
             // And what the worker holds, which it says as it sweeps.
             let storage = worker.blocks.borrow().storage().used();
             proxy.metrics.worker().holding(
-                worker.in_flight.get(),
+                worker.places.held(),
                 worker.idle_connections(),
                 storage,
             );
@@ -10359,7 +10455,7 @@ upstreams:
             // Memory held by frames alone, its blocks let go of by a sweep while the frames
             // wait on the upstream, was among what was counted.
             assert!(outlived > 0, "no pinned memory was ever held to account");
-            assert!(worker.in_flight.get() < limits.exchanges);
+            assert!(worker.places.held() < limits.exchanges);
 
             for client in &clients {
                 client.abort();

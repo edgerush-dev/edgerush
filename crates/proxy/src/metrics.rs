@@ -238,6 +238,9 @@ pub(crate) enum Answer {
     UpstreamTimedOut,
     /// This worker already has as many exchanges in hand as it will take.
     TooBusy,
+    /// This worker is short of places for exchanges, and the request's upstream already
+    /// holds its fair share of them ([03 §9](../../docs/03-data-plane.md)).
+    OverShare,
     /// This worker could not pay for the storage an exchange needed
     /// ([14 §8](../../docs/14-downstream-server.md)): its own failing, not the upstream's.
     Exhausted,
@@ -269,7 +272,7 @@ pub(crate) enum Answer {
 }
 
 impl Answer {
-    const ALL: [Self; 21] = [
+    const ALL: [Self; 22] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -281,6 +284,7 @@ impl Answer {
         Self::UpstreamFailed,
         Self::UpstreamTimedOut,
         Self::TooBusy,
+        Self::OverShare,
         Self::Exhausted,
         Self::Edits,
         Self::BadBody,
@@ -305,6 +309,7 @@ impl Answer {
             Self::NoBackend | Self::Edits => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NoEndpoints
             | Self::TooBusy
+            | Self::OverShare
             | Self::Exhausted
             | Self::QueueFull
             | Self::QueueTimedOut => StatusCode::SERVICE_UNAVAILABLE,
@@ -330,6 +335,7 @@ impl Answer {
             Self::UpstreamFailed => "upstream_failed",
             Self::UpstreamTimedOut => "upstream_timed_out",
             Self::TooBusy => "too_busy",
+            Self::OverShare => "over_share",
             Self::Exhausted => "exhausted",
             Self::Edits => "edits",
             Self::BadBody => "bad_body",
@@ -370,6 +376,10 @@ impl Answer {
             Self::TooBusy | Self::QueueFull | Self::QueueTimedOut => (
                 Code::Unavailable,
                 "the gateway is too busy to take the call",
+            ),
+            Self::OverShare => (
+                Code::Unavailable,
+                "the upstream holds its share of the gateway's places",
             ),
             Self::Exhausted => (Code::ResourceExhausted, "the gateway ran out of room"),
             Self::BodyTimedOut => (

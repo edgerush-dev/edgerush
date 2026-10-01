@@ -65,6 +65,11 @@ mod metrics;
 mod mirror;
 // Private, save when the fuzz targets and benchmarks are being built.
 #[cfg(feature = "fuzzing")]
+pub mod places;
+#[cfg(not(feature = "fuzzing"))]
+mod places;
+// Private, save when the fuzz targets and benchmarks are being built.
+#[cfg(feature = "fuzzing")]
 pub mod quic;
 #[cfg(not(feature = "fuzzing"))]
 mod quic;

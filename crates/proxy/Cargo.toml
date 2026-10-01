@@ -102,6 +102,11 @@ harness = false
 required-features = ["fuzzing"]
 
 [[bench]]
+name = "places"
+harness = false
+required-features = ["fuzzing"]
+
+[[bench]]
 name = "slots"
 harness = false
 required-features = ["fuzzing"]
