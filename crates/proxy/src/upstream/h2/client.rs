@@ -210,7 +210,9 @@ impl Drop for Waiting<'_> {
             return;
         }
         self.client.waiters.borrow_mut().remove(&self.waiter);
-        self.client.pool.borrow_mut().cancel(self.key, self.waiter);
+        let (key, waiter) = (self.key, self.waiter);
+        self.client
+            .event(|pool, now, actions| pool.cancel(key, waiter, now, actions));
     }
 }
 

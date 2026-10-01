@@ -67,6 +67,12 @@ impl Harness {
         actions
     }
 
+    fn cancel(&mut self, key: u64, waiter: WaiterId) -> Vec<Action> {
+        let mut actions = Vec::new();
+        self.pool.cancel(key, waiter, self.now, &mut actions);
+        actions
+    }
+
     fn sweep(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
         self.pool.sweep(self.now, &mut actions);
@@ -379,7 +385,7 @@ fn a_request_that_gives_up_is_never_granted() {
     let (Taken::Waiting(stays), _) = pool.take(KEY) else {
         panic!()
     };
-    pool.pool.cancel(KEY, gone);
+    assert!(pool.cancel(KEY, gone).is_empty());
     assert_eq!(pool.ended(KEY, only), [Action::Grant(stays, only)]);
 }
 
@@ -437,7 +443,7 @@ fn a_place_freed_under_the_workers_bound_is_dialled_for_whoever_waits() {
             panic!()
         };
         assert!(held.is_empty(), "{held:?}");
-        pool.pool.cancel(KEY, gone);
+        assert!(pool.cancel(KEY, gone).is_empty());
         let mut retiring = Vec::new();
         pool.pool.retire(KEY, pool.now, &mut retiring);
         assert!(retiring.is_empty(), "{retiring:?}");
@@ -464,6 +470,45 @@ fn a_place_freed_under_the_workers_bound_is_dialled_for_whoever_waits() {
         };
         assert_eq!((granted, on, closed), (served, serving, idle), "{news}");
     }
+}
+
+/// A retired destination whose last waiting request gives up winds down then, as when its
+/// last is served: what has nothing on it is closed, and the place it held under the
+/// worker's bound goes to a request another destination has waiting, rather than being
+/// held until the idle sweep.
+#[test]
+fn a_retired_destination_whose_last_waiter_gives_up_winds_down() {
+    const OTHER: u64 = KEY + 1;
+    let mut pool = Harness::new(Limits {
+        streams: 1,
+        connections_total: 3,
+        ..limits()
+    });
+    let busy = pool.first_connection(KEY, 1);
+    let (Taken::Waiting(gives_up), actions) = pool.take(KEY) else {
+        panic!()
+    };
+    let [Action::Dial(KEY, idle)] = actions[..] else {
+        panic!("{actions:?}")
+    };
+    // Open, but nothing may be sent on it before its peer is heard from.
+    assert!(pool.opened(KEY, idle, 0).is_empty());
+    pool.first_connection(OTHER, 1);
+    // At the worker's bound: this one waits with nothing dialled for it.
+    let (Taken::Waiting(_), held) = pool.take(OTHER) else {
+        panic!()
+    };
+    assert!(held.is_empty(), "{held:?}");
+    let mut retiring = Vec::new();
+    pool.pool.retire(KEY, pool.now, &mut retiring);
+    assert!(retiring.is_empty(), "{retiring:?}");
+    let actions = pool.cancel(KEY, gives_up);
+    let [Action::Close(closed), Action::Dial(OTHER, _)] = actions[..] else {
+        panic!("{actions:?}")
+    };
+    assert_eq!(closed, idle);
+    // The busy one takes no more, and closes when its stream ends.
+    assert_eq!(pool.ended(KEY, busy), [Action::Close(busy)]);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -705,7 +750,7 @@ proptest! {
                         .collect();
                     if let Some(at) = pick(at, all.len()) {
                         let (key, waiter) = all[at];
-                        pool.cancel(key, waiter);
+                        pool.cancel(key, waiter, now, &mut actions);
                         world.settled.insert(waiter);
                         for queue in world.waiting.values_mut() {
                             queue.retain(|w| *w != waiter);

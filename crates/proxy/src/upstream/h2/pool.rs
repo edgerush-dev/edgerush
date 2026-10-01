@@ -354,14 +354,24 @@ impl Pool {
         self.wake_starved(before, now, None, actions);
     }
 
-    /// The waiting request `waiter` for `key` gives up its place in the queue.
-    pub(crate) fn cancel(&mut self, key: u64, waiter: WaiterId) {
+    /// The waiting request `waiter` for `key` gives up its place in the queue. The last to
+    /// wait for a retired destination winds it down, as the last served does.
+    pub(crate) fn cancel(
+        &mut self,
+        key: u64,
+        waiter: WaiterId,
+        now: Instant,
+        actions: &mut Vec<Action>,
+    ) {
+        let before = self.total;
         if let Some(destination) = self.destinations.get_mut(&key)
             && let Some(at) = destination.waiting.iter().position(|w| *w == waiter)
         {
             destination.waiting.remove(at);
         }
+        self.wind_down(key, actions);
         self.forget_if_empty(key);
+        self.wake_starved(before, now, None, actions);
     }
 
     /// The destination under `key` is gone from the running config: nothing more is
