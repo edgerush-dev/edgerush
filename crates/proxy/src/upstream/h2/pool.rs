@@ -219,6 +219,7 @@ impl Pool {
         now: Instant,
         actions: &mut Vec<Action>,
     ) {
+        let before = self.total;
         if let Some(connection) = self.connection(key, id) {
             if connection.state == State::Connecting {
                 connection.state = State::Usable;
@@ -228,6 +229,8 @@ impl Pool {
             connection.peer = peer;
         }
         self.serve_waiting(key, now, actions);
+        // Serving the last waiter of a retired destination closes what it no longer needs.
+        self.wake_starved(before, now, None, actions);
     }
 
     /// The peer of connection `id` to `key` has been heard from: its SETTINGS allow `peer`
@@ -240,11 +243,13 @@ impl Pool {
         now: Instant,
         actions: &mut Vec<Action>,
     ) {
+        let before = self.total;
         if let Some(connection) = self.connection(key, id) {
             connection.peer = peer;
             connection.settled = true;
         }
         self.serve_waiting(key, now, actions);
+        self.wake_starved(before, now, None, actions);
     }
 
     /// The connection `id` to `key` could not be opened.
@@ -303,12 +308,14 @@ impl Pool {
         now: Instant,
         actions: &mut Vec<Action>,
     ) {
+        let before = self.total;
         if let Some(connection) = self.connection(key, id) {
             connection.peer = peer;
             // A change is the peer's SETTINGS heard.
             connection.settled = true;
         }
         self.serve_waiting(key, now, actions);
+        self.wake_starved(before, now, None, actions);
     }
 
     /// Connection `id` to `key` takes no new streams: its peer said GOAWAY, or it is to be

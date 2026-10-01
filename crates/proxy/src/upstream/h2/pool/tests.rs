@@ -405,6 +405,67 @@ fn a_retired_destination_winds_down() {
     assert_eq!(pool.pool.connections(), 0);
 }
 
+/// A connection closed because its retired destination no longer needs it frees a place
+/// under the worker's bound, and a request another destination has waiting for one gets
+/// a connection dialled, whichever news let the last waiter be served: a connection
+/// opening, its peer's SETTINGS heard, or its peer's limit rising.
+#[test]
+fn a_place_freed_under_the_workers_bound_is_dialled_for_whoever_waits() {
+    const OTHER: u64 = KEY + 1;
+    for news in ["opened", "settled", "peer limit"] {
+        let mut pool = Harness::new(Limits {
+            streams: 1,
+            connections_total: 3,
+            dialing: 2,
+            ..limits()
+        });
+        let (Taken::Waiting(served), first) = pool.take(KEY) else {
+            panic!()
+        };
+        let (Taken::Waiting(gone), second) = pool.take(KEY) else {
+            panic!()
+        };
+        let ([Action::Dial(KEY, idle)], [Action::Dial(KEY, serving)]) = (&first[..], &second[..])
+        else {
+            panic!("{first:?} {second:?}")
+        };
+        let (idle, serving) = (*idle, *serving);
+        // The other destination's one connection, busy.
+        pool.first_connection(OTHER, 1);
+        // At the worker's bound: this one waits with nothing dialled for it.
+        let (Taken::Waiting(_), held) = pool.take(OTHER) else {
+            panic!()
+        };
+        assert!(held.is_empty(), "{held:?}");
+        pool.pool.cancel(KEY, gone);
+        let mut retiring = Vec::new();
+        pool.pool.retire(KEY, pool.now, &mut retiring);
+        assert!(retiring.is_empty(), "{retiring:?}");
+        // Open, but nothing may be sent on it before its peer is heard from.
+        assert!(pool.opened(KEY, idle, 0).is_empty());
+        let actions = match news {
+            "opened" => pool.opened(KEY, serving, 1),
+            "settled" => {
+                assert!(pool.opened(KEY, serving, 0).is_empty());
+                pool.settled(KEY, serving, 1)
+            }
+            _ => {
+                assert!(pool.opened(KEY, serving, 0).is_empty());
+                pool.peer_limit(KEY, serving, 1)
+            }
+        };
+        let [
+            Action::Grant(granted, on),
+            Action::Close(closed),
+            Action::Dial(OTHER, _),
+        ] = actions[..]
+        else {
+            panic!("{news}: {actions:?}")
+        };
+        assert_eq!((granted, on, closed), (served, serving, idle), "{news}");
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Random runs: whatever happens, in whatever order, the pool keeps its promises.
 
