@@ -155,3 +155,10 @@ path = "fuzz_targets/websocket_frames.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "proxy_header"
+path = "fuzz_targets/proxy_header.rs"
+test = false
+doc = false
+bench = false

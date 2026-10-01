@@ -1,0 +1,15 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d17f7332f8ad72910cb83fd3d3464f85cb05be7e0fceadf02e9e27018c656407 # shrinks to header = [80, 82, 79, 88, 89, 32, 85, 78, 75, 78, 79, 87, 78, 32, 65, 46, 97, 97, 46, 69, 46, 32, 46, 97, 48, 48, 65, 32, 65, 97, 97, 46, 48, 65, 97, 97, 97, 97, 32, 65, 65, 65, 46, 65, 65, 65, 48, 46, 48, 46, 65, 13, 10], noise = [128], at = Index(4782489204295068938)
+cc a78ee2268a1984dc378d161785f39b6bb28d93e8a028c459a0515b79db68abb0 # shrinks to header = [80, 82, 79, 88, 89, 32, 85, 78, 75, 78, 79, 87, 78, 32, 65, 48, 65, 48, 97, 46, 46, 48, 32, 97, 46, 48, 97, 48, 46, 65, 65, 48, 46, 97, 32, 97, 65, 46, 97, 46, 48, 46, 46, 97, 32, 48, 48, 65, 46, 46, 65, 46, 48, 13, 10], noise = [108], at = Index(10870402757721700060)
+cc 5d0a77c70f5b443e2029f419aac8703a0d130cf581a5a2fb4a76dbb9dfdd80b3 # shrinks to header = [80, 82, 79, 88, 89, 32, 84, 67, 80, 52, 10], noise = [], at = Index(0)
+cc ccda0eff85e037eae59e00ffc0184f6d6dfa636316ca56e0f698248e148e80ef # shrinks to header = [13, 10, 13, 10, 0, 13, 10, 81, 85, 73, 84, 10, 32, 65, 0, 0], noise = [], at = Index(0)
+cc 3ef8b271e5c6df72eec709997cdbe2c9abebe30486114024b4195522f6403764 # shrinks to header = [13, 10, 13, 10, 0, 13, 10, 81, 85, 73, 84, 10, 34, 0, 0, 0], noise = [], at = Index(0)
+cc ad2f27f9527424b667875f34d924aad3ef3a286ead07e982ac04e1d55f7f9b38 # shrinks to header = [13, 10, 13, 10, 0, 13, 10, 81, 85, 73, 84, 10, 16, 0, 0, 0], noise = [], at = Index(0)
+cc de183380827a206c40b02587f7699e6d1dc9ad659b70751aa32e136dbcbaafad # shrinks to header = [13, 10, 13, 10, 0, 13, 10, 81, 85, 73, 84, 10, 33, 17, 0, 0], noise = [], at = Index(0)
+cc b75543ef0d77ef7f74d243fa28407bf12375a008f152028102196d11664fbe06 # shrinks to header = [13, 10, 13, 10, 0, 13, 10, 81, 85, 73, 84, 10, 33, 18, 0, 12], noise = [], at = Index(0)
+cc 33cd34ad9005a973b4ec5e2cf82aa801834220ac738f3b1e60aaa9ea9a6fe07c # shrinks to header = [13, 10, 13, 10, 0, 13, 10, 81, 85, 73, 84, 10, 33, 17, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], noise = [], at = Index(0)

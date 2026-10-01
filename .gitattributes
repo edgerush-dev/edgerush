@@ -3,3 +3,4 @@
 * text=auto eol=lf
 # Test corpora are wire bytes: a CRLF in one is the case under test, not a line ending.
 crates/proxy/tests/corpus/** -text
+fuzz/seeds/** -text

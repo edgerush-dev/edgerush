@@ -70,6 +70,11 @@ pub mod places;
 mod places;
 // Private, save when the fuzz targets and benchmarks are being built.
 #[cfg(feature = "fuzzing")]
+pub mod proxy_protocol;
+#[cfg(not(feature = "fuzzing"))]
+mod proxy_protocol;
+// Private, save when the fuzz targets and benchmarks are being built.
+#[cfg(feature = "fuzzing")]
 pub mod quic;
 #[cfg(not(feature = "fuzzing"))]
 mod quic;

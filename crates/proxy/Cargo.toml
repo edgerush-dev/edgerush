@@ -92,6 +92,11 @@ harness = false
 required-features = ["fuzzing"]
 
 [[bench]]
+name = "proxy_protocol"
+harness = false
+required-features = ["fuzzing"]
+
+[[bench]]
 name = "quic"
 harness = false
 required-features = ["fuzzing"]
