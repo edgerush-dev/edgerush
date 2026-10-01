@@ -276,7 +276,7 @@ mod tests {
     ) -> (SocketAddr, Arc<Loads>, Arc<Proxy>) {
         let yaml = r#"
 listeners:
-  web: { address: "127.0.0.1:0", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  web: { address: "127.0.0.1:0", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: everything
     listeners: [web]
@@ -380,8 +380,8 @@ upstreams:
     fn two_listeners(connections: usize) -> (SocketAddr, SocketAddr, Arc<Loads>, Arc<Proxy>) {
         let yaml = r#"
 listeners:
-  a: { address: "127.0.0.1:1", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
-  b: { address: "127.0.0.1:2", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  a: { address: "127.0.0.1:1", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  b: { address: "127.0.0.1:2", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: everything
     listeners: [a, b]

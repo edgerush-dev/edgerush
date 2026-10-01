@@ -40,7 +40,7 @@ const ID: HeaderValue = HeaderValue::from_static("0199e8a4-7c1b-7d2e-9a57-3f1c2b
 
 const SHOP: &str = r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }, request_id: generate }
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }, request_id: generate }
 routes:
   - name: shop
     listeners: [web]

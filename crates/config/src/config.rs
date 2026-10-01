@@ -70,6 +70,34 @@ pub struct Listener {
     /// its own; no other may.
     #[serde(default)]
     pub request_id: Option<RequestId>,
+    /// Whether every connection starts with a PROXY protocol header, and whose to believe
+    /// (20 in the docs). Every listener states it, `off` included: it decides who a
+    /// connection is taken to come from.
+    #[serde(default)]
+    pub proxy_protocol: Option<ListenerProxyProtocol>,
+}
+
+/// A listener's PROXY protocol ([20 §2](../../../docs/20-proxy-protocol.md)).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerProxyProtocol {
+    /// No header is read: a connection's first bytes are its protocol's.
+    Off,
+    /// Every connection must start with a header, v1 or v2. Its addresses are believed
+    /// when the connection comes from these ranges (`10.0.0.0/16`, `192.0.2.1/32` for one;
+    /// at least one), the load balancer's; from anywhere else, the header is read and
+    /// dropped, and whoever connected is the client.
+    Senders(Vec<String>),
+}
+
+/// The PROXY protocol version an upstream is sent ([20 §4](../../../docs/20-proxy-protocol.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyProtocolVersion {
+    /// The text line.
+    V1,
+    /// The binary header.
+    V2,
 }
 
 /// What an HTTP listener does with `X-Request-ID` (08 §3 in the docs).
@@ -206,6 +234,11 @@ pub struct Upstream {
     /// full share from the start.
     #[serde(default)]
     pub slow_start: Option<SlowStart>,
+    /// A PROXY protocol header ahead of each tunnel's bytes, telling the backend who the
+    /// client is; none is no header. For an upstream of TCP and TLS routes only: an HTTP
+    /// route's connections carry many clients' requests.
+    #[serde(default)]
+    pub proxy_protocol: Option<ProxyProtocolVersion>,
 }
 
 /// How an upstream's endpoint is chosen for an exchange ([03 §6](../../../docs/03-data-plane.md)).

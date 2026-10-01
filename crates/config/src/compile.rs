@@ -8,8 +8,9 @@ use crate::route::{
     Query, Redirect, Route, Scheme, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
 };
 use crate::{
-    Backend, Config, Forwarding, HealthCheck, Http3, Keepalive, LoadBalancer, Probe, Protocol,
-    RequestId, Rule, SlowStart, Tls, UpstreamProtocol, UpstreamTls,
+    Backend, Config, Forwarding, HealthCheck, Http3, Keepalive, ListenerProxyProtocol,
+    LoadBalancer, Probe, Protocol, ProxyProtocolVersion, RequestId, Rule, SlowStart, Tls,
+    UpstreamProtocol, UpstreamTls,
 };
 use edgerush_filters::forwarding::{ForwardingError, HeaderNames, TrustedProxies};
 use edgerush_filters::{
@@ -104,6 +105,9 @@ pub struct CompiledListener {
     /// What it does with `X-Request-ID`; [`RequestId::Pass`] for a `tcp` or `tls` listener,
     /// which carries no requests.
     pub request_id: RequestId,
+    /// The senders whose PROXY protocol headers are believed, on a listener that reads one
+    /// at the start of every connection; `None` for a listener that reads none.
+    pub proxy_senders: Option<TrustedProxies>,
 }
 
 /// What an HTTP listener tells its upstreams of a request's client, compiled.
@@ -435,6 +439,8 @@ pub struct CompiledUpstream {
     pub load_balancer: LoadBalancer,
     /// A new or recovered endpoint's ramp, if any.
     pub slow_start: Option<SlowStart>,
+    /// The PROXY protocol header its tunnels send first, if any.
+    pub proxy_protocol: Option<ProxyProtocolVersion>,
 }
 
 /// Compiles a config. The order of the routes, then of the rules, then of a rule's matches
@@ -466,6 +472,7 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             health_check: upstream.health_check.clone(),
             load_balancer: upstream.load_balancer,
             slow_start: upstream.slow_start,
+            proxy_protocol: upstream.proxy_protocol,
         })
         .collect();
     let data_plane = CompiledDataPlane {
@@ -593,6 +600,17 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             }
             _ => {}
         }
+        match &listener.proxy_protocol {
+            None => errors.push(Place::listener(name).problem(Problem::NoProxyProtocol)),
+            Some(ListenerProxyProtocol::Off) => {}
+            Some(ListenerProxyProtocol::Senders(senders)) => {
+                if senders.is_empty() {
+                    errors.push(Place::listener(name).problem(Problem::NoSenders));
+                } else if let Err(error) = senders_of(senders) {
+                    errors.push(Place::listener(name).problem(Problem::Senders(error)));
+                }
+            }
+        }
         let validation = listener
             .tls
             .as_ref()
@@ -679,6 +697,8 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
     }
 
     let mut l4 = l4_routes(config, &upstream_ids, &mut names, &mut errors);
+    proxy_protocol_upstreams(config, &mut errors);
+    tls_route_probes(config, &mut errors);
 
     if errors.is_empty() {
         let listeners = config
@@ -703,6 +723,11 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                     .unwrap_or_default(),
                 // Said for every HTTP listener, or there would have been an error.
                 request_id: listener.request_id.unwrap_or(RequestId::Pass),
+                // Found to compile above, or there would have been an error.
+                proxy_senders: match &listener.proxy_protocol {
+                    Some(ListenerProxyProtocol::Senders(senders)) => senders_of(senders).ok(),
+                    Some(ListenerProxyProtocol::Off) | None => None,
+                },
             })
             .collect();
         Ok(Compiled {
@@ -726,6 +751,76 @@ fn forwarding_of(forwarding: &Forwarding) -> Result<CompiledForwarding, Forwardi
             forwarding.trusted_only_headers.iter().map(String::as_str),
         )?,
     })
+}
+
+/// A listener's PROXY senders, compiled: ranges written as a trusted proxy's are.
+fn senders_of(senders: &[String]) -> Result<TrustedProxies, ForwardingError> {
+    TrustedProxies::new(senders.iter().map(String::as_str))
+}
+
+/// Refuses an upstream that sends a PROXY header as an HTTP route's backend or mirror: its
+/// backends expect a header first on every connection, and a connection to an HTTP upstream
+/// carries many clients' requests, on which the spec forbids one (20 §2).
+fn proxy_protocol_upstreams(config: &Config, errors: &mut Vec<ConfigError>) {
+    let sends = |upstream: &str| {
+        config
+            .upstreams
+            .get(upstream)
+            .is_some_and(|upstream| upstream.proxy_protocol.is_some())
+    };
+    for route in &config.routes {
+        for (rule_at, rule) in route.rules.iter().enumerate() {
+            let place = Place {
+                rule: Some(rule_at),
+                ..Place::route(&route.name)
+            };
+            let backends = rule.forward.iter().flat_map(|forward| &forward.backends);
+            for (at, backend) in backends.enumerate() {
+                if sends(&backend.upstream) {
+                    let place = Place {
+                        backend: Some(at),
+                        ..place.clone()
+                    };
+                    let problem = Problem::ProxyProtocolToHttp(backend.upstream.clone());
+                    errors.push(place.problem(problem));
+                }
+            }
+            for (at, filter) in rule.filters.iter().enumerate() {
+                if let Filter::RequestMirror(mirror) = filter
+                    && sends(&mirror.upstream)
+                {
+                    let place = Place {
+                        filter: Some(at),
+                        ..place.clone()
+                    };
+                    let problem = Problem::ProxyProtocolToHttp(mirror.upstream.clone());
+                    errors.push(place.problem(problem));
+                }
+            }
+        }
+    }
+}
+
+/// Refuses an HTTP probe of an upstream a TLS route reaches: its backends speak TLS, the
+/// client's, which a passthrough upstream cannot have, so a `GET` in the clear can never
+/// pass (20 §2). One only TCP routes reach may be an HTTP server, and may be probed so.
+fn tls_route_probes(config: &Config, errors: &mut Vec<ConfigError>) {
+    for route in &config.tls_routes {
+        for (at, backend) in route.backends.iter().enumerate() {
+            let probed = config
+                .upstreams
+                .get(&backend.upstream)
+                .and_then(|upstream| upstream.health_check.as_ref());
+            if probed.is_some_and(|check| matches!(check.probe, Probe::Http { .. })) {
+                let place = Place {
+                    backend: Some(at),
+                    ..Place::route(&route.name)
+                };
+                let problem = Problem::HttpProbeBehindTls(backend.upstream.clone());
+                errors.push(place.problem(problem));
+            }
+        }
+    }
 }
 
 /// The most backends a passthrough route has, as TCPRoute and TLSRoute allow.
@@ -1530,6 +1625,24 @@ pub enum Problem {
     /// A trusted proxy's range or a trusted-only header that is not one.
     #[error("`forwarding`: {0}")]
     Forwarding(ForwardingError),
+    /// A listener that does not say whether it reads a PROXY protocol header.
+    #[error("every listener needs `proxy_protocol`: `off`, or `{{ senders: [...] }}`")]
+    NoProxyProtocol,
+    /// PROXY protocol senders of which there are none, which would believe nobody.
+    #[error("`proxy_protocol.senders` is empty: at least one range, or `off`")]
+    NoSenders,
+    /// A PROXY protocol sender's range that is not one.
+    #[error("`proxy_protocol.senders`: {0}")]
+    Senders(ForwardingError),
+    /// An HTTP route's backend or mirror whose upstream is sent a PROXY header, which only a
+    /// tunnel sends.
+    #[error("upstream `{0}` is sent a PROXY protocol header, which only TCP and TLS routes send")]
+    ProxyProtocolToHttp(String),
+    /// An HTTP probe of an upstream whose backends speak TLS to the client.
+    #[error(
+        "upstream `{0}` is reached by a TLS route, whose backends speak TLS: an HTTP probe in the clear can never pass"
+    )]
+    HttpProbeBehindTls(String),
     /// An HTTP listener that does not say what it does with `X-Request-ID`.
     #[error("protocols `http` and `https` need `request_id`")]
     NoRequestId,
@@ -1801,7 +1914,7 @@ mod tests {
 
     const SHOP: &str = r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: shop
     listeners: [web]
@@ -1990,7 +2103,7 @@ upstreams:
     #[test]
     fn the_order_of_routes_is_the_last_tie_breaker() {
         let twins = r#"
-listeners: { web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
+listeners: { web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
 routes:
   - name: older
     listeners: [web]
@@ -2009,7 +2122,7 @@ upstreams: { u: { load_balancer: p2c, endpoints: [] } }
     #[test]
     fn wildcard_kind_and_fall_through_are_what_the_hostname_says() {
         let ingress_style = r#"
-listeners: { web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
+listeners: { web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
 routes:
   - name: wildcard
     listeners: [web]
@@ -2039,8 +2152,8 @@ upstreams: { u: { load_balancer: p2c, endpoints: [] } }
     fn every_problem_is_reported_with_its_place() {
         let broken = r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
-  web-again: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  web-again: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: a
     listeners: []
@@ -2111,7 +2224,7 @@ upstreams:
         let compiled = compile(&config(
             r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: a
     listeners: [web]
@@ -2190,7 +2303,7 @@ upstreams:
             let yaml = format!(
                 r#"
 listeners:
-  web: {{ address: "[::]:8080", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+  web: {{ address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
 routes:
   - name: a
     listeners: [web]
@@ -2238,7 +2351,7 @@ upstreams:
         let yaml = format!(
             r#"
 listeners:
-  web: {{ address: "[::]:8080", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+  web: {{ address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
 routes:
   - name: a
     listeners: [web]
@@ -2282,7 +2395,7 @@ upstreams:
         let compiled = compile(&config(
             r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: a
     listeners: [web]
@@ -2514,10 +2627,10 @@ upstreams: {}
             let yaml = format!("listeners: {{ l: {listener} }}\nroutes: []\nupstreams: {{}}\n");
             serde_saphyr::from_str::<Config>(&yaml).map(|_| ())
         };
-        assert!(listener(r#"{ address: "[::]:80", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }"#).is_ok());
+        assert!(listener(r#"{ address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }"#).is_ok());
         assert!(listener(r#"{ address: "[::]:80", protocol: gopher }"#).is_err());
         assert!(listener(r#"{ address: "[::]:80" }"#).is_err());
-        assert!(listener(r#"{ address: ":80", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }"#).is_err());
+        assert!(listener(r#"{ address: ":80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }"#).is_err());
     }
 
     /// An `https` listener has certificates, at least one; nothing else has any. What is in
@@ -2532,7 +2645,7 @@ upstreams: {}
         let one = r#"{ certificates: [{ chain: "C", key: "K" }] }"#;
 
         let compiled = compile(&with(&format!(
-            r#"{{ address: "[::]:443", protocol: https, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {one} }}"#
+            r#"{{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {one} }}"#
         )))
         .unwrap();
         assert_eq!(compiled.listeners[0].protocol, Protocol::Https);
@@ -2542,7 +2655,7 @@ upstreams: {}
         assert_eq!(tls.certificates[0].key, "K");
         assert_eq!(tls.client_validation, None);
         let validated = compile(&with(
-            r#"{ address: "[::]:443", protocol: https, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [{ chain: "C", key: "K" }], client_validation: { authorities: ["CA"] } } }"#,
+            r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [{ chain: "C", key: "K" }], client_validation: { authorities: ["CA"] } } }"#,
         ))
         .unwrap();
         let validation = validated.listeners[0].tls.as_ref().unwrap();
@@ -2552,7 +2665,7 @@ upstreams: {}
         );
         assert!(
             compile(&with(
-                r#"{ address: "[::]:443", protocol: https, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [{ chain: "C", key: "K" }], client_validation: { authorities: [] } } }"#,
+                r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [{ chain: "C", key: "K" }], client_validation: { authorities: [] } } }"#,
             ))
             .unwrap_err()[0]
                 .to_string()
@@ -2567,23 +2680,23 @@ upstreams: {}
                 .collect()
         };
         assert_eq!(
-            problems(r#"{ address: "[::]:443", protocol: https, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }"#.to_owned()),
+            problems(r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }"#.to_owned()),
             ["listener `l`: protocol `https` needs `tls` with a certificate"]
         );
         assert_eq!(
             problems(
-                r#"{ address: "[::]:443", protocol: https, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [] } }"#.to_owned()
+                r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [] } }"#.to_owned()
             ),
             ["listener `l`: protocol `https` needs `tls` with a certificate"]
         );
         assert_eq!(
             problems(format!(
-                r#"{{ address: "[::]:80", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {one} }}"#
+                r#"{{ address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {one} }}"#
             )),
             ["listener `l`: `tls` is for protocol `https`"]
         );
         // A certificate is its chain and its key, both said.
-        let yaml = r#"listeners: { l: { address: "[::]:443", protocol: https, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [{ chain: "C" }] } } }
+        let yaml = r#"listeners: { l: { address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [{ chain: "C" }] } } }
 routes: []
 upstreams: {}
 "#;
@@ -2603,7 +2716,7 @@ upstreams: {{}}
 "
             ))
         };
-        let https = r#"address: "[::]:443", protocol: https, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [{ chain: "C", key: "K" }] }"#;
+        let https = r#"address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [{ chain: "C", key: "K" }] }"#;
 
         let compiled = compile(&with(&format!("{{ {https}, http3: {{}} }}"))).unwrap();
         assert_eq!(
@@ -2633,7 +2746,7 @@ upstreams: {{}}
         assert_eq!(compiled.listeners[0].http3, None);
 
         let problems: Vec<String> = compile(&with(
-            r#"{ address: "[::]:80", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, http3: {} }"#,
+            r#"{ address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, http3: {} }"#,
         ))
         .unwrap_err()
         .iter()
@@ -2661,9 +2774,9 @@ upstreams: {{}}
         let compiled = compile(&config(
             r#"
 listeners:
-  web: { address: "[::]:80", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
-  db: { address: "[::]:5432", protocol: tcp, tunnel_idle_seconds: 90 }
-  sni: { address: "[::]:8443", protocol: tls }
+  web: { address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  db: { address: "[::]:5432", protocol: tcp, proxy_protocol: off, tunnel_idle_seconds: 90 }
+  sni: { address: "[::]:8443", protocol: tls, proxy_protocol: off }
 routes: []
 tcp_routes:
   - { name: db, listeners: [db], backends: [{ upstream: postgres, weight: 1 }] }
@@ -2728,9 +2841,9 @@ upstreams:
                 .map(ToString::to_string)
                 .collect()
         };
-        let tcp = r#"t: { address: "[::]:1", protocol: tcp }"#;
-        let tls = r#"s: { address: "[::]:2", protocol: tls }"#;
-        let http = r#"h: { address: "[::]:3", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }"#;
+        let tcp = r#"t: { address: "[::]:1", protocol: tcp, proxy_protocol: off }"#;
+        let tls = r#"s: { address: "[::]:2", protocol: tls, proxy_protocol: off }"#;
+        let http = r#"h: { address: "[::]:3", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }"#;
         let tcp_route = |name: &str, listeners: &str, backends: &str| {
             format!("{{ name: {name}, listeners: [{listeners}], backends: [{backends}] }}")
         };
@@ -2820,7 +2933,7 @@ upstreams:
         );
         assert_eq!(
             refused(
-                r#"t: { address: "[::]:1", protocol: tcp, tls: { certificates: [{ chain: C, key: K }] } }"#,
+                r#"t: { address: "[::]:1", protocol: tcp, proxy_protocol: off, tls: { certificates: [{ chain: C, key: K }] } }"#,
                 &format!("routes: []\ntcp_routes: [{}]", tcp_route("a", "t", up))
             ),
             ["listener `t`: `tls` is for protocol `https`"]
@@ -2840,7 +2953,7 @@ upstreams:
         assert_eq!(
             refused(
                 &format!(
-                    r#"{http}, w: {{ address: "[::]:4", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tunnel_idle_seconds: 60 }}"#
+                    r#"{http}, w: {{ address: "[::]:4", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tunnel_idle_seconds: 60 }}"#
                 ),
                 "routes: []"
             ),
@@ -2848,7 +2961,7 @@ upstreams:
         );
         assert_eq!(
             refused(
-                r#"t: { address: "[::]:1", protocol: tcp, tunnel_idle_seconds: 0 }"#,
+                r#"t: { address: "[::]:1", protocol: tcp, proxy_protocol: off, tunnel_idle_seconds: 0 }"#,
                 &format!("routes: []\ntcp_routes: [{}]", tcp_route("a", "t", up))
             ),
             ["listener `t`: `tunnel_idle_seconds` must be at least 1"]
@@ -2870,12 +2983,14 @@ upstreams:
                 .collect()
         };
         assert_eq!(
-            refused(r#"{ address: "[::]:80", protocol: http, request_id: generate }"#),
+            refused(
+                r#"{ address: "[::]:80", protocol: http, proxy_protocol: off, request_id: generate }"#
+            ),
             ["listener `l`: protocols `http` and `https` need `forwarding`"]
         );
         assert_eq!(
             refused(
-                r#"{ address: "[::]:80", protocol: tcp, forwarding: { trusted_proxies: [], trusted_only_headers: [] } }"#
+                r#"{ address: "[::]:80", protocol: tcp, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] } }"#
             ),
             [
                 "listener `l`: `forwarding` is for protocols `http` and `https`",
@@ -2885,13 +3000,13 @@ upstreams:
         // Both lists are written out, empty or not.
         assert!(
             serde_saphyr::from_str::<Config>(
-                "listeners: { l: { address: \"[::]:80\", protocol: http, forwarding: { trusted_proxies: [] } } }\nroutes: []\nupstreams: {}\n"
+                "listeners: { l: { address: \"[::]:80\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [] } } }\nroutes: []\nupstreams: {}\n"
             )
             .is_err()
         );
         assert_eq!(
             refused(
-                r#"{ address: "[::]:80", protocol: http, forwarding: { trusted_proxies: ["10.1.2.3/8"], trusted_only_headers: [] }, request_id: generate }"#
+                r#"{ address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: ["10.1.2.3/8"], trusted_only_headers: [] }, request_id: generate }"#
             ),
             [
                 "listener `l`: `forwarding`: `10.1.2.3/8` has bits set past its prefix; the range is `10.0.0.0/8`"
@@ -2899,7 +3014,7 @@ upstreams:
         );
         assert_eq!(
             refused(
-                r#"{ address: "[::]:80", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: ["Host"] }, request_id: generate }"#
+                r#"{ address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: ["Host"] }, request_id: generate }"#
             ),
             [
                 "listener `l`: `forwarding`: `Host` takes in `host`, which the gateway needs to read the request"
@@ -2907,7 +3022,7 @@ upstreams:
         );
 
         let compiled = compile(&config(
-            r#"listeners: { l: { address: "[::]:80", protocol: http, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: [Forwarded, "X-Forwarded-*"] }, request_id: generate } }
+            r#"listeners: { l: { address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: [Forwarded, "X-Forwarded-*"] }, request_id: generate } }
 routes: []
 upstreams: {}
 "#,
@@ -2930,6 +3045,160 @@ upstreams: {}
         );
     }
 
+    /// Every listener says whether it reads a PROXY protocol header, `off` included, and a
+    /// listener that reads one names at least one sender, each a range written as a trusted
+    /// proxy's is (20 §2).
+    #[test]
+    fn every_listener_says_whether_it_reads_a_proxy_header() {
+        const HTTP: &str = r#"address: "[::]:80", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate"#;
+        let refused = |listener: &str| -> Vec<String> {
+            let yaml =
+                format!("listeners: {{ l: {{ {listener} }} }}\nroutes: []\nupstreams: {{}}\n");
+            compile(&config(&yaml))
+                .err()
+                .unwrap_or_default()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(
+            refused(HTTP),
+            ["listener `l`: every listener needs `proxy_protocol`: `off`, or `{ senders: [...] }`"]
+        );
+        assert_eq!(
+            refused(&format!("{HTTP}, proxy_protocol: {{ senders: [] }}")),
+            ["listener `l`: `proxy_protocol.senders` is empty: at least one range, or `off`"]
+        );
+        assert_eq!(
+            refused(&format!(
+                r#"{HTTP}, proxy_protocol: {{ senders: ["10.1.2.3/8"] }}"#
+            )),
+            [
+                "listener `l`: `proxy_protocol.senders`: `10.1.2.3/8` has bits set past its prefix; the range is `10.0.0.0/8`"
+            ]
+        );
+        // One spelling: `off` or the senders, nothing else.
+        for other in [
+            "on",
+            "true",
+            "{ senders: [], off: true }",
+            "{ trusted: [\"10.0.0.0/8\"] }",
+        ] {
+            let yaml = format!(
+                "listeners: {{ l: {{ {HTTP}, proxy_protocol: {other} }} }}\nroutes: []\nupstreams: {{}}\n"
+            );
+            assert!(serde_saphyr::from_str::<Config>(&yaml).is_err(), "{other}");
+        }
+
+        let compiled = compile(&config(&format!(
+            r#"listeners:
+  l: {{ {HTTP}, proxy_protocol: {{ senders: ["10.0.0.0/16", "2001:db8::/32"] }} }}
+  off: {{ address: "[::]:81", protocol: tcp, proxy_protocol: off }}
+routes: []
+tcp_routes: [{{ name: db, listeners: [off], backends: [{{ upstream: up, weight: 1 }}] }}]
+upstreams: {{ up: {{ load_balancer: p2c, endpoints: [] }} }}
+"#
+        )))
+        .unwrap();
+        let senders = listener(&compiled, "l").proxy_senders.as_ref().unwrap();
+        assert!(senders.trusts("10.0.255.1".parse().unwrap()));
+        assert!(senders.trusts("::ffff:10.0.0.1".parse().unwrap()));
+        assert!(senders.trusts("2001:db8::7".parse().unwrap()));
+        assert!(!senders.trusts("10.1.0.1".parse().unwrap()));
+        assert!(listener(&compiled, "off").proxy_senders.is_none());
+    }
+
+    /// An upstream may say it is sent a PROXY header, in either version, and is then for TCP
+    /// and TLS routes only: an HTTP route's backend or mirror cannot be one (20 §2).
+    #[test]
+    fn an_upstream_sent_a_proxy_header_is_for_tunnels_only() {
+        let compile_with = |routes: &str| {
+            let yaml = format!(
+                r#"listeners:
+  h: {{ address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+  t: {{ address: "[::]:81", protocol: tcp, proxy_protocol: off }}
+{routes}
+tcp_routes: [{{ name: db, listeners: [t], backends: [{{ upstream: one, weight: 1 }}] }}]
+upstreams:
+  one: {{ load_balancer: p2c, endpoints: [], proxy_protocol: v1 }}
+  two: {{ load_balancer: p2c, endpoints: [], proxy_protocol: v2 }}
+  plain: {{ load_balancer: p2c, endpoints: [] }}
+"#
+            );
+            compile(&config(&yaml))
+        };
+        let compiled = compile_with("routes: []").unwrap();
+        let version = |name: &str| {
+            compiled
+                .upstreams
+                .iter()
+                .find(|upstream| upstream.name == name)
+                .unwrap()
+                .proxy_protocol
+        };
+        assert_eq!(version("one"), Some(ProxyProtocolVersion::V1));
+        assert_eq!(version("two"), Some(ProxyProtocolVersion::V2));
+        assert_eq!(version("plain"), None);
+
+        let problems: Vec<String> = compile_with(
+            r#"routes:
+  - name: web
+    listeners: [h]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        filters: [{ type: request_mirror, upstream: two, fraction: { numerator: 1, denominator: 1 } }]
+        forward: { backends: [{ upstream: plain, weight: 1 }, { upstream: one, weight: 1 }] }"#,
+        )
+        .unwrap_err()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(
+            problems,
+            [
+                "route `web`, rules[0], forward.backends[1]: upstream `one` is sent a PROXY protocol header, which only TCP and TLS routes send",
+                "route `web`, rules[0], filters[0]: upstream `two` is sent a PROXY protocol header, which only TCP and TLS routes send",
+            ]
+        );
+        let yaml = "listeners: {}\nroutes: []\nupstreams: { u: { load_balancer: p2c, endpoints: [], proxy_protocol: v3 } }\n";
+        assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
+    }
+
+    /// An HTTP probe can never pass against a TLS route's backends, which speak TLS; against
+    /// a TCP route's, which may be HTTP servers, it may (20 §2).
+    #[test]
+    fn an_http_probe_of_a_tls_routes_backends_is_refused() {
+        let compile_with = |route: &str| {
+            let yaml = format!(
+                r#"listeners:
+  t: {{ address: "[::]:81", protocol: tcp, proxy_protocol: off }}
+  s: {{ address: "[::]:82", protocol: tls, proxy_protocol: off }}
+routes: []
+tcp_routes: [{{ name: db, listeners: [t], backends: [{{ upstream: http, weight: 1 }}] }}]
+tls_routes: [{{ name: api, listeners: [s], hostnames: [{{ name: a.test, falls_through: true }}], backends: [{route}] }}]
+upstreams:
+  http: {{ load_balancer: p2c, endpoints: [], health_check: {{ interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 1, unhealthy_threshold: 1, probe: {{ http: {{ path: / }} }} }} }}
+  quiet: {{ load_balancer: p2c, endpoints: [] }}
+"#
+            );
+            compile(&config(&yaml))
+        };
+        assert!(compile_with("{ upstream: quiet, weight: 1 }").is_ok());
+        let problems: Vec<String> =
+            compile_with("{ upstream: quiet, weight: 1 }, { upstream: http, weight: 1 }")
+                .unwrap_err()
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+        assert_eq!(
+            problems,
+            [
+                "route `api`, backends[1]: upstream `http` is reached by a TLS route, whose backends speak TLS: an HTTP probe in the clear can never pass"
+            ]
+        );
+    }
+
     /// An HTTP listener always says what it does with `X-Request-ID`, a passthrough listener
     /// never; there are two things it can do, spelled out.
     #[test]
@@ -2946,12 +3215,14 @@ upstreams: {}
         };
         assert_eq!(
             refused(&format!(
-                r#"{{ address: "[::]:80", protocol: http, {FORWARDING} }}"#
+                r#"{{ address: "[::]:80", protocol: http, proxy_protocol: off, {FORWARDING} }}"#
             )),
             ["listener `l`: protocols `http` and `https` need `request_id`"]
         );
         assert_eq!(
-            refused(r#"{ address: "[::]:80", protocol: tcp, request_id: pass }"#),
+            refused(
+                r#"{ address: "[::]:80", protocol: tcp, proxy_protocol: off, request_id: pass }"#
+            ),
             [
                 "listener `l`: `request_id` is for protocols `http` and `https`",
                 "listener `l`: a `tcp` listener needs exactly one TCP route; it has 0",
@@ -2960,7 +3231,7 @@ upstreams: {}
         for unknown in ["on", "true", "Generate", "keep"] {
             assert!(
                 serde_saphyr::from_str::<Config>(&format!(
-                    "listeners: {{ l: {{ address: \"[::]:80\", protocol: http, {FORWARDING}, request_id: {unknown} }} }}\nroutes: []\nupstreams: {{}}\n"
+                    "listeners: {{ l: {{ address: \"[::]:80\", protocol: http, proxy_protocol: off, {FORWARDING}, request_id: {unknown} }} }}\nroutes: []\nupstreams: {{}}\n"
                 ))
                 .is_err(),
                 "{unknown}"
@@ -2969,7 +3240,7 @@ upstreams: {}
 
         for (written, meant) in [("generate", RequestId::Generate), ("pass", RequestId::Pass)] {
             let compiled = compile(&config(&format!(
-                "listeners: {{ l: {{ address: \"[::]:80\", protocol: http, {FORWARDING}, request_id: {written} }} }}\nroutes: []\nupstreams: {{}}\n"
+                "listeners: {{ l: {{ address: \"[::]:80\", protocol: http, proxy_protocol: off, {FORWARDING}, request_id: {written} }} }}\nroutes: []\nupstreams: {{}}\n"
             )))
             .unwrap();
             assert_eq!(listener(&compiled, "l").request_id, meant, "{written}");
@@ -3031,7 +3302,7 @@ upstreams: {}
         let with = |matching: &str| {
             let yaml = format!(
                 r#"
-listeners: {{ web: {{ address: "[::]:80", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }} }}
+listeners: {{ web: {{ address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }} }}
 routes:
   - name: r
     listeners: [web]
@@ -3077,7 +3348,7 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
     fn a_grpc_method_matches_as_the_path_its_calls_have() {
         let compiled = compile(&config(
             r#"
-listeners: { web: { address: "[::]:80", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
+listeners: { web: { address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
 routes:
   - name: r
     listeners: [web]
@@ -3261,7 +3532,7 @@ upstreams: { u: { load_balancer: p2c, endpoints: [] } }
         let with = |mirror: &str| {
             let yaml = format!(
                 r#"
-listeners: {{ web: {{ address: "[::]:80", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }} }}
+listeners: {{ web: {{ address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }} }}
 routes:
   - name: r
     listeners: [web]
@@ -3325,7 +3596,7 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }}, shadow: {{ load_balanc
         let with = |retry: &str| {
             let yaml = format!(
                 r#"
-listeners: {{ web: {{ address: "[::]:80", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }} }}
+listeners: {{ web: {{ address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }} }}
 routes:
   - name: r
     listeners: [web]
@@ -3409,7 +3680,7 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
         let with = |forward: &str| {
             let yaml = format!(
                 r#"
-listeners: {{ web: {{ address: "[::]:80", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }} }}
+listeners: {{ web: {{ address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }} }}
 routes:
   - name: r
     listeners: [web]
@@ -3537,9 +3808,9 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
     fn every_listener_has_a_router_of_the_routes_that_are_for_it() {
         let two = r#"
 listeners:
-  public: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
-  internal: { address: "127.0.0.1:9090", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
-  idle: { address: "127.0.0.1:9091", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  public: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  internal: { address: "127.0.0.1:9090", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  idle: { address: "127.0.0.1:9091", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: site
     listeners: [public]

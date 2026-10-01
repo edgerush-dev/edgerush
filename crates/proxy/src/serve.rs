@@ -4113,7 +4113,7 @@ mod tests {
                 let yaml = format!(
                     r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+  web: {{ address: "127.0.0.1:0", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
 routes:
   - name: everything
     listeners: [web]
@@ -4743,7 +4743,7 @@ upstreams:
     /// listener's settings.
     fn tcp_to(backend: SocketAddr, extra: &str) -> String {
         format!(
-            "listeners: {{ db: {{ address: \"127.0.0.1:0\", protocol: tcp{extra} }} }}\n\
+            "listeners: {{ db: {{ address: \"127.0.0.1:0\", protocol: tcp, proxy_protocol: off{extra} }} }}\n\
              routes: []\n\
              tcp_routes: [{{ name: db, listeners: [db], backends: [{{ upstream: up, weight: 1 }}] }}]\n\
              upstreams: {{ up: {{ load_balancer: p2c, endpoints: [\"{backend}\"] }} }}\n"
@@ -5031,7 +5031,7 @@ upstreams:
                 let exact = tls_backend("exact").await;
                 let wildcard = tls_backend("wildcard").await;
                 let yaml = format!(
-                    "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls }} }}\n\
+                    "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls, proxy_protocol: off }} }}\n\
                      routes: []\n\
                      tls_routes:\n\
                      \x20 - {{ name: exact, listeners: [sni], hostnames: [{{ name: api.example.test, falls_through: true }}], backends: [{{ upstream: exact, weight: 1 }}] }}\n\
@@ -5067,7 +5067,7 @@ upstreams:
             .run_until(async {
                 let backend = quiet_backend().await;
                 let yaml = format!(
-                    "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls }} }}\n\
+                    "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls, proxy_protocol: off }} }}\n\
                      routes: []\n\
                      tls_routes: [{{ name: a, listeners: [sni], hostnames: [{{ name: a.test, falls_through: true }}], backends: [{{ upstream: up, weight: 1 }}] }}]\n\
                      upstreams: {{ up: {{ load_balancer: p2c, endpoints: [\"{backend}\"] }} }}\n"
@@ -9871,7 +9871,7 @@ upstreams:
         let yaml = format!(
             r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+  web: {{ address: "127.0.0.1:0", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
 routes:
   - name: everything
     listeners: [web]
@@ -10678,7 +10678,7 @@ upstreams:
         let yaml = format!(
             r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+  web: {{ address: "127.0.0.1:0", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
 routes:
   - name: everything
     listeners: [web]
@@ -10920,7 +10920,7 @@ upstreams:
         let mut yaml = String::from("routes: []\nupstreams: {}\nlisteners:\n");
         for (at, name) in listeners.iter().enumerate() {
             yaml += &format!(
-                "  {name}: {{ address: \"127.0.0.1:{at}\", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
+                "  {name}: {{ address: \"127.0.0.1:{at}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
             );
         }
         let config: Config = serde_saphyr::from_str(&yaml).unwrap();

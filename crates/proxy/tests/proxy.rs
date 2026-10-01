@@ -193,7 +193,7 @@ fn everything_to(listeners: &[(&str, SocketAddr)], config: &str) -> String {
     let mut yaml = String::from("listeners:\n");
     for (at, (listener, _)) in listeners.iter().enumerate() {
         yaml += &format!(
-            "  {listener}: {{ address: \"127.0.0.1:{at}\", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
+            "  {listener}: {{ address: \"127.0.0.1:{at}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
         );
     }
     yaml += "routes:\n";
@@ -230,7 +230,7 @@ async fn shop() -> SocketAddr {
     let yaml = format!(
         r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+  web: {{ address: "127.0.0.1:0", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
 routes:
   - name: shop
     listeners: [web]
@@ -464,7 +464,7 @@ async fn moved() -> (Arc<Proxy>, SocketAddr, Arc<AtomicUsize>) {
     let yaml = format!(
         r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+  web: {{ address: "127.0.0.1:0", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
 routes:
   - name: moved
     listeners: [web]
@@ -595,7 +595,7 @@ async fn a_request_has_one_host_for_everything_that_looks_at_it() {
     let yaml = format!(
         r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+  web: {{ address: "127.0.0.1:0", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
 routes:
   - name: by-host-header
     listeners: [web]
@@ -710,7 +710,7 @@ async fn http2_comes_in_and_http1_goes_out() {
     let yaml = format!(
         r#"
 listeners:
-  web: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+  web: {{ address: "127.0.0.1:0", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
 routes:
   - name: everything
     listeners: [web]
@@ -753,8 +753,8 @@ async fn every_listener_serves_its_own_routes_and_every_endpoint_gets_requests()
     let yaml = format!(
         r#"
 listeners:
-  admin: {{ address: "127.0.0.1:0", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
-  web: {{ address: "127.0.0.1:1", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+  admin: {{ address: "127.0.0.1:0", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+  web: {{ address: "127.0.0.1:1", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
 routes:
   - name: web
     listeners: [web]
@@ -1212,7 +1212,7 @@ fn a_failure_to_accept_is_counted_and_only_some_are_waited_after() {
 /// several upstreams are reachable through one proxy and told apart by the answer.
 fn routed_to(upstreams: &[(&str, SocketAddr)]) -> String {
     let mut yaml = String::from(
-        "listeners:\n  web: { address: \"127.0.0.1:0\", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\nroutes:\n  \
+        "listeners:\n  web: { address: \"127.0.0.1:0\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\nroutes:\n  \
          - name: everything\n    listeners: [web]\n    hostnames:\n      \
          - { name: \"*\", falls_through: true }\n    rules:\n",
     );
@@ -1607,7 +1607,7 @@ fn balanced(endpoints: &[SocketAddr], balancer: &str, retry: bool) -> String {
         ""
     };
     format!(
-        "listeners:\n  web: {{ address: \"127.0.0.1:0\", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n\
+        "listeners:\n  web: {{ address: \"127.0.0.1:0\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n\
          routes:\n  - name: everything\n    listeners: [web]\n    hostnames:\n      - {{ name: \"*\", falls_through: true }}\n    rules:\n      \
          - matches:\n          - path: {{ prefix: / }}\n        forward: {{ backends: [{{ upstream: web, weight: 1 }}]{retry} }}\n\
          upstreams:\n  web: {{ load_balancer: {balancer}, endpoints: [{}] }}\n",

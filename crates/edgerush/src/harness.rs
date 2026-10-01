@@ -757,7 +757,7 @@ mod tests {
         let mut yaml = String::from("routes: []\nupstreams: {}\nlisteners:\n");
         for (name, address) in listeners {
             yaml += &format!(
-                "  {name}: {{ address: \"{address}\", protocol: http, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
+                "  {name}: {{ address: \"{address}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
             );
         }
         let config: Config = serde_saphyr::from_str(&yaml).unwrap();

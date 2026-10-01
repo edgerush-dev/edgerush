@@ -416,9 +416,9 @@ mod tests {
 
     const SHOP: &str = r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }, request_id: generate }
-  admin: { address: "[::]:9090", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
-  secure: { address: "[::]:8443", protocol: https, tls: { certificates: [{ chain: "C", key: "K" }] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }, request_id: generate }
+  admin: { address: "[::]:9090", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  secure: { address: "[::]:8443", protocol: https, proxy_protocol: off, tls: { certificates: [{ chain: "C", key: "K" }] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: shop
     listeners: [web, secure]
@@ -697,7 +697,7 @@ upstreams:
             &serde_saphyr::from_str::<Config>(
                 r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: ["X-*"] }, request_id: generate }
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: ["X-*"] }, request_id: generate }
 routes:
   - name: shop
     listeners: [web]
@@ -967,7 +967,7 @@ upstreams:
 
     const MOVED: &str = r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: moved
     listeners: [web]
@@ -1032,7 +1032,7 @@ upstreams:
 
     const REWRITTEN: &str = r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: rewritten
     listeners: [web]
@@ -1108,7 +1108,7 @@ upstreams:
 
     const MIRRORED: &str = r#"
 listeners:
-  web: { address: "[::]:8080", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: mirrored
     listeners: [web]

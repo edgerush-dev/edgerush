@@ -26,8 +26,8 @@ pub use compile::{
 };
 pub use config::{
     Certificate, ClientValidation, Config, DataPlane, Forwarding, HealthCheck, Http3, Keepalive,
-    Listener, LoadBalancer, Probe, Protocol, RequestId, SlowStart, Tls, Upstream, UpstreamProtocol,
-    UpstreamTls,
+    Listener, ListenerProxyProtocol, LoadBalancer, Probe, Protocol, ProxyProtocolVersion,
+    RequestId, SlowStart, Tls, Upstream, UpstreamProtocol, UpstreamTls,
 };
 pub use route::{
     Backend, Filter, Forward, Fraction, GrpcMethod, Header, HeaderChanges, Hostname, Match, Mirror,
