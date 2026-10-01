@@ -21,6 +21,10 @@
 //! not — connection and TLS state, the kernel's socket buffers, what the allocator keeps.
 //! Never more than a worker's own bound, which is also what it has without a limit.
 //!
+//! The other half also holds the connections, which no storage account counts: so a
+//! worker's connection cap is no more than that half, shared out, at what the dearest kind
+//! of idle connection was measured to cost the pod.
+//!
 //! [03 §9]: ../../../docs/03-data-plane.md
 
 use crate::per_core::CONNECTIONS_PER_WORKER;
@@ -30,6 +34,12 @@ use std::num::NonZeroUsize;
 /// The least storage a worker is given, however small the limit: room for 128 heads of the
 /// largest size, so that no limit leaves a worker unable to read a request.
 const STORAGE_FLOOR: usize = 8 * 1024 * 1024;
+
+/// What an idle connection costs the pod at most, of the kinds measured: TLS with HTTP/2,
+/// after one request, 21.5–21.9 KB of the cgroup's memory (18.2 KB the process's, 4.0 KB
+/// the kernel's), rounded up. Plain HTTP/1 is 7.7 KB, HTTP/2 16.4 KB, TLS HTTP/1 16.4 KB
+/// (laptop, 4 workers, `bench/idle.py`, 03 §9).
+const CONNECTION_COST: u64 = 22 * 1024;
 
 /// Where the pod's limit is read, in a cgroup namespace or not.
 #[cfg(target_os = "linux")]
@@ -106,19 +116,53 @@ pub(crate) fn raise_open_files() -> OpenFiles {
     OpenFiles::NoLimit
 }
 
-/// How many connections each of `workers` may hold under `open_files`: what the limit
-/// leaves after the reserve, two open files to a connection, shared out — never more than
-/// [`CONNECTIONS_PER_WORKER`], and never none.
-pub(crate) fn connections_per_worker(open_files: OpenFiles, workers: NonZeroUsize) -> usize {
-    let Some(limit) = open_files.limit() else {
-        return CONNECTIONS_PER_WORKER;
-    };
-    let usable = limit - RESERVE.min(limit / 2);
+/// How many connections each of `workers` may hold, and what set it: under `open_files`,
+/// what the limit leaves after the reserve, two open files to a connection, shared out; and
+/// under `memory`, the half of it beside storage at [`CONNECTION_COST`] a connection, shared
+/// out — the fewer of the two, never more than [`CONNECTIONS_PER_WORKER`], and never none.
+pub(crate) fn connections_per_worker(
+    open_files: OpenFiles,
+    memory: Memory,
+    workers: NonZeroUsize,
+) -> Connections {
     let workers = u64::try_from(workers.get()).unwrap_or(u64::MAX);
-    let each = usable / PER_CONNECTION / workers;
-    usize::try_from(each)
-        .unwrap_or(usize::MAX)
-        .clamp(1, CONNECTIONS_PER_WORKER)
+    let each = |many: u64| {
+        usize::try_from(many / workers)
+            .unwrap_or(usize::MAX)
+            .clamp(1, CONNECTIONS_PER_WORKER)
+    };
+    let by_files = open_files
+        .limit()
+        .map(|limit| each((limit - RESERVE.min(limit / 2)) / PER_CONNECTION));
+    let by_memory = match memory {
+        Memory::NoLimit => None,
+        Memory::Limit { bytes, .. } => Some(each(bytes / 2 / CONNECTION_COST)),
+    };
+    match (by_files, by_memory) {
+        (Some(files), Some(memory)) if memory < files => Connections {
+            each: memory,
+            set_by: "memory",
+        },
+        (None, Some(memory)) if memory < CONNECTIONS_PER_WORKER => Connections {
+            each: memory,
+            set_by: "memory",
+        },
+        (Some(files), _) if files < CONNECTIONS_PER_WORKER => Connections {
+            each: files,
+            set_by: "open files",
+        },
+        _ => Connections {
+            each: CONNECTIONS_PER_WORKER,
+            set_by: "a worker's bound",
+        },
+    }
+}
+
+/// How many connections a worker may hold, and which limit set it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Connections {
+    pub(crate) each: usize,
+    pub(crate) set_by: &'static str,
 }
 
 /// What memory the pod may use, as its cgroup says.
@@ -230,9 +274,13 @@ pub(crate) fn described_memory(memory: Memory, storage: usize) -> String {
     }
 }
 
-/// What the start says of the open files and the connections they allow each worker.
-pub(crate) fn described(open_files: OpenFiles, connections: usize) -> String {
-    let each = format!("{connections} connections a worker");
+/// What the start says of the open files, and the connections each worker may hold and
+/// what set that.
+pub(crate) fn described(open_files: OpenFiles, connections: Connections) -> String {
+    let each = format!(
+        "{} connections a worker, by {}",
+        connections.each, connections.set_by
+    );
     let shown = |limit: Option<u64>| limit.map_or("none".to_owned(), |limit| limit.to_string());
     match open_files {
         OpenFiles::NoLimit => each,
@@ -266,17 +314,64 @@ mod tests {
         }
     }
 
+    fn bound(each: usize, set_by: &'static str) -> Connections {
+        Connections { each, set_by }
+    }
+
+    #[test]
+    fn the_cap_is_the_fewer_of_what_open_files_and_memory_allow() {
+        const MIB: u64 = 1024 * 1024;
+        let memory = |bytes: u64| Memory::Limit {
+            bytes,
+            from: "memory.max",
+        };
+        // 512 MiB, 4 workers: 256 MiB at 22 KiB a connection, 11,915, 2,978 each.
+        assert_eq!(
+            connections_per_worker(limit(524_288), memory(512 * MIB), workers(4)),
+            bound(2_978, "memory")
+        );
+        // 1 GiB beside a hard limit of 65,536 open files: memory's 5,957 is fewer than
+        // the files' 8,064.
+        assert_eq!(
+            connections_per_worker(limit(65_536), memory(1024 * MIB), workers(4)),
+            bound(5_957, "memory")
+        );
+        // 8 GiB: memory would allow more than a worker's bound.
+        assert_eq!(
+            connections_per_worker(limit(524_288), memory(8192 * MIB), workers(4)),
+            bound(CONNECTIONS_PER_WORKER, "a worker's bound")
+        );
+        // A small memory limit with no open-file limit to speak of.
+        assert_eq!(
+            connections_per_worker(OpenFiles::NoLimit, memory(64 * MIB), workers(2)),
+            bound(744, "memory")
+        );
+        // Open files fewer than memory allows.
+        assert_eq!(
+            connections_per_worker(limit(4_096), memory(8192 * MIB), workers(1)),
+            bound(1_536, "open files")
+        );
+        // However small, never none.
+        assert_eq!(
+            connections_per_worker(OpenFiles::NoLimit, memory(0), workers(1)),
+            bound(1, "memory")
+        );
+    }
+
     #[test]
     fn a_limit_high_enough_leaves_the_cap_as_it_is() {
         // containerd 2.x's hard limit, raised to: room for the whole cap on up to seven
         // workers, and on eight a little less, (524,288 - 1,024) / 2 / 8.
         assert_eq!(
-            connections_per_worker(limit(524_288), workers(7)),
+            connections_per_worker(limit(524_288), Memory::NoLimit, workers(7)).each,
             CONNECTIONS_PER_WORKER
         );
-        assert_eq!(connections_per_worker(limit(524_288), workers(8)), 32_704);
         assert_eq!(
-            connections_per_worker(OpenFiles::NoLimit, workers(64)),
+            connections_per_worker(limit(524_288), Memory::NoLimit, workers(8)).each,
+            32_704
+        );
+        assert_eq!(
+            connections_per_worker(OpenFiles::NoLimit, Memory::NoLimit, workers(64)).each,
             CONNECTIONS_PER_WORKER
         );
         let unlimited = OpenFiles::Raised {
@@ -284,7 +379,7 @@ mod tests {
             now: None,
         };
         assert_eq!(
-            connections_per_worker(unlimited, workers(4)),
+            connections_per_worker(unlimited, Memory::NoLimit, workers(4)).each,
             CONNECTIONS_PER_WORKER
         );
     }
@@ -292,49 +387,67 @@ mod tests {
     #[test]
     fn a_lower_limit_is_shared_out_after_the_reserve_two_files_to_a_connection() {
         // (65,536 - 1,024) / 2 / 4
-        assert_eq!(connections_per_worker(limit(65_536), workers(4)), 8_064);
+        assert_eq!(
+            connections_per_worker(limit(65_536), Memory::NoLimit, workers(4)).each,
+            8_064
+        );
         // More workers than that leaves less to each.
-        assert_eq!(connections_per_worker(limit(524_288), workers(16)), 16_352);
+        assert_eq!(
+            connections_per_worker(limit(524_288), Memory::NoLimit, workers(16)).each,
+            16_352
+        );
     }
 
     #[test]
     fn a_small_limit_keeps_half_for_the_reserve_and_never_leaves_a_worker_none() {
         // The 1,024 a process is given if it cannot raise it: 512 kept, 256 connections.
-        assert_eq!(connections_per_worker(limit(1024), workers(1)), 256);
-        assert_eq!(connections_per_worker(limit(1024), workers(4)), 64);
+        assert_eq!(
+            connections_per_worker(limit(1024), Memory::NoLimit, workers(1)).each,
+            256
+        );
+        assert_eq!(
+            connections_per_worker(limit(1024), Memory::NoLimit, workers(4)).each,
+            64
+        );
         let kept = OpenFiles::Kept {
             now: Some(16),
             why: std::io::ErrorKind::PermissionDenied,
         };
-        assert_eq!(connections_per_worker(kept, workers(64)), 1);
-        assert_eq!(connections_per_worker(limit(0), workers(1)), 1);
+        assert_eq!(
+            connections_per_worker(kept, Memory::NoLimit, workers(64)).each,
+            1
+        );
+        assert_eq!(
+            connections_per_worker(limit(0), Memory::NoLimit, workers(1)).each,
+            1
+        );
     }
 
     #[test]
     fn the_start_says_what_became_of_the_limit_and_what_each_worker_may_hold() {
         assert_eq!(
-            described(limit(524_288), 32_768),
-            "open files: soft limit 1024 raised to 524288; 32768 connections a worker"
+            described(limit(524_288), bound(32_768, "a worker's bound")),
+            "open files: soft limit 1024 raised to 524288; 32768 connections a worker, by a worker's bound"
         );
         let same = OpenFiles::Raised {
             was: Some(4096),
             now: Some(4096),
         };
         assert_eq!(
-            described(same, 1_792),
-            "open files: soft limit 4096; 1792 connections a worker"
+            described(same, bound(1_792, "open files")),
+            "open files: soft limit 4096; 1792 connections a worker, by open files"
         );
         let kept = OpenFiles::Kept {
             now: Some(1024),
             why: std::io::ErrorKind::PermissionDenied,
         };
         assert_eq!(
-            described(kept, 256),
-            "open files: soft limit 1024, not raised (permission denied); 256 connections a worker"
+            described(kept, bound(256, "open files")),
+            "open files: soft limit 1024, not raised (permission denied); 256 connections a worker, by open files"
         );
         assert_eq!(
-            described(OpenFiles::NoLimit, 32_768),
-            "32768 connections a worker"
+            described(OpenFiles::NoLimit, bound(32_768, "memory")),
+            "32768 connections a worker, by memory"
         );
     }
 

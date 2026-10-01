@@ -254,8 +254,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         .unwrap_or(NonZeroUsize::MIN);
     // Before a socket is opened, as every socket is an open file.
     let open_files = crate::limits::raise_open_files();
-    let connections = crate::limits::connections_per_worker(open_files, workers);
     let memory = crate::limits::memory();
+    let connections = crate::limits::connections_per_worker(open_files, memory, workers);
     let mut limits = limits;
     limits.storage = crate::limits::storage_per_worker(memory, workers);
     // One worker is alone on every listener's port and needs nothing of the kernel; it is
@@ -321,8 +321,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     let (stopping, stop) = mpsc::channel();
     stop_signals(stopping.clone()).map_err(Failure::Runtime)?;
     // Every worker runs on a thread of its own, which stays for as long as the process.
-    let loads =
-        per_core::start(&proxy, sockets, accept, limits, connections).map_err(Failure::Runtime)?;
+    let loads = per_core::start(&proxy, sockets, accept, limits, connections.each)
+        .map_err(Failure::Runtime)?;
     health_checks(Arc::clone(&proxy)).map_err(Failure::Runtime)?;
     if let Some(socket) = metrics {
         let address = socket.local_addr().map_err(Failure::Runtime)?;
