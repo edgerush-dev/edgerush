@@ -1000,13 +1000,13 @@ impl Worker {
     /// Takes a place among the exchanges this worker has in hand for one with the upstream
     /// in `upstream`, if one is going to it: none once every place is held, and none for
     /// an upstream that holds its fair share once the worker is short of them
-    /// ([03 §9](../../docs/03-data-plane.md)). `upstreams` is how many the config it was
-    /// directed by has.
+    /// ([03 §9](../../docs/03-data-plane.md)). `alone` says the config it was directed by
+    /// has no other upstream.
     ///
     /// Nothing waits here. A request arriving at a worker that is already full is
     /// answered, because holding it would cost the very memory the bound is for.
-    fn admit(&self, upstream: usize, upstreams: usize) -> Result<Admitted, Answer> {
-        match self.places.take(upstream, upstreams) {
+    fn admit(&self, upstream: usize, alone: bool) -> Result<Admitted, Answer> {
+        match self.places.take(upstream, alone) {
             Ok(place) => Ok(Admitted {
                 _place: place,
                 counted: None,
@@ -1642,7 +1642,7 @@ impl Worker {
         // entitles a request to a connection, so it is taken before one is sought. The same
         // bound whichever client carries the request, so that the two are compared doing
         // the same work ([14 §2](../../docs/14-downstream-server.md)).
-        let admitted = match self.admit(directed.upstream_slot, directed.upstreams) {
+        let admitted = match self.admit(directed.upstream_slot, directed.alone) {
             Ok(admitted) => admitted,
             Err(refused) => return self.proxy.answer_to(listener, refused, call).into(),
         };
@@ -1651,14 +1651,7 @@ impl Worker {
             body
         } else {
             let mirrors = std::mem::take(&mut directed.mirrors);
-            self.mirror(
-                mirrors,
-                directed.upstreams,
-                &head,
-                &nominated,
-                sending,
-                body,
-            )
+            self.mirror(mirrors, directed.alone, &head, &nominated, sending, body)
         };
         let retry = directed.rule.as_ref().and_then(|rule| rule.retry());
         let outcome = match retry {
@@ -1901,7 +1894,7 @@ impl Worker {
             }
             // A place for the next try before this one's is given back with its answer:
             // a worker at its bound keeps the answer it has rather than lose it.
-            let Ok(next) = self.admit(directed.upstream_slot, directed.upstreams) else {
+            let Ok(next) = self.admit(directed.upstream_slot, directed.alone) else {
                 return outcome;
             };
             let Some((target, drawn, at, counted)) = directed.draw(head.uri(), &tried) else {
@@ -1929,7 +1922,7 @@ impl Worker {
     fn mirror<H: Forwarded>(
         &self,
         mirrors: Vec<Mirrored>,
-        upstreams: usize,
+        alone: bool,
         head: &H,
         nominated: &[HeaderName],
         sending: Sending,
@@ -1970,18 +1963,16 @@ impl Worker {
         };
         let placed: Vec<_> = mirrors
             .into_iter()
-            .filter_map(
-                |mut mirror| match self.admit(mirror.upstream_slot, upstreams) {
-                    Ok(admitted) => {
-                        let counted = mirror.counted.take();
-                        Some((mirror, admitted.counting(counted)))
-                    }
-                    Err(_) => {
-                        given_up(mirror.upstream_slot, |counters| &counters.mirrors_busy);
-                        None
-                    }
-                },
-            )
+            .filter_map(|mut mirror| match self.admit(mirror.upstream_slot, alone) {
+                Ok(admitted) => {
+                    let counted = mirror.counted.take();
+                    Some((mirror, admitted.counting(counted)))
+                }
+                Err(_) => {
+                    given_up(mirror.upstream_slot, |counters| &counters.mirrors_busy);
+                    None
+                }
+            })
             .collect();
         if placed.is_empty() {
             return body;
@@ -2020,7 +2011,7 @@ impl Worker {
                 let directed = Directed {
                     rule: None,
                     upstream_slot: mirror.upstream_slot,
-                    upstreams,
+                    alone,
                     endpoint: Arc::clone(&mirror.endpoint),
                     counted: None,
                     others: None,
@@ -2714,13 +2705,13 @@ impl Proxy {
         Ok(Directing::Upstream(Directed {
             rule: kept.then(|| Arc::clone(forward.rule)),
             upstream_slot,
-            upstreams: snapshot.upstream_slots.len(),
             endpoint: Arc::clone(identity),
             counted: Some(counted),
             others,
             mirrors,
             websocket,
             upgradable,
+            alone: snapshot.upstream_slots.len() < 2,
         }))
     }
 }
@@ -2745,9 +2736,6 @@ struct Redirect {
 struct Directed {
     rule: Option<Arc<CompiledRule>>,
     upstream_slot: usize,
-    /// How many upstreams the snapshot has, which a share of the worker's places is
-    /// counted against ([03 §9](../../docs/03-data-plane.md)).
-    upstreams: usize,
     /// The endpoint this request was directed to, taken from the same snapshot as the
     /// route so that no reload can come between the two.
     endpoint: Arc<ReuseIdentity>,
@@ -2764,6 +2752,10 @@ struct Directed {
     /// Whether its client spoke HTTP/1.1, which alone has `Upgrade`: a 426 that offers
     /// WebSocket says so to it, and to no other (19 §2).
     upgradable: bool,
+    /// Whether the snapshot has no upstream but this one, which may then take every place
+    /// a worker has ([03 §9](../../docs/03-data-plane.md)). Beside the other flag, where
+    /// it costs a request's future nothing.
+    alone: bool,
 }
 
 /// A WebSocket handshake as the gateway carries it (19 §2 to §4).

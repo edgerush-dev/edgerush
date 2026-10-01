@@ -68,14 +68,14 @@ impl Places {
     }
 
     /// A place for an exchange with the upstream in `upstream`, if one is going to it.
-    /// `upstreams` is how many upstreams the config it was directed by has.
+    /// `alone` says the config it was directed by has no other upstream.
     ///
     /// # Errors
     ///
     /// [`Refused::Full`] when every place is held, or `upstream` is not one of the slots;
     /// [`Refused::OverShare`] when the worker is short of places and the upstream holds its
     /// fair share already.
-    pub fn take(self: &Rc<Self>, upstream: usize, upstreams: usize) -> Result<Place, Refused> {
+    pub fn take(self: &Rc<Self>, upstream: usize, alone: bool) -> Result<Place, Refused> {
         let held = self.held.get();
         if held >= self.limit {
             return Err(Refused::Full);
@@ -85,7 +85,8 @@ impl Places {
         };
         let holds = own.get();
         if held >= self.short {
-            let sharing = (self.holding.get() + usize::from(holds == 0)).max(upstreams.min(2));
+            let sharing =
+                (self.holding.get() + usize::from(holds == 0)).max(2 - usize::from(alone));
             // Never divides by zero: `sharing` counts the one asking whenever it holds none.
             if holds >= self.limit / sharing {
                 return Err(Refused::OverShare);
@@ -149,8 +150,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// How many upstreams the configs of most tests have.
-    const SEVERAL: usize = 4;
+    /// What the configs of most tests have: other upstreams.
+    const SEVERAL: bool = false;
 
     /// Slots enough for every upstream the tests name.
     const SLOTS: usize = 8;
@@ -165,11 +166,11 @@ mod tests {
     fn the_only_upstream_of_a_config_may_take_every_place() {
         let places = Places::new(16, SLOTS);
         let held: Vec<Place> = (0..16)
-            .map(|_| places.take(3, 1).expect("a place"))
+            .map(|_| places.take(3, true).expect("a place"))
             .collect();
         assert_eq!(places.held(), 16);
         assert_eq!(places.held_by(3), 16);
-        assert_eq!(places.take(3, 1).err(), Some(Refused::Full));
+        assert_eq!(places.take(3, true).err(), Some(Refused::Full));
         drop(held);
         assert_eq!(places.held(), 0);
     }
@@ -309,7 +310,7 @@ mod tests {
                         let upstream = upstream % upstreams;
                         let holders: Vec<usize> = alive.iter().map(|(u, _)| *u).collect();
                         let expected = reference(limit, &holders, upstream, upstreams);
-                        let given = places.take(upstream, upstreams);
+                        let given = places.take(upstream, upstreams < 2);
                         prop_assert_eq!(given.as_ref().map(|_| ()).map_err(|e| *e), expected);
                         if let Ok(place) = given {
                             alive.push((upstream, place));
@@ -345,7 +346,7 @@ mod tests {
             let mut alive = Vec::new();
             for (upstream, count) in holdings.iter().enumerate() {
                 for _ in 0..*count {
-                    if let Ok(place) = places.take(upstream, 6) {
+                    if let Ok(place) = places.take(upstream, false) {
                         alive.push(place);
                     }
                 }
@@ -357,7 +358,7 @@ mod tests {
                 sharing += 1;
             }
             let sharing = sharing.max(2);
-            let given = places.take(asker, 6);
+            let given = places.take(asker, false);
             if held < limit - limit / 8 || (held < limit && own < limit / sharing) {
                 prop_assert!(given.is_ok(), "refused with {held} of {limit}, {own} of a share");
             }
@@ -373,14 +374,14 @@ mod tests {
         ) {
             let places = Places::new(limit, SLOTS);
             let mut held = Vec::new();
-            while let Ok(place) = places.take(0, upstreams) {
+            while let Ok(place) = places.take(0, false) {
                 held.push(place);
             }
             let short = limit - limit / 8;
             prop_assert!(held.len() <= short.max(limit / 2), "{} of {limit}", held.len());
             for other in 1..upstreams {
                 if places.held() < limit {
-                    let given = places.take(other, upstreams);
+                    let given = places.take(other, false);
                     prop_assert!(given.is_ok(), "upstream {other} refused");
                     held.extend(given.ok());
                 }
