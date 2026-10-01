@@ -17,7 +17,9 @@ What each connection does first is the fourth argument:
   WebSocket costs while no message moves (a tunnel, and its backend's connection);
 - `tls` and `tls-h2`: `one-request` and `h2` over TLS, to a listener that speaks it (the
   bench's certificate is not checked), HTTP/2 asked for by ALPN: what an idle TLS
-  connection costs, which a pod's memory pays for too.
+  connection costs, which a pod's memory pays for too. Opened 64 at a time: one after
+  another, handshakes are slow enough that the first would pass the proxy's keep-alive
+  deadline, and be closed, before the last was open.
 
 Says `ready` on its standard output once they are all answered, or all open, and then waits
 to be killed.
@@ -29,6 +31,7 @@ import socket
 import ssl
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 READY = b"HTTP/1.1 "
 SWITCHED = b"HTTP/1.1 101 "
@@ -115,6 +118,9 @@ def opened(address, port, request, http2=False, expect=READY, tls=None):
     TLS to the name `tls`, if it is given."""
     connection = socket.create_connection((address, int(port)), timeout=30)
     if tls is not None:
+        # The handshake's last flight and the request are small writes one after the other,
+        # which Nagle's algorithm would hold for an ACK the server delays.
+        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
@@ -158,7 +164,9 @@ def main() -> int:
     tls = host if kind in ("tls", "tls-h2") else None
 
     try:
-        held = [opened(address, port, asked, http2, expect, tls) for _ in range(many)]
+        # A handshake lets go of the interpreter while it waits, so threads do overlap.
+        with ThreadPoolExecutor(max_workers=64 if tls else 1) as pool:
+            held = list(pool.map(lambda _: opened(address, port, asked, http2, expect, tls), range(many)))
     except (OSError, ConnectionError) as error:
         print(error, file=sys.stderr)
         return 1
