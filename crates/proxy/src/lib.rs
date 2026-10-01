@@ -118,6 +118,7 @@ mod websocket;
 pub use forwarding::Client;
 pub use hop_by_hop::ConnectionError;
 pub use host::HostError;
+pub use metrics::AcceptPause;
 pub use request::{Copied, Decision, Forward, Mirroring, Opening, Redirected, Rejection, decide};
 pub use serve::{Forwarding, Proxy, ProxyError, Worker};
 pub use tls::TlsError;

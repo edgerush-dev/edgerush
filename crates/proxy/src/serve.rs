@@ -33,7 +33,7 @@ use crate::interim::Interim;
 use crate::l4::hello::{self, Hello};
 use crate::linger::{self, Lent, linger};
 use crate::map_head::MapHead;
-use crate::metrics::{Answer, Metrics, Socket, Stopped, Tunnel};
+use crate::metrics::{AcceptPause, Answer, Metrics, Socket, Stopped, Tunnel};
 use crate::mirror;
 use crate::places::{Place, Places, Refused};
 use crate::random::{random, unguessable};
@@ -828,6 +828,14 @@ impl Proxy {
             counters.accept_errors.inc();
         }
         (!is_about_one_connection(error)).then_some(ACCEPT_PAUSE)
+    }
+
+    /// Counts the listener at position `listener` stopping accepting, for `why`
+    /// ([03 §9](../../docs/03-data-plane.md)). For whoever accepts by themselves.
+    pub fn accept_paused(&self, listener: usize, why: AcceptPause) {
+        if let Some(counters) = self.metrics.listener(listener) {
+            counters.paused(why);
+        }
     }
 }
 

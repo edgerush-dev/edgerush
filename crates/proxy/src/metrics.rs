@@ -138,6 +138,28 @@ impl Quic {
     ];
 }
 
+/// Why a listener stopped accepting, its next connections left in the kernel's backlog
+/// ([03 §9](../../docs/03-data-plane.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptPause {
+    /// It holds its fair share of the workers' room for connections, which is short.
+    Share,
+    /// The worker holds as many connections as it may.
+    WorkerCap,
+}
+
+impl AcceptPause {
+    const ALL: [Self; 2] = [Self::Share, Self::WorkerCap];
+
+    /// The name this is counted under.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Share => "share",
+            Self::WorkerCap => "worker_cap",
+        }
+    }
+}
+
 /// How a `tcp` or `tls` listener's connection ended
 /// ([17 §4](../../docs/17-tcp-and-tls-passthrough.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,6 +443,7 @@ pub(crate) struct ListenerCounters {
     pub(crate) accepted: Counter,
     pub(crate) active: Gauge,
     pub(crate) accept_errors: Counter,
+    paused: [Counter; AcceptPause::ALL.len()],
     responses: [Counter; 5],
     answers: [Counter; Answer::ALL.len()],
     head_time: Histogram<14>,
@@ -448,6 +471,13 @@ impl ListenerCounters {
     /// The listener's HTTP/3 side did `event` with a datagram.
     pub(crate) fn quic(&self, event: Quic) {
         if let Some(counter) = self.quic.get(event as usize) {
+            counter.inc();
+        }
+    }
+
+    /// The listener stopped accepting, for `why`.
+    pub(crate) fn paused(&self, why: AcceptPause) {
+        if let Some(counter) = self.paused.get(why as usize) {
             counter.inc();
         }
     }
@@ -674,6 +704,20 @@ impl Metrics {
         for (listener, series) in listeners() {
             let labels = [("listener", listener.as_str())];
             scrape.sample(name, &labels, series.sum(|shard| shard.accept_errors.get()));
+        }
+        let name = "edgerush_listener_accept_paused_total";
+        let help = "Times the listener stopped accepting, its next connections left in the \
+                    kernel's backlog: for holding its fair share of the workers' room, or \
+                    for a worker at its cap.";
+        scrape.family(name, Kind::Counter, help);
+        for (listener, series) in listeners() {
+            for why in AcceptPause::ALL {
+                let labels = [("listener", listener.as_str()), ("reason", why.name())];
+                let count = |shard: &ListenerCounters| {
+                    shard.paused.get(why as usize).map_or(0, Counter::get)
+                };
+                scrape.sample(name, &labels, series.sum(count));
+            }
         }
         let name = "edgerush_listener_responses_total";
         let help = "Responses sent, the upstreams' and the gateway's own, by status class.";
@@ -1108,6 +1152,24 @@ mod tests {
         let scrape = metrics.render(&["web".to_owned()], &[], &[]);
         let line = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"} 6\n";
         assert!(scrape.contains(line), "{scrape}");
+    }
+
+    #[test]
+    fn a_listener_that_stops_accepting_is_counted_by_why() {
+        let metrics = metrics();
+        let web = metrics.listener(0).unwrap();
+        web.paused(AcceptPause::Share);
+        web.paused(AcceptPause::Share);
+        web.paused(AcceptPause::WorkerCap);
+        let scrape = metrics.render(&["web".to_owned()], &[], &[]);
+        for line in [
+            "edgerush_listener_accept_paused_total{listener=\"web\",reason=\"share\"} 2
+",
+            "edgerush_listener_accept_paused_total{listener=\"web\",reason=\"worker_cap\"} 1
+",
+        ] {
+            assert!(scrape.contains(line), "{scrape}");
+        }
     }
 
     #[test]

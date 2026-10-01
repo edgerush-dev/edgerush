@@ -12,7 +12,7 @@
 //! the engine spawns for it stay on the one thread and need not be `Send`.
 
 use crate::balance::{Held, Loads};
-use edgerush_proxy::{Forwarding, H1Limits, Proxy};
+use edgerush_proxy::{AcceptPause, Forwarding, H1Limits, Proxy};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -162,7 +162,18 @@ impl Worker {
     async fn accept(self, listener: usize, socket: TcpListener) {
         loop {
             // A worker at its cap leaves what comes in the backlog until one of its
-            // connections ends, rather than take on what it has no room for.
+            // connections ends, rather than take on what it has no room for; and a listener
+            // holding its share, while the workers' room is short (03 §9). Counted once a
+            // pause, so that a listener that is not accepting can be told from a slow one.
+            if !self.loads.has_room(self.position) {
+                self.plane
+                    .proxy()
+                    .accept_paused(listener, AcceptPause::WorkerCap);
+            } else if !self.loads.listener_has_room(listener) {
+                self.plane
+                    .proxy()
+                    .accept_paused(listener, AcceptPause::Share);
+            }
             self.loads.room(self.position, listener).await;
             // Draining: nothing new is taken, and the socket goes with this.
             let Some(accepted) = self.plane.accept(&socket).await else {
@@ -253,15 +264,16 @@ mod tests {
     /// Workers whose one listener `web` has nowhere to send a request: every request is
     /// answered with 503 by the worker that serves its connection.
     fn workers(count: usize, accept: Accept) -> (SocketAddr, Arc<Loads>) {
-        capped_workers(count, accept, CONNECTIONS_PER_WORKER)
+        let (address, loads, _) = capped_workers(count, accept, CONNECTIONS_PER_WORKER);
+        (address, loads)
     }
 
-    /// The same, each holding no more than `connections`.
+    /// The same, each holding no more than `connections`, and the data plane they serve.
     fn capped_workers(
         count: usize,
         accept: Accept,
         connections: usize,
-    ) -> (SocketAddr, Arc<Loads>) {
+    ) -> (SocketAddr, Arc<Loads>, Arc<Proxy>) {
         let yaml = r#"
 listeners:
   web: { address: "127.0.0.1:0", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
@@ -287,10 +299,8 @@ upstreams:
             address = socket.local_addr().unwrap();
             sockets.push(vec![(socket, None)]);
         }
-        (
-            address,
-            start(&proxy, sockets, accept, H1Limits::default(), connections).unwrap(),
-        )
+        let loads = start(&proxy, sockets, accept, H1Limits::default(), connections).unwrap();
+        (address, loads, proxy)
     }
 
     fn eventually(loads: &Loads, what: impl Fn(&[usize]) -> bool) -> Vec<usize> {
@@ -327,7 +337,7 @@ upstreams:
     /// its own ends; then it is served.
     #[test]
     fn a_connection_past_the_cap_waits_until_another_ends() {
-        let (address, loads) = capped_workers(1, Accept::Balanced, 1);
+        let (address, loads, proxy) = capped_workers(1, Accept::Balanced, 1);
         let mut first = std::net::TcpStream::connect(address).unwrap();
         assert_eq!(request(&mut first), "HTTP/1.1 503 Service Unavailable");
 
@@ -343,6 +353,10 @@ upstreams:
         let unanswered = second.read(&mut byte);
         assert!(unanswered.is_err(), "answered past the cap: {unanswered:?}");
         assert_eq!(loads.now(), [1]);
+        let scrape = proxy.metrics();
+        let paused =
+            "edgerush_listener_accept_paused_total{listener=\"web\",reason=\"worker_cap\"} 1";
+        assert!(scrape.contains(paused), "{scrape}");
 
         drop(first);
         second
@@ -363,7 +377,7 @@ upstreams:
     /// One worker holding no more than `connections`, with two listeners, `a` and `b`, each
     /// with nowhere to send a request: their addresses, in that order. The config's
     /// addresses only need to differ; the sockets are the test's own.
-    fn two_listeners(connections: usize) -> (SocketAddr, SocketAddr, Arc<Loads>) {
+    fn two_listeners(connections: usize) -> (SocketAddr, SocketAddr, Arc<Loads>, Arc<Proxy>) {
         let yaml = r#"
 listeners:
   a: { address: "127.0.0.1:1", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
@@ -400,7 +414,7 @@ upstreams:
             connections,
         )
         .unwrap();
-        (addresses["a"], addresses["b"], loads)
+        (addresses["a"], addresses["b"], loads, proxy)
     }
 
     /// Whether a request on `connection` is answered within half a second.
@@ -421,7 +435,7 @@ upstreams:
     #[test]
     fn a_listener_at_its_share_leaves_the_next_in_its_backlog_and_the_other_is_served() {
         // Short from 7 of 8; with two listeners, a share is 4.
-        let (a, b, loads) = two_listeners(8);
+        let (a, b, loads, proxy) = two_listeners(8);
         let mut held: Vec<std::net::TcpStream> = (0..7)
             .map(|_| {
                 let mut connection = std::net::TcpStream::connect(a).unwrap();
@@ -433,6 +447,9 @@ upstreams:
 
         let mut waiting = std::net::TcpStream::connect(a).unwrap();
         assert!(!answered_soon(&mut waiting), "answered past its share");
+        let scrape = proxy.metrics();
+        let paused = "edgerush_listener_accept_paused_total{listener=\"a\",reason=\"share\"} 1";
+        assert!(scrape.contains(paused), "{scrape}");
         let mut other = std::net::TcpStream::connect(b).unwrap();
         assert_eq!(request(&mut other), "HTTP/1.1 503 Service Unavailable");
 
