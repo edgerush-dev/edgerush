@@ -22,9 +22,9 @@ use tokio::runtime::Builder;
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
 use tokio::task::LocalSet;
 
-/// How many connections a worker holds before it stops accepting ([14 §8]): open ones,
+/// The most connections a worker holds before it stops accepting ([14 §8]): open ones,
 /// ones on their way to it and ones lingering to their close. Past it, connections wait in
-/// the kernel's backlog.
+/// the kernel's backlog. Fewer where the open files are fewer ([`crate::limits`]).
 ///
 /// [14 §8]: ../../../docs/14-downstream-server.md
 pub(crate) const CONNECTIONS_PER_WORKER: usize = 32_768;

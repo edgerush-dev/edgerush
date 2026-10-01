@@ -8,6 +8,7 @@ mod balance;
 mod bind;
 mod config_file;
 mod harness;
+mod limits;
 mod per_core;
 
 use std::io::{self, Write};

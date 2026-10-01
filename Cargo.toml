@@ -59,6 +59,11 @@ serde-saphyr = { version = "1.3", default-features = false, features = ["deseria
 # datagrams apart (the proxy crate, on Linux). tokio and hyper-util bring the crate in
 # anyway. "all" is where SO_REUSEPORT is.
 socket2 = { version = "0.6.5", features = ["all"] }
+# The open-file limit, raised by the binary at its start (03 §9): a container under
+# containerd 2.x is given a soft limit of 1,024. Safe calls, by raw system calls on Linux;
+# chosen over `rlimit`, and over an exception to the ban on `unsafe`.
+# Only the binary may depend on it.
+rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
 regex = { version = "1.13", default-features = false, features = ["std", "perf"] }
 # Finding the line feeds of a head a vector at a time; regex brings it in already.
 memchr = "2.8"

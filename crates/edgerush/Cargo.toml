@@ -22,6 +22,10 @@ thiserror.workspace = true
 # multi-thread one is not built.
 tokio = { workspace = true, features = ["signal", "sync"] }
 
+# The open-file limit, raised at the start (03 §9). There is none to raise on Windows.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 

@@ -252,6 +252,9 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     let workers = workers
         .or_else(|| thread::available_parallelism().ok())
         .unwrap_or(NonZeroUsize::MIN);
+    // Before a socket is opened, as every socket is an open file.
+    let open_files = crate::limits::raise_open_files();
+    let connections = crate::limits::connections_per_worker(open_files, workers);
     // One worker is alone on every listener's port and needs nothing of the kernel; it is
     // from the second on that they share one, which is what SO_REUSEPORT is for.
     let port = if workers == NonZeroUsize::MIN {
@@ -315,14 +318,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     let (stopping, stop) = mpsc::channel();
     stop_signals(stopping.clone()).map_err(Failure::Runtime)?;
     // Every worker runs on a thread of its own, which stays for as long as the process.
-    let loads = per_core::start(
-        &proxy,
-        sockets,
-        accept,
-        limits,
-        per_core::CONNECTIONS_PER_WORKER,
-    )
-    .map_err(Failure::Runtime)?;
+    let loads =
+        per_core::start(&proxy, sockets, accept, limits, connections).map_err(Failure::Runtime)?;
     health_checks(Arc::clone(&proxy)).map_err(Failure::Runtime)?;
     if let Some(socket) = metrics {
         let address = socket.local_addr().map_err(Failure::Runtime)?;
@@ -337,6 +334,10 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     say(
         stderr,
         format_args!("{workers} worker{plural}, thread-per-core"),
+    );
+    say(
+        stderr,
+        format_args!("{}", crate::limits::described(open_files, connections)),
     );
 
     // Until told to stop; `stopping` is still held here, so the channel cannot close.
