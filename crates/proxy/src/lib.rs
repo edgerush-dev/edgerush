@@ -84,6 +84,7 @@ mod request_body;
 mod retry;
 mod scrape;
 mod serve;
+pub mod share;
 // Private, save when the fuzz targets and benchmarks are being built.
 #[cfg(feature = "fuzzing")]
 pub mod slots;

@@ -781,8 +781,8 @@ mod tests {
     /// A drain ends as soon as the last connection goes.
     #[test]
     fn a_drain_ends_when_the_last_connection_goes() {
-        let loads = Loads::new(2, 8);
-        let (one, two) = (loads.hold(0), loads.hold(1));
+        let loads = Loads::new(2, 8, 1);
+        let (one, two) = (loads.hold(0, 0), loads.hold(1, 0));
         let (_stopping, stop) = mpsc::channel();
         let going = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
@@ -802,8 +802,8 @@ mod tests {
     /// A connection that outlasts the drain is not waited for.
     #[test]
     fn a_drain_ends_when_time_is_up() {
-        let loads = Loads::new(1, 8);
-        let _held = loads.hold(0);
+        let loads = Loads::new(1, 8, 1);
+        let _held = loads.hold(0, 0);
         let (_stopping, stop) = mpsc::channel();
         let began = Instant::now();
         let within = Duration::from_millis(300);
@@ -815,8 +815,8 @@ mod tests {
     /// Told to stop again, a drain ends at once, and so does one nobody can stop.
     #[test]
     fn a_drain_ends_when_told_to_stop_again() {
-        let loads = Loads::new(1, 8);
-        let _held = loads.hold(0);
+        let loads = Loads::new(1, 8, 1);
+        let _held = loads.hold(0, 0);
         let (stopping, stop) = mpsc::channel();
         stopping.send(()).unwrap();
         let began = Instant::now();

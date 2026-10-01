@@ -84,7 +84,9 @@ pub(crate) fn start(
     limits: H1Limits,
     connections: usize,
 ) -> io::Result<Arc<Loads>> {
-    let loads = Loads::new(sockets.len(), connections);
+    // Every worker has a socket for every listener, the same ones in the same order.
+    let listeners = sockets.first().map_or(0, Vec::len);
+    let loads = Loads::new(sockets.len(), connections, listeners);
     let (workers, handed_over): (Vec<_>, Vec<_>) = sockets
         .iter()
         .map(|_| mpsc::channel::<HandedOver>(ON_THEIR_WAY))
@@ -161,7 +163,7 @@ impl Worker {
         loop {
             // A worker at its cap leaves what comes in the backlog until one of its
             // connections ends, rather than take on what it has no room for.
-            self.loads.room(self.position).await;
+            self.loads.room(self.position, listener).await;
             // Draining: nothing new is taken, and the socket goes with this.
             let Some(accepted) = self.plane.accept(&socket).await else {
                 return;
@@ -181,8 +183,8 @@ impl Worker {
     /// over, the connection is not lost to it: it is served here then.
     fn place(&self, listener: usize, stream: TcpStream) {
         let held = match self.accept {
-            Accept::Balanced => self.loads.place(self.position),
-            Accept::Kernel => self.loads.hold(self.position),
+            Accept::Balanced => self.loads.place(self.position, listener),
+            Accept::Kernel => self.loads.hold(self.position, listener),
         };
         let Some(other) = self
             .workers
@@ -209,7 +211,7 @@ impl Worker {
         let HandedOver { stream, held, .. } = back;
         drop(held);
         if let Ok(stream) = TcpStream::from_std(stream) {
-            self.serve(listener, stream, self.loads.hold(self.position));
+            self.serve(listener, stream, self.loads.hold(self.position, listener));
         }
     }
 
@@ -349,6 +351,104 @@ upstreams:
         let mut answer = Vec::new();
         while !answer.ends_with(b"\r\n\r\n") {
             second.read_exact(&mut byte).unwrap();
+            answer.push(byte[0]);
+        }
+        assert!(
+            answer.starts_with(b"HTTP/1.1 503 "),
+            "{}",
+            String::from_utf8_lossy(&answer)
+        );
+    }
+
+    /// One worker holding no more than `connections`, with two listeners, `a` and `b`, each
+    /// with nowhere to send a request: their addresses, in that order. The config's
+    /// addresses only need to differ; the sockets are the test's own.
+    fn two_listeners(connections: usize) -> (SocketAddr, SocketAddr, Arc<Loads>) {
+        let yaml = r#"
+listeners:
+  a: { address: "127.0.0.1:1", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  b: { address: "127.0.0.1:2", protocol: http, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+routes:
+  - name: everything
+    listeners: [a, b]
+    hostnames:
+      - { name: "*", falls_through: true }
+    rules:
+      - matches:
+          - path: { prefix: / }
+        forward: { backends: [{ upstream: nowhere, weight: 1 }] }
+upstreams:
+  nowhere: { load_balancer: p2c, endpoints: [] }
+"#;
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let compiled = compile(&config).unwrap();
+        // The sockets go in the order the data plane has the listeners in.
+        let names: Vec<String> = compiled.listeners.iter().map(|l| l.name.clone()).collect();
+        let proxy = Arc::new(Proxy::new(compiled, NonZeroUsize::MIN).unwrap());
+        let mut addresses = std::collections::HashMap::new();
+        let mut sockets = Vec::new();
+        for name in &names {
+            let socket = listen("127.0.0.1:0".parse().unwrap(), Port::Own).unwrap();
+            addresses.insert(name.clone(), socket.local_addr().unwrap());
+            sockets.push((socket, None));
+        }
+        let loads = start(
+            &proxy,
+            vec![sockets],
+            Accept::Balanced,
+            H1Limits::default(),
+            connections,
+        )
+        .unwrap();
+        (addresses["a"], addresses["b"], loads)
+    }
+
+    /// Whether a request on `connection` is answered within half a second.
+    fn answered_soon(connection: &mut std::net::TcpStream) -> bool {
+        connection
+            .write_all(b"GET / HTTP/1.1\r\nhost: balance.test\r\n\r\n")
+            .unwrap();
+        connection
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut byte = [0];
+        connection.read(&mut byte).is_ok()
+    }
+
+    /// Once the worker is short of connections, the listener holding its share leaves the
+    /// next connection in its backlog while the other listener is served; it is not let in
+    /// until a connection of its own ends and the worker is no longer short (03 §9).
+    #[test]
+    fn a_listener_at_its_share_leaves_the_next_in_its_backlog_and_the_other_is_served() {
+        // Short from 7 of 8; with two listeners, a share is 4.
+        let (a, b, loads) = two_listeners(8);
+        let mut held: Vec<std::net::TcpStream> = (0..7)
+            .map(|_| {
+                let mut connection = std::net::TcpStream::connect(a).unwrap();
+                assert_eq!(request(&mut connection), "HTTP/1.1 503 Service Unavailable");
+                connection
+            })
+            .collect();
+        assert_eq!(loads.now(), [7]);
+
+        let mut waiting = std::net::TcpStream::connect(a).unwrap();
+        assert!(!answered_soon(&mut waiting), "answered past its share");
+        let mut other = std::net::TcpStream::connect(b).unwrap();
+        assert_eq!(request(&mut other), "HTTP/1.1 503 Service Unavailable");
+
+        // Still short, and `a` still holds more than its share.
+        drop(other);
+        eventually(&loads, |now| now == [7]);
+        let mut byte = [0];
+        assert!(waiting.read(&mut byte).is_err(), "let in over its share");
+
+        held.pop();
+        waiting
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut answer = Vec::new();
+        while !answer.ends_with(b"\r\n\r\n") {
+            waiting.read_exact(&mut byte).unwrap();
             answer.push(byte[0]);
         }
         assert!(

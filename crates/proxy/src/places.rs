@@ -9,7 +9,8 @@
 //! left for the healthy ones beside it.
 //!
 //! So once a worker holds seven eighths of its places, it is short of them, and an upstream
-//! that already holds its fair share is refused. The fair share is the places split equally
+//! that already holds its fair share is refused ([`crate::share`]: the same rule shares a
+//! worker's connections among listeners). The fair share is the places split equally
 //! among the upstreams holding any, the one asking counted — and never among fewer than two
 //! while the config has another upstream. A healthy upstream that answers in a millisecond
 //! holds a place only for that millisecond, so most of the time it holds none: counted only
@@ -29,6 +30,7 @@
 
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
 
+use crate::share::over_share;
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -36,8 +38,6 @@ use std::rc::Rc;
 #[derive(Debug)]
 pub struct Places {
     limit: usize,
-    /// How many held places make the worker short of them: seven eighths of `limit`.
-    short: usize,
     /// Places held, by anyone.
     held: Cell<usize>,
     /// Places held, by upstream slot.
@@ -60,7 +60,6 @@ impl Places {
     pub fn new(limit: usize, slots: usize) -> Rc<Self> {
         Rc::new(Self {
             limit,
-            short: limit - limit / 8,
             held: Cell::new(0),
             by_upstream: (0..slots).map(|_| Cell::new(0)).collect(),
             holding: Cell::new(0),
@@ -84,13 +83,8 @@ impl Places {
             return Err(Refused::Full);
         };
         let holds = own.get();
-        if held >= self.short {
-            let sharing =
-                (self.holding.get() + usize::from(holds == 0)).max(2 - usize::from(alone));
-            // Never divides by zero: `sharing` counts the one asking whenever it holds none.
-            if holds >= self.limit / sharing {
-                return Err(Refused::OverShare);
-            }
+        if over_share(self.limit, held, holds, self.holding.get(), alone) {
+            return Err(Refused::OverShare);
         }
         if holds == 0 {
             self.holding.set(self.holding.get() + 1);
