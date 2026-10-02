@@ -698,6 +698,16 @@ impl Metrics {
         self.listeners.get(socket).map(Sharded::local)
     }
 
+    /// The connections open on every listener, over TCP and QUIC alike, every worker's.
+    pub(crate) fn open_connections(&self) -> usize {
+        let open: i64 = self
+            .listeners
+            .iter()
+            .map(|series| series.sum(|shard| shard.active.get()))
+            .sum();
+        usize::try_from(open).unwrap_or(0)
+    }
+
     /// This thread's shard of the counters in an upstream's slot.
     pub(crate) fn upstream(&self, slot: usize) -> Option<&UpstreamCounters> {
         self.upstreams.get(slot)?.get().map(Sharded::local)

@@ -21,7 +21,6 @@
 //! Unix has; a single worker has the port to itself and needs nothing of the kind, so
 //! that is the shape the harness runs in on Windows.
 
-use crate::balance::Loads;
 use crate::bind::{Port, datagrams, listen};
 use crate::config_file::{ConfigFile, Rejected};
 use crate::per_core::{self, Accept};
@@ -385,7 +384,16 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     drop(stopping);
     say(stderr, format_args!("draining"));
     proxy.drain();
-    match drained(&loads, &stop, DRAIN) {
+    // The workers' TCP connections, and every connection the data plane counts open,
+    // HTTP/3's included, whose QUIC connections the balancer never sees: whichever is more.
+    let held = || {
+        loads
+            .now()
+            .iter()
+            .sum::<usize>()
+            .max(proxy.open_connections())
+    };
+    match drained(held, &stop, DRAIN) {
         Drained::Empty => say(stderr, format_args!("drained")),
         Drained::OutOfTime(held) => say(
             stderr,
@@ -410,12 +418,12 @@ enum Drained {
     Stopped(usize),
 }
 
-/// Waits until the workers hold no connection, `within` is up, or `stop` says to stop
-/// again.
-fn drained(loads: &Loads, stop: &Receiver<()>, within: Duration) -> Drained {
+/// Waits until nothing is `held` — no connection, over TCP or QUIC — `within` is up, or
+/// `stop` says to stop again.
+fn drained(held: impl Fn() -> usize, stop: &Receiver<()>, within: Duration) -> Drained {
     let until = Instant::now() + within;
     loop {
-        let held: usize = loads.now().iter().sum();
+        let held = held();
         if held == 0 {
             return Drained::Empty;
         }
@@ -574,7 +582,9 @@ fn say(stderr: &mut impl Write, line: std::fmt::Arguments<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::balance::Loads;
     use edgerush_config::{Config, compile};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn parsed(args: &[&str]) -> Result<Parsed, UsageError> {
         parse(args.iter().map(ToString::to_string))
@@ -802,11 +812,36 @@ mod tests {
         });
         let began = Instant::now();
         assert_eq!(
-            drained(&loads, &stop, Duration::from_secs(10)),
+            drained(|| loads.now().iter().sum(), &stop, Duration::from_secs(10)),
             Drained::Empty
         );
         assert!(began.elapsed() < Duration::from_secs(2));
         going.join().unwrap();
+    }
+
+    /// A drain waits on whatever is held, connections the balancer never sees (HTTP/3's)
+    /// as well as those it does.
+    #[test]
+    fn a_drain_waits_on_connections_the_balancer_does_not_see() {
+        let loads = Loads::new(1, 8, 1);
+        let quic = Arc::new(AtomicUsize::new(1));
+        let going = Arc::clone(&quic);
+        let (_stopping, stop) = mpsc::channel();
+        let gone = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            going.store(0, Ordering::SeqCst);
+        });
+        let began = Instant::now();
+        let held = || {
+            let tcp: usize = loads.now().iter().sum();
+            tcp.max(quic.load(Ordering::SeqCst))
+        };
+        assert_eq!(
+            drained(held, &stop, Duration::from_secs(10)),
+            Drained::Empty
+        );
+        assert!(began.elapsed() >= Duration::from_millis(200));
+        gone.join().unwrap();
     }
 
     /// A connection that outlasts the drain is not waited for.
@@ -817,7 +852,10 @@ mod tests {
         let (_stopping, stop) = mpsc::channel();
         let began = Instant::now();
         let within = Duration::from_millis(300);
-        assert_eq!(drained(&loads, &stop, within), Drained::OutOfTime(1));
+        assert_eq!(
+            drained(|| loads.now().iter().sum(), &stop, within),
+            Drained::OutOfTime(1)
+        );
         let took = began.elapsed();
         assert!(took >= within && took < within * 3, "{took:?}");
     }
@@ -831,12 +869,15 @@ mod tests {
         stopping.send(()).unwrap();
         let began = Instant::now();
         assert_eq!(
-            drained(&loads, &stop, Duration::from_secs(10)),
+            drained(|| loads.now().iter().sum(), &stop, Duration::from_secs(10)),
             Drained::Stopped(1)
         );
         assert!(began.elapsed() < Duration::from_secs(1));
         drop(stopping);
         let within = Duration::from_millis(200);
-        assert_eq!(drained(&loads, &stop, within), Drained::OutOfTime(1));
+        assert_eq!(
+            drained(|| loads.now().iter().sum(), &stop, within),
+            Drained::OutOfTime(1)
+        );
     }
 }

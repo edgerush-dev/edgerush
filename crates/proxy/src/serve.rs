@@ -777,6 +777,13 @@ impl Proxy {
         self.metrics.render(&self.listeners, &upstreams, &endpoints)
     }
 
+    /// How many connections are open, on every listener and every worker, over TCP and
+    /// QUIC alike: what a draining process waits on before it exits (03 §10).
+    #[must_use]
+    pub fn open_connections(&self) -> usize {
+        self.metrics.open_connections()
+    }
+
     /// Probes the endpoints of every upstream that asks for health checks, for as long as
     /// the data plane runs, and keeps those that fail them out of load balancing
     /// ([03 §6](../../docs/03-data-plane.md)). For a thread and runtime of its own, in a
@@ -4321,6 +4328,53 @@ mod tests {
                     assert_eq!(answer.final_status(), Some("200"), "{path}");
                     assert_eq!(answer.body, b"ok");
                 }
+            })
+            .await;
+    }
+
+    /// An HTTP/3 connection is open, as a TCP one is, until it has gone: a request held
+    /// through the drain keeps it so, and a draining process waits on it (03 §10).
+    #[tokio::test]
+    async fn an_http3_connection_is_open_until_it_has_gone() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::downstream::h3::testing::{Client, get};
+                let (open, gate) = tokio::sync::oneshot::channel();
+                let upstream =
+                    gated_upstream(b"", gate, b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                        .await;
+                let http3 = edgerush_config::Http3 {
+                    alt_svc_max_age: 60,
+                    force_retry: false,
+                };
+                let config = h3_config(upstream, http3);
+                let proxy =
+                    Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+                let worker = Worker::with_deadlines(Arc::clone(&proxy), H1Limits::default(), SHORT);
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
+                let alone = Forwarding::group(1).remove(0);
+                let _serving =
+                    tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
+                assert_eq!(proxy.open_connections(), 0);
+
+                let mut client = Client::connect(front, "a.test").await;
+                let id = client.request(&get("a.test", "/"), true);
+                // Sent, and in the upstream's hands, before the drain begins.
+                client.for_a_while(Duration::from_millis(100)).await;
+                assert_eq!(proxy.open_connections(), 1);
+                worker.drain();
+                // Draining, with the request still held by the upstream: still open.
+                client.for_a_while(Duration::from_millis(200)).await;
+                assert_eq!(proxy.open_connections(), 1);
+                open.send(()).unwrap();
+                let answer = client.answer(id).await;
+                assert_eq!(answer.final_status(), Some("200"));
+                assert_eq!(answer.body, b"ok");
+                // Answered, and drained: the connection goes, and with it the count.
+                client.until(|_| proxy.open_connections() == 0).await;
             })
             .await;
     }
