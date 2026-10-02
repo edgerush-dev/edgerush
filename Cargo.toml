@@ -93,11 +93,11 @@ proptest = { version = "1.11", default-features = false, features = ["std"] }
 lto = "fat"
 codegen-units = 1
 
-# quiche 0.30.0 as published, but for two changes (16 §2): it puts as many streams' STREAM
-# frames in a packet as fit, where the published crate puts one, and it can let an ACK
-# alone wait as RFC 9000 §13.2 allows. `vendor/quiche/VENDORED.md` says what changed, why,
-# and how to carry it to another version. `fuzz/Cargo.toml` names it too, being a
-# workspace of its own.
+# quiche 0.30.0 as published, but for changes of ours (16 §2): to how it fills a packet and
+# acknowledges one, how it follows a client that moves, what it bounds and accounts for of
+# what a peer makes it hold, and when it lets a stream go. `vendor/quiche/VENDORED.md` lists
+# every one, says why, and how to carry them to another version. `fuzz/Cargo.toml` names it
+# too, being a workspace of its own.
 [patch.crates-io]
 quiche = { path = "vendor/quiche" }
 # h2 0.4.19 as published, but for one addition (14 §3): a server connection can give back
