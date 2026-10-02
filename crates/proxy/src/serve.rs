@@ -11799,9 +11799,16 @@ upstreams:
                                 Ok(read) => came.extend_from_slice(&chunk[..read]),
                             }
                         };
-                        let Some((header, request)) = header else {
+                        let Some((header, mut request)) = header else {
                             return;
                         };
+                        // The header and the request may come in writes of their own.
+                        while !request.windows(4).any(|four| four == b"\r\n\r\n") {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => request.extend_from_slice(&chunk[..read]),
+                            }
+                        }
                         // No header, or not a strict one: no answer, and the probe fails.
                         let expected = if version == "v1" {
                             proxy_protocol::Header::Proxied {
