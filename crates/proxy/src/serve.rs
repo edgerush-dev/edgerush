@@ -1578,7 +1578,7 @@ impl Worker {
         let due = Instant::now() + self.deadlines.first_request;
         let connection = Connection::open(Rc::clone(self), listener);
         // Gone only if the client already is.
-        let (Ok(peer), Ok(local)) = (stream.peer_addr(), stream.local_addr()) else {
+        let Ok(peer) = stream.peer_addr() else {
             return;
         };
         // Whether its sender is believed: settled by who connected, before a byte is read.
@@ -1595,14 +1595,11 @@ impl Worker {
         else {
             return;
         };
-        // Its two ends, as far as anyone is told: its own, unless a sender says otherwise.
-        let ends = said.unwrap_or(Ends {
-            client: peer,
-            local,
-        });
+        // Its ends as a sender named them; none, and they are its own, the socket's, which
+        // a tunnel asks for only if a backend is to be told of them.
         if let Some(by_name) = passthrough {
             return Rc::clone(self)
-                .pass_through(connection, stream, by_name, Some(ends), Some(after), due)
+                .pass_through(connection, stream, by_name, said, Some(after), due)
                 .await;
         }
         let (mut lent, back) = Lent::new(stream);
@@ -1610,7 +1607,8 @@ impl Worker {
         let length = after.len();
         lent.read_first(after.take_frame(0..length, length));
         self.blocks.borrow_mut().give(after);
-        let client = Rc::new(Client::new(ends.client.ip()));
+        let client = said.map_or(peer, |ends| ends.client);
+        let client = Rc::new(Client::new(client.ip()));
         self.serve_settled(Rc::new(connection), tls, client, lent, back, due)
             .await;
     }
