@@ -26,6 +26,12 @@ pub struct Config {
     /// The data plane's own settings; left out, each has its value.
     #[serde(default)]
     pub data_plane: DataPlane,
+    /// The certificates listeners and upstreams name, by name: a resource of their own
+    /// ([07 §1](../../../docs/07-config-and-dsl.md)), which reaches a data plane apart from
+    /// the rest of its config and is never read with it, so that no file a config is read
+    /// from can carry a key.
+    #[serde(skip)]
+    pub certificates: BTreeMap<String, Certificate>,
 }
 
 /// The whole data plane's own settings ([07 §1](../../../docs/07-config-and-dsl.md)):
@@ -169,9 +175,10 @@ pub enum Protocol {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tls {
-    /// What it can present, at least one. A client is given the one whose names cover the
-    /// name it asked for (SNI), and the first when none does or it asked for none.
-    pub certificates: Vec<Certificate>,
+    /// The names of the certificates it can present, at least one. A client is given the
+    /// one whose names cover the name it asked for (SNI), and the first when none does or
+    /// it asked for none.
+    pub certificates: Vec<String>,
     /// Clients must show a certificate these authorities vouch for (mTLS); none, and any
     /// client is served.
     #[serde(default)]
@@ -188,9 +195,9 @@ pub struct ClientValidation {
 }
 
 /// A certificate and its private key, in PEM, as they came: reading them is the data
-/// plane's, which refuses a config whose certificates it cannot use.
-#[derive(Clone, PartialEq, Eq, Hash, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// plane's, which refuses a config whose certificates it cannot use. Not read from a
+/// config file ([`Config::certificates`]).
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Certificate {
     /// The certificate first, then the intermediates that lead from it towards a root.
     pub chain: String,
@@ -329,10 +336,10 @@ pub struct UpstreamTls {
     pub server_name: String,
     /// The certificates, in PEM, of the authorities trusted to vouch for it. At least one.
     pub authorities: Vec<String>,
-    /// What the data plane shows an endpoint that asks who it is (mTLS); none, and it
-    /// shows nothing.
+    /// The name of the certificate the data plane shows an endpoint that asks who it is
+    /// (mTLS); none, and it shows nothing.
     #[serde(default)]
-    pub client_certificate: Option<Certificate>,
+    pub client_certificate: Option<String>,
 }
 
 /// What an upstream is spoken to in. Unsaid, it is HTTP/1.1, as for a Kubernetes Service

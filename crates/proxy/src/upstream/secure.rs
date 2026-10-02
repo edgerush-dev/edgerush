@@ -10,9 +10,8 @@
 use crate::gathered::Gathered;
 use crate::tls::TlsError;
 use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
-use boring::x509::X509;
 use boring::x509::store::X509StoreBuilder;
-use edgerush_config::{UpstreamProtocol, UpstreamTls};
+use edgerush_config::{CompiledUpstreamTls, UpstreamProtocol};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -26,8 +25,8 @@ const GROUPS: &str = "X25519MLKEM768:X25519:P-256:P-384";
 /// What connections to an upstream's endpoints are secured with.
 pub(crate) struct Secure {
     connector: SslConnector,
-    /// What it was made from, which a later config's is compared with.
-    source: UpstreamTls,
+    /// What it was made from, which a later snapshot's is compared with.
+    source: CompiledUpstreamTls,
     protocol: UpstreamProtocol,
 }
 
@@ -45,8 +44,12 @@ impl Secure {
     ///
     /// # Errors
     ///
-    /// A [`TlsError`] for an authority that cannot be read as a certificate.
-    pub(crate) fn new(source: &UpstreamTls, protocol: UpstreamProtocol) -> Result<Self, TlsError> {
+    /// A [`TlsError`] for an authority that cannot be read as a certificate, or a client
+    /// certificate that cannot be used.
+    pub(crate) fn new(
+        source: &CompiledUpstreamTls,
+        protocol: UpstreamProtocol,
+    ) -> Result<Self, TlsError> {
         let setup = |error: boring::error::ErrorStack| TlsError::Setup(error.to_string());
         let mut builder = SslConnector::builder(SslMethod::tls()).map_err(setup)?;
         builder
@@ -55,25 +58,15 @@ impl Secure {
         builder.set_curves_list(GROUPS).map_err(setup)?;
         builder.set_verify(SslVerifyMode::PEER);
         let mut trusted = X509StoreBuilder::new().map_err(setup)?;
-        for (index, authority) in source.authorities.iter().enumerate() {
-            let certificates =
-                X509::stack_from_pem(authority.as_bytes()).map_err(|error| TlsError::Chain {
-                    index,
-                    reason: error.to_string(),
-                })?;
-            if certificates.is_empty() {
-                return Err(TlsError::Empty { index });
-            }
-            for certificate in certificates {
-                trusted.add_cert(certificate).map_err(setup)?;
-            }
+        for authority in crate::tls::authorities(&source.authorities)? {
+            trusted.add_cert(authority).map_err(setup)?;
         }
         // Only these: the machine's own store, which the builder loaded, is not consulted.
         builder
             .set_verify_cert_store(trusted.build())
             .map_err(setup)?;
         if let Some(certificate) = &source.client_certificate {
-            let identity = crate::tls::Identity::read(certificate, 0)?;
+            let identity = crate::tls::Identity::read(certificate)?;
             builder.set_certificate(&identity.leaf).map_err(setup)?;
             for intermediate in identity.intermediates {
                 builder.add_extra_chain_cert(intermediate).map_err(setup)?;
@@ -93,13 +86,13 @@ impl Secure {
     }
 
     /// What it was made from.
-    pub(crate) fn source(&self) -> &UpstreamTls {
+    pub(crate) fn source(&self) -> &CompiledUpstreamTls {
         &self.source
     }
 
     /// Whether this was made from `source` for `protocol`, and can serve a config that
     /// has them.
-    pub(crate) fn is_for(&self, source: &UpstreamTls, protocol: UpstreamProtocol) -> bool {
+    pub(crate) fn is_for(&self, source: &CompiledUpstreamTls, protocol: UpstreamProtocol) -> bool {
         self.source == *source && self.protocol == protocol
     }
 

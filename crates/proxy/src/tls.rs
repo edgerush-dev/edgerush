@@ -28,7 +28,7 @@ use boring::ssl::{
 };
 use boring::x509::X509;
 use boring::x509::store::X509StoreBuilder;
-use edgerush_config::{Certificate, ClientValidation};
+use edgerush_config::{ClientValidation, CompiledTls, NamedCertificate};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -73,8 +73,8 @@ pub(crate) struct Tls {
     certificates: Arc<Certificates>,
     /// The same, in QUIC's contexts.
     quic_certificates: Arc<Certificates>,
-    /// What it was made from, which a later config's is compared with.
-    source: edgerush_config::Tls,
+    /// What it was made from, which a later snapshot's is compared with.
+    source: CompiledTls,
 }
 
 /// Where every connection to a listener starts, and whose keys seal its session tickets.
@@ -111,41 +111,46 @@ impl std::fmt::Debug for Tls {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TlsError {
     /// The chain is not certificates in PEM.
-    #[error("certificate {index}: the chain is not PEM certificates: {reason}")]
+    #[error("certificate `{name}`: the chain is not PEM certificates: {reason}")]
     Chain {
-        /// Its position among the listener's certificates.
-        index: usize,
+        /// The certificate's name.
+        name: String,
         /// What BoringSSL said.
         reason: String,
     },
     /// The chain has no certificate in it.
-    #[error("certificate {index}: the chain is empty")]
+    #[error("certificate `{name}`: the chain is empty")]
     Empty {
-        /// Its position among the listener's certificates.
-        index: usize,
+        /// The certificate's name.
+        name: String,
     },
     /// The key is not a private key in PEM.
-    #[error("certificate {index}: the key is not a PEM private key: {reason}")]
+    #[error("certificate `{name}`: the key is not a PEM private key: {reason}")]
     Key {
-        /// Its position among the listener's certificates.
-        index: usize,
+        /// The certificate's name.
+        name: String,
         /// What BoringSSL said.
         reason: String,
     },
     /// The key is not the one the certificate was issued for.
-    #[error("certificate {index}: the key is not the certificate's")]
+    #[error("certificate `{name}`: the key is not the certificate's")]
     Mismatch {
-        /// Its position among the listener's certificates.
-        index: usize,
+        /// The certificate's name.
+        name: String,
     },
-    /// An authority trusted to vouch for clients is not a certificate in PEM.
-    #[error("client validation, authority {index}: not a PEM certificate: {reason}")]
+    /// An authority trusted to vouch for clients, or for an upstream's endpoints, is not a
+    /// certificate in PEM.
+    #[error("authority {index}: not a PEM certificate: {reason}")]
     Authority {
         /// Its position among the authorities.
         index: usize,
         /// What was wrong with it.
         reason: String,
     },
+    /// A listener with no certificate to present. Not known to happen: the config model
+    /// refuses an `https` listener without one.
+    #[error("no certificate to present")]
+    NoCertificate,
     /// BoringSSL would not set up what every certificate is served with. Not known to
     /// happen: the settings are fixed.
     #[error("TLS cannot be set up: {0}")]
@@ -158,7 +163,7 @@ impl Tls {
     /// # Errors
     ///
     /// A [`TlsError`] for the first certificate or authority that cannot be used.
-    pub(crate) fn new(source: &edgerush_config::Tls) -> Result<Self, TlsError> {
+    pub(crate) fn new(source: &CompiledTls) -> Result<Self, TlsError> {
         let authorities = authorities_of(source)?;
         let certificates = Arc::new(Certificates::new(
             source,
@@ -198,7 +203,7 @@ impl Tls {
     /// # Errors
     ///
     /// A [`TlsError`] for the first certificate or authority that cannot be used.
-    pub(crate) fn after(previous: &Self, source: &edgerush_config::Tls) -> Result<Self, TlsError> {
+    pub(crate) fn after(previous: &Self, source: &CompiledTls) -> Result<Self, TlsError> {
         if previous.front.validation != source.client_validation {
             return Self::new(source);
         }
@@ -250,8 +255,8 @@ impl Tls {
         &self.front.acceptor
     }
 
-    /// Whether this was made from `source`, and can serve a config that has it.
-    pub(crate) fn is_for(&self, source: &edgerush_config::Tls) -> bool {
+    /// Whether this was made from `source`, and can serve a snapshot that has it.
+    pub(crate) fn is_for(&self, source: &CompiledTls) -> bool {
         self.source == *source
     }
 
@@ -301,7 +306,7 @@ fn choose_by_name(builder: &mut SslContextBuilder, serving: &Arc<ArcSwap<Certifi
 
 impl Certificates {
     fn new(
-        source: &edgerush_config::Tls,
+        source: &CompiledTls,
         authorities: Option<&[X509]>,
         transport: Transport,
     ) -> Result<Self, TlsError> {
@@ -314,7 +319,7 @@ impl Certificates {
                     let mut builder =
                         SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(setup)?;
                     tcp_settings(&mut builder)?;
-                    let leaf = present(&mut builder, certificate, index)?;
+                    let leaf = present(&mut builder, certificate)?;
                     // As the front: whatever this context's own settings, it is the front's
                     // that hold, and these are kept the same so that nothing rests on which.
                     if let Some(authorities) = authorities {
@@ -325,7 +330,7 @@ impl Certificates {
                 }
                 Transport::Quic => {
                     let mut builder = protocol_quic()?;
-                    let leaf = present(&mut builder, certificate, index)?;
+                    let leaf = present(&mut builder, certificate)?;
                     if let Some(authorities) = authorities {
                         validate_clients(&mut builder, authorities)?;
                     }
@@ -336,15 +341,14 @@ impl Certificates {
             contexts.push(context);
         }
         if contexts.is_empty() {
-            // The config model refuses an `https` listener with no certificate.
-            return Err(TlsError::Empty { index: 0 });
+            return Err(TlsError::NoCertificate);
         }
         Ok(Self { names, contexts })
     }
 }
 
 /// The authorities `source` trusts to vouch for clients, read, if it validates them.
-fn authorities_of(source: &edgerush_config::Tls) -> Result<Option<Vec<X509>>, TlsError> {
+fn authorities_of(source: &CompiledTls) -> Result<Option<Vec<X509>>, TlsError> {
     source
         .client_validation
         .as_ref()
@@ -352,8 +356,9 @@ fn authorities_of(source: &edgerush_config::Tls) -> Result<Option<Vec<X509>>, Tl
         .transpose()
 }
 
-/// The certificates of the authorities trusted to vouch for clients, read.
-fn authorities(pems: &[String]) -> Result<Vec<X509>, TlsError> {
+/// The certificates of the authorities trusted to vouch for clients or for an upstream's
+/// endpoints, read.
+pub(crate) fn authorities(pems: &[String]) -> Result<Vec<X509>, TlsError> {
     let mut read = Vec::new();
     for (index, pem) in pems.iter().enumerate() {
         let certificates =
@@ -426,11 +431,10 @@ fn protocol_quic() -> Result<SslContextBuilder, TlsError> {
 /// are for the caller to file.
 fn present(
     builder: &mut SslContextBuilder,
-    certificate: &Certificate,
-    index: usize,
+    certificate: &NamedCertificate,
 ) -> Result<X509, TlsError> {
     let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
-    let identity = Identity::read(certificate, index)?;
+    let identity = Identity::read(certificate)?;
     builder.set_certificate(&identity.leaf).map_err(setup)?;
     for intermediate in identity.intermediates {
         builder.add_extra_chain_cert(intermediate).map_err(setup)?;
@@ -448,24 +452,28 @@ pub(crate) struct Identity {
 }
 
 impl Identity {
-    /// Reads `certificate`, which is the `index`th of its kind, for errors to say so.
+    /// Reads `named`, whose name errors say.
     ///
     /// # Errors
     ///
     /// A [`TlsError`] for a chain or key that cannot be read, or a key not the
     /// certificate's.
-    pub(crate) fn read(certificate: &Certificate, index: usize) -> Result<Self, TlsError> {
+    pub(crate) fn read(named: &NamedCertificate) -> Result<Self, TlsError> {
+        let name = || named.name.clone();
+        let certificate = &named.certificate;
         let chain = X509::stack_from_pem(certificate.chain.as_bytes()).map_err(|error| {
             TlsError::Chain {
-                index,
+                name: name(),
                 reason: error.to_string(),
             }
         })?;
         let mut chain = chain.into_iter();
-        let leaf = chain.next().ok_or(TlsError::Empty { index })?;
+        let leaf = chain
+            .next()
+            .ok_or_else(|| TlsError::Empty { name: name() })?;
         let key = PKey::private_key_from_pem(certificate.key.as_bytes()).map_err(|error| {
             TlsError::Key {
-                index,
+                name: name(),
                 reason: error.to_string(),
             }
         })?;
@@ -473,7 +481,7 @@ impl Identity {
         // but only as a failure to set the key.
         let matches = leaf.public_key().is_ok_and(|public| public.public_eq(&key));
         if !matches {
-            return Err(TlsError::Mismatch { index });
+            return Err(TlsError::Mismatch { name: name() });
         }
         Ok(Self {
             leaf,
@@ -540,7 +548,15 @@ pub(crate) mod testing {
     use boring::pkey::PKey;
     use boring::x509::extension::SubjectAlternativeName;
     use boring::x509::{X509, X509NameBuilder};
-    use edgerush_config::Certificate;
+    use edgerush_config::{Certificate, NamedCertificate};
+
+    /// `certificate`, known by `name` as a listener or an upstream names it.
+    pub(crate) fn named(name: &str, certificate: Certificate) -> NamedCertificate {
+        NamedCertificate {
+            name: name.to_owned(),
+            certificate,
+        }
+    }
 
     /// A self-signed certificate for `names`, with its key.
     pub(crate) fn certificate(names: &[&str]) -> Certificate {
@@ -585,8 +601,9 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::certificate;
+    use super::testing::{certificate, named};
     use super::*;
+    use edgerush_config::Certificate;
     use proptest::prelude::*;
 
     fn names(certificates: &[&[&str]]) -> Names {
@@ -658,14 +675,17 @@ mod tests {
 
     #[test]
     fn a_listener_with_usable_certificates_is_set_up() {
-        let source = edgerush_config::Tls {
-            certificates: vec![certificate(&["a.test"]), certificate(&["b.test"])],
+        let source = CompiledTls {
+            certificates: vec![
+                named("a", certificate(&["a.test"])),
+                named("b", certificate(&["b.test"])),
+            ],
             client_validation: None,
         };
         let tls = Tls::new(&source).unwrap();
         assert!(tls.is_for(&source));
-        let other = edgerush_config::Tls {
-            certificates: vec![certificate(&["a.test"])],
+        let other = CompiledTls {
+            certificates: vec![named("a", certificate(&["a.test"]))],
             client_validation: None,
         };
         assert!(!tls.is_for(&other));
@@ -674,9 +694,14 @@ mod tests {
     #[test]
     fn a_certificate_that_cannot_be_used_is_refused_and_said_which() {
         let good = certificate(&["a.test"]);
+        // The good one first, then the one to refuse, which errors name.
         let tls = |certificates: Vec<Certificate>| {
-            Tls::new(&edgerush_config::Tls {
-                certificates,
+            Tls::new(&CompiledTls {
+                certificates: certificates
+                    .into_iter()
+                    .zip(["good", "bad"])
+                    .map(|(certificate, name)| named(name, certificate))
+                    .collect(),
                 client_validation: None,
             })
             .map(|_| ())
@@ -688,7 +713,9 @@ mod tests {
         };
         assert_eq!(
             tls(vec![good.clone(), nothing]),
-            Err(TlsError::Empty { index: 1 })
+            Err(TlsError::Empty {
+                name: "bad".to_owned()
+            })
         );
         let broken = Certificate {
             chain: "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n"
@@ -697,7 +724,7 @@ mod tests {
         };
         assert!(matches!(
             tls(vec![good.clone(), broken]),
-            Err(TlsError::Chain { index: 1, .. })
+            Err(TlsError::Chain { name, .. }) if name == "bad"
         ));
         let key = Certificate {
             key: "not a key".to_owned(),
@@ -705,7 +732,7 @@ mod tests {
         };
         assert!(matches!(
             tls(vec![key]),
-            Err(TlsError::Key { index: 0, .. })
+            Err(TlsError::Key { name, .. }) if name == "good"
         ));
         let mismatched = Certificate {
             key: certificate(&["b.test"]).key,
@@ -713,11 +740,13 @@ mod tests {
         };
         assert_eq!(
             tls(vec![good, mismatched]),
-            Err(TlsError::Mismatch { index: 1 })
+            Err(TlsError::Mismatch {
+                name: "bad".to_owned()
+            })
         );
         let validated = |authorities: Vec<String>| {
-            Tls::new(&edgerush_config::Tls {
-                certificates: vec![certificate(&["a.test"])],
+            Tls::new(&CompiledTls {
+                certificates: vec![named("a", certificate(&["a.test"]))],
                 client_validation: Some(edgerush_config::ClientValidation { authorities }),
             })
             .map(|_| ())
@@ -767,8 +796,8 @@ mod tests {
         #[test]
         fn a_client_is_shown_the_certificate_for_its_name_and_speaks_http3() {
             let (a, b) = (certificate(&["a.test"]), certificate(&["b.test"]));
-            let tls = Tls::new(&edgerush_config::Tls {
-                certificates: vec![a.clone(), b.clone()],
+            let tls = Tls::new(&CompiledTls {
+                certificates: vec![named("a", a.clone()), named("b", b.clone())],
                 client_validation: None,
             })
             .unwrap();
@@ -788,8 +817,11 @@ mod tests {
         #[test]
         fn a_listener_that_validates_clients_serves_only_those_it_trusts() {
             let (trusted, stranger) = (certificate(&["client"]), certificate(&["client"]));
-            let tls = Tls::new(&edgerush_config::Tls {
-                certificates: vec![certificate(&["a.test"]), certificate(&["b.test"])],
+            let tls = Tls::new(&CompiledTls {
+                certificates: vec![
+                    named("a", certificate(&["a.test"])),
+                    named("b", certificate(&["b.test"])),
+                ],
                 client_validation: Some(edgerush_config::ClientValidation {
                     authorities: vec![trusted.chain.clone()],
                 }),
@@ -798,7 +830,7 @@ mod tests {
             let showing = |shown: Option<&Certificate>| {
                 let mut builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
                 if let Some(shown) = shown {
-                    let identity = Identity::read(shown, 0).unwrap();
+                    let identity = Identity::read(&named("client", shown.clone())).unwrap();
                     builder.set_certificate(&identity.leaf).unwrap();
                     builder.set_private_key(&identity.key).unwrap();
                 }
@@ -825,8 +857,8 @@ mod tests {
         /// its own — and after the certificates are rotated behind the same front.
         #[test]
         fn a_session_resumes_on_any_worker_and_across_a_rotation() {
-            let source = edgerush_config::Tls {
-                certificates: vec![certificate(&["a.test"])],
+            let source = CompiledTls {
+                certificates: vec![named("a", certificate(&["a.test"]))],
                 client_validation: None,
             };
             let tls = Tls::new(&source).unwrap();
@@ -837,8 +869,8 @@ mod tests {
 
             let rotated = Tls::after(
                 &tls,
-                &edgerush_config::Tls {
-                    certificates: vec![certificate(&["a.test"])],
+                &CompiledTls {
+                    certificates: vec![named("a", certificate(&["a.test"]))],
                     client_validation: None,
                 },
             )

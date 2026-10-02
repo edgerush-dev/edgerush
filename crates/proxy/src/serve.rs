@@ -4207,13 +4207,12 @@ mod tests {
     /// A config for `upstream` whose `web` listener is `https`, for `a.test`, with `http3`.
     fn h3_config(upstream: SocketAddr, http3: edgerush_config::Http3) -> edgerush_config::Config {
         let mut config = everything_config(upstream);
-        let web = config.listeners.get_mut("web").unwrap();
-        web.protocol = edgerush_config::Protocol::Https;
-        web.tls = Some(edgerush_config::Tls {
-            certificates: vec![crate::tls::testing::certificate(&["a.test"])],
-            client_validation: None,
-        });
-        web.http3 = Some(http3);
+        secured(
+            &mut config,
+            vec![crate::tls::testing::certificate(&["a.test"])],
+            None,
+        );
+        config.listeners.get_mut("web").unwrap().http3 = Some(http3);
         config
     }
 
@@ -5037,14 +5036,13 @@ upstreams:
                 let trusted = certificate(&["client"]);
                 let stranger = certificate(&["client"]);
                 let mut config = everything_config(upstream);
-                let web = config.listeners.get_mut("web").unwrap();
-                web.protocol = edgerush_config::Protocol::Https;
-                web.tls = Some(edgerush_config::Tls {
-                    certificates: vec![certificate(&["a.test"]), certificate(&["b.test"])],
-                    client_validation: Some(edgerush_config::ClientValidation {
+                secured(
+                    &mut config,
+                    vec![certificate(&["a.test"]), certificate(&["b.test"])],
+                    Some(edgerush_config::ClientValidation {
                         authorities: vec![trusted.chain.clone()],
                     }),
-                });
+                );
                 let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
                 let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
                 let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5476,15 +5474,15 @@ upstreams:
                     // What Alt-Svc names: the port the config gives, whatever socket the
                     // test serves on.
                     web.address = "127.0.0.1:8443".parse().unwrap();
-                    web.protocol = edgerush_config::Protocol::Https;
-                    web.tls = Some(edgerush_config::Tls {
-                        certificates: vec![crate::tls::testing::certificate(&["a.test"])],
-                        client_validation: None,
-                    });
                     web.http3 = http3.then_some(edgerush_config::Http3 {
                         alt_svc_max_age: 60,
                         force_retry: false,
                     });
+                    secured(
+                        &mut config,
+                        vec![crate::tls::testing::certificate(&["a.test"])],
+                        None,
+                    );
                     let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
                     let worker =
                         Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
@@ -5724,14 +5722,13 @@ upstreams:
 
         // Validating clients otherwise is a new front.
         let mut validating = everything_config(upstream);
-        let web = validating.listeners.get_mut("web").unwrap();
-        web.protocol = edgerush_config::Protocol::Https;
-        web.tls = Some(edgerush_config::Tls {
-            certificates: vec![crate::tls::testing::certificate(&["example.test"])],
-            client_validation: Some(edgerush_config::ClientValidation {
+        secured(
+            &mut validating,
+            vec![crate::tls::testing::certificate(&["example.test"])],
+            Some(edgerush_config::ClientValidation {
                 authorities: vec![crate::tls::testing::certificate(&["ca"]).chain],
             }),
-        });
+        );
         proxy.reload(compile(&validating).unwrap()).unwrap();
         assert!(!tls(&proxy).shares_keys_with(&after));
         proxy
@@ -7186,7 +7183,31 @@ upstreams:
         protocol: UpstreamProtocol,
         tls: edgerush_config::UpstreamTls,
     ) -> SocketAddr {
+        serving_worker_to_tls_with(protocol, tls, everything_config(upstream)).await
+    }
+
+    /// The same, with `gateway` the certificate `tls` may name to show an endpoint that
+    /// asks who the data plane is.
+    async fn serving_worker_to_tls_showing(
+        upstream: SocketAddr,
+        protocol: UpstreamProtocol,
+        tls: edgerush_config::UpstreamTls,
+        gateway: &edgerush_config::Certificate,
+    ) -> SocketAddr {
         let mut config = everything_config(upstream);
+        config
+            .certificates
+            .insert("gateway".to_owned(), gateway.clone());
+        serving_worker_to_tls_with(protocol, tls, config).await
+    }
+
+    /// A worker whose `config` has its upstream `up` reached over TLS as `tls` says and
+    /// spoken to in `protocol`.
+    async fn serving_worker_to_tls_with(
+        protocol: UpstreamProtocol,
+        tls: edgerush_config::UpstreamTls,
+        mut config: Config,
+    ) -> SocketAddr {
         let up = config.upstreams.get_mut("up").unwrap();
         up.protocol = protocol;
         up.tls = Some(tls);
@@ -7222,8 +7243,9 @@ upstreams:
                 for protocol in [UpstreamProtocol::Http1, UpstreamProtocol::Http2] {
                     let upstream = tls_upstream_asking(&server, Agrees::Either, Some(&ours)).await;
                     let mut tls = trusting("backend.test", &server);
-                    tls.client_certificate = Some(ours.clone());
-                    let front = serving_worker_to_tls(upstream, protocol, tls.clone()).await;
+                    tls.client_certificate = Some("gateway".to_owned());
+                    let front =
+                        serving_worker_to_tls_showing(upstream, protocol, tls.clone(), &ours).await;
                     let answer = h1_answer(front, CLOSING_GET).await;
                     assert!(
                         answer.starts_with("HTTP/1.1 200 OK\r\n"),
@@ -11024,13 +11046,29 @@ upstreams:
         certificates: Vec<edgerush_config::Certificate>,
     ) -> Compiled {
         let mut config = everything_config(upstream);
+        secured(&mut config, certificates, None);
+        compile(&config).unwrap()
+    }
+
+    /// `config`'s `web` listener made `https`, presenting `certificates`, each named for its
+    /// place (`web0`, `web1`, ...), and validating clients as `client_validation` says.
+    fn secured(
+        config: &mut Config,
+        certificates: Vec<edgerush_config::Certificate>,
+        client_validation: Option<edgerush_config::ClientValidation>,
+    ) {
+        let mut names = Vec::new();
+        for (at, certificate) in certificates.into_iter().enumerate() {
+            let name = format!("web{at}");
+            config.certificates.insert(name.clone(), certificate);
+            names.push(name);
+        }
         let web = config.listeners.get_mut("web").unwrap();
         web.protocol = edgerush_config::Protocol::Https;
         web.tls = Some(edgerush_config::Tls {
-            certificates,
-            client_validation: None,
+            certificates: names,
+            client_validation,
         });
-        compile(&config).unwrap()
     }
 
     fn everything_config(upstream: SocketAddr) -> Config {
@@ -11279,12 +11317,11 @@ upstreams:
             .run_until(async {
                 let (upstream, heads) = recording_upstream("200 OK");
                 let mut config = with_senders(everything_config(upstream), &["127.0.0.0/8"]);
-                let web = config.listeners.get_mut("web").unwrap();
-                web.protocol = edgerush_config::Protocol::Https;
-                web.tls = Some(edgerush_config::Tls {
-                    certificates: vec![crate::tls::testing::certificate(&["example.test"])],
-                    client_validation: None,
-                });
+                secured(
+                    &mut config,
+                    vec![crate::tls::testing::certificate(&["example.test"])],
+                    None,
+                );
                 let (front, _worker) = serving_config(&config).await;
                 let connector = || {
                     let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
@@ -12373,12 +12410,7 @@ upstreams:
                 let mut config = everything_config(upstream);
                 config.upstreams.get_mut("up").unwrap().tls =
                     Some(trusting("backend.test", &server));
-                let web = config.listeners.get_mut("web").unwrap();
-                web.protocol = edgerush_config::Protocol::Https;
-                web.tls = Some(edgerush_config::Tls {
-                    certificates: vec![certificate(&["a.test"])],
-                    client_validation: None,
-                });
+                secured(&mut config, vec![certificate(&["a.test"])], None);
                 let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
                 let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
                 let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();

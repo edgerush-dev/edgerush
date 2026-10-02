@@ -22,7 +22,7 @@ use crate::request_body::{RequestBody, RequestBodyError};
 use crate::storage::{LIMIT, Storage};
 use crate::timers::Timers;
 use crate::tls::Tls;
-use crate::tls::testing::certificate;
+use crate::tls::testing::{certificate, named};
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body::{Body, Frame};
@@ -191,8 +191,8 @@ where
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
     let tls = Arc::new(
-        Tls::new(&edgerush_config::Tls {
-            certificates: vec![certificate(&["a.test"])],
+        Tls::new(&edgerush_config::CompiledTls {
+            certificates: vec![named("a", certificate(&["a.test"]))],
             client_validation: None,
         })
         .unwrap(),

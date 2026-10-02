@@ -247,14 +247,15 @@ secure() {
     python3 - "$config" "$tls" "$H3" <<'PY'
 import json, sys
 config, tls, h3 = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
-chain = json.dumps(open(f"{tls}/cert.pem").read())
-key = json.dumps(open(f"{tls}/key.pem").read())
 text = open(config).read()
 plain = 'web: { address: "127.0.0.1:8080", protocol: http, proxy_protocol: off, '
-assert plain in text
+assert plain in text and "\ncertificates:" not in text
 http3 = "http3: {}, " if h3 else ""
 text = text.replace(plain, 'web: { address: "127.0.0.1:8080", protocol: https, proxy_protocol: off, '
-                    f'tls: {{ certificates: [{{ chain: {chain}, key: {key} }}] }}, {http3}')
+                    f'tls: {{ certificates: [web] }}, {http3}')
+# The config names the certificate's files; it never holds the key (07 §1 in the docs).
+chain, key = json.dumps(f"{tls}/cert.pem"), json.dumps(f"{tls}/key.pem")
+text += f"certificates: {{ web: {{ chain_file: {chain}, key_file: {key} }} }}\n"
 open(config, "w").write(text)
 PY
 }

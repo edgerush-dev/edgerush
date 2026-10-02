@@ -11,24 +11,28 @@
 //!
 //! So far: listeners, with the TLS they terminate and what they tell upstreams of a client, routes with their rules, header filters and weighted backends, and
 //! upstreams ([`Config`]), and their compilation ([`compile`]) into a router per listener
-//! and what each rule does and leads to ([`Compiled`]).
+//! and what each rule does and leads to ([`Compiled`]); and what the development harness
+//! reads from its file ([`HarnessFile`]).
 
 mod backends;
 mod compile;
 mod config;
+mod harness_file;
 mod route;
 
 pub use backends::{UpstreamId, WeightedBackends};
 pub use compile::{
     Compiled, CompiledDataPlane, CompiledForwarding, CompiledListener, CompiledMirror,
-    CompiledRetry, CompiledRule, CompiledTimeouts, CompiledUpstream, ConfigError, L4, L4Route,
-    Object, Outcome, Place, Problem, RuleId, SniRouter, Step, Timeout, compile,
+    CompiledRetry, CompiledRule, CompiledTimeouts, CompiledTls, CompiledUpstream,
+    CompiledUpstreamTls, ConfigError, L4, L4Route, NamedCertificate, Object, Outcome, Place,
+    Problem, RuleId, SniRouter, Step, Timeout, compile,
 };
 pub use config::{
     Certificate, ClientValidation, Config, DataPlane, Forwarding, HealthCheck, Http3, Keepalive,
     Listener, ListenerProxyProtocol, LoadBalancer, Probe, Protocol, ProxyProtocolVersion,
     RequestId, SlowStart, Tls, Upstream, UpstreamProtocol, UpstreamTls,
 };
+pub use harness_file::{CertificateFiles, HarnessFile};
 pub use route::{
     Backend, Filter, Forward, Fraction, GrpcMethod, Header, HeaderChanges, Hostname, Match, Mirror,
     PathChange, PathMatch, Query, Redirect, Retry, Route, Rule, Scheme, TcpRoute, Timeouts,

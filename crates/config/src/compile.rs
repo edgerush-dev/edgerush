@@ -8,9 +8,9 @@ use crate::route::{
     Query, Redirect, Route, Scheme, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
 };
 use crate::{
-    Backend, Config, Forwarding, HealthCheck, Http3, Keepalive, ListenerProxyProtocol,
-    LoadBalancer, Probe, Protocol, ProxyProtocolVersion, RequestId, Rule, SlowStart, Tls,
-    UpstreamProtocol, UpstreamTls,
+    Backend, Certificate, ClientValidation, Config, Forwarding, HealthCheck, Http3, Keepalive,
+    ListenerProxyProtocol, LoadBalancer, Probe, Protocol, ProxyProtocolVersion, RequestId, Rule,
+    SlowStart, UpstreamProtocol,
 };
 use edgerush_filters::forwarding::{ForwardingError, HeaderNames, TrustedProxies};
 use edgerush_filters::{
@@ -89,7 +89,7 @@ pub struct CompiledListener {
     /// What is spoken there.
     pub protocol: Protocol,
     /// What an `https` listener presents; `None` for any other.
-    pub tls: Option<Tls>,
+    pub tls: Option<CompiledTls>,
     /// Whether it serves HTTP/3 as well, and how it says so; `https` listeners only.
     pub http3: Option<Http3>,
     /// Finds the rule a request belongs to, among the routes that are for this listener.
@@ -430,7 +430,7 @@ pub struct CompiledUpstream {
     /// What to speak there.
     pub protocol: UpstreamProtocol,
     /// TLS to its endpoints, if any.
-    pub tls: Option<UpstreamTls>,
+    pub tls: Option<CompiledUpstreamTls>,
     /// PINGs on its HTTP/2 connections, if any.
     pub keepalive: Option<Keepalive>,
     /// Probes of its endpoints, if any.
@@ -441,6 +441,46 @@ pub struct CompiledUpstream {
     pub slow_start: Option<SlowStart>,
     /// The PROXY protocol header its tunnels send first, if any.
     pub proxy_protocol: Option<ProxyProtocolVersion>,
+}
+
+/// A certificate a listener or an upstream names, found among the config's.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NamedCertificate {
+    /// The name it is known by.
+    pub name: String,
+    /// The certificate.
+    pub certificate: Certificate,
+}
+
+/// What an `https` listener presents, its certificates found by their names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledTls {
+    /// Its certificates, in the order it names them. A client is given the one whose names
+    /// cover the name it asked for (SNI), and the first when none does or it asked for none.
+    pub certificates: Vec<NamedCertificate>,
+    /// Clients must show a certificate these authorities vouch for (mTLS); none, and any
+    /// client is served.
+    pub client_validation: Option<ClientValidation>,
+}
+
+/// TLS to an upstream's endpoints, the certificate it shows found by its name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CompiledUpstreamTls {
+    /// The name asked for (SNI), and the one an endpoint's certificate must carry.
+    pub server_name: String,
+    /// The certificates, in PEM, of the authorities trusted to vouch for it.
+    pub authorities: Vec<String>,
+    /// What the data plane shows an endpoint that asks who it is (mTLS), if anything.
+    pub client_certificate: Option<NamedCertificate>,
+}
+
+/// The certificate of `name` among `config`'s, if there is one.
+fn named(config: &Config, name: &str) -> Option<NamedCertificate> {
+    let certificate = config.certificates.get(name)?;
+    Some(NamedCertificate {
+        name: name.to_owned(),
+        certificate: certificate.clone(),
+    })
 }
 
 /// Compiles a config. The order of the routes, then of the rules, then of a rule's matches
@@ -467,7 +507,15 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             name: name.clone(),
             endpoints: upstream.endpoints.clone(),
             protocol: upstream.protocol,
-            tls: upstream.tls.clone(),
+            // A certificate not found is refused below, and nothing is compiled.
+            tls: upstream.tls.as_ref().map(|tls| CompiledUpstreamTls {
+                server_name: tls.server_name.clone(),
+                authorities: tls.authorities.clone(),
+                client_certificate: tls
+                    .client_certificate
+                    .as_deref()
+                    .and_then(|name| named(config, name)),
+            }),
             keepalive: upstream.keepalive,
             health_check: upstream.health_check.clone(),
             load_balancer: upstream.load_balancer,
@@ -539,6 +587,12 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                 let problem = Problem::ServerName(tls.server_name.clone());
                 errors.push(Place::upstream(name).problem(problem));
             }
+            if let Some(shown) = &tls.client_certificate
+                && !config.certificates.contains_key(shown)
+            {
+                let problem = Problem::UnknownCertificate(shown.clone());
+                errors.push(Place::upstream(name).problem(problem));
+            }
         }
     }
 
@@ -562,6 +616,19 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                 errors.push(Place::listener(name).problem(Problem::TlsUnwanted));
             }
             (Protocol::Https, Some(_)) | (Protocol::Http | Protocol::Tcp | Protocol::Tls, None) => {
+            }
+        }
+        if let (Protocol::Https, Some(tls)) = (listener.protocol, &listener.tls) {
+            let mut seen = HashSet::new();
+            for certificate in &tls.certificates {
+                let problem = if !seen.insert(certificate.as_str()) {
+                    Problem::CertificateTwice(certificate.clone())
+                } else if !config.certificates.contains_key(certificate) {
+                    Problem::UnknownCertificate(certificate.clone())
+                } else {
+                    continue;
+                };
+                errors.push(Place::listener(name).problem(problem));
             }
         }
         // QUIC is always TLS: there is no HTTP/3 in the clear (RFC 9114 §3.1).
@@ -708,7 +775,16 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                 name: name.clone(),
                 address: listener.address,
                 protocol: listener.protocol,
-                tls: listener.tls.clone(),
+                // Every certificate named was found above, or there would have been an
+                // error.
+                tls: listener.tls.as_ref().map(|tls| CompiledTls {
+                    certificates: tls
+                        .certificates
+                        .iter()
+                        .filter_map(|name| named(config, name))
+                        .collect(),
+                    client_validation: tls.client_validation.clone(),
+                }),
                 http3: listener.http3,
                 router: Router::new(matches.remove(name.as_str()).unwrap_or_default()),
                 l4: l4.remove(name.as_str()),
@@ -1604,6 +1680,12 @@ pub enum Problem {
     /// An `https` listener with nothing to present.
     #[error("protocol `https` needs `tls` with a certificate")]
     NoCertificate,
+    /// A certificate named that the config's certificates do not have.
+    #[error("there is no certificate `{0}`")]
+    UnknownCertificate(String),
+    /// A certificate a listener names more than once.
+    #[error("certificate `{0}` is named twice")]
+    CertificateTwice(String),
     /// TLS on a listener that does not speak it.
     #[error("`tls` is for protocol `https`")]
     TlsUnwanted,
@@ -2633,16 +2715,31 @@ upstreams: {}
         assert!(listener(r#"{ address: ":80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }"#).is_err());
     }
 
-    /// An `https` listener has certificates, at least one; nothing else has any. What is in
-    /// them is for the data plane to read: the model carries them as they came.
+    /// A config with the certificates `named`, each its name's chain and key.
+    fn with_certificates(mut config: Config, named: &[&str]) -> Config {
+        for name in named {
+            let certificate = Certificate {
+                chain: format!("chain of {name}"),
+                key: format!("key of {name}"),
+            };
+            config.certificates.insert((*name).to_owned(), certificate);
+        }
+        config
+    }
+
+    /// An `https` listener names its certificates, at least one; nothing else has any. What
+    /// is in them is for the data plane to read: the model carries them as they came.
     #[test]
     fn tls_is_for_https_listeners_and_every_one_has_it() {
         let with = |listener: &str| {
-            config(&format!(
-                "listeners: {{ l: {listener} }}\nroutes: []\nupstreams: {{}}\n"
-            ))
+            with_certificates(
+                config(&format!(
+                    "listeners: {{ l: {listener} }}\nroutes: []\nupstreams: {{}}\n"
+                )),
+                &["one"],
+            )
         };
-        let one = r#"{ certificates: [{ chain: "C", key: "K" }] }"#;
+        let one = r#"{ certificates: [one] }"#;
 
         let compiled = compile(&with(&format!(
             r#"{{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {one} }}"#
@@ -2651,11 +2748,12 @@ upstreams: {}
         assert_eq!(compiled.listeners[0].protocol, Protocol::Https);
         let tls = compiled.listeners[0].tls.as_ref().unwrap();
         assert_eq!(tls.certificates.len(), 1);
-        assert_eq!(tls.certificates[0].chain, "C");
-        assert_eq!(tls.certificates[0].key, "K");
+        assert_eq!(tls.certificates[0].name, "one");
+        assert_eq!(tls.certificates[0].certificate.chain, "chain of one");
+        assert_eq!(tls.certificates[0].certificate.key, "key of one");
         assert_eq!(tls.client_validation, None);
         let validated = compile(&with(
-            r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [{ chain: "C", key: "K" }], client_validation: { authorities: ["CA"] } } }"#,
+            r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [one], client_validation: { authorities: ["CA"] } } }"#,
         ))
         .unwrap();
         let validation = validated.listeners[0].tls.as_ref().unwrap();
@@ -2665,7 +2763,7 @@ upstreams: {}
         );
         assert!(
             compile(&with(
-                r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [{ chain: "C", key: "K" }], client_validation: { authorities: [] } } }"#,
+                r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [one], client_validation: { authorities: [] } } }"#,
             ))
             .unwrap_err()[0]
                 .to_string()
@@ -2695,10 +2793,74 @@ upstreams: {}
             )),
             ["listener `l`: `tls` is for protocol `https`"]
         );
-        // A certificate is its chain and its key, both said.
-        let yaml = r#"listeners: { l: { address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [{ chain: "C" }] } } }
+        // A listener names certificates; it does not carry them.
+        let yaml = r#"listeners: { l: { address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [{ chain: "C", key: "K" }] } } }
 routes: []
 upstreams: {}
+"#;
+        assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
+    }
+
+    /// A certificate named by a listener or an upstream is found among the config's
+    /// certificates, in the order the listener names them; one that is not there is
+    /// refused where it is named, and so is a listener that names one twice. Certificates
+    /// not named by anything are no problem: they are a resource of their own.
+    #[test]
+    fn a_named_certificate_is_found_or_refused_where_it_is_named() {
+        let yaml = r#"
+listeners:
+  l: { address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [b, a] } }
+routes: []
+upstreams:
+  u: { load_balancer: p2c, endpoints: [], tls: { server_name: backend.internal, authorities: ["CA"], client_certificate: c } }
+"#;
+        let compiled =
+            compile(&with_certificates(config(yaml), &["a", "b", "c", "unused"])).unwrap();
+        let names: Vec<&str> = compiled.listeners[0]
+            .tls
+            .as_ref()
+            .unwrap()
+            .certificates
+            .iter()
+            .map(|named| named.name.as_str())
+            .collect();
+        assert_eq!(names, ["b", "a"]);
+        let shown = compiled.upstreams[0].tls.as_ref().unwrap();
+        let shown = shown.client_certificate.as_ref().unwrap();
+        assert_eq!(shown.name, "c");
+        assert_eq!(shown.certificate.key, "key of c");
+
+        let problems: Vec<String> = compile(&with_certificates(config(yaml), &["a"]))
+            .unwrap_err()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            problems,
+            [
+                "upstream `u`: there is no certificate `c`",
+                "listener `l`: there is no certificate `b`",
+            ]
+        );
+        let twice = yaml.replace("certificates: [b, a]", "certificates: [a, b, a]");
+        let problems: Vec<String> = compile(&with_certificates(config(&twice), &["a", "b", "c"]))
+            .unwrap_err()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(problems, ["listener `l`: certificate `a` is named twice"]);
+    }
+
+    /// Certificates reach a data plane apart from the rest of its config, so no file a
+    /// config is read from can carry one: the harness reads them from files of their own.
+    #[test]
+    fn a_config_file_cannot_carry_certificates() {
+        let yaml =
+            "listeners: {}\nroutes: []\nupstreams: {}\ncertificates: { a: { chain: C, key: K } }\n";
+        assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
+        let yaml = r#"listeners: {}
+routes: []
+upstreams: { u: { load_balancer: p2c, endpoints: [], tls: { server_name: a.b, authorities: ["CA"], client_certificate: { chain: C, key: K } } } }
 "#;
         assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
     }
@@ -2709,14 +2871,17 @@ upstreams: {}
     #[test]
     fn http3_is_for_https_listeners() {
         let with = |listener: &str| {
-            config(&format!(
-                "listeners: {{ l: {listener} }}
+            with_certificates(
+                config(&format!(
+                    "listeners: {{ l: {listener} }}
 routes: []
 upstreams: {{}}
 "
-            ))
+                )),
+                &["c"],
+            )
         };
-        let https = r#"address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [{ chain: "C", key: "K" }] }"#;
+        let https = r#"address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [c] }"#;
 
         let compiled = compile(&with(&format!("{{ {https}, http3: {{}} }}"))).unwrap();
         assert_eq!(
@@ -2933,7 +3098,7 @@ upstreams:
         );
         assert_eq!(
             refused(
-                r#"t: { address: "[::]:1", protocol: tcp, proxy_protocol: off, tls: { certificates: [{ chain: C, key: K }] } }"#,
+                r#"t: { address: "[::]:1", protocol: tcp, proxy_protocol: off, tls: { certificates: [c] } }"#,
                 &format!("routes: []\ntcp_routes: [{}]", tcp_route("a", "t", up))
             ),
             ["listener `t`: `tls` is for protocol `https`"]

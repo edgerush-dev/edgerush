@@ -15,7 +15,7 @@ use crate::balance::Share;
 use crate::proxy_protocol::Version;
 use crate::upstream::secure::Secure;
 use edgerush_config::{
-    Compiled, HealthCheck, Keepalive, ProxyProtocolVersion, UpstreamProtocol, UpstreamTls,
+    Compiled, CompiledUpstreamTls, HealthCheck, Keepalive, ProxyProtocolVersion, UpstreamProtocol,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -264,7 +264,7 @@ impl Destinations {
             &'a str,
             SocketAddr,
             UpstreamProtocol,
-            Option<&'a UpstreamTls>,
+            Option<&'a CompiledUpstreamTls>,
             Option<Keepalive>,
             Option<&'a HealthCheck>,
             Option<Version>,

@@ -418,7 +418,7 @@ mod tests {
 listeners:
   web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }, request_id: generate }
   admin: { address: "[::]:9090", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
-  secure: { address: "[::]:8443", protocol: https, proxy_protocol: off, tls: { certificates: [{ chain: "C", key: "K" }] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  secure: { address: "[::]:8443", protocol: https, proxy_protocol: off, tls: { certificates: [secure] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: shop
     listeners: [web, secure]
@@ -509,8 +509,18 @@ upstreams:
 "#;
 
     fn shop() -> Compiled {
-        let config: Config = serde_saphyr::from_str(SHOP).unwrap();
-        compile(&config).unwrap()
+        compile(&shop_config(SHOP)).unwrap()
+    }
+
+    /// The config `yaml` states, with the certificate its `secure` listener names.
+    fn shop_config(yaml: &str) -> Config {
+        let mut config: Config = serde_saphyr::from_str(yaml).unwrap();
+        let secure = edgerush_config::Certificate {
+            chain: "C".to_owned(),
+            key: "K".to_owned(),
+        };
+        config.certificates.insert("secure".to_owned(), secure);
+        config
     }
 
     fn head(target: &str, fields: &[(&str, &str)]) -> Parts {
@@ -1504,8 +1514,7 @@ upstreams:
             "set: [{ name: X-Gateway, value: edgerush }]",
             "set: [{ name: Proxy-Authorization, value: Basic Z2F0ZXdheQ== }]",
         );
-        let config: Config = serde_saphyr::from_str(&chained).unwrap();
-        let chained = compile(&config).unwrap();
+        let chained = compile(&shop_config(&chained)).unwrap();
         let web = chained.listeners.iter().find(|l| l.name == "web").unwrap();
         let mut request = head("/cart", &fields);
         decide(&chained, web, &mut request, &peer(), &mut || 0, None).unwrap();

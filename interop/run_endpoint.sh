@@ -55,12 +55,9 @@ nginx -c /tmp/nginx.conf -e /logs/nginx.log -p /tmp/nginx-temp/
     echo '    forwarding: { trusted_proxies: [], trusted_only_headers: [] }'
     echo '    request_id: generate'
     echo "    http3: $http3"
-    echo '    tls:'
-    echo '      certificates:'
-    echo '        - chain: |'
-    sed 's/^/            /' /certs/cert.pem
-    echo '          key: |'
-    sed 's/^/            /' /certs/priv.key
+    echo '    tls: { certificates: [interop] }'
+    echo 'certificates:'
+    echo '  interop: { chain_file: /certs/cert.pem, key_file: /certs/priv.key }'
     echo 'routes:'
     echo '  - name: www'
     echo '    listeners: [web]'

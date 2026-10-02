@@ -1,11 +1,16 @@
 //! The harness's config file: read, compiled, and looked at again for changes.
 //!
+//! The file names the files of each certificate rather than holding it ([07 §1](../../../docs/07-config-and-dsl.md)):
+//! the harness reads them, as the control plane will read Secrets, each relative to the
+//! config file's directory unless its path is absolute.
+//!
 //! A change is a change of the file's bytes. Time stamps are not trusted: they are coarse
 //! on some file systems and a restored file brings its old one along.
 
-use edgerush_config::{Compiled, Config, ConfigError, compile};
+use edgerush_config::{Certificate, CertificateFiles, Compiled, ConfigError, HarnessFile, compile};
+use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 /// A config file and what was in it when it was last looked at.
@@ -20,7 +25,7 @@ impl ConfigFile {
     /// Reads the file for the first time.
     pub(crate) fn open(path: PathBuf) -> Result<(Self, Compiled), Rejected> {
         let bytes = fs::read(&path).map_err(Rejected::Read)?;
-        let compiled = compiled(&bytes)?;
+        let compiled = compiled(&bytes, directory(&path))?;
         let seen = Ok(bytes);
         let file = Self { path, seen };
         Ok((file, compiled))
@@ -41,7 +46,7 @@ impl ConfigFile {
         }
         let (seen, outcome) = match read {
             Ok(bytes) => {
-                let outcome = compiled(&bytes);
+                let outcome = compiled(&bytes, directory(&self.path));
                 (Ok(bytes), outcome)
             }
             Err(error) => (Err(error.kind()), Err(Rejected::Read(error))),
@@ -51,13 +56,53 @@ impl ConfigFile {
     }
 }
 
-fn compiled(yaml: &[u8]) -> Result<Compiled, Rejected> {
-    // Without the lines around a mistake, which the parser quotes by default: the file
-    // holds private keys, and what a rejection says goes to the log.
+/// The directory a config file's relative paths are taken from: its own.
+fn directory(path: &Path) -> &Path {
+    path.parent().unwrap_or(Path::new(""))
+}
+
+fn compiled(yaml: &[u8], directory: &Path) -> Result<Compiled, Rejected> {
+    // Without the lines around a mistake, which the parser quotes by default: what a
+    // rejection says goes to the log, and a key pasted into the file would go with it.
     let options = serde_saphyr::options! { with_snippet: false };
-    let config: Config = serde_saphyr::from_slice_with_options(yaml, options)
+    let file: HarnessFile = serde_saphyr::from_slice_with_options(yaml, options)
         .map_err(|error| Rejected::Parse(Box::new(error)))?;
+    let certificates = certificates(&file.certificates, directory)?;
+    let config = file.into_config(certificates);
     compile(&config).map_err(|problems| Rejected::Invalid(Problems(problems)))
+}
+
+/// Reads each certificate from the files `named` for it, relative to `directory`.
+fn certificates(
+    named: &BTreeMap<String, CertificateFiles>,
+    directory: &Path,
+) -> Result<BTreeMap<String, Certificate>, Rejected> {
+    let mut read = BTreeMap::new();
+    let mut unread = Vec::new();
+    for (name, files) in named {
+        let mut text = |file: &Path| {
+            let path = directory.join(file);
+            fs::read_to_string(&path)
+                .map_err(|error| {
+                    unread.push(Unread {
+                        name: name.clone(),
+                        path,
+                        error,
+                    });
+                })
+                .ok()
+        };
+        let chain = text(&files.chain_file);
+        let key = text(&files.key_file);
+        if let (Some(chain), Some(key)) = (chain, key) {
+            read.insert(name.clone(), Certificate { chain, key });
+        }
+    }
+    if unread.is_empty() {
+        Ok(read)
+    } else {
+        Err(Rejected::Certificates(Unreadable(unread)))
+    }
 }
 
 /// Why a config file cannot be run.
@@ -71,9 +116,44 @@ pub(crate) enum Rejected {
     /// and would be carried by every result on the way.
     #[error("{0}")]
     Parse(Box<serde_saphyr::Error>),
+    /// Files of its certificates cannot be read.
+    #[error("{0}")]
+    Certificates(Unreadable),
     /// The config has problems.
     #[error("{0}")]
     Invalid(Problems),
+}
+
+/// Every certificate file that cannot be read, a line each, told by its path.
+#[derive(Debug)]
+pub(crate) struct Unreadable(Vec<Unread>);
+
+/// A certificate file that cannot be read.
+#[derive(Debug)]
+struct Unread {
+    /// The certificate's name.
+    name: String,
+    /// Where the file was looked for.
+    path: PathBuf,
+    error: io::Error,
+}
+
+impl Display for Unreadable {
+    fn fmt(&self, to: &mut Formatter<'_>) -> fmt::Result {
+        for (at, unread) in self.0.iter().enumerate() {
+            if at > 0 {
+                writeln!(to)?;
+            }
+            write!(
+                to,
+                "certificate `{}`: {} cannot be read: {}",
+                unread.name,
+                unread.path.display(),
+                unread.error
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Every problem of a config, a line each.
@@ -159,37 +239,109 @@ mod tests {
         assert!(rejected.to_string().contains("line 2"), "{rejected}");
     }
 
-    /// A file rejected is told by the place of its mistake, not by quoting the lines around
-    /// it: those may be a private key's, and what is told goes to the log.
+    /// A key pasted into the config file is refused, and told by the place of the mistake,
+    /// not by quoting the lines around it: those are the key's, and what is told goes to
+    /// the log.
     #[test]
     fn a_rejected_config_does_not_repeat_its_private_keys() {
         let yaml = r#"
-listeners:
-  web:
-    address: "127.0.0.1:8443"
-    protocol: https
-    proxy_protocol: off
-    forwarding: { trusted_proxies: [], trusted_only_headers: [] }
-    request_id: generate
-    tls:
-      certificates:
-        - chain: |
-            -----BEGIN CERTIFICATE-----
-            -----END CERTIFICATE-----
-          key: |
-            -----BEGIN PRIVATE KEY-----
-            NOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEY0
-            NOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEY1
-            -----END PRIVATE KEY-----
-          keyy: mistyped
+listeners: {}
 routes: []
 upstreams: {}
+certificates:
+  shop:
+    chain_file: shop.crt
+    key: |
+      -----BEGIN PRIVATE KEY-----
+      NOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEY0
+      NOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEY1
+      -----END PRIVATE KEY-----
 "#;
         let rejected = Scratch::new("keys", yaml).open().unwrap_err();
         assert!(matches!(rejected, Rejected::Parse(_)), "{rejected}");
         let told = rejected.to_string();
-        assert!(told.contains("line 19"), "{told}");
+        assert!(told.contains("line 8"), "{told}");
         assert!(!told.contains("NOTAKEY"), "{told}");
+    }
+
+    /// A directory of the test's own in the system's temporary directory, for a config file
+    /// and the files it names; what is written into it goes with the test.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(test: &str) -> Self {
+            let name = format!("edgerush-{}-config_file-{test}", std::process::id());
+            let path = std::env::temp_dir().join(name);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        /// Writes `content` to the file `name` in it, and says where that is.
+        fn write(&self, name: &str, content: &str) -> PathBuf {
+            let path = self.0.join(name);
+            fs::write(&path, content).unwrap();
+            path
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            // The files in it one by one, then the directory itself, which is refused if
+            // anything else is left in it.
+            if let Ok(entries) = fs::read_dir(&self.0) {
+                for entry in entries.flatten() {
+                    let _gone_already = fs::remove_file(entry.path());
+                }
+            }
+            let _gone_already = fs::remove_dir(&self.0);
+        }
+    }
+
+    /// A config whose `https` listener presents the certificate `shop`, read from
+    /// `chain_file` and `key_file`.
+    fn presenting_shop(chain_file: &str, key_file: &str) -> String {
+        format!(
+            r#"listeners:
+  web: {{ address: "127.0.0.1:8443", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [shop] }} }}
+routes: []
+upstreams: {{}}
+certificates:
+  shop: {{ chain_file: '{chain_file}', key_file: '{key_file}' }}
+"#
+        )
+    }
+
+    /// A certificate is read from the two files the config file names for it: a path
+    /// relative to the config file's directory, wherever the harness was started from, or
+    /// an absolute one.
+    #[test]
+    fn a_certificate_is_read_from_its_files_relative_to_the_config_file() {
+        let scratch = ScratchDir::new("certificate-files");
+        scratch.write("shop.crt", "the chain");
+        let key = scratch.write("shop.key", "the key");
+        let yaml = presenting_shop("shop.crt", &key.display().to_string());
+        let (_, compiled) = ConfigFile::open(scratch.write("config.yaml", &yaml)).unwrap();
+        let shop = &compiled.listeners[0].tls.as_ref().unwrap().certificates[0];
+        assert_eq!(shop.name, "shop");
+        assert_eq!(shop.certificate.chain, "the chain");
+        assert_eq!(shop.certificate.key, "the key");
+    }
+
+    /// A certificate file that cannot be read refuses the config, told by its path; every
+    /// such file is told.
+    #[test]
+    fn a_certificate_file_that_cannot_be_read_is_refused_by_its_path() {
+        let scratch = ScratchDir::new("certificate-unread");
+        let yaml = presenting_shop("shop.crt", "shop.key");
+        let rejected = ConfigFile::open(scratch.write("config.yaml", &yaml)).unwrap_err();
+        assert!(matches!(rejected, Rejected::Certificates(_)), "{rejected}");
+        let told = rejected.to_string();
+        assert_eq!(told.lines().count(), 2, "{told}");
+        for file in ["shop.crt", "shop.key"] {
+            let path = scratch.0.join(file);
+            let unread = format!("certificate `shop`: {} cannot be read", path.display());
+            assert!(told.contains(&unread), "{told}");
+        }
     }
 
     #[test]
