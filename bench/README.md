@@ -61,7 +61,8 @@ bench/run.sh mixed [RATE...]        # HTTP/1 and HTTP/2 over TLS and HTTP/3 agai
 bench/run.sh passthrough CHURN [TLS_CHURN]
                                     # TCP and TLS passthrough (PASSTHROUGH=1): kept
                                     # connections at saturation, a connection a request at
-                                    # CHURN (TLS_CHURN) a second, 8 MiB answers
+                                    # CHURN (TLS_CHURN) a second, 8 MiB answers; with
+                                    # PROXY_PROTOCOL=1, a header in and one out
 bench/run.sh websocket [RATE] [CHURN]
                                     # WebSocket over HTTP/1.1 upgrades, wsbench the backend
                                     # (it echoes): 256 busy connections, RATE (25,000)
@@ -148,6 +149,15 @@ NGINX has its stream module in a package of its own: `sudo apt-get install
 libnginx-mod-stream`. TLS churn is a handshake at the client and one at the backend for
 every request; the laptop's generator and backend keep up with about 1,400 a second, so
 `TLS_CHURN` is half of `CHURN` unless said.
+
+`PROXY_PROTOCOL=1` with `passthrough` has every connection carry a PROXY header in and one
+out ([20](../../docs/20-proxy-protocol.md)): clients reach a front hop, HAProxy on the
+generator's CPUs at 7080 and 7443, which goes on to the proxy under test with a v2 header;
+the proxy believes it (EdgeRush's listeners name 127.0.0.0/8 as senders, NGINX has
+`set_real_ip_from`, HAProxy `accept-proxy`) and sends a header of its own to the backend,
+which listens for one on 9000 and 9443. EdgeRush and HAProxy send v2; NGINX 1.28's
+`stream` sends only v1. The front hop is the same for every variant and is not counted in
+any variant's CPU; at saturation it may be what limits the rate.
 
 While HTTP/3 is measured the loopback's MTU is set to `LOOPBACK_MTU` (1500 by default,
 with sudo; `0` leaves it alone) and put back when the run ends. At the loopback's own

@@ -35,7 +35,8 @@
 #   bench/run.sh passthrough CHURN [TLS_CHURN] [STREAMED]
 #                                             TCP and TLS passthrough: kept connections at
 #                                             saturation, a connection a request at CHURN (and
-#                                             TLS_CHURN) a second, and streamed answers
+#                                             TLS_CHURN) a second, and streamed answers;
+#                                             PROXY_PROTOCOL=1, a header in and one out
 #   bench/run.sh websocket [RATE] [CHURN]     WebSocket over HTTP/1.1 upgrades, to an echo
 #                                             backend: busy connections, messages at RATE
 #                                             a second, large messages, a connection a
@@ -108,6 +109,12 @@ repo=$(dirname "$here")
 # port as well, 9443, for the tls listener at 8443 to carry clients to by name.
 : "${PASSTHROUGH:=0}"
 [ "${1:-}" = passthrough ] && PASSTHROUGH=1
+# PROXY_PROTOCOL=1, with `passthrough`, has every connection come to the proxy with a PROXY
+# header and go on to the backend with one (20 step 6): clients reach a front hop, HAProxy on
+# the generator's CPUs, at 7080 and 7443, which sends each on with a v2 header to the proxy
+# under test; that one believes it, as from a sender, and sends a header of its own to the
+# backend, which listens for one. EdgeRush and HAProxy send v2; NGINX 1.28 sends only v1.
+: "${PROXY_PROTOCOL:=0}"
 # WEBSOCKET=1, which `websocket` sets, has bench/wsbench be the backend in NGINX's place: it
 # answers requests 200 and WebSocket handshakes with a 101, and echoes every message. NGINX
 # the proxy is told to pass the upgrade on, as its documentation has it; HAProxy and
@@ -188,6 +195,19 @@ start_backend() {
         sed "0,/^    server {/s##    server {\n        listen 127.0.0.1:9443 ssl reuseport backlog=4096;\n        ssl_certificate $tls/cert.pem;\n        ssl_certificate_key $tls/key.pem;#" \
             "$here/nginx.conf" >"$backend_conf"
         grep -q 'listen 127.0.0.1:9443 ssl' "$backend_conf"
+        if [ "$PROXY_PROTOCOL" = 1 ]; then
+            # Both of the backend's ports take a header first, and the proxies are told to
+            # send one, believing the front hop's.
+            sed -i 's#listen 127.0.0.1:9000 reuseport backlog=4096;#listen 127.0.0.1:9000 reuseport backlog=4096 proxy_protocol;#;
+                s#listen 127.0.0.1:9443 ssl reuseport backlog=4096;#listen 127.0.0.1:9443 ssl reuseport backlog=4096 proxy_protocol;#' \
+                "$backend_conf"
+            [ "$(grep -c 'backlog=4096 proxy_protocol;' "$backend_conf")" = 2 ]
+            sed -i 's#protocol: tcp, proxy_protocol: off#protocol: tcp, proxy_protocol: { senders: ["127.0.0.0/8"] }#;
+                s#protocol: tls, proxy_protocol: off#protocol: tls, proxy_protocol: { senders: ["127.0.0.0/8"] }#;
+                s#{ load_balancer: p2c, endpoints: \[#{ proxy_protocol: v2, load_balancer: p2c, endpoints: [#' "$config"
+            [ "$(grep -c 'senders' "$config")" = 2 ]
+            [ "$(grep -c 'proxy_protocol: v2' "$config")" = 2 ]
+        fi
     fi
     if [ "$WEBSOCKET" = 1 ]; then
         [ -x "$WSBENCH" ] || { echo "no wsbench at $WSBENCH: build it first" >&2; exit 2; }
@@ -197,7 +217,12 @@ start_backend() {
     else
         taskset -c "$BACKEND_CPUS" nginx -p "$run/" -c "$backend_conf" -e "$run/error.log"
     fi
-    await "$backend"
+    if [ "$PROXY_PROTOCOL" = 1 ]; then
+        await "$backend" --haproxy-protocol
+        start_front
+    else
+        await "$backend"
+    fi
 }
 
 cpus_in() { # list: how many CPUs a comma-separated list names
@@ -234,7 +259,35 @@ open(config, "w").write(text)
 PY
 }
 
+# PROXY_PROTOCOL's front hop: HAProxy on the generator's CPUs, carrying 7080 and 7443 to the
+# proxy under test with a v2 header in front of each connection, as a cloud load balancer
+# would. The same for every variant, and not counted in any variant's CPU.
+front_pid=
+start_front() {
+    cat >"$run-front.cfg" <<'CFG'
+global
+    maxconn 30000
+defaults
+    mode tcp
+    timeout connect 5s
+    timeout client 3600s
+    timeout server 3600s
+listen plain
+    bind 127.0.0.1:7080
+    server proxy 127.0.0.1:8080 send-proxy-v2
+listen named
+    bind 127.0.0.1:7443
+    server proxy 127.0.0.1:8443 send-proxy-v2
+CFG
+    taskset -c "$GEN_CPUS" haproxy -db -f "$run-front.cfg" 2>>"$OUT/front.log" &
+    front_pid=$!
+}
+
 stop_backend() {
+    if [ -n "$front_pid" ]; then
+        kill "$front_pid" 2>/dev/null || true
+        front_pid=
+    fi
     [ -f "$run/nginx.pid" ] && kill "$(cat "$run/nginx.pid")" 2>/dev/null || true
     if [ -f "$run/wsbench.pid" ]; then
         kill "$(cat "$run/wsbench.pid")" 2>/dev/null || true
@@ -290,6 +343,12 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
             if [ -f "$stream_module" ]; then
                 sed -i "1i load_module $stream_module;" "$run-proxy/nginx.conf"
             fi
+            if [ "$PROXY_PROTOCOL" = 1 ]; then
+                # A header read from the front hop, believed (realip), and one sent on.
+                sed -i 's#listen 127.0.0.1:\(8080\|8443\) reuseport backlog=4096;#listen 127.0.0.1:\1 reuseport backlog=4096 proxy_protocol;\n        proxy_protocol on;#;
+                    s#^stream {#stream {\n    set_real_ip_from 127.0.0.0/8;#' "$run-proxy/nginx.conf"
+                [ "$(grep -c 'proxy_protocol on;' "$run-proxy/nginx.conf")" = 2 ]
+            fi
         else
             sed "s/WORKERS/$WORKERS/" "$here/nginx-proxy.conf" >"$run-proxy/nginx.conf"
         fi
@@ -327,6 +386,12 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
         local haproxy_cfg=$run-haproxy.cfg
         if [ "$PASSTHROUGH" = 1 ]; then
             cp "$here/haproxy-tcp.cfg" "$haproxy_cfg"
+            if [ "$PROXY_PROTOCOL" = 1 ]; then
+                sed -i 's#^    bind 127.0.0.1:\(8080\|8443\)$#    bind 127.0.0.1:\1 accept-proxy#;
+                    s#^    server nginx \(127.0.0.1:9[0-9]*\)$#    server nginx \1 send-proxy-v2#' "$haproxy_cfg"
+                [ "$(grep -c 'accept-proxy' "$haproxy_cfg")" = 2 ]
+                [ "$(grep -c 'send-proxy-v2' "$haproxy_cfg")" = 2 ]
+            fi
         else
             cp "$here/haproxy.cfg" "$haproxy_cfg"
         fi
@@ -389,12 +454,14 @@ stop_proxy() {
     proxy_pid=
 }
 
-await() { # url
+await() { # url, curl options...
+    local url=$1
+    shift
     for _ in $(seq 100); do
-        curl -sk -o /dev/null -H "host: $host" "$1" && return
+        curl -sk -o /dev/null -H "host: $host" "$@" "$url" && return
         sleep 0.1
     done
-    echo "nothing answers at $1" >&2
+    echo "nothing answers at $url" >&2
     exit 1
 }
 
@@ -1156,10 +1223,16 @@ passthrough)
     # half of CHURN unless said.
     churn_rate=${2:?rate for churn} tls_churn_rate=${3:-$((${2:-0} / 2))} streamed_rate=${4:-20}
     named=https://$host:8443/
-    named_at=(--connect-to "$host:8443:127.0.0.1:8443" --insecure)
+    named_proxy_at=127.0.0.1:8443
+    if [ "$PROXY_PROTOCOL" = 1 ]; then
+        # Clients go to the front hop, which goes on to the proxy with a header.
+        proxy_at=127.0.0.1:7080
+        named_proxy_at=127.0.0.1:7443
+    fi
+    named_at=(--connect-to "$host:8443:$named_proxy_at" --insecure)
     passthrough_runs() {
         saturation_h1 "$1.saturation-tcp" "$proxy" --connect-to="$proxy_at"
-        saturation_h2 "$1.saturation-tls" "$named" --connect-to=127.0.0.1:8443
+        saturation_h2 "$1.saturation-tls" "$named" --connect-to="$named_proxy_at"
         churn "$1.churn-tcp" "$churn_rate" "$proxy"
         churn "$1.churn-tls" "$tls_churn_rate" "$named" "${named_at[@]}"
         streamed_answer "$1.streamed-tcp" "$streamed_rate"
