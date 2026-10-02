@@ -1,11 +1,14 @@
 //! The harness's config file: read, compiled, and looked at again for changes.
 //!
-//! The file names the files of each certificate rather than holding it ([07 §1](../../../docs/07-config-and-dsl.md)):
-//! the harness reads them, as the control plane will read Secrets, each relative to the
-//! config file's directory unless its path is absolute.
+//! The file names the files of each certificate rather than holding it
+//! ([07 §1](../../../docs/07-config-and-dsl.md)): the harness reads them, as the control
+//! plane will read Secrets, each relative to the config file's directory unless its path
+//! is absolute.
 //!
-//! A change is a change of the file's bytes. Time stamps are not trusted: they are coarse
-//! on some file systems and a restored file brings its old one along.
+//! A change is a change of the bytes of the file, or of a certificate file it names: that is
+//! how a certificate is rotated, with the config file untouched. Time stamps are not
+//! trusted: they are coarse on some file systems and a restored file brings its old one
+//! along.
 
 use edgerush_config::{Certificate, CertificateFiles, Compiled, ConfigError, HarnessFile, compile};
 use std::collections::BTreeMap;
@@ -13,45 +16,80 @@ use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-/// A config file and what was in it when it was last looked at.
+/// A config file, and what it and the certificate files it named held when last looked at.
 #[derive(Debug)]
 pub(crate) struct ConfigFile {
     path: PathBuf,
-    /// The bytes, or why there were none.
+    /// The config file's bytes, or why there were none.
     seen: Result<Vec<u8>, io::ErrorKind>,
+    /// Each certificate file the config named, as it was read for it.
+    certificates: Vec<Seen>,
+}
+
+/// A certificate file as it was last read: where from, and its bytes or why there were none.
+struct Seen {
+    path: PathBuf,
+    bytes: Result<Vec<u8>, io::ErrorKind>,
+}
+
+impl fmt::Debug for Seen {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        // The bytes may be a private key's: whatever prints this must not print them.
+        f.debug_struct("Seen")
+            .field("path", &self.path)
+            .field("bytes", &self.bytes.as_ref().map(Vec::len))
+            .finish()
+    }
+}
+
+/// Whether what was read now is what was read before.
+fn same(now: &io::Result<Vec<u8>>, before: &Result<Vec<u8>, io::ErrorKind>) -> bool {
+    match (now, before) {
+        (Ok(now), Ok(before)) => now == before,
+        (Err(now), Err(before)) => now.kind() == *before,
+        _ => false,
+    }
 }
 
 impl ConfigFile {
     /// Reads the file for the first time.
     pub(crate) fn open(path: PathBuf) -> Result<(Self, Compiled), Rejected> {
         let bytes = fs::read(&path).map_err(Rejected::Read)?;
-        let compiled = compiled(&bytes, directory(&path))?;
+        let (certificates, compiled) = compiled(&bytes, directory(&path));
+        let compiled = compiled?;
         let seen = Ok(bytes);
-        let file = Self { path, seen };
+        let file = Self {
+            path,
+            seen,
+            certificates,
+        };
         Ok((file, compiled))
     }
 
-    /// Reads the file again. `None` while it is as it was the last time — whether that was
-    /// a config, one that was rejected or no file at all, so that nothing is said twice.
-    /// A file caught half written is rejected, and read again when it is whole.
+    /// Reads the file again, and the certificate files it named. `None` while all are as
+    /// they were the last time — whether that was a config, one that was rejected or no
+    /// file at all, so that nothing is said twice. A file caught half written is rejected,
+    /// and read again when it is whole; so is a certificate caught half rotated, which the
+    /// data plane refuses as a key that is not its certificate's.
     pub(crate) fn changed(&mut self) -> Option<Result<Compiled, Rejected>> {
         let read = fs::read(&self.path);
-        let as_it_was = match (&read, &self.seen) {
-            (Ok(now), Ok(before)) => now == before,
-            (Err(now), Err(before)) => now.kind() == *before,
-            _ => false,
-        };
+        let as_it_was = same(&read, &self.seen)
+            && self
+                .certificates
+                .iter()
+                .all(|seen| same(&fs::read(&seen.path), &seen.bytes));
         if as_it_was {
             return None;
         }
-        let (seen, outcome) = match read {
+        let (seen, certificates, outcome) = match read {
             Ok(bytes) => {
-                let outcome = compiled(&bytes, directory(&self.path));
-                (Ok(bytes), outcome)
+                let (certificates, outcome) = compiled(&bytes, directory(&self.path));
+                (Ok(bytes), certificates, outcome)
             }
-            Err(error) => (Err(error.kind()), Err(Rejected::Read(error))),
+            Err(error) => (Err(error.kind()), Vec::new(), Err(Rejected::Read(error))),
         };
         self.seen = seen;
+        self.certificates = certificates;
         Some(outcome)
     }
 }
@@ -61,36 +99,55 @@ fn directory(path: &Path) -> &Path {
     path.parent().unwrap_or(Path::new(""))
 }
 
-fn compiled(yaml: &[u8], directory: &Path) -> Result<Compiled, Rejected> {
+/// Compiles the config `yaml` states, with the certificates read from the files it names,
+/// relative to `directory`; and says what was read of each of those files, for the next
+/// look to compare with. What compiles is what was read: a file that changes after is
+/// another change.
+fn compiled(yaml: &[u8], directory: &Path) -> (Vec<Seen>, Result<Compiled, Rejected>) {
     // Without the lines around a mistake, which the parser quotes by default: what a
     // rejection says goes to the log, and a key pasted into the file would go with it.
     let options = serde_saphyr::options! { with_snippet: false };
-    let file: HarnessFile = serde_saphyr::from_slice_with_options(yaml, options)
-        .map_err(|error| Rejected::Parse(Box::new(error)))?;
-    let certificates = certificates(&file.certificates, directory)?;
-    let config = file.into_config(certificates);
-    compile(&config).map_err(|problems| Rejected::Invalid(Problems(problems)))
+    let file: HarnessFile = match serde_saphyr::from_slice_with_options(yaml, options) {
+        Ok(file) => file,
+        Err(error) => return (Vec::new(), Err(Rejected::Parse(Box::new(error)))),
+    };
+    let (seen, certificates) = certificates(&file.certificates, directory);
+    let outcome = certificates.and_then(|certificates| {
+        let config = file.into_config(certificates);
+        compile(&config).map_err(|problems| Rejected::Invalid(Problems(problems)))
+    });
+    (seen, outcome)
 }
 
-/// Reads each certificate from the files `named` for it, relative to `directory`.
+/// Reads each certificate from the files `named` for it, relative to `directory`; and says
+/// what was read of each file.
 fn certificates(
     named: &BTreeMap<String, CertificateFiles>,
     directory: &Path,
-) -> Result<BTreeMap<String, Certificate>, Rejected> {
+) -> (Vec<Seen>, Result<BTreeMap<String, Certificate>, Rejected>) {
+    let mut seen = Vec::new();
     let mut read = BTreeMap::new();
     let mut unread = Vec::new();
     for (name, files) in named {
         let mut text = |file: &Path| {
             let path = directory.join(file);
-            fs::read_to_string(&path)
-                .map_err(|error| {
-                    unread.push(Unread {
-                        name: name.clone(),
-                        path,
-                        error,
-                    });
-                })
-                .ok()
+            let bytes = fs::read(&path);
+            seen.push(Seen {
+                path: path.clone(),
+                bytes: bytes.as_ref().map(Clone::clone).map_err(io::Error::kind),
+            });
+            let text = bytes.and_then(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "it is not UTF-8"))
+            });
+            text.map_err(|error| {
+                unread.push(Unread {
+                    name: name.clone(),
+                    path,
+                    error,
+                });
+            })
+            .ok()
         };
         let chain = text(&files.chain_file);
         let key = text(&files.key_file);
@@ -98,11 +155,12 @@ fn certificates(
             read.insert(name.clone(), Certificate { chain, key });
         }
     }
-    if unread.is_empty() {
+    let read = if unread.is_empty() {
         Ok(read)
     } else {
         Err(Rejected::Certificates(Unreadable(unread)))
-    }
+    };
+    (seen, read)
 }
 
 /// Why a config file cannot be run.
@@ -342,6 +400,93 @@ certificates:
             let unread = format!("certificate `shop`: {} cannot be read", path.display());
             assert!(told.contains(&unread), "{told}");
         }
+    }
+
+    /// A config presenting `shop` from `shop.crt` and `shop.key` in a directory of its own,
+    /// opened.
+    fn opened_with_shop(scratch: &ScratchDir) -> ConfigFile {
+        scratch.write("shop.crt", "chain 1");
+        scratch.write("shop.key", "key 1");
+        let yaml = presenting_shop("shop.crt", "shop.key");
+        let (file, _) = ConfigFile::open(scratch.write("config.yaml", &yaml)).unwrap();
+        file
+    }
+
+    /// What `shop` is in what `file` compiled now that it has changed.
+    fn shop_after_change(file: &mut ConfigFile) -> (String, String) {
+        let compiled = file.changed().expect("a change").unwrap();
+        let shop = &compiled.listeners[0].tls.as_ref().unwrap().certificates[0];
+        (shop.certificate.chain.clone(), shop.certificate.key.clone())
+    }
+
+    /// A certificate whose files change is read again with the config file untouched:
+    /// that is how one is rotated. Files as they were are no change.
+    #[test]
+    fn a_certificate_whose_files_change_is_read_again() {
+        let scratch = ScratchDir::new("certificate-rotated");
+        let mut file = opened_with_shop(&scratch);
+        assert!(file.changed().is_none());
+        scratch.write("shop.key", "key 1");
+        assert!(file.changed().is_none());
+
+        scratch.write("shop.crt", "chain 2");
+        scratch.write("shop.key", "key 2");
+        assert_eq!(
+            shop_after_change(&mut file),
+            ("chain 2".into(), "key 2".into())
+        );
+        assert!(file.changed().is_none());
+    }
+
+    /// A certificate caught half way through its rotation, its chain new and its key not
+    /// yet, is read as it is, for the data plane to refuse the pair; the rest of the
+    /// rotation is a change of its own, and the whole pair is read.
+    #[test]
+    fn a_certificate_caught_half_rotated_is_read_again_when_it_is_whole() {
+        let scratch = ScratchDir::new("certificate-half-rotated");
+        let mut file = opened_with_shop(&scratch);
+        scratch.write("shop.crt", "chain 2");
+        assert_eq!(
+            shop_after_change(&mut file),
+            ("chain 2".into(), "key 1".into())
+        );
+        assert!(file.changed().is_none());
+        scratch.write("shop.key", "key 2");
+        assert_eq!(
+            shop_after_change(&mut file),
+            ("chain 2".into(), "key 2".into())
+        );
+    }
+
+    /// What the harness holds of a certificate's files, to compare with, is printed without
+    /// them: one of them is a private key.
+    #[test]
+    fn what_is_held_of_a_certificate_is_printed_without_it() {
+        let scratch = ScratchDir::new("certificate-printed");
+        let file = opened_with_shop(&scratch);
+        let printed = format!("{file:?}");
+        assert!(printed.contains("shop.key"), "{printed}");
+        // "key 1", the key file's bytes as a `Vec<u8>` prints them.
+        assert!(!printed.contains("107, 101, 121, 32, 49"), "{printed}");
+    }
+
+    /// A certificate file that goes away is told once, as the config file's going is, and
+    /// is a change again when it is back.
+    #[test]
+    fn a_certificate_file_that_goes_away_is_told_once_and_is_a_change_when_it_is_back() {
+        let scratch = ScratchDir::new("certificate-removed");
+        let mut file = opened_with_shop(&scratch);
+        fs::remove_file(scratch.0.join("shop.key")).unwrap();
+        assert!(matches!(
+            file.changed(),
+            Some(Err(Rejected::Certificates(_)))
+        ));
+        assert!(file.changed().is_none());
+        scratch.write("shop.key", "key 2");
+        assert_eq!(
+            shop_after_change(&mut file),
+            ("chain 1".into(), "key 2".into())
+        );
     }
 
     #[test]

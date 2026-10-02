@@ -41,8 +41,9 @@ pub(crate) const USAGE: &str = "\
 Usage: edgerush proxy --config <FILE> [OPTIONS]
 
 Runs a data plane from a config file, without Kubernetes: a harness for development.
-The file is read again every second, and a changed config takes over without dropping a
-request. Listeners are bound once: one that is new or has moved takes a restart.
+The file, and the certificate files it names, are read again every second, and a change
+takes over without dropping a request. Listeners are bound once: one that is new or has
+moved takes a restart.
 Ctrl-C or SIGTERM drains it: what is under way is finished, for up to 29 seconds; a
 second one stops it at once.
 
