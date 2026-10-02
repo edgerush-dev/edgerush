@@ -52,8 +52,11 @@ impl ConfigFile {
 }
 
 fn compiled(yaml: &[u8]) -> Result<Compiled, Rejected> {
-    let config: Config =
-        serde_saphyr::from_slice(yaml).map_err(|error| Rejected::Parse(Box::new(error)))?;
+    // Without the lines around a mistake, which the parser quotes by default: the file
+    // holds private keys, and what a rejection says goes to the log.
+    let options = serde_saphyr::options! { with_snippet: false };
+    let config: Config = serde_saphyr::from_slice_with_options(yaml, options)
+        .map_err(|error| Rejected::Parse(Box::new(error)))?;
     compile(&config).map_err(|problems| Rejected::Invalid(Problems(problems)))
 }
 
@@ -63,7 +66,8 @@ pub(crate) enum Rejected {
     /// The file cannot be read.
     #[error("it cannot be read: {0}")]
     Read(io::Error),
-    /// The file is not YAML, or not a config. In a box, as the parser's error is large
+    /// The file is not YAML, or not a config, told by the line and column of the mistake
+    /// and never by quoting the lines around it. In a box, as the parser's error is large
     /// and would be carried by every result on the way.
     #[error("{0}")]
     Parse(Box<serde_saphyr::Error>),
@@ -153,6 +157,39 @@ mod tests {
         let rejected = scratch.open().unwrap_err();
         assert!(matches!(rejected, Rejected::Parse(_)), "{rejected}");
         assert!(rejected.to_string().contains("line 2"), "{rejected}");
+    }
+
+    /// A file rejected is told by the place of its mistake, not by quoting the lines around
+    /// it: those may be a private key's, and what is told goes to the log.
+    #[test]
+    fn a_rejected_config_does_not_repeat_its_private_keys() {
+        let yaml = r#"
+listeners:
+  web:
+    address: "127.0.0.1:8443"
+    protocol: https
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [] }
+    request_id: generate
+    tls:
+      certificates:
+        - chain: |
+            -----BEGIN CERTIFICATE-----
+            -----END CERTIFICATE-----
+          key: |
+            -----BEGIN PRIVATE KEY-----
+            NOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEY0
+            NOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEYNOTAKEY1
+            -----END PRIVATE KEY-----
+          keyy: mistyped
+routes: []
+upstreams: {}
+"#;
+        let rejected = Scratch::new("keys", yaml).open().unwrap_err();
+        assert!(matches!(rejected, Rejected::Parse(_)), "{rejected}");
+        let told = rejected.to_string();
+        assert!(told.contains("line 19"), "{told}");
+        assert!(!told.contains("NOTAKEY"), "{told}");
     }
 
     #[test]
