@@ -9886,12 +9886,18 @@ upstreams:
                 })
                 .await;
 
-                // It takes connections again, and says who it is.
+                // It takes connections again, and says who it is. A connection that opens
+                // and closes having said nothing is one the connect probe should have reset
+                // (20 §5).
                 let listening = held.listen(64).unwrap();
+                let empty = Rc::new(Cell::new(0_usize));
+                let counting = Rc::clone(&empty);
                 let _answering = tokio::task::spawn_local(async move {
                     while let Ok((mut stream, _)) = listening.accept().await {
                         let mut head = [0; 1024];
-                        let _read = stream.read(&mut head).await;
+                        if matches!(stream.read(&mut head).await, Ok(0)) {
+                            counting.set(counting.get() + 1);
+                        }
                         let answer = b"HTTP/1.1 200 OK\r\nx-upstream: back\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
                         let _written = stream.write_all(answer).await;
                     }
@@ -9918,6 +9924,7 @@ upstreams:
                     }
                 }
                 assert!(back, "the endpoint brought back was never sent a request");
+                assert_eq!(empty.get(), 0, "the connect probe closed without a reset");
             })
             .await;
     }
@@ -11611,6 +11618,208 @@ upstreams:
                     crate::l4::hello::read(hello),
                     crate::l4::hello::Hello::Whole(Some("a.test".to_owned()))
                 );
+            })
+            .await;
+    }
+
+    /// Whether the one endpoint of `config`'s upstream `up`, checked by `probe`, passes.
+    async fn probed(mut config: Config, probe: edgerush_config::Probe) -> bool {
+        config.upstreams.get_mut("up").unwrap().health_check = Some(every_second_by(probe));
+        let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+        let destination = proxy.checked().next().unwrap();
+        let check = destination.health_check().unwrap();
+        crate::health::probe::passes(&destination, check).await
+    }
+
+    /// An address that takes connections and never says a word on them.
+    async fn mute() -> SocketAddr {
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = socket.accept().await {
+                held.push(stream);
+            }
+        });
+        address
+    }
+
+    /// A TCP probe passes an endpoint it can connect to, and fails one it cannot (20 §5).
+    #[tokio::test]
+    async fn a_tcp_probe_passes_what_it_can_connect_to() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let listening = mute().await;
+                assert!(probed(everything_config(listening), edgerush_config::Probe::Tcp).await);
+                // Bound, then let go: nothing listens there.
+                let gone = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .unwrap()
+                    .local_addr()
+                    .unwrap();
+                assert!(!probed(everything_config(gone), edgerush_config::Probe::Tcp).await);
+            })
+            .await;
+    }
+
+    /// On an upstream reached over TLS, a TCP probe passes once the handshake does, as
+    /// traffic's would: not against a certificate nobody trusted vouches for, nor an
+    /// endpoint that takes the connection and never answers the handshake.
+    #[tokio::test]
+    async fn a_tcp_probe_of_a_tls_upstream_needs_the_handshake() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let certificate = crate::tls::testing::certificate(&["backend.test"]);
+                let stranger = crate::tls::testing::certificate(&["backend.test"]);
+                let upstream = tls_upstream(&certificate, Agrees::Either).await;
+                let secured = |endpoint: SocketAddr, vouched: &edgerush_config::Certificate| {
+                    let mut config = everything_config(endpoint);
+                    config.upstreams.get_mut("up").unwrap().tls =
+                        Some(trusting("backend.test", vouched));
+                    config
+                };
+                let tcp = edgerush_config::Probe::Tcp;
+                assert!(probed(secured(upstream, &certificate), tcp.clone()).await);
+                assert!(!probed(secured(upstream, &stranger), tcp.clone()).await);
+                let started = tokio::time::Instant::now();
+                assert!(!probed(secured(mute().await, &certificate), tcp).await);
+                // Given up on at the check's timeout, a second, and not before.
+                let took = started.elapsed();
+                assert!(took + EARLY >= Duration::from_secs(1), "{took:?}");
+                assert!(took < Duration::from_secs(1) + SLACK, "{took:?}");
+            })
+            .await;
+    }
+
+    /// A plain TCP probe that a backend does see reaches it as a reset, never as a
+    /// connection that opens and closes having said nothing; on Linux, as a rule, the
+    /// backend never sees it at all (20 §5). The set-aside reconnect closes the same way.
+    #[tokio::test]
+    async fn a_plain_tcp_probe_is_reset_if_it_is_seen() {
+        use tokio::io::AsyncReadExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let backend = socket.local_addr().unwrap();
+                for probe in 0..2 {
+                    if probe == 0 {
+                        assert!(
+                            probed(everything_config(backend), edgerush_config::Probe::Tcp).await
+                        );
+                    } else {
+                        crate::health::probe::connect_unseen(backend).await.unwrap();
+                    }
+                    // Seen or not: a backend that accepts it finds it reset.
+                    if let Ok(accepted) =
+                        tokio::time::timeout(Duration::from_millis(300), socket.accept()).await
+                    {
+                        let (mut stream, _) = accepted.unwrap();
+                        let mut byte = [0; 1];
+                        let read = within(stream.read(&mut byte)).await;
+                        assert!(
+                            read.as_ref().is_err_and(|error| {
+                                error.kind() == io::ErrorKind::ConnectionReset
+                            }),
+                            "probe {probe}: {read:?}"
+                        );
+                    }
+                }
+            })
+            .await;
+    }
+
+    /// How often, of many plain TCP probes, an accepting backend sees one: a measurement to
+    /// record (20 §5), not a gate. `cargo test -p edgerush-proxy --lib how_often -- --ignored
+    /// --nocapture`, on Linux.
+    #[tokio::test]
+    #[ignore = "a measurement, not a gate"]
+    async fn how_often_a_backend_sees_a_plain_tcp_probe() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let backend = socket.local_addr().unwrap();
+                let seen = Rc::new(Cell::new(0_usize));
+                let counting = Rc::clone(&seen);
+                tokio::task::spawn_local(async move {
+                    while socket.accept().await.is_ok() {
+                        counting.set(counting.get() + 1);
+                    }
+                });
+                let probes = 2_000;
+                for _ in 0..probes {
+                    crate::health::probe::connect_unseen(backend).await.unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                println!("an accepting backend saw {} of {probes} probes", seen.get());
+            })
+            .await;
+    }
+
+    /// An HTTP probe of an upstream sent a PROXY header sends one first that says the
+    /// connection is the gateway's own: v2's LOCAL, or a v1 line of the probe's own two
+    /// ends; the backend, a strict receiver, then answers it (20 §4).
+    #[tokio::test]
+    async fn an_http_probe_says_it_is_the_gateways_own() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for version in ["v1", "v2"] {
+                    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let backend = socket.local_addr().unwrap();
+                    let heard = Rc::new(RefCell::new(None));
+                    let hearing = Rc::clone(&heard);
+                    tokio::task::spawn_local(async move {
+                        let (mut stream, peer) = socket.accept().await.unwrap();
+                        let mut came = Vec::new();
+                        let mut chunk = [0; 512];
+                        let header = loop {
+                            if let proxy_protocol::Read::Whole { header, length } =
+                                proxy_protocol::read(&came)
+                            {
+                                break Some((header, came.split_off(length)));
+                            }
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break None,
+                                Ok(read) => came.extend_from_slice(&chunk[..read]),
+                            }
+                        };
+                        let Some((header, request)) = header else {
+                            return;
+                        };
+                        // No header, or not a strict one: no answer, and the probe fails.
+                        let expected = if version == "v1" {
+                            proxy_protocol::Header::Proxied {
+                                source: peer,
+                                destination: stream.local_addr().unwrap(),
+                            }
+                        } else {
+                            proxy_protocol::Header::Local
+                        };
+                        *hearing.borrow_mut() = Some(header);
+                        if header == expected && request.starts_with(b"GET /healthz ") {
+                            let _ = stream
+                                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                                .await;
+                        }
+                    });
+                    let mut config: Config =
+                        serde_saphyr::from_str(&sending(&tcp_to(backend, ""), version)).unwrap();
+                    config.upstreams.get_mut("up").unwrap().health_check =
+                        Some(every_second_by(healthz()));
+                    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+                    let destination = proxy.checked().next().unwrap();
+                    let check = destination.health_check().unwrap();
+                    assert!(
+                        crate::health::probe::passes(&destination, check).await,
+                        "{version}: {:?}",
+                        heard.borrow()
+                    );
+                }
             })
             .await;
     }

@@ -295,6 +295,10 @@ pub enum Probe {
         /// The service asked about.
         service: String,
     },
+    /// A connection made, and its handshake finished where the upstream has `tls`: nothing
+    /// is asked (20 in the docs). A plain one is closed so that, as a rule, the backend
+    /// never sees it.
+    Tcp,
 }
 
 /// PINGs on an HTTP/2 upstream's idle-looking connections, as gRPC's keepalive has them.

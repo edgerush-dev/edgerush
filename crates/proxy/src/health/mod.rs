@@ -15,7 +15,8 @@
 //!
 //! It also brings back an endpoint that a worker set aside because a try could not connect
 //! to it, whether or not the endpoint is checked: once it has waited the data plane's
-//! `set_aside_ms`, a TCP connect to it is tried, and one that gets through takes it back,
+//! `set_aside_ms`, a TCP connect to it is tried, closed so that as a rule the backend never
+//! sees it, and one that gets through takes it back,
 //! ramping up as anything that joins the draw does, while one that does not starts its wait
 //! again. No request is the trial. What it finds
 //! newly set aside it counts, as it finds it: the workers that set endpoints aside, over
@@ -32,7 +33,6 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::time::Instant;
 
 /// The most probes out at once.
@@ -142,8 +142,9 @@ fn reconnect(proxy: &Arc<Proxy>, aside: &Rc<RefCell<HashMap<u64, bool>>>, out: &
         out.set(out.get() + 1);
         let (aside, out) = (Rc::clone(aside), Rc::clone(out));
         let _probing = tokio::task::spawn_local(async move {
-            // The bound a worker's try has to connect in.
-            let connect = TcpStream::connect(destination.address());
+            // The bound a worker's try has to connect in, and closed as a plain TCP probe
+            // is, so that the backend need never see it (20 §5).
+            let connect = probe::connect_unseen(destination.address());
             let through = tokio::time::timeout(H1Limits::default().connect, connect)
                 .await
                 .is_ok_and(|connected| connected.is_ok());

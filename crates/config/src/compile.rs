@@ -3185,6 +3185,22 @@ upstreams:
             compile(&config(&yaml))
         };
         assert!(compile_with("{ upstream: quiet, weight: 1 }").is_ok());
+        // A TCP probe is what such an upstream may have.
+        let tcp_probed = compile(&config(
+            r#"listeners: {}
+routes: []
+upstreams:
+  db: { load_balancer: p2c, endpoints: [], health_check: { interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 1, unhealthy_threshold: 1, probe: tcp } }
+"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            tcp_probed.upstreams[0]
+                .health_check
+                .as_ref()
+                .map(|check| &check.probe),
+            Some(&Probe::Tcp)
+        );
         let problems: Vec<String> =
             compile_with("{ upstream: quiet, weight: 1 }, { upstream: http, weight: 1 }")
                 .unwrap_err()

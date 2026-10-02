@@ -19,16 +19,6 @@
 //! header over `STREAM` with no TLVs; and what the gateway's own connections send, v2's
 //! `LOCAL`, or a v1 line of their own two addresses.
 
-// Reached only by its own tests and the fuzz targets until a listener reads a header
-// (20, step 3). An expectation and not an allowance, so that the day a caller appears the
-// compiler says this line has served its purpose.
-#![cfg_attr(
-    not(any(test, feature = "fuzzing")),
-    expect(
-        dead_code,
-        reason = "reached only by its own tests until a listener reads a header"
-    )
-)]
 // What is here is `pub` so that the fuzz targets, a crate of their own, can name it. The
 // module is public only when they are being built, so in an ordinary build none of this is
 // API.
@@ -46,6 +36,13 @@ pub const SIGNATURE: [u8; 12] = *b"\r\n\r\n\0\r\nQUIT\n";
 pub const V1_LIMIT: usize = 107;
 /// The most of a v2 header ever needed to read it: its fixed part and the largest address
 /// block, two UNIX paths. Whatever its length says beyond that is TLVs, skipped by count.
+#[cfg_attr(
+    not(any(test, feature = "fuzzing")),
+    expect(
+        dead_code,
+        reason = "the bound the fuzz target and the tests hold the reader to"
+    )
+)]
 pub const HELD: usize = V2_FIXED + UNIX_BLOCK;
 
 /// How every v1 line starts.

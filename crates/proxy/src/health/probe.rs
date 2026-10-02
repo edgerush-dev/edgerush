@@ -6,15 +6,18 @@
 //! probe must not take a place in the pool that requests are waiting for.
 
 use crate::gathered::Gathered;
+use crate::proxy_protocol;
 use crate::upstream::destination::ReuseIdentity;
 use crate::upstream::secure::Socket;
 use bytes::{Buf, Bytes};
 use edgerush_config::{HealthCheck, Probe, UpstreamProtocol};
 use http::uri::Scheme;
 use http::{Request, StatusCode};
+use std::io;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 
 /// What gRPC's health service calls a server that serves.
 const SERVING: u64 = 1;
@@ -33,8 +36,19 @@ pub(crate) async fn passes(destination: &ReuseIdentity, check: &HealthCheck) -> 
 }
 
 async fn probe(destination: &ReuseIdentity, probe: &Probe) -> Option<bool> {
-    let socket = TcpStream::connect(destination.address()).await.ok()?;
+    // Connecting is all a plain TCP probe asks, and the backend need never see it.
+    if *probe == Probe::Tcp && destination.secure().is_none() {
+        return Some(connect_unseen(destination.address()).await.is_ok());
+    }
+    let mut socket = TcpStream::connect(destination.address()).await.ok()?;
     let _unset = socket.set_nodelay(true);
+    // A backend that asks for a PROXY header is told the probe is the gateway's own
+    // connection: v2's LOCAL, or a v1 line of its own two ends (20 §4).
+    if let Some(version) = destination.proxy_protocol() {
+        let (ours, theirs) = (socket.local_addr().ok()?, socket.peer_addr().ok()?);
+        let header = proxy_protocol::own(version, ours, theirs);
+        socket.write_all(header.as_bytes()).await.ok()?;
+    }
     let (socket, authority) = match destination.secure() {
         None => (Socket::Plain(socket), destination.address().to_string()),
         Some(secure) => (
@@ -45,12 +59,42 @@ async fn probe(destination: &ReuseIdentity, probe: &Probe) -> Option<bool> {
     // As a request's own: `https` exactly when the probe is secured.
     let scheme = destination.scheme();
     Some(match (probe, destination.protocol()) {
+        // The handshake, as traffic's would be, was all it asked.
+        (Probe::Tcp, _) => {
+            drop(socket);
+            true
+        }
         (Probe::Http { path }, UpstreamProtocol::Http1) => http1(socket, path, &authority).await?,
         (Probe::Http { path }, UpstreamProtocol::Http2) => {
             http2(socket, &scheme, path, &authority).await?
         }
         (Probe::Grpc { service }, _) => grpc(socket, &scheme, service, &authority).await?,
     })
+}
+
+/// Connects to `address` only to see that it can, and resets the connection at once (20 §5).
+/// The last ACK of the handshake is held back first (`TCP_QUICKACK` off, as HAProxy's plain
+/// check does), so that as a rule the reset goes before it: the connection never completes
+/// on the backend's side and never reaches its `accept`, and a database does not count an
+/// empty connection against the gateway. Best effort: should the ACK go first, because this
+/// thread was not run in time, the backend accepts and then sees a reset, which costs it no
+/// more than a close would. Windows has no `TCP_QUICKACK`; there it is only reset.
+///
+/// # Errors
+///
+/// The connect's, or the socket's if it cannot be set up.
+pub(crate) async fn connect_unseen(address: SocketAddr) -> io::Result<()> {
+    let socket = if address.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    #[cfg(target_os = "linux")]
+    socket2::SockRef::from(&socket).set_tcp_quickack(false)?;
+    let stream = socket.connect(address).await?;
+    stream.set_zero_linger()?;
+    drop(stream);
+    Ok(())
 }
 
 /// `GET` over HTTP/1.1, the connection closed after: a 2xx passes.
