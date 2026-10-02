@@ -60,4 +60,11 @@ say "fuzz targets"
 # no longer matches would go unnoticed until somebody went to fuzz something.
 cargo check --manifest-path fuzz/Cargo.toml
 
+say "fuzz targets, as cargo-fuzz builds them"
+# With `--cfg fuzzing`, which cargo-fuzz sets: code under it (vendored h2's own fuzzing
+# module, for one) builds only then, and a path dependency's lints are not capped at
+# warnings as a registry dependency's are. Cargo keeps what this builds apart from the
+# builds above, so it costs a second build of every crate once and little after.
+RUSTFLAGS="${RUSTFLAGS:-} --cfg fuzzing" cargo check --manifest-path fuzz/Cargo.toml
+
 printf '%s\n' "all checks passed"
