@@ -29,6 +29,15 @@ fi
 say "fmt"
 cargo fmt --check
 
+say "dependencies"
+# Advisories, licences, sources and crates in two versions (deny.toml), for the workspace's
+# lock file and fuzz/'s. Both are checked against the one file, and each is told not to
+# mind an entry that is there for the other: libFuzzer's licence is fuzz/'s, the benchmark
+# harness's advisories the workspace's. The advisories are read from the RustSec database,
+# so this needs the network, and a new advisory fails it until it is dealt with.
+cargo deny check --allow license-exception-not-encountered
+cargo deny --manifest-path fuzz/Cargo.toml check --allow advisory-not-detected
+
 say "clippy"
 cargo clippy --all-targets -- -D warnings
 

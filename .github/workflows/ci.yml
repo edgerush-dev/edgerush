@@ -40,3 +40,20 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+  dependencies:
+    name: advisories, licences, sources
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a commit: actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      # The version check.sh is run with, from crates.io rather than a third-party action.
+      - name: cargo-deny
+        run: cargo install --locked cargo-deny@0.20.2
+
+      # As check.sh runs it: deny.toml, for the workspace's lock file and fuzz/'s.
+      - name: Dependencies
+        run: |
+          cargo deny check --allow license-exception-not-encountered
+          cargo deny --manifest-path fuzz/Cargo.toml check --allow advisory-not-detected

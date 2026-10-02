@@ -1,0 +1,45 @@
+# What EdgeRush's dependencies may be (docs/09 §3), checked by `cargo deny check` in
+# `check.sh`, before every commit, and in CI: no advisory against a crate in the tree, its
+# licences from the list below, every crate from crates.io, and each crate in two versions
+# said. `fuzz/`, a workspace of its own, is checked against this file too; each run is told
+# not to mind an entry here that is for the other tree (`check.sh`).
+
+[graph]
+# The platforms EdgeRush is built and tested on; what only another target pulls in is
+# neither built nor run here.
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# The fuzzing and interop builds are ours as well.
+all-features = true
+
+[advisories]
+# Any advisory against a crate in the tree fails the check, an unmaintained crate's
+# included, until it is fixed or ignored here with the reason.
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+    # Both reach the tree only through iai-callgrind, the micro benchmarks' harness: a
+    # dev-dependency built into no binary, pinned to the runner installed in WSL (README).
+    # Neither has a safe upgrade.
+    { id = "RUSTSEC-2025-0141", reason = "bincode, unmaintained: only through iai-callgrind, a benchmark dev-dependency" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2, unmaintained: only through iai-callgrind, a benchmark dev-dependency" },
+]
+
+[licenses]
+allow = ["Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0"]
+confidence-threshold = 0.8
+exceptions = [
+    # libFuzzer, built into the fuzz targets alone, is under LLVM's former licence.
+    { allow = ["NCSA"], crate = "libfuzzer-sys" },
+]
+
+[bans]
+# Two versions of a crate are built twice and are two to keep current: said, not refused,
+# as a dependency the tree cannot do without may bring one.
+multiple-versions = "warn"
+wildcards = "deny"
+# Our own crates and the vendored ones are paths, not versions.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
