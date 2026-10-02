@@ -1215,13 +1215,9 @@ impl Worker {
         if let Some(by_name) = passthrough {
             let connection = Connection::open(Rc::clone(&self), listener);
             let due = Instant::now() + self.deadlines.first_request;
-            // Gone only if the client already is.
-            let (Ok(client), Ok(local)) = (stream.peer_addr(), stream.local_addr()) else {
-                return;
-            };
-            let ends = Ends { client, local };
+            // Its own ends, asked of the socket only if a backend is to be told of them.
             return self
-                .pass_through(connection, stream, by_name, ends, None, due)
+                .pass_through(connection, stream, by_name, None, None, due)
                 .await;
         }
         let connection = Rc::new(Connection::open(Rc::clone(&self), listener));
@@ -1318,16 +1314,17 @@ impl Worker {
     /// Carries a connection of a `tcp` or `tls` listener to a backend of its route, byte for
     /// byte, and counts how it ended ([17 §4](../../docs/17-tcp-and-tls-passthrough.md)).
     /// `by_name`: the route is the one whose hostnames cover the name the ClientHello asks
-    /// for, rather than the listener's one route. `ends`: the connection's, which a backend
-    /// that asks is told of. `after`: what the client sent after a PROXY header, read with
-    /// it, which goes first. `due`: the end of the stretch from accept in which the
-    /// ClientHello must come.
+    /// for, rather than the listener's one route. `ends`: the connection's as a sender's
+    /// header named them, which a backend that asks is told of; none, and they are the
+    /// socket's own. `after`: what the client sent after a PROXY header, read with it,
+    /// which goes first. `due`: the end of the stretch from accept in which the ClientHello
+    /// must come.
     async fn pass_through(
         self: Rc<Self>,
         connection: Connection,
         mut client: TcpStream,
         by_name: bool,
-        ends: Ends,
+        ends: Option<Ends>,
         after: Option<Block>,
         due: Instant,
     ) {
@@ -1350,7 +1347,7 @@ impl Worker {
         listener: usize,
         client: &mut TcpStream,
         by_name: bool,
-        ends: Ends,
+        ends: Option<Ends>,
         after: Option<Block>,
         due: Instant,
     ) -> Tunnel {
@@ -1409,6 +1406,20 @@ impl Worker {
         let hello = match endpoint.proxy_protocol() {
             None => hello,
             Some(version) => {
+                // The socket's own ends, where no sender named others: asked of it only
+                // here, so that a tunnel nobody is told of pays nothing for them.
+                let ends = match ends {
+                    Some(ends) => ends,
+                    None => match (client.peer_addr(), client.local_addr()) {
+                        (Ok(client), Ok(local)) => Ends { client, local },
+                        _ => {
+                            if let Some(hello) = hello {
+                                self.blocks.borrow_mut().give(hello);
+                            }
+                            return Tunnel::Failed;
+                        }
+                    },
+                };
                 let header = proxy_protocol::proxied(version, ends.client, ends.local);
                 match self.ahead_of(header.as_bytes(), hello) {
                     Ok(first) => Some(first),
@@ -1591,7 +1602,7 @@ impl Worker {
         });
         if let Some(by_name) = passthrough {
             return Rc::clone(self)
-                .pass_through(connection, stream, by_name, ends, Some(after), due)
+                .pass_through(connection, stream, by_name, Some(ends), Some(after), due)
                 .await;
         }
         let (mut lent, back) = Lent::new(stream);
