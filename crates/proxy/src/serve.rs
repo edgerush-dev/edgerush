@@ -6948,6 +6948,70 @@ upstreams:
             .await;
     }
 
+    /// An HTTP/2 upstream's trailers reach an HTTP/2 client less the names that may not
+    /// travel as trailers, as an HTTP/1 upstream's do (13 §4): `grpc-status` goes on,
+    /// `set-cookie` does not, and a section with nothing else in it is no section at all.
+    #[tokio::test]
+    async fn an_http2_upstreams_denied_trailers_do_not_reach_an_http2_client() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let script: Script = Rc::new(move |request, mut respond| {
+                    Box::pin(async move {
+                        let only_denied = request.uri().path() == "/only-denied";
+                        let mut body = request.into_body();
+                        let _ = read_all(&mut body).await;
+                        let Ok(mut sending) = respond.send_response(ok_head(), false) else {
+                            return;
+                        };
+                        let _ = sending.send_data(Bytes::from_static(b"reply"), false);
+                        let mut trailers = http::HeaderMap::new();
+                        if !only_denied {
+                            trailers.insert("grpc-status", "0".parse().unwrap());
+                        }
+                        trailers.insert("set-cookie", "session=late".parse().unwrap());
+                        let _ = sending.send_trailers(trailers);
+                    })
+                });
+                let upstream = scripted_h2_upstream(script).await;
+                let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                for path in ["/rpc", "/only-denied"] {
+                    let request = Request::get(format!("http://a.test{path}"))
+                        .header("te", "trailers")
+                        .body(())
+                        .unwrap();
+                    let (answer, _) = send.send_request(request, true).unwrap();
+                    let answer = within(answer).await.unwrap();
+                    assert_eq!(answer.status(), StatusCode::OK);
+                    let mut body = answer.into_body();
+                    let mut data = Vec::new();
+                    while let Some(chunk) = within(body.data()).await {
+                        let chunk = chunk.unwrap();
+                        let _ = body.flow_control().release_capacity(chunk.len());
+                        data.extend_from_slice(&chunk);
+                    }
+                    assert_eq!(data, b"reply", "{path}");
+                    let trailers = within(std::future::poll_fn(|cx| body.poll_trailers(cx)))
+                        .await
+                        .unwrap();
+                    match path {
+                        "/rpc" => {
+                            let trailers = trailers.expect("no trailers");
+                            assert_eq!(trailers["grpc-status"], "0");
+                            assert!(
+                                !trailers.contains_key("set-cookie"),
+                                "a denied trailer was forwarded: {trailers:?}"
+                            );
+                        }
+                        _ => assert_eq!(trailers, None, "a section of denied names was sent"),
+                    }
+                }
+            })
+            .await;
+    }
+
     /// An HTTP/2 upstream that resets a stream part way through its answer has the client's
     /// stream reset: with the same reason where it means the same thing on this hop, with
     /// INTERNAL_ERROR where it was about the upstream's hop.

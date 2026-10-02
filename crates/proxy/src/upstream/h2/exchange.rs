@@ -380,6 +380,20 @@ pub(crate) async fn connect<F: OutgoingFields + ?Sized>(
     }
 }
 
+/// Takes out of `trailers` the names that may not travel as trailers
+/// ([13 §4](../../../../../docs/13-http1-upstream.md)). HTTP/2 has no `Connection` to nominate
+/// more. Allocates only for a section that holds one.
+fn deny(trailers: &mut http::HeaderMap) {
+    let denied: Vec<_> = trailers
+        .keys()
+        .filter(|name| crate::h1::is_denied(name, &[]))
+        .cloned()
+        .collect();
+    for name in denied {
+        trailers.remove(name);
+    }
+}
+
 /// A header list's size as RFC 9113 §6.5.2 measures it: each field's name and value, and
 /// 32 for each field.
 fn list_size(headers: &http::HeaderMap) -> usize {
@@ -391,6 +405,10 @@ fn list_size(headers: &http::HeaderMap) -> usize {
 
 /// The body of an HTTP/2 upstream's answer, with what is left of the request's body going
 /// up as it is read. It holds the stream's place on its connection until it is dropped.
+///
+/// Its trailers are held to the names that may travel as trailers, as an HTTP/1 upstream's
+/// are where they are read ([13 §4](../../../../../docs/13-http1-upstream.md)), so that the
+/// writer of every kind of client is handed only those.
 pub(crate) struct Answer {
     body: IncomingH2,
     upload: Option<Upload>,
@@ -424,7 +442,18 @@ impl Body for Answer {
             // answer's body then reports.
             this.upload = None;
         }
-        Pin::new(&mut this.body).poll_frame(cx)
+        match Pin::new(&mut this.body).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => match frame.into_trailers() {
+                // A section left with nothing in it is no section, as an HTTP/1 upstream's
+                // empty one is none.
+                Ok(mut trailers) => {
+                    deny(&mut trailers);
+                    Poll::Ready((!trailers.is_empty()).then(|| Ok(Frame::trailers(trailers))))
+                }
+                Err(data) => Poll::Ready(Some(Ok(data))),
+            },
+            polled => polled,
+        }
     }
 
     fn is_end_stream(&self) -> bool {
