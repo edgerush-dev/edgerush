@@ -10,7 +10,7 @@ benchmarks, which are not here; nothing builds them.
 ## What is changed
 
 Every change is marked `EdgeRush:` in the source. One addition, for idle connections
-(14 §3 of the design docs):
+(14 §3 of the design docs), and one allowance, for fuzz builds:
 
 - **A server connection can give back its buffers.** h2 makes three buffers for every
   connection when it is handshaken, and keeps them for the connection's life: the 16 KiB
@@ -29,16 +29,22 @@ Every change is marked `EdgeRush:` in the source. One addition, for idle connect
   a release costs one more read; left to itself, tokio-util reserves a single byte before
   each read and would read a byte at a time. The decoder's, by `huffman::decode`, which
   reserves what each string needs.
+- **Its fuzzing module may go undocumented in every build.** cargo-fuzz builds with
+  `--cfg fuzzing`, which brings in h2's `fuzz_bridge` module, and h2 denies `missing_docs`
+  but allows it there only with its `unstable` feature. The lints of a registry dependency
+  are capped at warnings; a path dependency's are not, so the vendored copy stopped every
+  fuzz build of the workspace's crates. The allowance is now unconditional (`lib.rs`).
 
 h2's own tests are not carried: they need dependencies the workspace does not have. The
 change is covered by `a_server_connection_gives_back_its_buffers_and_serves_on` and
 `a_server_connection_keeps_what_waits_in_its_buffers` in `crates/proxy/tests/h2_library.rs`,
 which fail with the checks for an empty buffer taken out, or with the release doing nothing.
+The allowance is covered by building any fuzz target with cargo-fuzz (the repository
+README).
 
 ## Carrying it to another version
 
 Copy the new version's `Cargo.toml`, `LICENSE`, `README.md` and `src/` over these, then
-make the changes marked `EdgeRush:` again (`grep -rl EdgeRush src` lists the six files).
-They are additions, and change nothing h2 does unless a connection's buffers are given
-back. Update the version here, in the workspace's `Cargo.toml` and in `fuzz/Cargo.toml`,
-and run the two tests above.
+make the changes marked `EdgeRush:` again (`grep -rl EdgeRush src` lists the seven files).
+They change nothing h2 does unless a connection's buffers are given back. Update the version here, in the workspace's `Cargo.toml` and in `fuzz/Cargo.toml`,
+and run the two tests above and a fuzz target's build.

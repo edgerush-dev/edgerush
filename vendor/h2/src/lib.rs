@@ -131,8 +131,11 @@ pub mod ext;
 pub mod server;
 mod share;
 
+// EdgeRush: allowed whatever the features. cargo-fuzz builds with `--cfg fuzzing`, and the
+// lints of a path dependency are not capped as a registry dependency's are, so the
+// `missing_docs` denied above stopped every fuzz build of the workspace's crates.
 #[cfg(fuzzing)]
-#[cfg_attr(feature = "unstable", allow(missing_docs))]
+#[allow(missing_docs)]
 pub mod fuzz_bridge;
 
 pub use crate::error::{Error, Reason};
