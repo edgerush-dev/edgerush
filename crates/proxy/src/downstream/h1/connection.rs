@@ -69,7 +69,7 @@ const READ_AHEAD: usize = 16 * 1024;
 
 /// How much of an answer is queued for the socket before its body is asked for more: the
 /// body staging of 14 §8.
-const STAGING: usize = 64 * 1024;
+pub(crate) const STAGING: usize = 64 * 1024;
 
 /// The most queued pieces one write carries. A frame is three at most — its chunk size, the
 /// frame and the line break after it — and the staging holds a few frames at most, so this

@@ -1142,6 +1142,71 @@ async fn the_scrape_endpoint_speaks_http1_only() {
     );
 }
 
+/// The scrape socket serves ten connections at once: an eleventh waits in the backlog,
+/// unanswered, until one of the ten ends, and is served then (08 §4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scrape_past_ten_connections_waits_until_one_ends() {
+    let up = upstream("up").await;
+    let (proxy, _) = reloadable_proxy(&everything_to(&[("web", up)], "0")).await;
+    let scrape = scraped(proxy);
+    let mut idle = Vec::new();
+    for _ in 0..10 {
+        idle.push(TcpStream::connect(scrape).await.unwrap());
+    }
+    // Behind the ten in the backlog, which is taken from in order.
+    let mut eleventh = TcpStream::connect(scrape).await.unwrap();
+    eleventh
+        .write_all(b"GET /metrics HTTP/1.1\r\nhost: scrape.test\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    // Well inside the ten's first-request deadline, which would end them anyway.
+    let mut first = [0; 1];
+    let early = tokio::time::timeout(Duration::from_millis(500), eleventh.read(&mut first)).await;
+    assert!(early.is_err(), "answered while ten were open: {early:?}");
+
+    drop(idle.pop());
+    let mut answer = Vec::new();
+    within(eleventh.read_to_end(&mut answer)).await.unwrap();
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+}
+
+/// Every scrape the cap lets in is served at once, each with a head of nearly the largest
+/// size the server reads: the scrapes' storage is sized to hold them all.
+#[tokio::test(flavor = "multi_thread")]
+async fn ten_scrapes_with_the_largest_heads_are_served_at_once() {
+    let up = upstream("up").await;
+    let (proxy, _) = reloadable_proxy(&everything_to(&[("web", up)], "0")).await;
+    let scrape = scraped(proxy);
+    let padding = "a".repeat(60 * 1024);
+    let mut scrapes = Vec::new();
+    for _ in 0..10 {
+        let mut stream = TcpStream::connect(scrape).await.unwrap();
+        // The head all but its end, so that every one is held at once.
+        let head =
+            format!("GET /metrics HTTP/1.1\r\nhost: scrape.test\r\nx-padding: {padding}\r\n");
+        stream.write_all(head.as_bytes()).await.unwrap();
+        scrapes.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for stream in &mut scrapes {
+        stream
+            .write_all(b"connection: close\r\n\r\n")
+            .await
+            .unwrap();
+    }
+    for (at, mut stream) in scrapes.into_iter().enumerate() {
+        let mut answer = Vec::new();
+        within(stream.read_to_end(&mut answer)).await.unwrap();
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(
+            answer.starts_with("HTTP/1.1 200 "),
+            "scrape {at}: {}",
+            answer.lines().next().unwrap_or("closed unanswered")
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connection_accepted_on_one_thread_is_served_on_another() {
     let up = upstream("up").await;
