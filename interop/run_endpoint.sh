@@ -64,7 +64,7 @@ nginx -c /tmp/nginx.conf -e /logs/nginx.log -p /tmp/nginx-temp/
     echo '    hostnames: [{ name: "*", falls_through: true }]'
     echo '    rules:'
     echo '      - matches: [{ path: { prefix: / } }]'
-    echo '        backends: [{ upstream: origin, weight: 1 }]'
+    echo '        forward: { backends: [{ upstream: origin, weight: 1 }] }'
     echo 'upstreams:'
     echo '  origin: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }'
 } >/tmp/config.yaml
