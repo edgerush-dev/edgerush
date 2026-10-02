@@ -20,6 +20,8 @@ cargo-fuzz = true
 boring = "5.2"
 # A response head keeps the bytes it was read from, as the proxy's does.
 bytes = "1.12"
+# The model and compiler a harness file is read into.
+edgerush-config = { path = "../crates/config" }
 edgerush-filters = { path = "../crates/filters", features = ["reference"] }
 edgerush-proxy = { path = "../crates/proxy", features = ["fuzzing"] }
 edgerush-router = { path = "../crates/router", features = ["reference"] }
@@ -31,6 +33,9 @@ libfuzzer-sys = "0.4"
 # The connection IDs a datagram carries are read as this crate's parser reads them, at the
 # version the proxy pins.
 quiche = { version = "=0.30.0", default-features = false, features = ["boringssl-boring-crate"] }
+# A harness file is read as the harness reads it, at the version the workspace uses: the
+# config crate knows no format, so the reading is the harness's, which `config` repeats.
+serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
 
 # The proxy's quiche, patched as the workspace's is (see its Cargo.toml).
 [patch.crates-io]
@@ -159,6 +164,13 @@ bench = false
 [[bin]]
 name = "proxy_header"
 path = "fuzz_targets/proxy_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
 test = false
 doc = false
 bench = false

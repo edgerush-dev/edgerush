@@ -1,0 +1,35 @@
+listeners:
+  web: { address: "[::]:8443", protocol: https, proxy_protocol: { senders: ["10.0.0.0/8"] }, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: [Forwarded, X-Real-IP] }, request_id: pass, tls: { certificates: [site, other], client_validation: { authorities: ["CA"] } }, http3: { alt_svc_max_age: 60, force_retry: false } }
+  db: { address: "[::]:5432", protocol: tcp, proxy_protocol: off, tunnel_idle_seconds: 600 }
+routes:
+  - name: api
+    listeners: [web]
+    hostnames:
+      - { name: api.example.com, falls_through: true }
+      - { name: "*.example.com", wildcard: one_label, falls_through: true }
+    rules:
+      - matches:
+          - path: { regex: "/orders/[0-9]+" }
+            query: [{ name: tenant, value: { regex: "[a-z]+" } }]
+        filters:
+          - { type: request_mirror, upstream: shadow, fraction: { numerator: 1, denominator: 10 } }
+        forward:
+          backends: [{ upstream: orders, weight: 1 }]
+          retry: { attempts: 2, http_statuses: [502, 503], grpc_statuses: [UNAVAILABLE], on_timeout: false, backoff_base_ms: 25, backoff_max_ms: 250 }
+          timeouts: { request_ms: 1500, backend_request_ms: 500 }
+      - matches: [{ grpc: { service: pkg.Svc } }]
+        forward: { backends: [{ upstream: grpc, weight: 1 }] }
+      - matches: [{ path: { prefix: /old } }]
+        redirect: { status: 301, query: keep }
+tcp_routes:
+  - { name: db, listeners: [db], backends: [{ upstream: db, weight: 1 }] }
+upstreams:
+  orders: { load_balancer: p2c, endpoints: ["10.0.1.1:8080"], slow_start: { window_ms: 30000 }, health_check: { interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 1, unhealthy_threshold: 1, probe: { http: { path: /healthz } } } }
+  shadow: { load_balancer: round_robin, endpoints: ["10.0.1.2:8080"] }
+  grpc: { load_balancer: p2c, endpoints: ["10.0.1.3:9000"], protocol: http2, keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false }, tls: { server_name: grpc.internal, authorities: ["CA"], client_certificate: gateway } }
+  db: { load_balancer: p2c, endpoints: ["10.0.1.4:5432"], proxy_protocol: v2, health_check: { interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 1, unhealthy_threshold: 1, probe: tcp } }
+data_plane: { set_aside_ms: 2000 }
+certificates:
+  site: { chain_file: site.crt, key_file: site.key }
+  other: { chain_file: /etc/edgerush/other.crt, key_file: /etc/edgerush/other.key }
+  gateway: { chain_file: gateway.crt, key_file: gateway.key }

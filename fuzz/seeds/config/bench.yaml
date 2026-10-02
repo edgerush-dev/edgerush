@@ -1,0 +1,46 @@
+# The config of the macro benchmark: a handful of routes so that routing is not trivial, and
+# on the one that is measured a small filter chain — headers changed on the way in and on
+# the way out. Requests are for `bench.example.com`.
+listeners:
+  # The control plane's defaults: no proxy trusted, the forwarding headers only one may
+  # send taken off.
+  web: { address: "127.0.0.1:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }, request_id: generate }
+
+routes:
+  - name: bench
+    listeners: [web]
+    hostnames:
+      - { name: bench.example.com, falls_through: false }
+    rules:
+      - matches:
+          - path: { exact: /health }
+          - path: { prefix: /static }
+        forward: { backends: [{ upstream: nowhere, weight: 1 }] }
+      - matches:
+          - path: { prefix: /api/v1 }
+            method: POST
+        forward: { backends: [{ upstream: nowhere, weight: 1 }] }
+      - matches:
+          - path: { prefix: / }
+        filters:
+          - type: request_header_modifier
+            set: [{ name: x-forwarded-proto, value: http }]
+            add: [{ name: x-request-source, value: edge }]
+            remove: [x-internal-debug]
+          - type: response_header_modifier
+            set: [{ name: x-served-by, value: edgerush }]
+            remove: [server]
+        forward: { backends: [{ upstream: backend, weight: 1 }] }
+  - name: others
+    listeners: [web]
+    hostnames:
+      - { name: "*.example.org", wildcard: any_labels, falls_through: false }
+      - { name: www.example.net, falls_through: false }
+    rules:
+      - matches:
+          - path: { prefix: / }
+        forward: { backends: [{ upstream: nowhere, weight: 1 }] }
+
+upstreams:
+  backend: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }
+  nowhere: { load_balancer: p2c, endpoints: [] }

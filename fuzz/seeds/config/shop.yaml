@@ -1,0 +1,93 @@
+listeners:
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }, request_id: generate }
+  admin: { address: "[::]:9090", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  secure: { address: "[::]:8443", protocol: https, proxy_protocol: off, tls: { certificates: [secure] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+routes:
+  - name: shop
+    listeners: [web, secure]
+    hostnames:
+      - { name: shop.example.com, falls_through: true }
+    rules:
+      - matches:
+          - path: { prefix: /cart }
+        filters:
+          - type: request_header_modifier
+            set: [{ name: X-Gateway, value: edgerush }]
+            remove: [x-debug]
+        forward:
+          backends:
+            - { upstream: cart, weight: 9 }
+            - { upstream: cart-canary, weight: 1 }
+      - matches:
+          - path: { exact: /closed }
+        forward:
+          backends:
+            - { upstream: cart, weight: 0 }
+      - matches:
+          - path: { prefix: /search }
+            query: [{ name: q, value: { exact: "a b" } }]
+        forward:
+          backends:
+            - { upstream: search, weight: 1 }
+      - matches:
+          - path: { prefix: /account }
+            headers: [{ name: Cookie, value: { exact: "a=1; b=2" } }]
+        forward:
+          backends:
+            - { upstream: search, weight: 1 }
+      - matches:
+          - path: { prefix: /plain }
+            headers: [{ name: X-Forwarded-Proto, value: { exact: http } }]
+        forward:
+          backends:
+            - { upstream: search, weight: 1 }
+      - matches:
+          - path: { prefix: /told }
+        filters:
+          - type: request_header_modifier
+            set: [{ name: X-Forwarded-For, value: 192.0.2.1 }]
+            remove: [via]
+        forward:
+          backends:
+            - { upstream: search, weight: 1 }
+      - matches:
+          - path: { prefix: /v1 }
+        filters:
+          - { type: url_rewrite, host: api.internal, path: { replace_prefix: /api } }
+        forward:
+          backends:
+            - { upstream: search, weight: 1 }
+  - name: everything-else
+    listeners: [web]
+    hostnames:
+      - { name: "*", falls_through: true }
+    rules:
+      - matches:
+          - path: { prefix: /tenant }
+            headers: [{ name: Host, value: { exact: tenant.example.net } }]
+        forward:
+          backends:
+            - { upstream: search, weight: 1 }
+      - matches:
+          - path: { prefix: / }
+        forward:
+          backends:
+            - { upstream: fallback, weight: 1 }
+  - name: admin
+    listeners: [admin]
+    hostnames:
+      - { name: "*", falls_through: true }
+    rules:
+      - matches:
+          - path: { prefix: /status }
+        forward:
+          backends:
+            - { upstream: admin, weight: 1 }
+upstreams:
+  admin: { load_balancer: p2c, endpoints: ["127.0.0.1:9001"] }
+  cart: { load_balancer: p2c, endpoints: ["127.0.0.1:9002"] }
+  cart-canary: { load_balancer: p2c, endpoints: ["127.0.0.1:9003"] }
+  fallback: { load_balancer: p2c, endpoints: [] }
+  search: { load_balancer: p2c, endpoints: ["127.0.0.1:9004"] }
+certificates:
+  secure: { chain_file: secure.crt, key_file: secure.key }

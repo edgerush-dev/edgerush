@@ -105,7 +105,8 @@ fn directory(path: &Path) -> &Path {
 /// another change.
 fn compiled(yaml: &[u8], directory: &Path) -> (Vec<Seen>, Result<Compiled, Rejected>) {
     // Without the lines around a mistake, which the parser quotes by default: what a
-    // rejection says goes to the log, and a key pasted into the file would go with it.
+    // rejection says goes to the log, and a key pasted into the file would go with it. The
+    // fuzz target `config` reads with these same options: change both.
     let options = serde_saphyr::options! { with_snippet: false };
     let file: HarnessFile = match serde_saphyr::from_slice_with_options(yaml, options) {
         Ok(file) => file,
