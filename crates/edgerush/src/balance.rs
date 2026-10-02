@@ -54,7 +54,10 @@ pub(crate) struct Loads {
     held: Vec<AtomicUsize>,
     /// How many connections a worker may hold before it stops accepting.
     cap: usize,
-    /// For every worker, what wakes it when it has room again.
+    /// For every worker and listener, at `worker * listeners + listener`, what wakes the
+    /// worker's accepting on the listener when the worker has room again: one for each
+    /// listener, since each accepts on its own, and the one woken may have nothing to
+    /// accept while another has a backlog.
     room: Vec<Notify>,
     /// Connections held by every worker together.
     total: AtomicUsize,
@@ -72,7 +75,7 @@ impl Loads {
         Arc::new(Self {
             held: (0..workers).map(|_| AtomicUsize::new(0)).collect(),
             cap,
-            room: (0..workers).map(|_| Notify::new()).collect(),
+            room: (0..workers * listeners).map(|_| Notify::new()).collect(),
             total: AtomicUsize::new(0),
             by_listener: (0..listeners).map(|_| AtomicUsize::new(0)).collect(),
             holding: AtomicUsize::new(0),
@@ -121,7 +124,7 @@ impl Loads {
     /// Waits until `worker` has room, and `listener` has room for another connection.
     pub(crate) async fn room(&self, worker: usize, listener: usize) {
         let at = worker * self.by_listener.len() + listener;
-        let (Some(room), Some(listener_room)) = (self.room.get(worker), self.listener_room.get(at))
+        let (Some(room), Some(listener_room)) = (self.room.get(at), self.listener_room.get(at))
         else {
             return;
         };
@@ -214,11 +217,17 @@ impl Drop for Held {
             return;
         };
         let before = load.fetch_sub(1, Ordering::Relaxed);
-        // Only a worker that was full can be waiting, so only then is there anyone to wake.
+        // Only a worker that was full can be waiting, so only then is there anyone to wake:
+        // every one of its listeners, as each may be waiting.
+        let listeners = loads.by_listener.len();
         if before >= loads.cap
-            && let Some(room) = loads.room.get(self.worker)
+            && let Some(rooms) = loads
+                .room
+                .get(self.worker * listeners..(self.worker + 1) * listeners)
         {
-            room.notify_one();
+            for room in rooms {
+                room.notify_one();
+            }
         }
     }
 }
@@ -476,5 +485,44 @@ mod tests {
             .expect("not woken when a connection of its own ended")
             .unwrap();
         assert!(loads.has_room(0));
+    }
+
+    /// A worker at its cap that gets room again wakes every one of its listeners, not one
+    /// of them: one that is woken may have nothing to accept, and the others would then
+    /// stay parked while the worker has room.
+    #[test]
+    fn a_worker_back_under_its_cap_wakes_every_listener_waiting_on_it() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(wakes_every_listener_waiting_on_it());
+    }
+
+    async fn wakes_every_listener_waiting_on_it() {
+        let loads = Loads::new(1, 2, 2);
+        let first = loads.hold(0, 0);
+        let _second = loads.hold(0, 1);
+        assert!(!loads.has_room(0));
+
+        let waiting: Vec<_> = (0..2)
+            .map(|listener| {
+                let loads = Arc::clone(&loads);
+                tokio::spawn(async move { loads.room(0, listener).await })
+            })
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(waiting.iter().all(|wait| !wait.is_finished()));
+        drop(first);
+        assert!(loads.has_room(0));
+        assert!(loads.listener_has_room(0) && loads.listener_has_room(1));
+        for (listener, wait) in waiting.into_iter().enumerate() {
+            tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("listener {listener} not woken though the worker has room")
+                })
+                .unwrap();
+        }
     }
 }
