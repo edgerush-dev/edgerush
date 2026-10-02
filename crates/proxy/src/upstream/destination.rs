@@ -12,8 +12,11 @@
 //! reload keeps that key only where the destination really is the same one.
 
 use crate::balance::Share;
+use crate::proxy_protocol::Version;
 use crate::upstream::secure::Secure;
-use edgerush_config::{Compiled, HealthCheck, Keepalive, UpstreamProtocol, UpstreamTls};
+use edgerush_config::{
+    Compiled, HealthCheck, Keepalive, ProxyProtocolVersion, UpstreamProtocol, UpstreamTls,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -65,6 +68,9 @@ pub struct ReuseIdentity {
     keepalive: Option<Keepalive>,
     /// How its endpoint is probed, if it is.
     health_check: Option<HealthCheck>,
+    /// The PROXY protocol header its tunnels, and its HTTP probes, send first, if any
+    /// (20 §4).
+    proxy_protocol: Option<Version>,
     /// Whether it may be picked, in one word so that a pick reads it in one look: 0 when it
     /// may. [`UNHEALTHY`] when its last probes say it does not serve, set by the health
     /// checker — healthy until a probe says otherwise, as HAProxy and Pingora start a
@@ -127,6 +133,10 @@ impl ReuseIdentity {
     }
 
     /// How its endpoint is probed, if it is.
+    pub(crate) fn proxy_protocol(&self) -> Option<Version> {
+        self.proxy_protocol
+    }
+
     pub(crate) fn health_check(&self) -> Option<&HealthCheck> {
         self.health_check.as_ref()
     }
@@ -257,6 +267,7 @@ impl Destinations {
             Option<&'a UpstreamTls>,
             Option<Keepalive>,
             Option<&'a HealthCheck>,
+            Option<Version>,
         );
         let mut known: HashMap<Same<'_>, &Arc<ReuseIdentity>> = previous
             .0
@@ -271,6 +282,7 @@ impl Destinations {
                     tls,
                     identity.keepalive,
                     identity.health_check.as_ref(),
+                    identity.proxy_protocol,
                 );
                 (same, identity)
             })
@@ -297,6 +309,7 @@ impl Destinations {
                                 upstream.tls.as_ref(),
                                 upstream.keepalive,
                                 upstream.health_check.as_ref(),
+                                upstream.proxy_protocol.map(version_of),
                             ))
                             .map_or_else(
                                 || {
@@ -308,6 +321,7 @@ impl Destinations {
                                         secure: secure.get(position).cloned().flatten(),
                                         keepalive: upstream.keepalive,
                                         health_check: upstream.health_check.clone(),
+                                        proxy_protocol: upstream.proxy_protocol.map(version_of),
                                         standing: AtomicU64::new(0),
                                         retired: AtomicBool::new(false),
                                         ramping_since: AtomicU64::new(0),
@@ -359,6 +373,14 @@ impl Destinations {
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn endpoints(&self, upstream: usize) -> usize {
         self.0.get(upstream).map_or(0, Vec::len)
+    }
+}
+
+/// The PROXY protocol version a config names, as the writers take it.
+fn version_of(version: ProxyProtocolVersion) -> Version {
+    match version {
+        ProxyProtocolVersion::V1 => Version::V1,
+        ProxyProtocolVersion::V2 => Version::V2,
     }
 }
 

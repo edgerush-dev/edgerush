@@ -1215,8 +1215,13 @@ impl Worker {
         if let Some(by_name) = passthrough {
             let connection = Connection::open(Rc::clone(&self), listener);
             let due = Instant::now() + self.deadlines.first_request;
+            // Gone only if the client already is.
+            let (Ok(client), Ok(local)) = (stream.peer_addr(), stream.local_addr()) else {
+                return;
+            };
+            let ends = Ends { client, local };
             return self
-                .pass_through(connection, stream, by_name, None, due)
+                .pass_through(connection, stream, by_name, ends, None, due)
                 .await;
         }
         let connection = Rc::new(Connection::open(Rc::clone(&self), listener));
@@ -1313,20 +1318,22 @@ impl Worker {
     /// Carries a connection of a `tcp` or `tls` listener to a backend of its route, byte for
     /// byte, and counts how it ended ([17 §4](../../docs/17-tcp-and-tls-passthrough.md)).
     /// `by_name`: the route is the one whose hostnames cover the name the ClientHello asks
-    /// for, rather than the listener's one route. `after`: what the client sent after a
-    /// PROXY header, read with it, which goes first. `due`: the end of the stretch from
-    /// accept in which the ClientHello must come.
+    /// for, rather than the listener's one route. `ends`: the connection's, which a backend
+    /// that asks is told of. `after`: what the client sent after a PROXY header, read with
+    /// it, which goes first. `due`: the end of the stretch from accept in which the
+    /// ClientHello must come.
     async fn pass_through(
         self: Rc<Self>,
         connection: Connection,
         mut client: TcpStream,
         by_name: bool,
+        ends: Ends,
         after: Option<Block>,
         due: Instant,
     ) {
         let listener = connection.listener;
         let ended = self
-            .carry_through(listener, &mut client, by_name, after, due)
+            .carry_through(listener, &mut client, by_name, ends, after, due)
             .await;
         if let Some(counters) = self.proxy.metrics.listener(listener) {
             counters.tunnel(ended);
@@ -1343,6 +1350,7 @@ impl Worker {
         listener: usize,
         client: &mut TcpStream,
         by_name: bool,
+        ends: Ends,
         after: Option<Block>,
         due: Instant,
     ) -> Tunnel {
@@ -1395,6 +1403,31 @@ impl Worker {
             return Tunnel::ConnectFailed;
         };
         let _unset = backend.set_nodelay(true);
+        // A backend that asks is told who the client is before anything of the client's
+        // reaches it, at once, whether or not the client has said anything: in a protocol
+        // where the server speaks first, the client waits for it (20 §4).
+        let hello = match endpoint.proxy_protocol() {
+            None => hello,
+            Some(version) => {
+                let header = proxy_protocol::proxied(version, ends.client, ends.local);
+                match self.ahead_of(header.as_bytes(), hello) {
+                    Ok(first) => Some(first),
+                    Err(Some(hello)) => {
+                        // What was read leaves no room for the header beside it in one
+                        // block: the header goes on its own, and then it.
+                        if tokio::io::AsyncWriteExt::write_all(&mut backend, header.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            self.blocks.borrow_mut().give(hello);
+                            return Tunnel::Failed;
+                        }
+                        Some(hello)
+                    }
+                    Err(None) => return Tunnel::Exhausted,
+                }
+            }
+        };
         let bounds = TunnelBounds {
             idle,
             drain_within: self.deadlines.drain,
@@ -1412,6 +1445,31 @@ impl Worker {
         )
         .await
         .into()
+    }
+
+    /// `header`, and after it whatever `hello` holds, in one block, to be the tunnel's first
+    /// write; `hello` is given back. `Err(Some(hello))` when the two do not fit in a block,
+    /// and `Err(None)` when the worker has no block to give.
+    fn ahead_of(&self, header: &[u8], hello: Option<Block>) -> Result<Block, Option<Block>> {
+        let mut blocks = self.blocks.borrow_mut();
+        let Ok(mut first) = blocks.take() else {
+            return Err(hello);
+        };
+        let held = hello.as_ref().map_or(0, Block::len);
+        if header.len() + held > first.room().len() {
+            blocks.give(first);
+            return Err(hello);
+        }
+        let room = first.room();
+        room[..header.len()].copy_from_slice(header);
+        if let Some(hello) = &hello {
+            room[header.len()..header.len() + held].copy_from_slice(hello.data());
+        }
+        first.arrived(header.len() + held);
+        if let Some(hello) = hello {
+            blocks.give(hello);
+        }
+        Ok(first)
     }
 
     /// The route of a connection of a `tcp` or `tls` listener, from the config in force now,
@@ -1533,7 +1591,7 @@ impl Worker {
         });
         if let Some(by_name) = passthrough {
             return Rc::clone(self)
-                .pass_through(connection, stream, by_name, Some(after), due)
+                .pass_through(connection, stream, by_name, ends, Some(after), due)
                 .await;
         }
         let (mut lent, back) = Lent::new(stream);
@@ -11384,6 +11442,175 @@ upstreams:
                 drop(secured);
                 headers_counted(&worker, "sni", "accepted", 1).await;
                 tunnel_ended(&worker, "sni", "closed").await;
+            })
+            .await;
+    }
+
+    /// A backend that keeps every byte each connection sends until it ends, then closes.
+    async fn recording_backend() -> (SocketAddr, Rc<RefCell<Vec<Vec<u8>>>>) {
+        use tokio::io::AsyncReadExt;
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let hearing = Rc::clone(&heard);
+        tokio::task::spawn_local(async move {
+            while let Ok((mut stream, _)) = socket.accept().await {
+                let hearing = Rc::clone(&hearing);
+                tokio::task::spawn_local(async move {
+                    let mut came = Vec::new();
+                    let _ended = stream.read_to_end(&mut came).await;
+                    hearing.borrow_mut().push(came);
+                });
+            }
+        });
+        (address, heard)
+    }
+
+    /// `yaml` with its upstream `up` sent a PROXY header of `version`.
+    fn sending(yaml: &str, version: &str) -> String {
+        yaml.replace(
+            "up: { load_balancer: p2c,",
+            &format!("up: {{ proxy_protocol: {version}, load_balancer: p2c,"),
+        )
+    }
+
+    /// A backend that asks for a header is sent one first, in the version it asks for,
+    /// naming the connection's own ends where nobody said otherwise, and then exactly the
+    /// client's bytes (20 §4).
+    #[tokio::test]
+    async fn a_backend_that_asks_is_told_who_the_client_is_first() {
+        use tokio::io::AsyncWriteExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (backend, heard) = recording_backend().await;
+                for (at, version) in ["v1", "v2"].into_iter().enumerate() {
+                    let (front, _worker) = passing(&sending(&tcp_to(backend, ""), version)).await;
+                    let mut client = TcpStream::connect(front).await.unwrap();
+                    let own = client.local_addr().unwrap();
+                    client.write_all(b"hello there").await.unwrap();
+                    client.shutdown().await.unwrap();
+                    let mut rest = Vec::new();
+                    let _ended =
+                        bounded(tokio::io::AsyncReadExt::read_to_end(&mut client, &mut rest)).await;
+                    until(|| heard.borrow().len() > at).await;
+                    let came = heard.borrow()[at].clone();
+                    let version = if version == "v1" {
+                        proxy_protocol::Version::V1
+                    } else {
+                        proxy_protocol::Version::V2
+                    };
+                    let mut expected = proxy_protocol::proxied(version, own, front)
+                        .as_bytes()
+                        .to_vec();
+                    expected.extend_from_slice(b"hello there");
+                    assert_eq!(came, expected, "{}", came.escape_ascii());
+                }
+            })
+            .await;
+    }
+
+    /// Where a sender's header named the client, a backend that asks is told of that
+    /// client and the address it connected to, not of the sender (20 §4).
+    #[tokio::test]
+    async fn a_backend_is_told_of_the_client_a_sender_named() {
+        use tokio::io::AsyncWriteExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (backend, heard) = recording_backend().await;
+                let yaml = sending(&tcp_to(backend, ""), "v2").replace(
+                    "proxy_protocol: off",
+                    "proxy_protocol: { senders: [\"127.0.0.0/8\"] }",
+                );
+                let (front, _worker) = passing(&yaml).await;
+                let mut client = TcpStream::connect(front).await.unwrap();
+                let mut sent = v1_header("198.51.100.7:56324", "203.0.113.10:5432");
+                sent.extend_from_slice(b"select 1");
+                client.write_all(&sent).await.unwrap();
+                client.shutdown().await.unwrap();
+                let mut rest = Vec::new();
+                let _ended =
+                    bounded(tokio::io::AsyncReadExt::read_to_end(&mut client, &mut rest)).await;
+                until(|| !heard.borrow().is_empty()).await;
+                let mut expected = v2_header("198.51.100.7:56324", "203.0.113.10:5432");
+                expected.extend_from_slice(b"select 1");
+                assert_eq!(heard.borrow()[0], expected);
+            })
+            .await;
+    }
+
+    /// A backend that speaks first, as SMTP, FTP, SSH and MySQL do, is sent its header as
+    /// soon as it is connected to: the client, which has sent nothing, hears its greeting.
+    #[tokio::test]
+    async fn a_backend_that_speaks_first_is_sent_its_header_at_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let backend = socket.local_addr().unwrap();
+                tokio::task::spawn_local(async move {
+                    let (mut stream, _) = socket.accept().await.unwrap();
+                    // Nothing until its header is whole, as a backend that asks for one
+                    // holds to.
+                    let mut came = Vec::new();
+                    let mut chunk = [0; 256];
+                    while !matches!(
+                        proxy_protocol::read(&came),
+                        proxy_protocol::Read::Whole { .. }
+                    ) {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert_ne!(read, 0, "closed before its header came");
+                        came.extend_from_slice(&chunk[..read]);
+                    }
+                    stream.write_all(b"220 ready\r\n").await.unwrap();
+                    let mut rest = Vec::new();
+                    let _ended = stream.read_to_end(&mut rest).await;
+                });
+                let (front, _worker) = passing(&sending(&tcp_to(backend, ""), "v2")).await;
+                let mut client = TcpStream::connect(front).await.unwrap();
+                let mut greeting = [0; 11];
+                bounded(client.read_exact(&mut greeting)).await.unwrap();
+                assert_eq!(&greeting, b"220 ready\r\n");
+            })
+            .await;
+    }
+
+    /// A `tls` listener's backend that asks is sent its header, and after it the
+    /// ClientHello as the client sent it.
+    #[tokio::test]
+    async fn a_tls_backend_that_asks_is_sent_the_header_then_the_client_hello() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (backend, heard) = recording_backend().await;
+                let yaml = format!(
+                    "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls, proxy_protocol: off }} }}\n\
+                     routes: []\n\
+                     tls_routes: [{{ name: a, listeners: [sni], hostnames: [{{ name: a.test, falls_through: true }}], backends: [{{ upstream: up, weight: 1 }}] }}]\n\
+                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: [\"{backend}\"] }} }}\n"
+                );
+                let (front, _worker) = passing(&sending(&yaml, "v1")).await;
+                // The handshake goes nowhere: the backend only listens. The client gives up.
+                let _nothing = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    told_over_tls(front, Some("a.test")),
+                )
+                .await;
+                until(|| !heard.borrow().is_empty()).await;
+                let came = heard.borrow()[0].clone();
+                let proxy_protocol::Read::Whole { header, length } = proxy_protocol::read(&came) else {
+                    panic!("no header first: {}", came.escape_ascii());
+                };
+                assert!(matches!(header, proxy_protocol::Header::Proxied { .. }));
+                // A TLS handshake record, holding a ClientHello asking for a.test.
+                let hello = &came[length..];
+                assert_eq!(hello.first(), Some(&22));
+                assert_eq!(
+                    crate::l4::hello::read(hello),
+                    crate::l4::hello::Hello::Whole(Some("a.test".to_owned()))
+                );
             })
             .await;
     }

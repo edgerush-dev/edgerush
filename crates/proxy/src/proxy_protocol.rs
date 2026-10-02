@@ -301,7 +301,7 @@ fn v2(bytes: &[u8]) -> Read {
 }
 
 /// Which version a backend is sent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Version {
     /// The text line.
     V1,
