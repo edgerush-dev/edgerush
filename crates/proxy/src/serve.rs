@@ -11653,6 +11653,67 @@ upstreams:
         address
     }
 
+    /// An HTTP/1 backend that answers `said` to every request, whole, and closes.
+    async fn answering(said: &'static [u8]) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            while let Ok((mut stream, _)) = socket.accept().await {
+                tokio::task::spawn_local(async move {
+                    let mut head = [0; 1024];
+                    let _read = stream.read(&mut head).await;
+                    let _written = stream.write_all(said).await;
+                });
+            }
+        });
+        address
+    }
+
+    /// An HTTP/1 probe is judged by the final answer, past any informational ones before
+    /// it (RFC 9110 §15.2): Early Hints and then 200 passes, Early Hints and then 503 fails.
+    #[tokio::test]
+    async fn an_http1_probe_is_judged_by_the_final_answer() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for (said, passes) in [
+                    (
+                        &b"HTTP/1.1 103 Early Hints\r\nlink: </a.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"[..],
+                        true,
+                    ),
+                    (
+                        b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 102 Processing\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n",
+                        true,
+                    ),
+                    (
+                        b"HTTP/1.1 103 Early Hints\r\nlink: </a.css>; rel=preload\r\n\r\nHTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n",
+                        false,
+                    ),
+                    (b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n", true),
+                    // A switch is no answer to a probe that asked for none.
+                    (
+                        b"HTTP/1.1 101 Switching Protocols\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+                        false,
+                    ),
+                    // Informational answers without end are not waited through for ever.
+                    (
+                        b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+                        false,
+                    ),
+                ] {
+                    let backend = answering(said).await;
+                    assert_eq!(
+                        probed(everything_config(backend), healthz()).await,
+                        passes,
+                        "{}",
+                        said.escape_ascii()
+                    );
+                }
+            })
+            .await;
+    }
+
     /// A TCP probe passes an endpoint it can connect to, and fails one it cannot (20 §5).
     #[tokio::test]
     async fn a_tcp_probe_passes_what_it_can_connect_to() {

@@ -22,8 +22,13 @@ use tokio::net::{TcpSocket, TcpStream};
 /// What gRPC's health service calls a server that serves.
 const SERVING: u64 = 1;
 
-/// The most of an HTTP/1 answer read to find its status line.
+/// The most of an HTTP/1 answer read to find its status line, and of any line of its head.
 const STATUS_LINE: usize = 1024;
+
+/// The most informational answers an HTTP/1 probe passes over before the final one, and the
+/// most fields each may have.
+const INFORMATIONAL: usize = 8;
+const INFORMATIONAL_FIELDS: usize = 64;
 
 /// Whether `destination` passes `check`: within its timeout, connection and all.
 pub(crate) async fn passes(destination: &ReuseIdentity, check: &HealthCheck) -> bool {
@@ -103,6 +108,35 @@ async fn http1(mut socket: Socket, path: &str, authority: &str) -> Option<bool> 
         "GET {path} HTTP/1.1\r\nhost: {authority}\r\nuser-agent: edgerush-health\r\nconnection: close\r\n\r\n"
     );
     socket.write_all(asked.as_bytes()).await.ok()?;
+    // Informational answers may come before the final one (RFC 9110 §15.2): Early Hints,
+    // a 100 Continue nobody asked for. They are passed over, so many and no more, and the
+    // final answer judged.
+    for _ in 0..=INFORMATIONAL {
+        let line = line_of(&mut socket).await?;
+        // `HTTP/1.x NNN reason`
+        let status = line.get(9..12)?;
+        let known = line.starts_with(b"HTTP/1.")
+            && line.get(12).is_some_and(|b| *b == b' ' || *b == b'\r')
+            && status.iter().all(u8::is_ascii_digit);
+        // 101 is final: a switch that a probe never asks for, and no pass.
+        if known && status[0] == b'1' && status != b"101" {
+            // Its fields, to the empty line that ends it.
+            let mut fields = 0;
+            while line_of(&mut socket).await? != b"\r\n" {
+                fields += 1;
+                if fields > INFORMATIONAL_FIELDS {
+                    return None;
+                }
+            }
+            continue;
+        }
+        return Some(known && status[0] == b'2');
+    }
+    None
+}
+
+/// A line of an HTTP/1 answer's head, CRLF included, of at most [`STATUS_LINE`] bytes.
+async fn line_of(socket: &mut Socket) -> Option<Vec<u8>> {
     let mut line = Vec::with_capacity(64);
     let mut byte = [0; 1];
     while !line.ends_with(b"\r\n") {
@@ -111,11 +145,7 @@ async fn http1(mut socket: Socket, path: &str, authority: &str) -> Option<bool> 
         }
         line.push(byte[0]);
     }
-    // `HTTP/1.x NNN reason`
-    let status = line.get(9..12)?;
-    let known =
-        line.starts_with(b"HTTP/1.") && line.get(12).is_some_and(|b| *b == b' ' || *b == b'\r');
-    Some(known && status.first() == Some(&b'2') && status.iter().all(u8::is_ascii_digit))
+    Some(line)
 }
 
 /// `GET` over HTTP/2 by prior knowledge, or by what TLS agreed on: a 2xx passes.
