@@ -865,5 +865,55 @@ fn several_streams_share_a_packet() {
     assert_eq!(answered, streams);
 }
 
+/// A stream whose frame does not fit beside another's in a packet goes in a later one.
+/// Coalescing fills a packet frame after frame; when what is left cannot take the next
+/// stream's frame header, that stream waits, all its data still to send, for the next.
+#[test]
+fn a_stream_left_out_of_a_full_packet_is_sent_in_a_later_one() {
+    // A stream ID of 2^30 takes an 8-byte varint and an offset past 16 KiB a 4-byte one:
+    // a 15-byte frame header, more than another stream's frame may leave in a packet.
+    const LATE: u64 = 1 << 30;
+    const FIRST: usize = 16 << 10;
+    const REST: usize = 1_000;
+    // Some length of the other stream's answer leaves 13 or 14 bytes after its frame.
+    for early_len in 1_000..1_200 {
+        let mut config = server_ids();
+        config.set_initial_max_streams_bidi(1 << 29);
+        let mut pipe = Pipe::new(&mut config, &id(0xa5, ID_LEN));
+        pipe.client.stream_send(0, b"a", false).unwrap();
+        pipe.client.stream_send(LATE, b"b", false).unwrap();
+        pipe.advance();
+        // Stream 0 first in every packet, the late stream after it.
+        pipe.server.stream_priority(0, 0, false).unwrap();
+        // The late stream's offset past 16 KiB, as far as the window takes it each round.
+        let mut sent = 0;
+        while sent < FIRST {
+            sent += pipe
+                .server
+                .stream_send(LATE, &vec![b'x'; FIRST - sent], false)
+                .unwrap();
+            pipe.advance();
+        }
+
+        let early = vec![b'e'; early_len];
+        assert_eq!(pipe.server.stream_send(0, &early, false), Ok(early_len));
+        let rest = vec![b'y'; REST];
+        assert_eq!(pipe.server.stream_send(LATE, &rest, true), Ok(REST));
+        pipe.advance();
+
+        let mut buf = vec![0; 64 << 10];
+        let (mut got, mut fin) = (0, false);
+        while let Ok((len, end)) = pipe.client.stream_recv(LATE, &mut buf) {
+            got += len;
+            fin = end;
+        }
+        assert!(
+            fin && got == FIRST + REST,
+            "beside {early_len} bytes: {got} of {} bytes, fin {fin}",
+            FIRST + REST
+        );
+    }
+}
+
 // 17 bytes, the length 16 §3 gives server IDs, is within what QUIC allows and quiche takes.
 const _: () = assert!(ID_LEN <= quiche::MAX_CONN_ID_LEN);

@@ -18,6 +18,14 @@ Every change is marked `EdgeRush:` in the source.
 - **Two of quiche's tests follow from it.** `stream_round_robin` and `stream_reprioritize`
   expect one stream per packet. They now check the same order, frame by frame, across the
   one packet that carries them all (`src/tests.rs`).
+- **A stream whose frame header does not fit waits for the next packet.** When what was
+  left of a packet could not take the next stream's STREAM frame header, quiche took the
+  stream off its send queue with its data unsent, and nothing put it back: a stream is
+  queued again only if it was not flushable before, and it still was. Now the packet ends
+  there and the stream stays queued, as quinn does (`src/lib.rs`, in `send_single`). With
+  coalescing this is any stream after the first whose header needs 15 bytes or more (an
+  8-byte varint for its ID or offset) where 13 or 14 are left. `a_stream_left_out_of_a_full_packet_is_sent_in_a_later_one`
+  in `crates/proxy/tests/h3_library.rs` covers it.
 - **An ACK alone may wait, when asked to.** `Config::enable_delayed_ack(true)` (off by
   default) makes an ACK in the application space wait, once the handshake is confirmed.
   It goes out at once after a second ack-eliciting packet, after one that came out of order
@@ -134,6 +142,13 @@ quinn and ngtcp2 all fill a packet with as many streams' frames as fit, as RFC 9
 allows. Priority order is kept: the frames go in the order quiche would have sent them one
 packet at a time.
 
+**The stream left out.** Published quiche reaches that arm only for the first stream of a
+packet other frames have nearly filled; coalescing reaches it for every stream after the
+first. The rest of such an answer was never sent: a large answer on a long connection
+stalled for good, holding one of the client's stream credits until the client gave up on
+it. Stopping is one arm of a loop that only ever looks at the head of the queue; going on to
+a later stream that fits, as HAProxy does, would need the loop to walk the queue.
+
 **Delayed ACKs.** quiche sends an ACK whenever the application asks it for a packet and
 one is owed. A driver asks after every datagram it hands over, so a request answered from
 upstream costs two packets back: the ACK at once, the answer after. With 256 connections
@@ -202,7 +217,7 @@ HTTP/2 stage, and needs to know it. The pieces are told apart from the bytes bec
 costs a buffer and a node past its bytes: a peer that sends its data a byte a frame, in
 order, costs a hundred times what flow control counts.
 
-With all eleven changes, quiche's own library tests pass (1,176 of 1,176, on Windows and
+With all twelve changes, quiche's own library tests pass (1,176 of 1,176, on Windows and
 Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`).
 The proxy's probe `several_streams_share_a_packet` in `crates/proxy/tests/h3_library.rs`
 fails against the published crate, as do its tests `an_answer_carries_the_ack_of_its_request`

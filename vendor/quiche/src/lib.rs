@@ -5329,11 +5329,15 @@ impl<F: BufFactory> Connection<F> {
 
                 let max_len = match left.checked_sub(hdr_len) {
                     Some(v) => v,
+                    // EdgeRush: what is left of the packet cannot take this stream's
+                    // frame header, so the packet is done and the stream waits for the
+                    // next one, still queued. Upstream took it off the queue with its
+                    // data unsent, and nothing put it back: whatever queues a stream
+                    // again does so only if it was not flushable before, which it was.
                     None => {
-                        let priority_key = Arc::clone(&stream.priority_key);
-                        self.streams.remove_flushable(&priority_key);
+                        stream_data_skipped = true;
 
-                        continue;
+                        break;
                     },
                 };
 
