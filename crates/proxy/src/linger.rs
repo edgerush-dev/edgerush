@@ -13,6 +13,7 @@
 //! bounds. None of what is read is looked at: the engine has finished with the
 //! connection, and nothing more on it is a request.
 
+use bytes::{Buf, Bytes};
 use std::cell::Cell;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -45,6 +46,10 @@ pub(crate) struct Lent {
     /// Always there until the drop; an `Option` only so that the drop can move it out.
     stream: Option<TcpStream>,
     back: Returned,
+    /// Bytes the client sent that were read before the engine had the connection, to be
+    /// read first: what came with a PROXY header (20 §3). Boxed, as only a listener that
+    /// reads one has any, so that every other connection pays a word for it.
+    ahead: Option<Box<Bytes>>,
 }
 
 impl std::fmt::Debug for Lent {
@@ -62,8 +67,14 @@ impl Lent {
         let lent = Self {
             stream: Some(stream),
             back: Rc::clone(&back),
+            ahead: None,
         };
         (lent, back)
+    }
+
+    /// Has `bytes`, already read from the connection, read before anything more is.
+    pub(crate) fn read_first(&mut self, bytes: Bytes) {
+        self.ahead = (!bytes.is_empty()).then(|| Box::new(bytes));
     }
 
     /// The connection, while it is lent. Missing only after the drop has taken it, when
@@ -90,7 +101,17 @@ impl AsyncRead for Lent {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut().stream() {
+        let this = self.get_mut();
+        if let Some(ahead) = &mut this.ahead {
+            let given = ahead.len().min(buf.remaining());
+            buf.put_slice(&ahead[..given]);
+            ahead.advance(given);
+            if ahead.is_empty() {
+                this.ahead = None;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        match this.stream() {
             Ok(stream) => stream.poll_read(cx, buf),
             Err(error) => Poll::Ready(Err(error)),
         }

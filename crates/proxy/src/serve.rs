@@ -33,9 +33,10 @@ use crate::interim::Interim;
 use crate::l4::hello::{self, Hello};
 use crate::linger::{self, Lent, linger};
 use crate::map_head::MapHead;
-use crate::metrics::{AcceptPause, Answer, Metrics, Socket, Stopped, Tunnel};
+use crate::metrics::{AcceptPause, Answer, Metrics, ProxyHeader, Socket, Stopped, Tunnel};
 use crate::mirror;
 use crate::places::{Place, Places, Refused};
+use crate::proxy_protocol::{self, Header as Said, Read as HeaderRead};
 use crate::random::{random, unguessable};
 use crate::raw::{RawAnswer, RawHead};
 use crate::request::{Decision, Opening, decide};
@@ -1193,35 +1194,64 @@ impl Worker {
     pub async fn serve_connection(self: Rc<Self>, listener: usize, stream: TcpStream) {
         // Worth having, not worth refusing a connection over.
         let _unset = stream.set_nodelay(true);
-        // Gone only if the client already is.
-        let peer = stream.peer_addr();
-        let deadlines = self.deadlines;
-        let (tls, passthrough) = {
+        let (tls, passthrough, reads_header) = {
             let snapshot = self.proxy.current.load();
+            let compiled = snapshot.listener(listener);
             // The TLS of the config the connection came in under, which it keeps to its end.
             let tls = snapshot.tls.get(listener).cloned().flatten();
             // A `tcp` or `tls` listener's connections are carried, not served (17).
-            let passthrough = snapshot
-                .listener(listener)
+            let passthrough = compiled
                 .and_then(|compiled| compiled.l4.as_ref())
                 .map(|l4| matches!(l4, L4::Tls(_)));
-            (tls, passthrough)
+            let reads_header = compiled.is_some_and(|compiled| compiled.proxy_senders.is_some());
+            (tls, passthrough, reads_header)
         };
-        if let Some(by_name) = passthrough {
-            return self.pass_through(listener, stream, by_name).await;
+        // A connection that starts with a PROXY header is served, or carried, after it, in a
+        // future of its own: boxed, and settled first, so that nothing here is held across
+        // the wait for it and no other connection's future is the larger for it (14 §3).
+        if reads_header {
+            return Box::pin(self.after_header(listener, stream, tls, passthrough)).await;
         }
-        let connection = Rc::new(Connection::open(self, listener));
-        let Ok(peer) = peer else {
+        if let Some(by_name) = passthrough {
+            let connection = Connection::open(Rc::clone(&self), listener);
+            let due = Instant::now() + self.deadlines.first_request;
+            return self
+                .pass_through(connection, stream, by_name, None, due)
+                .await;
+        }
+        let connection = Rc::new(Connection::open(Rc::clone(&self), listener));
+        // Who the upstream is told the client is, written once for all its requests. Gone
+        // only if the client already is.
+        let Ok(client) = stream
+            .peer_addr()
+            .map(|peer| Rc::new(Client::new(peer.ip())))
+        else {
             return;
         };
-        // Who the upstream is told the client is, written once for all its requests.
-        let client = Rc::new(Client::new(peer.ip()));
+        // Lent rather than given, so that it comes back once the engine is done with it.
+        let (lent, back) = Lent::new(stream);
+        let due = Instant::now() + self.deadlines.first_request;
+        self.serve_settled(connection, tls, client, lent, back, due)
+            .await;
+    }
+
+    /// Serves a connection as HTTP, from accept to close, once it is known whose it is:
+    /// `client`'s, its socket `lent` to the engine and coming back through `back`. `due`:
+    /// the end of the stretch from accept in which its first request must come.
+    async fn serve_settled(
+        &self,
+        connection: Rc<Connection>,
+        tls: Option<Arc<Tls>>,
+        client: Rc<Client>,
+        lent: Lent,
+        back: linger::Returned,
+        due: Instant,
+    ) {
+        let deadlines = self.deadlines;
         // Set when the engine hands over the first request, which is the end of the one
         // stretch its own deadlines do not cover.
         let asked = Rc::new(Cell::new(false));
         let (ours, ours_asking) = (Rc::clone(&connection), Rc::clone(&asked));
-        // Lent rather than given, so that it comes back once the engine is done with it.
-        let (lent, back) = Lent::new(stream);
         // Each served by our own server: HTTP/1 by the one of 14, HTTP/2 over h2 (15 step 2).
         // A task is as large as its future's largest state, from accept to close, whatever
         // the connection turns out to be (14 §3). So only plain HTTP/1, which waits between
@@ -1251,7 +1281,7 @@ impl Worker {
         // HTTP/2 preface, is bounded here.
         let cut_off = {
             let mut serving = std::pin::pin!(serving);
-            let mut first = std::pin::pin!(tokio::time::sleep(deadlines.first_request));
+            let mut first = std::pin::pin!(tokio::time::sleep_until(due));
             std::future::poll_fn(|cx| {
                 // An error here is the end of one connection: the peer went away or spoke
                 // nonsense. There is nobody to tell.
@@ -1283,10 +1313,21 @@ impl Worker {
     /// Carries a connection of a `tcp` or `tls` listener to a backend of its route, byte for
     /// byte, and counts how it ended ([17 §4](../../docs/17-tcp-and-tls-passthrough.md)).
     /// `by_name`: the route is the one whose hostnames cover the name the ClientHello asks
-    /// for, rather than the listener's one route.
-    async fn pass_through(self: Rc<Self>, listener: usize, mut client: TcpStream, by_name: bool) {
-        let connection = Connection::open(Rc::clone(&self), listener);
-        let ended = self.carry_through(listener, &mut client, by_name).await;
+    /// for, rather than the listener's one route. `after`: what the client sent after a
+    /// PROXY header, read with it, which goes first. `due`: the end of the stretch from
+    /// accept in which the ClientHello must come.
+    async fn pass_through(
+        self: Rc<Self>,
+        connection: Connection,
+        mut client: TcpStream,
+        by_name: bool,
+        after: Option<Block>,
+        due: Instant,
+    ) {
+        let listener = connection.listener;
+        let ended = self
+            .carry_through(listener, &mut client, by_name, after, due)
+            .await;
         if let Some(counters) = self.proxy.metrics.listener(listener) {
             counters.tunnel(ended);
         }
@@ -1295,18 +1336,25 @@ impl Worker {
 
     /// The tunnel. A `tls` listener reads the ClientHello into a block of the worker's,
     /// which then carries the client's bytes on, so that what was read goes to the backend
-    /// first and unchanged; the tunnel gives it back once it has.
+    /// first and unchanged; the tunnel gives it back once it has. What came after a PROXY
+    /// header is already in a block, which goes on the same way.
     async fn carry_through(
         &self,
         listener: usize,
         client: &mut TcpStream,
         by_name: bool,
+        after: Option<Block>,
+        due: Instant,
     ) -> Tunnel {
         let (name, hello) = if by_name {
-            let Ok(mut block) = self.blocks.borrow_mut().take() else {
-                return Tunnel::Exhausted;
+            let mut block = match after {
+                Some(block) => block,
+                None => match self.blocks.borrow_mut().take() {
+                    Ok(block) => block,
+                    Err(_) => return Tunnel::Exhausted,
+                },
             };
-            match self.read_hello(client, &mut block).await {
+            match self.read_hello(client, &mut block, due).await {
                 Ok(name) => (Some(name), Some(block)),
                 Err(ended) => {
                     self.blocks.borrow_mut().give(block);
@@ -1314,7 +1362,16 @@ impl Worker {
                 }
             }
         } else {
-            (None, None)
+            // Bytes that came with a header go first; an empty block is given back.
+            let after = after.and_then(|block| {
+                if block.is_empty() {
+                    self.blocks.borrow_mut().give(block);
+                    None
+                } else {
+                    Some(block)
+                }
+            });
+            (None, after)
         };
         let routed = self.pass_route(listener, name.as_deref());
         // Held until the tunnel closes: it is load on its backend for as long as it is open.
@@ -1392,11 +1449,16 @@ impl Worker {
         Ok((Arc::clone(identity), compiled.tunnel_idle, counted))
     }
 
-    /// Reads a TLS client's ClientHello into `into`, within the first-request deadline
-    /// and [`hello::LIMIT`], for the host name it asks for (17 §3).
-    async fn read_hello(&self, client: &mut TcpStream, into: &mut Block) -> Result<String, Tunnel> {
+    /// Reads a TLS client's ClientHello into `into`, by `due`, the end of the first-request
+    /// stretch, and within [`hello::LIMIT`], for the host name it asks for (17 §3). What
+    /// `into` already holds is the start of it.
+    async fn read_hello(
+        &self,
+        client: &mut TcpStream,
+        into: &mut Block,
+        due: Instant,
+    ) -> Result<String, Tunnel> {
         let mut alarm = Alarm::new(&self.timers, None);
-        let due = Instant::now() + self.deadlines.first_request;
         std::future::poll_fn(|cx| {
             loop {
                 match hello::read(into.data()) {
@@ -1431,6 +1493,164 @@ impl Worker {
             }
         })
         .await
+    }
+
+    /// Serves or carries a connection of a listener with senders after the PROXY header it
+    /// starts with (20 §3), its ends as a believed header names them. `tls` and
+    /// `passthrough` are its listener's, as `serve_connection` found them.
+    async fn after_header(
+        self: &Rc<Self>,
+        listener: usize,
+        mut stream: TcpStream,
+        tls: Option<Arc<Tls>>,
+        passthrough: Option<bool>,
+    ) {
+        // From accept to the first request: one stretch, the header included.
+        let due = Instant::now() + self.deadlines.first_request;
+        let connection = Connection::open(Rc::clone(self), listener);
+        // Gone only if the client already is.
+        let (Ok(peer), Ok(local)) = (stream.peer_addr(), stream.local_addr()) else {
+            return;
+        };
+        // Whether its sender is believed: settled by who connected, before a byte is read.
+        let believed = self
+            .proxy
+            .current
+            .load()
+            .listener(listener)
+            .and_then(|compiled| compiled.proxy_senders.as_ref())
+            .is_some_and(|senders| senders.trusts(peer.ip()));
+        let Ok((said, mut after)) = self
+            .receive_header(listener, &mut stream, believed, due)
+            .await
+        else {
+            return;
+        };
+        // Its two ends, as far as anyone is told: its own, unless a sender says otherwise.
+        let ends = said.unwrap_or(Ends {
+            client: peer,
+            local,
+        });
+        if let Some(by_name) = passthrough {
+            return Rc::clone(self)
+                .pass_through(connection, stream, by_name, Some(after), due)
+                .await;
+        }
+        let (mut lent, back) = Lent::new(stream);
+        // What came after the header is the start of what the engine reads.
+        let length = after.len();
+        lent.read_first(after.take_frame(0..length, length));
+        self.blocks.borrow_mut().give(after);
+        let client = Rc::new(Client::new(ends.client.ip()));
+        self.serve_settled(Rc::new(connection), tls, client, lent, back, due)
+            .await;
+    }
+
+    /// Reads the PROXY protocol header a connection of a listener with senders starts with
+    /// ([20 §3](../../docs/20-proxy-protocol.md)), by `due`, into a block of the worker's
+    /// that then holds whatever came after it, to be read first. A header longer than what
+    /// is needed to read it (TLVs) is skipped by count, never held. `believed`: whether the
+    /// connection's peer is among the senders, whose header's addresses are its ends. What
+    /// came of the header is counted; `Err` is a connection to close.
+    async fn receive_header(
+        &self,
+        listener: usize,
+        client: &mut TcpStream,
+        believed: bool,
+        due: Instant,
+    ) -> Result<(Option<Ends>, Block), ()> {
+        let counted = |outcome| {
+            if let Some(counters) = self.proxy.metrics.listener(listener) {
+                counters.proxy_header(outcome);
+            }
+        };
+        let Ok(mut block) = self.blocks.borrow_mut().take() else {
+            return Err(());
+        };
+        let mut alarm = Alarm::new(&self.timers, None);
+        let mut said = None;
+        // What of the header is still to be read and dropped, once it has been read.
+        let mut skip = 0;
+        let read = poll_fn(|cx| {
+            loop {
+                if said.is_none() {
+                    match proxy_protocol::read(block.data()) {
+                        HeaderRead::More => {}
+                        HeaderRead::Whole { header, length } => {
+                            let have = block.len().min(length);
+                            block.consume(have);
+                            skip = length - have;
+                            said = Some(header);
+                        }
+                        HeaderRead::Refused(refusal) if refusal.is_missing() => {
+                            return Poll::Ready(Err(ProxyHeader::Missing));
+                        }
+                        HeaderRead::Refused(_) => {
+                            return Poll::Ready(Err(ProxyHeader::Malformed));
+                        }
+                    }
+                }
+                if let Some(header) = said
+                    && skip == 0
+                {
+                    return Poll::Ready(Ok(header));
+                }
+                // A header is decided within its first 232 bytes, and once it is the block
+                // holds nothing but what was read since: there is always room.
+                let mut buffer = ReadBuf::new(block.room());
+                if buffer.remaining() == 0 {
+                    return Poll::Ready(Err(ProxyHeader::Malformed));
+                }
+                match Pin::new(&mut *client).poll_read(cx, &mut buffer) {
+                    Poll::Ready(Ok(())) => {
+                        let count = buffer.filled().len();
+                        if count == 0 {
+                            return Poll::Ready(Err(ProxyHeader::Closed));
+                        }
+                        block.arrived(count);
+                        if said.is_some() {
+                            let dropped = count.min(skip);
+                            block.consume(dropped);
+                            skip -= dropped;
+                        }
+                    }
+                    Poll::Ready(Err(_)) => return Poll::Ready(Err(ProxyHeader::Closed)),
+                    Poll::Pending => {
+                        if alarm.poll_until(cx, due).is_ready() {
+                            return Poll::Ready(Err(ProxyHeader::TooSlow));
+                        }
+                        return Poll::Pending;
+                    }
+                }
+            }
+        })
+        .await;
+        let ends = match read {
+            Err(outcome) => {
+                counted(outcome);
+                self.blocks.borrow_mut().give(block);
+                return Err(());
+            }
+            Ok(_) if !believed => {
+                counted(ProxyHeader::Untrusted);
+                None
+            }
+            Ok(Said::Local) => {
+                counted(ProxyHeader::Local);
+                None
+            }
+            Ok(Said::Proxied {
+                source,
+                destination,
+            }) => {
+                counted(ProxyHeader::Accepted);
+                Some(Ends {
+                    client: source,
+                    local: destination,
+                })
+            }
+        };
+        Ok((ends, block))
     }
 
     /// Serves HTTP/3 on `socket`, the UDP socket of the listener at position `listener` of
@@ -3062,6 +3282,17 @@ fn request_length<F: Fields + ?Sized>(headers: &F) -> Option<u64> {
         return None;
     }
     std::str::from_utf8(only).ok()?.trim().parse().ok()
+}
+
+/// A connection's two ends as anyone is told of them: whoever connected and where, or what a
+/// sender's PROXY header says of the client it came for, both from the one place, never one
+/// end of each ([20 §3](../../docs/20-proxy-protocol.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ends {
+    /// The client.
+    client: SocketAddr,
+    /// Where the client connected.
+    local: SocketAddr,
 }
 
 /// A connection that came in on a listener's socket: what its requests share, and what
@@ -10693,6 +10924,468 @@ upstreams:
 "#
         );
         serde_saphyr::from_str(&yaml).unwrap()
+    }
+
+    /// `config` with its listener `web` reading a PROXY header from `senders`.
+    fn with_senders(mut config: Config, senders: &[&str]) -> Config {
+        let web = config.listeners.get_mut("web").unwrap();
+        web.proxy_protocol = Some(edgerush_config::ListenerProxyProtocol::Senders(
+            senders.iter().map(|range| (*range).to_owned()).collect(),
+        ));
+        config
+    }
+
+    /// A v1 header saying the connection is `source`'s, made to `destination`.
+    fn v1_header(source: &str, destination: &str) -> Vec<u8> {
+        let (source, destination) = (source.parse().unwrap(), destination.parse().unwrap());
+        proxy_protocol::proxied(proxy_protocol::Version::V1, source, destination)
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// The same in v2.
+    fn v2_header(source: &str, destination: &str) -> Vec<u8> {
+        let (source, destination) = (source.parse().unwrap(), destination.parse().unwrap());
+        proxy_protocol::proxied(proxy_protocol::Version::V2, source, destination)
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// A v2 `LOCAL` header: the sender's own connection.
+    const V2_LOCAL: &[u8] = b"\r\n\r\n\0\r\nQUIT\n\x20\x00\x00\x00";
+
+    /// Whether the listener `listener` has counted `count` PROXY headers as `outcome`, soon.
+    async fn headers_counted(worker: &Worker, listener: &str, outcome: &str, count: usize) {
+        let line = format!(
+            "edgerush_listener_proxy_headers_total{{listener=\"{listener}\",outcome=\"{outcome}\"}} {count}\n"
+        );
+        until(|| worker.proxy().metrics().contains(&line)).await;
+    }
+
+    /// A stream whose first write is sent with `ahead` in front of it, as one: a PROXY header
+    /// and the client's first bytes in the one segment, as load balancers send them.
+    #[derive(Debug)]
+    struct Fronted {
+        stream: TcpStream,
+        ahead: Option<Vec<u8>>,
+    }
+
+    impl AsyncRead for Fronted {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().stream).poll_read(context, buf)
+        }
+    }
+
+    impl AsyncWrite for Fronted {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if let Some(ahead) = &this.ahead {
+                let mut both = ahead.clone();
+                both.extend_from_slice(buf);
+                return match Pin::new(&mut this.stream).poll_write(context, &both) {
+                    Poll::Ready(Ok(written)) => {
+                        // A first write of a few hundred bytes to loopback goes whole.
+                        assert_eq!(written, both.len(), "the first write went in pieces");
+                        this.ahead = None;
+                        Poll::Ready(Ok(buf.len()))
+                    }
+                    other => other,
+                };
+            }
+            Pin::new(&mut this.stream).poll_write(context, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().stream).poll_flush(context)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().stream).poll_shutdown(context)
+        }
+    }
+
+    /// A sender's header names the client the upstream is told of, in either version and
+    /// whether or not the request comes in the same segment; a header from anyone else is
+    /// read and dropped, and whoever connected is the client (20 §3).
+    #[tokio::test]
+    async fn a_senders_header_names_the_client_and_a_strangers_is_dropped() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, heads) = recording_upstream("200 OK");
+                let config = with_senders(everything_config(upstream), &["127.0.0.0/8"]);
+                let (front, worker) = serving_config(&config).await;
+                let request = b"GET / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\n\r\n";
+
+                let mut sent = v1_header("198.51.100.7:56324", "203.0.113.10:443");
+                sent.extend_from_slice(request);
+                let answer = h1_answer(front, &sent).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                let head = heads.borrow()[0].clone();
+                assert!(
+                    head.contains("\r\nx-forwarded-for: 198.51.100.7\r\n"),
+                    "{head}"
+                );
+                assert!(!head.contains("proxy"), "{head}");
+
+                // v2, its header and the request in segments of their own.
+                {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut stream = TcpStream::connect(front).await.unwrap();
+                    let header = v2_header("[2001:db8::7]:1", "[2001:db8::1]:443");
+                    stream.write_all(&header[..7]).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    stream.write_all(&header[7..]).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    stream.write_all(request).await.unwrap();
+                    let mut answer = Vec::new();
+                    let _ended = within(stream.read_to_end(&mut answer)).await;
+                    assert!(answer.starts_with(b"HTTP/1.1 200 OK\r\n"));
+                }
+                let head = heads.borrow()[1].clone();
+                assert!(
+                    head.contains("\r\nx-forwarded-for: 2001:db8::7\r\n"),
+                    "{head}"
+                );
+                headers_counted(&worker, "web", "accepted", 2).await;
+
+                // From a listener whose only sender is elsewhere, the header is no one's word.
+                let config = with_senders(everything_config(upstream), &["10.0.0.0/8"]);
+                let (front, worker) = serving_config(&config).await;
+                let answer = h1_answer(front, &sent).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                let head = heads.borrow()[2].clone();
+                assert!(
+                    head.contains("\r\nx-forwarded-for: 127.0.0.1\r\n"),
+                    "{head}"
+                );
+                assert!(!head.contains("198.51.100.7"), "{head}");
+                headers_counted(&worker, "web", "untrusted", 1).await;
+            })
+            .await;
+    }
+
+    /// Sending a header is not trust for forwarding headers: a sender's `LOCAL` makes the
+    /// sender the client, and the `X-Forwarded-For` it relays is believed only if the
+    /// sender is a trusted proxy too (20 §3).
+    #[tokio::test]
+    async fn a_senders_own_connection_is_no_trusted_proxys() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, heads) = recording_upstream("200 OK");
+                let mut sent = V2_LOCAL.to_vec();
+                sent.extend_from_slice(
+                    b"GET / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\nx-forwarded-for: 10.9.9.9\r\n\r\n",
+                );
+
+                let config = with_senders(everything_config(upstream), &["127.0.0.0/8"]);
+                let (front, worker) = serving_config(&config).await;
+                let answer = h1_answer(front, &sent).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                let head = heads.borrow()[0].clone();
+                assert!(head.contains("\r\nx-forwarded-for: 127.0.0.1\r\n"), "{head}");
+                assert!(!head.contains("10.9.9.9"), "{head}");
+                headers_counted(&worker, "web", "local", 1).await;
+
+                let config = with_senders(
+                    forwarding_config(upstream, &["127.0.0.0/8"]),
+                    &["127.0.0.0/8"],
+                );
+                let (front, _worker) = serving_config(&config).await;
+                let answer = h1_answer(front, &sent).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                let head = heads.borrow()[1].clone();
+                assert!(head.contains("\r\nx-forwarded-for: 10.9.9.9\r\n"), "{head}");
+            })
+            .await;
+    }
+
+    /// HTTP/2 with prior knowledge after a header, the preface in the header's segment.
+    #[tokio::test]
+    async fn http2_follows_a_header_in_its_segment() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, heads) = recording_upstream("200 OK");
+                let config = with_senders(everything_config(upstream), &["127.0.0.0/8"]);
+                let (front, _worker) = serving_config(&config).await;
+                let stream = Fronted {
+                    stream: TcpStream::connect(front).await.unwrap(),
+                    ahead: Some(v2_header("192.0.2.44:1000", "192.0.2.1:80")),
+                };
+                let (mut send, connection) = ::h2::client::Builder::new()
+                    .handshake::<_, Bytes>(stream)
+                    .await
+                    .unwrap();
+                let _driving = tokio::task::spawn_local(async move {
+                    let _ended = connection.await;
+                });
+                let request = Request::get("http://a.test/").body(()).unwrap();
+                let (answer, _) = send.send_request(request, true).unwrap();
+                assert_eq!(within(answer).await.unwrap().status(), StatusCode::OK);
+                let head = heads.borrow()[0].clone();
+                assert!(
+                    head.contains("\r\nx-forwarded-for: 192.0.2.44\r\n"),
+                    "{head}"
+                );
+            })
+            .await;
+    }
+
+    /// TLS after a header: the ClientHello in the header's segment, and in one of its own
+    /// after it.
+    #[tokio::test]
+    async fn tls_follows_a_header_in_its_segment_or_after_it() {
+        use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, heads) = recording_upstream("200 OK");
+                let mut config = with_senders(everything_config(upstream), &["127.0.0.0/8"]);
+                let web = config.listeners.get_mut("web").unwrap();
+                web.protocol = edgerush_config::Protocol::Https;
+                web.tls = Some(edgerush_config::Tls {
+                    certificates: vec![crate::tls::testing::certificate(&["example.test"])],
+                    client_validation: None,
+                });
+                let (front, _worker) = serving_config(&config).await;
+                let connector = || {
+                    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+                    builder.set_verify(SslVerifyMode::NONE);
+                    builder.build().configure().unwrap().verify_hostname(false)
+                };
+
+                let together = Fronted {
+                    stream: TcpStream::connect(front).await.unwrap(),
+                    ahead: Some(v1_header("192.0.2.81:1", "192.0.2.1:443")),
+                };
+                let secured = within(tokio_boring::connect(connector(), "example.test", together))
+                    .await
+                    .unwrap();
+                assert!(h1_over(secured).await.starts_with("HTTP/1.1 200 OK\r\n"));
+                let head = heads.borrow()[0].clone();
+                assert!(
+                    head.contains("\r\nx-forwarded-for: 192.0.2.81\r\n"),
+                    "{head}"
+                );
+
+                let mut apart = TcpStream::connect(front).await.unwrap();
+                {
+                    use tokio::io::AsyncWriteExt;
+                    apart
+                        .write_all(&v2_header("192.0.2.82:1", "192.0.2.1:443"))
+                        .await
+                        .unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let secured = within(tokio_boring::connect(connector(), "example.test", apart))
+                    .await
+                    .unwrap();
+                assert!(h1_over(secured).await.starts_with("HTTP/1.1 200 OK\r\n"));
+                let head = heads.borrow()[1].clone();
+                assert!(
+                    head.contains("\r\nx-forwarded-for: 192.0.2.82\r\n"),
+                    "{head}"
+                );
+            })
+            .await;
+    }
+
+    /// No header taken closes the connection with nothing said, counted by why: bytes that
+    /// are no header, a header that is wrong, a client gone before its header was whole,
+    /// and one that never finished it within the first-request deadline.
+    #[tokio::test]
+    async fn a_connection_without_a_header_to_take_is_closed_and_counted() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, heads) = recording_upstream("200 OK");
+                let config = with_senders(everything_config(upstream), &["127.0.0.0/8"]);
+                let (front, worker) = serving_config(&config).await;
+                for (sent, outcome) in [
+                    (&b"GET / HTTP/1.1\r\nhost: a.test\r\n\r\n"[..], "missing"),
+                    (
+                        b"PROXY TCP4 192.0.2.1 192.0.2.2 01 2\r\nGET / HTTP/1.1\r\n\r\n",
+                        "malformed",
+                    ),
+                    (b"\r\n\r\n\0\r\nQUIT\n\x22\x11\x00\x0c", "malformed"),
+                ] {
+                    let answer = h1_answer(front, sent).await;
+                    assert_eq!(answer, "", "{outcome}: {answer}");
+                    headers_counted(&worker, "web", outcome, 1 + usize::from(sent[0] == b'\r'))
+                        .await;
+                }
+                // Gone before saying all of it.
+                let mut stream = TcpStream::connect(front).await.unwrap();
+                stream.write_all(b"PROXY TCP4 192.0.2.1").await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut rest = Vec::new();
+                let _ended = within(stream.read_to_end(&mut rest)).await;
+                headers_counted(&worker, "web", "closed", 1).await;
+                // Never finishing it.
+                let mut stream = TcpStream::connect(front).await.unwrap();
+                stream
+                    .write_all(b"\r\n\r\n\0\r\nQUIT\n\x21\x11\x00\x0c\xc0")
+                    .await
+                    .unwrap();
+                let took = closed_after(&mut stream).await;
+                assert!(took + EARLY >= SHORT.first_request, "closed after {took:?}");
+                assert!(took < SHORT.first_request + SLACK, "closed after {took:?}");
+                headers_counted(&worker, "web", "too_slow", 1).await;
+                assert!(heads.borrow().is_empty(), "{:?}", heads.borrow());
+            })
+            .await;
+    }
+
+    /// A v2 header's TLVs are skipped by count, never held, however many more than a
+    /// block's worth there are; what follows them is the request, every byte of it.
+    #[tokio::test]
+    async fn a_header_longer_than_a_block_is_skipped_to_its_end() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, heads) = recording_upstream("200 OK");
+                let config = with_senders(everything_config(upstream), &["127.0.0.0/8"]);
+                let (front, worker) = serving_config(&config).await;
+                // 40,000 bytes of TLVs: NOOPs of 1,000 bytes each, as padding would be.
+                let mut tlvs = Vec::new();
+                for _ in 0..40 {
+                    tlvs.push(0x04);
+                    tlvs.extend_from_slice(&997_u16.to_be_bytes());
+                    tlvs.extend(std::iter::repeat_n(b'G', 997));
+                }
+                let mut sent = b"\r\n\r\n\0\r\nQUIT\n\x21\x11".to_vec();
+                sent.extend_from_slice(&u16::try_from(12 + tlvs.len()).unwrap().to_be_bytes());
+                sent.extend_from_slice(&[192, 0, 2, 9, 192, 0, 2, 1, 0, 1, 0, 80]);
+                sent.extend_from_slice(&tlvs);
+                sent.extend_from_slice(
+                    b"GET /after HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\n\r\n",
+                );
+                let answer = h1_answer(front, &sent).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                let head = heads.borrow()[0].clone();
+                assert!(head.starts_with("get /after http/1.1\r\n"), "{head}");
+                assert!(
+                    head.contains("\r\nx-forwarded-for: 192.0.2.9\r\n"),
+                    "{head}"
+                );
+                headers_counted(&worker, "web", "accepted", 1).await;
+            })
+            .await;
+    }
+
+    /// A listener that reads no header takes one for what it is: bytes of a request that
+    /// is not one. Nothing is guessed (20 §1).
+    #[tokio::test]
+    async fn a_listener_that_reads_no_header_guesses_nothing() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, heads) = recording_upstream("200 OK");
+                let (front, _worker) = serving_config(&everything_config(upstream)).await;
+                let mut sent = v1_header("198.51.100.7:1", "192.0.2.1:80");
+                sent.extend_from_slice(
+                    b"GET / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\n\r\n",
+                );
+                let answer = h1_answer(front, &sent).await;
+                assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
+                assert!(heads.borrow().is_empty());
+            })
+            .await;
+    }
+
+    /// A `tcp` listener with senders carries what came after the header, and only that,
+    /// whether it came in the header's segment or in pieces.
+    #[tokio::test]
+    async fn a_tcp_tunnel_carries_what_follows_the_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let backend = tallying_backend().await;
+                let yaml = tcp_to(backend, "").replace(
+                    "proxy_protocol: off",
+                    "proxy_protocol: { senders: [\"127.0.0.0/8\"] }",
+                );
+                let (front, worker) = passing(&yaml).await;
+                let payload: Vec<u8> = (0..5_000_u32).map(|at| (at % 251) as u8).collect();
+                let sum: u64 = payload.iter().map(|&byte| u64::from(byte)).sum();
+
+                let mut client = TcpStream::connect(front).await.unwrap();
+                let mut sent = v2_header("192.0.2.5:1", "192.0.2.1:5432");
+                sent.extend_from_slice(&payload);
+                client.write_all(&sent).await.unwrap();
+                client.shutdown().await.unwrap();
+                let mut answer = String::new();
+                bounded(client.read_to_string(&mut answer)).await.unwrap();
+                assert_eq!(answer, format!("{} {sum}", payload.len()));
+
+                let mut client = TcpStream::connect(front).await.unwrap();
+                let mut sent = v1_header("192.0.2.5:1", "192.0.2.1:5432");
+                sent.extend_from_slice(&payload[..10]);
+                // In pieces, each its own segment, well within the first-request deadline.
+                for piece in sent.chunks(9) {
+                    client.write_all(piece).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                client.write_all(&payload[10..]).await.unwrap();
+                client.shutdown().await.unwrap();
+                let mut answer = String::new();
+                bounded(client.read_to_string(&mut answer)).await.unwrap();
+                assert_eq!(answer, format!("{} {sum}", payload.len()));
+                headers_counted(&worker, "db", "accepted", 2).await;
+                let line =
+                    "edgerush_listener_tunnels_total{listener=\"db\",outcome=\"closed\"} 2\n";
+                until(|| worker.proxy().metrics().contains(line)).await;
+            })
+            .await;
+    }
+
+    /// A `tls` listener with senders routes by the ClientHello after the header, and the
+    /// backend's handshake is the client's: the header does not reach it.
+    #[tokio::test]
+    async fn a_tls_tunnel_routes_by_the_client_hello_after_the_header() {
+        use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
+        use tokio::io::AsyncReadExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let backend = tls_backend("through").await;
+                let yaml = format!(
+                    "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls, proxy_protocol: {{ senders: [\"127.0.0.0/8\"] }} }} }}\n\
+                     routes: []\n\
+                     tls_routes: [{{ name: a, listeners: [sni], hostnames: [{{ name: a.test, falls_through: true }}], backends: [{{ upstream: up, weight: 1 }}] }}]\n\
+                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: [\"{backend}\"] }} }}\n"
+                );
+                let (front, worker) = passing(&yaml).await;
+                let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+                builder.set_verify(SslVerifyMode::NONE);
+                let config = builder.build().configure().unwrap().verify_hostname(false);
+                let stream = Fronted {
+                    stream: TcpStream::connect(front).await.unwrap(),
+                    ahead: Some(v2_header("192.0.2.5:1", "192.0.2.1:443")),
+                };
+                let mut secured = bounded(tokio_boring::connect(config, "a.test", stream))
+                    .await
+                    .unwrap();
+                let mut told = String::new();
+                let _ended = bounded(secured.read_to_string(&mut told)).await;
+                assert_eq!(told, "through");
+                drop(secured);
+                headers_counted(&worker, "sni", "accepted", 1).await;
+                tunnel_ended(&worker, "sni", "closed").await;
+            })
+            .await;
     }
 
     /// Waits for something the test is about to depend on, and fails rather than hangs

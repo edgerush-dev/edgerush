@@ -214,6 +214,53 @@ impl Tunnel {
     ];
 }
 
+/// What came of the PROXY protocol header a listener with senders reads at the start of
+/// every connection ([20 §6](../../docs/20-proxy-protocol.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyHeader {
+    /// A sender's, whose addresses are used.
+    Accepted,
+    /// A sender's that leaves the connection's own ends in use: `LOCAL`, `UNKNOWN`, or a
+    /// family or transport not taken.
+    Local,
+    /// A valid header from a peer that is not among the senders, dropped.
+    Untrusted,
+    /// A header that is not valid.
+    Malformed,
+    /// First bytes that are no header.
+    Missing,
+    /// The client closed before a whole header: one that never sends a byte included.
+    Closed,
+    /// No whole header within the first-request deadline.
+    TooSlow,
+}
+
+impl ProxyHeader {
+    /// The name this is counted under.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Local => "local",
+            Self::Untrusted => "untrusted",
+            Self::Malformed => "malformed",
+            Self::Missing => "missing",
+            Self::Closed => "closed",
+            Self::TooSlow => "too_slow",
+        }
+    }
+
+    /// Every one of them, for a scrape that shows a series whether it has happened or not.
+    const ALL: [Self; 7] = [
+        Self::Accepted,
+        Self::Local,
+        Self::Untrusted,
+        Self::Malformed,
+        Self::Missing,
+        Self::Closed,
+        Self::TooSlow,
+    ];
+}
+
 /// What became of a connection to an upstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Socket {
@@ -450,6 +497,7 @@ pub(crate) struct ListenerCounters {
     grpc: [Counter; NAMES.len()],
     quic: [Counter; Quic::ALL.len()],
     tunnels: [Counter; Tunnel::ALL.len()],
+    proxy_headers: [Counter; ProxyHeader::ALL.len()],
 }
 
 impl ListenerCounters {
@@ -485,6 +533,13 @@ impl ListenerCounters {
     /// A tunnel of the listener's ended so.
     pub(crate) fn tunnel(&self, ended: Tunnel) {
         if let Some(counter) = self.tunnels.get(ended as usize) {
+            counter.inc();
+        }
+    }
+
+    /// A connection's PROXY header came to `outcome`.
+    pub(crate) fn proxy_header(&self, outcome: ProxyHeader) {
+        if let Some(counter) = self.proxy_headers.get(outcome as usize) {
             counter.inc();
         }
     }
@@ -778,6 +833,23 @@ impl Metrics {
                 let labels = [("listener", listener.as_str()), ("outcome", ended.name())];
                 let count = |shard: &ListenerCounters| {
                     shard.tunnels.get(ended as usize).map_or(0, Counter::get)
+                };
+                scrape.sample(name, &labels, series.sum(count));
+            }
+        }
+        let name = "edgerush_listener_proxy_headers_total";
+        let help = "PROXY protocol headers read at the start of connections, by what came of \
+                    them: a sender's used, or left the connection's own ends in use; a \
+                    stranger's dropped; or none taken, the connection closed.";
+        scrape.family(name, Kind::Counter, help);
+        for (listener, series) in listeners() {
+            for outcome in ProxyHeader::ALL {
+                let labels = [("listener", listener.as_str()), ("outcome", outcome.name())];
+                let count = |shard: &ListenerCounters| {
+                    shard
+                        .proxy_headers
+                        .get(outcome as usize)
+                        .map_or(0, Counter::get)
                 };
                 scrape.sample(name, &labels, series.sum(count));
             }
@@ -1169,6 +1241,30 @@ mod tests {
 ",
         ] {
             assert!(scrape.contains(line), "{scrape}");
+        }
+    }
+
+    #[test]
+    fn proxy_headers_are_counted_by_what_came_of_them() {
+        let metrics = metrics();
+        let web = metrics.listener(0).unwrap();
+        web.proxy_header(ProxyHeader::Accepted);
+        web.proxy_header(ProxyHeader::Accepted);
+        web.proxy_header(ProxyHeader::Missing);
+        let scrape = metrics.render(&["web".to_owned()], &[], &[]);
+        for (outcome, count) in [
+            ("accepted", 2),
+            ("local", 0),
+            ("untrusted", 0),
+            ("malformed", 0),
+            ("missing", 1),
+            ("closed", 0),
+            ("too_slow", 0),
+        ] {
+            let line = format!(
+                "edgerush_listener_proxy_headers_total{{listener=\"web\",outcome=\"{outcome}\"}} {count}\n"
+            );
+            assert!(scrape.contains(&line), "{scrape}");
         }
     }
 
