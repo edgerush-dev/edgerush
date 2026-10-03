@@ -11,8 +11,10 @@
 //! What it reads, it holds to what BoringSSL, the likeliest backend, holds it to, and it
 //! refuses where BoringSSL would: a connection is never routed by a name that the backend
 //! reads otherwise, or not at all. So the handshake message may span records (RFC 8446
-//! §5.1), but no other record may come between its fragments, and none may be empty or
-//! longer than 2^14 bytes. Every length inside the ClientHello must add up exactly. No
+//! §5.1), but no other record may come between its fragments, and none may be longer than
+//! 2^14 bytes. Nor may one be empty, and there the reader is stricter than BoringSSL, which
+//! skips up to 32 empty records in a row: RFC 8446 §5.1 forbids sending them, and a
+//! connection refused is routed nowhere. Every length inside the ClientHello must add up exactly. No
 //! extension may come twice, and `server_name` must hold exactly one `host_name` (RFC 6066
 //! §3, and BoringSSL's reading of it). Beyond BoringSSL, the name must be one that routing
 //! can match: a DNS host name and not an address, which is also what RFC 6066 allows.
@@ -542,6 +544,36 @@ mod tests {
         let bytes = records(message, &every_byte);
         assert!(bytes.len() < LIMIT, "{} bytes", bytes.len());
         assert_eq!(read(&bytes), named("api.example.com"));
+    }
+
+    /// An empty handshake record is refused wherever it comes before the ClientHello is
+    /// whole, although BoringSSL skips it and reads the name: the one place the reader is
+    /// stricter than BoringSSL (RFC 8446 §5.1 forbids sending one). Both sides are held
+    /// here, so that BoringSSL changing its mind shows. Thirty-three in a row BoringSSL
+    /// refuses too.
+    #[test]
+    fn an_empty_record_is_refused_though_boringssl_skips_it() {
+        let hello = boring_hello(Some("a.test"));
+        let message = message_of(&hello);
+        let empty = [HANDSHAKE, 3, 1, 0, 0];
+        let first = [&empty[..], &hello].concat();
+        let between = [
+            records(&message[..100], &[]),
+            empty.to_vec(),
+            records(&message[100..], &[]),
+        ]
+        .concat();
+        for bytes in [first, between] {
+            assert_eq!(read(&bytes), refused(Refusal::Malformed));
+            assert_eq!(boring_reads(&bytes), Some(Some(b"a.test".to_vec())));
+        }
+        // Whatever follows it: a ClientHello that asks for no name as well.
+        let unnamed = [&empty[..], &boring_hello(None)].concat();
+        assert_eq!(read(&unnamed), refused(Refusal::Malformed));
+        assert_eq!(boring_reads(&unnamed), Some(None));
+        let many = [empty.repeat(33), hello.clone()].concat();
+        assert_eq!(read(&many), refused(Refusal::Malformed));
+        assert_eq!(boring_reads(&many), None);
     }
 
     /// What is not a TLS handshake that starts with a ClientHello is refused as soon as it

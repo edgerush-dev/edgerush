@@ -4,7 +4,9 @@
 //! BoringSSL checks far more of a ClientHello than the reader does (cipher suites, key
 //! shares, versions), so it refuses more. But wherever it reads a name, the reader must
 //! read the same one or refuse it as no host name, and never route by a name BoringSSL
-//! reads otherwise. And once the reader has decided, more bytes must not change its mind.
+//! reads otherwise. The one exception is an empty handshake record before the ClientHello
+//! is whole, which BoringSSL skips and the reader refuses as malformed, on purpose
+//! (`l4/hello.rs`). And once the reader has decided, more bytes must not change its mind.
 //!
 //! `cargo fuzz run tls_hello corpus/tls_hello seeds/tls_hello`.
 
@@ -86,6 +88,36 @@ fn acceptor() -> &'static SslAcceptor {
     })
 }
 
+/// Whether an empty handshake record comes before the first handshake message in `bytes` is
+/// whole, which the reader refuses and BoringSSL skips.
+fn empty_record_first(bytes: &[u8]) -> bool {
+    let mut at = 0;
+    let mut head = Vec::with_capacity(4);
+    let mut gathered = 0;
+    while let Some(header) = bytes.get(at..at + 5) {
+        if header[0] != 0x16 || header[1] != 3 {
+            return false;
+        }
+        let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+        if length == 0 {
+            return true;
+        }
+        let rest = bytes.get(at + 5..).unwrap_or_default();
+        let payload = &rest[..length.min(rest.len())];
+        let wanted = 4 - head.len();
+        head.extend_from_slice(&payload[..wanted.min(payload.len())]);
+        gathered += payload.len();
+        if let [_, a, b, c] = head[..] {
+            let whole = 4 + (usize::from(a) << 16 | usize::from(b) << 8 | usize::from(c));
+            if gathered >= whole {
+                return false;
+            }
+        }
+        at += 5 + length;
+    }
+    false
+}
+
 /// What BoringSSL's server reads of `bytes`: `None` if it refused them before it looked
 /// for a name.
 fn boring_reads(bytes: &[u8]) -> Option<Option<Vec<u8>>> {
@@ -122,6 +154,8 @@ fuzz_target!(|bytes: &[u8]| {
             );
         }
         (Hello::Refused(Refusal::BadName), Some(_)) | (Hello::Whole(None), None) => {}
+        // Whatever BoringSSL makes of what follows: the reader refuses at the empty record.
+        (Hello::Refused(Refusal::Malformed), _) if empty_record_first(bytes) => {}
         (ours, theirs) => panic!("read {ours:?} where BoringSSL read {theirs:?}"),
     }
 });
