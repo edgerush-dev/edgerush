@@ -35,10 +35,11 @@ use std::num::NonZeroUsize;
 /// largest size, so that no limit leaves a worker unable to read a request.
 const STORAGE_FLOOR: usize = 8 * 1024 * 1024;
 
-/// What an idle connection costs the pod at most, of the kinds measured: TLS with HTTP/2,
-/// after one request, 21.5–21.9 KB of the cgroup's memory (18.2 KB the process's, 4.0 KB
-/// the kernel's), rounded up. Plain HTTP/1 is 7.7 KB, HTTP/2 16.4 KB, TLS HTTP/1 16.4 KB
-/// (laptop, 4 workers, `bench/idle.py`, 03 §9).
+/// What an idle TCP connection costs the pod at most, of the kinds measured: TLS with
+/// HTTP/2, after one request, 21.5–21.9 KB of the cgroup's memory (18.2 KB the process's,
+/// 4.0 KB the kernel's), rounded up. Plain HTTP/1 is 7.7 KB, HTTP/2 16.4 KB, TLS HTTP/1
+/// 16.4 KB (laptop, 4 workers, `bench/idle.py`, 03 §9). An HTTP/3 connection, dearer, counts
+/// as several connections of this cost rather than raising it for every connection.
 const CONNECTION_COST: u64 = 22 * 1024;
 
 /// Where the pod's limit is read, in a cgroup namespace or not.

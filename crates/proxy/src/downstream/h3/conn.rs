@@ -7,6 +7,7 @@
 //! quiche wants sent. A stream's task waits in its [`Slot`] for what only the driver learns:
 //! that its body has more, that its client reset it, that it can take more of its answer.
 
+use crate::connections::Held;
 use crate::downstream::h3::head::Refused;
 use crate::drain::Drain;
 use crate::storage::{Charge, Exhausted, Storage};
@@ -42,6 +43,10 @@ pub(crate) struct Conn {
     /// What the connection drains with, and its WebSockets too: its worker's drain, or a
     /// reload replacing the client validation it was accepted under (03 §3).
     pub(crate) drain: Rc<Drain>,
+    /// What it counts as among its worker's connections, where the worker counts them:
+    /// given back when the last thing holding the connection lets go of it, with quiche's
+    /// memory for it (03 §9).
+    _held: Option<Held>,
 }
 
 /// What the connection holds.
@@ -102,8 +107,9 @@ impl Slot {
 }
 
 impl Conn {
-    /// A connection quiche has accepted, which drains with `drain`.
-    pub(crate) fn new(quic: quiche::Connection, drain: Rc<Drain>) -> Rc<Self> {
+    /// A connection quiche has accepted, which drains with `drain` and counts as `held`
+    /// among its worker's connections.
+    pub(crate) fn new(quic: quiche::Connection, drain: Rc<Drain>, held: Option<Held>) -> Rc<Self> {
         Rc::new(Self {
             state: RefCell::new(State {
                 quic,
@@ -120,6 +126,7 @@ impl Conn {
             requests: Cell::new(0),
             given_up: Cell::new(0),
             drain,
+            _held: held,
         })
     }
 

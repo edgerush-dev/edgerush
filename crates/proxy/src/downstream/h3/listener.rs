@@ -4,7 +4,9 @@
 //! Datagrams are read in bounded batches, and each goes straight to its connection's quiche,
 //! found by the destination ID its first packet names. A version 1 Initial that names no
 //! connection may start one: only in a datagram of the size RFC 9000 §14.1 requires, while
-//! the worker is not draining and holds fewer connections than its bound, a few to a batch
+//! the worker is not draining and holds fewer connections than its bound, with room for it
+//! among the worker's connections, where an HTTP/3 connection counts as [`SLOTS`] of
+//! them (03 §9), a few to a batch
 //! as TCP's accept is paced, and — past a number of handshakes under way — only from a
 //! client that has proved its address with a Retry token. A version the server does not
 //! speak is answered with a version negotiation.
@@ -14,12 +16,13 @@
 //! inbox, once (16 §3). An inbox is bounded by count and by bytes; a datagram that finds it
 //! full is dropped and counted, and QUIC sends it again.
 
+use crate::connections::Loads;
 use crate::downstream::h1::connection::Answered;
 use crate::downstream::h1::date::HttpDate;
-use crate::downstream::h3::Settings;
 use crate::downstream::h3::conn::Conn;
 use crate::downstream::h3::connection::drive;
 use crate::downstream::h3::send::Sending;
+use crate::downstream::h3::{SLOTS, Settings};
 use crate::drain::Drain;
 use crate::forwarding::Client;
 use crate::interim::Interim;
@@ -221,6 +224,15 @@ impl Issuer {
     }
 }
 
+/// Where a worker counts its connections, and which worker and listener these are: an HTTP/3
+/// connection counts as [`SLOTS`] of the worker's connections, on its listener, for as long
+/// as it lives, as a TCP connection counts as one (03 §9).
+pub(crate) struct Room {
+    pub(crate) loads: Arc<Loads>,
+    pub(crate) worker: usize,
+    pub(crate) listener: usize,
+}
+
 /// What a worker's listener and its connections share.
 pub(crate) struct Shared {
     pub(crate) socket: UdpSocket,
@@ -249,6 +261,9 @@ pub(crate) struct Shared {
     pub(crate) dropped: Cell<u64>,
     /// What its connections send through.
     pub(crate) sending: Sending,
+    /// Where the worker counts its connections, if it does: a connection is admitted only
+    /// with room for it there.
+    room: Option<Room>,
     /// Where what the listener does is counted.
     count: Box<dyn Fn(Quic)>,
 }
@@ -266,7 +281,7 @@ pub(crate) enum ListenerError {
 
 impl Shared {
     /// A listener on `socket`, as the `worker`th worker of those `secrets` are shared by,
-    /// charging what its connections hold to `storage`.
+    /// charging what its connections hold to `storage` and counting them in `room`.
     #[expect(
         clippy::too_many_arguments,
         reason = "each is the worker's, handed in once when the listener is made"
@@ -279,6 +294,7 @@ impl Shared {
         timers: Rc<Timers>,
         drain: Rc<Drain>,
         storage: Rc<Storage>,
+        room: Option<Room>,
         count: Box<dyn Fn(Quic)>,
     ) -> Result<Self, ListenerError> {
         Ok(Self {
@@ -298,6 +314,7 @@ impl Shared {
             forwarded: Cell::new(0),
             dropped: Cell::new(0),
             sending: Sending::new(),
+            room,
             count,
         })
     }
@@ -536,6 +553,12 @@ fn admit<T: Fn() -> Option<InForce>>(
     {
         return None;
     }
+    // A worker without room among its connections takes no one, as a TCP listener at its
+    // cap accepts no one; the client sends its Initial again (03 §9).
+    let held = match &shared.room {
+        Some(room) => Some(room.loads.take_slots(room.worker, room.listener, SLOTS)?),
+        None => None,
+    };
     // A listener the config no longer gives TLS takes no one.
     let in_force = in_force()?;
     // quiche's parser reads the token, which only an Initial carries.
@@ -578,7 +601,7 @@ fn admit<T: Fn() -> Option<InForce>>(
         None => quiche::accept(&scid, None, shared.local, from, &mut accepting.config),
     }
     .ok()?;
-    let conn = Conn::new(quic, in_force.drain);
+    let conn = Conn::new(quic, in_force.drain, held);
     {
         let mut table = shared.table.borrow_mut();
         table.insert(scid.to_vec(), Rc::clone(&conn));

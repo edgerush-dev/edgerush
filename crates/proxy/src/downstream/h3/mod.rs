@@ -25,6 +25,16 @@ pub(crate) mod writer;
 
 use std::time::Duration;
 
+/// How many of its worker's connections an HTTP/3 connection counts as. The worker's cap
+/// is sized from the pod's memory at 22 KiB a connection, what the dearest kind of idle
+/// TCP connection costs ([03 §9]); a held HTTP/3 connection costs 51 KB ([16 §8]), all of
+/// it the process's, since it has no socket of its own. Rounded up, so that the cap never
+/// counts one short.
+///
+/// [03 §9]: ../../../../../docs/03-data-plane.md
+/// [16 §8]: ../../../../../docs/16-http3.md
+pub(crate) const SLOTS: usize = 3;
+
 /// The protocols a client may ask for over QUIC: HTTP/3, and in the interop build HTTP/0.9
 /// as quic-interop-runner speaks it.
 #[cfg(not(any(test, feature = "interop")))]

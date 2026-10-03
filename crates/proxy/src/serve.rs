@@ -1975,6 +1975,11 @@ impl Worker {
                 counters.quic(event);
             }
         });
+        let room = self.connections.as_ref().map(|loads| h3_listener::Room {
+            loads: Arc::clone(loads),
+            worker: usize::from(self.position),
+            listener,
+        });
         let shared = h3_listener::Shared::new(
             socket,
             settings,
@@ -1983,6 +1988,7 @@ impl Worker {
             Rc::clone(&self.timers),
             Rc::clone(&self.drain),
             Rc::clone(self.blocks.borrow().storage()),
+            room,
             count,
         )
         .map_err(io::Error::other)?;
@@ -13839,8 +13845,9 @@ upstreams:
                 };
                 let config = compile(&h3_config(upstream, http3)).unwrap();
                 let proxy = Arc::new(Proxy::new(config, NonZeroUsize::MIN).unwrap());
-                // Room for one connection.
-                let connections = Loads::new(1, 1, 1);
+                // Room for the client's connection, which counts as an HTTP/3 connection
+                // does, and one WebSocket.
+                let connections = Loads::new(1, h3::SLOTS + 1, 1);
                 let worker = Worker::made(
                     Arc::clone(&proxy),
                     H1Limits::default(),
@@ -13872,7 +13879,7 @@ upstreams:
                             .is_some_and(|answer| answer.body.ends_with(b"hello"))
                     })
                     .await;
-                assert_eq!(connections.now(), [1]);
+                assert_eq!(connections.now(), [h3::SLOTS + 1]);
                 let second = client.request(&h3_connect("websocket"), false);
                 client
                     .until(|client| {
@@ -13884,7 +13891,60 @@ upstreams:
                     .await;
                 let answer = client.answers.get(&second).unwrap().clone();
                 assert_eq!(answer.final_status(), Some("503"), "{answer:?}");
-                assert_eq!(connections.now(), [1]);
+                assert_eq!(connections.now(), [h3::SLOTS + 1]);
+            })
+            .await;
+    }
+
+    /// An HTTP/3 connection lives in the half of the pod's memory beside storage, as a TCP
+    /// connection does, so a worker's connection cap, sized from that half (03 §9), holds its
+    /// HTTP/3 connections too, each at what it costs: with room for one, a second client is
+    /// not admitted until the first has gone.
+    #[tokio::test]
+    async fn http3_connections_are_held_to_their_workers_connection_cap() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::downstream::h3::testing::Client;
+                let upstream = echoing_websocket_backend().await;
+                let http3 = edgerush_config::Http3 {
+                    alt_svc_max_age: 60,
+                    force_retry: false,
+                };
+                let config = compile(&h3_config(upstream, http3)).unwrap();
+                let proxy = Arc::new(Proxy::new(config, NonZeroUsize::MIN).unwrap());
+                // Room for one HTTP/3 connection.
+                let connections = Loads::new(1, h3::SLOTS, 1);
+                let worker = Worker::made(
+                    Arc::clone(&proxy),
+                    H1Limits::default(),
+                    SHORT,
+                    0,
+                    Some(Arc::clone(&connections)),
+                );
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
+                let alone = Forwarding::group(1).remove(0);
+                let _serving =
+                    tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
+                let mut first = Client::connect(front, "a.test").await;
+                assert_eq!(connections.now(), [h3::SLOTS]);
+                let mut second = Client::new(front, "a.test").await;
+                second.for_a_while(Duration::from_secs(1)).await;
+                assert!(
+                    !second.quic.is_established(),
+                    "a second HTTP/3 connection admitted on a worker with room for one \
+                     (the worker counts {:?})",
+                    connections.now()
+                );
+
+                // The first goes, and with it what it was counted.
+                first.quic.close(true, 0x100, b"").unwrap();
+                first.flush().await;
+                until(|| connections.now() == [0]).await;
+                second.until(|client| client.quic.is_established()).await;
+                assert_eq!(connections.now(), [h3::SLOTS]);
             })
             .await;
     }

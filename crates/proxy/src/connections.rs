@@ -26,6 +26,11 @@
 //! connections too, for as long as it is open: its backend is a connection of its own
 //! beside the client's one, and a client connection may carry a hundred of them. It is
 //! refused while its worker has no room, or its listener holds its share ([`Loads::take`]).
+//!
+//! So does an HTTP/3 connection, as several: the cap is sized from the pod's memory at what
+//! an idle TCP connection costs, and an HTTP/3 connection costs more than twice that
+//! ([`Loads::take_slots`]). Its worker owns it from its first packet, so it is never placed
+//! elsewhere; without room its Initial is dropped, and the client sends it again.
 
 use crate::share::over_share;
 use std::sync::Arc;
@@ -171,19 +176,40 @@ impl Loads {
     /// None when there is no room, as there would be no accepting.
     #[must_use]
     pub fn take(self: &Arc<Self>, worker: usize, listener: usize) -> Option<Held> {
-        (self.has_room(worker) && self.listener_has_room(listener))
-            .then(|| self.hold(worker, listener))
+        self.take_slots(worker, listener, 1)
+    }
+
+    /// The same for a connection that costs as much as `slots` of them — an HTTP/3
+    /// connection, whose memory the cap would otherwise count short: all of them, only
+    /// where they all fit under the worker's cap, or none.
+    #[must_use]
+    pub fn take_slots(
+        self: &Arc<Self>,
+        worker: usize,
+        listener: usize,
+        slots: usize,
+    ) -> Option<Held> {
+        let fits = self
+            .held
+            .get(worker)
+            .is_none_or(|load| load.load(Ordering::Relaxed).saturating_add(slots) <= self.cap);
+        (fits && self.listener_has_room(listener)).then(|| self.hold_slots(worker, listener, slots))
     }
 
     /// Counts a connection on `listener` as `worker`'s, without looking at the others.
     #[must_use]
     pub fn hold(self: &Arc<Self>, worker: usize, listener: usize) -> Held {
+        self.hold_slots(worker, listener, 1)
+    }
+
+    /// Counts `slots` of them on `listener` as `worker`'s, as one connection.
+    fn hold_slots(self: &Arc<Self>, worker: usize, listener: usize, slots: usize) -> Held {
         if let Some(load) = self.held.get(worker) {
-            load.fetch_add(1, Ordering::Relaxed);
+            load.fetch_add(slots, Ordering::Relaxed);
         }
-        self.total.fetch_add(1, Ordering::Relaxed);
+        self.total.fetch_add(slots, Ordering::Relaxed);
         if let Some(own) = self.by_listener.get(listener)
-            && own.fetch_add(1, Ordering::Relaxed) == 0
+            && own.fetch_add(slots, Ordering::Relaxed) == 0
         {
             self.holding.fetch_add(1, Ordering::Relaxed);
         }
@@ -191,6 +217,7 @@ impl Loads {
             loads: Arc::clone(self),
             worker,
             listener,
+            slots,
         }
     }
 
@@ -211,6 +238,8 @@ pub struct Held {
     loads: Arc<Loads>,
     worker: usize,
     listener: usize,
+    /// How many of the worker's connections it counts as.
+    slots: usize,
 }
 
 impl Held {
@@ -224,12 +253,13 @@ impl Held {
 impl Drop for Held {
     fn drop(&mut self) {
         let loads = &self.loads;
+        let slots = self.slots;
         if let Some(own) = loads.by_listener.get(self.listener)
-            && own.fetch_sub(1, Ordering::Relaxed) == 1
+            && own.fetch_sub(slots, Ordering::Relaxed) == slots
         {
             loads.holding.fetch_sub(1, Ordering::Relaxed);
         }
-        let total = loads.total.fetch_sub(1, Ordering::Relaxed);
+        let total = loads.total.fetch_sub(slots, Ordering::Relaxed);
         // Only past seven eighths can a listener be waiting for its share, so only then is
         // there anyone to wake; and any connection that ends may be what gives it room.
         let limit = loads.limit();
@@ -241,7 +271,7 @@ impl Drop for Held {
         let Some(load) = loads.held.get(self.worker) else {
             return;
         };
-        let before = load.fetch_sub(1, Ordering::Relaxed);
+        let before = load.fetch_sub(slots, Ordering::Relaxed);
         // Only a worker that was full can be waiting, so only then is there anyone to wake:
         // every one of its listeners, as each may be waiting.
         let listeners = loads.by_listener.len();
@@ -464,6 +494,33 @@ mod tests {
             "taken past the listener's share"
         );
         assert!(shared.take(0, 1).is_some(), "the other listener refused");
+    }
+
+    /// A connection that costs several slots takes all of them or none — only where they
+    /// all fit under the worker's cap — counts them on its listener, and gives them all back
+    /// when it ends.
+    #[test]
+    fn a_connection_of_several_slots_is_taken_only_where_they_all_fit() {
+        let loads = Loads::new(1, 4, 2);
+        let accepted = loads.hold(0, 0);
+        let heavy = loads.take_slots(0, 1, 3).expect("room for three");
+        assert_eq!(loads.now(), [4]);
+        assert_eq!(loads.by_listener[1].load(Ordering::Relaxed), 3);
+        assert_eq!(loads.holding.load(Ordering::Relaxed), 2);
+        drop(accepted);
+        assert!(
+            loads.take_slots(0, 1, 3).is_none(),
+            "three taken with one free"
+        );
+        assert!(loads.take(0, 0).is_some(), "the one free refused");
+        drop(heavy);
+        assert_eq!(loads.now(), [0]);
+        assert_eq!(loads.total.load(Ordering::Relaxed), 0);
+        assert_eq!(loads.holding.load(Ordering::Relaxed), 0);
+        assert!(
+            loads.take_slots(0, 0, 5).is_none(),
+            "more taken than the cap"
+        );
     }
 
     /// A listener waiting at its share is woken when a connection ends and gives it room,
