@@ -6,6 +6,9 @@
 //! [`MOST`] in all. A body that grows past it is let go of, and the request is not sent
 //! again; so is one that has not ended by the time its answer asks for a retry, since
 //! what it has not sent yet cannot be sent twice. Trailers are kept with the data.
+//!
+//! A body none of which went is whole as it is: a try that lets go of it untouched — one
+//! that could not connect never reads it — gives it back, for the next try to send.
 
 use crate::request_body::{RequestBody, RequestBodyError};
 use bytes::Bytes;
@@ -33,13 +36,17 @@ struct Recording {
     /// It grew past [`MOST`]: nothing is kept, and it is not to be sent again.
     capped: bool,
     ended: bool,
+    /// The body itself, given back by a try that let go of it with none of it gone.
+    untouched: Option<RequestBody>,
 }
 
-/// A body on its way the first time, kept as it goes.
+/// A body on its way, kept as it goes.
 #[derive(Debug)]
 pub(crate) struct Tee {
     inner: RequestBody,
     recording: Rc<RefCell<Recording>>,
+    /// Some of it went: a frame, or an error in its place.
+    touched: bool,
 }
 
 /// What a [`Tee`] kept, to send again from.
@@ -58,9 +65,27 @@ impl Tee {
             Self {
                 inner,
                 recording: Rc::clone(&recording),
+                touched: false,
             },
             Recorded(recording),
         )
+    }
+}
+
+impl Drop for Tee {
+    /// A body none of which went is given back whole, for the next try to send.
+    fn drop(&mut self) {
+        if self.touched {
+            return;
+        }
+        // Not `borrow_mut`, which panics: nothing holds a borrow of the recording while a
+        // body is dropped, so this is not refused, and were it ever, the body would only go
+        // unsent rather than take the worker with it.
+        if let Ok(mut recording) = self.recording.try_borrow_mut()
+            && !recording.ended
+        {
+            recording.untouched = Some(std::mem::replace(&mut self.inner, RequestBody::None));
+        }
     }
 }
 
@@ -71,6 +96,17 @@ impl Recorded {
         (recording.ended && !recording.capped).then(|| Replayed {
             frames: recording.kept.iter().cloned().collect(),
         })
+    }
+
+    /// The body itself, if a try let go of it with none of it gone: once, and kept as it
+    /// goes this time.
+    pub(crate) fn given_back(&self) -> Option<RequestBody> {
+        let inner = self.0.borrow_mut().untouched.take()?;
+        Some(RequestBody::Recorded(Box::new(Tee {
+            inner,
+            recording: Rc::clone(&self.0),
+            touched: false,
+        })))
     }
 }
 
@@ -84,6 +120,7 @@ impl Body for Tee {
     ) -> Poll<Option<Result<Frame<Bytes>, RequestBodyError>>> {
         let this = self.get_mut();
         let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        this.touched |= matches!(polled, Poll::Ready(Some(_)));
         let mut recording = this.recording.borrow_mut();
         match &polled {
             Poll::Ready(Some(Ok(frame))) if !recording.capped => {
@@ -252,6 +289,32 @@ mod tests {
             let again = recorded.replay().expect("kept whole");
             assert_eq!(read(again).await, whole);
         }
+    }
+
+    /// A try that lets go of a body none of which went — one that could not connect never
+    /// reads it — gives it back whole, and it is kept as it goes the second time.
+    #[tokio::test]
+    async fn a_body_none_of_which_went_is_given_back_whole() {
+        let inner = Replayed::of(vec![data(b"ab"), data(b"cd"), Frame::trailers(trailers())]);
+        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner));
+        drop(tee);
+        assert!(recorded.replay().is_none(), "kept what never went");
+        let again = recorded.given_back().expect("given back");
+        assert!(recorded.given_back().is_none(), "given back twice");
+        assert_eq!(read(again).await, (b"abcd".to_vec(), Some(trailers())));
+        let third = recorded.replay().expect("kept the second time");
+        assert_eq!(read(third).await, (b"abcd".to_vec(), Some(trailers())));
+    }
+
+    /// One some of which went is not: what went cannot be had again from the body.
+    #[tokio::test]
+    async fn a_body_some_of_which_went_is_not_given_back() {
+        let inner = Replayed::of(vec![data(b"ab"), data(b"cd")]);
+        let (mut tee, recorded) = Tee::new(RequestBody::Replayed(inner));
+        let _sent = tee.frame().await;
+        drop(tee);
+        assert!(recorded.given_back().is_none());
+        assert!(recorded.replay().is_none());
     }
 
     #[tokio::test]

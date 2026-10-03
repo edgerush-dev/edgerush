@@ -2358,10 +2358,11 @@ impl Worker {
     }
 
     /// Tries, and tries again while the rule's retry says to, the budget allows and the
-    /// body was kept whole (03 §6). Each try goes to an endpoint drawn afresh; each waits
-    /// its backoff first; none goes past the request's deadline. What decides is the
-    /// answer's head alone — its status, or a gRPC status a trailers-only head carries —
-    /// so nothing of an answer has gone to the client when a request is sent again.
+    /// body was kept whole or none of it went (03 §6). Each try goes to an endpoint drawn
+    /// afresh; each waits its backoff first; none goes past the request's deadline. What
+    /// decides is the answer's head alone — its status, or a gRPC status a trailers-only
+    /// head carries — so nothing of an answer has gone to the client when a request is
+    /// sent again.
     #[expect(
         clippy::too_many_arguments,
         reason = "each is a different thing the exchange needs, as for `through_h1`"
@@ -2382,6 +2383,9 @@ impl Worker {
         let (tee, recorded) = Tee::new(body);
         let mut body = RequestBody::Recorded(Box::new(tee));
         let mut admitted = admitted;
+        // The first try's, and a later one's only where the first let go of the body
+        // untouched (below).
+        let listened = interim.clone();
         let mut interim = interim;
         let mut endpoint = Arc::clone(&directed.endpoint);
         self.budget(directed.upstream_slot, |budget| {
@@ -2411,7 +2415,15 @@ impl Worker {
             if retried >= retry.attempts || !wants_again(retry, &outcome) {
                 return outcome;
             }
-            let Some(replayed) = recorded.replay() else {
+            // A body none of which went is the body itself, given back: its client may
+            // still be waiting for leave to send it, which only the try that asks for the
+            // body can give, so what the client hears goes with it. A body sent again from
+            // what was kept went whole before, and its client has heard all it will.
+            let (again, hearing) = if let Some(replayed) = recorded.replay() {
+                (RequestBody::Replayed(replayed), None)
+            } else if let Some(untouched) = recorded.given_back() {
+                (untouched, listened.clone())
+            } else {
                 if let Some(upstream) = upstream() {
                     upstream.retries_unkept.inc();
                 }
@@ -2445,7 +2457,8 @@ impl Worker {
             }
             head.set_uri(target);
             endpoint = drawn;
-            body = RequestBody::Replayed(replayed);
+            body = again;
+            interim = hearing;
             admitted = next.counting(Some(counted));
             retried += 1;
         }
@@ -8953,6 +8966,90 @@ upstreams:
                     let line = "edgerush_upstream_failures_total{upstream=\"up\"} 1\n";
                     assert!(scrape.contains(line), "{protocol:?}: {scrape}");
                 }
+            })
+            .await;
+    }
+
+    /// A request with a body is sent on as well when its try could not connect: none of
+    /// the body went, so all of it is still there to send, whole, to the next endpoint.
+    #[tokio::test]
+    async fn a_stated_retry_sends_a_body_whose_try_could_not_connect_elsewhere() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (_held, nowhere) = refusing();
+                let (h1, bodies) = statuses_upstream(vec![200]).await;
+                let (h2, seen, _) = h2_upstream(UpstreamH2::default()).await;
+                for (protocol, answering) in
+                    [(UpstreamProtocol::Http1, h1), (UpstreamProtocol::Http2, h2)]
+                {
+                    let config = in_turn_retrying_503(vec![nowhere, answering], protocol);
+                    let (front, worker) = serving_config(&config).await;
+                    for _ in 0..4 {
+                        let answer = h1_answer(front, POSTING_HI).await;
+                        assert!(
+                            answer.starts_with("HTTP/1.1 200 OK\r\n"),
+                            "{protocol:?}: {answer}"
+                        );
+                    }
+                    let scrape = worker.proxy().metrics();
+                    let retried =
+                        counted(&scrape, "edgerush_upstream_retries_total{upstream=\"up\"}");
+                    assert!(retried >= 1, "{protocol:?}: {scrape}");
+                }
+                // Every body arrived whole, the ones sent on among them.
+                assert_eq!(*bodies.borrow(), vec![b"hi".to_vec(); 4]);
+                let read: Vec<usize> = seen
+                    .requests
+                    .borrow()
+                    .iter()
+                    .map(|(_, read)| *read)
+                    .collect();
+                assert_eq!(read, vec![2; 4]);
+            })
+            .await;
+    }
+
+    /// So is one whose client waits for leave to send it: the try sent on asks for the
+    /// body, and the client is told to send it then.
+    #[tokio::test]
+    async fn a_body_whose_client_waits_to_send_it_is_sent_on_as_well() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (_held, nowhere) = refusing();
+                let (h1, bodies) = statuses_upstream(vec![200]).await;
+                let (h2, seen, _) = h2_upstream(UpstreamH2::default()).await;
+                for (protocol, answering) in [
+                    (UpstreamProtocol::Http1, h1),
+                    (UpstreamProtocol::Http2, h2),
+                ] {
+                    let config = in_turn_retrying_503(vec![nowhere, answering], protocol);
+                    let (front, worker) = serving_config(&config).await;
+                    for _ in 0..2 {
+                        let mut stream = TcpStream::connect(front).await.unwrap();
+                        stream
+                            .write_all(b"POST / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\nexpect: 100-continue\r\ncontent-length: 2\r\n\r\n")
+                            .await
+                            .unwrap();
+                        let mut first = vec![0; 64];
+                        let got = within(stream.read(&mut first)).await.unwrap();
+                        let first = String::from_utf8_lossy(&first[..got]).into_owned();
+                        assert!(first.starts_with("HTTP/1.1 100 "), "{protocol:?}: {first}");
+                        stream.write_all(b"hi").await.unwrap();
+                        let mut rest = Vec::new();
+                        let _ = within(stream.read_to_end(&mut rest)).await;
+                        let rest = String::from_utf8_lossy(&rest);
+                        assert!(rest.contains("HTTP/1.1 200 OK\r\n"), "{protocol:?}: {rest}");
+                    }
+                    let scrape = worker.proxy().metrics();
+                    let retried = counted(&scrape, "edgerush_upstream_retries_total{upstream=\"up\"}");
+                    assert!(retried >= 1, "{protocol:?}: {scrape}");
+                }
+                assert_eq!(*bodies.borrow(), vec![b"hi".to_vec(); 2]);
+                let read: Vec<usize> = seen.requests.borrow().iter().map(|(_, read)| *read).collect();
+                assert_eq!(read, vec![2; 2]);
             })
             .await;
     }
