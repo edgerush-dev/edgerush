@@ -1,0 +1,560 @@
+//! Health checks and probes.
+
+use super::*;
+
+/// An HTTP/1 upstream that answers `/healthz` 200 while `serving` says so and 503
+/// otherwise, and every other request 200 with its name in `x-upstream`.
+async fn checked_upstream(name: &'static str, serving: Rc<Cell<bool>>) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    let _accepting = tokio::task::spawn_local(async move {
+        while let Ok((mut stream, _)) = socket.accept().await {
+            let serving = Rc::clone(&serving);
+            let _answering = tokio::task::spawn_local(async move {
+                let mut seen = Vec::new();
+                let mut byte = [0; 1];
+                loop {
+                    match stream.read(&mut byte).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => seen.push(byte[0]),
+                    }
+                    if !seen.ends_with(b"\r\n\r\n") {
+                        continue;
+                    }
+                    let probe = seen.starts_with(b"GET /healthz ");
+                    seen.clear();
+                    let answer = if probe && !serving.get() {
+                        "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n".to_owned()
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nx-upstream: {name}\r\ncontent-length: 0\r\n\r\n"
+                        )
+                    };
+                    if stream.write_all(answer.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    address
+}
+
+/// A worker whose one upstream `up` has `endpoints`, checked as `check` says, with the
+/// health checker running.
+async fn serving_checked_worker(
+    endpoints: Vec<SocketAddr>,
+    protocol: UpstreamProtocol,
+    check: edgerush_config::HealthCheck,
+) -> (SocketAddr, Rc<Worker>) {
+    let mut config = everything_config(endpoints[0]);
+    let up = config.upstreams.get_mut("up").unwrap();
+    up.endpoints = endpoints;
+    up.protocol = protocol;
+    up.health_check = Some(check);
+    let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+    let _checking = tokio::task::spawn_local(Arc::clone(&proxy).check_health());
+    let worker = Worker::with_deadlines(proxy, H1Limits::default(), SHORT);
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front = socket.local_addr().unwrap();
+    let _serving = serving(&worker, socket);
+    (front, worker)
+}
+
+/// How many endpoints of `up` the scrape says serve.
+fn serving_now(worker: &Worker) -> String {
+    let scrape = worker.proxy().metrics();
+    scrape
+        .lines()
+        .find(|line| line.starts_with("edgerush_upstream_healthy_endpoints{upstream=\"up\"}"))
+        .unwrap_or_default()
+        .rsplit(' ')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Until the scrape says `count` endpoints serve, for up to ten seconds.
+async fn until_serving(worker: &Worker, count: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while serving_now(worker) != count {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("never {count} serving; now {}", serving_now(worker)));
+}
+
+/// An endpoint that fails its checks gets no requests while it does, and gets them
+/// again once it passes.
+#[tokio::test]
+async fn an_endpoint_failing_its_checks_is_kept_out_until_it_passes() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let steady = checked_upstream("steady", Rc::new(Cell::new(true))).await;
+            let shaky_serving = Rc::new(Cell::new(false));
+            let shaky = checked_upstream("shaky", Rc::clone(&shaky_serving)).await;
+            let (front, worker) = serving_checked_worker(
+                vec![steady, shaky],
+                UpstreamProtocol::Http1,
+                every_second_by(healthz()),
+            )
+            .await;
+            until_serving(&worker, "1").await;
+            for _ in 0..20 {
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.contains("x-upstream: steady\r\n"), "{answer}");
+            }
+            shaky_serving.set(true);
+            until_serving(&worker, "2").await;
+            let mut answered_by_shaky = false;
+            for _ in 0..40 {
+                answered_by_shaky |= h1_answer(front, CLOSING_GET)
+                    .await
+                    .contains("x-upstream: shaky\r\n");
+            }
+            assert!(answered_by_shaky, "a healthy endpoint got nothing");
+        })
+        .await;
+}
+
+/// An endpoint a try could not connect to is set aside for every request after it, with
+/// no check configured, and counted; once it takes connections again, a connect probe
+/// after the data plane's `set_aside_ms` brings it back, ramping up where its upstream
+/// has a slow start, as everything that joins the draw does (03 §6).
+#[tokio::test]
+async fn an_endpoint_that_cannot_be_connected_to_is_set_aside_until_a_probe_gets_through() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (held, nowhere) = refusing();
+            let (answering, _) = statuses_upstream(vec![200]).await;
+            let mut config = everything_config(nowhere);
+            let up = config.upstreams.get_mut("up").unwrap();
+            up.endpoints = vec![nowhere, answering];
+            up.slow_start = Some(edgerush_config::SlowStart { window_ms: 60_000 });
+            config.data_plane.set_aside_ms = Some(200);
+            let proxy =
+                Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+            let _checking = tokio::task::spawn_local(Arc::clone(&proxy).check_health());
+            let worker = Worker::with_deadlines(proxy, H1Limits::default(), SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+
+            // Drawn at random, the endpoint that refuses is drawn before long, and its
+            // request is answered 502: no retry is stated.
+            let mut refused = false;
+            for _ in 0..50 {
+                let answer = h1_answer(front, CLOSING_GET).await;
+                if answer.starts_with("HTTP/1.1 502 ") {
+                    refused = true;
+                    break;
+                }
+            }
+            assert!(refused, "the endpoint that refuses was never drawn");
+            for _ in 0..30 {
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+            }
+            let scrape = worker.proxy().metrics();
+            let line = "edgerush_upstream_set_aside_endpoints{upstream=\"up\"} 1\n";
+            assert!(scrape.contains(line), "{scrape}");
+            until(|| {
+                worker
+                    .proxy()
+                    .metrics()
+                    .contains("edgerush_upstream_set_asides_total{upstream=\"up\"} 1\n")
+            })
+            .await;
+
+            // It takes connections again, and says who it is. A connection that opens
+            // and closes having said nothing is one the connect probe should have reset
+            // (20 §5).
+            let listening = held.listen(64).unwrap();
+            let empty = Rc::new(Cell::new(0_usize));
+            let counting = Rc::clone(&empty);
+            let _answering = tokio::task::spawn_local(async move {
+                while let Ok((mut stream, _)) = listening.accept().await {
+                    let mut head = [0; 1024];
+                    if matches!(stream.read(&mut head).await, Ok(0)) {
+                        counting.set(counting.get() + 1);
+                    }
+                    let answer = b"HTTP/1.1 200 OK\r\nx-upstream: back\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+                    let _written = stream.write_all(answer).await;
+                }
+            });
+            until(|| {
+                worker
+                    .proxy()
+                    .metrics()
+                    .contains("edgerush_upstream_set_aside_endpoints{upstream=\"up\"} 0\n")
+            })
+            .await;
+            let snapshot = worker.proxy().current.load();
+            let returned = snapshot.destinations.at(0, 0).unwrap();
+            assert_eq!(returned.address(), nowhere);
+            assert!(returned.is_ramping(), "brought back without a ramp");
+            // At a tenth of its share to begin with, but taking requests.
+            let mut back = false;
+            for _ in 0..400 {
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+                if answer.contains("x-upstream: back\r\n") {
+                    back = true;
+                    break;
+                }
+            }
+            assert!(back, "the endpoint brought back was never sent a request");
+            assert_eq!(empty.get(), 0, "the connect probe closed without a reset");
+        })
+        .await;
+}
+
+/// When fewer than half the endpoints pass, their health is ignored: requests go on
+/// to all of them rather than being answered 503.
+#[tokio::test]
+async fn with_most_endpoints_failing_their_health_is_ignored() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let one = checked_upstream("one", Rc::new(Cell::new(false))).await;
+            let two = checked_upstream("two", Rc::new(Cell::new(false))).await;
+            let three = checked_upstream("three", Rc::new(Cell::new(true))).await;
+            let (front, worker) = serving_checked_worker(
+                vec![one, two, three],
+                UpstreamProtocol::Http1,
+                every_second_by(healthz()),
+            )
+            .await;
+            until_serving(&worker, "1").await;
+            let mut unhealthy_answered = false;
+            for _ in 0..40 {
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                unhealthy_answered |= !answer.contains("x-upstream: three\r\n");
+            }
+            assert!(unhealthy_answered, "health was not ignored below half");
+        })
+        .await;
+}
+
+/// A gRPC health check passes an endpoint whose health service says `SERVING`, and
+/// fails one that says anything else.
+#[tokio::test]
+async fn a_grpc_health_check_passes_only_serving() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let state = Rc::new(Cell::new(1_u8));
+            let saying = Rc::clone(&state);
+            let script: Script = Rc::new(move |request, mut respond| {
+                let saying = Rc::clone(&saying);
+                Box::pin(async move {
+                    assert_eq!(request.uri().path(), "/grpc.health.v1.Health/Check");
+                    let mut body = request.into_body();
+                    let _ = read_all(&mut body).await;
+                    let Ok(mut sending) = respond.send_response(grpc_head(), false) else {
+                        return;
+                    };
+                    let message = [0, 0, 0, 0, 2, 0x08, saying.get()];
+                    let _ = sending.send_data(Bytes::copy_from_slice(&message), false);
+                    let mut status = http::HeaderMap::new();
+                    status.insert("grpc-status", "0".parse().unwrap());
+                    let _ = sending.send_trailers(status);
+                })
+            });
+            let upstream = scripted_h2_upstream(script).await;
+            let probe = edgerush_config::Probe::Grpc {
+                service: String::new(),
+            };
+            let (_front, worker) = serving_checked_worker(
+                vec![upstream],
+                UpstreamProtocol::Http2,
+                every_second_by(probe),
+            )
+            .await;
+            // NOT_SERVING takes it out, SERVING brings it back.
+            state.set(2);
+            until_serving(&worker, "0").await;
+            state.set(1);
+            until_serving(&worker, "1").await;
+        })
+        .await;
+}
+
+/// The one endpoint of `config`'s upstream `up`, checked by `probe`, ready to be probed:
+/// its config compiled and its TLS made. With the proxy it is of, to be kept beside it.
+fn checked_by(mut config: Config, probe: edgerush_config::Probe) -> (Proxy, Arc<ReuseIdentity>) {
+    config.upstreams.get_mut("up").unwrap().health_check = Some(every_second_by(probe));
+    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+    let destination = proxy.checked().next().unwrap();
+    (proxy, destination)
+}
+
+/// Whether the one endpoint of `config`'s upstream `up`, checked by `probe`, passes.
+async fn probed(config: Config, probe: edgerush_config::Probe) -> bool {
+    let (_proxy, destination) = checked_by(config, probe);
+    let check = destination.health_check().unwrap();
+    crate::health::probe::passes(&destination, check).await
+}
+
+/// An address that takes connections and never says a word on them.
+async fn mute() -> SocketAddr {
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    tokio::task::spawn_local(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = socket.accept().await {
+            held.push(stream);
+        }
+    });
+    address
+}
+
+/// An HTTP/1 backend that answers `said` to every request, whole, and closes.
+async fn answering(said: &'static [u8]) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    tokio::task::spawn_local(async move {
+        while let Ok((mut stream, _)) = socket.accept().await {
+            tokio::task::spawn_local(async move {
+                let mut head = [0; 1024];
+                let _read = stream.read(&mut head).await;
+                let _written = stream.write_all(said).await;
+            });
+        }
+    });
+    address
+}
+
+/// An HTTP/1 probe is judged by the final answer, past any informational ones before
+/// it (RFC 9110 §15.2): Early Hints and then 200 passes, Early Hints and then 503 fails.
+#[tokio::test]
+async fn an_http1_probe_is_judged_by_the_final_answer() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for (said, passes) in [
+                (
+                    &b"HTTP/1.1 103 Early Hints\r\nlink: </a.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"[..],
+                    true,
+                ),
+                (
+                    b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 102 Processing\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n",
+                    true,
+                ),
+                (
+                    b"HTTP/1.1 103 Early Hints\r\nlink: </a.css>; rel=preload\r\n\r\nHTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n",
+                    false,
+                ),
+                (b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n", true),
+                // A switch is no answer to a probe that asked for none.
+                (
+                    b"HTTP/1.1 101 Switching Protocols\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+                    false,
+                ),
+                // Informational answers without end are not waited through for ever.
+                (
+                    b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+                    false,
+                ),
+            ] {
+                let backend = answering(said).await;
+                assert_eq!(
+                    probed(everything_config(backend), healthz()).await,
+                    passes,
+                    "{}",
+                    said.escape_ascii()
+                );
+            }
+        })
+        .await;
+}
+
+/// A TCP probe passes an endpoint it can connect to, and fails one it cannot (20 §5).
+#[tokio::test]
+async fn a_tcp_probe_passes_what_it_can_connect_to() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listening = mute().await;
+            assert!(probed(everything_config(listening), edgerush_config::Probe::Tcp).await);
+            let (_held, gone) = refusing();
+            assert!(!probed(everything_config(gone), edgerush_config::Probe::Tcp).await);
+        })
+        .await;
+}
+
+/// On an upstream reached over TLS, a TCP probe passes once the handshake does, as
+/// traffic's would: not against a certificate nobody trusted vouches for, nor an
+/// endpoint that takes the connection and never answers the handshake.
+#[tokio::test]
+async fn a_tcp_probe_of_a_tls_upstream_needs_the_handshake() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let certificate = crate::tls::testing::certificate(&["backend.test"]);
+            let stranger = crate::tls::testing::certificate(&["backend.test"]);
+            let upstream = tls_upstream(&certificate, Agrees::Either).await;
+            let secured = |endpoint: SocketAddr, vouched: &edgerush_config::Certificate| {
+                let mut config = everything_config(endpoint);
+                config.upstreams.get_mut("up").unwrap().tls =
+                    Some(trusting("backend.test", vouched));
+                config
+            };
+            let tcp = edgerush_config::Probe::Tcp;
+            assert!(probed(secured(upstream, &certificate), tcp.clone()).await);
+            assert!(!probed(secured(upstream, &stranger), tcp.clone()).await);
+            // Timed from the probe itself: compiling the config and making its TLS are
+            // not the probe, and in a loaded run they have taken half a second.
+            let (_proxy, destination) = checked_by(secured(mute().await, &certificate), tcp);
+            let check = destination.health_check().unwrap();
+            let started = tokio::time::Instant::now();
+            assert!(!crate::health::probe::passes(&destination, check).await);
+            // Given up on at the check's timeout, a second, and not before.
+            let took = started.elapsed();
+            assert!(took + EARLY >= Duration::from_secs(1), "{took:?}");
+            assert!(took < Duration::from_secs(1) + SLACK, "{took:?}");
+        })
+        .await;
+}
+
+/// A plain TCP probe that a backend does see reaches it as a reset, never as a
+/// connection that opens and closes having said nothing; on Linux, as a rule, the
+/// backend never sees it at all (20 §5). The set-aside reconnect closes the same way.
+#[tokio::test]
+async fn a_plain_tcp_probe_is_reset_if_it_is_seen() {
+    use tokio::io::AsyncReadExt;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let backend = socket.local_addr().unwrap();
+            for probe in 0..2 {
+                if probe == 0 {
+                    assert!(probed(everything_config(backend), edgerush_config::Probe::Tcp).await);
+                } else {
+                    crate::health::probe::connect_unseen(backend).await.unwrap();
+                }
+                // Seen or not: a backend that accepts it finds it reset.
+                if let Ok(accepted) =
+                    tokio::time::timeout(Duration::from_millis(300), socket.accept()).await
+                {
+                    let (mut stream, _) = accepted.unwrap();
+                    let mut byte = [0; 1];
+                    let read = within(stream.read(&mut byte)).await;
+                    assert!(
+                        read.as_ref()
+                            .is_err_and(|error| { error.kind() == io::ErrorKind::ConnectionReset }),
+                        "probe {probe}: {read:?}"
+                    );
+                }
+            }
+        })
+        .await;
+}
+
+/// How often, of many plain TCP probes, an accepting backend sees one: a measurement to
+/// record (20 §5), not a gate. `cargo test -p edgerush-proxy --lib how_often -- --ignored
+/// --nocapture`, on Linux.
+#[tokio::test]
+#[ignore = "a measurement, not a gate"]
+async fn how_often_a_backend_sees_a_plain_tcp_probe() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let backend = socket.local_addr().unwrap();
+            let seen = Rc::new(Cell::new(0_usize));
+            let counting = Rc::clone(&seen);
+            tokio::task::spawn_local(async move {
+                while socket.accept().await.is_ok() {
+                    counting.set(counting.get() + 1);
+                }
+            });
+            let probes = 2_000;
+            for _ in 0..probes {
+                crate::health::probe::connect_unseen(backend).await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            println!("an accepting backend saw {} of {probes} probes", seen.get());
+        })
+        .await;
+}
+
+/// An HTTP probe of an upstream sent a PROXY header sends one first that says the
+/// connection is the gateway's own: v2's LOCAL, or a v1 line of the probe's own two
+/// ends; the backend, a strict receiver, then answers it (20 §4).
+#[tokio::test]
+async fn an_http_probe_says_it_is_the_gateways_own() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for version in ["v1", "v2"] {
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let backend = socket.local_addr().unwrap();
+                let heard = Rc::new(RefCell::new(None));
+                let hearing = Rc::clone(&heard);
+                tokio::task::spawn_local(async move {
+                    let (mut stream, peer) = socket.accept().await.unwrap();
+                    let mut came = Vec::new();
+                    let mut chunk = [0; 512];
+                    let header = loop {
+                        if let proxy_protocol::Read::Whole { header, length } =
+                            proxy_protocol::read(&came)
+                        {
+                            break Some((header, came.split_off(length)));
+                        }
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break None,
+                            Ok(read) => came.extend_from_slice(&chunk[..read]),
+                        }
+                    };
+                    let Some((header, mut request)) = header else {
+                        return;
+                    };
+                    // The header and the request may come in writes of their own.
+                    while !request.windows(4).any(|four| four == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => request.extend_from_slice(&chunk[..read]),
+                        }
+                    }
+                    // No header, or not a strict one: no answer, and the probe fails.
+                    let expected = if version == "v1" {
+                        proxy_protocol::Header::Proxied {
+                            source: peer,
+                            destination: stream.local_addr().unwrap(),
+                        }
+                    } else {
+                        proxy_protocol::Header::Local
+                    };
+                    *hearing.borrow_mut() = Some(header);
+                    if header == expected && request.starts_with(b"GET /healthz ") {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                            .await;
+                    }
+                });
+                let mut config: Config =
+                    serde_saphyr::from_str(&sending(&tcp_to(backend, ""), version)).unwrap();
+                config.upstreams.get_mut("up").unwrap().health_check =
+                    Some(every_second_by(healthz()));
+                let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+                let destination = proxy.checked().next().unwrap();
+                let check = destination.health_check().unwrap();
+                assert!(
+                    crate::health::probe::passes(&destination, check).await,
+                    "{version}: {:?}",
+                    heard.borrow()
+                );
+            }
+        })
+        .await;
+}
