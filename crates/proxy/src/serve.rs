@@ -12695,11 +12695,21 @@ upstreams:
             .await;
     }
 
-    /// Whether the one endpoint of `config`'s upstream `up`, checked by `probe`, passes.
-    async fn probed(mut config: Config, probe: edgerush_config::Probe) -> bool {
+    /// The one endpoint of `config`'s upstream `up`, checked by `probe`, ready to be probed:
+    /// its config compiled and its TLS made. With the proxy it is of, to be kept beside it.
+    fn checked_by(
+        mut config: Config,
+        probe: edgerush_config::Probe,
+    ) -> (Proxy, Arc<ReuseIdentity>) {
         config.upstreams.get_mut("up").unwrap().health_check = Some(every_second_by(probe));
         let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
         let destination = proxy.checked().next().unwrap();
+        (proxy, destination)
+    }
+
+    /// Whether the one endpoint of `config`'s upstream `up`, checked by `probe`, passes.
+    async fn probed(config: Config, probe: edgerush_config::Probe) -> bool {
+        let (_proxy, destination) = checked_by(config, probe);
         let check = destination.health_check().unwrap();
         crate::health::probe::passes(&destination, check).await
     }
@@ -12812,8 +12822,12 @@ upstreams:
                 let tcp = edgerush_config::Probe::Tcp;
                 assert!(probed(secured(upstream, &certificate), tcp.clone()).await);
                 assert!(!probed(secured(upstream, &stranger), tcp.clone()).await);
+                // Timed from the probe itself: compiling the config and making its TLS are
+                // not the probe, and in a loaded run they have taken half a second.
+                let (_proxy, destination) = checked_by(secured(mute().await, &certificate), tcp);
+                let check = destination.health_check().unwrap();
                 let started = tokio::time::Instant::now();
-                assert!(!probed(secured(mute().await, &certificate), tcp).await);
+                assert!(!crate::health::probe::passes(&destination, check).await);
                 // Given up on at the check's timeout, a second, and not before.
                 let took = started.elapsed();
                 assert!(took + EARLY >= Duration::from_secs(1), "{took:?}");
