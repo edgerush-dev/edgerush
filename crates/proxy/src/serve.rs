@@ -5875,12 +5875,7 @@ upstreams:
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                // Bound, then let go: nothing listens there.
-                let gone = TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .unwrap()
-                    .local_addr()
-                    .unwrap();
+                let (_held, gone) = refusing();
                 let (front, worker) = passing(&tcp_to(gone, "")).await;
                 let mut client = TcpStream::connect(front).await.unwrap();
                 // Refused at once on Linux; Windows tries again for two seconds or so. The
@@ -7270,9 +7265,7 @@ upstreams:
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let nobody = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let upstream = nobody.local_addr().unwrap();
-                drop(nobody);
+                let (_held, upstream) = refusing();
                 let (front, worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
                 let answer = h1_answer(front, CLOSING_GET).await;
                 assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
@@ -12793,12 +12786,7 @@ upstreams:
             .run_until(async {
                 let listening = mute().await;
                 assert!(probed(everything_config(listening), edgerush_config::Probe::Tcp).await);
-                // Bound, then let go: nothing listens there.
-                let gone = TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .unwrap()
-                    .local_addr()
-                    .unwrap();
+                let (_held, gone) = refusing();
                 assert!(!probed(everything_config(gone), edgerush_config::Probe::Tcp).await);
             })
             .await;
