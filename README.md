@@ -172,6 +172,12 @@ vendor/h2          h2 0.4.19 with changes of ours, built in place of the publish
 
 Crates are internal to this workspace and are not published.
 
+## Contributing
+
+Contributions are welcome, AI-assisted ones included: [CONTRIBUTING.md](CONTRIBUTING.md)
+says how. Security problems are reported privately ([SECURITY.md](SECURITY.md)), and
+everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE). `vendor/quiche` is quiche's, under its own BSD 2-Clause

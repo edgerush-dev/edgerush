@@ -1,0 +1,20 @@
+name: Feature request
+description: Something EdgeRush should do
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Kubernetes (the control plane, the operator, Ingress and Gateway API), rate limiting, access logs and authentication are planned already; the [README](https://github.com/edgerush-dev/edgerush#what-works-today) says what works today.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what stands in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: How EdgeRush could do it, and how other proxies do, if you know.
