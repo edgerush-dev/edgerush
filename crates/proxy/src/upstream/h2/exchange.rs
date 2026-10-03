@@ -19,7 +19,7 @@ use crate::downstream::h2::writer::{Outgoing, SendError, send_body};
 use crate::h2_stream::H2Stream;
 use crate::interim::{Channel, Interim};
 use crate::request_body::{RequestBody, RequestBodyError};
-use crate::retry::replay::Tee;
+use crate::retry::replay::{Recorded, Tee};
 use crate::storage::Storage;
 use crate::upstream::destination::ReuseIdentity;
 use crate::upstream::h1::codec::{OutgoingFields, Sending};
@@ -136,14 +136,8 @@ pub(crate) async fn exchange<F: OutgoingFields + ?Sized>(
     let nothing_to_send = matches!(sending, Sending::None | Sending::Length(0));
     channel.begin(expects_continue(fields), nothing_to_send);
     let end_stream = matches!(sending, Sending::None) || body.is_end_stream();
-    // Kept only where there is something to keep: a request with no body is sent again
-    // from its head alone.
-    let (mut body, kept) = if end_stream {
-        (Some(body), None)
-    } else {
-        let (tee, kept) = Tee::new(body, storage);
-        (Some(RequestBody::Recorded(Box::new(tee))), Some(kept))
-    };
+    let (body, kept) = kept(body, end_stream, storage);
+    let mut body = Some(body);
     let mut head = Some(first);
     let mut again = false;
     loop {
@@ -176,6 +170,27 @@ pub(crate) async fn exchange<F: OutgoingFields + ?Sized>(
             outcome => return outcome,
         }
     }
+}
+
+/// `body` as it is to be sent, and what is kept of it to send again: nothing where there is
+/// nothing to keep, a request with no body being sent again from its head alone; the
+/// recording that already keeps it, where a rule's retry does, so that a body is copied and
+/// paid for once ([03 §6](../../../../docs/03-data-plane.md)); and otherwise a recording
+/// made here.
+fn kept(
+    body: RequestBody,
+    end_stream: bool,
+    storage: &Rc<Storage>,
+) -> (RequestBody, Option<Recorded>) {
+    if end_stream {
+        return (body, None);
+    }
+    if let RequestBody::Recorded(tee) = &body {
+        let kept = tee.recorded();
+        return (body, Some(kept));
+    }
+    let (tee, kept) = Tee::new(body, storage);
+    (RequestBody::Recorded(Box::new(tee)), Some(kept))
 }
 
 /// Whether the upstream says it never processed the stream that failed with `error`: it
@@ -462,5 +477,49 @@ impl Body for Answer {
 
     fn size_hint(&self) -> SizeHint {
         self.body.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::retry::replay::Replayed;
+    use http_body_util::BodyExt;
+
+    /// A body a rule's retry already keeps as it goes is kept once: the same recording
+    /// serves a stream sent again, and nothing of it is copied, or paid for, a second time.
+    #[tokio::test]
+    async fn a_body_kept_for_a_retry_is_kept_once() {
+        let storage = Storage::with_provision(1 << 20, 0);
+        let frames = (0..1024)
+            .map(|_| Frame::data(Bytes::from_static(b"x")))
+            .collect();
+        let (tee, _for_the_retry) = Tee::new(RequestBody::Replayed(Replayed::of(frames)), &storage);
+        let (mut body, again) = kept(RequestBody::Recorded(Box::new(tee)), false, &storage);
+        while let Some(frame) = body.frame().await {
+            frame.unwrap();
+        }
+        assert_eq!(
+            storage.used(),
+            1024,
+            "a run of 1,024 bytes kept more than once"
+        );
+        assert!(again.and_then(|kept| kept.replay()).is_some());
+    }
+
+    /// A body nothing keeps yet is kept as it goes from here; one with nothing in it is
+    /// not kept at all, its head being all there is to send again.
+    #[tokio::test]
+    async fn a_body_nothing_keeps_is_kept_from_here() {
+        let storage = Storage::with_provision(1 << 20, 0);
+        let frames = vec![Frame::data(Bytes::from_static(b"hi"))];
+        let (mut body, again) = kept(RequestBody::Replayed(Replayed::of(frames)), false, &storage);
+        assert!(matches!(body, RequestBody::Recorded(_)));
+        while let Some(frame) = body.frame().await {
+            frame.unwrap();
+        }
+        assert!(again.and_then(|kept| kept.replay()).is_some());
+        let (_body, again) = kept(RequestBody::None, true, &storage);
+        assert!(again.is_none());
     }
 }

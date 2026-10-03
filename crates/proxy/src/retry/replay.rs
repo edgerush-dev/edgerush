@@ -173,6 +173,14 @@ impl Tee {
     }
 }
 
+impl Tee {
+    /// What it keeps, for one more to send again from: a body kept once serves all who may
+    /// send it again — a rule's retry, and an HTTP/2 upstream's resend of a refused stream.
+    pub(crate) fn recorded(&self) -> Recorded {
+        Recorded(Rc::clone(&self.recording))
+    }
+}
+
 impl Drop for Tee {
     /// A body none of which went is given back whole, for the next try to send.
     fn drop(&mut self) {
