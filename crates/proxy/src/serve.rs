@@ -16,6 +16,7 @@
 //! the pool of upstream connections to come, above all.
 
 use crate::balance::Tried;
+use crate::connections::{Held, Loads};
 use crate::downstream::detect::{Protocol, detect};
 use crate::downstream::h1::connection::{self as h1, Answered};
 use crate::downstream::h1::date::HttpDate;
@@ -390,6 +391,11 @@ pub struct Worker {
     slots: WorkerSlots,
     /// What its HTTP/1 connections are held to, which each borrows rather than copies.
     h1: h1::Settings,
+    /// Every worker's connections, counted, where the process counts them: a WebSocket it
+    /// carries for an HTTP/2 or HTTP/3 client counts among them as long as it is open
+    /// ([03 §9](../../docs/03-data-plane.md)). None for a worker that is not one of a
+    /// process's, which counts nothing.
+    connections: Option<Arc<Loads>>,
 }
 
 /// Serves `socket`, a connection of `ours` that speaks HTTP/1, with our own server (14).
@@ -866,18 +872,37 @@ impl Worker {
 
     /// The same, as the `position`th of the data plane's workers: what the QUIC
     /// connection IDs it issues say, so that another worker can hand it a datagram of its
-    /// connections'.
+    /// connections'. `connections` counts every worker's connections, its own at
+    /// `position`, and is what a WebSocket it carries for an HTTP/2 or HTTP/3 client is
+    /// counted in.
     #[must_use]
-    pub fn at(proxy: Arc<Proxy>, limits: H1Limits, position: u16) -> Rc<Self> {
-        Self::made(proxy, limits, Deadlines::default(), position)
+    pub fn at(
+        proxy: Arc<Proxy>,
+        limits: H1Limits,
+        position: u16,
+        connections: Arc<Loads>,
+    ) -> Rc<Self> {
+        Self::made(
+            proxy,
+            limits,
+            Deadlines::default(),
+            position,
+            Some(connections),
+        )
     }
 
     /// The same, holding client connections to `deadlines`.
     fn with_deadlines(proxy: Arc<Proxy>, limits: H1Limits, deadlines: Deadlines) -> Rc<Self> {
-        Self::made(proxy, limits, deadlines, 0)
+        Self::made(proxy, limits, deadlines, 0, None)
     }
 
-    fn made(proxy: Arc<Proxy>, limits: H1Limits, deadlines: Deadlines, position: u16) -> Rc<Self> {
+    fn made(
+        proxy: Arc<Proxy>,
+        limits: H1Limits,
+        deadlines: Deadlines,
+        position: u16,
+        connections: Option<Arc<Loads>>,
+    ) -> Rc<Self> {
         let body_limits = Rc::new(limits);
         let h1 = h1::Settings {
             limits: Rc::clone(&body_limits),
@@ -914,6 +939,7 @@ impl Worker {
             position,
             slots: WorkerSlots::default(),
             h1,
+            connections,
         })
     }
 
@@ -1885,6 +1911,20 @@ impl Worker {
             }
             Err(answer) => return self.proxy.answer_to(listener, answer, call).into(),
         };
+        // A WebSocket that an HTTP/2 or HTTP/3 client asks for holds a backend of its own
+        // beside the client's one connection, which may carry a hundred: it counts as one
+        // of the worker's connections for as long as it is open, and is refused, before
+        // anything goes upstream, while the worker or the listener has no room for one,
+        // as a connection would not be accepted then (03 §9).
+        if let Some(handshake) = &directed.websocket
+            && handshake.on_a_stream()
+            && let Some(connections) = &self.connections
+        {
+            let Some(held) = connections.take(usize::from(self.position), listener) else {
+                return self.proxy.answer_to(listener, Answer::NoRoom, call).into();
+            };
+            handshake.held.set(Some(held));
+        }
         let timing = Timing::of(call, directed.rule.as_deref());
 
         // Credentials can bind the upstream socket to this client, even when the
@@ -2595,6 +2635,7 @@ impl Worker {
                 }
             }),
             counted,
+            held: handshake.held.take(),
         }
     }
 
@@ -2937,6 +2978,7 @@ impl Proxy {
                     .unwrap_or(TUNNEL_IDLE),
                 listener: came_on,
                 server: None,
+                held: Cell::new(None),
             }))
         });
         if let Some(counters) = self.metrics.upstream(upstream_slot) {
@@ -3075,6 +3117,18 @@ struct Handshake {
     /// carry. Held here and not taken as a try's informational channel is, which only the
     /// first try has: any try may be the one that switches.
     server: Option<Interim>,
+    /// For an extended CONNECT, its count among the worker's connections, taken before
+    /// anything goes upstream and handed to the tunnel by the try that switches; let go of
+    /// with the handshake if none does (03 §9).
+    held: Cell<Option<Held>>,
+}
+
+impl Handshake {
+    /// Whether it came as an extended CONNECT, on a stream of an HTTP/2 or HTTP/3 client's
+    /// connection, which may carry many: the ones with no key of the client's.
+    fn on_a_stream(&self) -> bool {
+        self.client.is_none()
+    }
 }
 
 /// How a WebSocket handshake goes to its backend.
@@ -12839,6 +12893,71 @@ upstreams:
                 let line =
                     "edgerush_listener_tunnels_total{listener=\"web\",outcome=\"closed\"} 1\n";
                 until(|| proxy.metrics().contains(line)).await;
+            })
+            .await;
+    }
+
+    /// A WebSocket over HTTP/3 counts as one of its worker's connections while it is open,
+    /// as over HTTP/2: with no room left for one, the next is answered 503 (03 §9).
+    #[tokio::test]
+    async fn http3_websockets_count_as_connections_of_their_worker() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::downstream::h3::testing::Client;
+                let upstream = echoing_websocket_backend().await;
+                let http3 = edgerush_config::Http3 {
+                    alt_svc_max_age: 60,
+                    force_retry: false,
+                };
+                let config = compile(&h3_config(upstream, http3)).unwrap();
+                let proxy = Arc::new(Proxy::new(config, NonZeroUsize::MIN).unwrap());
+                // Room for one connection.
+                let connections = Loads::new(1, 1, 1);
+                let worker = Worker::made(
+                    Arc::clone(&proxy),
+                    H1Limits::default(),
+                    SHORT,
+                    0,
+                    Some(Arc::clone(&connections)),
+                );
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
+                let alone = Forwarding::group(1).remove(0);
+                let _serving =
+                    tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
+                let mut client = Client::connect(front, "a.test").await;
+                client
+                    .until(|client| {
+                        client
+                            .h3
+                            .as_ref()
+                            .is_some_and(quiche::h3::Connection::extended_connect_enabled_by_peer)
+                    })
+                    .await;
+                let first = client.request(&h3_connect("websocket"), false);
+                client
+                    .until(|client| {
+                        client
+                            .answers
+                            .get(&first)
+                            .is_some_and(|answer| answer.body.ends_with(b"hello"))
+                    })
+                    .await;
+                assert_eq!(connections.now(), [1]);
+                let second = client.request(&h3_connect("websocket"), false);
+                client
+                    .until(|client| {
+                        client
+                            .answers
+                            .get(&second)
+                            .is_some_and(|answer| answer.final_status().is_some())
+                    })
+                    .await;
+                let answer = client.answers.get(&second).unwrap().clone();
+                assert_eq!(answer.final_status(), Some("503"), "{answer:?}");
+                assert_eq!(connections.now(), [1]);
             })
             .await;
     }

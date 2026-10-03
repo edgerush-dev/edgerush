@@ -19,10 +19,15 @@
 //! And connections are counted by listener, so that one listener cannot take every
 //! connection there is room for: once seven eighths of all the workers' room is held, a
 //! listener that holds its fair share stops accepting while the others carry on
-//! ([03 §9](../../../docs/03-data-plane.md), [`edgerush_proxy::share`]). Balancing keeps the
+//! ([03 §9](../../../docs/03-data-plane.md), [`crate::share`]). Balancing keeps the
 //! workers level, so a share of all of them is a share of each.
+//!
+//! A WebSocket carried for an HTTP/2 or HTTP/3 client counts as one of its worker's
+//! connections too, for as long as it is open: its backend is a connection of its own
+//! beside the client's one, and a client connection may carry a hundred of them. It is
+//! refused while its worker has no room, or its listener holds its share ([`Loads::take`]).
 
-use edgerush_proxy::share::over_share;
+use crate::share::over_share;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
@@ -32,7 +37,7 @@ use tokio::sync::Notify;
 /// it, so that they are given to in turn and not the first of them every time.
 ///
 /// `own` must be a position in `loads`; one that is not keeps the connection.
-pub(crate) fn least_loaded(loads: &[usize], own: usize) -> usize {
+fn least_loaded(loads: &[usize], own: usize) -> usize {
     let Some(least) = loads.iter().copied().min() else {
         return own;
     };
@@ -50,7 +55,7 @@ pub(crate) fn least_loaded(loads: &[usize], own: usize) -> usize {
 /// listener holds. Written to when a connection comes or goes, never for a request, so the
 /// workers' numbers can share a line of cache.
 #[derive(Debug)]
-pub(crate) struct Loads {
+pub struct Loads {
     held: Vec<AtomicUsize>,
     /// How many connections a worker may hold before it stops accepting.
     cap: usize,
@@ -71,7 +76,10 @@ pub(crate) struct Loads {
 }
 
 impl Loads {
-    pub(crate) fn new(workers: usize, cap: usize, listeners: usize) -> Arc<Self> {
+    /// The counts of `workers` workers that may each hold `cap` connections, on
+    /// `listeners` listeners, none held.
+    #[must_use]
+    pub fn new(workers: usize, cap: usize, listeners: usize) -> Arc<Self> {
         Arc::new(Self {
             held: (0..workers).map(|_| AtomicUsize::new(0)).collect(),
             cap,
@@ -94,7 +102,8 @@ impl Loads {
     ///
     /// Workers that look at the same moment may each take one: a share is passed by at
     /// most that many.
-    pub(crate) fn listener_has_room(&self, listener: usize) -> bool {
+    #[must_use]
+    pub fn listener_has_room(&self, listener: usize) -> bool {
         let Some(own) = self.by_listener.get(listener) else {
             return true;
         };
@@ -115,14 +124,15 @@ impl Loads {
     /// workers that look at the same moment may each place one on the same worker, and a
     /// worker's listeners that are woken together may each accept one: the cap is passed
     /// by at most that many.
-    pub(crate) fn has_room(&self, worker: usize) -> bool {
+    #[must_use]
+    pub fn has_room(&self, worker: usize) -> bool {
         self.held
             .get(worker)
             .is_none_or(|load| load.load(Ordering::Relaxed) < self.cap)
     }
 
     /// Waits until `worker` has room, and `listener` has room for another connection.
-    pub(crate) async fn room(&self, worker: usize, listener: usize) {
+    pub async fn room(&self, worker: usize, listener: usize) {
         let at = worker * self.by_listener.len() + listener;
         let (Some(room), Some(listener_room)) = (self.room.get(at), self.listener_room.get(at))
         else {
@@ -149,13 +159,25 @@ impl Loads {
     ///
     /// Two workers that look at the same moment may pick the same third. They are then one
     /// connection off, which the accepts after them put right.
-    pub(crate) fn place(self: &Arc<Self>, own: usize, listener: usize) -> Held {
+    #[must_use]
+    pub fn place(self: &Arc<Self>, own: usize, listener: usize) -> Held {
         let loads: Vec<usize> = self.now();
         self.hold(least_loaded(&loads, own), listener)
     }
 
+    /// Counts a connection on `listener` as `worker`'s, if the worker has room for one and
+    /// the listener is not at its share: for what holds as much as a connection the worker
+    /// accepted, without being one — a WebSocket carried for an HTTP/2 or HTTP/3 client.
+    /// None when there is no room, as there would be no accepting.
+    #[must_use]
+    pub fn take(self: &Arc<Self>, worker: usize, listener: usize) -> Option<Held> {
+        (self.has_room(worker) && self.listener_has_room(listener))
+            .then(|| self.hold(worker, listener))
+    }
+
     /// Counts a connection on `listener` as `worker`'s, without looking at the others.
-    pub(crate) fn hold(self: &Arc<Self>, worker: usize, listener: usize) -> Held {
+    #[must_use]
+    pub fn hold(self: &Arc<Self>, worker: usize, listener: usize) -> Held {
         if let Some(load) = self.held.get(worker) {
             load.fetch_add(1, Ordering::Relaxed);
         }
@@ -173,7 +195,8 @@ impl Loads {
     }
 
     /// What every worker holds at this moment.
-    pub(crate) fn now(&self) -> Vec<usize> {
+    #[must_use]
+    pub fn now(&self) -> Vec<usize> {
         self.held
             .iter()
             .map(|load| load.load(Ordering::Relaxed))
@@ -184,14 +207,16 @@ impl Loads {
 /// A connection that counts as a worker's, until this is dropped: it goes where the
 /// connection goes, and is let go of wherever the connection ends — or is lost.
 #[derive(Debug)]
-pub(crate) struct Held {
+pub struct Held {
     loads: Arc<Loads>,
     worker: usize,
     listener: usize,
 }
 
 impl Held {
-    pub(crate) fn worker(&self) -> usize {
+    /// The worker it counts as.
+    #[must_use]
+    pub fn worker(&self) -> usize {
         self.worker
     }
 }
@@ -416,6 +441,29 @@ mod tests {
         let alone = Loads::new(2, 8, 1);
         let _held: Vec<Held> = (0..15).map(|at| alone.hold(at % 2, 0)).collect();
         assert!(alone.listener_has_room(0));
+    }
+
+    /// A connection taken rather than accepted is counted only while the worker has room
+    /// and the listener is not at its share, and counts like any other once taken.
+    #[test]
+    fn a_connection_is_taken_only_where_there_is_room() {
+        let loads = Loads::new(1, 2, 2);
+        let accepted = loads.hold(0, 0);
+        let taken = loads.take(0, 1).expect("room for a second");
+        assert_eq!(loads.now(), [2]);
+        assert!(loads.take(0, 1).is_none(), "taken past the worker's cap");
+        drop(accepted);
+        assert!(loads.take(0, 0).is_some(), "room again once one ended");
+        drop(taken);
+
+        // 16 in all, short from 14: the first listener holds 14, over its half.
+        let shared = Loads::new(2, 8, 2);
+        let _held: Vec<Held> = (0..14).map(|at| shared.hold(at % 2, 0)).collect();
+        assert!(
+            shared.take(0, 0).is_none(),
+            "taken past the listener's share"
+        );
+        assert!(shared.take(0, 1).is_some(), "the other listener refused");
     }
 
     /// A listener waiting at its share is woken when a connection ends and gives it room,

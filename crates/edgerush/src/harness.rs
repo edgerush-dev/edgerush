@@ -583,8 +583,8 @@ fn say(stderr: &mut impl Write, line: std::fmt::Arguments<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::balance::Loads;
     use edgerush_config::{Config, compile};
+    use edgerush_proxy::connections::Loads;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn parsed(args: &[&str]) -> Result<Parsed, UsageError> {

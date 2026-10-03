@@ -4,7 +4,6 @@
 //! subcommands. So far there is one: `proxy`, a data plane run from a config file — the
 //! development harness.
 
-mod balance;
 mod bind;
 mod config_file;
 mod harness;

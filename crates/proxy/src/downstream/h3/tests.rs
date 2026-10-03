@@ -2067,6 +2067,7 @@ async fn websocket_to(backend: SocketAddr) -> (Server, Client, u64, Ending) {
                     told.set(Some((carried, std::time::Instant::now())));
                 }),
                 counted: None,
+                held: None,
             });
             Answered::Map(Response::new(Full::new(Bytes::new())))
         }

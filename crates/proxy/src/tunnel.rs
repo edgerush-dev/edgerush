@@ -18,6 +18,7 @@
 //! side fails, when it has carried nothing for its idle bound, when the worker drains and
 //! its bound is up, or when the worker has no storage for a block to read into.
 
+use crate::connections::Held;
 use crate::drain::Drain;
 use crate::h2_stream::H2Stream;
 use crate::random::{random, unguessable};
@@ -111,6 +112,9 @@ pub(crate) struct Switched {
     /// The handshake's count at its endpoint, held until the tunnel closes: a WebSocket is
     /// load on its backend for as long as it is open (03 §6).
     pub(crate) counted: Option<InFlight>,
+    /// For a client over HTTP/2 or HTTP/3, the tunnel's count among its worker's
+    /// connections, held until it closes (03 §9).
+    pub(crate) held: Option<Held>,
 }
 
 impl std::fmt::Debug for Switched {
@@ -138,6 +142,7 @@ impl Switched {
             drain,
             ended,
             counted,
+            held,
         } = self;
         let carried = carry(
             client,
@@ -150,8 +155,9 @@ impl Switched {
             &drain,
         )
         .await;
-        // Load on its backend no longer.
+        // Load on its backend no longer, and a connection of its worker's no longer.
         drop(counted);
+        drop(held);
         ended(carried);
         carried
     }

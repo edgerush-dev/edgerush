@@ -15,6 +15,7 @@
 pub mod balance;
 #[cfg(not(feature = "fuzzing"))]
 mod balance;
+pub mod connections;
 mod cookies;
 mod drain;
 mod forwarding;

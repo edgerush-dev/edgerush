@@ -4,14 +4,14 @@
 //! process's, not a worker's.
 //!
 //! A worker accepts what the kernel gives its sockets and then decides whose connection it
-//! is ([`crate::balance`]). One that is another worker's is handed over as a socket that no
+//! is ([`edgerush_proxy::connections`]). One that is another worker's is handed over as a socket that no
 //! runtime knows yet, so that it is the other worker's runtime that watches it from its
 //! first byte on: once for a connection, and nothing crosses threads for a request.
 //!
 //! Everything a worker runs lives in a `LocalSet` of its own, so that a connection and all
 //! the engine spawns for it stay on the one thread and need not be `Send`.
 
-use crate::balance::{Held, Loads};
+use edgerush_proxy::connections::{Held, Loads};
 use edgerush_proxy::{AcceptPause, Forwarding, H1Limits, Proxy};
 use std::io;
 use std::rc::Rc;
@@ -128,7 +128,7 @@ pub(crate) fn start(
                 let entered = runtime.enter();
                 // The upstream connections of this worker and of no other, made where
                 // they are used: nothing about them can leave this thread.
-                let plane = edgerush_proxy::Worker::at(proxy, limits, number);
+                let plane = edgerush_proxy::Worker::at(proxy, limits, number, Arc::clone(&loads));
                 // One sweep for the worker, beside its listeners, for as long as it runs.
                 local.spawn_local(Rc::clone(&plane).maintain());
                 let worker = Worker {

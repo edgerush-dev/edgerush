@@ -14,7 +14,8 @@
 
 use bytes::Bytes;
 use edgerush_config::{Config, compile};
-use edgerush_proxy::{Proxy, Worker};
+use edgerush_proxy::connections::Loads;
+use edgerush_proxy::{H1Limits, Proxy, Worker};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -47,6 +48,16 @@ async fn within<T>(future: impl Future<Output = T>) -> T {
 /// A gateway whose one rule sends everything to `upstream`, the rule's `forward` given
 /// `extra` and the config `upstreams` besides; and the data plane, for its metrics.
 fn gateway(upstream: SocketAddr, extra: &str, upstreams: &str) -> (SocketAddr, Arc<Proxy>) {
+    gateway_counted(upstream, extra, upstreams, None)
+}
+
+/// The same, its worker the first of a process whose connections `connections` counts.
+fn gateway_counted(
+    upstream: SocketAddr,
+    extra: &str,
+    upstreams: &str,
+    connections: Option<Arc<Loads>>,
+) -> (SocketAddr, Arc<Proxy>) {
     let yaml = format!(
         r#"
 listeners:
@@ -79,7 +90,10 @@ upstreams:
         let local = tokio::task::LocalSet::new();
         let entered = runtime.enter();
         let socket = TcpListener::from_std(socket).unwrap();
-        let worker = Worker::new(serving);
+        let worker = match connections {
+            Some(connections) => Worker::at(serving, H1Limits::default(), 0, connections),
+            None => Worker::new(serving),
+        };
         local.spawn_local(std::rc::Rc::clone(&worker).maintain());
         local.spawn_local(worker.serve(0, socket));
         drop(entered);
@@ -852,6 +866,64 @@ async fn an_http2_websocket_is_carried_to_an_http1_backend() {
         ),
         Some(1)
     );
+}
+
+/// A WebSocket an HTTP/2 client asks for counts as one of its worker's connections for as
+/// long as it is open, and is answered 503 while there is no room for one, without a
+/// backend connection being opened for it; one that closes gives its room back. An HTTP/1.1
+/// client's is counted through its own connection, and is not refused (03 §9).
+#[tokio::test]
+async fn http2_websockets_count_as_connections_of_their_worker() {
+    let (saw, _seen) = mpsc::unbounded_channel();
+    let (upstream, accepted) = echoing(saw);
+    // Room for two connections, on one worker and one listener.
+    let connections = Loads::new(1, 2, 1);
+    let (address, proxy) = gateway_counted(upstream, FORWARD, "", Some(Arc::clone(&connections)));
+    let (mut send, announced) = h2_client(address).await;
+    assert!(announced, "extended CONNECT was not announced");
+    let mut open = Vec::new();
+    let mut statuses = Vec::new();
+    for _ in 0..4 {
+        send = within(send.ready()).await.unwrap();
+        let (response, stream) = send.send_request(connect_for("websocket"), false).unwrap();
+        let response = within(response).await.unwrap();
+        statuses.push(response.status().as_u16());
+        if response.status() == 200 {
+            // Kept, so that the tunnel stays open.
+            open.push((stream, response.into_body()));
+        }
+    }
+    assert_eq!(statuses, [200, 200, 503, 503]);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "a refused one went upstream"
+    );
+    assert_eq!(connections.now(), [2]);
+    let refused = r#"edgerush_listener_local_answers_total{listener="web",reason="no_room"}"#;
+    assert_eq!(sample(&proxy, refused), Some(2));
+
+    // An HTTP/1.1 client's own connection is what counts for it.
+    let mut client = Wire::to(address).await;
+    client.write(&handshake()).await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert_eq!(connections.now(), [2]);
+
+    // One closed, its room is back.
+    let (mut stream, mut body) = open.pop().unwrap();
+    stream.send_data(Bytes::new(), true).unwrap();
+    let _rest = all_of(&mut body).await;
+    counted(
+        &proxy,
+        r#"edgerush_listener_tunnels_total{listener="web",outcome="closed"}"#,
+        1,
+    )
+    .await;
+    assert_eq!(connections.now(), [1]);
+    send = within(send.ready()).await.unwrap();
+    let (response, _stream) = send.send_request(connect_for("websocket"), false).unwrap();
+    assert_eq!(within(response).await.unwrap().status(), 200);
 }
 
 /// A backend that answers an extended CONNECT's handshake with a page, 200, has not

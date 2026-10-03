@@ -313,6 +313,10 @@ pub(crate) enum Answer {
     /// This worker could not pay for the storage an exchange needed
     /// ([14 §8](../../docs/14-downstream-server.md)): its own failing, not the upstream's.
     Exhausted,
+    /// A WebSocket for an HTTP/2 or HTTP/3 client, which counts as a connection, found its
+    /// worker at its cap or its listener at its share
+    /// ([03 §9](../../docs/03-data-plane.md)).
+    NoRoom,
     /// The request's head could not take its changes ([14 §6](../../docs/14-downstream-server.md)).
     Edits,
     /// The request's body could not be read: the client's fault, found once the request
@@ -341,7 +345,7 @@ pub(crate) enum Answer {
 }
 
 impl Answer {
-    const ALL: [Self; 22] = [
+    const ALL: [Self; 23] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -355,6 +359,7 @@ impl Answer {
         Self::TooBusy,
         Self::OverShare,
         Self::Exhausted,
+        Self::NoRoom,
         Self::Edits,
         Self::BadBody,
         Self::BodyTimedOut,
@@ -380,6 +385,7 @@ impl Answer {
             | Self::TooBusy
             | Self::OverShare
             | Self::Exhausted
+            | Self::NoRoom
             | Self::QueueFull
             | Self::QueueTimedOut => StatusCode::SERVICE_UNAVAILABLE,
             Self::ConnectionAuth | Self::UnknownProtocol => StatusCode::NOT_IMPLEMENTED,
@@ -406,6 +412,7 @@ impl Answer {
             Self::TooBusy => "too_busy",
             Self::OverShare => "over_share",
             Self::Exhausted => "exhausted",
+            Self::NoRoom => "no_room",
             Self::Edits => "edits",
             Self::BadBody => "bad_body",
             Self::BodyTimedOut => "body_timed_out",
@@ -442,7 +449,7 @@ impl Answer {
             }
             Self::Unreachable => (Code::Unavailable, "the upstream could not be reached"),
             Self::UpstreamFailed => (Code::Unavailable, "the upstream failed to answer"),
-            Self::TooBusy | Self::QueueFull | Self::QueueTimedOut => (
+            Self::TooBusy | Self::NoRoom | Self::QueueFull | Self::QueueTimedOut => (
                 Code::Unavailable,
                 "the gateway is too busy to take the call",
             ),
