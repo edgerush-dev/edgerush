@@ -102,8 +102,9 @@ A first build of BoringSSL takes a few minutes.
 runs every check, stopping at the first that fails; all must pass before every commit,
 on Windows and on Linux. One of them, the dependencies' advisories and licences
 (`deny.toml`), needs `cargo-deny` (`cargo install --locked cargo-deny@0.20.2`, the version
-CI uses) and the network, to read the RustSec advisory database. There is no CI yet: the
-workflow in `.github/workflows/ci.yml` is kept ready for when the repository is published.
+CI uses) and the network, to read the RustSec advisory database. CI
+(`.github/workflows/ci.yml`) runs part of them, on Linux and Windows, for every push to
+`main` and every pull request; `check.sh` is the full set.
 
 ## Benchmarks
 
