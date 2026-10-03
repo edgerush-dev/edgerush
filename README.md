@@ -91,20 +91,20 @@ The Rust toolchain is pinned in `rust-toolchain.toml`; `rustup` installs it on f
 
 TLS is BoringSSL, built from source by `boring-sys`, which needs cmake and libclang
 (`apt install cmake libclang-dev` on Ubuntu) and on Windows NASM as well. On Windows,
-point `LIBCLANG_PATH` at the directory holding `libclang.dll` and `ASM_NASM` at
-`nasm.exe`, for instance in the `[env]` table of `~/.cargo/config.toml`. Go is not needed.
-A first build of BoringSSL takes a few minutes.
+which works for development but is not a recommended path, point `LIBCLANG_PATH` at the
+directory holding `libclang.dll` and `ASM_NASM` at `nasm.exe`, for instance in the `[env]`
+table of `~/.cargo/config.toml`. Go is not needed. A first build of BoringSSL takes a few
+minutes.
 
 ```sh
 ./check.sh
 ```
 
-runs every check, stopping at the first that fails; all must pass before every commit,
-on Windows and on Linux. One of them, the dependencies' advisories and licences
-(`deny.toml`), needs `cargo-deny` (`cargo install --locked cargo-deny@0.20.2`, the version
-CI uses) and the network, to read the RustSec advisory database. CI
-(`.github/workflows/ci.yml`) runs `check.sh` itself, on Linux and Windows, for every push
-to `main` and every pull request.
+runs every check, stopping at the first that fails; all must pass before every commit.
+One of them, the dependencies' advisories and licences (`deny.toml`), needs `cargo-deny`
+(`cargo install --locked cargo-deny@0.20.2`, the version CI uses) and the network, to read
+the RustSec advisory database. CI (`.github/workflows/ci.yml`) runs `check.sh` itself, on
+Linux, for every push to `main` and every pull request.
 
 ## Benchmarks
 

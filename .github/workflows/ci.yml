@@ -20,17 +20,11 @@ env:
 
 jobs:
   check:
-    # check.sh itself, so that CI and a local run cannot ask for different things.
-    name: check.sh (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    # check.sh itself, so that CI and a local run cannot ask for different things. On Linux
+    # alone: it is the platform EdgeRush is for, and Windows is only where it is developed.
+    name: check.sh
+    runs-on: ubuntu-latest
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    defaults:
-      run:
-        shell: bash
     steps:
       # Pinned to a commit; Dependabot moves the pin and the version after it together.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,7 +45,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             ~/.cargo/bin/cargo-deny
-            ~/.cargo/bin/cargo-deny.exe
             target
             fuzz/target
           key: ${{ runner.os }}-check-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'fuzz/Cargo.lock') }}
@@ -83,7 +76,6 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             ~/.cargo/bin/cargo-deny
-            ~/.cargo/bin/cargo-deny.exe
             target
             fuzz/target
           key: ${{ steps.cache.outputs.cache-primary-key }}
