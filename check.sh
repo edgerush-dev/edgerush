@@ -55,6 +55,13 @@ say "docs"
 # thing nobody reads a log to find.
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
+say "benchmarks"
+# The proxy's benchmarks reach its internals through its `fuzzing` feature, which nothing
+# above turns on, and clippy's --all-targets leaves out a target whose required features
+# are off: a signature they no longer match would go unnoticed until somebody ran one, as
+# benches/places.rs did from edef9a4 to fe60d90. Built, not run: running needs valgrind.
+cargo check -p edgerush-proxy --features fuzzing --benches
+
 say "fuzz targets"
 # A package of its own, outside the workspace: nothing above builds it, so a signature it
 # no longer matches would go unnoticed until somebody went to fuzz something.

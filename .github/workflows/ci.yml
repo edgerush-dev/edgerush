@@ -38,6 +38,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The proxy's benchmarks need its `fuzzing` feature, which --all-targets leaves off:
+      # built here so that one that no longer compiles is seen, as check.sh does.
+      - name: Benchmarks build
+        run: cargo check -p edgerush-proxy --features fuzzing --benches --locked
+
       - name: Test
         run: cargo test --workspace --locked
 
