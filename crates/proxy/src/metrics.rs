@@ -116,6 +116,9 @@ pub(crate) enum Quic {
     Retry,
     /// Answered with a version negotiation.
     Negotiation,
+    /// An Initial dropped: its worker had no room for another connection, or the listener
+    /// held its share of the room (03 §9).
+    NoRoom,
 }
 
 impl Quic {
@@ -126,15 +129,17 @@ impl Quic {
             Self::InboxFull => "inbox_full",
             Self::Retry => "retry",
             Self::Negotiation => "version_negotiation",
+            Self::NoRoom => "no_room",
         }
     }
 
     /// Every one of them, for a scrape that shows a series whether it has happened or not.
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Forwarded,
         Self::InboxFull,
         Self::Retry,
         Self::Negotiation,
+        Self::NoRoom,
     ];
 }
 
@@ -1206,6 +1211,7 @@ mod tests {
             "edgerush_listener_quic_datagrams_total{listener=\"web\",event=\"inbox_full\"} 0\n",
             "edgerush_listener_quic_datagrams_total{listener=\"web\",event=\"retry\"} 1\n",
             "edgerush_listener_quic_datagrams_total{listener=\"admin\",event=\"version_negotiation\"} 0\n",
+            "edgerush_listener_quic_datagrams_total{listener=\"web\",event=\"no_room\"} 0\n",
             "edgerush_listener_time_to_response_head_seconds_bucket{listener=\"web\",le=\"0.0005\"} 1\n",
             "edgerush_listener_time_to_response_head_seconds_bucket{listener=\"web\",le=\"0.001\"} 2\n",
             "edgerush_listener_time_to_response_head_seconds_bucket{listener=\"web\",le=\"+Inf\"} 2\n",

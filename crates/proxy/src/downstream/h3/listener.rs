@@ -554,9 +554,16 @@ fn admit<T: Fn() -> Option<InForce>>(
         return None;
     }
     // A worker without room among its connections takes no one, as a TCP listener at its
-    // cap accepts no one; the client sends its Initial again (03 §9).
+    // cap accepts no one; the client sends its Initial again (03 §9). Counted, as a
+    // listener's pause is: from outside, a refusal looks like a slow server.
     let held = match &shared.room {
-        Some(room) => Some(room.loads.take_slots(room.worker, room.listener, SLOTS)?),
+        Some(room) => {
+            let Some(held) = room.loads.take_slots(room.worker, room.listener, SLOTS) else {
+                (shared.count)(Quic::NoRoom);
+                return None;
+            };
+            Some(held)
+        }
         None => None,
     };
     // A listener the config no longer gives TLS takes no one.

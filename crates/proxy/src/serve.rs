@@ -13938,6 +13938,14 @@ upstreams:
                      (the worker counts {:?})",
                     connections.now()
                 );
+                // Each Initial dropped for want of room is counted.
+                let dropped = proxy.metrics().lines().find_map(|line| {
+                    line.strip_prefix(
+                        "edgerush_listener_quic_datagrams_total{listener=\"web\",event=\"no_room\"} ",
+                    )
+                    .and_then(|count| count.parse::<u64>().ok())
+                });
+                assert!(dropped.is_some_and(|count| count > 0), "{dropped:?}");
 
                 // The first goes, and with it what it was counted.
                 first.quic.close(true, 0x100, b"").unwrap();
