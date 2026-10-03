@@ -17,6 +17,7 @@
 
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::runs;
+use crate::storage::{Charge, Exhausted, Storage};
 use bytes::Bytes;
 use http::HeaderMap;
 use http_body::{Body, Frame, SizeHint};
@@ -37,14 +38,18 @@ struct GivenUp;
 #[derive(Debug)]
 enum Copied {
     Data(Bytes),
-    /// Small frames copied together; the last one on the queue may take more.
-    Run(Vec<u8>),
+    /// Small frames copied together, and what the worker is charged for them until the
+    /// mirror takes them; the last one on the queue may take more.
+    Run(Vec<u8>, Option<Charge>),
     Trailers(HeaderMap),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Queue {
     frames: VecDeque<Copied>,
+    /// The worker's account, which pays for the runs: a copy is paid for by nothing it was
+    /// copied from (14 §8).
+    storage: Rc<Storage>,
     /// Bytes on it not taken yet.
     behind: usize,
     ended: bool,
@@ -78,36 +83,50 @@ impl Queue {
     /// Puts a frame's data on the queue: as it is, unless it is small and finds a small
     /// frame or a run not taken yet at the queue's end, when it is copied onto the run — the
     /// frame it found with it.
-    fn put_data(&mut self, data: &Bytes) {
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`] if the worker cannot pay for the run.
+    fn put_data(&mut self, data: &Bytes) -> Result<(), Exhausted> {
         let small = |len: usize| len < runs::COPIED_BELOW;
         let joins = small(data.len())
             && match self.frames.back() {
-                Some(Copied::Run(_)) => true,
+                Some(Copied::Run(..)) => true,
                 Some(Copied::Data(last)) => small(last.len()),
                 _ => false,
             };
         if !joins {
-            return self.put(Copied::Data(data.clone()));
+            self.put(Copied::Data(data.clone()));
+            return Ok(());
         }
         if matches!(self.frames.back(), Some(Copied::Data(_)))
             && let Some(Copied::Data(last)) = self.frames.pop_back()
         {
-            self.frames.push_back(Copied::Run(Vec::new()));
-            self.copy(&last);
+            self.frames.push_back(Copied::Run(Vec::new(), None));
+            self.copy(&last)?;
         }
-        self.copy(data);
+        self.copy(data)?;
         self.wake_reader();
+        Ok(())
     }
 
-    /// Copies `data` onto the run at the queue's end, starting runs as each fills.
-    fn copy(&mut self, data: &[u8]) {
+    /// Copies `data` onto the run at the queue's end, paying for its room first, and starts
+    /// runs as each fills.
+    fn copy(&mut self, data: &[u8]) -> Result<(), Exhausted> {
         let mut rest = data;
         while !rest.is_empty() {
+            let storage = &self.storage;
             match self.frames.back_mut() {
-                Some(Copied::Run(run)) if run.len() < runs::RUN => rest = runs::fill(run, rest),
-                _ => self.frames.push_back(Copied::Run(Vec::new())),
+                Some(Copied::Run(run, charge)) if run.len() < runs::RUN => {
+                    rest = runs::fill(run, rest, |more| match charge {
+                        Some(charge) => charge.grow(more),
+                        None => storage.reserve(more).map(|paid| *charge = Some(paid)),
+                    })?;
+                }
+                _ => self.frames.push_back(Copied::Run(Vec::new(), None)),
             }
         }
+        Ok(())
     }
 
     fn wake_reader(&mut self) {
@@ -155,13 +174,23 @@ impl Kept {
 
 impl Tee {
     /// `inner`, copied to `mirrors` of them as it goes.
-    pub(crate) fn new(inner: RequestBody, mirrors: usize) -> (Self, Vec<(Copy, Kept)>) {
+    pub(crate) fn new(
+        inner: RequestBody,
+        mirrors: usize,
+        storage: &Rc<Storage>,
+    ) -> (Self, Vec<(Copy, Kept)>) {
         let ended = inner.is_end_stream();
         let queues: Vec<_> = (0..mirrors)
             .map(|_| {
                 Rc::new(RefCell::new(Queue {
+                    frames: VecDeque::new(),
+                    storage: Rc::clone(storage),
+                    behind: 0,
                     ended,
-                    ..Queue::default()
+                    given_up: false,
+                    fell_behind: false,
+                    waiting: None,
+                    watching: None,
                 }))
             })
             .collect();
@@ -202,9 +231,12 @@ impl Body for Tee {
                         if queue.behind + data.len() > MOST_BEHIND {
                             queue.fell_behind = true;
                             queue.give_up();
-                        } else {
+                        } else if queue.put_data(data).is_ok() {
                             queue.behind += data.len();
-                            queue.put_data(data);
+                        } else {
+                            // Behind further than the worker can pay to hold.
+                            queue.fell_behind = true;
+                            queue.give_up();
                         }
                     } else if let Some(trailers) = frame.trailers_ref() {
                         queue.put(Copied::Trailers(trailers.clone()));
@@ -262,7 +294,8 @@ impl Body for Copy {
                 queue.behind -= data.len();
                 Poll::Ready(Some(Ok(Frame::data(data))))
             }
-            Some(Copied::Run(run)) => {
+            // Its charge goes as it does: whoever sends it on pays for what it holds.
+            Some(Copied::Run(run, _charge)) => {
                 queue.behind -= run.len();
                 Poll::Ready(Some(Ok(Frame::data(Bytes::from(run)))))
             }
@@ -309,6 +342,11 @@ mod tests {
         RequestBody::Replayed(Replayed::of(frames))
     }
 
+    /// A worker's account with room for anything a test holds.
+    fn ample() -> Rc<Storage> {
+        Storage::new(crate::storage::LIMIT)
+    }
+
     /// Everything a body gives, or the error it stopped with; a body that waits on
     /// for more than a few seconds is a failure, not a test that never ends.
     async fn read(
@@ -334,6 +372,7 @@ mod tests {
         let (tee, mut copies) = Tee::new(
             body(vec![data(b"ab"), data(b"cd"), Frame::trailers(trailers())]),
             2,
+            &ample(),
         );
         let whole = (b"abcd".to_vec(), Some(trailers()));
         assert_eq!(read(tee).await.unwrap(), whole);
@@ -346,7 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_copy_waits_for_the_request_and_never_the_other_way() {
-        let (mut tee, mut copies) = Tee::new(body(vec![data(b"ab"), data(b"cd")]), 1);
+        let (mut tee, mut copies) = Tee::new(body(vec![data(b"ab"), data(b"cd")]), 1, &ample());
         let (mut copy, _kept) = copies.pop().unwrap();
         // Nothing has gone yet: the copy has nothing to give.
         let mut cx = Context::from_waker(Waker::noop());
@@ -359,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn a_mirror_too_far_behind_is_given_up_on_and_the_request_goes_on() {
         let big = Bytes::from(vec![b'x'; MOST_BEHIND]);
-        let (tee, mut copies) = Tee::new(body(vec![data(b"a"), Frame::data(big)]), 2);
+        let (tee, mut copies) = Tee::new(body(vec![data(b"a"), Frame::data(big)]), 2, &ample());
         let (keeping_up, _) = copies.pop().unwrap();
         let (behind, kept) = copies.pop().unwrap();
         // One mirror takes its first frame as it comes; the other takes nothing.
@@ -387,7 +426,7 @@ mod tests {
     #[tokio::test]
     async fn a_mirror_behind_on_small_frames_holds_them_in_runs() {
         let frames = (0..MOST_BEHIND).map(|_| data(b"x")).collect();
-        let (tee, mut copies) = Tee::new(body(frames), 2);
+        let (tee, mut copies) = Tee::new(body(frames), 2, &ample());
         let (keeping_up, _) = copies.pop().unwrap();
         let (behind, kept) = copies.pop().unwrap();
         let (mut tee, mut keeping_up) = (tee, keeping_up);
@@ -411,7 +450,7 @@ mod tests {
     async fn a_mirror_keeping_up_is_handed_the_frames_themselves() {
         let sent = [Bytes::from_static(b"a"), Bytes::from_static(b"b")];
         let frames = sent.iter().cloned().map(Frame::data).collect();
-        let (mut tee, mut copies) = Tee::new(body(frames), 1);
+        let (mut tee, mut copies) = Tee::new(body(frames), 1, &ample());
         let (mut copy, _kept) = copies.pop().unwrap();
         for frame in &sent {
             let _went = tee.frame().await.unwrap().unwrap();
@@ -428,7 +467,7 @@ mod tests {
     /// than coming as a frame of its own.
     #[tokio::test]
     async fn a_copy_waiting_is_woken_by_a_small_frame() {
-        let (mut tee, mut copies) = Tee::new(body(vec![data(b"a"), data(b"b")]), 1);
+        let (mut tee, mut copies) = Tee::new(body(vec![data(b"a"), data(b"b")]), 1, &ample());
         let (mut copy, _kept) = copies.pop().unwrap();
         let woken = std::sync::Arc::new(Woken::default());
         let waker = Waker::from(std::sync::Arc::clone(&woken));
@@ -438,9 +477,37 @@ mod tests {
         assert!(woken.was(), "a waiting copy was not told of a small frame");
     }
 
+    /// The runs a mirror that has fallen behind holds are paid for in the worker's storage
+    /// until it takes them, and a mirror the worker cannot pay to hold behind is given up on
+    /// as one too far behind: the request goes on.
+    #[tokio::test]
+    async fn a_mirrors_runs_are_paid_for_or_it_is_given_up() {
+        let bytes = || (0..1024).map(|_| data(b"x")).collect();
+        let storage = Storage::with_provision(1 << 20, 0);
+        let (mut tee, mut copies) = Tee::new(body(bytes()), 1, &storage);
+        let (copy, kept) = copies.pop().unwrap();
+        assert_eq!(read(&mut tee).await.unwrap().0.len(), 1024);
+        assert_eq!(storage.used(), 1024, "a run of 1,024 bytes");
+        assert_eq!(read(copy).await.unwrap().0.len(), 1024);
+        assert_eq!(storage.used(), 0, "the run taken, its charge went with it");
+        assert!(!kept.fell_behind());
+
+        let storage = Storage::with_provision(512, 0);
+        let (mut tee, mut copies) = Tee::new(body(bytes()), 1, &storage);
+        let (copy, kept) = copies.pop().unwrap();
+        assert_eq!(
+            read(&mut tee).await.unwrap().0.len(),
+            1024,
+            "the request held up"
+        );
+        assert!(kept.fell_behind());
+        assert!(read(copy).await.is_err());
+        assert_eq!(storage.used(), 0);
+    }
+
     #[tokio::test]
     async fn a_request_given_up_on_leaves_its_copies_failing_not_waiting() {
-        let (mut tee, mut copies) = Tee::new(body(vec![data(b"ab"), data(b"cd")]), 1);
+        let (mut tee, mut copies) = Tee::new(body(vec![data(b"ab"), data(b"cd")]), 1, &ample());
         let (copy, kept) = copies.pop().unwrap();
         let _first = tee.frame().await;
         drop(tee);
@@ -476,7 +543,7 @@ mod tests {
 
         // Too far behind: its reader took the first frame and turned to something else.
         let big = Bytes::from(vec![b'x'; MOST_BEHIND + 1]);
-        let (mut tee, mut copies) = Tee::new(body(vec![data(b"a"), Frame::data(big)]), 1);
+        let (mut tee, mut copies) = Tee::new(body(vec![data(b"a"), Frame::data(big)]), 1, &ample());
         let (mut copy, kept) = copies.pop().unwrap();
         let _first = tee.frame().await;
         let _taken = copy.frame().await;
@@ -491,7 +558,7 @@ mod tests {
         let woken = std::sync::Arc::new(Woken::default());
         let waker = Waker::from(std::sync::Arc::clone(&woken));
         let mut cx = Context::from_waker(&waker);
-        let (mut tee, mut copies) = Tee::new(body(vec![data(b"ab"), data(b"cd")]), 1);
+        let (mut tee, mut copies) = Tee::new(body(vec![data(b"ab"), data(b"cd")]), 1, &ample());
         let (_copy, kept) = copies.pop().unwrap();
         let _first = tee.frame().await;
         let mut told = std::pin::pin!(kept.given_up());
@@ -505,7 +572,7 @@ mod tests {
         assert!(!kept.fell_behind());
 
         // Whole, and not read at all.
-        let (tee, mut copies) = Tee::new(body(vec![data(b"ab"), data(b"cd")]), 1);
+        let (tee, mut copies) = Tee::new(body(vec![data(b"ab"), data(b"cd")]), 1, &ample());
         let (_copy, kept) = copies.pop().unwrap();
         assert_eq!(read(tee).await.unwrap().0, b"abcd");
         let mut cx = Context::from_waker(Waker::noop());
@@ -525,7 +592,7 @@ mod tests {
             ),
         ];
         for (frames, whole) in bodies {
-            let (mut tee, mut copies) = Tee::new(body(frames), 1);
+            let (mut tee, mut copies) = Tee::new(body(frames), 1, &ample());
             let (copy, kept) = copies.pop().unwrap();
             while !tee.is_end_stream() {
                 let _sent = tee.frame().await;
@@ -538,7 +605,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_without_a_body_is_copied_as_one() {
-        let (_tee, mut copies) = Tee::new(body(vec![]), 1);
+        let (_tee, mut copies) = Tee::new(body(vec![]), 1, &ample());
         let (copy, _) = copies.pop().unwrap();
         assert!(copy.is_end_stream());
         assert_eq!(read(copy).await.unwrap().0, b"");

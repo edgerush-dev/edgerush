@@ -8,13 +8,15 @@
 //! and a client chooses how small. A body that grows past [`MOST`] is let go of, and the
 //! request is not sent again; so is one that has not ended by the time its answer asks for a
 //! retry, since what it has not sent yet cannot be sent twice. Trailers are kept with the
-//! data.
+//! data. Once nothing can send it again — no handle to what was kept is left, as when its
+//! answer's head has come — a body is kept no more, and what was kept goes.
 //!
 //! A body none of which went is whole as it is: a try that lets go of it untouched — one
 //! that could not connect never reads it — gives it back, for the next try to send.
 
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::runs;
+use crate::storage::{Charge, Exhausted, Storage};
 use bytes::Bytes;
 use http::HeaderMap;
 use http_body::{Body, Frame, SizeHint};
@@ -33,7 +35,7 @@ enum Kept {
     Trailers(HeaderMap),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Recording {
     kept: Vec<Kept>,
     /// A small frame after everything in `kept`, kept as it is while no other small frame
@@ -42,8 +44,14 @@ struct Recording {
     /// Small frames being copied together, after everything in `kept`: kept itself once
     /// anything else comes, or the body ends.
     run: Vec<u8>,
+    /// The worker's account, which pays for the runs: a copy is paid for by nothing it was
+    /// copied from (14 §8).
+    storage: Rc<Storage>,
+    /// What the runs are charged, until the recording goes or keeps nothing.
+    charge: Option<Charge>,
     size: usize,
-    /// It grew past [`MOST`]: nothing is kept, and it is not to be sent again.
+    /// It grew past [`MOST`], or past what the worker could pay for, or nothing can send it
+    /// again: nothing is kept, and it is not to be sent again.
     capped: bool,
     ended: bool,
     /// The body itself, given back by a try that let go of it with none of it gone.
@@ -54,34 +62,56 @@ impl Recording {
     /// Keeps a frame's data: a larger one as it is, and a small one as it is too when it is
     /// the first small one in a row; one that follows it is copied onto a run, the first
     /// with it.
-    fn keep(&mut self, data: &Bytes) {
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`] if the worker cannot pay for the run.
+    fn keep(&mut self, data: &Bytes) -> Result<(), Exhausted> {
         if data.len() >= runs::COPIED_BELOW {
             self.close_run();
             self.kept.push(Kept::Data(data.clone()));
-            return;
+            return Ok(());
         }
         if self.run.is_empty() {
             match self.lone.take() {
                 None => {
                     self.lone = Some(data.clone());
-                    return;
+                    return Ok(());
                 }
-                Some(first) => self.copy(&first),
+                Some(first) => self.copy(&first)?,
             }
         }
-        self.copy(data);
+        self.copy(data)
     }
 
-    /// Copies `data` onto the run, keeping each run that fills.
-    fn copy(&mut self, data: &[u8]) {
+    /// Copies `data` onto the run, paying for its room first, and keeps each run that fills.
+    fn copy(&mut self, data: &[u8]) -> Result<(), Exhausted> {
         let mut rest = data;
         loop {
-            rest = runs::fill(&mut self.run, rest);
+            let Self {
+                run,
+                storage,
+                charge,
+                ..
+            } = self;
+            rest = runs::fill(run, rest, |more| match charge {
+                Some(charge) => charge.grow(more),
+                None => storage.reserve(more).map(|paid| *charge = Some(paid)),
+            })?;
             if rest.is_empty() {
-                break;
+                return Ok(());
             }
             self.close_run();
         }
+    }
+
+    /// Keeps nothing from now on, and lets go of what was kept and its charge.
+    fn cap(&mut self) {
+        self.capped = true;
+        self.kept = Vec::new();
+        self.lone = None;
+        self.run = Vec::new();
+        self.charge = None;
     }
 
     /// Keeps the small frames after everything in `kept`, as they stand: the lone one, or
@@ -117,12 +147,20 @@ pub(crate) struct Tee {
 pub(crate) struct Recorded(Rc<RefCell<Recording>>);
 
 impl Tee {
-    /// `inner`, kept as it goes, and where to find what was kept. A body that has ended
-    /// before it starts — none at all — is kept whole already.
-    pub(crate) fn new(inner: RequestBody) -> (Self, Recorded) {
+    /// `inner`, kept as it goes, the small frames it copies paid for in `storage`, and where
+    /// to find what was kept. A body that has ended before it starts — none at all — is kept
+    /// whole already.
+    pub(crate) fn new(inner: RequestBody, storage: &Rc<Storage>) -> (Self, Recorded) {
         let recording = Rc::new(RefCell::new(Recording {
+            kept: Vec::new(),
+            lone: None,
+            run: Vec::new(),
+            storage: Rc::clone(storage),
+            charge: None,
+            size: 0,
+            capped: false,
             ended: inner.is_end_stream(),
-            ..Recording::default()
+            untouched: None,
         }));
         (
             Self {
@@ -185,17 +223,17 @@ impl Body for Tee {
         let polled = Pin::new(&mut this.inner).poll_frame(cx);
         this.touched |= matches!(polled, Poll::Ready(Some(_)));
         let mut recording = this.recording.borrow_mut();
+        // Nothing can send it again once no handle to the recording is left — as when its
+        // answer's head has come — so it keeps nothing more, and lets go of what it kept.
+        if !recording.capped && Rc::strong_count(&this.recording) == 1 {
+            recording.cap();
+        }
         match &polled {
             Poll::Ready(Some(Ok(frame))) if !recording.capped => {
                 if let Some(data) = frame.data_ref() {
                     recording.size += data.len();
-                    if recording.size > MOST {
-                        recording.capped = true;
-                        recording.kept = Vec::new();
-                        recording.lone = None;
-                        recording.run = Vec::new();
-                    } else {
-                        recording.keep(data);
+                    if recording.size > MOST || recording.keep(data).is_err() {
+                        recording.cap();
                     }
                 } else if let Some(trailers) = frame.trailers_ref() {
                     recording.close_run();
@@ -283,6 +321,11 @@ mod tests {
         Frame::data(Bytes::from_static(bytes))
     }
 
+    /// A worker's account with room for anything a test keeps.
+    fn ample() -> Rc<Storage> {
+        Storage::new(crate::storage::LIMIT)
+    }
+
     fn trailers() -> HeaderMap {
         let mut trailers = HeaderMap::new();
         trailers.insert("x-sum", "7".parse().unwrap());
@@ -307,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_kept_whole_is_sent_again_the_same_trailers_and_all() {
         let inner = Replayed::of(vec![data(b"ab"), data(b"cd"), Frame::trailers(trailers())]);
-        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner));
+        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner), &ample());
         assert!(
             recorded.replay().is_none(),
             "sent again before it had all gone"
@@ -323,13 +366,13 @@ mod tests {
     async fn a_body_past_the_bound_is_not_kept_and_goes_on_as_it_came() {
         let big = Bytes::from(vec![b'x'; MOST]);
         let inner = Replayed::of(vec![data(b"a"), Frame::data(big)]);
-        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner));
+        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner), &ample());
         let (sent, _) = read(tee).await;
         assert_eq!(sent.len(), MOST + 1, "the body itself was cut short");
         assert!(recorded.replay().is_none());
         // Exactly at the bound is kept.
         let inner = Replayed::of(vec![Frame::data(Bytes::from(vec![b'x'; MOST]))]);
-        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner));
+        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner), &ample());
         let _sent = read(tee).await;
         assert!(recorded.replay().is_some());
     }
@@ -347,7 +390,7 @@ mod tests {
             data(b"de"),
             Frame::trailers(trailers()),
         ]);
-        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner));
+        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner), &ample());
         let mut whole = b"abc".to_vec();
         whole.extend_from_slice(&large);
         whole.extend_from_slice(b"de");
@@ -369,7 +412,7 @@ mod tests {
     async fn a_lone_small_frame_is_kept_as_it_is() {
         let small = Bytes::from_static(b"small");
         let inner = Replayed::of(vec![Frame::data(small.clone())]);
-        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner));
+        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner), &ample());
         let _sent = read(tee).await;
         let recording = recorded.0.borrow();
         assert!(
@@ -379,13 +422,59 @@ mod tests {
         );
     }
 
+    /// The runs a recording copies are paid for in the worker's storage for as long as it
+    /// keeps them, and a recording the worker cannot pay for is not kept: the body goes on
+    /// whole and is not sent again.
+    #[tokio::test]
+    async fn a_recordings_runs_are_paid_for_or_it_is_not_kept() {
+        let bytes = || (0..1024).map(|_| data(b"x")).collect();
+        let storage = Storage::with_provision(1 << 20, 0);
+        let (tee, recorded) = Tee::new(RequestBody::Replayed(Replayed::of(bytes())), &storage);
+        assert_eq!(read(tee).await.0.len(), 1024);
+        assert_eq!(storage.used(), 1024, "a run of 1,024 bytes");
+        assert!(recorded.replay().is_some());
+        drop(recorded);
+        assert_eq!(storage.used(), 0);
+
+        let storage = Storage::with_provision(512, 0);
+        let (tee, recorded) = Tee::new(RequestBody::Replayed(Replayed::of(bytes())), &storage);
+        assert_eq!(
+            read(tee).await.0.len(),
+            1024,
+            "the body itself was cut short"
+        );
+        assert!(
+            recorded.replay().is_none(),
+            "kept what the worker could not pay for"
+        );
+        assert_eq!(storage.used(), 0);
+    }
+
+    /// A recording nothing can send again any more — its handle gone, as once its answer's
+    /// head has come — keeps nothing more, and lets go of what it kept and its charge, while
+    /// the body goes on whole.
+    #[tokio::test]
+    async fn a_recording_nothing_can_send_again_lets_go_of_what_it_kept() {
+        let storage = Storage::with_provision(1 << 20, 0);
+        let frames = (0..1024).map(|_| data(b"x")).collect();
+        let (mut tee, recorded) = Tee::new(RequestBody::Replayed(Replayed::of(frames)), &storage);
+        for _ in 0..512 {
+            let _sent = tee.frame().await;
+        }
+        assert!(storage.used() > 0, "the run was not charged");
+        drop(recorded);
+        let _sent = tee.frame().await;
+        assert_eq!(storage.used(), 0, "kept on for nothing");
+        assert_eq!(read(tee).await.0.len(), 511, "the body did not go on whole");
+    }
+
     /// What a recording holds is bounded however the body is cut: a body within `MOST` in
     /// one-byte frames, as an HTTP/1 body of one-byte chunks arrives, is kept in no more than
     /// about `MOST`, its list of frames included, or not kept at all.
     #[tokio::test]
     async fn a_body_in_small_frames_is_kept_within_the_bound_or_not_at_all() {
         let frames = (0..MOST).map(|_| data(b"x")).collect();
-        let (tee, recorded) = Tee::new(RequestBody::Replayed(Replayed::of(frames)));
+        let (tee, recorded) = Tee::new(RequestBody::Replayed(Replayed::of(frames)), &ample());
         let (sent, _) = read(tee).await;
         assert_eq!(sent.len(), MOST);
         let recording = recorded.0.borrow();
@@ -410,7 +499,8 @@ mod tests {
             ),
         ];
         for (frames, whole) in bodies {
-            let (mut tee, recorded) = Tee::new(RequestBody::Replayed(Replayed::of(frames)));
+            let (mut tee, recorded) =
+                Tee::new(RequestBody::Replayed(Replayed::of(frames)), &ample());
             while !tee.is_end_stream() {
                 let _sent = tee.frame().await;
             }
@@ -425,7 +515,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_none_of_which_went_is_given_back_whole() {
         let inner = Replayed::of(vec![data(b"ab"), data(b"cd"), Frame::trailers(trailers())]);
-        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner));
+        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner), &ample());
         drop(tee);
         assert!(recorded.replay().is_none(), "kept what never went");
         let again = recorded.given_back().expect("given back");
@@ -439,7 +529,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_some_of_which_went_is_not_given_back() {
         let inner = Replayed::of(vec![data(b"ab"), data(b"cd")]);
-        let (mut tee, recorded) = Tee::new(RequestBody::Replayed(inner));
+        let (mut tee, recorded) = Tee::new(RequestBody::Replayed(inner), &ample());
         let _sent = tee.frame().await;
         drop(tee);
         assert!(recorded.given_back().is_none());
@@ -448,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_body_at_all_is_kept_from_the_start() {
-        let (_tee, recorded) = Tee::new(RequestBody::Replayed(Replayed::of(vec![])));
+        let (_tee, recorded) = Tee::new(RequestBody::Replayed(Replayed::of(vec![])), &ample());
         let again = recorded.replay().expect("nothing to wait for");
         assert!(again.is_end_stream());
     }

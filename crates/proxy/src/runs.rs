@@ -19,17 +19,28 @@ pub(crate) const RUN: usize = 16 * 1024;
 
 /// Copies as much of `data` onto `run` as fits within [`RUN`], and returns the rest. The
 /// run's room grows by doubling, never past [`RUN`], so that a run of one-byte frames is not
-/// made again for every byte.
-pub(crate) fn fill<'a>(run: &mut Vec<u8>, data: &'a [u8]) -> &'a [u8] {
+/// made again for every byte; a copy is not paid for by anything it was copied from, so
+/// `pay` is asked for each growth, in bytes, before it is made
+/// ([14 §8](../../docs/14-downstream-server.md)).
+///
+/// # Errors
+///
+/// What `pay` refuses with; the run is left as it was.
+pub(crate) fn fill<'a, E>(
+    run: &mut Vec<u8>,
+    data: &'a [u8],
+    pay: impl FnOnce(usize) -> Result<(), E>,
+) -> Result<&'a [u8], E> {
     let take = data.len().min(RUN.saturating_sub(run.len()));
     let (now, rest) = data.split_at(take);
     let wanted = run.len() + take;
     if wanted > run.capacity() {
         let room = wanted.next_power_of_two().min(RUN);
+        pay(room - run.capacity())?;
         run.reserve_exact(room - run.len());
     }
     run.extend_from_slice(now);
-    rest
+    Ok(rest)
 }
 
 #[cfg(test)]
@@ -37,16 +48,47 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// Pays for anything.
+    fn free(_more: usize) -> Result<(), ()> {
+        Ok(())
+    }
+
     #[test]
     fn a_run_takes_what_fits_and_gives_back_the_rest() {
         let mut run = Vec::new();
-        assert!(fill(&mut run, b"abc").is_empty());
+        assert_eq!(fill(&mut run, b"abc", free), Ok(&b""[..]));
         assert_eq!(run, b"abc");
         let big = vec![b'x'; RUN];
-        let rest = fill(&mut run, &big);
+        let rest = fill(&mut run, &big, free).unwrap();
         assert_eq!(run.len(), RUN);
         assert_eq!(rest.len(), 3);
-        assert_eq!(fill(&mut run, b"more"), b"more", "a full run took more");
+        assert_eq!(
+            fill(&mut run, b"more", free),
+            Ok(&b"more"[..]),
+            "a full run took more"
+        );
+    }
+
+    /// Every growth is paid for before it is made, all of the run's room in the end, and a
+    /// growth refused leaves the run as it was.
+    #[test]
+    fn a_run_is_paid_for_before_it_grows_and_a_refusal_changes_nothing() {
+        let mut run = Vec::new();
+        let mut paid = 0;
+        for _ in 0..100 {
+            let rest = fill(&mut run, b"x", |more| {
+                paid += more;
+                Ok::<_, ()>(())
+            });
+            assert_eq!(rest, Ok(&b""[..]));
+        }
+        assert_eq!(paid, run.capacity());
+        let before = (run.clone(), run.capacity());
+        assert_eq!(
+            fill(&mut run, &[b'y'; 100], |_| Err("no room")),
+            Err("no room")
+        );
+        assert_eq!((run.clone(), run.capacity()), before);
     }
 
     #[test]
@@ -55,7 +97,7 @@ mod tests {
         let mut grown = 0;
         let mut room = run.capacity();
         for _ in 0..RUN {
-            assert!(fill(&mut run, b"x").is_empty());
+            assert_eq!(fill(&mut run, b"x", free), Ok(&b""[..]));
             if run.capacity() != room {
                 grown += 1;
                 room = run.capacity();
@@ -77,7 +119,7 @@ mod tests {
             for frame in &frames {
                 let mut rest = frame.as_slice();
                 while let Some(run) = runs.last_mut() {
-                    rest = fill(run, rest);
+                    rest = fill(run, rest, free).unwrap();
                     if rest.is_empty() {
                         break;
                     }

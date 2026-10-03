@@ -2391,7 +2391,7 @@ impl Worker {
         retry: &CompiledRetry,
     ) -> Result<Answered<Body>, Answer> {
         let deadline = timing.deadline;
-        let (tee, recorded) = Tee::new(body);
+        let (tee, recorded) = Tee::new(body, self.blocks.borrow().storage());
         let mut body = RequestBody::Recorded(Box::new(tee));
         let mut admitted = admitted;
         // The first try's, and a later one's only where the first let go of the body
@@ -2540,7 +2540,7 @@ impl Worker {
         }
         // The request as it goes upstream, for the copies of it; made only if one is.
         let mut going = None;
-        let (tee, copies) = mirror::Tee::new(body, placed.len());
+        let (tee, copies) = mirror::Tee::new(body, placed.len(), self.blocks.borrow().storage());
         for ((mut mirror, admitted), (copy, kept)) in placed.into_iter().zip(copies) {
             let headers = match mirror.fields.take() {
                 // A copy made before the changes after it, and so before what the rest of

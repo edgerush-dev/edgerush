@@ -141,7 +141,7 @@ pub(crate) async fn exchange<F: OutgoingFields + ?Sized>(
     let (mut body, kept) = if end_stream {
         (Some(body), None)
     } else {
-        let (tee, kept) = Tee::new(body);
+        let (tee, kept) = Tee::new(body, storage);
         (Some(RequestBody::Recorded(Box::new(tee))), Some(kept))
     };
     let mut head = Some(first);

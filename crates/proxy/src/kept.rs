@@ -5,21 +5,27 @@
 use crate::mirror;
 use crate::request_body::RequestBody;
 use crate::retry::replay::{Replayed, Tee};
+use crate::storage::{LIMIT, Storage};
 use bytes::Bytes;
 use http_body::{Body, Frame};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-/// A request's body made of the data frames given, every one of them ready at once.
+/// A request's body made of the data frames given, every one of them ready at once, and the
+/// worker's account that pays for what is copied of it.
 #[derive(Debug)]
-pub struct Frames(RequestBody);
+pub struct Frames(RequestBody, Rc<Storage>);
 
 impl Frames {
     /// A body of `data`, a frame each.
     #[must_use]
     pub fn new(data: Vec<Bytes>) -> Self {
         let frames = data.into_iter().map(Frame::data).collect();
-        Self(RequestBody::Replayed(Replayed::of(frames)))
+        Self(
+            RequestBody::Replayed(Replayed::of(frames)),
+            Storage::new(LIMIT),
+        )
     }
 }
 
@@ -27,7 +33,7 @@ impl Frames {
 /// was kept once more; the frames given in all.
 #[must_use]
 pub fn recorded(body: Frames) -> usize {
-    let (mut tee, recorded) = Tee::new(body.0);
+    let (mut tee, recorded) = Tee::new(body.0, &body.1);
     let sent = drain(&mut tee);
     drop(tee);
     let again = recorded
@@ -40,7 +46,7 @@ pub fn recorded(body: Frames) -> usize {
 /// gone, as a mirror that has fallen behind reads it; the frames given in all.
 #[must_use]
 pub fn mirrored(body: Frames) -> usize {
-    let (mut tee, mut copies) = mirror::Tee::new(body.0, 1);
+    let (mut tee, mut copies) = mirror::Tee::new(body.0, 1, &body.1);
     let sent = drain(&mut tee);
     let copied = copies.pop().map_or(0, |(mut copy, _kept)| drain(&mut copy));
     sent + copied
