@@ -49,6 +49,8 @@ pub struct Compiled {
     /// By position of the route, then of the rule. Each is shared on its own, so that a
     /// request can hold on to its rule without holding on to the whole config.
     rules: Vec<Vec<Arc<CompiledRule>>>,
+    /// By position of the route: its name.
+    route_names: Vec<String>,
     /// The data plane's own settings.
     pub data_plane: CompiledDataPlane,
 }
@@ -77,6 +79,18 @@ impl Compiled {
     pub fn upstream(&self, id: UpstreamId) -> Option<&CompiledUpstream> {
         self.upstreams.get(id.0)
     }
+
+    /// The name of the route at `route`, a position as a [`RuleId`] gives it.
+    #[must_use]
+    pub fn route_name(&self, route: usize) -> Option<&str> {
+        self.route_names.get(route).map(String::as_str)
+    }
+
+    /// The rules of the route at `route`, in its order; none for a route there is not.
+    #[must_use]
+    pub fn rules_of(&self, route: usize) -> &[Arc<CompiledRule>] {
+        self.rules.get(route).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// A listener and the router for the requests that come in there.
@@ -94,6 +108,9 @@ pub struct CompiledListener {
     pub http3: Option<Http3>,
     /// Finds the rule a request belongs to, among the routes that are for this listener.
     pub router: Router<RuleId>,
+    /// The routes that are for it, by their positions, as a [`RuleId`] gives them; none for
+    /// a `tcp` or `tls` listener, whose routes are its `l4`.
+    pub http_routes: Vec<usize>,
     /// Where a `tcp` or `tls` listener's connections go; `None` for an HTTP listener.
     pub l4: Option<L4>,
     /// How long a tunnel of this listener's may carry nothing before it is closed: an hour
@@ -149,8 +166,21 @@ impl SniRouter {
     /// hostname that covers it, and among equally specific ones the route that came first.
     #[must_use]
     pub fn route(&self, name: &str) -> Option<&L4Route> {
+        self.route_at(name).map(|(_, route)| route)
+    }
+
+    /// The same, with its position among [`SniRouter::routes`].
+    #[must_use]
+    pub fn route_at(&self, name: &str) -> Option<(usize, &L4Route)> {
         let group = self.hosts.lookup(name).next()?;
-        self.routes.get(*group.first()?)
+        let at = *group.first()?;
+        Some((at, self.routes.get(at)?))
+    }
+
+    /// Every route of the listener's, each once.
+    #[must_use]
+    pub fn routes(&self) -> &[L4Route] {
+        &self.routes
     }
 }
 
@@ -695,12 +725,17 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
         .collect();
     let mut rules = Vec::new();
     let mut names = HashSet::new();
+    // The routes of every listener, by the listener's name.
+    let mut http_routes: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (route_at, route) in config.routes.iter().enumerate() {
         let place = Place::route(&route.name);
         if !names.insert(route.name.as_str()) {
             errors.push(place.problem(Problem::DuplicateName));
         }
         let listeners = listeners_of(route, &matches, &place, &mut errors);
+        for listener in &listeners {
+            http_routes.entry(listener).or_default().push(route_at);
+        }
         for listener in &listeners {
             let protocol = config.listeners.get(*listener).map(|l| l.protocol);
             if let Some(protocol @ (Protocol::Tcp | Protocol::Tls)) = protocol {
@@ -787,6 +822,7 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                 }),
                 http3: listener.http3,
                 router: Router::new(matches.remove(name.as_str()).unwrap_or_default()),
+                http_routes: http_routes.remove(name.as_str()).unwrap_or_default(),
                 l4: l4.remove(name.as_str()),
                 tunnel_idle: Duration::from_secs(
                     listener.tunnel_idle_seconds.unwrap_or(TUNNEL_IDLE_SECONDS),
@@ -810,6 +846,11 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
             listeners,
             upstreams,
             rules,
+            route_names: config
+                .routes
+                .iter()
+                .map(|route| route.name.clone())
+                .collect(),
             data_plane,
         })
     } else {
@@ -2978,6 +3019,21 @@ upstreams:
         assert_eq!(route("a.b.example.com"), Some("rest"));
         assert_eq!(route("example.com"), None);
         assert_eq!(route("elsewhere.test"), None);
+        // Each with its place among the listener's routes, which are each there once.
+        let at = |name: &str| {
+            sni.route_at(name)
+                .map(|(at, route)| (at, route.name.as_str()))
+        };
+        assert_eq!(at("api.example.com"), Some((0, "api")));
+        assert_eq!(at("www.example.com"), Some((1, "rest")));
+        let names: Vec<&str> = sni
+            .routes()
+            .iter()
+            .map(|route| route.name.as_str())
+            .collect();
+        assert_eq!(names, ["api", "rest", "also-api"]);
+        let upstreams: Vec<UpstreamId> = db.backends.upstreams().collect();
+        assert_eq!(upstreams, [UpstreamId(1)]);
         assert!(listener(&compiled, "web").l4.is_none());
         // A tunnel's idle bound, as said, or an hour.
         assert_eq!(
@@ -2988,6 +3044,52 @@ upstreams:
             listener(&compiled, "sni").tunnel_idle,
             Duration::from_secs(3_600)
         );
+    }
+
+    /// A listener's HTTP routes are known by their positions, as a rule's ID gives them, and
+    /// each position by its route's name and rules; a route for two listeners is each's.
+    #[test]
+    fn a_listeners_http_routes_are_known_by_position_and_name() {
+        let compiled = compile(&config(
+            r#"
+listeners:
+  a: { address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  b: { address: "[::]:81", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  idle: { address: "[::]:82", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+routes:
+  - name: first
+    listeners: [a]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: /one } }]
+        forward: { backends: [{ upstream: one, weight: 1 }] }
+      - matches: [{ path: { prefix: /two } }]
+        forward: { backends: [{ upstream: two, weight: 1 }, { upstream: one, weight: 0 }] }
+  - name: shared
+    listeners: [b, a]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: two, weight: 1 }] }
+upstreams:
+  one: { load_balancer: p2c, endpoints: ["10.0.0.1:80"] }
+  two: { load_balancer: p2c, endpoints: ["10.0.0.2:80"] }
+"#,
+        ))
+        .unwrap();
+        assert_eq!(listener(&compiled, "a").http_routes, [0, 1]);
+        assert_eq!(listener(&compiled, "b").http_routes, [1]);
+        assert!(listener(&compiled, "idle").http_routes.is_empty());
+        assert_eq!(compiled.route_name(0), Some("first"));
+        assert_eq!(compiled.route_name(1), Some("shared"));
+        assert_eq!(compiled.route_name(2), None);
+        assert_eq!(compiled.rules_of(0).len(), 2);
+        assert!(compiled.rules_of(2).is_empty());
+        // A backend with no share is no upstream of the rule's.
+        let Outcome::Forward { backends, .. } = &compiled.rules_of(0)[1].outcome else {
+            panic!("the rule forwards");
+        };
+        assert_eq!(backends.upstreams().collect::<Vec<_>>(), [UpstreamId(1)]);
     }
 
     /// A route goes only to listeners of its kind, a `tcp` listener has exactly one, a

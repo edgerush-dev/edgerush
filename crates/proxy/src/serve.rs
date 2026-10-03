@@ -45,6 +45,7 @@ use crate::request::{Decision, Opening, decide};
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::retry::budget::Budget;
 use crate::retry::replay::Tee;
+use crate::routed::{Routed, Through};
 use crate::slots::{Slots, WorkerSlots};
 use crate::storage::Storage;
 use crate::timers::{Alarm, Timers};
@@ -403,8 +404,11 @@ pub struct Worker {
     /// By position in [`Proxy::listeners`]: the client validation its connections here are
     /// accepted under, and the drain they hear.
     validations: RefCell<Vec<Validation>>,
-    /// Which snapshot `validations` were last brought up to.
+    /// Which snapshot `validations` and `routes` were last brought up to.
     validated: Cell<u64>,
+    /// By key ([`Routed`]): the drain of the tunnels routed by a listener, route and
+    /// upstream, which a reload that takes any of the three away starts (03 §10).
+    routes: RefCell<HashMap<u64, Rc<Drain>>>,
 }
 
 /// The client validation a listener's connections were accepted under on a worker, and the
@@ -592,6 +596,9 @@ struct Snapshot {
     /// By position in [`Proxy::listeners`]: the `Alt-Svc` its answers carry, if it serves
     /// HTTP/3 (16 §5), made once so that no answer formats it.
     alt_svc: Vec<Option<HeaderModifier>>,
+    /// What its tunnels are routed by, keyed so that a worker sees at a reload which went
+    /// (03 §10). Worked out against the config this one replaces, as `destinations` are.
+    routed: Routed,
 }
 
 impl Snapshot {
@@ -613,6 +620,9 @@ impl Snapshot {
             .iter()
             .map(|upstream| upstream.endpoints.iter().map(authority).collect())
             .collect::<Result<_, _>>()?;
+        let nothing_routed = Routed::default();
+        let previous_routed = previous.map_or(&nothing_routed, |previous| &previous.routed);
+        let routed = Routed::reconcile(&config, listeners, previous_routed, keys);
         let listeners: Vec<Option<usize>> = listeners
             .iter()
             .map(|name| config.listeners.iter().position(|l| l.name == *name))
@@ -688,6 +698,7 @@ impl Snapshot {
             tls,
             alt_svc,
             secure,
+            routed,
         })
     }
 }
@@ -998,6 +1009,7 @@ impl Worker {
             received,
             validations,
             validated,
+            routes: RefCell::default(),
         })
     }
 
@@ -1006,16 +1018,38 @@ impl Worker {
     /// (03 §10). A worker's sweep does this by itself once [`Proxy::drain`] has been called.
     pub fn drain(&self) {
         self.drain.start();
-        // Every connection's drain too; one accepted later is given one already started.
+        // Every connection's and tunnel's drain too; one made later is started as it is.
         let drains: Vec<Rc<Drain>> = self
             .validations
             .borrow()
             .iter()
             .map(|validation| Rc::clone(&validation.drain))
+            .chain(self.routes.borrow().values().map(Rc::clone))
             .collect();
         for drain in drains {
             drain.start();
         }
+    }
+
+    /// What a tunnel routed by `key` drains with besides its client's connection: the drain
+    /// of its listener, route and upstream, which a reload that takes any of them away
+    /// starts (03 §10). None, for a tunnel whose route has no key, is the worker's own.
+    fn route_drain(&self, key: Option<u64>) -> Rc<Drain> {
+        let Some(key) = key else {
+            return Rc::clone(&self.drain);
+        };
+        if let Some(drain) = self.routes.borrow().get(&key) {
+            return Rc::clone(drain);
+        }
+        let drain = Rc::new(Drain::default());
+        // A key the config in force no longer has — taken away while a WebSocket's
+        // handshake was under way — is drained at once, as is one of a worker that drains.
+        if self.drain.is_on() || !self.proxy.current.load().routed.holds(key) {
+            drain.start();
+            return drain;
+        }
+        self.routes.borrow_mut().insert(key, Rc::clone(&drain));
+        drain
     }
 
     /// What a connection accepted on `listener` with `tls` drains with: the drain of the
@@ -1038,16 +1072,17 @@ impl Worker {
         drain
     }
 
-    /// Brings the validations up to the snapshot in force, once a reload has come: the
-    /// connections of a listener whose client validation it replaced drain (03 §3), and those
-    /// of one whose certificates alone changed do not. For the sweep.
+    /// Brings the validations and the routes up to the snapshot in force, once a reload has
+    /// come: the connections of a listener whose client validation it replaced drain (03 §3),
+    /// and those of one whose certificates alone changed do not; the tunnels of a listener,
+    /// route and upstream it took away drain (03 §10). For the sweep.
     fn revalidate(&self) {
         let snapshot = self.proxy.current.load();
         if snapshot.generation == self.validated.get() {
             return;
         }
         self.validated.set(snapshot.generation);
-        let replaced: Vec<Rc<Drain>> = {
+        let mut replaced: Vec<Rc<Drain>> = {
             let mut validations = self.validations.borrow_mut();
             validations
                 .iter_mut()
@@ -1063,6 +1098,14 @@ impl Worker {
                 })
                 .collect()
         };
+        // A route's drain no tunnel holds is let go of too; the next tunnel makes another.
+        self.routes.borrow_mut().retain(|key, drain| {
+            if !snapshot.routed.holds(*key) {
+                replaced.push(Rc::clone(drain));
+                return false;
+            }
+            Rc::strong_count(drain) > 1
+        });
         for drain in replaced {
             drain.start();
         }
@@ -1551,7 +1594,7 @@ impl Worker {
         };
         let routed = self.pass_route(connection.listener, name.as_deref());
         // Held until the tunnel closes: it is load on its backend for as long as it is open.
-        let (endpoint, idle, _counted) = match routed {
+        let (endpoint, idle, _counted, route) = match routed {
             Ok(routed) => routed,
             Err(ended) => {
                 if let Some(block) = hello {
@@ -1623,7 +1666,7 @@ impl Worker {
             &self.blocks,
             bounds,
             &self.timers,
-            &connection.drain,
+            [&connection.drain, &route],
         )
         .await
         .into()
@@ -1660,17 +1703,19 @@ impl Worker {
         &self,
         listener: usize,
         name: Option<&str>,
-    ) -> Result<(Arc<ReuseIdentity>, Duration, InFlight), Tunnel> {
+    ) -> Result<(Arc<ReuseIdentity>, Duration, InFlight, Rc<Drain>), Tunnel> {
         let snapshot = self.proxy.current.load();
         let Some(compiled) = snapshot.listener(listener) else {
             return Err(Tunnel::Refused);
         };
         let route = match (&compiled.l4, name) {
-            (Some(L4::Tcp(route)), _) => Some(route),
-            (Some(L4::Tls(routes)), Some(name)) => routes.route(name),
+            (Some(L4::Tcp(route)), _) => Some((Through::Tcp, route)),
+            (Some(L4::Tls(routes)), Some(name)) => routes
+                .route_at(name)
+                .map(|(at, route)| (Through::Tls(at), route)),
             _ => None,
         };
-        let Some(route) = route else {
+        let Some((through, route)) = route else {
             return Err(Tunnel::Refused);
         };
         // A backend with no endpoint refuses its share of connections, as TLSRoute has
@@ -1686,7 +1731,9 @@ impl Worker {
         else {
             return Err(Tunnel::NoBackend);
         };
-        Ok((Arc::clone(identity), compiled.tunnel_idle, counted))
+        // Taken here, of the snapshot the tunnel was routed by, before anything is waited on.
+        let drain = self.route_drain(snapshot.routed.key(listener, through, upstream.0));
+        Ok((Arc::clone(identity), compiled.tunnel_idle, counted, drain))
     }
 
     /// Reads a TLS client's ClientHello into `into`, by `due`, the end of the first-request
@@ -2776,6 +2823,7 @@ impl Worker {
             },
             blocks: Rc::clone(&self.blocks),
             timers: Rc::clone(&self.timers),
+            route: self.route_drain(handshake.route),
             ended: Box::new(move |carried: Carried| {
                 if let Some(counters) = proxy.metrics.listener(listener) {
                     counters.tunnel(carried.into());
@@ -3126,6 +3174,9 @@ impl Proxy {
                 listener: came_on,
                 server: None,
                 held: Cell::new(None),
+                route: snapshot
+                    .routed
+                    .key(came_on, Through::Http(forward.route), upstream),
             }))
         });
         if let Some(counters) = self.metrics.upstream(upstream_slot) {
@@ -3268,6 +3319,9 @@ struct Handshake {
     /// anything goes upstream and handed to the tunnel by the try that switches; let go of
     /// with the handshake if none does (03 §9).
     held: Cell<Option<Held>>,
+    /// The key of the listener, route and upstream it was routed by, whose drain its tunnel
+    /// hears (03 §10).
+    route: Option<u64>,
 }
 
 impl Handshake {
@@ -5977,6 +6031,127 @@ upstreams:
                 assert!(took + EARLY >= SHORT.drain, "closed after {took:?}");
                 assert!(took < SHORT.drain + SLACK, "closed after {took:?}");
                 tunnel_ended(&worker, "db", "drained").await;
+            })
+            .await;
+    }
+
+    /// A worker serving `yaml`'s one listener, a passthrough one, as `passing` does, with its
+    /// sweep run every 50 ms, as `serving_swept`'s.
+    async fn passing_swept(yaml: &str) -> (SocketAddr, Rc<Worker>) {
+        let config: Config = serde_saphyr::from_str(yaml).unwrap();
+        serving_swept(compile(&config).unwrap()).await
+    }
+
+    /// Whether `client`'s tunnel is still open after `waited`: nothing read, and no end.
+    async fn still_open(client: &mut TcpStream, waited: Duration) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut byte = [0; 1];
+        tokio::time::timeout(waited, client.read(&mut byte))
+            .await
+            .is_err()
+    }
+
+    /// A tunnel open across a reload that keeps its listener, its route and the route's
+    /// upstream is left alone, whatever else the reload changes; one that takes the
+    /// listener and its route away drains it from the worker's next sweep: closed at the
+    /// drain's bound, as a draining worker's are (03 §10).
+    #[tokio::test]
+    async fn a_tunnel_is_drained_once_a_reload_takes_its_route_away() {
+        use tokio::io::AsyncReadExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let backend = naming_backend("a").await;
+                let other = naming_backend("b").await;
+                let yaml = tcp_to(backend, "");
+                let (front, worker) = passing_swept(&yaml).await;
+                let mut client = TcpStream::connect(front).await.unwrap();
+                let mut name = [0; 1];
+                bounded(client.read_exact(&mut name)).await.unwrap();
+                assert_eq!(&name, b"a");
+
+                // Another weight and another upstream: the route is the same.
+                let route = "backends: [{ upstream: up, weight: 1 }]";
+                assert!(yaml.contains(route), "{yaml}");
+                let reweighted = yaml
+                    .replace(
+                        route,
+                        "backends: [{ upstream: up, weight: 3 }, { upstream: spare, weight: 0 }]",
+                    )
+                    .replace(
+                        "upstreams: {",
+                        &format!(
+                            "upstreams: {{ spare: {{ load_balancer: p2c, endpoints: [\"{other}\"] }}, "
+                        ),
+                    );
+                let reweighted: Config = serde_saphyr::from_str(&reweighted).unwrap();
+                worker
+                    .proxy()
+                    .reload(compile(&reweighted).unwrap())
+                    .unwrap();
+                let quiet = worker.limits.sweep * 2 + SHORT.drain + SLACK;
+                assert!(
+                    still_open(&mut client, quiet).await,
+                    "a tunnel whose route was kept ended"
+                );
+
+                // No listener, no route: what comes in on its socket has none (03 §3).
+                let without: Config = serde_saphyr::from_str(&format!(
+                    "listeners: {{ web: {{ address: \"127.0.0.1:0\", protocol: http, \
+                     proxy_protocol: off, forwarding: {{ trusted_proxies: [], \
+                     trusted_only_headers: [] }}, request_id: generate }} }}\n\
+                     routes: []\n\
+                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: [\"{backend}\"] }} }}\n"
+                ))
+                .unwrap();
+                worker.proxy().reload(compile(&without).unwrap()).unwrap();
+                let took = closed_after(&mut client).await;
+                assert!(took + EARLY >= SHORT.drain, "closed after {took:?}");
+                assert!(
+                    took < worker.limits.sweep + SHORT.drain + SLACK,
+                    "closed after {took:?}"
+                );
+                tunnel_ended(&worker, "db", "drained").await;
+            })
+            .await;
+    }
+
+    /// A tunnel whose route a reload sends to another upstream is drained, as the route's
+    /// listing of the upstream it went to is gone; new connections go to the new one.
+    #[tokio::test]
+    async fn a_tunnel_is_drained_once_a_reload_takes_its_upstream_from_its_route() {
+        use tokio::io::AsyncReadExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let backend = naming_backend("a").await;
+                let other = naming_backend("b").await;
+                let yaml = tcp_to(backend, "");
+                let (front, worker) = passing_swept(&yaml).await;
+                let mut client = TcpStream::connect(front).await.unwrap();
+                let mut name = [0; 1];
+                bounded(client.read_exact(&mut name)).await.unwrap();
+                assert_eq!(&name, b"a");
+
+                let repointed = yaml
+                    .replace("{ upstream: up, weight: 1 }", "{ upstream: elsewhere, weight: 1 }")
+                    .replace(
+                        "upstreams: {",
+                        &format!(
+                            "upstreams: {{ elsewhere: {{ load_balancer: p2c, endpoints: [\"{other}\"] }}, "
+                        ),
+                    );
+                let repointed: Config = serde_saphyr::from_str(&repointed).unwrap();
+                worker.proxy().reload(compile(&repointed).unwrap()).unwrap();
+                let took = closed_after(&mut client).await;
+                assert!(took + EARLY >= SHORT.drain, "closed after {took:?}");
+                assert!(
+                    took < worker.limits.sweep + SHORT.drain + SLACK,
+                    "closed after {took:?}"
+                );
+                let mut fresh = TcpStream::connect(front).await.unwrap();
+                bounded(fresh.read_exact(&mut name)).await.unwrap();
+                assert_eq!(&name, b"b");
             })
             .await;
     }
@@ -13249,6 +13424,69 @@ upstreams:
                 assert_eq!(rest, b"", "the backend's answer went on");
                 let heard = within(seen.recv()).await.unwrap();
                 assert_eq!(heard.len(), 8, "{heard:?}");
+                assert_eq!(&heard[..2], &[0x88, 0x82], "{heard:?}");
+                let code = [heard[6] ^ heard[2], heard[7] ^ heard[3]];
+                assert_eq!(u16::from_be_bytes(code), 1001);
+                tunnel_ended(&worker, "web", "drained").await;
+            })
+            .await;
+    }
+
+    /// A WebSocket open across a reload that keeps its route is left alone; one whose route
+    /// a reload takes away is closed as a draining worker closes it, with a Close 1001 each
+    /// way, from the worker's next sweep (03 §10, 19 §6).
+    #[tokio::test]
+    async fn a_websocket_whose_route_a_reload_takes_away_is_closed_with_going_away() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (saw, mut seen) = tokio::sync::mpsc::unbounded_channel();
+                let upstream = closing_websocket_backend(saw).await;
+                let mut config = everything_config(upstream);
+                let (front, worker) = serving_swept(compile(&config).unwrap()).await;
+                let mut client = TcpStream::connect(front).await.unwrap();
+                client
+                    .write_all(
+                        b"GET /chat HTTP/1.1\r\nhost: a.test\r\nupgrade: websocket\r\n\
+                          connection: upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                          sec-websocket-version: 13\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    within(client.read_exact(&mut byte)).await.unwrap();
+                    head.push(byte[0]);
+                }
+                assert!(head.starts_with(b"HTTP/1.1 101 "));
+
+                // Another route beside it: its own is kept.
+                let mut other = config.routes[0].clone();
+                other.name = "other".to_owned();
+                config.routes.push(other);
+                worker.proxy().reload(compile(&config).unwrap()).unwrap();
+                let quiet = worker.limits.sweep * 4 + SLACK;
+                assert!(
+                    still_open(&mut client, quiet).await,
+                    "a WebSocket whose route was kept was sent something"
+                );
+
+                // Its route gone, another in its place: drained.
+                config.routes.remove(0);
+                worker.proxy().reload(compile(&config).unwrap()).unwrap();
+                let mut close = [0; 4];
+                within(client.read_exact(&mut close)).await.unwrap();
+                assert_eq!(close, [0x88, 0x02, 0x03, 0xe9], "not a Close 1001");
+                client
+                    .write_all(&[0x88, 0x82, 0, 0, 0, 0, 0x03, 0xe9])
+                    .await
+                    .unwrap();
+                let mut rest = Vec::new();
+                let _closed = within(client.read_to_end(&mut rest)).await;
+                assert_eq!(rest, b"", "the backend's answer went on");
+                let heard = within(seen.recv()).await.unwrap();
                 assert_eq!(&heard[..2], &[0x88, 0x82], "{heard:?}");
                 let code = [heard[6] ^ heard[2], heard[7] ^ heard[3]];
                 assert_eq!(u16::from_be_bytes(code), 1001);

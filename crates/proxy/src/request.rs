@@ -58,6 +58,8 @@ pub struct Forward<'a> {
     /// request that is still under way when the config changes keeps its rule, and only
     /// its rule, alive.
     pub rule: &'a Arc<CompiledRule>,
+    /// The position of the rule's route, as a [`RuleId`](edgerush_config::RuleId) gives it.
+    pub route: usize,
     /// The upstream chosen among the rule's backends: its position in the snapshot's list.
     pub upstream: UpstreamId,
     /// The rule's mirrors that take a copy of this request, in the rule's order. None of
@@ -379,6 +381,7 @@ pub fn decide<'a, H: Head>(
     }
     Ok(Decision::Forward(Forward {
         rule,
+        route: id.route,
         upstream,
         mirrors,
         websocket,

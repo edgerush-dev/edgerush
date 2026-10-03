@@ -36,14 +36,15 @@ fn now() -> u64 {
     u64::try_from(since).unwrap_or(u64::MAX - 1) + 1
 }
 
-/// Hands out destination keys. One per process; a key it has given out is never given
-/// again, so a key held past the life of what it named cannot come to name something else.
+/// Hands out keys: of destinations, and of what tunnels are routed by (`routed`). One per
+/// process; a key it has given out is never given again, so a key held past the life of
+/// what it named cannot come to name something else.
 #[derive(Debug, Default)]
 pub struct Keys(AtomicU64);
 
 impl Keys {
-    /// The next key, which no destination has had before.
-    fn next(&self) -> u64 {
+    /// The next key, which nothing has had before.
+    pub(crate) fn next(&self) -> u64 {
         self.0.fetch_add(1, Ordering::Relaxed)
     }
 }

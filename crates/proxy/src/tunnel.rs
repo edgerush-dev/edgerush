@@ -16,8 +16,8 @@
 //! until it ends too: a protocol that says "that is all I have" and then waits for the
 //! answer is carried as it is. The tunnel is closed once both ways have ended, when either
 //! side fails, when it has carried nothing for its idle bound, when it is drained — its
-//! worker drains, or its client's connection — and its bound is up, or when the worker has
-//! no storage for a block to read into.
+//! worker drains, or its client's connection, or a reload takes its route away — and its
+//! bound is up, or when the worker has no storage for a block to read into.
 
 use crate::connections::Held;
 use crate::drain::Drain;
@@ -107,6 +107,9 @@ pub(crate) struct Switched {
     pub(crate) bounds: Bounds,
     pub(crate) blocks: Rc<RefCell<Blocks>>,
     pub(crate) timers: Rc<Timers>,
+    /// The drain of the listener, route and upstream it was routed by, which a reload that
+    /// takes any of them away starts (03 §10).
+    pub(crate) route: Rc<Drain>,
     /// Told how the tunnel ended, which counts it as its listener's.
     pub(crate) ended: Box<dyn FnOnce(Carried)>,
     /// The handshake's count at its endpoint, held until the tunnel closes: a WebSocket is
@@ -145,6 +148,7 @@ impl Switched {
             bounds,
             blocks,
             timers,
+            route,
             ended,
             counted,
             held,
@@ -157,7 +161,7 @@ impl Switched {
             &blocks,
             bounds,
             &timers,
-            drain,
+            [drain, &route],
         )
         .await;
         // Load on its backend no longer, and a connection of its worker's no longer.
@@ -295,7 +299,8 @@ enum Draining {
 
 /// Carries `client` to `backend` and back until the tunnel ends. `up` may already hold
 /// bytes the client sent and `down` bytes the backend sent, which go first. Every block is
-/// back with `blocks` when it returns.
+/// back with `blocks` when it returns. It is drained once either of `drains` starts: its
+/// client connection's, and its route's.
 ///
 /// A WebSocket (`bounds.websocket`) is closed on drain as 19 §6 has it: at a moment drawn
 /// in the drain bound less five seconds, each side is sent a Close 1001 at its next frame
@@ -315,7 +320,7 @@ pub(crate) async fn carry<C, B>(
     blocks: &RefCell<Blocks>,
     bounds: Bounds,
     timers: &Rc<Timers>,
-    drain: &Drain,
+    drains: [&Drain; 2],
 ) -> Carried
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -324,7 +329,9 @@ where
     let mut up = Way::new(up, bounds.websocket, true);
     let mut down = Way::new(down, bounds.websocket, false);
     let mut alarm = Alarm::new(timers, None);
+    let [drain, also] = drains;
     let mut heard = pin!(drain.notified());
+    let mut heard_too = pin!(also.notified());
     let mut last = Instant::now();
     let mut drain_by = None;
     let mut draining = Draining::No;
@@ -380,7 +387,10 @@ where
                 last = Instant::now();
                 keep_until = Some(last + RELEASE_AFTER);
             }
-            if drain_by.is_none() && drain.poll_on(heard.as_mut(), cx).is_ready() {
+            if drain_by.is_none()
+                && (drain.poll_on(heard.as_mut(), cx).is_ready()
+                    || also.poll_on(heard_too.as_mut(), cx).is_ready())
+            {
                 let now = Instant::now();
                 drain_by = Some(now + bounds.drain_within);
                 if bounds.websocket {
@@ -822,7 +832,7 @@ mod tests {
                 &blocks,
                 BOUNDS,
                 &timers,
-                &drain,
+                [&drain, &drain],
             );
             let second = carry(
                 &mut two,
@@ -832,7 +842,7 @@ mod tests {
                 &blocks,
                 BOUNDS,
                 &timers,
-                &drain,
+                [&drain, &drain],
             );
             let talking = async {
                 for round in 0..3_u8 {
@@ -874,7 +884,7 @@ mod tests {
                 &blocks,
                 BOUNDS,
                 &timers,
-                &drain,
+                [&drain, &drain],
             );
             let talking = async {
                 moved(&mut client_side, &mut backend_side, b"ping").await;
@@ -916,7 +926,7 @@ mod tests {
                 &blocks,
                 BOUNDS,
                 &timers,
-                &drain,
+                [&drain, &drain],
             );
             let talking = async {
                 client_side.write_all(b"-late").await.unwrap();
@@ -952,7 +962,7 @@ mod tests {
                 &blocks,
                 BOUNDS,
                 &timers,
-                &drain,
+                [&drain, &drain],
             );
             let watching = async {
                 for _ in 0..3 {
@@ -996,7 +1006,7 @@ mod tests {
                 &blocks,
                 BOUNDS,
                 &timers,
-                &drain,
+                [&drain, &drain],
             );
             let ending = async {
                 tokio::task::yield_now().await;
@@ -1026,7 +1036,7 @@ mod tests {
             &blocks,
             BOUNDS,
             &timers,
-            &drain,
+            [&drain, &drain],
         )))
         .await;
         assert_eq!(carried, Carried::Exhausted);
@@ -1051,7 +1061,7 @@ mod tests {
                 &blocks,
                 BOUNDS,
                 &timers,
-                &drain,
+                [&drain, &drain],
             );
             let talking = async {
                 client_side.write_all(b"x").await.unwrap();
@@ -1098,7 +1108,7 @@ mod tests {
                 &blocks,
                 BOUNDS,
                 &timers,
-                &drain,
+                [&drain, &drain],
             );
             let talking = async {
                 assert_eq!(exactly(&mut backend_side, 4).await, b"more");
@@ -1124,7 +1134,7 @@ mod tests {
         mut backend: DuplexStream,
         blocks: &RefCell<Blocks>,
         timers: &Rc<Timers>,
-        drain: &Drain,
+        drains: [&Drain; 2],
     ) -> Carried {
         carry(
             &mut client,
@@ -1134,7 +1144,7 @@ mod tests {
             blocks,
             WEBSOCKET,
             timers,
-            drain,
+            drains,
         )
         .await
     }
@@ -1196,7 +1206,7 @@ mod tests {
         let ((client, backend), (mut client_side, mut backend_side)) = ends();
         let began = Instant::now();
         let (carried, ended) = within_drain(timers.driving(async {
-            let carrying = carried_and_closed(client, backend, &blocks, &timers, &drain);
+            let carrying = carried_and_closed(client, backend, &blocks, &timers, [&drain, &drain]);
             let talking = async {
                 moved(&mut client_side, &mut backend_side, &from_client(b"hi")).await;
                 moved(&mut backend_side, &mut client_side, &from_server(b"hello")).await;
@@ -1223,6 +1233,38 @@ mod tests {
         assert!(ended < Duration::from_secs(21), "{ended:?}");
     }
 
+    /// Either drain a tunnel hears closes it the same way: its route's, a reload having
+    /// taken the route away, while its client's connection drains not (03 §10).
+    #[tokio::test(start_paused = true)]
+    async fn a_websocket_whose_route_drains_is_closed_with_going_away() {
+        let timers = Timers::new();
+        let (connection, route) = (Drain::default(), Drain::default());
+        let blocks = blocks_within(4 * SMALL);
+        let ((client, backend), (mut client_side, mut backend_side)) = ends();
+        let (carried, ()) = within_drain(timers.driving(async {
+            let carrying =
+                carried_and_closed(client, backend, &blocks, &timers, [&connection, &route]);
+            let talking = async {
+                moved(&mut client_side, &mut backend_side, &from_client(b"hi")).await;
+                route.start();
+                assert_eq!(close_read(&mut client_side).await, (1001, false));
+                assert_eq!(close_read(&mut backend_side).await, (1001, true));
+                client_side
+                    .write_all(&going_away_masked([7, 7, 7, 7]))
+                    .await
+                    .unwrap();
+                backend_side.write_all(&GOING_AWAY).await.unwrap();
+                let mut to_client = Vec::new();
+                client_side.read_to_end(&mut to_client).await.unwrap();
+                assert_eq!(to_client, b"");
+            };
+            tokio::join!(carrying, talking)
+        }))
+        .await;
+        assert_eq!(carried, Carried::Drained);
+        assert!(!connection.is_on());
+    }
+
     /// A Close goes only where a frame ends: one the backend is part way through sending
     /// when the moment comes is finished first, and what comes after it goes nowhere.
     #[tokio::test(start_paused = true)]
@@ -1232,7 +1274,7 @@ mod tests {
         let blocks = blocks_within(4 * SMALL);
         let ((client, backend), (mut client_side, mut backend_side)) = ends();
         let (carried, ()) = within_drain(timers.driving(async {
-            let carrying = carried_and_closed(client, backend, &blocks, &timers, &drain);
+            let carrying = carried_and_closed(client, backend, &blocks, &timers, [&drain, &drain]);
             let talking = async {
                 let frame = from_server(b"a long message");
                 moved(&mut backend_side, &mut client_side, &frame[..6]).await;
@@ -1274,7 +1316,7 @@ mod tests {
         let ((client, backend), (mut client_side, mut backend_side)) = ends();
         let began = Instant::now();
         let (carried, ()) = within_drain(timers.driving(async {
-            let carrying = carried_and_closed(client, backend, &blocks, &timers, &drain);
+            let carrying = carried_and_closed(client, backend, &blocks, &timers, [&drain, &drain]);
             let talking = async {
                 let close = going_away_masked([3, 3, 3, 3]);
                 moved(&mut client_side, &mut backend_side, &close).await;
@@ -1306,7 +1348,7 @@ mod tests {
         unfollowable.extend_from_slice(&(1_u64 << 63).to_be_bytes());
         let began = Instant::now();
         let (carried, ()) = within_drain(timers.driving(async {
-            let carrying = carried_and_closed(client, backend, &blocks, &timers, &drain);
+            let carrying = carried_and_closed(client, backend, &blocks, &timers, [&drain, &drain]);
             let talking = async {
                 moved(&mut backend_side, &mut client_side, &unfollowable).await;
                 drain.start();

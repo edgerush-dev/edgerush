@@ -2102,6 +2102,7 @@ async fn websocket_to(backend: SocketAddr) -> (Server, Client, u64, Ending) {
                     Storage::new(LIMIT),
                 ))),
                 timers,
+                route: Rc::new(Drain::default()),
                 ended: Box::new(move |carried| {
                     told.set(Some((carried, std::time::Instant::now())));
                 }),

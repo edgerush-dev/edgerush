@@ -41,6 +41,11 @@ impl WeightedBackends {
         let at = self.shares.partition_point(|(sum, _)| *sum <= point);
         self.shares.get(at).map(|(_, upstream)| *upstream)
     }
+
+    /// The upstreams with a share, in the order they were given.
+    pub fn upstreams(&self) -> impl Iterator<Item = UpstreamId> + '_ {
+        self.shares.iter().map(|(_, upstream)| *upstream)
+    }
 }
 
 #[cfg(test)]

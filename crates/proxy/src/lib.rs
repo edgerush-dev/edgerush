@@ -93,6 +93,7 @@ mod raw;
 mod request;
 mod request_body;
 mod retry;
+mod routed;
 mod scrape;
 mod serve;
 pub mod share;
