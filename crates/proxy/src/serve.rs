@@ -7901,14 +7901,37 @@ upstreams:
                 let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let front = socket.local_addr().unwrap();
                 let _serving = serving(&worker, socket);
+                // Clients that grant no room read nothing at all, so no writer takes storage
+                // of its own for what it would send them: what runs out is what h2 holds of
+                // the answers. A writer that asked first would be refused and reset its own
+                // stream, its answer's charge going with it, and nothing need be closed.
+                let mut granting_nothing = ::h2::client::Builder::new();
+                granting_nothing.initial_window_size(0);
                 let mut stalled = Vec::new();
                 for path in ["/one", "/two"] {
-                    let mut client = h2_library_client(front, &::h2::client::Builder::new()).await;
+                    let mut client = h2_library_client(front, &granting_nothing).await;
                     let request = Request::get(format!("http://a.test{path}"))
                         .body(())
                         .unwrap();
                     let (answer, _) = client.send_request(request, true).unwrap();
-                    let body = within(answer).await.unwrap().into_body();
+                    // The second answer's data is what the worker cannot pay for, and the
+                    // connection may be closed in the very turn that answer's head was handed
+                    // to its client's stream: the stream is then reset before its head is
+                    // written, and h2 drops a head still queued, so that client hears only
+                    // the reset. Either way both were in flight.
+                    let body = match within(answer).await {
+                        Ok(answer) => {
+                            assert_eq!(answer.status(), StatusCode::OK, "{path}");
+                            Some(answer.into_body())
+                        }
+                        Err(reset)
+                            if path == "/two"
+                                && reset.reason() == Some(::h2::Reason::INTERNAL_ERROR) =>
+                        {
+                            None
+                        }
+                        Err(error) => panic!("{path}: {error}"),
+                    };
                     stalled.push((client, body));
                 }
                 // Neither is read, and nothing is released: the upstream connection under them
