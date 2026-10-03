@@ -198,6 +198,11 @@ where
         self.inner.streams.max_recv_streams()
     }
 
+    // EdgeRush: see `server::Connection::received_unreleased`.
+    pub(crate) fn received_unreleased(&self) -> usize {
+        self.inner.streams.received_unreleased()
+    }
+
     #[cfg(feature = "unstable")]
     pub fn num_wired_streams(&self) -> usize {
         self.inner.streams.num_wired_streams()

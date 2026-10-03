@@ -10,6 +10,7 @@
 
 use super::pool::{Action, ConnectionId, Failure, Limits, Pool, Taken, WaiterId};
 use crate::downstream::h2::writer::Outgoing;
+use crate::received::Received;
 use crate::upstream::destination::ReuseIdentity;
 use ::h2::client::{Connection, SendRequest};
 use std::cell::{Cell, RefCell};
@@ -129,6 +130,9 @@ pub(crate) struct Client {
     /// How many times a destination's keepalive interval has been doubled, by key, for
     /// telling this client to calm down: gRPC's backoff for too many PINGs.
     calmer: RefCell<HashMap<u64, u32>>,
+    /// The worker's HTTP/2 connections, where each of these is charged what h2 holds of
+    /// what its upstream sent (15 §3).
+    received: Rc<Received>,
 }
 
 impl std::fmt::Debug for Client {
@@ -217,8 +221,8 @@ impl Drop for Waiting<'_> {
 }
 
 impl Client {
-    /// A client with no connections yet.
-    pub(crate) fn new(settings: Settings) -> Rc<Self> {
+    /// A client with no connections yet, whose connections are charged in `received`.
+    pub(crate) fn new(settings: Settings, received: Rc<Received>) -> Rc<Self> {
         Rc::new(Self {
             settings,
             pool: RefCell::new(Pool::new(settings.pool)),
@@ -226,6 +230,7 @@ impl Client {
             waiters: RefCell::new(HashMap::new()),
             destinations: RefCell::new(HashMap::new()),
             calmer: RefCell::new(HashMap::new()),
+            received,
         })
     }
 
@@ -501,6 +506,8 @@ impl Client {
                 )))
             });
         let mut letting_go = pin!(link.released.notified());
+        // Its place among the worker's HTTP/2 connections, charged what h2 holds for it.
+        let account = self.received.open();
         // Made when the pool lets the connection go: with the last handle gone h2 closes
         // it once its streams are done, and it has so long to do so.
         let mut closing: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
@@ -527,6 +534,14 @@ impl Client {
                     let doubled = calmer.entry(key).or_insert(0);
                     *doubled = (*doubled + 1).min(MOST_DOUBLINGS);
                 }
+                return Poll::Ready(());
+            }
+            // What h2 holds of what the upstream sent — answers not yet read — is the
+            // worker's storage as well (15 §3); a connection closed to make room for others
+            // goes now, and whatever is on it with it.
+            account.drive_with(cx.waker());
+            account.settle(connection.received_unreleased());
+            if account.is_shed() {
                 return Poll::Ready(());
             }
             if let Some(pinging) = pings.as_mut()

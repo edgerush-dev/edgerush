@@ -100,10 +100,11 @@ codegen-units = 1
 # too, being a workspace of its own.
 [patch.crates-io]
 quiche = { path = "vendor/quiche" }
-# h2 0.4.19 as published, but for an addition of ours (14 §3): a server connection can give
-# back the buffers it reads, writes and decodes header blocks in while it has nothing in
-# them, and makes them again when next needed; and an allowance that lets fuzz builds
-# compile it. `vendor/h2/VENDORED.md` says what changed and why.
+# h2 0.4.19 as published, but for additions of ours: a server connection can give back the
+# buffers it reads, writes and decodes header blocks in while it has nothing in them, and
+# makes them again when next needed (14 §3); a connection says how much of what its peer
+# sent it holds unreleased, so that it can be charged (15 §3); and an allowance that lets
+# fuzz builds compile it. `vendor/h2/VENDORED.md` says what changed and why.
 h2 = { path = "vendor/h2" }
 
 # Callgrind attributes costs to functions by their symbols.

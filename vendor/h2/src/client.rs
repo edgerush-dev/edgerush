@@ -1458,6 +1458,16 @@ where
     pub fn max_concurrent_recv_streams(&self) -> usize {
         self.inner.max_recv_streams()
     }
+
+    /// The bytes of DATA the connection has received and not yet given back
+    /// as flow-control credit, over all its streams: what h2 holds of what
+    /// the peer sent until it is read, and what readers hold of it until they
+    /// release it. Never more than the connection's receive window.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn received_unreleased(&self) -> usize {
+        self.inner.received_unreleased()
+    }
 }
 
 impl<T, B> Future for Connection<T, B>

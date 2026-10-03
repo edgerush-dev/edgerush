@@ -40,6 +40,7 @@ use crate::places::{Place, Places, Refused};
 use crate::proxy_protocol::{self, Header as Said, Read as HeaderRead};
 use crate::random::{random, unguessable};
 use crate::raw::{RawAnswer, RawHead};
+use crate::received::Received;
 use crate::request::{Decision, Opening, decide};
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::retry::budget::Budget;
@@ -396,6 +397,9 @@ pub struct Worker {
     /// ([03 §9](../../docs/03-data-plane.md)). None for a worker that is not one of a
     /// process's, which counts nothing.
     connections: Option<Arc<Loads>>,
+    /// Its HTTP/2 connections, server's and client's, each charged what h2 holds of what
+    /// its peer sent; the one charged most is closed when the storage runs out (15 §3).
+    received: Rc<Received>,
 }
 
 /// Serves `socket`, a connection of `ours` that speaks HTTP/1, with our own server (14).
@@ -487,7 +491,16 @@ async fn serve_h2<S>(
         drain_within: deadlines.drain,
         ..h2::connection::Settings::default()
     };
-    h2::connection::serve(socket, settings, storage, date, &worker.drain, respond).await;
+    h2::connection::serve(
+        socket,
+        settings,
+        storage,
+        &worker.received,
+        date,
+        &worker.drain,
+        respond,
+    )
+    .await;
 }
 
 /// One exchange's place among those a worker has in hand, given back when it is dropped.
@@ -917,20 +930,22 @@ impl Worker {
             },
             budget: h1::Budget::default(),
         };
+        let blocks = Rc::new(RefCell::new(Blocks::new(
+            Sizes::within(&limits, SMALL),
+            Storage::new(limits.storage),
+        )));
+        let received = Received::new(Rc::clone(blocks.borrow().storage()));
         Rc::new_cyclic(|me| Self {
             proxy,
             pool: Rc::new(RefCell::new(Pool::default())),
-            blocks: Rc::new(RefCell::new(Blocks::new(
-                Sizes::within(&limits, SMALL),
-                Storage::new(limits.storage),
-            ))),
+            blocks,
             timers: Timers::new(),
             places: Places::new(limits.exchanges, crate::metrics::UPSTREAM_SLOTS),
             limits,
             deadlines,
             date: Cell::new(HttpDate::from_unix(unix_now())),
             drain: Rc::new(Drain::default()),
-            h2: H2Client::new(h2_settings(&limits)),
+            h2: H2Client::new(h2_settings(&limits), Rc::clone(&received)),
             budgets: RefCell::new(HashMap::new()),
             balancing: RefCell::default(),
             accepted: Cell::new(0),
@@ -940,6 +955,7 @@ impl Worker {
             slots: WorkerSlots::default(),
             h1,
             connections,
+            received,
         })
     }
 
@@ -7116,6 +7132,35 @@ upstreams:
             .await;
     }
 
+    /// An HTTP/2 upstream that answers every request with `size` bytes, sent as the client
+    /// gives it room.
+    fn answering_with(size: usize) -> Script {
+        Rc::new(move |_request, mut respond| {
+            Box::pin(async move {
+                let Ok(mut sending) = respond.send_response(ok_head(), false) else {
+                    return;
+                };
+                let mut left = size;
+                while left > 0 {
+                    let piece = left.min(64 * 1024);
+                    sending.reserve_capacity(piece);
+                    let Some(Ok(room)) = std::future::poll_fn(|cx| sending.poll_capacity(cx)).await
+                    else {
+                        return;
+                    };
+                    let give = room.min(piece);
+                    if sending
+                        .send_data(Bytes::from(vec![b'z'; give]), left == give)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    left -= give;
+                }
+            })
+        })
+    }
+
     /// One client that stops reading holds only its own stream's window: another stream on
     /// the same upstream connection is answered in full meanwhile.
     #[tokio::test]
@@ -7124,32 +7169,7 @@ upstreams:
         local
             .run_until(async {
                 const BIG: usize = 4 << 20;
-                let script: Script = Rc::new(|_request, mut respond| {
-                    Box::pin(async move {
-                        let Ok(mut sending) = respond.send_response(ok_head(), false) else {
-                            return;
-                        };
-                        let mut left = BIG;
-                        while left > 0 {
-                            let piece = left.min(64 * 1024);
-                            sending.reserve_capacity(piece);
-                            let Some(Ok(room)) =
-                                std::future::poll_fn(|cx| sending.poll_capacity(cx)).await
-                            else {
-                                return;
-                            };
-                            let give = room.min(piece);
-                            if sending
-                                .send_data(Bytes::from(vec![b'z'; give]), left == give)
-                                .is_err()
-                            {
-                                return;
-                            }
-                            left -= give;
-                        }
-                    })
-                });
-                let upstream = scripted_h2_upstream(script).await;
+                let upstream = scripted_h2_upstream(answering_with(BIG)).await;
                 let limits = H1Limits {
                     h2_connections: 1,
                     ..H1Limits::default()
@@ -7174,6 +7194,102 @@ upstreams:
                     let _ = body.flow_control().release_capacity(chunk.len());
                 }
                 assert_eq!(read, BIG);
+            })
+            .await;
+    }
+
+    /// What h2 holds of an answer from an HTTP/2 upstream that its client is not reading —
+    /// up to the stream window it gave the upstream — is the worker's storage, as an upload
+    /// nobody reads is (15 §3).
+    #[tokio::test]
+    async fn an_answer_nobody_reads_from_an_http2_upstream_is_charged_to_the_worker() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let upstream = scripted_h2_upstream(answering_with(4 << 20)).await;
+                // The usual deadlines: a stalled answer is not given up on while it is looked at.
+                let mut config = everything_config(upstream);
+                config.upstreams.get_mut("up").unwrap().protocol = UpstreamProtocol::Http2;
+                let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+                let worker = Worker::new(Arc::new(proxy));
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = serving(&worker, socket);
+                let mut slow = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let request = Request::get("http://a.test/slow").body(()).unwrap();
+                let (stalled, _) = slow.send_request(request, true).unwrap();
+                // Its head arrives; its body is never read.
+                let _stalled = within(stalled).await.unwrap();
+                // All of the window but what the exchange took out of h2 before the client's
+                // own window stopped it: well over three quarters.
+                let window = h2_settings(&H1Limits::default()).stream_window as usize;
+                let held = window * 3 / 4;
+                let used = || worker.blocks.borrow().storage().used();
+                for _ in 0..100 {
+                    if used() >= held {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert!(
+                    used() >= held,
+                    "{} charged while h2 holds most of the upstream's stream window",
+                    used()
+                );
+            })
+            .await;
+    }
+
+    /// When what h2 holds of answers nobody reads can no longer be paid for, the upstream
+    /// connection holding them is closed, and the clients waiting on it are told so rather
+    /// than left waiting (15 §3).
+    #[tokio::test]
+    async fn an_upstream_connection_holding_more_than_the_worker_can_pay_for_is_closed() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let upstream = scripted_h2_upstream(answering_with(4 << 20)).await;
+                let mut config = everything_config(upstream);
+                config.upstreams.get_mut("up").unwrap().protocol = UpstreamProtocol::Http2;
+                let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+                // Less than two of the upstream's stream windows, on one connection.
+                let limits = H1Limits {
+                    storage: 3 << 19,
+                    h2_connections: 1,
+                    ..H1Limits::default()
+                };
+                let worker = Worker::with_limits(Arc::new(proxy), limits);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = serving(&worker, socket);
+                let mut stalled = Vec::new();
+                for path in ["/one", "/two"] {
+                    let mut client = h2_library_client(front, &::h2::client::Builder::new()).await;
+                    let request = Request::get(format!("http://a.test{path}"))
+                        .body(())
+                        .unwrap();
+                    let (answer, _) = client.send_request(request, true).unwrap();
+                    let body = within(answer).await.unwrap().into_body();
+                    stalled.push((client, body));
+                }
+                // Neither is read, and nothing is released: the upstream connection under them
+                // would hold more than the worker can pay for, and is closed, its charge with
+                // it. (Each client is told when its stream's writer gives up on it, at the idle
+                // bound: a writer waiting for the client's room is not reading the answer.)
+                let used = || worker.blocks.borrow().storage().used();
+                for _ in 0..200 {
+                    if worker.h2_connections() == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert_eq!(
+                    worker.h2_connections(),
+                    0,
+                    "the upstream connection was kept"
+                );
+                assert!(used() < 1 << 20, "{} still charged", used());
+                drop(stalled);
             })
             .await;
     }

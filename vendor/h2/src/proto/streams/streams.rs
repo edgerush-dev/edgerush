@@ -1119,6 +1119,11 @@ where
         self.inner.lock().unwrap().counts.max_recv_streams()
     }
 
+    // EdgeRush: see `server::Connection::received_unreleased`.
+    pub(crate) fn received_unreleased(&self) -> usize {
+        self.inner.lock().unwrap().actions.recv.in_flight_data() as usize
+    }
+
     #[cfg(feature = "unstable")]
     pub fn num_active_streams(&self) -> usize {
         let me = self.inner.lock().unwrap();

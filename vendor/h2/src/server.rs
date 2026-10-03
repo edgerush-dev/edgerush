@@ -557,6 +557,16 @@ where
         self.connection.buffer_capacity()
     }
 
+    /// The bytes of DATA the connection has received and not yet given back
+    /// as flow-control credit, over all its streams: what h2 holds of what
+    /// the peer sent until it is read, and what readers hold of it until they
+    /// release it. Never more than the connection's receive window.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn received_unreleased(&self) -> usize {
+        self.connection.received_unreleased()
+    }
+
     /// Starts a [graceful shutdown][1] process.
     ///
     /// Must continue being polled to close connection.

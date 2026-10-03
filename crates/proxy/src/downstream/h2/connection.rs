@@ -19,6 +19,7 @@ use crate::downstream::h2::writer::{Outgoing, Responder, send_body};
 use crate::drain::Drain;
 use crate::h2_stream::H2Stream;
 use crate::interim::Interim;
+use crate::received::Received;
 use crate::request_body::RequestBody;
 use crate::storage::Storage;
 use bytes::Bytes;
@@ -162,11 +163,13 @@ impl Settings {
 }
 
 /// Serves an HTTP/2 connection, preface included, until it ends. Each request is handed to
-/// `respond`, and `date` dates an answer that has no `Date` of its own.
+/// `respond`, and `date` dates an answer that has no `Date` of its own. What h2 holds of
+/// what the client sent is charged in `received`.
 pub(crate) async fn serve<S, R, F, B, D>(
     socket: S,
     settings: Settings,
     storage: Rc<Storage>,
+    received: &Rc<Received>,
     date: Rc<D>,
     drain: &Drain,
     respond: Rc<R>,
@@ -181,7 +184,16 @@ pub(crate) async fn serve<S, R, F, B, D>(
     let Ok(mut connection) = settings.builder().handshake::<_, Outgoing>(socket).await else {
         return;
     };
-    drive(&mut connection, settings, storage, date, drain, respond).await;
+    drive(
+        &mut connection,
+        settings,
+        storage,
+        received,
+        date,
+        drain,
+        respond,
+    )
+    .await;
 }
 
 /// Drives `connection`, once handshaken, until it ends, as [`serve`] says.
@@ -189,6 +201,7 @@ async fn drive<S, R, F, B, D>(
     connection: &mut ::h2::server::Connection<S, Outgoing>,
     settings: Settings,
     storage: Rc<Storage>,
+    received: &Rc<Received>,
     date: Rc<D>,
     drain: &Drain,
     respond: Rc<R>,
@@ -201,6 +214,8 @@ async fn drive<S, R, F, B, D>(
     D: Fn() -> HttpDate + 'static,
 {
     let streams = Rc::new(Streams::default());
+    // Its place among the worker's HTTP/2 connections, charged what h2 holds for it.
+    let account = received.open();
     // One timer for the two things a connection with no stream open waits for (`quiet`).
     let mut idle_since = Instant::now();
     let mut released = false;
@@ -248,7 +263,15 @@ async fn drive<S, R, F, B, D>(
                 idle_from_now = true;
             }
             *streams.driver.borrow_mut() = Some(cx.waker().clone());
-            connection.poll_accept(cx).map(Next::Accepted)
+            let accepted = connection.poll_accept(cx);
+            // What h2 holds of what the client sent — uploads not yet read — is the worker's
+            // storage as well (15 §3); a connection closed to make room for others goes now.
+            account.drive_with(cx.waker());
+            account.settle(connection.received_unreleased());
+            if account.is_shed() {
+                return Poll::Ready(Next::Shed);
+            }
+            accepted.map(Next::Accepted)
         })
         .await;
         let (request, send) = match accepted {
@@ -275,7 +298,7 @@ async fn drive<S, R, F, B, D>(
                 .await;
                 return;
             }
-            Next::Resetting => {
+            Next::Resetting | Next::Shed => {
                 connection.abrupt_shutdown(::h2::Reason::ENHANCE_YOUR_CALM);
                 let _closing = tokio::time::timeout(
                     settings.closing,
@@ -334,6 +357,8 @@ enum Next<T> {
     Draining,
     /// Draining, and its streams have not finished within the drain's time.
     OutOfTime,
+    /// Closed to make room in the worker's storage: it held the most (15 §3).
+    Shed,
 }
 
 /// How a stream ended, as far as the driver cares.
@@ -481,7 +506,7 @@ where
 mod tests {
     use super::*;
     use crate::downstream::h2::testing::{
-        LONG, locally, locally_paused, post, serving, wire, within,
+        LONG, locally, locally_paused, pair, post, serving, wire, within,
     };
     use http_body_util::{BodyExt, Full};
 
@@ -558,6 +583,179 @@ mod tests {
         });
     }
 
+    /// What h2 holds of an upload nobody reads is the worker's storage, as what quiche holds
+    /// is for HTTP/3 (16 §6): a stream window received and not read is charged to the worker,
+    /// so that the ledger, not the pod's memory, is what runs out.
+    #[test]
+    fn an_upload_nobody_reads_is_charged_to_the_worker() {
+        locally(async {
+            let settings = Settings::default();
+            let (mut send, mut connection) = pair(&settings.builder()).await;
+            let gate = Rc::new(tokio::sync::Notify::new());
+            let held = Rc::new(Cell::new(None::<usize>));
+            let (opened, told) = (Rc::clone(&gate), Rc::clone(&held));
+            // The exchange reads nothing of its body, as with an upstream that takes nothing,
+            // until it is let; then it takes what h2 has without waiting, which is what h2
+            // held at that moment, and goes on reading nothing.
+            let respond = Rc::new(move |request: Request<RequestBody>, _: Interim| {
+                let (gate, held) = (Rc::clone(&opened), Rc::clone(&told));
+                async move {
+                    gate.notified().await;
+                    let mut body = request.into_body();
+                    let mut cx = std::task::Context::from_waker(Waker::noop());
+                    let mut taken = 0;
+                    while let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut cx)
+                    {
+                        taken += frame.data_ref().map_or(0, Bytes::len);
+                    }
+                    held.set(Some(taken));
+                    std::future::pending::<()>().await;
+                    Answered::Map(Response::new(Full::new(Bytes::new())))
+                }
+            });
+            let date = Rc::new(|| HttpDate::from_unix(0));
+            let (drain, storage) = (Drain::default(), Storage::new(crate::storage::LIMIT));
+            let received = Received::new(Rc::clone(&storage));
+            let window = settings.stream_window as usize;
+            let asking = async {
+                let (_answer, mut body) = send.send_request(post(), false).unwrap();
+                body.send_data(Bytes::from(vec![1u8; window]), false)
+                    .unwrap();
+                for _ in 0..40 {
+                    if storage.used() >= window {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                let used = storage.used();
+                gate.notify_one();
+                for _ in 0..40 {
+                    if held.get().is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                used
+            };
+            let driving = drive(
+                &mut connection,
+                settings,
+                Rc::clone(&storage),
+                &received,
+                date,
+                &drain,
+                respond,
+            );
+            let used = tokio::select! {
+                () = driving => panic!("the connection ended"),
+                used = asking => used,
+            };
+            assert_eq!(held.get(), Some(window), "what h2 held of the upload");
+            assert!(
+                used >= window,
+                "{used} charged while h2 held a {window}-byte upload"
+            );
+        });
+    }
+
+    /// When what h2 holds can no longer be paid for, the connection holding the most is told
+    /// to calm down and closed, letting go of its charge, and the one that asked is served
+    /// on and charged (15 §3).
+    #[test]
+    fn the_connection_holding_the_most_is_closed_when_storage_runs_out() {
+        locally(async {
+            let settings = Settings::default();
+            // Room for one stream window and some, not for a second.
+            let storage = Storage::with_provision(5 << 20, 0);
+            let received = Received::new(Rc::clone(&storage));
+            let date = Rc::new(|| HttpDate::from_unix(0));
+            // Nobody reads any upload: an upstream that takes nothing.
+            let respond = Rc::new(|request: Request<RequestBody>, _: Interim| async move {
+                let _unread = request;
+                std::future::pending::<()>().await;
+                Answered::Map(Response::new(Full::new(Bytes::new())))
+            });
+            // The heavy one's client is kept, to hear how its connection ended.
+            let (near, far) = wire();
+            let (client, server) = tokio::join!(
+                ::h2::client::handshake(far),
+                settings.builder().handshake::<_, Outgoing>(near)
+            );
+            let (mut heavy_send, heavy_client) = client.unwrap();
+            let heavy_client = tokio::task::spawn_local(heavy_client);
+            let heavy = server.unwrap();
+            let (mut light_send, light) = pair(&settings.builder()).await;
+            let heavy_ended = Rc::new(Cell::new(false));
+            for (mut connection, ended) in [(heavy, Some(Rc::clone(&heavy_ended))), (light, None)] {
+                let (storage, received) = (Rc::clone(&storage), Rc::clone(&received));
+                let (date, respond) = (Rc::clone(&date), Rc::clone(&respond));
+                tokio::task::spawn_local(async move {
+                    let drain = Drain::default();
+                    drive(
+                        &mut connection,
+                        settings,
+                        storage,
+                        &received,
+                        date,
+                        &drain,
+                        respond,
+                    )
+                    .await;
+                    if let Some(ended) = ended {
+                        ended.set(true);
+                    }
+                });
+            }
+            let window = settings.stream_window as usize;
+            let (heavy_answer, mut heavy_body) = heavy_send.send_request(post(), false).unwrap();
+            heavy_body
+                .send_data(Bytes::from(vec![1u8; window]), false)
+                .unwrap();
+            for _ in 0..100 {
+                if storage.used() >= window {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(storage.used() >= window, "{} charged", storage.used());
+
+            light_send = within(light_send.ready()).await.unwrap();
+            let (_light_answer, mut light_body) = light_send.send_request(post(), false).unwrap();
+            light_body
+                .send_data(Bytes::from(vec![2u8; 2 << 20]), false)
+                .unwrap();
+            assert!(
+                within(heavy_answer).await.is_err(),
+                "the heaviest was answered"
+            );
+            let ended = within(heavy_client).await.unwrap().unwrap_err();
+            assert_eq!(
+                ended.reason(),
+                Some(::h2::Reason::ENHANCE_YOUR_CALM),
+                "{ended:?}"
+            );
+            for _ in 0..100 {
+                if heavy_ended.get() && storage.used() >= 2 << 20 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                heavy_ended.get(),
+                "the heaviest was told to go but not closed"
+            );
+            let used = storage.used();
+            assert!(
+                (2 << 20..window).contains(&used),
+                "{used} charged: the light one's upload alone"
+            );
+            assert!(
+                within(light_send.ready()).await.is_ok(),
+                "the light one was closed"
+            );
+        });
+    }
+
     /// With no stream open, a connection gives back its buffers at its release time, then is
     /// told to go at its keep-alive time; once they are back, only the second is waited for.
     #[test]
@@ -621,6 +819,7 @@ mod tests {
             });
             let date = Rc::new(|| HttpDate::from_unix(0));
             let (drain, storage) = (Drain::default(), Storage::new(crate::storage::LIMIT));
+            let received = Received::new(Rc::clone(&storage));
             let long = "a long header, Huffman-coded ".repeat(40);
             // Driven while `waited` passes after a stream, then let go of to be looked at.
             for (round, waited) in [(0u8, 50), (1, 500), (2, 500)] {
@@ -648,6 +847,7 @@ mod tests {
                     &mut connection,
                     settings,
                     Rc::clone(&storage),
+                    &received,
                     Rc::clone(&date),
                     &drain,
                     Rc::clone(&respond),

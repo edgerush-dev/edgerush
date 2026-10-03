@@ -118,6 +118,11 @@ impl Recv {
     }
 
     /// Returns the initial receive window size
+    // EdgeRush: see `server::Connection::received_unreleased`.
+    pub fn in_flight_data(&self) -> WindowSize {
+        self.in_flight_data
+    }
+
     pub fn init_window_sz(&self) -> WindowSize {
         self.init_window_sz
     }

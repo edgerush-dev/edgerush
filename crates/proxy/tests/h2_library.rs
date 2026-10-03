@@ -1282,6 +1282,55 @@ async fn locally_reset_streams_are_remembered_up_to_a_count() {
     );
 }
 
+/// A connection says how much DATA it has received and not given back as credit, over all
+/// its streams: what it holds of uploads nobody has read, to the byte, and less once one
+/// is read and released. Added by the vendored copy (15 §3).
+#[tokio::test]
+async fn a_server_connection_says_what_it_holds_of_what_was_sent() {
+    let (near, far) = wire();
+    let (client, server) = tokio::join!(
+        client::handshake(far),
+        server::Builder::new().handshake::<_, Bytes>(near)
+    );
+    let (send, connection) = client.unwrap();
+    tokio::spawn(connection);
+    let mut server = server.unwrap();
+    let mut send = within(send.ready()).await.unwrap();
+    let mut kept = Vec::new();
+    for size in [10_000, 20_000] {
+        let request = Request::post("http://example.com/up").body(()).unwrap();
+        let (answer, mut body) = send.send_request(request, false).unwrap();
+        body.send_data(Bytes::from(vec![1; size]), false).unwrap();
+        kept.push((answer, body));
+        send = within(send.ready()).await.unwrap();
+    }
+    // Driven, and nothing read: what was sent is held.
+    let mut uploads = Vec::new();
+    for _ in 0..100 {
+        tokio::select! {
+            accepted = server.accept() => {
+                let (request, respond) = accepted.unwrap().unwrap();
+                uploads.push((request.into_body(), respond));
+            }
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        if uploads.len() == 2 && server.received_unreleased() == 30_000 {
+            break;
+        }
+    }
+    assert_eq!(server.received_unreleased(), 30_000);
+
+    // One read and released: only the other is held.
+    let (first, _) = uploads.first_mut().unwrap();
+    let mut read = 0;
+    while read < 10_000 {
+        let data = within(first.data()).await.unwrap().unwrap();
+        read += data.len();
+        first.flow_control().release_capacity(data.len()).unwrap();
+    }
+    assert_eq!(server.received_unreleased(), 20_000);
+}
+
 /// EdgeRush's vendored h2 (`vendor/h2/VENDORED.md`, 14 §3): a server connection with nothing
 /// in its buffers gives them back — what it reads frames into, writes them from and decodes
 /// Huffman-coded strings in — and makes them again for the next request. That request is

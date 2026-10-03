@@ -9,8 +9,9 @@ benchmarks, which are not here; nothing builds them.
 
 ## What is changed
 
-Every change is marked `EdgeRush:` in the source. One addition, for idle connections
-(14 §3 of the design docs), and one allowance, for fuzz builds:
+Every change is marked `EdgeRush:` in the source. Two additions, for idle connections
+(14 §3 of the design docs) and for charging what a connection holds (15 §3), and one
+allowance, for fuzz builds:
 
 - **A server connection can give back its buffers.** h2 makes three buffers for every
   connection when it is handshaken, and keeps them for the connection's life: the 16 KiB
@@ -29,6 +30,12 @@ Every change is marked `EdgeRush:` in the source. One addition, for idle connect
   a release costs one more read; left to itself, tokio-util reserves a single byte before
   each read and would read a byte at a time. The decoder's, by `huffman::decode`, which
   reserves what each string needs.
+- **A connection says what it holds of what its peer sent.**
+  `server::Connection::received_unreleased` and `client::Connection::received_unreleased`
+  return the connection's `in_flight_data` (`proto/streams/recv.rs`): the DATA received
+  over all its streams and not yet given back as credit — what h2 holds until it is read,
+  and what readers hold until they release it — through `proto::Connection` and
+  `Streams`, under the streams' lock. Nothing h2 does changes.
 - **Its fuzzing module may go undocumented in every build.** cargo-fuzz builds with
   `--cfg fuzzing`, which brings in h2's `fuzz_bridge` module, and h2 denies `missing_docs`
   but allows it there only with its `unstable` feature. The lints of a registry dependency
@@ -36,15 +43,19 @@ Every change is marked `EdgeRush:` in the source. One addition, for idle connect
   fuzz build of the workspace's crates. The allowance is now unconditional (`lib.rs`).
 
 h2's own tests are not carried: they need dependencies the workspace does not have. The
-change is covered by `a_server_connection_gives_back_its_buffers_and_serves_on` and
-`a_server_connection_keeps_what_waits_in_its_buffers` in `crates/proxy/tests/h2_library.rs`,
-which fail with the checks for an empty buffer taken out, or with the release doing nothing.
+buffers' release is covered by `a_server_connection_gives_back_its_buffers_and_serves_on`
+and `a_server_connection_keeps_what_waits_in_its_buffers` in
+`crates/proxy/tests/h2_library.rs`, which fail with the checks for an empty buffer taken
+out, or with the release doing nothing; the count of what is held by
+`a_server_connection_says_what_it_holds_of_what_was_sent` there, and through the proxy's
+charges by `an_upload_nobody_reads_is_charged_to_the_worker` and
+`an_answer_nobody_reads_from_an_http2_upstream_is_charged_to_the_worker`.
 The allowance is covered by building any fuzz target with cargo-fuzz (the repository
 README).
 
 ## Carrying it to another version
 
 Copy the new version's `Cargo.toml`, `LICENSE`, `README.md` and `src/` over these, then
-make the changes marked `EdgeRush:` again (`grep -rl EdgeRush src` lists the seven files).
+make the changes marked `EdgeRush:` again (`grep -rl EdgeRush src` lists the ten files).
 They change nothing h2 does unless a connection's buffers are given back. Update the version here, in the workspace's `Cargo.toml` and in `fuzz/Cargo.toml`,
-and run the two tests above and a fuzz target's build.
+and run the tests above and a fuzz target's build.
