@@ -1,3 +1,4 @@
 /target
 /bench/results
 /bench/wsbench/target
+/bench/__pycache__
