@@ -23,12 +23,15 @@ const EXCHANGES: usize = 100;
 /// Upstreams the config has, and the exchanges go to in turn.
 const UPSTREAMS: usize = 8;
 
+/// Whether the config has no upstream but the one asked for: it has eight.
+const ALONE: bool = false;
+
 /// A worker's places, with `held` of them held, spread over the upstreams.
 fn holding(held: usize) -> (Rc<Places>, Vec<Place>) {
     // As many slots as the data plane's metrics have.
     let places = Places::new(1024, 4096);
     let taken = (0..held)
-        .filter_map(|at| places.take(at % UPSTREAMS, UPSTREAMS).ok())
+        .filter_map(|at| places.take(at % UPSTREAMS, ALONE).ok())
         .collect();
     (places, taken)
 }
@@ -40,7 +43,7 @@ fn holding(held: usize) -> (Rc<Places>, Vec<Place>) {
 fn take_and_give_back(worker: (Rc<Places>, Vec<Place>)) -> ((Rc<Places>, Vec<Place>), usize) {
     let mut taken = 0;
     for exchange in 0..EXCHANGES {
-        let place = worker.0.take(black_box(exchange % UPSTREAMS), UPSTREAMS);
+        let place = worker.0.take(black_box(exchange % UPSTREAMS), ALONE);
         taken += usize::from(black_box(&place).is_ok());
     }
     (worker, taken)
