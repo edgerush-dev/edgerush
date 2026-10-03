@@ -2,7 +2,9 @@
 # `check.sh`, before every commit, and in CI: no advisory against a crate in the tree, its
 # licences from the list below, every crate from crates.io, and each crate in two versions
 # said. `fuzz/`, a workspace of its own, is checked against this file too; each run is told
-# not to mind an entry here that is for the other tree (`check.sh`).
+# not to mind an entry here that is for the other tree (`check.sh`). Advisories are looked up
+# only for crates from a registry: the vendored h2 and quiche, paths, are checked by hand
+# when they move to another version (`vendor/*/VENDORED.md`).
 
 [graph]
 # The platforms EdgeRush is built and tested on; what only another target pulls in is

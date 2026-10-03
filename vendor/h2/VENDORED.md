@@ -53,9 +53,18 @@ charges by `an_upload_nobody_reads_is_charged_to_the_worker` and
 The allowance is covered by building any fuzz target with cargo-fuzz (the repository
 README).
 
+## Advisories
+
+`cargo deny` (`check.sh`) does not look at this crate: it looks advisories up only for
+crates with a registry source, and a path has none. So h2's advisories in the RustSec
+database (<https://rustsec.org/packages/h2.html>) are read by hand when h2 is carried to
+another version, which is to be one none of them affects. Between versions, nothing reports
+a new one.
+
 ## Carrying it to another version
 
-Copy the new version's `Cargo.toml`, `LICENSE`, `README.md` and `src/` over these, then
-make the changes marked `EdgeRush:` again (`grep -rl EdgeRush src` lists the ten files).
+Read h2's advisories first (above). Copy the new version's `Cargo.toml`, `LICENSE`,
+`README.md` and `src/` over these, then make the changes marked `EdgeRush:` again
+(`grep -rl EdgeRush src` lists the ten files).
 They change nothing h2 does unless a connection's buffers are given back. Update the version here, in the workspace's `Cargo.toml` and in `fuzz/Cargo.toml`,
 and run the tests above and a fuzz target's build.

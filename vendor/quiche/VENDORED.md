@@ -227,10 +227,18 @@ fails against the published crate, as do its tests `an_answer_carries_the_ack_of
 `a_client_that_asks_and_stops_again_and_again_holds_no_more_than_its_streams` in
 `crates/proxy/src/downstream/h3/tests.rs`.
 
+## Advisories
+
+`cargo deny` (`check.sh`) does not look at this crate: it looks advisories up only for
+crates with a registry source, and a path has none. quiche marks its security fixes in its
+release notes (<https://github.com/cloudflare/quiche/releases>); the RustSec database has
+no entries for it. Both are read by hand when quiche moves to another version, which is to
+be one with no security fix it lacks. Between versions, nothing reports a new one.
+
 ## Moving to another version
 
-Take the new version's published package (`cargo download`, or the registry's source
-under `~/.cargo/registry/src/`) and copy the same files. Then re-apply every change marked
-`EdgeRush:`, run quiche's tests as above, and run the proxy's probe and tests. If upstream
-has them all by then, delete this directory and the `[patch.crates-io]` entries in
-`Cargo.toml` and `fuzz/Cargo.toml`.
+Read quiche's advisories first (above). Take the new version's published package
+(`cargo download`, or the registry's source under `~/.cargo/registry/src/`) and copy the
+same files. Then re-apply every change marked `EdgeRush:`, run quiche's tests as above, and
+run the proxy's probe and tests. If upstream has them all by then, delete this directory and
+the `[patch.crates-io]` entries in `Cargo.toml` and `fuzz/Cargo.toml`.
