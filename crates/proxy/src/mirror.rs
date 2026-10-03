@@ -3,7 +3,11 @@
 //!
 //! Each frame the request's upstream takes is put on each mirror's queue too, the copy the
 //! same bytes — a count on a shared buffer — and the mirror takes it from there at its own
-//! pace. A mirror more than [`MOST_BEHIND`] behind is given up on, its copy failing, rather
+//! pace. A small frame that finds another the mirror has not taken yet at the queue's end is
+//! copied together with it onto a run ([`crate::runs`]): a mirror that keeps up is handed
+//! each frame itself, and one that falls behind holds a few runs rather than an entry for
+//! every frame, however small a client made them. A mirror more than [`MOST_BEHIND`] behind
+//! is given up on, its copy failing, rather
 //! than let it slow the request or hold more: nginx reads the whole body before its mirrors
 //! start, and Envoy lets a backed-up mirror push back on the client, and neither is what a
 //! copy is for. A copy goes no faster than the request's own upstream reads, and when the
@@ -12,6 +16,7 @@
 //! reads it.
 
 use crate::request_body::{RequestBody, RequestBodyError};
+use crate::runs;
 use bytes::Bytes;
 use http::HeaderMap;
 use http_body::{Body, Frame, SizeHint};
@@ -32,6 +37,8 @@ struct GivenUp;
 #[derive(Debug)]
 enum Copied {
     Data(Bytes),
+    /// Small frames copied together; the last one on the queue may take more.
+    Run(Vec<u8>),
     Trailers(HeaderMap),
 }
 
@@ -65,6 +72,45 @@ impl Queue {
 
     fn put(&mut self, copied: Copied) {
         self.frames.push_back(copied);
+        self.wake_reader();
+    }
+
+    /// Puts a frame's data on the queue: as it is, unless it is small and finds a small
+    /// frame or a run not taken yet at the queue's end, when it is copied onto the run — the
+    /// frame it found with it.
+    fn put_data(&mut self, data: &Bytes) {
+        let small = |len: usize| len < runs::COPIED_BELOW;
+        let joins = small(data.len())
+            && match self.frames.back() {
+                Some(Copied::Run(_)) => true,
+                Some(Copied::Data(last)) => small(last.len()),
+                _ => false,
+            };
+        if !joins {
+            return self.put(Copied::Data(data.clone()));
+        }
+        if matches!(self.frames.back(), Some(Copied::Data(_)))
+            && let Some(Copied::Data(last)) = self.frames.pop_back()
+        {
+            self.frames.push_back(Copied::Run(Vec::new()));
+            self.copy(&last);
+        }
+        self.copy(data);
+        self.wake_reader();
+    }
+
+    /// Copies `data` onto the run at the queue's end, starting runs as each fills.
+    fn copy(&mut self, data: &[u8]) {
+        let mut rest = data;
+        while !rest.is_empty() {
+            match self.frames.back_mut() {
+                Some(Copied::Run(run)) if run.len() < runs::RUN => rest = runs::fill(run, rest),
+                _ => self.frames.push_back(Copied::Run(Vec::new())),
+            }
+        }
+    }
+
+    fn wake_reader(&mut self) {
         if let Some(waker) = self.waiting.take() {
             waker.wake();
         }
@@ -158,7 +204,7 @@ impl Body for Tee {
                             queue.give_up();
                         } else {
                             queue.behind += data.len();
-                            queue.put(Copied::Data(data.clone()));
+                            queue.put_data(data);
                         }
                     } else if let Some(trailers) = frame.trailers_ref() {
                         queue.put(Copied::Trailers(trailers.clone()));
@@ -215,6 +261,10 @@ impl Body for Copy {
             Some(Copied::Data(data)) => {
                 queue.behind -= data.len();
                 Poll::Ready(Some(Ok(Frame::data(data))))
+            }
+            Some(Copied::Run(run)) => {
+                queue.behind -= run.len();
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from(run)))))
             }
             Some(Copied::Trailers(trailers)) => Poll::Ready(Some(Ok(Frame::trailers(trailers)))),
             None if queue.ended => Poll::Ready(None),
@@ -329,6 +379,63 @@ mod tests {
         assert!(kept.fell_behind());
         // The one that kept up got it all: exactly at the bound is within it.
         assert_eq!(read(keeping_up).await.unwrap().0.len(), MOST_BEHIND);
+    }
+
+    /// A mirror behind on a body of tiny frames holds them copied together, a few runs
+    /// rather than an entry a frame, and gets every byte in order; one that keeps up is
+    /// handed each frame as it comes, not held back to fill a run.
+    #[tokio::test]
+    async fn a_mirror_behind_on_small_frames_holds_them_in_runs() {
+        let frames = (0..MOST_BEHIND).map(|_| data(b"x")).collect();
+        let (tee, mut copies) = Tee::new(body(frames), 2);
+        let (keeping_up, _) = copies.pop().unwrap();
+        let (behind, kept) = copies.pop().unwrap();
+        let (mut tee, mut keeping_up) = (tee, keeping_up);
+        let _first = tee.frame().await.unwrap().unwrap();
+        let taken = keeping_up.frame().await.unwrap().unwrap();
+        assert_eq!(taken.into_data().unwrap(), "x");
+        assert_eq!(read(&mut tee).await.unwrap().0.len(), MOST_BEHIND - 1);
+        let held = behind.0.borrow().frames.len();
+        assert!(
+            held <= MOST_BEHIND / runs::RUN + 1,
+            "{held} entries held for {MOST_BEHIND} one-byte frames"
+        );
+        assert!(!kept.fell_behind());
+        assert_eq!(read(behind).await.unwrap().0, vec![b'x'; MOST_BEHIND]);
+        assert_eq!(read(keeping_up).await.unwrap().0.len(), MOST_BEHIND - 1);
+    }
+
+    /// A mirror that keeps up is handed each frame itself, the same buffer as the one sent,
+    /// small or not: nothing is copied for it.
+    #[tokio::test]
+    async fn a_mirror_keeping_up_is_handed_the_frames_themselves() {
+        let sent = [Bytes::from_static(b"a"), Bytes::from_static(b"b")];
+        let frames = sent.iter().cloned().map(Frame::data).collect();
+        let (mut tee, mut copies) = Tee::new(body(frames), 1);
+        let (mut copy, _kept) = copies.pop().unwrap();
+        for frame in &sent {
+            let _went = tee.frame().await.unwrap().unwrap();
+            let taken = copy.frame().await.unwrap().unwrap().into_data().unwrap();
+            assert_eq!(
+                taken.as_ptr(),
+                frame.as_ptr(),
+                "copied for a mirror keeping up"
+            );
+        }
+    }
+
+    /// A copy waiting for its next frame is woken by a small one, which joins a run rather
+    /// than coming as a frame of its own.
+    #[tokio::test]
+    async fn a_copy_waiting_is_woken_by_a_small_frame() {
+        let (mut tee, mut copies) = Tee::new(body(vec![data(b"a"), data(b"b")]), 1);
+        let (mut copy, _kept) = copies.pop().unwrap();
+        let woken = std::sync::Arc::new(Woken::default());
+        let waker = Waker::from(std::sync::Arc::clone(&woken));
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut copy).poll_frame(&mut cx).is_pending());
+        let _first = tee.frame().await.unwrap().unwrap();
+        assert!(woken.was(), "a waiting copy was not told of a small frame");
     }
 
     #[tokio::test]

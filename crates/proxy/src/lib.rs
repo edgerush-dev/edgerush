@@ -48,6 +48,9 @@ pub mod hop_by_hop;
 mod hop_by_hop;
 pub mod host;
 mod interim;
+// What keeps a request's body for later, driven from frames given: for the benchmarks.
+#[cfg(feature = "fuzzing")]
+pub mod kept;
 // Whether a failed test waited on the code or on a machine that stood it still.
 #[cfg(test)]
 mod stall;
@@ -94,6 +97,7 @@ mod request;
 mod request_body;
 mod retry;
 mod routed;
+mod runs;
 mod scrape;
 mod serve;
 pub mod share;

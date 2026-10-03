@@ -3,14 +3,18 @@
 //!
 //! As linkerd's `ReplayBody` does: each frame is kept as it is sent on, the kept one the
 //! same bytes as the sent one — a count on a shared buffer, not a copy — up to
-//! [`MOST`] in all. A body that grows past it is let go of, and the request is not sent
-//! again; so is one that has not ended by the time its answer asks for a retry, since
-//! what it has not sent yet cannot be sent twice. Trailers are kept with the data.
+//! [`MOST`] in all; small frames are copied together into runs as they are kept
+//! ([`crate::runs`]), since a list of frames holds an entry for each however small it is,
+//! and a client chooses how small. A body that grows past [`MOST`] is let go of, and the
+//! request is not sent again; so is one that has not ended by the time its answer asks for a
+//! retry, since what it has not sent yet cannot be sent twice. Trailers are kept with the
+//! data.
 //!
 //! A body none of which went is whole as it is: a try that lets go of it untouched — one
 //! that could not connect never reads it — gives it back, for the next try to send.
 
 use crate::request_body::{RequestBody, RequestBodyError};
+use crate::runs;
 use bytes::Bytes;
 use http::HeaderMap;
 use http_body::{Body, Frame, SizeHint};
@@ -32,12 +36,71 @@ enum Kept {
 #[derive(Debug, Default)]
 struct Recording {
     kept: Vec<Kept>,
+    /// A small frame after everything in `kept`, kept as it is while no other small frame
+    /// follows it: a body of one small frame is kept without a copy.
+    lone: Option<Bytes>,
+    /// Small frames being copied together, after everything in `kept`: kept itself once
+    /// anything else comes, or the body ends.
+    run: Vec<u8>,
     size: usize,
     /// It grew past [`MOST`]: nothing is kept, and it is not to be sent again.
     capped: bool,
     ended: bool,
     /// The body itself, given back by a try that let go of it with none of it gone.
     untouched: Option<RequestBody>,
+}
+
+impl Recording {
+    /// Keeps a frame's data: a larger one as it is, and a small one as it is too when it is
+    /// the first small one in a row; one that follows it is copied onto a run, the first
+    /// with it.
+    fn keep(&mut self, data: &Bytes) {
+        if data.len() >= runs::COPIED_BELOW {
+            self.close_run();
+            self.kept.push(Kept::Data(data.clone()));
+            return;
+        }
+        if self.run.is_empty() {
+            match self.lone.take() {
+                None => {
+                    self.lone = Some(data.clone());
+                    return;
+                }
+                Some(first) => self.copy(&first),
+            }
+        }
+        self.copy(data);
+    }
+
+    /// Copies `data` onto the run, keeping each run that fills.
+    fn copy(&mut self, data: &[u8]) {
+        let mut rest = data;
+        loop {
+            rest = runs::fill(&mut self.run, rest);
+            if rest.is_empty() {
+                break;
+            }
+            self.close_run();
+        }
+    }
+
+    /// Keeps the small frames after everything in `kept`, as they stand: the lone one, or
+    /// the run.
+    fn close_run(&mut self) {
+        if let Some(lone) = self.lone.take() {
+            self.kept.push(Kept::Data(lone));
+        }
+        if !self.run.is_empty() {
+            let run = std::mem::take(&mut self.run);
+            self.kept.push(Kept::Data(Bytes::from(run)));
+        }
+    }
+
+    /// The body has ended: all of it is kept.
+    fn end(&mut self) {
+        self.close_run();
+        self.ended = true;
+    }
 }
 
 /// A body on its way, kept as it goes.
@@ -129,21 +192,24 @@ impl Body for Tee {
                     if recording.size > MOST {
                         recording.capped = true;
                         recording.kept = Vec::new();
+                        recording.lone = None;
+                        recording.run = Vec::new();
                     } else {
-                        recording.kept.push(Kept::Data(data.clone()));
+                        recording.keep(data);
                     }
                 } else if let Some(trailers) = frame.trailers_ref() {
+                    recording.close_run();
                     recording.kept.push(Kept::Trailers(trailers.clone()));
                 }
             }
-            Poll::Ready(None) => recording.ended = true,
+            Poll::Ready(None) => recording.end(),
             _ => {}
         }
         // A body may say it has ended with its last frame, and whatever sends it may stop
         // there without asking for the end, as the HTTP/2 writer does: it is whole with that
         // frame.
         if matches!(polled, Poll::Ready(Some(Ok(_)))) && this.inner.is_end_stream() {
-            recording.ended = true;
+            recording.end();
         }
         polled
     }
@@ -164,8 +230,8 @@ pub(crate) struct Replayed {
 }
 
 impl Replayed {
-    /// A body of these frames, as though kept: for tests.
-    #[cfg(test)]
+    /// A body of these frames, as though kept: for tests and the benchmarks.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn of(frames: Vec<Frame<Bytes>>) -> Self {
         Self {
             frames: frames
@@ -266,6 +332,69 @@ mod tests {
         let (tee, recorded) = Tee::new(RequestBody::Replayed(inner));
         let _sent = read(tee).await;
         assert!(recorded.replay().is_some());
+    }
+
+    /// Small frames are kept copied together and large ones as they are, the same buffer as
+    /// the one sent; sent again, the body is the same bytes in the same order, trailers and
+    /// all.
+    #[tokio::test]
+    async fn a_body_of_small_and_large_frames_is_sent_again_the_same() {
+        let large = Bytes::from(vec![b'L'; 5_000]);
+        let inner = Replayed::of(vec![
+            data(b"ab"),
+            data(b"c"),
+            Frame::data(large.clone()),
+            data(b"de"),
+            Frame::trailers(trailers()),
+        ]);
+        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner));
+        let mut whole = b"abc".to_vec();
+        whole.extend_from_slice(&large);
+        whole.extend_from_slice(b"de");
+        assert_eq!(read(tee).await, (whole.clone(), Some(trailers())));
+        let shared = recorded
+            .0
+            .borrow()
+            .kept
+            .iter()
+            .any(|kept| matches!(kept, Kept::Data(data) if data.as_ptr() == large.as_ptr()));
+        assert!(shared, "the large frame was copied");
+        let again = recorded.replay().expect("kept whole");
+        assert_eq!(read(again).await, (whole, Some(trailers())));
+    }
+
+    /// A body of one small frame is kept as it is, the same buffer as the one sent: only a
+    /// small frame that follows another is copied.
+    #[tokio::test]
+    async fn a_lone_small_frame_is_kept_as_it_is() {
+        let small = Bytes::from_static(b"small");
+        let inner = Replayed::of(vec![Frame::data(small.clone())]);
+        let (tee, recorded) = Tee::new(RequestBody::Replayed(inner));
+        let _sent = read(tee).await;
+        let recording = recorded.0.borrow();
+        assert!(
+            matches!(recording.kept.as_slice(), [Kept::Data(data)] if data.as_ptr() == small.as_ptr()),
+            "{:?}",
+            recording.kept
+        );
+    }
+
+    /// What a recording holds is bounded however the body is cut: a body within `MOST` in
+    /// one-byte frames, as an HTTP/1 body of one-byte chunks arrives, is kept in no more than
+    /// about `MOST`, its list of frames included, or not kept at all.
+    #[tokio::test]
+    async fn a_body_in_small_frames_is_kept_within_the_bound_or_not_at_all() {
+        let frames = (0..MOST).map(|_| data(b"x")).collect();
+        let (tee, recorded) = Tee::new(RequestBody::Replayed(Replayed::of(frames)));
+        let (sent, _) = read(tee).await;
+        assert_eq!(sent.len(), MOST);
+        let recording = recorded.0.borrow();
+        let held = recording.size + recording.kept.capacity() * std::mem::size_of::<Kept>();
+        assert!(
+            recording.capped || held <= 2 * MOST,
+            "{} frames kept, holding {held} bytes for a body of {MOST}",
+            recording.kept.len()
+        );
     }
 
     /// A body may say it has ended with its last frame, and whatever sends it may stop
