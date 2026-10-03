@@ -1,0 +1,9 @@
+# Keeps the actions CI uses, pinned to commits, up to date. Cargo is left out on purpose:
+# a new dependency or version is a deliberate change (CONTRIBUTING.md), and advisories
+# reach us through cargo-deny and Dependabot's security updates.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

@@ -25,8 +25,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      # Pinned to a commit: actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # Pinned to a commit; Dependabot moves the pin and the version after it together.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # rust-toolchain.toml pins the compiler; rustup on the runner installs it on first use.
       - name: Toolchain
@@ -50,8 +50,8 @@ jobs:
     name: advisories, licences, sources
     runs-on: ubuntu-latest
     steps:
-      # Pinned to a commit: actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # Pinned to a commit; Dependabot moves the pin and the version after it together.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The version check.sh is run with, from crates.io rather than a third-party action.
       - name: cargo-deny
