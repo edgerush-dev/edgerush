@@ -33,8 +33,9 @@ wants cmake and libclang, and NASM as well on Windows. Then
 runs every check the project has (formatting, the dependencies' advisories and licences,
 clippy, a build without test features, the tests, the docs, and the benchmarks and fuzz
 targets building) and stops at the first that fails. A pull request is ready when it
-passes. Judge it by its exit status, not by reading the output. Linux is the platform that
-counts; CI also builds and tests on Windows, which has to stay green as well.
+passes. Judge it by its exit status, not by reading the output. CI runs the same script on
+Linux and on Windows; Linux is the platform that counts, but Windows has to stay green as
+well.
 
 ## What a change needs
 

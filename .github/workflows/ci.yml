@@ -14,16 +14,23 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
+  # Incremental artifacts help a developer editing one crate; here they would only make the
+  # cache bigger.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   check:
-    name: fmt, clippy, test (${{ matrix.os }})
+    # check.sh itself, so that CI and a local run cannot ask for different things.
+    name: check.sh (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
     steps:
       # Pinned to a commit; Dependabot moves the pin and the version after it together.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -32,33 +39,51 @@ jobs:
       - name: Toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
-      - name: Format
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      # The proxy's benchmarks need its `fuzzing` feature, which --all-targets leaves off:
-      # built here so that one that no longer compiles is seen, as check.sh does.
-      - name: Benchmarks build
-        run: cargo check -p edgerush-proxy --features fuzzing --benches --locked
-
-      - name: Test
-        run: cargo test --workspace --locked
-
-  dependencies:
-    name: advisories, licences, sources
-    runs-on: ubuntu-latest
-    steps:
-      # Pinned to a commit; Dependabot moves the pin and the version after it together.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The dependencies as main last built them (BoringSSL takes minutes) and cargo-deny.
+      # Keyed on the lock files and the toolchain, so a change to either starts a new entry
+      # from the nearest old one.
+      - name: Restore the build cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-deny.exe
+            target
+            fuzz/target
+          key: ${{ runner.os }}-check-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'fuzz/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-check-
 
       # The version check.sh is run with, from crates.io rather than a third-party action.
       - name: cargo-deny
-        run: cargo install --locked cargo-deny@0.20.2
-
-      # As check.sh runs it: deny.toml, for the workspace's lock file and fuzz/'s.
-      - name: Dependencies
         run: |
-          cargo deny check --allow license-exception-not-encountered
-          cargo deny --manifest-path fuzz/Cargo.toml check --allow advisory-not-detected
+          if [ "$(cargo deny --version 2>/dev/null)" != "cargo-deny 0.20.2" ]; then
+            cargo install --locked cargo-deny@0.20.2
+          fi
+
+      - name: Checks
+        run: ./check.sh
+
+      # check.sh builds as a developer does, bringing a lock file up to date if it has to;
+      # here one that no longer matches its manifest fails instead.
+      - name: Lock files unchanged
+        run: git diff --exit-code Cargo.lock fuzz/Cargo.lock
+
+      # From main alone, and only once all is green: a pull request's cache could serve only
+      # that pull request, and it is main's that every run starts from.
+      - name: Save the build cache
+        if: github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-deny.exe
+            target
+            fuzz/target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
