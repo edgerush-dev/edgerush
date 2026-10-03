@@ -248,8 +248,9 @@ pub(crate) struct Shared {
     /// The worker's account of what it holds for requests, charged what quiche holds for
     /// the listener's connections (16 §6).
     pub(crate) storage: Rc<Storage>,
-    /// Connections not yet through their handshake.
-    pub(crate) handshakes: Cell<usize>,
+    /// Connections not yet through their handshake, on any of the worker's HTTP/3
+    /// listeners: what the Retry threshold is held to, a worker's (16 §6).
+    pub(crate) handshakes: Rc<Cell<usize>>,
     /// Connections held.
     pub(crate) connections: Cell<usize>,
     /// A connection ended while the worker drains: the listener looks whether it was the
@@ -281,7 +282,8 @@ pub(crate) enum ListenerError {
 
 impl Shared {
     /// A listener on `socket`, as the `worker`th worker of those `secrets` are shared by,
-    /// charging what its connections hold to `storage` and counting them in `room`.
+    /// charging what its connections hold to `storage`, counting them in `room`, and its
+    /// handshakes under way in the worker's `handshakes`.
     #[expect(
         clippy::too_many_arguments,
         reason = "each is the worker's, handed in once when the listener is made"
@@ -294,6 +296,7 @@ impl Shared {
         timers: Rc<Timers>,
         drain: Rc<Drain>,
         storage: Rc<Storage>,
+        handshakes: Rc<Cell<usize>>,
         room: Option<Room>,
         count: Box<dyn Fn(Quic)>,
     ) -> Result<Self, ListenerError> {
@@ -308,7 +311,7 @@ impl Shared {
             timers,
             drain,
             storage,
-            handshakes: Cell::new(0),
+            handshakes,
             connections: Cell::new(0),
             ended: tokio::sync::Notify::new(),
             forwarded: Cell::new(0),

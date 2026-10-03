@@ -401,6 +401,9 @@ pub struct Worker {
     /// Its HTTP/2 connections, server's and client's, each charged what h2 holds of what
     /// its peer sent; the one charged most is closed when the storage runs out (15 §3).
     received: Rc<Received>,
+    /// Its HTTP/3 connections still in their handshake, on all its HTTP/3 listeners: past
+    /// a threshold of them a client proves its address first (16 §6).
+    handshakes: Rc<Cell<usize>>,
     /// By position in [`Proxy::listeners`]: the client validation its connections here are
     /// accepted under, and the drain they hear.
     validations: RefCell<Vec<Validation>>,
@@ -1007,6 +1010,7 @@ impl Worker {
             h1,
             connections,
             received,
+            handshakes: Rc::default(),
             validations,
             validated,
             routes: RefCell::default(),
@@ -1988,6 +1992,7 @@ impl Worker {
             Rc::clone(&self.timers),
             Rc::clone(&self.drain),
             Rc::clone(self.blocks.borrow().storage()),
+            Rc::clone(&self.handshakes),
             room,
             count,
         )
@@ -13892,6 +13897,44 @@ upstreams:
                 let answer = client.answers.get(&second).unwrap().clone();
                 assert_eq!(answer.final_status(), Some("503"), "{answer:?}");
                 assert_eq!(connections.now(), [h3::SLOTS + 1]);
+            })
+            .await;
+    }
+
+    /// A worker counts the handshakes under way on all its HTTP/3 listeners as one, which
+    /// is what its Retry threshold is held to (16 §6).
+    #[tokio::test]
+    async fn a_workers_http3_listeners_share_its_count_of_handshakes() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::downstream::h3::testing::Client;
+                let upstream = echoing_websocket_backend().await;
+                let http3 = edgerush_config::Http3 {
+                    alt_svc_max_age: 60,
+                    force_retry: false,
+                };
+                let config = compile(&h3_config(upstream, http3)).unwrap();
+                let proxy = Arc::new(Proxy::new(config, NonZeroUsize::MIN).unwrap());
+                let worker = Worker::made(proxy, H1Limits::default(), SHORT, 0, None);
+                let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
+                let mut clients = Vec::new();
+                for _ in 0..2 {
+                    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    let front = socket.local_addr().unwrap();
+                    let alone = Forwarding::group(1).remove(0);
+                    let _serving =
+                        tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
+                    let mut client = Client::new(front, "a.test").await;
+                    client.flush().await;
+                    client.hear_for(Duration::from_millis(300)).await;
+                    clients.push(client);
+                }
+                assert_eq!(worker.handshakes.get(), 2);
+                for client in &mut clients {
+                    client.until(|client| client.quic.is_established()).await;
+                }
+                until(|| worker.handshakes.get() == 0).await;
             })
             .await;
     }

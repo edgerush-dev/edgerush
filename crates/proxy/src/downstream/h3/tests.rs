@@ -162,6 +162,7 @@ where
         &Secrets::new().unwrap(),
         Forwarding::group(1).remove(0),
         storage,
+        Rc::default(),
     )
     .await
 }
@@ -178,16 +179,26 @@ where
     B: Body<Data = Bytes> + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    serving_on(settings, respond, secrets, forwarding, Storage::new(LIMIT)).await
+    serving_on(
+        settings,
+        respond,
+        secrets,
+        forwarding,
+        Storage::new(LIMIT),
+        Rc::default(),
+    )
+    .await
 }
 
-/// The same, for a worker whose storage is `storage`.
+/// The same, for a worker whose storage is `storage` and whose handshakes under way, on
+/// all its HTTP/3 listeners, are counted in `handshakes`.
 async fn serving_on<F, B>(
     settings: Settings,
     respond: impl Fn(Request<RequestBody>, Interim) -> F + 'static,
     secrets: &Secrets,
     forwarding: Forwarding,
     storage: Rc<Storage>,
+    handshakes: Rc<Cell<usize>>,
 ) -> Server
 where
     F: Future<Output = Answered<B>> + 'static,
@@ -219,6 +230,7 @@ where
             timers,
             Rc::clone(&drain),
             storage,
+            handshakes,
             None,
             Box::new(|_| {}),
         )
@@ -1692,6 +1704,50 @@ fn an_unknown_version_is_negotiated_and_a_short_initial_ignored() {
         client.send_raw(&out[..1_000], server.address).await;
         assert!(client.read_raw(Duration::from_millis(300)).await.is_empty());
         assert_eq!(server.shared.connections.get(), 0);
+    });
+}
+
+/// The threshold is the worker's (16 §6): a handshake under way on one of its HTTP/3
+/// listeners counts on the others, and a client of another listener proves its address
+/// first.
+#[test]
+fn the_retry_threshold_counts_every_handshake_of_the_worker() {
+    locally(async {
+        let settings = Settings {
+            retry_above: 1,
+            ..short()
+        };
+        // Two HTTP/3 listeners of one worker: the same keys, worker, storage and count of
+        // handshakes under way.
+        let secrets = Secrets::new().unwrap();
+        let storage = Storage::new(LIMIT);
+        let handshakes = Rc::new(Cell::new(0));
+        let alone = || Forwarding::group(1).remove(0);
+        let first = serving_on(
+            settings,
+            echo,
+            &secrets,
+            alone(),
+            Rc::clone(&storage),
+            Rc::clone(&handshakes),
+        )
+        .await;
+        let second = serving_on(settings, echo, &secrets, alone(), storage, handshakes).await;
+        // A handshake begun on the first listener and left under way.
+        let mut waiting = Client::new(first.address, "a.test").await;
+        waiting.flush().await;
+        waiting.hear_for(Duration::from_millis(300)).await;
+        assert_eq!(first.shared.handshakes.get(), 1);
+        let client = Client::connect(second.address, "a.test").await;
+        let heard = &client.received[0];
+        // A long header of version 1 whose type is Retry (RFC 9000 §17.2.5).
+        assert_eq!(
+            heard[0] & 0xf0,
+            0xf0,
+            "no Retry from the second listener with a handshake under way on the first \
+             (first byte {:#x})",
+            heard[0]
+        );
     });
 }
 
