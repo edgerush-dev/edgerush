@@ -8,6 +8,7 @@
 //! that its body has more, that its client reset it, that it can take more of its answer.
 
 use crate::downstream::h3::head::Refused;
+use crate::drain::Drain;
 use crate::storage::{Charge, Exhausted, Storage};
 use http::HeaderMap;
 use std::cell::{Cell, RefCell};
@@ -38,6 +39,9 @@ pub(crate) struct Conn {
     requests: Cell<u64>,
     /// Of those, the ones the client gave up before their answer's head was sent.
     given_up: Cell<u64>,
+    /// What the connection drains with, and its WebSockets too: its worker's drain, or a
+    /// reload replacing the client validation it was accepted under (03 §3).
+    pub(crate) drain: Rc<Drain>,
 }
 
 /// What the connection holds.
@@ -98,8 +102,8 @@ impl Slot {
 }
 
 impl Conn {
-    /// A connection quiche has accepted.
-    pub(crate) fn new(quic: quiche::Connection) -> Rc<Self> {
+    /// A connection quiche has accepted, which drains with `drain`.
+    pub(crate) fn new(quic: quiche::Connection, drain: Rc<Drain>) -> Rc<Self> {
         Rc::new(Self {
             state: RefCell::new(State {
                 quic,
@@ -115,6 +119,7 @@ impl Conn {
             shed: Cell::new(false),
             requests: Cell::new(0),
             given_up: Cell::new(0),
+            drain,
         })
     }
 

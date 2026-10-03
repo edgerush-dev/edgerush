@@ -1110,7 +1110,8 @@ impl FinalHead {
 
 /// Serves `socket` until the connection ends, handing each request to `respond` as its raw
 /// head and its body, and says how it ended. The caller closes the socket, lingering where
-/// bytes may still be arriving.
+/// bytes may still be arriving. Once `drain` starts, the connection closes when idle and says
+/// so on the answer in hand (03 §10).
 ///
 /// Each request's future runs in a slot lent by `slots` for as long as the request does, not
 /// inside this future (14 §3): a connection waiting for its first or next request holds no
@@ -1220,7 +1221,7 @@ where
                 Err(stop) => return stop.into(),
             }
         };
-        // Kept only if the data plane is not draining, as well as what the request and the
+        // Kept only if the connection is not draining, as well as what the request and the
         // connection say (`answer_head`).
         let persistent = persistent && !drain.is_on();
         let switching = response.status() == StatusCode::SWITCHING_PROTOCOLS;
@@ -1236,7 +1237,7 @@ where
         if switching {
             drop(body);
             let switched = interim.take_switched();
-            return Box::pin(switch(connection, switched)).await;
+            return Box::pin(switch(connection, switched, drain)).await;
         }
 
         let mut framer = BodyFramer::new(written.delimited);
@@ -1336,10 +1337,12 @@ where
 }
 
 /// Writes out a 101, then carries the connection to the backend the request core switched,
-/// which it left with the request's interim channel.
+/// which it left with the request's interim channel, draining it with the connection's
+/// `drain`.
 async fn switch<S: AsyncRead + AsyncWrite + Unpin>(
     mut connection: Connection<S>,
     switched: Option<Switched>,
+    drain: &Drain,
 ) -> Ended {
     if let Err(stop) = connection.flush().await {
         return stop.into();
@@ -1349,7 +1352,7 @@ async fn switch<S: AsyncRead + AsyncWrite + Unpin>(
         return Ended::Gone;
     };
     let (mut socket, input) = connection.into_tunnel();
-    Ended::Switched(switched.carry(&mut socket, input).await)
+    Ended::Switched(switched.carry(&mut socket, input, drain).await)
 }
 
 /// Ends a connection whose answer's body failed. Before any byte of the final head has

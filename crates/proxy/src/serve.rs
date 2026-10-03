@@ -400,6 +400,34 @@ pub struct Worker {
     /// Its HTTP/2 connections, server's and client's, each charged what h2 holds of what
     /// its peer sent; the one charged most is closed when the storage runs out (15 §3).
     received: Rc<Received>,
+    /// By position in [`Proxy::listeners`]: the client validation its connections here are
+    /// accepted under, and the drain they hear.
+    validations: RefCell<Vec<Validation>>,
+    /// Which snapshot `validations` were last brought up to.
+    validated: Cell<u64>,
+}
+
+/// The client validation a listener's connections were accepted under on a worker, and the
+/// drain they hear: the worker's drain starts it, and so does a reload that replaces the
+/// validation, which drains the connections accepted under the one before (03 §3, §10). A
+/// certificate rotation keeps it.
+#[derive(Debug)]
+struct Validation {
+    /// The listener's TLS when they were accepted, for its front, which a reload keeps
+    /// exactly while the listener validates clients alike; none for a listener without TLS.
+    tls: Option<Arc<Tls>>,
+    drain: Rc<Drain>,
+}
+
+impl Validation {
+    /// Whether a connection accepted with `tls` is accepted under this validation.
+    fn holds_for(&self, tls: Option<&Arc<Tls>>) -> bool {
+        match (&self.tls, tls) {
+            (None, None) => true,
+            (Some(kept), Some(tls)) => kept.same_front(tls),
+            _ => false,
+        }
+    }
 }
 
 /// Serves `socket`, a connection of `ours` that speaks HTTP/1, with our own server (14).
@@ -408,7 +436,8 @@ async fn serve_h1<S>(ours: Rc<Connection>, client: Rc<Client>, asking: Rc<Cell<b
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let worker = Rc::clone(&ours.worker);
+    let connection = Rc::clone(&ours);
+    let worker = &connection.worker;
     let listener = ours.listener;
     // The connection is kept by this for as long as it is served; each request's future
     // owns only a handle on the worker. It is that future itself, not one wrapped around
@@ -424,7 +453,7 @@ where
         Rc::clone(&worker.blocks),
         Rc::clone(&worker.timers),
         || worker.date.get(),
-        &worker.drain,
+        &connection.drain,
         respond,
         &slots,
     )
@@ -477,6 +506,7 @@ async fn serve_h2<S>(
 {
     let worker = Rc::clone(&ours.worker);
     let listener = ours.listener;
+    let drain = Rc::clone(&ours.drain);
     let storage = Rc::clone(worker.blocks.borrow().storage());
     let dating = Rc::clone(&worker);
     let date = Rc::new(move || dating.date.get());
@@ -497,7 +527,7 @@ async fn serve_h2<S>(
         storage,
         &worker.received,
         date,
-        &worker.drain,
+        drain,
         respond,
     )
     .await;
@@ -935,6 +965,16 @@ impl Worker {
             Storage::new(limits.storage),
         )));
         let received = Received::new(Rc::clone(blocks.borrow().storage()));
+        let (validations, validated) = {
+            let snapshot = proxy.current.load();
+            let validations = (0..proxy.listeners.len())
+                .map(|listener| Validation {
+                    tls: snapshot.tls.get(listener).cloned().flatten(),
+                    drain: Rc::new(Drain::default()),
+                })
+                .collect();
+            (RefCell::new(validations), Cell::new(snapshot.generation))
+        };
         Rc::new_cyclic(|me| Self {
             proxy,
             pool: Rc::new(RefCell::new(Pool::default())),
@@ -956,6 +996,8 @@ impl Worker {
             h1,
             connections,
             received,
+            validations,
+            validated,
         })
     }
 
@@ -964,6 +1006,81 @@ impl Worker {
     /// (03 §10). A worker's sweep does this by itself once [`Proxy::drain`] has been called.
     pub fn drain(&self) {
         self.drain.start();
+        // Every connection's drain too; one accepted later is given one already started.
+        let drains: Vec<Rc<Drain>> = self
+            .validations
+            .borrow()
+            .iter()
+            .map(|validation| Rc::clone(&validation.drain))
+            .collect();
+        for drain in drains {
+            drain.start();
+        }
+    }
+
+    /// What a connection accepted on `listener` with `tls` drains with: the drain of the
+    /// client validation it is accepted under (03 §3). The connection read the snapshot on
+    /// this thread, no earlier than the worker last did, so a validation that does not hold
+    /// for it is one a reload replaced, and the connections accepted under it drain now.
+    fn drain_for(&self, listener: usize, tls: Option<&Arc<Tls>>) -> Rc<Drain> {
+        let (drain, replaced) = {
+            let mut validations = self.validations.borrow_mut();
+            let Some(validation) = validations.get_mut(listener) else {
+                return Rc::clone(&self.drain);
+            };
+            let replaced = (!validation.holds_for(tls)).then(|| self.replace(validation, tls));
+            (Rc::clone(&validation.drain), replaced)
+        };
+        // Started once nothing is borrowed: a waker may run what it wakes.
+        if let Some(replaced) = replaced {
+            replaced.start();
+        }
+        drain
+    }
+
+    /// Brings the validations up to the snapshot in force, once a reload has come: the
+    /// connections of a listener whose client validation it replaced drain (03 §3), and those
+    /// of one whose certificates alone changed do not. For the sweep.
+    fn revalidate(&self) {
+        let snapshot = self.proxy.current.load();
+        if snapshot.generation == self.validated.get() {
+            return;
+        }
+        self.validated.set(snapshot.generation);
+        let replaced: Vec<Rc<Drain>> = {
+            let mut validations = self.validations.borrow_mut();
+            validations
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(listener, validation)| {
+                    let tls = snapshot.tls.get(listener).and_then(Option::as_ref);
+                    if validation.holds_for(tls) {
+                        // The same front: what it served before is let go of.
+                        validation.tls = tls.cloned();
+                        return None;
+                    }
+                    Some(self.replace(validation, tls))
+                })
+                .collect()
+        };
+        for drain in replaced {
+            drain.start();
+        }
+    }
+
+    /// Puts a validation for `tls` in the place of `validation`, and gives back the drain of
+    /// the one replaced, for the caller to start once nothing is borrowed.
+    fn replace(&self, validation: &mut Validation, tls: Option<&Arc<Tls>>) -> Rc<Drain> {
+        let drain = Rc::new(Drain::default());
+        // A worker that drains drains whatever it accepts from then on.
+        if self.drain.is_on() {
+            drain.start();
+        }
+        let replaced = Validation {
+            tls: tls.cloned(),
+            drain,
+        };
+        std::mem::replace(validation, replaced).drain
     }
 
     /// Until this worker drains.
@@ -1019,9 +1136,10 @@ impl Worker {
         loop {
             tokio::time::sleep(every).await;
             self.date.set(HttpDate::from_unix(unix_now()));
-            if self.proxy.draining.load(Ordering::Acquire) {
-                self.drain.start();
+            if self.proxy.draining.load(Ordering::Acquire) && !self.drain.is_on() {
+                self.drain();
             }
+            self.revalidate();
             // Borrowed for the sweep and let go of before anything is waited on again.
             let swept = self.pool.borrow_mut().sweep(&self.limits);
             // And what a burst left parked of the blocks, down to what a quiet worker keeps.
@@ -1243,33 +1361,36 @@ impl Worker {
     pub async fn serve_connection(self: Rc<Self>, listener: usize, stream: TcpStream) {
         // Worth having, not worth refusing a connection over.
         let _unset = stream.set_nodelay(true);
-        let (tls, passthrough, reads_header) = {
+        let (tls, passthrough, reads_header, drain) = {
             let snapshot = self.proxy.current.load();
             let compiled = snapshot.listener(listener);
-            // The TLS of the config the connection came in under, which it keeps to its end.
+            // The TLS of the config the connection came in under, which it keeps to its end,
+            // and the drain of the client validation it is accepted under, which a reload
+            // that replaces the validation starts (03 §3).
             let tls = snapshot.tls.get(listener).cloned().flatten();
+            let drain = self.drain_for(listener, tls.as_ref());
             // A `tcp` or `tls` listener's connections are carried, not served (17).
             let passthrough = compiled
                 .and_then(|compiled| compiled.l4.as_ref())
                 .map(|l4| matches!(l4, L4::Tls(_)));
             let reads_header = compiled.is_some_and(|compiled| compiled.proxy_senders.is_some());
-            (tls, passthrough, reads_header)
+            (tls, passthrough, reads_header, drain)
         };
         // A connection that starts with a PROXY header is served, or carried, after it, in a
         // future of its own: boxed, and settled first, so that nothing here is held across
         // the wait for it and no other connection's future is the larger for it (14 §3).
         if reads_header {
-            return Box::pin(self.after_header(listener, stream, tls, passthrough)).await;
+            return Box::pin(self.after_header(listener, stream, tls, passthrough, drain)).await;
         }
         if let Some(by_name) = passthrough {
-            let connection = Connection::open(Rc::clone(&self), listener);
+            let connection = Connection::open(Rc::clone(&self), listener, drain);
             let due = Instant::now() + self.deadlines.first_request;
             // Its own ends, asked of the socket only if a backend is to be told of them.
             return self
                 .pass_through(connection, stream, by_name, None, None, due)
                 .await;
         }
-        let connection = Rc::new(Connection::open(Rc::clone(&self), listener));
+        let connection = Rc::new(Connection::open(Rc::clone(&self), listener, drain));
         // Who the upstream is told the client is, written once for all its requests. Gone
         // only if the client already is.
         let Ok(client) = stream
@@ -1379,7 +1500,7 @@ impl Worker {
     ) {
         let listener = connection.listener;
         let ended = self
-            .carry_through(listener, &mut client, by_name, ends, after, due)
+            .carry_through(&connection, &mut client, by_name, ends, after, due)
             .await;
         if let Some(counters) = self.proxy.metrics.listener(listener) {
             counters.tunnel(ended);
@@ -1390,10 +1511,11 @@ impl Worker {
     /// The tunnel. A `tls` listener reads the ClientHello into a block of the worker's,
     /// which then carries the client's bytes on, so that what was read goes to the backend
     /// first and unchanged; the tunnel gives it back once it has. What came after a PROXY
-    /// header is already in a block, which goes on the same way.
+    /// header is already in a block, which goes on the same way. It drains with
+    /// `connection`.
     async fn carry_through(
         &self,
-        listener: usize,
+        connection: &Connection,
         client: &mut TcpStream,
         by_name: bool,
         ends: Option<Ends>,
@@ -1427,7 +1549,7 @@ impl Worker {
             });
             (None, after)
         };
-        let routed = self.pass_route(listener, name.as_deref());
+        let routed = self.pass_route(connection.listener, name.as_deref());
         // Held until the tunnel closes: it is load on its backend for as long as it is open.
         let (endpoint, idle, _counted) = match routed {
             Ok(routed) => routed,
@@ -1501,7 +1623,7 @@ impl Worker {
             &self.blocks,
             bounds,
             &self.timers,
-            &self.drain,
+            &connection.drain,
         )
         .await
         .into()
@@ -1622,10 +1744,11 @@ impl Worker {
         mut stream: TcpStream,
         tls: Option<Arc<Tls>>,
         passthrough: Option<bool>,
+        drain: Rc<Drain>,
     ) {
         // From accept to the first request: one stretch, the header included.
         let due = Instant::now() + self.deadlines.first_request;
-        let connection = Connection::open(Rc::clone(self), listener);
+        let connection = Connection::open(Rc::clone(self), listener, drain);
         // Gone only if the client already is.
         let Ok(peer) = stream.peer_addr() else {
             return;
@@ -1824,7 +1947,14 @@ impl Worker {
                 .listener(listener)
                 .and_then(|listener| listener.http3)
                 .is_some_and(|http3| http3.force_retry);
-            Some(h3_listener::InForce { tls, force_retry })
+            // Read on this thread at the client's first packet, as a TCP connection reads it
+            // at its accept.
+            let drain = reading.drain_for(listener, Some(&tls));
+            Some(h3_listener::InForce {
+                tls,
+                force_retry,
+                drain,
+            })
         };
         let answering = Rc::clone(&self);
         let respond = Rc::new(
@@ -1835,7 +1965,9 @@ impl Worker {
         let dating = Rc::clone(&self);
         let date = Rc::new(move || dating.date.get());
         let opening = Rc::clone(&self);
-        let opened = move || Connection::open(Rc::clone(&opening), listener);
+        let opened = move |drain: &Rc<Drain>| {
+            Connection::open(Rc::clone(&opening), listener, Rc::clone(drain))
+        };
         h3_listener::serve(Rc::new(shared), in_force, respond, date, opened, forwarding).await;
         Ok(())
     }
@@ -2644,7 +2776,6 @@ impl Worker {
             },
             blocks: Rc::clone(&self.blocks),
             timers: Rc::clone(&self.timers),
-            drain: Rc::clone(&self.drain),
             ended: Box::new(move |carried: Carried| {
                 if let Some(counters) = proxy.metrics.listener(listener) {
                     counters.tunnel(carried.into());
@@ -3444,15 +3575,22 @@ struct Ends {
 struct Connection {
     worker: Rc<Worker>,
     listener: usize,
+    /// What it drains with, and a WebSocket it carries too: the worker's drain, and a reload
+    /// that replaces the client validation it was accepted under (03 §3).
+    drain: Rc<Drain>,
 }
 
 impl Connection {
-    fn open(worker: Rc<Worker>, listener: usize) -> Self {
+    fn open(worker: Rc<Worker>, listener: usize, drain: Rc<Drain>) -> Self {
         if let Some(counters) = worker.proxy.metrics.listener(listener) {
             counters.accepted.inc();
             counters.active.inc();
         }
-        Self { worker, listener }
+        Self {
+            worker,
+            listener,
+            drain,
+        }
     }
 }
 
@@ -5148,6 +5286,319 @@ upstreams:
             .await;
     }
 
+    /// A config of one `https` listener, `web`, presenting `served` and validating clients
+    /// against `authority`, that sends everything to `upstream`.
+    fn validating_to(
+        upstream: SocketAddr,
+        served: &edgerush_config::Certificate,
+        authority: &edgerush_config::Certificate,
+    ) -> Compiled {
+        let mut config = everything_config(upstream);
+        secured(
+            &mut config,
+            vec![served.clone()],
+            Some(edgerush_config::ClientValidation {
+                authorities: vec![authority.chain.clone()],
+            }),
+        );
+        compile(&config).unwrap()
+    }
+
+    /// Sets a TLS client up to show `shown` when asked who it is.
+    fn showing(
+        shown: &edgerush_config::Certificate,
+    ) -> impl Fn(&mut boring::ssl::SslConnectorBuilder) + Copy + '_ {
+        move |builder| {
+            let chain = boring::x509::X509::from_pem(shown.chain.as_bytes()).unwrap();
+            let key = boring::pkey::PKey::private_key_from_pem(shown.key.as_bytes()).unwrap();
+            builder.set_certificate(&chain).unwrap();
+            builder.set_private_key(&key).unwrap();
+        }
+    }
+
+    /// A worker serving `config`, its sweep run every 50 ms, far sooner than an idle
+    /// connection is let go of: what the sweep starts is told apart from the keep-alive.
+    async fn serving_swept(config: Compiled) -> (SocketAddr, Rc<Worker>) {
+        let limits = H1Limits {
+            sweep: Duration::from_millis(50),
+            ..H1Limits::default()
+        };
+        let proxy = Proxy::new(config, NonZeroUsize::MIN).unwrap();
+        let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        let _sweeping = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+        (front, worker)
+    }
+
+    /// Asks `client` for `/` on a connection it keeps, and reads the answer, the counting
+    /// upstream's `ok`.
+    async fn kept_answer<S>(client: &mut S) -> String
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        client
+            .write_all(b"GET / HTTP/1.1\r\nhost: example.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        while !answer.ends_with(b"ok") {
+            let mut some = [0; 512];
+            let got = within(client.read(&mut some)).await.unwrap();
+            assert_ne!(got, 0, "{:?}", String::from_utf8_lossy(&answer));
+            answer.extend_from_slice(&some[..got]);
+        }
+        String::from_utf8_lossy(&answer).into_owned()
+    }
+
+    /// A reload that takes away the authority that vouched for a client drains the
+    /// connections accepted under the validation before, as the worker's drain would, from
+    /// the worker's next sweep: one kept between requests is closed then, long before its
+    /// keep-alive would close it, and a new connection is refused (03 §3, §10).
+    #[tokio::test]
+    async fn a_reload_that_replaces_a_listeners_client_validation_drains_its_connections() {
+        use tokio::io::AsyncReadExt;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::tls::testing::certificate;
+                let (upstream, _) = counting_upstream().await;
+                let served = certificate(&["example.test"]);
+                let (trusted, other) = (certificate(&["client"]), certificate(&["client"]));
+                let (front, worker) =
+                    serving_swept(validating_to(upstream, &served, &trusted)).await;
+                let mut client = tls_client(front, "example.test", None, showing(&trusted))
+                    .await
+                    .unwrap();
+                let answer = kept_answer(&mut client).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+
+                worker
+                    .proxy()
+                    .reload(validating_to(upstream, &served, &other))
+                    .unwrap();
+                let reloaded = tokio::time::Instant::now();
+                let mut rest = Vec::new();
+                let _ended = within(client.read_to_end(&mut rest)).await;
+                let took = reloaded.elapsed();
+                assert!(
+                    rest.is_empty(),
+                    "said more: {}",
+                    String::from_utf8_lossy(&rest)
+                );
+                assert!(
+                    took < worker.limits.sweep + SLACK && took < SHORT.next_request,
+                    "closed {took:?} after the reload"
+                );
+                let refused = match tls_client(front, "example.test", None, showing(&trusted)).await
+                {
+                    Ok(stream) => h1_over_or_nothing(stream).await,
+                    Err(_) => String::new(),
+                };
+                assert_eq!(refused, "", "a new connection served after the reload");
+            })
+            .await;
+    }
+
+    /// The same over HTTP/2: the connection is told to go, and goes, from the next sweep.
+    #[tokio::test]
+    async fn an_http2_connection_under_a_replaced_client_validation_is_told_to_go() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::tls::testing::certificate;
+                let (upstream, _) = counting_upstream().await;
+                let served = certificate(&["example.test"]);
+                let (trusted, other) = (certificate(&["client"]), certificate(&["client"]));
+                let (front, worker) =
+                    serving_swept(validating_to(upstream, &served, &trusted)).await;
+                let offered: &[u8] = b"\x02h2";
+                let stream = tls_client(front, "example.test", Some(offered), showing(&trusted))
+                    .await
+                    .unwrap();
+                let (mut send, connection) = within(::h2::client::handshake(stream)).await.unwrap();
+                let ended = Rc::new(Cell::new(None));
+                let ending = Rc::clone(&ended);
+                let _driving = tokio::task::spawn_local(async move {
+                    let _ended = connection.await;
+                    ending.set(Some(tokio::time::Instant::now()));
+                });
+                let request = Request::get("https://example.test/").body(()).unwrap();
+                let (answer, _) = send.send_request(request, true).unwrap();
+                assert_eq!(within(answer).await.unwrap().status(), StatusCode::OK);
+
+                worker
+                    .proxy()
+                    .reload(validating_to(upstream, &served, &other))
+                    .unwrap();
+                let reloaded = tokio::time::Instant::now();
+                until(|| ended.get().is_some()).await;
+                let took = ended.get().unwrap() - reloaded;
+                assert!(
+                    took < worker.limits.sweep + SLACK && took < SHORT.next_request,
+                    "closed {took:?} after the reload"
+                );
+                drop(send);
+            })
+            .await;
+    }
+
+    /// The same over HTTP/3, through a reload that starts validating clients, which is a
+    /// validation of its own: the QUIC connection accepted before it is told to go from the
+    /// next sweep, long before its keep-alive would tell it.
+    #[tokio::test]
+    async fn an_http3_connection_under_a_replaced_client_validation_is_told_to_go() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::downstream::h3::testing::Client;
+                let (upstream, _) = counting_upstream().await;
+                let http3 = edgerush_config::Http3 {
+                    alt_svc_max_age: 60,
+                    force_retry: false,
+                };
+                let mut config = h3_config(upstream, http3);
+                let limits = H1Limits {
+                    sweep: Duration::from_millis(50),
+                    ..H1Limits::default()
+                };
+                let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+                let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let alone = Forwarding::group(1).remove(0);
+                let _serving =
+                    tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
+                let _sweeping = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+                let mut client = Client::connect(front, "a.test").await;
+                assert_eq!(client.get("a.test", "/").await.final_status(), Some("200"));
+
+                let authority = crate::tls::testing::certificate(&["client"]);
+                let web = config.listeners.get_mut("web").unwrap();
+                web.tls.as_mut().unwrap().client_validation =
+                    Some(edgerush_config::ClientValidation {
+                        authorities: vec![authority.chain],
+                    });
+                worker.proxy().reload(compile(&config).unwrap()).unwrap();
+                let reloaded = tokio::time::Instant::now();
+                client.until(|client| client.goaway.is_some()).await;
+                let took = reloaded.elapsed();
+                assert!(
+                    took < worker.limits.sweep + SLACK && took < SHORT.next_request,
+                    "told to go {took:?} after the reload"
+                );
+            })
+            .await;
+    }
+
+    /// New certificates behind the same client validation drain nothing: a connection kept
+    /// across the reload, and several sweeps after it, is still served.
+    #[tokio::test]
+    async fn a_reload_that_rotates_certificates_alone_drains_no_connection() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                use crate::tls::testing::certificate;
+                let (upstream, _) = counting_upstream().await;
+                let trusted = certificate(&["client"]);
+                let served = certificate(&["example.test"]);
+                let (front, worker) =
+                    serving_swept(validating_to(upstream, &served, &trusted)).await;
+                let mut client = tls_client(front, "example.test", None, showing(&trusted))
+                    .await
+                    .unwrap();
+                let answer = kept_answer(&mut client).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+
+                let rotated = certificate(&["example.test"]);
+                worker
+                    .proxy()
+                    .reload(validating_to(upstream, &rotated, &trusted))
+                    .unwrap();
+                tokio::time::sleep(worker.limits.sweep * 4).await;
+                let answer = kept_answer(&mut client).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                assert!(!answer.contains("connection: close"), "{answer}");
+            })
+            .await;
+    }
+
+    /// What a worker's connections drain with follows the client validation they were
+    /// accepted under: one drain for as long as a reload keeps it, certificate rotations
+    /// included; a reload that replaces it starts it, at the sweep or at the next accept,
+    /// whichever comes first; the worker's own drain starts them all, and any made after.
+    #[tokio::test]
+    async fn connections_drain_with_the_client_validation_they_were_accepted_under() {
+        use crate::tls::testing::certificate;
+        let upstream: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let served = certificate(&["example.test"]);
+        let (trusted, other) = (certificate(&["client"]), certificate(&["client"]));
+        let proxy = Proxy::new(
+            validating_to(upstream, &served, &trusted),
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let worker = Worker::new(Arc::new(proxy));
+        let tls_now = || worker.proxy.current.load().tls[0].clone();
+        let first = worker.drain_for(0, tls_now().as_ref());
+        assert!(Rc::ptr_eq(&first, &worker.drain_for(0, tls_now().as_ref())));
+
+        // New certificates, the same validation: the same drain.
+        let rotated = certificate(&["example.test"]);
+        worker
+            .proxy
+            .reload(validating_to(upstream, &rotated, &trusted))
+            .unwrap();
+        worker.revalidate();
+        assert!(!first.is_on());
+        assert!(Rc::ptr_eq(&first, &worker.drain_for(0, tls_now().as_ref())));
+
+        // Another validation: started at the sweep, and a new one for what comes after.
+        worker
+            .proxy
+            .reload(validating_to(upstream, &served, &other))
+            .unwrap();
+        worker.revalidate();
+        assert!(first.is_on(), "the validation before was not drained");
+        let second = worker.drain_for(0, tls_now().as_ref());
+        assert!(!second.is_on());
+
+        // Seen first by a connection accepted before the sweep: started then.
+        worker
+            .proxy
+            .reload(validating_to(upstream, &served, &trusted))
+            .unwrap();
+        let third = worker.drain_for(0, tls_now().as_ref());
+        assert!(second.is_on(), "the validation before was not drained");
+        assert!(!third.is_on());
+        worker.revalidate();
+        assert!(!third.is_on(), "the sweep drained the validation in force");
+
+        // No TLS at all is a validation of its own.
+        worker.proxy.reload(everything_to(upstream)).unwrap();
+        worker.revalidate();
+        assert!(third.is_on());
+        let plain = worker.drain_for(0, None);
+        assert!(!plain.is_on());
+
+        worker.drain();
+        assert!(
+            plain.is_on(),
+            "the worker's drain did not reach its connections"
+        );
+        assert!(worker.drain_for(0, None).is_on());
+        worker
+            .proxy
+            .reload(validating_to(upstream, &served, &trusted))
+            .unwrap();
+        assert!(
+            worker.drain_for(0, tls_now().as_ref()).is_on(),
+            "a draining worker accepted under a drain not started"
+        );
+    }
+
     /// A worker serving `yaml`'s one listener, a passthrough one, with the short deadlines.
     async fn passing(yaml: &str) -> (SocketAddr, Rc<Worker>) {
         let config: Config = serde_saphyr::from_str(yaml).unwrap();
@@ -5788,7 +6239,7 @@ upstreams:
             .unwrap();
         let after = tls(&proxy);
         assert!(!Arc::ptr_eq(&before, &after));
-        assert!(after.shares_keys_with(&before));
+        assert!(after.same_front(&before));
 
         // Validating clients otherwise is a new front.
         let mut validating = everything_config(upstream);
@@ -5800,7 +6251,7 @@ upstreams:
             }),
         );
         proxy.reload(compile(&validating).unwrap()).unwrap();
-        assert!(!tls(&proxy).shares_keys_with(&after));
+        assert!(!tls(&proxy).same_front(&after));
         proxy
             .reload(everything_secured_to(
                 upstream,

@@ -15,8 +15,9 @@
 //! A side's end is passed on as a half-close (`shutdown(Write)`), and the other way goes on
 //! until it ends too: a protocol that says "that is all I have" and then waits for the
 //! answer is carried as it is. The tunnel is closed once both ways have ended, when either
-//! side fails, when it has carried nothing for its idle bound, when the worker drains and
-//! its bound is up, or when the worker has no storage for a block to read into.
+//! side fails, when it has carried nothing for its idle bound, when it is drained — its
+//! worker drains, or its client's connection — and its bound is up, or when the worker has
+//! no storage for a block to read into.
 
 use crate::connections::Held;
 use crate::drain::Drain;
@@ -44,7 +45,7 @@ pub(crate) enum Carried {
     Closed,
     /// Nothing either way for the idle bound.
     Idle,
-    /// The worker drained, and the drain's bound came.
+    /// It was drained, and the drain's bound came.
     Drained,
     /// A side failed.
     Failed,
@@ -64,12 +65,12 @@ impl From<Carried> for crate::metrics::Tunnel {
     }
 }
 
-/// What a tunnel is held to, and how it ends when the worker drains.
+/// What a tunnel is held to, and how it ends when it is drained.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Bounds {
     /// How long it may carry nothing either way.
     pub(crate) idle: Duration,
-    /// How long it may go on once the worker drains.
+    /// How long it may go on once it is drained.
     pub(crate) drain_within: Duration,
     /// Whether it carries a WebSocket, whose frames are followed both ways so that a drain
     /// can close it with a Close frame each way (19 §6).
@@ -102,11 +103,10 @@ pub(crate) struct Switched {
     pub(crate) backend: Backend,
     /// What the backend sent after its 101, which goes to the client first.
     pub(crate) leftover: Option<Block>,
-    /// The rule's idle bound, and the worker's drain bound.
+    /// The rule's idle bound, and the drain bound.
     pub(crate) bounds: Bounds,
     pub(crate) blocks: Rc<RefCell<Blocks>>,
     pub(crate) timers: Rc<Timers>,
-    pub(crate) drain: Rc<Drain>,
     /// Told how the tunnel ended, which counts it as its listener's.
     pub(crate) ended: Box<dyn FnOnce(Carried)>,
     /// The handshake's count at its endpoint, held until the tunnel closes: a WebSocket is
@@ -128,8 +128,14 @@ impl std::fmt::Debug for Switched {
 
 impl Switched {
     /// Carries `client` to the backend until the tunnel ends, what the client sent after its
-    /// handshake (`early`) going first, and counts how it ended.
-    pub(crate) async fn carry<C>(self, client: &mut C, early: Option<Block>) -> Carried
+    /// handshake (`early`) going first, and counts how it ended. `drain` is the client
+    /// connection's, which the tunnel drains with: the server that carries it hands it over.
+    pub(crate) async fn carry<C>(
+        self,
+        client: &mut C,
+        early: Option<Block>,
+        drain: &Drain,
+    ) -> Carried
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
@@ -139,7 +145,6 @@ impl Switched {
             bounds,
             blocks,
             timers,
-            drain,
             ended,
             counted,
             held,
@@ -152,7 +157,7 @@ impl Switched {
             &blocks,
             bounds,
             &timers,
-            &drain,
+            drain,
         )
         .await;
         // Load on its backend no longer, and a connection of its worker's no longer.

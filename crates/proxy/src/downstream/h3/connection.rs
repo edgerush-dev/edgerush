@@ -133,7 +133,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
         hq_lines: std::collections::HashMap::new(),
     };
     let mut alarm = Alarm::new(&shared.timers, None);
-    let mut drain_heard = pin!(shared.drain.notified());
+    let mut drain_heard = pin!(conn.drain.notified());
     // Room in the socket, waited for when a flush leaves datagrams unsent. The socket is
     // every connection's: tokio wakes each task waiting on `writable()`, where
     // `poll_send_ready` keeps only the last task's waker.
@@ -142,8 +142,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
     poll_fn(|cx| {
         conn.drive_with(cx.waker());
         loop {
-            if driving.drain_by.is_none()
-                && shared.drain.poll_on(drain_heard.as_mut(), cx).is_ready()
+            if driving.drain_by.is_none() && conn.drain.poll_on(drain_heard.as_mut(), cx).is_ready()
             {
                 driving.drain_by = Some(Instant::now() + settings.drain_within);
                 go_away(&conn, &mut driving);
@@ -739,7 +738,7 @@ async fn answer<R, F, B, D>(
             IncomingH3::new(Rc::clone(&stream.conn), stream.id, None, ended, idle).unwatched();
         let mut tunnel = H3Stream::new(incoming, responder);
         // Closed by both ends is whole; anything else resets the stream as it goes.
-        if switched.carry(&mut tunnel, None).await == Carried::Closed {
+        if switched.carry(&mut tunnel, None, &stream.conn.drain).await == Carried::Closed {
             stream.answered();
         }
         return;

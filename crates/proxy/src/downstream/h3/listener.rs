@@ -315,13 +315,17 @@ pub(crate) struct InForce {
     /// Every client proves its address with a Retry first, however few handshakes are under
     /// way.
     pub(crate) force_retry: bool,
+    /// What a connection accepted with `tls` drains with: the worker's drain, and a reload
+    /// that replaces the client validation it was accepted under (03 §3).
+    pub(crate) drain: Rc<Drain>,
 }
 
 /// Serves the listener until the worker drains and its last connection is gone. `in_force`
 /// says what the config in force accepts a connection with, read at each client's first
 /// packet, so that a new config applies to the next; `respond` answers each request;
-/// `date` dates an answer; `opened` is held by each connection for as long as it lives;
-/// `forwarding` is this worker's share of the listener's inboxes.
+/// `date` dates an answer; what `opened` makes of a connection's drain is held by the
+/// connection for as long as it lives; `forwarding` is this worker's share of the
+/// listener's inboxes.
 pub(crate) async fn serve<T, R, F, B, D, O, G>(
     shared: Rc<Shared>,
     in_force: T,
@@ -336,7 +340,7 @@ pub(crate) async fn serve<T, R, F, B, D, O, G>(
     B: Body<Data = Bytes> + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     D: Fn() -> HttpDate + 'static,
-    O: Fn() -> G,
+    O: Fn(&Rc<Drain>) -> G,
     G: 'static,
 {
     let mut buffer = vec![0; DATAGRAM];
@@ -427,7 +431,7 @@ where
     B: Body<Data = Bytes> + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     D: Fn() -> HttpDate + 'static,
-    O: Fn() -> G,
+    O: Fn(&Rc<Drain>) -> G,
     G: 'static,
 {
     /// Routes one datagram: to its connection here; to another worker's inbox, if its ID
@@ -468,7 +472,7 @@ where
         };
         self.admitted += 1;
         deliver(&conn, datagram, from, shared.local);
-        let guard = (self.opened)();
+        let guard = (self.opened)(&conn.drain);
         let chosen = dcid
             .as_ref()
             .map_or_else(Vec::new, |dcid| dcid.as_slice().to_vec());
@@ -574,7 +578,7 @@ fn admit<T: Fn() -> Option<InForce>>(
         None => quiche::accept(&scid, None, shared.local, from, &mut accepting.config),
     }
     .ok()?;
-    let conn = Conn::new(quic);
+    let conn = Conn::new(quic, in_force.drain);
     {
         let mut table = shared.table.borrow_mut();
         table.insert(scid.to_vec(), Rc::clone(&conn));

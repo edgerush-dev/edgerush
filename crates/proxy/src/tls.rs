@@ -260,9 +260,10 @@ impl Tls {
         self.source == *source
     }
 
-    /// Whether this and `other` seal session tickets with the same keys.
-    #[cfg(test)]
-    pub(crate) fn shares_keys_with(&self, other: &Self) -> bool {
+    /// Whether this and `other` are behind the same front: they seal session tickets with
+    /// the same keys, and validate clients alike, since a config keeps a front only while
+    /// it validates clients as the front was made to.
+    pub(crate) fn same_front(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.front, &other.front)
     }
 }

@@ -94,8 +94,9 @@ impl Default for Settings {
 /// keep-alive clock starts then. Today h2 wakes the driver too, as the stream's handles
 /// go, so no test can tell this wake from that one; it is here because h2 does not promise
 /// it.
-#[derive(Default)]
 struct Streams {
+    /// The connection's drain, which its WebSockets drain with too.
+    drain: Rc<Drain>,
     open: Cell<usize>,
     driver: RefCell<Option<Waker>>,
     /// Streams accepted in the connection's life.
@@ -105,6 +106,16 @@ struct Streams {
 }
 
 impl Streams {
+    fn new(drain: Rc<Drain>) -> Self {
+        Self {
+            drain,
+            open: Cell::new(0),
+            driver: RefCell::new(None),
+            seen: Cell::new(0),
+            premature: Cell::new(0),
+        }
+    }
+
     /// Whether the connection is a rapid reset (CVE-2023-44487): at least `after` streams
     /// seen, half or more of them reset by the client before they were answered. Envoy's
     /// rule and its numbers; h2 bounds only resets that come before a stream is accepted.
@@ -164,14 +175,16 @@ impl Settings {
 
 /// Serves an HTTP/2 connection, preface included, until it ends. Each request is handed to
 /// `respond`, and `date` dates an answer that has no `Date` of its own. What h2 holds of
-/// what the client sent is charged in `received`.
+/// what the client sent is charged in `received`. Once `drain` starts, the client is told to
+/// go and the connection closes when its streams have ended or the drain's time is up
+/// (03 §10).
 pub(crate) async fn serve<S, R, F, B, D>(
     socket: S,
     settings: Settings,
     storage: Rc<Storage>,
     received: &Rc<Received>,
     date: Rc<D>,
-    drain: &Drain,
+    drain: Rc<Drain>,
     respond: Rc<R>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -203,7 +216,7 @@ async fn drive<S, R, F, B, D>(
     storage: Rc<Storage>,
     received: &Rc<Received>,
     date: Rc<D>,
-    drain: &Drain,
+    drain: Rc<Drain>,
     respond: Rc<R>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -213,7 +226,8 @@ async fn drive<S, R, F, B, D>(
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     D: Fn() -> HttpDate + 'static,
 {
-    let streams = Rc::new(Streams::default());
+    let streams = Rc::new(Streams::new(drain));
+    let drain = &streams.drain;
     // Its place among the worker's HTTP/2 connections, charged what h2 holds for it.
     let account = received.open();
     // One timer for the two things a connection with no stream open waits for (`quiet`).
@@ -411,7 +425,16 @@ where
     D: Fn() -> HttpDate,
 {
     Box::pin(async move {
-        let answered = answer(request, responder, &*respond, &storage, &*date, idle).await;
+        let answered = answer(
+            request,
+            responder,
+            &*respond,
+            &storage,
+            &*date,
+            idle,
+            &open.0.drain,
+        )
+        .await;
         if answered == Ended::ResetEarly {
             open.0.premature.set(open.0.premature.get() + 1);
         }
@@ -419,7 +442,7 @@ where
     })
 }
 
-/// Answers one stream.
+/// Answers one stream; a WebSocket it opens drains with the connection's `drain`.
 async fn answer<R, F, B, D>(
     request: Request<::h2::RecvStream>,
     mut responder: Responder,
@@ -427,6 +450,7 @@ async fn answer<R, F, B, D>(
     storage: &Rc<Storage>,
     date: &D,
     idle: Duration,
+    drain: &Drain,
 ) -> Ended
 where
     R: Fn(Request<RequestBody>, Interim) -> F,
@@ -491,7 +515,7 @@ where
     if let Some((switched, received)) = switched {
         drop(body);
         let mut tunnel = H2Stream::new(stream, received, Rc::clone(storage), None);
-        let _carried = switched.carry(&mut tunnel, None).await;
+        let _carried = switched.carry(&mut tunnel, None, drain).await;
         return Ended::Otherwise;
     }
     if !end {
@@ -536,8 +560,17 @@ mod tests {
             },
         );
         let answer = size_of_made(
-            |(request, responder, _, respond, storage, date): Asked| async move {
-                answer(request, responder, &*respond, &storage, &*date, LONG).await
+            |(request, responder, open, respond, storage, date): Asked| async move {
+                answer(
+                    request,
+                    responder,
+                    &*respond,
+                    &storage,
+                    &*date,
+                    LONG,
+                    &open.0.drain,
+                )
+                .await
             },
         );
         assert_eq!(
@@ -614,7 +647,10 @@ mod tests {
                 }
             });
             let date = Rc::new(|| HttpDate::from_unix(0));
-            let (drain, storage) = (Drain::default(), Storage::new(crate::storage::LIMIT));
+            let (drain, storage) = (
+                Rc::new(Drain::default()),
+                Storage::new(crate::storage::LIMIT),
+            );
             let received = Received::new(Rc::clone(&storage));
             let window = settings.stream_window as usize;
             let asking = async {
@@ -643,7 +679,7 @@ mod tests {
                 Rc::clone(&storage),
                 &received,
                 date,
-                &drain,
+                drain,
                 respond,
             );
             let used = tokio::select! {
@@ -690,14 +726,13 @@ mod tests {
                 let (storage, received) = (Rc::clone(&storage), Rc::clone(&received));
                 let (date, respond) = (Rc::clone(&date), Rc::clone(&respond));
                 tokio::task::spawn_local(async move {
-                    let drain = Drain::default();
                     drive(
                         &mut connection,
                         settings,
                         storage,
                         &received,
                         date,
-                        &drain,
+                        Rc::new(Drain::default()),
                         respond,
                     )
                     .await;
@@ -818,7 +853,10 @@ mod tests {
                 Answered::Map(Response::new(Full::new(uploaded)))
             });
             let date = Rc::new(|| HttpDate::from_unix(0));
-            let (drain, storage) = (Drain::default(), Storage::new(crate::storage::LIMIT));
+            let (drain, storage) = (
+                Rc::new(Drain::default()),
+                Storage::new(crate::storage::LIMIT),
+            );
             let received = Received::new(Rc::clone(&storage));
             let long = "a long header, Huffman-coded ".repeat(40);
             // Driven while `waited` passes after a stream, then let go of to be looked at.
@@ -849,7 +887,7 @@ mod tests {
                     Rc::clone(&storage),
                     &received,
                     Rc::clone(&date),
-                    &drain,
+                    Rc::clone(&drain),
                     Rc::clone(&respond),
                 );
                 tokio::select! {

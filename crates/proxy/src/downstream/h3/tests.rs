@@ -49,6 +49,10 @@ type Answering = Pin<Box<dyn Future<Output = Answered<Full<Bytes>>>>>;
 struct Server {
     address: SocketAddr,
     drain: Rc<Drain>,
+    /// What a connection accepted now drains with: the listener's own at first, as a
+    /// worker's connections drain when it does; a test may put another in its place, as a
+    /// reload that replaces the client validation does (03 §3).
+    accepted_with: Rc<RefCell<Rc<Drain>>>,
     shared: Rc<Shared>,
 }
 
@@ -219,23 +223,27 @@ where
         )
         .unwrap(),
     );
+    let accepted_with = Rc::new(RefCell::new(Rc::clone(&drain)));
+    let giving = Rc::clone(&accepted_with);
     tokio::task::spawn_local(listener::serve(
         Rc::clone(&shared),
         move || {
             Some(InForce {
                 tls: Arc::clone(&tls),
                 force_retry: false,
+                drain: Rc::clone(&giving.borrow()),
             })
         },
         // Who the client is, the request core's to act on, is nothing these cores look at.
         Rc::new(move |request, interim, _client| respond(request, interim)),
         Rc::new(|| HttpDate::from_unix(0)),
-        || (),
+        |_: &Rc<Drain>| (),
         forwarding,
     ));
     Server {
         address,
         drain,
+        accepted_with,
         shared,
     }
 }
@@ -1436,6 +1444,38 @@ fn a_draining_connection_finishes_its_requests_then_closes() {
     });
 }
 
+/// A connection drained on its own — a reload replaced the client validation it was
+/// accepted under (03 §3) — is told to go and closes, while the listener, not draining,
+/// goes on taking connections under the validation in force.
+#[test]
+fn a_connection_drained_alone_goes_and_the_listener_takes_others() {
+    locally(async {
+        // Kept alive far longer than the test waits, so that only the drain tells it to go.
+        let settings = Settings {
+            keep_alive: Duration::from_secs(30),
+            ..short()
+        };
+        let server = serving(settings, echo).await;
+        let first = Rc::new(Drain::default());
+        server.accepted_with.replace(Rc::clone(&first));
+        let mut client = Client::connect(server.address, "a.test").await;
+        let id = client.request(&get("a.test", "/before"), true);
+        assert_eq!(body_of(&client.answer(id).await), "GET /before 0 None");
+
+        server.accepted_with.replace(Rc::new(Drain::default()));
+        first.start();
+        client.until(|client| client.goaway.is_some()).await;
+        client
+            .until(|client| client.quic.is_closed() || client.quic.is_draining())
+            .await;
+        assert_eq!(client.closed_by_server(), Some((true, code::NO_ERROR)));
+
+        let mut later = Client::connect(server.address, "a.test").await;
+        let id = later.request(&get("a.test", "/after"), true);
+        assert_eq!(body_of(&later.answer(id).await), "GET /after 0 None");
+    });
+}
+
 /// An answer's body in pieces, each sent once its gate opens. A piece of no bytes sends
 /// nothing, so that the body's end goes alone.
 fn gated(
@@ -2062,7 +2102,6 @@ async fn websocket_to(backend: SocketAddr) -> (Server, Client, u64, Ending) {
                     Storage::new(LIMIT),
                 ))),
                 timers,
-                drain: Rc::new(Drain::default()),
                 ended: Box::new(move |carried| {
                     told.set(Some((carried, std::time::Instant::now())));
                 }),
