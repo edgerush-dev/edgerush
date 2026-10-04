@@ -23,6 +23,7 @@ boring = "5.2"
 # in the tree through hyper and http, at the same version.
 bytes = "1.12"
 edgerush-config = { path = "crates/config" }
+edgerush-explain = { path = "crates/explain" }
 edgerush-filters = { path = "crates/filters" }
 edgerush-proxy = { path = "crates/proxy" }
 edgerush-router = { path = "crates/router" }

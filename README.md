@@ -166,6 +166,8 @@ crates/edgerush    the binary (operator, control plane and data plane will be su
                    `edgerush proxy --config file.yaml`, a data plane run from a file for development,
                    and `edgerush explain`, where a request would go and why
 crates/config      the config model and its compilation (`edgerush-config`): pure, format-free
+crates/explain     where a request would go and why (`edgerush-explain`): what `edgerush explain`
+                   prints, worked out by the request core without a data plane; no I/O
 crates/filters     built-in filters (`edgerush-filters`): pure, on plain `http` types
 crates/proxy       the data plane (`edgerush-proxy`): listeners, TLS, our HTTP/1 server and client,
                    HTTP/2 on h2, HTTP/3 on quiche, upstream pools and the request core between them

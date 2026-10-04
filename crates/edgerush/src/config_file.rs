@@ -10,10 +10,8 @@
 //! trusted: they are coarse on some file systems and a restored file brings its old one
 //! along.
 
-use edgerush_config::{
-    Certificate, CertificateFiles, Compiled, Config, ConfigError, HarnessFile, Matches, compile,
-    compile_with_matches,
-};
+use edgerush_config::{Certificate, CertificateFiles, Compiled, ConfigError, HarnessFile, compile};
+use edgerush_explain::Snapshot;
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
@@ -133,7 +131,7 @@ fn parsed(yaml: &[u8]) -> Result<HarnessFile, Rejected> {
 /// harness compiles it, with every listener's matches kept, and its certificates known by
 /// name alone. No certificate file is opened, so a config can be explained where its keys
 /// are not ([22 §3](../../../docs/22-explain-and-test.md)).
-pub(crate) fn offline(path: &Path) -> Result<(Config, Compiled, Matches), Rejected> {
+pub(crate) fn offline(path: &Path) -> Result<Snapshot, Rejected> {
     let yaml = fs::read(path).map_err(Rejected::Read)?;
     let file = parsed(&yaml)?;
     let named = file
@@ -148,9 +146,7 @@ pub(crate) fn offline(path: &Path) -> Result<(Config, Compiled, Matches), Reject
         })
         .collect();
     let config = file.into_config(named);
-    let (compiled, matches) =
-        compile_with_matches(&config).map_err(|problems| Rejected::Invalid(Problems(problems)))?;
-    Ok((config, compiled, matches))
+    Snapshot::new(config).map_err(|problems| Rejected::Invalid(Problems(problems)))
 }
 
 /// Reads each certificate from the files `named` for it, relative to `directory`; and says

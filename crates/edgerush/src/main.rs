@@ -4,7 +4,6 @@
 //! subcommands. So far: `proxy`, a data plane run from a config file — the development
 //! harness — and `explain`, which says where a request would go and why.
 
-mod asked;
 mod bind;
 mod config_file;
 mod essential;

@@ -14,56 +14,77 @@ use std::net::IpAddr;
 
 /// A request to a listener of `http` or `https`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Asked {
+pub struct Asked {
     /// The address it came from.
-    pub(crate) client: IpAddr,
+    pub client: IpAddr,
     /// The HTTP version it came by.
-    pub(crate) protocol: Version,
+    pub protocol: Version,
     /// Its method, as sent.
-    pub(crate) method: Method,
-    /// Its scheme, host (with the port, if one is given) and target.
-    pub(crate) scheme: Scheme,
-    pub(crate) authority: Authority,
-    pub(crate) target: PathAndQuery,
+    pub method: Method,
+    /// Its scheme, the listener's.
+    pub scheme: Scheme,
+    /// Its host, with the port if one is given.
+    pub authority: Authority,
+    /// Its path and query, as written.
+    pub target: PathAndQuery,
     /// Its field lines, in order.
-    pub(crate) headers: Vec<(HeaderName, HeaderValue)>,
+    pub headers: Vec<(HeaderName, HeaderValue)>,
     /// An extended CONNECT's `:protocol`.
-    pub(crate) connect_protocol: Option<String>,
+    pub connect_protocol: Option<String>,
 }
 
 /// Why a request cannot be made of what was said.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum Invalid {
+pub enum Invalid {
+    /// The client is not an IP address.
     #[error("'{0}' is not an IP address")]
     Client(String),
+    /// The protocol is not an HTTP version the gateway serves.
     #[error("'{0}' is not a protocol: \"1.0\", \"1.1\", \"2\" or \"3\"")]
     Protocol(String),
+    /// The method is not a token.
     #[error("'{0}' is not a method")]
     Method(String),
+    /// The URL is not absolute.
     #[error("'{0}' is not a URL with a scheme, a host and a path")]
     Url(String),
+    /// A header line has no colon.
     #[error("'{0}' is not a header line, a name and a value: 'Name: value'")]
     HeaderLine(String),
+    /// A header name is not a token.
     #[error("'{0}' is not a header name")]
     HeaderName(String),
+    /// A header value has what no field value may.
     #[error("'{value}' is not a value for header {name}")]
-    HeaderValue { name: String, value: String },
+    HeaderValue {
+        /// The header's name.
+        name: String,
+        /// The value given.
+        value: String,
+    },
+    /// `Host` among the headers: the URL gives it.
     #[error("Host is the URL's to give: write it in the URL")]
     Host,
+    /// The URL's scheme is not the listener's.
     #[error("the scheme of listener {listener} is {wanted}, not {given}")]
     Scheme {
+        /// The listener.
         listener: String,
+        /// Its scheme.
         wanted: &'static str,
+        /// The URL's.
         given: String,
     },
+    /// HTTP/3 to a listener that does not serve it.
     #[error("listener {0} does not serve HTTP/3")]
     NoHttp3(String),
+    /// A connect protocol on anything but a CONNECT over HTTP/2 or HTTP/3.
     #[error("a connect protocol is for a CONNECT over HTTP/2 or HTTP/3 alone")]
     ConnectProtocol,
 }
 
 /// The HTTP version `text` names.
-pub(crate) fn protocol(text: &str) -> Result<Version, Invalid> {
+pub fn protocol(text: &str) -> Result<Version, Invalid> {
     match text {
         "1.0" => Ok(Version::HTTP_10),
         "1.1" => Ok(Version::HTTP_11),
@@ -74,13 +95,13 @@ pub(crate) fn protocol(text: &str) -> Result<Version, Invalid> {
 }
 
 /// The method `text` names, as sent: case matters, as it does on the wire.
-pub(crate) fn method(text: &str) -> Result<Method, Invalid> {
+pub fn method(text: &str) -> Result<Method, Invalid> {
     Method::from_bytes(text.as_bytes()).map_err(|_| Invalid::Method(text.to_owned()))
 }
 
 /// The scheme, host and target of an absolute URL, as written: the path is not normalised,
 /// so that what the core does to it is what is explained. A URL without a path has `/`.
-pub(crate) fn url(text: &str) -> Result<(Scheme, Authority, PathAndQuery), Invalid> {
+pub fn url(text: &str) -> Result<(Scheme, Authority, PathAndQuery), Invalid> {
     let invalid = || Invalid::Url(text.to_owned());
     let parts = text.parse::<Uri>().map_err(|_| invalid())?.into_parts();
     let scheme = parts.scheme.ok_or_else(invalid)?;
@@ -99,7 +120,7 @@ pub(crate) fn url(text: &str) -> Result<(Scheme, Authority, PathAndQuery), Inval
 
 /// A header line as a flag gives it, `Name: value`: the value without the white space
 /// around it, as a server reads a field line.
-pub(crate) fn header_line(line: &str) -> Result<(HeaderName, HeaderValue), Invalid> {
+pub fn header_line(line: &str) -> Result<(HeaderName, HeaderValue), Invalid> {
     let (name, value) = line
         .split_once(':')
         .ok_or_else(|| Invalid::HeaderLine(line.to_owned()))?;
@@ -107,7 +128,7 @@ pub(crate) fn header_line(line: &str) -> Result<(HeaderName, HeaderValue), Inval
 }
 
 /// A header, by its name and value. `Host` is refused: the URL gives it.
-pub(crate) fn header(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), Invalid> {
+pub fn header(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), Invalid> {
     let parsed = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| Invalid::HeaderName(name.to_owned()))?;
     if parsed == HOST {
@@ -127,7 +148,7 @@ impl Asked {
     ///
     /// If its scheme is not the listener's, it asks for HTTP/3 where none is served, or a
     /// connect protocol where it means nothing.
-    pub(crate) fn head(&self, listener: &CompiledListener) -> Result<Parts, Invalid> {
+    pub fn head(&self, listener: &CompiledListener) -> Result<Parts, Invalid> {
         let wanted = match listener.protocol {
             Protocol::Https => Scheme::HTTPS,
             Protocol::Http | Protocol::Tcp | Protocol::Tls => Scheme::HTTP,
@@ -183,7 +204,7 @@ impl Asked {
     }
 
     /// The URL as stated.
-    pub(crate) fn url(&self) -> String {
+    pub fn url(&self) -> String {
         format!("{}://{}{}", self.scheme, self.authority, self.target)
     }
 }

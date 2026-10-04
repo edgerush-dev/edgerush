@@ -208,9 +208,8 @@ name = "edgerush"
 version = "0.0.0"
 dependencies = [
  "edgerush-config",
+ "edgerush-explain",
  "edgerush-proxy",
- "edgerush-router",
- "http",
  "proptest",
  "rustix",
  "serde-saphyr",
@@ -229,6 +228,18 @@ dependencies = [
  "iai-callgrind",
  "proptest",
  "serde",
+ "serde-saphyr",
+ "thiserror",
+]
+
+[[package]]
+name = "edgerush-explain"
+version = "0.0.0"
+dependencies = [
+ "edgerush-config",
+ "edgerush-proxy",
+ "edgerush-router",
+ "http",
  "serde-saphyr",
  "thiserror",
 ]
