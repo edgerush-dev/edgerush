@@ -1,6 +1,6 @@
 [package]
 name = "edgerush-telemetry"
-description = "EdgeRush metrics: counters sharded by thread and their exposition, no I/O and no clock"
+description = "EdgeRush metrics and access-log records: counters sharded by thread, their exposition and the records' JSON, no I/O and no clock"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,9 +10,14 @@ publish.workspace = true
 [dev-dependencies]
 iai-callgrind.workspace = true
 proptest.workspace = true
+serde_json.workspace = true
 
 [[bench]]
 name = "counting"
+harness = false
+
+[[bench]]
+name = "access_log"
 harness = false
 
 [lints]

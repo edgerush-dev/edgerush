@@ -1,4 +1,5 @@
-//! EdgeRush metrics: what is counted on the request path, and how it is read.
+//! EdgeRush metrics: what is counted on the request path, and how it is read; and the
+//! access log's records.
 //!
 //! A pure crate: no I/O, no clock — durations are measured by whoever has one and passed
 //! in — and no dependencies.
@@ -8,7 +9,10 @@
 //! counts in a shard of its own, and the shards are only added up when somebody asks
 //! ([`Sharded::sum`]), which is rare and may be slow. What is asked for is written in the
 //! Prometheus text format ([`Exposition`]).
+//!
+//! An access-log record ([`access_log::Record`]) is written as a line of JSON.
 
+pub mod access_log;
 mod exposition;
 mod histogram;
 mod sharded;
