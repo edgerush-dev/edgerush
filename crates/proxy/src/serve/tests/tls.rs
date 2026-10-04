@@ -382,7 +382,8 @@ async fn an_http3_connection_under_a_replaced_client_validation_is_told_to_go() 
             let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let front = socket.local_addr().unwrap();
             let alone = Forwarding::group(1).remove(0);
-            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
+            let _serving =
+                tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone).unwrap());
             let _sweeping = tokio::task::spawn_local(Rc::clone(&worker).maintain());
             let mut client = Client::connect(front, "a.test").await;
             assert_eq!(client.get("a.test", "/").await.final_status(), Some("200"));

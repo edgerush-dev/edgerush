@@ -11,6 +11,7 @@
 //! Everything a worker runs lives in a `LocalSet` of its own, so that a connection and all
 //! the engine spawns for it stay on the one thread and need not be `Send`.
 
+use crate::essential::{Essential, Told, watched};
 use crate::limits::Connections;
 use edgerush_proxy::connections::{Held, Loads};
 use edgerush_proxy::{AcceptPause, Forwarding, H1Limits, Proxy};
@@ -72,19 +73,26 @@ pub(crate) type Sockets = (std::net::TcpListener, Option<std::net::UdpSocket>);
 /// Starts a worker on a thread of its own for every entry of `sockets` — the sockets of
 /// every listener, in the order of the listeners — all serving the one `proxy`, each
 /// accepting only while it holds fewer than `connections` allows, an HTTP/3 connection
-/// counting as it says. Returns what the workers hold, for whoever wants to look.
+/// counting as it says. Returns what the workers hold, for whoever wants to look, once every
+/// worker has set up what it serves. What a worker cannot do without, and the worker
+/// itself, tell `tell` when they end ([`crate::essential`]).
 ///
 /// # Errors
 ///
-/// A runtime or a thread that cannot be started, or a socket that a runtime does not take.
-/// Workers that were started before it stay.
+/// A runtime or a thread that cannot be started, a socket that a runtime does not take, or
+/// a listener whose HTTP/3 cannot be set up. Workers that were started before it stay.
 pub(crate) fn start(
     proxy: &Arc<Proxy>,
     sockets: Vec<Vec<Sockets>>,
     accept: Accept,
     limits: H1Limits,
     connections: Connections,
-) -> io::Result<Arc<Loads>> {
+    tell: &std::sync::mpsc::Sender<Told>,
+) -> Result<Arc<Loads>, NotStarted> {
+    let started = sockets.len();
+    // Each worker says, once it has set up what it serves, whether it could.
+    let (ready, readied) = std::sync::mpsc::channel::<Result<(), NotStarted>>();
+    let names: Arc<[String]> = proxy.listeners().into();
     // Every worker has a socket for every listener, the same ones in the same order.
     let listeners = sockets.first().map_or(0, Vec::len);
     let loads = Loads::new(sockets.len(), connections.each, connections.quic, listeners);
@@ -120,18 +128,27 @@ pub(crate) fn start(
         let number = u16::try_from(position)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "more than 65,536 workers"))?;
         let (proxy, loads, senders) = (Arc::clone(proxy), Arc::clone(&loads), Arc::clone(&workers));
+        let (tell, ready, names) = (tell.clone(), ready.clone(), Arc::clone(&names));
         // A runtime without threads of its own runs on the thread that waits on it, and a
         // LocalSet belongs to one thread, so it is made on that one.
         thread::Builder::new()
             .name(format!("worker-{position}"))
             .spawn(move || {
+                // The worker itself: a panic outside its tasks unwinds the thread.
+                let mut thread = Essential::new(format!("worker {position}"), &tell);
+                let essential =
+                    |what: String| Essential::new(format!("worker {position}'s {what}"), &tell);
+                let name = |listener: usize| names.get(listener).map_or("", String::as_str);
                 let local = LocalSet::new();
                 let entered = runtime.enter();
                 // The upstream connections of this worker and of no other, made where
                 // they are used: nothing about them can leave this thread.
                 let plane = edgerush_proxy::Worker::at(proxy, limits, number, Arc::clone(&loads));
                 // One sweep for the worker, beside its listeners, for as long as it runs.
-                local.spawn_local(Rc::clone(&plane).maintain());
+                local.spawn_local(watched(
+                    Rc::clone(&plane).maintain(),
+                    essential("sweep and timers".to_owned()),
+                ));
                 let worker = Worker {
                     position,
                     plane,
@@ -140,23 +157,55 @@ pub(crate) fn start(
                     accept,
                 };
                 for (listener, socket) in sockets.into_iter().enumerate() {
-                    local.spawn_local(worker.clone().accept(listener, socket));
+                    local.spawn_local(watched(
+                        worker.clone().accept(listener, socket),
+                        essential(format!("accepting on listener \"{}\"", name(listener))),
+                    ));
                 }
                 for (listener, socket, share) in datagrams {
-                    // Fails only for a socket with no address, or BoringSSL giving no keys:
-                    // the listener's HTTP/3 is then not served, and its TCP still is.
-                    let serving = Rc::clone(&worker.plane).serve_h3(listener, socket, share);
-                    local.spawn_local(async move {
-                        let _served = serving.await;
-                    });
+                    match Rc::clone(&worker.plane).serve_h3(listener, socket, share) {
+                        Ok(serving) => {
+                            local.spawn_local(watched(
+                                serving,
+                                essential(format!("HTTP/3 on listener \"{}\"", name(listener))),
+                            ));
+                        }
+                        Err(error) => {
+                            let listener = name(listener).to_owned();
+                            let _told = ready.send(Err(NotStarted::Http3 { listener, error }));
+                            thread.finished();
+                            return;
+                        }
+                    }
                 }
-                local.spawn_local(worker.receive(handed_over));
+                local.spawn_local(watched(
+                    worker.receive(handed_over),
+                    essential("connections handed over".to_owned()),
+                ));
                 drop(entered);
-                // Accepting has no end, so neither has the LocalSet that waits on it.
+                let _told = ready.send(Ok(()));
+                // Accepting has no end but a drain, so neither has the LocalSet that waits on
+                // it before then.
                 runtime.block_on(local);
+                thread.finished();
             })?;
     }
+    drop(ready);
+    // Every worker that is running has said so, or why it is not; one that panicked first
+    // has said nothing, and its thread's guard tells the main loop.
+    for worker in readied.iter().take(started) {
+        worker?;
+    }
     Ok(loads)
+}
+
+/// Why the workers did not all start.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum NotStarted {
+    #[error("cannot start the runtime: {0}")]
+    Runtime(#[from] io::Error),
+    #[error("listener \"{listener}\" cannot serve HTTP/3: {error}")]
+    Http3 { listener: String, error: io::Error },
 }
 
 impl Worker {
@@ -275,7 +324,7 @@ mod tests {
     /// Workers whose one listener `web` has nowhere to send a request: every request is
     /// answered with 503 by the worker that serves its connection.
     fn workers(count: usize, accept: Accept) -> (SocketAddr, Arc<Loads>) {
-        let (address, loads, _) = capped_workers(count, accept, CONNECTIONS_PER_WORKER);
+        let (address, loads, _, _told) = capped_workers(count, accept, CONNECTIONS_PER_WORKER);
         (address, loads)
     }
 
@@ -284,7 +333,12 @@ mod tests {
         count: usize,
         accept: Accept,
         connections: usize,
-    ) -> (SocketAddr, Arc<Loads>, Arc<Proxy>) {
+    ) -> (
+        SocketAddr,
+        Arc<Loads>,
+        Arc<Proxy>,
+        std::sync::mpsc::Receiver<Told>,
+    ) {
         let yaml = r#"
 listeners:
   web: { address: "127.0.0.1:0", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
@@ -310,15 +364,17 @@ upstreams:
             address = socket.local_addr().unwrap();
             sockets.push(vec![(socket, None)]);
         }
+        let (tell, told) = std::sync::mpsc::channel();
         let loads = start(
             &proxy,
             sockets,
             accept,
             H1Limits::default(),
             capped(connections),
+            &tell,
         )
         .unwrap();
-        (address, loads, proxy)
+        (address, loads, proxy, told)
     }
 
     fn eventually(loads: &Loads, what: impl Fn(&[usize]) -> bool) -> Vec<usize> {
@@ -355,7 +411,7 @@ upstreams:
     /// its own ends; then it is served.
     #[test]
     fn a_connection_past_the_cap_waits_until_another_ends() {
-        let (address, loads, proxy) = capped_workers(1, Accept::Balanced, 1);
+        let (address, loads, proxy, _told) = capped_workers(1, Accept::Balanced, 1);
         let mut first = std::net::TcpStream::connect(address).unwrap();
         assert_eq!(request(&mut first), "HTTP/1.1 503 Service Unavailable");
 
@@ -428,12 +484,15 @@ upstreams:
             addresses.insert(name.clone(), socket.local_addr().unwrap());
             sockets.push((socket, None));
         }
+        // What ends while a test runs is not what it looks at.
+        let (tell, _told) = std::sync::mpsc::channel();
         let loads = start(
             &proxy,
             vec![sockets],
             Accept::Balanced,
             H1Limits::default(),
             capped(connections),
+            &tell,
         )
         .unwrap();
         (addresses["a"], addresses["b"], loads, proxy)
@@ -546,5 +605,25 @@ upstreams:
         for connection in &mut connections {
             assert_eq!(request(connection), "HTTP/1.1 503 Service Unavailable");
         }
+    }
+
+    /// What a worker cannot do without tells when it ends: as the data plane drains, the
+    /// worker's accepting ends, and says so by the listener's name.
+    #[test]
+    fn a_workers_accepting_tells_when_it_ends() {
+        let (_address, _loads, proxy, told) =
+            capped_workers(1, Accept::Balanced, CONNECTIONS_PER_WORKER);
+        assert!(told.try_recv().is_err(), "something ended while serving");
+        proxy.drain();
+        let ended = loop {
+            match told.recv_timeout(Duration::from_secs(10)).unwrap() {
+                Told::Ended(ended) => break ended,
+                Told::Stop => {}
+            }
+        };
+        assert_eq!(
+            ended.to_string(),
+            "worker 0's accepting on listener \"web\" ended"
+        );
     }
 }

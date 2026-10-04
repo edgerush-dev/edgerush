@@ -353,13 +353,14 @@ impl Worker {
         Ok((ends, block))
     }
 
-    /// Serves HTTP/3 on `socket`, the UDP socket of the listener at position `listener` of
-    /// [`Proxy::listeners`], until the worker drains and its last connection has gone
-    /// ([16](../../docs/16-http3.md)). The listener's TLS, and whether it has every client
-    /// prove its address first, are those of the config in force when a connection comes.
-    /// `forwarding` is this worker's share of the listener's
-    /// [`Forwarding`] group: where a datagram for another worker's connection is handed,
-    /// and where this worker's are handed to it.
+    /// Sets up HTTP/3 on `socket`, the UDP socket of the listener at position `listener` of
+    /// [`Proxy::listeners`], and returns what serves it until the worker drains and its last
+    /// connection has gone ([16](../../docs/16-http3.md)). Set up at once, so that whoever
+    /// starts the worker knows before anything is served whether the listener has HTTP/3.
+    /// The listener's TLS, and whether it has every client prove its address first, are
+    /// those of the config in force when a connection comes. `forwarding` is this worker's
+    /// share of the listener's [`Forwarding`] group: where a datagram for another worker's
+    /// connection is handed, and where this worker's are handed to it.
     ///
     /// # Errors
     ///
@@ -368,15 +369,16 @@ impl Worker {
     ///
     /// # Panics
     ///
-    /// Runs inside the worker's `LocalSet`, where every connection and request is a task.
+    /// What it returns runs inside the worker's `LocalSet`, where every connection and
+    /// request is a task.
     ///
     /// [`Proxy::listeners`]: super::Proxy::listeners
-    pub async fn serve_h3(
+    pub fn serve_h3(
         self: Rc<Self>,
         listener: usize,
         socket: UdpSocket,
         forwarding: Forwarding,
-    ) -> io::Result<()> {
+    ) -> io::Result<impl Future<Output = ()> + use<>> {
         let deadlines = self.deadlines;
         let settings = h3::Settings {
             first_request: deadlines.first_request,
@@ -438,7 +440,13 @@ impl Worker {
         let opened = move |drain: &Rc<Drain>| {
             Connection::open(Rc::clone(&opening), listener, Rc::clone(drain))
         };
-        h3_listener::serve(Rc::new(shared), in_force, respond, date, opened, forwarding).await;
-        Ok(())
+        Ok(h3_listener::serve(
+            Rc::new(shared),
+            in_force,
+            respond,
+            date,
+            opened,
+            forwarding,
+        ))
     }
 }

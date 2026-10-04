@@ -477,7 +477,8 @@ async fn http3_websockets_count_as_connections_of_their_worker() {
             let front = socket.local_addr().unwrap();
             let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
             let alone = Forwarding::group(1).remove(0);
-            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
+            let _serving =
+                tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone).unwrap());
             let mut client = Client::connect(front, "a.test").await;
             client
                 .until(|client| {

@@ -23,6 +23,7 @@
 
 use crate::bind::{Port, datagrams, listen};
 use crate::config_file::{ConfigFile, Rejected};
+use crate::essential::{Ended, Essential, Told};
 use crate::per_core::{self, Accept};
 use edgerush_config::Compiled;
 use edgerush_proxy::{H1Limits, Proxy, ProxyError};
@@ -239,6 +240,10 @@ enum Failure {
     },
     #[error("cannot start the runtime: {0}")]
     Runtime(io::Error),
+    #[error(transparent)]
+    Workers(#[from] per_core::NotStarted),
+    #[error("{0}: the data plane stops, to be started afresh")]
+    Ended(Ended),
 }
 
 fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
@@ -321,12 +326,11 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     let (stopping, stop) = mpsc::channel();
     stop_signals(stopping.clone()).map_err(Failure::Runtime)?;
     // Every worker runs on a thread of its own, which stays for as long as the process.
-    let loads =
-        per_core::start(&proxy, sockets, accept, limits, connections).map_err(Failure::Runtime)?;
-    health_checks(Arc::clone(&proxy)).map_err(Failure::Runtime)?;
+    let loads = per_core::start(&proxy, sockets, accept, limits, connections, &stopping)?;
+    health_checks(Arc::clone(&proxy), &stopping).map_err(Failure::Runtime)?;
     if let Some(socket) = metrics {
         let address = socket.local_addr().map_err(Failure::Runtime)?;
-        scrapes(Arc::clone(&proxy), socket).map_err(Failure::Runtime)?;
+        scrapes(Arc::clone(&proxy), socket, &stopping).map_err(Failure::Runtime)?;
         say(stderr, format_args!("metrics are on {address}"));
     }
     let plural = if workers == NonZeroUsize::MIN {
@@ -351,7 +355,12 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     );
 
     // Until told to stop; `stopping` is still held here, so the channel cannot close.
-    while let Err(RecvTimeoutError::Timeout) = stop.recv_timeout(POLL) {
+    loop {
+        match next(&stop, POLL) {
+            Next::Look => {}
+            Next::Stop => break,
+            Next::Failed(ended) => return Err(Failure::Ended(ended)),
+        }
         let Some(changed) = file.changed() else {
             continue;
         };
@@ -419,9 +428,31 @@ enum Drained {
     Stopped(usize),
 }
 
+/// What the main loop does next.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// Looks at the config file again: `every` passed with nothing said.
+    Look,
+    /// Stops: a signal came.
+    Stop,
+    /// Fails: something the data plane cannot do without ended ([`crate::essential`]).
+    Failed(Ended),
+}
+
+/// What `told` says within `every`.
+fn next(told: &Receiver<Told>, every: Duration) -> Next {
+    match told.recv_timeout(every) {
+        Err(RecvTimeoutError::Timeout) => Next::Look,
+        Ok(Told::Stop) => Next::Stop,
+        Ok(Told::Ended(ended)) => Next::Failed(ended),
+        // Never while the loop holds a sender of its own; were it to, nothing could stop it.
+        Err(RecvTimeoutError::Disconnected) => Next::Stop,
+    }
+}
+
 /// Waits until nothing is `held` — no connection, over TCP or QUIC — `within` is up, or
 /// `stop` says to stop again.
-fn drained(held: impl Fn() -> usize, stop: &Receiver<()>, within: Duration) -> Drained {
+fn drained(held: impl Fn() -> usize, stop: &Receiver<Told>, within: Duration) -> Drained {
     let until = Instant::now() + within;
     loop {
         let held = held();
@@ -433,9 +464,11 @@ fn drained(held: impl Fn() -> usize, stop: &Receiver<()>, within: Duration) -> D
             return Drained::OutOfTime(held);
         }
         match stop.recv_timeout(DRAIN_POLL.min(left)) {
-            Ok(()) => return Drained::Stopped(held),
+            Ok(Told::Stop) => return Drained::Stopped(held),
             // With nobody left to say stop, the drain runs its course.
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
+            // What ends as the workers drain, their accepting first, was meant to.
+            Ok(Told::Ended(_))
+            | Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
         }
     }
 }
@@ -443,7 +476,7 @@ fn drained(held: impl Fn() -> usize, stop: &Receiver<()>, within: Duration) -> D
 /// Says on `stopping`, from a thread of its own, every time the process is told to stop:
 /// Ctrl-C, and on Unix SIGTERM, which is how Kubernetes asks. Both are listened for
 /// before this returns.
-fn stop_signals(stopping: Sender<()>) -> io::Result<()> {
+fn stop_signals(stopping: Sender<Told>) -> io::Result<()> {
     let runtime = Builder::new_current_thread().enable_io().build()?;
     let entered = runtime.enter();
     #[cfg(unix)]
@@ -469,7 +502,7 @@ fn stop_signals(stopping: Sender<()>) -> io::Result<()> {
                     .await;
                     // A signal that cannot be listened for is one that is not heard; the
                     // others still are, and so is being killed.
-                    if told.is_err() || stopping.send(()).is_err() {
+                    if told.is_err() || stopping.send(Told::Stop).is_err() {
                         return;
                     }
                 }
@@ -482,30 +515,41 @@ fn stop_signals(stopping: Sender<()>) -> io::Result<()> {
 /// Answers scrapes on `socket`, on a small runtime and a thread of their own: what a
 /// scraper asks for is added up over every worker's shard, and no worker's time goes on
 /// it ([03 §2] in the docs). Our own server serves them, so the thread runs a `LocalSet`
-/// as a worker's does.
-fn scrapes(proxy: Arc<Proxy>, socket: std::net::TcpListener) -> io::Result<()> {
+/// as a worker's does. Told on `tell` if it ever ends ([`crate::essential`]).
+fn scrapes(
+    proxy: Arc<Proxy>,
+    socket: std::net::TcpListener,
+    tell: &Sender<Told>,
+) -> io::Result<()> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
     // The socket is handed to the runtime that is entered, as a worker's are.
     let entered = runtime.enter();
     let socket = TcpListener::from_std(socket)?;
     drop(entered);
+    let tell = tell.clone();
     thread::Builder::new()
         .name("metrics".to_owned())
         .spawn(move || {
+            let mut essential = Essential::new("the scrape".to_owned(), &tell);
             tokio::task::LocalSet::new().block_on(&runtime, proxy.serve_metrics(socket));
+            essential.finished();
         })?;
     Ok(())
 }
 
 /// Probes the upstreams that ask for health checks, on a runtime and a thread of their
 /// own: a worker saturated with requests must not starve the checks that decide where
-/// its requests go ([03 §6] in the docs).
-fn health_checks(proxy: Arc<Proxy>) -> io::Result<()> {
+/// its requests go ([03 §6] in the docs). Told on `tell` if it ever ends
+/// ([`crate::essential`]).
+fn health_checks(proxy: Arc<Proxy>, tell: &Sender<Told>) -> io::Result<()> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
+    let tell = tell.clone();
     thread::Builder::new()
         .name("health".to_owned())
         .spawn(move || {
+            let mut essential = Essential::new("the health checker".to_owned(), &tell);
             tokio::task::LocalSet::new().block_on(&runtime, proxy.check_health());
+            essential.finished();
         })?;
     Ok(())
 }
@@ -867,7 +911,7 @@ mod tests {
         let loads = Loads::new(1, 8, QUIC_MOST, 1);
         let _held = loads.hold(0, 0);
         let (stopping, stop) = mpsc::channel();
-        stopping.send(()).unwrap();
+        stopping.send(Told::Stop).unwrap();
         let began = Instant::now();
         assert_eq!(
             drained(|| loads.now().iter().sum(), &stop, Duration::from_secs(10)),
@@ -879,6 +923,52 @@ mod tests {
         assert_eq!(
             drained(|| loads.now().iter().sum(), &stop, within),
             Drained::OutOfTime(1)
+        );
+    }
+
+    /// What ends as the workers drain — their accepting first of all — was meant to: the
+    /// drain goes on until the last connection goes.
+    #[test]
+    fn a_drain_is_not_cut_short_by_what_ends_as_it_drains() {
+        let loads = Loads::new(1, 8, QUIC_MOST, 1);
+        let held = loads.hold(0, 0);
+        let (stopping, stop) = mpsc::channel();
+        let accepting = Ended {
+            what: "worker 0's accepting on listener \"web\"".to_owned(),
+            finished: true,
+        };
+        stopping.send(Told::Ended(accepting)).unwrap();
+        let going = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+        assert_eq!(
+            drained(|| loads.now().iter().sum(), &stop, Duration::from_secs(10)),
+            Drained::Empty
+        );
+        going.join().unwrap();
+    }
+
+    /// The main loop looks at the config again while nothing is said, stops when a signal
+    /// comes, and fails at once when something the data plane cannot do without ends.
+    #[test]
+    fn the_main_loop_fails_when_something_essential_ends() {
+        let (tell, told) = mpsc::channel();
+        assert_eq!(next(&told, Duration::from_millis(10)), Next::Look);
+        tell.send(Told::Stop).unwrap();
+        assert_eq!(next(&told, Duration::from_secs(5)), Next::Stop);
+        let sweep = Ended {
+            what: "worker 0's sweep and timers".to_owned(),
+            finished: false,
+        };
+        tell.send(Told::Ended(sweep.clone())).unwrap();
+        assert_eq!(
+            next(&told, Duration::from_secs(5)),
+            Next::Failed(sweep.clone())
+        );
+        assert_eq!(
+            Failure::Ended(sweep).to_string(),
+            "worker 0's sweep and timers panicked: the data plane stops, to be started afresh"
         );
     }
 }

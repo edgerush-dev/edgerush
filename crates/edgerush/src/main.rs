@@ -6,6 +6,7 @@
 
 mod bind;
 mod config_file;
+mod essential;
 mod harness;
 mod limits;
 mod per_core;

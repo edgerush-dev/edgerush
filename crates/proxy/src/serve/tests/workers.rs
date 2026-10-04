@@ -58,7 +58,7 @@ pub(super) async fn serving_h3(config: &edgerush_config::Config) -> (SocketAddr,
     let front = socket.local_addr().unwrap();
     let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
     let alone = Forwarding::group(1).remove(0);
-    let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
+    let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone).unwrap());
     (front, proxy)
 }
 

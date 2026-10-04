@@ -136,7 +136,8 @@ async fn an_http3_connection_is_open_until_it_has_gone() {
             let front = socket.local_addr().unwrap();
             let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
             let alone = Forwarding::group(1).remove(0);
-            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
+            let _serving =
+                tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone).unwrap());
             assert_eq!(proxy.open_connections(), 0);
 
             let mut client = Client::connect(front, "a.test").await;
@@ -257,8 +258,9 @@ async fn a_workers_http3_listeners_share_its_count_of_handshakes() {
                 let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
                 let front = socket.local_addr().unwrap();
                 let alone = Forwarding::group(1).remove(0);
-                let _serving =
-                    tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
+                let _serving = tokio::task::spawn_local(
+                    Rc::clone(&worker).serve_h3(0, socket, alone).unwrap(),
+                );
                 let mut client = Client::new(front, "a.test").await;
                 client.flush().await;
                 client.hear_for(Duration::from_millis(300)).await;
@@ -303,7 +305,8 @@ async fn http3_connections_are_held_to_their_workers_connection_cap() {
             let front = socket.local_addr().unwrap();
             let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
             let alone = Forwarding::group(1).remove(0);
-            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
+            let _serving =
+                tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone).unwrap());
             let mut first = Client::connect(front, "a.test").await;
             assert_eq!(connections.now(), [3]);
             let mut second = Client::new(front, "a.test").await;
