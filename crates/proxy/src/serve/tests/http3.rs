@@ -291,7 +291,7 @@ async fn http3_connections_are_held_to_their_workers_connection_cap() {
             let config = compile(&h3_config(upstream, http3)).unwrap();
             let proxy = Arc::new(Proxy::new(config, NonZeroUsize::MIN).unwrap());
             // Room for one HTTP/3 connection.
-            let connections = Loads::new(1, h3::SLOTS, 1);
+            let connections = Loads::new(1, 3, QUIC_MOST, 1);
             let worker = Worker::made(
                 Arc::clone(&proxy),
                 H1Limits::default(),
@@ -305,7 +305,7 @@ async fn http3_connections_are_held_to_their_workers_connection_cap() {
             let alone = Forwarding::group(1).remove(0);
             let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone));
             let mut first = Client::connect(front, "a.test").await;
-            assert_eq!(connections.now(), [h3::SLOTS]);
+            assert_eq!(connections.now(), [3]);
             let mut second = Client::new(front, "a.test").await;
             second.for_a_while(Duration::from_secs(1)).await;
             assert!(
@@ -328,7 +328,7 @@ async fn http3_connections_are_held_to_their_workers_connection_cap() {
             first.flush().await;
             until(|| connections.now() == [0]).await;
             second.until(|client| client.quic.is_established()).await;
-            assert_eq!(connections.now(), [h3::SLOTS]);
+            assert_eq!(connections.now(), [3]);
         })
         .await;
 }

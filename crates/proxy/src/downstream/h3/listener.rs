@@ -19,10 +19,10 @@
 use crate::connections::Loads;
 use crate::downstream::h1::connection::Answered;
 use crate::downstream::h1::date::HttpDate;
+use crate::downstream::h3::Settings;
 use crate::downstream::h3::conn::Conn;
 use crate::downstream::h3::connection::drive;
 use crate::downstream::h3::send::Sending;
-use crate::downstream::h3::{SLOTS, Settings};
 use crate::drain::Drain;
 use crate::forwarding::Client;
 use crate::interim::Interim;
@@ -561,7 +561,7 @@ fn admit<T: Fn() -> Option<InForce>>(
     // listener's pause is: from outside, a refusal looks like a slow server.
     let held = match &shared.room {
         Some(room) => {
-            let Some(held) = room.loads.take_slots(room.worker, room.listener, SLOTS) else {
+            let Some(held) = room.loads.take_quic(room.worker, room.listener) else {
                 (shared.count)(Quic::NoRoom);
                 return None;
             };

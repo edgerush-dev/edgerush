@@ -321,8 +321,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     let (stopping, stop) = mpsc::channel();
     stop_signals(stopping.clone()).map_err(Failure::Runtime)?;
     // Every worker runs on a thread of its own, which stays for as long as the process.
-    let loads = per_core::start(&proxy, sockets, accept, limits, connections.each)
-        .map_err(Failure::Runtime)?;
+    let loads =
+        per_core::start(&proxy, sockets, accept, limits, connections).map_err(Failure::Runtime)?;
     health_checks(Arc::clone(&proxy)).map_err(Failure::Runtime)?;
     if let Some(socket) = metrics {
         let address = socket.local_addr().map_err(Failure::Runtime)?;
@@ -584,7 +584,7 @@ fn say(stderr: &mut impl Write, line: std::fmt::Arguments<'_>) {
 mod tests {
     use super::*;
     use edgerush_config::{Config, compile};
-    use edgerush_proxy::connections::Loads;
+    use edgerush_proxy::connections::{Loads, QUIC_MOST};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn parsed(args: &[&str]) -> Result<Parsed, UsageError> {
@@ -802,7 +802,7 @@ mod tests {
     /// A drain ends as soon as the last connection goes.
     #[test]
     fn a_drain_ends_when_the_last_connection_goes() {
-        let loads = Loads::new(2, 8, 1);
+        let loads = Loads::new(2, 8, QUIC_MOST, 1);
         let (one, two) = (loads.hold(0, 0), loads.hold(1, 0));
         let (_stopping, stop) = mpsc::channel();
         let going = thread::spawn(move || {
@@ -824,7 +824,7 @@ mod tests {
     /// as well as those it does.
     #[test]
     fn a_drain_waits_on_connections_the_balancer_does_not_see() {
-        let loads = Loads::new(1, 8, 1);
+        let loads = Loads::new(1, 8, QUIC_MOST, 1);
         let quic = Arc::new(AtomicUsize::new(1));
         let going = Arc::clone(&quic);
         let (_stopping, stop) = mpsc::channel();
@@ -848,7 +848,7 @@ mod tests {
     /// A connection that outlasts the drain is not waited for.
     #[test]
     fn a_drain_ends_when_time_is_up() {
-        let loads = Loads::new(1, 8, 1);
+        let loads = Loads::new(1, 8, QUIC_MOST, 1);
         let _held = loads.hold(0, 0);
         let (_stopping, stop) = mpsc::channel();
         let began = Instant::now();
@@ -864,7 +864,7 @@ mod tests {
     /// Told to stop again, a drain ends at once, and so does one nobody can stop.
     #[test]
     fn a_drain_ends_when_told_to_stop_again() {
-        let loads = Loads::new(1, 8, 1);
+        let loads = Loads::new(1, 8, QUIC_MOST, 1);
         let _held = loads.hold(0, 0);
         let (stopping, stop) = mpsc::channel();
         stopping.send(()).unwrap();

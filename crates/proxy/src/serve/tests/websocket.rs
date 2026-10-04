@@ -465,7 +465,7 @@ async fn http3_websockets_count_as_connections_of_their_worker() {
             let proxy = Arc::new(Proxy::new(config, NonZeroUsize::MIN).unwrap());
             // Room for the client's connection, which counts as an HTTP/3 connection
             // does, and one WebSocket.
-            let connections = Loads::new(1, h3::SLOTS + 1, 1);
+            let connections = Loads::new(1, 3 + 1, QUIC_MOST, 1);
             let worker = Worker::made(
                 Arc::clone(&proxy),
                 H1Limits::default(),
@@ -496,7 +496,7 @@ async fn http3_websockets_count_as_connections_of_their_worker() {
                         .is_some_and(|answer| answer.body.ends_with(b"hello"))
                 })
                 .await;
-            assert_eq!(connections.now(), [h3::SLOTS + 1]);
+            assert_eq!(connections.now(), [3 + 1]);
             let second = client.request(&h3_connect("websocket"), false);
             client
                 .until(|client| {
@@ -508,7 +508,7 @@ async fn http3_websockets_count_as_connections_of_their_worker() {
                 .await;
             let answer = client.answers.get(&second).unwrap().clone();
             assert_eq!(answer.final_status(), Some("503"), "{answer:?}");
-            assert_eq!(connections.now(), [h3::SLOTS + 1]);
+            assert_eq!(connections.now(), [3 + 1]);
         })
         .await;
 }

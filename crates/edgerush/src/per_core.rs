@@ -11,6 +11,7 @@
 //! Everything a worker runs lives in a `LocalSet` of its own, so that a connection and all
 //! the engine spawns for it stay on the one thread and need not be `Send`.
 
+use crate::limits::Connections;
 use edgerush_proxy::connections::{Held, Loads};
 use edgerush_proxy::{AcceptPause, Forwarding, H1Limits, Proxy};
 use std::io;
@@ -70,8 +71,8 @@ pub(crate) type Sockets = (std::net::TcpListener, Option<std::net::UdpSocket>);
 
 /// Starts a worker on a thread of its own for every entry of `sockets` — the sockets of
 /// every listener, in the order of the listeners — all serving the one `proxy`, each
-/// accepting only while it holds fewer than `connections`. Returns what the workers hold,
-/// for whoever wants to look.
+/// accepting only while it holds fewer than `connections` allows, an HTTP/3 connection
+/// counting as it says. Returns what the workers hold, for whoever wants to look.
 ///
 /// # Errors
 ///
@@ -82,11 +83,11 @@ pub(crate) fn start(
     sockets: Vec<Vec<Sockets>>,
     accept: Accept,
     limits: H1Limits,
-    connections: usize,
+    connections: Connections,
 ) -> io::Result<Arc<Loads>> {
     // Every worker has a socket for every listener, the same ones in the same order.
     let listeners = sockets.first().map_or(0, Vec::len);
-    let loads = Loads::new(sockets.len(), connections, listeners);
+    let loads = Loads::new(sockets.len(), connections.each, connections.quic, listeners);
     let (workers, handed_over): (Vec<_>, Vec<_>) = sockets
         .iter()
         .map(|_| mpsc::channel::<HandedOver>(ON_THEIR_WAY))
@@ -256,10 +257,20 @@ mod tests {
     use super::*;
     use crate::bind::{Port, listen};
     use edgerush_config::{Config, compile};
+    use edgerush_proxy::connections::QUIC_MOST;
     use std::io::{Read, Write};
     use std::net::SocketAddr;
     use std::num::NonZeroUsize;
     use std::time::{Duration, Instant};
+
+    /// A cap of `each` connections a worker, an HTTP/3 connection counting as three.
+    fn capped(each: usize) -> Connections {
+        Connections {
+            each,
+            set_by: "the test",
+            quic: QUIC_MOST,
+        }
+    }
 
     /// Workers whose one listener `web` has nowhere to send a request: every request is
     /// answered with 503 by the worker that serves its connection.
@@ -299,7 +310,14 @@ upstreams:
             address = socket.local_addr().unwrap();
             sockets.push(vec![(socket, None)]);
         }
-        let loads = start(&proxy, sockets, accept, H1Limits::default(), connections).unwrap();
+        let loads = start(
+            &proxy,
+            sockets,
+            accept,
+            H1Limits::default(),
+            capped(connections),
+        )
+        .unwrap();
         (address, loads, proxy)
     }
 
@@ -411,7 +429,7 @@ upstreams:
             vec![sockets],
             Accept::Balanced,
             H1Limits::default(),
-            connections,
+            capped(connections),
         )
         .unwrap();
         (addresses["a"], addresses["b"], loads, proxy)

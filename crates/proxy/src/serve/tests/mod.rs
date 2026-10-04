@@ -2,9 +2,8 @@
 //! `workers`, `clients`, `upstreams` and `configs`.
 
 use super::*;
-use crate::connections::Loads;
+use crate::connections::{Loads, QUIC_MOST};
 use crate::downstream::h1::deadlines::Bounds;
-use crate::downstream::h3;
 use crate::downstream::h3::listener::Forwarding;
 use crate::forwarding::Client;
 use crate::linger::Lent;

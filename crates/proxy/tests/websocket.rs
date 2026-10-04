@@ -14,7 +14,7 @@
 
 use bytes::Bytes;
 use edgerush_config::{Config, compile};
-use edgerush_proxy::connections::Loads;
+use edgerush_proxy::connections::{Loads, QUIC_MOST};
 use edgerush_proxy::{H1Limits, Proxy, Worker};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -877,7 +877,7 @@ async fn http2_websockets_count_as_connections_of_their_worker() {
     let (saw, _seen) = mpsc::unbounded_channel();
     let (upstream, accepted) = echoing(saw);
     // Room for two connections, on one worker and one listener.
-    let connections = Loads::new(1, 2, 1);
+    let connections = Loads::new(1, 2, QUIC_MOST, 1);
     let (address, proxy) = gateway_counted(upstream, FORWARD, "", Some(Arc::clone(&connections)));
     let (mut send, announced) = h2_client(address).await;
     assert!(announced, "extended CONNECT was not announced");

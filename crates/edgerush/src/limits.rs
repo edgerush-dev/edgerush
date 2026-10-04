@@ -29,6 +29,7 @@
 
 use crate::per_core::CONNECTIONS_PER_WORKER;
 use edgerush_proxy::H1Limits;
+use edgerush_proxy::connections::{CONNECTION, QUIC_MOST};
 use std::num::NonZeroUsize;
 
 /// The least storage a worker is given, however small the limit: room for 128 heads of the
@@ -39,7 +40,8 @@ const STORAGE_FLOOR: usize = 8 * 1024 * 1024;
 /// HTTP/2, after one request, 21.5–21.9 KB of the cgroup's memory (18.2 KB the process's,
 /// 4.0 KB the kernel's), rounded up. Plain HTTP/1 is 7.7 KB, HTTP/2 16.4 KB, TLS HTTP/1
 /// 16.4 KB (laptop, 4 workers, `bench/idle.py`, 03 §9). An HTTP/3 connection, dearer, counts
-/// as several connections of this cost rather than raising it for every connection.
+/// as up to three connections of this cost ([`quic_weight`]) rather than raising it for
+/// every connection.
 const CONNECTION_COST: u64 = 22 * 1024;
 
 /// Where the pod's limit is read, in a cgroup namespace or not.
@@ -121,49 +123,77 @@ pub(crate) fn raise_open_files() -> OpenFiles {
 /// what the limit leaves after the reserve, two open files to a connection, shared out; and
 /// under `memory`, the half of it beside storage at [`CONNECTION_COST`] a connection, shared
 /// out — the fewer of the two, never more than [`CONNECTIONS_PER_WORKER`], and never none.
+/// And what an HTTP/3 connection counts as against that ([`quic_weight`]).
 pub(crate) fn connections_per_worker(
     open_files: OpenFiles,
     memory: Memory,
     workers: NonZeroUsize,
 ) -> Connections {
     let workers = u64::try_from(workers.get()).unwrap_or(u64::MAX);
-    let each = |many: u64| {
-        usize::try_from(many / workers)
+    let bounded = |each: u64| {
+        usize::try_from(each)
             .unwrap_or(usize::MAX)
             .clamp(1, CONNECTIONS_PER_WORKER)
     };
     let by_files = open_files
         .limit()
-        .map(|limit| each((limit - RESERVE.min(limit / 2)) / PER_CONNECTION));
-    let by_memory = match memory {
+        .map(|limit| bounded((limit - RESERVE.min(limit / 2)) / PER_CONNECTION / workers));
+    // What memory allows a worker before it is bounded: what an HTTP/3 connection counts as
+    // turns on how far that is above the cap.
+    let memory_allows = match memory {
         Memory::NoLimit => None,
-        Memory::Limit { bytes, .. } => Some(each(bytes / 2 / CONNECTION_COST)),
+        Memory::Limit { bytes, .. } => Some(bytes / 2 / CONNECTION_COST / workers),
     };
-    match (by_files, by_memory) {
-        (Some(files), Some(memory)) if memory < files => Connections {
-            each: memory,
-            set_by: "memory",
-        },
-        (None, Some(memory)) if memory < CONNECTIONS_PER_WORKER => Connections {
-            each: memory,
-            set_by: "memory",
-        },
-        (Some(files), _) if files < CONNECTIONS_PER_WORKER => Connections {
-            each: files,
-            set_by: "open files",
-        },
-        _ => Connections {
-            each: CONNECTIONS_PER_WORKER,
-            set_by: "a worker's bound",
-        },
+    let by_memory = memory_allows.map(bounded);
+    let (each, set_by) = match (by_files, by_memory) {
+        (Some(files), Some(memory)) if memory < files => (memory, "memory"),
+        (None, Some(memory)) if memory < CONNECTIONS_PER_WORKER => (memory, "memory"),
+        (Some(files), _) if files < CONNECTIONS_PER_WORKER => (files, "open files"),
+        _ => (CONNECTIONS_PER_WORKER, "a worker's bound"),
+    };
+    Connections {
+        each,
+        set_by,
+        quic: quic_weight(each, memory_allows),
     }
 }
 
-/// How many connections a worker may hold, and which limit set it.
+/// What an HTTP/3 connection counts as, in sixteenths of a connection ([`CONNECTION`]),
+/// against a cap of `each` connections where memory allows a worker `memory` of them
+/// (`None` with no limit): `3 × each / memory` connections, rounded up, and never less than
+/// one. An HTTP/3 connection costs three connections' memory ([`QUIC_MOST`]) and holds no
+/// open file of its own, so it counts as all three where memory sets the cap, and as one
+/// where memory allows three times the cap or more, or has no limit.
+///
+/// No mix of TCP and HTTP/3 connections the cap then admits holds more memory than
+/// `memory` connections' worth: with `tcp + w × quic ≤ each`, `w ≥ 3 × each / memory` and
+/// `memory ≥ each`, `tcp + 3 × quic ≤ (memory / each) × (tcp + w × quic) ≤ memory`. A
+/// single weight picked by which bound is lowest would not do: at one, a cap set by open
+/// files just under what memory allows would admit three times the memory in HTTP/3.
+fn quic_weight(each: usize, memory: Option<u64>) -> usize {
+    let Some(memory) = memory else {
+        return CONNECTION;
+    };
+    let each = u64::try_from(each).unwrap_or(u64::MAX);
+    let most = u64::try_from(QUIC_MOST).unwrap_or(u64::MAX);
+    // With less memory than the cap, which is never none, nothing is to spare.
+    if memory < each {
+        return QUIC_MOST;
+    }
+    let weight = most.saturating_mul(each).div_ceil(memory);
+    usize::try_from(weight)
+        .unwrap_or(QUIC_MOST)
+        .clamp(CONNECTION, QUIC_MOST)
+}
+
+/// How many connections a worker may hold, which limit set it, and what an HTTP/3
+/// connection counts as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Connections {
     pub(crate) each: usize,
     pub(crate) set_by: &'static str,
+    /// In sixteenths of a connection, from one connection to three ([`quic_weight`]).
+    pub(crate) quic: usize,
 }
 
 /// What memory the pod may use, as its cgroup says.
@@ -315,48 +345,94 @@ mod tests {
         }
     }
 
-    fn bound(each: usize, set_by: &'static str) -> Connections {
-        Connections { each, set_by }
+    fn bound(each: usize, set_by: &'static str, quic: usize) -> Connections {
+        Connections { each, set_by, quic }
     }
 
     #[test]
     fn the_cap_is_the_fewer_of_what_open_files_and_memory_allow() {
-        const MIB: u64 = 1024 * 1024;
-        let memory = |bytes: u64| Memory::Limit {
-            bytes,
-            from: "memory.max",
-        };
-        // 512 MiB, 4 workers: 256 MiB at 22 KiB a connection, 11,915, 2,978 each.
+        // 512 MiB, 4 workers: 256 MiB at 22 KiB a connection, 11,915, 2,978 each. Memory
+        // sets the cap, so an HTTP/3 connection counts as all it costs.
         assert_eq!(
-            connections_per_worker(limit(524_288), memory(512 * MIB), workers(4)),
-            bound(2_978, "memory")
+            connections_per_worker(limit(524_288), limited(512 * MIB), workers(4)),
+            bound(2_978, "memory", QUIC_MOST)
         );
         // 1 GiB beside a hard limit of 65,536 open files: memory's 5,957 is fewer than
         // the files' 8,064.
         assert_eq!(
-            connections_per_worker(limit(65_536), memory(1024 * MIB), workers(4)),
-            bound(5_957, "memory")
+            connections_per_worker(limit(65_536), limited(1024 * MIB), workers(4)),
+            bound(5_957, "memory", QUIC_MOST)
         );
-        // 8 GiB: memory would allow more than a worker's bound.
+        // 8 GiB: memory would allow more than a worker's bound, 47,662 a worker. An
+        // HTTP/3 connection counts as 3 × 32,768 / 47,662 of one, 2.06, rounded up to the
+        // next sixteenth: 34.
         assert_eq!(
-            connections_per_worker(limit(524_288), memory(8192 * MIB), workers(4)),
-            bound(CONNECTIONS_PER_WORKER, "a worker's bound")
+            connections_per_worker(limit(524_288), limited(8192 * MIB), workers(4)),
+            bound(CONNECTIONS_PER_WORKER, "a worker's bound", 34)
         );
         // A small memory limit with no open-file limit to speak of.
         assert_eq!(
-            connections_per_worker(OpenFiles::NoLimit, memory(64 * MIB), workers(2)),
-            bound(744, "memory")
+            connections_per_worker(OpenFiles::NoLimit, limited(64 * MIB), workers(2)),
+            bound(744, "memory", QUIC_MOST)
         );
-        // Open files fewer than memory allows.
+        // Open files fewer than memory allows, far fewer: an HTTP/3 connection, holding no
+        // file of its own, counts as one.
         assert_eq!(
-            connections_per_worker(limit(4_096), memory(8192 * MIB), workers(1)),
-            bound(1_536, "open files")
+            connections_per_worker(limit(4_096), limited(8192 * MIB), workers(1)),
+            bound(1_536, "open files", CONNECTION)
         );
         // However small, never none.
         assert_eq!(
-            connections_per_worker(OpenFiles::NoLimit, memory(0), workers(1)),
-            bound(1, "memory")
+            connections_per_worker(OpenFiles::NoLimit, limited(0), workers(1)),
+            bound(1, "memory", QUIC_MOST)
         );
+    }
+
+    /// With no memory limit nothing is sized from memory, and an HTTP/3 connection counts as
+    /// any other.
+    #[test]
+    fn with_no_memory_limit_an_http3_connection_counts_as_one() {
+        for files in [
+            limit(1024),
+            limit(65_536),
+            limit(524_288),
+            OpenFiles::NoLimit,
+        ] {
+            let cap = connections_per_worker(files, Memory::NoLimit, workers(4));
+            assert_eq!(cap.quic, CONNECTION, "{cap:?}");
+        }
+    }
+
+    proptest::proptest! {
+        /// Whatever the limits, no mix of TCP and HTTP/3 connections the cap lets a worker
+        /// hold costs more memory than the limit allows a worker: at what an idle TCP
+        /// connection costs, an HTTP/3 connection costing three. Nor does an HTTP/3
+        /// connection ever count as less than one connection or more than three.
+        #[test]
+        fn no_mix_the_cap_admits_holds_more_than_memory_allows(
+            mebibytes in 0_u64..65_536,
+            files in proptest::option::of(0_u64..2_000_000),
+            count in 1_usize..64,
+        ) {
+            let files = match files {
+                Some(now) => limit(now),
+                None => OpenFiles::NoLimit,
+            };
+            let cap = connections_per_worker(files, limited(mebibytes * MIB), workers(count));
+            proptest::prop_assert!((CONNECTION..=QUIC_MOST).contains(&cap.quic), "{:?}", cap);
+            let allowed = mebibytes * MIB / 2 / CONNECTION_COST / count as u64;
+            // A cap is never none, however little memory there is.
+            proptest::prop_assume!(allowed >= cap.each as u64);
+            let room = cap.each * CONNECTION;
+            for quic in 0..=room / cap.quic {
+                let tcp = (room - quic * cap.quic) / CONNECTION;
+                let costs = tcp as u64 + 3 * quic as u64;
+                proptest::prop_assert!(
+                    costs <= allowed,
+                    "{} TCP and {} HTTP/3 cost {} of {}: {:?}", tcp, quic, costs, allowed, cap
+                );
+            }
+        }
     }
 
     #[test]
@@ -427,7 +503,10 @@ mod tests {
     #[test]
     fn the_start_says_what_became_of_the_limit_and_what_each_worker_may_hold() {
         assert_eq!(
-            described(limit(524_288), bound(32_768, "a worker's bound")),
+            described(
+                limit(524_288),
+                bound(32_768, "a worker's bound", CONNECTION)
+            ),
             "open files: soft limit 1024 raised to 524288; 32768 connections a worker, by a worker's bound"
         );
         let same = OpenFiles::Raised {
@@ -435,7 +514,7 @@ mod tests {
             now: Some(4096),
         };
         assert_eq!(
-            described(same, bound(1_792, "open files")),
+            described(same, bound(1_792, "open files", CONNECTION)),
             "open files: soft limit 4096; 1792 connections a worker, by open files"
         );
         let kept = OpenFiles::Kept {
@@ -443,11 +522,11 @@ mod tests {
             why: std::io::ErrorKind::PermissionDenied,
         };
         assert_eq!(
-            described(kept, bound(256, "open files")),
+            described(kept, bound(256, "open files", CONNECTION)),
             "open files: soft limit 1024, not raised (permission denied); 256 connections a worker, by open files"
         );
         assert_eq!(
-            described(OpenFiles::NoLimit, bound(32_768, "memory")),
+            described(OpenFiles::NoLimit, bound(32_768, "memory", QUIC_MOST)),
             "32768 connections a worker, by memory"
         );
     }

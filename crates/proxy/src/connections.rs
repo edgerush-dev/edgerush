@@ -27,15 +27,32 @@
 //! beside the client's one, and a client connection may carry a hundred of them. It is
 //! refused while its worker has no room, or its listener holds its share ([`Loads::take`]).
 //!
-//! So does an HTTP/3 connection, as several: the cap is sized from the pod's memory at what
-//! an idle TCP connection costs, and an HTTP/3 connection costs more than twice that
-//! ([`Loads::take_slots`]). Its worker owns it from its first packet, so it is never placed
-//! elsewhere; without room its Initial is dropped, and the client sends it again.
+//! So does an HTTP/3 connection, as up to three ([`Loads::take_quic`]): the cap is sized from
+//! the pod's memory at what an idle TCP connection costs, and an HTTP/3 connection costs
+//! more than twice that. Where memory does not set the cap, it counts for less, down to
+//! one. Its worker owns it from its first packet, so it is never placed elsewhere; without
+//! room its Initial is dropped, and the client sends it again.
 
 use crate::share::over_share;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
+
+/// What a connection counts as in a worker's load. Loads are counted in sixteenths of a
+/// connection, so that one that costs more than a connection and less than three can
+/// count as what it costs.
+pub const CONNECTION: usize = 16;
+
+/// The most an HTTP/3 connection counts as: three connections. The cap is sized from the
+/// pod's memory at 22 KiB a connection, what the dearest kind of idle TCP connection costs
+/// ([03 §9]); a held HTTP/3 connection costs 51 KB ([16 §8]), all of it the process's, since
+/// it has no socket of its own. Rounded up, so that the cap never counts one short. Where
+/// open files or a worker's bound set the cap instead, an HTTP/3 connection holds no file
+/// of its own and counts for less: whoever makes the [`Loads`] says how much.
+///
+/// [03 §9]: ../../../docs/03-data-plane.md
+/// [16 §8]: ../../../docs/16-http3.md
+pub const QUIC_MOST: usize = 3 * CONNECTION;
 
 /// The worker that a connection accepted by `own` goes to: the one with the least load.
 /// `own` keeps it if none has less; among others that tie, the next one after `own` gets
@@ -58,12 +75,15 @@ fn least_loaded(loads: &[usize], own: usize) -> usize {
 
 /// How many connections every worker holds, and how many it may, and how many every
 /// listener holds. Written to when a connection comes or goes, never for a request, so the
-/// workers' numbers can share a line of cache.
+/// workers' numbers can share a line of cache. Every count is in sixteenths of a connection
+/// ([`CONNECTION`]).
 #[derive(Debug)]
 pub struct Loads {
     held: Vec<AtomicUsize>,
-    /// How many connections a worker may hold before it stops accepting.
+    /// How much a worker may hold before it stops accepting.
     cap: usize,
+    /// What an HTTP/3 connection counts as.
+    quic: usize,
     /// For every worker and listener, at `worker * listeners + listener`, what wakes the
     /// worker's accepting on the listener when the worker has room again: one for each
     /// listener, since each accepts on its own, and the one woken may have nothing to
@@ -82,12 +102,14 @@ pub struct Loads {
 
 impl Loads {
     /// The counts of `workers` workers that may each hold `cap` connections, on
-    /// `listeners` listeners, none held.
+    /// `listeners` listeners, none held, an HTTP/3 connection counting as `quic` sixteenths
+    /// of one: from [`CONNECTION`] to [`QUIC_MOST`], and held to that.
     #[must_use]
-    pub fn new(workers: usize, cap: usize, listeners: usize) -> Arc<Self> {
+    pub fn new(workers: usize, cap: usize, quic: usize, listeners: usize) -> Arc<Self> {
         Arc::new(Self {
             held: (0..workers).map(|_| AtomicUsize::new(0)).collect(),
-            cap,
+            cap: cap.saturating_mul(CONNECTION),
+            quic: quic.clamp(CONNECTION, QUIC_MOST),
             room: (0..workers * listeners).map(|_| Notify::new()).collect(),
             total: AtomicUsize::new(0),
             by_listener: (0..listeners).map(|_| AtomicUsize::new(0)).collect(),
@@ -96,14 +118,14 @@ impl Loads {
         })
     }
 
-    /// What all the workers together may hold.
+    /// The connections all the workers together may hold.
     fn limit(&self) -> usize {
-        self.cap.saturating_mul(self.held.len())
+        (self.cap / CONNECTION).saturating_mul(self.held.len())
     }
 
     /// Whether `listener` may take another connection: always, but where every worker's
     /// room is seven eighths held and the listener holds its fair share of it. One that is
-    /// not there has none.
+    /// not there has none. Reckoned in whole connections, a part of one counted as one.
     ///
     /// Workers that look at the same moment may each take one: a share is passed by at
     /// most that many.
@@ -114,15 +136,15 @@ impl Loads {
         };
         !over_share(
             self.limit(),
-            self.total.load(Ordering::Relaxed),
-            own.load(Ordering::Relaxed),
+            connections(self.total.load(Ordering::Relaxed)),
+            connections(own.load(Ordering::Relaxed)),
             self.holding.load(Ordering::Relaxed),
             self.by_listener.len() < 2,
         )
     }
 
-    /// Whether `worker` holds fewer connections than its cap. One that is not there has
-    /// none.
+    /// Whether `worker` has room under its cap for another connection. One that is not there
+    /// has room.
     ///
     /// A worker that accepts only while this holds stays within its cap, and so does every
     /// worker it gives connections to, which hold no more than it does — except that
@@ -131,9 +153,14 @@ impl Loads {
     /// by at most that many.
     #[must_use]
     pub fn has_room(&self, worker: usize) -> bool {
+        self.fits(worker, CONNECTION)
+    }
+
+    /// Whether `worker` has room under its cap for `load` more. One that is not there has.
+    fn fits(&self, worker: usize, load: usize) -> bool {
         self.held
             .get(worker)
-            .is_none_or(|load| load.load(Ordering::Relaxed) < self.cap)
+            .is_none_or(|held| held.load(Ordering::Relaxed).saturating_add(load) <= self.cap)
     }
 
     /// Waits until `worker` has room, and `listener` has room for another connection.
@@ -166,7 +193,11 @@ impl Loads {
     /// connection off, which the accepts after them put right.
     #[must_use]
     pub fn place(self: &Arc<Self>, own: usize, listener: usize) -> Held {
-        let loads: Vec<usize> = self.now();
+        let loads: Vec<usize> = self
+            .held
+            .iter()
+            .map(|load| load.load(Ordering::Relaxed))
+            .collect();
         self.hold(least_loaded(&loads, own), listener)
     }
 
@@ -176,40 +207,35 @@ impl Loads {
     /// None when there is no room, as there would be no accepting.
     #[must_use]
     pub fn take(self: &Arc<Self>, worker: usize, listener: usize) -> Option<Held> {
-        self.take_slots(worker, listener, 1)
+        self.take_load(worker, listener, CONNECTION)
     }
 
-    /// The same for a connection that costs as much as `slots` of them — an HTTP/3
-    /// connection, whose memory the cap would otherwise count short: all of them, only
-    /// where they all fit under the worker's cap, or none.
+    /// The same for an HTTP/3 connection, which counts as what the loads were made with: all
+    /// of it, only where it all fits under the worker's cap, or none.
     #[must_use]
-    pub fn take_slots(
-        self: &Arc<Self>,
-        worker: usize,
-        listener: usize,
-        slots: usize,
-    ) -> Option<Held> {
-        let fits = self
-            .held
-            .get(worker)
-            .is_none_or(|load| load.load(Ordering::Relaxed).saturating_add(slots) <= self.cap);
-        (fits && self.listener_has_room(listener)).then(|| self.hold_slots(worker, listener, slots))
+    pub fn take_quic(self: &Arc<Self>, worker: usize, listener: usize) -> Option<Held> {
+        self.take_load(worker, listener, self.quic)
+    }
+
+    fn take_load(self: &Arc<Self>, worker: usize, listener: usize, load: usize) -> Option<Held> {
+        (self.fits(worker, load) && self.listener_has_room(listener))
+            .then(|| self.hold_load(worker, listener, load))
     }
 
     /// Counts a connection on `listener` as `worker`'s, without looking at the others.
     #[must_use]
     pub fn hold(self: &Arc<Self>, worker: usize, listener: usize) -> Held {
-        self.hold_slots(worker, listener, 1)
+        self.hold_load(worker, listener, CONNECTION)
     }
 
-    /// Counts `slots` of them on `listener` as `worker`'s, as one connection.
-    fn hold_slots(self: &Arc<Self>, worker: usize, listener: usize, slots: usize) -> Held {
-        if let Some(load) = self.held.get(worker) {
-            load.fetch_add(slots, Ordering::Relaxed);
+    /// Counts `load` on `listener` as `worker`'s, as one connection.
+    fn hold_load(self: &Arc<Self>, worker: usize, listener: usize, load: usize) -> Held {
+        if let Some(held) = self.held.get(worker) {
+            held.fetch_add(load, Ordering::Relaxed);
         }
-        self.total.fetch_add(slots, Ordering::Relaxed);
+        self.total.fetch_add(load, Ordering::Relaxed);
         if let Some(own) = self.by_listener.get(listener)
-            && own.fetch_add(slots, Ordering::Relaxed) == 0
+            && own.fetch_add(load, Ordering::Relaxed) == 0
         {
             self.holding.fetch_add(1, Ordering::Relaxed);
         }
@@ -217,18 +243,24 @@ impl Loads {
             loads: Arc::clone(self),
             worker,
             listener,
-            slots,
+            load,
         }
     }
 
-    /// What every worker holds at this moment.
+    /// How many connections every worker holds at this moment, a part of one counted as
+    /// one.
     #[must_use]
     pub fn now(&self) -> Vec<usize> {
         self.held
             .iter()
-            .map(|load| load.load(Ordering::Relaxed))
+            .map(|load| connections(load.load(Ordering::Relaxed)))
             .collect()
     }
+}
+
+/// The connections `load` makes, a part of one counted as one.
+fn connections(load: usize) -> usize {
+    load.div_ceil(CONNECTION)
 }
 
 /// A connection that counts as a worker's, until this is dropped: it goes where the
@@ -238,8 +270,8 @@ pub struct Held {
     loads: Arc<Loads>,
     worker: usize,
     listener: usize,
-    /// How many of the worker's connections it counts as.
-    slots: usize,
+    /// What it counts as, in sixteenths of a connection.
+    load: usize,
 }
 
 impl Held {
@@ -253,13 +285,13 @@ impl Held {
 impl Drop for Held {
     fn drop(&mut self) {
         let loads = &self.loads;
-        let slots = self.slots;
+        let load = self.load;
         if let Some(own) = loads.by_listener.get(self.listener)
-            && own.fetch_sub(slots, Ordering::Relaxed) == slots
+            && own.fetch_sub(load, Ordering::Relaxed) == load
         {
             loads.holding.fetch_sub(1, Ordering::Relaxed);
         }
-        let total = loads.total.fetch_sub(slots, Ordering::Relaxed);
+        let total = connections(loads.total.fetch_sub(load, Ordering::Relaxed));
         // Only past seven eighths can a listener be waiting for its share, so only then is
         // there anyone to wake; and any connection that ends may be what gives it room.
         let limit = loads.limit();
@@ -268,14 +300,14 @@ impl Drop for Held {
                 listener_room.notify_one();
             }
         }
-        let Some(load) = loads.held.get(self.worker) else {
+        let Some(held) = loads.held.get(self.worker) else {
             return;
         };
-        let before = load.fetch_sub(slots, Ordering::Relaxed);
-        // Only a worker that was full can be waiting, so only then is there anyone to wake:
-        // every one of its listeners, as each may be waiting.
+        let before = held.fetch_sub(load, Ordering::Relaxed);
+        // Only a worker that had no room for another connection can be waiting, so only
+        // then is there anyone to wake: every one of its listeners, as each may be waiting.
         let listeners = loads.by_listener.len();
-        if before >= loads.cap
+        if before.saturating_add(CONNECTION) > loads.cap
             && let Some(rooms) = loads
                 .room
                 .get(self.worker * listeners..(self.worker + 1) * listeners)
@@ -323,7 +355,7 @@ mod tests {
 
     #[test]
     fn four_connections_that_one_worker_accepts_go_to_four_workers() {
-        let loads = Loads::new(4, usize::MAX, 1);
+        let loads = Loads::new(4, usize::MAX, QUIC_MOST, 1);
         let held: Vec<Held> = (0..4).map(|_| loads.place(2, 0)).collect();
         assert_eq!(loads.now(), [1, 1, 1, 1]);
         let mut workers: Vec<usize> = held.iter().map(Held::worker).collect();
@@ -334,7 +366,7 @@ mod tests {
 
     #[test]
     fn a_connection_counts_until_it_is_let_go_of() {
-        let loads = Loads::new(2, usize::MAX, 1);
+        let loads = Loads::new(2, usize::MAX, QUIC_MOST, 1);
         let first = loads.hold(1, 0);
         let second = loads.hold(1, 0);
         assert_eq!(loads.now(), [0, 2]);
@@ -367,7 +399,7 @@ mod tests {
             workers in 1_usize..9,
             accepted_by in prop::collection::vec(0_usize..8, 0..200),
         ) {
-            let loads = Loads::new(workers, usize::MAX, 1);
+            let loads = Loads::new(workers, usize::MAX, QUIC_MOST, 1);
             let mut held = Vec::new();
             for own in accepted_by {
                 held.push(loads.place(own % workers, 0));
@@ -384,7 +416,7 @@ mod tests {
             workers in 1_usize..9,
             events in prop::collection::vec((any::<bool>(), 0_usize..64), 0..200),
         ) {
-            let loads = Loads::new(workers, usize::MAX, 1);
+            let loads = Loads::new(workers, usize::MAX, QUIC_MOST, 1);
             let mut held: Vec<Held> = Vec::new();
             for (ends, which) in events {
                 if ends && !held.is_empty() {
@@ -409,7 +441,7 @@ mod tests {
             listeners in 1_usize..5,
             events in prop::collection::vec((any::<bool>(), 0_usize..64, 0_usize..8), 0..300),
         ) {
-            let loads = Loads::new(workers, cap, listeners);
+            let loads = Loads::new(workers, cap, QUIC_MOST, listeners);
             let limit = workers * cap;
             let mut held: Vec<(usize, Held)> = Vec::new();
             for (ends, which, listener) in events {
@@ -443,7 +475,7 @@ mod tests {
             cap in 1_usize..6,
             events in prop::collection::vec((any::<bool>(), 0_usize..64), 0..300),
         ) {
-            let loads = Loads::new(workers, cap, 1);
+            let loads = Loads::new(workers, cap, QUIC_MOST, 1);
             let mut held: Vec<Held> = Vec::new();
             for (ends, which) in events {
                 if ends && !held.is_empty() {
@@ -460,7 +492,7 @@ mod tests {
     /// no room and one holding less has; with a single listener there is no share to hold.
     #[test]
     fn once_short_a_listener_at_its_share_has_no_room_and_the_others_have() {
-        let loads = Loads::new(2, 8, 2);
+        let loads = Loads::new(2, 8, QUIC_MOST, 2);
         // 16 in all, short from 14: one listener holds 14, over its half.
         let held: Vec<Held> = (0..14).map(|at| loads.hold(at % 2, 0)).collect();
         assert!(!loads.listener_has_room(0));
@@ -468,7 +500,7 @@ mod tests {
         drop(held);
         assert!(loads.listener_has_room(0));
 
-        let alone = Loads::new(2, 8, 1);
+        let alone = Loads::new(2, 8, QUIC_MOST, 1);
         let _held: Vec<Held> = (0..15).map(|at| alone.hold(at % 2, 0)).collect();
         assert!(alone.listener_has_room(0));
     }
@@ -477,7 +509,7 @@ mod tests {
     /// and the listener is not at its share, and counts like any other once taken.
     #[test]
     fn a_connection_is_taken_only_where_there_is_room() {
-        let loads = Loads::new(1, 2, 2);
+        let loads = Loads::new(1, 2, QUIC_MOST, 2);
         let accepted = loads.hold(0, 0);
         let taken = loads.take(0, 1).expect("room for a second");
         assert_eq!(loads.now(), [2]);
@@ -487,7 +519,7 @@ mod tests {
         drop(taken);
 
         // 16 in all, short from 14: the first listener holds 14, over its half.
-        let shared = Loads::new(2, 8, 2);
+        let shared = Loads::new(2, 8, QUIC_MOST, 2);
         let _held: Vec<Held> = (0..14).map(|at| shared.hold(at % 2, 0)).collect();
         assert!(
             shared.take(0, 0).is_none(),
@@ -496,31 +528,86 @@ mod tests {
         assert!(shared.take(0, 1).is_some(), "the other listener refused");
     }
 
-    /// A connection that costs several slots takes all of them or none — only where they
-    /// all fit under the worker's cap — counts them on its listener, and gives them all back
-    /// when it ends.
+    /// An HTTP/3 connection takes all it counts as or nothing — only where it all fits under
+    /// the worker's cap — counts it on its listener, and gives it all back when it ends.
     #[test]
-    fn a_connection_of_several_slots_is_taken_only_where_they_all_fit() {
-        let loads = Loads::new(1, 4, 2);
+    fn an_http3_connection_is_taken_only_where_all_it_counts_as_fits() {
+        let loads = Loads::new(1, 4, QUIC_MOST, 2);
         let accepted = loads.hold(0, 0);
-        let heavy = loads.take_slots(0, 1, 3).expect("room for three");
+        let heavy = loads.take_quic(0, 1).expect("room for three");
         assert_eq!(loads.now(), [4]);
-        assert_eq!(loads.by_listener[1].load(Ordering::Relaxed), 3);
+        assert_eq!(loads.by_listener[1].load(Ordering::Relaxed), QUIC_MOST);
         assert_eq!(loads.holding.load(Ordering::Relaxed), 2);
         drop(accepted);
-        assert!(
-            loads.take_slots(0, 1, 3).is_none(),
-            "three taken with one free"
-        );
+        assert!(loads.take_quic(0, 1).is_none(), "three taken with one free");
         assert!(loads.take(0, 0).is_some(), "the one free refused");
         drop(heavy);
         assert_eq!(loads.now(), [0]);
         assert_eq!(loads.total.load(Ordering::Relaxed), 0);
         assert_eq!(loads.holding.load(Ordering::Relaxed), 0);
-        assert!(
-            loads.take_slots(0, 0, 5).is_none(),
-            "more taken than the cap"
-        );
+        let small = Loads::new(1, 2, QUIC_MOST, 1);
+        assert!(small.take_quic(0, 0).is_none(), "more taken than the cap");
+    }
+
+    /// An HTTP/3 connection that counts as part of a connection more than a whole one leaves
+    /// the rest of the cap to whatever fits in it: a connection while a whole one is left,
+    /// nothing once less is. Asked in whole connections, the part counts as one.
+    #[test]
+    fn an_http3_connection_counts_as_the_part_of_a_connection_it_was_given() {
+        // 34 sixteenths, 2⅛ connections, under a cap of 4.
+        let loads = Loads::new(1, 4, 34, 1);
+        let quic = loads.take_quic(0, 0).expect("room for 2⅛");
+        assert_eq!(loads.now(), [3]);
+        assert!(loads.has_room(0), "no room with 1⅞ left");
+        let tcp = loads.hold(0, 0);
+        assert!(!loads.has_room(0), "room with ⅞ left");
+        assert!(loads.take(0, 0).is_none(), "taken with ⅞ left");
+        assert!(loads.take_quic(0, 0).is_none(), "2⅛ taken with ⅞ left");
+        drop(quic);
+        assert!(loads.take_quic(0, 0).is_some(), "no room once it went");
+        drop(tcp);
+    }
+
+    /// What an HTTP/3 connection counts as is held to between one connection and three,
+    /// whatever it was given.
+    #[test]
+    fn an_http3_connection_counts_as_one_connection_to_three() {
+        let light = Loads::new(1, 8, 0, 1);
+        let _one = light.take_quic(0, 0).expect("room for one");
+        assert_eq!(light.now(), [1]);
+        let heavy = Loads::new(1, 8, 1000, 1);
+        let _three = heavy.take_quic(0, 0).expect("room for three");
+        assert_eq!(heavy.now(), [3]);
+    }
+
+    /// A worker left with part of a connection's room has none, and is woken when what
+    /// filled it ends — an HTTP/3 connection counted as a part as much as a whole one.
+    #[test]
+    fn a_worker_with_less_than_a_connection_left_waits_for_room() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(waits_with_less_than_a_connection_left());
+    }
+
+    async fn waits_with_less_than_a_connection_left() {
+        // 2⅛ and one under a cap of 4: ⅞ left.
+        let loads = Loads::new(1, 4, 34, 1);
+        let quic = loads.take_quic(0, 0).unwrap();
+        let _tcp = loads.hold(0, 0);
+        assert!(!loads.has_room(0));
+        let waiting = tokio::spawn({
+            let loads = Arc::clone(&loads);
+            async move { loads.room(0, 0).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "woken with ⅞ of a connection left");
+        drop(quic);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("not woken when the HTTP/3 connection ended")
+            .unwrap();
     }
 
     /// A listener waiting at its share is woken when a connection ends and gives it room,
@@ -535,7 +622,7 @@ mod tests {
     }
 
     async fn waits_until_it_has_room() {
-        let loads = Loads::new(1, 8, 2);
+        let loads = Loads::new(1, 8, QUIC_MOST, 2);
         // Short from 7; the first listener holds 7, its share 4.
         let mut first: Vec<Held> = (0..7).map(|_| loads.hold(0, 0)).collect();
         let waiting = tokio::spawn({
@@ -567,7 +654,7 @@ mod tests {
     }
 
     async fn waits_for_one_of_its_connections_to_end() {
-        let loads = Loads::new(2, 2, 1);
+        let loads = Loads::new(2, 2, QUIC_MOST, 1);
         let first = loads.hold(0, 0);
         let _second = loads.hold(0, 0);
         let other = loads.hold(1, 0);
@@ -605,7 +692,7 @@ mod tests {
     }
 
     async fn wakes_every_listener_waiting_on_it() {
-        let loads = Loads::new(1, 2, 2);
+        let loads = Loads::new(1, 2, QUIC_MOST, 2);
         let first = loads.hold(0, 0);
         let _second = loads.hold(0, 1);
         assert!(!loads.has_room(0));
