@@ -39,11 +39,12 @@ without dropping a request.
   budget.
 - **At the edge:** `X-Forwarded-*` and `Via`, believed only from listed proxies; PROXY
   protocol v1 and v2; request IDs; caps on connections and a fair share of each worker for
-  every upstream; a drain on SIGTERM; Prometheus metrics.
+  every upstream; a drain on SIGTERM; Prometheus metrics; access logs, a line of JSON for
+  each request, WebSocket and passthrough connection, to stdout or a file.
 
 Not yet: anything Kubernetes (the control plane, the operator, translating Ingress and
-Gateway API), rate limiting, access logs, authentication. The request path comes first,
-then rate limiting, then the control plane and the operator.
+Gateway API), rate limiting, authentication. The request path comes first, then rate
+limiting, then the control plane and the operator.
 
 ## Trying it
 
@@ -161,7 +162,8 @@ crates/filters     built-in filters (`edgerush-filters`): pure, on plain `http` 
 crates/proxy       the data plane (`edgerush-proxy`): listeners, TLS, our HTTP/1 server and client,
                    HTTP/2 on h2, HTTP/3 on quiche, upstream pools and the request core between them
 crates/router      request matching (`edgerush-router`): pure logic, no I/O
-crates/telemetry   metrics (`edgerush-telemetry`): counters sharded by thread, the Prometheus text format
+crates/telemetry   metrics and access logs (`edgerush-telemetry`): counters sharded by thread, the
+                   Prometheus text format, an access-log record as a line of JSON
 bench              the macro benchmark: load generator, proxy and backend on one Linux machine
                    (bench/README.md)
 fuzz               fuzz targets (cargo-fuzz; not part of the workspace)
