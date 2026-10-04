@@ -66,12 +66,9 @@ impl Worker {
         interim: Option<Interim>,
     ) -> Answered<Body> {
         let came_in = Instant::now();
-        // One snapshot for the request's ID and its routing alike, so that a reload between
-        // the two cannot have it served by both configs (03 §4). `respond_to` lets go of it
-        // once the request is directed, before anything is waited on.
-        let snapshot = self.proxy.current.load();
-        // First, so that every answer the core gives, its own included, carries it.
-        let id = request_id(&snapshot, listener);
+        // First, so that every answer the core gives, its own included, carries it; with
+        // the snapshot it was decided on, which the request is directed by.
+        let (snapshot, id) = self.proxy.identify(listener);
         let mut answered = self
             .respond_to(
                 snapshot,
@@ -130,19 +127,17 @@ impl Worker {
         // from and everything it named looks like an ordinary field, so a trailer of that
         // name would travel on ([13 §4](../../docs/13-http1-upstream.md)).
         let nominated = crate::hop_by_hop::nominated(head.outgoing());
-        let directing =
-            self.proxy
-                .direct(&snapshot, listener, client, &mut head, id, &self.balancing);
-        // What the request needs of the config it was directed by is in hand: the snapshot
-        // is let go of before anything is waited on, and a reload no longer waits for it.
-        drop(snapshot);
-        let mut directed = match directing {
-            Ok(Directing::Upstream(directed)) => directed,
-            Ok(Directing::Redirect(redirect)) => {
-                return self.proxy.redirect(listener, redirect, call).into();
-            }
-            Err(answer) => return self.proxy.answer_to(listener, answer, call).into(),
-        };
+        let mut directed =
+            match self
+                .proxy
+                .direct(snapshot, listener, client, &mut head, id, &self.balancing)
+            {
+                Ok(Directing::Upstream(directed)) => directed,
+                Ok(Directing::Redirect(redirect)) => {
+                    return self.proxy.redirect(listener, redirect, call).into();
+                }
+                Err(answer) => return self.proxy.answer_to(listener, answer, call).into(),
+            };
         // A WebSocket that an HTTP/2 or HTTP/3 client asks for holds a backend of its own
         // beside the client's one connection, which may carry a hundred: it counts as one
         // of the worker's connections for as long as it is open, and is refused, before
@@ -298,6 +293,25 @@ impl Proxy {
         }
     }
 
+    /// The config in force, and an ID on it for a request that came in on `listener`, if
+    /// the listener gives its requests one (08 §3 in the docs). The request is directed by
+    /// the same snapshot, so that a reload between the two cannot have it served by both
+    /// configs (03 §4); and the ID is worked out once, so that the request and its client
+    /// are told the same one.
+    ///
+    /// Handed back beside the snapshot rather than worked out on a borrow of it by the
+    /// caller: a local that is borrowed stays in an async fn's future to the end of its
+    /// scope, and that one's layout then keeps the request's future from being made in
+    /// its slot, which costs a copy of all of it each request (14 §3).
+    fn identify(&self, listener: usize) -> (Guard<Arc<Snapshot>>, Option<HeaderValue>) {
+        let snapshot = self.current.load();
+        let id = snapshot
+            .listener(listener)
+            .filter(|listener| listener.request_id == RequestId::Generate)
+            .and_then(|_| Some(request_id::value(unix_millis(), unguessable()?)));
+        (snapshot, id)
+    }
+
     fn answer_to(&self, listener: usize, answer: Answer, call: Option<Call>) -> Response<Body> {
         let mut response = self.answer(listener, answer);
         if call.is_some() {
@@ -353,12 +367,12 @@ impl Proxy {
 
     /// Makes the head of a request that came in on a listener's socket the head of the
     /// request to send, target included, or says what to answer instead. All of it is done
-    /// on `snapshot`, the one the request's ID was worked out on, which the caller lets go
-    /// of before anything is waited for; what is kept for the response is the rule, and only
-    /// if it has something to do to the response, and the slot of the upstream's counters.
+    /// on `snapshot`, the one the request's ID was worked out on, which is let go of here,
+    /// before anything is waited for; what is kept for the response is the rule, and only if
+    /// it has something to do to the response, and the slot of the upstream's counters.
     fn direct<H: Forwarded>(
         &self,
-        snapshot: &Snapshot,
+        snapshot: Guard<Arc<Snapshot>>,
         listener: usize,
         client: &Client,
         head: &mut H,
@@ -391,7 +405,7 @@ impl Proxy {
         let upstream = forward.upstream.0;
         let endpoints = snapshot.endpoints.get(upstream).ok_or(Answer::NoBackend)?;
         let destinations = snapshot.destinations.of(upstream);
-        let balance = balance_of(balancing, snapshot, upstream).ok_or(Answer::NoEndpoints)?;
+        let balance = balance_of(balancing, &snapshot, upstream).ok_or(Answer::NoEndpoints)?;
         let (at, counted) = balance
             .pick(destinations, &Tried::default())
             .ok_or(Answer::NoEndpoints)?;
@@ -458,7 +472,7 @@ impl Proxy {
                 continue;
             }
             let destinations = snapshot.destinations.of(upstream);
-            let found = balance_of(balancing, snapshot, upstream).and_then(|balance| {
+            let found = balance_of(balancing, &snapshot, upstream).and_then(|balance| {
                 let (at, counted) = balance.pick(destinations, &Tried::default())?;
                 let authority = snapshot.endpoints.get(upstream)?.get(at)?;
                 Some((
@@ -509,16 +523,6 @@ impl Proxy {
             alone: snapshot.upstream_slots.len() < 2,
         }))
     }
-}
-
-/// An ID for a request that came in on `listener` under `snapshot`, if the listener gives its
-/// requests one (08 §3 in the docs). Worked out once, so that the request and its client are
-/// told the same one.
-fn request_id(snapshot: &Snapshot, listener: usize) -> Option<HeaderValue> {
-    if snapshot.listener(listener)?.request_id != RequestId::Generate {
-        return None;
-    }
-    Some(request_id::value(unix_millis(), unguessable()?))
 }
 
 /// `answered`, its body cut off, as a body that failed, if it is still coming at
