@@ -37,6 +37,9 @@ say "dependencies"
 # so this needs the network, and a new advisory fails it until it is dealt with.
 cargo deny check --allow license-exception-not-encountered
 cargo deny --manifest-path fuzz/Cargo.toml check --allow advisory-not-detected
+# And the published versions vendor/ holds patched copies of: advisories are looked up only
+# for crates from a registry, and the copies are paths (vendor/bases/Cargo.toml).
+cargo deny --manifest-path vendor/bases/Cargo.toml check advisories --allow advisory-not-detected
 
 say "clippy"
 cargo clippy --all-targets -- -D warnings
@@ -49,6 +52,13 @@ cargo check --workspace
 
 say "tests"
 cargo test --workspace
+
+say "vendored quiche's own tests"
+# vendor/quiche is not a member of the workspace, so the tests above never reach it, and its
+# own suite holds most of the tests of EdgeRush's changes to it (vendor/quiche/VENDORED.md).
+# Its lock file is its own, and so is its target directory.
+cargo test --manifest-path vendor/quiche/Cargo.toml --no-default-features \
+    --features boringssl-boring-crate --lib --target-dir "${CARGO_TARGET_DIR:-target}/vendored"
 
 say "docs"
 # Rustdoc's warnings are not failures by default, and a stale link is exactly the kind of

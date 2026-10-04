@@ -55,16 +55,18 @@ README).
 
 ## Advisories
 
-`cargo deny` (`check.sh`) does not look at this crate: it looks advisories up only for
-crates with a registry source, and a path has none. So h2's advisories in the RustSec
-database (<https://rustsec.org/packages/h2.html>) are read by hand when h2 is carried to
-another version, which is to be one none of them affects. Between versions, nothing reports
-a new one.
+`cargo deny` looks advisories up only for crates with a registry source, and a path has
+none. So `vendor/bases` names h2 0.4.19 as published, which `check.sh` checks against the
+RustSec database (<https://rustsec.org/packages/h2.html>) as it checks the workspace, and
+whose lock file GitHub's dependency graph reads for GitHub's own advisories. An advisory
+fixed in this copy is ignored in `deny.toml`, with the reason. h2 is carried only to a
+version none of them affects.
 
 ## Carrying it to another version
 
 Read h2's advisories first (above). Copy the new version's `Cargo.toml`, `LICENSE`,
 `README.md` and `src/` over these, then make the changes marked `EdgeRush:` again
 (`grep -rl EdgeRush src` lists the ten files).
-They change nothing h2 does unless a connection's buffers are given back. Update the version here, in the workspace's `Cargo.toml` and in `fuzz/Cargo.toml`,
-and run the tests above and a fuzz target's build.
+They change nothing h2 does unless a connection's buffers are given back. Update the version here, in the workspace's `Cargo.toml`, in `fuzz/Cargo.toml` and in
+`vendor/bases/Cargo.toml` (then `cargo generate-lockfile` there), and run the tests above
+and a fuzz target's build.

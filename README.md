@@ -103,8 +103,10 @@ minutes.
 runs every check, stopping at the first that fails; all must pass before every commit.
 One of them, the dependencies' advisories and licences (`deny.toml`), needs `cargo-deny`
 (`cargo install --locked cargo-deny@0.20.2`, the version CI uses) and the network, to read
-the RustSec advisory database. CI (`.github/workflows/ci.yml`) runs `check.sh` itself, on
-Linux, for every push to `main` and every pull request.
+the RustSec advisory database. The first run of `check.sh` builds BoringSSL a second
+time, for vendored quiche's own tests, which have a lock file and a target directory
+(`target/vendored`) of their own. CI (`.github/workflows/ci.yml`) runs `check.sh` itself,
+on Linux, for every push to `main` and every pull request.
 
 ## Benchmarks
 

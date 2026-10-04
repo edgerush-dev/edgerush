@@ -1,0 +1,22 @@
+# Never built. Names the published crates that `vendor/quiche` and `vendor/h2` are copies
+# of, at the versions they were taken from, with the features the workspace asks for, so
+# that `cargo deny check advisories` (check.sh) reports an advisory against them: it looks
+# advisories up only for crates from a registry, and the copies are paths. Moving a copy to
+# another version moves its line here (vendor/*/VENDORED.md). A package of its own, outside
+# the workspace, with a lock file of its own.
+[package]
+name = "edgerush-vendored-bases"
+description = "The published versions EdgeRush's vendored crates are copies of, for advisories"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[workspace]
+
+[dependencies]
+h2 = "=0.4.19"
+quiche = { version = "=0.30.0", default-features = false, features = ["boringssl-boring-crate"] }

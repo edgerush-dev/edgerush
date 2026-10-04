@@ -218,7 +218,9 @@ costs a buffer and a node past its bytes: a peer that sends its data a byte a fr
 order, costs a hundred times what flow control counts.
 
 With all twelve changes, quiche's own library tests pass (1,176 of 1,176, on Windows and
-Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`).
+Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`),
+and `check.sh` runs them, in a target directory of their own (`target/vendored`): the
+workspace's tests never reach this crate, which is not a member of it.
 The proxy's probe `several_streams_share_a_packet` in `crates/proxy/tests/h3_library.rs`
 fails against the published crate, as do its tests `an_answer_carries_the_ack_of_its_request`
 (without delayed ACKs), `a_client_rebound_again_and_again_is_followed`,
@@ -229,16 +231,20 @@ fails against the published crate, as do its tests `an_answer_carries_the_ack_of
 
 ## Advisories
 
-`cargo deny` (`check.sh`) does not look at this crate: it looks advisories up only for
-crates with a registry source, and a path has none. quiche marks its security fixes in its
-release notes (<https://github.com/cloudflare/quiche/releases>); the RustSec database has
-no entries for it. Both are read by hand when quiche moves to another version, which is to
-be one with no security fix it lacks. Between versions, nothing reports a new one.
+`cargo deny` looks advisories up only for crates with a registry source, and a path has
+none. So `vendor/bases` names quiche 0.30.0 as published, which `check.sh` checks against
+the RustSec database as it checks the workspace, and whose lock file GitHub's dependency
+graph reads for GitHub's own advisories. An advisory fixed in this copy is ignored in
+`deny.toml`, with the reason. quiche marks its security fixes in its release notes
+(<https://github.com/cloudflare/quiche/releases>), and not every one reaches either
+database: the notes are read by hand when quiche moves to another version, which is to be
+one with no security fix it lacks.
 
 ## Moving to another version
 
 Read quiche's advisories first (above). Take the new version's published package
 (`cargo download`, or the registry's source under `~/.cargo/registry/src/`) and copy the
-same files. Then re-apply every change marked `EdgeRush:`, run quiche's tests as above, and
-run the proxy's probe and tests. If upstream has them all by then, delete this directory and
+same files. Then re-apply every change marked `EdgeRush:`, move the version in
+`vendor/bases/Cargo.toml` and run `cargo generate-lockfile` there, run quiche's tests as
+above, and run the proxy's probe and tests. If upstream has them all by then, delete this directory and
 the `[patch.crates-io]` entries in `Cargo.toml` and `fuzz/Cargo.toml`.
