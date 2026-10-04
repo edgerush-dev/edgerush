@@ -56,6 +56,7 @@ pub(super) struct Logging {
     upstream_us: Cell<Option<u64>>,
     status: Cell<Option<u16>>,
     reason: Cell<Option<&'static str>>,
+    grpc_status: Cell<Option<u32>>,
     received: Cell<u64>,
     sent: Cell<u64>,
     /// Whether the answer's body was gone through to its end, or had nothing to go through.
@@ -135,6 +136,7 @@ impl Logging {
             upstream_us: Cell::new(None),
             status: Cell::new(None),
             reason: Cell::new(None),
+            grpc_status: Cell::new(None),
             received: Cell::new(0),
             sent: Cell::new(0),
             whole: Cell::new(false),
@@ -187,14 +189,26 @@ impl Logging {
         self.upstream_us.set(Some(microseconds(self.came_in)));
     }
 
-    /// Notes the answer: its status, and why the gateway gave it, if the answer is its own.
+    /// Notes the answer: its status; why the gateway gave it, if the answer is its own; and
+    /// a gRPC status its head carries, which a call the gateway answers itself has, and a
+    /// trailers-only answer.
     pub(super) fn answered(&self, answered: &Answered<Body>) {
         self.status.set(Some(answered.status().as_u16()));
-        if let Answered::Map(response) = answered
-            && let Some(h1::Local(why)) = response.extensions().get::<h1::Local>()
-        {
-            self.reason.set(Some(why.label()));
+        if let Answered::Map(response) = answered {
+            if let Some(h1::Local(why)) = response.extensions().get::<h1::Local>() {
+                self.reason.set(Some(why.label()));
+            }
+            let status = response.headers().get("grpc-status");
+            if let Some(code) = status.and_then(|code| code.to_str().ok()?.parse().ok()) {
+                self.grpc_status.set(Some(code));
+            }
         }
+    }
+
+    /// Notes the status a gRPC call ended with, wherever it came.
+    pub(super) fn called(&self, code: usize) {
+        self.grpc_status
+            .set(Some(u32::try_from(code).unwrap_or(u32::MAX)));
     }
 
     fn sent(&self, bytes: usize) {
@@ -246,7 +260,7 @@ impl Drop for Logging {
             upstream: self.upstream.get().and_then(text),
             endpoint: self.endpoint.get(),
             tries: Some(self.tries.get()).filter(|tries| *tries > 0),
-            grpc_status: None,
+            grpc_status: self.grpc_status.get(),
             bytes_in: Some(self.received.get()),
             bytes_out: Some(self.sent.get()),
             duration_us: Some(microseconds(self.came_in)),

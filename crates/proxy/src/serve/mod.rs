@@ -165,10 +165,15 @@ struct Timed {
 struct Called {
     proxy: Arc<Proxy>,
     listener: usize,
+    /// The call's access-log record, if its listener logs, which says how it ended.
+    logging: Option<Rc<Logging>>,
 }
 
 impl Count for Called {
     fn ended(&self, code: usize) {
+        if let Some(logging) = &self.logging {
+            logging.called(code);
+        }
         if let Some(counters) = self.proxy.metrics.listener(self.listener) {
             counters.called(code);
         }

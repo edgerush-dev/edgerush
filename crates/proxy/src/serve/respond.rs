@@ -305,6 +305,7 @@ impl Worker {
                 let called = Called {
                     proxy: Arc::clone(&self.proxy),
                     listener,
+                    logging: directed.logging.clone(),
                 };
                 let answered = GrpcAnswered::counted(body, &parts.headers, timing.deadline, called);
                 Answered::Map(Response::from_parts(parts, Body::Grpc(Box::new(answered))))

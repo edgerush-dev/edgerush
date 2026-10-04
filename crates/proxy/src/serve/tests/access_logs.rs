@@ -325,3 +325,185 @@ async fn a_trusted_proxys_client_is_the_client() {
         })
         .await;
 }
+
+/// A worker serving HTTP/3 for `config`, whose listener `web` logs to a file of the test's
+/// own, swept every 50 ms.
+async fn recording_h3(test: &str, mut config: Config) -> Recording {
+    let directory = scratch(test);
+    let path = directory.join("access.log");
+    config.listeners.get_mut("web").unwrap().access_log =
+        Some(edgerush_config::AccessLog::File(path.clone()));
+    let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+    let limits = H1Limits {
+        sweep: Duration::from_millis(50),
+        ..H1Limits::default()
+    };
+    let worker = Worker::with_deadlines(proxy, limits, SHORT);
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let front = socket.local_addr().unwrap();
+    let _sweeping = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+    let alone = Forwarding::group(1).remove(0);
+    let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone).unwrap());
+    Recording {
+        front,
+        _worker: worker,
+        path,
+        directory,
+    }
+}
+
+/// Reads `answer` to its end, so that its stream is done with.
+async fn drained(answer: ::h2::client::ResponseFuture) -> StatusCode {
+    let answer = within(answer).await.unwrap();
+    let status = answer.status();
+    let mut body = answer.into_body();
+    while let Some(chunk) = within(body.data()).await {
+        let _ = body.flow_control().release_capacity(chunk.unwrap().len());
+    }
+    status
+}
+
+/// An HTTP/2 request is logged as an HTTP/1.1 one is, as HTTP/2.
+#[tokio::test]
+async fn an_http2_request_is_logged() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _held) = scripted_upstream().await;
+            let logged = recording("h2", everything_config(upstream)).await;
+            let mut send = h2_library_client(logged.front, &::h2::client::Builder::new()).await;
+            let request = Request::get("http://example.test/a/ok").body(()).unwrap();
+            let (answer, _) = send.send_request(request, true).unwrap();
+            assert_eq!(drained(answer).await, StatusCode::OK);
+            let records = logged.records(1).await;
+            let record = &records[0];
+            assert_eq!(record["protocol"], "2");
+            assert_eq!(record["host"], "example.test");
+            assert_eq!(record["path"], "/a/ok");
+            assert_eq!(record["status"], 200);
+            assert_eq!(record["bytes_out"], 2);
+            assert_eq!(record["upstream"], "up");
+            assert!(record["peer"].as_str().unwrap().starts_with("127.0.0.1:"));
+            assert!(record.get("reason").is_none(), "{record}");
+        })
+        .await;
+}
+
+/// A gRPC call's record has the status it ended with: from the upstream's trailers, or
+/// one the gateway gave when the upstream's stream went before them.
+#[tokio::test]
+async fn a_grpc_calls_record_has_the_status_it_ended_with() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let script: Script = Rc::new(|request, mut respond| {
+                Box::pin(async move {
+                    let path = request.uri().path().to_owned();
+                    let Ok(mut sending) = respond.send_response(grpc_head(), false) else {
+                        return;
+                    };
+                    let _ = sending.send_data(Bytes::from_static(b"\0\0\0\0\x01m"), false);
+                    if path == "/pkg.Svc/Cancelled" {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        sending.send_reset(::h2::Reason::CANCEL);
+                    } else {
+                        let mut status = http::HeaderMap::new();
+                        status.insert("grpc-status", "0".parse().unwrap());
+                        let _ = sending.send_trailers(status);
+                    }
+                })
+            });
+            let upstream = scripted_h2_upstream(script).await;
+            let mut config = everything_config(upstream);
+            config.upstreams.get_mut("up").unwrap().protocol = UpstreamProtocol::Http2;
+            let logged = recording("grpc", config).await;
+            let mut send = h2_library_client(logged.front, &::h2::client::Builder::new()).await;
+            for (path, code) in [("/pkg.Svc/Ok", "0"), ("/pkg.Svc/Cancelled", "1")] {
+                let (answer, _) = send.send_request(grpc_call(path, None), true).unwrap();
+                assert_eq!(grpc_outcome(answer).await.1, code, "{path}");
+            }
+            let records = logged.records(2).await;
+            for (path, code) in [("/pkg.Svc/Ok", 0), ("/pkg.Svc/Cancelled", 1)] {
+                let record = records
+                    .iter()
+                    .find(|record| record["path"] == path)
+                    .unwrap();
+                assert_eq!(record["grpc_status"], code, "{record}");
+                assert_eq!(record["status"], 200, "{record}");
+            }
+        })
+        .await;
+}
+
+/// A gRPC call the gateway answers itself has the status it was told, and why.
+#[tokio::test]
+async fn a_grpc_call_the_gateway_answers_has_its_status() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut config = everything_config("127.0.0.1:9".parse().unwrap());
+            config.upstreams.get_mut("up").unwrap().endpoints.clear();
+            let logged = recording("grpc-own", config).await;
+            let mut send = h2_library_client(logged.front, &::h2::client::Builder::new()).await;
+            let (answer, _) = send
+                .send_request(grpc_call("/pkg.Svc/Any", None), true)
+                .unwrap();
+            assert_eq!(grpc_outcome(answer).await.1, "14");
+            let records = logged.records(1).await;
+            assert_eq!(records[0]["grpc_status"], 14);
+            assert_eq!(records[0]["reason"], "no_endpoints");
+        })
+        .await;
+}
+
+/// An HTTP/2 client that resets its stream before the answer is logged as one that left.
+#[tokio::test]
+async fn an_http2_stream_reset_before_its_answer_is_logged() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, held) = scripted_upstream().await;
+            let logged = recording("h2-reset", everything_config(upstream)).await;
+            let mut send = h2_library_client(logged.front, &::h2::client::Builder::new()).await;
+            let request = Request::get("http://example.test/a/held").body(()).unwrap();
+            let (answer, _) = send.send_request(request, true).unwrap();
+            until(|| held.borrow().len() == 1).await;
+            // Its last handle gone, h2 resets the stream.
+            drop(answer);
+            let records = logged.records(1).await;
+            let record = &records[0];
+            assert_eq!(record["protocol"], "2");
+            assert!(record["status"].is_null(), "{record}");
+            assert_eq!(record["reason"], "client_closed");
+        })
+        .await;
+}
+
+/// An HTTP/3 request is logged as the others are, as HTTP/3, from the address and port
+/// its datagrams came from.
+#[tokio::test]
+async fn an_http3_request_is_logged() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::Client;
+            let (upstream, _) = counting_upstream().await;
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let logged = recording_h3("h3", h3_config(upstream, http3)).await;
+            let mut client = Client::connect(logged.front, "a.test").await;
+            let answer = client.get("a.test", "/x").await;
+            assert_eq!(answer.final_status(), Some("200"));
+            let records = logged.records(1).await;
+            let record = &records[0];
+            assert_eq!(record["protocol"], "3");
+            assert_eq!(record["host"], "a.test");
+            assert_eq!(record["path"], "/x");
+            assert_eq!(record["status"], 200);
+            assert_eq!(record["bytes_out"], 2);
+            assert!(record["peer"].as_str().unwrap().starts_with("127.0.0.1:"));
+        })
+        .await;
+}
