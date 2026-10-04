@@ -16,7 +16,7 @@
 use crate::WildcardLabels;
 use crate::hash::Map;
 use crate::host::{HostPattern, Kind, MAX_NAME_LEN};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// One claim on a set of hosts, carrying whatever the caller wants to find again.
 #[derive(Debug, Clone)]
@@ -63,9 +63,12 @@ impl<G> HostIndex<G> {
         let claims: Vec<HostClaim<T>> = claims.into_iter().collect();
 
         // Claims by what they claim, each with its position: the position is what tells
-        // two selections of members apart or shows them to be the same group.
-        let mut exact: HashMap<&str, Vec<Claimed<'_, T>>> = HashMap::new();
-        let mut wildcards: HashMap<&str, Vec<Claimed<'_, T>>> = HashMap::new();
+        // two selections of members apart or shows them to be the same group. In order of
+        // the name, so that the groups and the tables built from going through them are laid
+        // out the same on every build: a lookup costs what the layout makes it, and a
+        // benchmark that counts instructions must see the same index every run.
+        let mut exact: BTreeMap<&str, Vec<Claimed<'_, T>>> = BTreeMap::new();
+        let mut wildcards: BTreeMap<&str, Vec<Claimed<'_, T>>> = BTreeMap::new();
         let mut any = Vec::new();
         for claimed in claims.iter().enumerate() {
             match &claimed.1.pattern {
@@ -190,7 +193,7 @@ type Claimed<'a, T> = (usize, &'a HostClaim<T>);
 
 /// The groups made so far while building, each made once however many hosts it serves.
 struct Groups<'a, T, G, F> {
-    wildcards: &'a HashMap<&'a str, Vec<Claimed<'a, T>>>,
+    wildcards: &'a BTreeMap<&'a str, Vec<Claimed<'a, T>>>,
     any: &'a [Claimed<'a, T>],
     make: F,
     made: Vec<G>,
@@ -426,6 +429,24 @@ mod tests {
         assert_eq!(made.len(), 102);
         assert_eq!(made.iter().filter(|members| **members == [1]).count(), 1);
         assert_eq!(made.iter().filter(|members| **members == [0]).count(), 1);
+    }
+
+    #[test]
+    fn an_index_is_laid_out_the_same_however_often_it_is_built() {
+        // Enough names that a build following some randomly seeded order would show it in
+        // the order of its groups and of its tables, which is what a lookup's cost and a
+        // benchmark's count depend on.
+        let specs: Vec<Spec> = (0..50)
+            .map(|n| on(&format!("host-{n}.example.com"), One, STAYS_PUT))
+            .chain(
+                (0..10).map(|n| on(&format!("*.wild-{n}.example.com"), OneOrMore, FALLS_THROUGH)),
+            )
+            .chain([(None, FALLS_THROUGH)])
+            .collect();
+        let first = format!("{:?}", index(&specs));
+        for _ in 0..20 {
+            assert_eq!(format!("{:?}", index(&specs)), first);
+        }
     }
 
     #[test]
