@@ -269,10 +269,6 @@ impl Worker {
 }
 
 impl Proxy {
-    /// An answer of the data plane's own for a request that may be a gRPC `call`: for one
-    /// that is, `200` and the status gRPC gives the cause, with nothing after the head — a
-    /// trailers-only answer, which is how gRPC answers a call it fails before any message
-    /// (15 §6). Counted by its reason either way.
     /// Says on `answered` that the listener serves HTTP/3 as well, if it does. Every answer
     /// carries it, HTTP/3's own too, which keeps what a client remembers fresh.
     ///
@@ -312,6 +308,10 @@ impl Proxy {
         (snapshot, id)
     }
 
+    /// An answer of the data plane's own for a request that may be a gRPC `call`: for one
+    /// that is, `200` and the status gRPC gives the cause, with nothing after the head — a
+    /// trailers-only answer, which is how gRPC answers a call it fails before any message
+    /// (15 §6). Counted by its reason either way.
     fn answer_to(&self, listener: usize, answer: Answer, call: Option<Call>) -> Response<Body> {
         let mut response = self.answer(listener, answer);
         if call.is_some() {

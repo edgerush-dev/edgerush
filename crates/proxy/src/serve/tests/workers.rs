@@ -32,7 +32,6 @@ pub(super) const SLACK: Duration = Duration::from_millis(400);
 /// deadline would be.
 pub(super) const EARLY: Duration = Duration::from_millis(50);
 
-/// Serves a worker for `upstream` on a listener of its own, and says where.
 /// Serves `socket` with `worker`, whose timers are waited on beside it as its
 /// maintenance would wait on them.
 pub(super) fn serving(worker: &Rc<Worker>, socket: TcpListener) -> tokio::task::JoinHandle<()> {
@@ -40,6 +39,7 @@ pub(super) fn serving(worker: &Rc<Worker>, socket: TcpListener) -> tokio::task::
     tokio::task::spawn_local(Rc::clone(worker).serve(0, socket))
 }
 
+/// Serves a worker for `upstream` on a listener of its own, and says where.
 pub(super) async fn serving_worker(upstream: SocketAddr) -> SocketAddr {
     let proxy = Proxy::new(everything_to(upstream), NonZeroUsize::MIN).unwrap();
     let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);

@@ -221,6 +221,7 @@ pub(super) async fn status_over_http1(address: SocketAddr) -> StatusCode {
     status_of(address, "/").await
 }
 
+/// What one HTTP/1.1 request for `path` to `address` is answered with.
 pub(super) async fn status_of(address: SocketAddr, path: &str) -> StatusCode {
     let stream = TcpStream::connect(address).await.unwrap();
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))

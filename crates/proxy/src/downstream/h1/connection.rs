@@ -600,15 +600,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         Ok(queued)
     }
 
-    /// Drops what is queued and has not begun to go, and with it what it was charged: all
-    /// of it, or all but the rest of a head part-written, which must be finished before
-    /// anything else follows it.
     /// The final head, as it was queued, if none of it has gone.
     fn queued_final_head(&self) -> Option<&[u8]> {
         let at = self.outbound.final_position()?;
         self.queued.get(at).map(|(bytes, _, _)| bytes.as_ref())
     }
 
+    /// Drops what is queued and has not begun to go, and with it what it was charged: all
+    /// of it, or all but the rest of a head part-written, which must be finished before
+    /// anything else follows it.
     fn discard_queued(&mut self, keep_front: bool) {
         let keep = usize::from(keep_front);
         while self.queued.len() > keep {

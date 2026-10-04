@@ -1421,7 +1421,6 @@ pub(crate) fn expects_continue<F: Fields + ?Sized>(headers: &F) -> bool {
         .any(|option| option.eq_ignore_ascii_case(b"100-continue"))
 }
 
-/// What a round of an exchange managed to do.
 /// Which way an exchange stopped moving.
 ///
 /// An exchange has three things it can be waiting for and they fail for different
@@ -1576,6 +1575,7 @@ struct Pushed {
     wants_upstream: bool,
 }
 
+/// What a round of an exchange managed to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Moved {
     /// Bytes arrived, which may have finished a head.

@@ -498,7 +498,6 @@ pub(super) async fn scripted_upstream() -> (SocketAddr, Rc<RefCell<Vec<TcpStream
     (address, held)
 }
 
-/// What one HTTP/1.1 request for `path` to `address` is answered with.
 /// An address that refuses every connection for as long as the socket returned with it
 /// is held: bound, so that nothing else can be given its port, and never listening.
 ///
