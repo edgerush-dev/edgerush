@@ -36,7 +36,7 @@ impl Drop for InFlight {
 
 /// A worker's balancing state for every upstream of one config.
 #[derive(Debug, Default)]
-pub(crate) struct Balancing {
+pub struct Balancing {
     /// The config it was made for; none until the first request.
     generation: Option<u64>,
     /// By position of the upstream.
@@ -65,12 +65,7 @@ impl Balancing {
     /// for: counts are kept for every destination that is the same one, and the turn for
     /// every upstream whose endpoints are all the same, in the same order; an upstream with a
     /// new list starts its turns at a place drawn at random. Once per worker per config.
-    pub(crate) fn refresh(
-        &mut self,
-        generation: u64,
-        config: &Compiled,
-        destinations: &Destinations,
-    ) {
+    pub fn refresh(&mut self, generation: u64, config: &Compiled, destinations: &Destinations) {
         if self.generation == Some(generation) {
             return;
         }

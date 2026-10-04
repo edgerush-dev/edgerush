@@ -107,6 +107,11 @@ harness = false
 required-features = ["fuzzing"]
 
 [[bench]]
+name = "refresh"
+harness = false
+required-features = ["fuzzing"]
+
+[[bench]]
 name = "raw_head"
 harness = false
 required-features = ["fuzzing"]

@@ -9,6 +9,10 @@
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
 
 pub mod auth;
+// Public when the benchmarks are built, for a worker's state brought up to a new config.
+#[cfg(feature = "fuzzing")]
+pub mod balancing;
+#[cfg(not(feature = "fuzzing"))]
 pub(crate) mod balancing;
 pub mod destination;
 pub mod h1;

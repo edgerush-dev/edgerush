@@ -246,6 +246,14 @@ impl ReuseIdentity {
 pub struct Destinations(Vec<Vec<Arc<ReuseIdentity>>>);
 
 impl Destinations {
+    /// [`Destinations::reconcile`] for a config none of whose upstreams speaks TLS: for the
+    /// benchmarks, which cannot name what TLS is made of.
+    #[cfg(feature = "fuzzing")]
+    #[must_use]
+    pub fn reconcile_plain(config: &Compiled, previous: &Self, keys: &Keys) -> Self {
+        Self::reconcile(config, previous, keys, &[])
+    }
+
     /// The destinations of `config`, keeping those of `previous` wherever the destination
     /// is the same one, and retiring those of `previous` that this config does not have.
     /// `secure` is what each upstream's connections are secured with, by position, for a
