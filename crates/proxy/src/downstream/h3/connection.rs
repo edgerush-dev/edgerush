@@ -35,7 +35,7 @@ use http_body::Body;
 use quiche::h3::Event;
 use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::task::Poll;
@@ -609,16 +609,15 @@ fn client_now(conn: &Conn, made: &mut Option<Rc<Client>>) -> Rc<Client> {
                 .quic
                 .path_stats()
                 .find(|path| path.active)
-                .map(|path| path.peer_addr.ip())
+                .map(|path| path.peer_addr)
         })
         // A connection that has a request has a path in use; were it ever without one, the
         // upstream is told of no address rather than of a wrong one.
-        .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
-        .to_canonical();
+        .unwrap_or(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0));
     match made {
-        Some(client) if client.address() == peer => Rc::clone(client),
+        Some(client) if client.peer() == Some(peer) => Rc::clone(client),
         _ => {
-            let client = Rc::new(Client::new(peer));
+            let client = Rc::new(Client::connected(peer.ip(), peer));
             *made = Some(Rc::clone(&client));
             client
         }

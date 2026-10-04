@@ -1,6 +1,7 @@
 //! A request, from its head to its answer: directed by the config in force, admitted, and
 //! answered by its upstream or by the data plane itself.
 
+use super::logged::{Logging, logged};
 use super::{
     Body, Called, Directed, Directing, Handshake, Mirrored, Others, Proxy, Redirect, Snapshot,
     TUNNEL_IDLE, Timed, Timing, Toward, Worker, at_endpoint, balance_of,
@@ -16,7 +17,7 @@ use crate::map_head::MapHead;
 use crate::metrics::Answer;
 use crate::random::{random, unguessable};
 use crate::request::{Decision, Opening, decide};
-use crate::request_body::RequestBody;
+use crate::request_body::{Counts, RequestBody};
 use crate::routed::Through;
 use crate::timers::{Alarm, Timers};
 use crate::upstream::balancing::Balancing;
@@ -55,6 +56,23 @@ impl Worker {
         self.handle_head(listener, client, head, body, interim)
     }
 
+    /// The record of a request that came in on `listener` from `client`, if its listener
+    /// logs, made from its head as it came (21 §4). A request of a config that logs
+    /// nothing looks at one flag.
+    fn logging<H: Forwarded>(
+        &self,
+        listener: usize,
+        client: &Client,
+        head: &H,
+    ) -> Option<Rc<Logging>> {
+        if !self.proxy.logs.on() {
+            return None;
+        }
+        let worker = self.me.upgrade()?;
+        let snapshot = self.proxy.current.load();
+        Logging::start(&worker, &snapshot, listener, client, head)
+    }
+
     /// The same for a request's head of whatever kind: a map, or the raw head our own
     /// server reads ([14 §6](../../docs/14-downstream-server.md)).
     pub(super) async fn handle_head<H: Forwarded>(
@@ -69,6 +87,11 @@ impl Worker {
         // First, so that every answer the core gives, its own included, carries it; with
         // the snapshot it was decided on, which the request is directed by.
         let (snapshot, id) = self.proxy.identify(listener);
+        // Its access-log record, if its listener logs: made where the head is in hand
+        // already, and handed back here for the answer to end. Made here, the head would be
+        // borrowed in this future as well and kept in it, and the future no longer made in
+        // its slot (14 §3).
+        let logging = Cell::new(None);
         let mut answered = self
             .respond_to(
                 snapshot,
@@ -78,6 +101,7 @@ impl Worker {
                 body,
                 interim,
                 id.as_ref(),
+                &logging,
             )
             .await;
         self.proxy.advertise(listener, &mut answered);
@@ -87,6 +111,11 @@ impl Worker {
         if let Some(counters) = self.proxy.metrics.listener(listener) {
             let took = u64::try_from(came_in.elapsed().as_nanos()).unwrap_or(u64::MAX);
             counters.responded(answered.status(), took);
+        }
+        // Last, so that it counts what goes of the answer and ends with it.
+        if let Some(logging) = logging.take() {
+            logging.answered(&answered);
+            answered = logged(answered, logging);
         }
         answered
     }
@@ -104,7 +133,20 @@ impl Worker {
         mut body: RequestBody,
         interim: Option<Interim>,
         id: Option<&HeaderValue>,
+        handed: &Cell<Option<Rc<Logging>>>,
     ) -> Answered<Body> {
+        // Its record, from its head as it came, and its body counted for it (21 §4).
+        // Only ever moved from here on, never borrowed, so that this future keeps it no longer
+        // than until `direct` takes it (14 §3).
+        let logging = match self.logging(listener, client, &head) {
+            Some(logging) => {
+                logging.identified(id);
+                handed.set(Some(Rc::clone(&logging)));
+                body = RequestBody::counted(body, Rc::clone(&logging) as Rc<dyn Counts>);
+                Some(logging)
+            }
+            None => None,
+        };
         // A request's trailers go no further than the gateway (03 §11): its body ends
         // where they would come, for the upstream, a retry and a mirror alike.
         body.drop_trailers();
@@ -127,17 +169,21 @@ impl Worker {
         // from and everything it named looks like an ordinary field, so a trailer of that
         // name would travel on ([13 §4](../../docs/13-http1-upstream.md)).
         let nominated = crate::hop_by_hop::nominated(head.outgoing());
-        let mut directed =
-            match self
-                .proxy
-                .direct(snapshot, listener, client, &mut head, id, &self.balancing)
-            {
-                Ok(Directing::Upstream(directed)) => directed,
-                Ok(Directing::Redirect(redirect)) => {
-                    return self.proxy.redirect(listener, redirect, call).into();
-                }
-                Err(answer) => return self.proxy.answer_to(listener, answer, call).into(),
-            };
+        let mut directed = match self.proxy.direct(
+            snapshot,
+            listener,
+            client,
+            &mut head,
+            id,
+            &self.balancing,
+            logging,
+        ) {
+            Ok(Directing::Upstream(directed)) => directed,
+            Ok(Directing::Redirect(redirect)) => {
+                return self.proxy.redirect(listener, redirect, call).into();
+            }
+            Err(answer) => return self.proxy.answer_to(listener, answer, call).into(),
+        };
         // A WebSocket that an HTTP/2 or HTTP/3 client asks for holds a backend of its own
         // beside the client's one connection, which may carry a hundred: it counts as one
         // of the worker's connections for as long as it is open, and is refused, before
@@ -243,6 +289,11 @@ impl Worker {
                 .await
             }
         };
+        if outcome.is_ok()
+            && let Some(logging) = &directed.logging
+        {
+            logging.upstream_answered();
+        }
         match outcome {
             // A gRPC call's answer that is gRPC's own ends with one status, whatever becomes
             // of it; any other answer goes on as it came, for the client to read (15 §6).
@@ -338,7 +389,7 @@ impl Proxy {
         }
         let mut response = Response::new(Body::Empty);
         *response.status_mut() = answer.status();
-        response.extensions_mut().insert(h1::Local);
+        response.extensions_mut().insert(h1::Local(answer));
         response
     }
 
@@ -370,6 +421,10 @@ impl Proxy {
     /// on `snapshot`, the one the request's ID was worked out on, which is let go of here,
     /// before anything is waited for; what is kept for the response is the rule, and only if
     /// it has something to do to the response, and the slot of the upstream's counters.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a different thing directing needs, as for `respond_to`"
+    )]
     fn direct<H: Forwarded>(
         &self,
         snapshot: Guard<Arc<Snapshot>>,
@@ -378,6 +433,7 @@ impl Proxy {
         head: &mut H,
         id: Option<&HeaderValue>,
         balancing: &RefCell<Balancing>,
+        logging: Option<Rc<Logging>>,
     ) -> Result<Directing, Answer> {
         let came_on = listener;
         let listener = snapshot
@@ -390,6 +446,10 @@ impl Proxy {
         let forward = match decide(&snapshot.config, listener, head, client, &mut random, id)? {
             Decision::Forward(forward) => forward,
             Decision::Redirect(redirected) => {
+                if let Some(logging) = &logging {
+                    let route = snapshot.config.route_name(redirected.id.route);
+                    logging.routed(route.unwrap_or_default(), redirected.id.rule, None);
+                }
                 return Ok(Directing::Redirect(Redirect {
                     rule: redirected
                         .rule
@@ -403,6 +463,15 @@ impl Proxy {
         };
         // An upstream the snapshot does not have is not known to happen.
         let upstream = forward.upstream.0;
+        if let Some(logging) = &logging {
+            let route = snapshot.config.route_name(forward.id.route);
+            let name = snapshot.config.upstreams().get(upstream);
+            logging.routed(
+                route.unwrap_or_default(),
+                forward.id.rule,
+                name.map(|upstream| upstream.name.as_str()),
+            );
+        }
         let endpoints = snapshot.endpoints.get(upstream).ok_or(Answer::NoBackend)?;
         let destinations = snapshot.destinations.of(upstream);
         let balance = balance_of(balancing, &snapshot, upstream).ok_or(Answer::NoEndpoints)?;
@@ -443,7 +512,7 @@ impl Proxy {
                 held: Cell::new(None),
                 route: snapshot
                     .routed
-                    .key(came_on, Through::Http(forward.route), upstream),
+                    .key(came_on, Through::Http(forward.id.route), upstream),
             }))
         });
         if let Some(counters) = self.metrics.upstream(balance.slot()) {
@@ -521,6 +590,7 @@ impl Proxy {
             websocket,
             upgradable,
             alone: snapshot.upstream_slots.len() < 2,
+            logging,
         }))
     }
 }

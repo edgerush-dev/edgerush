@@ -175,6 +175,9 @@ impl Worker {
         interim: Option<Interim>,
         timing: Timing,
     ) -> Result<Answered<Body>, Answer> {
+        if let Some(logging) = &directed.logging {
+            logging.tried(endpoint.address());
+        }
         let timing = timing.for_try();
         if endpoint.protocol() == UpstreamProtocol::Http2 {
             if let Some(handshake) = directed.websocket.as_deref() {

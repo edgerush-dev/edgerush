@@ -21,7 +21,7 @@ use edgerush_filters::forwarding::{address_value, client_address, proto_value, v
 use edgerush_filters::request_id;
 use edgerush_router::Fields;
 use http::header::{HeaderName, HeaderValue, VIA};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// `X-Forwarded-For`.
 pub(crate) const FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -32,11 +32,14 @@ pub(crate) const FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forward
 
 /// The peer a request came from, as its connection knows it: its address in its one form,
 /// and that address as `X-Forwarded-For` gives it, written once for all the connection's
-/// requests rather than once for each.
+/// requests rather than once for each; and, where it is known, the address and port that
+/// connected, which differ from it behind a load balancer that sends PROXY headers
+/// ([20 §3](../../docs/20-proxy-protocol.md)), for the access log.
 #[derive(Debug, Clone)]
 pub struct Client {
     address: IpAddr,
     value: HeaderValue,
+    peer: Option<SocketAddr>,
 }
 
 impl Client {
@@ -47,6 +50,16 @@ impl Client {
         Self {
             address,
             value: address_value(address),
+            peer: None,
+        }
+    }
+
+    /// The client at `address`, of a connection made from `peer`.
+    #[must_use]
+    pub fn connected(address: IpAddr, peer: SocketAddr) -> Self {
+        Self {
+            peer: Some(peer),
+            ..Self::new(address)
         }
     }
 
@@ -54,6 +67,12 @@ impl Client {
     #[must_use]
     pub fn address(&self) -> IpAddr {
         self.address
+    }
+
+    /// The address and port that connected, where the connection knows it.
+    #[must_use]
+    pub fn peer(&self) -> Option<SocketAddr> {
+        self.peer
     }
 }
 

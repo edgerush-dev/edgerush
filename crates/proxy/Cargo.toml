@@ -61,6 +61,8 @@ tonic = { version = "0.14", default-features = false, features = ["transport"] }
 tower-service = "0.3"
 # Fixtures are written the way harness files are.
 serde-saphyr.workspace = true
+# Access-log records read back as what they are, JSON.
+serde_json.workspace = true
 # "test-util" is what lets a test move the clock itself, so a test of a minute-long
 # deadline takes no time at all.
 tokio = { workspace = true, features = [

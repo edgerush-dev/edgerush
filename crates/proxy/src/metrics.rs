@@ -424,7 +424,7 @@ impl Answer {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::BadHost => "bad_host",
             Self::BadPath => "bad_path",

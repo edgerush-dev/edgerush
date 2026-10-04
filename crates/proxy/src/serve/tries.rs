@@ -236,6 +236,7 @@ impl Worker {
                     mirrors: Vec::new(),
                     websocket: None,
                     upgradable: false,
+                    logging: None,
                 };
                 // A copy given up on is let go of at once, its exchange and place with it:
                 // what sends it may be waiting for room its upstream will never give, and

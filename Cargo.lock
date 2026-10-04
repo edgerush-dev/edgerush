@@ -265,6 +265,7 @@ dependencies = [
  "proptest",
  "quiche",
  "serde-saphyr",
+ "serde_json",
  "socket2",
  "thiserror",
  "tokio",

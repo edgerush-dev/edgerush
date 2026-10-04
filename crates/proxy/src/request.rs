@@ -21,7 +21,7 @@ use crate::head::Head;
 use crate::hop_by_hop::ConnectionError;
 use crate::host::{HostError, bare_host};
 use edgerush_config::{
-    Compiled, CompiledListener, CompiledRule, Outcome, Protocol, Step, UpstreamId,
+    Compiled, CompiledListener, CompiledRule, Outcome, Protocol, RuleId, Step, UpstreamId,
 };
 use edgerush_filters::{Requested, Scheme, UrlRewrite};
 use edgerush_router::{NormaliseError, RequestParts, normalise_path};
@@ -45,6 +45,8 @@ pub enum Decision<'a> {
 pub struct Redirected<'a> {
     /// The rule the request belongs to, for its changes to the answer's headers.
     pub rule: &'a Arc<CompiledRule>,
+    /// The rule's route and its position in it.
+    pub id: RuleId,
     /// The status to answer with.
     pub status: StatusCode,
     /// Where the client is sent.
@@ -58,8 +60,8 @@ pub struct Forward<'a> {
     /// request that is still under way when the config changes keeps its rule, and only
     /// its rule, alive.
     pub rule: &'a Arc<CompiledRule>,
-    /// The position of the rule's route, as a [`RuleId`](edgerush_config::RuleId) gives it.
-    pub route: usize,
+    /// The rule's route and its position in it.
+    pub id: RuleId,
     /// The upstream chosen among the rule's backends: its position in the snapshot's list.
     pub upstream: UpstreamId,
     /// The rule's mirrors that take a copy of this request, in the rule's order. None of
@@ -280,6 +282,7 @@ pub fn decide<'a, H: Head>(
                 .map_err(|_| Rejection::Target)?;
             return Ok(Decision::Redirect(Redirected {
                 rule,
+                id,
                 status: redirect.status(),
                 location,
             }));
@@ -381,7 +384,7 @@ pub fn decide<'a, H: Head>(
     }
     Ok(Decision::Forward(Forward {
         rule,
-        route: id.route,
+        id,
         upstream,
         mirrors,
         websocket,

@@ -110,7 +110,7 @@ impl Worker {
         // only if the client already is.
         let Ok(client) = stream
             .peer_addr()
-            .map(|peer| Rc::new(Client::new(peer.ip())))
+            .map(|peer| Rc::new(Client::connected(peer.ip(), peer)))
         else {
             return;
         };
@@ -241,7 +241,7 @@ impl Worker {
         lent.read_first(after.take_frame(0..length, length));
         self.blocks.borrow_mut().give(after);
         let client = said.map_or(peer, |ends| ends.client);
-        let client = Rc::new(Client::new(client.ip()));
+        let client = Rc::new(Client::connected(client.ip(), peer));
         self.serve_settled(Rc::new(connection), tls, client, lent, back, due)
             .await;
     }

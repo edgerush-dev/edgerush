@@ -17,6 +17,7 @@ use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use std::error::Error as StdError;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 
 /// A request's body, as the server that read it hands it over.
@@ -43,6 +44,9 @@ pub(crate) enum RequestBody {
     Mirrored(Box<mirror::Tee>),
     /// A mirror's copy.
     Copy(mirror::Copy),
+    /// Any of those, its bytes counted as they come: only for a request whose listener
+    /// logs ([21 §4](../../docs/21-access-logs.md)).
+    Counted(Box<Counted>),
     /// None at all, whatever the client's stream goes on to carry: an extended CONNECT's,
     /// whose stream is a WebSocket's once it is answered
     /// ([19 §3](../../../docs/19-websocket.md)).
@@ -98,7 +102,37 @@ impl RequestBody {
             | Self::Mirrored(_)
             | Self::Copy(_)
             | Self::None => {}
+            Self::Counted(counted) => counted.body.drop_trailers(),
         }
+    }
+
+    /// `body`, its bytes counted for `counts` as they come; one with nothing to come, as it
+    /// is.
+    pub(crate) fn counted(body: Self, counts: Rc<dyn Counts>) -> Self {
+        if body.is_end_stream() {
+            return body;
+        }
+        Self::Counted(Box::new(Counted { body, counts }))
+    }
+}
+
+/// What a request body's bytes are counted for.
+pub(crate) trait Counts {
+    /// `bytes` more of the body have come.
+    fn received(&self, bytes: usize);
+}
+
+/// A request body, its bytes counted as they come.
+pub(crate) struct Counted {
+    body: RequestBody,
+    counts: Rc<dyn Counts>,
+}
+
+impl std::fmt::Debug for Counted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Counted")
+            .field("body", &self.body)
+            .finish_non_exhaustive()
     }
 }
 
@@ -129,6 +163,15 @@ impl Body for RequestBody {
             Self::Replayed(body) => Pin::new(body).poll_frame(cx),
             Self::Mirrored(body) => Pin::new(&mut **body).poll_frame(cx),
             Self::Copy(body) => Pin::new(body).poll_frame(cx),
+            Self::Counted(counted) => {
+                let polled = Pin::new(&mut counted.body).poll_frame(cx);
+                if let Poll::Ready(Some(Ok(frame))) = &polled
+                    && let Some(data) = frame.data_ref()
+                {
+                    counted.counts.received(data.len());
+                }
+                polled
+            }
             Self::None => Poll::Ready(None),
         }
     }
@@ -142,6 +185,7 @@ impl Body for RequestBody {
             Self::Replayed(body) => body.is_end_stream(),
             Self::Mirrored(body) => body.is_end_stream(),
             Self::Copy(body) => body.is_end_stream(),
+            Self::Counted(counted) => counted.body.is_end_stream(),
             Self::None => true,
         }
     }
@@ -155,6 +199,7 @@ impl Body for RequestBody {
             Self::Replayed(body) => body.size_hint(),
             Self::Mirrored(body) => body.size_hint(),
             Self::Copy(body) => body.size_hint(),
+            Self::Counted(counted) => counted.body.size_hint(),
             Self::None => SizeHint::with_exact(0),
         }
     }

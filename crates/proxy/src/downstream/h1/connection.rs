@@ -157,9 +157,9 @@ impl Default for Budget {
 
 /// Marks a response as the data plane's own answer rather than one it forwards: its head
 /// is paid for from the worker's provision, so that a worker that has run out can still say
-/// so (14 §8).
+/// so (14 §8). It says why the data plane answered, for the access log.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Local;
+pub(crate) struct Local(pub(crate) crate::metrics::Answer);
 
 /// How serving a connection ended, for the caller and for tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3051,7 +3051,9 @@ mod tests {
                 let mut response = Response::new(Answer::Full(Full::new(Bytes::new())));
                 *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
                 if local {
-                    response.extensions_mut().insert(Local);
+                    response
+                        .extensions_mut()
+                        .insert(Local(crate::metrics::Answer::TooBusy));
                 }
                 response
             };

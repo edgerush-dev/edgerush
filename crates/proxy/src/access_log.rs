@@ -34,10 +34,6 @@ use tokio::sync::Notify;
 
 /// How large a batch grows before it goes to the logger: a write of this or a little more,
 /// a few hundred records.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "requests make records from step 4 of 21 §7 on")
-)]
 pub(crate) const BATCH: usize = 64 * 1024;
 
 /// How many batches a worker has at most, those being written included: what a logger that
@@ -126,6 +122,9 @@ pub(crate) struct Logs {
     logger: OnceLock<SyncSender<Message>>,
     /// Every worker's word for the end, while the worker is there to be told.
     workers: Mutex<Vec<Weak<Finish>>>,
+    /// Whether the running config logs anything at all: what a request of one that does
+    /// not looks at, and no further.
+    on: AtomicBool,
     /// Room in the channel for every batch every worker can have, so that handing one over
     /// never finds it full.
     room: usize,
@@ -177,6 +176,7 @@ impl Logs {
             named: Mutex::default(),
             logger: OnceLock::new(),
             workers: Mutex::default(),
+            on: AtomicBool::new(false),
             room: workers.max(1) * BATCHES + 8,
             dropped,
         }
@@ -233,6 +233,8 @@ impl Logs {
     /// any request of it can make a record: the logger, started if this is the first config
     /// that logs, writes to each from now on.
     pub(crate) fn commit(&self, prepared: Prepared) {
+        let logging = prepared.by_listener.iter().any(Option::is_some);
+        self.on.store(logging, Ordering::Relaxed);
         let mut named = lock(&self.named);
         named.next = prepared.next;
         if prepared.opened.is_empty() {
@@ -275,6 +277,12 @@ impl Logs {
             returned,
             finish,
         }
+    }
+
+    /// Whether the running config has any listener log. Set as a config is put in force,
+    /// before any request of it.
+    pub(crate) fn on(&self) -> bool {
+        self.on.load(Ordering::Relaxed)
     }
 
     /// Tells the logger to open its files again, for whoever moved them aside.
@@ -353,17 +361,9 @@ pub(crate) struct Batches {
     open: RefCell<Vec<(Sink, Vec<u8>)>>,
     free: RefCell<Vec<Vec<u8>>>,
     /// How many it has made, at most [`BATCHES`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "requests make records from step 4 of 21 §7 on")
-    )]
     made: Cell<usize>,
     /// Where the logger gives them back, written and emptied.
     back: Sender<Vec<u8>>,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "requests make records from step 4 of 21 §7 on")
-    )]
     returned: Receiver<Vec<u8>>,
     finish: Arc<Finish>,
 }
@@ -372,10 +372,6 @@ impl Batches {
     /// Writes a record to `sink` with `write`, which appends its line: into the batch open
     /// for `sink`, handed over once full. With no batch free, the record is dropped and
     /// counted, and `write` is not called.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "requests make records from step 4 of 21 §7 on")
-    )]
     pub(crate) fn record(&self, logs: &Logs, sink: Sink, write: impl FnOnce(&mut Vec<u8>)) {
         let Ok(mut open) = self.open.try_borrow_mut() else {
             count(&logs.dropped, LogsDropped::Behind, 1);
@@ -447,10 +443,6 @@ impl Batches {
 
     /// A batch to write into: a free one, one the logger has given back, or a new one while
     /// the worker has made fewer than [`BATCHES`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "requests make records from step 4 of 21 §7 on")
-    )]
     fn take(&self) -> Option<Vec<u8>> {
         let mut free = self.free.try_borrow_mut().ok()?;
         if let Some(batch) = free.pop() {

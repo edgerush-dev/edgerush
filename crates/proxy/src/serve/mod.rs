@@ -17,6 +17,7 @@
 
 mod connection;
 mod exchange;
+mod logged;
 mod passthrough;
 mod plane;
 mod respond;
@@ -66,6 +67,7 @@ use edgerush_filters::HeaderModifier;
 use http::uri::{Authority, Scheme};
 use http::{HeaderMap, Request, StatusCode, Uri};
 use http_body::{Body as HttpBody, Frame, SizeHint};
+use logged::{Logged, Logging};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::Future;
@@ -143,6 +145,9 @@ enum Body {
     Grpc(Box<GrpcAnswered<Body, Called>>),
     /// An answer held to its request's deadline (03 §6).
     Timed(Box<Timed>),
+    /// An answer whose request is logged, counted as it goes
+    /// ([21 §4](../../docs/21-access-logs.md)).
+    Logged(Box<Logged>),
     /// An answer of the data plane's own. It has no body, and never will have one.
     Empty,
 }
@@ -285,6 +290,7 @@ impl HttpBody for Body {
                 }
                 Pin::new(&mut timed.body).poll_frame(context)
             }
+            Self::Logged(logged) => logged.poll_frame(context),
             Self::Empty => Poll::Ready(None),
         }
     }
@@ -295,6 +301,7 @@ impl HttpBody for Body {
             Self::H2(answer, ..) => answer.is_end_stream(),
             Self::Grpc(answered) => answered.is_end_stream(),
             Self::Timed(timed) => timed.body.is_end_stream(),
+            Self::Logged(logged) => logged.body.is_end_stream(),
             Self::Empty => true,
         }
     }
@@ -305,6 +312,7 @@ impl HttpBody for Body {
             Self::H2(answer, ..) => answer.size_hint(),
             Self::Grpc(answered) => answered.size_hint(),
             Self::Timed(timed) => timed.body.size_hint(),
+            Self::Logged(logged) => logged.body.size_hint(),
             Self::Empty => SizeHint::with_exact(0),
         }
     }
@@ -603,10 +611,6 @@ struct Snapshot {
     routed: Routed,
     /// By position in [`Proxy::listeners`]: where its access log is written, if it has one
     /// (21 §4).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "requests make records from step 4 of 21 §7 on")
-    )]
     logs: Vec<Option<Sink>>,
 }
 
@@ -660,6 +664,9 @@ struct Directed {
     /// a worker has ([03 §9](../../docs/03-data-plane.md)). Beside the other flag, where
     /// it costs a request's future nothing.
     alone: bool,
+    /// Its access-log record, for each try to note itself in; none for a request whose
+    /// listener does not log, nor for a mirror's copy (21 §4).
+    logging: Option<Rc<Logging>>,
 }
 
 /// A WebSocket handshake as the gateway carries it (19 §2 to §4).
