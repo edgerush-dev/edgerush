@@ -8,9 +8,9 @@ use crate::route::{
     Query, Redirect, Route, Scheme, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
 };
 use crate::{
-    Backend, Certificate, ClientValidation, Config, Forwarding, HealthCheck, Http3, Keepalive,
-    ListenerProxyProtocol, LoadBalancer, Probe, Protocol, ProxyProtocolVersion, RequestId, Rule,
-    SlowStart, UpstreamProtocol,
+    AccessLog, Backend, Certificate, ClientValidation, Config, Forwarding, HealthCheck, Http3,
+    Keepalive, ListenerProxyProtocol, LoadBalancer, Probe, Protocol, ProxyProtocolVersion,
+    RequestId, Rule, SlowStart, UpstreamProtocol,
 };
 use edgerush_filters::forwarding::{ForwardingError, HeaderNames, TrustedProxies};
 use edgerush_filters::{
@@ -153,6 +153,8 @@ pub struct CompiledListener {
     /// The senders whose PROXY protocol headers are believed, on a listener that reads one
     /// at the start of every connection; `None` for a listener that reads none.
     pub proxy_senders: Option<TrustedProxies>,
+    /// Where its access log goes; `None` for a listener that logs nothing.
+    pub access_log: Option<AccessLog>,
 }
 
 /// What an HTTP listener tells its upstreams of a request's client, compiled.
@@ -736,6 +738,11 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                 }
             }
         }
+        if let Some(AccessLog::File(path)) = &listener.access_log
+            && path.as_os_str().is_empty()
+        {
+            errors.push(Place::listener(name).problem(Problem::EmptyAccessLogPath));
+        }
         let validation = listener
             .tls
             .as_ref()
@@ -868,6 +875,7 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                     Some(ListenerProxyProtocol::Senders(senders)) => senders_of(senders).ok(),
                     Some(ListenerProxyProtocol::Off) | None => None,
                 },
+                access_log: listener.access_log.clone(),
             })
             .collect();
         Ok(Compiled {
@@ -1800,6 +1808,9 @@ pub enum Problem {
     /// A request ID on a listener that carries no requests.
     #[error("`request_id` is for protocols `http` and `https`")]
     RequestIdUnwanted,
+    /// A listener's access log names a file by an empty path.
+    #[error("`access_log` names a file by an empty path")]
+    EmptyAccessLogPath,
     /// A route for a listener that does not take its kind.
     #[error("a {kind} route cannot be for listener `{listener}`, which is `{protocol}`")]
     WrongListener {
@@ -2012,6 +2023,7 @@ mod tests {
     use super::*;
     use edgerush_router::RequestParts;
     use http::HeaderMap;
+    use std::path::PathBuf;
 
     fn config(yaml: &str) -> Config {
         serde_saphyr::from_str(yaml).unwrap()
@@ -3555,6 +3567,72 @@ upstreams:
             )))
             .unwrap();
             assert_eq!(listener(&compiled, "l").request_id, meant, "{written}");
+        }
+    }
+
+    /// A listener of any protocol may say where its access log goes, stdout or a file, and
+    /// one that says nothing logs nothing; a file is named by a path that is not empty
+    /// (08 §2, 21 §2 in the docs).
+    #[test]
+    fn a_listener_may_say_where_its_access_log_goes() {
+        let compiled = |web: &str, db: &str| {
+            compile(&config(&format!(
+                r#"
+listeners:
+  web: {{ address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate{web} }}
+  db: {{ address: "[::]:5432", protocol: tcp, proxy_protocol: off{db} }}
+routes: []
+tcp_routes:
+  - {{ name: db, listeners: [db], backends: [{{ upstream: postgres, weight: 1 }}] }}
+upstreams:
+  postgres: {{ load_balancer: p2c, endpoints: ["10.0.0.1:5432"] }}
+"#
+            )))
+        };
+        let silent = compiled("", "").unwrap();
+        assert_eq!(listener(&silent, "web").access_log, None);
+        assert_eq!(listener(&silent, "db").access_log, None);
+
+        let logging = compiled(
+            ", access_log: stdout",
+            ", access_log: { file: /var/log/edgerush/db.log }",
+        )
+        .unwrap();
+        assert_eq!(
+            listener(&logging, "web").access_log,
+            Some(AccessLog::Stdout)
+        );
+        assert_eq!(
+            listener(&logging, "db").access_log,
+            Some(AccessLog::File(PathBuf::from("/var/log/edgerush/db.log")))
+        );
+
+        let problems: Vec<String> = compiled(r#", access_log: { file: "" }"#, "")
+            .err()
+            .unwrap_or_default()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            problems,
+            ["listener `web`: `access_log` names a file by an empty path"]
+        );
+
+        for unknown in [
+            "on",
+            "true",
+            "stderr",
+            "Stdout",
+            "{ file: }",
+            "{ path: a.log }",
+        ] {
+            assert!(
+                serde_saphyr::from_str::<Config>(&format!(
+                    "listeners: {{ l: {{ address: \"[::]:80\", protocol: tcp, proxy_protocol: off, access_log: {unknown} }} }}\nroutes: []\nupstreams: {{}}\n"
+                ))
+                .is_err(),
+                "{unknown}"
+            );
         }
     }
 

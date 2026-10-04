@@ -28,9 +28,9 @@ pub use compile::{
     Problem, RuleId, SniRouter, Step, Timeout, compile,
 };
 pub use config::{
-    Certificate, ClientValidation, Config, DataPlane, Forwarding, HealthCheck, Http3, Keepalive,
-    Listener, ListenerProxyProtocol, LoadBalancer, Probe, Protocol, ProxyProtocolVersion,
-    RequestId, SlowStart, Tls, Upstream, UpstreamProtocol, UpstreamTls,
+    AccessLog, Certificate, ClientValidation, Config, DataPlane, Forwarding, HealthCheck, Http3,
+    Keepalive, Listener, ListenerProxyProtocol, LoadBalancer, Probe, Protocol,
+    ProxyProtocolVersion, RequestId, SlowStart, Tls, Upstream, UpstreamProtocol, UpstreamTls,
 };
 pub use harness_file::{CertificateFiles, HarnessFile};
 pub use route::{

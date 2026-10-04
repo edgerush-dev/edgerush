@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 /// A data plane's configuration. Filters are to come.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -81,6 +82,10 @@ pub struct Listener {
     /// connection is taken to come from.
     #[serde(default)]
     pub proxy_protocol: Option<ListenerProxyProtocol>,
+    /// Where a record of each of its requests, or each of its connections for a `tcp` or
+    /// `tls` listener, is written (08 §2, 21 in the docs). Left out, nothing is logged.
+    #[serde(default)]
+    pub access_log: Option<AccessLog>,
 }
 
 /// A listener's PROXY protocol ([20 §2](../../../docs/20-proxy-protocol.md)).
@@ -115,6 +120,18 @@ pub enum RequestId {
     Generate,
     /// The header is left as it is, both ways: a proxy in front can give the ID.
     Pass,
+}
+
+/// Where a listener's access log goes ([08 §2](../../../docs/08-observability.md)): one JSON
+/// line a record.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessLog {
+    /// The process's standard output, which a container runtime collects; the process's own
+    /// messages go to standard error.
+    Stdout,
+    /// A file, appended to; listeners that name the same path share it.
+    File(PathBuf),
 }
 
 /// What an HTTP listener tells its upstreams of a request's client (03 §11 in the docs):
