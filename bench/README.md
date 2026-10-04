@@ -172,6 +172,17 @@ gets measured.
 `TLS=1` has the clients reach the proxy over TLS — EdgeRush, NGINX and HAProxy, one
 self-signed ECDSA P-256 certificate made for the run — for `saturation`, `latency`
 (whose churn is then a full handshake for every request), `h2`, `grpc` and `handshakes`.
+`ACCESS_LOG=1` has EdgeRush, NGINX and HAProxy log every request they serve, the same
+fields as a line of JSON each, to one file, each its fastest way
+([21 §5](../../docs/21-access-logs.md)): EdgeRush through its access log; NGINX through a
+`log_format` with `escape=json` and `access_log ... buffer=64k flush=1s`; HAProxy through a
+JSON `log-format` into a ring, which it sends on over TCP to a receiver (an HAProxy
+`log-forward`) on the generator's CPUs that writes the file. The receiver's work is not
+counted in HAProxy's, as the front hop's is not; what EdgeRush and NGINX spend writing is
+counted in theirs. For the modes that
+keep the config they start with (`saturation`, `latency`); not with `passthrough`, nor for
+Envoy and Kong. After each turn the file's lines are counted into `access-log-lines`, its
+first line kept as `<turn>.access-log`, and the file removed.
 `UPSTREAM_H2=1` has the proxy speak HTTP/2 to the backend by prior knowledge: EdgeRush
 and HAProxy. NGINX's proxy cannot, but its gRPC proxy (`grpc_pass`) does, and the `grpc`
 mode gives that the gRPC service. Compare with other runs at the same

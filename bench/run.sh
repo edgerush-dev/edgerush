@@ -54,6 +54,10 @@
 # H3=1 (which is TLS=1 as well) has those three serve HTTP/3 on the same port, over UDP;
 # the `h3` scenario sets it itself. Its generator is h2load built with HTTP/3 (H2LOAD3).
 #
+# ACCESS_LOG=1 has EdgeRush, NGINX and HAProxy log every request they serve to a file, the
+# same record each, for the modes that keep the config they start with (saturation,
+# latency); not with passthrough.
+#
 # The variants — EdgeRush, and NGINX, HAProxy, Envoy and Kong set up to do the same
 # — are run in turns, REPS times, so that whatever drifts, heat above all, drifts
 # for all of them.
@@ -123,6 +127,16 @@ repo=$(dirname "$here")
 : "${WEBSOCKET:=0}"
 [ "${1:-}" = websocket ] && WEBSOCKET=1
 : "${WSBENCH:=$here/wsbench/target/release/wsbench}"
+# ACCESS_LOG=1 has every proxy log each request as EdgeRush's access log does (21 §5): the
+# same fields as a line of JSON each, to a file, each proxy its fastest way. EdgeRush its own
+# (a worker's batches, a logger thread); NGINX through `escape=json`, into a 64 KiB buffer
+# written at least every second; HAProxy a JSON log-format into a ring, which it sends on
+# over TCP in the background to a receiver (an HAProxy `log-forward`) on the generator's
+# CPUs that writes the file. The receiver's work is not counted in HAProxy's, as the front
+# hop's is not; EdgeRush's and NGINX's writing is counted in theirs. Each turn's records are
+# counted, one line a request, into access-log-lines, its first kept as <turn>.access-log,
+# and the file removed.
+: "${ACCESS_LOG:=0}"
 # h2load with HTTP/3: Ubuntu's is built without it (bench/README.md says how to build one).
 : "${H2LOAD3:=$HOME/tools/h2load3/bin/h2load}"
 # The loopback's MTU while HTTP/3 is measured (sudo). The loopback's own 64 KiB lets a QUIC
@@ -150,6 +164,7 @@ run=/tmp/edgerush-bench
 # The proxy is given a copy rather than the file in the repository: one scenario
 # rewrites it while the load is on, and the repository is not the place for that.
 config=$run-config.yaml
+access_log=$run-access.log
 backend=http://127.0.0.1:9000/
 # The proxy is asked for by the name its routes are for, and the generators are told where
 # that is: a `host` header would not do, as HTTP/2 names the host in the target.
@@ -181,6 +196,15 @@ start_backend() {
     printf '\0\0\0\0\0' >"$run/grpc.bin"
     cp "$here/proxy.yaml" "$config"
     [ "$TLS" = 1 ] && secure
+    if [ "$ACCESS_LOG" = 1 ]; then
+        if [ "$PASSTHROUGH" = 1 ]; then
+            echo "ACCESS_LOG is not set up for passthrough" >&2
+            exit 2
+        fi
+        rm -f "$access_log"
+        sed -i "s#request_id: generate }#request_id: generate, access_log: { file: \"$access_log\" } }#" "$config"
+        grep -q 'access_log: { file:' "$config"
+    fi
     if [ "$UPSTREAM_H2" = 1 ]; then
         sed -i 's#backend: { load_balancer: p2c, endpoints: \["127.0.0.1:9000"\] }#backend: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"], protocol: http2 }#' "$config"
         grep -q 'protocol: http2' "$config"
@@ -302,6 +326,12 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
     # Given unquoted below, so that it is two flags and their values rather than one
     # long argument. Only the variants that are EdgeRush are given it.
     local idle="--idle-per-destination $IDLE_PER_DESTINATION --idle-total $IDLE_TOTAL"
+    case "$ACCESS_LOG.$1" in
+    1.envoy | 1.kong | 1.nginx-direct)
+        echo "$1 is not set up to log: leave it out of ACCESS_LOG runs" >&2
+        exit 2
+        ;;
+    esac
     case "$1" in
     envoy)
         taskset -c "$PROXY_CPUS" envoy -c "$here/envoy.yaml" --concurrency "$WORKERS" \
@@ -352,6 +382,13 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
             fi
         else
             sed "s/WORKERS/$WORKERS/" "$here/nginx-proxy.conf" >"$run-proxy/nginx.conf"
+            if [ "$ACCESS_LOG" = 1 ]; then
+                # EdgeRush's fields, where NGINX has them; the route, rule, upstream and
+                # tries are the one route's, written as they are.
+                sed -i "s#^    access_log off;#    log_format edgerush escape=json '{\"time\":\"\$time_iso8601\",\"kind\":\"request\",\"id\":\"\$request_id\",\"listener\":\"web\",\"client\":\"\$remote_addr\",\"peer\":\"\$remote_addr:\$remote_port\",\"protocol\":\"\$server_protocol\",\"method\":\"\$request_method\",\"host\":\"\$host\",\"path\":\"\$request_uri\",\"status\":\$status,\"route\":\"bench\",\"rule\":2,\"upstream\":\"backend\",\"endpoint\":\"\$upstream_addr\",\"tries\":1,\"bytes_in\":\$request_length,\"bytes_out\":\$body_bytes_sent,\"duration_ms\":\$request_time,\"upstream_ms\":\$upstream_response_time}';\n    access_log $access_log edgerush buffer=64k flush=1s;#" \
+                    "$run-proxy/nginx.conf"
+                grep -q "access_log $access_log edgerush buffer=64k flush=1s;" "$run-proxy/nginx.conf"
+            fi
         fi
         if [ "$WEBSOCKET" = 1 ]; then
             # The upgrade passed on (NGINX's WebSocket proxying), and a tunnel's idle bound
@@ -395,6 +432,25 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
             fi
         else
             cp "$here/haproxy.cfg" "$haproxy_cfg"
+            if [ "$ACCESS_LOG" = 1 ]; then
+                # The host is captured as the request comes: a log-format cannot read a
+                # request's headers. The ring holds about two seconds of records at
+                # saturation, should the receiver fall behind.
+                sed -i 's#^    unique-id-header x-request-id$#&\n    http-request capture req.hdr(host) len 128\n    log ring@access format rfc5424 local0\n    log-format "%{+json}o %(time)tr %(kind)[str(request)] %(id)ID %(listener)f %(client)ci %(peer_port)cp %(protocol)HV %(method)HM %(host)[capture.req.hdr(0)] %(path)HU %(status)ST %(route)b %(upstream)b %(endpoint)si %(endpoint_port)sp %(tries)rc %(bytes_in)U %(bytes_out)B %(duration_ms)Ta %(upstream_ms)Tr"#' \
+                    "$haproxy_cfg"
+                grep -q '^    log ring@access format rfc5424 local0$' "$haproxy_cfg"
+                cat >>"$haproxy_cfg" <<'CFG'
+
+ring access
+    format rfc5424
+    maxlen 4096
+    size 67108864
+    timeout connect 5s
+    timeout server 3600s
+    server receiver 127.0.0.1:5514
+CFG
+                start_receiver
+            fi
         fi
         if [ "$TLS" = 1 ]; then
             sed -i "s#bind 127.0.0.1:8080#bind 127.0.0.1:8080 ssl crt $tls/both.pem alpn h2,http/1.1#" \
@@ -453,6 +509,33 @@ stop_proxy() {
         sleep 0.1
     done
     proxy_pid=
+    stop_receiver
+}
+
+# With ACCESS_LOG=1, HAProxy's log receiver: an HAProxy that takes the records its ring sends
+# over TCP and writes each to the access log as it came. On the generator's CPUs, as the
+# front hop is, and not counted in the proxy's work.
+receiver_pid=
+start_receiver() {
+    cat >"$run-receiver.cfg" <<'CFG'
+global
+    maxconn 100
+log-forward access
+    bind 127.0.0.1:5514
+    log stdout format raw local0
+CFG
+    taskset -c "$GEN_CPUS" haproxy -db -f "$run-receiver.cfg" >>"$access_log" 2>>"$OUT/proxy.log" &
+    receiver_pid=$!
+}
+
+# Once the proxy has gone, a moment for the receiver to write what it was sent, and then it
+# goes too.
+stop_receiver() {
+    [ -n "$receiver_pid" ] || return 0
+    sleep 1
+    kill "$receiver_pid" 2>/dev/null || true
+    wait "$receiver_pid" 2>/dev/null || true
+    receiver_pid=
 }
 
 await() { # url, curl options...
@@ -831,6 +914,16 @@ busy_idle_memory() { # name, count
     echo "done: $name"
 }
 
+# With ACCESS_LOG=1, once the proxy has gone: how many records the turn `name` wrote, and
+# the first of them; the file is removed for the next.
+logged() { # name
+    local lines=0
+    [ -f "$access_log" ] && lines=$(wc -l <"$access_log")
+    echo "$1 $lines" >>"$OUT/access-log-lines"
+    [ -f "$access_log" ] && head -1 "$access_log" >"$OUT/$1.access-log"
+    rm -f "$access_log"
+}
+
 each_variant() { # function, that is given: prefix of the names
     local policies
     read -ra policies <<<"$IDLE"
@@ -846,6 +939,7 @@ each_variant() { # function, that is given: prefix of the names
                 start_proxy "$variant"
                 "$1" "$label.$rep"
                 stop_proxy
+                [ "$ACCESS_LOG" = 1 ] && logged "$label.$rep"
                 sleep 5 # let it cool, and the sockets of the run go
             done
         done
