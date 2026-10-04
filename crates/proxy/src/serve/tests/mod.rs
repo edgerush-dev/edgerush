@@ -43,6 +43,7 @@ mod configs;
 mod upstreams;
 mod workers;
 
+mod access_logs;
 mod deadlines;
 mod drain;
 mod grpc;

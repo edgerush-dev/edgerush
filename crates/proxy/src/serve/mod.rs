@@ -23,6 +23,7 @@ mod respond;
 mod tries;
 mod worker;
 
+use crate::access_log::{Batches, CannotOpen, Logs, Sink};
 use crate::balance::Tried;
 use crate::connections::{Held, Loads};
 use crate::downstream::h1::connection::{self as h1, Answered};
@@ -329,6 +330,9 @@ pub struct Proxy {
     draining: AtomicBool,
     /// The keys every worker issues and reads QUIC connection IDs and Retry tokens with.
     quic: h3_listener::Secrets,
+    /// What the listeners' access logs are written to, and the thread that writes them
+    /// ([21 §4](../../docs/21-access-logs.md)).
+    logs: Logs,
 }
 
 /// One worker's share of the data plane: the connections it holds to the upstreams, which
@@ -397,6 +401,9 @@ pub struct Worker {
     /// By key ([`Routed`]): the drain of the tunnels routed by a listener, route and
     /// upstream, which a reload that takes any of the three away starts (03 §10).
     routes: RefCell<HashMap<u64, Rc<Drain>>>,
+    /// What its requests' access-log records are written into, until handed to the logger
+    /// ([21 §4](../../docs/21-access-logs.md)).
+    batches: Batches,
 }
 
 /// The client validation a listener's connections were accepted under on a worker, and the
@@ -594,6 +601,13 @@ struct Snapshot {
     /// What its tunnels are routed by, keyed so that a worker sees at a reload which went
     /// (03 §10). Worked out against the config this one replaces, as `destinations` are.
     routed: Routed,
+    /// By position in [`Proxy::listeners`]: where its access log is written, if it has one
+    /// (21 §4).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "requests make records from step 4 of 21 §7 on")
+    )]
+    logs: Vec<Option<Sink>>,
 }
 
 impl Snapshot {
@@ -923,6 +937,23 @@ pub enum ProxyError {
     /// BoringSSL could not give the keys the data plane makes at start.
     #[error("no random keys to be had: {0}")]
     Random(String),
+    /// A listener's access log that cannot be opened to be written to.
+    #[error("listener `{listener}`: its access log cannot be opened: {error}")]
+    AccessLog {
+        /// The listener's name.
+        listener: String,
+        /// Why not.
+        error: String,
+    },
+}
+
+impl From<CannotOpen> for ProxyError {
+    fn from(cannot: CannotOpen) -> Self {
+        Self::AccessLog {
+            listener: cannot.listener,
+            error: cannot.error.to_string(),
+        }
+    }
 }
 
 fn authority(endpoint: &SocketAddr) -> Result<Authority, ProxyError> {

@@ -79,6 +79,11 @@ const DRAIN: Duration = Duration::from_secs(29);
 /// How often a draining process looks at what its workers still hold.
 const DRAIN_POLL: Duration = Duration::from_millis(100);
 
+/// How long a drained process waits for its access-log records to be written: what is left
+/// of Kubernetes' grace after [`DRAIN`], less the exit itself. Writing what the workers hold
+/// takes a few batches' writes.
+const LOGS: Duration = Duration::from_millis(500);
+
 /// Runs `edgerush proxy` with the arguments after its name. Returns the exit status: once
 /// the data plane has drained, or at once when there is nothing to run or no way to.
 pub(crate) fn command(
@@ -324,7 +329,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     // Listened for before a request is served, so that no signal finds the default
     // action, which is to die on the spot.
     let (stopping, stop) = mpsc::channel();
-    stop_signals(stopping.clone()).map_err(Failure::Runtime)?;
+    let logs = Arc::clone(&proxy);
+    signals(stopping.clone(), move || logs.reopen_logs()).map_err(Failure::Runtime)?;
     // Every worker runs on a thread of its own, which stays for as long as the process.
     let loads = per_core::start(&proxy, sockets, accept, limits, connections, &stopping)?;
     health_checks(Arc::clone(&proxy), &stopping).map_err(Failure::Runtime)?;
@@ -414,6 +420,12 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
             format_args!("stopped while draining: {held} connections cut off"),
         ),
     }
+    if !proxy.finish_logs(LOGS) {
+        say(
+            stderr,
+            format_args!("out of time writing the access logs: what was left is lost"),
+        );
+    }
     Ok(())
 }
 
@@ -474,13 +486,21 @@ fn drained(held: impl Fn() -> usize, stop: &Receiver<Told>, within: Duration) ->
 }
 
 /// Says on `stopping`, from a thread of its own, every time the process is told to stop:
-/// Ctrl-C, and on Unix SIGTERM, which is how Kubernetes asks. Both are listened for
-/// before this returns.
-fn stop_signals(stopping: Sender<Told>) -> io::Result<()> {
+/// Ctrl-C, and on Unix SIGTERM, which is how Kubernetes asks. On Unix it also calls
+/// `reopen` at every SIGUSR1, which asks for the access logs' files to be opened again
+/// once they have been moved aside, as it asks NGINX and Envoy ([21 §4] in the docs). All
+/// are listened for before this returns.
+///
+/// [21 §4]: ../../../docs/21-access-logs.md
+fn signals(stopping: Sender<Told>, reopen: impl Fn() + Send + 'static) -> io::Result<()> {
     let runtime = Builder::new_current_thread().enable_io().build()?;
     let entered = runtime.enter();
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(unix)]
+    let mut rotate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    #[cfg(not(unix))]
+    drop(reopen);
     drop(entered);
     // Ctrl-C is listened for from the first poll of what waits for it, on that thread.
     let (listening, listens) = mpsc::channel();
@@ -491,6 +511,10 @@ fn stop_signals(stopping: Sender<Told>) -> io::Result<()> {
                 loop {
                     let mut interrupt = std::pin::pin!(tokio::signal::ctrl_c());
                     let told = std::future::poll_fn(|cx| {
+                        #[cfg(unix)]
+                        while let std::task::Poll::Ready(Some(())) = rotate.poll_recv(cx) {
+                            reopen();
+                        }
                         #[cfg(unix)]
                         if terminate.poll_recv(cx).is_ready() {
                             return std::task::Poll::Ready(Ok(()));

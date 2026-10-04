@@ -2,6 +2,7 @@
 //! what it tells a scrape and the health checker.
 
 use super::{ACCEPT_PAUSE, Proxy, ProxyError, Snapshot, authority, is_about_one_connection};
+use crate::access_log::{Logs, Sink};
 use crate::downstream::h3::listener as h3_listener;
 use crate::metrics::{AcceptPause, Metrics};
 use crate::routed::Routed;
@@ -25,6 +26,7 @@ impl Snapshot {
         metrics: &Metrics,
         previous: Option<&Snapshot>,
         keys: &Keys,
+        logs: Vec<Option<Sink>>,
     ) -> Result<Self, ProxyError> {
         let endpoints = config
             .upstreams()
@@ -138,6 +140,7 @@ impl Snapshot {
             alt_svc,
             secure,
             routed,
+            logs,
         })
     }
 }
@@ -173,9 +176,19 @@ impl Proxy {
         // A shard for every worker, so that no two write to one line of cache.
         let metrics = Metrics::new(workers, listeners.len());
         let keys = Keys::default();
-        let snapshot = Snapshot::new(config, &listeners, &metrics, None, &keys)?;
+        let logs = Logs::new(workers.get(), Arc::clone(&metrics.logs_dropped));
+        let prepared = logs.prepare(&config, &listeners)?;
+        let snapshot = Snapshot::new(
+            config,
+            &listeners,
+            &metrics,
+            None,
+            &keys,
+            prepared.by_listener(),
+        )?;
         let quic =
             h3_listener::Secrets::new().map_err(|error| ProxyError::Random(error.to_string()))?;
+        logs.commit(prepared);
         Ok(Self {
             listeners,
             current: ArcSwap::from_pointee(snapshot),
@@ -183,6 +196,7 @@ impl Proxy {
             keys,
             draining: AtomicBool::new(false),
             quic,
+            logs,
         })
     }
 
@@ -216,25 +230,43 @@ impl Proxy {
         // Against the config on its way out, so that a destination which has not changed
         // keeps what its connections are filed under and one that has gone is retired.
         let previous = self.current.load();
+        let prepared = self.logs.prepare(&config, &self.listeners)?;
         let snapshot = Snapshot::new(
             config,
             &self.listeners,
             &self.metrics,
             Some(&previous),
             &self.keys,
+            prepared.by_listener(),
         )?;
         drop(previous);
         // Only now that all of it is accepted: a config refused for one listener must not
-        // have changed the certificates of another.
+        // have changed the certificates of another, nor opened a file it logs to.
         for tls in snapshot.tls.iter().flatten() {
             tls.install();
         }
+        // Before any request of it can make a record.
+        self.logs.commit(prepared);
         self.current.store(Arc::new(snapshot));
         self.metrics.reloads.inc();
         let now = SystemTime::now().duration_since(UNIX_EPOCH);
         let now = now.map_or(0, |since_epoch| since_epoch.as_secs());
         self.metrics.last_reload.store(now, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Has the access logs' files opened again by their paths, for whoever moved them
+    /// aside to rotate them: what `SIGUSR1` asks for, as it asks NGINX and Envoy.
+    pub fn reopen_logs(&self) {
+        self.logs.reopen();
+    }
+
+    /// Has every worker hand over the access-log records it holds, and waits up to `within`
+    /// for all of them to be written: for the end of a drain, before the process exits.
+    /// Whether everything was written in time.
+    #[must_use]
+    pub fn finish_logs(&self, within: Duration) -> bool {
+        self.logs.finish(within)
     }
 
     /// What has been counted, in the Prometheus text format: per listener and per upstream

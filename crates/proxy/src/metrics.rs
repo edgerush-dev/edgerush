@@ -16,7 +16,7 @@ use http::StatusCode;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// How many upstream names get series of their own over the life of a data plane.
 pub(crate) const UPSTREAM_SLOTS: usize = 4096;
@@ -46,6 +46,28 @@ const HEAD_TIME_BOUNDS: [u64; 14] = [
 ];
 
 const CLASSES: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
+
+/// Why an access-log record was dropped ([21 §4](../../docs/21-access-logs.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogsDropped {
+    /// A worker had no batch free to write it into: the logger was behind.
+    Behind,
+    /// The logger could not write it.
+    Unwritten,
+}
+
+impl LogsDropped {
+    /// The name this reason is counted under.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Behind => "behind",
+            Self::Unwritten => "unwritten",
+        }
+    }
+
+    /// Every one of them, for a scrape that shows a series whether it has happened or not.
+    pub(crate) const ALL: [Self; 2] = [Self::Behind, Self::Unwritten];
+}
 
 /// Why an exchange by EdgeRush's own path ended without an answer.
 ///
@@ -630,6 +652,8 @@ pub(crate) struct Metrics {
     connections: Sharded<[Counter; 3]>,
     /// What each worker has in hand, sampled by the worker itself as it sweeps.
     workers: Sharded<WorkerGauges>,
+    /// Access-log records dropped, by why: counted by the workers and by the logger.
+    pub(crate) logs_dropped: crate::access_log::Dropped,
 }
 
 /// What one worker holds at the moment it last looked. Sampled rather than kept up to
@@ -683,6 +707,7 @@ impl Metrics {
             stopped: Sharded::new(shards),
             connections: Sharded::new(shards),
             workers: Sharded::new(shards),
+            logs_dropped: Arc::new(Sharded::new(shards)),
         }
     }
 
@@ -1055,6 +1080,15 @@ impl Metrics {
             self.workers
                 .sum(|shard| shard.storage.get().max(0).cast_unsigned()),
         );
+
+        let name = "edgerush_access_log_dropped_total";
+        let help = "Access-log records dropped, by why.";
+        scrape.family(name, Kind::Counter, help);
+        for why in LogsDropped::ALL {
+            let labels = [("reason", why.name())];
+            let count = |shard: &[Counter; LogsDropped::ALL.len()]| shard[why as usize].get();
+            scrape.sample(name, &labels, self.logs_dropped.sum(count));
+        }
 
         let name = "edgerush_config_reloads_total";
         scrape.family(name, Kind::Counter, "Configs taken over while running.");

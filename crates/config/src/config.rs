@@ -124,7 +124,7 @@ pub enum RequestId {
 
 /// Where a listener's access log goes ([08 §2](../../../docs/08-observability.md)): one JSON
 /// line a record.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessLog {
     /// The process's standard output, which a container runtime collects; the process's own

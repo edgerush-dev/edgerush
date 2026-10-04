@@ -112,6 +112,7 @@ impl Worker {
                 .collect();
             (RefCell::new(validations), Cell::new(snapshot.generation))
         };
+        let batches = proxy.logs.worker();
         Rc::new_cyclic(|me| Self {
             proxy,
             pool: Rc::new(RefCell::new(Pool::default())),
@@ -136,6 +137,7 @@ impl Worker {
             validations,
             validated,
             routes: RefCell::default(),
+            batches,
         })
     }
 
@@ -303,7 +305,19 @@ impl Worker {
     async fn sweep(self: Rc<Self>) {
         let every = self.limits.sweep;
         loop {
-            tokio::time::sleep(every).await;
+            // Or at once, when the data plane is about to end and wants the access-log
+            // records the worker holds.
+            let finishing = {
+                let mut slept = pin!(tokio::time::sleep(every));
+                let mut asked = pin!(self.batches.asked_to_finish());
+                poll_fn(|context| {
+                    if asked.as_mut().poll(context).is_ready() {
+                        return Poll::Ready(true);
+                    }
+                    slept.as_mut().poll(context).map(|()| false)
+                })
+                .await
+            };
             self.date.set(HttpDate::from_unix(unix_now()));
             if self.proxy.draining.load(Ordering::Acquire) && !self.drain.is_on() {
                 self.drain();
@@ -326,6 +340,12 @@ impl Worker {
             metrics
                 .worker()
                 .holding(self.places.held(), self.idle_connections(), storage);
+            // What its listeners logged since the last sweep goes to be written, so that a
+            // quiet worker holds no record for longer than a sweep (21 §4).
+            self.batches.hand_over(&self.proxy.logs);
+            if finishing {
+                self.batches.finished();
+            }
         }
     }
 

@@ -144,6 +144,7 @@ fn a_snapshot_knows_where_it_has_the_listeners_that_have_sockets() {
             &metrics,
             None,
             &Keys::default(),
+            vec![None; sockets.len()],
         )
         .unwrap()
         .listeners
