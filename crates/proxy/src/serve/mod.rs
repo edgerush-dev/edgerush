@@ -581,6 +581,10 @@ struct Snapshot {
     /// it is to speak TLS. Kept from the config before for as long as the certificates
     /// are the same, and with it the keys of the session tickets it has issued.
     tls: Vec<Option<Arc<Tls>>>,
+    /// By position in [`Proxy::listeners`]: the port its HTTP/3 is served on, where it has
+    /// a UDP socket. The first config's: sockets are bound once, at the start, and a reload
+    /// opens, closes and moves none of them (03 §4).
+    quic: Vec<Option<u16>>,
     /// By position in [`Proxy::listeners`]: the `Alt-Svc` its answers carry, if it serves
     /// HTTP/3 (16 §5), made once so that no answer formats it.
     alt_svc: Vec<Option<HeaderModifier>>,

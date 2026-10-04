@@ -63,9 +63,24 @@ impl Snapshot {
                     })
             })
             .collect::<Result<_, _>>()?;
+        // Where HTTP/3 is served: the first config says, as its sockets are the ones bound.
+        // A port the operating system chose is one the config does not know.
+        let quic: Vec<Option<u16>> = match previous {
+            Some(previous) => previous.quic.clone(),
+            None => listeners
+                .iter()
+                .map(|at| {
+                    let listener = at.and_then(|at| config.listeners().get(at))?;
+                    listener.http3?;
+                    Some(listener.address.port()).filter(|port| *port != 0)
+                })
+                .collect(),
+        };
+        // Advertised only where a socket serves it, on the port it is on.
         let alt_svc = listeners
             .iter()
-            .map(|at| alt_svc(at.and_then(|at| config.listeners().get(at))?))
+            .zip(&quic)
+            .map(|(at, port)| alt_svc(at.and_then(|at| config.listeners().get(at))?, (*port)?))
             .collect();
         let upstream_slots = config
             .upstreams()
@@ -106,6 +121,7 @@ impl Snapshot {
             upstream_slots,
             destinations,
             tls,
+            quic,
             alt_svc,
             secure,
             routed,
@@ -113,15 +129,10 @@ impl Snapshot {
     }
 }
 
-/// The `Alt-Svc` a listener's answers carry: HTTP/3 on the listener's port, for as long as
-/// its config says (RFC 7838 §3). None for a listener without HTTP/3, or on a port the
-/// operating system is to choose, which the config does not know.
-fn alt_svc(listener: &edgerush_config::CompiledListener) -> Option<HeaderModifier> {
+/// The `Alt-Svc` a listener's answers carry: HTTP/3 on `port`, where its UDP socket is, for
+/// as long as its config says (RFC 7838 §3). None for a listener whose config has no HTTP/3.
+fn alt_svc(listener: &edgerush_config::CompiledListener, port: u16) -> Option<HeaderModifier> {
     let http3 = listener.http3?;
-    let port = listener.address.port();
-    if port == 0 {
-        return None;
-    }
     let value = format!("h3=\":{port}\"; ma={}", http3.alt_svc_max_age);
     HeaderModifier::new([("alt-svc", value.as_str())], [], []).ok()
 }

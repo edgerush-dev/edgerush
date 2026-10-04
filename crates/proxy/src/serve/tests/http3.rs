@@ -236,6 +236,62 @@ async fn an_http3_listener_says_so_on_its_tcp_answers() {
         .await;
 }
 
+/// What a listener advertises follows the sockets it has, which a reload does not change
+/// (03 §4): one that turns HTTP/3 on for a listener started without it advertises nothing,
+/// as no UDP socket is there; one that moves the listener advertises the port it still
+/// listens on; one that turns HTTP/3 off stops advertising it at once.
+#[tokio::test]
+async fn a_reload_advertises_only_the_http3_a_listener_has_a_socket_for() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let with = |http3: bool, port: u16| {
+                let mut config = everything_config(upstream);
+                let web = config.listeners.get_mut("web").unwrap();
+                web.address = format!("127.0.0.1:{port}").parse().unwrap();
+                web.http3 = http3.then_some(edgerush_config::Http3 {
+                    alt_svc_max_age: 60,
+                    force_retry: false,
+                });
+                secured(
+                    &mut config,
+                    vec![crate::tls::testing::certificate(&["a.test"])],
+                    None,
+                );
+                compile(&config).unwrap()
+            };
+            let advertised = async |proxy: &Arc<Proxy>| {
+                let worker = Worker::with_deadlines(Arc::clone(proxy), H1Limits::default(), SHORT);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = serving(&worker, socket);
+                let stream = tls_client(front, "a.test", None, |_| {}).await.unwrap();
+                let answer = h1_over_or_nothing(stream).await.to_ascii_lowercase();
+                assert!(answer.starts_with("http/1.1 200 ok\r\n"), "{answer}");
+                answer
+                    .lines()
+                    .find_map(|line| line.strip_prefix("alt-svc: "))
+                    .map(str::to_owned)
+            };
+
+            let started_without =
+                Arc::new(Proxy::new(with(false, 8443), NonZeroUsize::MIN).unwrap());
+            started_without.reload(with(true, 8443)).unwrap();
+            assert_eq!(advertised(&started_without).await, None);
+
+            let started_with = Arc::new(Proxy::new(with(true, 8443), NonZeroUsize::MIN).unwrap());
+            started_with.reload(with(true, 8444)).unwrap();
+            assert_eq!(
+                advertised(&started_with).await.as_deref(),
+                Some("h3=\":8443\"; ma=60")
+            );
+            started_with.reload(with(false, 8443)).unwrap();
+            assert_eq!(advertised(&started_with).await, None);
+        })
+        .await;
+}
+
 /// A worker counts the handshakes under way on all its HTTP/3 listeners as one, which
 /// is what its Retry threshold is held to (16 §6).
 #[tokio::test]
