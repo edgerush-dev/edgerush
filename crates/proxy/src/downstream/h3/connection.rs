@@ -752,7 +752,8 @@ async fn answer<R, F, B, D>(
             IncomingH3::new(Rc::clone(&stream.conn), stream.id, None, ended, idle).unwatched();
         let mut tunnel = H3Stream::new(incoming, responder);
         // Closed by both ends is whole; anything else resets the stream as it goes.
-        if switched.carry(&mut tunnel, None, &stream.conn.drain).await == Carried::Closed {
+        let carried = switched.carry(&mut tunnel, None, &stream.conn.drain).await;
+        if carried.how == Carried::Closed {
             stream.answered();
         }
         return;

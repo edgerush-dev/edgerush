@@ -1,6 +1,7 @@
 //! The connections of a `tcp` or `tls` listener, carried to a backend rather than served
 //! (17).
 
+use super::logged::Passing;
 use super::{Connection, Ends, Worker, balance_of, connect_within};
 use crate::balance::Tried;
 use crate::drain::Drain;
@@ -26,7 +27,8 @@ use tokio::time::Instant;
 
 impl Worker {
     /// Carries a connection of a `tcp` or `tls` listener to a backend of its route, byte for
-    /// byte, and counts how it ended ([17 §4](../../docs/17-tcp-and-tls-passthrough.md)).
+    /// byte, and counts how it ended ([17 §4](../../docs/17-tcp-and-tls-passthrough.md)),
+    /// and logs it if its listener logs.
     /// `by_name`: the route is the one whose hostnames cover the name the ClientHello asks
     /// for, rather than the listener's one route. `ends`: the connection's as a sender's
     /// header named them, which a backend that asks is told of; none, and they are the
@@ -43,20 +45,65 @@ impl Worker {
         due: Instant,
     ) {
         let listener = connection.listener;
+        let mut logging = self.passing(listener, &client, ends.as_ref(), due);
         let ended = self
-            .carry_through(&connection, &mut client, by_name, ends, after, due)
+            .carry_through(
+                &connection,
+                &mut client,
+                by_name,
+                ends,
+                after,
+                due,
+                logging.as_deref_mut(),
+            )
             .await;
         if let Some(counters) = self.proxy.metrics.listener(listener) {
             counters.tunnel(ended);
         }
+        if let Some(logging) = logging {
+            logging.ended(&self, ended);
+        }
         drop(connection);
+    }
+
+    /// A record for a connection of `listener` from `client`, if the listener logs: from
+    /// whom `ends` names, if a PROXY header did, and accepted where the stretch to `due`
+    /// began. Boxed: it is held across the tunnel, in a future every connection's task has
+    /// room for (14 §3).
+    fn passing(
+        &self,
+        listener: usize,
+        client: &TcpStream,
+        ends: Option<&Ends>,
+        due: Instant,
+    ) -> Option<Box<Passing>> {
+        if !self.proxy.logs.on() {
+            return None;
+        }
+        let snapshot = self.proxy.current.load();
+        let accepted = due
+            .checked_sub(self.deadlines.first_request)
+            .unwrap_or_else(Instant::now);
+        let named = ends.map(|ends| ends.client.ip());
+        Passing::start(
+            &snapshot,
+            listener,
+            named,
+            client.peer_addr().ok(),
+            accepted,
+        )
+        .map(Box::new)
     }
 
     /// The tunnel. A `tls` listener reads the ClientHello into a block of the worker's,
     /// which then carries the client's bytes on, so that what was read goes to the backend
     /// first and unchanged; the tunnel gives it back once it has. What came after a PROXY
     /// header is already in a block, which goes on the same way. It drains with
-    /// `connection`.
+    /// `connection`, and notes what it finds in `logging`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a different thing the tunnel needs, as for `carry`"
+    )]
     async fn carry_through(
         &self,
         connection: &Connection,
@@ -65,6 +112,7 @@ impl Worker {
         ends: Option<Ends>,
         after: Option<Block>,
         due: Instant,
+        mut logging: Option<&mut Passing>,
     ) -> Tunnel {
         let (name, hello) = if by_name {
             let mut block = match after {
@@ -75,7 +123,12 @@ impl Worker {
                 },
             };
             match self.read_hello(client, &mut block, due).await {
-                Ok(name) => (Some(name), Some(block)),
+                Ok(name) => {
+                    if let Some(logging) = &mut logging {
+                        logging.named(&name);
+                    }
+                    (Some(name), Some(block))
+                }
                 Err(ended) => {
                     self.blocks.borrow_mut().give(block);
                     return ended;
@@ -93,7 +146,7 @@ impl Worker {
             });
             (None, after)
         };
-        let routed = self.pass_route(connection.listener, name.as_deref());
+        let routed = self.pass_route(connection.listener, name.as_deref(), logging.as_deref_mut());
         // Held until the tunnel closes: it is load on its backend for as long as it is open.
         let (endpoint, idle, _counted, route) = match routed {
             Ok(routed) => routed,
@@ -104,6 +157,9 @@ impl Worker {
                 return ended;
             }
         };
+        if let Some(logging) = &mut logging {
+            logging.connecting(endpoint.address());
+        }
         self.proxy.metrics.socket(Socket::Opened);
         let connected = connect_within(self.limits.connect, TcpStream::connect(endpoint.address()));
         let Ok(mut backend) = connected.await else {
@@ -117,7 +173,9 @@ impl Worker {
         let _unset = backend.set_nodelay(true);
         // A backend that asks is told who the client is before anything of the client's
         // reaches it, at once, whether or not the client has said anything: in a protocol
-        // where the server speaks first, the client waits for it (20 §4).
+        // where the server speaks first, the client waits for it (20 §4). Put ahead of what
+        // the tunnel carries, it is not counted as the client's.
+        let mut told = 0;
         let hello = match endpoint.proxy_protocol() {
             None => hello,
             Some(version) => {
@@ -137,7 +195,10 @@ impl Worker {
                 };
                 let header = proxy_protocol::proxied(version, ends.client, ends.local);
                 match self.ahead_of(header.as_bytes(), hello) {
-                    Ok(first) => Some(first),
+                    Ok(first) => {
+                        told = header.as_bytes().len();
+                        Some(first)
+                    }
                     Err(Some(hello)) => {
                         // What was read leaves no room for the header beside it in one
                         // block: the header goes on its own, and then it.
@@ -159,7 +220,7 @@ impl Worker {
             drain_within: self.deadlines.drain,
             websocket: false,
         };
-        carry(
+        let carried = carry(
             client,
             &mut backend,
             hello,
@@ -169,8 +230,11 @@ impl Worker {
             &self.timers,
             [&connection.drain, &route],
         )
-        .await
-        .into()
+        .await;
+        if let Some(logging) = logging {
+            logging.carried(carried, told);
+        }
+        carried.how.into()
     }
 
     /// `header`, and after it whatever `hello` holds, in one block, to be the tunnel's first
@@ -199,11 +263,13 @@ impl Worker {
     }
 
     /// The route of a connection of a `tcp` or `tls` listener, from the config in force now,
-    /// and a backend's endpoint, and the listener's idle bound.
+    /// and a backend's endpoint, and the listener's idle bound; the route's name and the
+    /// upstream's noted in `logging`.
     fn pass_route(
         &self,
         listener: usize,
         name: Option<&str>,
+        logging: Option<&mut Passing>,
     ) -> Result<(Arc<ReuseIdentity>, Duration, InFlight, Rc<Drain>), Tunnel> {
         let snapshot = self.proxy.current.load();
         let Some(compiled) = snapshot.listener(listener) else {
@@ -221,7 +287,12 @@ impl Worker {
         };
         // A backend with no endpoint refuses its share of connections, as TLSRoute has
         // it for a backend that cannot be used.
-        let Some(upstream) = route.backends.pick(random()) else {
+        let picked = route.backends.pick(random());
+        if let Some(logging) = logging {
+            let upstream = picked.and_then(|upstream| snapshot.config.upstreams().get(upstream.0));
+            logging.routed(&route.name, upstream.map(|upstream| upstream.name.as_str()));
+        }
+        let Some(upstream) = picked else {
             return Err(Tunnel::NoBackend);
         };
         let destinations = snapshot.destinations.of(upstream.0);

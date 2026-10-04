@@ -213,7 +213,7 @@ pub(crate) enum Tunnel {
 
 impl Tunnel {
     /// The name this is counted under.
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Closed => "closed",
             Self::Idle => "idle",

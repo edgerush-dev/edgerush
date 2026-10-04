@@ -1,6 +1,7 @@
 //! One try at an answer from an endpoint, over HTTP/1 or HTTP/2, and the WebSocket that
 //! a 101 or an extended CONNECT switches it to.
 
+use super::logged::Logging;
 use super::{
     Admitted, Body, Directed, Handshake, Timing, Toward, Watch, Worker, connect_within, why_stopped,
 };
@@ -12,7 +13,7 @@ use crate::metrics::{Answer, Socket, Stopped};
 use crate::raw::RawAnswer;
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::timers::{Alarm, Timers};
-use crate::tunnel::{Backend, Bounds as TunnelBounds, Carried, Switched};
+use crate::tunnel::{Backend, Bounds as TunnelBounds, Switched, Tunneled};
 use crate::upstream::balancing::InFlight;
 use crate::upstream::destination::ReuseIdentity;
 use crate::upstream::h1::blocks::Block;
@@ -420,7 +421,8 @@ impl Worker {
         let (read, mut body) = answer;
         if let Some(handshake) = &directed.websocket {
             if read.status() == StatusCode::SWITCHING_PROTOCOLS {
-                return self.switch(read, *body, handshake, admitted.count());
+                let logging = directed.logging.as_ref();
+                return self.switch(read, *body, handshake, admitted.count(), logging);
             }
             // A refused handshake's connection could carry another request, but not one
             // whose credentials may have bound it to this client (13 §6).
@@ -452,6 +454,7 @@ impl Worker {
         body: H1Body<UpstreamSocket, RequestBody>,
         handshake: &Handshake,
         counted: Option<InFlight>,
+        logging: Option<&Rc<Logging>>,
     ) -> Result<(RawAnswer, Body), Answer> {
         let Toward::Upgrade(ours) = &handshake.toward else {
             return Err(Answer::UpstreamFailed);
@@ -464,21 +467,28 @@ impl Worker {
             self.proxy.metrics.stopped(Stopped::Codec);
             return Err(Answer::UpstreamFailed);
         };
-        interim.switch(self.switched(Backend::Socket(backend), leftover, handshake, counted));
+        let backend = Backend::Socket(backend);
+        interim.switch(self.switched(backend, leftover, handshake, counted, logging));
         Ok((read, Body::Empty))
     }
 
     /// A switched WebSocket's backend, with what its tunnel needs of this worker, and its
-    /// end counted among its listener's tunnels.
+    /// end counted among its listener's tunnels and noted in its record, `logging`, which
+    /// the tunnel holds until then.
     fn switched(
         &self,
         backend: Backend,
         leftover: Option<Block>,
         handshake: &Handshake,
         counted: Option<InFlight>,
+        logging: Option<&Rc<Logging>>,
     ) -> Switched {
         let proxy = Arc::clone(&self.proxy);
         let listener = handshake.listener;
+        let logging = logging.map(|logging| {
+            logging.switched();
+            Rc::clone(logging)
+        });
         Switched {
             backend,
             leftover,
@@ -490,9 +500,12 @@ impl Worker {
             blocks: Rc::clone(&self.blocks),
             timers: Rc::clone(&self.timers),
             route: self.route_drain(handshake.route),
-            ended: Box::new(move |carried: Carried| {
+            ended: Box::new(move |carried: Tunneled| {
                 if let Some(counters) = proxy.metrics.listener(listener) {
-                    counters.tunnel(carried.into());
+                    counters.tunnel(carried.how.into());
+                }
+                if let Some(logging) = logging {
+                    logging.tunneled(carried);
                 }
             }),
             counted,
@@ -564,7 +577,10 @@ impl Worker {
                     return Err(Answer::UpstreamFailed);
                 };
                 let counted = admitted.count();
-                interim.switch(self.switched(Backend::H2(stream), None, handshake, counted));
+                let logging = directed.logging.as_ref();
+                let switched =
+                    self.switched(Backend::H2(stream), None, handshake, counted, logging);
+                interim.switch(switched);
                 (parts, Body::Empty)
             }
             Connected::Refused(parts, answer) => {

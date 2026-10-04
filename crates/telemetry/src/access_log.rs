@@ -80,7 +80,8 @@ pub struct Record<'a> {
     pub protocol: Option<Protocol>,
     /// The request's method, as received.
     pub method: Option<&'a str>,
-    /// The request's host, as received.
+    /// The request's host, as received; for a `tls` connection, the name its ClientHello
+    /// asked for.
     pub host: Option<&'a str>,
     /// The request's path, as received, its query included.
     pub path: Option<&'a str>,
@@ -104,8 +105,9 @@ pub struct Record<'a> {
     pub bytes_in: Option<u64>,
     /// Body bytes sent, or what a tunnel carried to the client.
     pub bytes_out: Option<u64>,
-    /// From the head arriving to the answer's last byte going, or the tunnel's end, in
-    /// microseconds.
+    /// From the head arriving to the answer's last byte going; for a WebSocket's second
+    /// record, from its handshake's answer going to its tunnel's end; for a connection, from
+    /// accept to its end. In microseconds.
     pub duration_us: Option<u64>,
     /// From the head arriving to the upstream's answer head, in microseconds.
     pub upstream_us: Option<u64>,

@@ -5,14 +5,21 @@
 //!
 //! It is written when the last of those that hold it lets go: the answer's body, once the
 //! server is done with it, or the request itself, given up with no answer. Whoever that is,
-//! nothing has to remember to write it, and a request cannot end without its record.
+//! nothing has to remember to write it, and a request cannot end without its record. A
+//! WebSocket's handshake has two: the first once its answer has gone, and the second when
+//! its tunnel, which holds it too, ends.
+//!
+//! A `tcp` or `tls` listener's connection has a record of its own kind, [`Passing`], which
+//! the one task that carries it fills in and writes.
 
 use super::{Body, BodyError, Snapshot, Worker};
 use crate::access_log::Sink;
 use crate::downstream::h1::connection::{self as h1, Answered};
 use crate::forwarding::{Client, FORWARDED_FOR};
 use crate::head::Forwarded;
+use crate::metrics::Tunnel;
 use crate::request_body::Counts;
+use crate::tunnel::Tunneled;
 use edgerush_filters::forwarding::client_address;
 use edgerush_router::Fields;
 use edgerush_telemetry::access_log::{Kind, Protocol, Record};
@@ -21,7 +28,7 @@ use http_body::Body as HttpBody;
 use std::cell::{Cell, RefCell};
 use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 
 /// Where one of the record's strings is in [`Logging::texts`].
@@ -61,6 +68,13 @@ pub(super) struct Logging {
     sent: Cell<u64>,
     /// Whether the answer's body was gone through to its end, or had nothing to go through.
     whole: Cell<bool>,
+    /// Whether the core switched a backend for it, a WebSocket's handshake.
+    switched: Cell<bool>,
+    /// When a switched handshake's first record was written, its answer gone: the start of
+    /// its tunnel's life.
+    opened: Cell<Option<Instant>>,
+    /// How its tunnel ended, and what it carried.
+    tunneled: Cell<Option<Tunneled>>,
 }
 
 impl Logging {
@@ -77,27 +91,19 @@ impl Logging {
         let sink = (*snapshot.logs.get(listener)?)?;
         let compiled = snapshot.listener(listener)?;
         let mut texts = String::with_capacity(160);
-        let mut keep = |text: &str| {
-            let from = texts.len();
-            texts.push_str(text);
-            Span {
-                from,
-                to: texts.len(),
-            }
-        };
-        let listener = keep(&compiled.name);
-        let method = keep(head.method().as_str());
+        let listener = keep(&mut texts, &compiled.name);
+        let method = keep(&mut texts, head.method().as_str());
         let host = head
             .uri()
             .authority()
             .map(http::uri::Authority::as_str)
             .or_else(|| head.host_field().ok())
-            .map(&mut keep);
+            .map(|host| keep(&mut texts, host));
         let path = head
             .uri()
             .path_and_query()
             .map(http::uri::PathAndQuery::as_str)
-            .map(&mut keep);
+            .map(|path| keep(&mut texts, path));
         // Who the client is, as forwarding works it out: whom a trusted proxy names
         // (03 §11).
         let trusted = &compiled.forwarding.trusted_proxies;
@@ -110,14 +116,10 @@ impl Logging {
         } else {
             client.address()
         };
-        let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH);
-        let time_ms = since_epoch.map_or(0, |since| {
-            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-        });
         Some(Rc::new(Self {
             worker: Rc::clone(worker),
             sink,
-            time_ms,
+            time_ms: unix_millis(Duration::ZERO),
             came_in,
             client: address,
             peer: client.peer(),
@@ -140,6 +142,9 @@ impl Logging {
             received: Cell::new(0),
             sent: Cell::new(0),
             whole: Cell::new(false),
+            switched: Cell::new(false),
+            opened: Cell::new(None),
+            tunneled: Cell::new(None),
         }))
     }
 
@@ -165,16 +170,9 @@ impl Logging {
         let Ok(mut texts) = self.texts.try_borrow_mut() else {
             return;
         };
-        let mut keep = |text: &str| {
-            let from = texts.len();
-            texts.push_str(text);
-            Span {
-                from,
-                to: texts.len(),
-            }
-        };
-        self.route.set(Some(keep(route)));
-        self.upstream.set(upstream.map(&mut keep));
+        self.route.set(Some(keep(&mut texts, route)));
+        self.upstream
+            .set(upstream.map(|upstream| keep(&mut texts, upstream)));
         self.rule.set(Some(rule));
     }
 
@@ -211,6 +209,17 @@ impl Logging {
             .set(Some(u32::try_from(code).unwrap_or(u32::MAX)));
     }
 
+    /// Notes that the core switched a backend for the request, a WebSocket's handshake,
+    /// whose tunnel goes on once its answer has gone.
+    pub(super) fn switched(&self) {
+        self.switched.set(true);
+    }
+
+    /// Notes how the request's tunnel ended, and what it carried.
+    pub(super) fn tunneled(&self, tunneled: Tunneled) {
+        self.tunneled.set(Some(tunneled));
+    }
+
     fn sent(&self, bytes: usize) {
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         self.sent.set(self.sent.get().saturating_add(bytes));
@@ -223,18 +232,14 @@ impl Logging {
         };
         self.reason.set(Some(why));
     }
-}
 
-impl Counts for Logging {
-    fn received(&self, bytes: usize) {
-        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
-        self.received.set(self.received.get().saturating_add(bytes));
-    }
-}
-
-impl Drop for Logging {
-    fn drop(&mut self) {
-        let texts = self.texts.get_mut();
+    /// Writes the record as it stands now, as one of `kind`: the request's, a WebSocket's
+    /// first, or its second, which has its tunnel's outcome, bytes and life in place of the
+    /// handshake's.
+    fn write(&self, kind: Kind) {
+        let Ok(texts) = self.texts.try_borrow() else {
+            return;
+        };
         let text = |span: Span| texts.get(span.from..span.to);
         // A client that got no answer, or not all of one, left before it could: unless
         // something else is known to have ended it.
@@ -242,9 +247,9 @@ impl Drop for Logging {
             .reason
             .get()
             .or_else(|| (!self.whole.get()).then_some("client_closed"));
-        let record = Record {
+        let mut record = Record {
             time_ms: self.time_ms,
-            kind: Kind::Request,
+            kind,
             id: self.id.get().and_then(text),
             listener: text(self.listener).unwrap_or_default(),
             client: Some(self.client),
@@ -266,10 +271,39 @@ impl Drop for Logging {
             duration_us: Some(microseconds(self.came_in)),
             upstream_us: self.upstream_us.get(),
         };
+        if kind == Kind::WebSocketClose {
+            // A tunnel its server never carried: its client was gone before the handshake's
+            // answer could reach it.
+            let tunneled = self.tunneled.get();
+            record.reason = Some(tunneled.map_or("client_closed", |tunneled| {
+                Tunnel::from(tunneled.how).name()
+            }));
+            record.bytes_in = Some(tunneled.map_or(0, |tunneled| tunneled.up));
+            record.bytes_out = Some(tunneled.map_or(0, |tunneled| tunneled.down));
+            record.duration_us = self.opened.get().map(microseconds);
+        }
         let worker = &self.worker;
         worker
             .batches
             .record(&worker.proxy.logs, self.sink, |out| record.write(out));
+    }
+}
+
+impl Counts for Logging {
+    fn received(&self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.received.set(self.received.get().saturating_add(bytes));
+    }
+}
+
+impl Drop for Logging {
+    fn drop(&mut self) {
+        let kind = if self.opened.get().is_some() {
+            Kind::WebSocketClose
+        } else {
+            Kind::Request
+        };
+        self.write(kind);
     }
 }
 
@@ -312,6 +346,13 @@ impl Drop for Logged {
         if self.body.is_end_stream() {
             self.logging.whole.set(true);
         }
+        // A WebSocket's handshake, its answer gone: its first record now, so that a long
+        // one is seen before it ends, and its second when its tunnel lets go (08 §2).
+        let logging = &self.logging;
+        if logging.switched.get() && logging.opened.get().is_none() {
+            logging.write(Kind::WebSocketOpen);
+            logging.opened.set(Some(Instant::now()));
+        }
     }
 }
 
@@ -336,11 +377,8 @@ pub(super) fn refused(
     else {
         return;
     };
-    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH);
     let record = Record {
-        time_ms: since_epoch.map_or(0, |since| {
-            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-        }),
+        time_ms: unix_millis(Duration::ZERO),
         kind: Kind::Request,
         listener: &compiled.name,
         client: Some(client.address()),
@@ -353,6 +391,108 @@ pub(super) fn refused(
     worker
         .batches
         .record(&worker.proxy.logs, *sink, |out| record.write(out));
+}
+
+/// A `tcp` or `tls` listener's connection's record while it is carried: who it came
+/// from, the name its ClientHello asks for, its route, upstream and endpoint as each is
+/// found, and what its tunnel carried. Written with how it ended, which is the one place
+/// a connection's task ends.
+pub(super) struct Passing {
+    sink: Sink,
+    time_ms: u64,
+    accepted: Instant,
+    client: Option<IpAddr>,
+    peer: Option<SocketAddr>,
+    texts: String,
+    listener: Span,
+    host: Option<Span>,
+    route: Option<Span>,
+    upstream: Option<Span>,
+    endpoint: Option<SocketAddr>,
+    /// What its tunnel carried, less the PROXY header the gateway put ahead of the
+    /// client's bytes.
+    up: u64,
+    down: u64,
+}
+
+impl Passing {
+    /// A record for a connection `accepted` on `listener`, if the listener logs: from
+    /// `client` as a PROXY header named it, or else `peer`, the address that connected.
+    pub(super) fn start(
+        snapshot: &Snapshot,
+        listener: usize,
+        client: Option<IpAddr>,
+        peer: Option<SocketAddr>,
+        accepted: Instant,
+    ) -> Option<Self> {
+        let sink = (*snapshot.logs.get(listener)?)?;
+        let compiled = snapshot.listener(listener)?;
+        let mut texts = String::with_capacity(96);
+        let listener = keep(&mut texts, &compiled.name);
+        Some(Self {
+            sink,
+            time_ms: unix_millis(accepted.elapsed()),
+            accepted,
+            client: client.or_else(|| peer.map(|peer| peer.ip())),
+            peer,
+            texts,
+            listener,
+            host: None,
+            route: None,
+            upstream: None,
+            endpoint: None,
+            up: 0,
+            down: 0,
+        })
+    }
+
+    /// Notes the name its ClientHello asks for.
+    pub(super) fn named(&mut self, name: &str) {
+        self.host = Some(keep(&mut self.texts, name));
+    }
+
+    /// Notes its route's name and its upstream's.
+    pub(super) fn routed(&mut self, route: &str, upstream: Option<&str>) {
+        self.route = Some(keep(&mut self.texts, route));
+        self.upstream = upstream.map(|upstream| keep(&mut self.texts, upstream));
+    }
+
+    /// Notes the endpoint it goes to.
+    pub(super) fn connecting(&mut self, endpoint: SocketAddr) {
+        self.endpoint = Some(endpoint);
+    }
+
+    /// Notes what its tunnel carried, of which the first `told` bytes up were a PROXY
+    /// header of the gateway's.
+    pub(super) fn carried(&mut self, tunneled: Tunneled, told: usize) {
+        let told = u64::try_from(told).unwrap_or(u64::MAX);
+        self.up = tunneled.up.saturating_sub(told);
+        self.down = tunneled.down;
+    }
+
+    /// Writes the record, of a connection that ended `how`.
+    pub(super) fn ended(self, worker: &Worker, how: Tunnel) {
+        let text = |span: Span| self.texts.get(span.from..span.to);
+        let record = Record {
+            time_ms: self.time_ms,
+            kind: Kind::Connection,
+            listener: text(self.listener).unwrap_or_default(),
+            client: self.client,
+            peer: self.peer,
+            host: self.host.and_then(text),
+            reason: Some(how.name()),
+            route: self.route.and_then(text),
+            upstream: self.upstream.and_then(text),
+            endpoint: self.endpoint,
+            bytes_in: Some(self.up),
+            bytes_out: Some(self.down),
+            duration_us: Some(microseconds(self.accepted)),
+            ..Record::default()
+        };
+        worker
+            .batches
+            .record(&worker.proxy.logs, self.sink, |out| record.write(out));
+    }
 }
 
 /// `answered`, its body counted for `logging`.
@@ -376,4 +516,21 @@ fn protocol(version: Version) -> Option<Protocol> {
 
 fn microseconds(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+/// `text` kept at the end of `texts`, and where.
+fn keep(texts: &mut String, text: &str) -> Span {
+    let from = texts.len();
+    texts.push_str(text);
+    Span {
+        from,
+        to: texts.len(),
+    }
+}
+
+/// When it was `ago`, in milliseconds since the Unix epoch.
+fn unix_millis(ago: Duration) -> u64 {
+    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH);
+    let at = since_epoch.map_or(Duration::ZERO, |since| since.saturating_sub(ago));
+    u64::try_from(at.as_millis()).unwrap_or(u64::MAX)
 }

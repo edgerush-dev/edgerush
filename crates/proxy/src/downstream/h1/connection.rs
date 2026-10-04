@@ -1352,7 +1352,7 @@ async fn switch<S: AsyncRead + AsyncWrite + Unpin>(
         return Ended::Gone;
     };
     let (mut socket, input) = connection.into_tunnel();
-    Ended::Switched(switched.carry(&mut socket, input, drain).await)
+    Ended::Switched(switched.carry(&mut socket, input, drain).await.how)
 }
 
 /// Ends a connection whose answer's body failed. Before any byte of the final head has

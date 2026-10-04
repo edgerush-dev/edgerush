@@ -53,6 +53,17 @@ pub(crate) enum Carried {
     Exhausted,
 }
 
+/// How a tunnel ended, and what it carried each way: the bytes passed on, not those of
+/// the gateway's own Close frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Tunneled {
+    pub(crate) how: Carried,
+    /// From the client to the backend.
+    pub(crate) up: u64,
+    /// From the backend to the client.
+    pub(crate) down: u64,
+}
+
 impl From<Carried> for crate::metrics::Tunnel {
     fn from(carried: Carried) -> Self {
         match carried {
@@ -111,7 +122,7 @@ pub(crate) struct Switched {
     /// takes any of them away starts (03 §10).
     pub(crate) route: Rc<Drain>,
     /// Told how the tunnel ended, which counts it as its listener's.
-    pub(crate) ended: Box<dyn FnOnce(Carried)>,
+    pub(crate) ended: Box<dyn FnOnce(Tunneled)>,
     /// The handshake's count at its endpoint, held until the tunnel closes: a WebSocket is
     /// load on its backend for as long as it is open (03 §6).
     pub(crate) counted: Option<InFlight>,
@@ -138,7 +149,7 @@ impl Switched {
         client: &mut C,
         early: Option<Block>,
         drain: &Drain,
-    ) -> Carried
+    ) -> Tunneled
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
@@ -234,6 +245,8 @@ struct Way {
     close: Close,
     /// Whether its far side is the backend, whose Close from the gateway is masked.
     to_backend: bool,
+    /// The bytes it has passed on.
+    carried: u64,
 }
 
 /// Where a way is with a Close frame of the gateway's.
@@ -265,6 +278,7 @@ impl Way {
             frames,
             close: Close::None,
             to_backend,
+            carried: 0,
         }
     }
 
@@ -321,7 +335,7 @@ pub(crate) async fn carry<C, B>(
     bounds: Bounds,
     timers: &Rc<Timers>,
     drains: [&Drain; 2],
-) -> Carried
+) -> Tunneled
 where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
@@ -339,7 +353,7 @@ where
     // Until when a read that finds nothing keeps its block: a second after bytes last moved,
     // and not at all before any have.
     let mut keep_until: Option<Instant> = None;
-    let carried = poll_fn(|cx| {
+    let how = poll_fn(|cx| {
         loop {
             let mut moved = false;
             // Past its release time, a read that finds nothing gives its block back.
@@ -449,6 +463,11 @@ where
         }
     })
     .await;
+    let carried = Tunneled {
+        how,
+        up: up.carried,
+        down: down.carried,
+    };
     let mut blocks = blocks.borrow_mut();
     for block in [up.block, down.block].into_iter().flatten() {
         blocks.give(block);
@@ -534,6 +553,7 @@ where
                     Poll::Ready(Ok(0) | Err(_)) => return Poll::Ready(Err(Stopped::Failed)),
                     Poll::Ready(Ok(written)) => {
                         block.consume(written);
+                        way.carried += u64::try_from(written).unwrap_or(u64::MAX);
                         *moved = true;
                         carried = true;
                     }
@@ -862,7 +882,10 @@ mod tests {
             (first, second)
         }))
         .await;
-        assert_eq!(carried, (Carried::Closed, Carried::Closed));
+        assert_eq!(
+            (carried.0.how, carried.1.how),
+            (Carried::Closed, Carried::Closed)
+        );
         // And every block is back.
         assert_eq!(blocks.borrow().parked(), 2);
     }
@@ -900,7 +923,7 @@ mod tests {
             tokio::join!(carrying, talking)
         }))
         .await;
-        assert_eq!(carried.0, Carried::Closed);
+        assert_eq!(carried.0.how, Carried::Closed);
     }
 
     /// Bytes already read go first, each way, before anything more is read.
@@ -940,7 +963,7 @@ mod tests {
             tokio::join!(carrying, talking)
         }))
         .await;
-        assert_eq!(carried.0, Carried::Closed);
+        assert_eq!(carried.0.how, Carried::Closed);
         assert_eq!(carried.1, (b"early-late".to_vec(), b"hello".to_vec()));
     }
 
@@ -980,7 +1003,7 @@ mod tests {
             tokio::join!(carrying, watching)
         }))
         .await;
-        assert_eq!(carried.0, Carried::Closed);
+        assert_eq!(carried.0.how, Carried::Closed);
         // What was taken to read into went back when the reads found nothing.
         assert!(
             carried.1,
@@ -1016,7 +1039,7 @@ mod tests {
             tokio::join!(carrying, ending).0
         }))
         .await;
-        assert_eq!(carried, Carried::Closed);
+        assert_eq!(carried.how, Carried::Closed);
     }
 
     /// A worker that cannot pay for a block to read into ends the tunnel, saying so, rather
@@ -1039,7 +1062,7 @@ mod tests {
             [&drain, &drain],
         )))
         .await;
-        assert_eq!(carried, Carried::Exhausted);
+        assert_eq!(carried.how, Carried::Exhausted);
     }
 
     /// A way whose side has ended gives its block back as the end is passed on, while the
@@ -1078,7 +1101,7 @@ mod tests {
             tokio::join!(tunnel, talking).0
         }))
         .await;
-        assert_eq!(carried, Carried::Closed);
+        assert_eq!(carried.how, Carried::Closed);
     }
 
     /// A block handed over with no room left — its memory gone with a frame cut from it,
@@ -1119,7 +1142,7 @@ mod tests {
             tokio::join!(tunnel, talking).0
         }))
         .await;
-        assert_eq!(carried, Carried::Closed);
+        assert_eq!(carried.how, Carried::Closed);
     }
 
     const WEBSOCKET: Bounds = Bounds {
@@ -1147,6 +1170,7 @@ mod tests {
             drains,
         )
         .await
+        .how
     }
 
     /// A text frame as a client sends it, masked.

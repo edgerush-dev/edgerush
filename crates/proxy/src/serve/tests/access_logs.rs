@@ -75,7 +75,7 @@ fn scratch(test: &str) -> PathBuf {
 /// every 50 ms so that what it logs is written within moments.
 struct Recording {
     front: SocketAddr,
-    _worker: Rc<Worker>,
+    worker: Rc<Worker>,
     path: PathBuf,
     directory: PathBuf,
 }
@@ -88,7 +88,7 @@ async fn recording(test: &str, mut config: Config) -> Recording {
     let (front, worker) = serving_swept(compile(&config).unwrap()).await;
     Recording {
         front,
-        _worker: worker,
+        worker,
         path,
         directory,
     }
@@ -346,7 +346,7 @@ async fn recording_h3(test: &str, mut config: Config) -> Recording {
     let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone).unwrap());
     Recording {
         front,
-        _worker: worker,
+        worker,
         path,
         directory,
     }
@@ -578,6 +578,349 @@ async fn an_http3_head_too_large_is_logged() {
             assert_eq!(record["protocol"], "3");
             assert!(record["peer"].as_str().unwrap().starts_with("127.0.0.1:"));
             assert!(record.get("path").is_none(), "{record}");
+        })
+        .await;
+}
+
+/// A worker serving the config `yaml` makes of where to log, its one listener's settings
+/// to add, swept as [`recording`]'s is: for a `tcp` or `tls` listener's.
+async fn recording_yaml(test: &str, yaml: impl FnOnce(&str) -> String) -> Recording {
+    let directory = scratch(test);
+    let path = directory.join("access.log");
+    let logs = format!(", access_log: {{ file: '{}' }}", path.display());
+    let config: Config = serde_saphyr::from_str(&yaml(&logs)).unwrap();
+    let (front, worker) = serving_swept(compile(&config).unwrap()).await;
+    Recording {
+        front,
+        worker,
+        path,
+        directory,
+    }
+}
+
+/// A plaintext WebSocket backend: a 101 with the Accept of the key it was sent, then, for
+/// each eight-byte frame that comes, a text frame `hello` for a text frame and a Close of
+/// its own for a Close; once its client has finished, it finishes too.
+async fn talking_websocket_backend() -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    let _accepting = tokio::task::spawn_local(async move {
+        while let Ok((mut stream, _)) = socket.accept().await {
+            let _serving = tokio::task::spawn_local(async move {
+                let mut head = Vec::new();
+                let mut byte = [0; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => head.push(byte[0]),
+                    }
+                }
+                let head = String::from_utf8(head).unwrap();
+                let key = head
+                    .split("\r\n")
+                    .find_map(|line| line.strip_prefix("sec-websocket-key: "))
+                    .and_then(|key| Key::read(key.as_bytes()))
+                    .unwrap();
+                let accept = String::from_utf8(key.accept().to_vec()).unwrap();
+                let switched = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\
+                         connection: upgrade\r\nsec-websocket-accept: {accept}\r\n\r\n"
+                );
+                stream.write_all(switched.as_bytes()).await.unwrap();
+                let mut frame = [0; 8];
+                while stream.read_exact(&mut frame).await.is_ok() {
+                    let answer: &[u8] = match frame[0] {
+                        0x81 => b"\x81\x05hello",
+                        // 1000, "Normal Closure", as a server answers a Close.
+                        0x88 => &[0x88, 0x02, 0x03, 0xe8],
+                        _ => &[],
+                    };
+                    let _ = stream.write_all(answer).await;
+                }
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    address
+}
+
+/// A client's text frame `hi`, masked as a client's must be, with a mask of zeros.
+const HI: [u8; 8] = [0x81, 0x82, 0, 0, 0, 0, b'h', b'i'];
+
+/// A WebSocket's handshake to `front` for `/chat`, read up to the end of its 101's head.
+async fn websocket_to(front: SocketAddr) -> TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut client = TcpStream::connect(front).await.unwrap();
+    client
+        .write_all(
+            b"GET /chat HTTP/1.1\r\nhost: a.test\r\nupgrade: websocket\r\n\
+                  connection: upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                  sec-websocket-version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        within(client.read_exact(&mut byte)).await.unwrap();
+        head.push(byte[0]);
+    }
+    assert!(head.starts_with(b"HTTP/1.1 101 "));
+    client
+}
+
+/// A WebSocket has two records (08 §2): the handshake's, once its 101 has gone and while
+/// the tunnel is still open, and the tunnel's, when it ends, with how it ended, what it
+/// carried each way and how long it lasted.
+#[tokio::test]
+async fn a_websocket_is_logged_when_it_opens_and_when_it_closes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let upstream = talking_websocket_backend().await;
+            let logged = recording("websocket", everything_config(upstream)).await;
+            let mut client = websocket_to(logged.front).await;
+            client.write_all(&HI).await.unwrap();
+            let mut hello = [0; 7];
+            within(client.read_exact(&mut hello)).await.unwrap();
+            assert_eq!(&hello, b"\x81\x05hello");
+
+            let opened = &logged.records(1).await[0];
+            assert_eq!(opened["kind"], "websocket_open", "{opened}");
+            assert_eq!(opened["status"], 101);
+            assert_eq!(opened["method"], "GET");
+            assert_eq!(opened["path"], "/chat");
+            assert_eq!(opened["route"], "everything");
+            assert_eq!(opened["upstream"], "up");
+            assert_eq!(opened["endpoint"], upstream.to_string());
+            assert_eq!(opened["bytes_in"], 0);
+            assert_eq!(opened["bytes_out"], 0);
+            assert!(opened.get("reason").is_none(), "{opened}");
+
+            client.shutdown().await.unwrap();
+            let mut rest = Vec::new();
+            within(client.read_to_end(&mut rest)).await.unwrap();
+            let records = logged.records(2).await;
+            let closed = &records[1];
+            assert_eq!(closed["kind"], "websocket_close", "{closed}");
+            assert_eq!(closed["status"], 101);
+            assert_eq!(closed["reason"], "closed");
+            assert_eq!(closed["bytes_in"], HI.len());
+            assert_eq!(closed["bytes_out"], hello.len());
+            assert_eq!(closed["path"], "/chat");
+            assert_eq!(closed["endpoint"], upstream.to_string());
+            assert!(closed["duration_ms"].as_f64().is_some(), "{closed}");
+            assert_eq!(records.len(), 2, "{records:?}");
+        })
+        .await;
+}
+
+/// A WebSocket a draining worker closes says so, and counts only what it carried: not the
+/// Close frames the gateway sent each way, nor the answers to them it took (19 §6).
+#[tokio::test]
+async fn a_drained_websocket_counts_only_what_it_carried() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let upstream = talking_websocket_backend().await;
+            let logged = recording("drained-websocket", everything_config(upstream)).await;
+            let mut client = websocket_to(logged.front).await;
+            client.write_all(&HI).await.unwrap();
+            let mut hello = [0; 7];
+            within(client.read_exact(&mut hello)).await.unwrap();
+
+            logged.worker.drain();
+            let mut close = [0; 4];
+            within(client.read_exact(&mut close)).await.unwrap();
+            assert_eq!(close, [0x88, 0x02, 0x03, 0xe9], "not a Close 1001");
+            client
+                .write_all(&[0x88, 0x82, 0, 0, 0, 0, 0x03, 0xe9])
+                .await
+                .unwrap();
+            let mut rest = Vec::new();
+            let _closed = within(client.read_to_end(&mut rest)).await;
+            let records = logged.records(2).await;
+            let closed = &records[1];
+            assert_eq!(closed["kind"], "websocket_close", "{closed}");
+            assert_eq!(closed["reason"], "drained");
+            assert_eq!(closed["bytes_in"], HI.len());
+            assert_eq!(closed["bytes_out"], hello.len());
+        })
+        .await;
+}
+
+/// The same over HTTP/2, as an extended CONNECT: its handshake's record, once its 200 has
+/// gone, and its tunnel's when the client ends its stream.
+#[tokio::test]
+async fn an_http2_websocket_is_logged_when_it_opens_and_when_it_closes() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let upstream = talking_websocket_backend().await;
+            let logged = recording("h2-websocket", everything_config(upstream)).await;
+            let stream = TcpStream::connect(logged.front).await.unwrap();
+            let (send, connection) = ::h2::client::handshake(stream).await.unwrap();
+            let _driving = tokio::task::spawn_local(async move {
+                let _ended = connection.await;
+            });
+            let mut send = within(send.ready()).await.unwrap();
+            until(|| send.is_extended_connect_protocol_enabled()).await;
+            let mut request = Request::builder()
+                .method(Method::CONNECT)
+                .uri("http://a.test/chat")
+                .header("sec-websocket-version", "13")
+                .body(())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(::h2::ext::Protocol::from_static("websocket"));
+            let (response, mut stream) = send.send_request(request, false).unwrap();
+            let response = within(response).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body();
+            stream.send_data(Bytes::from_static(&HI), false).unwrap();
+            let mut heard = Vec::new();
+            while heard.len() < 7 {
+                let data = within(body.data()).await.unwrap().unwrap();
+                let _released = body.flow_control().release_capacity(data.len());
+                heard.extend_from_slice(&data);
+            }
+            assert_eq!(heard, b"\x81\x05hello");
+
+            let opened = &logged.records(1).await[0];
+            assert_eq!(opened["kind"], "websocket_open", "{opened}");
+            assert_eq!(opened["protocol"], "2");
+            assert_eq!(opened["status"], 200);
+            assert_eq!(opened["method"], "CONNECT");
+
+            stream.send_data(Bytes::new(), true).unwrap();
+            while let Some(data) = within(body.data()).await {
+                if data.is_err() {
+                    break;
+                }
+            }
+            let records = logged.records(2).await;
+            let closed = &records[1];
+            assert_eq!(closed["kind"], "websocket_close", "{closed}");
+            assert_eq!(closed["reason"], "closed");
+            assert_eq!(closed["bytes_in"], HI.len());
+            assert_eq!(closed["bytes_out"], heard.len());
+        })
+        .await;
+}
+
+/// A `tcp` listener's connection has one record, at its end: who it came from, where it
+/// went, how it ended, and what it carried each way. No HTTP status: it had none.
+#[tokio::test]
+async fn a_tcp_connection_is_logged_at_its_end() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = tallying_backend().await;
+            let logged = recording_yaml("tcp", |logs| tcp_to(backend, logs)).await;
+            let mut client = TcpStream::connect(logged.front).await.unwrap();
+            let sent = vec![7_u8; 100_000];
+            client.write_all(&sent).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut answer = String::new();
+            within(client.read_to_string(&mut answer)).await.unwrap();
+            assert_eq!(answer, format!("{} {}", sent.len(), 7 * sent.len()));
+            let records = logged.records(1).await;
+            let record = &records[0];
+            assert_eq!(record["kind"], "connection");
+            assert_eq!(record["listener"], "db");
+            assert_eq!(record["client"], "127.0.0.1");
+            assert_eq!(
+                record["peer"],
+                client.local_addr().unwrap().to_string(),
+                "{record}"
+            );
+            assert_eq!(record["reason"], "closed");
+            assert_eq!(record["route"], "db");
+            assert_eq!(record["upstream"], "up");
+            assert_eq!(record["endpoint"], backend.to_string());
+            assert_eq!(record["bytes_in"], sent.len());
+            assert_eq!(record["bytes_out"], answer.len());
+            assert!(record["duration_ms"].as_f64().is_some(), "{record}");
+            for none in ["status", "protocol", "method", "host", "path", "tries"] {
+                assert!(record.get(none).is_none(), "{none}: {record}");
+            }
+        })
+        .await;
+}
+
+/// The PROXY header a backend is told of the client is the gateway's, not the client's,
+/// and is not counted among what the client sent (20 §4).
+#[tokio::test]
+async fn a_proxy_header_to_the_backend_is_not_counted_as_the_clients() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = tallying_backend().await;
+            let logged =
+                recording_yaml("tcp-told", |logs| sending(&tcp_to(backend, logs), "v1")).await;
+            let mut client = TcpStream::connect(logged.front).await.unwrap();
+            client.write_all(b"ping").await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut answer = String::new();
+            within(client.read_to_string(&mut answer)).await.unwrap();
+            // The backend counted the header as well.
+            let came: usize = answer.split(' ').next().unwrap().parse().unwrap();
+            assert!(came > 4, "{answer}");
+            let records = logged.records(1).await;
+            assert_eq!(records[0]["bytes_in"], 4, "{}", records[0]);
+        })
+        .await;
+}
+
+/// A `tls` listener's connection is logged with the name its ClientHello asked for as its
+/// host; one that no route has a name for is logged too, refused, with nowhere it went.
+#[tokio::test]
+async fn a_tls_connection_is_logged_with_the_name_it_asked_for() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let exact = tls_backend("exact").await;
+            let logged = recording_yaml("tls", |logs| {
+                format!(
+                    "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls, proxy_protocol: off{logs} }} }}\n\
+                         routes: []\n\
+                         tls_routes:\n\
+                         \x20 - {{ name: exact, listeners: [sni], hostnames: [{{ name: api.example.test, falls_through: true }}], backends: [{{ upstream: exact, weight: 1 }}] }}\n\
+                         upstreams: {{ exact: {{ load_balancer: p2c, endpoints: [\"{exact}\"] }} }}\n"
+                )
+            })
+            .await;
+            assert_eq!(
+                told_over_tls(logged.front, Some("api.example.test"))
+                    .await
+                    .as_deref(),
+                Some("exact")
+            );
+            let carried = &logged.records(1).await[0];
+            assert_eq!(carried["kind"], "connection");
+            assert_eq!(carried["host"], "api.example.test", "{carried}");
+            assert_eq!(carried["reason"], "closed");
+            assert_eq!(carried["route"], "exact");
+            assert_eq!(carried["upstream"], "exact");
+            assert_eq!(carried["endpoint"], exact.to_string());
+            assert!(carried["bytes_in"].as_u64().unwrap() > 0, "{carried}");
+            assert!(carried["bytes_out"].as_u64().unwrap() > 0, "{carried}");
+
+            assert_eq!(told_over_tls(logged.front, Some("elsewhere.test")).await, None);
+            let refused = &logged.records(2).await[1];
+            assert_eq!(refused["host"], "elsewhere.test", "{refused}");
+            assert_eq!(refused["reason"], "refused");
+            assert_eq!(refused["bytes_in"], 0);
+            assert_eq!(refused["bytes_out"], 0);
+            for none in ["route", "upstream", "endpoint"] {
+                assert!(refused.get(none).is_none(), "{none}: {refused}");
+            }
         })
         .await;
 }
