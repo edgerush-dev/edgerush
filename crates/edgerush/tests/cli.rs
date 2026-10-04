@@ -286,6 +286,49 @@ fn more_than_one_worker_does_not_start_where_a_port_cannot_be_shared() -> io::Re
     Ok(())
 }
 
+#[test]
+fn explain_says_where_a_request_goes_and_exits_0_or_2() -> io::Result<()> {
+    let file = scratch("explain.yaml");
+    std::fs::write(&file, config("127.0.0.1:1", "up", None))?;
+    let request = [
+        "--client",
+        "203.0.113.7",
+        "--protocol",
+        "1.1",
+        "--method",
+        "GET",
+        "--url",
+        "http://shop.example.com/cart",
+    ];
+    let explained = |listener: &str| {
+        let mut args = vec!["explain", "--config", &file, "--listener", listener];
+        args.extend(request);
+        edgerush(&args)
+    };
+
+    let output = explained("web")?;
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("web (http)  GET http://shop.example.com/cart  HTTP/1.1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\n→ everything rule 0 match 0  chosen\n"),
+        "{stdout}"
+    );
+    assert!(output.stderr.is_empty());
+
+    let output = explained("nowhere")?;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: there is no listener nowhere\n"
+    );
+    Ok(())
+}
+
 /// A path for a file of the test's own, as text for the command line.
 fn scratch(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);

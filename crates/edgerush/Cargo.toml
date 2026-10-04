@@ -14,6 +14,8 @@ interop = ["edgerush-proxy/interop"]
 [dependencies]
 edgerush-config.workspace = true
 edgerush-proxy.workspace = true
+edgerush-router.workspace = true
+http.workspace = true
 serde-saphyr.workspace = true
 socket2.workspace = true
 thiserror.workspace = true

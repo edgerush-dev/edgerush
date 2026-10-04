@@ -137,6 +137,13 @@ pub enum Rejection {
 }
 
 impl Rejection {
+    /// What the metrics and the access log call the answer the gateway gives for it
+    /// (`no_route`, `bad_host`, …).
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        crate::metrics::Answer::from(*self).label()
+    }
+
     /// The status to answer with: 400 for a request that cannot be read in one way only,
     /// 404 for one that no rule is for, and 500 for a rule with nowhere to send it, as
     /// Gateway API asks.
@@ -626,6 +633,20 @@ upstreams:
                 .clone()
         });
         (upstream, given)
+    }
+
+    #[test]
+    fn a_rejection_is_named_as_the_metrics_name_its_answer() {
+        let named = [
+            (Rejection::Host(HostError::Missing), "bad_host"),
+            (Rejection::Path(NormaliseError::Backslash), "bad_path"),
+            (Rejection::NoRoute, "no_route"),
+            (Rejection::NoBackend, "no_backend"),
+            (Rejection::Protocol, "unknown_protocol"),
+        ];
+        for (rejection, name) in named {
+            assert_eq!(rejection.reason(), name, "{rejection:?}");
+        }
     }
 
     #[test]

@@ -1,12 +1,14 @@
 //! The EdgeRush binary.
 //!
 //! One executable will carry every role (operator, control plane, data plane) as
-//! subcommands. So far there is one: `proxy`, a data plane run from a config file — the
-//! development harness.
+//! subcommands. So far: `proxy`, a data plane run from a config file — the development
+//! harness — and `explain`, which says where a request would go and why.
 
+mod asked;
 mod bind;
 mod config_file;
 mod essential;
+mod explain;
 mod harness;
 mod limits;
 mod per_core;
@@ -21,7 +23,8 @@ const USAGE: &str = "\
 Usage: edgerush [OPTIONS] [COMMAND]
 
 Commands:
-  proxy  Run a data plane from a config file, without Kubernetes (development harness)
+  proxy    Run a data plane from a config file, without Kubernetes (development harness)
+  explain  Say where a request to a listener goes, and why no other match took it
 
 Options:
   -V, --version  Print version
@@ -50,6 +53,7 @@ fn run(
         None | Some("-h" | "--help") => write!(stdout, "{USAGE}").map(|()| 0),
         Some("-V" | "--version") => writeln!(stdout, "{VERSION}").map(|()| 0),
         Some("proxy") => return harness::command(args, stdout, stderr),
+        Some("explain") => return explain::command(args, stdout, stderr),
         Some(other) => {
             write!(stderr, "error: unexpected argument '{other}'\n\n{USAGE}").map(|()| EXIT_USAGE)
         }

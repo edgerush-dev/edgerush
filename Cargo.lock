@@ -209,6 +209,8 @@ version = "0.0.0"
 dependencies = [
  "edgerush-config",
  "edgerush-proxy",
+ "edgerush-router",
+ "http",
  "proptest",
  "rustix",
  "serde-saphyr",

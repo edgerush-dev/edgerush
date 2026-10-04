@@ -148,6 +148,13 @@ pub trait Head {
     fn version(&self) -> Version;
 }
 
+/// Has a map head ask for `protocol` as an extended CONNECT does (`:protocol`), as our
+/// HTTP/2 and HTTP/3 servers hand such a head over: for heads made elsewhere, as
+/// `edgerush explain` makes one.
+pub fn set_protocol(parts: &mut Parts, protocol: &str) {
+    parts.extensions.insert(::h2::ext::Protocol::from(protocol));
+}
+
 impl Head for Parts {
     type Fields<'a> = &'a HeaderMap;
 

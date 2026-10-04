@@ -10,7 +10,10 @@
 //! trusted: they are coarse on some file systems and a restored file brings its old one
 //! along.
 
-use edgerush_config::{Certificate, CertificateFiles, Compiled, ConfigError, HarnessFile, compile};
+use edgerush_config::{
+    Certificate, CertificateFiles, Compiled, Config, ConfigError, HarnessFile, Matches, compile,
+    compile_with_matches,
+};
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
@@ -104,13 +107,9 @@ fn directory(path: &Path) -> &Path {
 /// look to compare with. What compiles is what was read: a file that changes after is
 /// another change.
 fn compiled(yaml: &[u8], directory: &Path) -> (Vec<Seen>, Result<Compiled, Rejected>) {
-    // Without the lines around a mistake, which the parser quotes by default: what a
-    // rejection says goes to the log, and a key pasted into the file would go with it. The
-    // fuzz target `config` reads with these same options: change both.
-    let options = serde_saphyr::options! { with_snippet: false };
-    let file: HarnessFile = match serde_saphyr::from_slice_with_options(yaml, options) {
+    let file = match parsed(yaml) {
         Ok(file) => file,
-        Err(error) => return (Vec::new(), Err(Rejected::Parse(Box::new(error)))),
+        Err(rejected) => return (Vec::new(), Err(rejected)),
     };
     let (seen, certificates) = certificates(&file.certificates, directory);
     let outcome = certificates.and_then(|certificates| {
@@ -118,6 +117,40 @@ fn compiled(yaml: &[u8], directory: &Path) -> (Vec<Seen>, Result<Compiled, Rejec
         compile(&config).map_err(|problems| Rejected::Invalid(Problems(problems)))
     });
     (seen, outcome)
+}
+
+/// The file `yaml` states.
+fn parsed(yaml: &[u8]) -> Result<HarnessFile, Rejected> {
+    // Without the lines around a mistake, which the parser quotes by default: what a
+    // rejection says goes to the log, and a key pasted into the file would go with it. The
+    // fuzz target `config` reads with these same options: change both.
+    let options = serde_saphyr::options! { with_snippet: false };
+    serde_saphyr::from_slice_with_options(yaml, options)
+        .map_err(|error| Rejected::Parse(Box::new(error)))
+}
+
+/// The config at `path` as `edgerush explain` and `edgerush test` read it: compiled as the
+/// harness compiles it, with every listener's matches kept, and its certificates known by
+/// name alone. No certificate file is opened, so a config can be explained where its keys
+/// are not ([22 §3](../../../docs/22-explain-and-test.md)).
+pub(crate) fn offline(path: &Path) -> Result<(Config, Compiled, Matches), Rejected> {
+    let yaml = fs::read(path).map_err(Rejected::Read)?;
+    let file = parsed(&yaml)?;
+    let named = file
+        .certificates
+        .keys()
+        .map(|name| {
+            let unread = Certificate {
+                chain: String::new(),
+                key: String::new(),
+            };
+            (name.clone(), unread)
+        })
+        .collect();
+    let config = file.into_config(named);
+    let (compiled, matches) =
+        compile_with_matches(&config).map_err(|problems| Rejected::Invalid(Problems(problems)))?;
+    Ok((config, compiled, matches))
 }
 
 /// Reads each certificate from the files `named` for it, relative to `directory`; and says

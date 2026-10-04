@@ -86,6 +86,13 @@ than defaulted, as the control plane will state them. `bench/proxy.yaml` and
 `edgerush proxy --help` lists the options. A worker runs on every CPU, which shares each
 port between them; Windows cannot, so there add `--workers 1`.
 
+`edgerush explain` says where a request to a listener would go and why no other match took
+it, from the same file and without running anything:
+
+```sh
+./target/release/edgerush explain --config edgerush.yaml --listener web     --client 203.0.113.7 --protocol 1.1 --method GET --url http://localhost/
+```
+
 ## Building
 
 The Rust toolchain is pinned in `rust-toolchain.toml`; `rustup` installs it on first use.
@@ -156,7 +163,8 @@ outside the workspace, the package is formatted on its own:
 
 ```
 crates/edgerush    the binary (operator, control plane and data plane will be subcommands); so far
-                   `edgerush proxy --config file.yaml`, a data plane run from a file for development
+                   `edgerush proxy --config file.yaml`, a data plane run from a file for development,
+                   and `edgerush explain`, where a request would go and why
 crates/config      the config model and its compilation (`edgerush-config`): pure, format-free
 crates/filters     built-in filters (`edgerush-filters`): pure, on plain `http` types
 crates/proxy       the data plane (`edgerush-proxy`): listeners, TLS, our HTTP/1 server and client,
