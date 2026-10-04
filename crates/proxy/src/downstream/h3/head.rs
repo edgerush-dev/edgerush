@@ -121,6 +121,18 @@ pub fn request<F: NameValue>(fields: &[F], limit: usize) -> Result<RequestHead, 
                 .ok_or(Refused::Malformed("a `:protocol` that is not a token"))
         })
         .transpose()?;
+    // A host is said once at most, and the same by `Host` as by `:authority` where both
+    // say one: on every request, a CONNECT's as well.
+    let mut hosts = headers.get_all(HOST).iter();
+    let host = hosts.next();
+    if hosts.next().is_some() {
+        return Err(Refused::Malformed("`Host` twice"));
+    }
+    if let (Some(authority), Some(host)) = (&authority, host)
+        && authority.as_str().as_bytes() != host.as_bytes()
+    {
+        return Err(Refused::Malformed("a `Host` other than `:authority`"));
+    }
     let uri = if method == Method::CONNECT && protocol.is_none() {
         // RFC 9114 §4.4: the authority to connect to, and neither a scheme nor a path.
         if scheme.is_some() || path.is_some() {
@@ -139,18 +151,9 @@ pub fn request<F: NameValue>(fields: &[F], limit: usize) -> Result<RequestHead, 
         }
         let path = PathAndQuery::try_from(path)
             .map_err(|_| Refused::Malformed("a `:path` that is not a path"))?;
-        // A scheme with an authority needs one, said by `:authority` or `Host`, and both
-        // the same where both are said.
+        // A scheme with an authority needs one, said by `:authority` or `Host`.
         let hosted = scheme == Scheme::HTTP || scheme == Scheme::HTTPS;
-        let mut hosts = headers.get_all(HOST).iter();
-        let host = hosts.next();
-        if hosts.next().is_some() {
-            return Err(Refused::Malformed("`Host` twice"));
-        }
         match (&authority, host) {
-            (Some(authority), Some(host)) if authority.as_str().as_bytes() != host.as_bytes() => {
-                return Err(Refused::Malformed("a `Host` other than `:authority`"));
-            }
             (None, None) if hosted => {
                 return Err(Refused::Malformed("neither `:authority` nor `Host`"));
             }
@@ -627,6 +630,26 @@ mod tests {
         .unwrap();
         assert_eq!(head.parts.method, Method::CONNECT);
         assert_eq!(head.parts.uri.authority().unwrap(), "a.test:443");
+    }
+
+    /// A CONNECT's `Host` is held to its `:authority` as any request's is: found by the
+    /// fuzz target.
+    #[test]
+    fn a_connect_says_its_host_once_and_as_its_authority() {
+        let connect = |more: &[(&'static str, &'static str)]| {
+            let mut pairs = vec![(":method", "CONNECT"), (":authority", "a.test:443")];
+            pairs.extend_from_slice(more);
+            pairs
+        };
+        request(&fields(&connect(&[("host", "a.test:443")])), LIMIT).unwrap();
+        assert_eq!(
+            refused(&connect(&[("host", "b.test")])),
+            "a `Host` other than `:authority`"
+        );
+        assert_eq!(
+            refused(&connect(&[("host", "a.test:443"), ("host", "a.test:443")])),
+            "`Host` twice"
+        );
     }
 
     /// Measured as RFC 9114 §4.2.2 measures it: every field's name and value, and 32 more.
