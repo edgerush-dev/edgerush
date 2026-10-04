@@ -187,6 +187,28 @@ pub fn decide<'a, H: Head>(
     random: &mut impl FnMut() -> u64,
     id: Option<&HeaderValue>,
 ) -> Result<Decision<'a>, Rejection> {
+    decide_routed(snapshot, listener, head, client, random, id, |request| {
+        listener.router.route(request).copied()
+    })
+}
+
+/// [`decide`], with the rule found by `route` from what routing reads of the request, in
+/// place of the listener's router: for `edgerush explain`, which walks every match on the
+/// very request that is routed ([22 §5](../../../docs/22-explain-and-test.md)). `route` is
+/// called once, unless the request is refused before it is routed.
+///
+/// # Errors
+///
+/// As [`decide`].
+pub fn decide_routed<'a, H: Head>(
+    snapshot: &'a Compiled,
+    listener: &CompiledListener,
+    head: &mut H,
+    client: &Client,
+    random: &mut impl FnMut() -> u64,
+    id: Option<&HeaderValue>,
+    route: impl FnOnce(&RequestParts<'_, H::Fields<'_>>) -> Option<RuleId>,
+) -> Result<Decision<'a>, Rejection> {
     let found = head.survey();
     // An extended CONNECT is for WebSocket or for nothing the gateway carries: it cannot be
     // served as a plain request, as an HTTP/1 upgrade can, since without its protocol it
@@ -261,7 +283,7 @@ pub fn decide<'a, H: Head>(
             method: head.method(),
             headers: &fields,
         };
-        *listener.router.route(&request).ok_or(Rejection::NoRoute)?
+        route(&request).ok_or(Rejection::NoRoute)?
     };
     // A router only ever yields rules of the snapshot it was compiled into.
     let rule = snapshot.rule(id).ok_or(Rejection::NoBackend)?;
@@ -571,6 +593,94 @@ upstreams:
 
     fn upstream_for(target: &str, fields: &[(&str, &str)]) -> Result<String, Rejection> {
         decide_on("web", &mut head(target, fields), 0)
+    }
+
+    /// What routing was given: host, path, query, method, and the `Host` and
+    /// `X-Forwarded-For` fields.
+    type Routed = (String, String, String, Method, Vec<String>, Vec<String>);
+
+    /// Decides on `web` with `route` passing on to the router, and says what it was given
+    /// each time it was called; the upstream, or the rejection.
+    fn decide_routed_on(
+        head: &mut Parts,
+        route: impl FnOnce(&RequestParts<'_, &HeaderMap>) -> Option<RuleId>,
+    ) -> (Result<String, Rejection>, Vec<Routed>) {
+        let shop = shop();
+        let web = shop.listeners().iter().find(|l| l.name == "web").unwrap();
+        let mut given = Vec::new();
+        let decided = decide_routed(&shop, web, head, &peer(), &mut || 0, None, |request| {
+            given.push((
+                request.host.to_owned(),
+                request.path.to_owned(),
+                request.query.to_owned(),
+                request.method.clone(),
+                values_of(request.headers, "host"),
+                values_of(request.headers, "x-forwarded-for"),
+            ));
+            route(request)
+        });
+        let upstream = decided.map(|decision| {
+            shop.upstream(forwarding(decision).upstream)
+                .unwrap()
+                .name
+                .clone()
+        });
+        (upstream, given)
+    }
+
+    #[test]
+    fn routing_passed_in_is_given_the_request_as_the_router_is() {
+        let shop = shop();
+        let web = shop.listeners().iter().find(|l| l.name == "web").unwrap();
+        let said = [
+            ("host", "elsewhere.example"),
+            ("x-forwarded-for", "10.0.0.1"),
+            ("x-debug", "1"),
+        ];
+        let target = "http://Shop.Example.com:8080/cart/./x/../items?id=7";
+        let (upstream, given) = decide_routed_on(&mut head(target, &said), |request| {
+            web.router.route(request).copied()
+        });
+        // The host the target names, the Host field made to say the same, the path
+        // normalised, and X-Forwarded-For the gateway's own word: an untrusted peer's is
+        // not passed on.
+        assert_eq!(
+            given,
+            [(
+                "Shop.Example.com".to_owned(),
+                "/cart/items".to_owned(),
+                "id=7".to_owned(),
+                Method::GET,
+                vec!["Shop.Example.com:8080".to_owned()],
+                vec!["203.0.113.7".to_owned()],
+            )]
+        );
+        assert_eq!(upstream, decide_on("web", &mut head(target, &said), 0));
+    }
+
+    #[test]
+    fn the_rule_routing_passed_in_finds_is_the_one_decided() {
+        let search = RuleId { route: 0, rule: 2 };
+        let (upstream, given) =
+            decide_routed_on(&mut head("/cart", &[("host", "shop.example.com")]), |_| {
+                Some(search)
+            });
+        assert_eq!((upstream, given.len()), (Ok("search".to_owned()), 1));
+        let (upstream, _) =
+            decide_routed_on(&mut head("/cart", &[("host", "shop.example.com")]), |_| {
+                None
+            });
+        assert_eq!(upstream, Err(Rejection::NoRoute));
+    }
+
+    #[test]
+    fn a_request_refused_before_it_is_routed_is_never_given_to_routing() {
+        let fields = [("host", "shop.example.com")];
+        let (upstream, given) = decide_routed_on(&mut head("/cart/%2e%2e/admin", &fields), |_| {
+            panic!("routed")
+        });
+        assert!(matches!(upstream, Err(Rejection::Path(_))), "{upstream:?}");
+        assert!(given.is_empty());
     }
 
     /// Every value of `name`, as text.
