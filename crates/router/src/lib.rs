@@ -8,8 +8,10 @@
 //! finds the groups of candidates for a request's host), the path stage (exact, prefix and
 //! regex patterns and their index) and the header, query parameter and method predicates in
 //! Gateway API's order of precedence. [`normalise_path`] is what request paths go through
-//! before they are routed.
+//! before they are routed. [`explain()`] says, for `edgerush explain` and `edgerush test`,
+//! why a request went where it did.
 
+pub mod explain;
 mod hash;
 pub mod header;
 pub mod host;
@@ -25,6 +27,7 @@ pub mod router;
 mod strategies;
 mod whole_regex;
 
+pub use explain::{Considered, Explanation, Failure, Key, Seen, Verdict, Wanted, explain};
 pub use header::{Fields, HeaderPredicate, HeaderPredicateError, HeaderPredicates};
 pub use host::{HostPattern, HostPatternError, WildcardLabels};
 pub use host_index::{HostClaim, HostIndex};

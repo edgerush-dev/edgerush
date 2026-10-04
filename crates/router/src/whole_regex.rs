@@ -39,6 +39,16 @@ impl WholeRegex {
     pub(crate) fn is_match(&self, value: &[u8]) -> bool {
         self.0.is_match(value)
     }
+
+    /// The pattern as it was written. Read back from the compiled form rather than kept
+    /// beside it: only `explain` asks.
+    pub(crate) fn as_str(&self) -> &str {
+        let compiled = self.0.as_str();
+        compiled
+            .strip_prefix("^(?:")
+            .and_then(|pattern| pattern.strip_suffix(")$"))
+            .unwrap_or(compiled)
+    }
 }
 
 fn compile(pattern: &str) -> Result<Regex, RegexError> {
@@ -105,6 +115,13 @@ mod tests {
     fn matching_is_case_sensitive_unless_the_pattern_says_otherwise() {
         assert!(!regex("/shop").is_match(b"/Shop"));
         assert!(regex("(?i)/shop").is_match(b"/SHOP"));
+    }
+
+    #[test]
+    fn the_pattern_reads_back_as_it_was_written() {
+        for pattern in [r"/users/\d+", "/a|/ab", r"^/x$", r"\)$", "(?i)a.*", ""] {
+            assert_eq!(regex(pattern).as_str(), pattern);
+        }
     }
 
     #[test]

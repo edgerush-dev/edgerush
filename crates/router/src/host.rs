@@ -111,6 +111,16 @@ impl HostPattern {
     }
 }
 
+/// The pattern as it is written, in lower case: `example.com`, `*.example.com`.
+impl std::fmt::Display for HostPattern {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            Kind::Exact => formatter.write_str(&self.name),
+            Kind::Wildcard(_) => write!(formatter, "*{}", self.name),
+        }
+    }
+}
+
 /// Checks that `name` is a dot-separated sequence of valid DNS labels.
 fn validate_name(name: &str) -> Result<(), HostPatternError> {
     for label in name.split('.') {
@@ -188,6 +198,16 @@ mod tests {
         assert_eq!(pattern("EXAMPLE.com", One), pattern("example.COM", One));
         assert_eq!(pattern("*.EXAMPLE.com", One), pattern("*.example.com", One));
         assert!(pattern("*.EXAMPLE.com", One).matches("a.example.com"));
+    }
+
+    #[test]
+    fn patterns_are_shown_as_written_in_lower_case() {
+        assert_eq!(pattern("Example.com", One).to_string(), "example.com");
+        assert_eq!(pattern("*.Example.com", One).to_string(), "*.example.com");
+        assert_eq!(
+            pattern("*.example.com", OneOrMore).to_string(),
+            "*.example.com"
+        );
     }
 
     #[test]

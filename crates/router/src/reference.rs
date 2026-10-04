@@ -305,55 +305,67 @@ pub struct RequestSpec {
     pub headers: Vec<(String, String)>,
 }
 
-/// The position of the route that [`Router::route`](crate::Router::route) must find: go
-/// through the groups of equally specific host claims, most specific first; in each, sort
-/// the routes whose path matches by the whole list of precedence — path, a method predicate
-/// before none, the number of header predicates that count, the number of query predicates
-/// that count, the order given — and take the first the request satisfies in full. Whether
-/// route `n`'s path matches is for `path_matches` to say.
+/// Where a route stands among routes on equally specific hosts whose path matches, field by
+/// field in the order they decide; less is first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Precedence {
+    /// The kind of path pattern, and for a prefix its length, the longest first.
+    pub path: (PathKind, Reverse<usize>),
+    /// A method predicate before none.
+    pub method: Reverse<bool>,
+    /// The number of header predicates that count, the most first.
+    pub headers: Reverse<usize>,
+    /// The number of query predicates that count, the most first.
+    pub query: Reverse<usize>,
+    /// The order given.
+    pub position: usize,
+}
+
+/// The precedence of route `position`.
 #[must_use]
-pub fn route(
-    routes: &[RouteSpec],
-    request: &RequestSpec,
-    path_matches: impl Fn(usize) -> bool,
-) -> Option<usize> {
+pub fn precedence(routes: &[RouteSpec], position: usize) -> Precedence {
     let distinct = |names: Vec<String>| {
         let mut names = names;
         names.sort();
         names.dedup();
         names.len()
     };
-    let precedence = |position: usize| {
-        let route = &routes[position];
-        let (path, kind) = &route.path;
-        let prefix_length = match kind {
-            PathKind::Prefix => path.strip_suffix('/').unwrap_or(path).len(),
-            PathKind::Exact | PathKind::Regex => 0,
-        };
-        let headers = route
-            .headers
-            .iter()
-            .map(|(name, _)| name.to_ascii_lowercase());
-        let query = route.query.iter().map(|(name, _)| name.clone());
-        (
-            *kind,
-            Reverse(prefix_length),
-            Reverse(route.method.is_some()),
-            Reverse(distinct(headers.collect())),
-            Reverse(distinct(query.collect())),
-            position,
-        )
+    let route = &routes[position];
+    let (path, kind) = &route.path;
+    let prefix_length = match kind {
+        PathKind::Prefix => path.strip_suffix('/').unwrap_or(path).len(),
+        PathKind::Exact | PathKind::Regex => 0,
     };
-    let serves = |position: usize| {
-        let route = &routes[position];
-        route
-            .method
-            .as_ref()
-            .is_none_or(|method| *method == request.method)
-            && exact_headers_match(&route.headers, &request.headers)
-            && exact_query_matches(&route.query, &request.query)
-    };
+    let headers = route
+        .headers
+        .iter()
+        .map(|(name, _)| name.to_ascii_lowercase());
+    let query = route.query.iter().map(|(name, _)| name.clone());
+    Precedence {
+        path: (*kind, Reverse(prefix_length)),
+        method: Reverse(route.method.is_some()),
+        headers: Reverse(distinct(headers.collect())),
+        query: Reverse(distinct(query.collect())),
+        position,
+    }
+}
 
+/// Whether the request satisfies the route's method, header and query predicates.
+#[must_use]
+pub fn serves(route: &RouteSpec, request: &RequestSpec) -> bool {
+    route
+        .method
+        .as_ref()
+        .is_none_or(|method| *method == request.method)
+        && exact_headers_match(&route.headers, &request.headers)
+        && exact_query_matches(&route.query, &request.query)
+}
+
+/// For every route, the first of the groups [`host_candidates`] gives for `host` that one
+/// of its claims is in, counted from the most specific; `None` for a route that is no
+/// candidate for the host.
+#[must_use]
+pub fn host_groups(routes: &[RouteSpec], host: &str) -> Vec<Option<usize>> {
     // Every host claim of every route, and whose it is.
     let (owners, claims): (Vec<usize>, Vec<HostClaimSpec>) = routes
         .iter()
@@ -365,12 +377,33 @@ pub fn route(
                 .map(move |claim| (position, claim.clone()))
         })
         .unzip();
-    host_candidates(&claims, &request.host)
+    let mut groups = vec![None; routes.len()];
+    for (at, group) in host_candidates(&claims, host).into_iter().enumerate() {
+        for claim in group {
+            groups[owners[claim]].get_or_insert(at);
+        }
+    }
+    groups
+}
+
+/// The position of the route that [`Router::route`](crate::Router::route) must find: go
+/// through the groups of equally specific host claims, most specific first; in each, sort
+/// the routes whose path matches by their [`precedence`] and take the first the request
+/// satisfies in full. Whether route `n`'s path matches is for `path_matches` to say.
+#[must_use]
+pub fn route(
+    routes: &[RouteSpec],
+    request: &RequestSpec,
+    path_matches: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let groups = host_groups(routes, &request.host);
+    // A route in several groups is first tried in the first of them, and what it fails
+    // there it fails everywhere.
+    let mut candidates: Vec<usize> = (0..routes.len())
+        .filter(|&position| groups[position].is_some() && path_matches(position))
+        .collect();
+    candidates.sort_by_key(|&position| (groups[position], precedence(routes, position)));
+    candidates
         .into_iter()
-        .find_map(|group| {
-            let mut members: Vec<usize> = group.into_iter().map(|claim| owners[claim]).collect();
-            members.retain(|&position| path_matches(position));
-            members.sort_by_key(|&position| precedence(position));
-            members.into_iter().find(|&position| serves(position))
-        })
+        .find(|&position| serves(&routes[position], request))
 }

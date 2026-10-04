@@ -113,6 +113,12 @@ impl PathPattern {
         matches!(self.kind, Kind::Prefix)
     }
 
+    /// Whether this is a regular expression.
+    #[must_use]
+    pub fn is_regex(&self) -> bool {
+        matches!(self.kind, Kind::Regex(_))
+    }
+
     /// Whether the request path falls under this pattern.
     ///
     /// `path` is the normalised path alone, without the query string. Anything that does
@@ -251,6 +257,14 @@ mod tests {
     #[test]
     fn exact_and_prefix_patterns_on_one_path_differ() {
         assert_ne!(exact("/shop"), prefix("/shop"));
+    }
+
+    #[test]
+    fn each_kind_says_what_it_is() {
+        let regex = PathPattern::regex("/shop").unwrap();
+        assert!(prefix("/shop").is_prefix() && !prefix("/shop").is_regex());
+        assert!(regex.is_regex() && !regex.is_prefix());
+        assert!(!exact("/shop").is_regex() && !exact("/shop").is_prefix());
     }
 
     #[test]

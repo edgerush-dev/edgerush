@@ -14,6 +14,7 @@
 //! The query is only read here, never rewritten: it is forwarded as it came.
 
 use crate::RegexError;
+use crate::explain::{Seen, Wanted};
 use crate::normalise::hex_value;
 use crate::whole_regex::WholeRegex;
 use std::borrow::Cow;
@@ -58,6 +59,35 @@ impl QueryPredicate {
             name: parse_name(name)?,
             value: ValueMatch::Regex(WholeRegex::new(pattern)?),
         })
+    }
+
+    /// The parameter it is about, as its decoded name must read.
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    /// What the parameter's decoded value must be.
+    #[must_use]
+    pub fn wanted(&self) -> Wanted<'_> {
+        match &self.value {
+            ValueMatch::Exact(value) => Wanted::Exact(value),
+            ValueMatch::Regex(regex) => Wanted::Regex(regex.as_str()),
+        }
+    }
+
+    /// The value this predicate judges the query by: its first occurrence's, decoded.
+    pub(crate) fn seen(&self, query: &str) -> Seen {
+        // Found as `matches` finds it. Not shared with it: as a function of its own, called
+        // from `matches`, the search cost a match 12–15% more instructions.
+        let first = pairs(query).find(|(name, _)| decoded_equals(name, &self.name) == Some(true));
+        match first {
+            None => Seen::Absent,
+            Some((_, value)) => match decoded(value).collect() {
+                Some(decoded) => Seen::Value(decoded),
+                None => Seen::Undecodable(value.to_vec()),
+            },
+        }
     }
 
     /// Whether the query string (without its `?`) satisfies this predicate. Allocates only
@@ -175,6 +205,11 @@ impl QueryPredicates {
     #[must_use]
     pub fn matches(&self, query: &str) -> bool {
         self.0.iter().all(|predicate| predicate.matches(query))
+    }
+
+    /// The predicates that count, in the order they are checked.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &QueryPredicate> {
+        self.0.iter()
     }
 }
 

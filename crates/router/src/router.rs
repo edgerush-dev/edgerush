@@ -158,45 +158,10 @@ impl<T> Router<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WildcardLabels;
     use crate::reference::{self, PathKind, RequestSpec, RouteSpec};
-    use crate::{HeaderPredicate, HostPattern, QueryPredicate, WildcardLabels};
-    use http::header::{HeaderName, HeaderValue};
+    use crate::strategies::{compile, get, header_map, on, pairs, request_spec, route_spec};
     use proptest::prelude::*;
-
-    fn compile(spec: &RouteSpec, value: usize) -> RouteMatch<usize> {
-        let (path, kind) = &spec.path;
-        RouteMatch {
-            hosts: spec
-                .hosts
-                .iter()
-                .map(|(pattern, falls_through)| HostClaim {
-                    pattern: pattern
-                        .as_ref()
-                        .map(|(text, wildcard)| HostPattern::parse(text, *wildcard).unwrap()),
-                    falls_through: *falls_through,
-                    value: (),
-                })
-                .collect(),
-            path: match kind {
-                PathKind::Exact => PathPattern::exact(path),
-                PathKind::Regex => PathPattern::regex(path),
-                PathKind::Prefix => PathPattern::prefix(path),
-            }
-            .unwrap(),
-            method: spec.method.as_ref().map(|method| method.parse().unwrap()),
-            headers: HeaderPredicates::new(
-                spec.headers
-                    .iter()
-                    .map(|(name, value)| HeaderPredicate::exact(name, value).unwrap()),
-            ),
-            query: QueryPredicates::new(
-                spec.query
-                    .iter()
-                    .map(|(name, value)| QueryPredicate::exact(name, value).unwrap()),
-            ),
-            value,
-        }
-    }
 
     /// Routes the request both ways and checks that they agree, so that every example below
     /// is also an example for the reference.
@@ -211,13 +176,7 @@ mod tests {
         });
 
         let method: Method = request.method.parse().unwrap();
-        let mut headers = HeaderMap::new();
-        for (name, value) in &request.headers {
-            headers.append(
-                HeaderName::from_bytes(name.as_bytes()).unwrap(),
-                HeaderValue::from_str(value).unwrap(),
-            );
-        }
+        let headers = header_map(&request.headers);
         let routed = Router::new(matches)
             .route(&RequestParts {
                 host: &request.host,
@@ -229,36 +188,6 @@ mod tests {
             .copied();
         assert_eq!(routed, expected, "router and reference disagree");
         routed
-    }
-
-    fn on(host: &str, kind: PathKind, path: &str) -> RouteSpec {
-        RouteSpec {
-            hosts: vec![(
-                (host != "*").then(|| (host.to_owned(), WildcardLabels::OneOrMore)),
-                true,
-            )],
-            path: (path.to_owned(), kind),
-            method: None,
-            headers: Vec::new(),
-            query: Vec::new(),
-        }
-    }
-
-    fn pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-            .collect()
-    }
-
-    fn get(host: &str, path: &str) -> RequestSpec {
-        RequestSpec {
-            host: host.to_owned(),
-            path: path.to_owned(),
-            query: String::new(),
-            method: "GET".to_owned(),
-            headers: Vec::new(),
-        }
     }
 
     #[test]
@@ -385,85 +314,6 @@ mod tests {
         let mut spec = on("example.com", PathKind::Prefix, "/");
         spec.hosts.clear();
         assert_eq!(route(&[spec], &get("example.com", "/")), None);
-    }
-
-    /// Routes and requests over a handful of hosts, paths, headers and parameters, so that
-    /// most requests have several routes to choose from.
-    fn route_spec() -> impl Strategy<Value = RouteSpec> {
-        let host = prop_oneof![
-            1 => Just(None),
-            6 => (
-                prop::sample::select(vec!["a.b", "c.b", "*.b", "*.a.b", "*.c"]),
-                prop::sample::select(vec![WildcardLabels::One, WildcardLabels::OneOrMore]),
-            )
-                .prop_map(|(text, wildcard)| Some((text.to_owned(), wildcard))),
-        ];
-        let path = prop_oneof![
-            (
-                prop::sample::select(vec!["/", "/a", "/a/b"]),
-                Just(PathKind::Exact)
-            ),
-            (
-                prop::sample::select(vec!["/", "/a", "/a/b"]),
-                Just(PathKind::Prefix)
-            ),
-            (
-                prop::sample::select(vec!["/a.*", "/[ab]", "/a/[^/]+"]),
-                Just(PathKind::Regex)
-            ),
-        ];
-        let field = (
-            prop::sample::select(vec!["x-a", "X-A", "x-b"]),
-            prop::sample::select(vec!["1", "2"]),
-        );
-        let parameter = (
-            prop::sample::select(vec!["p", "q"]),
-            prop::sample::select(vec!["1", "2"]),
-        );
-        (
-            prop::collection::vec((host, any::<bool>()), 0..3),
-            path,
-            prop::option::of(prop::sample::select(vec!["GET", "POST"])),
-            prop::collection::vec(field, 0..3),
-            prop::collection::vec(parameter, 0..3),
-        )
-            .prop_map(|(hosts, (path, kind), method, headers, query)| RouteSpec {
-                hosts,
-                path: (path.to_owned(), kind),
-                method: method.map(str::to_owned),
-                headers: pairs(&headers),
-                query: pairs(&query),
-            })
-    }
-
-    fn request_spec() -> impl Strategy<Value = RequestSpec> {
-        (
-            prop::sample::select(vec!["a.b", "c.b", "x.a.b", "x.y.a.b", "b", "x.c", "z"]),
-            prop::sample::select(vec!["/", "/a", "/a/", "/a/b", "/a/b/c", "/b", "/ab"]),
-            prop::sample::select(vec![
-                "",
-                "p=1",
-                "p=2&q=1",
-                "q=2&p=1",
-                "p=1&p=2",
-                "%70=1&q=1",
-            ]),
-            prop::sample::select(vec!["GET", "POST", "DELETE"]),
-            prop::collection::vec(
-                (
-                    prop::sample::select(vec!["x-a", "x-b", "x-c"]),
-                    prop::sample::select(vec!["1", "2"]),
-                ),
-                0..3,
-            ),
-        )
-            .prop_map(|(host, path, query, method, headers)| RequestSpec {
-                host: host.to_owned(),
-                path: path.to_owned(),
-                query: query.to_owned(),
-                method: method.to_owned(),
-                headers: pairs(&headers),
-            })
     }
 
     /// Routes on one host and path that differ only in their predicates, all of which the

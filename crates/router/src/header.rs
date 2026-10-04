@@ -9,6 +9,7 @@
 //! (RFC 9113 §8.2.3) — a comma would make a different cookie string of it.
 
 use crate::RegexError;
+use crate::explain::{Seen, Wanted};
 use crate::whole_regex::WholeRegex;
 use http::header::{COOKIE, HeaderMap, HeaderName, HeaderValue};
 
@@ -86,6 +87,36 @@ impl HeaderPredicate {
         })
     }
 
+    /// The header it is about, in lower case.
+    #[must_use]
+    pub fn name(&self) -> &HeaderName {
+        &self.name
+    }
+
+    /// What the header's value must be.
+    #[must_use]
+    pub fn wanted(&self) -> Wanted<'_> {
+        match &self.value {
+            ValueMatch::Exact(value) => Wanted::Exact(value.as_bytes()),
+            ValueMatch::Regex(regex) => Wanted::Regex(regex.as_str()),
+        }
+    }
+
+    /// The value this predicate judges the request by: its fields of the header, joined as
+    /// for matching.
+    pub(crate) fn seen<F: Fields + ?Sized>(&self, headers: &F) -> Seen {
+        let mut values = headers.values(&self.name);
+        let Some(first) = values.next() else {
+            return Seen::Absent;
+        };
+        let mut joined = first.to_vec();
+        for value in values {
+            joined.extend_from_slice(self.between);
+            joined.extend_from_slice(value);
+        }
+        Seen::Value(joined)
+    }
+
     /// Whether the request's headers satisfy this predicate. Allocates only to join the
     /// values of a repeated header for a regex.
     #[must_use]
@@ -154,6 +185,11 @@ impl HeaderPredicates {
     #[must_use]
     pub fn matches<F: Fields + ?Sized>(&self, headers: &F) -> bool {
         self.0.iter().all(|predicate| predicate.matches(headers))
+    }
+
+    /// The predicates that count, in the order they are checked.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &HeaderPredicate> {
+        self.0.iter()
     }
 }
 
