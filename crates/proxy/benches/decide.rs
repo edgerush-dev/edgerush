@@ -132,6 +132,13 @@ fn head_with(target: &str, host: Option<&str>, more: &[(&'static str, &'static s
     request.body(()).expect("valid request").into_parts().0
 }
 
+/// The core's random draw. A function of its own, not a closure written in the benchmark:
+/// the core is generic over it, and a closure's type would put the benchmark's path into the
+/// names of the core's own functions, which iai-callgrind then stops counting in (10 §3).
+fn draw() -> u64 {
+    0x9E37_79B9_7F4A_7C15
+}
+
 // The config and the head are handed back so that dropping them is not measured.
 #[library_benchmark]
 #[bench::usual_form(
@@ -193,7 +200,7 @@ fn request_core(
             listener,
             black_box(&mut head),
             black_box(&client),
-            &mut || 0x9E37_79B9_7F4A_7C15,
+            &mut draw,
             Some(&ID),
         )
         .is_ok(),
