@@ -4,8 +4,8 @@
 //! BoringSSL checks far more of a ClientHello than the reader does (cipher suites, key
 //! shares, versions), so it refuses more. But wherever it reads a name, the reader must
 //! read the same one or refuse it as no host name, and never route by a name BoringSSL
-//! reads otherwise. The one exception is an empty handshake record before the ClientHello
-//! is whole, which BoringSSL skips and the reader refuses as malformed, on purpose
+//! reads otherwise. The exceptions are an empty handshake record and an alert before the
+//! ClientHello is whole, which BoringSSL may skip and the reader refuses, on purpose
 //! (`l4/hello.rs`). And once the reader has decided, more bytes must not change its mind.
 //!
 //! `cargo fuzz run tls_hello corpus/tls_hello seeds/tls_hello`.
@@ -88,14 +88,20 @@ fn acceptor() -> &'static SslAcceptor {
     })
 }
 
-/// Whether an empty handshake record comes before the first handshake message in `bytes` is
-/// whole, which the reader refuses and BoringSSL skips.
-fn empty_record_first(bytes: &[u8]) -> bool {
+/// Whether an empty handshake record or an alert comes before the first handshake message
+/// in `bytes` is whole, which the reader refuses and BoringSSL may skip.
+fn skipped_record_first(bytes: &[u8]) -> bool {
     let mut at = 0;
     let mut head = Vec::with_capacity(4);
     let mut gathered = 0;
     while let Some(header) = bytes.get(at..at + 5) {
-        if header[0] != 0x16 || header[1] != 3 {
+        if header[1] != 3 {
+            return false;
+        }
+        if header[0] == 0x15 {
+            return true;
+        }
+        if header[0] != 0x16 {
             return false;
         }
         let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
@@ -154,8 +160,10 @@ fuzz_target!(|bytes: &[u8]| {
             );
         }
         (Hello::Refused(Refusal::BadName), Some(_)) | (Hello::Whole(None), None) => {}
-        // Whatever BoringSSL makes of what follows: the reader refuses at the empty record.
-        (Hello::Refused(Refusal::Malformed), _) if empty_record_first(bytes) => {}
+        // Whatever BoringSSL makes of what follows: the reader refuses at that record, as
+        // not TLS if it is the first and as malformed if not.
+        (Hello::Refused(Refusal::NotTls | Refusal::Malformed), _)
+            if skipped_record_first(bytes) => {}
         (ours, theirs) => panic!("read {ours:?} where BoringSSL read {theirs:?}"),
     }
 });

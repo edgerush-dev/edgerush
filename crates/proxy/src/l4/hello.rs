@@ -11,13 +11,16 @@
 //! What it reads, it holds to what BoringSSL, the likeliest backend, holds it to, and it
 //! refuses where BoringSSL would: a connection is never routed by a name that the backend
 //! reads otherwise, or not at all. So the handshake message may span records (RFC 8446
-//! §5.1), but no other record may come between its fragments, and none may be longer than
-//! 2^14 bytes. Nor may one be empty, and there the reader is stricter than BoringSSL, which
-//! skips up to 32 empty records in a row: RFC 8446 §5.1 forbids sending them, and a
-//! connection refused is routed nowhere. Every length inside the ClientHello must add up exactly. No
-//! extension may come twice, and `server_name` must hold exactly one `host_name` (RFC 6066
-//! §3, and BoringSSL's reading of it). Beyond BoringSSL, the name must be one that routing
-//! can match: a DNS host name and not an address, which is also what RFC 6066 allows.
+//! §5.1), but no other record may come before it or between its fragments, and none may be
+//! empty or longer than 2^14 bytes. In two places that is stricter than BoringSSL, which
+//! skips up to 32 empty records in a row, and up to four warning alerts, before the
+//! ClientHello is whole: RFC 8446 §5.1 forbids sending an empty one, no client sends an
+//! alert before its first message (NGINX and HAProxy refuse one there too), and a
+//! connection refused is routed nowhere. Every length inside the ClientHello must add up
+//! exactly. No extension may come twice, and `server_name` must hold exactly one
+//! `host_name` (RFC 6066 §3, and BoringSSL's reading of it). Beyond BoringSSL, the name
+//! must be one that routing can match: a DNS host name and not an address, which is also
+//! what RFC 6066 allows.
 
 use std::borrow::Cow;
 use std::net::IpAddr;
@@ -187,7 +190,7 @@ impl<'a> Iterator for Fragments<'a> {
             if first { Refusal::NotTls } else { refusal }
         };
         // A record of another type between a handshake message's fragments is not allowed
-        // (RFC 8446 §5.1); as the first record, it is not TLS at all.
+        // (RFC 8446 §5.1); as the first record, it is no TLS handshake, an alert included.
         if header[0] != HANDSHAKE || header[1] != 3 {
             self.ended = true;
             return Some(Err(refused(Refusal::Malformed)));
@@ -547,10 +550,10 @@ mod tests {
     }
 
     /// An empty handshake record is refused wherever it comes before the ClientHello is
-    /// whole, although BoringSSL skips it and reads the name: the one place the reader is
-    /// stricter than BoringSSL (RFC 8446 §5.1 forbids sending one). Both sides are held
-    /// here, so that BoringSSL changing its mind shows. Thirty-three in a row BoringSSL
-    /// refuses too.
+    /// whole, although BoringSSL skips it and reads the name: one of the two places the
+    /// reader is stricter than BoringSSL (RFC 8446 §5.1 forbids sending one). Both sides
+    /// are held here, so that BoringSSL changing its mind shows. Thirty-three in a row
+    /// BoringSSL refuses too.
     #[test]
     fn an_empty_record_is_refused_though_boringssl_skips_it() {
         let hello = boring_hello(Some("a.test"));
@@ -574,6 +577,41 @@ mod tests {
         let many = [empty.repeat(33), hello.clone()].concat();
         assert_eq!(read(&many), refused(Refusal::Malformed));
         assert_eq!(boring_reads(&many), None);
+    }
+
+    /// An alert is refused wherever it comes before the ClientHello is whole, although
+    /// BoringSSL skips up to four warning alerts in a row there and reads the name: the
+    /// other place the reader is stricter than BoringSSL (no client sends one before its
+    /// first message). Found by the fuzz target. Both sides are held here, so that
+    /// BoringSSL changing its mind shows. A fifth warning in a row, a warning that is
+    /// `close_notify` and a fatal alert BoringSSL refuses too.
+    #[test]
+    fn an_alert_is_refused_though_boringssl_skips_a_warning() {
+        let hello = boring_hello(Some("a.test"));
+        let message = message_of(&hello);
+        let alert = |level: u8, description: u8| [21, 3, 1, 0, 2, level, description];
+        // `user_canceled`, which even TLS 1.3 sends as a warning (RFC 8446 §6.1).
+        let warning = alert(1, 90);
+        let between = [
+            records(&message[..100], &[]),
+            warning.to_vec(),
+            records(&message[100..], &[]),
+        ]
+        .concat();
+        assert_eq!(read(&between), refused(Refusal::Malformed));
+        assert_eq!(boring_reads(&between), Some(Some(b"a.test".to_vec())));
+        let four = [warning.repeat(4), hello.clone()].concat();
+        for bytes in [[&warning[..], &hello].concat(), four] {
+            assert_eq!(read(&bytes), refused(Refusal::NotTls));
+            assert_eq!(boring_reads(&bytes), Some(Some(b"a.test".to_vec())));
+        }
+        let five = [warning.repeat(5), hello.clone()].concat();
+        let close_notify = [&alert(1, 0)[..], &hello].concat();
+        let fatal = [&alert(2, 40)[..], &hello].concat();
+        for bytes in [five, close_notify, fatal] {
+            assert_eq!(read(&bytes), refused(Refusal::NotTls));
+            assert_eq!(boring_reads(&bytes), None);
+        }
     }
 
     /// What is not a TLS handshake that starts with a ClientHello is refused as soon as it
