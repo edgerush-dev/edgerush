@@ -555,7 +555,11 @@ upstreams:
         random: u64,
     ) -> Result<String, Rejection> {
         let shop = shop();
-        let listener = shop.listeners.iter().find(|l| l.name == listener).unwrap();
+        let listener = shop
+            .listeners()
+            .iter()
+            .find(|l| l.name == listener)
+            .unwrap();
         decide(&shop, listener, head, client, &mut || random, None).map(|decision| {
             let forward = forwarding(decision);
             shop.upstream(forward.upstream).unwrap().name.clone()
@@ -649,7 +653,7 @@ upstreams:
         id: Option<&HeaderValue>,
     ) -> Result<String, Rejection> {
         let listener = snapshot
-            .listeners
+            .listeners()
             .iter()
             .find(|l| l.name == listener)
             .unwrap();
@@ -971,7 +975,7 @@ upstreams:
     #[test]
     fn the_forward_carries_the_rule() {
         let shop = shop();
-        let web = shop.listeners.iter().find(|l| l.name == "web").unwrap();
+        let web = shop.listeners().iter().find(|l| l.name == "web").unwrap();
         let mut head = head("/cart", &[("host", "shop.example.com")]);
         let forward = forwarding(decide(&shop, web, &mut head, &peer(), &mut || 0, None).unwrap());
         assert!(forward.rule.request_headers.is_some());
@@ -1000,7 +1004,7 @@ upstreams:
     fn redirected<H: Head>(head: &mut H) -> Option<(StatusCode, String)> {
         let config: Config = serde_saphyr::from_str(MOVED).unwrap();
         let moved = compile(&config).unwrap();
-        let web = moved.listeners.iter().find(|l| l.name == "web").unwrap();
+        let web = moved.listeners().iter().find(|l| l.name == "web").unwrap();
         match decide(&moved, web, head, &peer(), &mut || 0, None).unwrap() {
             Decision::Redirect(redirected) => Some((
                 redirected.status,
@@ -1074,7 +1078,7 @@ upstreams:
         let config: Config = serde_saphyr::from_str(REWRITTEN).unwrap();
         let rewritten = compile(&config).unwrap();
         let web = rewritten
-            .listeners
+            .listeners()
             .iter()
             .find(|l| l.name == "web")
             .unwrap();
@@ -1150,7 +1154,11 @@ upstreams:
     fn mirrored<H: Head>(mut head: H, draws: &[u64]) -> Vec<(usize, Option<Seen>)> {
         let config: Config = serde_saphyr::from_str(MIRRORED).unwrap();
         let mirrored = compile(&config).unwrap();
-        let web = mirrored.listeners.iter().find(|l| l.name == "web").unwrap();
+        let web = mirrored
+            .listeners()
+            .iter()
+            .find(|l| l.name == "web")
+            .unwrap();
         let mut draws = std::iter::once(0).chain(draws.iter().copied());
         let forward = forwarding(
             decide(
@@ -1213,7 +1221,11 @@ upstreams:
         // What every copy has lost: what was about the client's connection.
         let config: Config = serde_saphyr::from_str(MIRRORED).unwrap();
         let compiled = compile(&config).unwrap();
-        let web = compiled.listeners.iter().find(|l| l.name == "web").unwrap();
+        let web = compiled
+            .listeners()
+            .iter()
+            .find(|l| l.name == "web")
+            .unwrap();
         let mut request = head(target, &fields);
         let forward =
             forwarding(decide(&compiled, web, &mut request, &peer(), &mut || 0, None).unwrap());
@@ -1231,7 +1243,7 @@ upstreams:
     fn a_request_that_cannot_be_routed_is_rejected_before_any_redirect() {
         let config: Config = serde_saphyr::from_str(MOVED).unwrap();
         let moved = compile(&config).unwrap();
-        let web = moved.listeners.iter().find(|l| l.name == "web").unwrap();
+        let web = moved.listeners().iter().find(|l| l.name == "web").unwrap();
         let mut ambiguous = head("/old/%2e%2e/admin", &[("host", "shop.example.com")]);
         assert!(matches!(
             decide(&moved, web, &mut ambiguous, &peer(), &mut || 0, None),
@@ -1518,7 +1530,11 @@ upstreams:
             "set: [{ name: Proxy-Authorization, value: Basic Z2F0ZXdheQ== }]",
         );
         let chained = compile(&shop_config(&chained)).unwrap();
-        let web = chained.listeners.iter().find(|l| l.name == "web").unwrap();
+        let web = chained
+            .listeners()
+            .iter()
+            .find(|l| l.name == "web")
+            .unwrap();
         let mut request = head("/cart", &fields);
         decide(&chained, web, &mut request, &peer(), &mut || 0, None).unwrap();
         let credentials: Vec<_> = request

@@ -415,7 +415,11 @@ upstreams:
         let config: Config = serde_saphyr::from_str(yaml).unwrap();
         let compiled = compile(&config).unwrap();
         // The sockets go in the order the data plane has the listeners in.
-        let names: Vec<String> = compiled.listeners.iter().map(|l| l.name.clone()).collect();
+        let names: Vec<String> = compiled
+            .listeners()
+            .iter()
+            .map(|l| l.name.clone())
+            .collect();
         let proxy = Arc::new(Proxy::new(compiled, NonZeroUsize::MIN).unwrap());
         let mut addresses = std::collections::HashMap::new();
         let mut sockets = Vec::new();

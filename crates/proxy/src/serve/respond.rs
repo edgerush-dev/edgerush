@@ -357,7 +357,7 @@ impl Proxy {
             .get(listener)
             .copied()
             .flatten()
-            .and_then(|position| snapshot.config.listeners.get(position))
+            .and_then(|position| snapshot.config.listeners().get(position))
             .ok_or(Answer::NoRoute)?;
         let forward = match decide(&snapshot.config, listener, head, client, &mut random, id)? {
             Decision::Forward(forward) => forward,

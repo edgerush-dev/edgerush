@@ -290,7 +290,7 @@ impl Destinations {
             .collect();
 
         let destinations = config
-            .upstreams
+            .upstreams()
             .iter()
             .enumerate()
             .map(|(position, upstream)| {
@@ -392,6 +392,11 @@ mod tests {
 
     /// A config of the named upstreams, each with the addresses given.
     fn config(upstreams: &[(&str, &[&str])]) -> Compiled {
+        compile(&model(upstreams)).unwrap()
+    }
+
+    /// The same as the model states it, for a test to change before it is compiled.
+    fn model(upstreams: &[(&str, &[&str])]) -> Config {
         let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
         for (name, addresses) in upstreams {
             let listed: Vec<String> = addresses.iter().map(|a| format!("\"{a}\"")).collect();
@@ -400,8 +405,7 @@ mod tests {
                 listed.join(", ")
             );
         }
-        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
-        compile(&config).unwrap()
+        serde_saphyr::from_str(&yaml).unwrap()
     }
 
     /// Health and being set aside share a word and never overwrite each other: a pick takes
@@ -687,9 +691,9 @@ mod tests {
         );
         let was = Arc::clone(before.at(0, 0).unwrap());
         assert_eq!(was.protocol(), UpstreamProtocol::Http1);
-        let mut http2 = config(&[("web", &["127.0.0.1:1"])]);
-        http2.upstreams[0].protocol = UpstreamProtocol::Http2;
-        let after = Destinations::reconcile(&http2, &before, &keys, &[]);
+        let mut http2 = model(&[("web", &["127.0.0.1:1"])]);
+        http2.upstreams.get_mut("web").unwrap().protocol = UpstreamProtocol::Http2;
+        let after = Destinations::reconcile(&compile(&http2).unwrap(), &before, &keys, &[]);
         let now = after.at(0, 0).unwrap();
         assert_ne!(now.key(), was.key());
         assert_eq!(now.protocol(), UpstreamProtocol::Http2);

@@ -26,7 +26,7 @@ impl Snapshot {
         keys: &Keys,
     ) -> Result<Self, ProxyError> {
         let endpoints = config
-            .upstreams
+            .upstreams()
             .iter()
             .map(|upstream| upstream.endpoints.iter().map(authority).collect())
             .collect::<Result<_, _>>()?;
@@ -35,13 +35,13 @@ impl Snapshot {
         let routed = Routed::reconcile(&config, listeners, previous_routed, keys);
         let listeners: Vec<Option<usize>> = listeners
             .iter()
-            .map(|name| config.listeners.iter().position(|l| l.name == *name))
+            .map(|name| config.listeners().iter().position(|l| l.name == *name))
             .collect();
         let tls = listeners
             .iter()
             .enumerate()
             .map(|(position, at)| {
-                let Some(listener) = at.and_then(|at| config.listeners.get(at)) else {
+                let Some(listener) = at.and_then(|at| config.listeners().get(at)) else {
                     return Ok(None);
                 };
                 let Some(source) = &listener.tls else {
@@ -65,15 +65,15 @@ impl Snapshot {
             .collect::<Result<_, _>>()?;
         let alt_svc = listeners
             .iter()
-            .map(|at| alt_svc(at.and_then(|at| config.listeners.get(at))?))
+            .map(|at| alt_svc(at.and_then(|at| config.listeners().get(at))?))
             .collect();
         let upstream_slots = config
-            .upstreams
+            .upstreams()
             .iter()
             .map(|upstream| metrics.upstream_slot(&upstream.name))
             .collect();
         let secure: Vec<Option<Arc<Secure>>> = config
-            .upstreams
+            .upstreams()
             .iter()
             .map(|upstream| {
                 let Some(source) = &upstream.tls else {
@@ -142,7 +142,7 @@ impl Proxy {
     /// [`Worker::new`]: super::Worker::new
     pub fn new(config: Compiled, workers: NonZeroUsize) -> Result<Self, ProxyError> {
         let listeners: Vec<String> = config
-            .listeners
+            .listeners()
             .iter()
             .map(|listener| listener.name.clone())
             .collect();
@@ -221,7 +221,7 @@ impl Proxy {
         let snapshot = self.current.load();
         let upstreams: Vec<(&str, usize)> = snapshot
             .config
-            .upstreams
+            .upstreams()
             .iter()
             .zip(&snapshot.upstream_slots)
             .map(|(upstream, slot)| (upstream.name.as_str(), *slot))
@@ -230,7 +230,7 @@ impl Proxy {
         // scrape.
         let endpoints: Vec<(&str, usize, usize)> = snapshot
             .config
-            .upstreams
+            .upstreams()
             .iter()
             .enumerate()
             .map(|(position, upstream)| {
@@ -274,7 +274,7 @@ impl Proxy {
             .filter(|destination| destination.set_aside_for().is_some())
             .map(Arc::clone)
             .collect();
-        (aside, snapshot.config.data_plane.set_aside)
+        (aside, snapshot.config.data_plane().set_aside)
     }
 
     /// Counts `destination` as set aside, for its upstream. For the health checker, as it

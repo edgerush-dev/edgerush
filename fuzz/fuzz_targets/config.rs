@@ -41,9 +41,9 @@ fuzz_target!(|data: &[u8]| {
     let config = file.into_config(certificates);
     match compile(&config) {
         Ok(compiled) => {
-            assert_eq!(compiled.listeners.len(), config.listeners.len());
-            assert_eq!(compiled.upstreams.len(), config.upstreams.len());
-            for listener in &compiled.listeners {
+            assert_eq!(compiled.listeners().len(), config.listeners.len());
+            assert_eq!(compiled.upstreams().len(), config.upstreams.len());
+            for listener in compiled.listeners() {
                 if listener.protocol == Protocol::Https {
                     let tls = listener.tls.as_ref().expect("an https listener has TLS");
                     assert!(!tls.certificates.is_empty());

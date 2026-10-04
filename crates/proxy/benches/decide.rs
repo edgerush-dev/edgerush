@@ -187,7 +187,7 @@ fn request_core(
     client: Client,
     mut head: MapHead,
 ) -> (Compiled, Client, MapHead, bool) {
-    let forwarded = match snapshot.listeners.first() {
+    let forwarded = match snapshot.listeners().first() {
         Some(listener) => decide(
             black_box(&snapshot),
             listener,

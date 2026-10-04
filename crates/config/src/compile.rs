@@ -40,19 +40,29 @@ pub struct RuleId {
 }
 
 /// A config compiled: fully resolved and immutable, what a snapshot is made of.
+///
+/// Made by [`compile`] alone, and only read after: its parts point into one another by
+/// position (an [`UpstreamId`] is a position among the upstreams, a listener's routes are
+/// positions among the routes), so none of them can be reordered or replaced from outside.
+///
+/// ```compile_fail,E0616
+/// fn reorder(compiled: &mut edgerush_config::Compiled) {
+///     compiled.upstreams.swap(0, 1);
+/// }
+/// ```
 #[derive(Debug)]
 pub struct Compiled {
     /// The listeners, in the order of their names, each with the routes that are for it.
-    pub listeners: Vec<CompiledListener>,
+    listeners: Vec<CompiledListener>,
     /// The upstreams, in the order of their names; an [`UpstreamId`] is a position here.
-    pub upstreams: Vec<CompiledUpstream>,
+    upstreams: Vec<CompiledUpstream>,
     /// By position of the route, then of the rule. Each is shared on its own, so that a
     /// request can hold on to its rule without holding on to the whole config.
     rules: Vec<Vec<Arc<CompiledRule>>>,
     /// By position of the route: its name.
     route_names: Vec<String>,
     /// The data plane's own settings.
-    pub data_plane: CompiledDataPlane,
+    data_plane: CompiledDataPlane,
 }
 
 /// The data plane's own settings, each at the value it runs with.
@@ -68,6 +78,24 @@ impl CompiledDataPlane {
 }
 
 impl Compiled {
+    /// The listeners, in the order of their names, each with the routes that are for it.
+    #[must_use]
+    pub fn listeners(&self) -> &[CompiledListener] {
+        &self.listeners
+    }
+
+    /// The upstreams, in the order of their names; an [`UpstreamId`] is a position here.
+    #[must_use]
+    pub fn upstreams(&self) -> &[CompiledUpstream] {
+        &self.upstreams
+    }
+
+    /// The data plane's own settings.
+    #[must_use]
+    pub fn data_plane(&self) -> CompiledDataPlane {
+        self.data_plane
+    }
+
     /// What to do with a request that was routed to `id`.
     #[must_use]
     pub fn rule(&self, id: RuleId) -> Option<&Arc<CompiledRule>> {

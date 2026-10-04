@@ -270,7 +270,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         Ok(opened) => opened,
         Err(rejected) => return Err(Failure::Config { path, rejected }),
     };
-    let mut bound: Vec<Bound> = config.listeners.iter().map(Bound::from).collect();
+    let mut bound: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
     let proxy = Proxy::new(config, workers)
         .map(Arc::new)
         .map_err(|error| Failure::Proxy { path, error })?;
@@ -546,7 +546,7 @@ fn open(what: String, address: SocketAddr, port: Port) -> Result<std::net::TcpLi
 /// once, and a reload changes what is served on them, not where they are.
 fn restart_needed(bound: &[Bound], config: &Compiled) -> Vec<String> {
     let mut warnings = Vec::new();
-    for listener in &config.listeners {
+    for listener in config.listeners() {
         match bound.iter().find(|bound| bound.name == listener.name) {
             None => warnings.push(format!(
                 "listener \"{}\" is new: it is listened on after a restart",
@@ -565,7 +565,7 @@ fn restart_needed(bound: &[Bound], config: &Compiled) -> Vec<String> {
         }
     }
     for bound in bound {
-        if !config.listeners.iter().any(|l| l.name == bound.name) {
+        if !config.listeners().iter().any(|l| l.name == bound.name) {
             warnings.push(format!(
                 "listener \"{}\" is gone: its socket stays open, with no routes (404), until a restart",
                 bound.name
@@ -778,14 +778,14 @@ mod tests {
     #[test]
     fn listeners_that_are_as_they_were_need_no_restart() {
         let config = listeners(&[("admin", "127.0.0.1:81"), ("web", "[::]:80")]);
-        let bound: Vec<Bound> = config.listeners.iter().map(Bound::from).collect();
+        let bound: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
         assert_eq!(restart_needed(&bound, &config), [""; 0]);
     }
 
     #[test]
     fn a_listener_that_is_new_or_has_moved_or_is_gone_needs_a_restart() {
         let before = listeners(&[("admin", "127.0.0.1:81"), ("web", "[::]:80")]);
-        let bound: Vec<Bound> = before.listeners.iter().map(Bound::from).collect();
+        let bound: Vec<Bound> = before.listeners().iter().map(Bound::from).collect();
         let after = listeners(&[("api", "[::]:8080"), ("web", "[::]:8000")]);
         assert_eq!(
             restart_needed(&bound, &after),

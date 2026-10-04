@@ -160,7 +160,7 @@ fn by_raw(
         _ => None,
     };
     let mut raw = raw;
-    let forwarded = match (snapshot.listeners.first(), raw.as_mut()) {
+    let forwarded = match (snapshot.listeners().first(), raw.as_mut()) {
         (Some(listener), Some(head)) => decide(
             black_box(&snapshot),
             listener,
@@ -231,7 +231,7 @@ fn by_map(
         _ => None,
     };
     let mut parts = parts;
-    let forwarded = match (snapshot.listeners.first(), parts.as_mut()) {
+    let forwarded = match (snapshot.listeners().first(), parts.as_mut()) {
         (Some(listener), Some(head)) => decide(
             black_box(&snapshot),
             listener,
@@ -261,7 +261,7 @@ fn decided_raw(sent: &Bytes) -> RawHead {
         lines,
     );
     let snapshot = shop();
-    let listener = snapshot.listeners.first().expect("a listener");
+    let listener = snapshot.listeners().first().expect("a listener");
     decide(
         &snapshot,
         listener,
@@ -290,7 +290,7 @@ fn decided_map(sent: &Bytes) -> Parts {
     parts.uri = request.path.expect("a target").parse().expect("a target");
     parts.headers = headers;
     let snapshot = shop();
-    let listener = snapshot.listeners.first().expect("a listener");
+    let listener = snapshot.listeners().first().expect("a listener");
     decide(
         &snapshot,
         listener,

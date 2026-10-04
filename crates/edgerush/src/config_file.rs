@@ -268,17 +268,17 @@ mod tests {
     #[test]
     fn a_file_is_compiled_when_it_is_opened() {
         let (_, compiled) = Scratch::new("opened", ONE_UPSTREAM).open().unwrap();
-        assert_eq!(compiled.upstreams.len(), 1);
+        assert_eq!(compiled.upstreams().len(), 1);
     }
 
     #[test]
     fn a_changed_file_is_compiled_again() {
         let scratch = Scratch::new("changed-again", NOTHING);
         let (mut file, compiled) = scratch.open().unwrap();
-        assert_eq!(compiled.upstreams.len(), 0);
+        assert_eq!(compiled.upstreams().len(), 0);
         scratch.write(ONE_UPSTREAM);
         let compiled = file.changed().unwrap().unwrap();
-        assert_eq!(compiled.upstreams.len(), 1);
+        assert_eq!(compiled.upstreams().len(), 1);
     }
 
     #[test]
@@ -380,7 +380,7 @@ certificates:
         let key = scratch.write("shop.key", "the key");
         let yaml = presenting_shop("shop.crt", &key.display().to_string());
         let (_, compiled) = ConfigFile::open(scratch.write("config.yaml", &yaml)).unwrap();
-        let shop = &compiled.listeners[0].tls.as_ref().unwrap().certificates[0];
+        let shop = &compiled.listeners()[0].tls.as_ref().unwrap().certificates[0];
         assert_eq!(shop.name, "shop");
         assert_eq!(shop.certificate.chain, "the chain");
         assert_eq!(shop.certificate.key, "the key");
@@ -416,7 +416,7 @@ certificates:
     /// What `shop` is in what `file` compiled now that it has changed.
     fn shop_after_change(file: &mut ConfigFile) -> (String, String) {
         let compiled = file.changed().expect("a change").unwrap();
-        let shop = &compiled.listeners[0].tls.as_ref().unwrap().certificates[0];
+        let shop = &compiled.listeners()[0].tls.as_ref().unwrap().certificates[0];
         (shop.certificate.chain.clone(), shop.certificate.key.clone())
     }
 
@@ -529,7 +529,7 @@ upstreams: {}
         let (mut file, _) = scratch.open().unwrap();
         scratch.write(ONE_UPSTREAM);
         let compiled = file.changed().unwrap().unwrap();
-        assert_eq!(compiled.upstreams.len(), 1);
+        assert_eq!(compiled.upstreams().len(), 1);
         assert!(file.changed().is_none());
     }
 

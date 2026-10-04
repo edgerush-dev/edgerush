@@ -83,7 +83,7 @@ impl Balancing {
             turns.insert(upstream.keys.clone(), upstream.round_robin.get());
         }
         self.upstreams = config
-            .upstreams
+            .upstreams()
             .iter()
             .enumerate()
             .map(|(position, upstream)| {

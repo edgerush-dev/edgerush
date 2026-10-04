@@ -51,7 +51,7 @@ impl Routed {
         let mut routed = Self::default();
         for name in listeners {
             let mut here = HashMap::new();
-            if let Some(listener) = config.listeners.iter().find(|l| l.name == *name) {
+            if let Some(listener) = config.listeners().iter().find(|l| l.name == *name) {
                 for (through, route, upstream) in routes_of(config, listener) {
                     let Some(upstream_name) = config.upstream(upstream).map(|u| u.name.as_str())
                     else {

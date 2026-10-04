@@ -596,7 +596,7 @@ impl Snapshot {
     /// The compiled listener whose socket is at `position`, if the config still has it.
     fn listener(&self, position: usize) -> Option<&CompiledListener> {
         let at = self.listeners.get(position).copied().flatten()?;
-        self.config.listeners.get(at)
+        self.config.listeners().get(at)
     }
 }
 
