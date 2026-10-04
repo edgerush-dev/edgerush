@@ -507,3 +507,77 @@ async fn an_http3_request_is_logged() {
         })
         .await;
 }
+
+/// A head the HTTP/1 server refuses before the core has a request has a record of what is
+/// known: who sent it, how it was answered and why. Nothing of what it asked: nothing was
+/// read of it that could be believed. A connection that sent nothing has no record.
+#[tokio::test]
+async fn a_refused_http1_head_is_logged() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _held) = scripted_upstream().await;
+            let logged = recording("refused", everything_config(upstream)).await;
+            // First, so that a record of it would be the first read below.
+            drop(TcpStream::connect(logged.front).await.unwrap());
+            let long = format!(
+                "GET /{} HTTP/1.1\r\nhost: example.test\r\n\r\n",
+                "a".repeat(20_000)
+            );
+            let refusals: [(&[u8], u16, &str); 2] = [
+                (
+                    b"GET /a HTTP/1.1\r\nhost: example.test\r\ncontent-length: 1\r\ncontent-length: 1\r\n\r\n",
+                    400,
+                    "repeated_length",
+                ),
+                (long.as_bytes(), 414, "line_too_long"),
+            ];
+            for (request, status, _) in refusals {
+                let answer = h1_answer(logged.front, request).await;
+                assert!(answer.starts_with(&format!("HTTP/1.1 {status}")), "{answer}");
+            }
+            let records = logged.records(2).await;
+            for (record, (_, status, why)) in records.iter().zip(refusals) {
+                assert_eq!(record["status"], status, "{record}");
+                assert_eq!(record["reason"], why, "{record}");
+                assert_eq!(record["listener"], "web");
+                assert_eq!(record["client"], "127.0.0.1");
+                assert!(record["peer"].as_str().unwrap().starts_with("127.0.0.1:"));
+                for unknown in ["method", "host", "path", "protocol", "route", "duration_ms"] {
+                    assert!(record.get(unknown).is_none(), "{unknown}: {record}");
+                }
+            }
+        })
+        .await;
+}
+
+/// A head over HTTP/3 too large to take, which its server answers 431 itself, has a record
+/// as one over HTTP/1 does.
+#[tokio::test]
+async fn an_http3_head_too_large_is_logged() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::{Client, get};
+            let (upstream, _) = counting_upstream().await;
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let logged = recording_h3("h3-refused", h3_config(upstream, http3)).await;
+            let mut client = Client::connect(logged.front, "a.test").await;
+            let large = "v".repeat(100 << 10);
+            let mut head = get("a.test", "/big");
+            head.push(("x-large", &large));
+            let id = client.request(&head, true);
+            assert_eq!(client.answer(id).await.final_status(), Some("431"));
+            let records = logged.records(1).await;
+            let record = &records[0];
+            assert_eq!(record["status"], 431);
+            assert_eq!(record["reason"], "head_too_long");
+            assert_eq!(record["protocol"], "3");
+            assert!(record["peer"].as_str().unwrap().starts_with("127.0.0.1:"));
+            assert!(record.get("path").is_none(), "{record}");
+        })
+        .await;
+}

@@ -451,6 +451,8 @@ where
     let connection = Rc::clone(&ours);
     let worker = &connection.worker;
     let listener = ours.listener;
+    // For the record of a head the server refuses, which no request's future makes.
+    let logged_client = Rc::clone(&client);
     // The connection is kept by this for as long as it is served; each request's future
     // owns only a handle on the worker. It is that future itself, not one wrapped around
     // it, so that it is not moved into another on every request.
@@ -459,7 +461,7 @@ where
         Rc::clone(&ours.worker).handle_head(listener, Rc::clone(&client), head, body, Some(interim))
     };
     let slots = slots_for(&worker.slots, &respond);
-    let _ended = h1::serve(
+    let ended = h1::serve(
         socket,
         &worker.h1,
         Rc::clone(&worker.blocks),
@@ -470,6 +472,18 @@ where
         &slots,
     )
     .await;
+    // A head refused before the core had a request has a record of what is known of it
+    // (21 §4); the server closes the connection after it.
+    if let h1::Ended::Refused(error) = ended {
+        logged::refused(
+            worker,
+            listener,
+            &logged_client,
+            None,
+            error.status(),
+            error.name(),
+        );
+    }
 }
 
 /// The worker's slots for the futures `respond` makes: named by the closure, as the futures'

@@ -267,6 +267,9 @@ pub(crate) struct Shared {
     room: Option<Room>,
     /// Where what the listener does is counted.
     count: Box<dyn Fn(Quic)>,
+    /// Told of a request whose head was too large, which the driver answers 431 itself, with
+    /// the client it came from: for its access-log record (21 §4).
+    pub(crate) refused: Box<dyn Fn(Rc<Client>)>,
 }
 
 /// Why a listener cannot be served.
@@ -299,6 +302,7 @@ impl Shared {
         handshakes: Rc<Cell<usize>>,
         room: Option<Room>,
         count: Box<dyn Fn(Quic)>,
+        refused: Box<dyn Fn(Rc<Client>)>,
     ) -> Result<Self, ListenerError> {
         Ok(Self {
             local: socket.local_addr()?,
@@ -319,6 +323,7 @@ impl Shared {
             sending: Sending::new(),
             room,
             count,
+            refused,
         })
     }
 }

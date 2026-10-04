@@ -398,6 +398,19 @@ impl Worker {
             worker: usize::from(self.position),
             listener,
         });
+        let refusing = Rc::clone(&self);
+        let refused = Box::new(move |client: Rc<Client>| {
+            let status = http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE;
+            let protocol = Some(edgerush_telemetry::access_log::Protocol::Http3);
+            super::logged::refused(
+                &refusing,
+                listener,
+                &client,
+                protocol,
+                status,
+                "head_too_long",
+            );
+        });
         let shared = h3_listener::Shared::new(
             socket,
             settings,
@@ -409,6 +422,7 @@ impl Worker {
             Rc::clone(&self.handshakes),
             room,
             count,
+            refused,
         )
         .map_err(io::Error::other)?;
         let reading = Rc::clone(&self);

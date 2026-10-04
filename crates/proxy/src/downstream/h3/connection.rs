@@ -67,6 +67,9 @@ struct Driving {
     /// To be closed once what is queued has gone: the GOAWAY above all, which quiche would
     /// drop if the connection were closed with it still queued.
     to_close: bool,
+    /// Heads too large that were answered 431 since the last turn, to be told to the
+    /// listener with the client they came from.
+    refused: u32,
     /// The connection is closing: only quiche's own deadline is left to keep.
     closing: bool,
     unsent: Unsent,
@@ -127,6 +130,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
         drain_by: None,
         client: None,
         to_close: false,
+        refused: 0,
         closing: false,
         unsent: Unsent::new(),
         #[cfg(any(test, feature = "interop"))]
@@ -155,6 +159,10 @@ pub(crate) async fn drive<R, F, B, D, G>(
                 } else {
                     Some(client_now(&conn, &mut driving.client))
                 };
+                // A head answered 431 here has a record all the same (21 §4).
+                for _ in 0..std::mem::take(&mut driving.refused) {
+                    (shared.refused)(client_now(&conn, &mut driving.client));
+                }
                 for request in found.drain(..) {
                     // Made above whenever there is a request.
                     let Some(client) = &client else { break };
@@ -406,6 +414,7 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
                 shared.settings.head_limit,
                 &mut driving.seen,
                 found,
+                &mut driving.refused,
             );
         }
         #[cfg(any(test, feature = "interop"))]
@@ -459,7 +468,11 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
 }
 
 /// Hands on what quiche's HTTP/3 layer has, stream by stream. A 431 the driver answers
-/// itself joins `delivering`, as a task's whole answer does.
+/// itself joins `delivering`, as a task's whole answer does, and is counted in `refused`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is a different part of the connection's state that a turn hands on to"
+)]
 fn events(
     quic: &mut quiche::Connection,
     h3: &mut quiche::h3::Connection,
@@ -468,6 +481,7 @@ fn events(
     head_limit: usize,
     seen: &mut Seen,
     found: &mut Vec<Found>,
+    refused: &mut u32,
 ) {
     loop {
         let (id, event) = match h3.poll(quic) {
@@ -513,6 +527,7 @@ fn events(
                     Err(Refused::TooLarge) => {
                         if too_large(quic, h3, id) {
                             delivering.push(id);
+                            *refused += 1;
                         }
                     }
                     Err(Refused::Malformed(_)) => shut(quic, id, code::MESSAGE_ERROR),
@@ -786,6 +801,7 @@ mod tests {
             64 << 10,
             &mut seen,
             &mut found,
+            &mut 0,
         );
         let mut taken: Vec<u64> = found.iter().map(|found| found.id).collect();
         taken.sort_unstable();

@@ -168,8 +168,8 @@ pub(crate) enum Ended {
     Closed,
     /// An answer was written that the connection does not outlive.
     Answered,
-    /// A request was refused with this status before it reached the core.
-    Refused(StatusCode),
+    /// A request was refused before it reached the core, for this, with its status.
+    Refused(RequestError),
     /// This deadline ran out.
     TimedOut(Clock),
     /// The client went, or the socket failed, before an answer was done.
@@ -1451,7 +1451,7 @@ async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(
         return stop.into();
     }
     match connection.flush().await {
-        Ok(()) => Ended::Refused(status),
+        Ok(()) => Ended::Refused(error),
         Err(stop) => stop.into(),
     }
 }
@@ -1950,7 +1950,10 @@ mod tests {
                 "{status}: {received}"
             );
             assert!(received.contains("connection: close\r\n"), "{received}");
-            assert_eq!(ended, Ended::Refused(StatusCode::from_u16(status).unwrap()));
+            assert!(
+                matches!(ended, Ended::Refused(error) if error.status().as_u16() == status),
+                "{ended:?}"
+            );
             assert!(asked.borrow().is_empty());
         }
     }
@@ -2857,7 +2860,10 @@ mod tests {
             received.contains("\r\n4\r\ntick\r\n4\r\ntick\r\n4\r\ntick\r\n0\r\n\r\nHTTP/1.1 400 "),
             "{received}"
         );
-        assert_eq!(ended, Ended::Refused(StatusCode::BAD_REQUEST));
+        assert!(
+            matches!(ended, Ended::Refused(error) if error.status() == StatusCode::BAD_REQUEST),
+            "{ended:?}"
+        );
     }
 
     /// Blocks paying against an account of `limit` bytes, and the account.
@@ -3028,7 +3034,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(ended, Ended::Refused(StatusCode::BAD_REQUEST));
+        assert!(
+            matches!(ended, Ended::Refused(error) if error.status() == StatusCode::BAD_REQUEST),
+            "{ended:?}"
+        );
         let mut received = Vec::new();
         client.read_to_end(&mut received).await.unwrap();
         assert!(received.starts_with(b"HTTP/1.1 400 "), "{received:?}");

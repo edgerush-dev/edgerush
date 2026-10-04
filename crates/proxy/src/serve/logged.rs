@@ -315,6 +315,46 @@ impl Drop for Logged {
     }
 }
 
+/// Writes the record of a head refused before the core had a request, from `client` on
+/// `listener`, if the listener logs: what is known of it, which is who sent it, the
+/// `protocol` if that is known, the `status` it was answered and `why` (08 §2). It has no
+/// method, host or path, nothing having been read that could be believed.
+pub(super) fn refused(
+    worker: &Worker,
+    listener: usize,
+    client: &Client,
+    protocol: Option<Protocol>,
+    status: http::StatusCode,
+    why: &'static str,
+) {
+    if !worker.proxy.logs.on() {
+        return;
+    }
+    let snapshot = worker.proxy.current.load();
+    let (Some(Some(sink)), Some(compiled)) =
+        (snapshot.logs.get(listener), snapshot.listener(listener))
+    else {
+        return;
+    };
+    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH);
+    let record = Record {
+        time_ms: since_epoch.map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        }),
+        kind: Kind::Request,
+        listener: &compiled.name,
+        client: Some(client.address()),
+        peer: client.peer(),
+        protocol,
+        status: Some(status.as_u16()),
+        reason: Some(why),
+        ..Record::default()
+    };
+    worker
+        .batches
+        .record(&worker.proxy.logs, *sink, |out| record.write(out));
+}
+
 /// `answered`, its body counted for `logging`.
 pub(super) fn logged(answered: Answered<Body>, logging: Rc<Logging>) -> Answered<Body> {
     let wrap = |body: Body| Body::Logged(Box::new(Logged { body, logging }));

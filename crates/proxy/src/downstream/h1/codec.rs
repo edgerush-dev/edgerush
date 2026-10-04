@@ -78,6 +78,26 @@ pub enum RequestError {
 }
 
 impl RequestError {
+    /// What it is called in an access-log record ([21 §3](../../../../docs/21-access-logs.md)):
+    /// one of a fixed list, as a metric's reasons are, and never the error's own words.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::LineTooLong { .. } => "line_too_long",
+            Self::HeadTooLong { .. } => "head_too_long",
+            Self::TooManyFields { .. } => "too_many_fields",
+            Self::Version => "bad_version",
+            Self::Malformed(_) => "malformed",
+            Self::RepeatedLength => "repeated_length",
+            Self::BadLength => "bad_length",
+            Self::LengthAndCoding => "length_and_coding",
+            Self::CodingOnHttp10 => "coding_on_http10",
+            Self::NotChunkedLast => "not_chunked_last",
+            Self::ChunkedTwice => "chunked_twice",
+            Self::CodingNotUnderstood => "coding_not_understood",
+            Self::BadConnection => "bad_connection",
+        }
+    }
+
     /// What the client is answered ([14 §4](../../../../docs/14-downstream-server.md)).
     pub fn status(self) -> StatusCode {
         match self {
