@@ -39,6 +39,31 @@ pub struct RuleId {
     pub rule: usize,
 }
 
+/// Which of a rule's matches a request was routed by: the rule, and the match's position
+/// among the rule's matches, from 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MatchId {
+    /// The rule.
+    pub rule: RuleId,
+    /// The match's position in the rule.
+    pub position: usize,
+}
+
+/// Every listener's matches as its router is built from them, each labelled with its place:
+/// what `edgerush explain` walks ([22 §4](../../../docs/22-explain-and-test.md)). Made by
+/// [`compile_with_matches`]; a data plane never keeps them.
+#[derive(Debug, Default)]
+pub struct Matches(BTreeMap<String, Vec<RouteMatch<MatchId>>>);
+
+impl Matches {
+    /// The matches of the listener called `listener`, in the order its router was given
+    /// them; none for a `tcp` or `tls` listener, or a name there is no listener by.
+    #[must_use]
+    pub fn of(&self, listener: &str) -> &[RouteMatch<MatchId>] {
+        self.0.get(listener).map_or(&[], Vec::as_slice)
+    }
+}
+
 /// A config compiled: fully resolved and immutable, what a snapshot is made of.
 ///
 /// Made by [`compile`] alone, and only read after: its parts point into one another by
@@ -551,6 +576,21 @@ fn named(config: &Config, name: &str) -> Option<NamedCertificate> {
 /// Returns every problem found, each with its place. Nothing is compiled if there is any:
 /// a data plane keeps running what it has, and a harness does not start.
 pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
+    compiled(config, false).map(|(compiled, _)| compiled)
+}
+
+/// Compiles a config as [`compile`] does, and keeps every listener's matches as well.
+///
+/// # Errors
+///
+/// As [`compile`].
+pub fn compile_with_matches(config: &Config) -> Result<(Compiled, Matches), Vec<ConfigError>> {
+    compiled(config, true)
+}
+
+/// Compiles a config; with `keep`, gives every listener's matches beside it, and otherwise
+/// no matches at all.
+fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<ConfigError>> {
     let mut errors = Vec::new();
 
     // A `BTreeMap` hands out its names in order, so positions are the same on every pod.
@@ -753,7 +793,7 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
     }
 
     // The matches of every listener, by the listener's name.
-    let mut matches: BTreeMap<&str, Vec<RouteMatch<RuleId>>> = config
+    let mut matches: BTreeMap<&str, Vec<RouteMatch<MatchId>>> = config
         .listeners
         .keys()
         .map(|name| (name.as_str(), Vec::new()))
@@ -801,6 +841,10 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                     matching: Some(match_at),
                     ..place.clone()
                 };
+                let id = MatchId {
+                    rule: id,
+                    position: match_at,
+                };
                 match route_match(matching, &hosts, id) {
                     Ok(route_match) => {
                         for listener in &listeners {
@@ -838,47 +882,54 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
     tls_route_probes(config, &mut errors);
 
     if errors.is_empty() {
+        let mut kept = BTreeMap::new();
         let listeners = config
             .listeners
             .iter()
-            .map(|(name, listener)| CompiledListener {
-                name: name.clone(),
-                address: listener.address,
-                protocol: listener.protocol,
-                // Every certificate named was found above, or there would have been an
-                // error.
-                tls: listener.tls.as_ref().map(|tls| CompiledTls {
-                    certificates: tls
-                        .certificates
-                        .iter()
-                        .filter_map(|name| named(config, name))
-                        .collect(),
-                    client_validation: tls.client_validation.clone(),
-                }),
-                http3: listener.http3,
-                router: Router::new(matches.remove(name.as_str()).unwrap_or_default()),
-                http_routes: http_routes.remove(name.as_str()).unwrap_or_default(),
-                l4: l4.remove(name.as_str()),
-                tunnel_idle: Duration::from_secs(
-                    listener.tunnel_idle_seconds.unwrap_or(TUNNEL_IDLE_SECONDS),
-                ),
-                // Found to compile above, or there would have been an error.
-                forwarding: listener
-                    .forwarding
-                    .as_ref()
-                    .and_then(|forwarding| forwarding_of(forwarding).ok())
-                    .unwrap_or_default(),
-                // Said for every HTTP listener, or there would have been an error.
-                request_id: listener.request_id.unwrap_or(RequestId::Pass),
-                // Found to compile above, or there would have been an error.
-                proxy_senders: match &listener.proxy_protocol {
-                    Some(ListenerProxyProtocol::Senders(senders)) => senders_of(senders).ok(),
-                    Some(ListenerProxyProtocol::Off) | None => None,
-                },
-                access_log: listener.access_log.clone(),
+            .map(|(name, listener)| {
+                let own = matches.remove(name.as_str()).unwrap_or_default();
+                if keep {
+                    kept.insert(name.clone(), own.clone());
+                }
+                CompiledListener {
+                    name: name.clone(),
+                    address: listener.address,
+                    protocol: listener.protocol,
+                    // Every certificate named was found above, or there would have been an
+                    // error.
+                    tls: listener.tls.as_ref().map(|tls| CompiledTls {
+                        certificates: tls
+                            .certificates
+                            .iter()
+                            .filter_map(|name| named(config, name))
+                            .collect(),
+                        client_validation: tls.client_validation.clone(),
+                    }),
+                    http3: listener.http3,
+                    router: Router::new(own.into_iter().map(by_rule)),
+                    http_routes: http_routes.remove(name.as_str()).unwrap_or_default(),
+                    l4: l4.remove(name.as_str()),
+                    tunnel_idle: Duration::from_secs(
+                        listener.tunnel_idle_seconds.unwrap_or(TUNNEL_IDLE_SECONDS),
+                    ),
+                    // Found to compile above, or there would have been an error.
+                    forwarding: listener
+                        .forwarding
+                        .as_ref()
+                        .and_then(|forwarding| forwarding_of(forwarding).ok())
+                        .unwrap_or_default(),
+                    // Said for every HTTP listener, or there would have been an error.
+                    request_id: listener.request_id.unwrap_or(RequestId::Pass),
+                    // Found to compile above, or there would have been an error.
+                    proxy_senders: match &listener.proxy_protocol {
+                        Some(ListenerProxyProtocol::Senders(senders)) => senders_of(senders).ok(),
+                        Some(ListenerProxyProtocol::Off) | None => None,
+                    },
+                    access_log: listener.access_log.clone(),
+                }
             })
             .collect();
-        Ok(Compiled {
+        let compiled = Compiled {
             listeners,
             upstreams,
             rules,
@@ -888,9 +939,30 @@ pub fn compile(config: &Config) -> Result<Compiled, Vec<ConfigError>> {
                 .map(|route| route.name.clone())
                 .collect(),
             data_plane,
-        })
+        };
+        Ok((compiled, Matches(kept)))
     } else {
         Err(errors)
+    }
+}
+
+/// A match as the router is given it, which needs to know the rule alone.
+fn by_rule(route_match: RouteMatch<MatchId>) -> RouteMatch<RuleId> {
+    let RouteMatch {
+        hosts,
+        path,
+        method,
+        headers,
+        query,
+        value,
+    } = route_match;
+    RouteMatch {
+        hosts,
+        path,
+        method,
+        headers,
+        query,
+        value: value.rule,
     }
 }
 
@@ -1169,7 +1241,7 @@ fn is_host_name(name: &str) -> bool {
 /// The listeners a route is for, each once, as far as they exist.
 fn listeners_of<'a>(
     route: &'a Route,
-    known: &BTreeMap<&str, Vec<RouteMatch<RuleId>>>,
+    known: &BTreeMap<&str, Vec<RouteMatch<MatchId>>>,
     place: &Place,
     errors: &mut Vec<ConfigError>,
 ) -> Vec<&'a str> {
@@ -1239,8 +1311,8 @@ fn host_claim(hostname: &Hostname) -> Result<HostClaim<()>, Problem> {
 fn route_match(
     matching: &Match,
     hosts: &[HostClaim<()>],
-    value: RuleId,
-) -> Result<RouteMatch<RuleId>, Vec<Problem>> {
+    value: MatchId,
+) -> Result<RouteMatch<MatchId>, Vec<Problem>> {
     let mut problems = Vec::new();
 
     let path = match (&matching.path, &matching.grpc) {
@@ -2143,6 +2215,121 @@ upstreams:
             Some((0, 1))
         );
         assert_eq!(route(&compiled, "example.org", "/x"), Some((1, 0)));
+    }
+
+    /// A request: method, host, target, header fields.
+    type Asked = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+    );
+
+    /// Requests to `web` in [`SHOP`].
+    const SHOPPING: [Asked; 8] = [
+        ("POST", "shop.example.com", "/checkout", &[]),
+        ("GET", "shop.example.com", "/checkout", &[]),
+        (
+            "GET",
+            "shop.example.com",
+            "/cart/1?tenant=acme",
+            &[("x-beta", "on")],
+        ),
+        ("GET", "shop.example.com", "/cart/1?tenant=acme", &[]),
+        ("GET", "shop.example.com", "/orders/42", &[]),
+        ("GET", "eu.west.shop.example.com", "/x", &[]),
+        ("GET", "example.org", "/x", &[]),
+        ("GET", "shop.example.com", "/cart", &[("x-beta", "off")]),
+    ];
+
+    /// The labels of a listener's kept matches, in order: route, rule, match.
+    fn labels(matches: &Matches, listener: &str) -> Vec<(usize, usize, usize)> {
+        matches
+            .of(listener)
+            .iter()
+            .map(|kept| {
+                (
+                    kept.value.rule.route,
+                    kept.value.rule.rule,
+                    kept.value.position,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_match_is_kept_with_its_route_rule_and_position() {
+        let (_, matches) = compile_with_matches(&config(SHOP)).unwrap();
+        assert_eq!(
+            labels(&matches, "web"),
+            [(0, 0, 0), (0, 0, 1), (0, 1, 0), (0, 1, 1), (1, 0, 0)]
+        );
+        // Each under its route's hostnames.
+        let hostnames: Vec<usize> = matches.of("web").iter().map(|m| m.hosts.len()).collect();
+        assert_eq!(hostnames, [2, 2, 2, 2, 1]);
+        assert!(matches.of("nowhere").is_empty());
+    }
+
+    #[test]
+    fn a_route_for_two_listeners_has_its_matches_kept_for_each() {
+        let two = SHOP
+            .replace(
+                "routes:\n",
+                "  admin: { address: \"[::]:8081\", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\nroutes:\n",
+            )
+            .replace(
+                "- name: everything-else\n    listeners: [web]",
+                "- name: everything-else\n    listeners: [admin, web]",
+            );
+        let (_, matches) = compile_with_matches(&config(&two)).unwrap();
+        assert_eq!(labels(&matches, "admin"), [(1, 0, 0)]);
+        assert_eq!(labels(&matches, "web").len(), 5);
+    }
+
+    #[test]
+    fn the_walk_over_the_kept_matches_finds_the_routers_rule() {
+        let (compiled, matches) = compile_with_matches(&config(SHOP)).unwrap();
+        let web = compiled.listeners.iter().find(|l| l.name == "web").unwrap();
+        for (method, host, target, fields) in SHOPPING {
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            let mut headers = HeaderMap::new();
+            for (name, value) in fields {
+                headers.append(*name, value.parse().unwrap());
+            }
+            let request = RequestParts {
+                host,
+                path,
+                query,
+                method: &method.parse().unwrap(),
+                headers: &headers,
+            };
+            let walked = edgerush_router::explain(matches.of("web"), &request);
+            assert_eq!(
+                walked.chosen().map(|chosen| chosen.value.rule),
+                web.router.route(&request).copied(),
+                "{method} {host}{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn compiling_with_matches_compiles_and_refuses_as_compiling_does() {
+        let plain = compile(&config(SHOP)).unwrap();
+        let (kept, _) = compile_with_matches(&config(SHOP)).unwrap();
+        for (method, host, target, fields) in SHOPPING {
+            assert_eq!(
+                route_with(&kept, method, host, target, fields),
+                route_with(&plain, method, host, target, fields),
+                "{method} {host}{target}"
+            );
+        }
+        let broken = SHOP.replace(
+            "checkout-canary: { load_balancer",
+            "renamed: { load_balancer",
+        );
+        let refused = compile(&config(&broken)).unwrap_err();
+        assert!(!refused.is_empty());
+        assert_eq!(compile_with_matches(&config(&broken)).unwrap_err(), refused);
     }
 
     #[test]

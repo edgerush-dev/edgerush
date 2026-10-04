@@ -24,8 +24,8 @@ pub use backends::{UpstreamId, WeightedBackends};
 pub use compile::{
     Compiled, CompiledDataPlane, CompiledForwarding, CompiledListener, CompiledMirror,
     CompiledRetry, CompiledRule, CompiledTimeouts, CompiledTls, CompiledUpstream,
-    CompiledUpstreamTls, ConfigError, L4, L4Route, NamedCertificate, Object, Outcome, Place,
-    Problem, RuleId, SniRouter, Step, Timeout, compile,
+    CompiledUpstreamTls, ConfigError, L4, L4Route, MatchId, Matches, NamedCertificate, Object,
+    Outcome, Place, Problem, RuleId, SniRouter, Step, Timeout, compile, compile_with_matches,
 };
 pub use config::{
     AccessLog, Certificate, ClientValidation, Config, DataPlane, Forwarding, HealthCheck, Http3,
