@@ -240,6 +240,7 @@ dependencies = [
  "edgerush-proxy",
  "edgerush-router",
  "http",
+ "serde",
  "serde-saphyr",
  "thiserror",
 ]

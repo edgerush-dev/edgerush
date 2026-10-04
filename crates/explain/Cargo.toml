@@ -12,10 +12,9 @@ edgerush-config.workspace = true
 edgerush-proxy.workspace = true
 edgerush-router.workspace = true
 http.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
+serde.workspace = true
 serde-saphyr.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true
