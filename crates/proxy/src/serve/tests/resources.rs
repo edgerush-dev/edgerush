@@ -214,6 +214,56 @@ fn an_upstream_that_stops_answering_leaves_the_last_places_to_the_others() {
     }));
 }
 
+/// The same past the metrics' last slot: upstreams whose names come after the first 4,095
+/// a data plane has seen share one series, and nothing more. Each keeps its own share of the
+/// places, so the healthy one is still served beside the slow one.
+#[test]
+fn upstreams_past_the_last_metrics_slot_keep_their_own_share_of_places() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let (slow, held) = scripted_upstream().await;
+        let (healthy, _) = scripted_upstream().await;
+        let proxy = Arc::new(Proxy::new(everything_to(healthy), NonZeroUsize::MIN).unwrap());
+        // Every slot taken by names that came and went.
+        for name in 0..crate::metrics::UPSTREAM_SLOTS {
+            let _slot = proxy.metrics.upstream_slot(&format!("gone-{name}"));
+        }
+        let config = compile(&slow_and_healthy_config(slow, healthy)).unwrap();
+        proxy.reload(config).unwrap();
+        let limits = H1Limits {
+            exchanges: 16,
+            ..H1Limits::default()
+        };
+        let worker = Worker::with_limits(proxy, limits);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _serving = serving(&worker, socket);
+
+        for _ in 0..14 {
+            let _parked = tokio::task::spawn_local(async move {
+                let _never = status_of(front, "/slow/silent").await;
+            });
+        }
+        until(|| held.borrow().len() == 14).await;
+        let refused =
+            tokio::time::timeout(Duration::from_secs(5), status_of(front, "/slow/silent"))
+                .await
+                .unwrap_or_else(|_| panic!("took a fifteenth place for the slow upstream"));
+        assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            status_of(front, "/ok").await,
+            StatusCode::OK,
+            "the healthy upstream refused for the slow one's places"
+        );
+        held.borrow_mut().clear();
+        until(|| worker.places.held() == 0).await;
+    }));
+}
+
 /// Requests under `/slow` to `slow`, and the rest to `healthy`.
 fn slow_and_healthy_config(slow: SocketAddr, healthy: SocketAddr) -> Config {
     let yaml = format!(

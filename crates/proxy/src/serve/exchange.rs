@@ -213,7 +213,7 @@ impl Worker {
             .await
             .unwrap_or(Err(timing.lapsed()));
 
-        let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
+        let upstream = self.proxy.metrics.upstream(directed.upstream.slot());
         let (mut answer, body) = match answered {
             Ok(answered) => answered,
             // The worker's own storage running out, or a client's body that cannot be read,
@@ -312,12 +312,12 @@ impl Worker {
             bounds,
             timing.told,
             || {
-                if let Some(upstream) = self.proxy.metrics.upstream(directed.upstream_slot) {
+                if let Some(upstream) = self.proxy.metrics.upstream(directed.upstream.slot()) {
                     upstream.retries.inc();
                 }
             },
         ));
-        let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
+        let upstream = self.proxy.metrics.upstream(directed.upstream.slot());
         let Some(exchanged) = by_deadline(&self.timers, timing.deadline, exchanging).await else {
             let lapsed = timing.lapsed();
             if lapsed == Answer::UpstreamTimedOut
@@ -333,7 +333,7 @@ impl Worker {
         }
         let watch = Watch {
             proxy: Arc::clone(&self.proxy),
-            upstream: directed.upstream_slot,
+            upstream: directed.upstream.slot(),
         };
         let mut response = Response::from_parts(parts, Body::H2(Box::new(answer), admitted, watch));
         let headers = response.headers_mut();
@@ -434,7 +434,7 @@ impl Worker {
         // other way out of here has dropped it already.
         let watch = Watch {
             proxy: Arc::clone(&self.proxy),
-            upstream: directed.upstream_slot,
+            upstream: directed.upstream.slot(),
         };
         Ok((read, Body::Ours(body, admitted, watch)))
     }
@@ -523,7 +523,7 @@ impl Worker {
             &storage,
             bounds,
         ));
-        let upstream = self.proxy.metrics.upstream(directed.upstream_slot);
+        let upstream = self.proxy.metrics.upstream(directed.upstream.slot());
         let Some(connected) = by_deadline(&self.timers, timing.deadline, connecting).await else {
             let lapsed = timing.lapsed();
             if lapsed == Answer::UpstreamTimedOut
@@ -567,7 +567,7 @@ impl Worker {
             Connected::Refused(parts, answer) => {
                 let watch = Watch {
                     proxy: Arc::clone(&self.proxy),
-                    upstream: directed.upstream_slot,
+                    upstream: directed.upstream.slot(),
                 };
                 (parts, Body::H2(Box::new(answer), admitted, watch))
             }

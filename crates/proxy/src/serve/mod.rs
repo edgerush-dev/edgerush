@@ -43,7 +43,6 @@ use crate::places::{Place, Places};
 use crate::raw::RawHead;
 use crate::received::Received;
 use crate::request_body::{RequestBody, RequestBodyError};
-use crate::retry::budget::Budget;
 use crate::routed::Routed;
 use crate::slots::{Slots, WorkerSlots};
 use crate::timers::{Alarm, Timers};
@@ -363,8 +362,6 @@ pub struct Worker {
     drain: Rc<Drain>,
     /// Its HTTP/2 connections to upstreams, many requests at once on each (15 §4).
     h2: Rc<H2Client>,
-    /// Its retry budgets, by upstream slot: a worker's own, as its connections are.
-    budgets: RefCell<HashMap<usize, Budget>>,
     /// What it has in flight to each endpoint, and whose turn it is (03 §6).
     balancing: RefCell<Balancing>,
     /// Connections accepted since everything else last had a turn.
@@ -619,7 +616,9 @@ struct Redirect {
 /// What a request keeps of the snapshot it was directed on.
 struct Directed {
     rule: Option<Arc<CompiledRule>>,
-    upstream_slot: usize,
+    /// The worker's state for its upstream: where it is counted, the places it holds, its
+    /// retry budget and its balancer.
+    upstream: Rc<balancing::Upstream>,
     /// The endpoint this request was directed to, taken from the same snapshot as the
     /// route so that no reload can come between the two.
     endpoint: Arc<ReuseIdentity>,
@@ -694,14 +693,14 @@ struct Others {
     authorities: Vec<Authority>,
     /// By position of the endpoint.
     destinations: Vec<Arc<ReuseIdentity>>,
-    balance: Rc<balancing::Upstream>,
     /// Where the first try went.
     first: usize,
 }
 
 /// Where one copy of a request goes: drawn with the request, from the same snapshot.
 struct Mirrored {
-    upstream_slot: usize,
+    /// The worker's state for the mirror's upstream.
+    upstream: Rc<balancing::Upstream>,
     endpoint: Arc<ReuseIdentity>,
     /// Its count at that endpoint, until the place its exchange is given takes it: a copy
     /// is load on the mirror's backend like any exchange (03 §6).
@@ -722,7 +721,7 @@ impl Directed {
         tried: &Tried,
     ) -> Option<(Uri, Arc<ReuseIdentity>, usize, InFlight)> {
         let others = self.others.as_deref()?;
-        let (at, counted) = others.balance.pick(&others.destinations, tried)?;
+        let (at, counted) = self.upstream.pick(&others.destinations, tried)?;
         let authority = others.authorities.get(at)?;
         let destination = others.destinations.get(at)?;
         Some((
@@ -935,6 +934,7 @@ fn balance_of(
         snapshot.generation,
         &snapshot.config,
         &snapshot.destinations,
+        &snapshot.upstream_slots,
     );
     balancing.upstream(upstream).cloned()
 }

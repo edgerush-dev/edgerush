@@ -26,24 +26,37 @@ const UPSTREAMS: usize = 8;
 /// Whether the config has no upstream but the one asked for: it has eight.
 const ALONE: bool = false;
 
-/// A worker's places, with `held` of them held, spread over the upstreams.
-fn holding(held: usize) -> (Rc<Places>, Vec<Place>) {
-    // As many slots as the data plane's metrics have.
-    let places = Places::new(1024, 4096);
+/// A worker's places, with `held` of them held, spread over the upstreams, and each
+/// upstream's count of them.
+pub struct Holding {
+    places: Rc<Places>,
+    upstreams: Vec<Rc<Cell<usize>>>,
+    /// Kept, so that they stay held.
+    _held: Vec<Place>,
+}
+
+fn holding(held: usize) -> Holding {
+    let places = Places::new(1024);
+    let upstreams: Vec<Rc<Cell<usize>>> = (0..UPSTREAMS).map(|_| Rc::default()).collect();
     let taken = (0..held)
-        .filter_map(|at| places.take(at % UPSTREAMS, ALONE).ok())
+        .filter_map(|at| places.take(&upstreams[at % UPSTREAMS], ALONE).ok())
         .collect();
-    (places, taken)
+    Holding {
+        places,
+        upstreams,
+        _held: taken,
+    }
 }
 
 // The places are handed back so that dropping them is not measured.
 #[library_benchmark]
 #[bench::with_room(holding(0))]
 #[bench::short_of_places(holding(900))]
-fn take_and_give_back(worker: (Rc<Places>, Vec<Place>)) -> ((Rc<Places>, Vec<Place>), usize) {
+fn take_and_give_back(worker: Holding) -> (Holding, usize) {
     let mut taken = 0;
     for exchange in 0..EXCHANGES {
-        let place = worker.0.take(black_box(exchange % UPSTREAMS), ALONE);
+        let upstream = &worker.upstreams[black_box(exchange % UPSTREAMS)];
+        let place = worker.places.take(upstream, ALONE);
         taken += usize::from(black_box(&place).is_ok());
     }
     (worker, taken)

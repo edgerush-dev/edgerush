@@ -56,7 +56,7 @@ fn reloaded(upstreams: usize, one_moved: bool) -> Reloaded {
     let before = config(upstreams, None);
     let was = Destinations::reconcile_plain(&before, &Destinations::default(), &keys);
     let mut balancing = Balancing::default();
-    balancing.refresh(1, &before, &was);
+    balancing.refresh(1, &before, &was, &[]);
     let config = config(upstreams, one_moved.then_some(0));
     let destinations = Destinations::reconcile_plain(&config, &was, &keys);
     Reloaded {
@@ -75,7 +75,7 @@ fn reloaded(upstreams: usize, one_moved: bool) -> Reloaded {
 fn refresh(mut reloaded: Reloaded) -> Reloaded {
     reloaded
         .balancing
-        .refresh(2, &reloaded.config, &reloaded.destinations);
+        .refresh(2, &reloaded.config, &reloaded.destinations, &[]);
     black_box(reloaded)
 }
 

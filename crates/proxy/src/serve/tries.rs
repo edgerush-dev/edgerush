@@ -10,7 +10,6 @@ use crate::metrics::Answer;
 use crate::mirror;
 use crate::random::random;
 use crate::request_body::RequestBody;
-use crate::retry::budget::Budget;
 use crate::retry::replay::Tee;
 use crate::upstream::h1::codec::{OutgoingFields, Sending};
 use edgerush_config::CompiledRetry;
@@ -56,10 +55,10 @@ impl Worker {
         let listened = interim.clone();
         let mut interim = interim;
         let mut endpoint = Arc::clone(&directed.endpoint);
-        self.budget(directed.upstream_slot, |budget| {
+        directed.upstream.budget(|budget| {
             budget.deposit(Instant::now());
         });
-        let upstream = || self.proxy.metrics.upstream(directed.upstream_slot);
+        let upstream = || self.proxy.metrics.upstream(directed.upstream.slot());
         let mut retried = 0;
         // Where the tries have gone, for the next to keep away from (03 §6).
         let mut tried = Tried::default();
@@ -97,9 +96,10 @@ impl Worker {
                 }
                 return outcome;
             };
-            if !self.budget(directed.upstream_slot, |budget| {
-                budget.withdraw(Instant::now())
-            }) {
+            if !directed
+                .upstream
+                .budget(|budget| budget.withdraw(Instant::now()))
+            {
                 if let Some(upstream) = upstream() {
                     upstream.retries_over_budget.inc();
                 }
@@ -111,7 +111,7 @@ impl Worker {
             }
             // A place for the next try before this one's is given back with its answer:
             // a worker at its bound keeps the answer it has rather than lose it.
-            let Ok(next) = self.admit(directed.upstream_slot, directed.alone) else {
+            let Ok(next) = self.admit(&directed.upstream, directed.alone) else {
                 return outcome;
             };
             let Some((target, drawn, at, counted)) = directed.draw(head.uri(), &tried) else {
@@ -166,7 +166,7 @@ impl Worker {
                     .as_ref()
                     .map_or(upstream_carries, carries_credentials);
                 if bound {
-                    given_up(mirror.upstream_slot, |counters| {
+                    given_up(mirror.upstream.slot(), |counters| {
                         &counters.mirrors_credentials
                     });
                 }
@@ -181,13 +181,13 @@ impl Worker {
         };
         let placed: Vec<_> = mirrors
             .into_iter()
-            .filter_map(|mut mirror| match self.admit(mirror.upstream_slot, alone) {
+            .filter_map(|mut mirror| match self.admit(&mirror.upstream, alone) {
                 Ok(admitted) => {
                     let counted = mirror.counted.take();
                     Some((mirror, admitted.counting(counted)))
                 }
                 Err(_) => {
-                    given_up(mirror.upstream_slot, |counters| &counters.mirrors_busy);
+                    given_up(mirror.upstream.slot(), |counters| &counters.mirrors_busy);
                     None
                 }
             })
@@ -228,7 +228,7 @@ impl Worker {
             let _copying = tokio::task::spawn_local(async move {
                 let directed = Directed {
                     rule: None,
-                    upstream_slot: mirror.upstream_slot,
+                    upstream: Rc::clone(&mirror.upstream),
                     alone,
                     endpoint: Arc::clone(&mirror.endpoint),
                     counted: None,
@@ -278,22 +278,13 @@ impl Worker {
                     .await;
                 }
                 if kept.fell_behind()
-                    && let Some(upstream) = worker.proxy.metrics.upstream(mirror.upstream_slot)
+                    && let Some(upstream) = worker.proxy.metrics.upstream(mirror.upstream.slot())
                 {
                     upstream.mirrors_behind.inc();
                 }
             });
         }
         RequestBody::Mirrored(Box::new(tee))
-    }
-
-    /// This worker's retry budget for the upstream in `slot`, for `act` to use.
-    fn budget<T>(&self, slot: usize, act: impl FnOnce(&mut Budget) -> T) -> T {
-        let mut budgets = self.budgets.borrow_mut();
-        let budget = budgets
-            .entry(slot)
-            .or_insert_with(|| Budget::new(Instant::now()));
-        act(budget)
     }
 }
 

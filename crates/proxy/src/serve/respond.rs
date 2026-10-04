@@ -216,7 +216,7 @@ impl Worker {
         // entitles a request to a connection, so it is taken before one is sought. The same
         // bound whichever client carries the request, so that the two are compared doing
         // the same work ([14 §2](../../docs/14-downstream-server.md)).
-        let admitted = match self.admit(directed.upstream_slot, directed.alone) {
+        let admitted = match self.admit(&directed.upstream, directed.alone) {
             Ok(admitted) => admitted,
             Err(refused) => return self.proxy.answer_to(listener, refused, call).into(),
         };
@@ -390,10 +390,6 @@ impl Proxy {
         // An upstream the snapshot does not have is not known to happen.
         let upstream = forward.upstream.0;
         let endpoints = snapshot.endpoints.get(upstream).ok_or(Answer::NoBackend)?;
-        let upstream_slot = *snapshot
-            .upstream_slots
-            .get(upstream)
-            .ok_or(Answer::NoBackend)?;
         let destinations = snapshot.destinations.of(upstream);
         let balance = balance_of(balancing, snapshot, upstream).ok_or(Answer::NoEndpoints)?;
         let (at, counted) = balance
@@ -436,7 +432,7 @@ impl Proxy {
                     .key(came_on, Through::Http(forward.route), upstream),
             }))
         });
-        if let Some(counters) = self.metrics.upstream(upstream_slot) {
+        if let Some(counters) = self.metrics.upstream(balance.slot()) {
             counters.requests.inc();
         }
         let mut mirrors = Vec::new();
@@ -469,10 +465,11 @@ impl Proxy {
                     at_endpoint(&target, authority)?,
                     destinations.get(at)?,
                     counted,
+                    balance,
                 ))
             });
             let counters = self.metrics.upstream(slot);
-            let Some((target, destination, counted)) = found else {
+            let Some((target, destination, counted, balance)) = found else {
                 if let Some(counters) = counters {
                     counters.mirrors_nowhere.inc();
                 }
@@ -482,7 +479,7 @@ impl Proxy {
                 counters.requests.inc();
             }
             mirrors.push(Mirrored {
-                upstream_slot: slot,
+                upstream: balance,
                 endpoint: Arc::clone(destination),
                 counted: Some(counted),
                 target,
@@ -497,13 +494,12 @@ impl Proxy {
             Box::new(Others {
                 authorities: endpoints.clone(),
                 destinations: destinations.to_vec(),
-                balance,
                 first: at,
             })
         });
         Ok(Directing::Upstream(Directed {
             rule: kept.then(|| Arc::clone(forward.rule)),
-            upstream_slot,
+            upstream: balance,
             endpoint: Arc::clone(identity),
             counted: Some(counted),
             others,

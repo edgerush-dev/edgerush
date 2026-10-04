@@ -14,12 +14,12 @@ use crate::slots::WorkerSlots;
 use crate::storage::Storage;
 use crate::timers::Timers;
 use crate::tls::Tls;
+use crate::upstream::balancing;
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::{Blocks, SMALL, Sizes};
 use crate::upstream::h1::pool::Pool;
 use crate::upstream::h2::client::Client as H2Client;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::pin;
@@ -117,13 +117,12 @@ impl Worker {
             pool: Rc::new(RefCell::new(Pool::default())),
             blocks,
             timers: Timers::new(),
-            places: Places::new(limits.exchanges, crate::metrics::UPSTREAM_SLOTS),
+            places: Places::new(limits.exchanges),
             limits,
             deadlines,
             date: Cell::new(HttpDate::from_unix(unix_now())),
             drain: Rc::new(Drain::default()),
             h2: H2Client::new(h2_settings(&limits), Rc::clone(&received)),
-            budgets: RefCell::new(HashMap::new()),
             balancing: RefCell::default(),
             accepted: Cell::new(0),
             body_limits,
@@ -343,16 +342,20 @@ impl Worker {
         self.h2.connections()
     }
 
-    /// Takes a place among the exchanges this worker has in hand for one with the upstream
-    /// in `upstream`, if one is going to it: none once every place is held, and none for
-    /// an upstream that holds its fair share once the worker is short of them
+    /// Takes a place among the exchanges this worker has in hand for one with `upstream`,
+    /// if one is going to it: none once every place is held, and none for an upstream that
+    /// holds its fair share once the worker is short of them
     /// ([03 §9](../../docs/03-data-plane.md)). `alone` says the config it was directed by
     /// has no other upstream.
     ///
     /// Nothing waits here. A request arriving at a worker that is already full is
     /// answered, because holding it would cost the very memory the bound is for.
-    pub(super) fn admit(&self, upstream: usize, alone: bool) -> Result<Admitted, Answer> {
-        match self.places.take(upstream, alone) {
+    pub(super) fn admit(
+        &self,
+        upstream: &balancing::Upstream,
+        alone: bool,
+    ) -> Result<Admitted, Answer> {
+        match self.places.take(upstream.places(), alone) {
             Ok(place) => Ok(Admitted {
                 _place: place,
                 counted: None,

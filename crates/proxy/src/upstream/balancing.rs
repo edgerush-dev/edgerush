@@ -1,19 +1,27 @@
-//! A worker's side of load balancing ([03 §6](../../../docs/03-data-plane.md)): what it has
-//! in flight to each endpoint and whose turn it is, per upstream of the config it serves,
-//! for [`crate::balance`] to choose with.
+//! A worker's state for each upstream of the config it serves: its side of load balancing
+//! ([03 §6](../../../docs/03-data-plane.md)) — what it has in flight to each endpoint and
+//! whose turn it is, for [`crate::balance`] to choose with — and the places its exchanges
+//! hold ([`crate::places`], 03 §9) and its retry budget (03 §6).
 //!
 //! **A worker's own.** It counts only its own exchanges, and no request writes where another
 //! core writes: a stalled pod shows in every worker's count, since every worker's exchanges
 //! to it stop coming back.
+//!
+//! **An upstream is its name.** A reload carries the places and the budget over to the
+//! upstream of the same name, and lets go of those of an upstream no config has once nothing
+//! holds them. Its metrics slot is only where it is counted: upstreams past the last slot
+//! share a series and nothing else.
 
 use crate::balance::{self, Candidates, RoundRobin, Share, Tried};
 use crate::random::random;
+use crate::retry::budget::Budget;
 use crate::upstream::destination::{Destinations, ReuseIdentity};
 use edgerush_config::{Compiled, LoadBalancer};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use tokio::time::Instant;
 
 /// One exchange in flight to an endpoint, counted from its pick until it is let go of:
 /// with the place its exchange holds, which goes with the answer's body to its end, or with
@@ -43,10 +51,18 @@ pub struct Balancing {
     upstreams: Vec<Rc<Upstream>>,
 }
 
-/// A worker's balancing state for one upstream: its balancer, a count for each endpoint, and
-/// whose turn it is.
+/// A worker's state for one upstream: its balancer, a count for each endpoint, whose turn it
+/// is, the places it holds and its retry budget.
 #[derive(Debug)]
 pub(crate) struct Upstream {
+    /// Its name: how a new config finds its places and its budget.
+    name: Box<str>,
+    /// Where it is counted in the data plane's metrics.
+    slot: usize,
+    /// How many of the worker's places its exchanges hold, each place holding the count.
+    places: Rc<Cell<usize>>,
+    /// Its retry budget on this worker, made when it is first wanted.
+    budget: Rc<RefCell<Option<Budget>>>,
     balancer: LoadBalancer,
     /// Its slow start's window in milliseconds, if it has one.
     window: Option<u64>,
@@ -62,20 +78,31 @@ pub(crate) struct Upstream {
 
 impl Balancing {
     /// Made again for the config numbered `generation`, if it is not the one this was made
-    /// for: counts are kept for every destination that is the same one, and the turn for
-    /// every upstream whose endpoints are all the same, in the same order; an upstream with a
-    /// new list starts its turns at a place drawn at random. Once per worker per config.
-    pub fn refresh(&mut self, generation: u64, config: &Compiled, destinations: &Destinations) {
+    /// for, whose upstreams are counted in `slots` by position: counts are kept for every
+    /// destination that is the same one, the turn for every upstream whose endpoints are all
+    /// the same, in the same order, and the places and the budget for every upstream of the
+    /// same name. An upstream with a new list starts its turns at a place drawn at random.
+    /// Once per worker per config.
+    pub fn refresh(
+        &mut self,
+        generation: u64,
+        config: &Compiled,
+        destinations: &Destinations,
+        slots: &[usize],
+    ) {
         if self.generation == Some(generation) {
             return;
         }
-        let mut counts: HashMap<u64, Rc<Cell<u32>>> = HashMap::new();
-        let mut turns: HashMap<Box<[u64]>, RoundRobin> = HashMap::new();
-        for upstream in self.upstreams.drain(..) {
+        let before = std::mem::take(&mut self.upstreams);
+        let mut counts: HashMap<u64, &Rc<Cell<u32>>> = HashMap::new();
+        let mut turns: HashMap<&[u64], RoundRobin> = HashMap::new();
+        let mut named: HashMap<&str, &Upstream> = HashMap::new();
+        for upstream in &before {
             for (key, count) in upstream.keys.iter().zip(upstream.counts.iter()) {
-                counts.insert(*key, Rc::clone(count));
+                counts.insert(*key, count);
             }
-            turns.insert(upstream.keys.clone(), upstream.round_robin.get());
+            turns.insert(&upstream.keys, upstream.round_robin.get());
+            named.insert(&upstream.name, upstream);
         }
         self.upstreams = config
             .upstreams()
@@ -89,13 +116,18 @@ impl Balancing {
                     .collect();
                 let counts = keys
                     .iter()
-                    .map(|key| counts.remove(key).unwrap_or_default())
+                    .map(|key| counts.remove(key).map(Rc::clone).unwrap_or_default())
                     .collect();
-                let round_robin = turns.remove(&keys).unwrap_or_else(|| {
+                let round_robin = turns.remove(&*keys).unwrap_or_else(|| {
                     // Any `usize` will do: it is taken modulo the endpoints.
                     RoundRobin::starting_at(random() as usize)
                 });
+                let same = named.get(upstream.name.as_str());
                 Rc::new(Upstream {
+                    name: upstream.name.as_str().into(),
+                    slot: slots.get(position).copied().unwrap_or_default(),
+                    places: same.map_or_else(Rc::default, |same| Rc::clone(&same.places)),
+                    budget: same.map_or_else(Rc::default, |same| Rc::clone(&same.budget)),
                     balancer: upstream.load_balancer,
                     window: upstream.slow_start.map(|slow_start| slow_start.window_ms),
                     keys,
@@ -110,6 +142,25 @@ impl Balancing {
     /// The state of the upstream at `position` of the config last refreshed for.
     pub(crate) fn upstream(&self, position: usize) -> Option<&Rc<Upstream>> {
         self.upstreams.get(position)
+    }
+}
+
+impl Upstream {
+    /// Where it is counted in the data plane's metrics.
+    pub(crate) fn slot(&self) -> usize {
+        self.slot
+    }
+
+    /// How many of the worker's places its exchanges hold.
+    pub(crate) fn places(&self) -> &Rc<Cell<usize>> {
+        &self.places
+    }
+
+    /// Its retry budget on this worker, for `act` to use: made with the time it is first
+    /// wanted.
+    pub(crate) fn budget<T>(&self, act: impl FnOnce(&mut Budget) -> T) -> T {
+        let mut budget = self.budget.borrow_mut();
+        act(budget.get_or_insert_with(|| Budget::new(Instant::now())))
     }
 }
 
@@ -197,7 +248,7 @@ mod tests {
         generation: u64,
     ) -> Destinations {
         let destinations = Destinations::reconcile(config, previous, keys, &[None, None]);
-        balancing.refresh(generation, config, &destinations);
+        balancing.refresh(generation, config, &destinations, &[]);
         destinations
     }
 
@@ -239,6 +290,48 @@ mod tests {
         assert_eq!(at, 1, "the endpoint with nothing in flight");
         drop(held);
         assert_eq!(reloaded.counts[0].get(), 0);
+    }
+
+    /// An upstream is its name: a reload carries its places and its retry budget over to
+    /// the upstream of the same name, wherever it now sits and whatever its endpoints are.
+    /// One of a new name starts with none, and no two upstreams ever share them, whatever
+    /// their metrics slots — here every one of them is slot 0.
+    #[test]
+    fn a_reload_carries_places_and_budget_by_the_upstreams_name() {
+        let before = compiled(&[
+            ("a", "p2c", &["10.0.0.1:80"]),
+            ("b", "p2c", &["10.0.0.2:80"]),
+        ]);
+        let keys = Keys::default();
+        let mut balancing = Balancing::default();
+        let first = state(&before, &Destinations::default(), &keys, &mut balancing, 0);
+        let a = Rc::clone(balancing.upstream(0).unwrap());
+        let b = Rc::clone(balancing.upstream(1).unwrap());
+        assert!(
+            !Rc::ptr_eq(a.places(), b.places()),
+            "two upstreams share places"
+        );
+        assert!(
+            !Rc::ptr_eq(&a.budget, &b.budget),
+            "two upstreams share a budget"
+        );
+        a.places().set(3);
+
+        // "0new" sorts first, so "a" moves along one; "b" goes.
+        let after = compiled(&[
+            ("0new", "p2c", &["10.0.0.3:80"]),
+            ("a", "p2c", &["10.0.0.4:80"]),
+        ]);
+        let _second = state(&after, &first, &keys, &mut balancing, 1);
+        let moved = balancing.upstream(1).unwrap();
+        assert!(Rc::ptr_eq(moved.places(), a.places()));
+        assert!(Rc::ptr_eq(&moved.budget, &a.budget));
+        assert_eq!(moved.places().get(), 3);
+        let new = balancing.upstream(0).unwrap();
+        assert_eq!(new.places().get(), 0);
+        assert!(!Rc::ptr_eq(new.places(), a.places()));
+        assert!(!Rc::ptr_eq(new.places(), b.places()));
+        assert!(!Rc::ptr_eq(&new.budget, &b.budget));
     }
 
     #[test]
@@ -305,7 +398,7 @@ mod tests {
         let firsts: std::collections::BTreeSet<usize> = (0..16)
             .map(|_| {
                 let mut balancing = Balancing::default();
-                balancing.refresh(0, &config, &destinations);
+                balancing.refresh(0, &config, &destinations, &[]);
                 let upstream = balancing.upstream(0).unwrap();
                 upstream
                     .pick(destinations.of(0), &Tried::default())
