@@ -2,7 +2,8 @@
 //! ([03 §6](../../../docs/03-data-plane.md)): what the first request on each worker pays
 //! after a reload, on its own thread, while every connection of the worker waits. At 10,
 //! 1,000 and 10,000 upstreams of four endpoints each, when nothing of the upstreams changed
-//! and when one upstream's endpoints did.
+//! and when one upstream's endpoints did: for a worker one config behind, which follows
+//! what the reload worked out, and for one further behind, which finds what it had by name.
 //!
 //! Linux only (valgrind):
 //! `cargo bench -p edgerush-proxy --features fuzzing --bench refresh`, see the repository
@@ -18,7 +19,7 @@
 )]
 
 use edgerush_config::{Compiled, Config, compile};
-use edgerush_proxy::upstream::balancing::Balancing;
+use edgerush_proxy::upstream::balancing::{Balancing, Carry};
 use edgerush_proxy::upstream::destination::{Destinations, Keys};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::fmt::Write;
@@ -44,38 +45,52 @@ fn config(upstreams: usize, moved: Option<usize>) -> Compiled {
     compile(&config).expect("valid config")
 }
 
-/// A worker's balancing state made for one config, and the next config to bring it up to.
+/// A worker's balancing state made for one config, the next config to bring it up to, and
+/// what the reload worked out became of each upstream: nothing, for a worker further behind.
 pub struct Reloaded {
     balancing: Balancing,
     config: Compiled,
     destinations: Destinations,
+    carried: Vec<Carry>,
 }
 
-fn reloaded(upstreams: usize, one_moved: bool) -> Reloaded {
+fn reloaded(upstreams: usize, one_moved: bool, one_behind: bool) -> Reloaded {
     let keys = Keys::default();
     let before = config(upstreams, None);
     let was = Destinations::reconcile_plain(&before, &Destinations::default(), &keys);
     let mut balancing = Balancing::default();
-    balancing.refresh(1, &before, &was, &[]);
+    balancing.refresh(1, &before, &was, &[], &[]);
     let config = config(upstreams, one_moved.then_some(0));
     let destinations = Destinations::reconcile_plain(&config, &was, &keys);
+    let carried = if one_behind {
+        Carry::between(&before, &was, &config, &destinations)
+    } else {
+        Vec::new()
+    };
     Reloaded {
         balancing,
         config,
         destinations,
+        carried,
     }
 }
 
 #[library_benchmark]
-#[bench::unchanged_10(reloaded(10, false))]
-#[bench::unchanged_1000(reloaded(1_000, false))]
-#[bench::unchanged_10000(reloaded(10_000, false))]
-#[bench::one_moved_1000(reloaded(1_000, true))]
-#[bench::one_moved_10000(reloaded(10_000, true))]
+#[bench::unchanged_10(reloaded(10, false, true))]
+#[bench::unchanged_1000(reloaded(1_000, false, true))]
+#[bench::unchanged_10000(reloaded(10_000, false, true))]
+#[bench::one_moved_1000(reloaded(1_000, true, true))]
+#[bench::one_moved_10000(reloaded(10_000, true, true))]
+#[bench::by_name_1000(reloaded(1_000, true, false))]
+#[bench::by_name_10000(reloaded(10_000, true, false))]
 fn refresh(mut reloaded: Reloaded) -> Reloaded {
-    reloaded
-        .balancing
-        .refresh(2, &reloaded.config, &reloaded.destinations, &[]);
+    reloaded.balancing.refresh(
+        2,
+        &reloaded.config,
+        &reloaded.destinations,
+        &[],
+        &reloaded.carried,
+    );
     black_box(reloaded)
 }
 

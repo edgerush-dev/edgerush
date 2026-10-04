@@ -570,6 +570,9 @@ struct Snapshot {
     endpoints: Vec<Vec<Authority>>,
     /// By position of the upstream: the slot of its counters.
     upstream_slots: Vec<usize>,
+    /// By position of the upstream: what became of it at this reload, worked out once for
+    /// every worker to follow (03 §6).
+    carried: Vec<balancing::Carry>,
     /// By position of the upstream, then of the endpoint: what a kept connection to it is
     /// filed under. Worked out against the config this one replaces, because that is the
     /// only moment both are in hand ([13 §3](../../docs/13-http1-upstream.md)).
@@ -939,6 +942,7 @@ fn balance_of(
         &snapshot.config,
         &snapshot.destinations,
         &snapshot.upstream_slots,
+        &snapshot.carried,
     );
     balancing.upstream(upstream).cloned()
 }

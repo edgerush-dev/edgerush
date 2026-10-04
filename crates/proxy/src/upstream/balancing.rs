@@ -11,12 +11,20 @@
 //! upstream of the same name, and lets go of those of an upstream no config has once nothing
 //! holds them. Its metrics slot is only where it is counted: upstreams past the last slot
 //! share a series and nothing else.
+//!
+//! **A reload costs a worker what it changed.** A worker brings its state up to a new
+//! config at its first request after the reload, on its own thread, with every connection of
+//! it waiting; made again whole, that was 4 ms for 10,000 upstreams. So the thread that
+//! reloads works out once what became of each upstream ([`Carry`]), and a worker one config
+//! behind keeps the state of every upstream that is the same as it is and makes again only
+//! the rest, as Envoy hands its workers the clusters that changed. A worker further behind,
+//! which saw no request in between, makes its state again from what it had, by name.
 
 use crate::balance::{self, Candidates, RoundRobin, Share, Tried};
 use crate::random::random;
 use crate::retry::budget::Budget;
 use crate::upstream::destination::{Destinations, ReuseIdentity};
-use edgerush_config::{Compiled, LoadBalancer};
+use edgerush_config::{Compiled, CompiledUpstream, LoadBalancer};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -40,6 +48,68 @@ impl Drop for InFlight {
     fn drop(&mut self) {
         self.0.set(self.0.get().saturating_sub(1));
     }
+}
+
+/// What became of an upstream at a reload, worked out once for every worker
+/// ([`Carry::between`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carry {
+    /// The same upstream as the one at this position in the config before: the same name,
+    /// endpoints, balancer and slow start. A worker keeps its state for it as it is.
+    Same(usize),
+    /// The upstream of the same name as the one at this position in the config before,
+    /// changed: its state is made again, keeping what of it still holds.
+    Changed(usize),
+    /// An upstream the config before did not have.
+    New,
+}
+
+impl Carry {
+    /// What became of each upstream of `config`, whose destinations are `destinations`, by
+    /// position, against the config `before` it, whose destinations were `was`.
+    #[must_use]
+    pub fn between(
+        before: &Compiled,
+        was: &Destinations,
+        config: &Compiled,
+        destinations: &Destinations,
+    ) -> Vec<Self> {
+        let named: HashMap<&str, usize> = before
+            .upstreams()
+            .iter()
+            .enumerate()
+            .map(|(at, upstream)| (upstream.name.as_str(), at))
+            .collect();
+        config
+            .upstreams()
+            .iter()
+            .enumerate()
+            .map(|(position, upstream)| {
+                let Some((&from, old)) = named
+                    .get(upstream.name.as_str())
+                    .and_then(|from| Some((from, before.upstreams().get(*from)?)))
+                else {
+                    return Self::New;
+                };
+                let window = |slow_start: Option<edgerush_config::SlowStart>| {
+                    slow_start.map(|slow_start| slow_start.window_ms)
+                };
+                let same = old.load_balancer == upstream.load_balancer
+                    && window(old.slow_start) == window(upstream.slow_start)
+                    && keys(was.of(from)).eq(keys(destinations.of(position)));
+                if same {
+                    Self::Same(from)
+                } else {
+                    Self::Changed(from)
+                }
+            })
+            .collect()
+    }
+}
+
+/// What each destination is filed under, in order.
+fn keys(destinations: &[Arc<ReuseIdentity>]) -> impl Iterator<Item = u64> + '_ {
+    destinations.iter().map(|destination| destination.key())
 }
 
 /// A worker's balancing state for every upstream of one config.
@@ -78,62 +148,63 @@ pub(crate) struct Upstream {
 
 impl Balancing {
     /// Made again for the config numbered `generation`, if it is not the one this was made
-    /// for, whose upstreams are counted in `slots` by position: counts are kept for every
-    /// destination that is the same one, the turn for every upstream whose endpoints are all
-    /// the same, in the same order, and the places and the budget for every upstream of the
-    /// same name. An upstream with a new list starts its turns at a place drawn at random.
-    /// Once per worker per config.
+    /// for, whose upstreams are counted in `slots` by position and became what `carried`
+    /// says of the config before it: counts are kept for every destination that is the same
+    /// one, the turn for every upstream whose endpoints are all the same, in the same order,
+    /// and the places and the budget for every upstream of the same name. An upstream with a
+    /// new list starts its turns at a place drawn at random. Once per worker per config.
+    ///
+    /// A worker one config behind keeps its state for every upstream `carried` says is the
+    /// same, and makes again only the rest. One further behind, or given nothing carried,
+    /// finds what it had by the upstreams' names.
     pub fn refresh(
         &mut self,
         generation: u64,
         config: &Compiled,
         destinations: &Destinations,
         slots: &[usize],
+        carried: &[Carry],
     ) {
         if self.generation == Some(generation) {
             return;
         }
         let before = std::mem::take(&mut self.upstreams);
-        let mut counts: HashMap<u64, &Rc<Cell<u32>>> = HashMap::new();
-        let mut turns: HashMap<&[u64], RoundRobin> = HashMap::new();
-        let mut named: HashMap<&str, &Upstream> = HashMap::new();
-        for upstream in &before {
-            for (key, count) in upstream.keys.iter().zip(upstream.counts.iter()) {
-                counts.insert(*key, count);
-            }
-            turns.insert(&upstream.keys, upstream.round_robin.get());
-            named.insert(&upstream.name, upstream);
-        }
+        let one_behind = self.generation.and_then(|was| was.checked_add(1)) == Some(generation)
+            && carried.len() == config.upstreams().len();
+        let named: HashMap<&str, &Upstream> = if one_behind {
+            HashMap::new()
+        } else {
+            before
+                .iter()
+                .map(|upstream| (&*upstream.name, &**upstream))
+                .collect()
+        };
         self.upstreams = config
             .upstreams()
             .iter()
             .enumerate()
             .map(|(position, upstream)| {
-                let keys: Box<[u64]> = destinations
-                    .of(position)
-                    .iter()
-                    .map(|destination| destination.key())
-                    .collect();
-                let counts = keys
-                    .iter()
-                    .map(|key| counts.remove(key).map(Rc::clone).unwrap_or_default())
-                    .collect();
-                let round_robin = turns.remove(&*keys).unwrap_or_else(|| {
-                    // Any `usize` will do: it is taken modulo the endpoints.
-                    RoundRobin::starting_at(random() as usize)
-                });
-                let same = named.get(upstream.name.as_str());
-                Rc::new(Upstream {
-                    name: upstream.name.as_str().into(),
-                    slot: slots.get(position).copied().unwrap_or_default(),
-                    places: same.map_or_else(Rc::default, |same| Rc::clone(&same.places)),
-                    budget: same.map_or_else(Rc::default, |same| Rc::clone(&same.budget)),
-                    balancer: upstream.load_balancer,
-                    window: upstream.slow_start.map(|slow_start| slow_start.window_ms),
-                    keys,
-                    counts,
-                    round_robin: Cell::new(round_robin),
-                })
+                let was = if one_behind {
+                    match carried.get(position) {
+                        Some(Carry::Same(from)) => {
+                            if let Some(kept) = before.get(*from) {
+                                return Rc::clone(kept);
+                            }
+                            None
+                        }
+                        Some(Carry::Changed(from)) => before.get(*from).map(|was| &**was),
+                        Some(Carry::New) | None => None,
+                    }
+                } else {
+                    named.get(upstream.name.as_str()).copied()
+                };
+                let slot = slots.get(position).copied().unwrap_or_default();
+                Rc::new(Upstream::made(
+                    upstream,
+                    destinations.of(position),
+                    slot,
+                    was,
+                ))
             })
             .collect();
         self.generation = Some(generation);
@@ -146,6 +217,47 @@ impl Balancing {
 }
 
 impl Upstream {
+    /// The state for `upstream`, whose destinations are `destinations` and whose metrics are
+    /// in `slot`, made from what the state `was` for the upstream of its name had: the counts
+    /// of the destinations that stayed, the turn if they all did, in the same order, and the
+    /// places and the budget.
+    fn made(
+        upstream: &CompiledUpstream,
+        destinations: &[Arc<ReuseIdentity>],
+        slot: usize,
+        was: Option<&Self>,
+    ) -> Self {
+        let keys: Box<[u64]> = keys(destinations).collect();
+        // A destination's key is its upstream's as well as its own, so what the upstream of
+        // the same name had is all there is to keep.
+        let kept: HashMap<u64, &Rc<Cell<u32>>> = was
+            .map(|was| was.keys.iter().copied().zip(was.counts.iter()).collect())
+            .unwrap_or_default();
+        let counts = keys
+            .iter()
+            .map(|key| {
+                kept.get(key)
+                    .map_or_else(Rc::default, |count| Rc::clone(count))
+            })
+            .collect();
+        let round_robin = was.filter(|was| was.keys == keys).map_or_else(
+            // Any `usize` will do: it is taken modulo the endpoints.
+            || RoundRobin::starting_at(random() as usize),
+            |was| was.round_robin.get(),
+        );
+        Self {
+            name: upstream.name.as_str().into(),
+            slot,
+            places: was.map_or_else(Rc::default, |was| Rc::clone(&was.places)),
+            budget: was.map_or_else(Rc::default, |was| Rc::clone(&was.budget)),
+            balancer: upstream.load_balancer,
+            window: upstream.slow_start.map(|slow_start| slow_start.window_ms),
+            keys,
+            counts,
+            round_robin: Cell::new(round_robin),
+        }
+    }
+
     /// Where it is counted in the data plane's metrics.
     pub(crate) fn slot(&self) -> usize {
         self.slot
@@ -225,6 +337,7 @@ mod tests {
     use super::*;
     use crate::upstream::destination::Keys;
     use edgerush_config::{Config, compile};
+    use proptest::prelude::*;
 
     fn compiled(upstreams: &[(&str, &str, &[&str])]) -> Compiled {
         let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
@@ -248,7 +361,7 @@ mod tests {
         generation: u64,
     ) -> Destinations {
         let destinations = Destinations::reconcile(config, previous, keys, &[None, None]);
-        balancing.refresh(generation, config, &destinations, &[]);
+        balancing.refresh(generation, config, &destinations, &[], &[]);
         destinations
     }
 
@@ -398,7 +511,7 @@ mod tests {
         let firsts: std::collections::BTreeSet<usize> = (0..16)
             .map(|_| {
                 let mut balancing = Balancing::default();
-                balancing.refresh(0, &config, &destinations, &[]);
+                balancing.refresh(0, &config, &destinations, &[], &[]);
                 let upstream = balancing.upstream(0).unwrap();
                 upstream
                     .pick(destinations.of(0), &Tried::default())
@@ -407,6 +520,140 @@ mod tests {
             })
             .collect();
         assert!(firsts.len() > 1, "{firsts:?}");
+    }
+
+    /// An upstream as it says it is: its name, its balancer, its slow start's window, if it
+    /// has one, and the addresses of its endpoints.
+    type Stated = (&'static str, &'static str, Option<u64>, Vec<&'static str>);
+
+    fn stated(upstreams: &[Stated]) -> Compiled {
+        let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
+        for (name, balancer, window, addresses) in upstreams {
+            let listed: Vec<String> = addresses.iter().map(|a| format!("\"{a}\"")).collect();
+            let slow = window.map_or(String::new(), |ms| {
+                format!(", slow_start: {{ window_ms: {ms} }}")
+            });
+            yaml += &format!(
+                "  {name}: {{ load_balancer: {balancer}, endpoints: [{}]{slow} }}\n",
+                listed.join(", ")
+            );
+        }
+        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+        compile(&config).unwrap()
+    }
+
+    /// Of a config and the one after it, what became of each upstream of the second.
+    fn carried(before: &[Stated], after: &[Stated]) -> Vec<Carry> {
+        let keys = Keys::default();
+        let (first, second) = (stated(before), stated(after));
+        let was = Destinations::reconcile(&first, &Destinations::default(), &keys, &[]);
+        let now = Destinations::reconcile(&second, &was, &keys, &[]);
+        Carry::between(&first, &was, &second, &now)
+    }
+
+    /// An upstream is the same when its name, endpoints, balancer and slow start all are,
+    /// wherever it now sits; changed when its name is and anything else is not; new when
+    /// the config before had no upstream of its name.
+    #[test]
+    fn a_reload_says_what_became_of_each_upstream() {
+        let one = |balancer, window, addresses: &[&'static str]| -> Vec<Stated> {
+            vec![("u", balancer, window, addresses.to_vec())]
+        };
+        let before = one("p2c", None, &["10.0.0.1:80", "10.0.0.2:80"]);
+        assert_eq!(carried(&before, &before), [Carry::Same(0)]);
+        for after in [
+            one("p2c", None, &["10.0.0.1:80"]),
+            one("p2c", None, &["10.0.0.2:80", "10.0.0.1:80"]),
+            one("round_robin", None, &["10.0.0.1:80", "10.0.0.2:80"]),
+            one("p2c", Some(1000), &["10.0.0.1:80", "10.0.0.2:80"]),
+        ] {
+            assert_eq!(carried(&before, &after), [Carry::Changed(0)], "{after:?}");
+        }
+        // "0new" sorts first, so "u" moves along one.
+        let mut after = before.clone();
+        after.insert(0, ("0new", "p2c", None, vec!["10.0.0.3:80"]));
+        assert_eq!(carried(&before, &after), [Carry::New, Carry::Same(0)]);
+    }
+
+    fn an_upstream() -> impl Strategy<Value = Stated> {
+        (
+            proptest::sample::select(vec!["a", "b", "c", "d"]),
+            proptest::sample::select(vec!["p2c", "round_robin"]),
+            proptest::option::of(proptest::sample::select(vec![1000_u64, 2000])),
+            proptest::sample::subsequence(
+                vec!["10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80", "10.0.0.4:80"],
+                0..=4,
+            ),
+        )
+    }
+
+    fn a_config() -> impl Strategy<Value = Vec<Stated>> {
+        proptest::collection::vec(an_upstream(), 0..5).prop_map(|mut upstreams| {
+            upstreams.sort_by_key(|upstream| upstream.0);
+            upstreams.dedup_by_key(|upstream| upstream.0);
+            upstreams
+        })
+    }
+
+    /// Where `rc` came from among `old`: the position of the upstream state that held it,
+    /// and the endpoint for a count; none for one made afresh.
+    fn origin<T>(
+        old: &[Rc<Upstream>],
+        rc: &Rc<T>,
+        of: impl Fn(&Upstream) -> Vec<Rc<T>>,
+    ) -> Option<(usize, usize)> {
+        old.iter().enumerate().find_map(|(at, upstream)| {
+            of(upstream)
+                .iter()
+                .position(|held| Rc::ptr_eq(held, rc))
+                .map(|endpoint| (at, endpoint))
+        })
+    }
+
+    proptest! {
+        /// Whatever two configs follow one another, a worker one config behind that keeps
+        /// what the reload says is the same, and makes again only the rest, ends where one
+        /// that finds everything it had by name ends: every count, place count and budget
+        /// carried from the same state, and the same turn wherever the endpoints all stayed.
+        #[test]
+        fn following_the_reload_ends_where_finding_by_name_ends(
+            before in a_config(),
+            after in a_config(),
+        ) {
+            let keys = Keys::default();
+            let (first, second) = (stated(&before), stated(&after));
+            let was = Destinations::reconcile(&first, &Destinations::default(), &keys, &[]);
+            let now = Destinations::reconcile(&second, &was, &keys, &[]);
+            let mut initial = Balancing::default();
+            initial.refresh(0, &first, &was, &[], &[]);
+            let old = initial.upstreams.clone();
+            let carried = Carry::between(&first, &was, &second, &now);
+            let mut fast = Balancing { generation: Some(0), upstreams: old.clone() };
+            let mut by_name = Balancing { generation: Some(0), upstreams: old.clone() };
+            fast.refresh(1, &second, &now, &[], &carried);
+            by_name.refresh(1, &second, &now, &[], &[]);
+            prop_assert_eq!(fast.upstreams.len(), by_name.upstreams.len());
+            for (fast, by_name) in fast.upstreams.iter().zip(&by_name.upstreams) {
+                prop_assert_eq!(&fast.name, &by_name.name);
+                prop_assert_eq!(fast.balancer, by_name.balancer);
+                prop_assert_eq!(fast.window, by_name.window);
+                prop_assert_eq!(&fast.keys, &by_name.keys);
+                let places = |u: &Upstream| vec![Rc::clone(&u.places)];
+                let budget = |u: &Upstream| vec![Rc::clone(&u.budget)];
+                let counts = |u: &Upstream| u.counts.to_vec();
+                prop_assert_eq!(origin(&old, &fast.places, places), origin(&old, &by_name.places, places));
+                prop_assert_eq!(origin(&old, &fast.budget, budget), origin(&old, &by_name.budget, budget));
+                for (a, b) in fast.counts.iter().zip(by_name.counts.iter()) {
+                    prop_assert_eq!(origin(&old, a, counts), origin(&old, b, counts));
+                }
+                if old.iter().any(|was| was.name == fast.name && was.keys == fast.keys) {
+                    prop_assert_eq!(
+                        format!("{:?}", fast.round_robin.get()),
+                        format!("{:?}", by_name.round_robin.get())
+                    );
+                }
+            }
+        }
     }
 
     #[test]

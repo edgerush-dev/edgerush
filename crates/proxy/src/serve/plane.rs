@@ -6,6 +6,7 @@ use crate::downstream::h3::listener as h3_listener;
 use crate::metrics::{AcceptPause, Metrics};
 use crate::routed::Routed;
 use crate::tls::Tls;
+use crate::upstream::balancing::Carry;
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::secure::Secure;
 use arc_swap::ArcSwap;
@@ -113,12 +114,24 @@ impl Snapshot {
         let previous_destinations =
             previous.map_or(&nothing_yet, |previous| &previous.destinations);
         let destinations = Destinations::reconcile(&config, previous_destinations, keys, &secure);
+        let carried = previous.map_or_else(
+            || vec![Carry::New; config.upstreams().len()],
+            |previous| {
+                Carry::between(
+                    &previous.config,
+                    &previous.destinations,
+                    &config,
+                    &destinations,
+                )
+            },
+        );
         Ok(Self {
             config,
             generation: previous.map_or(0, |previous| previous.generation + 1),
             listeners,
             endpoints,
             upstream_slots,
+            carried,
             destinations,
             tls,
             quic,
