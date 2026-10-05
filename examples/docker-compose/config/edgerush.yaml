@@ -1,0 +1,49 @@
+# RUNS TODAY: the compose demo's data plane, read again every second. Edit it while the
+# demo runs and the change takes over without a restart; a config that cannot be run is
+# reported in the log and changes nothing. Endpoints are addresses, not names (in a
+# cluster they come from EndpointSlices), so the backends have fixed ones in compose.yaml.
+listeners:
+  web:
+    address: "0.0.0.0:8080"
+    protocol: http
+    proxy_protocol: off
+    # No proxy in front is trusted: what only one could say of a client is taken off.
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    access_log: stdout
+
+routes:
+  - name: demo
+    listeners: [web]
+    hostnames:
+      - { name: "*", falls_through: false }
+    rules:
+      # /old/... is told to go to /new/..., its query kept.
+      - matches:
+          - path: { prefix: /old }
+        redirect: { status: 301, path: { replace_prefix: /new }, query: keep }
+      # /api/... reaches the backends without the /api.
+      - matches:
+          - path: { prefix: /api }
+        filters:
+          - { type: url_rewrite, path: { replace_prefix: / } }
+        forward: { backends: [{ upstream: web, weight: 1 }] }
+      # Everything else, as it came; the answer says it passed through EdgeRush.
+      - matches:
+          - path: { prefix: / }
+        filters:
+          - type: response_header_modifier
+            set: [{ name: x-served-by, value: edgerush }]
+        forward: { backends: [{ upstream: web, weight: 1 }] }
+
+upstreams:
+  web:
+    # Round robin, so successive requests visibly take turns between the two backends.
+    load_balancer: round_robin
+    endpoints: ["172.30.89.11:80", "172.30.89.12:80"]
+    health_check:
+      interval_seconds: 2
+      timeout_seconds: 1
+      healthy_threshold: 1
+      unhealthy_threshold: 1
+      probe: { http: { path: /healthz } }

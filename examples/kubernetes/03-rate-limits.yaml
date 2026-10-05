@@ -1,0 +1,72 @@
+# NOT IMPLEMENTED. Limits would come from an existing file that other applications also read.
+# The control plane mounts it, maps it into tables, validates, diffs and ships deltas to
+# the data planes. Nothing here needs a redeploy when the file changes.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: Table
+metadata: { name: accounts, namespace: payments-edge }
+spec:
+  source:
+    file: { volume: limits, path: clients.yaml }
+  map: |
+    accounts[*] -> { key: .id, rps: .rps, class: .class ?? "standard" }
+  schema: { rps: int, class: string }
+  onError: keepLastGood
+  maxStaleness: 1h
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: Table
+metadata: { name: apikeys, namespace: payments-edge }
+spec:
+  source:
+    file: { volume: limits, path: clients.yaml }
+  map: |
+    accounts[*].apikeys[*] -> { key: .key, rps: .rps, account: parent.id }
+  schema: { rps: int, account: string }
+  onError: keepLastGood
+---
+# Hierarchical + caller-independent limits. Every applicable rule is checked,
+# the most restrictive wins, and all are charged together.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: RateLimitPolicy
+metadata: { name: orders-limits, namespace: payments }
+spec:
+  targetRefs:
+    - { group: gateway.networking.k8s.io, kind: HTTPRoute, name: orders }
+  rules:
+    - name: per-api-key
+      key: request.headers["x-api-key"]
+      limit: table("apikeys")[request.headers["x-api-key"]].rps ?? 5
+      window: { per: 1s, type: sliding }
+      burst: 20%
+    - name: per-account                      # caps the total of all the account's keys
+      key: table("apikeys")[request.headers["x-api-key"]].account
+      limit: table("accounts")[key].rps ?? 20
+      window: { per: 1s, type: sliding }
+      burst: 20%
+    - name: orders-backend                   # caller-independent system protection
+      key: '"orders-backend"'
+      limit: 4000
+      window: { per: 1s, type: sliding }
+      classes:                               # priority-aware shedding
+        from: table("accounts")[jwt.claims.account_id].class ?? jwt.claims.priority ?? "standard"
+        admitBelow: { best-effort: 70%, standard: 90%, protected: 100% }
+        shedLevels:                          # a signal can tighten the thresholds
+          signal: orders-pressure
+          1: { best-effort: 40%, standard: 80% }
+          2: { best-effort: 0%,  standard: 50% }
+  onPeerLoss: local_full                     # cut off from peers: never shave a contracted rate
+  response: { status: 429, headers: ietf }
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: Signal
+metadata: { name: orders-pressure, namespace: payments-edge }
+spec:
+  source:
+    prometheus:
+      url: http://prometheus.monitoring:9090
+      query: 'avg(rate(container_cpu_usage_seconds_total{namespace="payments",pod=~"orders-.*"}[1m]))'
+      interval: 10s
+  levels:
+    - { level: 1, enter: "> 0.80 for 30s", exit: "< 0.70 for 2m" }
+    - { level: 2, enter: "> 0.95 for 10s", exit: "< 0.85 for 2m" }
+  failSafe: { level: 0, after: 60s }

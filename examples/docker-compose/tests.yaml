@@ -1,0 +1,33 @@
+# Routing and header checks; Docker and backend processes are not needed.
+tests:
+  - name: redirect preserves the query
+    request: { listener: web, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://localhost:8080/old/page?x=1", headers: [] }
+    expect:
+      route: demo
+      rule: 0
+      redirect: { status: 301, location: "/new/page?x=1" }
+  - name: api prefix is stripped and the query is kept
+    request: { listener: web, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://localhost:8080/api/users?active=1", headers: [] }
+    expect:
+      route: demo
+      rule: 1
+      forward: { backends: [{ upstream: web, weight: 1 }], mirrors: [] }
+      upstream_request: { target: "/users?active=1" }
+  - name: the default route replaces untrusted forwarding and adds a response header
+    request:
+      listener: web
+      client: 203.0.113.7
+      protocol: "1.1"
+      method: GET
+      url: http://localhost:8080/
+      headers: [{ name: x-forwarded-for, value: 1.2.3.4 }]
+    upstream_answer: { status: 200, headers: [] }
+    expect:
+      route: demo
+      rule: 2
+      forward: { backends: [{ upstream: web, weight: 1 }], mirrors: [] }
+      upstream_request:
+        headers: [{ name: x-forwarded-for, value: 203.0.113.7 }]
+      response:
+        status: 200
+        headers: [{ name: x-served-by, value: edgerush }]

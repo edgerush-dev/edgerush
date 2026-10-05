@@ -1,0 +1,51 @@
+# EdgeRush in front of two NGINX backends. From this folder: docker compose up --build
+# README.md says what to try.
+name: edgerush-demo
+
+services:
+  edgerush:
+    build:
+      context: ../..
+      dockerfile: examples/docker-compose/edgerush.Dockerfile
+    image: edgerush-demo:latest
+    command:
+      - proxy
+      - --config
+      - /etc/edgerush/edgerush.yaml
+      - --metrics
+      - 0.0.0.0:9090
+      - --workers
+      - "2"
+    # The folder, not the file: an editor that saves by replacing the file would leave a
+    # single mounted file behind as it was.
+    volumes:
+      - ./config:/etc/edgerush:ro
+    # Published on loopback only: the demo is for this machine, not the network.
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9090:9090"
+    networks:
+      demo: { ipv4_address: 172.30.89.10 }
+    depends_on: [web-1, web-2]
+
+  web-1:
+    image: nginx:alpine
+    hostname: web-1
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      demo: { ipv4_address: 172.30.89.11 }
+
+  web-2:
+    image: nginx:alpine
+    hostname: web-2
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      demo: { ipv4_address: 172.30.89.12 }
+
+networks:
+  demo:
+    ipam:
+      config:
+        - subnet: 172.30.89.0/24

@@ -80,6 +80,10 @@ python3 -m http.server 9000 --bind 127.0.0.1 &   # a backend, if you have none
 curl -i http://127.0.0.1:8080/
 ```
 
+For a complete local demo with backends, see [Docker Compose](examples/docker-compose/README.md).
+[Examples](examples/README.md) also has runnable HTTP and gRPC configs with routing tests
+and `explain` commands.
+
 The format asks for choices such as `forwarding` and `proxy_protocol` to be stated rather
 than defaulted, as the control plane will state them. `bench/proxy.yaml` and
 `fuzz/seeds/config/` have fuller examples, with TLS, HTTP/3, passthrough and more;

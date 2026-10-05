@@ -1,0 +1,33 @@
+# A runnable development config. From the repository root:
+#   cargo run -p edgerush -- proxy --config examples/dev-harness.yaml --workers 1
+#   cargo run -p edgerush -- test --config examples/dev-harness.yaml examples/dev-harness-tests.yaml
+# Start HTTP backends on 127.0.0.1 ports 9000, 9001 and 9002 to serve traffic.
+# The test command checks routing and headers without starting those backends.
+listeners:
+  # No proxy in front is trusted, and what only one may say of a client is taken off.
+  http:
+    address: "127.0.0.1:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    access_log: stdout
+
+routes:
+  - name: app
+    listeners: [http]
+    hostnames:
+      - { name: "*", falls_through: true }
+    rules:
+      - matches:
+          - path: { prefix: /api }
+        filters:
+          - { type: url_rewrite, path: { replace_prefix: / } }
+        forward: { backends: [{ upstream: api, weight: 1 }] }
+      - matches:
+          - path: { prefix: / }
+        forward: { backends: [{ upstream: web, weight: 1 }] }
+
+upstreams:
+  api: { load_balancer: p2c, endpoints: ["127.0.0.1:9001", "127.0.0.1:9002"], slow_start: { window_ms: 30000 } }
+  web: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }

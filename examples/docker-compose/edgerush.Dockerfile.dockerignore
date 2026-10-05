@@ -1,0 +1,8 @@
+# The build needs the sources, not what was built from them on the host.
+.git
+target
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
+bench/results
+**/__pycache__

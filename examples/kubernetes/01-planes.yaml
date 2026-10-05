@@ -1,0 +1,46 @@
+# NOT IMPLEMENTED. A team owns one control plane and registers a data plane per kind of traffic.
+# The operator turns these into Deployments, LoadBalancer Services, a GatewayClass
+# (per control plane) and an IngressClass + Gateway (per data plane).
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata:
+  name: payments
+  namespace: payments-edge
+spec:
+  watch:
+    namespaces:
+      selector: { matchLabels: { team: payments } }
+  replicas: 2
+  nginxCompat: true
+  sources:
+    files:
+      - { name: limits, configMap: client-limits }     # readable by Tables
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata:
+  name: payments-api            # → IngressClass "payments-api", Gateway "payments-api"
+  namespace: payments-edge
+spec:
+  controlPlaneRef: { name: payments }
+  profile: api
+  replicas: { min: 3, max: 20, scaleOn: requests }
+  listeners:
+    - { name: http,  port: 80,  protocol: HTTP }
+    - { name: https, port: 443, protocol: HTTPS, tls: { certificateRefs: [{ name: api-example-com }] } }
+  service:
+    type: LoadBalancer
+---
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: DataPlane
+metadata:
+  name: payments-ws             # separate address, failure domain and rate-limit counters
+  namespace: payments-edge
+spec:
+  controlPlaneRef: { name: payments }
+  profile: websocket            # long idle timeouts, long drain, scales on connections
+  replicas: { min: 2, max: 10, scaleOn: connections }
+  listeners:
+    - { name: wss, port: 443, protocol: HTTPS, tls: { certificateRefs: [{ name: ws-example-com }] } }
+  service:
+    type: LoadBalancer

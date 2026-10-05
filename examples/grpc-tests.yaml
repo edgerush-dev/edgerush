@@ -1,0 +1,37 @@
+# Checks method matching and mirror selection without making gRPC calls.
+tests:
+  - name: SayHello selects the greeter and its canary mirror
+    request:
+      listener: grpc
+      client: 203.0.113.7
+      protocol: "2"
+      method: POST
+      url: http://localhost:8080/helloworld.Greeter/SayHello
+      headers: [{ name: content-type, value: application/grpc }]
+    expect:
+      route: greeter
+      rule: 0
+      forward:
+        backends: [{ upstream: greeter, weight: 1 }]
+        mirrors: [{ upstream: greeter-canary, fraction: { numerator: 1, denominator: 10 } }]
+  - name: other Greeter methods have no mirror
+    request:
+      listener: grpc
+      client: 203.0.113.7
+      protocol: "2"
+      method: POST
+      url: http://localhost:8080/helloworld.Greeter/SayGoodbye
+      headers: [{ name: content-type, value: application/grpc }]
+    expect:
+      route: greeter
+      rule: 1
+      forward: { backends: [{ upstream: greeter, weight: 1 }], mirrors: [] }
+  - name: an unrelated service is not routed
+    request:
+      listener: grpc
+      client: 203.0.113.7
+      protocol: "2"
+      method: POST
+      url: http://localhost:8080/other.Service/Call
+      headers: [{ name: content-type, value: application/grpc }]
+    expect: { answer: no_route }

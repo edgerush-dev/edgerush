@@ -1,0 +1,43 @@
+# Routing and response checks; no backend processes are needed.
+# From the repository root:
+#   cargo run -p edgerush -- test --config examples/dev-harness.yaml examples/dev-harness-tests.yaml
+tests:
+  - name: api prefix is stripped and sent to the api upstream
+    request:
+      listener: http
+      client: 203.0.113.7
+      protocol: "1.1"
+      method: GET
+      url: http://localhost:8080/api/users
+      headers: []
+    expect:
+      route: app
+      rule: 0
+      forward:
+        backends: [{ upstream: api, weight: 1 }]
+        mirrors: []
+      upstream_request:
+        target: /users
+  - name: everything else goes to web
+    request: { listener: http, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://localhost:8080/index.html", headers: [] }
+    expect:
+      route: app
+      rule: 1
+      forward: { backends: [{ upstream: web, weight: 1 }], mirrors: [] }
+  - name: web's answer reaches the client without what was about its connection
+    request: { listener: http, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://localhost:8080/index.html", headers: [] }
+    upstream_answer:
+      status: 200
+      headers:
+        - { name: Content-Type, value: text/html }
+        - { name: Keep-Alive, value: timeout=5 }
+    expect:
+      route: app
+      rule: 1
+      forward: { backends: [{ upstream: web, weight: 1 }], mirrors: [] }
+      response:
+        status: 200
+        headers:
+          - { name: Content-Type, value: text/html }
+          - { name: Keep-Alive, absent: true }
+          - { name: X-Request-ID, value: 00000000-0000-7000-8000-000000000000 }

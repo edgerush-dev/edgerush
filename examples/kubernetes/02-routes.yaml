@@ -1,0 +1,37 @@
+# NOT IMPLEMENTED. Both objects would be served by the data plane "payments-api":
+# the Ingress selects it by class, the HTTPRoute attaches to its Gateway.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: legacy-billing
+  namespace: payments
+spec:
+  ingressClassName: payments-api
+  tls:
+    - hosts: [billing.example.com]
+      secretName: billing-tls
+  rules:
+    - host: billing.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: billing, port: { number: 8080 } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: orders
+  namespace: payments
+spec:
+  parentRefs:
+    - { name: payments-api, namespace: payments-edge, sectionName: https }
+  hostnames: [api.example.com]
+  rules:
+    - name: orders
+      matches:
+        - path: { type: PathPrefix, value: /v1/orders }
+      timeouts: { request: 10s, backendRequest: 3s }
+      backendRefs:
+        - { name: orders-v1, port: 8080, weight: 90 }
+        - { name: orders-v2, port: 8080, weight: 10 }

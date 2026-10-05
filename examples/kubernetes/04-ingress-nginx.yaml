@@ -1,0 +1,54 @@
+# NOT IMPLEMENTED. Existing ingress-nginx manifests, unchanged, on a control plane with
+# `nginxCompat: true`. The planned translator would reproduce their annotation semantics;
+# the data plane would see ordinary config. See README.md for this folder's status.
+#
+# Two Ingresses for one host is the idiomatic ingress-nginx pattern, because
+# `rewrite-target` applies to EVERY path of the Ingress it is set on.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop-api
+  namespace: shop
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"          # makes ALL paths of this host regex locations
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/proxy-body-size: 8m
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.example.com"
+    nginx.ingress.kubernetes.io/whitelist-source-range: 10.0.0.0/8,203.0.113.0/24
+    nginx.ingress.kubernetes.io/limit-rps: "20"            # nginx semantics: 5x burst, 503, per replica
+    gateway.edgerush.dev/rate-limit-scope: cluster          # one extra annotation makes it cluster-wide
+    # Rejected at admission with an explanation:
+    # nginx.ingress.kubernetes.io/configuration-snippet: |
+    #   more_set_headers "X-Frame-Options: DENY";
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [shop.example.com]
+      secretName: shop-tls            # ssl-redirect is implied by TLS (an nginx global default)
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - path: /api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend: { service: { name: shop-api, port: { number: 8080 } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop-web
+  namespace: shop
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [shop.example.com]
+      secretName: shop-tls
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: shop-web, port: { number: 80 } } }

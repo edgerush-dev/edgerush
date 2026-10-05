@@ -1,0 +1,59 @@
+# A gRPC service behind EdgeRush. From the repository root:
+#   cargo run -p edgerush -- proxy --config examples/grpc.yaml --workers 1
+# Clients speak HTTP/2 by prior knowledge on :8080 (h2c), as GRPCRoute requires of a
+# cleartext listener; an `https` listener with `tls` would take them by ALPN instead.
+# What is shown: a method-level match, an upstream spoken to in HTTP/2 with keepalive
+# PINGs and grpc.health.v1 checks, retries on UNAVAILABLE within the upstream's budget,
+# and a share of the calls mirrored to a canary. See README.md for backend requirements.
+listeners:
+  grpc:
+    address: "127.0.0.1:8080"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+    request_id: generate
+    access_log: stdout
+
+routes:
+  - name: greeter
+    listeners: [grpc]
+    hostnames:
+      - { name: "*", falls_through: true }
+    rules:
+      # One method goes to the canary as well, one call in ten; its answers are dropped
+      # and it is not awaited by the client request.
+      - matches:
+          - grpc: { service: helloworld.Greeter, method: SayHello }
+        filters:
+          - type: request_mirror
+            upstream: greeter-canary
+            fraction: { numerator: 1, denominator: 10 }
+        forward:
+          backends: [{ upstream: greeter, weight: 1 }]
+          retry:
+            attempts: 2
+            grpc_statuses: [UNAVAILABLE]
+            on_timeout: false   # a try that ran out of time is not sent again
+            backoff_base_ms: 25
+            backoff_max_ms: 250
+      # The rest of the service.
+      - matches:
+          - grpc: { service: helloworld.Greeter }
+        forward: { backends: [{ upstream: greeter, weight: 1 }] }
+
+upstreams:
+  greeter:
+    endpoints: ["127.0.0.1:50051", "127.0.0.1:50052"]
+    load_balancer: p2c
+    protocol: http2
+    keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false }
+    health_check:
+      interval_seconds: 5
+      timeout_seconds: 1
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+      probe: { grpc: { service: helloworld.Greeter } }
+  greeter-canary:
+    endpoints: ["127.0.0.1:50061"]
+    load_balancer: p2c
+    protocol: http2
