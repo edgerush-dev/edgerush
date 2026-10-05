@@ -558,3 +558,151 @@ async fn an_http_probe_says_it_is_the_gateways_own() {
         })
         .await;
 }
+
+/// A probe's HTTP/2 client is held to the bounds the data plane's own client is (15 §3):
+/// it refuses server push and streams of the peer's, and says how large a header list it
+/// takes, so that a backend cannot make the health checker hold more than a request's
+/// client would (review A04-02).
+#[tokio::test]
+async fn a_probes_http2_client_announces_the_request_clients_bounds() {
+    use crate::h2_peer::{Peer, setting};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = socket.local_addr().unwrap();
+            let asked = tokio::task::spawn_local(async move {
+                let (stream, _) = socket.accept().await.unwrap();
+                let (_peer, first) = Peer::accept_as_server(stream, &[]).await;
+                first.settings()
+            });
+            let probe = edgerush_config::Probe::Grpc {
+                service: String::new(),
+            };
+            let mut config = everything_config(address);
+            config.upstreams.get_mut("up").unwrap().protocol = UpstreamProtocol::Http2;
+            // The peer goes once it has read the SETTINGS, and the probe fails with it:
+            // only what its client announced is looked at.
+            let _passed = probed(config, probe).await;
+            let announced = within(asked).await.unwrap();
+            assert!(
+                announced.contains(&(setting::ENABLE_PUSH, 0)),
+                "the probe's client leaves push enabled: it announced {announced:?}"
+            );
+            assert!(
+                announced.contains(&(setting::MAX_CONCURRENT_STREAMS, 0)),
+                "the probe's client lets the peer open streams: it announced {announced:?}"
+            );
+            assert!(
+                announced
+                    .iter()
+                    .any(|&(id, value)| id == setting::MAX_HEADER_LIST_SIZE && value <= 64 * 1024),
+                "the probe's client takes header lists past 64 KiB: it announced {announced:?}"
+            );
+        })
+        .await;
+}
+
+/// A probe's HTTP/2 connection goes with the probe: a backend that keeps the probe
+/// connection's writes blocked — PINGs it never reads the answers to — does not keep the
+/// connection open once the probe's timeout has passed (03 §6 Health; review A08-03).
+async fn a_probes_http2_connection_ends_with_it(probe: edgerush_config::Probe) {
+    use tokio::io::AsyncWriteExt;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Small buffers on the backend's side, so that little is needed to fill them.
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.set_recv_buffer_size(4096).unwrap();
+            socket.set_send_buffer_size(4096).unwrap();
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let address = socket.local_addr().unwrap();
+            let listener = socket.listen(8).unwrap();
+            let backend = tokio::task::spawn_local(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                // A server's SETTINGS, then PINGs, never reading what comes back.
+                stream
+                    .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+                let ping = [0_u8, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+                let batch = ping.repeat(1024);
+                let mut sent = 0_usize;
+                // Bounded: 64 MiB at most; blocked once a write has waited 500 ms. A write
+                // that fails means the probe's side has let go of the connection already.
+                while sent < 64 << 20 {
+                    let wrote =
+                        tokio::time::timeout(Duration::from_millis(500), stream.write_all(&batch))
+                            .await;
+                    match wrote {
+                        Ok(Ok(())) => sent += batch.len(),
+                        Ok(Err(_)) => return (None, sent),
+                        Err(_) => return (Some(stream), sent),
+                    }
+                }
+                panic!("the probe's side read {sent} bytes of PINGs and never stopped");
+            });
+            let mut config = everything_config(address);
+            config.upstreams.get_mut("up").unwrap().protocol = UpstreamProtocol::Http2;
+            // The probe times out (1 s) with nothing answered.
+            let passed = probed(config, probe).await;
+            assert!(!passed);
+            let (blocked, sent) = within(backend).await.unwrap();
+            // Let go of already.
+            let Some(stream) = blocked else { return };
+            // Whatever the probe left behind has had time to go.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            match stream.try_write(&[0]) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => panic!(
+                    "the probe's connection is still open 2 s after the probe ended (its \
+                     writes blocked after {sent} bytes of PINGs)"
+                ),
+                // Reset: the probe's side let go of the connection with PINGs unread.
+                Err(_) => {}
+                Ok(_) => panic!("the probe's side read again after the probe ended"),
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn an_http_probes_http2_connection_ends_with_it() {
+    a_probes_http2_connection_ends_with_it(healthz()).await;
+}
+
+#[tokio::test]
+async fn a_grpc_probes_http2_connection_ends_with_it() {
+    a_probes_http2_connection_ends_with_it(edgerush_config::Probe::Grpc {
+        service: String::new(),
+    })
+    .await;
+}
+
+/// A probe that has its answer tells the backend it is going, GOAWAY with no error, and
+/// closes the connection, as a request's client does when it lets a connection go.
+#[tokio::test]
+async fn a_passed_http2_probe_says_goaway_and_closes() {
+    use crate::h2_peer::{Peer, code, headers, kind, response};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = socket.local_addr().unwrap();
+            let backend = tokio::task::spawn_local(async move {
+                let (stream, _) = socket.accept().await.unwrap();
+                let (mut peer, _) = Peer::accept_as_server(stream, &[]).await;
+                let (asked, _) = peer.until(|frame| frame.kind == kind::HEADERS).await;
+                peer.send(&headers(asked.stream, response(200), true)).await;
+                let (away, _) = peer.until(|frame| frame.kind == kind::GOAWAY).await;
+                let closed = peer.try_next().await.is_none();
+                (away.goaway(), closed)
+            });
+            let mut config = everything_config(address);
+            config.upstreams.get_mut("up").unwrap().protocol = UpstreamProtocol::Http2;
+            assert!(probed(config, healthz()).await);
+            let ((last, error), closed) = within(backend).await.unwrap();
+            assert_eq!((last, error), (0, code::NO_ERROR));
+            assert!(closed, "a frame came after GOAWAY");
+        })
+        .await;
+}

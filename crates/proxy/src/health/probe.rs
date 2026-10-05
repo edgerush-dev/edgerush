@@ -9,12 +9,16 @@ use crate::gathered::Gathered;
 use crate::proxy_protocol;
 use crate::upstream::destination::ReuseIdentity;
 use crate::upstream::secure::Socket;
+use ::h2::client::SendRequest;
 use bytes::{Buf, Bytes};
 use edgerush_config::{HealthCheck, Probe, UpstreamProtocol};
 use http::uri::Scheme;
 use http::{Request, StatusCode};
+use std::future::{Future, poll_fn};
 use std::io;
 use std::net::SocketAddr;
+use std::pin::{Pin, pin};
+use std::task::Poll;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
@@ -150,19 +154,29 @@ async fn line_of(socket: &mut Socket) -> Option<Vec<u8>> {
 
 /// `GET` over HTTP/2 by prior knowledge, or by what TLS agreed on: a 2xx passes.
 async fn http2(socket: Socket, scheme: &Scheme, path: &str, authority: &str) -> Option<bool> {
-    let mut send = handshake(socket).await?;
-    let asked = Request::get(format!("{scheme}://{authority}{path}"))
-        .header("user-agent", "edgerush-health")
-        .body(())
-        .ok()?;
-    let (answer, _) = send.send_request(asked, true).ok()?;
-    let answer = answer.await.ok()?;
-    Some(answer.status().is_success())
+    over_h2(socket, |mut send| async move {
+        let asked = Request::get(format!("{scheme}://{authority}{path}"))
+            .header("user-agent", "edgerush-health")
+            .body(())
+            .ok()?;
+        let (answer, _) = send.send_request(asked, true).ok()?;
+        let answer = answer.await.ok()?;
+        Some(answer.status().is_success())
+    })
+    .await
 }
 
 /// `grpc.health.v1.Health/Check` for `service`: `SERVING`, with `grpc-status` 0, passes.
 async fn grpc(socket: Socket, scheme: &Scheme, service: &str, authority: &str) -> Option<bool> {
-    let mut send = handshake(socket).await?;
+    over_h2(socket, |send| grpc_check(send, scheme, service, authority)).await
+}
+
+async fn grpc_check(
+    mut send: SendRequest<Bytes>,
+    scheme: &Scheme,
+    service: &str,
+    authority: &str,
+) -> Option<bool> {
     let asked = Request::post(format!(
         "{scheme}://{authority}/grpc.health.v1.Health/Check"
     ))
@@ -201,13 +215,68 @@ async fn grpc(socket: Socket, scheme: &Scheme, service: &str, authority: &str) -
     Some(ok && serving(&message))
 }
 
-/// Opens HTTP/2 on `socket`, its connection driven beside the probe.
-async fn handshake(socket: Socket) -> Option<::h2::client::SendRequest<Bytes>> {
-    let (send, connection) = ::h2::client::handshake(socket).await.ok()?;
-    let _driving = tokio::task::spawn_local(async move {
-        let _ended = connection.await;
-    });
-    send.ready().await.ok()
+/// Opens HTTP/2 on `socket` and asks what `ask` asks over it.
+///
+/// The connection is driven here, beside the asking, not in a task of its own: whatever ends
+/// the probe — its answer, or its timeout dropping it — ends the connection and lets go of
+/// its socket. A detached connection would outlive the probe and the 64 out at once, and a
+/// backend that stopped reading would keep it for ever, its GOAWAY never written (03 §6).
+async fn over_h2<A, F>(socket: Socket, ask: A) -> Option<bool>
+where
+    A: FnOnce(SendRequest<Bytes>) -> F,
+    F: Future<Output = Option<bool>>,
+{
+    let (send, mut connection) = client().handshake(socket).await.ok()?;
+    let passed = {
+        let mut asking = pin!(async move { ask(send.ready().await.ok()?).await });
+        let asked = poll_fn(|cx| {
+            if let Poll::Ready(passed) = asking.as_mut().poll(cx) {
+                return Poll::Ready(Some(passed));
+            }
+            // Ended, by the peer or by an error: the probe's stream hears so once it is gone.
+            Pin::new(&mut connection).poll(cx).map(|_| None)
+        })
+        .await;
+        match asked {
+            Some(passed) => passed,
+            None => {
+                drop(connection);
+                return asking.await;
+            }
+        }
+        // `asking` goes here, and the probe's handles with it: h2 sees nothing left open.
+    };
+    // One turn, for h2 to say GOAWAY if the socket takes it now; not waited for, as an
+    // HTTP/1 probe does not wait for its close.
+    poll_fn(|cx| {
+        let _turn = Pin::new(&mut connection).poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+    passed
+}
+
+/// h2's client for a probe, every bound set as a request's client sets it (15 §3) rather
+/// than left to h2's defaults, which take pushed streams without limit and header lists of
+/// 16 MiB.
+fn client() -> ::h2::client::Builder {
+    let mut builder = ::h2::client::Builder::new();
+    builder
+        .enable_push(false)
+        .max_concurrent_streams(0)
+        .initial_max_send_streams(1)
+        // A probe reads one small answer: RFC 9113's default windows hold it.
+        .initial_window_size(65_535)
+        .initial_connection_window_size(65_535)
+        .max_header_list_size(64 * 1024)
+        .header_table_size(4096)
+        .max_frame_size(16_384)
+        // A head and at most one small message to send.
+        .max_send_buffer_size(16 * 1024)
+        .max_concurrent_reset_streams(50)
+        .reset_stream_duration(Duration::from_secs(1))
+        .max_local_error_reset_streams(Some(1024));
+    builder
 }
 
 /// `HealthCheckRequest { service }`, as one gRPC message: a byte saying it is not
