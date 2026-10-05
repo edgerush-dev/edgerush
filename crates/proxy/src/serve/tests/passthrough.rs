@@ -338,6 +338,62 @@ async fn a_tunnel_is_drained_once_a_reload_takes_its_route_away() {
         .await;
 }
 
+/// A ClientHello asking for `api.example.com`, as BoringSSL sends one: the fuzz target's seed.
+const HELLO: &[u8] = include_bytes!("../../../../../fuzz/seeds/tls_hello/named");
+
+/// A TLS tunnel is known by its route among its listener's: one open across a reload that
+/// takes another route away, and moves its own to another place, is left alone; once a
+/// reload takes its own route away, it is drained.
+#[tokio::test]
+async fn a_tls_tunnel_is_drained_once_a_reload_takes_its_route_away() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = naming_backend("a").await;
+            let tls = |routes: &str| {
+                format!(
+                    "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls, proxy_protocol: off }} }}\n\
+                     routes: []\n\
+                     tls_routes:\n{routes}\
+                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: [\"{backend}\"] }} }}\n"
+                )
+            };
+            let route = |name: &str| {
+                format!(
+                    "\x20 - {{ name: {name}, listeners: [sni], hostnames: [{{ name: {name}.example.com, falls_through: true }}], backends: [{{ upstream: up, weight: 1 }}] }}\n"
+                )
+            };
+            let (api, other) = (route("api"), route("other"));
+            let (front, worker) = passing_swept(&tls(&format!("{other}{api}"))).await;
+            let mut client = TcpStream::connect(front).await.unwrap();
+            client.write_all(HELLO).await.unwrap();
+            let mut name = [0; 1];
+            bounded(client.read_exact(&mut name)).await.unwrap();
+            assert_eq!(&name, b"a");
+
+            let reload = |yaml: String| {
+                let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+                worker.proxy().reload(compile(&config).unwrap()).unwrap();
+            };
+            reload(tls(&api));
+            let quiet = worker.limits.sweep * 2 + SHORT.drain + SLACK;
+            assert!(
+                still_open(&mut client, quiet).await,
+                "a tunnel whose route was kept ended"
+            );
+            reload(tls(&other));
+            let took = closed_after(&mut client).await;
+            assert!(took + EARLY >= SHORT.drain, "closed after {took:?}");
+            assert!(
+                took < worker.limits.sweep + SHORT.drain + SLACK,
+                "closed after {took:?}"
+            );
+            tunnel_ended(&worker, "sni", "drained").await;
+        })
+        .await;
+}
+
 /// A tunnel whose route a reload sends to another upstream is drained, as the route's
 /// listing of the upstream it went to is gone; new connections go to the new one.
 #[tokio::test]

@@ -15,7 +15,6 @@ use crate::tunnel::{Bounds as TunnelBounds, carry};
 use crate::upstream::balancing::InFlight;
 use crate::upstream::destination::ReuseIdentity;
 use crate::upstream::h1::blocks::Block;
-use edgerush_config::L4;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -275,13 +274,11 @@ impl Worker {
         let Some(compiled) = snapshot.listener(listener) else {
             return Err(Tunnel::Refused);
         };
-        let route = match (&compiled.l4, name) {
-            (Some(L4::Tcp(route)), _) => Some((Through::Tcp, route)),
-            (Some(L4::Tls(routes)), Some(name)) => routes
-                .route_at(name)
-                .map(|(at, route)| (Through::Tls(at), route)),
-            _ => None,
-        };
+        let route = compiled
+            .l4
+            .as_ref()
+            .and_then(|l4| l4.route(name))
+            .map(|(at, route)| (at.map_or(Through::Tcp, Through::Tls), route));
         let Some((through, route)) = route else {
             return Err(Tunnel::Refused);
         };

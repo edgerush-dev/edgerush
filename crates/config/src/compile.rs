@@ -200,6 +200,24 @@ pub enum L4 {
     Tls(SniRouter),
 }
 
+impl L4 {
+    /// The route of a connection to the listener: a `tcp` listener's one route, whatever is
+    /// asked; for a `tls` one, the route [`SniRouter::route_at`] finds for the name the
+    /// ClientHello asks for, with its position among the listener's routes. `None` for a
+    /// `tls` connection that asks for no name, or for one no route covers. The passthrough
+    /// path and `edgerush explain` both choose by this (22 §5 in the docs).
+    #[must_use]
+    pub fn route(&self, name: Option<&str>) -> Option<(Option<usize>, &L4Route)> {
+        match (self, name) {
+            (Self::Tcp(route), _) => Some((None, route)),
+            (Self::Tls(routes), Some(name)) => {
+                routes.route_at(name).map(|(at, route)| (Some(at), route))
+            }
+            (Self::Tls(_), None) => None,
+        }
+    }
+}
+
 /// A TCP or TLS route, compiled.
 #[derive(Debug, Clone)]
 pub struct L4Route {
@@ -3253,6 +3271,24 @@ upstreams:
         };
         assert_eq!(at("api.example.com"), Some((0, "api")));
         assert_eq!(at("www.example.com"), Some((1, "rest")));
+        // A connection's route as the passthrough path chooses it: a tcp listener's one
+        // route whatever the ClientHello asks; a tls listener's by the name asked, and none
+        // for a ClientHello that asks for no name.
+        let l4 = |listener: &str, name: Option<&str>| {
+            let l4 = compiled_listener_l4(&compiled, listener);
+            l4.route(name).map(|(at, route)| (at, route.name.clone()))
+        };
+        assert_eq!(l4("db", None), Some((None, "db".to_owned())));
+        assert_eq!(
+            l4("db", Some("api.example.com")),
+            Some((None, "db".to_owned()))
+        );
+        assert_eq!(
+            l4("sni", Some("www.example.com")),
+            Some((Some(1), "rest".to_owned()))
+        );
+        assert_eq!(l4("sni", Some("elsewhere.test")), None);
+        assert_eq!(l4("sni", None), None);
         let names: Vec<&str> = sni
             .routes()
             .iter()
@@ -3271,6 +3307,10 @@ upstreams:
             listener(&compiled, "sni").tunnel_idle,
             Duration::from_secs(3_600)
         );
+    }
+
+    fn compiled_listener_l4<'c>(compiled: &'c Compiled, name: &str) -> &'c L4 {
+        listener(compiled, name).l4.as_ref().unwrap()
     }
 
     /// A listener's HTTP routes are known by their positions, as a rule's ID gives them, and
