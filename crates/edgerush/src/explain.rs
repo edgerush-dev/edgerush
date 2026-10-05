@@ -3,7 +3,8 @@
 //! printing what the library says.
 
 use crate::config_file::{self, Rejected};
-use edgerush_explain::{Asked, Invalid, Unexplained, asked, protocol_name};
+use edgerush_config::Protocol;
+use edgerush_explain::{Asked, Invalid, Unexplained, asked};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -21,6 +22,10 @@ Request, every part of it required for an http or https listener:
       --url <URL>                Its scheme (the listener's), host and port, path and query
       --header <'NAME: VALUE'>   A field line, in order: once for each, or not at all
       --connect-protocol <NAME>  An extended CONNECT's protocol, over HTTP/2 or HTTP/3
+
+Connection to a tls listener, one of the two (a tcp listener's takes nothing):
+      --sni <NAME>               The name its ClientHello asks for
+      --no-sni                   A ClientHello that asks for no name
 
 Options:
       --config <FILE>            The config, in YAML
@@ -49,7 +54,8 @@ pub(crate) fn command(
 #[derive(Debug, PartialEq, Eq)]
 enum Parsed {
     Help,
-    Explain(Options),
+    /// Boxed: much the larger of the two, and passed by value.
+    Explain(Box<Options>),
 }
 
 /// The command line, as given.
@@ -63,6 +69,8 @@ struct Options {
     url: Option<String>,
     headers: Vec<String>,
     connect_protocol: Option<String>,
+    sni: Option<String>,
+    no_sni: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -84,6 +92,12 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
     while let Some(arg) = args.next() {
         let flag: &'static str = match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
+            "--no-sni" => {
+                if std::mem::replace(&mut options.no_sni, true) {
+                    return Err(UsageError::Twice("--no-sni"));
+                }
+                continue;
+            }
             "--config" => "--config",
             "--listener" => "--listener",
             "--client" => "--client",
@@ -92,6 +106,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             "--url" => "--url",
             "--header" => "--header",
             "--connect-protocol" => "--connect-protocol",
+            "--sni" => "--sni",
             _ => return Err(UsageError::Unexpected(arg)),
         };
         let value = args.next().ok_or(UsageError::NoValue(flag))?;
@@ -103,6 +118,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
             "--method" => &mut options.method,
             "--url" => &mut options.url,
             "--connect-protocol" => &mut options.connect_protocol,
+            "--sni" => &mut options.sni,
             _ => {
                 options.headers.push(value);
                 continue;
@@ -116,7 +132,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
         .map(PathBuf::from)
         .ok_or(UsageError::Required("--config <FILE>"))?;
     options.listener = listener.ok_or(UsageError::Required("--listener <NAME>"))?;
-    Ok(Parsed::Explain(options))
+    Ok(Parsed::Explain(Box::new(options)))
 }
 
 /// Why a request could not be explained.
@@ -126,8 +142,12 @@ enum Failed {
     Config { path: PathBuf, rejected: Rejected },
     #[error("there is no listener {0}")]
     NoListener(String),
-    #[error("'{0}' is required for an {1} listener")]
+    #[error("'{0}' is required for {1} listener")]
     Required(&'static str, &'static str),
+    #[error("'{0}' does not apply to {1} listener")]
+    Unwanted(&'static str, &'static str),
+    #[error("'--sni' and '--no-sni' are given together: a ClientHello asks for a name or none")]
+    SniTwice,
     #[error(transparent)]
     Invalid(#[from] Invalid),
     #[error(transparent)]
@@ -142,32 +162,66 @@ fn run(options: &Options) -> Result<String, Failed> {
     let listener = snapshot
         .listener(&options.listener)
         .ok_or_else(|| Failed::NoListener(options.listener.clone()))?;
-    let kind = protocol_name(listener.protocol);
-    let required = |given: &Option<String>, flag| given.clone().ok_or(Failed::Required(flag, kind));
-    // A tcp or tls listener is refused by the library before anything is asked of it.
-    let asked = match listener.protocol {
-        edgerush_config::Protocol::Tcp | edgerush_config::Protocol::Tls => None,
-        edgerush_config::Protocol::Http | edgerush_config::Protocol::Https => {
-            let (scheme, authority, target) = asked::url(&required(&options.url, "--url")?)?;
-            let client = required(&options.client, "--client")?;
-            Some(Asked {
-                client: client.parse().map_err(|_| Invalid::Client(client))?,
-                protocol: asked::protocol(&required(&options.protocol, "--protocol")?)?,
-                method: asked::method(&required(&options.method, "--method")?)?,
-                scheme,
-                authority,
-                target,
-                headers: options
-                    .headers
-                    .iter()
-                    .map(|line| asked::header_line(line))
-                    .collect::<Result<_, _>>()?,
-                connect_protocol: options.connect_protocol.clone(),
-            })
-        }
+    // The listener's kind, as the errors below name it.
+    let kind = match listener.protocol {
+        Protocol::Http => "an http",
+        Protocol::Https => "an https",
+        Protocol::Tcp => "a tcp",
+        Protocol::Tls => "a tls",
     };
-    let Some(asked) = asked else {
-        return Err(Unexplained::NotHttp(listener.name.clone(), kind).into());
+    // What the listener's kind takes, and nothing else.
+    let http = [
+        ("--client", options.client.is_some()),
+        ("--protocol", options.protocol.is_some()),
+        ("--method", options.method.is_some()),
+        ("--url", options.url.is_some()),
+        ("--header", !options.headers.is_empty()),
+        ("--connect-protocol", options.connect_protocol.is_some()),
+    ];
+    let sni = [
+        ("--sni", options.sni.is_some()),
+        ("--no-sni", options.no_sni),
+    ];
+    let unwanted = |given: &[(&'static str, bool)]| {
+        given
+            .iter()
+            .find(|(_, given)| *given)
+            .map_or(Ok(()), |(flag, _)| Err(Failed::Unwanted(flag, kind)))
+    };
+    match listener.protocol {
+        Protocol::Http | Protocol::Https => unwanted(&sni)?,
+        Protocol::Tcp => {
+            unwanted(&http)?;
+            unwanted(&sni)?;
+            return Ok(snapshot.explain_connection(listener, None)?.text());
+        }
+        Protocol::Tls => {
+            unwanted(&http)?;
+            let name = match (&options.sni, options.no_sni) {
+                (Some(name), false) => Some(name.as_str()),
+                (None, true) => None,
+                (Some(_), true) => return Err(Failed::SniTwice),
+                (None, false) => return Err(Failed::Required("--sni <NAME>' or '--no-sni", kind)),
+            };
+            return Ok(snapshot.explain_connection(listener, name)?.text());
+        }
+    }
+    let required = |given: &Option<String>, flag| given.clone().ok_or(Failed::Required(flag, kind));
+    let (scheme, authority, target) = asked::url(&required(&options.url, "--url")?)?;
+    let client = required(&options.client, "--client")?;
+    let asked = Asked {
+        client: client.parse().map_err(|_| Invalid::Client(client))?,
+        protocol: asked::protocol(&required(&options.protocol, "--protocol")?)?,
+        method: asked::method(&required(&options.method, "--method")?)?,
+        scheme,
+        authority,
+        target,
+        headers: options
+            .headers
+            .iter()
+            .map(|line| asked::header_line(line))
+            .collect::<Result<_, _>>()?,
+        connect_protocol: options.connect_protocol.clone(),
     };
     Ok(snapshot.explain(listener, &asked)?.text())
 }
@@ -361,9 +415,10 @@ redirect  301 to /open
             ),
             "error: there is no listener nowhere\n"
         );
+        // A tcp listener takes a connection and nothing of a request.
         assert_eq!(
             failed("tcp", CONFIG, &request("db", "1.1", "GET", url)),
-            "error: listener db is a tcp listener: explain takes http and https listeners for now\n"
+            "error: '--client' does not apply to a tcp listener\n"
         );
         let mut no_client = request("web", "1.1", "GET", url);
         no_client.drain(2..4);
@@ -455,6 +510,74 @@ redirect  301 to /open
         };
         assert_eq!(options.headers, ["A: 1", "B: 2", "A: 3"]);
         assert_eq!(options.listener, "web");
+    }
+
+    #[test]
+    fn a_tls_listener_takes_a_name_or_none_and_nothing_else() {
+        let tls = CONFIG.replace(
+            "  db: {",
+            "  sni: { address: \"[::]:443\", protocol: tls, proxy_protocol: off }\n  db: {",
+        ) + "tls_routes:\n  - { name: api, listeners: [sni], hostnames: [{ name: api.example.com, falls_through: true }], backends: [{ upstream: api, weight: 1 }] }\n";
+        let run = |test: &str, args: &[&str]| explain_on(&tls, test, args);
+        let (status, text, _) = run(
+            "tls_named",
+            &["--listener", "sni", "--sni", "api.example.com"],
+        );
+        assert_eq!(status, 0);
+        assert!(
+            text.starts_with("sni (tls)  SNI api.example.com\n\n→ api  chosen\n"),
+            "{text}"
+        );
+        let (status, text, _) = run("tls_unnamed", &["--listener", "sni", "--no-sni"]);
+        assert_eq!(status, 0);
+        assert!(
+            text.starts_with("sni (tls)  no SNI\n\n  a ClientHello that asks for no name"),
+            "{text}"
+        );
+        assert!(text.ends_with("\nrefused   no_route\n"), "{text}");
+        let (status, text, _) = run("tls_tcp", &["--listener", "db"]);
+        assert_eq!(status, 0);
+        assert!(text.starts_with("db (tcp)\n\n→ "), "{text}");
+
+        let failed = |test: &str, args: &[&str]| {
+            let (status, stdout, stderr) = run(test, args);
+            assert_eq!((status, stdout.as_str()), (2, ""), "{test}");
+            stderr
+        };
+        assert_eq!(
+            failed("tls_neither", &["--listener", "sni"]),
+            "error: '--sni <NAME>' or '--no-sni' is required for a tls listener\n"
+        );
+        assert_eq!(
+            failed(
+                "tls_both",
+                &["--listener", "sni", "--sni", "a.test", "--no-sni"]
+            ),
+            "error: '--sni' and '--no-sni' are given together: a ClientHello asks for a name or none\n"
+        );
+        assert_eq!(
+            failed(
+                "tls_http_flag",
+                &["--listener", "sni", "--no-sni", "--method", "GET"]
+            ),
+            "error: '--method' does not apply to a tls listener\n"
+        );
+        assert_eq!(
+            failed("tls_sni_on_tcp", &["--listener", "db", "--sni", "a.test"]),
+            "error: '--sni' does not apply to a tcp listener\n"
+        );
+        let mut http = request("web", "1.1", "GET", "http://shop.example.com/");
+        http.push("--no-sni");
+        assert_eq!(
+            failed("tls_sni_on_http", &http),
+            "error: '--no-sni' does not apply to an http listener\n"
+        );
+        let parsed = |args: &[&str]| parse(args.iter().map(ToString::to_string));
+        assert_eq!(
+            parsed(&["--no-sni", "--no-sni"]),
+            Err(UsageError::Twice("--no-sni"))
+        );
+        assert_eq!(parsed(&["--sni"]), Err(UsageError::NoValue("--sni")));
     }
 
     #[test]

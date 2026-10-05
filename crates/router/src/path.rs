@@ -80,6 +80,16 @@ impl PathPattern {
         })
     }
 
+    /// The root prefix, which covers every path: what a match on hostnames alone has, as a
+    /// `tls` listener's route is for `explain`.
+    #[must_use]
+    pub fn every() -> Self {
+        Self {
+            kind: Kind::Prefix,
+            path: "".into(),
+        }
+    }
+
     /// A pattern that matches the paths a regular expression describes: the **whole** path,
     /// so `/users/\d+` matches `/users/42` but not `/users/42/edit`; whoever wants less
     /// writes `.*`. Case-sensitive unless the pattern says otherwise (`(?i)`).
@@ -257,6 +267,14 @@ mod tests {
     #[test]
     fn exact_and_prefix_patterns_on_one_path_differ() {
         assert_ne!(exact("/shop"), prefix("/shop"));
+    }
+
+    #[test]
+    fn every_path_is_the_root_prefix() {
+        assert_eq!(PathPattern::every(), prefix("/"));
+        assert!(PathPattern::every().matches("/"));
+        assert!(PathPattern::every().matches("/a/b"));
+        assert!(!PathPattern::every().matches("*"));
     }
 
     #[test]

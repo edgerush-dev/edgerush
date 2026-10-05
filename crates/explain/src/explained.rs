@@ -20,9 +20,9 @@ use http::{Method, Version};
 /// A config as `explain` and `test` read it: compiled, with every listener's matches kept.
 #[derive(Debug)]
 pub struct Snapshot {
-    config: Config,
-    compiled: Compiled,
-    matches: Matches,
+    pub(crate) config: Config,
+    pub(crate) compiled: Compiled,
+    pub(crate) matches: Matches,
 }
 
 /// Why a request could not be explained.
@@ -31,9 +31,12 @@ pub enum Unexplained {
     /// A listener the config does not have.
     #[error("there is no listener {0}")]
     NoListener(String),
-    /// A `tcp` or `tls` listener, which `explain` does not take yet.
-    #[error("listener {0} is a {1} listener: explain takes http and https listeners for now")]
+    /// A request to a `tcp` or `tls` listener, which takes connections.
+    #[error("listener {0} is a {1} listener: it takes connections, not requests")]
     NotHttp(String, &'static str),
+    /// A connection to an `http` or `https` listener, which takes requests.
+    #[error("listener {0} is an {1} listener: it takes requests, not bare connections")]
+    NotPassthrough(String, &'static str),
     /// The request cannot be made into a head for the listener.
     #[error(transparent)]
     Invalid(#[from] Invalid),
@@ -245,7 +248,13 @@ fn text(
                 } else {
                     ' '
                 };
-                let why = verdict(&considered.verdict, walk, chosen.map(&label));
+                let why = verdict(
+                    &considered.verdict,
+                    &walk.path,
+                    &walk.method,
+                    chosen.map(&label),
+                    "match",
+                );
                 lines.push(format!(
                     "{marker} {:<width$}  {why}",
                     label(considered.route_match.value)
@@ -362,7 +371,7 @@ fn text(
 }
 
 /// Adds a field of the rule's: its name, then its lines beside it.
-fn field(lines: &mut Vec<String>, name: &str, said: Vec<String>) {
+pub(crate) fn field(lines: &mut Vec<String>, name: &str, said: Vec<String>) {
     for (at, line) in said.into_iter().enumerate() {
         let name = if at == 0 { name } else { "" };
         lines.push(format!("{name:<10}{line}").trim_end().to_owned());
@@ -370,7 +379,15 @@ fn field(lines: &mut Vec<String>, name: &str, said: Vec<String>) {
 }
 
 /// Why a match did or did not take the request.
-fn verdict(verdict: &Verdict<'_>, walk: &Walk<'_>, chosen: Option<String>) -> String {
+/// Why something the walk ranked did or did not take what was asked, by the `path` and
+/// `method` routed on; `what` it is (a match, a route), and the label of the one `chosen`.
+pub(crate) fn verdict(
+    verdict: &Verdict<'_>,
+    path: &str,
+    method: &Method,
+    chosen: Option<String>,
+    what: &str,
+) -> String {
     match verdict {
         Verdict::Chosen => "chosen".to_owned(),
         Verdict::Outranked(key) => {
@@ -385,11 +402,10 @@ fn verdict(verdict: &Verdict<'_>, walk: &Walk<'_>, chosen: Option<String>) -> St
             format!("outranked by {} ({key})", chosen.unwrap_or_default())
         }
         Verdict::Overshadowed { by } => {
-            format!("{by} claims this host, and this match's hostname does not fall through")
+            format!("{by} claims this host, and this {what}'s hostname does not fall through")
         }
         Verdict::Failed(failure) => match failure {
             Failure::Path(pattern) => {
-                let path = &walk.path;
                 if pattern.is_regex() {
                     format!("path {path} does not match {}", pattern.as_str())
                 } else if pattern.is_prefix() {
@@ -403,7 +419,7 @@ fn verdict(verdict: &Verdict<'_>, walk: &Walk<'_>, chosen: Option<String>) -> St
                     format!("path {path} is not {}", pattern.as_str())
                 }
             }
-            Failure::Method(wanted) => format!("method {}, wanted {wanted}", walk.method),
+            Failure::Method(wanted) => format!("method {method}, wanted {wanted}"),
             Failure::Header { predicate, seen } => {
                 let name = predicate.name().as_str();
                 format!(

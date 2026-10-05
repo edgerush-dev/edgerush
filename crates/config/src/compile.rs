@@ -53,14 +53,26 @@ pub struct MatchId {
 /// what `edgerush explain` walks ([22 §4](../../../docs/22-explain-and-test.md)). Made by
 /// [`compile_with_matches`]; a data plane never keeps them.
 #[derive(Debug, Default)]
-pub struct Matches(BTreeMap<String, Vec<RouteMatch<MatchId>>>);
+pub struct Matches {
+    http: BTreeMap<String, Vec<RouteMatch<MatchId>>>,
+    sni: BTreeMap<String, Vec<RouteMatch<usize>>>,
+}
 
 impl Matches {
     /// The matches of the listener called `listener`, in the order its router was given
     /// them; none for a `tcp` or `tls` listener, or a name there is no listener by.
     #[must_use]
     pub fn of(&self, listener: &str) -> &[RouteMatch<MatchId>] {
-        self.0.get(listener).map_or(&[], Vec::as_slice)
+        self.http.get(listener).map_or(&[], Vec::as_slice)
+    }
+
+    /// The routes of the `tls` listener called `listener`, each a match on its hostnames
+    /// alone — every path, no predicates, so that a walk ranks them by hostname and order as
+    /// [`SniRouter`] does — and known by its position among [`SniRouter::routes`]; none for
+    /// any other listener.
+    #[must_use]
+    pub fn sni_of(&self, listener: &str) -> &[RouteMatch<usize>] {
+        self.sni.get(listener).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -895,7 +907,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
         rules.push(compiled_rules);
     }
 
-    let mut l4 = l4_routes(config, &upstream_ids, &mut names, &mut errors);
+    let (mut l4, sni) = l4_routes(config, &upstream_ids, &mut names, &mut errors);
     proxy_protocol_upstreams(config, &mut errors);
     tls_route_probes(config, &mut errors);
 
@@ -958,7 +970,14 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                 .collect(),
             data_plane,
         };
-        Ok((compiled, Matches(kept)))
+        let sni = if keep {
+            sni.into_iter()
+                .map(|(listener, matches)| (listener.to_owned(), matches))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        Ok((compiled, Matches { http: kept, sni }))
     } else {
         Err(errors)
     }
@@ -1082,6 +1101,9 @@ fn protocol_name(protocol: Protocol) -> &'static str {
     }
 }
 
+/// Each `tls` listener's routes as matches on their hostnames alone, by the listener's name.
+type SniMatches<'a> = BTreeMap<&'a str, Vec<RouteMatch<usize>>>;
+
 /// The TCP and TLS routes, compiled, by the listener they are for; every problem with
 /// them, and with the passthrough listeners they leave without a route, into `errors`.
 fn l4_routes<'a>(
@@ -1089,7 +1111,7 @@ fn l4_routes<'a>(
     upstream_ids: &BTreeMap<&str, UpstreamId>,
     names: &mut HashSet<&'a str>,
     errors: &mut Vec<ConfigError>,
-) -> BTreeMap<&'a str, L4> {
+) -> (BTreeMap<&'a str, L4>, SniMatches<'a>) {
     let mut tcp: BTreeMap<&str, Vec<L4Route>> = BTreeMap::new();
     for route in &config.tcp_routes {
         let place = Place::route(&route.name);
@@ -1106,6 +1128,8 @@ fn l4_routes<'a>(
         }
     }
     let mut tls: BTreeMap<&str, (Vec<L4Route>, Vec<HostClaim<usize>>)> = BTreeMap::new();
+    // Each tls listener's routes as matches on their hostnames alone, for `explain`.
+    let mut sni: SniMatches<'_> = BTreeMap::new();
     for route in &config.tls_routes {
         let place = Place::route(&route.name);
         if !names.insert(route.name.as_str()) {
@@ -1137,6 +1161,14 @@ fn l4_routes<'a>(
                 falls_through: claim.falls_through,
                 value: at,
             }));
+            sni.entry(listener).or_default().push(RouteMatch {
+                hosts: claims.clone(),
+                path: PathPattern::every(),
+                method: None,
+                headers: HeaderPredicates::default(),
+                query: QueryPredicates::default(),
+                value: at,
+            });
         }
     }
 
@@ -1161,7 +1193,7 @@ fn l4_routes<'a>(
             Protocol::Http | Protocol::Https => {}
         }
     }
-    compiled
+    (compiled, sni)
 }
 
 /// The listeners a passthrough route is for, each once, as far as they exist and are of
@@ -3307,6 +3339,64 @@ upstreams:
             listener(&compiled, "sni").tunnel_idle,
             Duration::from_secs(3_600)
         );
+    }
+
+    #[test]
+    fn a_tls_listeners_routes_are_kept_as_matches_the_walk_ranks_as_the_router_does() {
+        let (compiled, matches) = compile_with_matches(&config(
+            r#"
+listeners:
+  sni: { address: "[::]:443", protocol: tls, proxy_protocol: off }
+  db: { address: "[::]:5432", protocol: tcp, proxy_protocol: off }
+routes: []
+tcp_routes:
+  - { name: db, listeners: [db], backends: [{ upstream: up, weight: 1 }] }
+tls_routes:
+  - { name: rest, listeners: [sni], hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: true }], backends: [{ upstream: up, weight: 1 }] }
+  - { name: api, listeners: [sni], hostnames: [{ name: api.example.com, falls_through: true }, { name: api.example.org, falls_through: true }], backends: [{ upstream: up, weight: 1 }] }
+  - { name: kept, listeners: [sni], hostnames: [{ name: "*.example.org", wildcard: one_label, falls_through: false }], backends: [{ upstream: up, weight: 1 }] }
+  - { name: also-api, listeners: [sni], hostnames: [{ name: api.example.com, falls_through: true }], backends: [{ upstream: up, weight: 1 }] }
+upstreams:
+  up: { load_balancer: p2c, endpoints: [] }
+"#,
+        ))
+        .unwrap();
+        let kept = matches.sni_of("sni");
+        let positions: Vec<usize> = kept.iter().map(|kept| kept.value).collect();
+        assert_eq!(positions, [0, 1, 2, 3]);
+        assert_eq!(kept[1].hosts.len(), 2);
+        assert!(matches.sni_of("db").is_empty());
+        assert!(matches.of("sni").is_empty());
+
+        let Some(L4::Tls(router)) = &listener(&compiled, "sni").l4 else {
+            panic!("sni is a tls listener");
+        };
+        let none = HeaderMap::new();
+        for name in [
+            "api.example.com",
+            "API.Example.com",
+            "www.example.com",
+            "a.b.example.com",
+            "api.example.org",
+            "www.example.org",
+            "a.b.example.org",
+            "example.com",
+            "elsewhere.test",
+        ] {
+            let asked = RequestParts {
+                host: name,
+                path: "/",
+                query: "",
+                method: &Method::GET,
+                headers: &none,
+            };
+            let walked = edgerush_router::explain(kept, &asked);
+            assert_eq!(
+                walked.chosen().map(|chosen| chosen.value),
+                router.route_at(name).map(|(at, _)| at),
+                "{name}"
+            );
+        }
     }
 
     fn compiled_listener_l4<'c>(compiled: &'c Compiled, name: &str) -> &'c L4 {
