@@ -7,6 +7,7 @@ import unittest
 
 from storm import (
     Shared,
+    cannot_progress,
     metric_sum,
     one_connection,
     parse_metrics,
@@ -81,6 +82,19 @@ class Percentiles(unittest.TestCase):
 
     def test_empty_is_zeros(self):
         self.assertEqual(percentiles([], [50, 100]), {50: 0.0, 100: 0.0})
+
+
+class CannotProgress(unittest.TestCase):
+    def test_no_failures_keeps_going(self):
+        self.assertFalse(cannot_progress(0, 0, 0, 400))
+
+    def test_short_of_the_width_keeps_going(self):
+        self.assertFalse(cannot_progress(0, 0, 399, 400))
+
+    def test_failures_of_any_kind_add_up_to_the_width(self):
+        self.assertTrue(cannot_progress(0, 0, 400, 400))
+        self.assertTrue(cannot_progress(150, 150, 100, 400))
+        self.assertTrue(cannot_progress(500, 0, 0, 400))
 
 
 class LiveConnection(unittest.TestCase):

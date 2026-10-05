@@ -189,6 +189,15 @@ def shared_count(shared, field_name):
         setattr(shared, field_name, getattr(shared, field_name) + 1)
 
 
+def cannot_progress(exhausted, refused, timed_out, concurrency):
+    """An unbounded storm gives up once persistent connect failures — ports or addresses
+    exhausted, connections refused, or connects timed out — reach the storm's width: at that
+    point every thread is failing rather than establishing, so the client has grown as far
+    as the kernel and the gateway will let it. A healthy run against a listener with room
+    has no such failures and keeps going until the client runs out of ports."""
+    return exhausted + refused + timed_out >= concurrency
+
+
 def storm(target, count, concurrency, rate, sources, timeout, request, shared):
     """Runs `concurrency` threads opening connections until `count` are established (or, when
     `count` is None, until the client runs out of ports), pacing to `rate` a second if set."""
@@ -202,11 +211,12 @@ def storm(target, count, concurrency, rate, sources, timeout, request, shared):
         while not shared.stop:
             with shared.lock:
                 enough = count is not None and shared.established >= count
-                dry = shared.exhausted  # the client is out of ports/addresses
-            if enough:
-                return
-            # Give up an unbounded run once every thread has hit exhaustion at least once.
-            if unbounded and dry >= concurrency:
+                stuck = unbounded and cannot_progress(
+                    shared.exhausted, shared.refused, shared.timed_out, concurrency
+                )
+            # Stop when the target is reached, or when an unbounded run can grow no further
+            # — whether the client ran out of ports or the server stopped taking connections.
+            if enough or stuck:
                 return
             if rate:
                 with pace_lock:
