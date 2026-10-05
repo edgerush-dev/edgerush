@@ -37,3 +37,11 @@ fn compose_example() -> io::Result<()> {
         "examples/docker-compose/tests.yaml",
     )
 }
+
+#[test]
+fn all_features_example() -> io::Result<()> {
+    check(
+        "examples/all-features.yaml",
+        "examples/all-features-tests.yaml",
+    )
+}

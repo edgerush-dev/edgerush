@@ -1,0 +1,264 @@
+# yaml-language-server: $schema=../schema/config.schema.json
+#
+# A worked config that uses every implemented feature once: several listeners, routes and
+# upstreams. Each field's meaning, choices, defaults and limits are in the JSON Schema
+# (schema/config.schema.json), which an editor with YAML support shows on hover and
+# checks as you type; the notes here say what each part demonstrates.
+#
+# From the repository root:
+#   cargo run -p edgerush -- test --config examples/all-features.yaml examples/all-features-tests.yaml
+#   cargo run -p edgerush -- proxy --config examples/all-features.yaml --workers 1
+#
+# It binds loopback only and needs no certificate. To serve traffic, supply the backends
+# listed under upstreams. Process options (workers, /metrics, accept balancing) are command
+# line flags: `cargo run -p edgerush -- proxy --help`.
+
+listeners:
+  web:
+    address: "127.0.0.1:8080"
+    protocol: http
+    proxy_protocol: off
+    # proxy_protocol: { senders: ["192.0.2.0/24", "2001:db8::/32"] }
+    forwarding:
+      trusted_proxies: []
+      trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"]
+    request_id: generate
+    access_log: stdout
+    # access_log: { file: /var/log/edgerush/access.log }
+
+  internal:
+    address: "127.0.0.1:8081"
+    protocol: http
+    proxy_protocol: off
+    forwarding: { trusted_proxies: [], trusted_only_headers: [] }
+    # pass: the caller's X-Request-ID goes through untouched.
+    request_id: pass
+    # No access_log: nothing is logged for this listener.
+
+  # HTTPS and HTTP/3. To try it, create a certificate (examples/README.md), uncomment this
+  # listener and the `server` certificate at the end, and add `secure` to the routes'
+  # listeners. A new listener takes a restart.
+  # secure:
+  #   address: "127.0.0.1:8443"
+  #   protocol: https
+  #   proxy_protocol: off
+  #   forwarding: { trusted_proxies: [], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }
+  #   request_id: generate
+  #   access_log: stdout
+  #   tls:
+  #     certificates: [server]
+  #     # mTLS: clients must show a certificate these authorities vouch for (PEM contents).
+  #     # client_validation:
+  #     #   authorities:
+  #     #     - |
+  #     #       -----BEGIN CERTIFICATE-----
+  #     #       REPLACE_WITH_CLIENT_CA_BASE64
+  #     #       -----END CERTIFICATE-----
+  #   http3: { alt_svc_max_age: 86400, force_retry: false }
+
+  raw:
+    address: "127.0.0.1:10000"
+    protocol: tcp
+    proxy_protocol: off
+    tunnel_idle_seconds: 3600
+    access_log: stdout
+
+  sni:
+    # TLS passthrough: routed by the name the client asks for; the backend terminates TLS.
+    address: "127.0.0.1:10443"
+    protocol: tls
+    proxy_protocol: off
+    tunnel_idle_seconds: 3600
+    access_log: stdout
+
+routes:
+  - name: application
+    listeners: [web]
+    hostnames:
+      # Every host; falls_through keeps these rules as candidates where a more specific
+      # hostname (assets' *.example.net below) also matches.
+      - name: "*"
+        falls_through: true
+    rules:
+      # Rule 0: conditions on method, a header and a query parameter; every filter kind;
+      # a weighted split with timeouts and retries.
+      - matches:
+          - path: { prefix: /api }
+            method: GET
+            headers:
+              - name: x-api-version
+                value: { exact: "1" }
+            query:
+              - name: mode
+                value: { regex: 'full|brief' }
+        filters:
+          - type: request_header_modifier
+            set: [{ name: x-gateway, value: edgerush }]
+            add: [{ name: x-feature, value: reference }]
+            remove: [x-internal-token]
+          - type: response_header_modifier
+            set: [{ name: x-served-by, value: edgerush }]
+            add: []
+            remove: [x-powered-by]
+          - type: url_rewrite
+            # /api/users becomes /users, sent with this Host.
+            host: backend.example.com
+            path: { replace_prefix: / }
+          - type: request_mirror
+            upstream: canary
+            fraction: { numerator: 1, denominator: 10 }
+        forward:
+          backends:
+            - { upstream: web_backend, weight: 90 }
+            - { upstream: canary, weight: 10 }
+          timeouts:
+            request_ms: 10000
+            backend_request_ms: 3000
+            tunnel_idle_ms: 3600000
+          retry:
+            attempts: 2
+            http_statuses: [502, 503]
+            grpc_statuses: []
+            on_timeout: true
+            backoff_base_ms: 25
+            backoff_max_ms: 250
+
+      # Rule 1: a redirect, keeping the rest of the path and the query.
+      - matches:
+          - path: { prefix: /old }
+        redirect:
+          status: 301
+          scheme: https
+          host: www.example.com
+          port: 443
+          path: { replace_prefix: /new }
+          query: keep
+
+      # Rule 2: a gRPC method, to an HTTP/2 upstream, sent again on UNAVAILABLE.
+      - matches:
+          - grpc: { service: helloworld.Greeter, method: SayHello }
+            method: POST
+        forward:
+          backends: [{ upstream: grpc_backend, weight: 1 }]
+          retry:
+            attempts: 1
+            grpc_statuses: [UNAVAILABLE]
+            on_timeout: false
+            backoff_base_ms: 25
+            backoff_max_ms: 100
+
+      # Rule 3: WebSockets are routed as ordinary requests; the backend must speak them.
+      - matches: [{ path: { prefix: /ws } }]
+        forward:
+          backends: [{ upstream: web_backend, weight: 1 }]
+          timeouts: { tunnel_idle_ms: 60000 }
+
+      # Rule 4: everything else.
+      - matches: [{ path: { prefix: / } }]
+        forward:
+          backends: [{ upstream: web_backend, weight: 1 }]
+
+  # A one-label wildcard host with a regex path: cdn.example.net, not a.b.example.net. A
+  # request it does not match falls through to application's "*".
+  - name: assets
+    listeners: [web]
+    hostnames: [{ name: "*.example.net", wildcard: one_label, falls_through: true }]
+    rules:
+      - matches:
+          - path: { regex: '/assets/[a-z]+[.]css' }
+            headers: [{ name: x-client, value: { regex: 'web|mobile' } }]
+            query: [{ name: version, value: { exact: "2" } }]
+        forward:
+          backends: [{ upstream: canary, weight: 1 }]
+
+  # One exact path on one host, and no catch-all: anything else on `internal` is 404.
+  - name: internal_status
+    listeners: [internal]
+    hostnames: [{ name: localhost, falls_through: false }]
+    rules:
+      - matches: [{ path: { exact: /status }, method: GET }]
+        forward:
+          backends: [{ upstream: web_backend, weight: 1 }]
+
+tcp_routes:
+  - name: raw_forward
+    listeners: [raw]
+    backends: [{ upstream: raw_backend, weight: 1 }]
+
+tls_routes:
+  # Any number of labels: a.example.com and a.b.example.com, not example.com.
+  - name: tls_forward
+    listeners: [sni]
+    hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: true }]
+    backends: [{ upstream: tls_backend, weight: 1 }]
+
+upstreams:
+  web_backend:
+    endpoints: ["127.0.0.1:9000", "127.0.0.1:9001"]
+    protocol: http1
+    load_balancer: p2c
+    slow_start: { window_ms: 30000 }
+    health_check:
+      interval_seconds: 5
+      timeout_seconds: 1
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+      probe: { http: { path: /healthz } }
+    # TLS to the endpoints: replace the placeholder with the authority's PEM. A client
+    # certificate, for mTLS, is named from the certificates at the end.
+    # tls:
+    #   server_name: backend.example.com
+    #   authorities:
+    #     - |
+    #       -----BEGIN CERTIFICATE-----
+    #       REPLACE_WITH_BACKEND_CA_BASE64
+    #       -----END CERTIFICATE-----
+    #   client_certificate: client
+
+  canary:
+    endpoints: ["127.0.0.1:9002"]
+    load_balancer: round_robin
+
+  grpc_backend:
+    # HTTP/2 without TLS: spoken by prior knowledge (h2c).
+    endpoints: ["127.0.0.1:50051"]
+    protocol: http2
+    load_balancer: p2c
+    keepalive:
+      interval_seconds: 300
+      timeout_seconds: 20
+      without_calls: false
+      backend_allows_short_intervals: false
+    health_check:
+      interval_seconds: 5
+      timeout_seconds: 1
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+      probe: { grpc: { service: helloworld.Greeter } }
+
+  raw_backend:
+    # The backend must accept a PROXY v2 header before the client's bytes.
+    endpoints: ["127.0.0.1:10001"]
+    load_balancer: round_robin
+    proxy_protocol: v2
+    health_check:
+      interval_seconds: 5
+      timeout_seconds: 1
+      healthy_threshold: 1
+      unhealthy_threshold: 2
+      probe: tcp
+
+  tls_backend:
+    # Carries the client's TLS unchanged, so it has no tls of its own; an HTTP probe could
+    # never pass behind it, and a health check here would be a tcp one.
+    endpoints: ["127.0.0.1:9443"]
+    load_balancer: p2c
+
+data_plane:
+  set_aside_ms: 5000
+
+# Paths are relative to this file's directory. For the commented TLS parts above:
+# certificates:
+#   server: { chain_file: certs/server-chain.pem, key_file: certs/server-key.pem }
+#   client: { chain_file: certs/client-chain.pem, key_file: certs/client-key.pem }
+certificates: {}

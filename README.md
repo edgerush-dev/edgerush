@@ -83,6 +83,10 @@ curl -i http://127.0.0.1:8080/
 For a complete local demo with backends, see [Docker Compose](examples/docker-compose/README.md).
 [Examples](examples/README.md) also has runnable HTTP and gRPC configs with routing tests
 and `explain` commands.
+Every field of the config file is described in its JSON Schema,
+[schema/config.schema.json](schema/config.schema.json), made from the code; editors use
+it for completion and checks. [all-features.yaml](examples/all-features.yaml) uses every
+implemented feature once.
 
 The format asks for choices such as `forwarding` and `proxy_protocol` to be stated rather
 than defaulted, as the control plane will state them. `bench/proxy.yaml` and

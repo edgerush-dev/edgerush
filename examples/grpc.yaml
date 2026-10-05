@@ -1,3 +1,5 @@
+# yaml-language-server: $schema=../schema/config.schema.json
+#
 # A gRPC service behind EdgeRush. From the repository root:
 #   cargo run -p edgerush -- proxy --config examples/grpc.yaml --workers 1
 # Clients speak HTTP/2 by prior knowledge on :8080 (h2c), as GRPCRoute requires of a

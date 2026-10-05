@@ -2,3 +2,4 @@
 /bench/results
 /bench/wsbench/target
 /bench/__pycache__
+/examples/certs/

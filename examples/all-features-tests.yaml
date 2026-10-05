@@ -1,0 +1,114 @@
+# Routing checks for all-features.yaml: no backend or certificate is needed. They check
+# routes, filters and answers, not TLS handshakes, live retries or probes.
+tests:
+  - name: API conditions select weighted backends and apply filters
+    request:
+      listener: web
+      client: 203.0.113.7
+      protocol: "1.1"
+      method: GET
+      url: http://localhost:8080/api/users?mode=full
+      headers:
+        - { name: x-api-version, value: "1" }
+        - { name: x-internal-token, value: secret }
+    upstream_answer:
+      status: 200
+      headers: [{ name: x-powered-by, value: backend }]
+    expect:
+      route: application
+      rule: 0
+      forward:
+        backends: [{ upstream: web_backend, weight: 90 }, { upstream: canary, weight: 10 }]
+        mirrors: [{ upstream: canary, fraction: { numerator: 1, denominator: 10 } }]
+      upstream_request:
+        target: /users?mode=full
+        headers:
+          - { name: host, value: backend.example.com }
+          - { name: x-gateway, value: edgerush }
+          - { name: x-feature, value: reference }
+          - { name: x-internal-token, absent: true }
+      response:
+        status: 200
+        headers:
+          - { name: x-served-by, value: edgerush }
+          - { name: x-powered-by, absent: true }
+  - name: missing API condition falls back without a rewrite
+    request: { listener: web, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://localhost:8080/api/users?mode=full", headers: [] }
+    expect:
+      route: application
+      rule: 4
+      forward: { backends: [{ upstream: web_backend, weight: 1 }], mirrors: [] }
+      upstream_request: { target: "/api/users?mode=full" }
+  - name: redirect changes host scheme and prefix but keeps query
+    request: { listener: web, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://localhost:8080/old/item?q=1", headers: [] }
+    expect:
+      route: application
+      rule: 1
+      redirect: { status: 301, location: "https://www.example.com/new/item?q=1" }
+  - name: gRPC uses its HTTP2 upstream
+    request: { listener: web, client: 203.0.113.7, protocol: "2", method: POST, url: "http://localhost:8080/helloworld.Greeter/SayHello", headers: [{ name: content-type, value: application/grpc }] }
+    expect:
+      route: application
+      rule: 2
+      forward: { backends: [{ upstream: grpc_backend, weight: 1 }], mirrors: [] }
+  - name: WebSocket handshake selects the tunnel route
+    request:
+      listener: web
+      client: 203.0.113.7
+      protocol: "1.1"
+      method: GET
+      url: http://localhost:8080/ws/chat
+      headers:
+        - { name: connection, value: Upgrade }
+        - { name: upgrade, value: websocket }
+        - { name: sec-websocket-version, value: "13" }
+        - { name: sec-websocket-key, value: dGhlIHNhbXBsZSBub25jZQ== }
+    expect:
+      route: application
+      rule: 3
+      forward: { backends: [{ upstream: web_backend, weight: 1 }], mirrors: [] }
+  - name: wildcard hostname regex path and predicates choose assets
+    request: { listener: web, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://cdn.example.net/assets/main.css?version=2", headers: [{ name: x-client, value: mobile }] }
+    expect:
+      route: assets
+      rule: 0
+      forward: { backends: [{ upstream: canary, weight: 1 }], mirrors: [] }
+  - name: one-label wildcard does not match two labels
+    request: { listener: web, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://a.b.example.net/assets/main.css?version=2", headers: [{ name: x-client, value: mobile }] }
+    expect:
+      route: application
+      rule: 4
+      forward: { backends: [{ upstream: web_backend, weight: 1 }], mirrors: [] }
+  - name: fallback hostname remains eligible when assets has no path match
+    request: { listener: web, client: 203.0.113.7, protocol: "1.1", method: GET, url: http://cdn.example.net/index.html, headers: [] }
+    expect:
+      route: application
+      rule: 4
+      forward: { backends: [{ upstream: web_backend, weight: 1 }], mirrors: [] }
+  - name: internal exact route preserves a supplied request ID
+    request: { listener: internal, client: 203.0.113.7, protocol: "1.1", method: GET, url: http://localhost:8081/status, headers: [{ name: x-request-id, value: supplied-id }] }
+    expect:
+      route: internal_status
+      rule: 0
+      forward: { backends: [{ upstream: web_backend, weight: 1 }], mirrors: [] }
+      upstream_request:
+        headers: [{ name: x-request-id, value: supplied-id }]
+  - name: exact path does not match children
+    request: { listener: internal, client: 203.0.113.7, protocol: "1.1", method: GET, url: http://localhost:8081/status/child, headers: [] }
+    expect: { answer: no_route }
+  - name: TCP chooses its only route
+    request: { listener: raw }
+    expect:
+      route: raw_forward
+      forward: { backends: [{ upstream: raw_backend, weight: 1 }] }
+  - name: SNI wildcard matches multiple labels
+    request: { listener: sni, sni: { name: a.b.example.com } }
+    expect:
+      route: tls_forward
+      forward: { backends: [{ upstream: tls_backend, weight: 1 }] }
+  - name: SNI wildcard excludes its bare suffix
+    request: { listener: sni, sni: { name: example.com } }
+    expect: { refused: no_route }
+  - name: TLS without SNI has no route
+    request: { listener: sni, sni: none }
+    expect: { refused: no_route }

@@ -1,3 +1,5 @@
+# yaml-language-server: $schema=../../../schema/config.schema.json
+#
 # RUNS TODAY: the compose demo's data plane, read again every second. Edit it while the
 # demo runs and the change takes over without a restart; a config that cannot be run is
 # reported in the log and changes nothing. Endpoints are addresses, not names (in a
