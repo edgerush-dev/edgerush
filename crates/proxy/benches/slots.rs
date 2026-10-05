@@ -57,6 +57,13 @@ fn run<F: Future<Output = u8>>(mut future: Pin<&mut F>) -> u8 {
 // Each request's future made in a slot of the worker's, run, and dropped where it stands.
 #[library_benchmark]
 fn in_a_slot() -> u32 {
+    requests_in_slots()
+}
+
+/// The benchmark's body, as a function of its own: a closure written in the benchmark would
+/// put the benchmark's path into the name of the generic it is handed to, which
+/// iai-callgrind stops counting in (10 §3). Written here, it carries this function's.
+fn requests_in_slots() -> u32 {
     let slots = Slots::default();
     let mut sum = 0_u32;
     for seed in 0..REQUESTS {

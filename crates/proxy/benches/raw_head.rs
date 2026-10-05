@@ -110,6 +110,13 @@ fn sent_with(target: &str, host: Option<&str>, more: &[(&'static str, &'static s
     Bytes::from(sent)
 }
 
+/// The core's random draw. A function of its own, not a closure written in a benchmark:
+/// the core is generic over it, and a closure's type would put the benchmark's path into the
+/// names of the core's own functions, which iai-callgrind stops counting in (10 §3).
+fn draw() -> u64 {
+    0x9E37_79B9_7F4A_7C15
+}
+
 // Both are measured from the same bytes to the same decision: the parser's reading, then a
 // header map built of it or its lines taken down, then the request core. The config and
 // what was made are handed back so that dropping them is not measured.
@@ -166,7 +173,7 @@ fn by_raw(
             listener,
             head,
             black_box(&client),
-            &mut || 0x9E37_79B9_7F4A_7C15,
+            &mut draw,
             Some(&ID),
         )
         .is_ok(),
@@ -237,7 +244,7 @@ fn by_map(
             listener,
             head,
             black_box(&client),
-            &mut || 0x9E37_79B9_7F4A_7C15,
+            &mut draw,
             Some(&ID),
         )
         .is_ok(),

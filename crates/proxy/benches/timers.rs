@@ -33,6 +33,25 @@ fn waiting() -> (Heap<u64>, Vec<Key>, Instant) {
     (heap, keys, start)
 }
 
+/// The moment an owner waits for, as the heap asks for it. Made here, as [`woken`] and
+/// [`counting`] are, not in the benchmarks: a closure written there would put the
+/// benchmark's path into the name of the generic it is handed to, which iai-callgrind stops
+/// counting in (10 §3).
+fn due_at(due: Instant) -> impl FnOnce() -> Instant {
+    move || due
+}
+
+/// What an owner keeps of being woken: a count.
+fn woken(times: &mut u64) {
+    *times += 1;
+}
+
+/// What the worker's task does with each owner it hands a deadline to: counts it into
+/// `handed`.
+fn counting(handed: &mut u64) -> impl FnMut(&mut u64) + '_ {
+    move |woken| *handed += *woken + 1
+}
+
 // Every owner polled four times, its deadline a little later each time: what a busy
 // worker's heap is asked, request after request, and never has to queue.
 #[library_benchmark]
@@ -41,7 +60,7 @@ fn waits_moving_later((mut heap, keys, start): (Heap<u64>, Vec<Key>, Instant)) -
     for round in 1..=4_u64 {
         for (at, key) in keys.iter().enumerate() {
             let due = start + Duration::from_secs(30 + round) + Duration::from_micros(at as u64);
-            black_box(heap.wait(*key, due, || due, |woken| *woken += 1));
+            black_box(heap.wait(*key, due, due_at(due), woken));
         }
     }
     heap
@@ -52,9 +71,7 @@ fn waits_moving_later((mut heap, keys, start): (Heap<u64>, Vec<Key>, Instant)) -
 #[bench::all_due(waiting())]
 fn expiring((mut heap, _keys, start): (Heap<u64>, Vec<Key>, Instant)) -> (Heap<u64>, u64) {
     let mut handed = 0;
-    heap.expire(start + Duration::from_secs(31), |woken| {
-        handed += *woken + 1;
-    });
+    heap.expire(start + Duration::from_secs(31), counting(&mut handed));
     (heap, black_box(handed))
 }
 
