@@ -28,6 +28,9 @@ pub struct Snapshot {
 /// Why a request could not be explained.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Unexplained {
+    /// A listener the config does not have.
+    #[error("there is no listener {0}")]
+    NoListener(String),
     /// A `tcp` or `tls` listener, which `explain` does not take yet.
     #[error("listener {0} is a {1} listener: explain takes http and https listeners for now")]
     NotHttp(String, &'static str),
@@ -139,7 +142,7 @@ pub struct Explained<'s> {
     after: http::request::Parts,
 }
 
-impl Explained<'_> {
+impl<'s> Explained<'s> {
     /// The explanation, as text.
     #[must_use]
     pub fn text(&self) -> String {
@@ -151,6 +154,27 @@ impl Explained<'_> {
             &self.asked,
             self,
         )
+    }
+
+    /// The route the request was routed to, by name, and its rule as the config states it,
+    /// with its position in the route; `None` for a request that was not routed.
+    #[must_use]
+    pub fn routed(&self) -> Option<(&'s str, &'s Rule, usize)> {
+        let snapshot = self.snapshot;
+        let id = self.walk.as_ref()?.explanation.chosen()?.value.rule;
+        let route = snapshot.config.routes.get(id.route)?;
+        Some((route.name.as_str(), route.rules.get(id.rule)?, id.rule))
+    }
+
+    /// What the core decided: where the request goes, or why the gateway answers it.
+    pub fn decided(&self) -> Result<&Decision<'s>, Rejection> {
+        self.decided.as_ref().map_err(|rejection| *rejection)
+    }
+
+    /// The head as the upstream would be sent it, for a request that goes to one.
+    #[must_use]
+    pub fn upstream(&self) -> &http::request::Parts {
+        &self.after
     }
 }
 

@@ -329,6 +329,41 @@ fn explain_says_where_a_request_goes_and_exits_0_or_2() -> io::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_runs_a_file_of_tests_and_exits_0_or_1() -> io::Result<()> {
+    let config = scratch("test-config.yaml");
+    std::fs::write(&config, config_text())?;
+    let tests = scratch("tests.yaml");
+    let file = |route: &str| {
+        format!(
+            "tests:\n  - name: everything goes up\n    request: {{ listener: web, client: 203.0.113.7, protocol: \"1.1\", method: GET, url: \"http://shop.example.com/\", headers: [] }}\n    expect: {{ route: {route}, rule: 0, forward: {{ backends: [{{ upstream: up, weight: 1 }}], mirrors: [] }} }}\n"
+        )
+    };
+
+    std::fs::write(&tests, file("everything"))?;
+    let output = edgerush(&["test", "--config", &config, &tests])?;
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("ok    everything goes up ("), "{stdout}");
+    assert!(stdout.ends_with("\n0 failed, 1 passed\n"), "{stdout}");
+
+    std::fs::write(&tests, file("elsewhere"))?;
+    let output = edgerush(&["test", "--config", &config, &tests])?;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("FAIL  everything goes up ("), "{stdout}");
+    assert!(
+        stdout.contains("\n  route: expected elsewhere, got everything\n"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+/// The config of [`config`] with no upstream to reach: for the commands that only read it.
+fn config_text() -> String {
+    config("127.0.0.1:1", "up", None)
+}
+
 /// A path for a file of the test's own, as text for the command line.
 fn scratch(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);

@@ -6,6 +6,7 @@
 
 pub mod asked;
 mod explained;
+pub mod runner;
 pub mod test_file;
 
 pub use asked::{Asked, Invalid};

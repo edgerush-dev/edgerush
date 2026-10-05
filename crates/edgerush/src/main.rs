@@ -2,7 +2,8 @@
 //!
 //! One executable will carry every role (operator, control plane, data plane) as
 //! subcommands. So far: `proxy`, a data plane run from a config file — the development
-//! harness — and `explain`, which says where a request would go and why.
+//! harness — `explain`, which says where a request would go and why, and `test`, which
+//! checks a file of such requests and what is expected of them.
 
 mod bind;
 mod config_file;
@@ -11,6 +12,7 @@ mod explain;
 mod harness;
 mod limits;
 mod per_core;
+mod testing;
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -24,6 +26,7 @@ Usage: edgerush [OPTIONS] [COMMAND]
 Commands:
   proxy    Run a data plane from a config file, without Kubernetes (development harness)
   explain  Say where a request to a listener goes, and why no other match took it
+  test     Check where requests go against a file of tests, without running a data plane
 
 Options:
   -V, --version  Print version
@@ -53,6 +56,7 @@ fn run(
         Some("-V" | "--version") => writeln!(stdout, "{VERSION}").map(|()| 0),
         Some("proxy") => return harness::command(args, stdout, stderr),
         Some("explain") => return explain::command(args, stdout, stderr),
+        Some("test") => return testing::command(args, stdout, stderr),
         Some(other) => {
             write!(stderr, "error: unexpected argument '{other}'\n\n{USAGE}").map(|()| EXIT_USAGE)
         }

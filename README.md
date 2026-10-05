@@ -93,6 +93,9 @@ it, from the same file and without running anything:
 ./target/release/edgerush explain --config edgerush.yaml --listener web     --client 203.0.113.7 --protocol 1.1 --method GET --url http://localhost/
 ```
 
+`edgerush test --config edgerush.yaml tests.yaml` checks a file of such requests and where
+each is expected to go, and exits 1 when one goes elsewhere: a config's tests for CI.
+
 ## Building
 
 The Rust toolchain is pinned in `rust-toolchain.toml`; `rustup` installs it on first use.
@@ -164,10 +167,11 @@ outside the workspace, the package is formatted on its own:
 ```
 crates/edgerush    the binary (operator, control plane and data plane will be subcommands); so far
                    `edgerush proxy --config file.yaml`, a data plane run from a file for development,
-                   and `edgerush explain`, where a request would go and why
+                   `edgerush explain`, where a request would go and why, and `edgerush test`
 crates/config      the config model and its compilation (`edgerush-config`): pure, format-free
 crates/explain     where a request would go and why (`edgerush-explain`): what `edgerush explain`
-                   prints, worked out by the request core without a data plane; no I/O
+                   prints and `edgerush test` checks, worked out by the request core without a
+                   data plane; no I/O
 crates/filters     built-in filters (`edgerush-filters`): pure, on plain `http` types
 crates/proxy       the data plane (`edgerush-proxy`): listeners, TLS, our HTTP/1 server and client,
                    HTTP/2 on h2, HTTP/3 on quiche, upstream pools and the request core between them
