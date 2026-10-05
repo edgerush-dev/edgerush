@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc a857db6317a215119c86e393cbe1cfe77976a76630a9ce91984a843d89cafe44 # shrinks to status = "200 OK", fields = [], set = [], add = [], remove = [], upgradable = false, websocket = Some((true, true))
+cc b10d800d6d51fd8a358c4afaf0d2a0b7880e683b05d6e39647dbd6af9b4b2145 # shrinks to version = HTTP/3.0, types = ["application/grpc"], timeouts = []
+cc efdce51ff1979999a344e7d9c8910d6b70f9ad8ebabbec37f44e77ece10eb032 # shrinks to version = HTTP/2.0, types = ["application/grpc", "application/grpc"], timeouts = []

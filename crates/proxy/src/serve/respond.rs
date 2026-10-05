@@ -28,7 +28,7 @@ use arc_swap::Guard;
 use edgerush_config::{RequestId, UpstreamProtocol};
 use edgerush_filters::request_id;
 use edgerush_router::Fields;
-use http::{HeaderValue, Method, Request, Response, StatusCode, Version};
+use http::{HeaderValue, Method, Request, Response, Version};
 use http_body::Body as HttpBody;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -362,18 +362,10 @@ impl Proxy {
     fn answer_to(&self, listener: usize, answer: Answer, call: Option<Call>) -> Response<Body> {
         let mut response = self.answer(listener, answer);
         if call.is_some() {
-            let (code, why) = answer.grpc();
             if let Some(counters) = self.metrics.listener(listener) {
-                counters.called(code as usize);
+                counters.called(answer.grpc().0 as usize);
             }
-            *response.status_mut() = StatusCode::OK;
-            let headers = response.headers_mut();
-            headers.insert(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static("application/grpc"),
-            );
-            headers.insert("grpc-status", code.value());
-            headers.insert("grpc-message", crate::grpc::status::message(why));
+            way_back::call_answer(&mut response, answer);
         }
         response
     }

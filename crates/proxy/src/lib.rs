@@ -126,17 +126,14 @@ mod tunnel;
 pub mod upstream;
 #[cfg(not(feature = "fuzzing"))]
 mod upstream;
-// Private, save when the benchmarks are being built.
-#[cfg(feature = "fuzzing")]
 pub mod way_back;
-#[cfg(not(feature = "fuzzing"))]
-mod way_back;
 // Private, save when the fuzz targets are being built, for its frame reader.
 #[cfg(feature = "fuzzing")]
 pub mod websocket;
 #[cfg(not(feature = "fuzzing"))]
 mod websocket;
 
+pub use fields::OverlayFull;
 pub use forwarding::Client;
 pub use hop_by_hop::ConnectionError;
 pub use host::HostError;

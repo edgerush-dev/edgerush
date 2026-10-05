@@ -12,7 +12,6 @@ use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
 use crate::upstream::secure::Secure;
 use arc_swap::ArcSwap;
 use edgerush_config::Compiled;
-use edgerush_filters::HeaderModifier;
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -83,7 +82,9 @@ impl Snapshot {
         let alt_svc = listeners
             .iter()
             .zip(&quic)
-            .map(|(at, port)| alt_svc(at.and_then(|at| config.listeners().get(at))?, (*port)?))
+            .map(|(at, port)| {
+                crate::way_back::alt_svc(at.and_then(|at| config.listeners().get(at))?, (*port)?)
+            })
             .collect();
         let upstream_slots = config
             .upstreams()
@@ -143,14 +144,6 @@ impl Snapshot {
             logs,
         })
     }
-}
-
-/// The `Alt-Svc` a listener's answers carry: HTTP/3 on `port`, where its UDP socket is, for
-/// as long as its config says (RFC 7838 §3). None for a listener whose config has no HTTP/3.
-fn alt_svc(listener: &edgerush_config::CompiledListener, port: u16) -> Option<HeaderModifier> {
-    let http3 = listener.http3?;
-    let value = format!("h3=\":{port}\"; ma={}", http3.alt_svc_max_age);
-    HeaderModifier::new([("alt-svc", value.as_str())], [], []).ok()
 }
 
 impl Proxy {

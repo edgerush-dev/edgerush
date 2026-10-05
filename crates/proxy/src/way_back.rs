@@ -1,24 +1,26 @@
 //! An answer on its way back to the client: what the gateway does to it, whichever way it
 //! holds it — the lines our own client read, or a map — and whichever path it came by
 //! ([22 §5](../../../docs/22-explain-and-test.md)). An upstream's answer is edited for the
-//! hop it goes on ([`upstream_answer`]), a redirect's is made ([`redirect_answer`]), and every
-//! answer, the gateway's own among them, says last what each one says ([`every_answer`]).
-//! `serve` calls these on each of its paths, so that an answer is edited the same whichever
-//! it took.
+//! hop it goes on ([`upstream_answer`]), a redirect's is made ([`redirect_answer`]), a gRPC
+//! call the gateway answers itself is answered as gRPC answers ([`call_rejected`],
+//! [`call_redirected`]), and every answer, the gateway's own among them, says last what each
+//! one says ([`every_answer`]). `serve` calls these on each of its paths, so that an answer
+//! is edited the same whichever it took, and `edgerush test` calls them to tell the answer a
+//! test's client would get.
 //!
 //! Nothing here does I/O: what each step needs is passed in.
 
-// `pub` for the benchmarks, which are a crate of their own; in an ordinary build none of
-// this is API.
-#![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
-
 use crate::fields::OverlayFull;
+use crate::grpc::status::is_grpc;
 use crate::hop_by_hop;
+use crate::metrics::Answer;
+use crate::request::Rejection;
 use crate::websocket::{self, Key, WEBSOCKET};
+use edgerush_config::CompiledListener;
 use edgerush_filters::{HeaderModifier, request_id};
 use edgerush_router::Fields;
-use http::header::{LOCATION, SEC_WEBSOCKET_ACCEPT, UPGRADE};
-use http::{HeaderName, HeaderValue, Response, StatusCode};
+use http::header::{CONTENT_TYPE, LOCATION, SEC_WEBSOCKET_ACCEPT, UPGRADE};
+use http::{HeaderName, HeaderValue, Response, StatusCode, Version};
 
 /// An answer's head, as the way back edits it: its status and its fields.
 pub trait AnswerHead {
@@ -248,6 +250,56 @@ pub fn every_answer<A: AnswerHead + ?Sized>(
     if let Some(id) = id {
         let _set = answer.set_field(request_id::HEADER, id);
     }
+}
+
+/// The `Alt-Svc` a listener's answers carry: HTTP/3 on `port`, where its UDP socket is, for
+/// as long as its config says (RFC 7838 §3). None for a listener whose config has no HTTP/3.
+#[must_use]
+pub fn alt_svc(listener: &CompiledListener, port: u16) -> Option<HeaderModifier> {
+    let http3 = listener.http3?;
+    let value = format!("h3=\":{port}\"; ma={}", http3.alt_svc_max_age);
+    HeaderModifier::new([("alt-svc", value.as_str())], [], []).ok()
+}
+
+/// Whether a request is a gRPC call, which the gateway answers itself as gRPC does: HTTP/2
+/// or HTTP/3 with one gRPC content type, read from its head as the client sent it (15 §6).
+/// What `serve` reads a call by, without the deadline it reads beside it; a test holds the
+/// two to each other.
+#[must_use]
+pub fn is_grpc_call<F: Fields + ?Sized>(version: Version, fields: &F) -> bool {
+    if !matches!(version, Version::HTTP_2 | Version::HTTP_3) {
+        return false;
+    }
+    let mut types = fields.values(&CONTENT_TYPE);
+    types.next().is_some_and(is_grpc) && types.next().is_none()
+}
+
+/// Makes `answer` the data plane's own answer to a gRPC call it refuses for `rejection`: a
+/// trailers-only answer, 200 with the status gRPC gives the cause, which is how gRPC answers
+/// a call it fails before any message (15 §6).
+pub fn call_rejected<A: AnswerHead + ?Sized>(answer: &mut A, rejection: Rejection) {
+    call_answer(answer, rejection.into());
+}
+
+/// The same for a gRPC call its rule redirects: no gRPC client follows a redirect.
+pub fn call_redirected<A: AnswerHead + ?Sized>(answer: &mut A) {
+    call_answer(answer, Answer::Redirected);
+}
+
+/// Makes `answer` the data plane's own answer to a gRPC call, for `reason`.
+pub(crate) fn call_answer<A: AnswerHead + ?Sized>(answer: &mut A, reason: Answer) {
+    let (code, why) = reason.grpc();
+    answer.set_status(StatusCode::OK);
+    // An answer of the gateway's own holds these three and more: nothing here fails.
+    let _told = answer
+        .set_field(CONTENT_TYPE, HeaderValue::from_static("application/grpc"))
+        .and_then(|()| answer.set_field(HeaderName::from_static("grpc-status"), code.value()))
+        .and_then(|()| {
+            answer.set_field(
+                HeaderName::from_static("grpc-message"),
+                crate::grpc::status::message(why),
+            )
+        });
 }
 
 #[cfg(test)]
@@ -577,6 +629,49 @@ mod tests {
         );
     }
 
+    /// A call the gateway refuses or redirects is told so as gRPC tells it: 200, its content
+    /// type and the status gRPC gives the cause, whatever the answer held before.
+    #[test]
+    fn a_grpc_call_the_gateway_answers_is_answered_as_grpc_answers() {
+        let check = |make: &dyn Fn(&mut dyn AnswerHead<Fields = HeaderMap>),
+                     code: &str,
+                     why: &str| {
+            let (_, mut map) = both("HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\n\r\n");
+            make(&mut map);
+            assert_eq!(
+                Ok(of_map(&map)),
+                expected(
+                    200,
+                    &[
+                        ("content-type", "application/grpc"),
+                        ("grpc-message", why),
+                        ("grpc-status", code)
+                    ]
+                )
+            );
+        };
+        check(
+            &|answer| call_rejected(answer, Rejection::NoRoute),
+            "12",
+            "no route serves this method",
+        );
+        check(
+            &|answer| call_rejected(answer, Rejection::NoBackend),
+            "14",
+            "no upstream can serve the call",
+        );
+        check(
+            &|answer| call_redirected(answer),
+            "12",
+            "the route answers with a redirect, which a call cannot follow",
+        );
+        // The same for a raw answer, as the module's every step is.
+        let (mut raw, mut map) = both("HTTP/1.1 200 OK\r\nx-a: 1\r\n\r\n");
+        call_rejected(&mut raw, Rejection::NoRoute);
+        call_rejected(&mut map, Rejection::NoRoute);
+        assert_eq!(of_raw(raw), of_map(&map));
+    }
+
     /// Names in any case, among them every one the way back does something with, and values
     /// that make them mean something.
     fn field() -> impl Strategy<Value = (&'static str, &'static str)> {
@@ -658,6 +753,33 @@ mod tests {
                 }),
             };
             let _same = edited(&sent, &way);
+        }
+
+        /// A call is told as `serve`'s request reads one: by its version and its content
+        /// types, whatever its deadline says.
+        #[test]
+        fn a_call_is_told_as_serve_tells_one(
+            version in prop::sample::select(vec![
+                Version::HTTP_10, Version::HTTP_11, Version::HTTP_2, Version::HTTP_3,
+            ]),
+            types in prop::collection::vec(prop::sample::select(vec![
+                "application/grpc", "application/grpc+proto", "Application/GRPC",
+                "application/grpc; charset=utf-8", "application/grpcx", "application/json",
+                "text/plain", "",
+            ]), 0..3),
+            timeouts in prop::collection::vec(prop::sample::select(vec![
+                "1S", "100m", "x", "",
+            ]), 0..3),
+        ) {
+            let mut fields = HeaderMap::new();
+            for value in &types {
+                fields.append(CONTENT_TYPE, HeaderValue::from_static(value));
+            }
+            for value in &timeouts {
+                fields.append("grpc-timeout", HeaderValue::from_static(value));
+            }
+            let call = crate::grpc::call::Call::of(version, &fields, tokio::time::Instant::now);
+            prop_assert_eq!(is_grpc_call(version, &fields), call.is_some());
         }
     }
 }
