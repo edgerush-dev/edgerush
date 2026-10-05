@@ -35,7 +35,7 @@ use http_body::Body;
 use quiche::h3::Event;
 use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::task::Poll;
@@ -61,8 +61,13 @@ struct Driving {
     seen: Seen,
     /// When a draining connection is closed regardless.
     drain_by: Option<Instant>,
-    /// The client its requests are from, as the upstream is told: the peer of the path in
-    /// use when they came, made again only when the path's peer changes.
+    /// Where its requests are from: the peer of the last path validated, the handshake's
+    /// address until the client moves and its new path is validated (03 §11). The path in
+    /// use is no proof: quiche moves to a new address on one datagram from it, which anyone
+    /// able to forge a source address can send (RFC 9000 §9.3).
+    proved: SocketAddr,
+    /// The client its requests are from, as the upstream is told, made again only when
+    /// `proved` changes.
     client: Option<Rc<Client>>,
     /// To be closed once what is queued has gone: the GOAWAY above all, which quiche would
     /// drop if the connection were closed with it still queued.
@@ -99,12 +104,14 @@ struct Found {
     hq: bool,
 }
 
-/// Drives `conn` until it closes. `chosen` is the ID the client first sent to; `opened`
-/// is held as long as the connection lives.
+/// Drives `conn` until it closes. `chosen` is the ID the client first sent to, and `from`
+/// the address it sent from, which completing the handshake proves; `opened` is held as
+/// long as the connection lives.
 pub(crate) async fn drive<R, F, B, D, G>(
     conn: Rc<Conn>,
     shared: Rc<Shared>,
     chosen: Vec<u8>,
+    from: SocketAddr,
     respond: Rc<R>,
     date: Rc<D>,
     opened: G,
@@ -128,6 +135,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
         ids: vec![first_id],
         seen: Seen::default(),
         drain_by: None,
+        proved: from,
         client: None,
         to_close: false,
         refused: 0,
@@ -157,11 +165,11 @@ pub(crate) async fn drive<R, F, B, D, G>(
                 let client = if found.is_empty() {
                     None
                 } else {
-                    Some(client_now(&conn, &mut driving.client))
+                    Some(client_now(driving.proved, &mut driving.client))
                 };
                 // A head answered 431 here has a record all the same (21 §4).
                 for _ in 0..std::mem::take(&mut driving.refused) {
-                    (shared.refused)(client_now(&conn, &mut driving.client));
+                    (shared.refused)(client_now(driving.proved, &mut driving.client));
                 }
                 for request in found.drain(..) {
                     // Made above whenever there is a request.
@@ -386,8 +394,14 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
                 }
             }
         }
-        // Drained every turn, so that nothing queues without bound (16 §6).
-        while quic.path_event_next().is_some() {}
+        // Drained every turn, so that nothing queues without bound (16 §6). A server's quiche
+        // tells of a move only once the path moved to is validated, or when it moves back to
+        // one that was.
+        while let Some(event) = quic.path_event_next() {
+            if let quiche::PathEvent::PeerMigrated(_, peer) = event {
+                driving.proved = peer;
+            }
+        }
         while let Some(id) = quic.retired_scid_next() {
             retired.push(id.to_vec());
         }
@@ -614,21 +628,10 @@ fn send_interim(responder: &mut Responder, interim: &Interim) {
     }
 }
 
-/// Who the requests found now are from: the peer of the path the connection is using,
-/// which may not be the one it began on (RFC 9000 §9). The client last made is kept while
-/// that peer stays the same, so that it is not written out again for every request.
-fn client_now(conn: &Conn, made: &mut Option<Rc<Client>>) -> Rc<Client> {
-    let peer = conn
-        .with(|state| {
-            state
-                .quic
-                .path_stats()
-                .find(|path| path.active)
-                .map(|path| path.peer_addr)
-        })
-        // A connection that has a request has a path in use; were it ever without one, the
-        // upstream is told of no address rather than of a wrong one.
-        .unwrap_or(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0));
+/// Who the requests found now are from: `peer`, the last address proved, which may not be
+/// the one the connection began on (RFC 9000 §9). The client last made is kept while that
+/// stays the same, so that it is not written out again for every request.
+fn client_now(peer: SocketAddr, made: &mut Option<Rc<Client>>) -> Rc<Client> {
     match made {
         Some(client) if client.peer() == Some(peer) => Rc::clone(client),
         _ => {

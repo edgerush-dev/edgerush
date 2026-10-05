@@ -247,6 +247,12 @@ impl Client {
         self.socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     }
 
+    /// Goes on from `socket`, quiche on this side none the wiser, and hands back the socket it
+    /// went from, for a test to take up again.
+    pub(crate) fn swap_socket(&mut self, socket: UdpSocket) -> UdpSocket {
+        std::mem::replace(&mut self.socket, socket)
+    }
+
     /// Sends `datagram` as it is.
     pub(crate) async fn send_raw(&self, datagram: &[u8], to: SocketAddr) {
         self.socket.send_to(datagram, to).await.unwrap();

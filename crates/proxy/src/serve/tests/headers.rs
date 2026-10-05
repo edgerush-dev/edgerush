@@ -128,6 +128,162 @@ async fn the_upstream_is_told_who_an_http3_client_is() {
         .await;
 }
 
+/// Over HTTP/3 the upstream is told only an address the client has shown it holds: a
+/// request that arrives from an address that never answers path validation — a source the
+/// client forged, or a packet an on-path party copied (RFC 9000 §9.3.2) — is not told as
+/// coming from there.
+#[tokio::test]
+async fn an_http3_request_from_an_address_never_validated_is_not_told_as_its_client() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::{Client, get};
+            let (upstream, heads) = recording_upstream("200 OK");
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let (front, _) = serving_h3(&h3_config(upstream, http3)).await;
+            let mut client = Client::connect(front, "a.test").await;
+            // First from the address its handshake proved.
+            let answer = client.get("a.test", "/first").await;
+            assert_eq!(answer.final_status(), Some("200"));
+            assert!(heads.borrow()[0].contains("\r\nx-forwarded-for: 127.0.0.1\r\n"));
+
+            // The next request leaves from another address, which never answers anything:
+            // the client takes its own socket up again at once.
+            let elsewhere = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+            let own = client.swap_socket(elsewhere);
+            let _second = client.request(&get("a.test", "/second"), true);
+            client.flush().await;
+            let elsewhere = client.swap_socket(own);
+            // The client goes on from its own address, so whatever the gateway would wait
+            // for, it has; bounded, since refusing the request is right as well.
+            let until = Instant::now() + Duration::from_secs(3);
+            while heads.borrow().len() < 2 && Instant::now() < until {
+                client.for_a_while(Duration::from_millis(50)).await;
+            }
+            if let Some(head) = heads.borrow().get(1) {
+                assert!(
+                    !head.contains("127.0.0.2"),
+                    "an address that never proved itself was told as the client: {head}"
+                );
+            }
+            drop(elsewhere);
+        })
+        .await;
+}
+
+/// Over HTTP/3 a request is taken as a trusted proxy's only from an address that has shown
+/// it holds it: a datagram sent from a trusted proxy's address, which needs no answer, does
+/// not have its forwarding headers believed nor its trusted-only headers kept.
+#[tokio::test]
+async fn an_http3_request_from_an_unproven_trusted_address_is_not_believed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::{Client, get};
+            let (upstream, heads) = recording_upstream("200 OK");
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let mut config = h3_config(upstream, http3);
+            config.listeners.get_mut("web").unwrap().forwarding =
+                forwarding_config(upstream, &["127.0.0.2/32"]).listeners["web"]
+                    .forwarding
+                    .clone();
+            let (front, _) = serving_h3(&config).await;
+            let mut client = Client::connect(front, "a.test").await;
+            // From the address its handshake proved, which is no trusted proxy.
+            let answer = client.get("a.test", "/first").await;
+            assert_eq!(answer.final_status(), Some("200"));
+            assert!(heads.borrow()[0].contains("\r\nx-forwarded-for: 127.0.0.1\r\n"));
+
+            // The next request leaves from the trusted proxy's address, which never answers:
+            // the client takes its own socket up again at once.
+            let elsewhere = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+            let own = client.swap_socket(elsewhere);
+            let mut fields = get("a.test", "/second");
+            fields.push(("x-forwarded-for", "203.0.113.7"));
+            fields.push(("x-real-ip", "203.0.113.7"));
+            let _second = client.request(&fields, true);
+            client.flush().await;
+            let elsewhere = client.swap_socket(own);
+            // Bounded: refusing the request would be right as well.
+            let until = Instant::now() + Duration::from_secs(3);
+            while heads.borrow().len() < 2 && Instant::now() < until {
+                client.for_a_while(Duration::from_millis(50)).await;
+            }
+            if let Some(head) = heads.borrow().get(1) {
+                assert!(
+                    !head.contains("203.0.113.7"),
+                    "an unproven address was trusted as a proxy: {head}"
+                );
+            }
+            drop(elsewhere);
+        })
+        .await;
+}
+
+/// Over HTTP/3 a client that moves to another address, and answers for it there, is told as
+/// coming from it once its new path is validated; until then its requests are the last
+/// validated address's.
+#[tokio::test]
+async fn an_http3_client_that_moves_is_told_from_its_new_address_once_validated() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::Client;
+            let (upstream, heads) = recording_upstream("200 OK");
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let (front, _) = serving_h3(&h3_config(upstream, http3)).await;
+            let mut client = Client::connect(front, "a.test").await;
+            let answer = client.get("a.test", "/first").await;
+            assert_eq!(answer.final_status(), Some("200"));
+            assert!(heads.borrow()[0].contains("\r\nx-forwarded-for: 127.0.0.1\r\n"));
+
+            // From here on the client is at another address, and hears the gateway there.
+            let elsewhere = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+            let _own = client.swap_socket(elsewhere);
+            // Found in the turn its datagram is read in, before any answer to path
+            // validation can have come back.
+            let answer = client.get("a.test", "/moving").await;
+            assert_eq!(answer.final_status(), Some("200"));
+            let head = heads.borrow()[1].clone();
+            assert!(
+                head.contains("\r\nx-forwarded-for: 127.0.0.1\r\n"),
+                "{head}"
+            );
+
+            // Validation needs the client's answer to the gateway's challenge, which goes as
+            // the client goes on hearing the gateway. Bounded: each request is answered, and
+            // the loop is given 5 s.
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let answer = client.get("a.test", "/moved").await;
+                assert_eq!(answer.final_status(), Some("200"));
+                let head = heads.borrow().last().unwrap().clone();
+                if head.contains("\r\nx-forwarded-for: 127.0.0.2\r\n") {
+                    break;
+                }
+                assert!(
+                    head.contains("\r\nx-forwarded-for: 127.0.0.1\r\n"),
+                    "{head}"
+                );
+                assert!(
+                    Instant::now() < until,
+                    "the new address was never told, though it answered: {head}"
+                );
+                client.for_a_while(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+}
+
 /// Every `x-request-id` in `text`, a head or answer in lower case, as the value it holds.
 fn request_ids(text: &str) -> Vec<String> {
     text.split("\r\n")
