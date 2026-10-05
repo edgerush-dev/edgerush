@@ -1,0 +1,7 @@
+tests:
+  - name: twice
+    request: { listener: db }
+    expect: { answer: no_route }
+  - name: twice
+    request: { listener: web, client: somewhere, protocol: "3", method: GET, url: "https://a/", headers: [{ name: Host, value: b }] }
+    expect: { route: shop, forward: { backends: [], mirrors: [] }, upstream_request: { headers: [{ name: X-A, values: [a] }] } }

@@ -1,0 +1,35 @@
+tests:
+  - name: the gateway's headers, and a client's taken off
+    request:
+      listener: web
+      client: 203.0.113.7
+      protocol: "2"
+      method: GET
+      url: http://shop.example.com/cart?id=7
+      headers:
+        - { name: X-Forwarded-For, value: 10.0.0.1 }
+        - { name: Cookie, value: a=1 }
+        - { name: Cookie, value: b=2 }
+    expect:
+      route: shop
+      rule: 0
+      forward:
+        backends: [{ upstream: cart, weight: 9 }, { upstream: cart-canary, weight: 1 }]
+        mirrors: [{ upstream: shadow, fraction: { numerator: 1, denominator: 10 } }]
+      upstream_request:
+        target: /cart?id=7
+        headers:
+          - { name: X-Forwarded-For, value: 203.0.113.7 }
+          - { name: Cookie, value: "a=1; b=2" }
+          - { name: X-Debug, absent: true }
+          - { name: Via, values: ["2 edgerush", "1.1 other"] }
+  - name: a passing listener keeps a request's own ID
+    request: { listener: passing, client: "2001:db8::1", protocol: "1.0", method: POST, url: "http://x.example.net/", headers: [{ name: X-Request-ID, value: abc }] }
+    expect:
+      route: passed
+      rule: 0
+      forward: { backends: [{ upstream: fallback, weight: 1 }], mirrors: [] }
+      upstream_request: { headers: [{ name: X-Request-ID, value: abc }] }
+  - name: a rule with nowhere to send
+    request: { listener: web, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://shop.example.com/static/x", headers: [] }
+    expect: { route: everything-else, rule: 0, answer: no_backend }

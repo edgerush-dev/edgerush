@@ -22,6 +22,8 @@ boring = "5.2"
 bytes = "1.12"
 # The model and compiler a harness file is read into.
 edgerush-config = { path = "../crates/config" }
+# edgerush test's file of tests, read, checked and run.
+edgerush-explain = { path = "../crates/explain" }
 edgerush-filters = { path = "../crates/filters", features = ["reference"] }
 edgerush-proxy = { path = "../crates/proxy", features = ["fuzzing"] }
 edgerush-router = { path = "../crates/router", features = ["reference"] }
@@ -171,6 +173,13 @@ bench = false
 [[bin]]
 name = "config"
 path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "test_file"
+path = "fuzz_targets/test_file.rs"
 test = false
 doc = false
 bench = false

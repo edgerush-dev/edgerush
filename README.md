@@ -157,7 +157,8 @@ Targets compare the real code with the slow reference implementations in the rou
 the filters' `reference` modules, the same ones the property tests use; `request_host`
 compares with the `http` crate's reading instead, and `quic_header` with quiche's parser.
 `config` reads a harness config file and compiles it, holding both to not failing and what
-compiles to being whole. An input that fails is saved under `fuzz/artifacts/`; fix the bug
+compiles to being whole; `test_file` reads, checks and runs a file of `edgerush test`'s
+tests against a fixed config, holding all three to not failing. An input that fails is saved under `fuzz/artifacts/`; fix the bug
 and add the input to the unit tests. Run a target after changing the code it covers. Being
 outside the workspace, the package is formatted on its own:
 `cargo fmt --manifest-path fuzz/Cargo.toml`.
