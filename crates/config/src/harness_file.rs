@@ -10,26 +10,36 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// The harness's config file: a [`Config`]'s sections, and where its certificates are.
+/// A data plane's config file, as the development harness (`edgerush proxy --config`) reads
+/// it: the config's sections, and the files of the certificates they name. The file and
+/// those certificate files are read again every second; a change takes over without
+/// dropping a request, and a file that is not valid leaves the config before it running.
+/// Listeners are bound at the start: one that is new or has moved, or HTTP/3 turned on or
+/// off, takes a restart.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(title = "EdgeRush config file"))]
 #[serde(deny_unknown_fields)]
 pub struct HarnessFile {
-    /// As [`Config::listeners`].
+    /// Where requests come in, by name.
     pub listeners: BTreeMap<String, Listener>,
-    /// As [`Config::routes`].
+    /// The routes of `http` and `https` listeners, in order of precedence among otherwise
+    /// equal matches; empty for none.
     pub routes: Vec<Route>,
-    /// As [`Config::tcp_routes`].
+    /// The routes of `tcp` listeners: one for each.
     #[serde(default)]
     pub tcp_routes: Vec<TcpRoute>,
-    /// As [`Config::tls_routes`].
+    /// The routes of `tls` listeners, in order of precedence among equally specific
+    /// hostnames.
     #[serde(default)]
     pub tls_routes: Vec<TlsRoute>,
-    /// As [`Config::upstreams`].
+    /// The upstreams that backends and mirrors name, by name.
     pub upstreams: BTreeMap<String, Upstream>,
-    /// As [`Config::data_plane`].
+    /// The data plane's own settings; left out, each has its value.
     #[serde(default)]
     pub data_plane: DataPlane,
-    /// The files of each certificate that listeners and upstreams name, by its name.
+    /// The files of each certificate that listeners and upstreams name, by its name. A key
+    /// is never written into the config file itself.
     #[serde(default)]
     pub certificates: BTreeMap<String, CertificateFiles>,
 }
@@ -37,6 +47,7 @@ pub struct HarnessFile {
 /// The two files a certificate is read from, each relative to the config file's directory
 /// unless it is absolute.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CertificateFiles {
     /// The certificate, then the intermediates that lead from it towards a root, in PEM.

@@ -52,6 +52,12 @@ hyper-util = { version = "0.1.20", features = ["tokio", "http1", "http2"] }
 # The config model derives these traits and knows no format; formats belong to whoever
 # reads or writes a file or a stream.
 serde = { version = "1.0", features = ["derive"] }
+# The JSON Schema of the config file, published at `schema/config.schema.json` and made from
+# the model's own types and rustdoc, so that it cannot say other than the code. Only the
+# config crate may depend on it, behind its `schema` feature, which nothing on the request
+# path turns on, and the binary's test that writes the file; kube-rs will want it for the
+# CRDs' schemas too.
+schemars = "1.2"
 # YAML for the development harness and the command-line tools only. Reading only, no
 # optional extras; pure Rust with budgets against hostile input.
 serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }

@@ -32,6 +32,12 @@ and NASM on Windows) and the layout of the crates.
   you cannot read one, do not guess what it says; ask.
 - The pure crates (`router`, `config`, `filters`) do no I/O: clocks, sockets and randomness
   are passed in.
+- `schema/config.schema.json` is made from the config model's types and their rustdoc. A
+  change to either changes it: write it again with
+  `EDGERUSH_WRITE_SCHEMA=1 cargo test -p edgerush --test schema` and commit it with the
+  change. The rustdoc is what users read there. A limit on one field goes in a `schemars`
+  attribute beside it (`range`, `length`, `regex`), taken from the constant the compiler
+  checks where there is one, not into the prose; a rule across fields goes in the prose.
 - No new dependency without an issue that agreed it.
 - On Windows, run the proxy with `--workers 1`: workers share a port, which Windows cannot
   do.

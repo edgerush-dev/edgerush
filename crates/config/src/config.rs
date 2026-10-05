@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 /// A data plane's configuration. Filters are to come.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Where requests come in, by name. They have no order.
@@ -39,21 +40,25 @@ pub struct Config {
 /// bounds rather than behaviour, each with its value when left out. The control plane fills
 /// them from the `DataPlane` resource; they reload with the rest of the config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct DataPlane {
     /// Milliseconds an endpoint that could not be connected to is set aside before a
     /// connect probe may bring it back ([03 §6](../../../docs/03-data-plane.md)); 5,000
-    /// when left out, and at least 1.
+    /// when left out.
     #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub set_aside_ms: Option<u64>,
 }
 
 /// A place where requests come in. Hostnames are to come; until a listener can be told
 /// from another by hostname, each needs an address of its own.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
-    /// The address to listen on; `[::]:8080` is every address, IPv4 included.
+    /// The address to listen on; `[::]:8080` is every address, IPv4 included. No two
+    /// listeners have the same one.
     pub address: SocketAddr,
     /// What is spoken there.
     pub protocol: Protocol,
@@ -68,6 +73,7 @@ pub struct Listener {
     /// as HAProxy's `timeout tunnel` is set in practice: what a tunnel carries (a database's
     /// connection, a long poll) can be quiet for long. For those listeners only.
     #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub tunnel_idle_seconds: Option<u64>,
     /// What an `http` or `https` listener, which must have it, tells its upstreams of a
     /// request's client; no other may.
@@ -90,19 +96,24 @@ pub struct Listener {
 
 /// A listener's PROXY protocol ([20 §2](../../../docs/20-proxy-protocol.md)).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ListenerProxyProtocol {
     /// No header is read: a connection's first bytes are its protocol's.
     Off,
     /// Every connection must start with a header, v1 or v2. Its addresses are believed
     /// when the connection comes from these ranges (`10.0.0.0/16`, `192.0.2.1/32` for one;
-    /// at least one), the load balancer's; from anywhere else, the header is read and
-    /// dropped, and whoever connected is the client.
-    Senders(Vec<String>),
+    /// written as `trusted_proxies` are), the load balancer's; from anywhere else, the
+    /// header is read and dropped, and whoever connected is the client.
+    Senders(
+        #[cfg_attr(feature = "schema", schemars(length(min = 1, max = edgerush_filters::forwarding::MOST_ENTRIES)))]
+         Vec<String>,
+    ),
 }
 
 /// The PROXY protocol version an upstream is sent ([20 §4](../../../docs/20-proxy-protocol.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyProtocolVersion {
     /// The text line.
@@ -113,6 +124,7 @@ pub enum ProxyProtocolVersion {
 
 /// What an HTTP listener does with `X-Request-ID` (08 §3 in the docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RequestId {
     /// Every request gets an ID the gateway makes, in place of any it came with, whoever
@@ -125,12 +137,15 @@ pub enum RequestId {
 /// Where a listener's access log goes ([08 §2](../../../docs/08-observability.md)): one JSON
 /// line a record.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AccessLog {
     /// The process's standard output, which a container runtime collects; the process's own
     /// messages go to standard error.
     Stdout,
-    /// A file, appended to; listeners that name the same path share it.
+    /// A file, appended to; listeners that name the same path share it. A relative path is
+    /// taken from the process's working directory. SIGUSR1 has it opened again, for
+    /// rotation.
     File(PathBuf),
 }
 
@@ -139,19 +154,25 @@ pub enum AccessLog {
 /// are always written out, an empty list included, since both decide who a request is
 /// taken to come from.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Forwarding {
     /// The proxies whose `X-Forwarded-For` is believed, as ranges of their addresses:
-    /// `10.0.0.0/8`, `192.0.2.1/32` for one. Empty, no one's is.
+    /// `10.0.0.0/8`, `192.0.2.1/32` for one. Empty, no one's is. Each is written one
+    /// way: no bits set past its prefix, and an IPv4 range not as IPv6.
+    #[cfg_attr(feature = "schema", schemars(length(max = edgerush_filters::forwarding::MOST_ENTRIES)))]
     pub trusted_proxies: Vec<String>,
     /// Headers taken off a request that did not come from a trusted proxy: names, or the
     /// front of one followed by `*` (`X-Forwarded-*`), matched whatever their case. The
-    /// control plane's default is `Forwarded`, `X-Real-IP` and `X-Forwarded-*`.
+    /// control plane's default is `Forwarded`, `X-Real-IP` and `X-Forwarded-*`. One that
+    /// takes in a header the gateway reads itself (`Host`, `Con*`) is refused.
+    #[cfg_attr(feature = "schema", schemars(length(max = edgerush_filters::forwarding::MOST_ENTRIES)))]
     pub trusted_only_headers: Vec<String>,
 }
 
 /// An `https` listener's HTTP/3 (16 in the docs): the same routes and TLS, over QUIC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Http3 {
     /// How long, in seconds, a client told over TCP that the listener serves HTTP/3 may
@@ -175,6 +196,7 @@ impl Http3 {
 
 /// What a listener speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
     /// HTTP/1.1 and HTTP/2 without TLS.
@@ -190,11 +212,13 @@ pub enum Protocol {
 
 /// The TLS a listener terminates.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Tls {
-    /// The names of the certificates it can present, at least one. A client is given the
+    /// The names of the certificates it can present. A client is given the
     /// one whose names cover the name it asked for (SNI), and the first when none does or
-    /// it asked for none.
+    /// it asked for none. No name twice.
+    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
     pub certificates: Vec<String>,
     /// Clients must show a certificate these authorities vouch for (mTLS); none, and any
     /// client is served.
@@ -205,9 +229,11 @@ pub struct Tls {
 /// Whom a listener trusts to vouch for its clients (Gateway API's frontend validation, in
 /// its default mode: a client without a valid certificate is refused in the handshake).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ClientValidation {
-    /// The certificates, in PEM, of the authorities trusted. At least one.
+    /// The certificates, in PEM, of the authorities trusted.
+    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
     pub authorities: Vec<String>,
 }
 
@@ -234,18 +260,21 @@ impl fmt::Debug for Certificate {
 
 /// A set of endpoints that serve the same thing.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
     /// Where to connect: addresses, not names. None is allowed, and means there is nothing
     /// to send a request to — a state a running system passes through, not a mistake.
     pub endpoints: Vec<SocketAddr>,
-    /// What its endpoints are spoken to in, whatever the client spoke.
+    /// What its endpoints are spoken to in, whatever the client spoke. An upstream of TCP
+    /// and TLS routes is sent their bytes as they come: neither `http2` nor `tls`.
     #[serde(default)]
     pub protocol: UpstreamProtocol,
     /// TLS to its endpoints; none is plain TCP.
     #[serde(default)]
     pub tls: Option<UpstreamTls>,
-    /// HTTP/2 PINGs to find a dead connection before a request does; none is no PINGs.
+    /// HTTP/2 PINGs to find a dead connection before a request does; none is no PINGs. For
+    /// an upstream spoken to in HTTP/2 only.
     #[serde(default)]
     pub keepalive: Option<Keepalive>,
     /// Probes of each endpoint, which keep one that fails them out of load balancing;
@@ -267,6 +296,7 @@ pub struct Upstream {
 
 /// How an upstream's endpoint is chosen for an exchange ([03 §6](../../../docs/03-data-plane.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LoadBalancer {
     /// Two different endpoints drawn at random, and the one with fewer exchanges in flight:
@@ -280,9 +310,11 @@ pub enum LoadBalancer {
 /// that keeps an endpoint it had, or passing its checks again after failing them, takes a
 /// share rising linearly from a tenth of a full one to all of it over the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct SlowStart {
-    /// How long the ramp takes, in milliseconds; at least 1.
+    /// How long the ramp takes, in milliseconds.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub window_ms: u64,
 }
 
@@ -290,15 +322,21 @@ pub struct SlowStart {
 /// probe may take, and how many results in a row change an endpoint's state (HAProxy's
 /// `rise` and `fall`; Envoy's thresholds).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct HealthCheck {
     /// Seconds between probes of an endpoint.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub interval_seconds: u64,
-    /// Seconds a probe may take, connection and handshake included.
+    /// Seconds a probe may take, connection and handshake included; no more than the
+    /// interval.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub timeout_seconds: u64,
     /// Passes in a row that make an unhealthy endpoint healthy.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub healthy_threshold: u32,
     /// Failures in a row that make a healthy endpoint unhealthy.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub unhealthy_threshold: u32,
     /// What a probe asks.
     pub probe: Probe,
@@ -306,11 +344,14 @@ pub struct HealthCheck {
 
 /// What a health check asks an endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Probe {
-    /// `GET` this path, in the upstream's protocol: a 2xx answer passes.
+    /// `GET` this path, in the upstream's protocol: a 2xx answer passes. Not for an upstream
+    /// of TLS routes, whose endpoints speak TLS to the client, not to the data plane.
     Http {
         /// The path asked for.
+        #[cfg_attr(feature = "schema", schemars(regex(pattern = "^/")))]
         path: String,
     },
     /// gRPC's `grpc.health.v1.Health/Check` for this service (empty for the server as a
@@ -330,11 +371,14 @@ pub enum Probe {
 /// with GOAWAY(ENHANCE_YOUR_CALM), so nothing shorter is allowed unless the backend is
 /// said to take it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Keepalive {
-    /// Seconds between PINGs.
+    /// Seconds between PINGs: at least 300 unless `backend_allows_short_intervals` is said.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub interval_seconds: u64,
     /// Seconds a PING's answer is waited for before the connection is taken for dead.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub timeout_seconds: u64,
     /// Whether to PING a connection with no call on it too; gRPC asks this be chosen on
     /// purpose.
@@ -347,11 +391,14 @@ pub struct Keepalive {
 /// TLS to an upstream's endpoints: whom they are expected to be, and whom to trust to say
 /// so (Gateway API's BackendTLSPolicy: a hostname and CA certificates).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamTls {
-    /// The name asked for (SNI), and the one an endpoint's certificate must carry.
+    /// The name asked for (SNI), and the one an endpoint's certificate must carry: a host
+    /// name, not an address, and with no wildcard or port.
     pub server_name: String,
-    /// The certificates, in PEM, of the authorities trusted to vouch for it. At least one.
+    /// The certificates, in PEM, of the authorities trusted to vouch for it.
+    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
     pub authorities: Vec<String>,
     /// The name of the certificate the data plane shows an endpoint that asks who it is
     /// (mTLS); none, and it shows nothing.
@@ -362,6 +409,7 @@ pub struct UpstreamTls {
 /// What an upstream is spoken to in. Unsaid, it is HTTP/1.1, as for a Kubernetes Service
 /// port that names no application protocol.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamProtocol {
     /// HTTP/1.1, a request at a time on each connection.

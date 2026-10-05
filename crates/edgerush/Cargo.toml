@@ -28,7 +28,11 @@ tokio = { workspace = true, features = ["signal", "sync"] }
 rustix.workspace = true
 
 [dev-dependencies]
+# Its `schema` feature: `tests/schema.rs` keeps `schema/config.schema.json` as the types say.
+edgerush-config = { workspace = true, features = ["schema"] }
 proptest.workspace = true
+schemars.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

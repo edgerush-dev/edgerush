@@ -1,0 +1,1529 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EdgeRush config file",
+  "description": "A data plane's config file, as the development harness (`edgerush proxy --config`) reads\nit: the config's sections, and the files of the certificates they name. The file and\nthose certificate files are read again every second; a change takes over without\ndropping a request, and a file that is not valid leaves the config before it running.\nListeners are bound at the start: one that is new or has moved, or HTTP/3 turned on or\noff, takes a restart.",
+  "type": "object",
+  "properties": {
+    "certificates": {
+      "description": "The files of each certificate that listeners and upstreams name, by its name. A key\nis never written into the config file itself.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/CertificateFiles"
+      }
+    },
+    "data_plane": {
+      "description": "The data plane's own settings; left out, each has its value.",
+      "$ref": "#/$defs/DataPlane"
+    },
+    "listeners": {
+      "description": "Where requests come in, by name.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Listener"
+      }
+    },
+    "routes": {
+      "description": "The routes of `http` and `https` listeners, in order of precedence among otherwise\nequal matches; empty for none.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Route"
+      }
+    },
+    "tcp_routes": {
+      "description": "The routes of `tcp` listeners: one for each.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TcpRoute"
+      }
+    },
+    "tls_routes": {
+      "description": "The routes of `tls` listeners, in order of precedence among equally specific\nhostnames.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TlsRoute"
+      }
+    },
+    "upstreams": {
+      "description": "The upstreams that backends and mirrors name, by name.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Upstream"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "listeners",
+    "routes",
+    "upstreams"
+  ],
+  "$defs": {
+    "AccessLog": {
+      "description": "Where a listener's access log goes: one JSON\nline a record.",
+      "oneOf": [
+        {
+          "description": "The process's standard output, which a container runtime collects; the process's own\nmessages go to standard error.",
+          "type": "string",
+          "const": "stdout"
+        },
+        {
+          "description": "A file, appended to; listeners that name the same path share it. A relative path is\ntaken from the process's working directory. SIGUSR1 has it opened again, for\nrotation.",
+          "type": "object",
+          "properties": {
+            "file": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "file"
+          ]
+        }
+      ]
+    },
+    "Backend": {
+      "description": "One destination of a rule.",
+      "type": "object",
+      "properties": {
+        "upstream": {
+          "description": "The name of an upstream in the same config.",
+          "type": "string"
+        },
+        "weight": {
+          "description": "This backend's share of the rule's requests, relative to the other weights. Zero\nis no share; if all are zero the rule has nowhere to send a request.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "upstream",
+        "weight"
+      ]
+    },
+    "CertificateFiles": {
+      "description": "The two files a certificate is read from, each relative to the config file's directory\nunless it is absolute.",
+      "type": "object",
+      "properties": {
+        "chain_file": {
+          "description": "The certificate, then the intermediates that lead from it towards a root, in PEM.",
+          "type": "string"
+        },
+        "key_file": {
+          "description": "Its private key, in PEM.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "chain_file",
+        "key_file"
+      ]
+    },
+    "ClientValidation": {
+      "description": "Whom a listener trusts to vouch for its clients (Gateway API's frontend validation, in\nits default mode: a client without a valid certificate is refused in the handshake).",
+      "type": "object",
+      "properties": {
+        "authorities": {
+          "description": "The certificates, in PEM, of the authorities trusted.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "authorities"
+      ]
+    },
+    "DataPlane": {
+      "description": "The whole data plane's own settings:\nbounds rather than behaviour, each with its value when left out. The control plane fills\nthem from the `DataPlane` resource; they reload with the rest of the config.",
+      "type": "object",
+      "properties": {
+        "set_aside_ms": {
+          "description": "Milliseconds an endpoint that could not be connected to is set aside before a\nconnect probe may bring it back; 5,000\nwhen left out.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "Filter": {
+      "description": "Something done to a request or its response.",
+      "oneOf": [
+        {
+          "description": "Changes the headers of the request before it goes to the upstream. `Host`,\n`Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Transfer-Encoding`, `Upgrade`,\n`Content-Length` and `X-Request-ID` may not be named.",
+          "type": "object",
+          "properties": {
+            "add": {
+              "description": "Values to append to whatever the headers had.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Header"
+              },
+              "maxItems": 16
+            },
+            "remove": {
+              "description": "Headers to take away.",
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 16
+            },
+            "set": {
+              "description": "Headers to give one value, whatever they had. A header is named once in the three\nlists.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Header"
+              },
+              "maxItems": 16
+            },
+            "type": {
+              "type": "string",
+              "const": "request_header_modifier"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Changes the headers of the response before it goes to the client, as the request's\nare changed, and beside a `redirect` too, where `Location` may not be named.",
+          "type": "object",
+          "properties": {
+            "add": {
+              "description": "Values to append to whatever the headers had.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Header"
+              },
+              "maxItems": 16
+            },
+            "remove": {
+              "description": "Headers to take away.",
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 16
+            },
+            "set": {
+              "description": "Headers to give one value, whatever they had. A header is named once in the three\nlists.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Header"
+              },
+              "maxItems": 16
+            },
+            "type": {
+              "type": "string",
+              "const": "response_header_modifier"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Sends a copy of the request to another upstream too, and throws its answer away.",
+          "type": "object",
+          "properties": {
+            "fraction": {
+              "description": "The share of requests copied: every one is `{ numerator: 1, denominator: 1 }`, none\na numerator of 0. The numerator is no more than the denominator.",
+              "$ref": "#/$defs/Fraction"
+            },
+            "type": {
+              "type": "string",
+              "const": "request_mirror"
+            },
+            "upstream": {
+              "description": "Where the copies go.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "upstream",
+            "fraction"
+          ]
+        },
+        {
+          "description": "Sends the upstream another host, another path or both.",
+          "type": "object",
+          "properties": {
+            "host": {
+              "description": "The `Host` the upstream is sent: a DNS name in lower case, with no port.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "path": {
+              "description": "The path the upstream is sent, made from the request's.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PathChange"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "url_rewrite"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
+    "Forward": {
+      "description": "A rule's requests sent on to its backends.",
+      "type": "object",
+      "properties": {
+        "backends": {
+          "description": "Where requests go, in proportion to the weights.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Backend"
+          },
+          "minItems": 1
+        },
+        "retry": {
+          "description": "Sending a request again when its answer says to; none is never.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Retry"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timeouts": {
+          "description": "How long its requests may take; none leaves them to the data plane's fixed clocks.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timeouts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "backends"
+      ]
+    },
+    "Forwarding": {
+      "description": "What an HTTP listener tells its upstreams of a request's client:\nwho it trusts to say who their clients are, and which headers only they may send. Both\nare always written out, an empty list included, since both decide who a request is\ntaken to come from.",
+      "type": "object",
+      "properties": {
+        "trusted_only_headers": {
+          "description": "Headers taken off a request that did not come from a trusted proxy: names, or the\nfront of one followed by `*` (`X-Forwarded-*`), matched whatever their case. The\ncontrol plane's default is `Forwarded`, `X-Real-IP` and `X-Forwarded-*`. One that\ntakes in a header the gateway reads itself (`Host`, `Con*`) is refused.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
+        },
+        "trusted_proxies": {
+          "description": "The proxies whose `X-Forwarded-For` is believed, as ranges of their addresses:\n`10.0.0.0/8`, `192.0.2.1/32` for one. Empty, no one's is. Each is written one\nway: no bits set past its prefix, and an IPv4 range not as IPv6.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "trusted_proxies",
+        "trusted_only_headers"
+      ]
+    },
+    "Fraction": {
+      "description": "A share: `numerator` out of every `denominator`.",
+      "type": "object",
+      "properties": {
+        "denominator": {
+          "description": "Out of how many.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "numerator": {
+          "description": "How many.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "numerator",
+        "denominator"
+      ]
+    },
+    "GrpcMethod": {
+      "description": "A gRPC method, matched exactly — Gateway API's Core matching for GRPCRoute: its\nservice, its method, or both; at least one. A gRPC call's path is `/service/method`,\nand this is matched as that path would be: both as the exact path, a service alone as\nthe prefix `/service`, a method alone in any service.",
+      "type": "object",
+      "properties": {
+        "method": {
+          "description": "The method: one identifier, as a service's are.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "service": {
+          "description": "The fully qualified service, as `package.Service`: identifiers joined by dots, each\nof ASCII letters, digits and `_`, not starting with a digit.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "Header": {
+      "description": "A header with a value.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "The header name; case does not matter.",
+          "type": "string"
+        },
+        "value": {
+          "description": "The value, with no white space at either end and no control characters.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "value"
+      ]
+    },
+    "HealthCheck": {
+      "description": "An active check of an upstream's endpoints. Everything is stated: how often, how long a\nprobe may take, and how many results in a row change an endpoint's state (HAProxy's\n`rise` and `fall`; Envoy's thresholds).",
+      "type": "object",
+      "properties": {
+        "healthy_threshold": {
+          "description": "Passes in a row that make an unhealthy endpoint healthy.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "interval_seconds": {
+          "description": "Seconds between probes of an endpoint.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "probe": {
+          "description": "What a probe asks.",
+          "$ref": "#/$defs/Probe"
+        },
+        "timeout_seconds": {
+          "description": "Seconds a probe may take, connection and handshake included; no more than the\ninterval.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "unhealthy_threshold": {
+          "description": "Failures in a row that make a healthy endpoint unhealthy.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "interval_seconds",
+        "timeout_seconds",
+        "healthy_threshold",
+        "unhealthy_threshold",
+        "probe"
+      ]
+    },
+    "Hostname": {
+      "description": "A claim on hosts.",
+      "type": "object",
+      "properties": {
+        "falls_through": {
+          "description": "Whether this claim stays a candidate on hosts that a more specific claim also\ncovers: Gateway API requires it, nginx-style Ingress does not want it.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "An exact name, a wildcard (`*.example.com`), or `*` for every host.",
+          "type": "string"
+        },
+        "wildcard": {
+          "description": "What the `*` of a wildcard name stands for. Required for a wildcard name; without\nmeaning, and ignored, for any other.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Wildcard"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "falls_through"
+      ]
+    },
+    "Http3": {
+      "description": "An `https` listener's HTTP/3: the same routes and TLS, over QUIC.",
+      "type": "object",
+      "properties": {
+        "alt_svc_max_age": {
+          "description": "How long, in seconds, a client told over TCP that the listener serves HTTP/3 may\nremember it (the `ma` of `Alt-Svc`, RFC 7838 §3.1). A day unless said otherwise, as\nEnvoy advertises it.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 86400,
+          "minimum": 0
+        },
+        "force_retry": {
+          "description": "Whether every client is to prove its address with a Retry before its handshake\n(RFC 9000 §8.1.2), as NGINX's `quic_retry` and HAProxy's `quic-force-retry` ask.\nOtherwise only past a threshold of handshakes under way, since a Retry costs a round\ntrip. Off unless said.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "Keepalive": {
+      "description": "PINGs on an HTTP/2 upstream's idle-looking connections, as gRPC's keepalive has them.\nA gRPC server takes a PING more often than every five minutes as abuse, and says so\nwith GOAWAY(ENHANCE_YOUR_CALM), so nothing shorter is allowed unless the backend is\nsaid to take it.",
+      "type": "object",
+      "properties": {
+        "backend_allows_short_intervals": {
+          "description": "That the backend takes PINGs more often than every five minutes.",
+          "type": "boolean",
+          "default": false
+        },
+        "interval_seconds": {
+          "description": "Seconds between PINGs: at least 300 unless `backend_allows_short_intervals` is said.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "timeout_seconds": {
+          "description": "Seconds a PING's answer is waited for before the connection is taken for dead.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "without_calls": {
+          "description": "Whether to PING a connection with no call on it too; gRPC asks this be chosen on\npurpose.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "interval_seconds",
+        "timeout_seconds",
+        "without_calls"
+      ]
+    },
+    "Listener": {
+      "description": "A place where requests come in. Hostnames are to come; until a listener can be told\nfrom another by hostname, each needs an address of its own.",
+      "type": "object",
+      "properties": {
+        "access_log": {
+          "description": "Where a record of each of its requests, or each of its connections for a `tcp` or\n`tls` listener, is written. Left out, nothing is logged.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccessLog"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "address": {
+          "description": "The address to listen on; `[::]:8080` is every address, IPv4 included. No two\nlisteners have the same one.",
+          "type": "string"
+        },
+        "forwarding": {
+          "description": "What an `http` or `https` listener, which must have it, tells its upstreams of a\nrequest's client; no other may.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Forwarding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "http3": {
+          "description": "HTTP/3 as well, on the same port over UDP: for an `https` listener only.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Http3"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "protocol": {
+          "description": "What is spoken there.",
+          "$ref": "#/$defs/Protocol"
+        },
+        "proxy_protocol": {
+          "description": "Whether every connection starts with a PROXY protocol header, and whose to believe. Every listener states it, `off` included: it decides who a\nconnection is taken to come from.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ListenerProxyProtocol"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "request_id": {
+          "description": "Whether an `http` or `https` listener, which must say, gives each request an ID of\nits own; no other may.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tls": {
+          "description": "What an `https` listener presents, which it must have; no other may.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tls"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tunnel_idle_seconds": {
+          "description": "How long, in seconds, a `tcp` or `tls` listener's tunnel may carry nothing either\nway before both its ends are closed. An hour unless said otherwise,\nas HAProxy's `timeout tunnel` is set in practice: what a tunnel carries (a database's\nconnection, a long poll) can be quiet for long. For those listeners only.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "address",
+        "protocol"
+      ]
+    },
+    "ListenerProxyProtocol": {
+      "description": "A listener's PROXY protocol.",
+      "oneOf": [
+        {
+          "description": "No header is read: a connection's first bytes are its protocol's.",
+          "type": "string",
+          "const": "off"
+        },
+        {
+          "description": "Every connection must start with a header, v1 or v2. Its addresses are believed\nwhen the connection comes from these ranges (`10.0.0.0/16`, `192.0.2.1/32` for one;\nwritten as `trusted_proxies` are), the load balancer's; from anywhere else, the\nheader is read and dropped, and whoever connected is the client.",
+          "type": "object",
+          "properties": {
+            "senders": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "minItems": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "senders"
+          ]
+        }
+      ]
+    },
+    "LoadBalancer": {
+      "description": "How an upstream's endpoint is chosen for an exchange.",
+      "oneOf": [
+        {
+          "description": "Two different endpoints drawn at random, and the one with fewer exchanges in flight:\nthe power of two choices. Steers away from an endpoint that stalls.",
+          "type": "string",
+          "const": "p2c"
+        },
+        {
+          "description": "Each endpoint in turn.",
+          "type": "string",
+          "const": "round_robin"
+        }
+      ]
+    },
+    "Match": {
+      "description": "One way for a request to belong to a rule: all of what is stated here must hold.",
+      "type": "object",
+      "properties": {
+        "grpc": {
+          "description": "A gRPC method, as a GRPCRoute matches one: said in place of `path`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrpcMethod"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "headers": {
+          "description": "Conditions on headers; names are case-insensitive. A repeated header is judged by its\nfields joined.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ValuePredicate"
+          }
+        },
+        "method": {
+          "description": "The method, in upper case, if it matters.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "path": {
+          "description": "The path; `{ prefix: / }` is how to say any path. A match says this or `grpc`:\none of the two, never both.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PathMatch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "query": {
+          "description": "Conditions on decoded query parameters; names are case-sensitive. A repeated\nparameter is judged by its first occurrence.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ValuePredicate"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "PathChange": {
+      "description": "A change to a request's path. Either replacement is a path in normal form, without `?` or\n`#`.",
+      "oneOf": [
+        {
+          "description": "The whole path becomes this.",
+          "type": "object",
+          "properties": {
+            "replace_full": {
+              "type": "string",
+              "maxLength": 1024,
+              "pattern": "^/"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "replace_full"
+          ]
+        },
+        {
+          "description": "The rule's one match, a prefix, is replaced by this, by whole segments; it may be\nempty.",
+          "type": "object",
+          "properties": {
+            "replace_prefix": {
+              "type": "string",
+              "maxLength": 1024
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "replace_prefix"
+          ]
+        }
+      ]
+    },
+    "PathMatch": {
+      "description": "How a path is matched.",
+      "oneOf": [
+        {
+          "description": "This path and no other.",
+          "type": "object",
+          "properties": {
+            "exact": {
+              "type": "string",
+              "pattern": "^/"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "exact"
+          ]
+        },
+        {
+          "description": "This path and everything below it, by whole segments: `/api` takes in `/api` and\n`/api/x`, not `/apix`; `/` takes in every path.",
+          "type": "object",
+          "properties": {
+            "prefix": {
+              "type": "string",
+              "pattern": "^/"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "prefix"
+          ]
+        },
+        {
+          "description": "The paths this regular expression describes as a whole, normalised: RE2-style\nsyntax in ASCII, with no look-around or backreferences, at most 256 KiB compiled;\ncase matters unless it says `(?i)`.",
+          "type": "object",
+          "properties": {
+            "regex": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "regex"
+          ]
+        }
+      ]
+    },
+    "Probe": {
+      "description": "What a health check asks an endpoint.",
+      "oneOf": [
+        {
+          "description": "`GET` this path, in the upstream's protocol: a 2xx answer passes. Not for an upstream\nof TLS routes, whose endpoints speak TLS to the client, not to the data plane.",
+          "type": "object",
+          "properties": {
+            "http": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "The path asked for.",
+                  "type": "string",
+                  "pattern": "^/"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "http"
+          ]
+        },
+        {
+          "description": "gRPC's `grpc.health.v1.Health/Check` for this service (empty for the server as a\nwhole): `SERVING` passes, anything else fails. For an upstream spoken to in HTTP/2.",
+          "type": "object",
+          "properties": {
+            "grpc": {
+              "type": "object",
+              "properties": {
+                "service": {
+                  "description": "The service asked about.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "service"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "grpc"
+          ]
+        },
+        {
+          "description": "A connection made, and its handshake finished where the upstream has `tls`: nothing\nis asked. A plain one is closed so that, as a rule, the backend\nnever sees it.",
+          "type": "string",
+          "const": "tcp"
+        }
+      ]
+    },
+    "Protocol": {
+      "description": "What a listener speaks.",
+      "oneOf": [
+        {
+          "description": "HTTP/1.1 and HTTP/2 without TLS.",
+          "type": "string",
+          "const": "http"
+        },
+        {
+          "description": "HTTP/1.1 and HTTP/2 over TLS, told apart by ALPN.",
+          "type": "string",
+          "const": "https"
+        },
+        {
+          "description": "Bytes, as they come, to the listener's one TCP route.",
+          "type": "string",
+          "const": "tcp"
+        },
+        {
+          "description": "TLS read as far as its ClientHello and no further, to the TLS route whose\nhostnames cover the name the client asks for (SNI).",
+          "type": "string",
+          "const": "tls"
+        }
+      ]
+    },
+    "ProxyProtocolVersion": {
+      "description": "The PROXY protocol version an upstream is sent.",
+      "oneOf": [
+        {
+          "description": "The text line.",
+          "type": "string",
+          "const": "v1"
+        },
+        {
+          "description": "The binary header.",
+          "type": "string",
+          "const": "v2"
+        }
+      ]
+    },
+    "Query": {
+      "description": "What becomes of a request's query when it is redirected.",
+      "oneOf": [
+        {
+          "description": "It goes with it, byte for byte.",
+          "type": "string",
+          "const": "keep"
+        },
+        {
+          "description": "It is left out.",
+          "type": "string",
+          "const": "drop"
+        }
+      ]
+    },
+    "Redirect": {
+      "description": "A redirect (Gateway API's `RequestRedirect`): the client is sent elsewhere, and nothing\ngoes upstream. The `Location` holds what is said here and only what it needs besides:\nrelative when none of scheme, host and port is said, and otherwise absolute, the scheme\nunsaid taken from the listener and the host from the request.",
+      "type": "object",
+      "properties": {
+        "host": {
+          "description": "The host to send the client to: a DNS name in lower case.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "path": {
+          "description": "The path to send the client to, made from the request's.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PathChange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "port": {
+          "description": "The port to send the client to; written only if it is not its scheme's default.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "default": null,
+          "maximum": 65535,
+          "minimum": 1
+        },
+        "query": {
+          "description": "Whether the request's query goes with it.",
+          "$ref": "#/$defs/Query"
+        },
+        "scheme": {
+          "description": "The scheme to send the client to.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Scheme"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "The answer's status.",
+          "type": "integer",
+          "format": "uint16",
+          "enum": [
+            301,
+            302,
+            303,
+            307,
+            308
+          ],
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "query"
+      ]
+    },
+    "RequestId": {
+      "description": "What an HTTP listener does with `X-Request-ID`.",
+      "oneOf": [
+        {
+          "description": "Every request gets an ID the gateway makes, in place of any it came with, whoever\nsent it; the answer tells the client the same ID, in place of any the upstream gave.",
+          "type": "string",
+          "const": "generate"
+        },
+        {
+          "description": "The header is left as it is, both ways: a proxy in front can give the ID.",
+          "type": "string",
+          "const": "pass"
+        }
+      ]
+    },
+    "Retry": {
+      "description": "When a request is sent again, and how often (Gateway API's HTTPRoute retry, with\ngRPC's statuses beside HTTP's). A try that could not connect is sent again whatever is\nnamed, as Gateway API asks: nothing of it reached the endpoint. Otherwise decided on an\nanswer's head alone: once a head has gone to the client, the request is not sent again.\nWithin a budget of the upstream's, and only for a body small enough to be kept.",
+      "type": "object",
+      "properties": {
+        "attempts": {
+          "description": "Times a request may be sent again, beyond the first.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 5,
+          "minimum": 1
+        },
+        "backoff_base_ms": {
+          "description": "Milliseconds before the first retry; each after it waits twice as long, and as much\nagain at random. No more than `backoff_max_ms`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "backoff_max_ms": {
+          "description": "The most milliseconds a wait may double to, before its random part is added: a wait\ncan come to nearly twice this.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "grpc_statuses": {
+          "description": "gRPC statuses, by gRPC's names (`UNAVAILABLE`), that send a call again when the\nanswer's head carries them.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string",
+            "pattern": "^(CANCELLED|UNKNOWN|INVALID_ARGUMENT|DEADLINE_EXCEEDED|NOT_FOUND|ALREADY_EXISTS|PERMISSION_DENIED|RESOURCE_EXHAUSTED|FAILED_PRECONDITION|ABORTED|OUT_OF_RANGE|UNIMPLEMENTED|INTERNAL|UNAVAILABLE|DATA_LOSS|UNAUTHENTICATED)$"
+          }
+        },
+        "http_statuses": {
+          "description": "HTTP statuses that send it again. `502` also stands for an upstream that connected\nand answered nothing; a try that ran out of time is `on_timeout`'s, not\n`502`'s.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "integer",
+            "format": "uint16",
+            "maximum": 599,
+            "minimum": 400
+          }
+        },
+        "on_timeout": {
+          "description": "Whether a try that ran out of time before its answer's head is sent again: the\nupstream's fixed clocks for a head, or for the request's upload or the answer to\ngo on, running out. Stated whichever way, so that a config says what it does. `true`\nneeds a try to have a clock of its own: the fixed clocks, which stay while `timeouts`\nstates neither `request_ms` nor `backend_request_ms`, or a `backend_request_ms` above\n0. A retry names at least one status, or says `true` here.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "attempts",
+        "on_timeout",
+        "backoff_base_ms",
+        "backoff_max_ms"
+      ]
+    },
+    "Route": {
+      "description": "A route: the hosts it serves and its rules.\n\nRoutes come as an ordered list, and the order matters: it is the last tie-breaker of\nprecedence. The control plane emits them oldest first, then by name.",
+      "type": "object",
+      "properties": {
+        "hostnames": {
+          "description": "The hosts served; every host is asked for by the name `*`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Hostname"
+          },
+          "minItems": 1
+        },
+        "listeners": {
+          "description": "The names of the `http` and `https` listeners whose requests this route is for.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "name": {
+          "description": "Unique among every kind of route; what errors, status and metrics refer to.",
+          "type": "string"
+        },
+        "rules": {
+          "description": "The rules, in order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Rule"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "listeners",
+        "hostnames",
+        "rules"
+      ]
+    },
+    "Rule": {
+      "description": "A rule: the requests it is for, what is done to them on the way, and what becomes of\nthem.",
+      "type": "object",
+      "properties": {
+        "filters": {
+          "description": "What is done to a request and its response. Each kind of filter at most once.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Filter"
+          }
+        },
+        "forward": {
+          "description": "Its requests sent on to its backends. A rule says this or `redirect`: one of the\ntwo, never both.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Forward"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "matches": {
+          "description": "The rule is for a request that satisfies any one of these.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Match"
+          },
+          "minItems": 1
+        },
+        "redirect": {
+          "description": "Its requests answered with a redirect, said in place of `forward`. Of the filters,\nonly `response_header_modifier` goes with it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Redirect"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "matches"
+      ]
+    },
+    "Scheme": {
+      "description": "A scheme a redirect sends a client to.",
+      "oneOf": [
+        {
+          "description": "`http`.",
+          "type": "string",
+          "const": "http"
+        },
+        {
+          "description": "`https`.",
+          "type": "string",
+          "const": "https"
+        }
+      ]
+    },
+    "SlowStart": {
+      "description": "Slow start: an endpoint added to an upstream\nthat keeps an endpoint it had, or passing its checks again after failing them, takes a\nshare rising linearly from a tenth of a full one to all of it over the window.",
+      "type": "object",
+      "properties": {
+        "window_ms": {
+          "description": "How long the ramp takes, in milliseconds.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "window_ms"
+      ]
+    },
+    "TcpRoute": {
+      "description": "A route for a `tcp` listener: every connection it takes goes to these backends, as\nGateway API's TCPRoute has it.",
+      "type": "object",
+      "properties": {
+        "backends": {
+          "description": "Where connections go, in proportion to the weights.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Backend"
+          },
+          "maxItems": 16,
+          "minItems": 1
+        },
+        "listeners": {
+          "description": "The names of the `tcp` listeners it is for.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "name": {
+          "description": "Unique among every kind of route.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "listeners",
+        "backends"
+      ]
+    },
+    "Timeouts": {
+      "description": "How long a rule's requests may take (Gateway API's HTTPRoute `timeouts`). A timeout\nstated takes the place of the data plane's fixed clocks for an answer's head; the idle\nclocks, which find data that stopped flowing, run whatever is stated. At least one.",
+      "type": "object",
+      "properties": {
+        "backend_request_ms": {
+          "description": "Milliseconds a try may take, from its start — connecting, and waiting for a place on\nan HTTP/2 connection, included — to its answer's head; `0` for no limit at all. No\nmore than `request_ms`. A try that runs out of it is sent again under a retry's\n`on_timeout`. It stops at the head, not the answer's end: the answer streams to the\nclient as the client takes it, and a slow client is not the backend running late.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "request_ms": {
+          "description": "Milliseconds from the request's head arriving to its answer's end, upload, retries\nand all; `0` for no limit at all.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "tunnel_idle_ms": {
+          "description": "Milliseconds a WebSocket may carry nothing either way once its upgrade is made,\nbefore it is closed; an hour when not\nstated. Not Gateway API's: it has no such field.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "Tls": {
+      "description": "The TLS a listener terminates.",
+      "type": "object",
+      "properties": {
+        "certificates": {
+          "description": "The names of the certificates it can present. A client is given the\none whose names cover the name it asked for (SNI), and the first when none does or\nit asked for none. No name twice.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "client_validation": {
+          "description": "Clients must show a certificate these authorities vouch for (mTLS); none, and any\nclient is served.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientValidation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "certificates"
+      ]
+    },
+    "TlsRoute": {
+      "description": "A route for a `tls` listener: the connections whose ClientHello asks for a name its\nhostnames cover, as Gateway API's TLSRoute has it in passthrough mode.",
+      "type": "object",
+      "properties": {
+        "backends": {
+          "description": "Where connections go, in proportion to the weights.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Backend"
+          },
+          "maxItems": 16,
+          "minItems": 1
+        },
+        "hostnames": {
+          "description": "The names served, matched against the SNI as a request's host is against an HTTP\nroute's.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Hostname"
+          },
+          "minItems": 1
+        },
+        "listeners": {
+          "description": "The names of the `tls` listeners it is for.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "name": {
+          "description": "Unique among every kind of route.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "listeners",
+        "hostnames",
+        "backends"
+      ]
+    },
+    "Upstream": {
+      "description": "A set of endpoints that serve the same thing.",
+      "type": "object",
+      "properties": {
+        "endpoints": {
+          "description": "Where to connect: addresses, not names. None is allowed, and means there is nothing\nto send a request to — a state a running system passes through, not a mistake.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "health_check": {
+          "description": "Probes of each endpoint, which keep one that fails them out of load balancing;\nnone is every endpoint taken as healthy.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HealthCheck"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "keepalive": {
+          "description": "HTTP/2 PINGs to find a dead connection before a request does; none is no PINGs. For\nan upstream spoken to in HTTP/2 only.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Keepalive"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "load_balancer": {
+          "description": "Which endpoint takes each exchange. Always stated: it chooses behaviour.",
+          "$ref": "#/$defs/LoadBalancer"
+        },
+        "protocol": {
+          "description": "What its endpoints are spoken to in, whatever the client spoke. An upstream of TCP\nand TLS routes is sent their bytes as they come: neither `http2` nor `tls`.",
+          "$ref": "#/$defs/UpstreamProtocol"
+        },
+        "proxy_protocol": {
+          "description": "A PROXY protocol header ahead of each tunnel's bytes, telling the backend who the\nclient is; none is no header. For an upstream of TCP and TLS routes only: an HTTP\nroute's connections carry many clients' requests.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProxyProtocolVersion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "slow_start": {
+          "description": "A new or recovered endpoint's ramp to its full share; none is every endpoint at its\nfull share from the start.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SlowStart"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tls": {
+          "description": "TLS to its endpoints; none is plain TCP.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpstreamTls"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "endpoints",
+        "load_balancer"
+      ]
+    },
+    "UpstreamProtocol": {
+      "description": "What an upstream is spoken to in. Unsaid, it is HTTP/1.1, as for a Kubernetes Service\nport that names no application protocol.",
+      "oneOf": [
+        {
+          "description": "HTTP/1.1, a request at a time on each connection.",
+          "type": "string",
+          "const": "http1"
+        },
+        {
+          "description": "HTTP/2, many requests at once on each connection. Without TLS, by prior knowledge\n(RFC 9113 §3.3): the upstream is expected to speak it from the first byte.",
+          "type": "string",
+          "const": "http2"
+        }
+      ]
+    },
+    "UpstreamTls": {
+      "description": "TLS to an upstream's endpoints: whom they are expected to be, and whom to trust to say\nso (Gateway API's BackendTLSPolicy: a hostname and CA certificates).",
+      "type": "object",
+      "properties": {
+        "authorities": {
+          "description": "The certificates, in PEM, of the authorities trusted to vouch for it.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "client_certificate": {
+          "description": "The name of the certificate the data plane shows an endpoint that asks who it is\n(mTLS); none, and it shows nothing.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "server_name": {
+          "description": "The name asked for (SNI), and the one an endpoint's certificate must carry: a host\nname, not an address, and with no wildcard or port.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "server_name",
+        "authorities"
+      ]
+    },
+    "ValueMatch": {
+      "description": "How a value is matched.",
+      "oneOf": [
+        {
+          "description": "This value and no other.",
+          "type": "object",
+          "properties": {
+            "exact": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "exact"
+          ]
+        },
+        {
+          "description": "The values this regular expression describes as a whole: RE2-style syntax in\nASCII, with no look-around or backreferences, at most 256 KiB compiled; case matters\nunless it says `(?i)`.",
+          "type": "object",
+          "properties": {
+            "regex": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "regex"
+          ]
+        }
+      ]
+    },
+    "ValuePredicate": {
+      "description": "A condition on a named value: a header or a query parameter.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "The header or parameter name.",
+          "type": "string"
+        },
+        "value": {
+          "description": "What its value must be.",
+          "$ref": "#/$defs/ValueMatch"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "value"
+      ]
+    },
+    "Wildcard": {
+      "description": "What the `*` of a wildcard hostname stands for. Neither covers the bare suffix:\n`*.example.com` is not `example.com`.",
+      "oneOf": [
+        {
+          "description": "Exactly one label, as in Ingress.",
+          "type": "string",
+          "const": "one_label"
+        },
+        {
+          "description": "One or more labels, as in Gateway API.",
+          "type": "string",
+          "const": "any_labels"
+        }
+      ]
+    }
+  }
+}

@@ -440,9 +440,20 @@ const GRPC_CODES: [&str; 17] = [
     "UNAUTHENTICATED",
 ];
 
+/// The pattern a gRPC status a retry names must match, for the config file's schema: any of
+/// gRPC's names but `OK`'s.
+#[cfg(feature = "schema")]
+pub(crate) fn retry_grpc_status_pattern() -> String {
+    format!("^({})$", GRPC_CODES[1..].join("|"))
+}
+
+/// The HTTP statuses a retry may name: an answer that succeeded, or one still to come, is
+/// nothing to try again for.
+pub(crate) const RETRY_STATUSES: std::ops::RangeInclusive<u16> = 400..=599;
+
 /// The most times a request may be sent again: beyond it a retry policy is a load
 /// multiplier more than a remedy.
-const MOST_ATTEMPTS: u32 = 5;
+pub(crate) const MOST_ATTEMPTS: u32 = 5;
 
 fn timeouts(
     forward: &Forward,
@@ -508,8 +519,7 @@ fn retry(forward: &Forward, place: &Place, errors: &mut Vec<ConfigError>) -> Opt
         problems.push(Problem::RetryOnTimeoutNever);
     }
     for status in &retry.http_statuses {
-        // An answer that succeeded, or one still to come, is nothing to try again for.
-        if !(400..=599).contains(status) {
+        if !RETRY_STATUSES.contains(status) {
             problems.push(Problem::RetryStatus(*status));
         }
     }
@@ -1086,7 +1096,7 @@ fn tls_route_probes(config: &Config, errors: &mut Vec<ConfigError>) {
 }
 
 /// The most backends a passthrough route has, as TCPRoute and TLSRoute allow.
-const MOST_BACKENDS: usize = 16;
+pub(crate) const MOST_BACKENDS: usize = 16;
 
 /// A tunnel's idle bound unless its listener's config says otherwise: an hour.
 const TUNNEL_IDLE_SECONDS: u64 = 3_600;

@@ -91,8 +91,11 @@ enum Origin {
     },
 }
 
+/// The statuses a redirect may have: Gateway API's five.
+pub const STATUSES: [u16; 5] = [301, 302, 303, 307, 308];
+
 impl Redirect {
-    /// A redirect with this status (301, 302, 303, 307 or 308), sending the client to what
+    /// A redirect with this status (one of [`STATUSES`]), sending the client to what
     /// it states of scheme, host, port and path, and keeping or dropping the query.
     ///
     /// # Errors
@@ -108,12 +111,10 @@ impl Redirect {
         path: Option<PathModifier>,
         query: Query,
     ) -> Result<Self, RedirectError> {
-        let status = match status {
-            301 | 302 | 303 | 307 | 308 => {
-                StatusCode::from_u16(status).map_err(|_| RedirectError::Status(status))?
-            }
-            _ => return Err(RedirectError::Status(status)),
-        };
+        if !STATUSES.contains(&status) {
+            return Err(RedirectError::Status(status));
+        }
+        let status = StatusCode::from_u16(status).map_err(|_| RedirectError::Status(status))?;
         if let Some(host) = host
             && !is_precise_host(host)
         {
