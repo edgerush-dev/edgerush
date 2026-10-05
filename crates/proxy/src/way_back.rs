@@ -199,14 +199,12 @@ fn switch<A: AnswerHead + ?Sized>(
         }
         Some(_) if offers => answer.set_field(UPGRADE, WEBSOCKET)?,
         Some(_) => {}
-        // An extended CONNECT's client is told of the switch with a 200 (RFC 8441 §5); an
-        // HTTP/1.1 backend's 101 goes without the Accept, which has no key to be of here.
+        // An extended CONNECT's client is told of the switch with a 200 (RFC 8441 §5), and
+        // with no Accept, which has no key to be of here, whatever backend or rule gave one.
         None if switched => {
             answer.set_status(StatusCode::OK);
-            if !handshake.connected {
-                answer.remove_field(&SEC_WEBSOCKET_ACCEPT);
-                answer.remove_field(&UPGRADE);
-            }
+            answer.remove_field(&SEC_WEBSOCKET_ACCEPT);
+            answer.remove_field(&UPGRADE);
         }
         // Never 2xx of anything else: to a CONNECT, that opens the tunnel.
         None if status.is_success() => return Err(Failed::NotSwitched),
@@ -469,13 +467,25 @@ mod tests {
             edited(sent, &handshake(None, false)),
             expected(200, &[("x-a", "1")])
         );
-        // An HTTP/2 backend's: any 2xx, its fields as they came.
+        // An HTTP/2 backend's: any 2xx, and without an Accept it should not have given.
         for status in ["200 OK", "204 No Content"] {
-            let sent = format!("HTTP/1.1 {status}\r\nsec-websocket-accept: a\r\n\r\n");
+            let sent = format!("HTTP/1.1 {status}\r\nsec-websocket-accept: a\r\nx-a: 1\r\n\r\n");
             assert_eq!(
                 edited(&sent, &handshake(None, true)),
-                expected(200, &[("sec-websocket-accept", "a")])
+                expected(200, &[("x-a", "1")])
             );
+        }
+        // Nor one a rule gives it, from either.
+        let changes = modifier(&[("sec-websocket-accept", "b")], &[], &[]);
+        for (sent, connected) in [
+            ("HTTP/1.1 101 Switching Protocols\r\nx-a: 1\r\n\r\n", false),
+            ("HTTP/1.1 200 OK\r\nx-a: 1\r\n\r\n", true),
+        ] {
+            let way = Way {
+                changes: Some(&changes),
+                ..handshake(None, connected)
+            };
+            assert_eq!(edited(sent, &way), expected(200, &[("x-a", "1")]));
         }
         // A page in place of an HTTP/1.1 backend's switch does not go.
         for status in ["200 OK", "204 No Content"] {
