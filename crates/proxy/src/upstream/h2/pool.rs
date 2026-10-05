@@ -476,6 +476,13 @@ impl Pool {
         self.total
     }
 
+    /// Whether anything of `key` is still here: a request waiting for it, or a connection
+    /// to it, opening and closing ones included. Nothing is ever asked of a destination
+    /// the pool no longer holds.
+    pub(crate) fn holds(&self, key: u64) -> bool {
+        self.destinations.contains_key(&key)
+    }
+
     /// The streams connection `id` to `key` has on it now.
     pub(crate) fn streams(&self, key: u64, id: ConnectionId) -> u32 {
         self.destinations

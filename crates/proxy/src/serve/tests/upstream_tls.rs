@@ -241,3 +241,140 @@ fn a_reload_keeps_the_tls_to_an_upstream_that_has_not_changed() {
         "{refused:?}"
     );
 }
+
+/// The first byte whatever connects to `endpoint` within two seconds sends, if anything
+/// connects and sends one.
+async fn first_byte_at(endpoint: &TcpListener) -> Option<u8> {
+    use tokio::io::AsyncReadExt;
+    let wait = Duration::from_secs(2);
+    let (mut socket, _) = tokio::time::timeout(wait, endpoint.accept())
+        .await
+        .ok()?
+        .ok()?;
+    let mut byte = [0_u8; 1];
+    tokio::time::timeout(wait, socket.read_exact(&mut byte))
+        .await
+        .ok()?
+        .ok()?;
+    Some(byte[0])
+}
+
+/// The first byte of a TLS handshake record.
+const HANDSHAKE: u8 = 0x16;
+
+/// A connection the HTTP/2 client opens for a destination secured with TLS is secured,
+/// even when a reload has retired the destination and the worker's sweep has run
+/// between the request asking for the connection and the connection being opened —
+/// whether the reload came before the request or after (review A06-01).
+#[tokio::test]
+async fn a_connection_dialled_for_a_retired_destination_is_still_secured() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let certificate = crate::tls::testing::certificate(&["backend.test"]);
+            for reloaded_first in [false, true] {
+                // The endpoint: whatever connects is read for its first byte.
+                let endpoint = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = endpoint.local_addr().unwrap();
+                let secured = |server_name: &str| {
+                    let mut config = everything_config(address);
+                    let up = config.upstreams.get_mut("up").unwrap();
+                    up.protocol = UpstreamProtocol::Http2;
+                    up.tls = Some(trusting(server_name, &certificate));
+                    compile(&config).unwrap()
+                };
+                let proxy =
+                    Arc::new(Proxy::new(secured("backend.test"), NonZeroUsize::MIN).unwrap());
+                let worker = Worker::with_deadlines(Arc::clone(&proxy), H1Limits::default(), SHORT);
+                let destination = Arc::clone(proxy.current.load().destinations.at(0, 0).unwrap());
+                if reloaded_first {
+                    // A request directed by the config before the reload.
+                    proxy.reload(secured("other.test")).unwrap();
+                }
+
+                // The request waits for a place, and the pool has a connection dialled
+                // for it.
+                let mut placing = Box::pin(worker.h2.place(&destination));
+                let first = std::future::poll_fn(|cx| Poll::Ready(placing.as_mut().poll(cx))).await;
+                assert!(first.is_pending());
+                if !reloaded_first {
+                    proxy.reload(secured("other.test")).unwrap();
+                }
+                assert!(destination.is_retired());
+                // Before the dial runs.
+                worker.h2.sweep();
+
+                let first = first_byte_at(&endpoint).await;
+                assert_eq!(
+                    first,
+                    Some(HANDSHAKE),
+                    "reloaded first: {reloaded_first}; the endpoint's first byte {first:x?} is \
+                     not a TLS handshake"
+                );
+                drop(placing);
+            }
+        })
+        .await;
+}
+
+/// A retired destination still serves the requests already waiting for it (15 §4): one
+/// held back by the worker's bound on connections has a connection opened for it when
+/// one is freed, at a sweep after the one that retired the destination, and secured like
+/// any other.
+#[tokio::test]
+async fn a_request_waiting_for_a_retired_destination_gets_a_secured_connection() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let certificate = crate::tls::testing::certificate(&["backend.test"]);
+            let kept = tls_upstream(&certificate, Agrees::Either).await;
+            let endpoint = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dropped = endpoint.local_addr().unwrap();
+            let secured = |endpoints: &[SocketAddr]| {
+                let mut config = everything_config(kept);
+                let up = config.upstreams.get_mut("up").unwrap();
+                up.endpoints = endpoints.to_vec();
+                up.protocol = UpstreamProtocol::Http2;
+                up.tls = Some(trusting("backend.test", &certificate));
+                compile(&config).unwrap()
+            };
+            let proxy = Arc::new(Proxy::new(secured(&[kept, dropped]), NonZeroUsize::MIN).unwrap());
+            // One HTTP/2 connection a worker, let go of at any sweep that finds it idle.
+            let limits = H1Limits {
+                idle_total: 1,
+                idle_timeout: Duration::ZERO,
+                ..H1Limits::default()
+            };
+            let worker = Worker::with_deadlines(Arc::clone(&proxy), limits, SHORT);
+            let (staying, going) = {
+                let current = proxy.current.load();
+                let at = |endpoint| Arc::clone(current.destinations.at(0, endpoint).unwrap());
+                (at(0), at(1))
+            };
+
+            // A request to the endpoint that stays takes the worker's one connection.
+            let busy = within(worker.h2.place(&staying)).await.unwrap();
+            // A request to the other waits, with nothing opened for it.
+            let mut placing = Box::pin(worker.h2.place(&going));
+            let first = std::future::poll_fn(|cx| Poll::Ready(placing.as_mut().poll(cx))).await;
+            assert!(first.is_pending());
+            assert_eq!(worker.h2.connections(), 1);
+
+            // A reload drops the other endpoint, and a sweep retires it.
+            proxy.reload(secured(&[kept])).unwrap();
+            assert!(going.is_retired() && !staying.is_retired());
+            worker.h2.sweep();
+            // The connection is done with, and the next sweep lets it go.
+            drop(busy);
+            worker.h2.sweep();
+
+            let first = first_byte_at(&endpoint).await;
+            assert_eq!(
+                first,
+                Some(HANDSHAKE),
+                "the waiting request's endpoint got {first:x?}, not a TLS handshake"
+            );
+            drop(placing);
+        })
+        .await;
+}

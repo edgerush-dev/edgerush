@@ -13,10 +13,10 @@ use crate::downstream::h2::writer::Outgoing;
 use crate::received::Received;
 use crate::upstream::destination::ReuseIdentity;
 use ::h2::client::{Connection, SendRequest};
+use edgerush_config::Keepalive;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::poll_fn;
-use std::net::SocketAddr;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -125,7 +125,9 @@ pub(crate) struct Client {
     links: RefCell<HashMap<ConnectionId, Rc<Link>>>,
     waiters: RefCell<HashMap<WaiterId, oneshot::Sender<Result<ConnectionId, Failure>>>>,
     /// Every destination asked for, by key: where to open the connections the pool asks
-    /// for, and whether a reload has retired it.
+    /// for, and whether a reload has retired it. A retired one is kept for as long as the
+    /// pool holds anything of it, so that whoever already waits for it is still served
+    /// (15 §4).
     destinations: RefCell<HashMap<u64, Arc<ReuseIdentity>>>,
     /// How many times a destination's keepalive interval has been doubled, by key, for
     /// telling this client to calm down: gRPC's backoff for too many PINGs.
@@ -311,10 +313,13 @@ impl Client {
             .map(|(key, _)| *key)
             .collect();
         for key in retired {
-            self.destinations.borrow_mut().remove(&key);
             self.event(|pool, now, actions| pool.retire(key, now, actions));
         }
         self.event(|pool, now, actions| pool.sweep(now, actions));
+        let pool = self.pool.borrow();
+        self.destinations
+            .borrow_mut()
+            .retain(|key, destination| !destination.is_retired() || pool.holds(*key));
     }
 
     /// The place already reserved on connection `id`.
@@ -353,15 +358,17 @@ impl Client {
         for action in actions {
             match action {
                 Action::Dial(key, id) => {
-                    let address = self
-                        .destinations
-                        .borrow()
-                        .get(&key)
-                        .map(|destination| destination.address());
-                    match address {
-                        Some(address) => {
-                            let _dialling =
-                                tokio::task::spawn_local(Rc::clone(self).dial(key, id, address));
+                    let destination = self.destinations.borrow().get(&key).cloned();
+                    match destination {
+                        // Taken along, not looked up again when the task runs: a sweep
+                        // between the two may have let go of it, and a connection is
+                        // opened with what the pool asked for or not at all.
+                        Some(destination) => {
+                            let _dialling = tokio::task::spawn_local(Rc::clone(self).dial(
+                                key,
+                                id,
+                                destination,
+                            ));
                         }
                         // Every dial is for a request that said where to.
                         None => self.event(|pool, now, actions| pool.failed(key, id, now, actions)),
@@ -393,14 +400,12 @@ impl Client {
         }
     }
 
-    /// Opens connection `id` to `address` for the destination under `key`, and drives it
-    /// until it ends.
-    async fn dial(self: Rc<Self>, key: u64, id: ConnectionId, address: SocketAddr) {
+    /// Opens connection `id` to `destination`, under `key`, and drives it until it ends.
+    async fn dial(self: Rc<Self>, key: u64, id: ConnectionId, destination: Arc<ReuseIdentity>) {
         let settings = self.settings;
-        let destination = self.destinations.borrow().get(&key).cloned();
-        let secure = destination
-            .as_ref()
-            .and_then(|destination| destination.secure().cloned());
+        let address = destination.address();
+        let secure = destination.secure().cloned();
+        let keepalive = destination.keepalive();
         // Whether TCP got through: only a connect that did not is the endpoint set aside
         // for, not a handshake that failed after it (03 §6).
         let connected = Cell::new(false);
@@ -415,24 +420,27 @@ impl Client {
             })
         };
         let Ok(Some(transport)) = tokio::time::timeout(settings.connect, opening).await else {
-            if !connected.get()
-                && let Some(destination) = destination
-            {
+            if !connected.get() {
                 destination.set_aside();
             }
             self.event(|pool, now, actions| pool.failed(key, id, now, actions));
             return;
         };
         match transport {
-            Transport::Plain(socket) => self.handshaken(key, id, socket).await,
-            Transport::Secured(socket) => self.handshaken(key, id, socket).await,
+            Transport::Plain(socket) => self.handshaken(key, id, keepalive, socket).await,
+            Transport::Secured(socket) => self.handshaken(key, id, keepalive, socket).await,
         }
     }
 
     /// Runs HTTP/2's own handshake on `socket` for connection `id` to `key`, and drives
-    /// the connection until it ends.
-    async fn handshaken<S>(self: Rc<Self>, key: u64, id: ConnectionId, socket: S)
-    where
+    /// the connection, kept alive as `keepalive` says, until it ends.
+    async fn handshaken<S>(
+        self: Rc<Self>,
+        key: u64,
+        id: ConnectionId,
+        keepalive: Option<Keepalive>,
+        socket: S,
+    ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         let settings = self.settings;
@@ -452,7 +460,8 @@ impl Client {
         });
         self.links.borrow_mut().insert(id, Rc::clone(&link));
         self.event(|pool, now, actions| pool.opened(key, id, peer, now, actions));
-        self.drive(key, id, &link, send, connection).await;
+        self.drive(key, id, keepalive, &link, send, connection)
+            .await;
         self.links.borrow_mut().remove(&id);
         self.event(|pool, now, actions| pool.closed(key, id, now, actions));
     }
@@ -462,6 +471,7 @@ impl Client {
         self: &Rc<Self>,
         key: u64,
         id: ConnectionId,
+        keepalive: Option<Keepalive>,
         link: &Link,
         watch: SendRequest<Outgoing>,
         mut connection: Connection<S, Outgoing>,
@@ -487,11 +497,6 @@ impl Client {
             self.event(|pool, at, actions| pool.settled(key, id, peer, at, actions));
             link.settle();
         }
-        let keepalive = self
-            .destinations
-            .borrow()
-            .get(&key)
-            .and_then(|destination| destination.keepalive());
         let calmer = self.calmer.borrow().get(&key).copied().unwrap_or(0);
         let interval = keepalive.map(|keepalive| {
             Duration::from_secs(keepalive.interval_seconds).saturating_mul(1 << calmer)

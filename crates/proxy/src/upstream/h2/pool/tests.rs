@@ -407,8 +407,11 @@ fn a_retired_destination_winds_down() {
     let mut actions = Vec::new();
     pool.pool.retire(KEY, pool.now, &mut actions);
     assert_eq!(actions, [Action::Close(idle)]);
+    // Held while a connection to it is.
+    assert!(pool.pool.holds(KEY));
     assert_eq!(pool.ended(KEY, busy), [Action::Close(busy)]);
     assert_eq!(pool.pool.connections(), 0);
+    assert!(!pool.pool.holds(KEY));
 }
 
 /// A connection closed because its retired destination no longer needs it frees a place
