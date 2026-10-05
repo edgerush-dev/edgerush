@@ -94,7 +94,8 @@ it, from the same file and without running anything:
 ```
 
 `edgerush test --config edgerush.yaml tests.yaml` checks a file of such requests and where
-each is expected to go, and exits 1 when one goes elsewhere: a config's tests for CI.
+each is expected to go, and, given what its upstream answers, the answer its client gets;
+it exits 1 when one goes elsewhere or is answered otherwise: a config's tests for CI.
 
 ## Building
 

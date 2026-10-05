@@ -129,16 +129,27 @@ pub fn header_line(line: &str) -> Result<(HeaderName, HeaderValue), Invalid> {
 
 /// A header, by its name and value. `Host` is refused: the URL gives it.
 pub fn header(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), Invalid> {
-    let parsed = HeaderName::from_bytes(name.as_bytes())
-        .map_err(|_| Invalid::HeaderName(name.to_owned()))?;
+    let parsed = header_name(name)?;
     if parsed == HOST {
         return Err(Invalid::Host);
     }
-    let value = HeaderValue::from_str(value).map_err(|_| Invalid::HeaderValue {
+    Ok((parsed, header_value(name, value)?))
+}
+
+/// A field line of an answer, by its name and value: any an answer may have.
+pub fn answer_header(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), Invalid> {
+    Ok((header_name(name)?, header_value(name, value)?))
+}
+
+fn header_name(name: &str) -> Result<HeaderName, Invalid> {
+    HeaderName::from_bytes(name.as_bytes()).map_err(|_| Invalid::HeaderName(name.to_owned()))
+}
+
+fn header_value(name: &str, value: &str) -> Result<HeaderValue, Invalid> {
+    HeaderValue::from_str(value).map_err(|_| Invalid::HeaderValue {
         name: name.to_owned(),
         value: value.to_owned(),
-    })?;
-    Ok((parsed, value))
+    })
 }
 
 impl Asked {

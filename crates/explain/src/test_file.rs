@@ -6,6 +6,8 @@
 use crate::asked::{self, Asked, Invalid};
 use crate::explained::Snapshot;
 use edgerush_config::Protocol;
+use edgerush_proxy::Decision;
+use http::StatusCode;
 use serde::Deserialize;
 use serde_saphyr::Spanned;
 use std::collections::HashSet;
@@ -27,8 +29,22 @@ pub struct Test {
     pub name: String,
     /// The request.
     pub request: Request,
+    /// The answer its upstream gives, for a forwarded request whose `response` is checked.
+    #[serde(default)]
+    pub upstream_answer: Option<UpstreamAnswer>,
     /// What is expected of it.
     pub expect: Expect,
+}
+
+/// An upstream's answer as a test states it: a final status, and its field lines in order,
+/// `[]` for none.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamAnswer {
+    /// Its status.
+    pub status: u16,
+    /// Its field lines.
+    pub headers: Vec<Header>,
 }
 
 /// A request as a test states it (22 §2): every field that changes what the core does,
@@ -122,6 +138,9 @@ pub struct Expect {
     /// What the upstream is sent, as far as it is stated.
     #[serde(default)]
     pub upstream_request: Option<UpstreamRequest>,
+    /// The answer the client gets, as far as it is stated.
+    #[serde(default)]
+    pub response: Option<Response>,
 }
 
 /// The rule's backends and mirrors, each list whole: what is drawn at random is asserted
@@ -184,6 +203,19 @@ pub struct UpstreamRequest {
     /// Its target, path and query.
     #[serde(default)]
     pub target: Option<String>,
+    /// Headers, each as it must be.
+    #[serde(default)]
+    pub headers: Vec<HeaderExpected>,
+}
+
+/// The answer the client gets, as the gateway hands it to its server, whose framing fields
+/// are the server's to write: only what is stated is checked.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Response {
+    /// Its status.
+    #[serde(default)]
+    pub status: Option<u16>,
     /// Headers, each as it must be.
     #[serde(default)]
     pub headers: Vec<HeaderExpected>,
@@ -272,6 +304,27 @@ pub enum Problem {
     /// `upstream_request` beside something other than `forward`.
     #[error("upstream_request is for a forwarded request")]
     UpstreamRequest,
+    /// `upstream_answer` beside something other than `forward`.
+    #[error("upstream_answer is for a forwarded request")]
+    UpstreamAnswer,
+    /// `upstream_answer` with no `response` to check.
+    #[error("an upstream_answer is stated for the response it makes: state the response")]
+    NoResponse,
+    /// A forwarded request's `response` without the answer it is made from.
+    #[error("a forwarded request's response is made from its upstream_answer: state it")]
+    NoUpstreamAnswer,
+    /// A number that is no status.
+    #[error("{0} is not a status")]
+    Status(u16),
+    /// An upstream's status that ends no exchange.
+    #[error("{0} is not the status of a final answer")]
+    NotFinal(u16),
+    /// An upstream answer to a WebSocket handshake.
+    #[error(
+        "a WebSocket handshake's answer cannot be told offline: whether it switches rests on \
+         the gateway's own key and on its backend's connection"
+    )]
+    WebSocket,
     /// A header expected in no one way.
     #[error("header {0} is expected by one of value, values and absent: true")]
     HeaderForm(String),
@@ -320,6 +373,8 @@ pub struct Prepared {
     pub listener: String,
     /// The request, or the connection.
     pub asked: Asking,
+    /// The answer its upstream gives, if the test states one.
+    pub upstream_answer: Option<UpstreamAnswer>,
     /// What is expected of it.
     pub expect: Expect,
 }
@@ -361,19 +416,29 @@ impl TestFile {
             for problem in expectation(&test.expect) {
                 wrong(problem);
             }
+            for problem in answers(test) {
+                wrong(problem);
+            }
             if let Some(listener) = snapshot.listener(&test.request.listener) {
-                for problem in for_listener(&test.expect, listener.protocol) {
+                for problem in for_listener(test, listener.protocol) {
                     wrong(problem);
                 }
             }
             match asked(&test.request, snapshot) {
-                Ok(asked) => prepared.push(Prepared {
-                    line,
-                    name: test.name.clone(),
-                    listener: test.request.listener.clone(),
-                    asked,
-                    expect: test.expect.clone(),
-                }),
+                Ok(asked) => {
+                    if test.upstream_answer.is_some() && handshake(snapshot, &test.request, &asked)
+                    {
+                        wrong(Problem::WebSocket);
+                    }
+                    prepared.push(Prepared {
+                        line,
+                        name: test.name.clone(),
+                        listener: test.request.listener.clone(),
+                        asked,
+                        upstream_answer: test.upstream_answer.clone(),
+                        expect: test.expect.clone(),
+                    });
+                }
                 Err(problem) => wrong(problem),
             }
         }
@@ -411,18 +476,83 @@ fn expectation(expect: &Expect) -> Vec<Problem> {
         if expect.forward.is_none() {
             problems.push(Problem::UpstreamRequest);
         }
-        for header in &upstream.headers {
-            let name = header.name.clone();
-            match (&header.value, &header.values, header.absent) {
-                (Some(_), None, None) | (None, None, Some(true)) => {}
-                (None, Some(values), None) if values.len() >= 2 => {}
-                (None, Some(_), None) => problems.push(Problem::TooFewValues(name)),
-                (None, None, Some(false)) => problems.push(Problem::AbsentFalse(name)),
-                _ => problems.push(Problem::HeaderForm(name)),
-            }
-        }
+        problems.extend(header_forms(&upstream.headers));
     }
     problems
+}
+
+/// What is wrong with how each header is expected: by one of `value`, `values` (two or more)
+/// and `absent: true`.
+fn header_forms(headers: &[HeaderExpected]) -> Vec<Problem> {
+    headers
+        .iter()
+        .filter_map(|header| {
+            let name = header.name.clone();
+            match (&header.value, &header.values, header.absent) {
+                (Some(_), None, None) | (None, None, Some(true)) => None,
+                (None, Some(values), None) if values.len() >= 2 => None,
+                (None, Some(_), None) => Some(Problem::TooFewValues(name)),
+                (None, None, Some(false)) => Some(Problem::AbsentFalse(name)),
+                _ => Some(Problem::HeaderForm(name)),
+            }
+        })
+        .collect()
+}
+
+/// What is wrong with a test's upstream answer and the response it is checked by: an
+/// answer goes with a forward and a response to check; a forwarded request's response is
+/// made from one.
+fn answers(test: &Test) -> Vec<Problem> {
+    let mut problems = Vec::new();
+    let expect = &test.expect;
+    if let Some(answer) = &test.upstream_answer {
+        if expect.forward.is_none() {
+            problems.push(Problem::UpstreamAnswer);
+        } else if expect.response.is_none() {
+            problems.push(Problem::NoResponse);
+        }
+        match StatusCode::from_u16(answer.status) {
+            Err(_) => problems.push(Problem::Status(answer.status)),
+            Ok(status) if status.is_informational() => {
+                problems.push(Problem::NotFinal(answer.status));
+            }
+            Ok(_) => {}
+        }
+        problems.extend(
+            answer
+                .headers
+                .iter()
+                .filter_map(|header| asked::answer_header(&header.name, &header.value).err())
+                .map(Problem::from),
+        );
+    }
+    if let Some(response) = &expect.response {
+        if expect.forward.is_some() && test.upstream_answer.is_none() {
+            problems.push(Problem::NoUpstreamAnswer);
+        }
+        if let Some(status) = response.status
+            && StatusCode::from_u16(status).is_err()
+        {
+            problems.push(Problem::Status(status));
+        }
+        problems.extend(header_forms(&response.headers));
+    }
+    problems
+}
+
+/// Whether a request is a WebSocket handshake the gateway would carry, as the core decides
+/// it: one it forwards as one.
+fn handshake(snapshot: &Snapshot, request: &Request, asked: &Asking) -> bool {
+    let (Some(listener), Asking::Request(asked)) = (snapshot.listener(&request.listener), asked)
+    else {
+        return false;
+    };
+    snapshot.explain(listener, asked).is_ok_and(|explained| {
+        matches!(
+            explained.decided(),
+            Ok(Decision::Forward(forward)) if forward.websocket.is_some()
+        )
+    })
 }
 
 /// A listener of `protocol`, as the problems name it.
@@ -435,10 +565,11 @@ fn kind(protocol: Protocol) -> &'static str {
     }
 }
 
-/// What is wrong with an expectation for a listener of `protocol`: a request's has a rule
-/// beside its route and states its mirrors; a connection's has a route alone, and is
-/// forwarded or refused.
-fn for_listener(expect: &Expect, protocol: Protocol) -> Vec<Problem> {
+/// What is wrong with a test for a listener of `protocol`: a request's has a rule beside
+/// its route and states its mirrors; a connection's has a route alone, is forwarded or
+/// refused, and has no answer of HTTP's.
+fn for_listener(test: &Test, protocol: Protocol) -> Vec<Problem> {
+    let expect = &test.expect;
     let mut problems = Vec::new();
     let kind = kind(protocol);
     match protocol {
@@ -466,6 +597,8 @@ fn for_listener(expect: &Expect, protocol: Protocol) -> Vec<Problem> {
                 ("redirect", expect.redirect.is_some()),
                 ("answer", expect.answer.is_some()),
                 ("upstream_request", expect.upstream_request.is_some()),
+                ("upstream_answer", test.upstream_answer.is_some()),
+                ("response", expect.response.is_some()),
                 (
                     "mirrors",
                     expect
@@ -897,5 +1030,139 @@ tls_routes:
             assert_eq!(mistake.line, 0);
             assert!(matches!(mistake.problem, Problem::Unreadable(_)), "{yaml}");
         }
+    }
+
+    /// A test of this request, upstream answer and expectation, each written as a flow
+    /// mapping.
+    fn answered(name: &str, request: &str, answer: &str, expect: &str) -> String {
+        format!(
+            "  - name: {name}\n    request: {request}\n    upstream_answer: {answer}\n    expect: {expect}\n"
+        )
+    }
+
+    const ANSWER: &str = "{ status: 200, headers: [{ name: Server, value: gunicorn }] }";
+    const RESPONSE: &str = "response: { status: 200, headers: [{ name: Server, absent: true }] }";
+
+    #[test]
+    fn an_upstream_answer_and_its_response_go_together() {
+        let forward = |with: &str| {
+            format!(
+                "{{ route: shop, rule: 0, forward: {{ backends: [{{ upstream: cart, weight: 1 }}], mirrors: [] }}{with} }}"
+            )
+        };
+        let with_response = forward(&format!(", {RESPONSE}"));
+        // Valid: a forward's response from its answer; a redirect's or an answer's alone.
+        let yaml = format!(
+            "tests:\n{}{}",
+            answered("forwarded", REQUEST, ANSWER, &with_response),
+            test(
+                "refused",
+                REQUEST,
+                "{ answer: no_route, response: { status: 404 } }"
+            )
+        );
+        let prepared = read(yaml.as_bytes()).unwrap().prepare(&snapshot()).unwrap();
+        let stated = prepared[0].upstream_answer.as_ref().unwrap();
+        assert_eq!((stated.status, stated.headers.len()), (200, 1));
+        assert!(prepared[1].upstream_answer.is_none());
+
+        let cases = [
+            (
+                answered(
+                    "a",
+                    REQUEST,
+                    ANSWER,
+                    &format!("{{ answer: no_route, {RESPONSE} }}"),
+                ),
+                vec!["upstream_answer is for a forwarded request"],
+            ),
+            (
+                answered("a", REQUEST, ANSWER, FORWARD),
+                vec!["an upstream_answer is stated for the response it makes: state the response"],
+            ),
+            (
+                test("a", REQUEST, &with_response),
+                vec!["a forwarded request's response is made from its upstream_answer: state it"],
+            ),
+            (
+                answered("a", REQUEST, "{ status: 103, headers: [] }", &with_response),
+                vec!["103 is not the status of a final answer"],
+            ),
+            (
+                answered(
+                    "a",
+                    REQUEST,
+                    "{ status: 1000, headers: [] }",
+                    &with_response,
+                ),
+                vec!["1000 is not a status"],
+            ),
+            (
+                answered(
+                    "a",
+                    REQUEST,
+                    "{ status: 200, headers: [{ name: \"X A\", value: b }] }",
+                    &with_response,
+                ),
+                vec!["'X A' is not a header name"],
+            ),
+            (
+                test(
+                    "a",
+                    REQUEST,
+                    "{ answer: no_route, response: { status: 99 } }",
+                ),
+                vec!["99 is not a status"],
+            ),
+            (
+                test(
+                    "a",
+                    REQUEST,
+                    "{ answer: no_route, response: { headers: [{ name: X-A, values: [a] }] } }",
+                ),
+                vec!["header X-A has values for two field lines or more: write one as value"],
+            ),
+            (
+                answered(
+                    "a",
+                    "{ listener: db }",
+                    ANSWER,
+                    &format!("{{ route: postgres, forward: {{ backends: [] }}, {RESPONSE} }}"),
+                ),
+                vec![
+                    "upstream_answer does not apply to a tcp listener",
+                    "response does not apply to a tcp listener",
+                ],
+            ),
+        ];
+        for (test, said) in cases {
+            let said: Vec<(u64, String)> =
+                said.into_iter().map(|said| (2, said.to_owned())).collect();
+            assert_eq!(mistakes(std::slice::from_ref(&test)), said, "{test}");
+        }
+    }
+
+    /// Whether a WebSocket handshake switches cannot be told offline, so its test states no
+    /// upstream answer; one that is no handshake, by the core's reading, may.
+    #[test]
+    fn a_websocket_handshake_states_no_upstream_answer() {
+        let handshake = "{ listener: web, client: 203.0.113.7, protocol: \"1.1\", method: GET, url: \"http://shop.example.com/chat\", headers: [{ name: Connection, value: Upgrade }, { name: Upgrade, value: websocket }, { name: Sec-WebSocket-Key, value: dGhlIHNhbXBsZSBub25jZQ== }, { name: Sec-WebSocket-Version, value: \"13\" }] }";
+        let expect = format!(
+            "{{ route: shop, rule: 0, forward: {{ backends: [{{ upstream: cart, weight: 1 }}], mirrors: [] }}, {RESPONSE} }}"
+        );
+        assert_eq!(
+            mistakes(&[answered("a", handshake, ANSWER, &expect)]),
+            [(
+                2,
+                "a WebSocket handshake's answer cannot be told offline: whether it switches rests on the gateway's own key and on its backend's connection".to_owned()
+            )]
+        );
+        // Without its key it is a plain GET, whose answer can be told.
+        let plain = handshake.replace(
+            ", { name: Sec-WebSocket-Key, value: dGhlIHNhbXBsZSBub25jZQ== }",
+            "",
+        );
+        let yaml = format!("tests:\n{}", answered("a", &plain, ANSWER, &expect));
+        assert!(read(yaml.as_bytes()).unwrap().prepare(&snapshot()).is_ok());
     }
 }

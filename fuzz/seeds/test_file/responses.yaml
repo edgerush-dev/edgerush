@@ -1,0 +1,46 @@
+tests:
+  - name: the cart's answer, as the client gets it
+    request: { listener: web, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://shop.example.com/cart", headers: [] }
+    upstream_answer:
+      status: 200
+      headers:
+        - { name: Connection, value: x-debug }
+        - { name: X-Debug, value: "1" }
+        - { name: Trailer, value: "x-debug, grpc-status" }
+    expect:
+      route: shop
+      rule: 0
+      forward:
+        backends: [{ upstream: cart, weight: 9 }, { upstream: cart-canary, weight: 1 }]
+        mirrors: [{ upstream: shadow, fraction: { numerator: 1, denominator: 10 } }]
+      response:
+        status: 200
+        headers:
+          - { name: X-Debug, absent: true }
+          - { name: Trailer, value: grpc-status }
+          - { name: X-Request-ID, value: 00000000-0000-7000-8000-000000000000 }
+  - name: a 426 that offers WebSocket
+    request: { listener: web, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://shop.example.com/cart", headers: [] }
+    upstream_answer: { status: 426, headers: [{ name: Upgrade, value: "h2c, websocket" }] }
+    expect:
+      route: shop
+      rule: 0
+      forward:
+        backends: [{ upstream: cart, weight: 9 }, { upstream: cart-canary, weight: 1 }]
+        mirrors: [{ upstream: shadow, fraction: { numerator: 1, denominator: 10 } }]
+      response: { status: 426, headers: [{ name: Upgrade, value: websocket }] }
+  - name: a redirect's answer
+    request: { listener: web, client: 203.0.113.7, protocol: "2", method: GET, url: "http://shop.example.com/closed?x=1", headers: [] }
+    expect:
+      route: shop
+      rule: 1
+      redirect: { status: 301, location: "/open?x=1" }
+      response: { status: 301, headers: [{ name: Location, value: "/open?x=1" }] }
+  - name: a call with no route
+    request: { listener: web, client: 203.0.113.7, protocol: "2", method: POST, url: "http://nowhere.example/bench.Echo/Call", headers: [{ name: Content-Type, value: application/grpc }] }
+    expect:
+      answer: no_route
+      response: { status: 200, headers: [{ name: grpc-status, value: "12" }] }
+  - name: no route at all
+    request: { listener: web, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://nowhere.example/", headers: [] }
+    expect: { answer: no_route, response: { status: 404, headers: [{ name: X-Request-ID, value: 00000000-0000-7000-8000-000000000000 }] } }

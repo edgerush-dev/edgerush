@@ -2,12 +2,16 @@
 //! explained, and what came of it held to what the test expects. Each difference is a line,
 //! expected beside got; a test with none passed.
 
-use crate::asked::Asked;
-use crate::explained::{Snapshot, Unexplained};
-use crate::test_file::{Asking, Backend, Expect, Fraction, HeaderExpected, Mirror, Prepared};
-use edgerush_config::{CompiledListener, Filter, Rule};
-use edgerush_proxy::Decision;
+use crate::asked::{self, Asked};
+use crate::explained::{STAND_IN_ID, Snapshot, Unexplained};
+use crate::test_file::{
+    Asking, Backend, Expect, Fraction, HeaderExpected, Mirror, Prepared, UpstreamAnswer,
+};
+use edgerush_config::{CompiledListener, Filter, RequestId, Rule};
+use edgerush_proxy::way_back::{self, Way};
+use edgerush_proxy::{Decision, Rejection};
 use http::header::HeaderMap;
+use http::{StatusCode, Version};
 
 /// What a test came to.
 #[derive(Debug)]
@@ -37,7 +41,13 @@ pub fn run(snapshot: &Snapshot, test: &Prepared) -> Result<Ran, Unexplained> {
         .listener(&test.listener)
         .ok_or_else(|| Unexplained::NoListener(test.listener.clone()))?;
     match &test.asked {
-        Asking::Request(asked) => request(snapshot, listener, asked, &test.expect),
+        Asking::Request(asked) => request(
+            snapshot,
+            listener,
+            asked,
+            test.upstream_answer.as_ref(),
+            &test.expect,
+        ),
         Asking::Connection(sni) => connection(snapshot, listener, sni.as_deref(), &test.expect),
     }
 }
@@ -65,6 +75,7 @@ fn request(
     snapshot: &Snapshot,
     listener: &CompiledListener,
     asked: &Asked,
+    upstream_answer: Option<&UpstreamAnswer>,
     expect: &Expect,
 ) -> Result<Ran, Unexplained> {
     let explained = snapshot.explain(listener, asked)?;
@@ -146,10 +157,76 @@ fn request(
         }
     }
 
+    if let Some(response) = &expect.response
+        && let Some(got) = answer(listener, asked, decided, upstream_answer)
+    {
+        if let Some(status) = response.status {
+            differ(
+                "response status",
+                status.to_string(),
+                got.status().as_u16().to_string(),
+            );
+        }
+        for header in &response.headers {
+            let (expected, got) = header_values(header, got.headers());
+            differ(&format!("response header {}", header.name), expected, got);
+        }
+    }
+
     Ok(Ran {
         differences: differences.0,
         explanation: explained.text(),
     })
+}
+
+/// The answer the client gets, as the gateway hands it to its server (22 §5): the upstream's
+/// answer edited on its way back, a redirect's, or the gateway's own, each with what every
+/// answer says last. None for a request forwarded without an upstream answer stated, which
+/// only a test that expected another outcome has, and which that outcome's line tells.
+fn answer(
+    listener: &CompiledListener,
+    asked: &Asked,
+    decided: Result<&Decision<'_>, Rejection>,
+    stated: Option<&UpstreamAnswer>,
+) -> Option<http::Response<()>> {
+    // Read from the head as the client sent it, as `serve` reads it.
+    let sent: HeaderMap = asked.headers.iter().cloned().collect();
+    let call = way_back::is_grpc_call(asked.protocol, &sent);
+    let mut answer = http::Response::new(());
+    match decided {
+        Ok(Decision::Forward(forward)) => {
+            let stated = stated?;
+            *answer.status_mut() = StatusCode::from_u16(stated.status).ok()?;
+            for header in &stated.headers {
+                let (name, value) = asked::answer_header(&header.name, &header.value).ok()?;
+                answer.headers_mut().append(name, value);
+            }
+            let way = Way {
+                changes: forward.rule.response_headers.as_ref(),
+                upgradable: asked.protocol == Version::HTTP_11,
+                websocket: None,
+            };
+            // A map takes every field it is given, and no WebSocket's answer is told here:
+            // nothing fails.
+            let _edited = way_back::upstream_answer(&mut answer, &way);
+        }
+        Ok(Decision::Redirect(_)) if call => way_back::call_redirected(&mut answer),
+        Ok(Decision::Redirect(redirected)) => {
+            // A map takes every field it is given: nothing fails.
+            let _made = way_back::redirect_answer(
+                &mut answer,
+                redirected.status,
+                redirected.location.clone(),
+                redirected.rule.response_headers.as_ref(),
+            );
+        }
+        Err(rejection) if call => way_back::call_rejected(&mut answer, rejection),
+        Err(rejection) => *answer.status_mut() = rejection.status(),
+    }
+    let alt_svc = way_back::alt_svc(listener, listener.address.port());
+    let id = (listener.request_id == RequestId::Generate).then_some(STAND_IN_ID);
+    way_back::every_answer(&mut answer, alt_svc.as_ref(), id);
+    Some(answer)
 }
 
 /// Runs a connection's test: its route, and its backends or why it is refused.
@@ -305,8 +382,11 @@ routes:
         filters:
           - { type: request_header_modifier, set: [{ name: X-Gateway, value: edgerush }], add: [{ name: X-Tag, value: b }] }
           - { type: request_mirror, upstream: shadow, fraction: { numerator: 1, denominator: 10 } }
+          - { type: response_header_modifier, set: [{ name: X-Served-By, value: edgerush }], remove: [server] }
         forward: { backends: [{ upstream: cart, weight: 9 }, { upstream: canary, weight: 1 }] }
       - matches: [{ path: { exact: /closed } }]
+        filters:
+          - { type: response_header_modifier, set: [{ name: Cache-Control, value: no-store }] }
         redirect: { status: 301, path: { replace_full: /open }, query: keep }
 upstreams:
   cart: { load_balancer: p2c, endpoints: [] }
@@ -493,6 +573,162 @@ upstreams:
         assert_eq!(
             differences("http://shop.example.com/closed", "[]", &expect),
             ["outcome: expected forward, got redirect 301 to /open"]
+        );
+    }
+
+    /// Runs one test against `snapshot`, its request, upstream answer and expectation written
+    /// as flow mappings; what differed.
+    fn ran(snapshot: &Snapshot, request: &str, answer: Option<&str>, expect: &str) -> Vec<String> {
+        let answer = answer.map_or_else(String::new, |answer| {
+            format!("    upstream_answer: {answer}\n")
+        });
+        let yaml =
+            format!("tests:\n  - name: a\n    request: {request}\n{answer}    expect: {expect}\n");
+        let tests = test_file::read(yaml.as_bytes())
+            .unwrap()
+            .prepare(snapshot)
+            .unwrap();
+        let ran = run(snapshot, &tests[0]).unwrap();
+        assert_eq!(ran.passed(), ran.differences.is_empty());
+        ran.differences
+    }
+
+    fn shop() -> Snapshot {
+        Snapshot::new(serde_saphyr::from_str(CONFIG).unwrap()).unwrap()
+    }
+
+    /// An HTTP/1.1 GET of `url` to the shop's listener.
+    fn get(url: &str) -> String {
+        format!(
+            "{{ listener: web, client: 203.0.113.7, protocol: \"1.1\", method: GET, url: \"{url}\", headers: [] }}"
+        )
+    }
+
+    /// An upstream's answer with fields about its connection, one its `Connection` names, and
+    /// one the rule takes off.
+    const ANSWER: &str = "{ status: 200, headers: [{ name: Connection, value: x-debug }, { name: X-Debug, value: \"1\" }, { name: Keep-Alive, value: timeout=5 }, { name: Server, value: gunicorn }, { name: Content-Type, value: text/plain }] }";
+
+    const ID: &str = "{ name: X-Request-ID, value: 00000000-0000-7000-8000-000000000000 }";
+
+    #[test]
+    fn the_response_is_the_upstreams_answer_as_the_way_back_leaves_it() {
+        let response = format!(
+            ", response: {{ status: 200, headers: [{{ name: X-Debug, absent: true }}, {{ name: Keep-Alive, absent: true }}, {{ name: Server, absent: true }}, {{ name: Content-Type, value: text/plain }}, {{ name: X-Served-By, value: edgerush }}, {ID}] }}"
+        );
+        let expect = forward("route: shop, rule: 0", BACKENDS, MIRRORS, &response);
+        assert_eq!(
+            ran(&shop(), &get(CART), Some(ANSWER), &expect),
+            Vec::<String>::new()
+        );
+        // What differs is said, a line each.
+        let response = ", response: { status: 201, headers: [{ name: X-Served-By, value: other }, { name: Server, value: gunicorn }] }";
+        let expect = forward("route: shop, rule: 0", BACKENDS, MIRRORS, response);
+        assert_eq!(
+            ran(&shop(), &get(CART), Some(ANSWER), &expect),
+            [
+                "response status: expected 201, got 200",
+                "response header X-Served-By: expected \"other\", got \"edgerush\"",
+                "response header Server: expected \"gunicorn\", got absent"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_redirects_and_the_gateways_own_answers_are_told_without_one() {
+        let redirect = format!(
+            "{{ route: shop, rule: 1, redirect: {{ status: 301, location: \"/open?x=1\" }}, response: {{ status: 301, headers: [{{ name: Location, value: \"/open?x=1\" }}, {{ name: Cache-Control, value: no-store }}, {ID}] }} }}"
+        );
+        assert_eq!(
+            ran(
+                &shop(),
+                &get("http://shop.example.com/closed?x=1"),
+                None,
+                &redirect
+            ),
+            Vec::<String>::new()
+        );
+        let missing = format!(
+            "{{ answer: no_route, response: {{ status: 404, headers: [{ID}, {{ name: Content-Type, absent: true }}] }} }}"
+        );
+        assert_eq!(
+            ran(&shop(), &get("http://elsewhere.example/"), None, &missing),
+            Vec::<String>::new()
+        );
+        let wrong = "{ answer: no_route, response: { status: 500 } }";
+        assert_eq!(
+            ran(&shop(), &get("http://elsewhere.example/"), None, wrong),
+            ["response status: expected 500, got 404"]
+        );
+    }
+
+    /// A gRPC call the gateway answers itself is answered as gRPC answers: 200, with the
+    /// status gRPC gives the cause.
+    #[test]
+    fn a_grpc_call_is_answered_as_grpc_answers() {
+        let call = "{ listener: web, client: 203.0.113.7, protocol: \"2\", method: POST, url: \"http://elsewhere.example/bench.Echo/Call\", headers: [{ name: Content-Type, value: application/grpc }] }";
+        let expect = "{ answer: no_route, response: { status: 200, headers: [{ name: Content-Type, value: application/grpc }, { name: grpc-status, value: \"12\" }, { name: grpc-message, value: no route serves this method }] } }";
+        assert_eq!(ran(&shop(), call, None, expect), Vec::<String>::new());
+        let redirect = call.replace(
+            "elsewhere.example/bench.Echo/Call",
+            "shop.example.com/closed",
+        );
+        let expect = "{ route: shop, rule: 1, redirect: { status: 301, location: /open }, response: { status: 200, headers: [{ name: grpc-status, value: \"12\" }, { name: Location, absent: true }] } }";
+        assert_eq!(ran(&shop(), &redirect, None, expect), Vec::<String>::new());
+        // The same request over HTTP/1.1 is no call.
+        let plain = call.replace("\"2\"", "\"1.1\"");
+        let expect = "{ answer: no_route, response: { status: 404, headers: [{ name: grpc-status, absent: true }] } }";
+        assert_eq!(ran(&shop(), &plain, None, expect), Vec::<String>::new());
+    }
+
+    /// A listener that serves HTTP/3 says so on every answer, on the port of its address and
+    /// for as long as its config says; one that passes request IDs tells the client none.
+    #[test]
+    fn a_listener_that_serves_http3_says_so_on_every_response() {
+        let mut config: edgerush_config::Config = serde_saphyr::from_str(
+            r#"
+listeners:
+  quic: { address: "[::]:9443", protocol: https, proxy_protocol: off, tls: { certificates: [site] }, http3: { alt_svc_max_age: 60 }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
+routes: []
+upstreams: {}
+"#,
+        )
+        .unwrap();
+        let site = edgerush_config::Certificate {
+            chain: String::new(),
+            key: String::new(),
+        };
+        config.certificates.insert("site".to_owned(), site);
+        let snapshot = Snapshot::new(config).unwrap();
+        let request = "{ listener: quic, client: 203.0.113.7, protocol: \"3\", method: GET, url: \"https://a.example/\", headers: [] }";
+        let expect = r#"{ answer: no_route, response: { status: 404, headers: [{ name: Alt-Svc, value: 'h3=":9443"; ma=60' }, { name: X-Request-ID, absent: true }] } }"#;
+        assert_eq!(ran(&snapshot, request, None, expect), Vec::<String>::new());
+    }
+
+    /// A 426 that offers WebSocket says so to an HTTP/1.1 client, which alone can switch to
+    /// it, and not to an HTTP/2 one.
+    #[test]
+    fn a_426_offers_websocket_to_an_http11_client_alone() {
+        let refusal = "{ status: 426, headers: [{ name: Upgrade, value: \"h2c, websocket\" }, { name: Connection, value: upgrade }] }";
+        let offered = forward(
+            "route: shop, rule: 0",
+            BACKENDS,
+            MIRRORS,
+            ", response: { status: 426, headers: [{ name: Upgrade, value: websocket }] }",
+        );
+        assert_eq!(
+            ran(&shop(), &get(CART), Some(refusal), &offered),
+            Vec::<String>::new()
+        );
+        let over_h2 = get(CART).replace("\"1.1\"", "\"2\"");
+        let not_offered = forward(
+            "route: shop, rule: 0",
+            BACKENDS,
+            MIRRORS,
+            ", response: { status: 426, headers: [{ name: Upgrade, absent: true }] }",
+        );
+        assert_eq!(
+            ran(&shop(), &over_h2, Some(refusal), &not_offered),
+            Vec::<String>::new()
         );
     }
 }
