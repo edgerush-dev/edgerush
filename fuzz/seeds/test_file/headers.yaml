@@ -10,6 +10,7 @@ tests:
         - { name: X-Forwarded-For, value: 10.0.0.1 }
         - { name: Cookie, value: a=1 }
         - { name: Cookie, value: b=2 }
+        - { name: Via, value: "1.1 other" }
     expect:
       route: shop
       rule: 0
@@ -22,7 +23,7 @@ tests:
           - { name: X-Forwarded-For, value: 203.0.113.7 }
           - { name: Cookie, value: "a=1; b=2" }
           - { name: X-Debug, absent: true }
-          - { name: Via, values: ["2 edgerush", "1.1 other"] }
+          - { name: Via, values: ["1.1 other", "2 edgerush"] }
   - name: a passing listener keeps a request's own ID
     request: { listener: passing, client: "2001:db8::1", protocol: "1.0", method: POST, url: "http://x.example.net/", headers: [{ name: X-Request-ID, value: abc }] }
     expect:

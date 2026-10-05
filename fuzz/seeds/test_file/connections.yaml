@@ -1,0 +1,19 @@
+tests:
+  - name: the database, by its listener
+    request: { listener: db }
+    expect: { route: postgres, forward: { backends: [{ upstream: fallback, weight: 1 }] } }
+  - name: the api, by its name
+    request: { listener: sni, sni: { name: api.example.com } }
+    expect: { route: tls-api, forward: { backends: [{ upstream: api, weight: 3 }, { upstream: cart, weight: 1 }] } }
+  - name: a name no route covers
+    request: { listener: sni, sni: { name: elsewhere.test } }
+    expect: { refused: no_route }
+  - name: no name at all
+    request: { listener: sni, sni: none }
+    expect: { refused: no_route }
+  - name: a route with nowhere to send
+    request: { listener: sni, sni: { name: a.example.org } }
+    expect: { route: tls-kept, refused: no_backend }
+  - name: kept from a host a more specific route claims
+    request: { listener: sni, sni: { name: www.example.org } }
+    expect: { route: tls-org, forward: { backends: [{ upstream: api, weight: 1 }] } }

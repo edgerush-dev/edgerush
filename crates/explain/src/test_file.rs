@@ -4,7 +4,7 @@
 //! run as.
 
 use crate::asked::{self, Asked, Invalid};
-use crate::explained::{Snapshot, protocol_name};
+use crate::explained::Snapshot;
 use edgerush_config::Protocol;
 use serde::Deserialize;
 use serde_saphyr::Spanned;
@@ -56,6 +56,35 @@ pub struct Request {
     /// An extended CONNECT's `:protocol`.
     #[serde(default)]
     pub connect_protocol: Option<String>,
+    /// For a `tls` listener, the name the ClientHello asks for, or `none`.
+    #[serde(default)]
+    pub sni: Option<Sni>,
+}
+
+/// What a ClientHello asks for: `none`, or `{ name }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum Sni {
+    /// `none`: it asks for no name.
+    Word(NoName),
+    /// `{ name }`: it asks for this one.
+    Name(SniName),
+}
+
+/// The word `none`, and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoName {
+    /// No name.
+    None,
+}
+
+/// A name a ClientHello asks for.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SniName {
+    /// The name.
+    pub name: String,
 }
 
 /// A field line of a request.
@@ -87,6 +116,9 @@ pub struct Expect {
     /// The gateway answers it itself, for the reason the metrics name.
     #[serde(default)]
     pub answer: Option<String>,
+    /// A `tcp` or `tls` connection is refused, for the reason the metrics name.
+    #[serde(default)]
+    pub refused: Option<String>,
     /// What the upstream is sent, as far as it is stated.
     #[serde(default)]
     pub upstream_request: Option<UpstreamRequest>,
@@ -99,8 +131,10 @@ pub struct Expect {
 pub struct Forward {
     /// The backends, in the rule's order.
     pub backends: Vec<Backend>,
-    /// The mirrors, in the rule's order; `[]` for none.
-    pub mirrors: Vec<Mirror>,
+    /// The mirrors, in the rule's order; `[]` for none. Stated for a request, and never for
+    /// a connection, which has no mirrors.
+    #[serde(default)]
+    pub mirrors: Option<Vec<Mirror>>,
 }
 
 /// A backend and its weight.
@@ -184,6 +218,9 @@ const ANSWERS: [&str; 8] = [
     "unknown_protocol",
 ];
 
+/// The reasons a `tcp` or `tls` connection is refused for, as the metrics name them.
+const REFUSALS: [&str; 2] = ["no_route", "no_backend"];
+
 /// What is wrong with a file of tests, and where.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mistake {
@@ -212,17 +249,26 @@ pub enum Problem {
     #[error("test name '{0}' is used twice")]
     NameTwice(String),
     /// No outcome, or more than one.
-    #[error("a test expects one of forward, redirect and answer, and only one")]
+    #[error("a test expects one of forward, redirect, answer and refused, and only one")]
     Outcome,
-    /// `route` without `rule`, or the other way round.
+    /// `route` without `rule`, or the other way round, for a request.
     #[error("route and rule are stated together")]
     RouteAndRule,
     /// A forward or redirect without its route and rule.
     #[error("a forwarded or redirected request has a route and rule: state them")]
     NoRoute,
+    /// A forwarded connection without its route.
+    #[error("a forwarded connection has a route: state it")]
+    NoConnectionRoute,
+    /// A forwarded request without its mirrors.
+    #[error("a forwarded request states its mirrors: [] for none")]
+    NoMirrors,
     /// An answer the gateway never gives itself.
     #[error("'{0}' is not an answer the gateway gives: one of {list}", list = ANSWERS.join(", "))]
     Answer(String),
+    /// A refusal the gateway never gives a connection.
+    #[error("'{0}' is not a refusal the gateway gives: one of {list}", list = REFUSALS.join(", "))]
+    Refused(String),
     /// `upstream_request` beside something other than `forward`.
     #[error("upstream_request is for a forwarded request")]
     UpstreamRequest,
@@ -238,12 +284,12 @@ pub enum Problem {
     /// A listener the config does not have.
     #[error("there is no listener {0}")]
     NoListener(String),
-    /// A listener that is not `http` or `https`.
-    #[error("listener {0} is a {1} listener: test takes http and https listeners for now")]
-    NotHttp(String, &'static str),
     /// A field the listener's kind needs, missing.
-    #[error("request needs {0} for an {1} listener")]
+    #[error("request needs {0} for {1} listener")]
     Missing(&'static str, &'static str),
+    /// A field that means nothing for the listener's kind.
+    #[error("{0} does not apply to {1} listener")]
+    Unwanted(&'static str, &'static str),
     /// A request that cannot be what it says.
     #[error(transparent)]
     Invalid(#[from] Invalid),
@@ -272,10 +318,20 @@ pub struct Prepared {
     pub name: String,
     /// The listener it goes to.
     pub listener: String,
-    /// The request.
-    pub asked: Asked,
+    /// The request, or the connection.
+    pub asked: Asking,
     /// What is expected of it.
     pub expect: Expect,
+}
+
+/// What a test sends its listener.
+#[derive(Debug, Clone)]
+pub enum Asking {
+    /// A request, to an `http` or `https` listener.
+    Request(Asked),
+    /// A connection, to a `tcp` or `tls` listener, with the name its ClientHello asks for:
+    /// always `None` for `tcp`.
+    Connection(Option<String>),
 }
 
 impl TestFile {
@@ -305,6 +361,11 @@ impl TestFile {
             for problem in expectation(&test.expect) {
                 wrong(problem);
             }
+            if let Some(listener) = snapshot.listener(&test.request.listener) {
+                for problem in for_listener(&test.expect, listener.protocol) {
+                    wrong(problem);
+                }
+            }
             match asked(&test.request, snapshot) {
                 Ok(asked) => prepared.push(Prepared {
                     line,
@@ -324,26 +385,27 @@ impl TestFile {
     }
 }
 
-/// What is wrong with an expectation on its own.
+/// What is wrong with an expectation on its own, whatever its listener.
 fn expectation(expect: &Expect) -> Vec<Problem> {
     let mut problems = Vec::new();
     let outcomes = [
         expect.forward.is_some(),
         expect.redirect.is_some(),
         expect.answer.is_some(),
+        expect.refused.is_some(),
     ];
     if outcomes.iter().filter(|stated| **stated).count() != 1 {
         problems.push(Problem::Outcome);
-    }
-    if expect.route.is_some() != expect.rule.is_some() {
-        problems.push(Problem::RouteAndRule);
-    } else if (expect.forward.is_some() || expect.redirect.is_some()) && expect.route.is_none() {
-        problems.push(Problem::NoRoute);
     }
     if let Some(answer) = &expect.answer
         && !ANSWERS.contains(&answer.as_str())
     {
         problems.push(Problem::Answer(answer.clone()));
+    }
+    if let Some(refused) = &expect.refused
+        && !REFUSALS.contains(&refused.as_str())
+    {
+        problems.push(Problem::Refused(refused.clone()));
     }
     if let Some(upstream) = &expect.upstream_request {
         if expect.forward.is_none() {
@@ -363,15 +425,105 @@ fn expectation(expect: &Expect) -> Vec<Problem> {
     problems
 }
 
-/// The request a test states, made for its listener: every field the listener's kind
-/// needs, and each one what it can be.
-fn asked(request: &Request, snapshot: &Snapshot) -> Result<Asked, Problem> {
+/// A listener of `protocol`, as the problems name it.
+fn kind(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Http => "an http",
+        Protocol::Https => "an https",
+        Protocol::Tcp => "a tcp",
+        Protocol::Tls => "a tls",
+    }
+}
+
+/// What is wrong with an expectation for a listener of `protocol`: a request's has a rule
+/// beside its route and states its mirrors; a connection's has a route alone, and is
+/// forwarded or refused.
+fn for_listener(expect: &Expect, protocol: Protocol) -> Vec<Problem> {
+    let mut problems = Vec::new();
+    let kind = kind(protocol);
+    match protocol {
+        Protocol::Http | Protocol::Https => {
+            let routed = expect.forward.is_some() || expect.redirect.is_some();
+            if expect.route.is_some() != expect.rule.is_some() {
+                problems.push(Problem::RouteAndRule);
+            } else if routed && expect.route.is_none() {
+                problems.push(Problem::NoRoute);
+            }
+            if expect
+                .forward
+                .as_ref()
+                .is_some_and(|forward| forward.mirrors.is_none())
+            {
+                problems.push(Problem::NoMirrors);
+            }
+            if expect.refused.is_some() {
+                problems.push(Problem::Unwanted("refused", kind));
+            }
+        }
+        Protocol::Tcp | Protocol::Tls => {
+            let unwanted = [
+                ("rule", expect.rule.is_some()),
+                ("redirect", expect.redirect.is_some()),
+                ("answer", expect.answer.is_some()),
+                ("upstream_request", expect.upstream_request.is_some()),
+                (
+                    "mirrors",
+                    expect
+                        .forward
+                        .as_ref()
+                        .is_some_and(|forward| forward.mirrors.is_some()),
+                ),
+            ];
+            problems.extend(
+                unwanted
+                    .into_iter()
+                    .filter(|(_, stated)| *stated)
+                    .map(|(field, _)| Problem::Unwanted(field, kind)),
+            );
+            if expect.forward.is_some() && expect.route.is_none() {
+                problems.push(Problem::NoConnectionRoute);
+            }
+        }
+    }
+    problems
+}
+
+/// What a test sends its listener, made for the listener: every field the listener's kind
+/// needs, none it does not, and each one what it can be.
+fn asked(request: &Request, snapshot: &Snapshot) -> Result<Asking, Problem> {
     let listener = snapshot
         .listener(&request.listener)
         .ok_or_else(|| Problem::NoListener(request.listener.clone()))?;
-    let kind = protocol_name(listener.protocol);
-    if matches!(listener.protocol, Protocol::Tcp | Protocol::Tls) {
-        return Err(Problem::NotHttp(listener.name.clone(), kind));
+    let kind = kind(listener.protocol);
+    let http = [
+        ("client", request.client.is_some()),
+        ("protocol", request.protocol.is_some()),
+        ("method", request.method.is_some()),
+        ("url", request.url.is_some()),
+        ("headers", request.headers.is_some()),
+        ("connect_protocol", request.connect_protocol.is_some()),
+    ];
+    let unwanted = |given: &[(&'static str, bool)]| {
+        given
+            .iter()
+            .find(|(_, given)| *given)
+            .map_or(Ok(()), |(field, _)| Err(Problem::Unwanted(field, kind)))
+    };
+    match listener.protocol {
+        Protocol::Tcp => {
+            unwanted(&http)?;
+            unwanted(&[("sni", request.sni.is_some())])?;
+            return Ok(Asking::Connection(None));
+        }
+        Protocol::Tls => {
+            unwanted(&http)?;
+            return match &request.sni {
+                None => Err(Problem::Missing("sni (none for no name)", kind)),
+                Some(Sni::Word(NoName::None)) => Ok(Asking::Connection(None)),
+                Some(Sni::Name(SniName { name })) => Ok(Asking::Connection(Some(name.clone()))),
+            };
+        }
+        Protocol::Http | Protocol::Https => unwanted(&[("sni", request.sni.is_some())])?,
     }
     let needed = |given: &Option<String>, field| given.clone().ok_or(Problem::Missing(field, kind));
     let (scheme, authority, target) = asked::url(&needed(&request.url, "url")?)?;
@@ -396,7 +548,7 @@ fn asked(request: &Request, snapshot: &Snapshot) -> Result<Asked, Problem> {
     // What only the listener can say of the request: its scheme, HTTP/3, a connect
     // protocol.
     asked.head(listener)?;
-    Ok(asked)
+    Ok(Asking::Request(asked))
 }
 
 #[cfg(test)]
@@ -408,6 +560,7 @@ mod tests {
 listeners:
   web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
   db: { address: "[::]:5432", protocol: tcp, proxy_protocol: off }
+  sni: { address: "[::]:443", protocol: tls, proxy_protocol: off }
 routes:
   - name: shop
     listeners: [web]
@@ -419,6 +572,8 @@ upstreams:
   cart: { load_balancer: p2c, endpoints: [] }
 tcp_routes:
   - { name: postgres, listeners: [db], backends: [{ upstream: cart, weight: 1 }] }
+tls_routes:
+  - { name: api, listeners: [sni], hostnames: [{ name: api.example.com, falls_through: true }], backends: [{ upstream: cart, weight: 1 }] }
 "#;
 
     fn snapshot() -> Snapshot {
@@ -460,19 +615,22 @@ tcp_routes:
         assert_eq!(lines, [(2, "first"), (5, "second")]);
         let second = &prepared[1];
         assert_eq!(second.listener, "web");
-        assert_eq!(second.asked.client.to_string(), "2001:db8::1");
+        let Asking::Request(asked) = &second.asked else {
+            panic!("a request");
+        };
+        assert_eq!(asked.client.to_string(), "2001:db8::1");
         assert_eq!(
-            (second.asked.protocol, &second.asked.method),
+            (asked.protocol, &asked.method),
             (Version::HTTP_2, &Method::POST)
         );
-        assert_eq!(second.asked.target.as_str(), "/x?q=1");
-        assert_eq!(second.asked.headers.len(), 1);
+        assert_eq!(asked.target.as_str(), "/x?q=1");
+        assert_eq!(asked.headers.len(), 1);
         assert_eq!(second.expect.answer.as_deref(), Some("no_route"));
     }
 
     #[test]
     fn what_is_wrong_with_an_expectation_is_said_with_its_line() {
-        let one = "a test expects one of forward, redirect and answer, and only one";
+        let one = "a test expects one of forward, redirect, answer and refused, and only one";
         let cases = [
             ("{ route: shop, rule: 0 }", one.to_owned()),
             (
@@ -551,8 +709,8 @@ tcp_routes:
         let cases = [
             ("{ listener: nowhere }", "there is no listener nowhere"),
             (
-                "{ listener: db }",
-                "listener db is a tcp listener: test takes http and https listeners for now",
+                "{ listener: web, client: 203.0.113.7, protocol: \"1.1\", method: GET, url: \"http://a/\", headers: [], sni: none }",
+                "sni does not apply to an http listener",
             ),
             (
                 "{ listener: web, protocol: \"1.1\", method: GET, url: \"http://a/\", headers: [] }",
@@ -589,6 +747,117 @@ tcp_routes:
     }
 
     #[test]
+    fn a_connection_is_its_listener_and_for_tls_its_name_or_none() {
+        let forward = "{ route: postgres, forward: { backends: [{ upstream: cart, weight: 1 }] } }";
+        let yaml = format!(
+            "tests:\n{}{}{}",
+            test("tcp", "{ listener: db }", forward),
+            test(
+                "named",
+                "{ listener: sni, sni: { name: api.example.com } }",
+                "{ refused: no_route }"
+            ),
+            test(
+                "unnamed",
+                "{ listener: sni, sni: none }",
+                "{ refused: no_route }"
+            )
+        );
+        let prepared = read(yaml.as_bytes()).unwrap().prepare(&snapshot()).unwrap();
+        let asked: Vec<Option<String>> = prepared
+            .iter()
+            .map(|test| match &test.asked {
+                Asking::Connection(sni) => sni.clone(),
+                Asking::Request(_) => panic!("a connection"),
+            })
+            .collect();
+        assert_eq!(asked, [None, Some("api.example.com".to_owned()), None]);
+    }
+
+    #[test]
+    fn what_does_not_apply_to_a_connection_is_said() {
+        let refused = "{ refused: no_route }";
+        let cases = [
+            (
+                "{ listener: db, client: 203.0.113.7 }",
+                refused,
+                vec!["client does not apply to a tcp listener"],
+            ),
+            (
+                "{ listener: db, sni: none }",
+                refused,
+                vec!["sni does not apply to a tcp listener"],
+            ),
+            (
+                "{ listener: sni }",
+                refused,
+                vec!["request needs sni (none for no name) for a tls listener"],
+            ),
+            (
+                "{ listener: sni, sni: none, headers: [] }",
+                refused,
+                vec!["headers does not apply to a tls listener"],
+            ),
+            (
+                "{ listener: db }",
+                "{ route: postgres, rule: 0, forward: { backends: [], mirrors: [] } }",
+                vec![
+                    "rule does not apply to a tcp listener",
+                    "mirrors does not apply to a tcp listener",
+                ],
+            ),
+            (
+                "{ listener: db }",
+                "{ forward: { backends: [] } }",
+                vec!["a forwarded connection has a route: state it"],
+            ),
+            (
+                "{ listener: sni, sni: none }",
+                "{ answer: no_route }",
+                vec!["answer does not apply to a tls listener"],
+            ),
+            (
+                "{ listener: sni, sni: none }",
+                "{ refused: no_way }",
+                vec!["'no_way' is not a refusal the gateway gives: one of no_route, no_backend"],
+            ),
+        ];
+        for (request, expect, said) in cases {
+            let said: Vec<(u64, String)> =
+                said.into_iter().map(|said| (2, said.to_owned())).collect();
+            assert_eq!(
+                mistakes(&[test("a", request, expect)]),
+                said,
+                "{request} {expect}"
+            );
+        }
+        // A request is refused nothing: its listener answers.
+        assert_eq!(
+            mistakes(&[test("a", REQUEST, refused)]),
+            [(2, "refused does not apply to an http listener".to_owned())]
+        );
+        // And a request forwarded states its mirrors.
+        let no_mirrors =
+            "{ route: shop, rule: 0, forward: { backends: [{ upstream: cart, weight: 1 }] } }";
+        assert_eq!(
+            mistakes(&[test("a", REQUEST, no_mirrors)]),
+            [(
+                2,
+                "a forwarded request states its mirrors: [] for none".to_owned()
+            )]
+        );
+        // An sni that is neither none nor a name cannot be read.
+        let odd = format!(
+            "tests:\n{}",
+            test("a", "{ listener: sni, sni: off }", refused)
+        );
+        assert!(matches!(
+            read(odd.as_bytes()).unwrap_err().problem,
+            Problem::Unreadable(_)
+        ));
+    }
+
+    #[test]
     fn what_is_wrong_with_the_file_as_a_whole_is_said() {
         let file = read(b"tests: []\n").unwrap();
         assert_eq!(
@@ -621,7 +890,8 @@ tcp_routes:
             "tests: [",
             "test: []\n",
             "tests:\n  - name: a\n    request: { listener: web }\n    expect: { answer: no_route }\n    extra: 1\n",
-            "tests:\n  - name: a\n    request: { listener: web }\n    expect: { route: shop, rule: 0, forward: { backends: [] } }\n",
+            // A forward's backends are stated, whatever its listener.
+            "tests:\n  - name: a\n    request: { listener: web }\n    expect: { route: shop, rule: 0, forward: { mirrors: [] } }\n",
         ] {
             let mistake = read(yaml.as_bytes()).unwrap_err();
             assert_eq!(mistake.line, 0);

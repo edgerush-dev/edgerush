@@ -1,10 +1,11 @@
-//! Running a test ([22 §3](../../../docs/22-explain-and-test.md)): its request explained, and
-//! what came of it held to what the test expects. Each difference is a line, expected
-//! beside got; a test with none passed.
+//! Running a test ([22 §3](../../../docs/22-explain-and-test.md)): its request or connection
+//! explained, and what came of it held to what the test expects. Each difference is a line,
+//! expected beside got; a test with none passed.
 
+use crate::asked::Asked;
 use crate::explained::{Snapshot, Unexplained};
-use crate::test_file::{Backend, Fraction, HeaderExpected, Mirror, Prepared};
-use edgerush_config::{Filter, Rule};
+use crate::test_file::{Asking, Backend, Expect, Fraction, HeaderExpected, Mirror, Prepared};
+use edgerush_config::{CompiledListener, Filter, Rule};
 use edgerush_proxy::Decision;
 use http::header::HeaderMap;
 
@@ -35,17 +36,44 @@ pub fn run(snapshot: &Snapshot, test: &Prepared) -> Result<Ran, Unexplained> {
     let listener = snapshot
         .listener(&test.listener)
         .ok_or_else(|| Unexplained::NoListener(test.listener.clone()))?;
-    let explained = snapshot.explain(listener, &test.asked)?;
-    let expect = &test.expect;
-    let mut differences = Vec::new();
-    let mut differ = |what: &str, expected: String, got: String| {
+    match &test.asked {
+        Asking::Request(asked) => request(snapshot, listener, asked, &test.expect),
+        Asking::Connection(sni) => connection(snapshot, listener, sni.as_deref(), &test.expect),
+    }
+}
+
+/// What differs, a line each.
+#[derive(Default)]
+struct Differences(Vec<String>);
+
+impl Differences {
+    fn differ(&mut self, what: &str, expected: String, got: String) {
         if expected != got {
-            differences.push(format!("{what}: expected {expected}, got {got}"));
+            self.0
+                .push(format!("{what}: expected {expected}, got {got}"));
         }
+    }
+}
+
+/// What was said, or `none`.
+fn or_none(said: Option<String>) -> String {
+    said.unwrap_or_else(|| "none".to_owned())
+}
+
+/// Runs a request's test.
+fn request(
+    snapshot: &Snapshot,
+    listener: &CompiledListener,
+    asked: &Asked,
+    expect: &Expect,
+) -> Result<Ran, Unexplained> {
+    let explained = snapshot.explain(listener, asked)?;
+    let mut differences = Differences::default();
+    let mut differ = |what: &str, expected: String, got: String| {
+        differences.differ(what, expected, got);
     };
 
     let routed = explained.routed();
-    let or_none = |said: Option<String>| said.unwrap_or_else(|| "none".to_owned());
     differ(
         "route",
         or_none(expect.route.clone()),
@@ -68,7 +96,7 @@ pub fn run(snapshot: &Snapshot, test: &Prepared) -> Result<Ran, Unexplained> {
             );
             differ(
                 "mirrors",
-                mirrors(&forward.mirrors),
+                mirrors(forward.mirrors.as_deref().unwrap_or_default()),
                 mirrors(&rule.map_or_else(Vec::new, rule_mirrors)),
             );
             if let Some(upstream) = &expect.upstream_request {
@@ -119,8 +147,57 @@ pub fn run(snapshot: &Snapshot, test: &Prepared) -> Result<Ran, Unexplained> {
     }
 
     Ok(Ran {
-        differences,
+        differences: differences.0,
         explanation: explained.text(),
+    })
+}
+
+/// Runs a connection's test: its route, and its backends or why it is refused.
+fn connection(
+    snapshot: &Snapshot,
+    listener: &CompiledListener,
+    sni: Option<&str>,
+    expect: &Expect,
+) -> Result<Ran, Unexplained> {
+    let connected = snapshot.explain_connection(listener, sni)?;
+    let mut differences = Differences::default();
+    differences.differ(
+        "route",
+        or_none(expect.route.clone()),
+        or_none(connected.route().map(str::to_owned)),
+    );
+    let got_backends: Vec<Backend> = connected
+        .backends()
+        .iter()
+        .map(|backend| Backend {
+            upstream: backend.upstream.clone(),
+            weight: backend.weight,
+        })
+        .collect();
+    match (&expect.forward, &expect.refused, connected.refused()) {
+        (Some(forward), _, None) => {
+            differences.differ(
+                "backends",
+                backends(&forward.backends),
+                backends(&got_backends),
+            );
+        }
+        (_, Some(refused), Some(got)) => {
+            differences.differ("refused", refused.clone(), got.to_owned());
+        }
+        (_, refused, got) => {
+            let said = |refused: Option<&str>| {
+                refused.map_or_else(
+                    || "forward".to_owned(),
+                    |reason| format!("refused {reason}"),
+                )
+            };
+            differences.differ("outcome", said(refused.as_deref()), said(got));
+        }
+    }
+    Ok(Ran {
+        differences: differences.0,
+        explanation: connected.text(),
     })
 }
 
@@ -261,6 +338,76 @@ upstreams:
 
     fn forward(route: &str, backends: &str, mirrors: &str, upstream: &str) -> String {
         format!("{{ {route}, forward: {{ {backends}, {mirrors} }}{upstream} }}")
+    }
+
+    const CONNECTIONS: &str = r#"
+listeners:
+  db: { address: "[::]:5432", protocol: tcp, proxy_protocol: off }
+  sni: { address: "[::]:443", protocol: tls, proxy_protocol: off }
+routes: []
+tcp_routes:
+  - { name: postgres, listeners: [db], backends: [{ upstream: pg, weight: 1 }] }
+tls_routes:
+  - { name: api, listeners: [sni], hostnames: [{ name: api.example.com, falls_through: true }], backends: [{ upstream: api, weight: 3 }, { upstream: canary, weight: 1 }] }
+  - { name: idle, listeners: [sni], hostnames: [{ name: idle.example.com, falls_through: true }], backends: [{ upstream: api, weight: 0 }] }
+upstreams:
+  api: { load_balancer: p2c, endpoints: [] }
+  canary: { load_balancer: p2c, endpoints: [] }
+  pg: { load_balancer: p2c, endpoints: [] }
+"#;
+
+    /// Runs one test of a connection; what differed.
+    fn connection_differences(request: &str, expect: &str) -> Vec<String> {
+        let snapshot = Snapshot::new(serde_saphyr::from_str(CONNECTIONS).unwrap()).unwrap();
+        let yaml = format!("tests:\n  - name: a\n    request: {request}\n    expect: {expect}\n");
+        let tests = test_file::read(yaml.as_bytes())
+            .unwrap()
+            .prepare(&snapshot)
+            .unwrap();
+        let ran = run(&snapshot, &tests[0]).unwrap();
+        assert!(ran.explanation.contains(" (t"), "{}", ran.explanation);
+        ran.differences
+    }
+
+    #[test]
+    fn a_connections_test_holds_its_route_backends_and_refusal() {
+        let tcp = "{ listener: db }";
+        let api = "{ listener: sni, sni: { name: api.example.com } }";
+        let idle = "{ listener: sni, sni: { name: idle.example.com } }";
+        let none = "{ listener: sni, sni: none }";
+        let pg = "{ route: postgres, forward: { backends: [{ upstream: pg, weight: 1 }] } }";
+        let api_backends = "{ route: api, forward: { backends: [{ upstream: api, weight: 3 }, { upstream: canary, weight: 1 }] } }";
+        assert!(connection_differences(tcp, pg).is_empty());
+        assert!(connection_differences(api, api_backends).is_empty());
+        assert!(connection_differences(none, "{ refused: no_route }").is_empty());
+        assert!(connection_differences(idle, "{ route: idle, refused: no_backend }").is_empty());
+
+        assert_eq!(
+            connection_differences(
+                api,
+                "{ route: api, forward: { backends: [{ upstream: api, weight: 1 }] } }"
+            ),
+            ["backends: expected api (weight 1), got api (weight 3), canary (weight 1)"]
+        );
+        assert_eq!(
+            connection_differences(idle, "{ refused: no_backend }"),
+            ["route: expected none, got idle"]
+        );
+        assert_eq!(
+            connection_differences(idle, "{ route: idle, refused: no_route }"),
+            ["refused: expected no_route, got no_backend"]
+        );
+        assert_eq!(
+            connection_differences(none, pg),
+            [
+                "route: expected postgres, got none",
+                "outcome: expected forward, got refused no_route"
+            ]
+        );
+        assert_eq!(
+            connection_differences(api, "{ route: api, refused: no_backend }"),
+            ["outcome: expected refused no_backend, got forward"]
+        );
     }
 
     #[test]

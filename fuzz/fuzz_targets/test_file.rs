@@ -18,12 +18,15 @@ use std::sync::OnceLock;
 /// What the tests run against: hosts exact, wildcard and every one, one that does not fall
 /// through; paths exact, regex and prefix; predicates on method, header and query; a
 /// redirect, a rewrite, a mirror, a rule with nowhere to send; listeners that generate
-/// request IDs and that pass them, over HTTP/1.1 and 2, and a tcp listener.
+/// request IDs and that pass them, over HTTP/1.1 and 2; a tcp listener, and a tls one with
+/// routes by exact name, by wildcard, one that does not fall through and one with nowhere to
+/// send.
 const CONFIG: &str = r#"
 listeners:
   web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }, request_id: generate }
   passing: { address: "[::]:8081", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
   db: { address: "[::]:5432", protocol: tcp, proxy_protocol: off }
+  sni: { address: "[::]:443", protocol: tls, proxy_protocol: off }
 routes:
   - name: shop
     listeners: [web]
@@ -82,6 +85,11 @@ upstreams:
   shadow: { load_balancer: p2c, endpoints: [] }
 tcp_routes:
   - { name: postgres, listeners: [db], backends: [{ upstream: fallback, weight: 1 }] }
+tls_routes:
+  - { name: tls-rest, listeners: [sni], hostnames: [{ name: "*.example.com", wildcard: any_labels, falls_through: true }], backends: [{ upstream: api, weight: 1 }] }
+  - { name: tls-api, listeners: [sni], hostnames: [{ name: api.example.com, falls_through: true }], backends: [{ upstream: api, weight: 3 }, { upstream: cart, weight: 1 }] }
+  - { name: tls-kept, listeners: [sni], hostnames: [{ name: "*.example.org", wildcard: one_label, falls_through: false }], backends: [{ upstream: api, weight: 0 }] }
+  - { name: tls-org, listeners: [sni], hostnames: [{ name: www.example.org, falls_through: true }], backends: [{ upstream: api, weight: 1 }] }
 "#;
 
 /// The config, compiled once.
@@ -111,10 +119,7 @@ fuzz_target!(|data: &[u8]| {
         Ok(tests) => {
             for test in &tests {
                 let ran = runner::run(snapshot(), test).expect("a valid test runs");
-                assert!(
-                    ran.explanation
-                        .starts_with(&format!("{} (http)  ", test.listener))
-                );
+                assert!(ran.explanation.starts_with(&format!("{} (", test.listener)));
                 assert_eq!(ran.passed(), ran.differences.is_empty());
                 for difference in &ran.differences {
                     assert!(difference.contains(": expected "));
