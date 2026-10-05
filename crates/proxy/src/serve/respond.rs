@@ -22,6 +22,7 @@ use crate::routed::Through;
 use crate::timers::{Alarm, Timers};
 use crate::upstream::balancing::Balancing;
 use crate::upstream::h1::codec::Sending;
+use crate::way_back;
 use crate::websocket::{self, Key};
 use arc_swap::Guard;
 use edgerush_config::{RequestId, UpstreamProtocol};
@@ -104,10 +105,7 @@ impl Worker {
                 &logging,
             )
             .await;
-        self.proxy.advertise(listener, &mut answered);
-        if let Some(id) = id {
-            tell_id(&mut answered, id);
-        }
+        self.proxy.say_last(listener, &mut answered, id);
         if let Some(counters) = self.proxy.metrics.listener(listener) {
             let took = u64::try_from(came_in.elapsed().as_nanos()).unwrap_or(u64::MAX);
             counters.responded(answered.status(), took);
@@ -321,23 +319,20 @@ impl Worker {
 }
 
 impl Proxy {
-    /// Says on `answered` that the listener serves HTTP/3 as well, if it does. Every answer
-    /// carries it, HTTP/3's own too, which keeps what a client remembers fresh.
+    /// Says on `answered` what every answer says last (22 §5): that the listener serves
+    /// HTTP/3 as well, if it does — every answer carries it, HTTP/3's own too, which keeps
+    /// what a client remembers fresh — and the request's ID, `id`, if the listener gives one.
     ///
-    /// Read from the config in force when the answer goes, not the one the request was
-    /// directed by: it says what the listener offers now, so a reload that stops HTTP/3
-    /// stops it being advertised at once, on the answers of requests under way too (03 §4).
-    fn advertise(&self, listener: usize, answered: &mut Answered<Body>) {
+    /// Whether it serves HTTP/3 is read from the config in force when the answer goes, not
+    /// the one the request was directed by: it says what the listener offers now, so a
+    /// reload that stops HTTP/3 stops it being advertised at once, on the answers of
+    /// requests under way too (03 §4).
+    fn say_last(&self, listener: usize, answered: &mut Answered<Body>, id: Option<HeaderValue>) {
         let snapshot = self.current.load();
-        let Some(alt_svc) = snapshot.alt_svc.get(listener).and_then(Option::as_ref) else {
-            return;
-        };
+        let alt_svc = snapshot.alt_svc.get(listener).and_then(Option::as_ref);
         match answered {
-            // An overlay holds as many fields as a rule adds and more; this is one.
-            Answered::Raw(answer, _) => {
-                let _added = answer.apply(alt_svc);
-            }
-            Answered::Map(response) => alt_svc.apply(response.headers_mut()),
+            Answered::Raw(answer, _) => way_back::every_answer(answer, alt_svc, id),
+            Answered::Map(response) => way_back::every_answer(response, alt_svc, id),
         }
     }
 
@@ -403,17 +398,13 @@ impl Proxy {
             return self.answer_to(listener, Answer::Redirected, call);
         }
         let mut response = self.answer(listener, Answer::Redirected);
-        *response.status_mut() = redirect.status;
-        response
-            .headers_mut()
-            .insert(http::header::LOCATION, redirect.location);
-        if let Some(changes) = redirect
+        let changes = redirect
             .rule
             .as_ref()
-            .and_then(|rule| rule.response_headers.as_ref())
-        {
-            changes.apply(response.headers_mut());
-        }
+            .and_then(|rule| rule.response_headers.as_ref());
+        // A map takes every field it is given: nothing here fails.
+        let _made =
+            way_back::redirect_answer(&mut response, redirect.status, redirect.location, changes);
         response
     }
 
@@ -675,17 +666,4 @@ fn unix_millis() -> u64 {
         .map_or(0, |since| {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         })
-}
-
-/// Tells the client the request's ID on `answered`, in place of any the upstream gave.
-fn tell_id<B>(answered: &mut Answered<B>, id: HeaderValue) {
-    match answered {
-        // An overlay holds as many fields as a rule adds and more; this is one.
-        Answered::Raw(answer, _) => {
-            let _set = answer.set_field(request_id::HEADER, id);
-        }
-        Answered::Map(response) => {
-            response.headers_mut().insert(request_id::HEADER, id);
-        }
-    }
 }

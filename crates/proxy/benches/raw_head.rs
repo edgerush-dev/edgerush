@@ -19,18 +19,18 @@
 
 use bytes::Bytes;
 use edgerush_config::{Compiled, Config, compile};
-use edgerush_filters::{HeaderModifier, request_id};
+use edgerush_filters::HeaderModifier;
 use edgerush_proxy::fields::FieldLines;
 use edgerush_proxy::head::Head;
-use edgerush_proxy::hop_by_hop::{nominated, strip_response};
 use edgerush_proxy::raw::{RawAnswer, RawHead};
 use edgerush_proxy::upstream::auth::challenges;
 use edgerush_proxy::upstream::h1::H1Limits;
-use edgerush_proxy::upstream::h1::codec::{Sending, filter_declaration, head_len, write_head};
+use edgerush_proxy::upstream::h1::codec::{Sending, head_len, write_head};
+use edgerush_proxy::way_back::{Way, every_answer, upstream_answer};
 use edgerush_proxy::{Client, decide};
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::request::Parts;
-use http::{Method, Request, StatusCode, Uri};
+use http::{Method, Request, Response, StatusCode, Uri};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
 
@@ -375,6 +375,15 @@ fn answer(more: &[(&'static str, &'static str)]) -> Bytes {
     Bytes::from(sent)
 }
 
+/// What an answer to an HTTP/1.1 client's request, not a WebSocket's, is edited by.
+fn way(changes: Option<&HeaderModifier>) -> Way<'_> {
+    Way {
+        changes,
+        upgradable: true,
+        websocket: None,
+    }
+}
+
 /// A rule's response header changes.
 fn response_changes() -> Option<HeaderModifier> {
     Some(
@@ -388,8 +397,9 @@ fn response_changes() -> Option<HeaderModifier> {
 }
 
 // Both from the same bytes to the answer the client is to be sent, as the way back puts it
-// through: the parser's reading, its fields taken down, the `Trailer` declaration, the
-// challenge check, the hop-by-hop fields taken off and the rule's changes.
+// through: the parser's reading, its fields taken down and the challenge check, then what
+// every path does to an upstream's answer (the `Trailer` declaration, the hop-by-hop fields
+// taken off, the rule's changes) and what every answer says last, for an HTTP/1.1 client.
 #[library_benchmark]
 #[bench::usual(answer(&[]), None)]
 #[bench::keep_alive(answer(&[("connection", "keep-alive"), ("keep-alive", "timeout=5")]), None)]
@@ -408,16 +418,11 @@ fn answer_raw(
     let answer = match (parsed, status, lines) {
         (Ok(httparse::Status::Complete(_)), Some(status), Some(lines)) => {
             let mut raw = RawAnswer::new(status, sent.clone(), lines);
-            let nominated = nominated(&raw);
-            let declared = raw.filter_declaration(&nominated).is_ok();
             let _challenged = black_box(challenges(status, &raw));
-            raw.strip();
-            let applied = changes
-                .as_ref()
-                .is_none_or(|changes| raw.apply(changes).is_ok());
+            let edited = upstream_answer(&mut raw, &way(changes.as_ref())).is_ok();
             // The request's ID, told the client as a generating listener does.
-            let told = raw.set_field(request_id::HEADER, ID).is_ok();
-            (declared && applied && told).then_some(raw)
+            every_answer(&mut raw, None, Some(ID));
+            edited.then_some(raw)
         }
         _ => None,
     };
@@ -431,7 +436,7 @@ fn answer_raw(
 fn answer_map(
     sent: Bytes,
     changes: Option<HeaderModifier>,
-) -> (Option<HeaderModifier>, Option<HeaderMap>) {
+) -> (Option<HeaderModifier>, Option<Response<()>>) {
     let mut room = [httparse::EMPTY_HEADER; 32];
     let mut response = httparse::Response::new(&mut room);
     let parsed = response.parse(black_box(&sent));
@@ -450,16 +455,14 @@ fn answer_map(
                     headers.append(name, value);
                 }
             }
-            let nominated = nominated(&headers);
-            filter_declaration(&mut headers, &nominated);
             let _challenged = black_box(challenges(status, &headers));
-            strip_response(&mut headers);
-            if let Some(changes) = &changes {
-                changes.apply(&mut headers);
-            }
+            let mut answer = Response::new(());
+            *answer.status_mut() = status;
+            *answer.headers_mut() = headers;
+            let edited = upstream_answer(&mut answer, &way(changes.as_ref())).is_ok();
             // The request's ID, told the client as a generating listener does.
-            headers.insert(request_id::HEADER, ID);
-            Some(headers)
+            every_answer(&mut answer, None, Some(ID));
+            edited.then_some(answer)
         }
         _ => None,
     };

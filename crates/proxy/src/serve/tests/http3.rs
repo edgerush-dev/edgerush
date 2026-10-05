@@ -197,13 +197,19 @@ async fn an_upstream_103_reaches_an_http3_client_before_its_answer() {
 
 /// An HTTPS listener that serves HTTP/3 says so on its TCP answers, with the port its
 /// config gives and for as long as it says (RFC 7838); one that does not, says nothing.
+/// The gateway's own answers say so too: here a 502 for an upstream that refuses.
 #[tokio::test]
 async fn an_http3_listener_says_so_on_its_tcp_answers() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (upstream, _) = counting_upstream().await;
-            for http3 in [true, false] {
+            let (answering, _) = counting_upstream().await;
+            let (_held, refusing) = super::upstreams::refusing();
+            for (upstream, status, http3) in [
+                (answering, "200 ok", true),
+                (answering, "200 ok", false),
+                (refusing, "502 bad gateway", true),
+            ] {
                 let mut config = everything_config(upstream);
                 let web = config.listeners.get_mut("web").unwrap();
                 // What Alt-Svc names: the port the config gives, whatever socket the
@@ -225,7 +231,10 @@ async fn an_http3_listener_says_so_on_its_tcp_answers() {
                 let _serving = serving(&worker, socket);
                 let stream = tls_client(front, "a.test", None, |_| {}).await.unwrap();
                 let answer = h1_over_or_nothing(stream).await.to_ascii_lowercase();
-                assert!(answer.starts_with("http/1.1 200 ok\r\n"), "{answer}");
+                assert!(
+                    answer.starts_with(&format!("http/1.1 {status}\r\n")),
+                    "{answer}"
+                );
                 assert_eq!(
                     answer.contains("\r\nalt-svc: h3=\":8443\"; ma=60\r\n"),
                     http3,

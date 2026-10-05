@@ -16,6 +16,7 @@ use crate::host::HostError;
 use crate::request::Rejection;
 use crate::upstream::h1::blocks::Blocks;
 use crate::upstream::h1::codec::{HeldField, OutgoingFields};
+use crate::way_back::AnswerHead;
 use bytes::Bytes;
 use edgerush_filters::{Edit, HeaderModifier};
 use edgerush_router::Fields;
@@ -432,53 +433,6 @@ impl RawAnswer {
         self.overlay.pieces(&self.lines, skip)
     }
 
-    /// Takes the names its own `Connection` gave, and those that may never follow, out of
-    /// its `Trailer` declaration.
-    ///
-    /// # Errors
-    ///
-    /// [`OverlayFull`] if the declaration that is left cannot be added.
-    pub fn filter_declaration(&mut self, nominated: &[HeaderName]) -> Result<(), OverlayFull> {
-        filter_declaration(self.lines.view(&self.head), &mut self.overlay, nominated)
-    }
-
-    /// Takes off the fields that are about the upstream's connection and not the client's.
-    pub fn strip(&mut self) {
-        let view = self.lines.view(&self.head);
-        // Most answers say nothing about their connection, and one pass over their names is
-        // all they pay, as a map's does: looking each of the names up costs several times as
-        // much. Without one of them there is no `Connection` to name any other field either.
-        // A request's core has surveyed its head for these already.
-        if self
-            .overlay
-            .edited(view)
-            .iter()
-            .any(|(name, _)| is_hop_by_hop_name(name))
-        {
-            strip(view, &mut self.overlay);
-        }
-    }
-
-    /// Makes a rule's changes to the answer.
-    ///
-    /// # Errors
-    ///
-    /// [`OverlayFull`] if more fields are added than an overlay holds, which no config the
-    /// gateway takes comes to.
-    pub fn apply(&mut self, changes: &HeaderModifier) -> Result<(), OverlayFull> {
-        apply(self.lines.view(&self.head), &mut self.overlay, changes)
-    }
-
-    /// Gives `name` the one value `value`, in place of every one it had.
-    ///
-    /// # Errors
-    ///
-    /// [`OverlayFull`] if the field cannot be added.
-    pub fn set_field(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), OverlayFull> {
-        let view = self.lines.view(&self.head);
-        self.overlay.set(&view, name, value)
-    }
-
     /// The answer as `http`'s parts, in this hop's version, for a server that takes those:
     /// HTTP/2's. What was added goes over as it was added, its flags kept (a request's ID
     /// never indexed) and not checked again.
@@ -508,6 +462,57 @@ impl RawAnswer {
 impl Fields for RawAnswer {
     fn values(&self, name: &HeaderName) -> impl Iterator<Item = &[u8]> {
         self.fields().values_of(name)
+    }
+}
+
+/// Every edit goes to the overlay, which holds only so many fields.
+impl AnswerHead for RawAnswer {
+    type Fields = Self;
+
+    fn as_fields(&self) -> &Self {
+        self
+    }
+
+    fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    fn set_status(&mut self, status: StatusCode) {
+        self.status = status;
+    }
+
+    fn filter_declaration(&mut self, nominated: &[HeaderName]) -> Result<(), OverlayFull> {
+        filter_declaration(self.lines.view(&self.head), &mut self.overlay, nominated)
+    }
+
+    fn strip(&mut self) {
+        let view = self.lines.view(&self.head);
+        // Most answers say nothing about their connection, and one pass over their names is
+        // all they pay, as a map's does: looking each of the names up costs several times as
+        // much. Without one of them there is no `Connection` to name any other field either.
+        // A request's core has surveyed its head for these already.
+        if self
+            .overlay
+            .edited(view)
+            .iter()
+            .any(|(name, _)| is_hop_by_hop_name(name))
+        {
+            strip(view, &mut self.overlay);
+        }
+    }
+
+    fn apply(&mut self, changes: &HeaderModifier) -> Result<(), OverlayFull> {
+        apply(self.lines.view(&self.head), &mut self.overlay, changes)
+    }
+
+    fn set_field(&mut self, name: HeaderName, value: HeaderValue) -> Result<(), OverlayFull> {
+        let view = self.lines.view(&self.head);
+        self.overlay.set(&view, name, value)
+    }
+
+    fn remove_field(&mut self, name: &HeaderName) {
+        let view = self.lines.view(&self.head);
+        self.overlay.remove(&view, name);
     }
 }
 

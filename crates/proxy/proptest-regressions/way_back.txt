@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a857db6317a215119c86e393cbe1cfe77976a76630a9ce91984a843d89cafe44 # shrinks to status = "200 OK", fields = [], set = [], add = [], remove = [], upgradable = false, websocket = Some((true, true))

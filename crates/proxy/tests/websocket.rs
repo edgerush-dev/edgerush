@@ -978,6 +978,15 @@ fn h2_backend(
     announces: bool,
     saw: mpsc::UnboundedSender<Asked>,
 ) -> (SocketAddr, Arc<AtomicUsize>) {
+    h2_backend_answering(announces, 426, saw)
+}
+
+/// The same, answering anything but a CONNECT for `websocket` with `status`.
+fn h2_backend_answering(
+    announces: bool,
+    status: u16,
+    saw: mpsc::UnboundedSender<Asked>,
+) -> (SocketAddr, Arc<AtomicUsize>) {
     backend(move |wire| {
         let saw = saw.clone();
         async move {
@@ -1003,7 +1012,7 @@ fn h2_backend(
                     && asked.protocol.as_deref() == Some("websocket");
                 let _told = saw.send(asked);
                 if !websocket {
-                    let refusal = http::Response::builder().status(426).body(()).unwrap();
+                    let refusal = http::Response::builder().status(status).body(()).unwrap();
                     if let Ok(mut sending) = respond.send_response(refusal, false) {
                         let _sent = sending.send_data(Bytes::from_static(b"no"), true);
                     }
@@ -1131,6 +1140,31 @@ async fn an_http2_backend_that_does_not_announce_it_is_sent_a_plain_request() {
     let (response, _stream) = send.send_request(connect_for("websocket"), false).unwrap();
     let response = within(response).await.unwrap();
     assert_eq!(response.status(), 426);
+    let asked = within(seen.recv()).await.unwrap();
+    assert_eq!(asked.method, http::Method::GET);
+}
+
+/// A 2xx to that plain GET is no switch: an HTTP/1.1 client is told it as it came, not a
+/// 101, and an HTTP/2 client, which a CONNECT's 2xx would tell of the switch, is told 502.
+#[tokio::test]
+async fn a_2xx_to_the_plain_request_is_no_switch() {
+    let (saw, mut seen) = mpsc::unbounded_channel();
+    let (h2, _) = h2_backend_answering(false, 200, saw);
+    let (unused, _) = backend(|_| async {});
+    let (address, _) = gateway(unused, FORWARD_H2, &h2_upstream(h2));
+    let mut client = Wire::to(address).await;
+    client.write(&handshake()).await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(field(&head, "upgrade"), None, "{head}");
+    assert_eq!(field(&head, "sec-websocket-accept"), None, "{head}");
+    let asked = within(seen.recv()).await.unwrap();
+    assert_eq!(asked.method, http::Method::GET);
+
+    let (mut send, _) = h2_client(address).await;
+    let (response, _stream) = send.send_request(connect_for("websocket"), false).unwrap();
+    let response = within(response).await.unwrap();
+    assert_eq!(response.status(), 502);
     let asked = within(seen.recv()).await.unwrap();
     assert_eq!(asked.method, http::Method::GET);
 }

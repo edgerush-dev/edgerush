@@ -23,7 +23,7 @@ use crate::upstream::h1::pool::Lease;
 use crate::upstream::h2::client::PlaceError;
 use crate::upstream::h2::exchange::{self as h2_exchange, Bounds as H2Bounds, Connected};
 use crate::upstream::secure::Socket as UpstreamSocket;
-use crate::websocket;
+use crate::{way_back, websocket};
 use bytes::Bytes;
 use edgerush_config::UpstreamProtocol;
 use http::{HeaderName, Method, Response, StatusCode, Uri};
@@ -239,52 +239,18 @@ impl Worker {
         if let Some(upstream) = upstream {
             upstream.responded(answer.status());
         }
-        // A name the answer's own `Connection` gave does not travel on, and is not declared
-        // onwards either; then what is about the upstream's connection comes off, and the
-        // rule's changes are made (14 §6).
-        let nominated = crate::hop_by_hop::nominated(&answer);
-        let changes = directed
-            .rule
-            .as_ref()
-            .and_then(|rule| rule.response_headers.as_ref());
-        // Read before the hop-by-hop fields come off: RFC 9110 §15.5.22 has a 426 name the
-        // protocol it wants, and WebSocket is one the gateway can switch to (19 §2).
-        let offers = answer.status() == StatusCode::UPGRADE_REQUIRED
-            && directed.upgradable
-            && websocket::offered(&answer);
-        let edited = answer.filter_declaration(&nominated).and_then(|()| {
-            answer.strip();
-            changes.map_or(Ok(()), |changes| answer.apply(changes))
-        });
-        // A 101 says it switched to WebSocket, with the Accept of the client's own key; the
-        // backend's was of the gateway's.
-        let handshake = directed.websocket.as_deref();
-        let upgraded = match handshake.and_then(|handshake| handshake.client.as_ref()) {
-            Some(client) if answer.status() == StatusCode::SWITCHING_PROTOCOLS => answer
-                .set_field(http::header::UPGRADE, websocket::WEBSOCKET)
-                .and_then(|()| {
-                    answer.set_field(http::header::SEC_WEBSOCKET_ACCEPT, client.accept_value())
-                }),
-            _ if offers => answer.set_field(http::header::UPGRADE, websocket::WEBSOCKET),
-            _ => Ok(()),
-        };
-        if edited.is_err() || upgraded.is_err() {
-            return Err(Answer::Edits);
-        }
-        // An extended CONNECT's client is told of the switch with a 200 (RFC 8441 §5), and
-        // must never be told 2xx of anything else: to a CONNECT that opens the tunnel.
-        if handshake.is_some_and(|handshake| handshake.client.is_none()) {
-            return connected_answer(answer.status(), answer.into_parts(), body);
-        }
+        way_back::upstream_answer(&mut answer, &directed.way(false))?;
         // Written in this hop's version and not the upstream's: "Intermediaries that
         // process HTTP messages ... MUST send their own HTTP-version in forwarded messages"
         // (RFC 9110 §6.2). Our writer says HTTP/1.1, and so does a map made for HTTP/2.
         Ok(Answered::Raw(answer, body))
     }
 
-    /// The answer of an HTTP/2 upstream, edited as an HTTP/1 upstream's would be: what its
-    /// `Connection` named and what is about its connection comes off — h2 lets none of
-    /// the latter through, and this does not rest on it — and the rule's changes are made.
+    /// The answer of an HTTP/2 upstream, edited as an HTTP/1 upstream's is: what is about its
+    /// connection comes off — h2 lets none of it through, and this does not rest on it — and
+    /// the rule's changes are made. A WebSocket handshake comes here when the upstream's
+    /// connection does not take extended CONNECT, sent as the plain GET it came as, and its
+    /// answer is told to its client as one that did not switch (19 §4).
     #[expect(
         clippy::too_many_arguments,
         reason = "each is a different thing the exchange needs, as for `through_h1`"
@@ -340,17 +306,7 @@ impl Worker {
             upstream: directed.upstream.slot(),
         };
         let mut response = Response::from_parts(parts, Body::H2(Box::new(answer), admitted, watch));
-        let headers = response.headers_mut();
-        let nominated = crate::hop_by_hop::nominated(&*headers);
-        crate::h1::filter_declaration(headers, &nominated);
-        crate::hop_by_hop::strip_response(headers);
-        if let Some(changes) = directed
-            .rule
-            .as_ref()
-            .and_then(|rule| rule.response_headers.as_ref())
-        {
-            changes.apply(headers);
-        }
+        way_back::upstream_answer(&mut response, &directed.way(false))?;
         Ok(Answered::Map(response))
     }
 
@@ -549,9 +505,9 @@ impl Worker {
             }
             return Err(lapsed);
         };
-        let (mut parts, body) = match connected.map_err(|error| h2_failed(error, upstream))? {
+        let (parts, body) = match connected.map_err(|error| h2_failed(error, upstream))? {
             Connected::NotOffered => {
-                let answered = self
+                return self
                     .respond_by_h2(
                         directed,
                         endpoint,
@@ -563,14 +519,7 @@ impl Worker {
                         interim,
                         timing,
                     )
-                    .await?;
-                return match (&handshake.client, answered) {
-                    (None, Answered::Map(response)) => {
-                        let (parts, body) = response.into_parts();
-                        connected_answer(parts.status, parts, body)
-                    }
-                    (_, answered) => Ok(answered),
-                };
+                    .await;
             }
             Connected::Switched(parts, stream) => {
                 let Some(interim) = &handshake.server else {
@@ -594,31 +543,9 @@ impl Worker {
         if let Some(upstream) = upstream {
             upstream.responded(parts.status);
         }
-        let switched = parts.status.is_success();
-        let headers = &mut parts.headers;
-        let nominated = crate::hop_by_hop::nominated(&*headers);
-        crate::h1::filter_declaration(headers, &nominated);
-        crate::hop_by_hop::strip_response(headers);
-        if let Some(changes) = directed
-            .rule
-            .as_ref()
-            .and_then(|rule| rule.response_headers.as_ref())
-        {
-            changes.apply(headers);
-        }
-        // To an HTTP/1.1 client, the switch is its 101, with the Accept of its own key.
-        if switched && let Some(client) = &handshake.client {
-            parts.status = StatusCode::SWITCHING_PROTOCOLS;
-            parts
-                .headers
-                .insert(http::header::UPGRADE, websocket::WEBSOCKET);
-            parts
-                .headers
-                .insert(http::header::SEC_WEBSOCKET_ACCEPT, client.accept_value());
-        } else if switched {
-            parts.status = StatusCode::OK;
-        }
-        Ok(Answered::Map(Response::from_parts(parts, body)))
+        let mut response = Response::from_parts(parts, body);
+        way_back::upstream_answer(&mut response, &directed.way(true))?;
+        Ok(Answered::Map(response))
     }
 
     /// What an HTTP/2 exchange is held to, for a try held to `timing`.
@@ -668,27 +595,16 @@ fn h2_failed(
     answer
 }
 
-/// An extended CONNECT's answer, from its backend's (19 §3, §4): a switch, 101 from an
-/// HTTP/1.1 backend, is told as 200 (RFC 8441 §5), with no Accept, which has no key to be of;
-/// any other 2xx is answered 502 — to a CONNECT every 2xx opens the tunnel (RFC 9110
-/// §9.3.6), and a page the backend served in place of the switch would be read as
-/// WebSocket frames — and the backend's answer dropped, its connection with it; anything
-/// else goes as it came.
-fn connected_answer(
-    status: StatusCode,
-    mut parts: http::response::Parts,
-    body: Body,
-) -> Result<Answered<Body>, Answer> {
-    if status == StatusCode::SWITCHING_PROTOCOLS {
-        parts.status = StatusCode::OK;
-        parts.headers.remove(http::header::SEC_WEBSOCKET_ACCEPT);
-        parts.headers.remove(http::header::UPGRADE);
-        return Ok(Answered::Map(Response::from_parts(parts, body)));
+/// What an answer that cannot go to the client is answered with in its place: one whose
+/// edits could not all be made, as a request's are; and the backend's failing for a page
+/// in place of a WebSocket's switch, which is dropped, its connection with it (19 §3, §4).
+impl From<way_back::Failed> for Answer {
+    fn from(failed: way_back::Failed) -> Self {
+        match failed {
+            way_back::Failed::Edits => Self::Edits,
+            way_back::Failed::NotSwitched => Self::UpstreamFailed,
+        }
     }
-    if status.is_success() {
-        return Err(Answer::UpstreamFailed);
-    }
-    Ok(Answered::Map(Response::from_parts(parts, body)))
 }
 
 /// `exchange`'s outcome, or nothing if `deadline` comes first, kept in the worker's

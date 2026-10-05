@@ -59,6 +59,7 @@ use crate::upstream::h2::client::{Client as H2Client, Settings as H2Settings};
 use crate::upstream::h2::exchange as h2_exchange;
 use crate::upstream::h2::pool::Limits as H2Limits;
 use crate::upstream::secure::{Secure, Socket as UpstreamSocket};
+use crate::way_back::{Way, WebSocket};
 use crate::websocket::Key;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -686,6 +687,25 @@ struct Directed {
     /// Its access-log record, for each try to note itself in; none for a request whose
     /// listener does not log, nor for a mirror's copy (21 §4).
     logging: Option<Rc<Logging>>,
+}
+
+impl Directed {
+    /// What its upstream's answer is edited by (22 §5): its rule's changes, and what its
+    /// client asked; `connected` if a WebSocket handshake went to the backend as an extended
+    /// CONNECT.
+    fn way(&self, connected: bool) -> Way<'_> {
+        Way {
+            changes: self
+                .rule
+                .as_ref()
+                .and_then(|rule| rule.response_headers.as_ref()),
+            upgradable: self.upgradable,
+            websocket: self.websocket.as_deref().map(|handshake| WebSocket {
+                client: handshake.client.as_ref(),
+                connected,
+            }),
+        }
+    }
 }
 
 /// A WebSocket handshake as the gateway carries it (19 §2 to §4).
