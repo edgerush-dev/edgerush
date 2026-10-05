@@ -1,17 +1,22 @@
-//! Path normalisation: the one form of a request path that is both matched and forwarded,
-//! so that the gateway and the upstream read the same path — as far as that can be had
-//! without knowing the upstream's parser. What is assumed of it is written down in the
+//! Path normalisation: the one form of a request path that is both matched and forwarded.
+//! It brings together the spellings RFC 3986 makes equivalent, and rejects the paths an
+//! upstream could split or resolve otherwise than the gateway (encoded separators, encoded
+//! or parameterised dot segments). What is assumed of the upstream is written down in the
 //! architecture docs (data plane, protocol correctness): it decodes a path at most once,
 //! splits it at `/` only, and may or may not know path parameters, decode before it looks
-//! for them, or decode unreserved characters. What would be read differently within those
-//! bounds is rejected; what lies outside them (decoding twice, Unicode look-alikes,
-//! file-system rules for case and trailing dots) is not something a normal form can settle.
+//! for them, or decode unreserved characters. Those assumptions do not make the two read
+//! every path alike. A reserved character and its percent-encoding stay two spellings here,
+//! as in RFC 3986 (`$` and `%24`, `:` and `%3A`), and so two paths to the router, while an
+//! upstream that decodes once reads them as one; a path parameter (`/cart;x`) is part of its
+//! segment here, while some upstreams set it aside. A route names each spelling it means to
+//! take. What lies outside the assumptions (decoding twice, Unicode look-alikes, file-system
+//! rules for case and trailing dots) is not something a normal form can settle.
 //!
 //! A path in normal form starts with `/`; has no empty, `.` or `..` segments (a trailing
 //! slash is allowed); and consists of plain path characters and percent-encodings in
 //! upper-case hex that stand for anything but an unreserved character, a control character,
-//! a slash or a backslash. Every path has at most one normal form, and paths that could be
-//! read in more than one way have none: they are rejected.
+//! a slash or a backslash. Every path has at most one normal form, and paths the upstream
+//! could split or resolve otherwise have none: they are rejected.
 
 use std::borrow::Cow;
 

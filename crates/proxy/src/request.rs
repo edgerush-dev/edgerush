@@ -1544,6 +1544,71 @@ upstreams:
         assert_eq!(head.uri, "/cart/items?x=%61&y");
     }
 
+    /// A reserved character and its percent-encoding are two spellings and two paths
+    /// (03 §4, RFC 3986 §2.2): a rule written in one does not take the other, which goes on
+    /// to whatever less specific rule matches it, forwarded as it came; a rule that names
+    /// both takes both, and an encoding in lower-case hex is no third spelling.
+    #[test]
+    fn a_reserved_character_and_its_encoding_are_two_paths() {
+        const SPELLINGS: &str = r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+routes:
+  - name: api
+    listeners: [web]
+    hostnames:
+      - { name: "*", falls_through: false }
+    rules:
+      - matches:
+          - path: { exact: /odata/$metadata }
+          - path: { exact: /v1/jobs:cancel }
+        forward:
+          backends:
+            - { upstream: one-spelling, weight: 1 }
+      - matches:
+          - path: { exact: /odata/$batch }
+          - path: { exact: /odata/%24batch }
+          - path: { exact: /v1/jobs:retry }
+          - path: { exact: /v1/jobs%3Aretry }
+        forward:
+          backends:
+            - { upstream: both-spellings, weight: 1 }
+      - matches:
+          - path: { prefix: / }
+        forward:
+          backends:
+            - { upstream: other, weight: 1 }
+upstreams:
+  one-spelling: { load_balancer: p2c, endpoints: ["127.0.0.1:9001"] }
+  both-spellings: { load_balancer: p2c, endpoints: ["127.0.0.1:9002"] }
+  other: { load_balancer: p2c, endpoints: ["127.0.0.1:9003"] }
+"#;
+        let config: Config = serde_saphyr::from_str(SPELLINGS).unwrap();
+        let spellings = compile(&config).unwrap();
+        let web = &spellings.listeners()[0];
+        for (target, upstream, forwarded) in [
+            ("/odata/$metadata", "one-spelling", "/odata/$metadata"),
+            ("/odata/%24metadata", "other", "/odata/%24metadata"),
+            ("/v1/jobs:cancel", "one-spelling", "/v1/jobs:cancel"),
+            ("/v1/jobs%3Acancel", "other", "/v1/jobs%3Acancel"),
+            ("/v1/jobs%3acancel", "other", "/v1/jobs%3Acancel"),
+            ("/odata/$batch", "both-spellings", "/odata/$batch"),
+            ("/odata/%24batch", "both-spellings", "/odata/%24batch"),
+            ("/v1/jobs:retry", "both-spellings", "/v1/jobs:retry"),
+            ("/v1/jobs%3Aretry", "both-spellings", "/v1/jobs%3Aretry"),
+            ("/v1/jobs%3aretry", "both-spellings", "/v1/jobs%3Aretry"),
+        ] {
+            let mut head = head(target, &[("host", "api.example.com")]);
+            let decided = decide(&spellings, web, &mut head, &peer(), &mut || 0, None);
+            let chosen = decided.map(|decision| {
+                let forward = forwarding(decision);
+                spellings.upstream(forward.upstream).unwrap().name.clone()
+            });
+            assert_eq!(chosen.as_deref(), Ok(upstream), "{target}");
+            assert_eq!(head.uri, forwarded, "{target}");
+        }
+    }
+
     #[test]
     fn the_query_is_routed_on() {
         let host = [("host", "shop.example.com")];
