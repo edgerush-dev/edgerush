@@ -46,7 +46,7 @@ The file, and the certificate files it names, are read again every second, and a
 takes over without dropping a request. Listeners are bound once: one that is new or has
 moved takes a restart.
 Ctrl-C or SIGTERM drains it: what is under way is finished, for up to 29 seconds; a
-second one stops it at once.
+second one stops it at once. SIGUSR1 opens the access logs' files again, for rotation.
 
 Options:
       --config <FILE>      The config, in YAML

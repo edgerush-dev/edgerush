@@ -869,8 +869,9 @@ impl Metrics {
         }
         let name = "edgerush_listener_quic_datagrams_total";
         let help = "HTTP/3 datagrams not simply handed to their connection: forwarded to the \
-                    worker that owns it, dropped for a full inbox, or answered with a Retry or \
-                    a version negotiation.";
+                    worker that owns it, dropped for a full inbox, answered with a Retry or a \
+                    version negotiation, or an Initial dropped for no room among its worker's \
+                    connections.";
         scrape.family(name, Kind::Counter, help);
         for (listener, series) in listeners() {
             for event in Quic::ALL {

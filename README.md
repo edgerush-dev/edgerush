@@ -40,7 +40,8 @@ without dropping a request.
 - **At the edge:** `X-Forwarded-*` and `Via`, believed only from listed proxies; PROXY
   protocol v1 and v2; request IDs; caps on connections and a fair share of each worker for
   every upstream; a drain on SIGTERM; Prometheus metrics; access logs, a line of JSON for
-  each request, WebSocket and passthrough connection, to stdout or a file.
+  each request, WebSocket and passthrough connection, to stdout or a file reopened on
+  SIGUSR1.
 
 Not yet: anything Kubernetes (the control plane, the operator, translating Ingress and
 Gateway API), rate limiting, authentication. The request path comes first, then rate
