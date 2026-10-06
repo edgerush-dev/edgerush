@@ -17,7 +17,7 @@ use super::codec::{
     Asked, BodyReader, BodyWriter, CodecError, Delivery, Framing, Head, HeadReader, OutgoingFields,
     Piece, ResponseHead, Sending, Trailers, delivery, head_len, write_head,
 };
-use super::pool::Lease;
+use super::pool::{Close, Lease};
 use crate::interim::{Channel, Interim};
 use crate::storage::{Charge, Exhausted};
 use crate::timers::{Alarm, Timers};
@@ -1082,7 +1082,7 @@ impl<S, B> H1Body<S, B> {
     /// who could be affected by a peer that misbehaves; it cannot stop one.
     pub fn take_if_reusable(&mut self) -> Option<Kept<S>>
     where
-        S: AsyncRead + Unpin,
+        S: AsyncRead + Unpin + Close,
     {
         // What the head allowed, and one answer read to its end with everything passed on.
         if !self.persistent || !self.is_complete() {
@@ -1102,6 +1102,9 @@ impl<S, B> H1Body<S, B> {
         let rest = self.rest.take()?;
         let mut socket = rest.exchange.socket;
         if !nothing_to_say(&mut socket) {
+            // Out of step with us, but at the end of an exchange that finished: closed in
+            // good order all the same.
+            socket.close();
             return None;
         }
         Some(Kept {
@@ -1116,18 +1119,28 @@ impl<S, B> H1Body<S, B> {
         self.persistent = false;
     }
 
-    /// Puts the connection back if it has earned its way, now that the body is over.
+    /// Puts the connection back if it has earned its way, now that the body is over, and
+    /// otherwise closes it in good order if the exchange finished with nothing owing — the
+    /// upstream said it would not carry another, or closed (13 §6).
     ///
     /// Done when the body ends rather than when whoever holds it lets go: a body that is
     /// finished with has nothing more to say, and a connection that could be carrying the
     /// next request should not wait on a client to drop an object.
     pub fn settle(&mut self)
     where
-        S: AsyncRead + Unpin,
+        S: AsyncRead + Unpin + Close,
     {
         let limits = Rc::clone(&self.limits);
         if let Some(kept) = self.take_if_reusable() {
             kept.put_back(&limits);
+            return;
+        }
+        if self.is_complete()
+            && let Some(rest) = self
+                .rest
+                .take_if(|rest| !rest.upload.stopped && rest.upload_finished())
+        {
+            rest.exchange.socket.close();
         }
     }
 
@@ -1371,16 +1384,18 @@ pub struct Kept<S> {
     returner: Option<Lease<S>>,
 }
 
-impl<S> Kept<S> {
+impl<S: Close> Kept<S> {
     /// Puts the connection back where it came from. A connection that came from nowhere
     /// goes nowhere: it is closed here, which is the only other thing to do with one.
     pub fn put_back(self, limits: &H1Limits) {
         match self.returner {
             Some(lease) => lease.keep(self.socket, limits),
-            None => drop(self.socket),
+            None => self.socket.close(),
         }
     }
+}
 
+impl<S> Kept<S> {
     /// The connection itself, for a caller that means to do something else with it.
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn into_socket(self) -> S {
@@ -1690,6 +1705,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    /// Closed as it is dropped: the tests' upstream has no closure alert to be sent.
+    impl Close for DuplexStream {
+        fn close(self) {}
+    }
 
     /// A body that never gives anything and never ends: a client that has stopped
     /// sending without saying so.

@@ -19,7 +19,7 @@ use crate::upstream::destination::ReuseIdentity;
 use crate::upstream::h1::blocks::Block;
 use crate::upstream::h1::codec::{OutgoingFields, Sending};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, Stalled, nothing_to_say};
-use crate::upstream::h1::pool::Lease;
+use crate::upstream::h1::pool::{Close, Lease};
 use crate::upstream::h2::client::PlaceError;
 use crate::upstream::h2::exchange::{self as h2_exchange, Bounds as H2Bounds, Connected};
 use crate::upstream::secure::Socket as UpstreamSocket;
@@ -87,8 +87,9 @@ impl Worker {
                 break;
             }
             // Anything readable is an upstream saying something nobody asked for, and the
-            // socket goes rather than being lent again.
+            // socket goes rather than being lent again, closed in good order (13 §6).
             self.proxy.metrics.socket(Socket::Discarded);
+            socket.close();
         }
         let (socket, opened) = match kept {
             Some(reused) => {

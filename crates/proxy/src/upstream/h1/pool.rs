@@ -9,7 +9,8 @@
 //! from the pool, so there is no arrangement under which two exchanges could be given the
 //! same socket. Putting one back is something a caller does on purpose and only when it
 //! has earned it; a socket that is simply dropped is a connection closed, which is what
-//! should become of one whose state nobody knows.
+//! should become of one whose state nobody knows. One let go of in good order — too old,
+//! idle too long, its destination gone, or one too many — is closed as [`Close`] says.
 
 use super::H1Limits;
 use crate::upstream::destination::ReuseIdentity;
@@ -19,6 +20,16 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use tokio::time::Instant;
+
+/// How a connection let go of in good order is closed: by the pool, or after an exchange
+/// that finished with nothing owing ([13 §6](../../../docs/13-http1-upstream.md)). Over
+/// TLS with a closure alert first — RFC 9112 §9.8: "Clients MUST send a closure alert
+/// before closing the connection" — tried once and never waited for, as HAProxy and Envoy
+/// close. A connection dropped part way through something is told nothing.
+pub trait Close {
+    /// Closes it.
+    fn close(self);
+}
 
 /// A connection nobody is using, and what is known about it.
 #[derive(Debug)]
@@ -54,7 +65,7 @@ impl<S> Default for Pool<S> {
     }
 }
 
-impl<S> Pool<S> {
+impl<S: Close> Pool<S> {
     /// A connection for `identity` that is fit to be used again, and when it was opened.
     ///
     /// The time it was opened travels with it, because a connection that started its age
@@ -80,6 +91,7 @@ impl<S> Pool<S> {
             if is_fit(&connection, now, limits) {
                 return Some((connection.socket, connection.opened));
             }
+            connection.socket.close();
         }
         None
     }
@@ -131,9 +143,12 @@ impl<S> Pool<S> {
                 .first()
                 .is_some_and(|first| first.identity.is_retired())
             {
+                held.drain(..)
+                    .for_each(|connection| connection.socket.close());
                 return false;
             }
-            held.retain(|connection| is_fit(connection, now, limits));
+            held.extract_if(.., |connection| !is_fit(connection, now, limits))
+                .for_each(|connection| connection.socket.close());
             !held.is_empty()
         });
         self.total = self.idle.values().map(Vec::len).sum();
@@ -150,6 +165,8 @@ impl<S> Pool<S> {
     fn forget(&mut self, key: u64) {
         if let Some(held) = self.idle.remove(&key) {
             self.total -= held.len();
+            held.into_iter()
+                .for_each(|connection| connection.socket.close());
         }
     }
 }
@@ -244,7 +261,9 @@ impl<S> Lease<S> {
     pub fn take_socket(&mut self) -> Option<S> {
         self.socket.take()
     }
+}
 
+impl<S: Close> Lease<S> {
     /// Puts a connection back, given the proof that an exchange finished with nothing
     /// owing. The pool may still refuse it — for being one too many, or too old — and
     /// then it is closed here, which is what refusing it means.
@@ -252,12 +271,15 @@ impl<S> Lease<S> {
         let Some(pool) = self.pool.upgrade() else {
             // The worker has gone. There is nowhere to put this, and holding it would
             // only keep a socket open that nobody will ever come for.
+            socket.close();
             return;
         };
         let refused = pool
             .borrow_mut()
             .put(&self.identity, socket, self.opened, limits);
-        drop(refused);
+        if let Some(refused) = refused {
+            refused.close();
+        }
     }
 }
 
@@ -274,6 +296,24 @@ mod tests {
     use crate::upstream::destination::{Destinations, Keys};
     use edgerush_config::{Config, compile};
     use std::time::Duration;
+
+    thread_local! {
+        /// The tests' connections closed in good order on this thread, each test's on its
+        /// own.
+        static CLOSED: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// The tests' connections are numbers, and closing one notes it.
+    impl Close for i32 {
+        fn close(self) {
+            CLOSED.with_borrow_mut(|closed| closed.push(self));
+        }
+    }
+
+    /// The connections closed in good order since this was last asked.
+    fn closed() -> Vec<i32> {
+        CLOSED.take()
+    }
 
     /// Destinations for the named upstreams, each with the addresses given.
     fn destinations(upstreams: &[(&str, &[&str])], keys: &Keys) -> Destinations {
@@ -442,6 +482,7 @@ mod tests {
             0,
             "it was dropped rather than left to be found again"
         );
+        assert_eq!(closed(), [1], "not closed in good order");
     }
 
     /// Age bounds a connection however busy it is: one in constant use is still a
@@ -483,6 +524,7 @@ mod tests {
 
         assert!(pool.take(&identity, &limits).is_none());
         assert_eq!(pool.idle(), 0, "a retired destination kept its connections");
+        assert_eq!(closed(), [1], "not closed in good order");
         assert_eq!(pool.put(&identity, 2, Instant::now(), &limits), Some(2));
     }
 
@@ -520,6 +562,7 @@ mod tests {
 
         assert_eq!(pool.sweep(&limits), 1);
         assert_eq!(pool.idle(), 1);
+        assert_eq!(closed(), [2], "not closed in good order");
         assert_eq!(pool.take(&staying, &limits).map(|(s, _)| s), Some(1));
     }
 
@@ -534,6 +577,7 @@ mod tests {
         tokio::time::sleep(limits.idle_timeout * 2).await;
         assert_eq!(pool.sweep(&limits), 1);
         assert_eq!(pool.idle(), 0);
+        assert_eq!(closed(), [1], "not closed in good order");
     }
 
     /// Reload after reload leaves no trace: a bucket with nothing in it is a bucket that
@@ -553,7 +597,7 @@ mod tests {
             previous = Destinations::reconcile(&compile(&config).unwrap(), &previous, &keys, &[]);
 
             let identity = Arc::clone(previous.at(0, 0).unwrap());
-            pool.put(&identity, round, Instant::now(), &limits);
+            pool.put(&identity, i32::from(round), Instant::now(), &limits);
             pool.sweep(&limits);
         }
         assert_eq!(pool.idle(), 1);
@@ -627,6 +671,10 @@ mod tests {
 
         assert_eq!(pool.borrow().idle(), 0);
         assert!(pool.borrow_mut().take(&identity, &limits).is_none());
+        assert!(
+            closed().is_empty(),
+            "one let go of part way was closed in good order"
+        );
     }
 
     /// A lease that outlives its worker has nowhere to put anything, and does not keep
@@ -648,6 +696,7 @@ mod tests {
 
         // Nothing to put it back into, and nothing that panics for the want of one.
         lease.keep(9, &limits);
+        assert_eq!(closed(), [9], "not closed in good order");
     }
 
     /// What the pool will not hold, the lease does not hold either: refusing a connection
@@ -666,6 +715,7 @@ mod tests {
         Lease::new(2, Arc::clone(&identity), Instant::now(), &pool).keep(2, &limits);
 
         assert_eq!(pool.borrow().idle(), 1, "the second was kept as well");
+        assert_eq!(closed(), [2], "not closed in good order");
     }
 
     /// Taking the socket out is not putting it back: a lease unwrapped for an exchange

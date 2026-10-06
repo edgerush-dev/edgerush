@@ -9,12 +9,13 @@
 
 use crate::gathered::Gathered;
 use crate::tls::TlsError;
+use crate::upstream::h1::pool::Close;
 use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
 use boring::x509::store::X509StoreBuilder;
 use edgerush_config::{CompiledUpstreamTls, UpstreamProtocol};
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_boring::SslStream;
@@ -129,6 +130,18 @@ pub(crate) enum Socket {
     Plain(TcpStream),
     /// TLS over TCP, a request's pieces gathered into records ([`Gathered`]).
     Secured(Gathered<SslStream<TcpStream>>),
+}
+
+impl Close for Socket {
+    /// Over TLS, the closure alert, if the socket takes it at once; over TCP the close says
+    /// it. Nothing waits: a waker that wakes nobody, as the question is only whether it can
+    /// go now.
+    fn close(self) {
+        if let Self::Secured(mut socket) = self {
+            let mut context = Context::from_waker(Waker::noop());
+            let _told = Pin::new(&mut socket).poll_shutdown(&mut context);
+        }
+    }
 }
 
 impl AsyncRead for Socket {

@@ -444,6 +444,11 @@ pub struct Scripted {
     shared: Arc<Mutex<Shared>>,
 }
 
+/// Closed as it is dropped: a script has no closure alert to send.
+impl super::pool::Close for Scripted {
+    fn close(self) {}
+}
+
 impl Scripted {
     fn shared(&self) -> MutexGuard<'_, Shared> {
         // A run is one thread and the lock is never held across an await, so there is

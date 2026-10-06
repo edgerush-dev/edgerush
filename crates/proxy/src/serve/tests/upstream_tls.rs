@@ -378,3 +378,129 @@ async fn a_request_waiting_for_a_retired_destination_gets_a_secured_connection()
         })
         .await;
 }
+
+/// A TLS backend as `certificate` says, on a thread of its own, that answers the one
+/// request of its one connection `ok` — saying it will carry no other if `closing` — then
+/// reads until the gateway closes the connection, and says whether a closure alert came
+/// before the close. BoringSSL's blocking stream is the one that can say so.
+fn alert_heeding_backend(
+    certificate: &edgerush_config::Certificate,
+    closing: bool,
+) -> (SocketAddr, std::sync::mpsc::Receiver<bool>) {
+    use boring::pkey::PKey;
+    use boring::ssl::{ShutdownState, SslAcceptor, SslMethod};
+    use boring::x509::X509;
+    use std::io::{Read, Write};
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+    builder
+        .set_certificate(&X509::from_pem(certificate.chain.as_bytes()).unwrap())
+        .unwrap();
+    builder
+        .set_private_key(&PKey::private_key_from_pem(certificate.key.as_bytes()).unwrap())
+        .unwrap();
+    let acceptor = builder.build();
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    let (heard, hearing) = std::sync::mpsc::channel();
+    let _serving = std::thread::spawn(move || {
+        let (stream, _) = socket.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut secured = acceptor.accept(stream).unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            secured.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let answer: &[u8] = if closing {
+            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+        } else {
+            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"
+        };
+        secured.write_all(answer).unwrap();
+        let mut rest = Vec::new();
+        let _ended = secured.read_to_end(&mut rest);
+        let _ = heard.send(secured.get_shutdown().contains(ShutdownState::RECEIVED));
+    });
+    (address, hearing)
+}
+
+/// Whether `backend_heard` says a closure alert came, waited for off the runtime's thread.
+async fn alerted(backend_heard: std::sync::mpsc::Receiver<bool>) -> bool {
+    within(tokio::task::spawn_blocking(move || {
+        backend_heard.recv_timeout(Duration::from_secs(10))
+    }))
+    .await
+    .unwrap()
+        == Ok(true)
+}
+
+/// A connection to an upstream over TLS that the gateway closes in good order ends with a
+/// closure alert (RFC 9112 §9.8: "Clients MUST send a closure alert before closing the
+/// connection"): here after an exchange that finished, its answer saying the connection
+/// would carry no other (13 §6).
+#[tokio::test]
+async fn an_upstream_connection_closed_after_its_exchange_ends_with_a_closure_alert() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = crate::tls::testing::certificate(&["backend.test"]);
+            let (upstream, backend_heard) = alert_heeding_backend(&server, true);
+            let front = serving_worker_to_tls(
+                upstream,
+                UpstreamProtocol::Http1,
+                trusting("backend.test", &server),
+            )
+            .await;
+            let answer = h1_answer(
+                front,
+                b"GET / HTTP/1.1\r\nhost: example.test\r\nconnection: close\r\n\r\n",
+            )
+            .await;
+            assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+            assert!(
+                alerted(backend_heard).await,
+                "no closure alert to the upstream"
+            );
+        })
+        .await;
+}
+
+/// And when the pool lets a kept connection go, here for having been idle too long.
+#[tokio::test]
+async fn an_upstream_connection_the_pool_lets_go_ends_with_a_closure_alert() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = crate::tls::testing::certificate(&["backend.test"]);
+            let (upstream, backend_heard) = alert_heeding_backend(&server, false);
+            let mut config = everything_config(upstream);
+            let up = config.upstreams.get_mut("up").unwrap();
+            up.protocol = UpstreamProtocol::Http1;
+            up.tls = Some(trusting("backend.test", &server));
+            let limits = H1Limits {
+                idle_timeout: Duration::from_millis(200),
+                sweep: Duration::from_millis(50),
+                ..H1Limits::default()
+            };
+            let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+            let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+            let _sweeping = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+            let answer = h1_answer(
+                front,
+                b"GET / HTTP/1.1\r\nhost: example.test\r\nconnection: close\r\n\r\n",
+            )
+            .await;
+            assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+            assert!(
+                alerted(backend_heard).await,
+                "no closure alert to the upstream"
+            );
+        })
+        .await;
+}
