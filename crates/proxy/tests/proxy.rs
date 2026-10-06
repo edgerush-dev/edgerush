@@ -1151,9 +1151,23 @@ async fn a_scrape_past_ten_connections_waits_until_one_ends() {
     let scrape = scraped(proxy);
     let mut idle = Vec::new();
     for _ in 0..10 {
-        idle.push(TcpStream::connect(scrape).await.unwrap());
+        let mut stream = TcpStream::connect(scrape).await.unwrap();
+        // Answered, so certainly taken from the backlog before the eleventh is in it: a
+        // connect returns when the client has its handshake's answer, which can be before
+        // the server has queued the connection. Then idle, kept alive.
+        stream
+            .write_all(b"HEAD /metrics HTTP/1.1\r\nhost: scrape.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0; 1];
+            assert_eq!(within(stream.read(&mut byte)).await.unwrap(), 1, "closed");
+            head.push(byte[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 200 "));
+        idle.push(stream);
     }
-    // Behind the ten in the backlog, which is taken from in order.
     let mut eleventh = TcpStream::connect(scrape).await.unwrap();
     eleventh
         .write_all(b"GET /metrics HTTP/1.1\r\nhost: scrape.test\r\nconnection: close\r\n\r\n")
