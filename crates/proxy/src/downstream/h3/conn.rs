@@ -40,6 +40,9 @@ pub(crate) struct Conn {
     requests: Cell<u64>,
     /// Of those, the ones the client gave up before their answer's head was sent.
     given_up: Cell<u64>,
+    /// Requests the server reset for the client's own errors, or refused 431, in the
+    /// connection's life: what h2 counts as `max_local_error_reset_streams` (15 §3).
+    provoked: Cell<u64>,
     /// What the connection drains with, and its WebSockets too: its worker's drain, or a
     /// reload replacing the client validation it was accepted under (03 §3).
     pub(crate) drain: Rc<Drain>,
@@ -125,6 +128,7 @@ impl Conn {
             shed: Cell::new(false),
             requests: Cell::new(0),
             given_up: Cell::new(0),
+            provoked: Cell::new(0),
             drain,
             _held: held,
         })
@@ -147,6 +151,21 @@ impl Conn {
     pub(crate) fn resetting(&self, after: u64) -> bool {
         let requests = self.requests.get();
         requests >= after && self.given_up.get().saturating_mul(2) >= requests
+    }
+
+    /// Counts `requests` the server reset for the client's own errors, a malformed head,
+    /// body or trailers, or refused 431 for a head too large.
+    pub(crate) fn provoked(&self, requests: u32) {
+        self.provoked
+            .set(self.provoked.get().saturating_add(u64::from(requests)));
+    }
+
+    /// Whether the client has made the server reset or refuse more than `most` of its
+    /// requests: a client that has its requests acted on and then reset gets its streams
+    /// back each time, which the rapid-reset rule does not see (CVE-2025-8671). HTTP/2's
+    /// rule and its number, which are h2's (15 §3).
+    pub(crate) fn provoking(&self, most: u64) -> bool {
+        self.provoked.get() > most
     }
 
     /// Charges `storage` what quiche holds for the connection now: what it received that

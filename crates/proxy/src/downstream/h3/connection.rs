@@ -11,7 +11,10 @@
 //!
 //! A request whose head is malformed is reset with `H3_MESSAGE_ERROR`; one whose head is too
 //! large is answered 431; one on a stream past the GOAWAY sent is reset with
-//! `H3_REQUEST_REJECTED`, which a client may send again elsewhere (RFC 9114 §5.2).
+//! `H3_REQUEST_REJECTED`, which a client may send again elsewhere (RFC 9114 §5.2). A
+//! connection whose client has had more than 1,024 requests reset or refused for its own
+//! errors, its head, body or trailers, is closed with `H3_EXCESSIVE_LOAD`, as h2 closes an
+//! HTTP/2 one (15 §3).
 
 use crate::downstream::h1::connection::{Answered, expects_continue};
 use crate::downstream::h1::date::HttpDate;
@@ -216,8 +219,12 @@ pub(crate) async fn drive<R, F, B, D, G>(
                 room.set(shared.socket.writable());
                 continue;
             }
-            // A rapid reset (CVE-2023-44487) is closed, as HTTP/2 closes one (15 §3).
-            if !driving.closing && conn.resetting(settings.reset_judged_after) {
+            // A rapid reset (CVE-2023-44487) is closed, as HTTP/2 closes one (15 §3), and so is
+            // a client that has made the server reset too many of its requests.
+            if !driving.closing
+                && (conn.resetting(settings.reset_judged_after)
+                    || conn.provoking(settings.provoked_resets))
+            {
                 conn.with(|state| {
                     // Fails only for a connection already closing.
                     let _closing = state.quic.close(true, code::EXCESSIVE_LOAD, b"");
@@ -420,6 +427,7 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
             }
         }
         if let Some(h3) = h3.as_mut() {
+            let mut provoked = 0;
             events(
                 quic,
                 h3,
@@ -429,7 +437,9 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
                 &mut driving.seen,
                 found,
                 &mut driving.refused,
+                &mut provoked,
             );
+            conn.provoked(provoked);
         }
         #[cfg(any(test, feature = "interop"))]
         if quic.is_established() && quic.application_proto() == super::hq::ALPN {
@@ -483,6 +493,9 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
 
 /// Hands on what quiche's HTTP/3 layer has, stream by stream. A 431 the driver answers
 /// itself joins `delivering`, as a task's whole answer does, and is counted in `refused`.
+/// Each head reset for the client's error, or refused 431, is counted in `provoked`; a
+/// request rejected after the GOAWAY is not, since the client may have sent it before the
+/// GOAWAY reached it (RFC 9114 §5.2).
 #[expect(
     clippy::too_many_arguments,
     reason = "each is a different part of the connection's state that a turn hands on to"
@@ -496,6 +509,7 @@ fn events(
     seen: &mut Seen,
     found: &mut Vec<Found>,
     refused: &mut u32,
+    provoked: &mut u32,
 ) {
     loop {
         let (id, event) = match h3.poll(quic) {
@@ -521,6 +535,7 @@ fn events(
                     // A head that ends the stream leaves no room for the body it declares.
                     Ok(head) if !more_frames && head.length.is_some_and(|length| length > 0) => {
                         shut(quic, id, code::MESSAGE_ERROR);
+                        *provoked += 1;
                     }
                     Ok(head) => {
                         streams.insert(
@@ -543,8 +558,12 @@ fn events(
                             delivering.push(id);
                             *refused += 1;
                         }
+                        *provoked += 1;
                     }
-                    Err(Refused::Malformed(_)) => shut(quic, id, code::MESSAGE_ERROR),
+                    Err(Refused::Malformed(_)) => {
+                        shut(quic, id, code::MESSAGE_ERROR);
+                        *provoked += 1;
+                    }
                 }
             }
             Event::Data => {
@@ -805,6 +824,7 @@ mod tests {
             64 << 10,
             &mut seen,
             &mut found,
+            &mut 0,
             &mut 0,
         );
         let mut taken: Vec<u64> = found.iter().map(|found| found.id).collect();

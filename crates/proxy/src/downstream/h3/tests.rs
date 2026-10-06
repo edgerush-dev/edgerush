@@ -1149,6 +1149,223 @@ fn an_answer_the_server_gives_up_is_not_counted_against_the_client() {
     });
 }
 
+/// Resets a client provokes are bounded, as h2's `max_local_error_reset_streams` bounds them
+/// over HTTP/2 (15 §3, "Resets we are made to send"). A request whose whole body reaches the
+/// core and whose trailers then break a head's rules is malformed (RFC 9114 §4.1.2): the server
+/// resets it with H3_MESSAGE_ERROR and the client gets its stream back, having had its request
+/// acted on. A client that does so again and again is closed in the end with
+/// H3_EXCESSIVE_LOAD, as HTTP/2 closes one with ENHANCE_YOUR_CALM (review A05-01).
+#[test]
+fn resets_a_client_provokes_are_bounded() {
+    locally(async {
+        // Requests whose whole body the core read before the stream failed under it.
+        let whole = Rc::new(Cell::new(0_usize));
+        let seen = Rc::clone(&whole);
+        let server = serving(
+            Settings::default(),
+            move |request: Request<RequestBody>, _interim| -> Answering {
+                let seen = Rc::clone(&seen);
+                Box::pin(async move {
+                    let mut body = std::pin::pin!(request.into_body());
+                    let mut read = 0;
+                    while let Some(Ok(frame)) = body.as_mut().frame().await {
+                        if let Ok(data) = frame.into_data() {
+                            read += data.len();
+                        }
+                    }
+                    if read == 1 {
+                        seen.set(seen.get() + 1);
+                    }
+                    Answered::Map(Response::new(Full::new(Bytes::new())))
+                })
+            },
+        )
+        .await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        // Past HTTP/2's bound of 1,024 and the rapid-reset rule's 500.
+        const PROVOKED: usize = 1_100;
+        let mut cut_off = None;
+        for provoked in 0..PROVOKED {
+            client
+                .until(|client| {
+                    client.quic.peer_streams_left_bidi() > 0 || client.closed_by_server().is_some()
+                })
+                .await;
+            if client.closed_by_server().is_some() {
+                cut_off = Some(provoked);
+                break;
+            }
+            let mut head = get("a.test", "/up");
+            head[0].1 = "POST";
+            head.push(("content-length", "1"));
+            let id = client.request(&head, false);
+            client.body(id, &[1], false).await;
+            // A field only a connection has, which a trailer section may not carry either.
+            client.trailers(id, &[("connection", "close")]).await;
+            client
+                .until(|client| {
+                    client
+                        .answers
+                        .get(&id)
+                        .is_some_and(|answer| answer.reset.is_some() || answer.finished)
+                        || client.closed_by_server().is_some()
+                })
+                .await;
+            if let Some(answer) = client.answers.remove(&id) {
+                assert_eq!(
+                    answer.reset,
+                    Some(code::MESSAGE_ERROR),
+                    "request {provoked}"
+                );
+            }
+        }
+        assert!(
+            cut_off.is_some(),
+            "{PROVOKED} resets provoked, {} of them after the core had the whole body, and the \
+             connection is still open",
+            whole.get()
+        );
+        assert_eq!(
+            client.closed_by_server(),
+            Some((true, code::EXCESSIVE_LOAD))
+        );
+    });
+}
+
+/// The ways a client can have its request refused for its own error.
+#[derive(Clone, Copy, Debug)]
+enum Provoked {
+    /// A field only a connection has, which HTTP/3 carries in no message (RFC 9114 §4.2).
+    Head,
+    /// A head that ends the stream, declaring a body.
+    EndedShort,
+    /// A head between the 64 KiB limit and 128 KiB, answered 431: h2 counts that answer
+    /// over HTTP/2, the stream reset after it.
+    TooLarge,
+    /// A body longer than its `Content-Length`.
+    BodyLong,
+    /// A body shorter than its `Content-Length`.
+    BodyShort,
+    /// Trailers that break a head's rules.
+    Trailers,
+}
+
+impl Provoked {
+    const ALL: [Self; 6] = [
+        Self::Head,
+        Self::EndedShort,
+        Self::TooLarge,
+        Self::BodyLong,
+        Self::BodyShort,
+        Self::Trailers,
+    ];
+}
+
+/// Sends a request that the server refuses `how`, and sees it refused so, unless the
+/// connection closes first.
+async fn provoke(client: &mut Client, how: Provoked) {
+    let large = "v".repeat(100 << 10);
+    let mut head = get("a.test", "/up");
+    head[0].1 = "POST";
+    match how {
+        Provoked::Head => head.push(("connection", "close")),
+        Provoked::TooLarge => head.push(("x-large", &large)),
+        Provoked::BodyShort => head.push(("content-length", "2")),
+        _ => head.push(("content-length", "1")),
+    }
+    let ended = matches!(
+        how,
+        Provoked::Head | Provoked::EndedShort | Provoked::TooLarge
+    );
+    let id = client.request(&head, ended);
+    match how {
+        Provoked::BodyLong => client.body(id, &[1, 2], true).await,
+        Provoked::BodyShort => client.body(id, &[1], true).await,
+        Provoked::Trailers => {
+            client.body(id, &[1], false).await;
+            client.trailers(id, &[("connection", "close")]).await;
+        }
+        _ => {}
+    }
+    client
+        .until(|client| {
+            client
+                .answers
+                .get(&id)
+                .is_some_and(|answer| answer.reset.is_some() || answer.finished)
+                || client.closed_by_server().is_some()
+        })
+        .await;
+    if let Some(answer) = client.answers.remove(&id) {
+        match how {
+            Provoked::TooLarge => assert_eq!(answer.final_status(), Some("431")),
+            _ => assert_eq!(answer.reset, Some(code::MESSAGE_ERROR), "{how:?}"),
+        }
+    }
+}
+
+/// Each way a client can have its request refused counts towards the bound: up to it the
+/// connection carries on and serves, and one past it, it is closed.
+#[test]
+fn every_request_refused_for_the_clients_error_counts_towards_the_bound() {
+    locally(async {
+        const MOST: u64 = 3;
+        let settings = Settings {
+            provoked_resets: MOST,
+            ..short()
+        };
+        let server = serving(settings, echo).await;
+        for how in Provoked::ALL {
+            let mut client = Client::connect(server.address, "a.test").await;
+            for _ in 0..MOST {
+                provoke(&mut client, how).await;
+            }
+            let answer = client.get("a.test", "/after").await;
+            assert_eq!(body_of(&answer), "GET /after 0 None", "{how:?}");
+            assert_eq!(client.closed_by_server(), None, "{how:?}");
+            provoke(&mut client, how).await;
+            client
+                .until(|client| client.closed_by_server().is_some())
+                .await;
+            assert_eq!(
+                client.closed_by_server(),
+                Some((true, code::EXCESSIVE_LOAD)),
+                "{how:?}"
+            );
+        }
+    });
+}
+
+/// A request rejected because it came after the GOAWAY is no fault of the client's, which
+/// may have sent it before the GOAWAY reached it (RFC 9114 §5.2), and is not counted.
+#[test]
+fn a_request_rejected_after_the_goaway_is_not_counted() {
+    locally(async {
+        let settings = Settings {
+            provoked_resets: 0,
+            ..short()
+        };
+        let server = serving(settings, echo).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        // Seen, so that the GOAWAY names a stream past it; held open, so that the
+        // connection waits for it before it closes.
+        let held = client.request(&get("a.test", "/held"), false);
+        client.for_a_while(Duration::from_millis(50)).await;
+        // Sent before the GOAWAY has reached the client, whose quiche would send nothing new
+        // after it, and seen by the server after it has sent the GOAWAY.
+        server.drain.start();
+        let rejected = client.request(&get("a.test", "/late"), true);
+        let answer = client.answer(rejected).await;
+        assert_eq!(client.goaway, Some(4));
+        assert_eq!(answer.reset, Some(code::REQUEST_REJECTED));
+        client.for_a_while(Duration::from_millis(50)).await;
+        assert_eq!(client.closed_by_server(), None);
+        client.body(held, &[], true).await;
+        let answer = client.answer(held).await;
+        assert_eq!(body_of(&answer), "GET /held 0 None");
+    });
+}
+
 /// A client that gives up a request now and then — one in ten — is nowhere near the rule,
 /// and keeps its connection.
 #[test]

@@ -95,6 +95,9 @@ pub(crate) struct Settings {
     /// How many requests a connection must have had before its share given up early is
     /// judged: HTTP/2's number (15 §3).
     pub(crate) reset_judged_after: u64,
+    /// How many requests a connection may have reset or refused for its own errors before
+    /// it is closed: HTTP/2's number (15 §3).
+    pub(crate) provoked_resets: u64,
     /// New connections admitted in one batch, as TCP's accept is paced (03 §3).
     pub(crate) admit_per_batch: usize,
 }
@@ -118,6 +121,7 @@ impl Default for Settings {
             retry_above: 1_024,
             batch: 64,
             reset_judged_after: 500,
+            provoked_resets: 1_024,
             admit_per_batch: 16,
         }
     }

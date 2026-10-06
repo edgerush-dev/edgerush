@@ -200,8 +200,9 @@ impl IncomingH3 {
     }
 
     /// Refuses a malformed body (RFC 9114 §4.1.2): the stream is reset both ways with
-    /// `H3_MESSAGE_ERROR`, as for a malformed head, and the read fails.
+    /// `H3_MESSAGE_ERROR`, as for a malformed head, and counted as such, and the read fails.
     fn malformed(&self, quic: &mut quiche::Connection, error: StreamError) -> RequestBodyError {
+        self.conn.provoked(1);
         // Fails only for a side already done.
         let _reset =
             quic.stream_shutdown(self.stream, quiche::Shutdown::Write, code::MESSAGE_ERROR);
