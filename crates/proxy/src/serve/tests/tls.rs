@@ -733,3 +733,163 @@ async fn a_tls_hello_on_a_plaintext_listener_is_refused_as_http1() {
         })
         .await;
 }
+
+/// Sends `request` to `front` over TLS, as HTTP/1.1, and reads to the end: what came, and
+/// whether a closure alert came before the end. The client is BoringSSL's blocking one, on a
+/// thread of its own: tokio-boring's reads an end with no alert as an end all the same, and
+/// cannot say which it was.
+async fn closed_over_tls(front: SocketAddr, request: &[u8]) -> (String, bool) {
+    let request = request.to_vec();
+    within(tokio::task::spawn_blocking(move || {
+        use boring::ssl::{ShutdownState, SslConnector, SslMethod, SslVerifyMode};
+        use std::io::{Read, Write};
+        let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+        builder.set_verify(SslVerifyMode::NONE);
+        builder.set_alpn_protos(b"\x08http/1.1").unwrap();
+        let config = builder.build().configure().unwrap().verify_hostname(false);
+        let tcp = std::net::TcpStream::connect(front).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut tls = config.connect("example.test", tcp).unwrap();
+        tls.write_all(&request).unwrap();
+        let mut answer = Vec::new();
+        // An end with no alert is read as an end too, which is why it is asked below.
+        let _ended = tls.read_to_end(&mut answer);
+        let alerted = tls.get_shutdown().contains(ShutdownState::RECEIVED);
+        (String::from_utf8_lossy(&answer).into_owned(), alerted)
+    }))
+    .await
+    .unwrap()
+}
+
+/// An HTTP/1 connection over TLS that the server closes with nothing left unfinished ends
+/// with a closure alert (RFC 9112 §9.8: "Servers MUST attempt to initiate an exchange of
+/// closure alerts with the client before closing the connection"; RFC 8446 §6.1): after an
+/// answer the connection does not outlive, closed or ended by the close, after a refused
+/// head, and when it has waited for a next request long enough. Without one a client can
+/// tell no end of an answer from a cut, and RFC 9112 §9.8 has an answer ended by the close
+/// complete only once the alert has come.
+#[tokio::test]
+async fn an_http1_connection_over_tls_the_server_closes_ends_with_a_closure_alert() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let certificates = vec![crate::tls::testing::certificate(&["example.test"])];
+            let (front, _worker) = serving_secured_worker(upstream, certificates).await;
+            for (request, said) in [
+                (
+                    &b"GET / HTTP/1.1\r\nhost: example.test\r\nconnection: close\r\n\r\n"[..],
+                    "HTTP/1.1 200 OK\r\n",
+                ),
+                (
+                    b"GET / HTTP/1.0\r\nhost: example.test\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\n",
+                ),
+                (
+                    b"GET / HTTP/1.1\r\nhost: example.test\r\nnot a field\r\n\r\n",
+                    "HTTP/1.1 400 ",
+                ),
+                // Kept, and then closed for asking nothing more.
+                (
+                    b"GET / HTTP/1.1\r\nhost: example.test\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\n",
+                ),
+            ] {
+                let (answer, alerted) = closed_over_tls(front, request).await;
+                assert!(answer.starts_with(said), "{answer}");
+                assert!(
+                    alerted,
+                    "no closure alert after {:?}: {answer:?}",
+                    String::from_utf8_lossy(request)
+                );
+            }
+        })
+        .await;
+}
+
+/// An answer whose body fails after its head has gone ends with no closure alert: the
+/// client is left with a message it can tell is unfinished, and over TLS a close without the
+/// alert is how it tells (RFC 9112 §9.8). One ended by the close, to an HTTP/1.0 client,
+/// would otherwise be taken as whole.
+#[tokio::test]
+async fn an_http1_answer_over_tls_cut_short_ends_without_a_closure_alert() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _held) = scripted_upstream().await;
+            let certificates = vec![crate::tls::testing::certificate(&["example.test"])];
+            let (front, _worker) = serving_secured_worker(upstream, certificates).await;
+            for request in [
+                &b"GET /short HTTP/1.1\r\nhost: example.test\r\nconnection: close\r\n\r\n"[..],
+                b"GET /short HTTP/1.0\r\nhost: example.test\r\n\r\n",
+            ] {
+                let (answer, alerted) = closed_over_tls(front, request).await;
+                assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+                assert!(answer.ends_with("short"), "{answer}");
+                assert!(!alerted, "a closure alert after a cut answer: {answer:?}");
+            }
+        })
+        .await;
+}
+
+/// An HTTP/2 connection over TLS that the server closes for having been idle long enough
+/// ends with a closure alert as well: h2 shuts its socket once it has said GOAWAY. Told from
+/// the wire, the client held to TLS 1.2, whose records say their type in the clear: the last
+/// the server sends is an alert, which on a connection closed in good order is the closure
+/// alert.
+#[tokio::test]
+async fn an_http2_connection_over_tls_the_server_closes_ends_with_a_closure_alert() {
+    use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
+    use tokio::io::AsyncReadExt;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let certificates = vec![crate::tls::testing::certificate(&["example.test"])];
+            let (front, _worker) = serving_secured_worker(upstream, certificates).await;
+            let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+            builder.set_verify(SslVerifyMode::NONE);
+            builder.set_alpn_protos(b"\x02h2").unwrap();
+            builder
+                .set_max_proto_version(Some(SslVersion::TLS1_2))
+                .unwrap();
+            let config = builder.build().configure().unwrap().verify_hostname(false);
+            let read = Rc::new(RefCell::new(Vec::new()));
+            let tapped = Tapped {
+                stream: TcpStream::connect(front).await.unwrap(),
+                read: Rc::clone(&read),
+            };
+            let mut stream = within(tokio_boring::connect(config, "example.test", tapped))
+                .await
+                .unwrap();
+            {
+                let (mut send, connection) =
+                    within(::h2::client::handshake(&mut stream)).await.unwrap();
+                let mut connection = std::pin::pin!(connection);
+                let request = Request::get("https://example.test/").body(()).unwrap();
+                let (answer, _) = send.send_request(request, true).unwrap();
+                let answer = within(async {
+                    tokio::select! {
+                        answer = answer => answer.unwrap(),
+                        ended = &mut connection => panic!("ended before the answer: {ended:?}"),
+                    }
+                })
+                .await;
+                assert_eq!(answer.status(), StatusCode::OK);
+                // Asked nothing more, the server closes it.
+                let _ended = within(connection).await;
+            }
+            let mut rest = Vec::new();
+            let _ended = within(stream.read_to_end(&mut rest)).await;
+            // A type, a version and a length each, to the last.
+            let wire = read.borrow().clone();
+            let (mut at, mut last) = (0, None);
+            while let Some(header) = wire.get(at..at + 5) {
+                last = Some(header[0]);
+                at += 5 + usize::from(u16::from_be_bytes([header[3], header[4]]));
+            }
+            assert_eq!(at, wire.len(), "records cut short");
+            assert_eq!(last, Some(21), "the last record is no alert");
+        })
+        .await;
+}

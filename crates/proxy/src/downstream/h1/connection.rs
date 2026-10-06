@@ -186,6 +186,24 @@ pub(crate) enum Ended {
     Switched(Carried),
 }
 
+impl Ended {
+    /// Whether the connection ended with nothing of a message left part way, and so may say
+    /// its end in order: over TLS, with a closure alert (RFC 9112 §9.8). Not after an answer
+    /// cut short, nor one a stalled upload or a client that stopped reading left unfinished,
+    /// which an alert would pass off as whole; nor once the client has gone or the socket
+    /// failed, nor when the worker could not pay for what it needed.
+    fn is_in_order(self) -> bool {
+        match self {
+            Self::Closed | Self::Answered | Self::Refused(_) => true,
+            Self::TimedOut(clock) => matches!(
+                clock,
+                Clock::FirstRequest | Clock::NextHead | Clock::KeepAlive
+            ),
+            Self::Gone | Self::Cut | Self::Exhausted | Self::Switched(_) => false,
+        }
+    }
+}
+
 /// What the connection has read and not yet handed on, shared with the body of the
 /// request being served.
 #[derive(Debug)]
@@ -1006,6 +1024,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         })
         .await
     }
+
+    /// Shuts the socket's sending half — over TLS, its closure alert first — waiting for the
+    /// client to take it no longer than for any write. One that fails, or does not go in
+    /// time, leaves the connection to be closed all the same.
+    async fn shut(&mut self) {
+        self.deadlines.shutting(now());
+        poll_fn(|context| {
+            if Pin::new(&mut self.socket).poll_shutdown(context).is_ready()
+                || self.poll_deadline(context).is_err()
+            {
+                return Poll::Ready(());
+            }
+            Poll::Pending
+        })
+        .await;
+    }
 }
 
 /// The time the deadlines are told of. Tokio's, so that a test that stops the clock stops
@@ -1113,6 +1147,11 @@ impl FinalHead {
 /// bytes may still be arriving. Once `drain` starts, the connection closes when idle and says
 /// so on the answer in hand (03 §10).
 ///
+/// A connection that ends in order — nothing of a message left part way — has its sending
+/// half shut first, within the write's idle bound: over TLS that is the closure alert RFC 9112
+/// §9.8 asks of a server before it closes, without which a client cannot tell an answer ended
+/// by the close from one cut short ([13 §5](../../../../docs/13-http1-upstream.md)).
+///
 /// Each request's future runs in a slot lent by `slots` for as long as the request does, not
 /// inside this future (14 §3): a connection waiting for its first or next request holds no
 /// room for one.
@@ -1137,7 +1176,8 @@ where
     let mut connection = Connection::new(socket, settings, blocks, &timers);
     let mut draining = std::pin::pin!(drain.notified());
 
-    loop {
+    // Every way out but the tunnel's comes here, with how the connection ended.
+    let ended = 'serving: loop {
         // A local is kept in the connection's future across every await while it is in
         // scope, even once its value has been moved out of it. So each step's outcome is
         // taken apart in a block of its own, and only what the next step needs leaves it
@@ -1149,10 +1189,10 @@ where
             // is written.
             let error = match connection.read_head(limits, drain, draining.as_mut()).await {
                 Ok(read) => break 'read read,
-                Err(Ok(ended)) => return ended,
+                Err(Ok(ended)) => break 'serving ended,
                 Err(Err(error)) => error,
             };
-            return refuse(&mut connection, error, &date).await;
+            break 'serving refuse(&mut connection, error, &date).await;
         };
         let Begun {
             head,
@@ -1165,7 +1205,7 @@ where
                 Ok(begun) => break 'begun begun,
                 Err(error) => error,
             };
-            return refuse(&mut connection, error, &date).await;
+            break 'serving refuse(&mut connection, error, &date).await;
         };
         // The answer, with both directions kept moving while it is worked out.
         let response = {
@@ -1218,7 +1258,7 @@ where
             };
             match answer {
                 Ok(response) => response,
-                Err(stop) => return stop.into(),
+                Err(stop) => break 'serving stop.into(),
             }
         };
         // Kept only if the connection is not draining, as well as what the request and the
@@ -1228,7 +1268,7 @@ where
         let (mut body, written) =
             match connection.answer_head(&interim, response, asked, persistent, &date()) {
                 Ok(answering) => answering,
-                Err(ended) => return ended,
+                Err(ended) => break 'serving ended,
             };
         // A WebSocket's 101: once it has gone, the connection is the tunnel's, and what the
         // client sent after its handshake goes to the backend first (19 §2).
@@ -1322,18 +1362,22 @@ where
         match sent {
             Ok(true) => {}
             Ok(false) => {
-                return replace_or_cut(&mut connection, asked, &date).await;
+                break 'serving replace_or_cut(&mut connection, asked, &date).await;
             }
-            Err(stop) => return stop.into(),
+            Err(stop) => break 'serving stop.into(),
         }
         // A kept connection's request had ended when its answer began (`persistent`), and
         // nothing is read while the answer is written unless that request's body asks.
         if written.closes {
-            return Ended::Answered;
+            break 'serving Ended::Answered;
         }
         let read_ahead = connection.inbound.borrow().holds_any();
         connection.deadlines.answered(now(), read_ahead);
+    };
+    if ended.is_in_order() {
+        connection.shut().await;
     }
+    ended
 }
 
 /// Writes out a 101, then carries the connection to the backend the request core switched,

@@ -95,6 +95,9 @@ enum Phase {
     KeepAlive { by: Instant },
     /// The next head can be read and must be finished by then.
     NextHead { by: Instant },
+    /// Done with the connection, its end being said: shutting its sending half, which a
+    /// client that takes nothing more holds up, so it is a write's clock that runs.
+    Shutting { by: Instant },
     /// Done with the connection: reading and discarding what the client still sends.
     Lingering { quiet: Instant, most: Instant },
     /// Nothing is running.
@@ -152,6 +155,7 @@ impl Deadlines {
             Phase::First { .. }
             | Phase::Serving { .. }
             | Phase::NextHead { .. }
+            | Phase::Shutting { .. }
             | Phase::Closed => {}
         }
     }
@@ -221,6 +225,16 @@ impl Deadlines {
         }
     }
 
+    /// The server is done with the connection and shuts its sending half, which must go
+    /// within a write's idle bound.
+    pub fn shutting(&mut self, now: Instant) {
+        if !matches!(self.phase, Phase::Lingering { .. } | Phase::Closed) {
+            self.phase = Phase::Shutting {
+                by: now + self.bounds.idle,
+            };
+        }
+    }
+
     /// The server is done with the connection and lingers, reading and discarding what
     /// the client still sends (13 §5).
     pub fn lingering(&mut self, now: Instant) {
@@ -249,6 +263,7 @@ impl Deadlines {
             Phase::First { by } => Some((Clock::FirstRequest, by)),
             Phase::NextHead { by } => Some((Clock::NextHead, by)),
             Phase::KeepAlive { by } => Some((Clock::KeepAlive, by)),
+            Phase::Shutting { by } => Some((Clock::WriteIdle, by)),
             Phase::Serving { body, write } => {
                 let body = body.map(|due| (Clock::BodyIdle, due));
                 let write = write.map(|due| (Clock::WriteIdle, due));
@@ -428,6 +443,34 @@ mod tests {
         );
     }
 
+    /// Shutting the sending half waits on the client as a write does, from whatever the
+    /// connection was doing, and for no longer: what the client sends meanwhile does not
+    /// put it off.
+    #[test]
+    fn a_shutting_connection_waits_a_writes_idle_bound() {
+        let (mut connection, start) = accepted();
+        connection.head_read();
+        connection.body_waited_on(start + secs(1), true);
+        connection.shutting(start + secs(2));
+        assert_eq!(
+            connection.next(),
+            Some((Clock::WriteIdle, start + secs(32)))
+        );
+        connection.bytes_arrived(start + secs(20));
+        assert_eq!(connection.expired(start + secs(31)), None);
+        assert_eq!(connection.expired(start + secs(32)), Some(Clock::WriteIdle));
+        // Nor does it start a lingering or a closed connection's clocks again.
+        connection.lingering(start + secs(33));
+        connection.shutting(start + secs(34));
+        assert_eq!(
+            connection.next().map(|(clock, _)| clock),
+            Some(Clock::LingerQuiet)
+        );
+        connection.closed();
+        connection.shutting(start + secs(35));
+        assert_eq!(connection.next(), None);
+    }
+
     #[test]
     fn events_that_do_not_apply_change_nothing() {
         let (mut connection, start) = accepted();
@@ -463,7 +506,7 @@ mod tests {
         #[test]
         fn a_deadline_comes_sooner_only_by_the_shortest_bound_from_now(
             seconds in proptest::collection::vec(1_u64..40, 6),
-            events in proptest::collection::vec((0_u8..10, 0_u64..20_000, proptest::bool::ANY), 0..40),
+            events in proptest::collection::vec((0_u8..11, 0_u64..20_000, proptest::bool::ANY), 0..40),
         ) {
             let [first_request, next_head, keep_alive, idle, linger_quiet, linger_most] =
                 [0, 1, 2, 3, 4, 5].map(|at| secs(seconds[at]));
@@ -484,6 +527,7 @@ mod tests {
                     6 => connection.answered(now, flag),
                     7 => connection.lingering(now),
                     8 => connection.closed(),
+                    9 => connection.shutting(now),
                     _ => {}
                 }
                 if let Some((clock, due)) = connection.next()
