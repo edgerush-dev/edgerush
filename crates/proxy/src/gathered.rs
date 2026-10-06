@@ -10,6 +10,13 @@
 //! A write TLS could not finish has its record sealed and waiting in BoringSSL, which takes
 //! it only from the same buffer, offered again: the gathered bytes are kept until then, and
 //! the next write finishes them before anything else is gathered.
+//!
+//! Once a write has finished, a buffer larger than [`KEPT`] is let go of: the stream lives
+//! as long as its connection, idle between requests included, and an idle connection is to
+//! hold no request-sized allocation ([14 §8](../../../docs/14-downstream-server.md)). A
+//! smaller one is kept, so that small answers, nearly all of them, gather into the same
+//! memory each time; a large answer pays one allocation a record, small beside its copy and
+//! its sealing.
 
 use std::io::{self, IoSlice};
 use std::pin::Pin;
@@ -18,6 +25,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// The most one TLS record carries.
 const RECORD: usize = 16 * 1024;
+
+/// The largest buffer kept from one write to the next: what a head and a small answer
+/// gather into.
+const KEPT: usize = 4 * 1024;
 
 /// A TLS stream, `S`, written to a record at a time.
 #[derive(Debug)]
@@ -46,6 +57,9 @@ impl<S: AsyncWrite + Unpin> Gathered<S> {
         let written =
             std::task::ready!(Pin::new(&mut self.inner).poll_write(context, &self.gathered));
         self.unfinished = false;
+        if self.gathered.capacity() > KEPT {
+            self.gathered = Vec::new();
+        }
         Poll::Ready(written)
     }
 }
@@ -97,6 +111,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Gathered<S> {
             return Pin::new(&mut this.inner).poll_write(context, first);
         }
         this.gathered.clear();
+        // Made once, at its size, rather than grown piece by piece.
+        this.gathered.reserve(offered.min(RECORD));
         for piece in std::iter::once(first).chain(pieces) {
             let room = RECORD - this.gathered.len();
             if room == 0 {
@@ -254,5 +270,62 @@ mod tests {
         assert!(first.is_pending());
         let error = write(&mut stream, &[b"head"]).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// Once a large gathered write has gone, the connection holds none of it while it
+    /// waits for its next request (14 §8): a head and a record's worth of body, as a large
+    /// answer is written.
+    #[tokio::test]
+    async fn a_finished_record_leaves_no_buffer_behind() {
+        let mut stream = Gathered::new(Records::default());
+        let head = vec![b'h'; 200];
+        let body = vec![b'b'; RECORD];
+        let written = write(&mut stream, &[&head, &body]).await.unwrap();
+        assert_eq!(written, RECORD);
+        assert_eq!(
+            stream.gathered.capacity(),
+            0,
+            "kept by an idle connection's gatherer after a finished record"
+        );
+    }
+
+    /// A record TLS could not finish keeps its bytes until it is offered again and goes,
+    /// and only then is its buffer let go of.
+    #[tokio::test]
+    async fn an_unfinished_record_is_let_go_of_once_it_goes() {
+        let mut stream = Gathered::new(Records {
+            refuse: 1,
+            ..Records::default()
+        });
+        let head = vec![b'h'; 200];
+        let body = vec![b'b'; RECORD];
+        let slices = [IoSlice::new(&head), IoSlice::new(&body)];
+        let first = poll_fn(|context| {
+            Poll::Ready(Pin::new(&mut stream).poll_write_vectored(context, &slices))
+        })
+        .await;
+        assert!(first.is_pending());
+        assert_eq!(stream.gathered.len(), RECORD, "kept for TLS to finish");
+        let again =
+            poll_fn(|context| Pin::new(&mut stream).poll_write_vectored(context, &slices)).await;
+        assert_eq!(again.unwrap(), RECORD);
+        assert_eq!(stream.gathered.capacity(), 0);
+    }
+
+    /// A small answer's buffer is kept and gathered into again: small answers allocate
+    /// nothing after the first.
+    #[tokio::test]
+    async fn a_small_answers_buffer_is_kept_for_the_next() {
+        let mut stream = Gathered::new(Records::default());
+        write(&mut stream, &[b"HTTP/1.1 200 OK\r\n\r\n", b"hello"])
+            .await
+            .unwrap();
+        let kept = stream.gathered.as_ptr();
+        assert!(stream.gathered.capacity() > 0);
+        write(&mut stream, &[b"HTTP/1.1 200 OK\r\n\r\n", b"again"])
+            .await
+            .unwrap();
+        assert_eq!(stream.gathered.as_ptr(), kept);
+        assert_eq!(stream.inner.written[1], b"HTTP/1.1 200 OK\r\n\r\nagain");
     }
 }
