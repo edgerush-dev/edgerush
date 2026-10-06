@@ -266,6 +266,35 @@ pub(super) async fn scripted_h2_upstream(script: Script) -> SocketAddr {
     address
 }
 
+/// An HTTP/2 upstream that answers every request with `size` bytes, sent as the client
+/// gives it room.
+pub(super) fn answering_with(size: usize) -> Script {
+    Rc::new(move |_request, mut respond| {
+        Box::pin(async move {
+            let Ok(mut sending) = respond.send_response(ok_head(), false) else {
+                return;
+            };
+            let mut left = size;
+            while left > 0 {
+                let piece = left.min(64 * 1024);
+                sending.reserve_capacity(piece);
+                let Some(Ok(room)) = std::future::poll_fn(|cx| sending.poll_capacity(cx)).await
+                else {
+                    return;
+                };
+                let give = room.min(piece);
+                if sending
+                    .send_data(Bytes::from(vec![b'z'; give]), left == give)
+                    .is_err()
+                {
+                    return;
+                }
+                left -= give;
+            }
+        })
+    })
+}
+
 pub(super) fn ok_head() -> Response<()> {
     Response::builder().status(200).body(()).unwrap()
 }

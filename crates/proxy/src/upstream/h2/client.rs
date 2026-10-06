@@ -109,6 +109,8 @@ struct Link {
     settled: Cell<bool>,
     /// Wakes whoever waits for them.
     heard: Notify,
+    /// Closed because the worker could not pay for what h2 held of its answers.
+    shed: Cell<bool>,
 }
 
 impl Link {
@@ -151,6 +153,19 @@ pub(crate) struct Place {
     key: u64,
     id: ConnectionId,
     send: SendRequest<Outgoing>,
+    /// The connection's, read once it has gone.
+    link: Rc<Link>,
+}
+
+/// Whether a connection was closed for the worker's storage: what h2 tells its streams then
+/// is no fault of the upstream's.
+pub(crate) struct Shed(Rc<Link>);
+
+impl Shed {
+    /// Whether it was.
+    pub(crate) fn is_shed(&self) -> bool {
+        self.0.shed.get()
+    }
 }
 
 impl std::fmt::Debug for Place {
@@ -166,6 +181,12 @@ impl Place {
     /// What the stream is opened with.
     pub(crate) fn sender(&mut self) -> &mut SendRequest<Outgoing> {
         &mut self.send
+    }
+
+    /// Whether the place's connection was closed because the worker could not pay for
+    /// what h2 held of its answers, asked once it has gone.
+    pub(crate) fn shed(&self) -> Shed {
+        Shed(Rc::clone(&self.link))
     }
 
     /// Once the peer's SETTINGS have been heard on the place's connection. The pool lets a
@@ -324,17 +345,18 @@ impl Client {
 
     /// The place already reserved on connection `id`.
     fn place_on(self: &Rc<Self>, key: u64, id: ConnectionId) -> Result<Place, PlaceError> {
-        let send = self
-            .links
-            .borrow()
-            .get(&id)
-            .and_then(|link| link.send.borrow().clone());
+        let link = self.links.borrow().get(&id).cloned();
+        let send = link
+            .as_ref()
+            .and_then(|link| link.send.borrow().clone())
+            .zip(link);
         match send {
-            Some(send) => Ok(Place {
+            Some((send, link)) => Ok(Place {
                 client: Rc::clone(self),
                 key,
                 id,
                 send,
+                link,
             }),
             // A place is reserved only on a connection that is up, and a connection with
             // places taken is not let go of; so this is not known to happen. The
@@ -457,6 +479,7 @@ impl Client {
             released: Notify::new(),
             settled: Cell::new(false),
             heard: Notify::new(),
+            shed: Cell::new(false),
         });
         self.links.borrow_mut().insert(id, Rc::clone(&link));
         self.event(|pool, now, actions| pool.opened(key, id, peer, now, actions));
@@ -547,6 +570,7 @@ impl Client {
             account.drive_with(cx.waker());
             account.settle(connection.received_unreleased());
             if account.is_shed() {
+                link.shed.set(true);
                 return Poll::Ready(());
             }
             if let Some(pinging) = pings.as_mut()

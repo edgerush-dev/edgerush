@@ -617,35 +617,6 @@ async fn an_http2_upstreams_reset_is_passed_on_where_it_means_the_same() {
         .await;
 }
 
-/// An HTTP/2 upstream that answers every request with `size` bytes, sent as the client
-/// gives it room.
-fn answering_with(size: usize) -> Script {
-    Rc::new(move |_request, mut respond| {
-        Box::pin(async move {
-            let Ok(mut sending) = respond.send_response(ok_head(), false) else {
-                return;
-            };
-            let mut left = size;
-            while left > 0 {
-                let piece = left.min(64 * 1024);
-                sending.reserve_capacity(piece);
-                let Some(Ok(room)) = std::future::poll_fn(|cx| sending.poll_capacity(cx)).await
-                else {
-                    return;
-                };
-                let give = room.min(piece);
-                if sending
-                    .send_data(Bytes::from(vec![b'z'; give]), left == give)
-                    .is_err()
-                {
-                    return;
-                }
-                left -= give;
-            }
-        })
-    })
-}
-
 /// One client that stops reading holds only its own stream's window: another stream on
 /// the same upstream connection is answered in full meanwhile.
 #[tokio::test]
@@ -1223,6 +1194,160 @@ async fn an_http2_field_value_with_whitespace_at_either_end_is_not_forwarded() {
             for (value, outcome) in &outcomes {
                 assert_eq!(outcome, "reset Some(PROTOCOL_ERROR)", "{value:?}");
             }
+        })
+        .await;
+}
+
+/// An upload to an HTTP/2 upstream whose pieces the worker cannot pay for is the worker's
+/// own shortage, as it is going to an HTTP/1 upstream: answered 503 and not counted against
+/// the upstream, which did nothing wrong (14 §8). The worker can pay for the client's one
+/// frame, which h2 holds until the next is asked for, and for nothing more: the piece the
+/// upload would stage beside it is what it cannot pay for. The upstream reads the whole body
+/// before it answers.
+#[tokio::test]
+async fn an_upload_to_an_http2_upstream_the_worker_cannot_pay_for_is_answered_503() {
+    const FRAME: usize = 4096;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _seen, _gate) = h2_upstream(UpstreamH2::default()).await;
+            let limits = H1Limits {
+                storage: FRAME + 1024,
+                ..H1Limits::default()
+            };
+            let (front, worker) = serving_worker_to_h2(upstream, limits).await;
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let request = Request::post("http://a.test/upload").body(()).unwrap();
+            send = within(send.ready()).await.unwrap();
+            let (answer, mut body) = send.send_request(request, false).unwrap();
+            body.send_data(Bytes::from(vec![b'x'; FRAME]), true)
+                .unwrap();
+            let answer = within(answer).await.unwrap();
+            assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let proxy = &worker.proxy;
+            let up = proxy.metrics.upstream_slot("up");
+            let scrape = proxy
+                .metrics
+                .render(&["web".to_owned()], &[("up", up)], &[]);
+            assert!(
+                scrape.contains("edgerush_upstream_failures_total{upstream=\"up\"} 0\n"),
+                "{scrape}"
+            );
+        })
+        .await;
+}
+
+/// An upstream connection the worker closes because it cannot pay for what h2 holds of
+/// its answers is closed by the worker's shortage, not the upstream's failing: a request
+/// still waiting on it for its head is answered 503 and not counted against the upstream
+/// (14 §8). Two clients that read nothing fill the worker's storage with their answers on
+/// the one connection the worker may open, while a third waits there for an answer the
+/// upstream holds back.
+#[tokio::test]
+async fn a_request_on_an_upstream_connection_shed_for_storage_is_answered_503() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let big = answering_with(4 << 20);
+            let script: Script = Rc::new(move |request, respond| {
+                if request.uri().path() == "/held" {
+                    // Kept and never answered.
+                    Box::pin(async move {
+                        let _respond = respond;
+                        std::future::pending::<()>().await;
+                    })
+                } else {
+                    big(request, respond)
+                }
+            });
+            let upstream = scripted_h2_upstream(script).await;
+            let limits = H1Limits {
+                storage: 3 << 19,
+                h2_connections: 1,
+                ..H1Limits::default()
+            };
+            let (front, worker) = serving_worker_to_h2(upstream, limits).await;
+            let mut waiting = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let request = Request::get("http://a.test/held").body(()).unwrap();
+            let (held, _) = waiting.send_request(request, true).unwrap();
+            let mut granting_nothing = ::h2::client::Builder::new();
+            granting_nothing.initial_window_size(0);
+            let mut stalled = Vec::new();
+            for path in ["/one", "/two"] {
+                let mut client = h2_library_client(front, &granting_nothing).await;
+                let request = Request::get(format!("http://a.test{path}"))
+                    .body(())
+                    .unwrap();
+                let (answer, _) = client.send_request(request, true).unwrap();
+                stalled.push((client, answer));
+            }
+            let held = within(held).await.unwrap();
+            assert_eq!(held.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let proxy = &worker.proxy;
+            let up = proxy.metrics.upstream_slot("up");
+            let scrape = proxy
+                .metrics
+                .render(&["web".to_owned()], &[("up", up)], &[]);
+            assert!(
+                scrape.contains("edgerush_upstream_failures_total{upstream=\"up\"} 0\n"),
+                "{scrape}"
+            );
+            drop(stalled);
+        })
+        .await;
+}
+
+/// An answer already under way on an upstream connection the worker closes for storage is
+/// cut by the worker's shortage, not the upstream's: it is not counted among the upstream's
+/// failed bodies (14 §8). A client reads its answer's head and stops, holding what h2 has of
+/// its answer; one more that reads nothing takes the worker past what it can pay for on the
+/// one connection it may open, and the connection goes. The first client then reads on, and
+/// its answer ends cut short.
+#[tokio::test]
+async fn an_answer_cut_by_a_connection_shed_for_storage_is_not_the_upstreams_body_failing() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let upstream = scripted_h2_upstream(answering_with(4 << 20)).await;
+            let limits = H1Limits {
+                storage: 3 << 19,
+                h2_connections: 1,
+                ..H1Limits::default()
+            };
+            let (front, worker) = serving_worker_to_h2(upstream, limits).await;
+            let mut reading = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let request = Request::get("http://a.test/read").body(()).unwrap();
+            let (answer, _) = reading.send_request(request, true).unwrap();
+            let answer = within(answer).await.unwrap();
+            assert_eq!(answer.status(), StatusCode::OK);
+            let mut body = answer.into_body();
+            let mut granting_nothing = ::h2::client::Builder::new();
+            granting_nothing.initial_window_size(0);
+            let mut stalled = h2_library_client(front, &granting_nothing).await;
+            let request = Request::get("http://a.test/stalled").body(()).unwrap();
+            let (_stalled, _) = stalled.send_request(request, true).unwrap();
+            until(|| worker.h2_connections() == 0).await;
+            let mut read = 0;
+            let ended = loop {
+                match within(body.data()).await {
+                    Some(Ok(data)) => {
+                        read += data.len();
+                        let _released = body.flow_control().release_capacity(data.len());
+                    }
+                    Some(Err(error)) => break Some(error),
+                    None => break None,
+                }
+            };
+            assert!(ended.is_some(), "all {read} bytes of a cut answer came");
+            let proxy = &worker.proxy;
+            let up = proxy.metrics.upstream_slot("up");
+            let scrape = proxy
+                .metrics
+                .render(&["web".to_owned()], &[("up", up)], &[]);
+            assert!(
+                scrape.contains("edgerush_upstream_body_failures_total{upstream=\"up\"} 0\n"),
+                "{scrape}"
+            );
         })
         .await;
 }

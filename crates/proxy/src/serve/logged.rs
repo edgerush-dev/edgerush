@@ -228,7 +228,9 @@ impl Logging {
     fn failed(&self, error: &BodyError) {
         let why = match error {
             BodyError::DeadlinePassed => "deadline_exceeded",
-            BodyError::Ours(_) | BodyError::H2(_) => "upstream_failed",
+            error if error.is_the_upstreams() => "upstream_failed",
+            // The worker's own storage ran out under it, as a 503 before the head says.
+            BodyError::Ours(_) | BodyError::H2(_) | BodyError::Shed => "exhausted",
         };
         self.reason.set(Some(why));
     }

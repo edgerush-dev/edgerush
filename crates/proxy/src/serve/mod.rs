@@ -229,10 +229,14 @@ struct Watch {
 }
 
 impl Watch {
-    fn body_failed(&self) {
-        if let Some(counters) = self.proxy.metrics.upstream(self.upstream) {
+    /// `error`, counted among the upstream's failed bodies where it is the upstream's.
+    fn failed(&self, error: BodyError) -> BodyError {
+        if error.is_the_upstreams()
+            && let Some(counters) = self.proxy.metrics.upstream(self.upstream)
+        {
             counters.body_failures.inc();
         }
+        error
     }
 }
 
@@ -244,8 +248,20 @@ enum BodyError {
     Ours(#[from] ExchangeError),
     #[error("the HTTP/2 upstream's answer could not be read")]
     H2(#[source] RequestBodyError),
+    /// The HTTP/2 upstream's connection was closed because the worker could not pay for
+    /// what h2 held of its answers.
+    #[error("the worker could not pay for the HTTP/2 upstream connection's answers")]
+    Shed,
     #[error("the request's deadline passed before its answer's end")]
     DeadlinePassed,
+}
+
+impl BodyError {
+    /// Whether the upstream is to answer for it: not where the worker's own storage ran
+    /// out, which cut the answer whatever the upstream did (14 §8).
+    fn is_the_upstreams(&self) -> bool {
+        !matches!(self, Self::Ours(ExchangeError::Exhausted(_)) | Self::Shed)
+    }
 }
 
 impl HttpBody for Body {
@@ -267,20 +283,19 @@ impl HttpBody for Body {
                     ours.settle();
                 }
                 frame.map(|frame| {
-                    frame.map(|frame| {
-                        frame.map_err(|error| {
-                            watch.body_failed();
-                            BodyError::Ours(error)
-                        })
-                    })
+                    frame.map(|frame| frame.map_err(|error| watch.failed(BodyError::Ours(error))))
                 })
             }
             Self::H2(answer, _place, watch) => {
-                Pin::new(&mut **answer).poll_frame(context).map(|frame| {
+                let frame = Pin::new(&mut **answer).poll_frame(context);
+                frame.map(|frame| {
                     frame.map(|frame| {
                         frame.map_err(|error| {
-                            watch.body_failed();
-                            BodyError::H2(error)
+                            watch.failed(if answer.is_shed() {
+                                BodyError::Shed
+                            } else {
+                                BodyError::H2(error)
+                            })
                         })
                     })
                 })

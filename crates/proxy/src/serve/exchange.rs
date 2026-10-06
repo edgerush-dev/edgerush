@@ -562,7 +562,8 @@ impl Worker {
 }
 
 /// What an HTTP/2 exchange that failed is answered with, counted against `upstream` where
-/// it was the upstream's failing: waiting for a place, or the client's own body, is not.
+/// it was the upstream's failing: waiting for a place, the client's own body, or the
+/// worker's own storage running out, is not.
 fn h2_failed(
     error: h2_exchange::ExchangeError,
     upstream: Option<&crate::metrics::UpstreamCounters>,
@@ -581,6 +582,7 @@ fn h2_failed(
             Answer::BodyTimedOut
         }
         h2_exchange::ExchangeError::RequestBody(_) => Answer::BadBody,
+        h2_exchange::ExchangeError::Exhausted => Answer::Exhausted,
         h2_exchange::ExchangeError::TooSlow { .. } | h2_exchange::ExchangeError::Idle { .. } => {
             Answer::UpstreamTimedOut
         }

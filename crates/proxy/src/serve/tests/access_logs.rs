@@ -924,3 +924,62 @@ async fn a_tls_connection_is_logged_with_the_name_it_asked_for() {
         })
         .await;
 }
+
+/// An answer the worker's own storage cut short after its head — its HTTP/2 upstream
+/// connection closed to make room — is logged as that, `exhausted`, not as the upstream
+/// failing (14 §8). Set up as the metrics' test of it is: one client reads its answer's
+/// head and stops, another reads nothing, and the one connection the worker may open goes.
+#[tokio::test]
+async fn an_answer_cut_by_the_workers_shortage_is_logged_as_that() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let upstream = scripted_h2_upstream(answering_with(4 << 20)).await;
+            let directory = scratch("shed");
+            let path = directory.join("access.log");
+            let mut config = everything_config(upstream);
+            config.upstreams.get_mut("up").unwrap().protocol = UpstreamProtocol::Http2;
+            config.listeners.get_mut("web").unwrap().access_log =
+                Some(edgerush_config::AccessLog::File(path.clone()));
+            let limits = H1Limits {
+                storage: 3 << 19,
+                h2_connections: 1,
+                sweep: Duration::from_millis(50),
+                ..H1Limits::default()
+            };
+            let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+            let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+            let _sweeping = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+            let logged = Recording {
+                front,
+                worker,
+                path,
+                directory,
+            };
+
+            let mut reading = h2_library_client(logged.front, &::h2::client::Builder::new()).await;
+            let request = Request::get("http://example.test/read").body(()).unwrap();
+            let (answer, _) = reading.send_request(request, true).unwrap();
+            let mut body = within(answer).await.unwrap().into_body();
+            let mut granting_nothing = ::h2::client::Builder::new();
+            granting_nothing.initial_window_size(0);
+            let mut stalled = h2_library_client(logged.front, &granting_nothing).await;
+            let request = Request::get("http://example.test/stalled")
+                .body(())
+                .unwrap();
+            let (_stalled, _) = stalled.send_request(request, true).unwrap();
+            until(|| logged.worker.h2_connections() == 0).await;
+            while let Some(Ok(data)) = within(body.data()).await {
+                let _released = body.flow_control().release_capacity(data.len());
+            }
+            let records = logged.records(1).await;
+            let record = &records[0];
+            assert_eq!(record["path"], "/read", "{record}");
+            assert_eq!(record["status"], 200);
+            assert_eq!(record["reason"], "exhausted", "{record}");
+        })
+        .await;
+}

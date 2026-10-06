@@ -12,7 +12,7 @@
 //! charges them to the worker's storage; the answer is read by the same reader, which
 //! returns a frame's flow-control credit when the next is asked for.
 
-use super::client::{Client, Place, PlaceError};
+use super::client::{Client, Place, PlaceError, Shed};
 use super::head::{self, HeadError};
 use crate::downstream::h2::body::IncomingH2;
 use crate::downstream::h2::writer::{Outgoing, SendError, send_body};
@@ -63,6 +63,11 @@ pub(crate) enum ExchangeError {
     /// The request's own body failed while it was being sent, before any answer.
     #[error("the request's body failed")]
     RequestBody(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The worker could not pay, before any answer: for a piece of the request's body, or
+    /// for what h2 held of the connection's answers, the connection being closed for it.
+    /// Its own shortage, not the upstream's failing.
+    #[error("the worker could not pay for the exchange's storage")]
+    Exhausted,
     /// More interim heads, or more of them, than an exchange takes before its final one.
     #[error("the upstream sent more interim answers than {heads} heads or {bytes} bytes")]
     Interim {
@@ -193,6 +198,19 @@ fn kept(
     (RequestBody::Recorded(Box::new(tee)), Some(kept))
 }
 
+/// What an error h2 gives a stream says of its exchange: the worker's own shortage where its
+/// connection was closed because the worker could not pay for it, whatever h2 then told the
+/// stream ([14 §8](../../../../docs/14-downstream-server.md)); otherwise h2's error as it is.
+fn failed(shed: Shed) -> impl Fn(::h2::Error) -> ExchangeError {
+    move |error| {
+        if shed.is_shed() {
+            ExchangeError::Exhausted
+        } else {
+            ExchangeError::H2(error)
+        }
+    }
+}
+
 /// Whether the upstream says it never processed the stream that failed with `error`: it
 /// refused it, or a GOAWAY left it above the last it accepted. Nothing else says so — a
 /// stream it reset any other way, or a connection lost under it, may have been acted on.
@@ -230,6 +248,7 @@ impl Attempt<'_> {
             again,
         } = self;
         let mut place = client.place(destination).await?;
+        let failed = failed(place.shed());
         // A gRPC call's deadline goes up as the time it has left now, waiting for a place
         // and all: the upstream sees the deadline the client set, not a fresh one (15 §6).
         if let Some(deadline) = deadline {
@@ -241,8 +260,8 @@ impl Attempt<'_> {
         let sender = place.sender();
         // A handle that has opened nothing is ready unless the connection can take no new
         // streams at all; the place is what says there is room on it.
-        poll_fn(|cx| sender.poll_ready(cx)).await?;
-        let (mut response, stream) = sender.send_request(request, end_stream)?;
+        poll_fn(|cx| sender.poll_ready(cx)).await.map_err(&failed)?;
+        let (mut response, stream) = sender.send_request(request, end_stream).map_err(&failed)?;
         let mut upload: Option<Upload> = if end_stream {
             None
         } else {
@@ -264,7 +283,7 @@ impl Attempt<'_> {
         let waiting = poll_fn(|cx| {
             // Interim answers first, as h2 has them asked for, in the order they came.
             while let Poll::Ready(Some(interim)) = response.poll_informational(cx) {
-                let (interim, ()) = interim.map_err(ExchangeError::H2)?.into_parts();
+                let (interim, ()) = interim.map_err(&failed)?.into_parts();
                 heads += 1;
                 bytes += list_size(&interim.headers);
                 if heads > bounds.interim_heads || bytes > bounds.interim_bytes {
@@ -299,10 +318,15 @@ impl Attempt<'_> {
                     Err(SendError::TimedOut) => {
                         return Poll::Ready(Err(ExchangeError::Idle { limit: bounds.idle }));
                     }
+                    // The worker had nothing to pay for a piece with: the sender has reset
+                    // the stream, and the answer would blame the upstream for it.
+                    Err(SendError::Exhausted(_)) => {
+                        return Poll::Ready(Err(ExchangeError::Exhausted));
+                    }
                     _ => {}
                 }
             }
-            Pin::new(&mut response).poll(cx).map_err(ExchangeError::H2)
+            Pin::new(&mut response).poll(cx).map_err(&failed)
         });
         let answered = match bounds.final_head {
             Some(limit) => tokio::time::timeout(limit, waiting)
@@ -320,7 +344,7 @@ impl Attempt<'_> {
             body: IncomingH2::new(received, bounds.idle),
             upload,
             abandoned,
-            _place: place,
+            place,
         };
         Ok((parts, answer))
     }
@@ -365,14 +389,15 @@ pub(crate) async fn connect<F: OutgoingFields + ?Sized>(
         .insert(::h2::ext::Protocol::from_static("websocket"));
     let connecting = async {
         let mut place = client.place(destination).await?;
+        let failed = failed(place.shed());
         place.settled().await;
         if !place.sender().is_extended_connect_protocol_enabled() {
             return Ok(Connected::NotOffered);
         }
         let sender = place.sender();
-        poll_fn(|cx| sender.poll_ready(cx)).await?;
-        let (response, mut send) = sender.send_request(request, false)?;
-        let (parts, recv) = response.await?.into_parts();
+        poll_fn(|cx| sender.poll_ready(cx)).await.map_err(&failed)?;
+        let (response, mut send) = sender.send_request(request, false).map_err(&failed)?;
+        let (parts, recv) = response.await.map_err(&failed)?.into_parts();
         if parts.status.is_success() {
             let stream = H2Stream::new(send, recv, Rc::clone(storage), Some(place));
             return Ok(Connected::Switched(parts, stream));
@@ -383,7 +408,7 @@ pub(crate) async fn connect<F: OutgoingFields + ?Sized>(
             body: IncomingH2::new(recv, bounds.idle),
             upload: None,
             abandoned: false,
-            _place: place,
+            place,
         };
         Ok(Connected::Refused(parts, answer))
     };
@@ -429,7 +454,15 @@ pub(crate) struct Answer {
     upload: Option<Upload>,
     /// The upload was never wanted: it is not sent, only dropped with the answer.
     abandoned: bool,
-    _place: Place,
+    place: Place,
+}
+
+impl Answer {
+    /// Whether its connection was closed because the worker could not pay for what h2 held
+    /// of its answers: what then cuts this one is the worker's shortage, not the upstream.
+    pub(crate) fn is_shed(&self) -> bool {
+        self.place.shed().is_shed()
+    }
 }
 
 impl std::fmt::Debug for Answer {

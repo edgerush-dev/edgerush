@@ -1194,3 +1194,16 @@ fn kept_body_is_charged(sender: Sender) {
         until(|| bodies.load(Ordering::SeqCst) >= 2 * BODY).await;
     }));
 }
+
+/// An answer's body cut by the worker's own storage running out — a block it could not pay
+/// for, or an HTTP/2 upstream connection closed to make room — is not the upstream's to
+/// answer for; anything else that cuts one is (14 §8).
+#[test]
+fn only_the_upstreams_cuts_count_against_it() {
+    let exhausted = crate::storage::Storage::new(0).reserve(1).unwrap_err();
+    assert!(!BodyError::Ours(ExchangeError::Exhausted(exhausted)).is_the_upstreams());
+    assert!(!BodyError::Shed.is_the_upstreams());
+    assert!(BodyError::Ours(ExchangeError::Closed).is_the_upstreams());
+    let reset = crate::request_body::RequestBodyError::TimedOut;
+    assert!(BodyError::H2(reset).is_the_upstreams());
+}
