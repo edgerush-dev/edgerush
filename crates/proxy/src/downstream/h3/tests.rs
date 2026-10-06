@@ -1705,6 +1705,96 @@ fn an_idle_connection_is_told_to_go_at_its_keep_alive_deadline() {
     });
 }
 
+/// Settings whose QUIC idle timeout is short enough to outlast on real time, and whose
+/// keep-alive is not: what ends a quiet connection here is the transport's timer.
+fn idling() -> Settings {
+    Settings {
+        idle_timeout: Duration::from_millis(300),
+        keep_alive: Duration::from_secs(30),
+        stream_idle: Duration::from_secs(30),
+        ..short()
+    }
+}
+
+/// Waits, without driving any client, until the server holds no connection; panics if it
+/// still does after `within`.
+async fn let_go_within(server: &Server, within: Duration) {
+    let until = tokio::time::Instant::now() + within;
+    while !server.shared.table.borrow().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "the connection was not let go"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A connection with a request open is not idle, as an HTTP/2 one is not (15 §3): while
+/// the request waits on its upstream with nothing sent either way, the server keeps the
+/// transport's idle timer from ending it, for a client that sends nothing of its own
+/// (16 §6; review A12-02, A07-01).
+#[test]
+fn a_connection_with_a_request_open_is_kept_past_its_idle_timeout() {
+    locally(async {
+        let server = serving(idling(), |request, interim| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
+                echo(request, interim).await
+            })
+        })
+        .await;
+        // It advertises no idle timeout, and so never sends a PING of its own.
+        let mut client = Client::connect_with(server.address, "a.test", |config| {
+            config.set_max_idle_timeout(0);
+        })
+        .await;
+        let id = client.request(&get("a.test", "/slow"), true);
+        let answer = client.answer(id).await;
+        assert_eq!(body_of(&answer), "GET /slow 0 None");
+        assert!(!client.quic.is_closed());
+    });
+}
+
+/// A client that vanishes while its request is open is still let go: what keeps the
+/// connection is the client answering, and one that answers nothing leaves the
+/// transport's idle timer to run out.
+#[test]
+fn a_vanished_client_is_let_go_with_its_request_open() {
+    locally(async {
+        let exchanges = Exchanges::default();
+        let server = serving(idling(), exchanges.core()).await;
+        let mut client = Client::connect_with(server.address, "a.test", |config| {
+            config.set_max_idle_timeout(0);
+        })
+        .await;
+        let _id = client.request(&get("a.test", "/stalled"), true);
+        client.for_a_while(Duration::from_millis(100)).await;
+        assert_eq!(exchanges.alive.get(), 1);
+        let_go_within(&server, Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(exchanges.alive.get(), 0, "its exchange outlived it");
+    });
+}
+
+/// With nothing open, a quiet connection is not kept: it ends at the transport's idle
+/// timeout, however willing its client is to answer.
+#[test]
+fn a_quiet_connection_with_nothing_open_is_not_kept() {
+    locally(async {
+        let server = serving(idling(), echo).await;
+        let mut client = Client::connect_with(server.address, "a.test", |config| {
+            config.set_max_idle_timeout(0);
+        })
+        .await;
+        client.get("a.test", "/").await;
+        client.for_a_while(Duration::from_millis(1_200)).await;
+        assert!(
+            server.shared.table.borrow().is_empty(),
+            "a connection with nothing open was kept past its idle timeout"
+        );
+    });
+}
+
 /// Draining, a connection is told which requests were not seen, finishes those that were,
 /// and closes; the listener takes no new connection meanwhile.
 #[test]

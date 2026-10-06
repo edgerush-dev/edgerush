@@ -527,7 +527,13 @@ fn destination(datagram: &[u8]) -> Option<Option<Id>> {
 fn deliver(conn: &Rc<Conn>, datagram: &mut [u8], from: SocketAddr, to: SocketAddr) {
     conn.with(|state| {
         // What quiche cannot use it drops, and what ends the connection it acts on itself.
-        let _received = state.quic.recv(datagram, quiche::RecvInfo { from, to });
+        if state
+            .quic
+            .recv(datagram, quiche::RecvInfo { from, to })
+            .is_ok()
+        {
+            state.heard = state.heard.wrapping_add(1);
+        }
     });
     conn.stir();
 }

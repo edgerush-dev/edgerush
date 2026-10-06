@@ -7,7 +7,9 @@
 //! sends what quiche wants sent. Its deadlines, one alarm in the worker's timers for the
 //! soonest: quiche's own; the handshake, 30 s from the first packet, then the first
 //! request, 10 s from the handshake's end; the keep-alive, once no request is open; the
-//! drain's bound.
+//! drain's bound. And while a request or tunnel is open, a PING once the client has been
+//! quiet for half the idle timeout in force, so that quiche's idle timer, which sees only
+//! packets, never ends a connection with a stream open and a client that answers (16 §6).
 //!
 //! A request whose head is malformed is reset with `H3_MESSAGE_ERROR`; one whose head is too
 //! large is answered 431; one on a stream past the GOAWAY sent is reset with
@@ -52,6 +54,14 @@ struct Driving {
     asked: bool,
     /// No request has been open since then.
     quiet_since: Option<Instant>,
+    /// The client's datagrams quiche had taken when the driver last saw the count change,
+    /// and when that was.
+    heard: (u64, Instant),
+    /// When the last PING was sent to keep the connection.
+    pinged_at: Option<Instant>,
+    /// How long a connection with a stream open may be quiet before it is sent a PING:
+    /// half the idle timeout in force, known once the handshake is done; none for none.
+    ping_after: Option<Duration>,
     /// Still in its handshake, and counted as one.
     handshaking: bool,
     /// When the handshake ended, from which the first request is timed.
@@ -132,6 +142,9 @@ pub(crate) async fn drive<R, F, B, D, G>(
         accepted,
         asked: false,
         quiet_since: Some(accepted),
+        heard: (0, accepted),
+        pinged_at: None,
+        ping_after: None,
         handshaking: true,
         established_at: None,
         chosen,
@@ -233,8 +246,11 @@ pub(crate) async fn drive<R, F, B, D, G>(
                 conn.stir();
                 continue;
             }
-            let open = conn.with(|state| state.streams.len());
+            let (open, heard) = conn.with(|state| (state.streams.len(), state.heard));
             let now = Instant::now();
+            if heard != driving.heard.0 {
+                driving.heard = (heard, now);
+            }
             if open == 0 {
                 driving.quiet_since.get_or_insert(now);
             } else {
@@ -272,7 +288,13 @@ pub(crate) async fn drive<R, F, B, D, G>(
                     driving.drain_by,
                 )
             };
-            let due = [quic_due, first_due, quiet_due, drain_due]
+            // From the later of the client last heard and the last PING: a client that
+            // answers none is left to quiche's idle timer, which a PING restarts only once.
+            let ping_due = driving
+                .ping_after
+                .filter(|_| open > 0 && !driving.to_close && !driving.closing)
+                .map(|after| driving.heard.1.max(driving.pinged_at.unwrap_or(accepted)) + after);
+            let due = [quic_due, first_due, quiet_due, drain_due, ping_due]
                 .into_iter()
                 .flatten()
                 .min();
@@ -286,6 +308,12 @@ pub(crate) async fn drive<R, F, B, D, G>(
             let now = Instant::now();
             if quic_due.is_some_and(|due| due <= now) {
                 conn.with(|state| state.quic.on_timeout());
+                conn.stir();
+            }
+            if ping_due.is_some_and(|due| due <= now) {
+                // Fails only with no path in use, when there is no one to keep.
+                let _pinging = conn.with(|state| state.quic.send_ack_eliciting());
+                driving.pinged_at = Some(now);
                 conn.stir();
             }
             let over = [first_due, quiet_due, drain_due]
@@ -352,6 +380,20 @@ fn close(conn: &Conn, driving: &mut Driving) {
     conn.stir();
 }
 
+/// How long a connection with a stream open may be quiet before it is sent a PING: half the
+/// idle timeout in force, `ours` or the client's `theirs_ms`, whichever is lower, a zero
+/// being none (RFC 9000 §10.1); none if neither has one.
+fn ping_after(ours: Duration, theirs_ms: u64) -> Option<Duration> {
+    let theirs = Duration::from_millis(theirs_ms);
+    let idle = match (ours.is_zero(), theirs.is_zero()) {
+        (true, true) => return None,
+        (true, false) => theirs,
+        (false, true) => ours,
+        (false, false) => ours.min(theirs),
+    };
+    Some(idle / 2)
+}
+
 /// Sends a GOAWAY naming the first request not seen, once.
 fn go_away(conn: &Conn, driving: &mut Driving) {
     if driving.seen.goaway.is_some() {
@@ -393,6 +435,12 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
         let established = driving.handshaking && quic.is_established();
         // HTTP/3 only where the handshake agreed on it: the interop build offers HTTP/0.9
         // as well.
+        if established {
+            let theirs = quic
+                .peer_transport_params()
+                .map_or(0, |params| params.max_idle_timeout);
+            driving.ping_after = ping_after(shared.settings.idle_timeout, theirs);
+        }
         if established && quic.application_proto() == b"h3" {
             match quiche::h3::Connection::with_transport(quic, &shared.h3) {
                 Ok(connection) => *h3 = Some(connection),
@@ -792,6 +840,20 @@ async fn answer<R, F, B, D>(
 mod tests {
     use super::*;
     use crate::h3_peer::{self, Pipe, id, server_config, server_tls};
+
+    /// A PING is due at half the lower of the two idle timeouts, a zero being none.
+    #[test]
+    fn a_ping_is_due_at_half_the_idle_timeout_in_force() {
+        let ours = Duration::from_secs(30);
+        assert_eq!(ping_after(ours, 0), Some(Duration::from_secs(15)));
+        assert_eq!(ping_after(ours, 10_000), Some(Duration::from_secs(5)));
+        assert_eq!(ping_after(ours, 60_000), Some(Duration::from_secs(15)));
+        assert_eq!(
+            ping_after(Duration::ZERO, 8_000),
+            Some(Duration::from_secs(4))
+        );
+        assert_eq!(ping_after(Duration::ZERO, 0), None);
+    }
 
     /// Two requests whose datagrams come in the other order, as they do when the first is
     /// lost and sent again: both are found, and the first stream not seen is past both.

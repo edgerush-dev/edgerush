@@ -68,6 +68,9 @@ pub(crate) struct State {
     pub(crate) delivering: Vec<u64>,
     /// The connection has ended; nothing more will come on any stream.
     pub(crate) closed: bool,
+    /// How many datagrams quiche has taken from the client: the driver keeps a connection
+    /// with a stream open alive from the last.
+    pub(crate) heard: u64,
 }
 
 impl State {
@@ -124,6 +127,7 @@ impl Conn {
                 streams: HashMap::new(),
                 delivering: Vec::new(),
                 closed: false,
+                heard: 0,
             }),
             driver: RefCell::new(None),
             stirred: Cell::new(true),
