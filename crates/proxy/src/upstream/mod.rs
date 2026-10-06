@@ -15,6 +15,7 @@ pub mod balancing;
 #[cfg(not(feature = "fuzzing"))]
 pub(crate) mod balancing;
 pub mod destination;
+pub mod dial;
 pub mod h1;
 pub(crate) mod secure;
 // Crate-private even when the fuzz targets are built: nothing of it is theirs.

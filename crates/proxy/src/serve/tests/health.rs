@@ -167,7 +167,9 @@ async fn an_endpoint_that_cannot_be_connected_to_is_set_aside_until_a_probe_gets
                 worker
                     .proxy()
                     .metrics()
-                    .contains("edgerush_upstream_set_asides_total{upstream=\"up\"} 1\n")
+                    .contains(
+                        "edgerush_upstream_set_asides_total{upstream=\"up\",reason=\"connect\"} 1\n",
+                    )
             })
             .await;
 
@@ -703,6 +705,163 @@ async fn a_passed_http2_probe_says_goaway_and_closes() {
             let ((last, error), closed) = within(backend).await.unwrap();
             assert_eq!((last, error), (0, code::NO_ERROR));
             assert!(closed, "a frame came after GOAWAY");
+        })
+        .await;
+}
+
+/// A worker with no socket to connect with is short of its own, as one with no storage is:
+/// the request is answered 503, under the answer reason `exhausted`, and neither its endpoint
+/// is set aside nor its upstream counted as failing, whichever protocol it speaks (03 §6,
+/// C13). Once sockets can be had again, the same endpoint answers.
+#[tokio::test]
+async fn a_worker_with_no_socket_to_connect_with_blames_no_endpoint() {
+    use crate::upstream::dial::short_of_sockets;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for protocol in [UpstreamProtocol::Http1, UpstreamProtocol::Http2] {
+                let upstream = match protocol {
+                    UpstreamProtocol::Http2 => h2_upstream(UpstreamH2::default()).await.0,
+                    _ => statuses_upstream(vec![200, 200]).await.0,
+                };
+                let mut config = everything_config(upstream);
+                config.upstreams.get_mut("up").unwrap().protocol = protocol;
+                let (front, worker) = serving_config(&config).await;
+                short_of_sockets(true);
+                let answer = h1_answer(front, CLOSING_GET).await;
+                short_of_sockets(false);
+                assert!(answer.starts_with("HTTP/1.1 503 "), "{protocol:?}: {answer}");
+                let scrape = worker.proxy().metrics();
+                for line in [
+                    "edgerush_upstream_set_aside_endpoints{upstream=\"up\"} 0\n",
+                    "edgerush_upstream_failures_total{upstream=\"up\"} 0\n",
+                    "edgerush_listener_local_answers_total{listener=\"web\",reason=\"exhausted\"} 1\n",
+                ] {
+                    assert!(scrape.contains(line), "{protocol:?}: {line}{scrape}");
+                }
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{protocol:?}: {answer}");
+            }
+        })
+        .await;
+}
+
+/// The same for a tunnel: closed, counted `exhausted`, and its backend not set aside.
+#[tokio::test]
+async fn a_tunnel_with_no_socket_to_connect_with_blames_no_backend() {
+    use crate::upstream::dial::short_of_sockets;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (front, worker) = passing(&tcp_to(backend.local_addr().unwrap(), "")).await;
+            short_of_sockets(true);
+            let mut client = TcpStream::connect(front).await.unwrap();
+            let closed = closed_after(&mut client).await;
+            short_of_sockets(false);
+            assert!(closed < SLACK, "closed after {closed:?}");
+            tunnel_ended(&worker, "db", "exhausted").await;
+            let scrape = worker.proxy().metrics();
+            let line = "edgerush_upstream_set_aside_endpoints{upstream=\"up\"} 0\n";
+            assert!(scrape.contains(line), "{scrape}");
+        })
+        .await;
+}
+
+/// The checker's connect probe of an endpoint set aside, made while the worker has no
+/// socket, says nothing of the endpoint: it is neither brought back nor made to wait its
+/// time again, and is brought back by the first probe once sockets can be had.
+#[tokio::test]
+async fn a_probe_with_no_socket_neither_brings_back_nor_waits_again() {
+    use crate::upstream::dial::short_of_sockets;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (held, nowhere) = refusing();
+            let mut config = everything_config(nowhere);
+            config.data_plane.set_aside_ms = Some(200);
+            let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+            let worker = Worker::with_deadlines(Arc::clone(&proxy), H1Limits::default(), SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
+            let aside = || {
+                proxy
+                    .current
+                    .load()
+                    .destinations
+                    .at(0, 0)
+                    .unwrap()
+                    .set_aside_for()
+            };
+            assert!(aside().is_some(), "not set aside");
+
+            // It takes connections again, but the worker has no socket to see so with.
+            let _listening = held.listen(64).unwrap();
+            short_of_sockets(true);
+            let _checking = tokio::task::spawn_local(Arc::clone(&proxy).check_health());
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let waited = aside();
+            short_of_sockets(false);
+            let waited = waited.expect("brought back without a probe that got through");
+            assert!(
+                waited >= Duration::from_millis(700),
+                "its wait was started again: aside for {waited:?}"
+            );
+            until(|| aside().is_none()).await;
+        })
+        .await;
+}
+
+/// An endpoint set aside for want of a local port to it is counted under a reason of its
+/// own, apart from one whose connects failed: port exhaustion is not a dead pod (03 §6).
+#[test]
+fn an_endpoint_set_aside_for_want_of_a_port_is_counted_as_that() {
+    use crate::upstream::destination::Aside;
+    let config = everything_config("127.0.0.1:1".parse().unwrap());
+    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+    let destination = Arc::clone(proxy.current.load().destinations.at(0, 0).unwrap());
+    assert!(destination.set_aside(Aside::NoPort));
+    proxy.count_set_aside(&destination);
+    let scrape = proxy.metrics();
+    for line in [
+        "edgerush_upstream_set_asides_total{upstream=\"up\",reason=\"no_port\"} 1\n",
+        "edgerush_upstream_set_asides_total{upstream=\"up\",reason=\"connect\"} 0\n",
+    ] {
+        assert!(scrape.contains(line), "{line}{scrape}");
+    }
+}
+
+/// A configured probe made while the worker has no socket says nothing of the endpoint: it
+/// is neither a pass nor a fail, and an endpoint that one failure would mark down stays in
+/// (C25). Probed every second, it is watched for longer than two intervals.
+#[tokio::test]
+async fn a_probe_with_no_socket_marks_nothing_down() {
+    use crate::upstream::dial::short_of_sockets;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let steady = checked_upstream("steady", Rc::new(Cell::new(true))).await;
+            let (_front, worker) = serving_checked_worker(
+                vec![steady],
+                UpstreamProtocol::Http1,
+                every_second_by(healthz()),
+            )
+            .await;
+            until_serving(&worker, "1").await;
+            short_of_sockets(true);
+            let mut seen = Vec::new();
+            for _ in 0..25 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                seen.push(serving_now(&worker));
+            }
+            short_of_sockets(false);
+            assert!(
+                seen.iter().all(|serving| serving == "1"),
+                "marked down for want of a socket: {seen:?}"
+            );
         })
         .await;
 }

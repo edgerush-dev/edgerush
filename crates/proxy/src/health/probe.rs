@@ -8,6 +8,7 @@
 use crate::gathered::Gathered;
 use crate::proxy_protocol;
 use crate::upstream::destination::ReuseIdentity;
+use crate::upstream::dial::{self, Unconnected};
 use crate::upstream::secure::Socket;
 use ::h2::client::SendRequest;
 use bytes::{Buf, Bytes};
@@ -15,13 +16,12 @@ use edgerush_config::{HealthCheck, Probe, UpstreamProtocol};
 use http::uri::Scheme;
 use http::{Request, StatusCode};
 use std::future::{Future, poll_fn};
-use std::io;
 use std::net::SocketAddr;
 use std::pin::{Pin, pin};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::TcpStream;
 
 /// What gRPC's health service calls a server that serves.
 const SERVING: u64 = 1;
@@ -34,22 +34,54 @@ const STATUS_LINE: usize = 1024;
 const INFORMATIONAL: usize = 8;
 const INFORMATIONAL_FIELDS: usize = 64;
 
-/// Whether `destination` passes `check`: within its timeout, connection and all.
-pub(crate) async fn passes(destination: &ReuseIdentity, check: &HealthCheck) -> bool {
+/// What a probe came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Probed {
+    Passed,
+    Failed,
+    /// The worker had no socket to probe with: nothing is known of the endpoint either way
+    /// ([03 §6](../../../docs/03-data-plane.md)).
+    Unknown,
+}
+
+/// What a probe of `destination` by `check` came to: within its timeout, connection and all.
+pub(crate) async fn probed(destination: &ReuseIdentity, check: &HealthCheck) -> Probed {
     let timeout = Duration::from_secs(check.timeout_seconds);
     tokio::time::timeout(timeout, probe(destination, &check.probe))
         .await
-        .ok()
-        .flatten()
-        .unwrap_or(false)
+        .unwrap_or(Probed::Failed)
 }
 
-async fn probe(destination: &ReuseIdentity, probe: &Probe) -> Option<bool> {
+/// Whether `destination` passes `check`.
+#[cfg(test)]
+pub(crate) async fn passes(destination: &ReuseIdentity, check: &HealthCheck) -> bool {
+    probed(destination, check).await == Probed::Passed
+}
+
+async fn probe(destination: &ReuseIdentity, probe: &Probe) -> Probed {
+    let whose = |unconnected: Unconnected| match unconnected {
+        Unconnected::Short(_) => Probed::Unknown,
+        Unconnected::NoPort(_) | Unconnected::Endpoint(_) => Probed::Failed,
+    };
     // Connecting is all a plain TCP probe asks, and the backend need never see it.
     if *probe == Probe::Tcp && destination.secure().is_none() {
-        return Some(connect_unseen(destination.address()).await.is_ok());
+        return connect_unseen(destination.address())
+            .await
+            .map_or_else(whose, |()| Probed::Passed);
     }
-    let mut socket = TcpStream::connect(destination.address()).await.ok()?;
+    let socket = match dial::connect(destination.address()).await {
+        Ok(socket) => socket,
+        Err(unconnected) => return whose(unconnected),
+    };
+    match over(socket, destination, probe).await {
+        Some(true) => Probed::Passed,
+        Some(false) | None => Probed::Failed,
+    }
+}
+
+/// The probe made over `socket`, connected to `destination`: whether it passed, or nothing
+/// where it could not be made.
+async fn over(mut socket: TcpStream, destination: &ReuseIdentity, probe: &Probe) -> Option<bool> {
     let _unset = socket.set_nodelay(true);
     // A backend that asks for a PROXY header is told the probe is the gateway's own
     // connection: v2's LOCAL, or a v1 line of its own two ends (20 §4).
@@ -91,17 +123,19 @@ async fn probe(destination: &ReuseIdentity, probe: &Probe) -> Option<bool> {
 ///
 /// # Errors
 ///
-/// The connect's, or the socket's if it cannot be set up.
-pub(crate) async fn connect_unseen(address: SocketAddr) -> io::Result<()> {
-    let socket = if address.is_ipv4() {
-        TcpSocket::new_v4()?
-    } else {
-        TcpSocket::new_v6()?
-    };
+/// [`Unconnected`]: the connect's, saying whose it is, or the worker's own shortage where
+/// the socket cannot be made or set up.
+pub(crate) async fn connect_unseen(address: SocketAddr) -> Result<(), Unconnected> {
+    let socket = dial::socket(address)?;
     #[cfg(target_os = "linux")]
-    socket2::SockRef::from(&socket).set_tcp_quickack(false)?;
-    let stream = socket.connect(address).await?;
-    stream.set_zero_linger()?;
+    socket2::SockRef::from(&socket)
+        .set_tcp_quickack(false)
+        .map_err(Unconnected::Short)?;
+    let stream = socket
+        .connect(address)
+        .await
+        .map_err(dial::connect_failed)?;
+    stream.set_zero_linger().map_err(Unconnected::Short)?;
     drop(stream);
     Ok(())
 }

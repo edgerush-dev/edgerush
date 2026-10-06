@@ -50,11 +50,12 @@ pub enum ExchangeError {
     /// What the upstream sent could not be read.
     #[error("the upstream's answer could not be read: {0}")]
     Codec(#[from] CodecError),
-    /// No connection could be opened: refused, reset or out of time while connecting, or
-    /// its TLS handshake failed. Nothing of the request was sent, so it may go to another
-    /// endpoint whatever it is ([03 §6](../../../docs/03-data-plane.md)).
+    /// No connection could be opened: refused, reset or out of time while connecting, no
+    /// local port free to it, its TLS handshake failed, or no socket to connect with, the
+    /// worker's own shortage. Nothing of the request was sent
+    /// ([03 §6](../../../docs/03-data-plane.md)).
     #[error("no connection to the upstream could be opened: {0}")]
-    Unconnected(#[source] io::Error),
+    Unconnected(#[source] crate::upstream::dial::Unconnected),
     /// The connection itself failed.
     #[error("the connection to the upstream failed: {0}")]
     Io(#[from] io::Error),

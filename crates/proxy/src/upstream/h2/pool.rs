@@ -68,6 +68,9 @@ pub(crate) enum Failure {
     /// Every connection that could have served it failed or went, and there is no other
     /// being opened.
     Unreachable,
+    /// The same, the last to fail having failed for want of the worker's own: a socket to
+    /// connect with ([03 §6](../../../../docs/03-data-plane.md)).
+    Exhausted,
 }
 
 /// What the driver is to do.
@@ -252,7 +255,8 @@ impl Pool {
         self.wake_starved(before, now, None, actions);
     }
 
-    /// The connection `id` to `key` could not be opened.
+    /// The connection `id` to `key` could not be opened, `why` being what those it leaves
+    /// with nothing are refused with.
     ///
     /// Nothing is dialled again in its place: whoever waited is served by another
     /// connection that is up or being opened, or, when there is none, refused. Trying again
@@ -261,12 +265,13 @@ impl Pool {
         &mut self,
         key: u64,
         id: ConnectionId,
+        why: Failure,
         now: Instant,
         actions: &mut Vec<Action>,
     ) {
         let before = self.total;
         self.remove(key, id);
-        if !self.refuse_if_hopeless(key, actions) {
+        if !self.refuse_if_hopeless(key, why, actions) {
             self.grant_waiting(key, now, actions);
             self.wind_down(key, actions);
             self.forget_if_empty(key);
@@ -570,12 +575,12 @@ impl Pool {
     /// can be — refused.
     fn after_loss(&mut self, key: u64, now: Instant, actions: &mut Vec<Action>) {
         self.serve_waiting(key, now, actions);
-        self.refuse_if_hopeless(key, actions);
+        self.refuse_if_hopeless(key, Failure::Unreachable, actions);
     }
 
-    /// Refuses whoever waits for `key` when no connection that could take them is up or
-    /// being opened, and says whether it did.
-    fn refuse_if_hopeless(&mut self, key: u64, actions: &mut Vec<Action>) -> bool {
+    /// Refuses whoever waits for `key`, with `why`, when no connection that could take them
+    /// is up or being opened, and says whether it did.
+    fn refuse_if_hopeless(&mut self, key: u64, why: Failure, actions: &mut Vec<Action>) -> bool {
         let Some(destination) = self.destinations.get_mut(&key) else {
             return false;
         };
@@ -586,7 +591,7 @@ impl Pool {
         let refused = !hope && !destination.waiting.is_empty();
         if refused {
             for waiter in destination.waiting.drain(..) {
-                actions.push(Action::Fail(waiter, Failure::Unreachable));
+                actions.push(Action::Fail(waiter, why));
             }
         }
         self.forget_if_empty(key);

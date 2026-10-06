@@ -9,25 +9,29 @@ use super::*;
 async fn a_connect_that_never_completes_is_given_up_on_at_its_limit() {
     let limit = Duration::from_secs(5);
     let started = tokio::time::Instant::now();
-    let failed = connect_within(limit, std::future::pending::<io::Result<()>>())
+    let failed = connect_within(limit, std::future::pending::<Result<(), Unconnected>>())
         .await
         .unwrap_err();
     assert!(
-        matches!(&failed, ExchangeError::Unconnected(error) if error.kind() == io::ErrorKind::TimedOut),
+        matches!(&failed, ExchangeError::Unconnected(Unconnected::Endpoint(error)) if error.kind() == io::ErrorKind::TimedOut),
         "{failed}"
     );
     assert_eq!(started.elapsed(), limit);
 
     let slow = async {
         tokio::time::sleep(limit - Duration::from_millis(1)).await;
-        Ok::<_, io::Error>("connected")
+        Ok::<_, Unconnected>("connected")
     };
     assert_eq!(connect_within(limit, slow).await.unwrap(), "connected");
 
-    let refused = async { Err::<(), _>(io::Error::from(io::ErrorKind::ConnectionRefused)) };
+    let refused = async {
+        Err::<(), _>(crate::upstream::dial::connect_failed(
+            io::ErrorKind::ConnectionRefused.into(),
+        ))
+    };
     let failed = connect_within(limit, refused).await.unwrap_err();
     assert!(
-        matches!(&failed, ExchangeError::Unconnected(error) if error.kind() == io::ErrorKind::ConnectionRefused),
+        matches!(&failed, ExchangeError::Unconnected(Unconnected::Endpoint(error)) if error.kind() == io::ErrorKind::ConnectionRefused),
         "{failed}"
     );
 }

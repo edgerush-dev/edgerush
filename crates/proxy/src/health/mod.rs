@@ -27,7 +27,9 @@ pub(crate) mod probe;
 use crate::random::random;
 use crate::serve::Proxy;
 use crate::upstream::destination::ReuseIdentity;
+use crate::upstream::dial::Unconnected;
 use crate::upstream::h1::H1Limits;
+use probe::Probed;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -109,11 +111,14 @@ pub(crate) async fn check(proxy: Arc<Proxy>) {
                 let Some(check) = destination.health_check() else {
                     return;
                 };
-                let passed = probe::passes(&destination, check).await;
+                let probed = probe::probed(&destination, check).await;
                 out.set(out.get() - 1);
                 if let Some(entry) = tracked.borrow_mut().get_mut(&key) {
                     entry.probing = false;
-                    record(entry, passed);
+                    // The worker's own shortage of sockets says nothing of the endpoint.
+                    if probed != Probed::Unknown {
+                        record(entry, probed == Probed::Passed);
+                    }
                 }
             });
         }
@@ -145,21 +150,25 @@ fn reconnect(proxy: &Arc<Proxy>, aside: &Rc<RefCell<HashMap<u64, bool>>>, out: &
             // The bound a worker's try has to connect in, and closed as a plain TCP probe
             // is, so that the backend need never see it (20 §5).
             let connect = probe::connect_unseen(destination.address());
-            let through = tokio::time::timeout(H1Limits::default().connect, connect)
-                .await
-                .is_ok_and(|connected| connected.is_ok());
+            let connected = tokio::time::timeout(H1Limits::default().connect, connect).await;
             out.set(out.get() - 1);
-            if through {
-                destination.bring_back();
-                // Back in the draw: a slow start for it, if its upstream has one (03 §6).
-                destination.start_ramp();
-                // Set aside again later, it is new again, and counted.
-                aside.borrow_mut().remove(&key);
-            } else {
-                destination.wait_again();
-                if let Some(probing) = aside.borrow_mut().get_mut(&key) {
-                    *probing = false;
+            match connected {
+                Ok(Ok(())) => {
+                    destination.bring_back();
+                    // Back in the draw: a slow start for it, if its upstream has one (03 §6).
+                    destination.start_ramp();
+                    // Set aside again later, it is new again, and counted.
+                    aside.borrow_mut().remove(&key);
+                    return;
                 }
+                // The worker's own shortage of sockets says nothing of the endpoint: it
+                // stays aside as it was, its wait not started again, and is tried at the
+                // next round.
+                Ok(Err(Unconnected::Short(_))) => {}
+                _ => destination.wait_again(),
+            }
+            if let Some(probing) = aside.borrow_mut().get_mut(&key) {
+                *probing = false;
             }
         });
     }

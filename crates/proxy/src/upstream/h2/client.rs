@@ -11,7 +11,8 @@
 use super::pool::{Action, ConnectionId, Failure, Limits, Pool, Taken, WaiterId};
 use crate::downstream::h2::writer::Outgoing;
 use crate::received::Received;
-use crate::upstream::destination::ReuseIdentity;
+use crate::upstream::destination::{Aside, ReuseIdentity};
+use crate::upstream::dial;
 use ::h2::client::{Connection, SendRequest};
 use edgerush_config::Keepalive;
 use std::cell::{Cell, RefCell};
@@ -86,6 +87,9 @@ pub(crate) enum PlaceError {
     /// No connection to the destination could be opened, and none is left.
     #[error("the upstream could not be reached")]
     Unreachable,
+    /// The same, for want of the worker's own: a socket to connect with.
+    #[error("the worker had no socket to connect to the upstream with")]
+    Exhausted,
 }
 
 /// The most a destination's keepalive interval is doubled: 64 times what was configured.
@@ -312,6 +316,10 @@ impl Client {
                 waiting.settled = true;
                 Err(PlaceError::Unreachable)
             }
+            Ok(Ok(Err(Failure::Exhausted))) => {
+                waiting.settled = true;
+                Err(PlaceError::Exhausted)
+            }
             // Dropping `waiting` gives the place in the queue up, or a grant that came in
             // the same moment.
             Err(_) => Err(PlaceError::TimedOut),
@@ -393,7 +401,9 @@ impl Client {
                             ));
                         }
                         // Every dial is for a request that said where to.
-                        None => self.event(|pool, now, actions| pool.failed(key, id, now, actions)),
+                        None => self.event(|pool, now, actions| {
+                            pool.failed(key, id, Failure::Unreachable, now, actions);
+                        }),
                     }
                 }
                 Action::Grant(waiter, id) => {
@@ -429,10 +439,19 @@ impl Client {
         let secure = destination.secure().cloned();
         let keepalive = destination.keepalive();
         // Whether TCP got through: only a connect that did not is the endpoint set aside
-        // for, not a handshake that failed after it (03 §6).
+        // for, not a handshake that failed after it, and not the worker's own shortage of
+        // sockets (03 §6).
         let connected = Cell::new(false);
+        // What it is set aside for if it did not: out of connect time unless told otherwise.
+        let why = Cell::new(Some(Aside::Connect));
         let opening = async {
-            let socket = TcpStream::connect(address).await.ok()?;
+            let socket = match dial::connect(address).await {
+                Ok(socket) => socket,
+                Err(unconnected) => {
+                    why.set(unconnected.aside());
+                    return None;
+                }
+            };
             connected.set(true);
             // Worth having, not worth refusing an upstream over.
             let _unset = socket.set_nodelay(true);
@@ -442,10 +461,16 @@ impl Client {
             })
         };
         let Ok(Some(transport)) = tokio::time::timeout(settings.connect, opening).await else {
-            if !connected.get() {
-                destination.set_aside();
-            }
-            self.event(|pool, now, actions| pool.failed(key, id, now, actions));
+            let why = match why.get() {
+                None => Failure::Exhausted,
+                Some(aside) => {
+                    if !connected.get() {
+                        destination.set_aside(aside);
+                    }
+                    Failure::Unreachable
+                }
+            };
+            self.event(|pool, now, actions| pool.failed(key, id, why, now, actions));
             return;
         };
         match transport {
@@ -469,7 +494,9 @@ impl Client {
         let handshake = settings.builder().handshake(socket);
         let Ok(Ok((send, connection))) = tokio::time::timeout(settings.connect, handshake).await
         else {
-            self.event(|pool, now, actions| pool.failed(key, id, now, actions));
+            self.event(|pool, now, actions| {
+                pool.failed(key, id, Failure::Unreachable, now, actions);
+            });
             return;
         };
         let peer = u32::try_from(send.current_max_send_streams()).unwrap_or(u32::MAX);

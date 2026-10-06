@@ -207,7 +207,8 @@ pub(crate) enum Tunnel {
     NoBackend,
     /// The backend's endpoint could not be reached within the connect bound.
     ConnectFailed,
-    /// The worker had no storage for its buffers.
+    /// The worker was short: of storage for its buffers, or of a socket to connect to the
+    /// backend with.
     Exhausted,
 }
 
@@ -617,6 +618,8 @@ pub(crate) struct UpstreamCounters {
     /// Endpoints set aside because a try could not connect to them (03 §6), counted by the
     /// health checker as it finds them.
     pub(crate) set_asides: Counter,
+    /// The same, for want of a local port to them.
+    pub(crate) set_asides_no_port: Counter,
 }
 
 impl UpstreamCounters {
@@ -1013,11 +1016,19 @@ impl Metrics {
         }
 
         let name = "edgerush_upstream_set_asides_total";
-        let help = "Endpoints set aside because a try could not connect to them.";
+        let help = "Endpoints set aside because a try could not connect to them, by why: \
+                    the connect failed, or no local port was free to them.";
         scrape.family(name, Kind::Counter, help);
         for (upstream, series) in upstreams() {
-            let labels = [("upstream", upstream)];
-            scrape.sample(name, &labels, series.sum(|shard| shard.set_asides.get()));
+            for (reason, count) in [
+                ("connect", series.sum(|shard| shard.set_asides.get())),
+                (
+                    "no_port",
+                    series.sum(|shard| shard.set_asides_no_port.get()),
+                ),
+            ] {
+                scrape.sample(name, &[("upstream", upstream), ("reason", reason)], count);
+            }
         }
 
         let name = "edgerush_upstream_healthy_endpoints";

@@ -8,7 +8,7 @@ use crate::metrics::{AcceptPause, Metrics};
 use crate::routed::Routed;
 use crate::tls::Tls;
 use crate::upstream::balancing::Carry;
-use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
+use crate::upstream::destination::{Aside, Destinations, Keys, ReuseIdentity};
 use crate::upstream::secure::Secure;
 use arc_swap::ArcSwap;
 use edgerush_config::Compiled;
@@ -331,7 +331,10 @@ impl Proxy {
     pub(crate) fn count_set_aside(&self, destination: &ReuseIdentity) {
         let slot = self.metrics.upstream_slot(destination.upstream());
         if let Some(counters) = self.metrics.upstream(slot) {
-            counters.set_asides.inc();
+            match destination.aside() {
+                Some(Aside::NoPort) => counters.set_asides_no_port.inc(),
+                _ => counters.set_asides.inc(),
+            }
         }
     }
 

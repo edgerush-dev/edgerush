@@ -13,8 +13,10 @@ use crate::routed::Through;
 use crate::timers::Alarm;
 use crate::tunnel::{Bounds as TunnelBounds, carry};
 use crate::upstream::balancing::InFlight;
-use crate::upstream::destination::ReuseIdentity;
+use crate::upstream::destination::{Aside, ReuseIdentity};
+use crate::upstream::dial;
 use crate::upstream::h1::blocks::Block;
+use crate::upstream::h1::exchange::ExchangeError;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -160,14 +162,25 @@ impl Worker {
             logging.connecting(endpoint.address());
         }
         self.proxy.metrics.socket(Socket::Opened);
-        let connected = connect_within(self.limits.connect, TcpStream::connect(endpoint.address()));
-        let Ok(mut backend) = connected.await else {
-            // Nothing but TCP here: whatever stopped it is the endpoint's to be set aside for.
-            endpoint.set_aside();
-            if let Some(block) = hello {
-                self.blocks.borrow_mut().give(block);
+        let connected = connect_within(self.limits.connect, dial::connect(endpoint.address()));
+        let mut backend = match connected.await {
+            Ok(backend) => backend,
+            Err(failed) => {
+                if let Some(block) = hello {
+                    self.blocks.borrow_mut().give(block);
+                }
+                // Nothing but TCP here: whatever stopped it is the endpoint's to be set aside
+                // for, but for the worker's own shortage of sockets (03 §6).
+                let why = match &failed {
+                    ExchangeError::Unconnected(unconnected) => unconnected.aside(),
+                    _ => Some(Aside::Connect),
+                };
+                let Some(why) = why else {
+                    return Tunnel::Exhausted;
+                };
+                endpoint.set_aside(why);
+                return Tunnel::ConnectFailed;
             }
-            return Tunnel::ConnectFailed;
         };
         let _unset = backend.set_nodelay(true);
         // A backend that asks is told who the client is before anything of the client's

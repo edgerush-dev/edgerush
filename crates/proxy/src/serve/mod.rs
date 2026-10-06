@@ -51,6 +51,7 @@ use crate::timers::{Alarm, Timers};
 use crate::tls::{self, Tls, TlsError};
 use crate::upstream::balancing::{self, Balancing, InFlight};
 use crate::upstream::destination::{Destinations, Keys, ReuseIdentity};
+use crate::upstream::dial::Unconnected;
 use crate::upstream::h1::H1Limits;
 use crate::upstream::h1::blocks::Blocks;
 use crate::upstream::h1::exchange::{ExchangeError, H1Body};
@@ -188,11 +189,13 @@ impl Count for Called {
 /// put to it.
 async fn connect_within<S>(
     limit: Duration,
-    opening: impl Future<Output = io::Result<S>>,
+    opening: impl Future<Output = Result<S, Unconnected>>,
 ) -> Result<S, ExchangeError> {
     match tokio::time::timeout(limit, opening).await {
         Ok(socket) => socket.map_err(ExchangeError::Unconnected),
-        Err(_) => Err(ExchangeError::Unconnected(io::ErrorKind::TimedOut.into())),
+        Err(_) => Err(ExchangeError::Unconnected(Unconnected::Endpoint(
+            io::ErrorKind::TimedOut.into(),
+        ))),
     }
 }
 
@@ -204,6 +207,7 @@ async fn connect_within<S>(
 fn why_stopped(error: &ExchangeError) -> Stopped {
     match error {
         ExchangeError::Codec(_) => Stopped::Codec,
+        ExchangeError::Unconnected(Unconnected::Short(_)) => Stopped::Exhausted,
         ExchangeError::Unconnected(_) | ExchangeError::Io(_) => Stopped::Io,
         ExchangeError::RequestBody(_) => Stopped::RequestBody,
         ExchangeError::Closed => Stopped::Closed,

@@ -16,6 +16,7 @@ use crate::timers::{Alarm, Timers};
 use crate::tunnel::{Backend, Bounds as TunnelBounds, Switched, Tunneled};
 use crate::upstream::balancing::InFlight;
 use crate::upstream::destination::ReuseIdentity;
+use crate::upstream::dial::{self, Unconnected};
 use crate::upstream::h1::blocks::Block;
 use crate::upstream::h1::codec::{OutgoingFields, Sending};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, Stalled, nothing_to_say};
@@ -34,7 +35,6 @@ use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Poll;
-use tokio::net::TcpStream;
 use tokio::time::Instant;
 
 impl Worker {
@@ -100,11 +100,12 @@ impl Worker {
                 self.proxy.metrics.socket(Socket::Opened);
                 let secure = identity.secure().cloned();
                 // Whether TCP got through: only a connect that did not is the endpoint set
-                // aside for, not a handshake that failed after it (03 §6).
+                // aside for, not a handshake that failed after it, and not the worker's own
+                // shortage of sockets (03 §6).
                 let connected = Cell::new(false);
                 // One bound for the connection and its handshake together.
                 let opening = async {
-                    let socket = TcpStream::connect(identity.address()).await?;
+                    let socket = dial::connect(identity.address()).await?;
                     connected.set(true);
                     // Worth having, not worth refusing an upstream over.
                     let _unset = socket.set_nodelay(true);
@@ -113,12 +114,16 @@ impl Worker {
                         Some(secure) => secure
                             .connect(socket)
                             .await
-                            .map(|secured| UpstreamSocket::Secured(Gathered::new(secured))),
+                            .map(|secured| UpstreamSocket::Secured(Gathered::new(secured)))
+                            .map_err(Unconnected::Endpoint),
                     }
                 };
                 let opened = connect_within(self.limits.connect, opening).await;
-                if opened.is_err() && !connected.get() {
-                    identity.set_aside();
+                if let Err(ExchangeError::Unconnected(unconnected)) = &opened
+                    && let Some(why) = unconnected.aside()
+                    && !connected.get()
+                {
+                    identity.set_aside(why);
                 }
                 (opened?, Instant::now())
             }
@@ -370,6 +375,9 @@ impl Worker {
                         waiting: Stalled::Upstream | Stalled::Answer,
                         ..
                     } => Answer::UpstreamTimedOut,
+                    // The worker had no socket to connect with: its own shortage, as storage
+                    // is, not counted against the upstream nor tried again (14 §8).
+                    ExchangeError::Unconnected(Unconnected::Short(_)) => Answer::Exhausted,
                     ExchangeError::Unconnected(_) => Answer::Unreachable,
                     _ => Answer::UpstreamFailed,
                 });
@@ -573,6 +581,8 @@ fn h2_failed(
         h2_exchange::ExchangeError::Place(PlaceError::TimedOut) => Answer::QueueTimedOut,
         // Waiting for a place, the request was never sent.
         h2_exchange::ExchangeError::Place(PlaceError::Unreachable) => Answer::Unreachable,
+        // No socket to connect with: the worker's own shortage, not the upstream's (14 §8).
+        h2_exchange::ExchangeError::Place(PlaceError::Exhausted) => Answer::Exhausted,
         h2_exchange::ExchangeError::RequestBody(cause)
             if matches!(
                 cause.downcast_ref::<RequestBodyError>(),

@@ -44,8 +44,12 @@ impl Harness {
     }
 
     fn failed(&mut self, key: u64, id: ConnectionId) -> Vec<Action> {
+        self.failed_for(key, id, Failure::Unreachable)
+    }
+
+    fn failed_for(&mut self, key: u64, id: ConnectionId, why: Failure) -> Vec<Action> {
         let mut actions = Vec::new();
-        self.pool.failed(key, id, self.now, &mut actions);
+        self.pool.failed(key, id, why, self.now, &mut actions);
         actions
     }
 
@@ -281,6 +285,23 @@ fn a_failed_connection_fails_its_waiters_only_when_nothing_else_is_left() {
     };
     assert!(pool.failed(KEY, second).is_empty());
     assert_eq!(pool.ended(KEY, up), [Action::Grant(waiter, up)]);
+}
+
+/// A connection that could not be opened for want of the worker's own, a socket, refuses
+/// whoever it leaves with nothing for that, not for an upstream out of reach.
+#[test]
+fn a_connection_the_worker_had_no_socket_for_refuses_its_waiters_as_that() {
+    let mut pool = Harness::new(limits());
+    let (Taken::Waiting(waiter), actions) = pool.take(KEY) else {
+        panic!()
+    };
+    let [Action::Dial(KEY, first)] = actions[..] else {
+        panic!()
+    };
+    assert_eq!(
+        pool.failed_for(KEY, first, Failure::Exhausted),
+        [Action::Fail(waiter, Failure::Exhausted)]
+    );
 }
 
 /// GOAWAY: the connection takes no more, is closed when its streams end, and whoever waits
@@ -703,7 +724,7 @@ proptest! {
                 Event::Fail(at) => {
                     if let Some(at) = pick(at, world.dialling.len()) {
                         let (key, id) = world.dialling.remove(at);
-                        pool.failed(key, id, now, &mut actions);
+                        pool.failed(key, id, Failure::Unreachable, now, &mut actions);
                     }
                 }
                 Event::End(at) => {

@@ -27,6 +27,23 @@ use std::time::{Duration, Instant};
 /// milliseconds since the process started will not reach.
 const UNHEALTHY: u64 = 1 << 63;
 
+/// The bit below it, which says it was set aside for want of a local port to it rather than
+/// for anything it did.
+const NO_PORT: u64 = 1 << 62;
+
+/// Every bit of the standing that is not the time it was set aside.
+const MARKS: u64 = UNHEALTHY | NO_PORT;
+
+/// Why an endpoint was set aside ([03 §6](../../../docs/03-data-plane.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aside {
+    /// A connect to it failed: refused, reset, unreachable, out of time.
+    Connect,
+    /// No local port was free to it: the worker's, but per destination, so that another
+    /// endpoint has ports of its own.
+    NoPort,
+}
+
 /// Milliseconds since the first time anything asked, plus one: what a ramp's start is kept
 /// as, so that the health checker's thread and every worker's read one clock, and 0 can
 /// mean no ramp at all.
@@ -75,9 +92,10 @@ pub struct ReuseIdentity {
     /// Whether it may be picked, in one word so that a pick reads it in one look: 0 when it
     /// may. [`UNHEALTHY`] when its last probes say it does not serve, set by the health
     /// checker — healthy until a probe says otherwise, as HAProxy and Pingora start a
-    /// server. Below that, when it was set aside, as [`now`] tells it, because a try could
-    /// not connect to it (03 §6): set by the worker whose try it was, and cleared by the
-    /// checker once a connect probe gets through.
+    /// server. [`NO_PORT`] when it was set aside for want of a local port. Below those, when
+    /// it was set aside, as [`now`] tells it, because a try could not connect to it
+    /// (03 §6): set by the worker whose try it was, and cleared by the checker once a
+    /// connect probe gets through.
     standing: AtomicU64,
     /// Set when a config without this destination is published. Nothing retired is ever
     /// kept or taken out again; an exchange already under way finishes as it is.
@@ -162,31 +180,46 @@ impl ReuseIdentity {
         }
     }
 
-    /// Sets it aside, now: a try could not connect to it. Whether this is what set it
-    /// aside; one already set aside keeps when that was.
-    pub(crate) fn set_aside(&self) -> bool {
-        let now = now() & !UNHEALTHY;
+    /// Sets it aside, now, for `why`: a try could not connect to it. Whether this is what
+    /// set it aside; one already set aside keeps when that was, and why.
+    pub(crate) fn set_aside(&self, why: Aside) -> bool {
+        let now = now() & !MARKS;
+        let mark = match why {
+            Aside::Connect => now,
+            Aside::NoPort => now | NO_PORT,
+        };
         self.standing
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |standing| {
-                (standing & !UNHEALTHY == 0).then_some(standing | now)
+                (standing & !UNHEALTHY == 0).then_some(standing | mark)
             })
             .is_ok()
+    }
+
+    /// Why it is set aside; none when it is not.
+    pub(crate) fn aside(&self) -> Option<Aside> {
+        let standing = self.standing.load(Ordering::Relaxed);
+        (standing & !UNHEALTHY != 0).then_some(if standing & NO_PORT == 0 {
+            Aside::Connect
+        } else {
+            Aside::NoPort
+        })
     }
 
     /// How long it has been set aside, or waited since its last connect probe failed; none
     /// when it is not set aside.
     pub(crate) fn set_aside_for(&self) -> Option<Duration> {
-        let since = self.standing.load(Ordering::Relaxed) & !UNHEALTHY;
+        let since = self.standing.load(Ordering::Relaxed) & !MARKS;
         (since != 0).then(|| Duration::from_millis(now().saturating_sub(since)))
     }
 
-    /// Starts its wait again: a connect probe did not get through.
+    /// Starts its wait again: a connect probe did not get through. Why it was set aside is
+    /// kept.
     pub(crate) fn wait_again(&self) {
-        let now = now() & !UNHEALTHY;
+        let now = now() & !MARKS;
         let _unless_brought_back =
             self.standing
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |standing| {
-                    (standing & !UNHEALTHY != 0).then_some((standing & UNHEALTHY) | now)
+                    (standing & !UNHEALTHY != 0).then_some((standing & MARKS) | now)
                 });
     }
 
@@ -431,10 +464,22 @@ mod tests {
         let destination = destinations.at(0, 0).unwrap();
         assert!(destination.serves() && destination.set_aside_for().is_none());
 
-        assert!(destination.set_aside());
-        assert!(!destination.set_aside(), "one already set aside keeps when");
+        assert!(destination.aside().is_none());
+        assert!(destination.set_aside(Aside::NoPort));
+        assert!(
+            !destination.set_aside(Aside::Connect),
+            "one already set aside keeps when"
+        );
+        assert_eq!(destination.aside(), Some(Aside::NoPort), "nor why");
         assert!(!destination.serves() && destination.is_healthy());
-        assert!(destination.set_aside_for().is_some());
+        let since = destination.set_aside_for().unwrap();
+        assert!(since < Duration::from_secs(60), "aside since {since:?}");
+        destination.wait_again();
+        assert_eq!(destination.aside(), Some(Aside::NoPort), "forgot why");
+        destination.bring_back();
+        assert!(destination.aside().is_none());
+        assert!(destination.set_aside(Aside::Connect));
+        assert_eq!(destination.aside(), Some(Aside::Connect));
 
         destination.set_healthy(false);
         destination.set_healthy(true);
