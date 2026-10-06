@@ -288,12 +288,10 @@ pub(crate) async fn drive<R, F, B, D, G>(
                     driving.drain_by,
                 )
             };
-            // From the later of the client last heard and the last PING: a client that
-            // answers none is left to quiche's idle timer, which a PING restarts only once.
             let ping_due = driving
                 .ping_after
                 .filter(|_| open > 0 && !driving.to_close && !driving.closing)
-                .map(|after| driving.heard.1.max(driving.pinged_at.unwrap_or(accepted)) + after);
+                .and_then(|after| ping_due(after, driving.heard.1, driving.pinged_at));
             let due = [quic_due, first_due, quiet_due, drain_due, ping_due]
                 .into_iter()
                 .flatten()
@@ -392,6 +390,19 @@ fn ping_after(ours: Duration, theirs_ms: u64) -> Option<Duration> {
         (false, false) => ours.min(theirs),
     };
     Some(idle / 2)
+}
+
+/// When a connection whose client was last heard at `heard` is due a PING, `after` the
+/// silence began: one a silence, none if one has gone since. What the server sends is so
+/// bounded by what the client sends, however short an idle timeout the client asks for —
+/// pinging on unanswered, every half of it, would answer one datagram with as many PINGs
+/// as the congestion window and quiche's idle timer let through. A client that answers
+/// none is left to that timer, which a PING restarts only once anyway.
+fn ping_due(after: Duration, heard: Instant, pinged: Option<Instant>) -> Option<Instant> {
+    match pinged {
+        Some(at) if at > heard => None,
+        _ => Some(heard + after),
+    }
 }
 
 /// Sends a GOAWAY naming the first request not seen, once.
@@ -853,6 +864,22 @@ mod tests {
             Some(Duration::from_secs(4))
         );
         assert_eq!(ping_after(Duration::ZERO, 0), None);
+    }
+
+    /// One PING a silence: after one, none is due until the client is heard again, so that
+    /// a client asking for a 1 ms idle timeout gets no PING a millisecond for a datagram.
+    #[test]
+    fn a_ping_is_sent_once_a_silence() {
+        let after = Duration::from_micros(500);
+        let heard = Instant::now();
+        assert_eq!(ping_due(after, heard, None), Some(heard + after));
+        let pinged = heard + after;
+        assert_eq!(ping_due(after, heard, Some(pinged)), None);
+        // Heard again, the next silence gets its PING.
+        let again = pinged + Duration::from_millis(3);
+        assert_eq!(ping_due(after, again, Some(pinged)), Some(again + after));
+        // A PING before a client last heard is no reason to wait.
+        assert_eq!(ping_due(after, pinged, Some(pinged)), Some(pinged + after));
     }
 
     /// Two requests whose datagrams come in the other order, as they do when the first is
