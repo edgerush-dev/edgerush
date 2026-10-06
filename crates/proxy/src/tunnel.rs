@@ -463,6 +463,22 @@ where
         }
     })
     .await;
+    // A tunnel ended in order says its end on each side not yet told: over TLS with a
+    // closure alert (RFC 8446 §6.1), over TCP a FIN, on an HTTP/2 or HTTP/3 stream its end.
+    // One try, never waited on, as HAProxy and Envoy close: a side that cannot take it now
+    // has stopped reading, and would not see it. One that failed is told nothing.
+    if matches!(how, Carried::Idle | Carried::Drained) {
+        poll_fn(|cx| {
+            if !up.shut {
+                let _told = Pin::new(&mut *backend).poll_shutdown(cx);
+            }
+            if !down.shut {
+                let _told = Pin::new(&mut *client).poll_shutdown(cx);
+            }
+            Poll::Ready(())
+        })
+        .await;
+    }
     let carried = Tunneled {
         how,
         up: up.carried,

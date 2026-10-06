@@ -129,6 +129,150 @@ async fn a_websocket_is_carried_over_tls_on_both_sides() {
         .await;
 }
 
+/// A blocking TLS server as `certificate` says, on a thread of its own, that speaks
+/// WebSocket as far as the handshake goes — a 101 with the Accept of the key it was sent —
+/// then reads until its peer closes, and says whether a closure alert came before the close.
+/// BoringSSL's blocking stream is the one that can say so.
+fn alert_heeding_websocket_backend(
+    certificate: &edgerush_config::Certificate,
+) -> (SocketAddr, std::sync::mpsc::Receiver<bool>) {
+    use boring::pkey::PKey;
+    use boring::ssl::{ShutdownState, SslAcceptor, SslMethod};
+    use boring::x509::X509;
+    use std::io::{Read, Write};
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+    builder
+        .set_certificate(&X509::from_pem(certificate.chain.as_bytes()).unwrap())
+        .unwrap();
+    builder
+        .set_private_key(&PKey::private_key_from_pem(certificate.key.as_bytes()).unwrap())
+        .unwrap();
+    let acceptor = builder.build();
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    let (heard, hearing) = std::sync::mpsc::channel();
+    let _serving = std::thread::spawn(move || {
+        let (stream, _) = socket.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut secured = acceptor.accept(stream).unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            secured.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        let key = head
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("sec-websocket-key: "))
+            .and_then(|key| Key::read(key.as_bytes()))
+            .unwrap();
+        let accept = String::from_utf8(key.accept().to_vec()).unwrap();
+        let switched = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\
+                 connection: upgrade\r\nsec-websocket-accept: {accept}\r\n\r\n"
+        );
+        secured.write_all(switched.as_bytes()).unwrap();
+        let mut rest = Vec::new();
+        let _ended = secured.read_to_end(&mut rest);
+        let _ = heard.send(secured.get_shutdown().contains(ShutdownState::RECEIVED));
+    });
+    (address, hearing)
+}
+
+/// A WebSocket over TLS on both sides that the gateway closes — idle for long enough, or
+/// drained (`drained`) — ends with a closure alert each way (RFC 8446 §6.1): the tunnel
+/// ended in order, and its TLS ends say so before their connections close (19 §5). Says
+/// what the client was sent, and whether the client and the backend each heard the alert.
+async fn closed_by_the_gateway_over_tls(drained: bool) -> (String, bool, bool) {
+    use crate::tls::testing::certificate;
+    let server = certificate(&["backend.test"]);
+    let (upstream, backend_heard) = alert_heeding_websocket_backend(&server);
+    let mut config = everything_config(upstream);
+    config.upstreams.get_mut("up").unwrap().tls = Some(trusting("backend.test", &server));
+    config.routes[0].rules[0].forward.as_mut().unwrap().timeouts =
+        Some(edgerush_config::Timeouts {
+            request_ms: None,
+            backend_request_ms: None,
+            tunnel_idle_ms: Some(if drained { 60_000 } else { 300 }),
+        });
+    secured(&mut config, vec![certificate(&["a.test"])], None);
+    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+    let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front = socket.local_addr().unwrap();
+    let _serving = serving(&worker, socket);
+
+    let (switched, switching) = tokio::sync::oneshot::channel();
+    let client = tokio::task::spawn_blocking(move || {
+        use boring::ssl::{ShutdownState, SslConnector, SslMethod, SslVerifyMode};
+        use std::io::{Read, Write};
+        let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+        builder.set_verify(SslVerifyMode::NONE);
+        builder.set_alpn_protos(b"\x08http/1.1").unwrap();
+        let config = builder.build().configure().unwrap().verify_hostname(false);
+        let tcp = std::net::TcpStream::connect(front).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut tls = config.connect("a.test", tcp).unwrap();
+        tls.write_all(
+            b"GET /chat HTTP/1.1\r\nhost: a.test\r\nupgrade: websocket\r\n\
+              connection: upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              sec-websocket-version: 13\r\n\r\n",
+        )
+        .unwrap();
+        let mut said = Vec::new();
+        let mut byte = [0; 1];
+        while !said.ends_with(b"\r\n\r\n") && tls.read(&mut byte).unwrap_or(0) == 1 {
+            said.push(byte[0]);
+        }
+        let _ = switched.send(());
+        // Then until the gateway closes it.
+        let _ended = tls.read_to_end(&mut said);
+        let heard = tls.get_shutdown().contains(ShutdownState::RECEIVED);
+        (String::from_utf8_lossy(&said).into_owned(), heard)
+    });
+    within(switching).await.unwrap();
+    if drained {
+        worker.drain();
+    }
+    let (said, client_heard) = within(client).await.unwrap();
+    tunnel_ended(&worker, "web", if drained { "drained" } else { "idle" }).await;
+    let backend_heard = within(tokio::task::spawn_blocking(move || {
+        backend_heard.recv_timeout(Duration::from_secs(5))
+    }))
+    .await
+    .unwrap();
+    (said, client_heard, backend_heard == Ok(true))
+}
+
+/// One closed for having been idle.
+#[tokio::test]
+async fn a_websocket_over_tls_closed_for_idling_ends_with_a_closure_alert_each_way() {
+    let local = tokio::task::LocalSet::new();
+    let (said, client, backend) = local.run_until(closed_by_the_gateway_over_tls(false)).await;
+    assert!(
+        said.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "{said}"
+    );
+    assert!(client, "no closure alert to the client");
+    assert!(backend, "no closure alert to the backend");
+}
+
+/// One closed by a drain, its Close frames gone and unanswered until the drain's bound.
+#[tokio::test]
+async fn a_drained_websocket_over_tls_ends_with_a_closure_alert_each_way() {
+    let local = tokio::task::LocalSet::new();
+    let (said, client, backend) = local.run_until(closed_by_the_gateway_over_tls(true)).await;
+    assert!(
+        said.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "{said}"
+    );
+    assert!(client, "no closure alert to the client");
+    assert!(backend, "no closure alert to the backend");
+}
+
 /// A plaintext backend that speaks WebSocket as far as the handshake and the close go:
 /// a 101 with the Accept of the key it was sent, then it reads until a Close frame
 /// comes, answers it with a Close of its own, and says everything it read once the

@@ -10,7 +10,8 @@
 //! until h2 lets it go, as an answer's writer does. The stream's end is a half-close each
 //! way: END_STREAM received reads as the end of the bytes, and shutting the writing half
 //! sends it. A stream dropped before its end is reset by h2 (CANCEL), which is how a
-//! tunnel that fails or is closed tells the far side.
+//! tunnel that fails tells the far side; one the gateway ends idle or drained has its
+//! writing half ended first.
 
 use crate::downstream::h2::writer::Outgoing;
 use crate::storage::Storage;
