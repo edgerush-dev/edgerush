@@ -48,6 +48,15 @@ Every change is marked `EdgeRush:` in the source. Two additions, for idle connec
   a fragment off without an error, so `/a#b` was handed over as `/a`. The server's
   `convert_poll_message` (`server.rs`) now refuses a `:path` with a `#`, as it refuses an
   empty one: the stream is reset with PROTOCOL_ERROR, and counted.
+- **An answer without `:status` is malformed** (RFC 9113 §8.3.2). Published h2 took it for
+  a 200. The client's `convert_poll_message` (`client.rs`) resets the stream with
+  PROTOCOL_ERROR: h2's own fix, `3c5f61c` (#959), not in a release yet, carried as it was
+  made; drop it when a release has it.
+- **An answer with a request's pseudo-field is malformed** (§8.3). Published h2 set
+  `:method`, `:path` and the like aside; `convert_poll_message` resets the stream.
+- **Trailers with a pseudo-field are malformed** (§8.1). Published h2 dropped them and passed
+  the rest of the section on. `recv_trailers` (`proto/streams/recv.rs`) resets the stream,
+  on a client and a server alike; a server's reset counts as any malformed request's.
 - **Its fuzzing module may go undocumented in every build.** cargo-fuzz builds with
   `--cfg fuzzing`, which brings in h2's `fuzz_bridge` module, and h2 denies `missing_docs`
   but allows it there only with its `unstable` feature. The lints of a registry dependency
@@ -67,7 +76,11 @@ The refusal of whitespace at either end is covered by
 `resets_for_whitespace_at_either_end_are_bounded`,
 `request_trailers_with_whitespace_at_either_end_are_reset` and
 `an_answer_with_whitespace_at_either_end_of_a_field_value_is_reset` there, the refusal of
-a fragment by `a_path_with_a_fragment_is_reset`.
+a fragment by `a_path_with_a_fragment_is_reset`, of an answer without `:status` by
+`an_answer_without_a_status_is_reset`, of a request's pseudo-field in an answer by
+`an_answer_with_a_requests_pseudo_field_is_reset`, and of pseudo-fields in trailers by
+`an_answers_trailers_with_a_pseudo_field_are_refused` and
+`a_requests_trailers_with_a_pseudo_field_are_reset`.
 The allowance is covered by building any fuzz target with cargo-fuzz (the repository
 README).
 

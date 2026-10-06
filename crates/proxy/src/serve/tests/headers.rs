@@ -644,3 +644,36 @@ async fn an_http1_target_with_a_fragment_is_refused() {
         })
         .await;
 }
+
+/// An HTTP/2 upstream's answer whose head has no `:status` is malformed (RFC 9113 §8.3.2,
+/// "Clients MUST NOT accept a malformed response"): it is answered as an upstream that
+/// failed, never passed on as a 200 (review A04-03).
+#[tokio::test]
+async fn an_http2_answer_without_a_status_is_not_taken_for_a_200() {
+    use crate::h2_peer::{self, Peer, kind};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = socket.local_addr().unwrap();
+            let _answering = tokio::task::spawn_local(async move {
+                let (stream, _) = socket.accept().await.unwrap();
+                let (mut peer, _) = Peer::accept_as_server(stream, &[]).await;
+                peer.send(&h2_peer::settings_ack()).await;
+                let (request, _) = peer.until(|frame| frame.kind == kind::HEADERS).await;
+                // A head with a field and no `:status`, ending the stream.
+                let block = h2_peer::block(&[("content-type", "text/plain")]);
+                peer.send(&h2_peer::headers(request.stream, block, true))
+                    .await;
+                std::future::pending::<()>().await;
+            });
+            let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(
+                answer.starts_with("HTTP/1.1 502"),
+                "an answer with no :status was passed on as {answer:?}"
+            );
+            assert!(!answer.contains("text/plain"), "{answer}");
+        })
+        .await;
+}

@@ -1645,3 +1645,123 @@ async fn a_path_with_a_fragment_is_reset() {
         "only the well-formed request was handed over"
     );
 }
+
+/// RFC 9113 §8.3.2: every answer carries `:status`, and one without is malformed. h2 as
+/// published took it for a 200; this copy resets the stream with PROTOCOL_ERROR, a final
+/// head after a 103 included (h2's own fix, `3c5f61c`, not yet released). An answer is
+/// taken on the next stream as before.
+#[tokio::test]
+async fn an_answer_without_a_status_is_reset() {
+    let (mut client, mut peer) = client(&[]).await;
+    let bare = open(&mut client.send);
+    opened(&mut peer, 1).await;
+    peer.send(&h2_peer::headers(
+        1,
+        h2_peer::block(&[("content-type", "text/plain")]),
+        true,
+    ))
+    .await;
+    let refused = within(bare).await.map(|answer| answer.status());
+    assert_eq!(
+        refused.map_err(|error| error.reason()).err(),
+        Some(Some(Reason::PROTOCOL_ERROR))
+    );
+    // That head ended a stream the request had ended too: closed both ways, it is not
+    // reset as well. The one after the 103 is still open, and is.
+
+    let after_early_hints = open(&mut client.send);
+    opened(&mut peer, 3).await;
+    peer.send(&h2_peer::headers(3, h2_peer::response(103), false))
+        .await;
+    peer.send(&h2_peer::headers(
+        3,
+        h2_peer::block(&[("server", "test")]),
+        false,
+    ))
+    .await;
+    let refused = within(after_early_hints)
+        .await
+        .map(|answer| answer.status());
+    assert_eq!(
+        refused.map_err(|error| error.reason()).err(),
+        Some(Some(Reason::PROTOCOL_ERROR))
+    );
+    assert_eq!(reset_of(&mut peer, 3).await, code::PROTOCOL_ERROR);
+
+    let taken = open(&mut client.send);
+    opened(&mut peer, 5).await;
+    peer.send(&h2_peer::headers(5, h2_peer::response(204), true))
+        .await;
+    assert_eq!(
+        within(taken).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
+/// RFC 9113 §8.3: the pseudo-fields of a request do not appear in an answer, which is
+/// malformed if they do. h2 as published set them aside; this copy resets the stream.
+#[tokio::test]
+async fn an_answer_with_a_requests_pseudo_field_is_reset() {
+    let (mut client, mut peer) = client(&[]).await;
+    let head = open(&mut client.send);
+    opened(&mut peer, 1).await;
+    peer.send(&h2_peer::headers(
+        1,
+        h2_peer::block(&[(":status", "200"), (":path", "/elsewhere")]),
+        false,
+    ))
+    .await;
+    let refused = within(head).await.map(|answer| answer.status());
+    assert_eq!(
+        refused.map_err(|error| error.reason()).err(),
+        Some(Some(Reason::PROTOCOL_ERROR))
+    );
+    assert_eq!(reset_of(&mut peer, 1).await, code::PROTOCOL_ERROR);
+}
+
+/// RFC 9113 §8.1: pseudo-fields in trailers make a message malformed. h2 as published
+/// dropped them and passed the rest on; this copy refuses the answer.
+#[tokio::test]
+async fn an_answers_trailers_with_a_pseudo_field_are_refused() {
+    let (mut client, mut peer) = client(&[]).await;
+    let answered = open(&mut client.send);
+    opened(&mut peer, 1).await;
+    peer.send(&h2_peer::headers(1, h2_peer::response(200), false))
+        .await;
+    peer.send(&h2_peer::headers(
+        1,
+        h2_peer::block(&[(":status", "500"), ("grpc-status", "0")]),
+        true,
+    ))
+    .await;
+    let mut body = within(answered).await.unwrap().into_body();
+    let read = within(body.trailers()).await;
+    assert_eq!(
+        read.map_err(|error| error.reason()).err(),
+        Some(Some(Reason::PROTOCOL_ERROR))
+    );
+    // The trailers ended a stream the request had ended: closed both ways, it is not
+    // reset as well.
+}
+
+/// The same for a request's trailers on the server, where the answer is still to come: the
+/// stream is reset.
+#[tokio::test]
+async fn a_requests_trailers_with_a_pseudo_field_are_reset() {
+    let (connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    let mut server = serve(connection, Serve::Hold);
+    request(&mut peer, 1, false).await;
+    let (request, _respond) = server.next().await;
+    peer.send(&h2_peer::headers(
+        1,
+        h2_peer::block(&[(":path", "/other"), ("x-sum", "1")]),
+        true,
+    ))
+    .await;
+    assert_eq!(reset_of(&mut peer, 1).await, code::PROTOCOL_ERROR);
+    let read = within(request.into_body().trailers()).await;
+    assert_eq!(
+        read.map_err(|error| error.reason()).err(),
+        Some(Some(Reason::PROTOCOL_ERROR))
+    );
+}

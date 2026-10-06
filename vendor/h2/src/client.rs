@@ -1733,6 +1733,24 @@ impl proto::Peer for Peer {
 
         if let Some(status) = pseudo.status {
             b = b.status(status);
+        } else {
+            // EdgeRush: h2's own fix (3c5f61c, unreleased), carried as it was made.
+            // Every response must include :status (RFC 9113, section 8.3.2).
+            // https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.2
+            proto_err!(stream: "missing :status; stream={:?}", stream_id);
+            return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+        }
+
+        // EdgeRush: RFC 9113 §8.3, "Pseudo-header fields defined for requests MUST NOT
+        // appear in responses"; one that does is malformed, not set aside.
+        if pseudo.method.is_some()
+            || pseudo.scheme.is_some()
+            || pseudo.authority.is_some()
+            || pseudo.path.is_some()
+            || pseudo.protocol.is_some()
+        {
+            proto_err!(stream: "request pseudo-header in a response; stream={:?}", stream_id);
+            return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
         }
 
         let mut response = match b.body(()) {

@@ -434,6 +434,21 @@ impl Recv {
             return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
         }
 
+        // EdgeRush: RFC 9113 §8.1, "An endpoint that receives pseudo-header fields in
+        // trailers MUST treat the request or response as malformed". `into_fields` would
+        // drop them, and the rest be taken.
+        let pseudo = frame.pseudo();
+        if pseudo.method.is_some()
+            || pseudo.scheme.is_some()
+            || pseudo.authority.is_some()
+            || pseudo.path.is_some()
+            || pseudo.protocol.is_some()
+            || pseudo.status.is_some()
+        {
+            proto_err!(stream: "recv_trailers: pseudo-header in trailers; stream={:?};", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+        }
+
         let trailers = frame.into_fields();
 
         // Push the frame onto the stream's recv buffer
