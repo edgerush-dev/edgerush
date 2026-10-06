@@ -78,6 +78,23 @@ pub enum RequestError {
 }
 
 impl RequestError {
+    /// Every name [`name`](Self::name) gives: the reasons a refused head is counted by.
+    pub const NAMES: [&'static str; 13] = [
+        "line_too_long",
+        "head_too_long",
+        "too_many_fields",
+        "bad_version",
+        "malformed",
+        "repeated_length",
+        "bad_length",
+        "length_and_coding",
+        "coding_on_http10",
+        "not_chunked_last",
+        "chunked_twice",
+        "coding_not_understood",
+        "bad_connection",
+    ];
+
     /// What it is called in an access-log record ([21 §3](../../../../docs/21-access-logs.md)):
     /// one of a fixed list, as a metric's reasons are, and never the error's own words.
     pub fn name(self) -> &'static str {
@@ -575,6 +592,28 @@ mod tests {
 
     fn limits() -> H1Limits {
         H1Limits::default()
+    }
+
+    /// The names refused heads are counted by are every name a refusal has, each once.
+    #[test]
+    fn every_refusal_s_name_is_among_those_counted() {
+        let every = [
+            RequestError::LineTooLong { limit: 1 },
+            RequestError::HeadTooLong { limit: 1 },
+            RequestError::TooManyFields { limit: 1 },
+            RequestError::Version,
+            RequestError::Malformed(""),
+            RequestError::RepeatedLength,
+            RequestError::BadLength,
+            RequestError::LengthAndCoding,
+            RequestError::CodingOnHttp10,
+            RequestError::NotChunkedLast,
+            RequestError::ChunkedTwice,
+            RequestError::CodingNotUnderstood,
+            RequestError::BadConnection,
+        ];
+        let names: Vec<&str> = every.iter().map(|error| error.name()).collect();
+        assert_eq!(names, RequestError::NAMES);
     }
 
     /// Reads a head from all of `bytes` at once.

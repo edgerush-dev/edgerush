@@ -9,6 +9,7 @@
 //! counted together in one series, as docs/08 wants of anything that a config can make
 //! arbitrarily many of.
 
+use crate::downstream::h1::codec::RequestError;
 use crate::grpc::status::{Code, NAMES};
 use crate::request::Rejection;
 use edgerush_telemetry::{Counter, Exposition, Gauge, Histogram, Kind, Sharded};
@@ -530,6 +531,9 @@ pub(crate) struct ListenerCounters {
     paused: [Counter; AcceptPause::ALL.len()],
     responses: [Counter; 5],
     answers: [Counter; Answer::ALL.len()],
+    /// Heads refused before the core had a request, by the reasons of
+    /// [`RequestError::NAMES`] that are not among [`Answer`]'s.
+    refusals: [Counter; RequestError::NAMES.len()],
     head_time: Histogram<14>,
     grpc: [Counter; NAMES.len()],
     quic: [Counter; Quic::ALL.len()],
@@ -577,6 +581,23 @@ impl ListenerCounters {
     /// A connection's PROXY header came to `outcome`.
     pub(crate) fn proxy_header(&self, outcome: ProxyHeader) {
         if let Some(counter) = self.proxy_headers.get(outcome as usize) {
+            counter.inc();
+        }
+    }
+
+    /// A head was refused, `why` being one of [`RequestError::NAMES`], and answered
+    /// `status`: one of the gateway's own answers, counted among the responses by class and
+    /// among those answers by why — under the core's reason where one has the same name. Not
+    /// timed: there was no request.
+    pub(crate) fn refused(&self, status: StatusCode, why: &str) {
+        if let Some(class) = self.responses.get(class_of(status)) {
+            class.inc();
+        }
+        if let Some(answer) = Answer::ALL.iter().find(|answer| answer.label() == why) {
+            self.answered(*answer);
+        } else if let Some(position) = RequestError::NAMES.iter().position(|name| *name == why)
+            && let Some(counter) = self.refusals.get(position)
+        {
             counter.inc();
         }
     }
@@ -852,6 +873,16 @@ impl Metrics {
                 let labels = [("listener", listener.as_str()), ("reason", answer.label())];
                 let count =
                     |shard: &ListenerCounters| shard.answers.get(position).map_or(0, Counter::get);
+                scrape.sample(name, &labels, series.sum(count));
+            }
+            for (position, why) in RequestError::NAMES.iter().enumerate() {
+                // Counted under the core's reason of the same name.
+                if Answer::ALL.iter().any(|answer| answer.label() == *why) {
+                    continue;
+                }
+                let labels = [("listener", listener.as_str()), ("reason", *why)];
+                let count =
+                    |shard: &ListenerCounters| shard.refusals.get(position).map_or(0, Counter::get);
                 scrape.sample(name, &labels, series.sum(count));
             }
         }
@@ -1352,6 +1383,35 @@ mod tests {
             "{} workers, shards {shards:?}",
             shards.len()
         );
+    }
+
+    /// A refused head is counted among the gateway's own answers by why; a reason the core's
+    /// answers have too is one series, not two, which a scrape would refuse.
+    #[test]
+    fn a_refused_head_is_one_of_the_gateway_s_own_answers() {
+        let metrics = metrics();
+        let counters = metrics.listener(0).unwrap();
+        counters.refused(StatusCode::BAD_REQUEST, "repeated_length");
+        counters.refused(StatusCode::BAD_REQUEST, "bad_connection");
+        counters.answered(Answer::BadConnection);
+        counters.refused(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, "head_too_long");
+        let scrape = metrics.render(&["web".to_owned(), "api".to_owned()], &[], &[]);
+        for line in [
+            "edgerush_listener_responses_total{listener=\"web\",class=\"4xx\"} 3\n",
+            "edgerush_listener_local_answers_total{listener=\"web\",reason=\"repeated_length\"} 1\n",
+            "edgerush_listener_local_answers_total{listener=\"web\",reason=\"bad_connection\"} 2\n",
+            "edgerush_listener_local_answers_total{listener=\"web\",reason=\"head_too_long\"} 1\n",
+            "edgerush_listener_local_answers_total{listener=\"api\",reason=\"head_too_long\"} 0\n",
+        ] {
+            assert!(scrape.contains(line), "{line}");
+        }
+        let series: Vec<&str> = scrape
+            .lines()
+            .filter(|line| line.starts_with("edgerush_listener_local_answers_total{"))
+            .filter_map(|line| line.rsplit_once(' ').map(|(series, _)| series))
+            .collect();
+        let distinct: std::collections::HashSet<_> = series.iter().collect();
+        assert_eq!(distinct.len(), series.len(), "a series twice");
     }
 
     #[test]

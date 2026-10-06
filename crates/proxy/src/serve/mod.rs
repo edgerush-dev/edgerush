@@ -517,7 +517,7 @@ where
     // A head refused before the core had a request has a record of what is known of it
     // (21 §4); the server closes the connection after it.
     if let h1::Ended::Refused(error) = ended {
-        logged::refused(
+        refused(
             worker,
             listener,
             &logged_client,
@@ -526,6 +526,23 @@ where
             error.name(),
         );
     }
+}
+
+/// A head refused before the core had a request, answered `status` for `why`, one of
+/// [`RequestError::NAMES`](crate::downstream::h1::codec::RequestError::NAMES): counted among the listener's responses and the gateway's own
+/// answers (08 §1), and recorded with what is known of it (21 §4).
+fn refused(
+    worker: &Worker,
+    listener: usize,
+    client: &Client,
+    protocol: Option<edgerush_telemetry::access_log::Protocol>,
+    status: StatusCode,
+    why: &'static str,
+) {
+    if let Some(counters) = worker.proxy.metrics.listener(listener) {
+        counters.refused(status, why);
+    }
+    logged::refused(worker, listener, client, protocol, status, why);
 }
 
 /// The worker's slots for the futures `respond` makes: named by the closure, as the futures'

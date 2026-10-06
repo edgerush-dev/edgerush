@@ -624,6 +624,56 @@ async fn a_refused_http1_head_is_logged() {
         .await;
 }
 
+/// A head our HTTP/1 server refuses is one of the gateway's own answers, and the scrape
+/// counts it among the responses by class and among those answers by why (review A10-07,
+/// C29): a refusal of the `Connection` field under the core's reason of the same name.
+#[tokio::test]
+async fn a_refused_http1_head_is_counted_by_class_and_why() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _held) = scripted_upstream().await;
+            let logged = recording("refused-counted", everything_config(upstream)).await;
+            let refusals: [&[u8]; 3] = [
+                b"GET /a HTTP/1.1\r\nhost: example.test\r\ncontent-length: 1\r\ncontent-length: 1\r\n\r\n",
+                b"GET /a HTTP/1.1\r\nhost: example.test\r\ncontent-length: 1\r\ncontent-length: 1\r\n\r\n",
+                b"GET /a HTTP/1.1\r\nhost: example.test\r\nconnection: a b\r\n\r\n",
+            ];
+            for request in refusals {
+                let answer = h1_answer(logged.front, request).await;
+                assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+            }
+            // Their records written: the server is done with them.
+            let _records = logged.records(3).await;
+            let scrape = logged.worker.proxy.metrics();
+            let sample = |series: &str| {
+                scrape
+                    .lines()
+                    .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
+                    .unwrap_or("absent")
+                    .to_owned()
+            };
+            let answers = |why: &str| {
+                sample(&format!(
+                    "edgerush_listener_local_answers_total{{listener=\"web\",reason=\"{why}\"}}"
+                ))
+            };
+            assert_eq!(
+                sample("edgerush_listener_responses_total{listener=\"web\",class=\"4xx\"}"),
+                "3"
+            );
+            assert_eq!(answers("repeated_length"), "2");
+            assert_eq!(answers("bad_connection"), "1");
+            assert_eq!(answers("line_too_long"), "0");
+            // No request: nothing is timed.
+            assert_eq!(
+                sample("edgerush_listener_time_to_response_head_seconds_count{listener=\"web\"}"),
+                "0"
+            );
+        })
+        .await;
+}
+
 /// A head over HTTP/3 too large to take, which its server answers 431 itself, has a record
 /// as one over HTTP/1 does.
 #[tokio::test]
@@ -651,6 +701,14 @@ async fn an_http3_head_too_large_is_logged() {
             assert_eq!(record["protocol"], "3");
             assert!(record["peer"].as_str().unwrap().starts_with("127.0.0.1:"));
             assert!(record.get("path").is_none(), "{record}");
+            // And counted as one over HTTP/1 is (C29).
+            let scrape = logged.worker.proxy.metrics();
+            for line in [
+                "edgerush_listener_responses_total{listener=\"web\",class=\"4xx\"} 1",
+                "edgerush_listener_local_answers_total{listener=\"web\",reason=\"head_too_long\"} 1",
+            ] {
+                assert!(scrape.lines().any(|shown| shown == line), "{line}");
+            }
         })
         .await;
 }

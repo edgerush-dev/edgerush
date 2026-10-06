@@ -402,7 +402,7 @@ impl Worker {
         let refused = Box::new(move |client: Rc<Client>| {
             let status = http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE;
             let protocol = Some(edgerush_telemetry::access_log::Protocol::Http3);
-            super::logged::refused(
+            super::refused(
                 &refusing,
                 listener,
                 &client,
