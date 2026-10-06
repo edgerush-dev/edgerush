@@ -203,3 +203,52 @@ async fn a_grpc_answer_always_ends_with_exactly_one_status() {
         })
         .await;
 }
+
+/// A status in a head that goes on is not the call's: gRPC sends a call's status in its
+/// trailers, and only a head that ends the stream (trailers-only) carries it. The call is
+/// counted once, by its trailers, and the client is given those (A04-05).
+#[tokio::test]
+async fn a_status_in_a_head_that_goes_on_counts_the_call_once_by_its_trailers() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let script: Script = Rc::new(|_request, mut respond| {
+                Box::pin(async move {
+                    let mut head = grpc_head();
+                    head.headers_mut()
+                        .insert("grpc-status", "14".parse().unwrap());
+                    let Ok(mut sending) = respond.send_response(head, false) else {
+                        return;
+                    };
+                    let _ = sending.send_data(Bytes::from_static(b"\0\0\0\0\x01m"), false);
+                    let mut status = http::HeaderMap::new();
+                    status.insert("grpc-status", "0".parse().unwrap());
+                    let _ = sending.send_trailers(status);
+                })
+            });
+            let upstream = scripted_h2_upstream(script).await;
+            let (front, worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let (answer, _) = send
+                .send_request(grpc_call("/pkg.Svc/GoesOn", None), true)
+                .unwrap();
+            let mut body = within(answer).await.unwrap().into_body();
+            while let Some(chunk) = within(body.data()).await {
+                let _ = body.flow_control().release_capacity(chunk.unwrap().len());
+            }
+            let trailers = within(std::future::poll_fn(|cx| body.poll_trailers(cx)))
+                .await
+                .unwrap()
+                .expect("no trailers");
+            assert_eq!(trailers["grpc-status"], "0");
+
+            let scrape = worker.proxy().metrics();
+            for (status, count) in [("OK", 1), ("UNAVAILABLE", 0)] {
+                let line = format!(
+                    "edgerush_listener_grpc_calls_total{{listener=\"web\",status=\"{status}\"}} {count}\n"
+                );
+                assert!(scrape.contains(&line), "{line}{scrape}");
+            }
+        })
+        .await;
+}

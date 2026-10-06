@@ -25,6 +25,16 @@ pub(crate) fn is_grpc_answer(status: StatusCode, head: &HeaderMap) -> bool {
             .is_some_and(|content_type| is_grpc(content_type.as_bytes()))
 }
 
+/// The status of a trailers-only answer — one whose head carries `grpc-status` and ends
+/// the stream, its body `body` already over — as gRPC's number for it. A head that goes
+/// on is gRPC's Response-Headers, and a status in it is not the call's: gRPC sends that in
+/// the trailers (its PROTOCOL-HTTP2), and a client reads it there.
+pub(crate) fn trailers_only(head: &HeaderMap, body: &impl Body) -> Option<usize> {
+    head.get("grpc-status")
+        .filter(|_| body.is_end_stream())
+        .map(|status| code_of(status.as_bytes()))
+}
+
 /// Where a call's status is counted, once, when it is known.
 pub(crate) trait Count {
     /// The call ended with `code`, gRPC's number for it.
@@ -44,8 +54,9 @@ pub(crate) struct Answered<B, C = ()> {
     deadline: Option<Pin<Box<Sleep>>>,
     /// A status has gone, the upstream's or ours: nothing more is sent.
     ended: bool,
-    /// The answer's head carried the status itself (a trailers-only answer).
-    status_in_head: bool,
+    /// The answer's head carried the call's status, and was the whole of it (a
+    /// trailers-only answer).
+    trailers_only: bool,
 }
 
 impl<B, C> std::fmt::Debug for Answered<B, C> {
@@ -56,7 +67,7 @@ impl<B, C> std::fmt::Debug for Answered<B, C> {
     }
 }
 
-impl<B> Answered<B> {
+impl<B: Body> Answered<B> {
     /// The body of a gRPC answer whose head is `head`, for a call that must end by
     /// `deadline`, its status counted nowhere.
     #[cfg(test)]
@@ -65,20 +76,20 @@ impl<B> Answered<B> {
     }
 }
 
-impl<B, C: Count> Answered<B, C> {
+impl<B: Body, C: Count> Answered<B, C> {
     /// The body of a gRPC answer whose head is `head`, for a call that must end by
-    /// `deadline`, its status counted by `count`: now, for a status the head carries.
+    /// `deadline`, its status counted by `count`: now, for a trailers-only answer's.
     pub(crate) fn counted(inner: B, head: &HeaderMap, deadline: Option<Instant>, count: C) -> Self {
-        let status = head.get("grpc-status");
-        if let Some(status) = status {
-            count.ended(code_of(status.as_bytes()));
+        let status = trailers_only(head, &inner);
+        if let Some(code) = status {
+            count.ended(code);
         }
         Self {
             inner,
             count,
             deadline: deadline.map(|at| Box::pin(tokio::time::sleep_until(at))),
             ended: false,
-            status_in_head: status.is_some(),
+            trailers_only: status.is_some(),
         }
     }
 
@@ -158,7 +169,7 @@ where
             }
             Poll::Ready(None) => {
                 this.ended = true;
-                if this.status_in_head {
+                if this.trailers_only {
                     return Poll::Ready(None);
                 }
                 // An answer that ended with no status at all: not a success.
@@ -171,7 +182,7 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.ended || (self.status_in_head && self.inner.is_end_stream())
+        self.ended || (self.trailers_only && self.inner.is_end_stream())
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -184,7 +195,9 @@ where
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
+    use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::rc::Rc;
     use std::time::Duration;
 
     #[derive(Debug, thiserror::Error)]
@@ -239,6 +252,13 @@ mod tests {
 
     /// What the body gave: its data, and the status its trailers said.
     async fn read(body: Answered<Scripted>) -> (Vec<u8>, Option<String>) {
+        read_counted(body).await
+    }
+
+    /// What a body counted somewhere gave: its data, and the status its trailers said.
+    async fn read_counted<C: Count + Unpin>(
+        body: Answered<Scripted, C>,
+    ) -> (Vec<u8>, Option<String>) {
         let mut body = body;
         let mut data = Vec::new();
         let mut code = None;
@@ -278,6 +298,64 @@ mod tests {
         let answered = Answered::new(scripted(vec![], false), &status("5"), None);
         assert!(answered.is_end_stream());
         assert_eq!(read(answered).await, (vec![], None));
+    }
+
+    /// The statuses a call was counted with.
+    #[derive(Clone, Default)]
+    struct Counted(Rc<RefCell<Vec<usize>>>);
+
+    impl Count for Counted {
+        fn ended(&self, code: usize) {
+            self.0.borrow_mut().push(code);
+        }
+    }
+
+    /// A status in a head that goes on is gRPC's Response-Headers, not a trailers-only
+    /// answer: the call is the trailers', or the gateway's for a failure or for none, and
+    /// is counted once, by that (A04-05).
+    #[tokio::test]
+    async fn a_status_in_a_head_that_goes_on_is_not_the_calls() {
+        for (frames, code) in [
+            (vec![data(), Ok(Frame::trailers(status("0")))], "0"),
+            (vec![data(), Err(Broke::Lost)], "14"),
+            (vec![data()], "13"),
+        ] {
+            let counted = Counted::default();
+            let inner = scripted(frames, false);
+            let answered = Answered::counted(inner, &status("5"), None, counted.clone());
+            assert!(!answered.is_end_stream());
+            assert_eq!(
+                read_counted(answered).await,
+                (b"m".to_vec(), Some(code.to_owned()))
+            );
+            assert_eq!(*counted.0.borrow(), [code.parse::<usize>().unwrap()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_trailers_only_answer_is_counted_once_by_its_head() {
+        let counted = Counted::default();
+        let answered =
+            Answered::counted(scripted(vec![], false), &status("5"), None, counted.clone());
+        assert_eq!(read_counted(answered).await, (vec![], None));
+        assert_eq!(*counted.0.borrow(), [5]);
+    }
+
+    #[test]
+    fn only_a_head_that_ends_the_stream_is_trailers_only() {
+        assert_eq!(
+            trailers_only(&status("14"), &scripted(vec![], false)),
+            Some(14)
+        );
+        assert_eq!(
+            trailers_only(&status("14"), &scripted(vec![data()], false)),
+            None
+        );
+        assert_eq!(trailers_only(&status("14"), &scripted(vec![], true)), None);
+        assert_eq!(
+            trailers_only(&HeaderMap::new(), &scripted(vec![], false)),
+            None
+        );
     }
 
     #[tokio::test]

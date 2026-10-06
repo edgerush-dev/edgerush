@@ -461,3 +461,59 @@ async fn a_grpc_call_is_sent_again_for_a_status_in_its_head() {
         })
         .await;
 }
+
+/// A gRPC status in a head that does not end the stream is not a trailers-only answer: the
+/// call's messages and its trailers follow, and it is not sent again for the status in its
+/// head (03 §6: "a gRPC status named in a trailers-only head") (A08-04).
+#[tokio::test]
+async fn a_status_in_a_head_that_goes_on_does_not_send_a_call_again() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let asked = Rc::new(Cell::new(0_usize));
+            let asking = Rc::clone(&asked);
+            let script: Script = Rc::new(move |_request, mut respond| {
+                let asking = Rc::clone(&asking);
+                Box::pin(async move {
+                    asking.set(asking.get() + 1);
+                    let mut head = grpc_head();
+                    head.headers_mut()
+                        .insert("grpc-status", "14".parse().unwrap());
+                    let Ok(mut stream) = respond.send_response(head, false) else {
+                        return;
+                    };
+                    // One empty message, then the call's own status.
+                    let _ = stream.send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), false);
+                    let mut ok = http::HeaderMap::new();
+                    ok.insert("grpc-status", "0".parse().unwrap());
+                    let _ = stream.send_trailers(ok);
+                })
+            });
+            let upstream = scripted_h2_upstream(script).await;
+            let (front, _worker) = serving_retrying_worker(
+                upstream,
+                UpstreamProtocol::Http2,
+                retrying(2, &[], &["UNAVAILABLE"], 1),
+            )
+            .await;
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let (answer, _) = send
+                .send_request(grpc_call("/pkg.Svc/Do", None), true)
+                .unwrap();
+            let mut body = within(answer).await.unwrap().into_body();
+            while let Some(chunk) = within(body.data()).await {
+                let _ = body.flow_control().release_capacity(chunk.unwrap().len());
+            }
+            let trailers = within(std::future::poll_fn(|cx| body.poll_trailers(cx)))
+                .await
+                .unwrap()
+                .expect("no trailers");
+            assert_eq!(trailers["grpc-status"], "0");
+            assert_eq!(
+                asked.get(),
+                1,
+                "sent again for a status in a head that went on"
+            );
+        })
+        .await;
+}

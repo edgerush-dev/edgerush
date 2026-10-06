@@ -923,9 +923,8 @@ fn wants_again(retry: &CompiledRetry, outcome: &Result<Answered<Body>, Answer>) 
         Ok(Answered::Raw(answer, _)) => retry.on_status(answer.status().as_u16()),
         Ok(Answered::Map(response)) => {
             retry.on_status(response.status().as_u16())
-                || response.headers().get("grpc-status").is_some_and(|status| {
-                    retry.on_grpc(crate::grpc::status::code_of(status.as_bytes()))
-                })
+                || crate::grpc::answer::trailers_only(response.headers(), response.body())
+                    .is_some_and(|code| retry.on_grpc(code))
         }
         // Nothing of the request reached the endpoint: any retry at all sends it on
         // (GEP-1731).
