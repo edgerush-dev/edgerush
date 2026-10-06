@@ -1,10 +1,11 @@
 //! Fuzzes the reading of an HTTP/3 request head from the fields quiche decoded: any names
 //! and values at all, in any order.
 //!
-//! A head taken must be one an HTTP/1 upstream reads as the client meant it: no field only
-//! a connection has, lower-case token names, no control character in a value and no
-//! whitespace at either end of one, a `Host` that is the `:authority` where both are said,
-//! and one length at most, however it is spelt (`06` is 6). Anything else is refused, never passed on and never a panic.
+//! A head taken must be one an HTTP/1 upstream reads as the client meant it: the `:path`
+//! sent, whole, as its target, no field only a connection has, lower-case token names, no
+//! control character in a value and no whitespace at either end of one, a `Host` that is
+//! the `:authority` where both are said, and one length at most, however it is spelt (`06`
+//! is 6). Anything else is refused, never passed on and never a panic.
 //!
 //! The input is a list of fields, each a byte of name length, the name, a byte of value
 //! length and the value: `cargo fuzz run h3_head corpus/h3_head seeds/h3_head`.
@@ -13,7 +14,7 @@
 
 use edgerush_proxy::downstream::h3::head::request;
 use libfuzzer_sys::fuzz_target;
-use quiche::h3::Header;
+use quiche::h3::{Header, NameValue};
 
 fuzz_target!(|bytes: &[u8]| {
     let mut fields = Vec::new();
@@ -34,6 +35,11 @@ fuzz_target!(|bytes: &[u8]| {
     let Ok(head) = request(&fields, 64 << 10) else {
         return;
     };
+    // Taken, a request has one `:path` at most; what it is taken with is that, not a part.
+    if let Some(path) = fields.iter().find(|field| field.name() == b":path") {
+        let taken = head.parts.uri.path_and_query().map(|taken| taken.as_str());
+        assert_eq!(taken.map(str::as_bytes), Some(path.value()));
+    }
     for (name, value) in &head.parts.headers {
         let name = name.as_str();
         assert!(!matches!(

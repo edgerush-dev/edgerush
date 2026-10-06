@@ -1610,3 +1610,38 @@ async fn an_answer_with_whitespace_at_either_end_of_a_field_value_is_reset() {
     );
     assert_eq!(reset_of(&mut peer, 3).await, code::PROTOCOL_ERROR);
 }
+
+/// RFC 9113 §8.3.1: `:path` is the target's path and query; a fragment is no part of a
+/// valid one. h2 as published builds the URI with `http`, which cuts a fragment off without
+/// a word, so `/a#b` would be handed over as `/a`; this copy resets the stream with
+/// PROTOCOL_ERROR, as any malformed request, and the application never sees it.
+#[tokio::test]
+async fn a_path_with_a_fragment_is_reset() {
+    let (connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    let mut server = serve(connection, Serve::Hold);
+    for (stream, path) in [(1, "/a#b"), (3, "/a?q=1#b"), (5, "/#")] {
+        peer.send(&h2_peer::headers(
+            stream,
+            h2_peer::request("GET", path),
+            true,
+        ))
+        .await;
+        assert_eq!(
+            reset_of(&mut peer, stream).await,
+            code::PROTOCOL_ERROR,
+            "{path:?}"
+        );
+    }
+    peer.send(&h2_peer::headers(
+        7,
+        h2_peer::request("GET", "/a?q=1"),
+        true,
+    ))
+    .await;
+    let (request, _) = server.next().await;
+    assert_eq!(request.uri().path_and_query().unwrap().as_str(), "/a?q=1");
+    assert!(
+        server.accepted.try_recv().is_err(),
+        "only the well-formed request was handed over"
+    );
+}

@@ -588,3 +588,59 @@ async fn an_http2_answer_with_whitespace_at_either_end_of_a_field_value_is_not_p
         })
         .await;
 }
+
+/// An HTTP/2 `:path` holds the target's path and query and nothing more (RFC 9113
+/// §8.3.1): one carrying a fragment is not a valid value, and the request's stream is reset
+/// with PROTOCOL_ERROR, as HTTP/1 refuses a target with one — never routed and forwarded cut
+/// short (review A12-01, the HTTP/2 side of A05-02).
+#[tokio::test]
+async fn an_http2_path_with_a_fragment_is_not_forwarded_cut_short() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::h2_peer::{code, kind};
+            let (upstream, heads) = recording_upstream("200 OK");
+            let (front, _worker) = serving_config(&forwarding_config(upstream, &[])).await;
+            let mut peer = h2_client(front).await;
+            for (stream, path) in [(1, "/a#b"), (3, "/a?q#b"), (5, "/#")] {
+                h2_get(&mut peer, stream, path).await;
+                // Bounded: whatever comes first on the stream, an answer or a reset.
+                let (frame, _) = within(peer.until(|frame| {
+                    frame.stream == stream
+                        && (frame.kind == kind::HEADERS || frame.kind == kind::RST_STREAM)
+                }))
+                .await;
+                let forwarded = heads.borrow().clone();
+                assert!(
+                    forwarded.is_empty(),
+                    "an HTTP/2 :path {path:?} was forwarded cut short (the client got \
+                     {frame:?}): {forwarded:?}"
+                );
+                assert!(
+                    frame.kind == kind::RST_STREAM && frame.reset() == code::PROTOCOL_ERROR,
+                    "{path:?}: {frame:?}"
+                );
+            }
+        })
+        .await;
+}
+
+/// Control for A12-01: HTTP/1 refuses a target with a fragment (RFC 9112 §3.2) and
+/// forwards nothing.
+#[tokio::test]
+async fn an_http1_target_with_a_fragment_is_refused() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, heads) = recording_upstream("200 OK");
+            let (front, _worker) = serving_config(&forwarding_config(upstream, &[])).await;
+            let answer = h1_answer(
+                front,
+                b"GET /a#b HTTP/1.1\r\nhost: example.test\r\nconnection: close\r\n\r\n",
+            )
+            .await;
+            assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+            assert!(heads.borrow().is_empty(), "{:?}", heads.borrow());
+        })
+        .await;
+}

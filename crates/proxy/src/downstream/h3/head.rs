@@ -150,6 +150,11 @@ pub fn request<F: NameValue>(fields: &[F], limit: usize) -> Result<RequestHead, 
         if !(path.starts_with(b"/") || asterisk && method == Method::OPTIONS) {
             return Err(Refused::Malformed("a `:path` that is not a path"));
         }
+        // Path and query, and no fragment (§4.3.1), which `PathAndQuery` would cut off
+        // without a word: the request would be taken for a shorter one.
+        if path.contains(&b'#') {
+            return Err(Refused::Malformed("a `:path` with a fragment"));
+        }
         let path = PathAndQuery::try_from(path)
             .map_err(|_| Refused::Malformed("a `:path` that is not a path"))?;
         // A scheme with an authority needs one, said by `:authority` or `Host`.
@@ -396,6 +401,24 @@ mod tests {
         match trailers(&fields(&[("x-sum", " 1")]), LIMIT) {
             Err(Refused::Malformed(_)) => {}
             other => panic!("a trailer value with a leading space was taken: {other:?}"),
+        }
+    }
+
+    /// A `:path` is the target's path and query and nothing more (RFC 9114 §4.3.1): one that
+    /// carries a fragment has an invalid value and is malformed (§4.1.2), as an HTTP/1 target
+    /// with one is refused (RFC 9112 §3.2), and is never taken cut short (review A05-02).
+    #[test]
+    fn a_path_with_a_fragment_is_malformed() {
+        for path in ["/a#b", "/a?q=1#b", "/#"] {
+            let mut pairs = get(&[]);
+            pairs[3].1 = path;
+            match request(&fields(&pairs), LIMIT) {
+                Err(Refused::Malformed(_)) => {}
+                other => panic!(
+                    "{path:?} was taken: {:?}",
+                    other.map(|head| head.parts.uri.to_string())
+                ),
+            }
         }
     }
 
@@ -792,6 +815,18 @@ mod tests {
             sorted_kept.sort();
             sent.sort();
             prop_assert_eq!(sorted_kept, sent);
+        }
+
+        /// A path taken is the `:path` sent, whole: nothing of it is dropped on the way, as
+        /// `PathAndQuery` drops a fragment.
+        #[test]
+        fn a_path_taken_is_the_path_sent(path in "/(\\PC|[\\x00-\\x7f]){0,20}") {
+            let mut pairs = get(&[]);
+            pairs[3].1 = &path;
+            if let Ok(head) = request(&fields(&pairs), LIMIT) {
+                let taken = head.parts.uri.path_and_query().map(|taken| taken.as_str());
+                prop_assert_eq!(taken, Some(path.as_str()));
+            }
         }
 
         /// Whatever the fields, a head is refused or taken, never a panic, and one taken

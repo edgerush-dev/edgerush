@@ -10,7 +10,7 @@ benchmarks, which are not here; nothing builds them.
 ## What is changed
 
 Every change is marked `EdgeRush:` in the source. Two additions, for idle connections
-(14 §3 of the design docs) and for charging what a connection holds (15 §3), a check RFC
+(14 §3 of the design docs) and for charging what a connection holds (15 §3), checks RFC
 9113 asks for that published h2 does not make (15 §3), and one allowance, for fuzz builds:
 
 - **A server connection can give back its buffers.** h2 makes three buffers for every
@@ -43,6 +43,11 @@ Every change is marked `EdgeRush:` in the source. Two additions, for idle connec
   the stream is reset with PROTOCOL_ERROR, in a head or trailers, a request's or an
   answer's, and on a server the reset counts towards `max_local_error_reset_streams` as
   every malformed request does.
+- **A `:path` with a fragment is malformed.** RFC 9113 §8.3.1: `:path` is the target's path
+  and query. Published h2 builds the request's URI with `http`'s `PathAndQuery`, which cuts
+  a fragment off without an error, so `/a#b` was handed over as `/a`. The server's
+  `convert_poll_message` (`server.rs`) now refuses a `:path` with a `#`, as it refuses an
+  empty one: the stream is reset with PROTOCOL_ERROR, and counted.
 - **Its fuzzing module may go undocumented in every build.** cargo-fuzz builds with
   `--cfg fuzzing`, which brings in h2's `fuzz_bridge` module, and h2 denies `missing_docs`
   but allows it there only with its `unstable` feature. The lints of a registry dependency
@@ -61,7 +66,8 @@ The refusal of whitespace at either end is covered by
 `a_request_field_value_with_whitespace_at_either_end_is_reset`,
 `resets_for_whitespace_at_either_end_are_bounded`,
 `request_trailers_with_whitespace_at_either_end_are_reset` and
-`an_answer_with_whitespace_at_either_end_of_a_field_value_is_reset` there.
+`an_answer_with_whitespace_at_either_end_of_a_field_value_is_reset` there, the refusal of
+a fragment by `a_path_with_a_fragment_is_reset`.
 The allowance is covered by building any fuzz target with cargo-fuzz (the repository
 README).
 

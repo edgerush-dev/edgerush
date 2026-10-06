@@ -1779,6 +1779,13 @@ impl proto::Peer for Peer {
                 malformed!("malformed headers: missing path");
             }
 
+            // EdgeRush: RFC 9113 §8.3.1, `:path` is the path and query of the target, and a
+            // fragment is no part of a valid one. `PathAndQuery` would cut it off silently,
+            // and the request be taken for a shorter one.
+            if path.as_str().contains('#') {
+                malformed!("malformed headers: fragment in path ({:?})", path);
+            }
+
             let maybe_path = uri::PathAndQuery::from_maybe_shared(path.clone().into_inner());
             parts.path_and_query = Some(maybe_path.or_else(|why| {
                 malformed!("malformed headers: malformed path ({:?}): {}", path, why,)
