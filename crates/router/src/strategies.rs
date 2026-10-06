@@ -32,6 +32,7 @@ pub(crate) fn compile(spec: &RouteSpec, value: usize) -> RouteMatch<usize> {
             PathKind::Exact => PathPattern::exact(path),
             PathKind::Regex => PathPattern::regex(path),
             PathKind::Prefix => PathPattern::prefix(path),
+            PathKind::GrpcMethod => PathPattern::grpc_method(path),
         }
         .unwrap(),
         method: spec.method.as_ref().map(|method| method.parse().unwrap()),
@@ -117,6 +118,10 @@ pub(crate) fn route_spec() -> impl Strategy<Value = RouteSpec> {
             prop::sample::select(vec!["/a.*", "/[ab]", "/a/[^/]+"]),
             Just(PathKind::Regex)
         ),
+        (
+            prop::sample::select(vec!["a", "b"]),
+            Just(PathKind::GrpcMethod)
+        ),
     ];
     let field = (
         prop::sample::select(vec!["x-a", "X-A", "x-b"]),
@@ -145,7 +150,9 @@ pub(crate) fn route_spec() -> impl Strategy<Value = RouteSpec> {
 pub(crate) fn request_spec() -> impl Strategy<Value = RequestSpec> {
     (
         prop::sample::select(vec!["a.b", "c.b", "x.a.b", "x.y.a.b", "b", "x.c", "z"]),
-        prop::sample::select(vec!["/", "/a", "/a/", "/a/b", "/a/b/c", "/b", "/ab"]),
+        prop::sample::select(vec![
+            "/", "/a", "/a/", "/a/b", "/a/b/c", "/b", "/b/a", "/ab",
+        ]),
         prop::sample::select(vec![
             "",
             "p=1",

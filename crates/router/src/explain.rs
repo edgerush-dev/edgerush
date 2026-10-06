@@ -117,7 +117,7 @@ pub enum Key {
     /// A more specific hostname.
     Host,
     /// A better path: exact before regular expression before prefix, a longer prefix
-    /// before a shorter one.
+    /// before a shorter one, a gRPC method after every prefix but the root.
     Path,
     /// A method predicate before none.
     Method,
@@ -219,7 +219,10 @@ fn path_rank(path: &PathPattern) -> (u8, Reverse<usize>) {
     match path.kind {
         PathKind::Exact => (0, Reverse(0)),
         PathKind::Regex(_) => (1, Reverse(0)),
+        // The root prefix, stored as the empty string, comes after gRPC methods.
+        PathKind::Prefix if path.path.is_empty() => (4, Reverse(0)),
         PathKind::Prefix => (2, Reverse(path.path.len())),
+        PathKind::GrpcMethod => (3, Reverse(0)),
     }
 }
 
@@ -834,6 +837,7 @@ mod tests {
             ("/[a]/b", PathKind::Regex),
             ("/a/b", PathKind::Prefix),
             ("/a", PathKind::Prefix),
+            ("b", PathKind::GrpcMethod),
             ("/", PathKind::Prefix),
         ]);
         (

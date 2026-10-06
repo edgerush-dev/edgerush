@@ -247,6 +247,27 @@ mod tests {
         assert_eq!(route(&[short, long, regex, exact], &request), Some(2));
     }
 
+    /// GRPCRoute: a service's characters before a method's, whatever the order given, and a
+    /// method's before a rule that matches every call — headers come after both.
+    #[test]
+    fn a_grpc_service_outranks_a_method_and_a_method_outranks_the_root() {
+        let service = on("example.com", PathKind::Prefix, "/pkg.Svc");
+        let method = on("example.com", PathKind::GrpcMethod, "Do");
+        let mut root = on("example.com", PathKind::Prefix, "/");
+        root.headers = pairs(&[("x-a", "1")]);
+        let mut call = get("example.com", "/pkg.Svc/Do");
+        call.headers = pairs(&[("x-a", "1")]);
+        let mut elsewhere = call.clone();
+        elsewhere.path = "/other.Svc/Do".to_owned();
+
+        let routes = [root.clone(), method.clone(), service.clone()];
+        assert_eq!(route(&routes, &call), Some(2));
+        assert_eq!(route(&routes, &elsewhere), Some(1));
+        let routes = [service, method, root];
+        assert_eq!(route(&routes, &call), Some(0));
+        assert_eq!(route(&routes, &elsewhere), Some(1));
+    }
+
     #[test]
     fn among_equal_paths_method_then_header_count_then_query_count_then_order() {
         let base = on("example.com", PathKind::Prefix, "/api");

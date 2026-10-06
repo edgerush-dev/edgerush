@@ -1,5 +1,6 @@
 //! Path patterns: exact paths, segment-wise prefixes and regular expressions, the three
-//! kinds of Gateway API (Ingress has the first two).
+//! kinds of Gateway API (Ingress has the first two); and a gRPC method in any service,
+//! which GRPCRoute ranks where no path pattern of those three kinds would.
 //!
 //! Patterns are compared case-sensitively with the *normalised* request path
 //! ([`normalise_path`]). Normalising the request path is not done here: the caller does it
@@ -22,7 +23,7 @@ pub struct PathPattern {
     pub(crate) kind: Kind,
     /// The pattern text. For a prefix, without its trailing slash (the root prefix is the
     /// empty string), so that `/shop` and `/shop/` are one pattern and the boundary check
-    /// is uniform. For a regex, as the user wrote it.
+    /// is uniform. For a regex, as the user wrote it. For a gRPC method, its name.
     pub(crate) path: Box<str>,
 }
 
@@ -32,6 +33,8 @@ pub(crate) enum Kind {
     Prefix,
     /// Compiled to match the whole path.
     Regex(WholeRegex),
+    /// A path of two segments, the second this name.
+    GrpcMethod,
 }
 
 /// Patterns are what their kind and text say; a compiled regex adds nothing to that.
@@ -109,9 +112,29 @@ impl PathPattern {
         })
     }
 
+    /// A pattern that matches a call of the gRPC method `name` in any service: a path of
+    /// two segments, `/{service}/{name}`, whatever the first. It ranks after every prefix
+    /// but the root (03 §4), as GRPCRoute puts a method alone after a service.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PathPatternError`] if `name` is not one path segment, or is a segment
+    /// that requests are rejected for.
+    pub fn grpc_method(name: &str) -> Result<Self, PathPatternError> {
+        if name.is_empty() || name.contains('/') {
+            return Err(PathPatternError::NotOneSegment);
+        }
+        let path = format!("/{name}");
+        let path = canonical(&path)?;
+        Ok(Self {
+            kind: Kind::GrpcMethod,
+            path: path.strip_prefix('/').unwrap_or(&path).into(),
+        })
+    }
+
     /// The pattern in its canonical form: an exact path as it is matched; a prefix
     /// without its trailing slash, so that the root prefix is the empty string; a regular
-    /// expression as it was written.
+    /// expression as it was written; a gRPC method's name.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.path
@@ -127,6 +150,12 @@ impl PathPattern {
     #[must_use]
     pub fn is_regex(&self) -> bool {
         matches!(self.kind, Kind::Regex(_))
+    }
+
+    /// Whether this is a gRPC method in any service.
+    #[must_use]
+    pub fn is_grpc_method(&self) -> bool {
+        matches!(self.kind, Kind::GrpcMethod)
     }
 
     /// Whether the request path falls under this pattern.
@@ -147,8 +176,17 @@ impl PathPattern {
                         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
             }
             Kind::Regex(regex) => path.starts_with('/') && regex.is_match(path.as_bytes()),
+            Kind::GrpcMethod => grpc_method_of(path) == Some(&*self.path),
         }
     }
+}
+
+/// The method a path calls, if it has the shape of a gRPC call: two segments, the first
+/// not empty. The second may hold anything but a slash; only a pattern's name is compared
+/// with it.
+pub(crate) fn grpc_method_of(path: &str) -> Option<&str> {
+    let (service, method) = path.strip_prefix('/')?.split_once('/')?;
+    (!service.is_empty() && !method.contains('/')).then_some(method)
 }
 
 /// The pattern text in the normal form request paths have: structure checked, not changed;
@@ -188,6 +226,9 @@ pub enum PathPatternError {
     /// The path contains a `.` or `..` segment, which normalised request paths never do.
     #[error("path contains a `.` or `..` segment")]
     DotSegment,
+    /// A gRPC method's name is empty or holds a `/`.
+    #[error("a gRPC method is not one path segment")]
+    NotOneSegment,
     /// The path is one that a request would be rejected for, so nothing could match it.
     #[error(transparent)]
     Ambiguous(#[from] NormaliseError),
@@ -200,7 +241,7 @@ pub enum PathPatternError {
 mod tests {
     use super::*;
     use crate::reference;
-    use crate::strategies::{nasty_path, path_near, path_pattern_text};
+    use crate::strategies::{host_label, nasty_path, path_near, path_pattern_text, valid_label};
     use proptest::prelude::*;
 
     fn exact(path: &str) -> PathPattern {
@@ -213,6 +254,10 @@ mod tests {
 
     fn regex(pattern: &str) -> PathPattern {
         PathPattern::regex(pattern).unwrap()
+    }
+
+    fn grpc_method(name: &str) -> PathPattern {
+        PathPattern::grpc_method(name).unwrap()
     }
 
     #[test]
@@ -279,10 +324,17 @@ mod tests {
 
     #[test]
     fn each_kind_says_what_it_is() {
-        let regex = PathPattern::regex("/shop").unwrap();
-        assert!(prefix("/shop").is_prefix() && !prefix("/shop").is_regex());
-        assert!(regex.is_regex() && !regex.is_prefix());
-        assert!(!exact("/shop").is_regex() && !exact("/shop").is_prefix());
+        let kinds = |pattern: &PathPattern| {
+            (
+                pattern.is_prefix(),
+                pattern.is_regex(),
+                pattern.is_grpc_method(),
+            )
+        };
+        assert_eq!(kinds(&prefix("/shop")), (true, false, false));
+        assert_eq!(kinds(&regex("/shop")), (false, true, false));
+        assert_eq!(kinds(&grpc_method("shop")), (false, false, true));
+        assert_eq!(kinds(&exact("/shop")), (false, false, false));
     }
 
     #[test]
@@ -382,6 +434,46 @@ mod tests {
     }
 
     #[test]
+    fn grpc_method_pattern_matches_that_method_in_any_service() {
+        let method = grpc_method("Do");
+        assert!(method.matches("/pkg.Svc/Do"));
+        assert!(method.matches("/other.Svc/Do"));
+        assert!(method.matches("/x/Do"));
+        assert!(!method.matches("/pkg.Svc/Done"));
+        assert!(!method.matches("/pkg.Svc/do"));
+        assert!(!method.matches("/pkg.Svc/Do/"));
+        assert!(!method.matches("/pkg.Svc/Do/x"));
+        assert!(!method.matches("/a/b/Do"));
+        assert!(!method.matches("/Do"));
+        assert!(!method.matches("//Do"));
+        assert!(!method.matches("Do"));
+        assert!(!method.matches(""));
+    }
+
+    #[test]
+    fn grpc_method_pattern_is_one_segment_in_canonical_form() {
+        assert_eq!(grpc_method("caf%c3%a9"), grpc_method("café"));
+        assert!(grpc_method("café").matches("/s/caf%C3%A9"));
+        assert_eq!(grpc_method("Do").as_str(), "Do");
+        assert_ne!(grpc_method("Do"), exact("/Do"));
+        assert_ne!(grpc_method("Do"), prefix("/Do"));
+        for (name, reason) in [
+            ("", PathPatternError::NotOneSegment),
+            ("a/b", PathPatternError::NotOneSegment),
+            ("Do/", PathPatternError::NotOneSegment),
+            ("/Do", PathPatternError::NotOneSegment),
+            (".", PathPatternError::DotSegment),
+            ("..", PathPatternError::DotSegment),
+            (
+                "a%2Fb",
+                PathPatternError::Ambiguous(crate::NormaliseError::EncodedSeparator),
+            ),
+        ] {
+            assert_eq!(PathPattern::grpc_method(name), Err(reason), "{name:?}");
+        }
+    }
+
+    #[test]
     fn regex_pattern_matches_nothing_that_is_not_an_absolute_path() {
         let anything = regex(".*");
         assert!(anything.matches("/"));
@@ -426,6 +518,14 @@ mod tests {
         })
     }
 
+    /// A method name and a path near a call of it, in a service that may be empty.
+    fn grpc_case() -> impl Strategy<Value = (String, String)> {
+        (valid_label(), host_label()).prop_flat_map(|(name, service)| {
+            let path = path_near(&format!("/{service}/{name}"));
+            (Just(name), path)
+        })
+    }
+
     proptest! {
         #[test]
         fn pattern_made_from_any_path_matches_the_normal_form_of_that_path(
@@ -451,6 +551,19 @@ mod tests {
             let as_prefix = regex(&format!("{literal}(?:/.*)?"));
             prop_assert_eq!(as_exact.matches(&path), exact(&text).matches(&path));
             prop_assert_eq!(as_prefix.matches(&path), prefix(&text).matches(&path));
+        }
+
+        #[test]
+        fn grpc_method_matches_as_its_regex_and_the_reference_do(
+            (name, path) in grpc_case()
+        ) {
+            let pattern = grpc_method(&name);
+            let as_regex = regex(&format!("/[^/]+/{}", ::regex::escape(pattern.as_str())));
+            prop_assert_eq!(pattern.matches(&path), as_regex.matches(&path));
+            prop_assert_eq!(
+                pattern.matches(&path),
+                reference::grpc_method_matches(pattern.as_str(), &path)
+            );
         }
 
         #[test]

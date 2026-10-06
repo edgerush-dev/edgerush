@@ -1,12 +1,13 @@
 //! Fuzzes the path stage against its reference: exact and prefix patterns must agree with
-//! the segment-by-segment matcher, and the index with the scan of every entry — which
+//! the segment-by-segment matcher, gRPC methods with the reference's, and the index with
+//! the scan of every entry — which
 //! entries are candidates for a path, and in what order. (There is no second regex engine
 //! to compare regex patterns with; for those only the index's use of them is checked.)
 //!
 //! Input: the request path on the first line, then one entry per line. The first character
-//! of an entry line gives its kind (`e` exact, `p` prefix, `r` regex; any other character
-//! counts as one of them), the rest is the pattern. Lines that are not valid patterns are
-//! skipped.
+//! of an entry line gives its kind (`e` exact, `p` prefix, `r` regex, `g` gRPC method; any
+//! other character counts as one of the first three), the rest is the pattern. Lines that
+//! are not valid patterns are skipped.
 
 #![no_main]
 
@@ -24,24 +25,32 @@ fuzz_target!(|input: &str| {
     let mut patterns = Vec::new();
     for line in lines {
         let mut characters = line.chars();
-        let Some(kind) = characters.next().map(u32::from) else {
+        let Some(kind) = characters.next() else {
             continue;
         };
         let text = characters.as_str();
-        let (kind, pattern) = match kind % 3 {
-            0 => (PathKind::Regex, PathPattern::regex(text)),
-            1 => (PathKind::Prefix, PathPattern::prefix(text)),
-            _ => (PathKind::Exact, PathPattern::exact(text)),
+        let (kind, pattern) = match kind {
+            'g' => (PathKind::GrpcMethod, PathPattern::grpc_method(text)),
+            _ => match u32::from(kind) % 3 {
+                0 => (PathKind::Regex, PathPattern::regex(text)),
+                1 => (PathKind::Prefix, PathPattern::prefix(text)),
+                _ => (PathKind::Exact, PathPattern::exact(text)),
+            },
         };
         let Ok(pattern) = pattern else {
             continue;
         };
-        // The reference works on the canonical text of exact and prefix patterns, and it
-        // must find every text canonical that the real code accepted.
+        // The reference works on the canonical text of exact and prefix patterns and of
+        // gRPC methods, and it must find every text canonical that the real code accepted.
+        let rejected = || panic!("accepted {text:?}, which the reference rejects");
         let text = match kind {
             PathKind::Regex => text.to_owned(),
-            PathKind::Exact | PathKind::Prefix => reference::normalise_path(text)
-                .unwrap_or_else(|| panic!("accepted {text:?}, which the reference rejects")),
+            PathKind::Exact | PathKind::Prefix => {
+                reference::normalise_path(text).unwrap_or_else(rejected)
+            }
+            PathKind::GrpcMethod => reference::normalise_path(&format!("/{text}"))
+                .and_then(|path| path.strip_prefix('/').map(str::to_owned))
+                .unwrap_or_else(rejected),
         };
         specs.push((text, kind));
         patterns.push(pattern);
@@ -54,6 +63,11 @@ fuzz_target!(|input: &str| {
     for path in [Some(raw_path), normal.as_deref()].into_iter().flatten() {
         let matches = |n: usize| match &specs[n] {
             (_, PathKind::Regex) => patterns[n].matches(path),
+            (text, PathKind::GrpcMethod) => {
+                let expected = reference::grpc_method_matches(text, path);
+                assert_eq!(patterns[n].matches(path), expected, "{text:?} on {path:?}");
+                expected
+            }
             (text, kind) => {
                 let expected = reference::path_matches(text, *kind == PathKind::Prefix, path);
                 assert_eq!(patterns[n].matches(path), expected, "{text:?} on {path:?}");

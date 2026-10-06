@@ -89,8 +89,16 @@ pub fn path_matches(pattern: &str, is_prefix: bool, path: &str) -> bool {
         && wanted.iter().zip(&given).all(|(a, b)| a == b)
 }
 
-/// The kinds of path pattern, in order of precedence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Whether `path` is a call of the gRPC method `name` in any service: two segments, the
+/// first not empty and the second `name`.
+#[must_use]
+pub fn grpc_method_matches(name: &str, path: &str) -> bool {
+    let segments: Vec<&str> = path.split('/').collect();
+    matches!(segments[..], ["", service, method] if !service.is_empty() && method == name)
+}
+
+/// The kinds of path pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
     /// The whole path, byte for byte.
     Exact,
@@ -98,15 +106,47 @@ pub enum PathKind {
     Regex,
     /// A prefix of whole segments.
     Prefix,
+    /// A gRPC method in any service; the text is the method's name.
+    GrpcMethod,
 }
 
 /// A path pattern as text, in canonical form, with its kind.
 pub type PathSpec = (String, PathKind);
 
+/// Where a path pattern stands among those that match a path, first first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PathRank {
+    /// An exact path.
+    Exact,
+    /// A regular expression.
+    Regex,
+    /// A prefix of one segment or more, the longest first.
+    Prefix(Reverse<usize>),
+    /// A gRPC method in any service: after a service's prefix and before the root, as
+    /// GRPCRoute ranks a method alone between a service and a rule that matches anything.
+    GrpcMethod,
+    /// The root prefix `/`.
+    Root,
+}
+
+/// The rank of a path pattern.
+#[must_use]
+pub fn path_rank((text, kind): &PathSpec) -> PathRank {
+    match kind {
+        PathKind::Exact => PathRank::Exact,
+        PathKind::Regex => PathRank::Regex,
+        PathKind::GrpcMethod => PathRank::GrpcMethod,
+        PathKind::Prefix => match text.strip_suffix('/').unwrap_or(text).len() {
+            0 => PathRank::Root,
+            length => PathRank::Prefix(Reverse(length)),
+        },
+    }
+}
+
 /// The positions of the entries that are candidates for a path, in the order
-/// [`PathIndex::lookup`](crate::PathIndex::lookup) must give them: exact ones first, then
-/// regexes, then the longest prefix first. Whether entry `n` matches the path is for
-/// `matches` to say; this is the specification of the order.
+/// [`PathIndex::lookup`](crate::PathIndex::lookup) must give them: by [`path_rank`], and
+/// equal ranks in the order given. Whether entry `n` matches the path is for `matches` to
+/// say; this is the specification of the order.
 #[must_use]
 pub fn path_candidates(entries: &[PathSpec], matches: impl Fn(usize) -> bool) -> Vec<usize> {
     let mut candidates: Vec<(usize, &PathSpec)> = entries
@@ -114,13 +154,7 @@ pub fn path_candidates(entries: &[PathSpec], matches: impl Fn(usize) -> bool) ->
         .enumerate()
         .filter(|(position, _)| matches(*position))
         .collect();
-    candidates.sort_by_key(|(position, (text, kind))| {
-        let length = match kind {
-            PathKind::Prefix => text.strip_suffix('/').unwrap_or(text).len(),
-            PathKind::Exact | PathKind::Regex => 0,
-        };
-        (*kind, Reverse(length), *position)
-    });
+    candidates.sort_by_key(|(position, spec)| (path_rank(spec), *position));
     candidates
         .into_iter()
         .map(|(position, _)| position)
@@ -309,8 +343,8 @@ pub struct RequestSpec {
 /// field in the order they decide; less is first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Precedence {
-    /// The kind of path pattern, and for a prefix its length, the longest first.
-    pub path: (PathKind, Reverse<usize>),
+    /// The rank of the path pattern.
+    pub path: PathRank,
     /// A method predicate before none.
     pub method: Reverse<bool>,
     /// The number of header predicates that count, the most first.
@@ -331,18 +365,13 @@ pub fn precedence(routes: &[RouteSpec], position: usize) -> Precedence {
         names.len()
     };
     let route = &routes[position];
-    let (path, kind) = &route.path;
-    let prefix_length = match kind {
-        PathKind::Prefix => path.strip_suffix('/').unwrap_or(path).len(),
-        PathKind::Exact | PathKind::Regex => 0,
-    };
     let headers = route
         .headers
         .iter()
         .map(|(name, _)| name.to_ascii_lowercase());
     let query = route.query.iter().map(|(name, _)| name.clone());
     Precedence {
-        path: (*kind, Reverse(prefix_length)),
+        path: path_rank(&route.path),
         method: Reverse(route.method.is_some()),
         headers: Reverse(distinct(headers.collect())),
         query: Reverse(distinct(query.collect())),

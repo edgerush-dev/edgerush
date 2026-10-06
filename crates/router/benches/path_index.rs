@@ -1,6 +1,7 @@
 //! Instruction counts for the per-request path lookup, against one host with far more
 //! routes than any real one: 10 000 exact paths and 1 110 prefixes nested three deep, and
-//! for the regex cases ten or a hundred regex routes on top.
+//! for the regex cases ten or a hundred regex routes on top; and a gRPC host of 100
+//! services.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-router`, see the repository README.
 
@@ -92,8 +93,34 @@ fn with_regexes(index: PathIndex<u32>, path: &str) -> (PathIndex<u32>, Option<u3
     (index, best)
 }
 
+/// A gRPC host: 100 services, ten methods of each named in full, ten methods matched in
+/// any service, and a rule for every call.
+fn grpc_index() -> PathIndex<u32> {
+    let services = (0..100).map(|s| PathPattern::prefix(&format!("/pkg.Svc{s}")));
+    let calls = (0..100)
+        .flat_map(|s| (0..10).map(move |m| PathPattern::exact(&format!("/pkg.Svc{s}/Method{m}"))));
+    let methods = (0..10).map(|m| PathPattern::grpc_method(&format!("Health{m}")));
+    let patterns = services
+        .chain(calls)
+        .chain(methods)
+        .chain([PathPattern::prefix("/")])
+        .map(|pattern| pattern.expect("valid pattern"));
+    PathIndex::new(patterns.zip(0..))
+}
+
+// GRPCRoute's order: both names, the service, the method in any service, any call.
+#[library_benchmark]
+#[bench::service_and_method(grpc_index(), "/pkg.Svc50/Method5")]
+#[bench::service_alone(grpc_index(), "/pkg.Svc50/Other")]
+#[bench::method_alone(grpc_index(), "/other.Svc/Health5")]
+#[bench::any_call(grpc_index(), "/other.Svc/Other")]
+fn grpc(index: PathIndex<u32>, path: &str) -> (PathIndex<u32>, Option<u32>) {
+    let best = black_box(&index).lookup(black_box(path)).next().copied();
+    (index, best)
+}
+
 library_benchmark_group!(
     name = path_index;
-    benchmarks = best_candidate, all_candidates, with_regexes
+    benchmarks = best_candidate, all_candidates, with_regexes, grpc
 );
 main!(library_benchmark_groups = path_index);

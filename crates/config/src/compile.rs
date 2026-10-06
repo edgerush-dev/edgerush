@@ -1483,8 +1483,7 @@ fn grpc_path(grpc: &GrpcMethod) -> Result<PathPattern, Problem> {
     let path = match (&grpc.service, &grpc.method) {
         (Some(service), Some(method)) => PathPattern::exact(&format!("/{service}/{method}")),
         (Some(service), None) => PathPattern::prefix(&format!("/{service}")),
-        // Checked to be an identifier: nothing in it means anything to a pattern.
-        (None, Some(method)) => PathPattern::regex(&format!("/[^/]+/{method}")),
+        (None, Some(method)) => PathPattern::grpc_method(method),
         (None, None) => return Err(bad()),
     };
     path.map_err(Problem::Path)
@@ -4087,6 +4086,38 @@ upstreams: { u: { load_balancer: p2c, endpoints: [] } }
         assert_eq!(rule("/other.Svc/Do"), Some(0));
         assert_eq!(rule("/other.Svc/Other"), None);
         assert_eq!(rule("/pkg.SvcX/Other"), None);
+    }
+
+    /// GRPCRoute ranks the characters of a matching service before those of a matching
+    /// method, so a service alone outranks a method alone for a call both serve (07 §1),
+    /// whichever is listed first (review A02-01).
+    #[test]
+    fn a_service_only_grpc_match_outranks_a_method_only_one() {
+        for (method_rule, service_rule) in [(0, 1), (1, 0)] {
+            let mut rules = [String::new(), String::new()];
+            rules[method_rule] = "      - matches: [{ grpc: { method: Do } }]\n        forward: { backends: [{ upstream: u, weight: 1 }] }\n".to_owned();
+            rules[service_rule] = "      - matches: [{ grpc: { service: pkg.Svc } }]\n        forward: { backends: [{ upstream: u, weight: 1 }] }\n".to_owned();
+            let yaml = format!(
+                r#"
+listeners: {{ web: {{ address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }} }}
+routes:
+  - name: r
+    listeners: [web]
+    hostnames: [{{ name: "*", falls_through: true }}]
+    rules:
+{}{}upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
+"#,
+                rules[0], rules[1]
+            );
+            let compiled = compile(&config(&yaml)).unwrap();
+            let rule = |target: &str| route(&compiled, "a.test", target).map(|(_, rule)| rule);
+            assert_eq!(
+                rule("/pkg.Svc/Do"),
+                Some(service_rule),
+                "method-only listed {method_rule}, service-only {service_rule}"
+            );
+            assert_eq!(rule("/other.Svc/Do"), Some(method_rule));
+        }
     }
 
     /// PINGs are for HTTP/2 upstreams, and no more often than gRPC servers take unless the

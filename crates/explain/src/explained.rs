@@ -408,6 +408,8 @@ pub(crate) fn verdict(
             Failure::Path(pattern) => {
                 if pattern.is_regex() {
                     format!("path {path} does not match {}", pattern.as_str())
+                } else if pattern.is_grpc_method() {
+                    format!("path {path} does not call method {}", pattern.as_str())
                 } else if pattern.is_prefix() {
                     let prefix = if pattern.as_str().is_empty() {
                         "/"
@@ -814,6 +816,46 @@ answer    400 bad_path
         let text = explained_get("http://shop.example.com/search?q=%zz", &[]);
         assert!(
             text.contains(" query q: \"%zz\" cannot be decoded, wanted \"a b\"\n"),
+            "{text}"
+        );
+    }
+
+    /// GRPCRoute's order: both names, then the service, then the method in any service.
+    #[test]
+    fn grpc_matches_rank_service_before_method() {
+        let config = r#"
+listeners: { web: { address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
+routes:
+  - name: rpc
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ grpc: { method: Do } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+      - matches: [{ grpc: { service: pkg.Svc } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+      - matches: [{ grpc: { service: pkg.Svc, method: Do } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+upstreams: { u: { load_balancer: p2c, endpoints: [] } }
+"#;
+        let snapshot = Snapshot::new(serde_saphyr::from_str(config).unwrap()).unwrap();
+        let listener = snapshot.listener("web").unwrap();
+        let call = |url: &str| {
+            let asked = asked("2", "POST", url, &["content-type: application/grpc"]);
+            snapshot.explain(listener, &asked).unwrap().text()
+        };
+        let text = call("http://a.test/pkg.Svc/Do");
+        assert!(
+            text.contains(
+                "\n→ rpc rule 2 match 0  chosen\n  rpc rule 1 match 0  outranked by rpc rule 2 match 0 (path)\n  rpc rule 0 match 0  outranked by rpc rule 2 match 0 (path)\n"
+            ),
+            "{text}"
+        );
+        let text = call("http://a.test/pkg.Svc/Other");
+        assert!(
+            text.contains(
+                "\n  rpc rule 2 match 0  path /pkg.Svc/Other is not /pkg.Svc/Do\n→ rpc rule 1 match 0  chosen\n  rpc rule 0 match 0  path /pkg.Svc/Other does not call method Do\n"
+            ),
             "{text}"
         );
     }

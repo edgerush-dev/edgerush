@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 901e04f96d9e94d125fbddaa30387e43b585bc7e113f041343725018b10166e8 # shrinks to (specs, path) = ([("a", GrpcMethod)], "/a/a/")
+cc 96fa4a7fe4312a482f230067fc6df945783e49a990ba4340c5695401f5b666e5 # shrinks to (specs, path) = ([("ab", GrpcMethod), ("a", GrpcMethod), ("/ab/a/", Prefix)], "/ab/a")
