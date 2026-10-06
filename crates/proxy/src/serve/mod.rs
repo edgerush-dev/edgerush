@@ -268,6 +268,16 @@ impl BodyError {
     fn is_the_upstreams(&self) -> bool {
         !matches!(self, Self::Ours(ExchangeError::Exhausted(_)) | Self::Shed)
     }
+
+    /// Why the answer it cut is counted and logged as cut: its deadline, the upstream, or
+    /// the worker's own storage.
+    fn answer(&self) -> Answer {
+        match self {
+            Self::DeadlinePassed => Answer::DeadlineExceeded,
+            error if error.is_the_upstreams() => Answer::UpstreamFailed,
+            Self::Ours(_) | Self::H2(_) | Self::Shed => Answer::Exhausted,
+        }
+    }
 }
 
 impl HttpBody for Body {
@@ -482,7 +492,14 @@ where
     // it, so that it is not moved into another on every request.
     let respond = move |head: RawHead, body, interim| {
         asking.set(true);
-        Rc::clone(&ours.worker).handle_head(listener, Rc::clone(&client), head, body, Some(interim))
+        Rc::clone(&ours.worker).handle_head(
+            listener,
+            Rc::clone(&client),
+            head,
+            body,
+            Some(interim),
+            Some(Rc::clone(&ours)),
+        )
     };
     let slots = slots_for(&worker.slots, &respond);
     let ended = h1::serve(
@@ -493,6 +510,7 @@ where
         || worker.date.get(),
         &connection.drain,
         respond,
+        |went| connection.went(went),
         &slots,
     )
     .await;
@@ -956,6 +974,26 @@ struct Connection {
     /// What it drains with, and a WebSocket it carries too: the worker's drain, and a reload
     /// that replaces the client validation it was accepted under (03 §3).
     drain: Rc<Drain>,
+    /// Over HTTP/1, what the answer in hand is to be counted as.
+    owed: Owed,
+}
+
+/// What an HTTP/1 answer is counted as, kept from when the core hands it over until our
+/// server says whose head went: its body can still fail before any of its head has gone,
+/// and the client get a 502 in its place (14 §4), which is what the scrape and the record
+/// are to say. A counter cannot be taken back.
+#[derive(Default)]
+struct Owed {
+    answer: Cell<Option<OwedAnswer>>,
+    record: Cell<Weak<Logging>>,
+}
+
+#[derive(Clone, Copy)]
+struct OwedAnswer {
+    status: StatusCode,
+    /// From its request's head coming in to the core handing it over.
+    took: u64,
+    came_in: Instant,
 }
 
 impl Connection {
@@ -968,6 +1006,47 @@ impl Connection {
             worker,
             listener,
             drain,
+            owed: Owed::default(),
+        }
+    }
+
+    /// Keeps what the answer the core has handed over is to be counted as, and its record,
+    /// until the server says whose head went.
+    fn owe(&self, status: StatusCode, took: u64, came_in: Instant, record: Option<&Rc<Logging>>) {
+        self.owed.answer.set(Some(OwedAnswer {
+            status,
+            took,
+            came_in,
+        }));
+        self.owed
+            .record
+            .set(record.map_or_else(Weak::new, Rc::downgrade));
+    }
+
+    /// Counts the answer the server says went: the core's, or the server's 502 in its place
+    /// for the body's `error`, the gateway's own answer, timed to now, when its head goes.
+    fn went(&self, went: h1::Went<'_, BodyError>) {
+        let Some(owed) = self.owed.answer.take() else {
+            return;
+        };
+        let record = self.owed.record.take();
+        let counters = self.worker.proxy.metrics.listener(self.listener);
+        match went {
+            h1::Went::Core => {
+                if let Some(counters) = counters {
+                    counters.responded(owed.status, owed.took);
+                }
+            }
+            h1::Went::Replaced(error) => {
+                if let Some(counters) = counters {
+                    let took = u64::try_from(owed.came_in.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    counters.responded(StatusCode::BAD_GATEWAY, took);
+                    counters.answered(error.answer());
+                }
+                if let Some(record) = record.upgrade() {
+                    record.replaced(StatusCode::BAD_GATEWAY);
+                }
+            }
         }
     }
 }

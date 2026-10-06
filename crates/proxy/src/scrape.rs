@@ -151,6 +151,8 @@ impl Proxy {
                     date,
                     &never,
                     respond,
+                    // Its own answers are not counted, so nothing is owed them.
+                    |_| {},
                     &slots,
                 )
                 .await;

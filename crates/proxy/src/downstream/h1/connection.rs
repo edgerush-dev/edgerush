@@ -1155,6 +1155,9 @@ impl FinalHead {
 /// Each request's future runs in a slot lent by `slots` for as long as the request does, not
 /// inside this future (14 §3): a connection waiting for its first or next request holds no
 /// room for one.
+///
+/// `went` is told of every answer `respond` gave, once it is known whose head the client
+/// gets, and before the answer's body is let go of.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve<S, R, F, B>(
     socket: S,
@@ -1164,6 +1167,7 @@ pub(crate) async fn serve<S, R, F, B>(
     date: impl Fn() -> HttpDate,
     drain: &Drain,
     mut respond: R,
+    went: impl Fn(Went<'_, B::Error>),
     slots: &Slots<F>,
 ) -> Ended
 where
@@ -1268,13 +1272,17 @@ where
         let (mut body, written) =
             match connection.answer_head(&interim, response, asked, persistent, &date()) {
                 Ok(answering) => answering,
-                Err(ended) => break 'serving ended,
+                Err(ended) => {
+                    went(Went::Core);
+                    break 'serving ended;
+                }
             };
         // A WebSocket's 101: once it has gone, the connection is the tunnel's, and what the
         // client sent after its handshake goes to the backend first (19 §2).
         // Boxed: a tunnel's state is several times a connection's, and every connection's
         // future would otherwise carry room for it between requests (14 §3).
         if switching {
+            went(Went::Core);
             drop(body);
             let switched = interim.take_switched();
             return Box::pin(switch(connection, switched, drain)).await;
@@ -1282,7 +1290,8 @@ where
 
         let mut framer = BodyFramer::new(written.delimited);
         let mut body_left = written.delimited != Delimited::Nothing;
-        let sent = poll_fn(|context| -> Poll<Result<bool, Stop>> {
+        // Whether the body ended, or the error it failed with.
+        let sent = poll_fn(|context| -> Poll<Result<Option<B::Error>, Stop>> {
             loop {
                 if connection.spent() {
                     return connection.yield_turn(context);
@@ -1329,7 +1338,7 @@ where
                         }
                         // What becomes of the answer depends on how much of it has gone,
                         // which is for the caller to settle.
-                        Some(Err(_)) => return Poll::Ready(Ok(false)),
+                        Some(Err(error)) => return Poll::Ready(Ok(Some(error))),
                     }
                 }
                 moved |= connection.poll_write_queued(context)?;
@@ -1349,7 +1358,7 @@ where
                     connection.deadlines.body_moved(now());
                 }
                 if !body_left && connection.queued.is_empty() {
-                    return Poll::Ready(Ok(true));
+                    return Poll::Ready(Ok(None));
                 }
                 if !moved {
                     connection.poll_deadline(context)?;
@@ -1358,13 +1367,32 @@ where
             }
         })
         .await;
-        drop(body);
-        match sent {
-            Ok(true) => {}
-            Ok(false) => {
-                break 'serving replace_or_cut(&mut connection, asked, &date).await;
+        // Whose head the client gets is known now, and said before the body is let go of:
+        // whatever ends with it, a record, is to say the same. The error goes here, and is
+        // not kept across what is waited on next.
+        let failed = match sent {
+            Ok(None) => {
+                went(Went::Core);
+                false
             }
-            Err(stop) => break 'serving stop.into(),
+            Ok(Some(error)) => {
+                let replacing = !matches!(connection.outbound.on_failure(), OnFailure::Close);
+                went(if replacing {
+                    Went::Replaced(&error)
+                } else {
+                    Went::Core
+                });
+                true
+            }
+            Err(stop) => {
+                went(Went::Core);
+                drop(body);
+                break 'serving stop.into();
+            }
+        };
+        drop(body);
+        if failed {
+            break 'serving replace_or_cut(&mut connection, asked, &date).await;
         }
         // A kept connection's request had ended when its answer began (`persistent`), and
         // nothing is read while the answer is written unless that request's body asks.
@@ -1378,6 +1406,14 @@ where
         connection.shut().await;
     }
     ended
+}
+
+/// Whose head an answer's client got, as [`serve`] says once it knows (14 §4): the core's,
+/// or the 502 the server answers in its place, the answer's body having failed with this
+/// before any byte of its head went.
+pub(crate) enum Went<'a, E> {
+    Core,
+    Replaced(&'a E),
 }
 
 /// Writes out a 101, then carries the connection to the backend the request core switched,
@@ -1518,7 +1554,25 @@ mod tests {
         settings: Settings,
         blocks: Rc<RefCell<Blocks>>,
         date: impl Fn() -> HttpDate,
+        respond: R,
+    ) -> Ended
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+        R: FnMut(Request<RequestBody>, Interim) -> F,
+        F: Future<Output = Response<B>>,
+        B: Body<Data = Bytes> + Unpin,
+    {
+        serve_telling(socket, settings, blocks, date, respond, |_| {}).await
+    }
+
+    /// The same, telling `went` of each answer as the driver tells its caller.
+    async fn serve_telling<S, R, F, B>(
+        socket: S,
+        settings: Settings,
+        blocks: Rc<RefCell<Blocks>>,
+        date: impl Fn() -> HttpDate,
         mut respond: R,
+        went: impl Fn(Went<'_, B::Error>),
     ) -> Ended
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -1541,6 +1595,7 @@ mod tests {
                     let answering = respond(Request::from_parts(head.into_parts(), body), interim);
                     async move { Answered::Map(answering.await) }
                 },
+                went,
                 &slots,
             ))
             .await
@@ -2295,19 +2350,33 @@ mod tests {
     /// An answer whose body fails before any byte of its head has gone can still be put
     /// right: the client is answered 502 in its place, and the connection closes. Once the
     /// head has begun to go the answer is the upstream's, and the client is left with a
-    /// message it can tell is unfinished (14 §4).
+    /// message it can tell is unfinished (14 §4). Either way the caller is told whose head
+    /// went, and why another's did, before the body is let go of: what is counted and
+    /// recorded of the answer is to say the same.
     #[tokio::test]
     async fn a_body_that_fails_before_its_head_goes_is_answered_502_instead() {
-        for (pending, answer, ending) in [
-            (0, "HTTP/1.1 502 Bad Gateway\r\n", Ended::Answered),
-            (1, "HTTP/1.1 200 OK\r\n", Ended::Cut),
+        for (pending, answer, ending, told) in [
+            (
+                0,
+                "HTTP/1.1 502 Bad Gateway\r\n",
+                Ended::Answered,
+                "replaced: the upstream's body could not be read",
+            ),
+            (1, "HTTP/1.1 200 OK\r\n", Ended::Cut, "core"),
         ] {
             let failing = move |_: Request<RequestBody>, _: Interim| async move {
                 Response::new(Failing { pending })
             };
             let (mut client, server) = tokio::io::duplex(1 << 16);
             client.write_all(GET).await.unwrap();
-            let serving = serve(server, settings(), blocks(), date, failing);
+            let said = RefCell::new(Vec::new());
+            let went = |went: Went<'_, &'static str>| {
+                said.borrow_mut().push(match went {
+                    Went::Core => "core".to_owned(),
+                    Went::Replaced(error) => format!("replaced: {error}"),
+                });
+            };
+            let serving = serve_telling(server, settings(), blocks(), date, failing, went);
             let (ended, received) = tokio::time::timeout(Duration::from_secs(10), async {
                 let ended = serving.await;
                 let mut received = Vec::new();
@@ -2318,6 +2387,7 @@ mod tests {
             .unwrap();
             assert!(received.starts_with(answer), "{pending}: {received:?}");
             assert_eq!(ended, ending, "{pending}: {received:?}");
+            assert_eq!(said.take(), [told], "{pending}");
             if pending == 0 {
                 assert!(
                     received.contains("\r\nconnection: close\r\n"),
@@ -3162,6 +3232,7 @@ mod tests {
                 date,
                 &Drain::default(),
                 answering,
+                |_| {},
                 &Slots::default(),
             ),
         )
@@ -3317,6 +3388,7 @@ mod tests {
                 date,
                 &never,
                 respond,
+                |_| {},
                 slots,
             ))
             .await
@@ -3423,7 +3495,15 @@ mod tests {
         let driver = size_of_made(
             |(socket, settings, blocks, timers, drain, respond, slots): Driving| {
                 super::serve(
-                    socket, settings, blocks, timers, date, drain, respond, slots,
+                    socket,
+                    settings,
+                    blocks,
+                    timers,
+                    date,
+                    drain,
+                    respond,
+                    |_| {},
+                    slots,
                 )
             },
         );

@@ -292,6 +292,7 @@ async fn composed(client: Vec<ClientStep>, core: Core, pipe: usize) -> Run {
                     || HttpDate::from_unix(0),
                     &never,
                     respond,
+                    |_| {},
                     &slots,
                 ))
                 .await;

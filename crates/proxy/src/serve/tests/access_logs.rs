@@ -308,6 +308,79 @@ async fn an_answer_cut_short_upstream_is_logged() {
         .await;
 }
 
+/// An answer whose body is found broken before any byte of its head has gone is answered
+/// 502 in its place (14 §4): its record says the status the client got, and the scrape
+/// counts the 502 among the responses and the gateway's own answers, not the 200 it
+/// replaced (review A10-02, C28).
+#[tokio::test]
+async fn an_answer_replaced_before_its_head_went_is_logged_and_counted_as_the_502_sent() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // An upstream whose answer's body is broken from its first byte: a chunk size
+            // that is not one, right behind its head; then held open, so that the body fails
+            // on its framing and not on a close.
+            let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = backend.local_addr().unwrap();
+            let _answering = tokio::task::spawn_local(async move {
+                let Ok((mut stream, _)) = backend.accept().await else {
+                    return;
+                };
+                let mut seen = Vec::new();
+                let mut byte = [0; 1];
+                while !seen.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte).await {
+                        Ok(1) => seen.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                let _said = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nZ\r\n")
+                    .await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+            let logged = recording("replaced", everything_config(upstream)).await;
+            let answer = h1_answer(logged.front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
+            let records = logged.records(1).await;
+            let record = &records[0];
+            assert_eq!(record["status"], 502, "{record}");
+            assert_eq!(record["reason"], "upstream_failed", "{record}");
+            let scrape = logged.worker.proxy.metrics();
+            let sample = |series: &str| {
+                scrape
+                    .lines()
+                    .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
+                    .unwrap_or("absent")
+                    .to_owned()
+            };
+            let class = |class: &str| {
+                sample(&format!(
+                    "edgerush_listener_responses_total{{listener=\"web\",class=\"{class}\"}}"
+                ))
+            };
+            assert_eq!((class("5xx"), class("2xx")), ("1".into(), "0".into()));
+            assert_eq!(
+                sample(
+                    "edgerush_listener_local_answers_total{listener=\"web\",reason=\"upstream_failed\"}"
+                ),
+                "1"
+            );
+            assert_eq!(
+                sample("edgerush_listener_time_to_response_head_seconds_count{listener=\"web\"}"),
+                "1"
+            );
+            // The upstream did answer 200, and its own series say so.
+            assert_eq!(
+                sample("edgerush_upstream_responses_total{upstream=\"up\",class=\"2xx\"}"),
+                "1",
+                "{scrape}"
+            );
+        })
+        .await;
+}
+
 /// Behind a trusted proxy the client is the one the proxy names, and the peer the proxy.
 #[tokio::test]
 async fn a_trusted_proxys_client_is_the_client() {

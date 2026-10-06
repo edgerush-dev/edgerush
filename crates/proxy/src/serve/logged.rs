@@ -23,7 +23,7 @@ use crate::tunnel::Tunneled;
 use edgerush_filters::forwarding::client_address;
 use edgerush_router::Fields;
 use edgerush_telemetry::access_log::{Kind, Protocol, Record};
-use http::{HeaderValue, Version};
+use http::{HeaderValue, StatusCode, Version};
 use http_body::Body as HttpBody;
 use std::cell::{Cell, RefCell};
 use std::net::{IpAddr, SocketAddr};
@@ -203,6 +203,12 @@ impl Logging {
         }
     }
 
+    /// Notes that the server answered `status` in place of the answer noted: its body
+    /// failed before any of its head went (14 §4).
+    pub(super) fn replaced(&self, status: StatusCode) {
+        self.status.set(Some(status.as_u16()));
+    }
+
     /// Notes the status a gRPC call ended with, wherever it came.
     pub(super) fn called(&self, code: usize) {
         self.grpc_status
@@ -226,13 +232,7 @@ impl Logging {
     }
 
     fn failed(&self, error: &BodyError) {
-        let why = match error {
-            BodyError::DeadlinePassed => "deadline_exceeded",
-            error if error.is_the_upstreams() => "upstream_failed",
-            // The worker's own storage ran out under it, as a 503 before the head says.
-            BodyError::Ours(_) | BodyError::H2(_) | BodyError::Shed => "exhausted",
-        };
-        self.reason.set(Some(why));
+        self.reason.set(Some(error.answer().label()));
     }
 
     /// Writes the record as it stands now, as one of `kind`: the request's, a WebSocket's

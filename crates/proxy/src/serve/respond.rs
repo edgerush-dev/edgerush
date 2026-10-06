@@ -3,8 +3,8 @@
 
 use super::logged::{Logging, logged};
 use super::{
-    Body, Called, Directed, Directing, Handshake, Mirrored, Others, Proxy, Redirect, Snapshot,
-    TUNNEL_IDLE, Timed, Timing, Toward, Worker, at_endpoint, balance_of,
+    Body, Called, Connection, Directed, Directing, Handshake, Mirrored, Others, Proxy, Redirect,
+    Snapshot, TUNNEL_IDLE, Timed, Timing, Toward, Worker, at_endpoint, balance_of,
 };
 use crate::balance::Tried;
 use crate::downstream::h1::connection::{self as h1, Answered};
@@ -54,7 +54,7 @@ impl Worker {
         let (head, body) = request.into_parts();
         // What the core adds is kept beside the map, in room the worker lends (14 §6).
         let head = MapHead::lent(head, &self.blocks);
-        self.handle_head(listener, client, head, body, interim)
+        self.handle_head(listener, client, head, body, interim, None)
     }
 
     /// The record of a request that came in on `listener` from `client`, if its listener
@@ -75,7 +75,8 @@ impl Worker {
     }
 
     /// The same for a request's head of whatever kind: a map, or the raw head our own
-    /// server reads ([14 §6](../../docs/14-downstream-server.md)).
+    /// server reads ([14 §6](../../docs/14-downstream-server.md)). Over HTTP/1 the answer is
+    /// counted once the server says whose head went, `owed` keeping it till then.
     pub(super) async fn handle_head<H: Forwarded>(
         self: Rc<Self>,
         listener: usize,
@@ -83,6 +84,7 @@ impl Worker {
         head: H,
         body: RequestBody,
         interim: Option<Interim>,
+        owed: Option<Rc<Connection>>,
     ) -> Answered<Body> {
         let came_in = Instant::now();
         // First, so that every answer the core gives, its own included, carries it; with
@@ -106,12 +108,20 @@ impl Worker {
             )
             .await;
         self.proxy.say_last(listener, &mut answered, id);
-        if let Some(counters) = self.proxy.metrics.listener(listener) {
-            let took = u64::try_from(came_in.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            counters.responded(answered.status(), took);
+        let took = u64::try_from(came_in.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let logging = logging.take();
+        match owed {
+            Some(connection) => {
+                connection.owe(answered.status(), took, came_in, logging.as_ref());
+            }
+            None => {
+                if let Some(counters) = self.proxy.metrics.listener(listener) {
+                    counters.responded(answered.status(), took);
+                }
+            }
         }
         // Last, so that it counts what goes of the answer and ends with it.
-        if let Some(logging) = logging.take() {
+        if let Some(logging) = logging {
             logging.answered(&answered);
             answered = logged(answered, logging);
         }
