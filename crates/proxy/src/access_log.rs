@@ -50,18 +50,29 @@ pub(crate) struct Sink(u32);
 
 /// What the logger is told.
 enum Message {
-    /// Write to `target` as `sink` from now on.
-    Open(Sink, Target),
     /// A worker's batch for `sink`, to be written and given back.
     Batch {
         sink: Sink,
         bytes: Vec<u8>,
         back: Sender<Vec<u8>>,
     },
-    /// Open every file again by its path: it has been moved aside for rotation.
-    Reopen,
+    /// Something has been left in [`Asked`]: a wake, which a full channel can do without,
+    /// since the logger looks there before every message.
+    Asked,
     /// Says on the channel once everything sent before it has been written.
     Finished(Sender<()>),
+}
+
+/// What the logger is asked for by the threads that run the process, left for it to take
+/// before its next message rather than sent: a logger held in a write holds none of them
+/// (08 §2), and however many rotations are asked for meanwhile, one reopen does for all.
+#[derive(Default)]
+struct Asked {
+    /// Sinks to write to from now on, with what each writes to.
+    opened: Mutex<Vec<(Sink, Target)>>,
+    /// Whether every file is to be opened again by its path, having been moved aside for
+    /// rotation.
+    reopen: AtomicBool,
 }
 
 /// Where a sink's records go, as the logger holds it.
@@ -120,13 +131,15 @@ pub(crate) struct Logs {
     named: Mutex<Named>,
     /// The logger, from the first config that logs.
     logger: OnceLock<SyncSender<Message>>,
+    /// What the logger is left to take.
+    asked: Arc<Asked>,
     /// Every worker's word for the end, while the worker is there to be told.
     workers: Mutex<Vec<Weak<Finish>>>,
     /// Whether the running config logs anything at all: what a request of one that does
     /// not looks at, and no further.
     on: AtomicBool,
     /// Room in the channel for every batch every worker can have, so that handing one over
-    /// never finds it full.
+    /// never finds it full, and for a few wakes and a finish.
     room: usize,
     dropped: Dropped,
 }
@@ -175,6 +188,7 @@ impl Logs {
         Self {
             named: Mutex::default(),
             logger: OnceLock::new(),
+            asked: Arc::default(),
             workers: Mutex::default(),
             on: AtomicBool::new(false),
             room: workers.max(1) * BATCHES + 8,
@@ -240,23 +254,34 @@ impl Logs {
         if prepared.opened.is_empty() {
             return;
         }
-        let logger = self.logger();
+        let mut opened = Vec::with_capacity(prepared.opened.len());
         for (log, sink, target) in prepared.opened {
             named.sinks.insert(log, sink);
-            let _sent = logger.send(Message::Open(sink, target));
+            opened.push((sink, target));
         }
+        // Taken before any batch for these sinks: none is made until this config runs.
+        self.ask(|asked| lock(&asked.opened).append(&mut opened));
+    }
+
+    /// Leaves the logger something to take, started now if it was not, and wakes it if
+    /// there is room to: one with no room is busy, and looks before its next message.
+    fn ask(&self, what: impl FnOnce(&Asked)) {
+        let logger = self.logger();
+        what(&self.asked);
+        let _woken = logger.try_send(Message::Asked);
     }
 
     /// The logger, started now if it was not.
     fn logger(&self) -> &SyncSender<Message> {
         self.logger.get_or_init(|| {
             let (to, from) = mpsc::sync_channel(self.room);
+            let asked = Arc::clone(&self.asked);
             let dropped = Arc::clone(&self.dropped);
             // A thread that cannot be started leaves a channel nobody reads, and every
             // record is counted as dropped.
             let _started = thread::Builder::new()
                 .name("access-log".to_owned())
-                .spawn(move || write(&from, &dropped));
+                .spawn(move || write(&from, &asked, &dropped));
             to
         })
     }
@@ -285,10 +310,11 @@ impl Logs {
         self.on.load(Ordering::Relaxed)
     }
 
-    /// Tells the logger to open its files again, for whoever moved them aside.
+    /// Asks the logger to open its files again, for whoever moved them aside. Returns at
+    /// once, whatever the logger is doing.
     pub(crate) fn reopen(&self) {
-        if let Some(logger) = self.logger.get() {
-            let _sent = logger.send(Message::Reopen);
+        if self.logger.get().is_some() {
+            self.ask(|asked| asked.reopen.store(true, Ordering::Release));
         }
     }
 
@@ -316,10 +342,25 @@ impl Logs {
             return true;
         };
         let (finished, written) = mpsc::channel();
-        logger.send(Message::Finished(finished)).is_ok()
-            && written
-                .recv_timeout(until.saturating_duration_since(Instant::now()))
-                .is_ok()
+        let mut finish = Message::Finished(finished);
+        // A channel with no room has a logger held in a write: offered again until it has
+        // room or time is up, rather than waited on without bound.
+        loop {
+            match logger.try_send(finish) {
+                Ok(()) => break,
+                Err(TrySendError::Disconnected(_)) => return false,
+                Err(TrySendError::Full(refused)) => {
+                    if Instant::now() >= until {
+                        return false;
+                    }
+                    finish = refused;
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        written
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .is_ok()
     }
 
     /// Hands `bytes` to the logger to write as `sink`'s; if it cannot take them, they are
@@ -463,14 +504,19 @@ impl Batches {
     }
 }
 
-/// The logger: writes what it is sent, in the order it was sent, until every sender is gone.
-fn write(from: &Receiver<Message>, dropped: &Dropped) {
+/// The logger: writes what it is sent, in the order it was sent, until every sender is gone,
+/// taking what it has been asked for before each message.
+fn write(from: &Receiver<Message>, asked: &Asked, dropped: &Dropped) {
     let mut targets: HashMap<Sink, Target> = HashMap::new();
     for message in from {
-        match message {
-            Message::Open(sink, target) => {
-                targets.insert(sink, target);
+        targets.extend(lock(&asked.opened).drain(..));
+        if asked.reopen.swap(false, Ordering::Acquire) {
+            for target in targets.values_mut() {
+                target.reopen();
             }
+        }
+        match message {
+            Message::Asked => {}
             Message::Batch {
                 sink,
                 mut bytes,
@@ -485,11 +531,6 @@ fn write(from: &Receiver<Message>, dropped: &Dropped) {
                 bytes.clear();
                 // A worker that has gone takes no batches back.
                 let _given = back.send(bytes);
-            }
-            Message::Reopen => {
-                for target in targets.values_mut() {
-                    target.reopen();
-                }
             }
             Message::Finished(finished) => {
                 let _flushed = io::stdout().lock().flush();
@@ -522,9 +563,7 @@ impl Logs {
         let mut named = lock(&self.named);
         let sink = Sink(named.next);
         named.next += 1;
-        let _sent = self
-            .logger()
-            .send(Message::Open(sink, Target::Test(writer)));
+        self.ask(|asked| lock(&asked.opened).push((sink, Target::Test(writer))));
         sink
     }
 
@@ -726,6 +765,54 @@ mod tests {
         assert!(written >= BATCHES * BATCH / 100, "{written}");
         assert_eq!(written as u64 + dropped, records as u64);
         assert_eq!(logs.dropped(LogsDropped::Unwritten), 0);
+    }
+
+    /// Nobody who asks something of the logger waits on it (08 §2): held in a write, its
+    /// channel full, the signals thread asking for rotation after rotation, the main thread
+    /// putting in force a config that names a new file and then ending a drain all come
+    /// back at once, the end out of time (21 §4). Let go, the logger writes to the new file.
+    #[test]
+    fn a_stalled_logger_holds_nobody_who_asks_something_of_it() {
+        let scratch = Scratch::new("stalled");
+        let path = scratch.file("new.log");
+        let logs = logs();
+        let (go, held) = mpsc::channel();
+        let sink = logs.writing_to(Box::new(Held {
+            go: held,
+            held: false,
+            got: Arc::default(),
+        }));
+        let batches = logs.worker();
+        batches.record(&logs, sink, |out| out.extend_from_slice(b"held\n"));
+        batches.hand_over(&logs);
+        batches.finished();
+        let (told, heard) = mpsc::channel();
+        let said = std::thread::scope(|scope| {
+            let logs = &logs;
+            let config = compiled(&listener("web", &file(&path)));
+            scope.spawn(move || {
+                for _ in 0..2 * logs.room {
+                    logs.reopen();
+                }
+                let sinks = running(logs, &config, &names(&["web"]));
+                let finished = logs.finish(Duration::from_millis(100));
+                let _told = told.send((sinks, finished));
+            });
+            let said = heard.recv_timeout(WITHIN);
+            // Let go whatever happened, so that the thread ends.
+            go.send(()).unwrap();
+            said
+        });
+        let Ok((sinks, finished)) = said else {
+            panic!("held by the logger: {said:?}")
+        };
+        assert!(!finished, "finished while the logger was held");
+        // Caught up, so that the next batch finds room.
+        assert!(logs.finish(WITHIN));
+        let Some(web) = sinks[0] else { panic!() };
+        batches.record(&logs, web, |out| out.extend_from_slice(b"web\n"));
+        finish(&logs, &batches);
+        assert_eq!(read(&path), "web\n");
     }
 
     struct Failing;
