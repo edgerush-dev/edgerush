@@ -37,7 +37,9 @@ struct GivenUp;
 
 #[derive(Debug)]
 enum Copied {
-    Data(Bytes),
+    /// A frame as it is, and what the worker is charged for it until the mirror takes it,
+    /// where its source pays for it no longer ([`RequestBody::unpaid`]).
+    Data(Bytes, Option<Charge>),
     /// Small frames copied together, and what the worker is charged for them until the
     /// mirror takes them; the last one on the queue may take more.
     Run(Vec<u8>, Option<Charge>),
@@ -47,9 +49,12 @@ enum Copied {
 #[derive(Debug)]
 struct Queue {
     frames: VecDeque<Copied>,
-    /// The worker's account, which pays for the runs: a copy is paid for by nothing it was
-    /// copied from (14 §8).
+    /// The worker's account, which pays for the runs, since a copy is paid for by nothing it
+    /// was copied from (14 §8), and for the frames whose source pays for them no longer.
     storage: Rc<Storage>,
+    /// What the frame the mirror took last is charged, until it asks for the next: as h2's
+    /// credit pays for a frame its body has handed on.
+    in_hand: Option<Charge>,
     /// Bytes on it not taken yet.
     behind: usize,
     ended: bool,
@@ -80,27 +85,32 @@ impl Queue {
         self.wake_reader();
     }
 
-    /// Puts a frame's data on the queue: as it is, unless it is small and finds a small
-    /// frame or a run not taken yet at the queue's end, when it is copied onto the run — the
-    /// frame it found with it.
+    /// Puts a frame's data on the queue: as it is, charged `unpaid`, unless it is small and
+    /// finds a small frame or a run not taken yet at the queue's end, when it is copied onto
+    /// the run — the frame it found with it.
     ///
     /// # Errors
     ///
-    /// [`Exhausted`] if the worker cannot pay for the run.
-    fn put_data(&mut self, data: &Bytes) -> Result<(), Exhausted> {
+    /// [`Exhausted`] if the worker cannot pay for the frame or the run.
+    fn put_data(&mut self, data: &Bytes, unpaid: usize) -> Result<(), Exhausted> {
         let small = |len: usize| len < runs::COPIED_BELOW;
         let joins = small(data.len())
             && match self.frames.back() {
                 Some(Copied::Run(..)) => true,
-                Some(Copied::Data(last)) => small(last.len()),
+                Some(Copied::Data(last, _)) => small(last.len()),
                 _ => false,
             };
         if !joins {
-            self.put(Copied::Data(data.clone()));
+            let charge = match unpaid {
+                0 => None,
+                unpaid => Some(self.storage.reserve(unpaid)?),
+            };
+            self.put(Copied::Data(data.clone(), charge));
             return Ok(());
         }
-        if matches!(self.frames.back(), Some(Copied::Data(_)))
-            && let Some(Copied::Data(last)) = self.frames.pop_back()
+        // Copied, the frame it found goes, and its charge with it.
+        if matches!(self.frames.back(), Some(Copied::Data(..)))
+            && let Some(Copied::Data(last, _)) = self.frames.pop_back()
         {
             self.frames.push_back(Copied::Run(Vec::new(), None));
             self.copy(&last)?;
@@ -185,6 +195,7 @@ impl Tee {
                 Rc::new(RefCell::new(Queue {
                     frames: VecDeque::new(),
                     storage: Rc::clone(storage),
+                    in_hand: None,
                     behind: 0,
                     ended,
                     given_up: false,
@@ -199,6 +210,12 @@ impl Tee {
             .map(|queue| (Copy(Rc::clone(queue)), Kept(Rc::clone(queue))))
             .collect();
         (Self { inner, queues }, copies)
+    }
+
+    /// What keeping `data`, a frame it handed on, holds that nothing pays for: what its
+    /// body says ([`RequestBody::unpaid`]).
+    pub(crate) fn unpaid(&self, data: &Bytes) -> usize {
+        self.inner.unpaid(data)
     }
 }
 
@@ -231,7 +248,7 @@ impl Body for Tee {
                         if queue.behind + data.len() > MOST_BEHIND {
                             queue.fell_behind = true;
                             queue.give_up();
-                        } else if queue.put_data(data).is_ok() {
+                        } else if queue.put_data(data, this.inner.unpaid(data)).is_ok() {
                             queue.behind += data.len();
                         } else {
                             // Behind further than the worker can pay to hold.
@@ -277,6 +294,15 @@ impl Drop for Tee {
     }
 }
 
+impl Copy {
+    /// What keeping `data`, the frame it handed on last, holds that nothing pays for once
+    /// the next is asked for: what it was charged on the queue, which its source, or a run's
+    /// copying, made it cost. Nothing for one its source still pays for.
+    pub(crate) fn unpaid(&self, _data: &Bytes) -> usize {
+        self.0.borrow().in_hand.as_ref().map_or(0, Charge::bytes)
+    }
+}
+
 impl Body for Copy {
     type Data = Bytes;
     type Error = RequestBodyError;
@@ -286,17 +312,20 @@ impl Body for Copy {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, RequestBodyError>>> {
         let mut queue = self.0.borrow_mut();
+        // Asked for the next, the mirror is done with the frame it took last.
+        queue.in_hand = None;
         if queue.given_up {
             return Poll::Ready(Some(Err(RequestBodyError::Other(Box::new(GivenUp)))));
         }
         match queue.frames.pop_front() {
-            Some(Copied::Data(data)) => {
+            Some(Copied::Data(data, charge)) => {
                 queue.behind -= data.len();
+                queue.in_hand = charge;
                 Poll::Ready(Some(Ok(Frame::data(data))))
             }
-            // Its charge goes as it does: whoever sends it on pays for what it holds.
-            Some(Copied::Run(run, _charge)) => {
+            Some(Copied::Run(run, charge)) => {
                 queue.behind -= run.len();
+                queue.in_hand = charge;
                 Poll::Ready(Some(Ok(Frame::data(Bytes::from(run)))))
             }
             Some(Copied::Trailers(trailers)) => Poll::Ready(Some(Ok(Frame::trailers(trailers)))),
@@ -475,6 +504,44 @@ mod tests {
         assert!(Pin::new(&mut copy).poll_frame(&mut cx).is_pending());
         let _first = tee.frame().await.unwrap().unwrap();
         assert!(woken.was(), "a waiting copy was not told of a small frame");
+    }
+
+    /// A frame put on a mirror's queue as it is is paid for at what its source pays for no
+    /// longer (14 §8), until the mirror has taken it and asked for the next; a small one
+    /// copied onto a run with the next lets go of its charge for the run's.
+    #[tokio::test]
+    async fn frames_a_mirror_holds_are_paid_for_what_their_source_pays_no_longer() {
+        let storage = Storage::with_provision(1 << 20, 0);
+        let (tee, mut copies) = Tee::new(body(vec![data(b"x")]), 1, &storage);
+        let (mut copy, _kept) = copies.pop().unwrap();
+        let piece = 16 * 1024;
+        // As the request's tee puts them, counting what the mirror has yet to take.
+        let put = |data: Bytes, unpaid: usize| {
+            let mut queue = tee.queues[0].borrow_mut();
+            queue.put_data(&data, unpaid).unwrap();
+            queue.behind += data.len();
+        };
+        put(Bytes::from(vec![b'L'; 5_000]), piece);
+        put(Bytes::from_static(b"a"), piece);
+        assert_eq!(storage.used(), 2 * piece);
+        put(Bytes::from_static(b"b"), piece);
+        assert_eq!(storage.used(), piece + 2, "copied, a run of two bytes");
+        let first = copy.frame().await.unwrap().unwrap();
+        assert_eq!(first.data_ref().map(Bytes::len), Some(5_000));
+        assert_eq!(storage.used(), piece + 2, "taken, and in hand");
+        let first = first.into_data().unwrap();
+        assert_eq!(copy.unpaid(&first), piece, "for whoever keeps it after");
+        let run = copy.frame().await.unwrap().unwrap();
+        assert_eq!(run.data_ref().map(|run| &run[..]), Some(&b"ab"[..]));
+        assert_eq!(storage.used(), 2, "the next asked for: the last let go of");
+        assert_eq!(copy.unpaid(&run.into_data().unwrap()), 2, "the run's room");
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut copy).poll_frame(&mut cx).is_pending());
+        assert_eq!(storage.used(), 0);
+        put(Bytes::from(vec![b'L'; 5_000]), 0);
+        assert_eq!(storage.used(), 0, "one its source pays for");
+        let paid = copy.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(copy.unpaid(&paid), 0);
     }
 
     /// The runs a mirror that has fallen behind holds are paid for in the worker's storage

@@ -106,6 +106,25 @@ impl RequestBody {
         }
     }
 
+    /// What keeping `data`, a frame this body handed on, holds that nothing pays for once
+    /// the next frame is asked for: what a recording or a mirror that keeps it is to pay
+    /// (14 §8). Nothing for HTTP/1's, cut from blocks paid for until the last piece of them
+    /// goes; its length for HTTP/2's, h2's memory, paid for by its credit until it is given
+    /// back; the piece it was read into for HTTP/3's, which nothing pays for once read out of
+    /// quiche. Nothing for what a recording hands on, which it pays for itself while it
+    /// keeps it; for a mirror's copy, what its queue charged.
+    pub(crate) fn unpaid(&self, data: &Bytes) -> usize {
+        match self {
+            Self::Ours(_) | Self::Replayed(_) | Self::None => 0,
+            Self::Copy(body) => body.unpaid(data),
+            Self::H2(_) => data.len(),
+            Self::H3(_) => IncomingH3::PIECE,
+            Self::Recorded(body) => body.unpaid(data),
+            Self::Mirrored(body) => body.unpaid(data),
+            Self::Counted(counted) => counted.body.unpaid(data),
+        }
+    }
+
     /// `body`, its bytes counted for `counts` as they come; one with nothing to come, as it
     /// is.
     pub(crate) fn counted(body: Self, counts: Rc<dyn Counts>) -> Self {

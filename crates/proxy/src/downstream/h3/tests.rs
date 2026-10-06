@@ -12,6 +12,7 @@
 use crate::downstream::h1::connection::Answered;
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h3::Settings;
+use crate::downstream::h3::body::IncomingH3;
 use crate::downstream::h3::code;
 use crate::downstream::h3::conn::State;
 use crate::downstream::h3::listener::{self, Forwarding, InForce, Secrets, Shared};
@@ -664,6 +665,72 @@ fn the_worker_is_charged_what_quiche_holds_for_it() {
         client.flush().await;
         client.until(|_| storage.used() == 0).await;
     });
+}
+
+/// A piece of a body read out of quiche and handed on is charged, the 16 KiB it was read
+/// into, until the next is asked for, as h2's credit pays for an HTTP/2 body's frame: once
+/// read, nothing else pays for it (14 §8).
+#[test]
+fn a_piece_handed_on_is_charged_until_the_next_is_asked_for() {
+    locally(piece_in_hand(false));
+}
+
+/// The same until the body is let go of without asking for more.
+#[test]
+fn a_piece_handed_on_is_charged_until_its_body_goes() {
+    locally(piece_in_hand(true));
+}
+
+/// A core that reads one piece of a small body and holds it; when told, asks for the next,
+/// or lets go of the body if `dropped`, and holds on; when told again, answers. The piece is
+/// charged while it is held, and not once it is let go of, though the request goes on.
+async fn piece_in_hand(dropped: bool) {
+    let storage = Storage::new(LIMIT);
+    let step = Rc::new(Cell::new(0));
+    let gate = Rc::new(Notify::new());
+    let (stepping, opening) = (Rc::clone(&step), Rc::clone(&gate));
+    let server = serving_in(
+        short(),
+        Rc::clone(&storage),
+        move |request: Request<RequestBody>, _interim| -> Answering {
+            let (stepping, opening) = (Rc::clone(&stepping), Rc::clone(&opening));
+            Box::pin(async move {
+                let mut body = request.into_body();
+                let frame = body.frame().await.unwrap().unwrap();
+                assert_eq!(frame.into_data().unwrap().len(), 12);
+                stepping.set(1);
+                opening.notified().await;
+                if dropped {
+                    drop(body);
+                } else {
+                    assert!(body.frame().await.is_none());
+                }
+                stepping.set(2);
+                opening.notified().await;
+                Answered::Map(Response::new(Full::new(Bytes::from_static(b"read"))))
+            })
+        },
+    )
+    .await;
+    let mut client = Client::connect(server.address, "a.test").await;
+    let id = client.request(&post("/up"), false);
+    client.body(id, b"a small body", true).await;
+    client.until(|_| step.get() == 1).await;
+    // A turn of the driver, which charges what the connection holds.
+    client.for_a_while(Duration::from_millis(50)).await;
+    let charged = storage.used();
+    assert!(
+        charged >= IncomingH3::PIECE,
+        "{charged} charged for a piece in hand"
+    );
+
+    gate.notify_one();
+    client.until(|_| step.get() == 2).await;
+    client.for_a_while(Duration::from_millis(50)).await;
+    let charged = storage.used();
+    assert!(charged < 4 << 10, "{charged} charged for a piece let go of");
+    gate.notify_one();
+    assert_eq!(body_of(&client.answer(id).await), "read");
 }
 
 /// A head that has come in part is charged as it comes: quiche holds its frame whole until

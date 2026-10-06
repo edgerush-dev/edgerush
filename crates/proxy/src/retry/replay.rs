@@ -39,15 +39,17 @@ enum Kept {
 struct Recording {
     kept: Vec<Kept>,
     /// A small frame after everything in `kept`, kept as it is while no other small frame
-    /// follows it: a body of one small frame is kept without a copy.
-    lone: Option<Bytes>,
+    /// follows it: a body of one small frame is kept without a copy. With what it is
+    /// charged.
+    lone: Option<(Bytes, usize)>,
     /// Small frames being copied together, after everything in `kept`: kept itself once
     /// anything else comes, or the body ends.
     run: Vec<u8>,
-    /// The worker's account, which pays for the runs: a copy is paid for by nothing it was
-    /// copied from (14 §8).
+    /// The worker's account, which pays for the runs, since a copy is paid for by nothing it
+    /// was copied from (14 §8), and for the frames kept as they are whose source stops
+    /// paying for them once it has handed on the next: an HTTP/2 or HTTP/3 client's.
     storage: Rc<Storage>,
-    /// What the runs are charged, until the recording goes or keeps nothing.
+    /// What those are charged, until the recording goes or keeps nothing.
     charge: Option<Charge>,
     size: usize,
     /// It grew past [`MOST`], or past what the worker could pay for, or nothing can send it
@@ -61,27 +63,50 @@ struct Recording {
 impl Recording {
     /// Keeps a frame's data: a larger one as it is, and a small one as it is too when it is
     /// the first small one in a row; one that follows it is copied onto a run, the first
-    /// with it.
+    /// with it. One kept as it is is charged `unpaid`, what its source no longer pays for
+    /// ([`RequestBody::unpaid`]); a copy, its room.
     ///
     /// # Errors
     ///
-    /// [`Exhausted`] if the worker cannot pay for the run.
-    fn keep(&mut self, data: &Bytes) -> Result<(), Exhausted> {
+    /// [`Exhausted`] if the worker cannot pay for the frame or the run.
+    fn keep(&mut self, data: &Bytes, unpaid: usize) -> Result<(), Exhausted> {
         if data.len() >= runs::COPIED_BELOW {
             self.close_run();
+            self.pay(unpaid)?;
             self.kept.push(Kept::Data(data.clone()));
             return Ok(());
         }
         if self.run.is_empty() {
             match self.lone.take() {
                 None => {
-                    self.lone = Some(data.clone());
+                    self.pay(unpaid)?;
+                    self.lone = Some((data.clone(), unpaid));
                     return Ok(());
                 }
-                Some(first) => self.copy(&first)?,
+                Some((first, paid)) => {
+                    self.copy(&first)?;
+                    // Copied, it goes, and what it held with it.
+                    if let Some(charge) = &mut self.charge {
+                        charge.shrink(paid);
+                    }
+                }
             }
         }
         self.copy(data)
+    }
+
+    /// Pays `bytes` more for what is kept.
+    fn pay(&mut self, bytes: usize) -> Result<(), Exhausted> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        match &mut self.charge {
+            Some(charge) => charge.grow(bytes),
+            None => {
+                self.charge = Some(self.storage.reserve(bytes)?);
+                Ok(())
+            }
+        }
     }
 
     /// Copies `data` onto the run, paying for its room first, and keeps each run that fills.
@@ -117,7 +142,7 @@ impl Recording {
     /// Keeps the small frames after everything in `kept`, as they stand: the lone one, or
     /// the run.
     fn close_run(&mut self) {
-        if let Some(lone) = self.lone.take() {
+        if let Some((lone, _)) = self.lone.take() {
             self.kept.push(Kept::Data(lone));
         }
         if !self.run.is_empty() {
@@ -174,6 +199,12 @@ impl Tee {
 }
 
 impl Tee {
+    /// What keeping `data`, a frame it handed on, holds that nothing pays for: what its
+    /// body says ([`RequestBody::unpaid`]).
+    pub(crate) fn unpaid(&self, data: &Bytes) -> usize {
+        self.inner.unpaid(data)
+    }
+
     /// What it keeps, for one more to send again from: a body kept once serves all who may
     /// send it again — a rule's retry, and an HTTP/2 upstream's resend of a refused stream.
     pub(crate) fn recorded(&self) -> Recorded {
@@ -240,7 +271,9 @@ impl Body for Tee {
             Poll::Ready(Some(Ok(frame))) if !recording.capped => {
                 if let Some(data) = frame.data_ref() {
                     recording.size += data.len();
-                    if recording.size > MOST || recording.keep(data).is_err() {
+                    if recording.size > MOST
+                        || recording.keep(data, this.inner.unpaid(data)).is_err()
+                    {
                         recording.cap();
                     }
                 } else if let Some(trailers) = frame.trailers_ref() {
@@ -428,6 +461,48 @@ mod tests {
             "{:?}",
             recording.kept
         );
+    }
+
+    /// A frame kept as it is is paid for at what its source pays for no longer, for as long
+    /// as it is kept (14 §8); so is a lone small one, until a small one after it has it
+    /// copied onto a run, which is paid for instead.
+    #[test]
+    fn frames_kept_as_they_are_are_paid_for_what_their_source_pays_no_longer() {
+        let storage = Storage::with_provision(1 << 20, 0);
+        let inner = RequestBody::Replayed(Replayed::of(vec![data(b"x")]));
+        let (tee, recorded) = Tee::new(inner, &storage);
+        let piece = 16 * 1024;
+        let mut recording = recorded.0.borrow_mut();
+        recording
+            .keep(&Bytes::from(vec![b'L'; 5_000]), piece)
+            .unwrap();
+        assert_eq!(storage.used(), piece);
+        recording.keep(&Bytes::from_static(b"a"), piece).unwrap();
+        assert_eq!(storage.used(), 2 * piece, "the lone small frame");
+        recording.keep(&Bytes::from_static(b"b"), piece).unwrap();
+        assert_eq!(storage.used(), piece + 2, "copied, a run of two bytes");
+        recording.keep(&Bytes::from(vec![b'L'; 5_000]), 0).unwrap();
+        assert_eq!(storage.used(), piece + 2, "one its source pays for");
+        drop(recording);
+        drop((tee, recorded));
+        assert_eq!(storage.used(), 0);
+    }
+
+    /// A frame the worker cannot pay to keep is refused, and charges nothing.
+    #[test]
+    fn a_frame_the_worker_cannot_pay_to_keep_is_refused() {
+        let storage = Storage::with_provision(1_000, 0);
+        let inner = RequestBody::Replayed(Replayed::of(vec![data(b"x")]));
+        let (_tee, recorded) = Tee::new(inner, &storage);
+        let mut recording = recorded.0.borrow_mut();
+        let large = Bytes::from(vec![b'L'; 5_000]);
+        assert!(recording.keep(&large, 16 * 1024).is_err());
+        assert!(
+            recording
+                .keep(&Bytes::from_static(b"a"), 16 * 1024)
+                .is_err()
+        );
+        assert_eq!(storage.used(), 0);
     }
 
     /// The runs a recording copies are paid for in the worker's storage for as long as it

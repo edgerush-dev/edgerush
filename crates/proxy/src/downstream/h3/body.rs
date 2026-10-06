@@ -24,9 +24,6 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-/// The most read out of quiche at once: what a DATA frame of the usual size carries.
-const PIECE: usize = 16 * 1024;
-
 /// What went wrong with a stream, as a cause of a [`RequestBodyError`].
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StreamError {
@@ -63,6 +60,15 @@ pub(crate) struct IncomingH3 {
     /// Whether its trailers are handed over; the request core wants none (03 §11), and
     /// a server's own tests all of them.
     trailers_wanted: bool,
+    /// It has handed on a piece, charged to its connection until the next is asked for, as
+    /// h2's credit pays for an HTTP/2 body's frame (14 §8).
+    holding: bool,
+}
+
+impl Drop for IncomingH3 {
+    fn drop(&mut self) {
+        self.let_go();
+    }
 }
 
 impl std::fmt::Debug for IncomingH3 {
@@ -76,6 +82,17 @@ impl std::fmt::Debug for IncomingH3 {
 }
 
 impl IncomingH3 {
+    /// The most read out of quiche at once, what a DATA frame of the usual size carries:
+    /// what each frame it hands on holds.
+    pub(crate) const PIECE: usize = 16 * 1024;
+
+    /// Lets go of the piece it handed on last, if it holds one.
+    fn let_go(&mut self) {
+        if std::mem::take(&mut self.holding) {
+            self.conn.let_go(Self::PIECE);
+        }
+    }
+
     /// Has its trailers read to their end and not handed over.
     pub(crate) fn drop_trailers(&mut self) {
         self.trailers_wanted = false;
@@ -105,6 +122,7 @@ impl IncomingH3 {
             idle: Idle::new(idle),
             interim: None,
             trailers_wanted: true,
+            holding: false,
         }
     }
 
@@ -146,9 +164,9 @@ impl IncomingH3 {
             let Some(h3) = h3.as_mut() else {
                 return Poll::Ready(Some(Err(other(StreamError::Closed))));
             };
-            let mut piece = BytesMut::with_capacity(PIECE);
+            let mut piece = BytesMut::with_capacity(Self::PIECE);
             // quiche reads on while the buffer has room, which one that grows always has.
-            match h3.recv_body_buf(quic, self.stream, (&mut piece).limit(PIECE)) {
+            match h3.recv_body_buf(quic, self.stream, (&mut piece).limit(Self::PIECE)) {
                 Ok(read) if read > 0 => {
                     self.received += read as u64;
                     if self
@@ -163,6 +181,8 @@ impl IncomingH3 {
                     }
                     // Credit may be owed to the client now.
                     self.conn.stir();
+                    self.holding = true;
+                    self.conn.hand(Self::PIECE);
                     return Poll::Ready(Some(Ok(Frame::data(piece.freeze()))));
                 }
                 Ok(_) | Err(quiche::h3::Error::Done) => {}
@@ -255,6 +275,8 @@ impl Body for IncomingH3 {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, RequestBodyError>>> {
         let this = self.get_mut();
+        // Asked for the next, whoever reads it is done with the piece it was handed last.
+        this.let_go();
         if this.ended {
             return Poll::Ready(None);
         }

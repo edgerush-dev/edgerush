@@ -34,6 +34,10 @@ pub(crate) struct Conn {
     charge: RefCell<Option<Charge>>,
     /// What that charge is.
     charged: Cell<usize>,
+    /// The pieces its requests' bodies have read out of quiche and handed on, in bytes, until
+    /// each is let go of: charged with what quiche holds, as nothing else pays for them once
+    /// read (14 §8).
+    in_hand: Cell<usize>,
     /// Closed to make room for the rest: charged nothing from then on.
     shed: Cell<bool>,
     /// Requests the connection has had.
@@ -125,6 +129,7 @@ impl Conn {
             stirred: Cell::new(true),
             charge: RefCell::new(None),
             charged: Cell::new(0),
+            in_hand: Cell::new(0),
             shed: Cell::new(false),
             requests: Cell::new(0),
             given_up: Cell::new(0),
@@ -170,7 +175,8 @@ impl Conn {
 
     /// Charges `storage` what quiche holds for the connection now: what it received that
     /// has not been read, `PIECE` bytes more for each piece that is held in, and the HTTP/3
-    /// layer's frame buffers, a head held whole until it has all come.
+    /// layer's frame buffers, a head held whole until it has all come; and the pieces read
+    /// out of it that its bodies have handed on.
     ///
     /// # Errors
     ///
@@ -188,6 +194,7 @@ impl Conn {
             bytes
                 .saturating_add(pieces.saturating_mul(PIECE))
                 .saturating_add(frames)
+                .saturating_add(self.in_hand.get())
         });
         let charged = self.charged.get();
         let mut charge = self.charge.borrow_mut();
@@ -201,6 +208,19 @@ impl Conn {
         }
         self.charged.set(held);
         Ok(())
+    }
+
+    /// A body has handed on `bytes` it read out of quiche: charged from the driver's next
+    /// turn until they are let go of.
+    pub(crate) fn hand(&self, bytes: usize) {
+        self.in_hand.set(self.in_hand.get().saturating_add(bytes));
+    }
+
+    /// A body has let go of `bytes` it handed on: no longer charged once the driver, stirred
+    /// for it, has had its turn, which a quiet connection would otherwise not have.
+    pub(crate) fn let_go(&self, bytes: usize) {
+        self.in_hand.set(self.in_hand.get().saturating_sub(bytes));
+        self.stir();
     }
 
     /// What the connection is charged.

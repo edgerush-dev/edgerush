@@ -980,3 +980,217 @@ fn a_body_that_fails_after_its_head_is_counted() {
         );
     }));
 }
+
+/// Which client sends the body a rule keeps to send again.
+#[derive(Debug, Clone, Copy)]
+enum Sender {
+    Http1,
+    Http2,
+    Http3,
+}
+
+/// A request's body kept to send again is paid for in the worker's storage whichever
+/// client sent it (14 §8): over HTTP/2 the frames are h2's, whose charge ends as each
+/// one's credit is given back, so the recording pays for them itself.
+#[test]
+fn a_body_kept_to_send_again_is_charged_over_http2() {
+    kept_body_is_charged(Sender::Http2);
+}
+
+/// The same over HTTP/3, whose frames are pieces read out of quiche, charged nowhere
+/// once read.
+#[test]
+fn a_body_kept_to_send_again_is_charged_over_http3() {
+    kept_body_is_charged(Sender::Http3);
+}
+
+/// The same over HTTP/1, whose frames are cut from blocks paid for while a piece of them
+/// is held: the control.
+#[test]
+fn a_body_kept_to_send_again_is_charged_over_http1() {
+    kept_body_is_charged(Sender::Http1);
+}
+
+/// A rule retrying 503 once, an upstream that reads a request whole and holds its answer
+/// until told, then answers the first try 503 and the second 200: the body, 48 KiB in three
+/// frames, is kept from when it has gone until the first answer's head, and sent whole again
+/// after it. Once the upstream has all of it, the worker's storage holds at least what is
+/// kept.
+fn kept_body_is_charged(sender: Sender) {
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const PIECE: usize = 16 * 1024;
+    const BODY: usize = 3 * PIECE;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        let bodies = Arc::new(AtomicUsize::new(0));
+        let answer = Arc::new(tokio::sync::Notify::new());
+        {
+            let (bodies, answer) = (Arc::clone(&bodies), Arc::clone(&answer));
+            tokio::spawn(async move {
+                let mut first = true;
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let (bodies, answer) = (Arc::clone(&bodies), Arc::clone(&answer));
+                    let first_try = std::mem::replace(&mut first, false);
+                    tokio::spawn(async move {
+                        let (mut seen, mut buffer) = (Vec::new(), vec![0; 64 * 1024]);
+                        let body = loop {
+                            match stream.read(&mut buffer).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => seen.extend_from_slice(&buffer[..read]),
+                            }
+                            if let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n")
+                                && seen.len() - end - 4 >= BODY
+                            {
+                                break seen.len() - end - 4;
+                            }
+                        };
+                        bodies.fetch_add(body, Ordering::SeqCst);
+                        let said: &[u8] = if first_try {
+                            answer.notified().await;
+                            b"HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+                        } else {
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"
+                        };
+                        let _said = stream.write_all(said).await;
+                        std::future::pending::<()>().await;
+                    });
+                }
+            });
+        }
+        let mut config = match sender {
+            Sender::Http3 => h3_config(
+                upstream,
+                edgerush_config::Http3 {
+                    alt_svc_max_age: 60,
+                    force_retry: false,
+                },
+            ),
+            Sender::Http1 | Sender::Http2 => everything_config(upstream),
+        };
+        config.routes[0].rules[0]
+            .forward
+            .as_mut()
+            .expect("the rule forwards")
+            .retry = Some(retrying(1, &[503], &[], 1));
+        let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+        let worker = Worker::with_limits(Arc::clone(&proxy), H1Limits::default());
+        let storage = Rc::clone(worker.blocks.borrow().storage());
+        let within = Duration::from_secs(10);
+        let kept = || {
+            let used = storage.used();
+            assert!(
+                used >= BODY,
+                "{BODY} bytes kept to send again over {sender:?}, {used} charged"
+            );
+        };
+        let body = Bytes::from(vec![b'x'; PIECE]);
+
+        match sender {
+            Sender::Http3 => {
+                use crate::downstream::h3::testing::Client;
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
+                let alone = Forwarding::group(1).remove(0);
+                let _serving = tokio::task::spawn_local(
+                    Rc::clone(&worker).serve_h3(0, socket, alone).unwrap(),
+                );
+                let mut client = Client::connect(front, "a.test").await;
+                let length = BODY.to_string();
+                let id = client.request(
+                    &[
+                        (":method", "POST"),
+                        (":scheme", "https"),
+                        (":authority", "a.test"),
+                        (":path", "/"),
+                        ("content-length", &length),
+                    ],
+                    false,
+                );
+                for at in 0..3 {
+                    client.body(id, &body, at == 2).await;
+                }
+                client
+                    .until(|_| bodies.load(Ordering::SeqCst) >= BODY)
+                    .await;
+                client.for_a_while(Duration::from_millis(100)).await;
+                kept();
+                answer.notify_one();
+                let answered = client.answer(id).await;
+                assert_eq!(answered.final_status(), Some("200"));
+            }
+            Sender::Http2 => {
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = serving(&worker, socket);
+                let stream = TcpStream::connect(front).await.unwrap();
+                let (mut send, mut connection) = ::h2::client::handshake(stream).await.unwrap();
+                let mut ping_pong = connection.ping_pong().expect("a ping-pong handle");
+                let _driving = tokio::task::spawn_local(async move {
+                    let _ended = connection.await;
+                });
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("http://a.test/")
+                    .header("content-length", BODY.to_string())
+                    .body(())
+                    .unwrap();
+                let (answered, mut sending) = send.send_request(request, false).unwrap();
+                for at in 0..3 {
+                    sending.send_data(body.clone(), at == 2).unwrap();
+                }
+                until(|| bodies.load(Ordering::SeqCst) >= BODY).await;
+                // A turn more of the server's connection, which charges what h2 holds now.
+                tokio::time::timeout(within, ping_pong.ping(::h2::Ping::opaque()))
+                    .await
+                    .expect("no pong")
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                kept();
+                answer.notify_one();
+                let answered = tokio::time::timeout(within, answered)
+                    .await
+                    .expect("no answer")
+                    .unwrap();
+                assert_eq!(answered.status(), StatusCode::OK);
+            }
+            Sender::Http1 => {
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = serving(&worker, socket);
+                let mut client = TcpStream::connect(front).await.unwrap();
+                let head =
+                    format!("POST / HTTP/1.1\r\nhost: a.test\r\ncontent-length: {BODY}\r\n\r\n");
+                client.write_all(head.as_bytes()).await.unwrap();
+                client.write_all(&vec![b'x'; BODY]).await.unwrap();
+                until(|| bodies.load(Ordering::SeqCst) >= BODY).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                kept();
+                answer.notify_one();
+                let mut answered = Vec::new();
+                let mut byte = [0; 1];
+                while !answered.ends_with(b"\r\n\r\n") {
+                    tokio::time::timeout(within, client.read_exact(&mut byte))
+                        .await
+                        .expect("no answer")
+                        .unwrap();
+                    answered.push(byte[0]);
+                }
+                assert!(
+                    answered.starts_with(b"HTTP/1.1 200"),
+                    "{}",
+                    String::from_utf8_lossy(&answered)
+                );
+            }
+        }
+        // Kept whole: the second try carried all of it again.
+        until(|| bodies.load(Ordering::SeqCst) >= 2 * BODY).await;
+    }));
+}

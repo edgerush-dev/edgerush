@@ -220,7 +220,6 @@ impl Charge {
     }
 
     /// What it reserves.
-    #[cfg(test)]
     pub fn bytes(&self) -> usize {
         self.bytes
     }
