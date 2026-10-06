@@ -294,8 +294,19 @@ impl Way {
 enum Stopped {
     /// A side failed.
     Failed,
-    /// No block could be had to read into.
+    /// The worker could not pay: for a block to read into, or for a write to a side that
+    /// charges what it is given to the worker's storage, as an HTTP/2 stream does.
     Exhausted,
+}
+
+/// Why a write to a side failed: the worker's storage, which a side that charges for what
+/// it is given says by [`io::ErrorKind::OutOfMemory`], or the side.
+fn unwritten(error: &std::io::Error) -> Stopped {
+    if error.kind() == std::io::ErrorKind::OutOfMemory {
+        Stopped::Exhausted
+    } else {
+        Stopped::Failed
+    }
 }
 
 /// Where a WebSocket is with a drain.
@@ -566,7 +577,8 @@ where
         if let Some(block) = way.block.as_mut() {
             while !block.is_empty() {
                 match Pin::new(&mut *to).poll_write(cx, block.data()) {
-                    Poll::Ready(Ok(0) | Err(_)) => return Poll::Ready(Err(Stopped::Failed)),
+                    Poll::Ready(Ok(0)) => return Poll::Ready(Err(Stopped::Failed)),
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(unwritten(&error))),
                     Poll::Ready(Ok(written)) => {
                         block.consume(written);
                         way.carried += u64::try_from(written).unwrap_or(u64::MAX);
@@ -681,7 +693,8 @@ where
     if let Close::Writing(frame, length, written) = way.close {
         let rest = &frame[usize::from(written)..usize::from(length)];
         return match Pin::new(&mut *to).poll_write(cx, rest) {
-            Poll::Ready(Ok(0) | Err(_)) => Poll::Ready(Err(Stopped::Failed)),
+            Poll::Ready(Ok(0)) => Poll::Ready(Err(Stopped::Failed)),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(unwritten(&error))),
             Poll::Ready(Ok(more)) => {
                 // Never more than the eight bytes asked for.
                 let written = written.saturating_add(u8::try_from(more).unwrap_or(length));
@@ -1066,6 +1079,64 @@ mod tests {
         let drain = Drain::default();
         let blocks = blocks_within(0);
         let ((mut client, mut backend), (mut client_side, _backend_side)) = ends();
+        client_side.write_all(b"hello").await.unwrap();
+        let carried = within(timers.driving(carry(
+            &mut client,
+            &mut backend,
+            None,
+            None,
+            &blocks,
+            BOUNDS,
+            &timers,
+            [&drain, &drain],
+        )))
+        .await;
+        assert_eq!(carried.how, Carried::Exhausted);
+    }
+
+    /// A side whose write the worker cannot pay for — an HTTP/2 stream's, whose pieces are
+    /// charged to its storage — ends the tunnel exhausted as well, not failed: the side did
+    /// nothing wrong (19 §7).
+    #[tokio::test]
+    async fn a_write_the_worker_cannot_pay_for_ends_the_tunnel_exhausted() {
+        /// A backend that reads as a socket does and refuses every write as `H2Stream`
+        /// refuses one it cannot pay for.
+        struct Unpaid(DuplexStream);
+        impl AsyncRead for Unpaid {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+            }
+        }
+        impl AsyncWrite for Unpaid {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Err(std::io::ErrorKind::OutOfMemory.into()))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let timers = Timers::new();
+        let drain = Drain::default();
+        let blocks = blocks_within(crate::storage::LIMIT);
+        let ((mut client, backend), (mut client_side, _backend_side)) = ends();
+        let mut backend = Unpaid(backend);
         client_side.write_all(b"hello").await.unwrap();
         let carried = within(timers.driving(carry(
             &mut client,

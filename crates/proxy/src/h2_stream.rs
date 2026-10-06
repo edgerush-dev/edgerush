@@ -122,6 +122,8 @@ impl AsyncWrite for H2Stream {
             let granted = this.send.capacity();
             if granted > 0 {
                 let count = granted.min(data.len()).min(PIECE);
+                // Said as the one kind a tunnel reads as the worker's shortage rather than
+                // this side failing.
                 let charge = this
                     .storage
                     .reserve(count)
