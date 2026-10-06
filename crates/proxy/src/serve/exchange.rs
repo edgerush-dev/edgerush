@@ -18,7 +18,7 @@ use crate::upstream::balancing::InFlight;
 use crate::upstream::destination::ReuseIdentity;
 use crate::upstream::dial::{self, Unconnected};
 use crate::upstream::h1::blocks::Block;
-use crate::upstream::h1::codec::{OutgoingFields, Sending};
+use crate::upstream::h1::codec::{OutgoingFields, Sending, head_len};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, Stalled, nothing_to_say};
 use crate::upstream::h1::pool::{Close, Lease};
 use crate::upstream::h2::client::PlaceError;
@@ -70,6 +70,14 @@ impl Worker {
         B: HttpBody<Data = Bytes> + Unpin,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
+        // Measured before a connection is taken for it: a head the gateway's own fields
+        // took past the bound is never sent, and spends no connection (14 §6).
+        let measured = head_len(method, uri, headers, sending);
+        if measured > self.limits.head {
+            return Err(ExchangeError::TooLong {
+                limit: self.limits.head,
+            });
+        }
         // Bound in its own statement, so the pool is not still borrowed when the connect
         // below is waited on.
         let mut kept = None;
@@ -129,7 +137,8 @@ impl Worker {
             }
         };
 
-        let mut exchange = Exchange::new(socket, Rc::clone(&self.blocks), Rc::clone(&self.timers));
+        let mut exchange = Exchange::new(socket, Rc::clone(&self.blocks), Rc::clone(&self.timers))
+            .head_measured(measured);
         if let Some(interim) = interim {
             exchange = exchange.heard_by(interim);
         }
@@ -226,14 +235,15 @@ impl Worker {
         let upstream = self.proxy.metrics.upstream(directed.upstream.slot());
         let (mut answer, body) = match answered {
             Ok(answered) => answered,
-            // The worker's own storage running out, or a client's body that cannot be read,
-            // is not the upstream failing, and is not counted as though it were
-            // ([14 §8](../../docs/14-downstream-server.md)).
+            // The worker's own storage running out, a client's body that cannot be read, or a
+            // head the gateway's own fields took past its bound, is not the upstream failing,
+            // and is not counted as though it were ([14 §8](../../docs/14-downstream-server.md)).
             Err(
                 answer @ (Answer::Exhausted
                 | Answer::BadBody
                 | Answer::BodyTimedOut
-                | Answer::DeadlineExceeded),
+                | Answer::DeadlineExceeded
+                | Answer::Edits),
             ) => return Err(answer),
             Err(answer) => {
                 if let Some(upstream) = upstream {
@@ -350,8 +360,13 @@ impl Worker {
         {
             Ok(answer) => answer,
             Err(error) => {
-                self.proxy.metrics.stopped(why_stopped(&error));
+                if let Some(why) = why_stopped(&error) {
+                    self.proxy.metrics.stopped(why);
+                }
                 return Err(match error {
+                    // Refused as an edit that does not fit is, the gateway's own failing
+                    // (14 §6).
+                    ExchangeError::TooLong { .. } => Answer::Edits,
                     ExchangeError::Exhausted(_) => Answer::Exhausted,
                     ExchangeError::RequestBody(cause)
                         if matches!(

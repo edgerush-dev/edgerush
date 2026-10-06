@@ -523,7 +523,7 @@ fn what_became_of_a_connection_is_counted() {
 fn an_exchange_the_worker_could_not_pay_for_is_counted_as_that() {
     let exhausted = crate::storage::Storage::new(0).reserve(1).unwrap_err();
     assert_eq!(
-        why_stopped(&ExchangeError::Exhausted(exhausted)),
+        why_stopped(&ExchangeError::Exhausted(exhausted)).unwrap(),
         Stopped::Exhausted
     );
 }

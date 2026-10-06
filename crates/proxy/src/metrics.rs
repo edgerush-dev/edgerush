@@ -345,7 +345,8 @@ pub(crate) enum Answer {
     /// worker at its cap or its listener at its share
     /// ([03 §9](../../docs/03-data-plane.md)).
     NoRoom,
-    /// The request's head could not take its changes ([14 §6](../../docs/14-downstream-server.md)).
+    /// The request's head could not take its changes, or they took it past the bound on a
+    /// head ([14 §6](../../docs/14-downstream-server.md)).
     Edits,
     /// The request's body could not be read: the client's fault, found once the request
     /// had gone upstream, and not the upstream failing.

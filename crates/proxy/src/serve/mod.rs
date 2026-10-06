@@ -199,13 +199,15 @@ async fn connect_within<S>(
     }
 }
 
-/// Which of the named reasons an exchange stopped for.
+/// Which of the named reasons an exchange stopped for; none for a head refused before an
+/// exchange began.
 ///
 /// A fixed list on purpose: an upstream that fails in a new way must not be able to make
 /// a new series, and no error text reaches a label
 /// ([13 §7](../../docs/13-http1-upstream.md)).
-fn why_stopped(error: &ExchangeError) -> Stopped {
-    match error {
+fn why_stopped(error: &ExchangeError) -> Option<Stopped> {
+    Some(match error {
+        ExchangeError::TooLong { .. } => return None,
         ExchangeError::Codec(_) => Stopped::Codec,
         ExchangeError::Unconnected(Unconnected::Short(_)) => Stopped::Exhausted,
         ExchangeError::Unconnected(_) | ExchangeError::Io(_) => Stopped::Io,
@@ -218,7 +220,7 @@ fn why_stopped(error: &ExchangeError) -> Stopped {
         ExchangeError::TooSlow { .. } => Stopped::TooSlow,
         ExchangeError::Idle { .. } => Stopped::Idle,
         ExchangeError::Exhausted(_) => Stopped::Exhausted,
-    }
+    })
 }
 
 /// Where a body says that it failed.

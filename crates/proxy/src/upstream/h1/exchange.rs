@@ -29,6 +29,7 @@ use std::cell::RefCell;
 use std::error::Error as StdError;
 use std::future::poll_fn;
 use std::io;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -59,6 +60,14 @@ pub enum ExchangeError {
     /// The connection itself failed.
     #[error("the connection to the upstream failed: {0}")]
     Io(#[from] io::Error),
+    /// The request's head, as it is to go upstream, comes to more than the bound: the
+    /// gateway's own fields took it there, the client's having fitted. Never sent, and no
+    /// fault of the upstream's ([14 §6](../../../docs/14-downstream-server.md)).
+    #[error("the request's head would come to more than {limit} bytes upstream")]
+    TooLong {
+        /// The most a head may come to.
+        limit: usize,
+    },
     /// The worker could not pay for storage the exchange needed. Never taken for an
     /// upstream that stopped reading: the exchange is cancelled, not carried on with half a
     /// request sent ([14 §8](../../../docs/14-downstream-server.md)).
@@ -249,6 +258,8 @@ pub struct Exchange<S> {
     /// Whether the request is a WebSocket handshake, whose 101 is its final answer
     /// ([19 §2](../../../../docs/19-websocket.md)).
     upgrading: bool,
+    /// The head's length, where whoever began the exchange measured it already.
+    measured: Option<NonZeroUsize>,
 }
 
 impl<S> Exchange<S> {
@@ -409,7 +420,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             alarm: Alarm::new(&timers, None),
             head_bounded_elsewhere: false,
             upgrading: false,
+            measured: None,
         }
+    }
+
+    /// Writes a head of `len` bytes, as [`head_len`] measured it for this request: measured
+    /// once, by whoever had to know it first.
+    pub(crate) fn head_measured(mut self, len: usize) -> Self {
+        self.measured = NonZeroUsize::new(len);
+        self
     }
 
     /// Sends a WebSocket handshake, whose 101 is taken as its final answer rather than
@@ -523,7 +542,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
         self.lend_staging()?;
         // Paid for before it is written. A head over the bound is refused below, before a
         // byte of it is, so no room is made for one.
-        let head = head_len(method, uri, headers, sending);
+        let head = self.measured.map_or_else(
+            || head_len(method, uri, headers, sending),
+            NonZeroUsize::get,
+        );
         if head <= limits.head {
             self.stage_room(head)?;
         }
@@ -535,7 +557,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Exchange<S> {
             sending,
             head,
             limits,
-        )?;
+        )
+        .map_err(|error| match error {
+            CodecError::HeadTooLong { limit } => ExchangeError::TooLong { limit },
+            error => ExchangeError::Codec(error),
+        })?;
         self.head_left = self.outgoing.len();
         // A request that asks to be told before it sends its body has its head go out
         // alone; what follows waits for the upstream to answer, or for the wait to end.

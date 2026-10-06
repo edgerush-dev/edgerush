@@ -970,3 +970,35 @@ async fn a_grpc_answer_still_coming_at_the_request_timeout_ends_exceeded() {
         })
         .await;
 }
+
+/// A request head that the gateway's own fields take past the head bound on its way
+/// upstream is never sent, and no connection is taken for it: it is refused as the
+/// gateway's own failure, 500 under the answer reason `edits`, as an edit that does not fit
+/// is (14 §6), and not counted against the upstream, which was never asked (C22).
+#[tokio::test]
+async fn a_request_head_grown_past_its_bound_is_refused_before_it_goes_upstream() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, opened) = counting_upstream().await;
+            let (front, worker) = serving_worker_and(upstream).await;
+            // Exactly as long as a head may be, before the gateway adds its forwarding
+            // fields and the request's ID.
+            let start = b"GET / HTTP/1.1\r\nhost: a\r\nconnection: close\r\nx-pad: ";
+            let end = b"\r\n\r\n";
+            let mut request = start.to_vec();
+            request.resize(H1Limits::default().head - end.len(), b'v');
+            request.extend_from_slice(end);
+            let answer = h1_answer(front, &request).await;
+            assert!(answer.starts_with("HTTP/1.1 500 "), "{answer}");
+            assert_eq!(opened.load(Ordering::SeqCst), 0, "a connection was opened");
+            let scrape = worker.proxy().metrics();
+            for line in [
+                "edgerush_upstream_failures_total{upstream=\"up\"} 0\n",
+                "edgerush_listener_local_answers_total{listener=\"web\",reason=\"edits\"} 1\n",
+            ] {
+                assert!(scrape.contains(line), "{line}{scrape}");
+            }
+        })
+        .await;
+}
