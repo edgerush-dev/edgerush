@@ -7,7 +7,7 @@ use crate::downstream::h1::connection as h1;
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h1::deadlines::Bounds;
 use crate::drain::Drain;
-use crate::metrics::{Answer, Socket};
+use crate::metrics::{Answer, Said, Socket};
 use crate::places::{Places, Refused};
 use crate::received::Received;
 use crate::slots::WorkerSlots;
@@ -138,6 +138,7 @@ impl Worker {
             validated,
             routes: RefCell::default(),
             batches,
+            said: Said::default(),
         })
     }
 
@@ -337,9 +338,12 @@ impl Worker {
             // everything these ask about, so nothing is counted on the request path for
             // them ([13 §7](../../docs/13-http1-upstream.md)).
             let storage = self.blocks.borrow().storage().used();
-            metrics
-                .worker()
-                .holding(self.places.held(), self.idle_connections(), storage);
+            metrics.worker().holding(
+                &self.said,
+                self.places.held(),
+                self.idle_connections(),
+                storage,
+            );
             // What its listeners logged since the last sweep goes to be written, so that a
             // quiet worker holds no record for longer than a sweep (21 §4).
             self.batches.hand_over(&self.proxy.logs);

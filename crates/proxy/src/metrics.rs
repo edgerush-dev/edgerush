@@ -13,6 +13,7 @@ use crate::grpc::status::{Code, NAMES};
 use crate::request::Rejection;
 use edgerush_telemetry::{Counter, Exposition, Gauge, Histogram, Kind, Sharded};
 use http::StatusCode;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -675,27 +676,33 @@ pub(crate) struct WorkerGauges {
 }
 
 impl WorkerGauges {
-    /// What this worker holds now. A gauge counts up and down rather than being told a
-    /// number, so what it is given is the difference from what it last said.
-    pub(crate) fn holding(&self, exchanges: usize, idle: usize, storage: usize) {
-        move_to(&self.exchanges, exchanges);
-        move_to(&self.idle, idle);
-        // Bytes change by far too much between sweeps to be stepped to.
-        self.storage.set(i64::try_from(storage).unwrap_or(i64::MAX));
+    /// What this worker holds now, `said` being what it last said. A gauge is given the
+    /// difference, never set: a thread that is not a worker can take a shard's number
+    /// before a worker does and leave two workers in one shard (08 §1).
+    pub(crate) fn holding(&self, said: &Said, exchanges: usize, idle: usize, storage: usize) {
+        said.exchanges.move_to(&self.exchanges, exchanges);
+        said.idle.move_to(&self.idle, idle);
+        said.storage.move_to(&self.storage, storage);
     }
 }
 
-/// Moves a gauge to `now`, a step at a time in whichever direction.
-fn move_to(gauge: &Gauge, now: usize) {
-    let now = i64::try_from(now).unwrap_or(i64::MAX);
-    let mut was = gauge.get();
-    while was < now {
-        gauge.inc();
-        was += 1;
-    }
-    while was > now {
-        gauge.dec();
-        was -= 1;
+/// What one worker last said it holds, kept by the worker.
+#[derive(Debug, Default)]
+pub(crate) struct Said {
+    exchanges: SaidOne,
+    idle: SaidOne,
+    storage: SaidOne,
+}
+
+#[derive(Debug, Default)]
+struct SaidOne(Cell<i64>);
+
+impl SaidOne {
+    /// Moves `gauge` by the difference between `now` and what was said before, and
+    /// remembers `now`.
+    fn move_to(&self, gauge: &Gauge, now: usize) {
+        let now = i64::try_from(now).unwrap_or(i64::MAX);
+        gauge.add(now.wrapping_sub(self.0.replace(now)));
     }
 }
 
@@ -1293,6 +1300,57 @@ mod tests {
         let scrape = metrics.render(&["web".to_owned()], &[], &[]);
         let line = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"} 6\n";
         assert!(scrape.contains(line), "{scrape}");
+    }
+
+    /// What every worker holds adds up on a scrape even when two workers count in one
+    /// shard, which a data plane gets when a thread that is not a worker (the health
+    /// checker counting a set-aside, the logger an unwritten record) counts before every
+    /// worker has. Each worker sweeps twice, saying less the second time.
+    #[test]
+    fn what_workers_hold_adds_up_even_when_two_share_a_shard() {
+        use std::collections::HashSet;
+        let metrics = Arc::new(Metrics::new(NonZeroUsize::new(2).unwrap(), 1));
+        // A worker on a thread of its own: says what it holds, and in which shard.
+        let sweeps = |exchanges: usize, storage: usize| {
+            let metrics = Arc::clone(&metrics);
+            std::thread::spawn(move || {
+                let gauges = metrics.worker();
+                let said = Said::default();
+                gauges.holding(&said, exchanges + 2, 0, storage * 2);
+                gauges.holding(&said, exchanges, 0, storage);
+                std::ptr::from_ref(gauges) as usize
+            })
+            .join()
+            .unwrap()
+        };
+        // Workers until two have counted in one shard, which two of any three do here.
+        let (mut shards, mut exchanges, mut storage) = (Vec::new(), 0, 0);
+        for (held, bytes) in [(3, 1_000), (5, 2_000), (7, 4_000)] {
+            shards.push(sweeps(held, bytes));
+            exchanges += held;
+            storage += bytes;
+            if shards.iter().collect::<HashSet<_>>().len() < shards.len() {
+                break;
+            }
+        }
+        assert!(shards.iter().collect::<HashSet<_>>().len() < shards.len());
+        let scrape = metrics.render(&["web".to_owned()], &[], &[]);
+        let sample = |name: &str| {
+            scrape
+                .lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+                .unwrap_or("absent")
+                .to_owned()
+        };
+        assert_eq!(
+            (
+                sample("edgerush_upstream_exchanges_active"),
+                sample("edgerush_worker_storage_bytes")
+            ),
+            (exchanges.to_string(), storage.to_string()),
+            "{} workers, shards {shards:?}",
+            shards.len()
+        );
     }
 
     #[test]

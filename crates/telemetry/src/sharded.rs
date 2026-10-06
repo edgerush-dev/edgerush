@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Threads are numbered as they first count something; a thread's shard is its number
 /// modulo the number of shards. With at least as many shards as worker threads, which is
-/// how a data plane sets it up, no two workers share a shard — and if they do, counting is
-/// still right, only slower.
+/// how a data plane sets it up, two workers share a shard only when another thread counted
+/// before one of them did — and then counting is still right, only slower: nothing in a
+/// shard assumes one writer.
 static THREADS: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {

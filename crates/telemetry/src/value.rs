@@ -46,10 +46,11 @@ impl Gauge {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Sets this shard's part to `value`: for a gauge whose shard has one writer, which
-    /// samples what it holds rather than counting it up and down.
-    pub fn set(&self, value: i64) {
-        self.0.store(value, Ordering::Relaxed);
+    /// `amount` more, or fewer if it is negative: for whoever samples what it holds and
+    /// says the difference from what it last said, which sums right whoever else counts in
+    /// the shard.
+    pub fn add(&self, amount: i64) {
+        self.0.fetch_add(amount, Ordering::Relaxed);
     }
 
     /// This shard's part of the number.
@@ -93,11 +94,12 @@ mod tests {
     }
 
     #[test]
-    fn a_gauge_can_be_set_to_what_its_one_writer_found() {
+    fn a_gauge_moves_by_what_it_is_given() {
         let gauge = Gauge::default();
-        gauge.set(3_145_728);
-        assert_eq!(gauge.get(), 3_145_728);
-        gauge.set(0);
-        assert_eq!(gauge.get(), 0);
+        gauge.add(3_145_728);
+        gauge.inc();
+        assert_eq!(gauge.get(), 3_145_729);
+        gauge.add(-3_145_730);
+        assert_eq!(gauge.get(), -1);
     }
 }

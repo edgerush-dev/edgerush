@@ -439,6 +439,8 @@ pub struct Worker {
     /// What its requests' access-log records are written into, until handed to the logger
     /// ([21 §4](../../docs/21-access-logs.md)).
     batches: Batches,
+    /// What its sweep last said it holds.
+    said: crate::metrics::Said,
 }
 
 /// The client validation a listener's connections were accepted under on a worker, and the

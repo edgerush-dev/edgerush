@@ -496,10 +496,12 @@ fn what_became_of_a_connection_is_counted() {
         );
         // And what the worker holds, which it says as it sweeps.
         let storage = worker.blocks.borrow().storage().used();
-        proxy
-            .metrics
-            .worker()
-            .holding(worker.places.held(), worker.idle_connections(), storage);
+        proxy.metrics.worker().holding(
+            &worker.said,
+            worker.places.held(),
+            worker.idle_connections(),
+            storage,
+        );
         let scrape = proxy.metrics.render(&["web".to_owned()], &[], &[]);
         assert!(
             scrape.contains(
