@@ -858,7 +858,9 @@ mod tests {
                 Storage::new(crate::storage::LIMIT),
             );
             let received = Received::new(Rc::clone(&storage));
-            let long = "a long header, Huffman-coded ".repeat(40);
+            // Joined, not repeated with a space after each: a value may not end with one
+            // (RFC 9113 §8.2.1).
+            let long = ["a long header, Huffman-coded"; 40].join(" ");
             // Driven while `waited` passes after a stream, then let go of to be looked at.
             for (round, waited) in [(0u8, 50), (1, 500), (2, 500)] {
                 let asking = async {

@@ -2,9 +2,9 @@
 //! and values at all, in any order.
 //!
 //! A head taken must be one an HTTP/1 upstream reads as the client meant it: no field only
-//! a connection has, lower-case token names, no control character in a value, a `Host` that
-//! is the `:authority` where both are said, and one length at most, however it is spelt
-//! (`06` is 6). Anything else is refused, never passed on and never a panic.
+//! a connection has, lower-case token names, no control character in a value and no
+//! whitespace at either end of one, a `Host` that is the `:authority` where both are said,
+//! and one length at most, however it is spelt (`06` is 6). Anything else is refused, never passed on and never a panic.
 //!
 //! The input is a list of fields, each a byte of name length, the name, a byte of value
 //! length and the value: `cargo fuzz run h3_head corpus/h3_head seeds/h3_head`.
@@ -47,6 +47,9 @@ fuzz_target!(|bytes: &[u8]| {
                 .iter()
                 .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
         );
+        let blank = |byte: &u8| *byte == b' ' || *byte == b'\t';
+        assert!(!value.as_bytes().first().is_some_and(blank));
+        assert!(!value.as_bytes().last().is_some_and(blank));
         if name == "te" {
             assert!(value.as_bytes().eq_ignore_ascii_case(b"trailers"));
         }

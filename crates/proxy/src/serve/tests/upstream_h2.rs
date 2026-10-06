@@ -1182,3 +1182,47 @@ async fn told_to_calm_down_the_next_connection_pings_half_as_often() {
         })
         .await;
 }
+
+/// A field value that starts or ends with whitespace makes an HTTP/2 request malformed
+/// (RFC 9113 §8.2.1): its stream is reset with PROTOCOL_ERROR, and it is never forwarded.
+/// Forwarded, an HTTP/1.1 upstream would read the value without the whitespace, while a
+/// rule's header predicate compares it with it.
+#[tokio::test]
+async fn an_http2_field_value_with_whitespace_at_either_end_is_not_forwarded() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, seen, _gate) = h2_upstream(UpstreamH2::default()).await;
+            let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let mut outcomes = Vec::new();
+            for value in [" canary", "canary\t"] {
+                let request = Request::get("http://shop.example.com/x")
+                    .header("x-env", value)
+                    .body(())
+                    .unwrap();
+                send = within(send.ready()).await.unwrap();
+                let (answer, _) = send.send_request(request, true).unwrap();
+                let outcome = match within(answer).await {
+                    Ok(answer) => format!("answered {}", answer.status()),
+                    Err(error) => format!("reset {:?}", error.reason()),
+                };
+                outcomes.push((value, outcome));
+            }
+            let forwarded: Vec<_> = seen
+                .requests
+                .borrow()
+                .iter()
+                .filter_map(|(request, _)| request.headers().get("x-env").cloned())
+                .collect();
+            assert!(
+                forwarded.is_empty(),
+                "malformed requests reached the upstream with x-env {forwarded:?}; \
+                 the client was {outcomes:?}"
+            );
+            for (value, outcome) in &outcomes {
+                assert_eq!(outcome, "reset Some(PROTOCOL_ERROR)", "{value:?}");
+            }
+        })
+        .await;
+}

@@ -10,8 +10,8 @@ benchmarks, which are not here; nothing builds them.
 ## What is changed
 
 Every change is marked `EdgeRush:` in the source. Two additions, for idle connections
-(14 §3 of the design docs) and for charging what a connection holds (15 §3), and one
-allowance, for fuzz builds:
+(14 §3 of the design docs) and for charging what a connection holds (15 §3), a check RFC
+9113 asks for that published h2 does not make (15 §3), and one allowance, for fuzz builds:
 
 - **A server connection can give back its buffers.** h2 makes three buffers for every
   connection when it is handshaken, and keeps them for the connection's life: the 16 KiB
@@ -36,6 +36,13 @@ allowance, for fuzz builds:
   over all its streams and not yet given back as credit — what h2 holds until it is read,
   and what readers hold until they release it — through `proto::Connection` and
   `Streams`, under the streams' lock. Nothing h2 does changes.
+- **A field value with whitespace at either end is malformed.** RFC 9113 §8.2.1: "A field
+  value MUST NOT start or end with an ASCII whitespace character". `HeaderValue` allows SP
+  and HTAB anywhere, so published h2 takes such a value. `HeaderBlock::load`
+  (`frame/headers.rs`) marks the block malformed, as it does a field only a connection has:
+  the stream is reset with PROTOCOL_ERROR, in a head or trailers, a request's or an
+  answer's, and on a server the reset counts towards `max_local_error_reset_streams` as
+  every malformed request does.
 - **Its fuzzing module may go undocumented in every build.** cargo-fuzz builds with
   `--cfg fuzzing`, which brings in h2's `fuzz_bridge` module, and h2 denies `missing_docs`
   but allows it there only with its `unstable` feature. The lints of a registry dependency
@@ -50,6 +57,11 @@ out, or with the release doing nothing; the count of what is held by
 `a_server_connection_says_what_it_holds_of_what_was_sent` there, and through the proxy's
 charges by `an_upload_nobody_reads_is_charged_to_the_worker` and
 `an_answer_nobody_reads_from_an_http2_upstream_is_charged_to_the_worker`.
+The refusal of whitespace at either end is covered by
+`a_request_field_value_with_whitespace_at_either_end_is_reset`,
+`resets_for_whitespace_at_either_end_are_bounded`,
+`request_trailers_with_whitespace_at_either_end_are_reset` and
+`an_answer_with_whitespace_at_either_end_of_a_field_value_is_reset` there.
 The allowance is covered by building any fuzz target with cargo-fuzz (the repository
 README).
 
@@ -66,7 +78,8 @@ version none of them affects.
 
 Read h2's advisories first (above). Copy the new version's `Cargo.toml`, `LICENSE`,
 `README.md` and `src/` over these, then make the changes marked `EdgeRush:` again
-(`grep -rl EdgeRush src` lists the ten files).
-They change nothing h2 does unless a connection's buffers are given back. Update the version here, in the workspace's `Cargo.toml`, in `fuzz/Cargo.toml` and in
+(`grep -rl EdgeRush src` lists the eleven files); a refusal the new version makes itself is
+dropped, with its probe kept. The buffers' changes change nothing h2 does unless a
+connection's buffers are given back. Update the version here, in the workspace's `Cargo.toml`, in `fuzz/Cargo.toml` and in
 `vendor/bases/Cargo.toml` (then `cargo generate-lockfile` there), and run the tests above
 and a fuzz target's build.

@@ -938,6 +938,13 @@ impl HeaderBlock {
                             value
                         );
                         malformed = true;
+                    } else if has_whitespace_at_either_end(value.as_bytes()) {
+                        // EdgeRush: RFC 9113 §8.2.1, "A field value MUST NOT start or end
+                        // with an ASCII whitespace character". `HeaderValue` allows SP and
+                        // HTAB anywhere, and a peer that trims them would read another
+                        // value than the one taken here.
+                        tracing::trace!("load_hpack; field value with whitespace at either end");
+                        malformed = true;
                     } else {
                         reg = true;
 
@@ -1037,6 +1044,13 @@ fn calculate_headermap_size(map: &HeaderMap) -> usize {
 
 fn decoded_header_size(name: usize, value: usize) -> usize {
     name + value + 32
+}
+
+/// EdgeRush: whether a field value starts or ends with SP or HTAB, which RFC 9113 §8.2.1
+/// makes a message malformed. An empty value does neither.
+fn has_whitespace_at_either_end(value: &[u8]) -> bool {
+    let blank = |byte: &u8| *byte == b' ' || *byte == b'\t';
+    value.first().is_some_and(blank) || value.last().is_some_and(blank)
 }
 
 #[cfg(test)]

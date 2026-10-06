@@ -5,8 +5,9 @@
 //! request may carry, and in what form, is this module's. A request is refused as malformed
 //! where RFC 9114 §4.1.2 says so — a stream error of `H3_MESSAGE_ERROR` — and never passed
 //! on in a form an HTTP/1 upstream could read differently: fields in upper case, fields
-//! only a connection has (`Connection`, `Transfer-Encoding` and the like), a `Host` that
-//! names another authority than `:authority`, a `Content-Length` that is not one number.
+//! only a connection has (`Connection`, `Transfer-Encoding` and the like), values with
+//! whitespace at either end, a `Host` that names another authority than `:authority`, a
+//! `Content-Length` that is not one number.
 //! One whose fields are merely too many is answered 431, as over HTTP/1 and HTTP/2.
 
 use http::header::{CONTENT_LENGTH, HOST, TE};
@@ -208,7 +209,8 @@ pub fn trailers<F: NameValue>(fields: &[F], limit: usize) -> Result<HeaderMap, R
 }
 
 /// A regular field, as RFC 9114 §4.2 allows it: a lower-case token for its name, none of
-/// the fields only a connection has, and a value with no control character but a tab.
+/// the fields only a connection has, and a value with no control character but a tab and
+/// no whitespace at either end.
 fn regular_field(name: &[u8], value: &[u8]) -> Result<(HeaderName, HeaderValue), Refused> {
     if name.is_empty() || !name.iter().all(|&byte| is_lower_token_byte(byte)) {
         return Err(Refused::Malformed(
@@ -224,6 +226,15 @@ fn regular_field(name: &[u8], value: &[u8]) -> Result<(HeaderName, HeaderValue),
     // either, which `HeaderValue` refuses.
     let value = HeaderValue::from_bytes(value)
         .map_err(|_| Refused::Malformed("a field value with a control character"))?;
+    // Nor whitespace at either end, which `HeaderValue` allows: a header predicate compares
+    // the value as sent, and an HTTP/1 upstream reads it trimmed (as RFC 9113 §8.2.1 says
+    // outright for HTTP/2, which the vendored h2 refuses the same way).
+    let blank = |byte: &u8| *byte == b' ' || *byte == b'\t';
+    if value.as_bytes().first().is_some_and(blank) || value.as_bytes().last().is_some_and(blank) {
+        return Err(Refused::Malformed(
+            "a field value with whitespace at either end",
+        ));
+    }
     Ok((name, value))
 }
 
@@ -365,6 +376,27 @@ mod tests {
             refused(&[(":method", "GET"), (":scheme", "https"), (":path", "/")]),
             "neither `:authority` nor `Host`"
         );
+    }
+
+    /// A field value is RFC 9110's field-content, which neither starts nor ends with
+    /// whitespace (RFC 9114 §4.1.2, §10.3; RFC 9113 §8.2.1 says so outright for HTTP/2): one
+    /// that does is malformed, since a header predicate compares it as sent and an HTTP/1
+    /// upstream reads it trimmed (review A05-06, A04-01's HTTP/3 counterpart).
+    #[test]
+    fn a_field_value_with_whitespace_at_either_end_is_malformed() {
+        for value in [" canary", "canary ", "\tcanary", "canary\t"] {
+            match request(&fields(&get(&[("x-env", value)])), LIMIT) {
+                Err(Refused::Malformed(_)) => {}
+                other => panic!(
+                    "{value:?} was taken: {:?}",
+                    other.map(|head| head.parts.headers)
+                ),
+            }
+        }
+        match trailers(&fields(&[("x-sum", " 1")]), LIMIT) {
+            Err(Refused::Malformed(_)) => {}
+            other => panic!("a trailer value with a leading space was taken: {other:?}"),
+        }
     }
 
     #[test]
@@ -730,7 +762,9 @@ mod tests {
             method in "(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|[A-Z]{1,8})",
             authority in "[a-z]{1,10}(\\.[a-z]{1,5}){0,2}(:[0-9]{1,4})?",
             path in "/[a-zA-Z0-9/._~-]{0,20}(\\?[a-z0-9=&]{0,10})?",
-            regular in prop::collection::vec((name(), "[ -~]{0,20}"), 0..8),
+            // RFC 9110's field-content: empty, or visible at either end with anything
+            // printable between.
+            regular in prop::collection::vec((name(), "([!-~]([ -~]{0,18}[!-~])?)?"), 0..8),
         ) {
             let mut pairs: Vec<(&str, &str)> = vec![
                 (":method", &method),
@@ -771,6 +805,9 @@ mod tests {
                 for (name, value) in &head.parts.headers {
                     prop_assert!(!is_connection_specific(name.as_str().as_bytes()));
                     prop_assert!(!value.as_bytes().iter().any(|b| matches!(b, b'\0' | b'\r' | b'\n')));
+                    let blank = |byte: &u8| *byte == b' ' || *byte == b'\t';
+                    prop_assert!(!value.as_bytes().first().is_some_and(blank));
+                    prop_assert!(!value.as_bytes().last().is_some_and(blank));
                 }
             }
         }

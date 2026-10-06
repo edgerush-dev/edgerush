@@ -559,3 +559,32 @@ async fn every_try_is_sent_the_rewritten_path_and_host() {
         })
         .await;
 }
+
+/// An HTTP/2 upstream's answer with a field value that starts or ends with whitespace is
+/// malformed (RFC 9113 §8.2.1), and a client of it must not take it (§8.1.1): it is
+/// answered as an upstream that failed, never passed on.
+#[tokio::test]
+async fn an_http2_answer_with_whitespace_at_either_end_of_a_field_value_is_not_passed_on() {
+    use crate::h2_peer::{self, Peer, kind};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = socket.local_addr().unwrap();
+            let _answering = tokio::task::spawn_local(async move {
+                let (stream, _) = socket.accept().await.unwrap();
+                let (mut peer, _) = Peer::accept_as_server(stream, &[]).await;
+                peer.send(&h2_peer::settings_ack()).await;
+                let (request, _) = peer.until(|frame| frame.kind == kind::HEADERS).await;
+                let block = h2_peer::block(&[(":status", "200"), ("x-env", " canary")]);
+                peer.send(&h2_peer::headers(request.stream, block, true))
+                    .await;
+                std::future::pending::<()>().await;
+            });
+            let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
+            assert!(!answer.contains("canary"), "{answer}");
+        })
+        .await;
+}

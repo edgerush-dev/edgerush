@@ -1382,7 +1382,9 @@ async fn a_server_connection_gives_back_its_buffers_and_serves_on() {
 
     let (mut send, connection) = client::handshake(far).await.unwrap();
     tokio::spawn(connection);
-    let long = "Huffman-coded where it is shorter ".repeat(60);
+    // Joined, not repeated with a space after each: a value may not end with one
+    // (RFC 9113 §8.2.1).
+    let long = ["Huffman-coded where it is shorter"; 60].join(" ");
     for round in 0..2 {
         let request = Request::builder()
             .uri("http://example.com/up")
@@ -1481,4 +1483,130 @@ async fn a_server_connection_keeps_what_waits_in_its_buffers() {
         received.extend_from_slice(&data);
     }
     assert!(received == upload, "{} bytes came back", received.len());
+}
+
+// ===== Malformed messages: refused by EdgeRush's copy =====
+
+/// A GET's header block with one more field, `x-env: value`.
+fn get_with(value: &str) -> Vec<u8> {
+    h2_peer::block(&[
+        (":method", "GET"),
+        (":scheme", "http"),
+        (":authority", "example.com"),
+        (":path", "/"),
+        ("x-env", value),
+    ])
+}
+
+/// What `stream` was reset with, once the peer has seen it reset.
+async fn reset_of(peer: &mut Peer<DuplexStream>, stream: u32) -> u32 {
+    let (reset, _) = within(peer.until(|f| f.kind == kind::RST_STREAM && f.stream == stream)).await;
+    reset.reset()
+}
+
+/// RFC 9113 §8.2.1: a field value that starts or ends with whitespace makes a message
+/// malformed. h2 as published takes it, `HeaderValue` allowing SP and HTAB anywhere; this
+/// copy resets the stream with PROTOCOL_ERROR before the application sees the request
+/// (vendor/h2/VENDORED.md). An empty value, and whitespace inside one, are well formed.
+#[tokio::test]
+async fn a_request_field_value_with_whitespace_at_either_end_is_reset() {
+    let (connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    let mut server = serve(connection, Serve::Hold);
+    for (stream, value) in [(1, " a"), (3, "a "), (5, "\ta"), (7, "a\t"), (9, " ")] {
+        peer.send(&h2_peer::headers(stream, get_with(value), true))
+            .await;
+        assert_eq!(
+            reset_of(&mut peer, stream).await,
+            code::PROTOCOL_ERROR,
+            "{value:?}"
+        );
+    }
+    for (stream, value) in [(11, ""), (13, "a \tb")] {
+        peer.send(&h2_peer::headers(stream, get_with(value), true))
+            .await;
+        let (request, _) = server.next().await;
+        assert_eq!(request.headers()["x-env"], value);
+    }
+    assert!(
+        server.accepted.try_recv().is_err(),
+        "only the well-formed requests were handed over"
+    );
+}
+
+/// Those resets are h2's own, so they count towards `max_local_error_reset_streams` as
+/// any other malformed request does (15 §3's bound on resets a client provokes).
+#[tokio::test]
+async fn resets_for_whitespace_at_either_end_are_bounded() {
+    let mut builder = server::Builder::new();
+    builder.max_local_error_reset_streams(Some(3));
+    let (connection, mut peer, _) = server_with(&builder, true).await;
+    let _server = serve(connection, Serve::Answer);
+    let closed = goaway_after(&mut peer, 20, async |peer, attempt| {
+        peer.send(&h2_peer::headers(attempt * 2 - 1, get_with(" a"), true))
+            .await;
+    })
+    .await;
+    assert_eq!(closed, Some((4, code::ENHANCE_YOUR_CALM)));
+}
+
+/// A request's trailers are held to the same rule: the stream is reset, and the reading
+/// application told so.
+#[tokio::test]
+async fn request_trailers_with_whitespace_at_either_end_are_reset() {
+    let (connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    let mut server = serve(connection, Serve::Hold);
+    request(&mut peer, 1, false).await;
+    let (request, _respond) = server.next().await;
+    peer.send(&h2_peer::headers(
+        1,
+        h2_peer::block(&[("x-sum", "1 ")]),
+        true,
+    ))
+    .await;
+    assert_eq!(reset_of(&mut peer, 1).await, code::PROTOCOL_ERROR);
+    let read = within(request.into_body().trailers()).await;
+    assert_eq!(
+        read.map_err(|error| error.reason()).err(),
+        Some(Some(Reason::PROTOCOL_ERROR)),
+        "the application reads a reset"
+    );
+}
+
+/// The client half refuses such an answer (RFC 9113 §8.1.1: "Clients MUST NOT accept a
+/// malformed response"), in its head and in its trailers.
+#[tokio::test]
+async fn an_answer_with_whitespace_at_either_end_of_a_field_value_is_reset() {
+    let (mut client, mut peer) = client(&[]).await;
+    let head = open(&mut client.send);
+    opened(&mut peer, 1).await;
+    peer.send(&h2_peer::headers(
+        1,
+        h2_peer::block(&[(":status", "200"), ("x-env", "\ta")]),
+        true,
+    ))
+    .await;
+    let refused = within(head).await.map(|answer| answer.status());
+    assert_eq!(
+        refused.map_err(|error| error.reason()).err(),
+        Some(Some(Reason::PROTOCOL_ERROR))
+    );
+    assert_eq!(reset_of(&mut peer, 1).await, code::PROTOCOL_ERROR);
+
+    let trailed = open(&mut client.send);
+    opened(&mut peer, 3).await;
+    peer.send(&h2_peer::headers(3, h2_peer::response(200), false))
+        .await;
+    peer.send(&h2_peer::headers(
+        3,
+        h2_peer::block(&[("grpc-message", "a ")]),
+        true,
+    ))
+    .await;
+    let mut body = within(trailed).await.unwrap().into_body();
+    let read = within(body.trailers()).await;
+    assert_eq!(
+        read.map_err(|error| error.reason()).err(),
+        Some(Some(Reason::PROTOCOL_ERROR))
+    );
+    assert_eq!(reset_of(&mut peer, 3).await, code::PROTOCOL_ERROR);
 }
