@@ -396,10 +396,23 @@ impl Edit for Editing<'_> {
     }
 
     fn append_cookie(&mut self, value: &HeaderValue) {
-        let view = self.head.view();
-        let had = view
-            .values(&http::header::COOKIE)
-            .map(|piece| (piece, false));
+        // The values themselves, the map's then those added, each with its mark: a piece
+        // the client sent not to be indexed keeps the string so (RFC 7541 §6.2.3).
+        let cookie = &http::header::COOKIE;
+        let had = self
+            .head
+            .parts
+            .headers
+            .get_all(cookie)
+            .iter()
+            .chain(
+                self.head
+                    .added
+                    .iter()
+                    .filter(|(name, _)| name == cookie)
+                    .map(|(_, value)| value),
+            )
+            .map(|piece| (piece.as_bytes(), piece.is_sensitive()));
         let joined = edgerush_filters::cookie_with(had, value);
         let edited = match joined {
             Some(whole) => self.head.set(http::header::COOKIE, whole),
@@ -477,6 +490,14 @@ mod tests {
             head.apply(&adds).unwrap();
             assert_eq!(values(&head, "cookie"), [whole]);
         }
+        // A cookie string the client sent not to be indexed (RFC 7541 §6.2.3) stays so.
+        let mut sent = parts(&[]);
+        let mut secret = HeaderValue::from_static("a=1");
+        secret.set_sensitive(true);
+        sent.headers.insert(http::header::COOKIE, secret);
+        let mut head = MapHead::new(sent);
+        head.apply(&adds).unwrap();
+        assert!(head.to_map()[http::header::COOKIE].is_sensitive());
     }
 
     /// Our servers' heads add in room the worker lends, and give it back when done.
