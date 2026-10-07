@@ -1378,3 +1378,86 @@ async fn a_connect_carried_on_does_not_wait_for_another() {
         })
         .await;
 }
+
+/// A worker that ends before its watcher's task has had a single turn still lets go of
+/// what was handed to it: the queue, the places and the registrations, held otherwise by
+/// the watcher's queue holding the watcher.
+#[test]
+fn a_worker_ending_before_its_watcher_ran_holds_nothing() {
+    use crate::serve::watched::{Connecting, Watcher};
+    use crate::upstream::dial::hold_connects;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let places = crate::places::Places::new(2);
+    let watcher = Rc::new(Watcher::default());
+    let local = tokio::task::LocalSet::new();
+    let (upstream, proxy, identity, mut admitted) = local.block_on(&runtime, async {
+        let (upstream, _) = counting_upstream().await;
+        hold_connects(upstream, Some(Duration::from_secs(60)));
+        let (proxy, identity, admitted) = try_at(upstream, &places);
+        (upstream, proxy, identity, admitted)
+    });
+    {
+        let _runtime = runtime.enter();
+        let _local = local.enter();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        // Begun, which spawns the watcher's task, and let go of at once: polled once by
+        // hand, never by the LocalSet, whose tasks never run.
+        let mut connecting = Box::pin(Connecting::new(
+            &identity,
+            deadline,
+            &mut admitted,
+            &watcher,
+        ));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(connecting.as_mut().poll(&mut cx).is_pending());
+    }
+    assert_eq!((watcher.watched(), watcher.queued()), (1, 1));
+    assert_eq!(places.held(), 1);
+    drop(local);
+    assert_eq!((watcher.watched(), watcher.queued()), (0, 0));
+    assert_eq!(places.held(), 0);
+    drop(proxy);
+    hold_connects(upstream, None);
+}
+
+/// A try let go of past its connect bound, the connect not done and the try's own timeout
+/// never polled — its client's reset seen first — sets the endpoint aside as that timeout
+/// would have, rather than taking the connect away untold.
+#[tokio::test]
+async fn a_connect_let_go_of_past_its_bound_unpolled_sets_its_endpoint_aside() {
+    use crate::serve::watched::{Connecting, Watcher};
+    use crate::upstream::dial::hold_connects;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            hold_connects(upstream, Some(Duration::from_secs(60)));
+            let places = crate::places::Places::new(2);
+            let (_proxy, identity, mut admitted) = try_at(upstream, &places);
+            let watcher = Rc::new(Watcher::default());
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+            {
+                let mut connecting = Box::pin(Connecting::new(
+                    &identity,
+                    deadline,
+                    &mut admitted,
+                    &watcher,
+                ));
+                std::future::poll_fn(|cx| {
+                    assert!(connecting.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                // Let go of now, past its bound, without a poll since.
+            }
+            assert!(identity.aside().is_some(), "the endpoint was not set aside");
+            assert_eq!((watcher.watched(), watcher.queued()), (0, 0));
+            hold_connects(upstream, None);
+        })
+        .await;
+}

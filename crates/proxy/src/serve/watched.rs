@@ -82,7 +82,10 @@ impl Watcher {
             return;
         }
         self.open.set(true);
-        let _detached = tokio::task::spawn_local(watch(Rc::clone(self)));
+        // Made before the task, and moved into it: a task dropped before its first turn
+        // still closes the watcher and lets go of what was queued.
+        let closing = Closing(Rc::clone(self));
+        let _detached = tokio::task::spawn_local(watch(Rc::clone(self), closing));
     }
 
     /// Takes over `connect`, let go of by a try: queued with what it holds, unless its
@@ -153,16 +156,27 @@ impl Carried {
         let ended = match self.connect.as_mut().poll(cx) {
             Poll::Ready(connected) => connected,
             Poll::Pending => match self.due.as_mut().poll(cx) {
-                Poll::Ready(()) => Err(Unconnected::Endpoint(std::io::ErrorKind::TimedOut.into())),
+                Poll::Ready(()) => Err(out_of_time()),
                 Poll::Pending => return Poll::Pending,
             },
         };
-        if let Err(unconnected) = ended
-            && let Some(why) = unconnected.aside()
-        {
-            self.identity.set_aside(why);
-        }
+        settle(&self.identity, ended);
         Poll::Ready(())
+    }
+}
+
+/// A connect that ran out of its time.
+fn out_of_time() -> Unconnected {
+    Unconnected::Endpoint(std::io::ErrorKind::TimedOut.into())
+}
+
+/// What a connect nobody waits for came to: refused or out of time sets its endpoint
+/// aside, as the try's would have; a connection made is closed.
+fn settle(identity: &ReuseIdentity, ended: Result<TcpStream, Unconnected>) {
+    if let Err(unconnected) = ended
+        && let Some(why) = unconnected.aside()
+    {
+        identity.set_aside(why);
     }
 }
 
@@ -180,8 +194,8 @@ impl Drop for Closing {
 
 /// Sees every connect handed over through to its end, each polled on every turn so that
 /// none waits on another. Ends only with its worker.
-async fn watch(watcher: Rc<Watcher>) {
-    let _closing = Closing(Rc::clone(&watcher));
+async fn watch(watcher: Rc<Watcher>, closing: Closing) {
+    let _closing = closing;
     let mut watching: Vec<Carried> = Vec::new();
     poll_fn(|cx| {
         watching.append(&mut watcher.queue.borrow_mut());
@@ -238,11 +252,19 @@ impl Future for Connecting<'_> {
 
 impl Drop for Connecting<'_> {
     fn drop(&mut self) {
-        let Some(connect) = self.connect.take() else {
+        let Some(mut connect) = self.connect.take() else {
             return;
         };
-        // Let go of at its bound, the try's own timeout has it: nothing to carry on.
+        // Let go of past its bound: settled here as the try's own timeout would have
+        // settled it, the connect looked at first and then the clock. A try dropped for
+        // its client's reset need not have polled that timeout.
         if Instant::now() >= self.deadline {
+            let mut cx = Context::from_waker(Waker::noop());
+            let ended = match connect.as_mut().poll(&mut cx) {
+                Poll::Ready(connected) => connected,
+                Poll::Pending => Err(out_of_time()),
+            };
+            settle(self.identity, ended);
             return;
         }
         self.watcher
