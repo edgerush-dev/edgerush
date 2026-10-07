@@ -57,6 +57,11 @@ Every change is marked `EdgeRush:` in the source. Two additions, for idle connec
 - **Trailers with a pseudo-field are malformed** (§8.1). Published h2 dropped them and passed
   the rest of the section on. `recv_trailers` (`proto/streams/recv.rs`) resets the stream,
   on a client and a server alike; a server's reset counts as any malformed request's.
+- **A GOAWAY on a stream is a connection error** (RFC 9113 §6.8). Published h2 took one
+  with a stream identifier other than 0 for a graceful GOAWAY. `GoAway::load`
+  (`frame/go_away.rs`) is given the frame's head and refuses it, and the connection is
+  closed with PROTOCOL_ERROR: h2's own fix, `d4a37fc` (#951), not in a release yet, carried
+  as it was made; drop it when a release has it.
 - **Its fuzzing module may go undocumented in every build.** cargo-fuzz builds with
   `--cfg fuzzing`, which brings in h2's `fuzz_bridge` module, and h2 denies `missing_docs`
   but allows it there only with its `unstable` feature. The lints of a registry dependency
@@ -80,7 +85,8 @@ a fragment by `a_path_with_a_fragment_is_reset`, of an answer without `:status` 
 `an_answer_without_a_status_is_reset`, of a request's pseudo-field in an answer by
 `an_answer_with_a_requests_pseudo_field_is_reset`, and of pseudo-fields in trailers by
 `an_answers_trailers_with_a_pseudo_field_are_refused` and
-`a_requests_trailers_with_a_pseudo_field_are_reset`.
+`a_requests_trailers_with_a_pseudo_field_are_reset`, and of a GOAWAY on a stream by
+`a_goaway_on_a_stream_is_a_connection_error_to_a_server` and `…_to_a_client`.
 The allowance is covered by building any fuzz target with cargo-fuzz (the repository
 README).
 
@@ -97,7 +103,7 @@ version none of them affects.
 
 Read h2's advisories first (above). Copy the new version's `Cargo.toml`, `LICENSE`,
 `README.md` and `src/` over these, then make the changes marked `EdgeRush:` again
-(`grep -rl EdgeRush src` lists the eleven files); a refusal the new version makes itself is
+(`grep -rl EdgeRush src` lists the twelve files); a refusal the new version makes itself is
 dropped, with its probe kept. The buffers' changes change nothing h2 does unless a
 connection's buffers are given back. Update the version here, in the workspace's `Cargo.toml`, in `fuzz/Cargo.toml` and in
 `vendor/bases/Cargo.toml` (then `cargo generate-lockfile` there), and run the tests above

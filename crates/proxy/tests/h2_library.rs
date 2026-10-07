@@ -1765,3 +1765,46 @@ async fn a_requests_trailers_with_a_pseudo_field_are_reset() {
         Some(Some(Reason::PROTOCOL_ERROR))
     );
 }
+
+/// RFC 9113 §6.8: a GOAWAY applies to the connection, and one with a stream identifier
+/// other than 0 is a connection error PROTOCOL_ERROR. h2 as published took it for a
+/// graceful GOAWAY and answered GOAWAY(NO_ERROR); this copy refuses it (h2's own fix,
+/// `d4a37fc`, not yet released).
+#[tokio::test]
+async fn a_goaway_on_a_stream_is_a_connection_error_to_a_server() {
+    let (connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    let _server = serve(connection, Serve::Answer);
+    let mut payload = 0_u32.to_be_bytes().to_vec();
+    payload.extend_from_slice(&code::NO_ERROR.to_be_bytes());
+    peer.send(&Frame::new(kind::GOAWAY, 0, 1, payload)).await;
+    let frames = peer.drain_for(QUIET).await;
+    assert_eq!(
+        goaway_in(&frames).map(|(_, code)| code),
+        Some(code::PROTOCOL_ERROR),
+        "{frames:?}"
+    );
+}
+
+/// The same frames are read by h2's client: an upstream's GOAWAY on a stream ends the
+/// connection with PROTOCOL_ERROR, and the stream open on it fails with that, where a
+/// graceful GOAWAY that counted it processed would have left it to be answered.
+#[tokio::test]
+async fn a_goaway_on_a_stream_is_a_connection_error_to_a_client() {
+    let (mut client, mut peer) = client(&[]).await;
+    let open = open(&mut client.send);
+    opened(&mut peer, 1).await;
+    let mut payload = 1_u32.to_be_bytes().to_vec();
+    payload.extend_from_slice(&code::NO_ERROR.to_be_bytes());
+    peer.send(&Frame::new(kind::GOAWAY, 0, 1, payload)).await;
+    let frames = quiet_frames(&mut peer).await;
+    assert_eq!(
+        goaway_in(&frames).map(|(_, code)| code),
+        Some(code::PROTOCOL_ERROR),
+        "{frames:?}"
+    );
+    let failed = within(open).await.map(|answer| answer.status());
+    assert_eq!(
+        failed.map_err(|error| error.reason()).err(),
+        Some(Some(Reason::PROTOCOL_ERROR))
+    );
+}
