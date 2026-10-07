@@ -394,6 +394,21 @@ impl Edit for Editing<'_> {
             self.full = true;
         }
     }
+
+    fn append_cookie(&mut self, value: &HeaderValue) {
+        let view = self.head.view();
+        let had = view
+            .values(&http::header::COOKIE)
+            .map(|piece| (piece, false));
+        let joined = edgerush_filters::cookie_with(had, value);
+        let edited = match joined {
+            Some(whole) => self.head.set(http::header::COOKIE, whole),
+            None => self.head.push(http::header::COOKIE, value.clone()),
+        };
+        if edited.is_err() {
+            self.full = true;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -450,6 +465,18 @@ mod tests {
         map.insert("x-two", HeaderValue::from_static("2b"));
         map.insert(HOST, HeaderValue::from_static("b"));
         assert_eq!(head.to_map(), map);
+    }
+
+    /// A rule's `add` on `Cookie` joins the cookie string with "; " here too, as on a map
+    /// or a raw head, and gives a head with none the cookie added.
+    #[test]
+    fn a_cookie_a_rule_adds_joins_the_cookie_string() {
+        let adds = HeaderModifier::new([], [("cookie", "flag=on")], []).unwrap();
+        for (had, whole) in [(&[("cookie", "a=1")][..], "a=1; flag=on"), (&[], "flag=on")] {
+            let mut head = MapHead::new(parts(had));
+            head.apply(&adds).unwrap();
+            assert_eq!(values(&head, "cookie"), [whole]);
+        }
     }
 
     /// Our servers' heads add in room the worker lends, and give it back when done.

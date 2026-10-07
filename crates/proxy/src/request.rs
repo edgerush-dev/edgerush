@@ -1710,6 +1710,65 @@ upstreams:
         assert_eq!(cookies, ["a=1; c=3"]);
     }
 
+    /// A cookie a rule adds joins the cookie string with "; ", as the client's own pieces
+    /// were joined (03 §11): an HTTP/1.1 upstream is sent one `Cookie` field (RFC 9110 §5.3,
+    /// RFC 9113 §8.2.3), whichever way the head is held. A request with no cookie is given
+    /// the one added.
+    #[test]
+    fn a_cookie_a_rule_adds_joins_the_cookie_string() {
+        const ADDS: &str = r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
+routes:
+  - name: r
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        filters:
+          - type: request_header_modifier
+            add: [{ name: Cookie, value: "flag=on" }, { name: X-Note, value: "n" }]
+        forward: { backends: [{ upstream: app, weight: 1 }] }
+upstreams:
+  app: { load_balancer: p2c, endpoints: ["127.0.0.1:9001"] }
+"#;
+        let compiled = compile(&shop_config(ADDS)).unwrap();
+        let web = compiled
+            .listeners()
+            .iter()
+            .find(|l| l.name == "web")
+            .unwrap();
+        for (sent, whole) in [
+            (
+                &b"GET / HTTP/1.1\r\nHost: a.test\r\nCookie: a=1\r\n\r\n"[..],
+                "a=1; flag=on",
+            ),
+            (
+                &b"GET / HTTP/1.1\r\nHost: a.test\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n"[..],
+                "a=1; b=2; flag=on",
+            ),
+            (&b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n"[..], "flag=on"),
+        ] {
+            let (mut map, mut raw) = both_heads(sent).unwrap();
+            assert!(decide(&compiled, web, &mut map, &peer(), &mut || 0, None).is_ok());
+            assert!(decide(&compiled, web, &mut raw, &peer(), &mut || 0, None).is_ok());
+            let from_map: Vec<Vec<u8>> = Fields::values(&map.headers, &http::header::COOKIE)
+                .map(<[u8]>::to_vec)
+                .collect();
+            let from_raw: Vec<Vec<u8>> = raw
+                .fields()
+                .values(&http::header::COOKIE)
+                .map(<[u8]>::to_vec)
+                .collect();
+            let whole = vec![whole.as_bytes().to_vec()];
+            assert_eq!(
+                (from_map, from_raw),
+                (whole.clone(), whole),
+                "(map head, raw head)"
+            );
+        }
+    }
+
     #[test]
     fn three_pieces_and_a_sensitive_one_make_one_sensitive_cookie_string() {
         let mut request = head(

@@ -15,7 +15,9 @@ mod redirect;
 pub mod request_id;
 mod rewrite;
 
-pub use header_modifier::{Edit, HeaderModifier, HeaderModifierError, MOST_PER_LIST, RESERVED};
+pub use header_modifier::{
+    Edit, HeaderModifier, HeaderModifierError, MOST_PER_LIST, RESERVED, cookie_with,
+};
 pub use path_modifier::{MOST_BYTES, PathModifier, PathModifierError};
 pub use redirect::{
     Query, Redirect, RedirectError, Requested, STATUSES as REDIRECT_STATUSES, Scheme,

@@ -620,6 +620,19 @@ impl Edit for Editing<'_> {
             self.full = true;
         }
     }
+
+    fn append_cookie(&mut self, value: &HeaderValue) {
+        let edited = self.overlay.edited(self.view);
+        let had = edited.values(&COOKIE).map(|piece| (piece, false));
+        let joined = edgerush_filters::cookie_with(had, value);
+        let edited = match joined {
+            Some(whole) => self.overlay.set(&self.view, COOKIE, whole),
+            None => self.overlay.append(COOKIE, value.clone()),
+        };
+        if edited.is_err() {
+            self.full = true;
+        }
+    }
 }
 
 #[cfg(test)]

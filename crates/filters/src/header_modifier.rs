@@ -1,7 +1,9 @@
 //! Header modification: Gateway API's `RequestHeaderModifier` and `ResponseHeaderModifier`.
 //!
 //! `set` gives a header one value, whatever it had; `add` appends a value to whatever it
-//! had; `remove` takes the header away. Names are case-insensitive. The spec does not say
+//! had — to `Cookie`'s one string after `"; "`, a cookie string being one field whose pieces
+//! are joined so (RFC 9110 §5.3, RFC 6265 §4.2.1), where any other header gets a field line
+//! more; `remove` takes the header away. Names are case-insensitive. The spec does not say
 //! what a header named in more than one of the three, or twice in one, should come to — so
 //! that is not accepted, and the order in which the three are carried out can never matter.
 //!
@@ -42,6 +44,33 @@ pub trait Edit {
     fn set(&mut self, name: &HeaderName, value: &HeaderValue);
     /// Adds a value to `name`, after every one it has.
     fn append(&mut self, name: &HeaderName, value: &HeaderValue);
+    /// Adds `value` to the cookie string, after `"; "`: one `Cookie` field, its pieces
+    /// joined so, or `value` alone where there was none ([`cookie_with`]).
+    fn append_cookie(&mut self, value: &HeaderValue);
+}
+
+/// The cookie string `had` joined with `added` by `"; "`: `added` alone where `had` is
+/// nothing. Sensitive if any piece is. `None` only for pieces no field value could be made
+/// of, which a header value's bytes joined by `"; "` never are.
+#[must_use]
+pub fn cookie_with<'a>(
+    had: impl IntoIterator<Item = (&'a [u8], bool)>,
+    added: &HeaderValue,
+) -> Option<HeaderValue> {
+    let mut joined = Vec::new();
+    let mut sensitive = added.is_sensitive();
+    for (piece, secret) in had {
+        joined.extend_from_slice(piece);
+        joined.extend_from_slice(b"; ");
+        sensitive |= secret;
+    }
+    if joined.is_empty() {
+        return Some(added.clone());
+    }
+    joined.extend_from_slice(added.as_bytes());
+    let mut whole = HeaderValue::from_bytes(&joined).ok()?;
+    whole.set_sensitive(sensitive);
+    Some(whole)
 }
 
 impl Edit for HeaderMap {
@@ -56,6 +85,21 @@ impl Edit for HeaderMap {
     fn append(&mut self, name: &HeaderName, value: &HeaderValue) {
         HeaderMap::append(self, name.clone(), value.clone());
     }
+
+    fn append_cookie(&mut self, value: &HeaderValue) {
+        let had = self
+            .get_all(header::COOKIE)
+            .iter()
+            .map(|piece| (piece.as_bytes(), piece.is_sensitive()));
+        match cookie_with(had, value) {
+            Some(whole) => {
+                self.insert(header::COOKIE, whole);
+            }
+            None => {
+                HeaderMap::append(self, header::COOKIE, value.clone());
+            }
+        }
+    }
 }
 
 /// The most entries each of `set`, `add` and `remove` may have: Gateway API's own bound
@@ -68,7 +112,11 @@ pub const MOST_PER_LIST: usize = 16;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HeaderModifier {
     set: Box<[(HeaderName, HeaderValue)]>,
+    /// What `add` gives every header but `Cookie`.
     add: Box<[(HeaderName, HeaderValue)]>,
+    /// What `add` gives the cookie string, kept apart so that only a modifier that adds a
+    /// cookie looks for the string it joins.
+    cookie: Option<HeaderValue>,
     remove: Box<[HeaderName]>,
 }
 
@@ -88,7 +136,7 @@ impl HeaderModifier {
     ) -> Result<Self, HeaderModifierError> {
         let mut named = Named(Vec::new());
         let set = named.pairs(set)?;
-        let add = named.pairs(add)?;
+        let mut add = named.pairs(add)?.into_vec();
         let remove: Box<[HeaderName]> = remove
             .into_iter()
             .map(|name| named.once(name))
@@ -102,13 +150,25 @@ impl HeaderModifier {
                 return Err(HeaderModifierError::TooMany(list));
             }
         }
-        Ok(Self { set, add, remove })
+        let cookie = add
+            .iter()
+            .position(|(name, _)| name == header::COOKIE)
+            .map(|at| add.remove(at).1);
+        Ok(Self {
+            set,
+            add: add.into_boxed_slice(),
+            cookie,
+            remove,
+        })
     }
 
     /// Whether there is nothing to do, so the modifier need not be kept at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.set.is_empty() && self.add.is_empty() && self.remove.is_empty()
+        self.set.is_empty()
+            && self.add.is_empty()
+            && self.cookie.is_none()
+            && self.remove.is_empty()
     }
 
     /// Whether any of the three names `name`.
@@ -117,6 +177,7 @@ impl HeaderModifier {
         self.remove.contains(name)
             || self.set.iter().any(|(named, _)| named == name)
             || self.add.iter().any(|(named, _)| named == name)
+            || (self.cookie.is_some() && name == header::COOKIE)
     }
 
     /// Carries out the changes. Allocates only as what is edited does to hold what is
@@ -130,6 +191,9 @@ impl HeaderModifier {
         }
         for (name, value) in &self.add {
             headers.append(name, value);
+        }
+        if let Some(cookie) = &self.cookie {
+            headers.append_cookie(cookie);
         }
     }
 }
@@ -242,6 +306,38 @@ mod tests {
         let mut headers = headers(before);
         modifier.apply(&mut headers);
         fields(&headers)
+    }
+
+    /// `add` on `Cookie` joins the one cookie string with "; ", where another header gets
+    /// a line more; a request with no cookie gets the one added, and a string that had a
+    /// piece not to be indexed stays so.
+    #[test]
+    fn add_joins_the_cookie_string_and_lists_other_headers() {
+        let adds = HeaderModifier::new([], [("cookie", "flag=on"), ("x-a", "2")], []).unwrap();
+        assert!(adds.names(&header::COOKIE));
+        assert_eq!(
+            modified(&adds, &[("cookie", "a=1; b=2"), ("x-a", "1")]),
+            [
+                ("cookie".to_owned(), "a=1; b=2; flag=on".to_owned()),
+                ("x-a".to_owned(), "1".to_owned()),
+                ("x-a".to_owned(), "2".to_owned()),
+            ]
+        );
+        let mut none_before = modified(&adds, &[]);
+        none_before.sort();
+        assert_eq!(
+            none_before,
+            [
+                ("cookie".to_owned(), "flag=on".to_owned()),
+                ("x-a".to_owned(), "2".to_owned()),
+            ]
+        );
+        let mut secret = HeaderValue::from_static("a=1");
+        secret.set_sensitive(true);
+        let mut sent = HeaderMap::new();
+        sent.insert(header::COOKIE, secret);
+        adds.apply(&mut sent);
+        assert!(sent[header::COOKIE].is_sensitive());
     }
 
     #[test]

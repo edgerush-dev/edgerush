@@ -164,7 +164,7 @@
           "type": "object",
           "properties": {
             "add": {
-              "description": "Values to append to whatever the headers had.",
+              "description": "Values to append to whatever the headers had: a field line more, but for `Cookie`,\nwhose one string the value joins after `\"; \"`.",
               "type": "array",
               "items": {
                 "$ref": "#/$defs/Header"
@@ -203,7 +203,7 @@
           "type": "object",
           "properties": {
             "add": {
-              "description": "Values to append to whatever the headers had.",
+              "description": "Values to append to whatever the headers had: a field line more, but for `Cookie`,\nwhose one string the value joins after `\"; \"`.",
               "type": "array",
               "items": {
                 "$ref": "#/$defs/Header"

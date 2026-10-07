@@ -329,7 +329,8 @@ pub struct HeaderChanges {
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(length(max = edgerush_filters::MOST_PER_LIST)))]
     pub set: Vec<Header>,
-    /// Values to append to whatever the headers had.
+    /// Values to append to whatever the headers had: a field line more, but for `Cookie`,
+    /// whose one string the value joins after `"; "`.
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(length(max = edgerush_filters::MOST_PER_LIST)))]
     pub add: Vec<Header>,
