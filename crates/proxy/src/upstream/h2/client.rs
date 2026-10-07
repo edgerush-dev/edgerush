@@ -111,7 +111,9 @@ struct Link {
     released: Notify,
     /// The peer's SETTINGS have been heard: what it announced can be read off the handle.
     settled: Cell<bool>,
-    /// Wakes whoever waits for them.
+    /// The connection has ended, whether or not they were.
+    ended: Cell<bool>,
+    /// Wakes whoever waits for either.
     heard: Notify,
     /// Closed because the worker could not pay for what h2 held of its answers.
     shed: Cell<bool>,
@@ -120,6 +122,11 @@ struct Link {
 impl Link {
     fn settle(&self) {
         self.settled.set(true);
+        self.heard.notify_waiters();
+    }
+
+    fn end(&self) {
+        self.ended.set(true);
         self.heard.notify_waiters();
     }
 }
@@ -193,18 +200,19 @@ impl Place {
         Shed(Rc::clone(&self.link))
     }
 
-    /// Once the peer's SETTINGS have been heard on the place's connection. The pool lets a
+    /// Once the peer's SETTINGS have been heard on the place's connection, true; false if
+    /// the connection ended first, which nothing on it can be sent over. The pool lets a
     /// connection's first stream go before then (15 §3); what the peer announced, such as
     /// extended CONNECT, is known only after ([19 §4](../../../../docs/19-websocket.md)).
-    pub(crate) async fn settled(&self) {
-        let Some(link) = self.client.links.borrow().get(&self.id).cloned() else {
-            return;
-        };
+    pub(crate) async fn settled(&self) -> bool {
         loop {
             // Made before the look, so that a settling in between is not missed.
-            let heard = link.heard.notified();
-            if link.settled.get() {
-                return;
+            let heard = self.link.heard.notified();
+            if self.link.settled.get() {
+                return true;
+            }
+            if self.link.ended.get() {
+                return false;
             }
             heard.await;
         }
@@ -505,6 +513,7 @@ impl Client {
             send: RefCell::new(Some(send.clone())),
             released: Notify::new(),
             settled: Cell::new(false),
+            ended: Cell::new(false),
             heard: Notify::new(),
             shed: Cell::new(false),
         });
@@ -512,6 +521,7 @@ impl Client {
         self.event(|pool, now, actions| pool.opened(key, id, peer, now, actions));
         self.drive(key, id, keepalive, &link, send, connection)
             .await;
+        link.end();
         self.links.borrow_mut().remove(&id);
         self.event(|pool, now, actions| pool.closed(key, id, now, actions));
     }

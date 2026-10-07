@@ -390,8 +390,10 @@ pub(crate) async fn connect<F: OutgoingFields + ?Sized>(
     let connecting = async {
         let mut place = client.place(destination).await?;
         let failed = failed(place.shed());
-        place.settled().await;
-        if !place.sender().is_extended_connect_protocol_enabled() {
+        // A connection that ended unsettled said nothing either way, and is not offered
+        // another try beside it: its readiness fails, and says how.
+        let settled = place.settled().await;
+        if settled && !place.sender().is_extended_connect_protocol_enabled() {
             return Ok(Connected::NotOffered);
         }
         let sender = place.sender();

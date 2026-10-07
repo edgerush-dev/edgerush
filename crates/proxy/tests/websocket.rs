@@ -1562,3 +1562,53 @@ async fn an_extended_connect_that_says_grpc_is_never_answered_2xx() {
     assert_eq!(statuses, [(502, None), (501, None)]);
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
 }
+
+/// An HTTP/2 backend's new connection that ends before its settling PING is answered fails
+/// the WebSocket waiting for its SETTINGS at once, as a request on a dead connection fails
+/// (502), rather than leaving it to wait out the answer's head deadline (60 s).
+#[tokio::test]
+async fn a_websocket_waiting_for_settings_fails_when_the_connection_ends() {
+    let (dying, opened) = backend(|mut wire| async move {
+        // The client's preface and SETTINGS, then SETTINGS announcing extended CONNECT, and
+        // no answer to anything after: the connection closes without a PING's answer.
+        let mut first = [0; 64];
+        let _read = within(wire.stream.read(&mut first)).await;
+        let settings = [0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 1];
+        let _wrote = wire.stream.write_all(&settings).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(wire);
+    });
+    let (unused, _) = backend(|_| async {});
+    let (address, _) = gateway(unused, FORWARD_H2, &h2_upstream(dying));
+    let mut client = Wire::to(address).await;
+    client.write(&handshake()).await;
+    let began = Instant::now();
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        began.elapsed()
+    );
+    assert!(opened.load(Ordering::SeqCst) >= 1);
+}
+
+/// The same for a connection that ends before the backend's SETTINGS came at all: having
+/// said nothing of extended CONNECT, it is not taken as having refused them, so the
+/// handshake is not tried again as a plain GET on a connection of its own.
+#[tokio::test]
+async fn a_websocket_on_a_connection_that_ends_before_its_settings_is_not_tried_again() {
+    let (dying, opened) = backend(|mut wire| async move {
+        let mut first = [0; 64];
+        let _read = within(wire.stream.read(&mut first)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(wire);
+    });
+    let (unused, _) = backend(|_| async {});
+    let (address, _) = gateway(unused, FORWARD_H2, &h2_upstream(dying));
+    let mut client = Wire::to(address).await;
+    client.write(&handshake()).await;
+    let head = within(client.head()).await;
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    assert_eq!(opened.load(Ordering::SeqCst), 1);
+}
