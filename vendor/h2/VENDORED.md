@@ -11,7 +11,8 @@ benchmarks, which are not here; nothing builds them.
 
 Every change is marked `EdgeRush:` in the source. Two additions, for idle connections
 (14 §3 of the design docs) and for charging what a connection holds (15 §3), checks RFC
-9113 asks for that published h2 does not make (15 §3), and one allowance, for fuzz builds:
+9113 asks for that published h2 does not make (15 §3), the never-indexed mark RFC 7541 asks
+an intermediary to keep (15 §3), and one allowance, for fuzz builds:
 
 - **A server connection can give back its buffers.** h2 makes three buffers for every
   connection when it is handshaken, and keeps them for the connection's life: the 16 KiB
@@ -62,6 +63,10 @@ Every change is marked `EdgeRush:` in the source. Two additions, for idle connec
   (`frame/go_away.rs`) is given the frame's head and refuses it, and the connection is
   closed with PROTOCOL_ERROR: h2's own fix, `d4a37fc` (#951), not in a release yet, carried
   as it was made; drop it when a release has it.
+- **A field sent never indexed keeps the mark** (RFC 7541 §6.2.3: an intermediary
+  re-encodes it the same way). Published h2 decoded it as any literal (a `TODO` in
+  `hpack/decoder.rs`). The decoder now marks its value sensitive, which h2's encoder already
+  never indexes, so a value passed on to the next hop as it was handed over goes as it came.
 - **Its fuzzing module may go undocumented in every build.** cargo-fuzz builds with
   `--cfg fuzzing`, which brings in h2's `fuzz_bridge` module, and h2 denies `missing_docs`
   but allows it there only with its `unstable` feature. The lints of a registry dependency
@@ -86,7 +91,10 @@ a fragment by `a_path_with_a_fragment_is_reset`, of an answer without `:status` 
 `an_answer_with_a_requests_pseudo_field_is_reset`, and of pseudo-fields in trailers by
 `an_answers_trailers_with_a_pseudo_field_are_refused` and
 `a_requests_trailers_with_a_pseudo_field_are_reset`, and of a GOAWAY on a stream by
-`a_goaway_on_a_stream_is_a_connection_error_to_a_server` and `…_to_a_client`.
+`a_goaway_on_a_stream_is_a_connection_error_to_a_server` and `…_to_a_client`; the
+never-indexed mark by `a_requests_field_sent_never_indexed_is_handed_over_sensitive` and
+`an_answers_field_sent_never_indexed_is_handed_over_sensitive`, and through the proxy by
+`a_field_sent_never_indexed_stays_never_indexed_both_ways_through_an_http2_upstream`.
 The allowance is covered by building any fuzz target with cargo-fuzz (the repository
 README).
 

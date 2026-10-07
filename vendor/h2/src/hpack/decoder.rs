@@ -247,10 +247,15 @@ impl Decoder {
                 LiteralNeverIndexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
                     can_resize = false;
-                    let entry = self.decode_literal(src, false)?;
+                    let mut entry = self.decode_literal(src, false)?;
                     consume(src);
 
-                    // TODO: Track that this should never be indexed
+                    // EdgeRush: RFC 7541 §6.2.3, an intermediary re-encodes this field the
+                    // same way. A sensitive value is what h2's encoder never indexes, and
+                    // a clone of it keeps the mark for the hop after.
+                    if let Header::Field { ref mut value, .. } = entry {
+                        value.set_sensitive(true);
+                    }
 
                     if f(entry).is_break() {
                         break;

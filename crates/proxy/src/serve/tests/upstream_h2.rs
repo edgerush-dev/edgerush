@@ -1351,3 +1351,53 @@ async fn an_answer_cut_by_a_connection_shed_for_storage_is_not_the_upstreams_bod
         })
         .await;
 }
+
+/// A field an HTTP/2 client sent "never indexed" goes to an HTTP/2 upstream the same way,
+/// and an upstream's back to the client (RFC 7541 §6.2.3, §7.1.3): never in the dynamic
+/// table of an upstream connection other clients' requests share. Each side's decoder
+/// marks such a field sensitive, so a mark seen there is the representation it came in.
+#[tokio::test]
+async fn a_field_sent_never_indexed_stays_never_indexed_both_ways_through_an_http2_upstream() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let heard = Rc::new(RefCell::new(None::<(bool, bool)>));
+            let hearing = Rc::clone(&heard);
+            let script: Script = Rc::new(move |request, mut respond| {
+                let hearing = Rc::clone(&hearing);
+                Box::pin(async move {
+                    let fields = request.headers();
+                    *hearing.borrow_mut() = Some((
+                        fields["x-api-key"].is_sensitive(),
+                        fields["x-plain"].is_sensitive(),
+                    ));
+                    let mut token = http::HeaderValue::from_static("secret");
+                    token.set_sensitive(true);
+                    let answer = http::Response::builder()
+                        .header("x-token", token)
+                        .header("x-plain", "a")
+                        .body(())
+                        .unwrap();
+                    let _ = respond.send_response(answer, true);
+                })
+            });
+            let upstream = scripted_h2_upstream(script).await;
+            let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let mut key = http::HeaderValue::from_static("secret");
+            key.set_sensitive(true);
+            let request = Request::get("http://a.test/")
+                .header("x-api-key", key)
+                .header("x-plain", "a")
+                .body(())
+                .unwrap();
+            let (answer, _) = send.send_request(request, true).unwrap();
+            let answer = within(answer).await.unwrap();
+            assert_eq!(answer.status(), StatusCode::OK);
+            assert_eq!(*heard.borrow(), Some((true, false)));
+            assert!(answer.headers()["x-token"].is_sensitive());
+            assert!(!answer.headers()["x-plain"].is_sensitive());
+        })
+        .await;
+}

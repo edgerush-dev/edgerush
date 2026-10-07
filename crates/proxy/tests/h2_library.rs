@@ -1808,3 +1808,46 @@ async fn a_goaway_on_a_stream_is_a_connection_error_to_a_client() {
         Some(Some(Reason::PROTOCOL_ERROR))
     );
 }
+
+/// A field as a literal "never indexed" with a literal name, without Huffman coding (RFC
+/// 7541 §6.2.3), to follow a block of `h2_peer::block`'s.
+fn never_indexed(name: &str, value: &str) -> Vec<u8> {
+    let mut out = vec![0x10];
+    for part in [name, value] {
+        out.push(u8::try_from(part.len()).unwrap());
+        out.extend_from_slice(part.as_bytes());
+    }
+    out
+}
+
+/// RFC 7541 §6.2.3: an intermediary re-encodes a field it was sent "never indexed" the same
+/// way. h2 as published dropped the mark when it decoded one; this copy marks its value
+/// sensitive, which h2's encoder never indexes, so a request handed over keeps it for the
+/// hop after. A field sent otherwise is not marked.
+#[tokio::test]
+async fn a_requests_field_sent_never_indexed_is_handed_over_sensitive() {
+    let (connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    let mut server = serve(connection, Serve::Hold);
+    let mut block = h2_peer::request("GET", "/");
+    block.extend(h2_peer::block(&[("x-plain", "a")]));
+    block.extend(never_indexed("x-api-key", "secret"));
+    peer.send(&h2_peer::headers(1, block, true)).await;
+    let (request, _) = server.next().await;
+    assert!(request.headers()["x-api-key"].is_sensitive());
+    assert!(!request.headers()["x-plain"].is_sensitive());
+}
+
+/// The same for an answer's fields, which h2's client decodes.
+#[tokio::test]
+async fn an_answers_field_sent_never_indexed_is_handed_over_sensitive() {
+    let (mut client, mut peer) = client(&[]).await;
+    let answered = open(&mut client.send);
+    opened(&mut peer, 1).await;
+    let mut block = h2_peer::response(200);
+    block.extend(h2_peer::block(&[("x-plain", "a")]));
+    block.extend(never_indexed("x-token", "secret"));
+    peer.send(&h2_peer::headers(1, block, true)).await;
+    let answer = within(answered).await.unwrap();
+    assert!(answer.headers()["x-token"].is_sensitive());
+    assert!(!answer.headers()["x-plain"].is_sensitive());
+}
