@@ -1526,3 +1526,39 @@ async fn a_handshake_tried_again_is_carried_to_an_http2_backend_once_it_switches
     assert_eq!(within(client.exactly(4)).await, "ping");
     assert_eq!(tries.load(Ordering::SeqCst), 2);
 }
+
+/// An extended CONNECT is answered 2xx only when its tunnel opens (RFC 9110 §9.3.6, 19 §3,
+/// §4), whatever content type its client gave it: a page in place of the switch is 502,
+/// and a protocol not carried 501, never the 200 that answers a gRPC call the gateway
+/// refuses. A CONNECT is never a gRPC call.
+#[tokio::test]
+async fn an_extended_connect_that_says_grpc_is_never_answered_2xx() {
+    let (upstream, accepted) = backend(|mut wire| async move {
+        let _head = wire.head().await;
+        wire.write("HTTP/1.1 200 OK\r\ncontent-length: 15\r\n\r\n<html>hi</html>")
+            .await;
+        let _closed = within(wire.rest()).await;
+    });
+    let (address, _) = gateway(upstream, FORWARD, "");
+    let (mut send, _) = h2_client(address).await;
+    let mut statuses = Vec::new();
+    for protocol in ["websocket", "webtransport"] {
+        send = within(send.ready()).await.unwrap();
+        let mut request = connect_for(protocol);
+        request.headers_mut().insert(
+            "content-type",
+            http::HeaderValue::from_static("application/grpc"),
+        );
+        let (response, _stream) = send.send_request(request, false).unwrap();
+        let response = within(response).await.unwrap();
+        statuses.push((
+            response.status().as_u16(),
+            response
+                .headers()
+                .get("grpc-status")
+                .map(|status| status.to_str().unwrap().to_owned()),
+        ));
+    }
+    assert_eq!(statuses, [(502, None), (501, None)]);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}

@@ -689,6 +689,45 @@ async fn an_http3_extended_connect_for_another_protocol_is_answered_501() {
         .await;
 }
 
+/// The same over HTTP/3: an extended CONNECT that says it is gRPC is still answered 501,
+/// not 200 with a gRPC status (RFC 9110 §9.3.6).
+#[tokio::test]
+async fn an_http3_extended_connect_that_says_grpc_is_never_answered_2xx() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::Client;
+            let (upstream, opened) = counting_upstream().await;
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let (front, _) = serving_h3(&h3_config(upstream, http3)).await;
+            let mut client = Client::connect(front, "a.test").await;
+            let mut head = h3_connect("connect-udp");
+            head.push(("content-type", "application/grpc"));
+            let id = client.request(&head, false);
+            client
+                .until(|client| {
+                    client
+                        .answers
+                        .get(&id)
+                        .is_some_and(|answer| answer.final_status().is_some())
+                })
+                .await;
+            let answer = client.answers.get(&id).unwrap().clone();
+            assert_eq!(answer.final_status(), Some("501"), "{answer:?}");
+            assert!(
+                !answer.heads[0]
+                    .iter()
+                    .any(|(name, _)| name == "grpc-status"),
+                "{answer:?}"
+            );
+            assert_eq!(opened.load(Ordering::SeqCst), 0);
+        })
+        .await;
+}
+
 /// A backend whose connection fails under an HTTP/3 WebSocket has the client's stream
 /// reset with `H3_REQUEST_CANCELLED` (RFC 9220 §3), and the tunnel counted as failed.
 #[tokio::test]

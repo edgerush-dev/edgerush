@@ -20,7 +20,7 @@ use edgerush_config::CompiledListener;
 use edgerush_filters::{HeaderModifier, request_id};
 use edgerush_router::Fields;
 use http::header::{CONTENT_TYPE, LOCATION, SEC_WEBSOCKET_ACCEPT, UPGRADE};
-use http::{HeaderName, HeaderValue, Response, StatusCode, Version};
+use http::{HeaderName, HeaderValue, Method, Response, StatusCode, Version};
 
 /// An answer's head, as the way back edits it: its status and its fields.
 pub trait AnswerHead {
@@ -283,12 +283,13 @@ pub fn alt_svc(listener: &CompiledListener, port: u16) -> Option<HeaderModifier>
 }
 
 /// Whether a request is a gRPC call, which the gateway answers itself as gRPC does: HTTP/2
-/// or HTTP/3 with one gRPC content type, read from its head as the client sent it (15 §6).
+/// or HTTP/3 with one gRPC content type, read from its head as the client sent it (15 §6),
+/// and never a CONNECT, which a 2xx would tell its tunnel opened (RFC 9110 §9.3.6).
 /// What `serve` reads a call by, without the deadline it reads beside it; a test holds the
 /// two to each other.
 #[must_use]
-pub fn is_grpc_call<F: Fields + ?Sized>(version: Version, fields: &F) -> bool {
-    if !matches!(version, Version::HTTP_2 | Version::HTTP_3) {
+pub fn is_grpc_call<F: Fields + ?Sized>(version: Version, method: &Method, fields: &F) -> bool {
+    if !matches!(version, Version::HTTP_2 | Version::HTTP_3) || method == Method::CONNECT {
         return false;
     }
     let mut types = fields.values(&CONTENT_TYPE);
@@ -776,13 +777,14 @@ mod tests {
             let _same = edited(&sent, &way);
         }
 
-        /// A call is told as `serve`'s request reads one: by its version and its content
-        /// types, whatever its deadline says.
+        /// A call is told as `serve`'s request reads one: by its version, its method and
+        /// its content types, whatever its deadline says.
         #[test]
         fn a_call_is_told_as_serve_tells_one(
             version in prop::sample::select(vec![
                 Version::HTTP_10, Version::HTTP_11, Version::HTTP_2, Version::HTTP_3,
             ]),
+            method in prop::sample::select(vec![Method::POST, Method::GET, Method::CONNECT]),
             types in prop::collection::vec(prop::sample::select(vec![
                 "application/grpc", "application/grpc+proto", "Application/GRPC",
                 "application/grpc; charset=utf-8", "application/grpcx", "application/json",
@@ -799,8 +801,9 @@ mod tests {
             for value in &timeouts {
                 fields.append("grpc-timeout", HeaderValue::from_static(value));
             }
-            let call = crate::grpc::call::Call::of(version, &fields, tokio::time::Instant::now);
-            prop_assert_eq!(is_grpc_call(version, &fields), call.is_some());
+            let call =
+                crate::grpc::call::Call::of(version, &method, &fields, tokio::time::Instant::now);
+            prop_assert_eq!(is_grpc_call(version, &method, &fields), call.is_some());
         }
     }
 }

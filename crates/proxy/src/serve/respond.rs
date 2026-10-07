@@ -164,7 +164,7 @@ impl Worker {
         let sending = sending_for(&head, &body);
         // A gRPC call is answered as one, the gateway's own answers included; read from the
         // head as the client sent it, before any filter touches it (15 §6).
-        let call = Call::of(head.version(), head.outgoing(), Instant::now);
+        let call = Call::of(head.version(), head.method(), head.outgoing(), Instant::now);
         let deadline = call.and_then(|call| call.deadline());
         if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
             return self

@@ -191,7 +191,7 @@ fn answer(
 ) -> Option<http::Response<()>> {
     // Read from the head as the client sent it, as `serve` reads it.
     let sent: HeaderMap = asked.headers.iter().cloned().collect();
-    let call = way_back::is_grpc_call(asked.protocol, &sent);
+    let call = way_back::is_grpc_call(asked.protocol, &asked.method, &sent);
     let mut answer = http::Response::new(());
     match decided {
         Ok(Decision::Forward(forward)) => {
