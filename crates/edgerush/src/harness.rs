@@ -249,6 +249,8 @@ enum Failure {
     Workers(#[from] per_core::NotStarted),
     #[error("{0}: the data plane stops, to be started afresh")]
     Ended(Ended),
+    #[error("{0} while the data plane drained")]
+    PanickedDraining(Ended),
 }
 
 fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
@@ -409,7 +411,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
             .sum::<usize>()
             .max(proxy.open_connections())
     };
-    match drained(held, &stop, DRAIN) {
+    let (how, panicked) = drained(held, &stop, DRAIN);
+    match how {
         Drained::Empty => say(stderr, format_args!("drained")),
         Drained::OutOfTime(held) => say(
             stderr,
@@ -426,7 +429,12 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
             format_args!("out of time writing the access logs: what was left is lost"),
         );
     }
-    Ok(())
+    // A panic as the workers drained fails the process all the same, once the drain has let
+    // the other workers' requests finish (03 §2): an exit status of 0 would hide it.
+    match panicked {
+        Some(ended) => Err(Failure::PanickedDraining(ended)),
+        None => Ok(()),
+    }
 }
 
 /// How a drain ended.
@@ -463,20 +471,30 @@ fn next(told: &Receiver<Told>, every: Duration) -> Next {
 }
 
 /// Waits until nothing is `held` — no connection, over TCP or QUIC — `within` is up, or
-/// `stop` says to stop again.
-fn drained(held: impl Fn() -> usize, stop: &Receiver<Told>, within: Duration) -> Drained {
+/// `stop` says to stop again; and says the first watched task or thread that panicked
+/// meanwhile, which does not cut the drain short.
+fn drained(
+    held: impl Fn() -> usize,
+    stop: &Receiver<Told>,
+    within: Duration,
+) -> (Drained, Option<Ended>) {
     let until = Instant::now() + within;
+    let mut panicked = None;
     loop {
         let held = held();
         if held == 0 {
-            return Drained::Empty;
+            return (Drained::Empty, panicked);
         }
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Drained::OutOfTime(held);
+            return (Drained::OutOfTime(held), panicked);
         }
         match stop.recv_timeout(DRAIN_POLL.min(left)) {
-            Ok(Told::Stop) => return Drained::Stopped(held),
+            Ok(Told::Stop) => return (Drained::Stopped(held), panicked),
+            // A panic is remembered; the other workers' requests still finish.
+            Ok(Told::Ended(ended)) if !ended.finished => {
+                panicked.get_or_insert(ended);
+            }
             // With nobody left to say stop, the drain runs its course.
             // What ends as the workers drain, their accepting first, was meant to.
             Ok(Told::Ended(_))
@@ -882,7 +900,7 @@ mod tests {
         let began = Instant::now();
         assert_eq!(
             drained(|| loads.now().iter().sum(), &stop, Duration::from_secs(10)),
-            Drained::Empty
+            (Drained::Empty, None)
         );
         assert!(began.elapsed() < Duration::from_secs(2));
         going.join().unwrap();
@@ -907,7 +925,7 @@ mod tests {
         };
         assert_eq!(
             drained(held, &stop, Duration::from_secs(10)),
-            Drained::Empty
+            (Drained::Empty, None)
         );
         assert!(began.elapsed() >= Duration::from_millis(200));
         gone.join().unwrap();
@@ -923,7 +941,7 @@ mod tests {
         let within = Duration::from_millis(300);
         assert_eq!(
             drained(|| loads.now().iter().sum(), &stop, within),
-            Drained::OutOfTime(1)
+            (Drained::OutOfTime(1), None)
         );
         let took = began.elapsed();
         assert!(took >= within && took < within * 3, "{took:?}");
@@ -939,14 +957,14 @@ mod tests {
         let began = Instant::now();
         assert_eq!(
             drained(|| loads.now().iter().sum(), &stop, Duration::from_secs(10)),
-            Drained::Stopped(1)
+            (Drained::Stopped(1), None)
         );
         assert!(began.elapsed() < Duration::from_secs(1));
         drop(stopping);
         let within = Duration::from_millis(200);
         assert_eq!(
             drained(|| loads.now().iter().sum(), &stop, within),
-            Drained::OutOfTime(1)
+            (Drained::OutOfTime(1), None)
         );
     }
 
@@ -968,9 +986,47 @@ mod tests {
         });
         assert_eq!(
             drained(|| loads.now().iter().sum(), &stop, Duration::from_secs(10)),
-            Drained::Empty
+            (Drained::Empty, None)
         );
         going.join().unwrap();
+    }
+
+    /// A watched thread that panics as the workers drain does not cut the drain short — the
+    /// other workers' requests still finish — but is remembered, the first of them, for the
+    /// process to fail with once the drain is done (03 §2; review A01-02, C3).
+    #[test]
+    fn a_panic_as_the_workers_drain_is_remembered_and_the_drain_goes_on() {
+        let loads = Loads::new(1, 8, QUIC_MOST, 1);
+        let held = loads.hold(0, 0);
+        let (stopping, stop) = mpsc::channel();
+        let panicked = |what: &str| Ended {
+            what: what.to_owned(),
+            finished: false,
+        };
+        stopping
+            .send(Told::Ended(panicked("worker 1's sweep and timers")))
+            .unwrap();
+        stopping
+            .send(Told::Ended(Ended {
+                what: "worker 0's accepting on listener \"web\"".to_owned(),
+                finished: true,
+            }))
+            .unwrap();
+        stopping
+            .send(Told::Ended(panicked("the health checker")))
+            .unwrap();
+        let going = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+        let (how, first) = drained(|| loads.now().iter().sum(), &stop, Duration::from_secs(10));
+        going.join().unwrap();
+        assert_eq!(how, Drained::Empty);
+        assert_eq!(first, Some(panicked("worker 1's sweep and timers")));
+        assert_eq!(
+            Failure::PanickedDraining(panicked("worker 1's sweep and timers")).to_string(),
+            "worker 1's sweep and timers panicked while the data plane drained"
+        );
     }
 
     /// The main loop looks at the config again while nothing is said, stops when a signal
