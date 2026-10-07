@@ -2173,6 +2173,34 @@ fn an_unknown_version_is_negotiated_and_a_short_initial_ignored() {
     });
 }
 
+/// The same rule holds for a connection that exists: an Initial in a datagram under 1,200
+/// bytes is discarded before it is looked up (RFC 9000 §14.1), so the connection's quiche
+/// never hears one, while a whole Initial sent again still reaches it.
+#[test]
+fn a_short_initial_never_reaches_a_connection_under_way() {
+    locally(async {
+        let server = serving(short(), echo).await;
+        let mut client = Client::new(server.address, "a.test").await;
+        let mut out = vec![0; 1_500];
+        let (len, _) = client.quic.send(&mut out).unwrap();
+        client.send_raw(&out[..len], server.address).await;
+        client.hear_for(Duration::from_millis(300)).await;
+        let before = server.connection(|state| state.heard);
+        client.send_raw(&out[..1_000], server.address).await;
+        client.send_raw(&out[..len], server.address).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while server.connection(|state| state.heard) == before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the whole Initial never came"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(server.connection(|state| state.heard), before + 1);
+    });
+}
+
 /// The threshold is the worker's (16 §6): a handshake under way on one of its HTTP/3
 /// listeners counts on the others, and a client of another listener proves its address
 /// first.

@@ -519,10 +519,15 @@ where
 }
 
 /// The destination ID of a datagram's first packet, copied out of it: `None` if there is no
-/// header to read, `Some(None)` for an ID longer than any connection is known by.
+/// header to read, or if the packet is an Initial in a datagram under 1,200 bytes, which is
+/// discarded whichever connection it is for (RFC 9000 §14.1); `Some(None)` for an ID longer
+/// than any connection is known by.
 fn destination(datagram: &[u8]) -> Option<Option<Id>> {
     let dcid = match header::read(datagram, id::LEN)? {
         Header::Short { dcid } => dcid,
+        Header::Long(long) if long.is_initial() && datagram.len() < INITIAL_DATAGRAM => {
+            return None;
+        }
         Header::Long(long) => long.dcid,
     };
     Some(Id::of(dcid))
@@ -564,9 +569,9 @@ fn admit<T: Fn() -> Option<InForce>>(
         }
         return None;
     }
-    // A worker whose storage is full takes no one, as at its bound (16 §6).
+    // A worker whose storage is full takes no one, as at its bound (16 §6). An Initial too
+    // small to start one never came this far (`destination`).
     if !long.is_initial()
-        || datagram.len() < INITIAL_DATAGRAM
         || shared.drain.is_on()
         || shared.connections.get() >= shared.settings.connections
         || !shared.storage.has_room()
