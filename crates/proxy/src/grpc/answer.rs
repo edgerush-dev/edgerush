@@ -153,14 +153,27 @@ where
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Ok(frame))) => {
-                if let Some(trailers) = frame.trailers_ref() {
-                    this.ended = true;
-                    // Trailers with no status end the call no better than none at all.
-                    let code = trailers
-                        .get("grpc-status")
-                        .map_or(Code::Unknown as usize, |status| code_of(status.as_bytes()));
-                    this.count.ended(code);
-                }
+                let frame = match frame.into_trailers() {
+                    Ok(mut trailers) => {
+                        this.ended = true;
+                        let code = match trailers.get("grpc-status") {
+                            Some(status) => code_of(status.as_bytes()),
+                            // Trailers with no status end the call no better than none at
+                            // all: INTERNAL, told in them, their metadata kept (15 §6).
+                            None => {
+                                trailers.insert("grpc-status", Code::Internal.value());
+                                trailers.insert(
+                                    "grpc-message",
+                                    message("the upstream ended the call without a status"),
+                                );
+                                Code::Internal as usize
+                            }
+                        };
+                        this.count.ended(code);
+                        Frame::trailers(trailers)
+                    }
+                    Err(frame) => frame,
+                };
                 Poll::Ready(Some(Ok(frame)))
             }
             // Failed part way: the client is told so in the trailers, while it can be.
@@ -330,6 +343,29 @@ mod tests {
             );
             assert_eq!(*counted.0.borrow(), [code.parse::<usize>().unwrap()]);
         }
+    }
+
+    /// Trailers with no status end the call no better than none at all: the client is told
+    /// INTERNAL in them, with the rest of what they carry, and the call counted so
+    /// (15 §6; review A04-07).
+    #[tokio::test]
+    async fn trailers_without_a_status_end_the_call_internal() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-note", "kept".parse().unwrap());
+        let counted = Counted::default();
+        let inner = scripted(vec![data(), Ok(Frame::trailers(trailers))], false);
+        let mut answered = Answered::counted(inner, &HeaderMap::new(), None, counted.clone());
+        let mut last = None;
+        while let Some(frame) = answered.frame().await {
+            if let Ok(trailers) = frame.unwrap().into_trailers() {
+                last = Some(trailers);
+            }
+        }
+        let last = last.expect("trailers");
+        assert_eq!(last["grpc-status"], "13");
+        assert!(last.contains_key("grpc-message"));
+        assert_eq!(last["x-note"], "kept");
+        assert_eq!(*counted.0.borrow(), [13]);
     }
 
     #[tokio::test]

@@ -252,3 +252,47 @@ async fn a_status_in_a_head_that_goes_on_counts_the_call_once_by_its_trailers() 
         })
         .await;
 }
+
+/// An upstream's gRPC trailers that say no `grpc-status` end the call INTERNAL, as an
+/// answer with no trailers at all does (15 §6): the client is told one status
+/// (review A04-07).
+#[tokio::test]
+async fn trailers_without_a_status_end_the_call_internal() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let script: Script = Rc::new(|_request, mut respond| {
+                Box::pin(async move {
+                    let Ok(mut sending) = respond.send_response(grpc_head(), false) else {
+                        return;
+                    };
+                    let _ = sending.send_data(Bytes::from_static(b"\0\0\0\0\x01m"), false);
+                    let mut trailers = http::HeaderMap::new();
+                    trailers.insert("x-note", "no status".parse().unwrap());
+                    let _ = sending.send_trailers(trailers);
+                })
+            });
+            let upstream = scripted_h2_upstream(script).await;
+            let (front, _worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let (answer, _) = send
+                .send_request(grpc_call("/pkg.Svc/NoStatus", None), true)
+                .unwrap();
+            let mut body = within(answer).await.unwrap().into_body();
+            while let Some(chunk) = within(body.data()).await {
+                let Ok(chunk) = chunk else { break };
+                let _ = body.flow_control().release_capacity(chunk.len());
+            }
+            let trailers = within(std::future::poll_fn(|cx| body.poll_trailers(cx))).await;
+            let status = trailers
+                .ok()
+                .flatten()
+                .and_then(|trailers| trailers.get("grpc-status").cloned());
+            assert_eq!(
+                status.as_ref().and_then(|status| status.to_str().ok()),
+                Some("13"),
+                "the client was told {status:?}"
+            );
+        })
+        .await;
+}
