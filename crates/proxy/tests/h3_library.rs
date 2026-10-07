@@ -279,6 +279,68 @@ fn retry_binds_the_first_id_or_the_handshake_fails() {
     }
 }
 
+/// A Retry token that fails is answered with a CONNECTION_CLOSE carrying INVALID_TOKEN, in
+/// an Initial made without a connection (RFC 9000 §8.1.3), which quiche as published cannot
+/// write: the vendored `invalid_token_close`. The client, back at the Retry's ID with its
+/// token, reads it under that ID's keys and gives up at once, told why.
+#[test]
+fn an_invalid_retry_token_is_told_with_a_close_the_client_reads() {
+    let mut config = client_config();
+    let client = quiche::connect(
+        Some(h3_peer::SERVER_NAME),
+        &id(0xc1, 16),
+        client_addr(),
+        server_addr(),
+        &mut config,
+    )
+    .unwrap();
+    let mut pipe = Pipe::of(
+        client,
+        quiche::accept(
+            &id(0xee, ID_LEN),
+            None,
+            server_addr(),
+            "203.0.113.9:1".parse().unwrap(),
+            &mut server_ids(),
+        )
+        .unwrap(),
+    );
+    let mut initial = pipe.client_flush().remove(0);
+    let header = quiche::Header::from_slice(&mut initial.bytes, ID_LEN).unwrap();
+    let retry_id = id(0xa7, ID_LEN);
+    let mut out = vec![0; 1_500];
+    let len = quiche::retry(
+        &header.scid,
+        &header.dcid,
+        &retry_id,
+        b"token of ours",
+        header.version,
+        &mut out,
+    )
+    .unwrap();
+    pipe.deliver_to_client(Datagram {
+        bytes: out[..len].to_vec(),
+        from: server_addr(),
+        to: client_addr(),
+    });
+
+    let mut again = pipe.client_flush().remove(0);
+    let header = quiche::Header::from_slice(&mut again.bytes, ID_LEN).unwrap();
+    assert_eq!(header.dcid, retry_id);
+    let len =
+        quiche::invalid_token_close(&header.scid, &header.dcid, header.version, &mut out).unwrap();
+    assert!(len < 1_200, "{len} bytes: no larger than what it answers");
+    pipe.deliver_to_client(Datagram {
+        bytes: out[..len].to_vec(),
+        from: server_addr(),
+        to: client_addr(),
+    });
+
+    let error = pipe.client.peer_error().expect("the client was told");
+    assert_eq!((error.is_app, error.error_code), (false, 0xb));
+    assert!(pipe.client.is_draining() || pipe.client.is_closed());
+}
+
 /// `timeout_instant` names the next time quiche must be called back, idle close included,
 /// and `on_timeout` at that time is what closes an idle connection: quiche keeps no timer
 /// and closes nothing on its own (16 §4, timers).

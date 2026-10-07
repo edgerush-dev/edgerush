@@ -784,6 +784,61 @@ pub fn retry(
     Ok(b.off())
 }
 
+/// EdgeRush: a CONNECTION_CLOSE with INVALID_TOKEN, in an Initial packet made without a
+/// connection, for a client whose Initial carried a Retry token that failed (RFC 9000
+/// §8.1.3: the client will take no other Retry). `scid` and `dcid` are the source and
+/// destination IDs of the client's Initial; its keys come from `dcid`, as the client's own
+/// did, and the packet is sent from it.
+pub fn invalid_token_close(
+    scid: &[u8], dcid: &[u8], version: u32, out: &mut [u8],
+) -> Result<usize> {
+    if !crate::version_is_supported(version) {
+        return Err(Error::UnknownVersion);
+    }
+
+    let (_, mut seal) =
+        crypto::derive_initial_key_material(dcid, version, true, false)?;
+
+    let pn = 0;
+    let pn_len = 1;
+
+    let hdr = Header {
+        ty: Type::Initial,
+        version,
+        dcid: ConnectionId::from_ref(scid),
+        scid: ConnectionId::from_ref(dcid),
+        pkt_num: pn,
+        pkt_num_len: pn_len,
+        token: None,
+        versions: None,
+        key_phase: false,
+    };
+
+    let close = crate::frame::Frame::ConnectionClose {
+        error_code: crate::WireErrorCode::InvalidToken as u64,
+        frame_type: 0,
+        reason: Vec::new(),
+    };
+
+    let mut b = octets::OctetsMut::with_slice(out);
+
+    hdr.to_bytes(&mut b)?;
+
+    // Four bytes of frame: with the packet number, the tag and the header
+    // protection's sample have room.
+    let payload_len = close.wire_len();
+    let len = pn_len + payload_len + seal.alg().tag_len();
+    b.put_varint_with_len(len as u64, 2)?;
+
+    encode_pkt_num(pn, pn_len, &mut b)?;
+
+    let payload_offset = b.off();
+
+    close.to_bytes(&mut b)?;
+
+    encrypt_pkt(&mut b, pn, pn_len, payload_len, payload_offset, None, &mut seal)
+}
+
 pub fn verify_retry_integrity(
     b: &octets::OctetsMut, odcid: &[u8], version: u32,
 ) -> Result<()> {

@@ -2221,6 +2221,70 @@ fn a_resumed_client_is_never_let_send_early_data() {
     });
 }
 
+/// A client whose Retry token no longer holds — its NAT moved it to a new port between the
+/// Retry and its next Initial, and the token binds the address it was sent to — is told at
+/// once with INVALID_TOKEN (RFC 9000 §8.1.3), free to start a new connection, rather than
+/// left to send the same token until its handshake timer gives up. Nothing is accepted.
+#[test]
+fn a_retry_token_that_fails_is_answered_invalid_token() {
+    locally(async {
+        let settings = Settings {
+            retry_above: 0,
+            ..short()
+        };
+        let server = serving(settings, echo).await;
+        let mut client = Client::new(server.address, "a.test").await;
+        client.flush().await;
+        client.hear_for(Duration::from_millis(300)).await;
+        client.rebind().await;
+        client
+            .until(|client| client.quic.peer_error().is_some())
+            .await;
+        let error = client.quic.peer_error().unwrap();
+        assert_eq!((error.is_app, error.error_code), (false, 0xb));
+        assert_eq!(server.shared.connections.get(), 0);
+    });
+}
+
+/// The same when the worker no longer asks for a token, its handshakes under way having
+/// fallen below the threshold meanwhile: a Retry token that fails is still told so, never
+/// taken as no token, which would spend a handshake on a client that must refuse it for want
+/// of the Retry's parameters.
+#[test]
+fn a_retry_token_that_fails_is_answered_invalid_token_below_the_threshold() {
+    locally(async {
+        let settings = Settings {
+            retry_above: 1,
+            ..short()
+        };
+        let server = serving(settings, echo).await;
+        // A handshake left under way, so that the next client is asked to prove its address.
+        let mut waiting = Client::new(server.address, "a.test").await;
+        waiting.flush().await;
+        waiting.hear_for(Duration::from_millis(300)).await;
+        let mut client = Client::new(server.address, "a.test").await;
+        client.flush().await;
+        client.hear_for(Duration::from_millis(300)).await;
+        assert!(
+            client
+                .received
+                .iter()
+                .any(|datagram| datagram[0] & 0xf0 == 0xf0),
+            "no Retry"
+        );
+        // The first handshake done, none is under way: no token is asked any more.
+        waiting.until(|waiting| waiting.quic.is_established()).await;
+        waiting.for_a_while(Duration::from_millis(100)).await;
+        assert_eq!(server.shared.handshakes.get(), 0);
+        client.rebind().await;
+        client
+            .until(|client| client.quic.peer_error().is_some())
+            .await;
+        let error = client.quic.peer_error().unwrap();
+        assert_eq!((error.is_app, error.error_code), (false, 0xb));
+    });
+}
+
 /// The threshold is the worker's (16 §6): a handshake under way on one of its HTTP/3
 /// listeners counts on the others, and a client of another listener proves its address
 /// first.

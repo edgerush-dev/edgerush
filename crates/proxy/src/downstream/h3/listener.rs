@@ -605,8 +605,14 @@ fn admit<T: Fn() -> Option<InForce>>(
     if !token.is_empty() {
         match token::validate(&shared.retry_key, now, from, &token) {
             Some(original) => retried = Some(original.to_vec()),
-            // Not ours, or stale: as if there were none, unless a token is required.
-            None if must_prove => return None,
+            // A Retry token that fails — another address, too old, not ours — is told so at
+            // once: its client will take no other Retry (RFC 9000 §8.1.3), and a handshake
+            // without the Retry's parameters is one it must refuse.
+            None if token::is_retry(&token) => {
+                invalid_token(shared, &scid_of_client, &dcid, from);
+                return None;
+            }
+            // A token of another kind: as if there were none.
             None => {}
         }
     }
@@ -705,6 +711,22 @@ fn retry(shared: &Shared, scid: &[u8], odcid: &[u8], now: u64, to: SocketAddr) {
     if let Ok(written) = written {
         let _sent = shared.socket.try_send_to(&out[..written], to);
         (shared.count)(Quic::Retry);
+    }
+}
+
+/// Tells a client whose Retry token failed, with a CONNECTION_CLOSE carrying INVALID_TOKEN in
+/// an Initial made without a connection: smaller than the Initial it answers.
+fn invalid_token(shared: &Shared, scid: &[u8], dcid: &[u8], to: SocketAddr) {
+    let mut out = [0; INITIAL_DATAGRAM];
+    let written = quiche::invalid_token_close(
+        &quiche::ConnectionId::from_ref(scid),
+        &quiche::ConnectionId::from_ref(dcid),
+        VERSION_1,
+        &mut out,
+    );
+    if let Ok(written) = written {
+        let _sent = shared.socket.try_send_to(&out[..written], to);
+        (shared.count)(Quic::InvalidToken);
     }
 }
 

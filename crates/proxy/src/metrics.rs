@@ -141,6 +141,8 @@ pub(crate) enum Quic {
     Retry,
     /// Answered with a version negotiation.
     Negotiation,
+    /// Answered with INVALID_TOKEN: a Retry token that failed.
+    InvalidToken,
     /// An Initial dropped: its worker had no room for another connection, or the listener
     /// held its share of the room (03 §9).
     NoRoom,
@@ -154,16 +156,18 @@ impl Quic {
             Self::InboxFull => "inbox_full",
             Self::Retry => "retry",
             Self::Negotiation => "version_negotiation",
+            Self::InvalidToken => "invalid_token",
             Self::NoRoom => "no_room",
         }
     }
 
     /// Every one of them, for a scrape that shows a series whether it has happened or not.
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Forwarded,
         Self::InboxFull,
         Self::Retry,
         Self::Negotiation,
+        Self::InvalidToken,
         Self::NoRoom,
     ];
 }

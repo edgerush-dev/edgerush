@@ -1929,6 +1929,20 @@ pub fn retry(
     packet::retry(scid, dcid, new_scid, token, version, out)
 }
 
+/// Writes a CONNECTION_CLOSE with INVALID_TOKEN in an Initial packet, made
+/// without a connection, for a client whose Initial carried a Retry token that
+/// failed validation (RFC 9000 §8.1.3).
+///
+/// The `scid` and `dcid` parameters are the source and destination connection
+/// IDs extracted from the client's Initial packet.
+///
+/// Added by EdgeRush's vendored copy; not in quiche as published.
+pub fn invalid_token_close(
+    scid: &ConnectionId, dcid: &ConnectionId, version: u32, out: &mut [u8],
+) -> Result<usize> {
+    packet::invalid_token_close(scid, dcid, version, out)
+}
+
 /// Returns true if the given protocol version is supported.
 #[inline]
 pub fn version_is_supported(version: u32) -> bool {

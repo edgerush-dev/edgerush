@@ -68,6 +68,11 @@ pub fn validate<'a>(
     (made <= now && now - made <= LIFETIME).then_some(odcid)
 }
 
+/// Whether `token` says it is a Retry token, whether or not it is good.
+pub fn is_retry(token: &[u8]) -> bool {
+    token.first() == Some(&RETRY)
+}
+
 /// The MAC over `signed` and `peer`'s address and port.
 fn mac(key: &[u8; 32], signed: &[u8], peer: SocketAddr) -> Option<[u8; MAC]> {
     let mut input = Vec::with_capacity(signed.len() + 18);
@@ -111,6 +116,21 @@ mod tests {
             "expired"
         );
         assert_eq!(validate(&KEY, 999, peer(), &token), None, "from the future");
+    }
+
+    /// A token says it is a Retry token by its first byte, good or not; one of another kind,
+    /// or none, does not.
+    #[test]
+    fn a_retry_token_says_so_whether_or_not_it_holds() {
+        let token = mint(&KEY, 1_000, peer(), b"first-id").unwrap();
+        assert!(is_retry(&token));
+        let moved: SocketAddr = "192.0.2.1:4434".parse().unwrap();
+        assert_eq!(validate(&KEY, 1_000, moved, &token), None);
+        assert!(is_retry(&token), "failing, still a Retry token");
+        let mut other = token.clone();
+        other[0] = 0x4e;
+        assert!(!is_retry(&other));
+        assert!(!is_retry(&[]));
     }
 
     #[test]

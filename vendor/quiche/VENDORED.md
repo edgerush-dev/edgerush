@@ -130,6 +130,11 @@ Every change is marked `EdgeRush:` in the source.
   `src/h3/qpack/decoder.rs`). Its API is as it was: `Header::new` still copies, and
   `name()` and `value()` still give slices. `static_fields_are_borrowed_from_the_table`
   at the end of `src/h3/qpack/decoder.rs` covers it.
+- **An invalid Retry token can be told without a connection.** `invalid_token_close()`
+  writes a CONNECTION_CLOSE with INVALID_TOKEN in an Initial packet under the keys of the
+  client's destination ID, as `retry()` writes a Retry (`packet::invalid_token_close` in
+  `src/packet.rs`). `an_invalid_retry_token_is_told_with_a_close_the_client_reads` in
+  `crates/proxy/tests/h3_library.rs` covers it.
 
 ## Why
 
@@ -217,7 +222,13 @@ HTTP/2 stage, and needs to know it. The pieces are told apart from the bytes bec
 costs a buffer and a node past its bytes: a peer that sends its data a byte a frame, in
 order, costs a hundred times what flow control counts.
 
-With all twelve changes, quiche's own library tests pass (1,176 of 1,176, on Windows and
+**The invalid token.** A client whose Retry token fails will take no other Retry, and RFC
+9000 §8.1.3 has the server close at once with INVALID_TOKEN, as NGINX and quinn do, so the
+client can start again rather than wait out its handshake timer. Published quiche can
+write that close only from a connection, and a connection writes nothing before it has
+processed the client's Initial, which runs the TLS handshake a Retry is there to spare.
+
+With all fourteen changes, quiche's own library tests pass (1,176 of 1,176, on Windows and
 Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`),
 and `check.sh` runs them, in a target directory of their own (`target/vendored`): the
 workspace's tests never reach this crate, which is not a member of it.
