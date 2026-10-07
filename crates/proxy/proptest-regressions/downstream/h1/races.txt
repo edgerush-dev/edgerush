@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 626ef7b36fe973fae73f7d83d1ccd6591a38633184cbd4f7c68942b4e728afde # shrinks to expectation = Expectation { client: false, version: HTTP/1.1, upstream: false, nothing_to_send: false }, steps = [Interim(100), Interim(100), Waits, Failed]
