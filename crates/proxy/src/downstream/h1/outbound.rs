@@ -6,10 +6,13 @@
 //! still be replaced, and if a local answer is wanted instead, may it be written now
 //! ([14 §4](../../../../docs/14-downstream-server.md)).
 //!
-//! The final head is **committed** by its first byte the socket accepts. Until then a
-//! final head that is wholly queued can be replaced. An informational head does not commit
-//! anything, but one part-written must be finished before any other head follows it: a new
-//! status line in the middle of a head is two messages spliced into one.
+//! The final head is **committed** by its first byte the socket accepts, or by a write that
+//! offered it and did not finish: TLS seals what a write offers and sends it however the
+//! write ends, so a head left in a write that waits may be on its way, and over every
+//! transport it is taken to be. Until then a final head that is wholly queued can be
+//! replaced. An informational head does not commit anything, but one begun — part-written,
+//! or offered — must be finished before any other head follows it: a new status line in the
+//! middle of a head is two messages spliced into one.
 
 use std::collections::VecDeque;
 
@@ -32,8 +35,9 @@ pub enum OutboundError {
 pub enum OnFailure {
     /// Nothing is part-written: drop what has not gone and write a local answer now.
     Answer,
-    /// An informational head is part-written: write the rest of it — this many bytes —
-    /// within the existing write deadline, then the local answer, or close.
+    /// Informational heads have begun to go: write the rest of them — this many bytes, the
+    /// pieces at the front of the queue — within the existing write deadline, then the
+    /// local answer, or close.
     FinishThenAnswer(usize),
     /// The final head has begun to go: the answer is the upstream's, and all that is left
     /// is to end the connection without a clean end.
@@ -55,6 +59,9 @@ pub struct Outbound {
     heads: VecDeque<(Kind, usize)>,
     /// How much of the front head has been accepted.
     front_sent: usize,
+    /// How many heads at the front were offered in a write that did not finish, and so are
+    /// begun whatever the socket has said of them.
+    offered: usize,
     final_queued: bool,
     committed: bool,
 }
@@ -135,6 +142,17 @@ impl Outbound {
             count -= left;
             self.front_sent = 0;
             self.heads.pop_front();
+            self.offered = self.offered.saturating_sub(1);
+        }
+    }
+
+    /// A write of everything queued did not finish. The transport may hold it all the same,
+    /// sealed — TLS does — and send it whatever is offered next: every head queued now is
+    /// begun, the final head committed.
+    pub fn pending(&mut self) {
+        self.offered = self.heads.len();
+        if self.heads.iter().any(|&(kind, _)| kind == Kind::Final) {
+            self.committed = true;
         }
     }
 
@@ -144,6 +162,7 @@ impl Outbound {
     pub fn reset(&mut self) {
         self.heads.clear();
         self.front_sent = 0;
+        self.offered = 0;
         self.final_queued = false;
         self.committed = false;
     }
@@ -163,12 +182,23 @@ impl Outbound {
         if self.committed {
             return OnFailure::Close;
         }
-        match self.heads.front() {
-            Some(&(Kind::Interim, length)) if self.front_sent > 0 => {
-                OnFailure::FinishThenAnswer(length - self.front_sent)
-            }
-            _ => OnFailure::Answer,
+        // Every head offered in a write that waited, or the front one part-written: all
+        // informational, a final head among them having committed the answer.
+        let begun = if self.offered > 0 {
+            self.offered
+        } else {
+            usize::from(self.front_sent > 0)
+        };
+        if begun == 0 {
+            return OnFailure::Answer;
         }
+        let left: usize = self
+            .heads
+            .iter()
+            .take(begun)
+            .map(|&(_, length)| length)
+            .sum();
+        OnFailure::FinishThenAnswer(left - self.front_sent)
     }
 }
 
@@ -210,6 +240,45 @@ mod tests {
         assert_eq!(out.on_failure(), OnFailure::Close);
         out.accepted(29);
         assert!(out.heads_sent());
+    }
+
+    /// A head offered in a write that did not finish may be on its way — TLS seals what it is
+    /// offered and sends it — so a final head offered so is committed, and an informational
+    /// one is finished before anything follows it, all of it (A03-03, C32).
+    #[test]
+    fn a_head_offered_in_a_write_that_waits_is_begun() {
+        let mut out = Outbound::default();
+        out.final_head(40).unwrap();
+        out.pending();
+        assert!(out.committed());
+        assert!(!out.can_replace_final());
+        assert_eq!(out.on_failure(), OnFailure::Close);
+
+        let mut out = Outbound::default();
+        out.interim(10).unwrap();
+        out.pending();
+        assert_eq!(out.on_failure(), OnFailure::FinishThenAnswer(10));
+        // A final head queued after the write that waited was not offered in it.
+        out.final_head(40).unwrap();
+        assert!(out.can_replace_final());
+        out.accepted(4);
+        assert_eq!(out.on_failure(), OnFailure::FinishThenAnswer(6));
+        // The interim head gone, nothing of the final head was offered while it waited.
+        out.accepted(6);
+        assert_eq!(out.on_failure(), OnFailure::Answer);
+        assert!(out.can_replace_final());
+
+        // Two informational heads offered together are both begun.
+        let mut out = Outbound::default();
+        out.interim(10).unwrap();
+        out.interim(12).unwrap();
+        out.pending();
+        assert_eq!(out.on_failure(), OnFailure::FinishThenAnswer(22));
+        out.accepted(10);
+        assert_eq!(out.on_failure(), OnFailure::FinishThenAnswer(12));
+        out.reset();
+        out.interim(10).unwrap();
+        assert_eq!(out.on_failure(), OnFailure::Answer, "a reset forgets it");
     }
 
     /// Every split of an informational head: before any of it, part of it, all of it.

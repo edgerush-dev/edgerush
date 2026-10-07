@@ -32,6 +32,9 @@ enum Step {
     ClientSentBody,
     /// The socket took up to this many bytes.
     Socket(usize),
+    /// A write of everything queued waited, as a TLS write does whose record is sealed:
+    /// the socket sends what it was offered before anything, whatever it is offered next.
+    Waits,
 }
 
 /// A driver of the three pieces, reduced to what the race is about.
@@ -53,6 +56,8 @@ struct Driver {
     closed: bool,
     /// The upstream failed, and what had not gone of its interim heads was dropped.
     failed: bool,
+    /// What a write that waited offered, which the socket owes.
+    sealed: Vec<u8>,
 }
 
 impl Driver {
@@ -72,6 +77,7 @@ impl Driver {
             final_status: None,
             closed: false,
             failed: false,
+            sealed: Vec::new(),
         }
     }
 
@@ -104,8 +110,20 @@ impl Driver {
         self.final_status = Some(status.as_u16());
     }
 
+    /// The writing half of a turn: what the events before it settled is written now, a
+    /// local 100 among it, and not before — so an expiry and a final head can arrive in one
+    /// turn, as they can on a real connection.
+    fn local_continue(&mut self) {
+        if self.coordinator.take_local_continue() {
+            self.locals += 1;
+            self.interim(100);
+        }
+    }
+
     fn step(&mut self, step: Step) {
-        if self.closed || (self.final_status.is_some() && !matches!(step, Step::Socket(_))) {
+        if self.closed
+            || (self.final_status.is_some() && !matches!(step, Step::Socket(_) | Step::Waits))
+        {
             return;
         }
         match step {
@@ -147,13 +165,28 @@ impl Driver {
                     OnFailure::Close => self.closed = true,
                 }
             }
+            Step::Waits => {
+                self.local_continue();
+                if self.sealed.is_empty() && !self.queued.is_empty() {
+                    self.sealed = self.queued.clone();
+                    self.outbound.pending();
+                }
+            }
             Step::Socket(most) => {
-                // The writing half of a turn: what the events before it settled is written
-                // now, a local 100 among it, and not before — so an expiry and a final head
-                // can arrive in one turn, as they can on a real connection.
-                if self.coordinator.take_local_continue() {
-                    self.locals += 1;
-                    self.interim(100);
+                self.local_continue();
+                if !self.sealed.is_empty() {
+                    // What is offered now finishes the sealed write: the socket sends what
+                    // it sealed and says that many bytes of what it is offered went. TLS
+                    // refuses an offer shorter than what it holds, and the connection ends.
+                    let sealed = std::mem::take(&mut self.sealed);
+                    if self.queued.len() < sealed.len() {
+                        self.closed = true;
+                        return;
+                    }
+                    self.wire.extend(sealed.iter());
+                    self.queued.drain(..sealed.len());
+                    self.outbound.accepted(sealed.len());
+                    return;
                 }
                 let taken = most.min(self.queued.len());
                 self.wire.extend(self.queued.drain(..taken));
@@ -173,6 +206,7 @@ fn step() -> impl Strategy<Value = Step> {
         Just(Step::ClientSentBody),
         (0_usize..40).prop_map(Step::Socket),
         (0_usize..40).prop_map(Step::Socket),
+        Just(Step::Waits),
     ]
 }
 
@@ -240,6 +274,32 @@ fn a_failure_mid_100_finishes_it_before_answering() {
     );
 }
 
+/// Two interim heads in a write that waited are sealed together: an upstream that fails
+/// then has both finished before its 502, as the socket owes them (A03-03, C32).
+#[test]
+fn interim_heads_sealed_together_are_both_finished_before_answering() {
+    let mut driver = Driver::new(Expectation {
+        client: false,
+        version: Version::HTTP_11,
+        upstream: true,
+        nothing_to_send: false,
+    });
+    driver.step(Step::HeadSent);
+    driver.step(Step::Interim(103));
+    driver.step(Step::Interim(102));
+    driver.step(Step::Waits);
+    driver.step(Step::Failed);
+    driver.step(Step::Socket(usize::MAX));
+    driver.step(Step::Socket(usize::MAX));
+    let text = String::from_utf8(driver.wire).unwrap();
+    assert!(
+        text.starts_with(
+            "HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 102 Processing\r\n\r\nHTTP/1.1 502 Bad Gateway\r\n"
+        ),
+        "{text}"
+    );
+}
+
 proptest! {
     #[test]
     fn what_the_client_receives_is_always_one_answer(
@@ -253,6 +313,8 @@ proptest! {
         // Whatever was left is written, and an exchange with no answer yet is given one
         // by the upstream.
         driver.step(Step::Final(200));
+        // A sealed write finished first, then the rest.
+        driver.step(Step::Socket(usize::MAX));
         driver.step(Step::Socket(usize::MAX));
 
         prop_assert!(driver.locals <= 1, "{} local 100s", driver.locals);

@@ -627,8 +627,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     /// Drops what is queued and has not begun to go, and with it what it was charged: all
     /// of it, or all but the rest of a head part-written, which must be finished before
     /// anything else follows it.
-    fn discard_queued(&mut self, keep_front: bool) {
-        let keep = usize::from(keep_front);
+    fn discard_queued(&mut self, keep: usize) {
+        // The pieces that hold the first `keep` bytes, which end where a piece does.
+        let mut kept = 0;
+        let keep = self
+            .queued
+            .iter()
+            .take_while(|(bytes, _, _)| {
+                let more = kept < keep;
+                kept += bytes.len();
+                more
+            })
+            .count();
         while self.queued.len() > keep {
             let Some((bytes, charged, answer)) = self.queued.pop_back() else {
                 break;
@@ -666,7 +676,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 match Pin::new(&mut self.socket).poll_write_vectored(context, &slices[..count]) {
                     Poll::Ready(Ok(0) | Err(_)) => return Err(Stop::Gone),
                     Poll::Ready(Ok(written)) => written,
-                    Poll::Pending => break,
+                    Poll::Pending => {
+                        // What it offered may be on its way all the same (14 §4).
+                        self.outbound.pending();
+                        break;
+                    }
                 };
             self.queued_bytes -= written;
             self.outbound.accepted(written);
@@ -1460,10 +1474,10 @@ async fn replace_or_cut<S: AsyncRead + AsyncWrite + Unpin>(
     asked: Asked,
     date: &impl Fn() -> HttpDate,
 ) -> Ended {
-    let keep_front = match connection.outbound.on_failure() {
+    let keep = match connection.outbound.on_failure() {
         OnFailure::Close => return Ended::Cut,
-        OnFailure::Answer => false,
-        OnFailure::FinishThenAnswer(_) => true,
+        OnFailure::Answer => 0,
+        OnFailure::FinishThenAnswer(left) => left,
     };
     // Read back out of the head being thrown away, rather than noted as every answer's
     // head is written: only an answer that fails here pays for it.
@@ -1475,7 +1489,7 @@ async fn replace_or_cut<S: AsyncRead + AsyncWrite + Unpin>(
     {
         fields.insert(request_id::HEADER, id);
     }
-    connection.discard_queued(keep_front);
+    connection.discard_queued(keep);
     let mut head = Vec::with_capacity(128);
     if write_head(
         &mut head,
@@ -2472,6 +2486,211 @@ mod tests {
         .unwrap();
         assert!(received.starts_with("HTTP/1.1 200 OK\r\n"), "{received:?}");
         assert_eq!(said.take(), ["core"], "while its body still streams");
+    }
+
+    /// Over TLS a write that did not finish is sealed and owed: BoringSSL sends what it was
+    /// first offered, whatever it is offered next, and says that many bytes went
+    /// (boring-sys ssl/s3_pkt.cc `do_tls_write`; ssl.h on `SSL_write`). An answer whose body
+    /// fails while its head is owed so cannot be put right with a 502 (14 §4): what the
+    /// client receives must be one answer or the other, never a head followed by pieces of
+    /// another. Review repro A03-03.
+    #[tokio::test]
+    async fn an_answer_whose_head_is_owed_to_tls_is_not_replaced_by_another() {
+        use boring::pkey::PKey;
+        use boring::ssl::{SslAcceptor, SslConnector, SslMethod, SslOptions, SslVerifyMode};
+        use boring::x509::X509;
+        let certificate = crate::tls::testing::certificate(&["example.test"]);
+        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        acceptor
+            .set_certificate(&X509::from_pem(certificate.chain.as_bytes()).unwrap())
+            .unwrap();
+        acceptor
+            .set_private_key(&PKey::private_key_from_pem(certificate.key.as_bytes()).unwrap())
+            .unwrap();
+        // No tickets after the handshake, so that the first record written is the head's.
+        acceptor.set_options(SslOptions::NO_TICKET);
+        let acceptor = acceptor.build();
+        let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+        connector.set_verify(SslVerifyMode::NONE);
+        let config = connector
+            .build()
+            .configure()
+            .unwrap()
+            .verify_hostname(false);
+        // Room for little more than a record header, so that a write waits for the client
+        // to read.
+        let (client_end, server_end) = tokio::io::duplex(64);
+        let (client, server) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                tokio_boring::connect(config, "example.test", client_end),
+                tokio_boring::accept(&acceptor, server_end),
+            )
+        })
+        .await
+        .expect("no handshake");
+        let mut client = client.unwrap();
+        let server = crate::gathered::Gathered::new(server.unwrap());
+        // A head of its own, and a body that fails a few turns after it is first asked.
+        let failing = |_: Request<RequestBody>, _: Interim| async move {
+            Response::new(Failing { pending: 3 })
+        };
+        let serving = serve(server, settings(), blocks(), date, failing);
+        let reading = async move {
+            client.write_all(GET).await.unwrap();
+            // Nothing is read until the server has queued its head, been refused room for
+            // it, seen the body fail and offered its 502 instead.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut received = Vec::new();
+            let _ended = client.read_to_end(&mut received).await;
+            String::from_utf8_lossy(&received).into_owned()
+        };
+        let (ended, received) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(serving, reading)
+        })
+        .await
+        .expect("serving never finished");
+        let (head, after) = received.split_once("\r\n\r\n").unwrap_or((&received, ""));
+        if head.starts_with("HTTP/1.1 200 OK\r\n") {
+            assert!(
+                after.is_empty(),
+                "a 200 head followed by {after:?} (ended {ended:?}): {received:?}"
+            );
+        } else {
+            assert!(
+                received.is_empty() || received.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+                "{ended:?}: {received:?}"
+            );
+        }
+        if ended == Ended::Answered {
+            assert!(
+                received.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+                "said it answered 502, sent {received:?}"
+            );
+        }
+    }
+
+    /// A transport that seals what a write offers, as TLS does: its first write waits until
+    /// `release`, and a write after it sends what the first was offered, whatever it is
+    /// offered then, and says that many bytes went.
+    struct Sealing {
+        inner: tokio::io::DuplexStream,
+        release: Rc<Cell<bool>>,
+        waited: bool,
+        sealed: Vec<u8>,
+        sent: usize,
+    }
+
+    impl AsyncRead for Sealing {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(context, buf)
+        }
+    }
+
+    impl AsyncWrite for Sealing {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.poll_write_vectored(context, &[io::IoSlice::new(buf)])
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if !this.waited {
+                this.waited = true;
+                this.sealed = bufs.iter().flat_map(|buf| buf.iter().copied()).collect();
+            }
+            if !this.release.get() {
+                context.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if this.sent < this.sealed.len() {
+                let offered: usize = bufs.iter().map(|buf| buf.len()).sum();
+                assert!(offered >= this.sealed.len(), "offered less than it sealed");
+                while this.sent < this.sealed.len() {
+                    let rest = &this.sealed[this.sent..];
+                    this.sent +=
+                        std::task::ready!(Pin::new(&mut this.inner).poll_write(context, rest))?;
+                }
+                return Poll::Ready(Ok(this.sealed.len()));
+            }
+            Pin::new(&mut this.inner).poll_write_vectored(context, bufs)
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+        }
+    }
+
+    /// Two interim heads offered in a write that waited are both sealed: when the answer's
+    /// body then fails, both are finished before the 502, never one of them and the 502
+    /// written over the other (A03-03, C32).
+    #[tokio::test]
+    async fn interim_heads_owed_to_the_transport_are_finished_before_a_502() {
+        let release = Rc::new(Cell::new(false));
+        let releasing = Rc::clone(&release);
+        let hinting_then_failing = move |_: Request<RequestBody>, interim: Interim| {
+            let releasing = Rc::clone(&releasing);
+            async move {
+                let mut exchange = crate::interim::Channel::Listened(interim);
+                exchange.begin(false, false);
+                exchange.upstream_interim(StatusCode::from_u16(103).unwrap(), HeaderMap::new());
+                exchange.upstream_interim(StatusCode::PROCESSING, HeaderMap::new());
+                // Turns for the server to offer them to the transport, which waits until the
+                // answer has come and its body failed.
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                exchange.final_head();
+                releasing.set(true);
+                Response::new(Failing { pending: 0 })
+            }
+        };
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        client.write_all(GET).await.unwrap();
+        let sealing = Sealing {
+            inner: server,
+            release,
+            waited: false,
+            sealed: Vec::new(),
+            sent: 0,
+        };
+        let serving = serve(sealing, settings(), blocks(), date, hinting_then_failing);
+        let received = tokio::time::timeout(Duration::from_secs(10), async {
+            let ended = serving.await;
+            let mut received = Vec::new();
+            client.read_to_end(&mut received).await.unwrap();
+            (ended, String::from_utf8_lossy(&received).into_owned())
+        })
+        .await
+        .unwrap();
+        let (ended, received) = received;
+        assert!(
+            received.starts_with(concat!(
+                "HTTP/1.1 103 Early Hints\r\n\r\n",
+                "HTTP/1.1 102 Processing\r\n\r\n",
+                "HTTP/1.1 502 Bad Gateway\r\n"
+            )),
+            "{ended:?}: {received:?}"
+        );
+        assert_eq!(ended, Ended::Answered);
     }
 
     /// The 502 put in place of an answer whose body failed tells the client the request's
