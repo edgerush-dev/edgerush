@@ -23,7 +23,7 @@ use edgerush_router::{
     QueryPredicates, RouteMatch, Router, WildcardLabels,
 };
 use http::Method;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -683,6 +683,14 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
         errors.push(Place::of(Object::DataPlane).problem(Problem::SetAsideNever));
     }
     for (name, upstream) in &config.upstreams {
+        // Once each: a destination is known across a reload by its upstream and address.
+        let mut listed = BTreeSet::new();
+        for endpoint in &upstream.endpoints {
+            if !listed.insert(endpoint) {
+                let problem = Problem::EndpointTwice(*endpoint);
+                errors.push(Place::upstream(name).problem(problem));
+            }
+        }
         if upstream
             .slow_start
             .is_some_and(|slow_start| slow_start.window_ms == 0)
@@ -2008,6 +2016,10 @@ pub enum Problem {
     /// A keepalive interval or timeout of nothing.
     #[error("`keepalive` needs an interval and a timeout of at least a second")]
     KeepaliveZero,
+    /// An endpoint an upstream lists more than once: endpoints carry no weight, and a
+    /// repeated address would be a hidden one.
+    #[error("endpoint {0} is listed twice")]
+    EndpointTwice(SocketAddr),
     /// A slow start over no time at all, which is none: left out is how none is said.
     #[error("`slow_start.window_ms` is 0: at least 1, or no `slow_start`")]
     SlowStartNever,
@@ -4248,6 +4260,35 @@ routes:
         // Random is no longer a choice, and least-request is spelled `p2c`.
         assert!(parsed("{ load_balancer: random, endpoints: [] }").is_err());
         assert!(parsed("{ load_balancer: least_request, endpoints: [] }").is_err());
+    }
+
+    /// An upstream lists each endpoint once: a repeated address would be a second, hidden
+    /// way of weighting it, which endpoints do not have (03 §6), and a destination is known
+    /// by its upstream and address across a reload. The same address in two upstreams, or
+    /// two ports of one host, are different endpoints.
+    #[test]
+    fn an_upstream_lists_each_endpoint_once() {
+        let with = |upstreams: &str| {
+            let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {upstreams}\n");
+            compile(&config(&yaml))
+                .map(|compiled| compiled.upstreams.len())
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let refused = with(
+            r#"{ u: { load_balancer: p2c, endpoints: ["127.0.0.1:9000", "127.0.0.1:9001", "127.0.0.1:9000"] } }"#,
+        )
+        .unwrap_err();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].ends_with("endpoint 127.0.0.1:9000 is listed twice"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            with(
+                r#"{ u: { load_balancer: p2c, endpoints: ["127.0.0.1:9000", "127.0.0.1:9001"] }, v: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] } }"#
+            ),
+            Ok(2)
+        );
     }
 
     /// Slow start states its window, of at least a millisecond; left out, there is none.

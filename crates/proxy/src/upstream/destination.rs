@@ -294,6 +294,8 @@ impl Destinations {
     ///
     /// Sameness is the upstream's name, the address, the protocol and the TLS, and nothing
     /// about where any of them sits: a config that says the same thing in a different order says the same thing.
+    /// It names one destination of a config at most, compile refusing an endpoint an
+    /// upstream lists twice.
     /// A destination that goes and comes back is a new one, because nothing here can tell
     /// whether what answers at that address is still what answered before.
     pub(crate) fn reconcile(

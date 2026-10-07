@@ -1343,11 +1343,12 @@
       "type": "object",
       "properties": {
         "endpoints": {
-          "description": "Where to connect: addresses, not names. None is allowed, and means there is nothing\nto send a request to — a state a running system passes through, not a mistake.",
+          "description": "Where to connect: addresses, not names, each once. None is allowed, and means there\nis nothing to send a request to — a state a running system passes through, not a\nmistake.",
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "uniqueItems": true
         },
         "health_check": {
           "description": "Probes of each endpoint, which keep one that fails them out of load balancing;\nnone is every endpoint taken as healthy.",

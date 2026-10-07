@@ -266,8 +266,10 @@ impl fmt::Debug for Certificate {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
-    /// Where to connect: addresses, not names. None is allowed, and means there is nothing
-    /// to send a request to — a state a running system passes through, not a mistake.
+    /// Where to connect: addresses, not names, each once. None is allowed, and means there
+    /// is nothing to send a request to — a state a running system passes through, not a
+    /// mistake.
+    #[cfg_attr(feature = "schema", schemars(extend("uniqueItems" = true)))]
     pub endpoints: Vec<SocketAddr>,
     /// What its endpoints are spoken to in, whatever the client spoke. An upstream of TCP
     /// and TLS routes is sent their bytes as they come: neither `http2` nor `tls`.
