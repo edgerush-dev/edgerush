@@ -18,6 +18,7 @@ use crate::downstream::h3::conn::State;
 use crate::downstream::h3::listener::{self, Forwarding, InForce, Secrets, Shared};
 use crate::downstream::h3::testing::{Client, PATIENCE, get};
 use crate::drain::Drain;
+use crate::forwarding::Cut;
 use crate::interim::Interim;
 use crate::request_body::{RequestBody, RequestBodyError};
 use crate::storage::{LIMIT, Storage};
@@ -55,6 +56,8 @@ struct Server {
     /// reload that replaces the client validation does (03 §3).
     accepted_with: Rc<RefCell<Rc<Drain>>>,
     shared: Rc<Shared>,
+    /// The client each request was from, in the order the requests were taken.
+    clients: Rc<RefCell<Vec<Rc<crate::forwarding::Client>>>>,
 }
 
 impl Server {
@@ -240,6 +243,8 @@ where
     );
     let accepted_with = Rc::new(RefCell::new(Rc::clone(&drain)));
     let giving = Rc::clone(&accepted_with);
+    let clients = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::clone(&clients);
     tokio::task::spawn_local(listener::serve(
         Rc::clone(&shared),
         move || {
@@ -249,8 +254,12 @@ where
                 drain: Rc::clone(&giving.borrow()),
             })
         },
-        // Who the client is, the request core's to act on, is nothing these cores look at.
-        Rc::new(move |request, interim, _client| respond(request, interim)),
+        // Who the client is, the request core's to act on, is nothing these cores look at;
+        // only kept, for what the server tells it.
+        Rc::new(move |request, interim, client| {
+            seen.borrow_mut().push(client);
+            respond(request, interim)
+        }),
         Rc::new(|| HttpDate::from_unix(0)),
         |_: &Rc<Drain>| (),
         forwarding,
@@ -260,6 +269,7 @@ where
         drain,
         accepted_with,
         shared,
+        clients,
     }
 }
 
@@ -822,6 +832,15 @@ fn a_worker_that_runs_out_closes_its_heaviest_connection() {
         light.for_a_while(Duration::from_millis(100)).await;
         assert_eq!(light.closed_by_server(), None);
         assert!(storage.used() <= 1 << 20);
+        // The heavy one's request, the first taken, is told it was cut for the worker's
+        // storage; the light one's is not (21 §3).
+        let cut: Vec<_> = server
+            .clients
+            .borrow()
+            .iter()
+            .map(|c| c.was_cut())
+            .collect();
+        assert_eq!(cut, [Some(Cut::Exhausted), None]);
     });
 }
 
@@ -1048,6 +1067,58 @@ fn a_rapid_reset_is_cut_off_by_its_share_of_early_resets() {
             client.closed_by_server(),
             Some((true, code::EXCESSIVE_LOAD))
         );
+        // What was under way is told it was cut for its client's resets (21 §3).
+        let last = server
+            .clients
+            .borrow()
+            .last()
+            .map(|client| client.was_cut());
+        assert_eq!(last, Some(Some(Cut::TooManyResets)));
+    });
+}
+
+/// A request still under way when the drain's time is up is cut off with its connection,
+/// and told so: its record says the gateway drained it, not that its client left (21 §3).
+#[test]
+fn a_request_cut_at_the_drain_bound_is_told_it_was_drained() {
+    locally(async {
+        let exchanges = Exchanges::default();
+        let server = serving(short(), exchanges.core()).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let _id = client.request(&get("a.test", "/held"), true);
+        client.until(|_| exchanges.alive.get() == 1).await;
+        server.drain.start();
+        client
+            .until(|client| client.quic.is_closed() || client.quic.is_draining())
+            .await;
+        let cut: Vec<_> = server
+            .clients
+            .borrow()
+            .iter()
+            .map(|c| c.was_cut())
+            .collect();
+        assert_eq!(cut, [Some(Cut::Drained)]);
+    });
+}
+
+/// A connection drained with nothing left under way is not cut: it went in order.
+#[test]
+fn a_connection_drained_in_order_is_not_told_it_was_cut() {
+    locally(async {
+        let server = serving(short(), echo).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        client.get("a.test", "/").await;
+        server.drain.start();
+        client
+            .until(|client| client.quic.is_closed() || client.quic.is_draining())
+            .await;
+        let cut: Vec<_> = server
+            .clients
+            .borrow()
+            .iter()
+            .map(|c| c.was_cut())
+            .collect();
+        assert_eq!(cut, [None]);
     });
 }
 

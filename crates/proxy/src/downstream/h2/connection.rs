@@ -17,6 +17,7 @@ use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h2::body::IncomingH2;
 use crate::downstream::h2::writer::{Outgoing, Responder, send_body};
 use crate::drain::Drain;
+use crate::forwarding::Cut;
 use crate::h2_stream::H2Stream;
 use crate::interim::Interim;
 use crate::received::Received;
@@ -177,7 +178,9 @@ impl Settings {
 /// `respond`, and `date` dates an answer that has no `Date` of its own. What h2 holds of
 /// what the client sent is charged in `received`. Once `drain` starts, the client is told to
 /// go and the connection closes when its streams have ended or the drain's time is up
-/// (03 §10).
+/// (03 §10). `cut` is told why, before the streams under way go, when the connection is
+/// closed with them: at the drain's time, for the worker's storage, or for its resets.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve<S, R, F, B, D>(
     socket: S,
     settings: Settings,
@@ -186,6 +189,7 @@ pub(crate) async fn serve<S, R, F, B, D>(
     date: Rc<D>,
     drain: Rc<Drain>,
     respond: Rc<R>,
+    cut: impl Fn(Cut),
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
     R: Fn(Request<RequestBody>, Interim) -> F + 'static,
@@ -205,11 +209,13 @@ pub(crate) async fn serve<S, R, F, B, D>(
         date,
         drain,
         respond,
+        cut,
     )
     .await;
 }
 
 /// Drives `connection`, once handshaken, until it ends, as [`serve`] says.
+#[allow(clippy::too_many_arguments)]
 async fn drive<S, R, F, B, D>(
     connection: &mut ::h2::server::Connection<S, Outgoing>,
     settings: Settings,
@@ -218,6 +224,7 @@ async fn drive<S, R, F, B, D>(
     date: Rc<D>,
     drain: Rc<Drain>,
     respond: Rc<R>,
+    cut: impl Fn(Cut),
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
     R: Fn(Request<RequestBody>, Interim) -> F + 'static,
@@ -288,6 +295,13 @@ async fn drive<S, R, F, B, D>(
             accepted.map(Next::Accepted)
         })
         .await;
+        // Closing with streams under way, it says why first: their records end as they go.
+        match accepted {
+            Next::OutOfTime => cut(Cut::Drained),
+            Next::Shed => cut(Cut::Exhausted),
+            Next::Resetting => cut(Cut::TooManyResets),
+            Next::Accepted(_) | Next::Idle | Next::Draining => {}
+        }
         let (request, send) = match accepted {
             Next::Accepted(Some(Ok(stream))) => stream,
             // Closed, or failed: either way there is nothing left to serve.
@@ -681,6 +695,7 @@ mod tests {
                 date,
                 drain,
                 respond,
+                |_| {},
             );
             let used = tokio::select! {
                 () = driving => panic!("the connection ended"),
@@ -722,7 +737,12 @@ mod tests {
             let heavy = server.unwrap();
             let (mut light_send, light) = pair(&settings.builder()).await;
             let heavy_ended = Rc::new(Cell::new(false));
-            for (mut connection, ended) in [(heavy, Some(Rc::clone(&heavy_ended))), (light, None)] {
+            // What each connection's driver says of why it closed it with streams open.
+            let (heavy_cut, light_cut) = (Rc::new(Cell::new(None)), Rc::new(Cell::new(None)));
+            for (mut connection, ended, told) in [
+                (heavy, Some(Rc::clone(&heavy_ended)), Rc::clone(&heavy_cut)),
+                (light, None, Rc::clone(&light_cut)),
+            ] {
                 let (storage, received) = (Rc::clone(&storage), Rc::clone(&received));
                 let (date, respond) = (Rc::clone(&date), Rc::clone(&respond));
                 tokio::task::spawn_local(async move {
@@ -734,6 +754,7 @@ mod tests {
                         date,
                         Rc::new(Drain::default()),
                         respond,
+                        |why| told.set(Some(why)),
                     )
                     .await;
                     if let Some(ended) = ended {
@@ -779,6 +800,9 @@ mod tests {
                 heavy_ended.get(),
                 "the heaviest was told to go but not closed"
             );
+            // Its streams' records say the gateway cut them, for its storage (21 §3).
+            assert_eq!(heavy_cut.get(), Some(Cut::Exhausted));
+            assert_eq!(light_cut.get(), None);
             let used = storage.used();
             assert!(
                 (2 << 20..window).contains(&used),
@@ -891,6 +915,7 @@ mod tests {
                     Rc::clone(&date),
                     Rc::clone(&drain),
                     Rc::clone(&respond),
+                    |_| {},
                 );
                 tokio::select! {
                     () = driving => panic!("the connection ended"),

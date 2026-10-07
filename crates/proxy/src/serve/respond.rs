@@ -63,7 +63,7 @@ impl Worker {
     fn logging<H: Forwarded>(
         &self,
         listener: usize,
-        client: &Client,
+        client: &Rc<Client>,
         head: &H,
     ) -> Option<Rc<Logging>> {
         if !self.proxy.logs.on() {
@@ -136,7 +136,7 @@ impl Worker {
         &self,
         snapshot: Guard<Arc<Snapshot>>,
         listener: usize,
-        client: &Client,
+        client: &Rc<Client>,
         mut head: H,
         mut body: RequestBody,
         interim: Option<Interim>,

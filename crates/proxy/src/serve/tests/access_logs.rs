@@ -381,6 +381,78 @@ async fn an_answer_replaced_before_its_head_went_is_logged_and_counted_as_the_50
         .await;
 }
 
+/// An HTTP/2 stream that the worker's drain cuts at its bound (03 §10) was not given up by
+/// its client, and its record says the gateway drained it (review A10-03, C30).
+#[tokio::test]
+async fn a_stream_cut_at_the_drain_bound_is_logged_as_drained() {
+    use crate::h2_peer::{Frame, flag, kind};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _held) = scripted_upstream().await;
+            let logged = recording("drain-cut", everything_config(upstream)).await;
+            let mut peer = h2_client(logged.front).await;
+            h2_get(&mut peer, 1, "/held").await;
+            peer.settled().await;
+            logged.worker.drain();
+            let (ping, _) = peer
+                .until(|f| f.kind == kind::PING && !f.has(flag::ACK))
+                .await;
+            peer.send(&Frame::new(kind::PING, flag::ACK, 0, ping.payload.clone()))
+                .await;
+            // Closed by the gateway at the drain's bound, the stream still waiting upstream;
+            // the client never reset it.
+            let _closed = peer.rest().await;
+            let records = logged.records(1).await;
+            let record = &records[0];
+            assert_eq!(record["reason"], "drained", "{record}");
+            assert!(record["status"].is_null(), "{record}");
+        })
+        .await;
+}
+
+/// A connection closed for its client's resets cuts off what it had under way, whose record
+/// says so (C30).
+#[tokio::test]
+async fn a_stream_cut_off_with_a_rapid_reset_is_logged_as_such() {
+    use crate::h2_peer::{self, code, kind};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _held) = scripted_upstream().await;
+            let logged = recording("resets-cut", everything_config(upstream)).await;
+            let mut peer = h2_client(logged.front).await;
+            // One request it keeps waiting on, then a rapid reset of the rest.
+            h2_get(&mut peer, 1, "/kept").await;
+            peer.settled().await;
+            let mut cut_off = false;
+            for n in 1..600u32 {
+                let id = n * 2 + 1;
+                h2_get(&mut peer, id, "/held").await;
+                peer.send_if_open(&h2_peer::rst_stream(id, code::CANCEL))
+                    .await;
+                let frames = peer.settled().await;
+                if frames.iter().any(|f| f.kind == kind::GOAWAY) {
+                    cut_off = true;
+                    break;
+                }
+            }
+            assert!(cut_off, "never cut off");
+            let kept = within(async {
+                loop {
+                    let records = logged.records(1).await;
+                    if let Some(kept) = records.into_iter().find(|r| r["path"] == "/kept") {
+                        return kept;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            assert_eq!(kept["reason"], "too_many_resets", "{kept}");
+        })
+        .await;
+}
+
 /// Behind a trusted proxy the client is the one the proxy names, and the peer the proxy.
 #[tokio::test]
 async fn a_trusted_proxys_client_is_the_client() {

@@ -595,6 +595,7 @@ async fn serve_h2<S>(
     let storage = Rc::clone(worker.blocks.borrow().storage());
     let dating = Rc::clone(&worker);
     let date = Rc::new(move || dating.date.get());
+    let cutting = Rc::clone(&client);
     let respond = Rc::new(move |request: Request<RequestBody>, interim| {
         asking.set(true);
         Rc::clone(&ours.worker).handle(listener, Rc::clone(&client), request, Some(interim))
@@ -614,6 +615,7 @@ async fn serve_h2<S>(
         date,
         drain,
         respond,
+        |why| cutting.cut(why),
     )
     .await;
 }

@@ -10,6 +10,7 @@
 use crate::connections::Held;
 use crate::downstream::h3::head::Refused;
 use crate::drain::Drain;
+use crate::forwarding::{Client, Cut};
 use crate::storage::{Charge, Exhausted, Storage};
 use http::HeaderMap;
 use std::cell::{Cell, RefCell};
@@ -71,6 +72,20 @@ pub(crate) struct State {
     /// How many datagrams quiche has taken from the client: the driver keeps a connection
     /// with a stream open alive from the last.
     pub(crate) heard: u64,
+    /// The client its requests are from, as the upstream is told, made again only when the
+    /// path its requests are taken to be from changes; told why, when the gateway closes
+    /// the connection with requests under way. Requests begun on a path before it keep the
+    /// client of their own, and are not told.
+    pub(crate) client: Option<Rc<Client>>,
+}
+
+impl State {
+    /// Notes that the gateway is closing the connection for `why` (21 §3).
+    pub(crate) fn cut(&self, why: Cut) {
+        if let Some(client) = &self.client {
+            client.cut(why);
+        }
+    }
 }
 
 impl State {
@@ -128,6 +143,7 @@ impl Conn {
                 delivering: Vec::new(),
                 closed: false,
                 heard: 0,
+                client: None,
             }),
             driver: RefCell::new(None),
             stirred: Cell::new(true),
@@ -240,6 +256,7 @@ impl Conn {
         self.charge.borrow_mut().take();
         self.charged.set(0);
         self.with(|state| {
+            state.cut(Cut::Exhausted);
             // Fails only for a connection already closing.
             let _closing = state
                 .quic

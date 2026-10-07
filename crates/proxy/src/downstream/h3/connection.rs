@@ -28,7 +28,7 @@ use crate::downstream::h3::listener::Shared;
 use crate::downstream::h3::send::{Unsent, flush};
 use crate::downstream::h3::stream::H3Stream;
 use crate::downstream::h3::writer::{Responder, SendError};
-use crate::forwarding::Client;
+use crate::forwarding::{Client, Cut};
 use crate::interim::Interim;
 use crate::request_body::RequestBody;
 use crate::timers::Alarm;
@@ -79,9 +79,6 @@ struct Driving {
     /// use is no proof: quiche moves to a new address on one datagram from it, which anyone
     /// able to forge a source address can send (RFC 9000 §9.3).
     proved: SocketAddr,
-    /// The client its requests are from, as the upstream is told, made again only when
-    /// `proved` changes.
-    client: Option<Rc<Client>>,
     /// To be closed once what is queued has gone: the GOAWAY above all, which quiche would
     /// drop if the connection were closed with it still queued.
     to_close: bool,
@@ -152,7 +149,6 @@ pub(crate) async fn drive<R, F, B, D, G>(
         seen: Seen::default(),
         drain_by: None,
         proved: from,
-        client: None,
         to_close: false,
         refused: 0,
         closing: false,
@@ -178,14 +174,15 @@ pub(crate) async fn drive<R, F, B, D, G>(
             if conn.take_stirred() || !driving.unsent.is_empty() {
                 turn(&conn, &shared, &mut driving, &mut found);
                 account(&conn, &shared);
+                let proved = driving.proved;
                 let client = if found.is_empty() {
                     None
                 } else {
-                    Some(client_now(driving.proved, &mut driving.client))
+                    Some(conn.with(|state| client_now(proved, &mut state.client)))
                 };
                 // A head answered 431 here has a record all the same (21 §4).
                 for _ in 0..std::mem::take(&mut driving.refused) {
-                    (shared.refused)(client_now(driving.proved, &mut driving.client));
+                    (shared.refused)(conn.with(|state| client_now(proved, &mut state.client)));
                 }
                 for request in found.drain(..) {
                     // Made above whenever there is a request.
@@ -239,6 +236,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
                     || conn.provoking(settings.provoked_resets))
             {
                 conn.with(|state| {
+                    state.cut(Cut::TooManyResets);
                     // Fails only for a connection already closing.
                     let _closing = state.quic.close(true, code::EXCESSIVE_LOAD, b"");
                 });
@@ -319,6 +317,10 @@ pub(crate) async fn drive<R, F, B, D, G>(
                 .flatten()
                 .any(|due| due <= now);
             if over {
+                // At the drain's bound, what is still under way is cut off.
+                if drain_due.is_some_and(|due| due <= now) {
+                    conn.with(|state| state.cut(Cut::Drained));
+                }
                 close(&conn, &mut driving);
             }
         }

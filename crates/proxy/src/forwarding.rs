@@ -21,6 +21,7 @@ use edgerush_filters::forwarding::{address_value, client_address, proto_value, v
 use edgerush_filters::request_id;
 use edgerush_router::Fields;
 use http::header::{HeaderName, HeaderValue, VIA};
+use std::cell::Cell;
 use std::net::{IpAddr, SocketAddr};
 
 /// `X-Forwarded-For`.
@@ -37,6 +38,8 @@ pub(crate) const FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forward
 /// ([20 §3](../../docs/20-proxy-protocol.md)), for the access log.
 #[derive(Debug, Clone)]
 pub struct Client {
+    /// Why the gateway closed the connection with requests under way, once it has.
+    cut: Cell<Option<Cut>>,
     address: IpAddr,
     value: HeaderValue,
     peer: Option<SocketAddr>,
@@ -48,6 +51,7 @@ impl Client {
     pub fn new(address: IpAddr) -> Self {
         let address = address.to_canonical();
         Self {
+            cut: Cell::new(None),
             address,
             value: address_value(address),
             peer: None,
@@ -73,6 +77,40 @@ impl Client {
     #[must_use]
     pub fn peer(&self) -> Option<SocketAddr> {
         self.peer
+    }
+
+    /// Notes that the gateway is closing the connection for `why`, cutting off what is
+    /// under way on it: said before the requests' futures go, whose records end with them.
+    pub(crate) fn cut(&self, why: Cut) {
+        self.cut.set(Some(why));
+    }
+
+    /// Why the gateway closed the connection with requests under way, if it has.
+    pub(crate) fn was_cut(&self) -> Option<Cut> {
+        self.cut.get()
+    }
+}
+
+/// Why the gateway closed a connection with requests under way: what their records say in
+/// place of a client that left ([21 §3](../../docs/21-access-logs.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cut {
+    /// The drain's time was up.
+    Drained,
+    /// The worker's storage ran out and the connection held the most of it.
+    Exhausted,
+    /// Its client had too many of its streams reset.
+    TooManyResets,
+}
+
+impl Cut {
+    /// Its name in a record.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Drained => "drained",
+            Self::Exhausted => "exhausted",
+            Self::TooManyResets => "too_many_resets",
+        }
     }
 }
 

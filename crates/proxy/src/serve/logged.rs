@@ -15,7 +15,7 @@
 use super::{Body, BodyError, Snapshot, Worker};
 use crate::access_log::Sink;
 use crate::downstream::h1::connection::{self as h1, Answered};
-use crate::forwarding::{Client, FORWARDED_FOR};
+use crate::forwarding::{Client, Cut, FORWARDED_FOR};
 use crate::head::Forwarded;
 use crate::metrics::Tunnel;
 use crate::request_body::Counts;
@@ -44,6 +44,8 @@ pub(super) struct Logging {
     sink: Sink,
     time_ms: u64,
     came_in: Instant,
+    /// The connection's client, which says whether the gateway cut the connection.
+    connection: Rc<Client>,
     client: IpAddr,
     peer: Option<SocketAddr>,
     protocol: Option<Protocol>,
@@ -84,7 +86,7 @@ impl Logging {
         worker: &Rc<Worker>,
         snapshot: &Snapshot,
         listener: usize,
-        client: &Client,
+        client: &Rc<Client>,
         head: &H,
     ) -> Option<Rc<Self>> {
         let came_in = Instant::now();
@@ -121,6 +123,7 @@ impl Logging {
             sink,
             time_ms: unix_millis(Duration::ZERO),
             came_in,
+            connection: Rc::clone(client),
             client: address,
             peer: client.peer(),
             protocol: protocol(head.version()),
@@ -244,11 +247,15 @@ impl Logging {
         };
         let text = |span: Span| texts.get(span.from..span.to);
         // A client that got no answer, or not all of one, left before it could: unless
-        // something else is known to have ended it.
-        let reason = self
-            .reason
-            .get()
-            .or_else(|| (!self.whole.get()).then_some("client_closed"));
+        // something else is known to have ended it, the gateway closing its connection
+        // among them.
+        let reason = self.reason.get().or_else(|| {
+            (!self.whole.get()).then(|| {
+                self.connection
+                    .was_cut()
+                    .map_or("client_closed", Cut::label)
+            })
+        });
         let mut record = Record {
             time_ms: self.time_ms,
             kind,
