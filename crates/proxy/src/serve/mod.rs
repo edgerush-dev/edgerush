@@ -514,6 +514,9 @@ where
         &slots,
     )
     .await;
+    if ended == h1::Ended::Cut {
+        connection.cut.set(true);
+    }
     // A head refused before the core had a request has a record of what is known of it
     // (21 §4); the server closes the connection after it.
     if let h1::Ended::Refused(error) = ended {
@@ -1000,6 +1003,9 @@ struct Connection {
     drain: Rc<Drain>,
     /// Over HTTP/1, what the answer in hand is to be counted as.
     owed: Owed,
+    /// Over HTTP/1, an answer was cut after its head went: the connection is reset rather
+    /// than closed in order (13 §7).
+    cut: Cell<bool>,
 }
 
 /// What an HTTP/1 answer is counted as, kept from when the core hands it over until our
@@ -1031,6 +1037,7 @@ impl Connection {
             listener,
             drain,
             owed: Owed::default(),
+            cut: Cell::new(false),
         }
     }
 

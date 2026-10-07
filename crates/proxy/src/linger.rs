@@ -167,6 +167,15 @@ impl AsyncWrite for Lent {
 ///
 /// A client that has already closed, which is how most connections end, costs one read
 /// that finds the end at once.
+/// Closes `stream` abortively: a reset, sent at once, whatever was still unsent thrown away.
+/// For a connection whose answer was cut after its head went, which an orderly close would
+/// let its client take for the whole answer when the close is what ends it (13 §7).
+pub(crate) fn reset(stream: TcpStream) {
+    // A socket that will not take it is closed in order, which is no worse than lingering.
+    let _abortive = stream.set_zero_linger();
+    drop(stream);
+}
+
 pub(crate) async fn linger(mut stream: TcpStream, quiet: Duration, most: Duration) {
     // The engine has usually shut it already. Doing it again is harmless, and where it had
     // not, it is what tells the client the answer is over.

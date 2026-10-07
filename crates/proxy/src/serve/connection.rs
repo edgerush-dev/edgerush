@@ -186,6 +186,10 @@ impl Worker {
                 // It has been sent nothing, so there is no answer a reset could take with
                 // it, and lingering would only hold the connection longer.
                 drop(stream);
+            } else if connection.cut.get() {
+                // An answer cut after its head went: a reset tells its client so, where an
+                // orderly close could pass for its end.
+                linger::reset(stream);
             } else {
                 // Dropped with bytes the client sent still unread — the rest of an upload
                 // the engine never read — the connection would be reset, and the reset can

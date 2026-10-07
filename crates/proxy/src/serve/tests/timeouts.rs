@@ -1002,3 +1002,53 @@ async fn a_request_head_grown_past_its_bound_is_refused_before_it_goes_upstream(
         })
         .await;
 }
+
+/// An answer to an HTTP/1.0 client whose length nobody knew goes out ended by the close
+/// (14 §4). Cut after its head, it must not end with the ordinary close a whole one ends
+/// with: "an error is never disguised as clean EOF" (13 §5), "neither outcome is a clean
+/// truncation" (13 §7). Review repro A03-02.
+#[tokio::test]
+async fn an_http_1_0_answer_cut_after_its_head_does_not_end_as_a_whole_one_does() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (open, gate) = tokio::sync::oneshot::channel();
+            let upstream = gated_upstream(
+                b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
+                gate,
+                // Not a chunk: the answer's body fails here, after its head has gone.
+                b"zz\r\n",
+            )
+            .await;
+            let front = serving_worker(upstream).await;
+            let mut client = TcpStream::connect(front).await.unwrap();
+            client
+                .write_all(b"GET / HTTP/1.0\r\nhost: a\r\n\r\n")
+                .await
+                .unwrap();
+            let mut received = Vec::new();
+            while !received.ends_with(b"hello") {
+                let mut some = [0; 512];
+                let got = within(client.read(&mut some)).await.unwrap();
+                assert_ne!(got, 0, "{:?}", String::from_utf8_lossy(&received));
+                received.extend_from_slice(&some[..got]);
+            }
+            let head = String::from_utf8_lossy(&received).into_owned();
+            assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+            assert!(
+                !head.to_ascii_lowercase().contains("content-length")
+                    && !head.to_ascii_lowercase().contains("transfer-encoding"),
+                "not ended by the close: {head}"
+            );
+            let _ = open.send(());
+            let mut rest = Vec::new();
+            let ended = within(client.read_to_end(&mut rest)).await;
+            assert!(
+                ended.is_err(),
+                "the cut answer ended as a whole one does ({ended:?}), after {:?}",
+                String::from_utf8_lossy(&rest)
+            );
+        })
+        .await;
+}
