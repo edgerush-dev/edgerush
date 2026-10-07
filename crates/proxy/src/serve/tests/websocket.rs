@@ -801,3 +801,262 @@ async fn a_failing_backend_resets_an_http3_websocket() {
         })
         .await;
 }
+
+/// A worker serving `config` over HTTP/3 alone, with the worker, for a test that drains it.
+async fn serving_h3_worker_of(config: &edgerush_config::Config) -> (SocketAddr, Rc<Worker>) {
+    let proxy = Arc::new(Proxy::new(compile(config).unwrap(), NonZeroUsize::MIN).unwrap());
+    let worker = Worker::with_deadlines(proxy, H1Limits::default(), SHORT);
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let front = socket.local_addr().unwrap();
+    let _timing = tokio::task::spawn_local(Rc::clone(&worker.timers).run());
+    let alone = Forwarding::group(1).remove(0);
+    let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve_h3(0, socket, alone).unwrap());
+    (front, worker)
+}
+
+/// Opens a WebSocket over HTTP/3 once the connection says it takes extended CONNECT, and
+/// waits for the final head of its answer: the stream it went on.
+async fn h3_websocket(client: &mut crate::downstream::h3::testing::Client) -> u64 {
+    client
+        .until(|client| {
+            client
+                .h3
+                .as_ref()
+                .is_some_and(quiche::h3::Connection::extended_connect_enabled_by_peer)
+        })
+        .await;
+    let id = client.request(&h3_connect("websocket"), false);
+    client
+        .until(|client| {
+            client
+                .answers
+                .get(&id)
+                .is_some_and(|answer| answer.final_status().is_some())
+        })
+        .await;
+    id
+}
+
+/// An HTTP/2 backend that takes extended CONNECT: it answers a WebSocket's CONNECT 200,
+/// says `hello`, echoes what comes, the first piece in brackets, and says `bye` when the
+/// client's side ends.
+async fn echoing_h2_websocket_backend() -> SocketAddr {
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    let _accepting = tokio::task::spawn_local(async move {
+        while let Ok((stream, _)) = socket.accept().await {
+            let _serving = tokio::task::spawn_local(async move {
+                let Ok(mut connection) = ::h2::server::Builder::new()
+                    .enable_connect_protocol()
+                    .handshake::<_, Bytes>(stream)
+                    .await
+                else {
+                    return;
+                };
+                while let Some(Ok((request, mut respond))) = connection.accept().await {
+                    let _answering = tokio::task::spawn_local(async move {
+                        let websocket = request.method() == Method::CONNECT
+                            && request
+                                .extensions()
+                                .get::<::h2::ext::Protocol>()
+                                .is_some_and(|protocol| protocol.as_str() == "websocket");
+                        let status = if websocket { 200 } else { 400 };
+                        let head = Response::builder().status(status).body(()).unwrap();
+                        let Ok(mut sending) = respond.send_response(head, !websocket) else {
+                            return;
+                        };
+                        if !websocket {
+                            return;
+                        }
+                        let _ = sending.send_data(Bytes::from_static(b"hello"), false);
+                        let mut body = request.into_body();
+                        let mut first = true;
+                        while let Some(Ok(data)) = body.data().await {
+                            let _ = body.flow_control().release_capacity(data.len());
+                            let echo = if first {
+                                first = false;
+                                Bytes::from(format!("[{}]", String::from_utf8_lossy(&data)))
+                            } else {
+                                data
+                            };
+                            let _ = sending.send_data(echo, false);
+                        }
+                        let _ = sending.send_data(Bytes::from_static(b"bye"), true);
+                    });
+                }
+            });
+        }
+    });
+    address
+}
+
+/// A WebSocket from an HTTP/3 client is carried to an HTTP/2 backend by extended CONNECT,
+/// the last of the six pairs (19 §4): told 200, the bytes both ways, and each side's end
+/// passed on as a half-close.
+#[tokio::test]
+async fn an_http3_websocket_is_carried_to_an_http2_backend() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::Client;
+            let upstream = echoing_h2_websocket_backend().await;
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let mut config = h3_config(upstream, http3);
+            config.upstreams.get_mut("up").unwrap().protocol = UpstreamProtocol::Http2;
+            let (front, proxy) = serving_h3(&config).await;
+            let mut client = Client::connect(front, "a.test").await;
+            let id = h3_websocket(&mut client).await;
+            let said = |client: &Client, what: &[u8]| {
+                client
+                    .answers
+                    .get(&id)
+                    .is_some_and(|answer| answer.body.ends_with(what))
+            };
+            client.until(|client| said(client, b"hello")).await;
+            assert_eq!(
+                client.answers[&id].final_status(),
+                Some("200"),
+                "{:?}",
+                client.answers[&id]
+            );
+            client.body(id, b"ping", false).await;
+            client.until(|client| said(client, b"[ping]")).await;
+            client.body(id, b"", true).await;
+            let answer = client.answer(id).await;
+            assert!(answer.finished, "{answer:?}");
+            assert_eq!(answer.body, b"hello[ping]bye");
+            let line = "edgerush_listener_tunnels_total{listener=\"web\",outcome=\"closed\"} 1\n";
+            until(|| proxy.metrics().contains(line)).await;
+        })
+        .await;
+}
+
+/// A backend that answers an HTTP/3 client's WebSocket with a page, 200 and no switch, has
+/// failed it: the client is answered 502, never a 2xx that would say its tunnel opened
+/// (RFC 9110 §9.3.6, 19 §3).
+#[tokio::test]
+async fn a_page_in_place_of_the_switch_is_answered_502_to_an_http3_client() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::Client;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = socket.local_addr().unwrap();
+            let _accepting = tokio::task::spawn_local(async move {
+                let (mut stream, _) = socket.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                let page = b"HTTP/1.1 200 OK\r\ncontent-length: 15\r\n\r\n<html>hi</html>";
+                let _ = stream.write_all(page).await;
+                let mut rest = Vec::new();
+                let _ = stream.read_to_end(&mut rest).await;
+            });
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let (front, _proxy) = serving_h3(&h3_config(upstream, http3)).await;
+            let mut client = Client::connect(front, "a.test").await;
+            let id = h3_websocket(&mut client).await;
+            let answer = client.answers[&id].clone();
+            assert_eq!(answer.final_status(), Some("502"), "{answer:?}");
+            assert!(!answer.body.ends_with(b"</html>"), "{answer:?}");
+        })
+        .await;
+}
+
+/// An HTTP/3 client that resets its WebSocket's stream ends the tunnel at once: the
+/// backend's connection is closed with nothing more sent on it, and the tunnel counted
+/// failed, as over HTTP/2.
+#[tokio::test]
+async fn a_client_reset_ends_an_http3_websocket() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::Client;
+            let (saw, mut seen) = tokio::sync::mpsc::unbounded_channel();
+            let upstream = closing_websocket_backend(saw).await;
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let (front, proxy) = serving_h3(&h3_config(upstream, http3)).await;
+            let mut client = Client::connect(front, "a.test").await;
+            let id = h3_websocket(&mut client).await;
+            assert_eq!(client.answers[&id].final_status(), Some("200"));
+            let began = std::time::Instant::now();
+            let cancelled = crate::downstream::h3::code::REQUEST_CANCELLED;
+            let _reset = client
+                .quic
+                .stream_shutdown(id, quiche::Shutdown::Write, cancelled);
+            let _stopped = client
+                .quic
+                .stream_shutdown(id, quiche::Shutdown::Read, cancelled);
+            client.flush().await;
+            let backend_heard = within(seen.recv()).await.unwrap();
+            assert_eq!(backend_heard, b"", "{backend_heard:?}");
+            let line = "edgerush_listener_tunnels_total{listener=\"web\",outcome=\"failed\"} 1\n";
+            until(|| proxy.metrics().contains(line)).await;
+            assert!(
+                began.elapsed() < Duration::from_secs(2),
+                "{:?}",
+                began.elapsed()
+            );
+        })
+        .await;
+}
+
+/// A draining worker closes an HTTP/3 client's WebSocket as it closes the others: a Close
+/// 1001 inside the stream each way, both answers taken, and the tunnel counted drained
+/// (19 §6).
+#[tokio::test]
+async fn a_draining_worker_closes_http3_websockets_with_going_away() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::Client;
+            let (saw, mut seen) = tokio::sync::mpsc::unbounded_channel();
+            let upstream = closing_websocket_backend(saw).await;
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let (front, worker) = serving_h3_worker_of(&h3_config(upstream, http3)).await;
+            let mut client = Client::connect(front, "a.test").await;
+            let id = h3_websocket(&mut client).await;
+            assert_eq!(client.answers[&id].final_status(), Some("200"));
+
+            worker.drain();
+            client
+                .until(|client| client.answers[&id].body.len() >= 4)
+                .await;
+            assert_eq!(
+                client.answers[&id].body,
+                [0x88, 0x02, 0x03, 0xe9],
+                "not a Close 1001"
+            );
+            client
+                .body(id, &[0x88, 0x82, 0, 0, 0, 0, 0x03, 0xe9], false)
+                .await;
+            let answer = client.answer(id).await;
+            assert_eq!(
+                answer.body,
+                [0x88, 0x02, 0x03, 0xe9],
+                "the backend's answer went on"
+            );
+            let backend_heard = within(seen.recv()).await.unwrap();
+            assert_eq!(&backend_heard[..2], &[0x88, 0x82], "{backend_heard:?}");
+            tunnel_ended(&worker, "web", "drained").await;
+        })
+        .await;
+}
