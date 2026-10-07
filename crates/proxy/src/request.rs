@@ -24,8 +24,8 @@ use edgerush_config::{
     Compiled, CompiledListener, CompiledRule, Outcome, Protocol, RuleId, Step, UpstreamId,
 };
 use edgerush_filters::{Requested, Scheme, UrlRewrite};
-use edgerush_router::{NormaliseError, RequestParts, normalise_path};
-use http::header::HeaderMap;
+use edgerush_router::{Fields, NormaliseError, RequestParts, normalise_path};
+use http::header::{HeaderMap, HeaderName};
 use http::uri::PathAndQuery;
 use http::{HeaderValue, Method, StatusCode, Uri, Version};
 use std::borrow::Cow;
@@ -130,6 +130,14 @@ pub enum Rejection {
     /// hold. Not reachable from a config the gateway accepts (14 §6).
     #[error("request head cannot take its changes")]
     Edits,
+    /// A TRACE or OPTIONS that may be forwarded no further, `Max-Forwards: 0`, which the
+    /// gateway answers as its final recipient (RFC 9110 §7.6.2): 200 to OPTIONS, 405 to
+    /// TRACE, which it does not reflect.
+    #[error("Max-Forwards 0: answered here, as the final recipient")]
+    MaxForwards {
+        /// Whether it is an OPTIONS, rather than a TRACE.
+        options: bool,
+    },
     /// An extended CONNECT for a protocol other than WebSocket, which is all the gateway
     /// carries (RFC 9220 §3: a server "SHOULD respond ... with a 501").
     #[error("extended CONNECT for a protocol not carried")]
@@ -156,8 +164,34 @@ impl Rejection {
             Self::NoRoute => StatusCode::NOT_FOUND,
             Self::NoBackend | Self::Edits => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Protocol => StatusCode::NOT_IMPLEMENTED,
+            Self::MaxForwards { options: true } => StatusCode::OK,
+            Self::MaxForwards { options: false } => StatusCode::METHOD_NOT_ALLOWED,
         }
     }
+}
+
+/// `Max-Forwards`.
+const MAX_FORWARDS: HeaderName = HeaderName::from_static("max-forwards");
+
+/// How many more times a request may be forwarded, as its one `Max-Forwards` field says
+/// (RFC 9110 §7.6.2: `1*DIGIT`): one too large for a number is as good as without end.
+/// None for a request without one, with more than one, or with one that is not a number,
+/// which is forwarded as it came.
+fn max_forwards<F: Fields>(fields: &F) -> Option<u64> {
+    let name = MAX_FORWARDS;
+    let mut values = fields.values(&name);
+    let value = values.next()?;
+    if values.next().is_some() || value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(
+        value
+            .iter()
+            .try_fold(0_u64, |sum, digit| {
+                sum.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
+            })
+            .unwrap_or(u64::MAX),
+    )
 }
 
 /// Decides where a request from `client` that came in on `listener` goes, and makes its
@@ -257,6 +291,21 @@ pub fn decide_routed<'a, H: Head>(
         }
     }
     head.agree_host()?;
+    // RFC 9110 §7.6.2: a TRACE or OPTIONS that may be forwarded no further is answered
+    // here, by its final recipient, and one that may goes on with one hop fewer.
+    let left = if matches!(*head.method(), Method::TRACE | Method::OPTIONS) {
+        max_forwards(&head.fields())
+    } else {
+        None
+    };
+    if let Some(left) = left {
+        let Some(fewer) = left.checked_sub(1) else {
+            return Err(Rejection::MaxForwards {
+                options: *head.method() == Method::OPTIONS,
+            });
+        };
+        head.set_field(MAX_FORWARDS, HeaderValue::from(fewer))?;
+    }
     // Before routing, so that a rule's predicates read what the upstream will be told, and
     // before the host is borrowed from the head for routing.
     forward(head, listener, client, id)?;

@@ -235,6 +235,27 @@ pub fn redirect_answer<A: AnswerHead + ?Sized>(
     Ok(())
 }
 
+/// Makes `answer` the gateway's own as the final recipient of a TRACE or OPTIONS that may
+/// be forwarded no further (RFC 9110 §7.6.2): 200 to OPTIONS and 405 to TRACE, which it does
+/// not reflect, each with the `Allow` RFC 9110 §15.5.6 asks of a 405: what it answers
+/// itself.
+///
+/// # Errors
+///
+/// As [`redirect_answer`]'s, which a map never gives.
+pub fn final_recipient_answer<A: AnswerHead + ?Sized>(
+    answer: &mut A,
+    options: bool,
+) -> Result<(), Failed> {
+    answer.set_status(if options {
+        StatusCode::OK
+    } else {
+        StatusCode::METHOD_NOT_ALLOWED
+    });
+    answer.set_field(http::header::ALLOW, HeaderValue::from_static("OPTIONS"))?;
+    Ok(())
+}
+
 /// What every answer says last, the gateway's own among them: that its listener serves
 /// HTTP/3 as well, `alt_svc`, if it does (03 §4), and the request's ID, `id`, in place of
 /// any the upstream gave, if its listener gives one.

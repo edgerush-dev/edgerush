@@ -16,7 +16,7 @@ use crate::interim::Interim;
 use crate::map_head::MapHead;
 use crate::metrics::Answer;
 use crate::random::{random, unguessable};
-use crate::request::{Decision, Opening, decide};
+use crate::request::{Decision, Opening, Rejection, decide};
 use crate::request_body::{Counts, RequestBody};
 use crate::routed::Through;
 use crate::timers::{Alarm, Timers};
@@ -189,6 +189,12 @@ impl Worker {
             Ok(Directing::Upstream(directed)) => directed,
             Ok(Directing::Redirect(redirect)) => {
                 return self.proxy.redirect(listener, redirect, call).into();
+            }
+            Ok(Directing::FinalRecipient { options }) => {
+                let mut response = self.proxy.answer(listener, Answer::MaxForwards);
+                // A map takes every field it is given: nothing here fails.
+                let _made = way_back::final_recipient_answer(&mut response, options);
+                return response.into();
             }
             Err(answer) => return self.proxy.answer_to(listener, answer, call).into(),
         };
@@ -437,7 +443,13 @@ impl Proxy {
             .flatten()
             .and_then(|position| snapshot.config.listeners().get(position))
             .ok_or(Answer::NoRoute)?;
-        let forward = match decide(&snapshot.config, listener, head, client, &mut random, id)? {
+        let decided = match decide(&snapshot.config, listener, head, client, &mut random, id) {
+            Err(Rejection::MaxForwards { options }) => {
+                return Ok(Directing::FinalRecipient { options });
+            }
+            decided => decided?,
+        };
+        let forward = match decided {
             Decision::Forward(forward) => forward,
             Decision::Redirect(redirected) => {
                 if let Some(logging) = &logging {

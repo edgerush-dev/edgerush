@@ -464,6 +464,50 @@ async fn a_stream_cut_off_with_a_rapid_reset_is_logged_as_such() {
         .await;
 }
 
+/// A TRACE or OPTIONS that may be forwarded no further is answered by the gateway as its
+/// final recipient (RFC 9110 §7.6.2; review A03-05, C35), over HTTP/1.1 and HTTP/2 alike:
+/// 200 to OPTIONS, 405 to TRACE, each with the `Allow` a 405 must have; nothing goes
+/// upstream, and each is one of the gateway's own answers, `max_forwards`.
+#[tokio::test]
+async fn max_forwards_0_is_answered_by_the_gateway_as_final_recipient() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, asked) = counting_upstream().await;
+            let logged = recording("max-forwards", everything_config(upstream)).await;
+            for (request, status) in [
+                (&b"OPTIONS /x HTTP/1.1\r\nhost: a\r\nmax-forwards: 0\r\nconnection: close\r\n\r\n"[..], "200"),
+                (&b"TRACE / HTTP/1.1\r\nhost: a\r\nmax-forwards: 0\r\nconnection: close\r\n\r\n"[..], "405"),
+            ] {
+                let answer = h1_answer(logged.front, request).await;
+                assert!(answer.starts_with(&format!("HTTP/1.1 {status} ")), "{answer}");
+                assert!(answer.to_ascii_lowercase().contains("\r\nallow: options\r\n"), "{answer}");
+            }
+            let mut send = h2_library_client(logged.front, &::h2::client::Builder::new()).await;
+            let request = Request::builder()
+                .method(Method::OPTIONS)
+                .uri("http://example.test/x")
+                .version(Version::HTTP_2)
+                .header("max-forwards", "0")
+                .body(())
+                .unwrap();
+            let (response, _) = send.send_request(request, true).unwrap();
+            let response = within(response).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["allow"], "OPTIONS");
+            let records = logged.records(3).await;
+            assert!(
+                records.iter().all(|record| record["reason"] == "max_forwards"),
+                "{records:?}"
+            );
+            assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0, "sent upstream");
+            let line = "edgerush_listener_local_answers_total{listener=\"web\",reason=\"max_forwards\"} 3";
+            let scrape = logged.worker.proxy.metrics();
+            assert!(scrape.lines().any(|shown| shown == line), "{line}");
+        })
+        .await;
+}
+
 /// Behind a trusted proxy the client is the one the proxy names, and the peer the proxy.
 #[tokio::test]
 async fn a_trusted_proxys_client_is_the_client() {

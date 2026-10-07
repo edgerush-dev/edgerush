@@ -716,6 +716,9 @@ enum Directing {
     Upstream(Directed),
     /// It is answered with a redirect.
     Redirect(Redirect),
+    /// A TRACE or OPTIONS that may be forwarded no further, answered here (03 §11): an
+    /// OPTIONS if `options`.
+    FinalRecipient { options: bool },
 }
 
 /// What a redirected request keeps of the snapshot it was decided on.

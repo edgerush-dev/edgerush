@@ -402,6 +402,22 @@ fn request_line() -> Vec<Case> {
             .seen(b"content-length: 3\r\n\r\nabc"),
         case("TRACE goes on", "nginx-tests http_method.t:52 (answers 405 itself)", b"TRACE / HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(200)], Open)
             .seen(b"TRACE / HTTP/1.1\r\n"),
+        // Review repro A03-05: RFC 9110 §7.6.2, "Each intermediary that receives a TRACE or
+        // OPTIONS request containing a Max-Forwards header field MUST check and update its
+        // value prior to forwarding the request".
+        case("Max-Forwards on TRACE is counted down", "RFC 9110 §7.6.2 (MUST)", b"TRACE / HTTP/1.1\r\nHost: a\r\nMax-Forwards: 5\r\n\r\n", &[Is(200)], Open)
+            .seen(b"max-forwards: 4\r\n")
+            .unseen("max-forwards: 5"),
+        case("Max-Forwards on OPTIONS is counted down", "RFC 9110 §7.6.2 (MUST)", b"OPTIONS /x HTTP/1.1\r\nHost: a\r\nMax-Forwards: 2\r\n\r\n", &[Is(200)], Open)
+            .seen(b"max-forwards: 1\r\n")
+            .unseen("max-forwards: 2"),
+        case("Max-Forwards 0 on OPTIONS is answered here", "RFC 9110 §7.6.2 (MUST); C35", b"OPTIONS /x HTTP/1.1\r\nHost: a\r\nMax-Forwards: 0\r\n\r\n", &[Is(200)], Open)
+            .unseen("options /x"),
+        case("Max-Forwards 0 on TRACE is answered here, not reflected", "RFC 9110 §7.6.2 (MUST); C35", b"TRACE / HTTP/1.1\r\nHost: a\r\nMax-Forwards: 0\r\n\r\n", &[Is(405)], Open),
+        case("Max-Forwards on GET is not the gateway's", "RFC 9110 §7.6.2 (TRACE and OPTIONS only)", b"GET / HTTP/1.1\r\nHost: a\r\nMax-Forwards: 0\r\n\r\n", &[Is(200)], Open)
+            .seen(b"Max-Forwards: 0\r\n"),
+        case("two Max-Forwards fields go on as they came", "RFC 9110 §7.6.2 (1*DIGIT, one value)", b"OPTIONS /x HTTP/1.1\r\nHost: a\r\nMax-Forwards: 0\r\nMax-Forwards: 3\r\n\r\n", &[Is(200)], Open)
+            .seen(b"Max-Forwards: 0\r\nMax-Forwards: 3\r\n"),
         case("two spaces before the target", "hyper role.rs:1889", b"GET  / HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Closed),
         case("two spaces before the version", "HAProxy http_request_buffer.vtc:120 and nginx accept it; RFC 9112 §3 has one SP", b"GET /  HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Closed),
         case("no method, a leading space", "nginx-tests control_api.t:236", b" / HTTP/1.1\r\nHost: a\r\n\r\n", &[Is(400)], Closed),

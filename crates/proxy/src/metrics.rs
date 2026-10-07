@@ -374,10 +374,13 @@ pub(crate) enum Answer {
     /// An extended CONNECT for a protocol other than WebSocket
     /// ([19 §4](../../docs/19-websocket.md)).
     UnknownProtocol,
+    /// A TRACE or OPTIONS that may be forwarded no further, answered by the gateway as its
+    /// final recipient ([03 §11](../../docs/03-data-plane.md)).
+    MaxForwards,
 }
 
 impl Answer {
-    const ALL: [Self; 23] = [
+    const ALL: [Self; 24] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -401,6 +404,7 @@ impl Answer {
         Self::DeadlineExceeded,
         Self::Redirected,
         Self::UnknownProtocol,
+        Self::MaxForwards,
     ];
 
     /// The status that is answered with.
@@ -426,6 +430,8 @@ impl Answer {
             Self::BodyTimedOut => StatusCode::REQUEST_TIMEOUT,
             // A redirect's own status, one of five, takes its place.
             Self::Redirected => StatusCode::FOUND,
+            // OPTIONS is answered 200 in its place.
+            Self::MaxForwards => StatusCode::METHOD_NOT_ALLOWED,
         }
     }
 
@@ -454,6 +460,7 @@ impl Answer {
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::Redirected => "redirected",
             Self::UnknownProtocol => "unknown_protocol",
+            Self::MaxForwards => "max_forwards",
         }
     }
 
@@ -504,6 +511,8 @@ impl Answer {
                 "the route answers with a redirect, which a call cannot follow",
             ),
             Self::UnknownProtocol => (Code::Unimplemented, "no protocol but WebSocket is carried"),
+            // Not a gRPC call's method; said for completeness.
+            Self::MaxForwards => (Code::Unimplemented, "answered here, as the final recipient"),
         }
     }
 }
@@ -519,6 +528,7 @@ impl From<Rejection> for Answer {
             Rejection::NoBackend => Self::NoBackend,
             Rejection::Edits => Self::Edits,
             Rejection::Protocol => Self::UnknownProtocol,
+            Rejection::MaxForwards { .. } => Self::MaxForwards,
         }
     }
 }

@@ -221,6 +221,10 @@ fn answer(
             );
         }
         Err(rejection) if call => way_back::call_rejected(&mut answer, rejection),
+        Err(Rejection::MaxForwards { options }) => {
+            // A map takes every field it is given: nothing fails.
+            let _made = way_back::final_recipient_answer(&mut answer, options);
+        }
         Err(rejection) => *answer.status_mut() = rejection.status(),
     }
     let alt_svc = way_back::alt_svc(listener, listener.address.port());
