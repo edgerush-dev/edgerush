@@ -865,3 +865,516 @@ async fn a_probe_with_no_socket_marks_nothing_down() {
         })
         .await;
 }
+
+/// A config for `up` at `upstream`, spoken to in HTTP/1, whose rule gives a try `try_ms`.
+fn trying(upstream: SocketAddr, try_ms: u64) -> Config {
+    let mut config = everything_config(upstream);
+    config.routes[0].rules[0]
+        .forward
+        .as_mut()
+        .expect("the rule forwards")
+        .timeouts = Some(edgerush_config::Timeouts {
+        request_ms: None,
+        backend_request_ms: Some(try_ms),
+        tunnel_idle_ms: None,
+    });
+    config
+}
+
+/// A worker serving [`trying`], whose connects are bounded by `connect`.
+async fn trying_within(
+    upstream: SocketAddr,
+    try_ms: u64,
+    connect: Duration,
+) -> (SocketAddr, Rc<Worker>) {
+    let limits = H1Limits {
+        connect,
+        ..H1Limits::default()
+    };
+    let proxy = Proxy::new(
+        compile(&trying(upstream, try_ms)).unwrap(),
+        NonZeroUsize::MIN,
+    )
+    .unwrap();
+    let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front = socket.local_addr().unwrap();
+    let _serving = serving(&worker, socket);
+    (front, worker)
+}
+
+/// How many of `up`'s endpoints are set aside, by the worker's scrape.
+fn set_aside(worker: &Worker) -> u64 {
+    let line = "edgerush_upstream_set_aside_endpoints{upstream=\"up\"} ";
+    worker
+        .proxy()
+        .metrics()
+        .lines()
+        .find_map(|found| found.strip_prefix(line))
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Waits, a few seconds at most, for `done`.
+async fn soon(mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(
+            Instant::now() < deadline,
+            "waited for something that never happened"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A try whose clock runs out while its connect hangs is answered at its clock, and the
+/// connect is carried on until its own bound, which sets the endpoint aside, as a try that
+/// waited for it would have (03 §6, C40): over HTTP/1 the connect is no longer the try's to
+/// drop.
+#[tokio::test]
+async fn a_connect_its_try_let_go_of_sets_its_endpoint_aside_at_its_bound() {
+    use crate::upstream::dial::hold_connects;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            hold_connects(upstream, Some(Duration::from_secs(60)));
+            let (front, worker) = trying_within(upstream, 200, Duration::from_millis(800)).await;
+            let began = Instant::now();
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+            assert!(
+                began.elapsed() < Duration::from_millis(600),
+                "{:?}",
+                began.elapsed()
+            );
+            assert_eq!(set_aside(&worker), 0, "set aside before its bound");
+            soon(|| set_aside(&worker) == 1).await;
+            assert!(began.elapsed() >= Duration::from_millis(800) - EARLY);
+            soon(|| worker.watcher.watched() == 0 && worker.places.held() == 0).await;
+            hold_connects(upstream, None);
+        })
+        .await;
+}
+
+/// Tries let go of one after another, while the first one's connect is still carried on,
+/// leave no more than it: one connect watched for the destination, holding one place, the
+/// others ended with theirs. A reload meanwhile changes nothing, and once the bound has
+/// passed nothing is held.
+#[tokio::test]
+async fn connects_let_go_of_to_one_destination_are_watched_once() {
+    use crate::upstream::dial::hold_connects;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            hold_connects(upstream, Some(Duration::from_secs(60)));
+            let (front, worker) = trying_within(upstream, 100, Duration::from_millis(1_500)).await;
+            for _ in 0..3 {
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(worker.watcher.watched(), 1);
+            assert_eq!(worker.places.held(), 1);
+            worker
+                .proxy()
+                .reload(compile(&trying(upstream, 100)).unwrap())
+                .unwrap();
+            soon(|| set_aside(&worker) == 1).await;
+            soon(|| worker.watcher.watched() == 0 && worker.places.held() == 0).await;
+            hold_connects(upstream, None);
+        })
+        .await;
+}
+
+/// A connect carried on that gets through after all is closed, and sets nothing aside;
+/// what it held goes with it.
+#[tokio::test]
+async fn a_connect_carried_on_that_gets_through_is_closed() {
+    use crate::upstream::dial::hold_connects;
+    use std::sync::atomic::Ordering;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, opened) = counting_upstream().await;
+            hold_connects(upstream, Some(Duration::from_millis(400)));
+            let (front, worker) = trying_within(upstream, 100, Duration::from_secs(2)).await;
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+            soon(|| opened.load(Ordering::SeqCst) == 1).await;
+            soon(|| worker.watcher.watched() == 0 && worker.places.held() == 0).await;
+            assert_eq!(set_aside(&worker), 0);
+            assert_eq!(
+                worker.idle_connections(),
+                0,
+                "kept a connection nobody asked for"
+            );
+            hold_connects(upstream, None);
+        })
+        .await;
+}
+
+/// What sets nothing aside for a try sets nothing aside carried on: the worker's own
+/// shortage of sockets, met by a connect its try let go of, blames no endpoint.
+#[tokio::test]
+async fn a_connect_carried_on_into_the_workers_own_shortage_blames_no_endpoint() {
+    use crate::upstream::dial::{hold_connects, short_of_sockets};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            hold_connects(upstream, Some(Duration::from_millis(300)));
+            let (front, worker) = trying_within(upstream, 100, Duration::from_secs(2)).await;
+            short_of_sockets(true);
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+            soon(|| worker.watcher.watched() == 0 && worker.places.held() == 0).await;
+            short_of_sockets(false);
+            assert_eq!(set_aside(&worker), 0);
+            hold_connects(upstream, None);
+        })
+        .await;
+}
+
+/// Nor is a try let go of in its TLS handshake, its connect through: nothing is carried
+/// on, and an endpoint that took the connection is not set aside.
+#[tokio::test]
+async fn a_try_let_go_of_in_its_handshake_carries_nothing_on() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let upstream = mute().await;
+            let mut config = trying(upstream, 200);
+            let authority = crate::tls::testing::certificate(&["backend.test"]);
+            config.upstreams.get_mut("up").unwrap().tls =
+                Some(trusting("backend.test", &authority));
+            let (front, worker) = serving_config(&config).await;
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+            assert!(worker.watcher.watched() == 0);
+            assert_eq!(worker.places.held(), 0);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(set_aside(&worker), 0);
+        })
+        .await;
+}
+
+/// A worker that ends while a connect is carried on lets go of what it held: the place,
+/// and the destination watched.
+#[test]
+fn a_worker_ending_mid_watch_holds_nothing() {
+    use crate::upstream::dial::hold_connects;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let (worker, upstream) = local.block_on(&runtime, async {
+        let (upstream, _) = counting_upstream().await;
+        hold_connects(upstream, Some(Duration::from_secs(60)));
+        let (front, worker) = trying_within(upstream, 100, Duration::from_secs(30)).await;
+        let answer = h1_answer(front, CLOSING_GET).await;
+        assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(worker.watcher.watched(), 1);
+        (worker, upstream)
+    });
+    drop(local);
+    assert!(worker.watcher.watched() == 0);
+    assert_eq!(worker.places.held(), 0);
+    hold_connects(upstream, None);
+}
+
+/// A worker serving `config`, whose connects are bounded by `connect`.
+async fn serving_connecting_within(config: &Config, connect: Duration) -> (SocketAddr, Rc<Worker>) {
+    let limits = H1Limits {
+        connect,
+        ..H1Limits::default()
+    };
+    let proxy = Proxy::new(compile(config).unwrap(), NonZeroUsize::MIN).unwrap();
+    let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front = socket.local_addr().unwrap();
+    let _serving = serving(&worker, socket);
+    (front, worker)
+}
+
+/// How many of `upstream`'s endpoints are set aside, by the worker's scrape.
+fn set_aside_of(worker: &Worker, upstream: &str) -> u64 {
+    let line = format!("edgerush_upstream_set_aside_endpoints{{upstream=\"{upstream}\"}} ");
+    worker
+        .proxy()
+        .metrics()
+        .lines()
+        .find_map(|found| found.strip_prefix(line.as_str()))
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// A try let go of while its connect hangs, and retried: the connect carried on keeps the
+/// first try's place, and the retry, sent to the other endpoint, takes one of its own and
+/// is answered. Once the bound has passed only the endpoint set aside is left of it.
+#[tokio::test]
+async fn a_retry_takes_a_place_of_its_own_beside_a_connect_carried_on() {
+    use crate::upstream::dial::hold_connects;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (hanging, _) = counting_upstream().await;
+            let (answering, _) = counting_upstream().await;
+            hold_connects(hanging, Some(Duration::from_secs(60)));
+            let mut config = trying(hanging, 100);
+            config.upstreams.get_mut("up").unwrap().endpoints = vec![hanging, answering];
+            let mut retry = retrying(1, &[], &[], 10);
+            retry.on_timeout = true;
+            config.routes[0].rules[0]
+                .forward
+                .as_mut()
+                .expect("the rule forwards")
+                .retry = Some(retry);
+            let (front, worker) = serving_connecting_within(&config, Duration::from_secs(2)).await;
+            let retried = "edgerush_upstream_retries_total{upstream=\"up\"} 1\n";
+            // Until a request's first try draws the endpoint that hangs: the other draws
+            // it half the time.
+            for _ in 0..30 {
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+                if worker.proxy().metrics().contains(retried) {
+                    break;
+                }
+            }
+            assert!(worker.proxy().metrics().contains(retried), "no try drew it");
+            assert_eq!(worker.watcher.watched(), 1);
+            soon(|| worker.places.held() == 1).await;
+            soon(|| set_aside(&worker) == 1).await;
+            soon(|| worker.watcher.watched() == 0 && worker.places.held() == 0).await;
+            hold_connects(hanging, None);
+        })
+        .await;
+}
+
+/// A mirror's copy given up on while its connect hangs — its request went before its body
+/// ended — is let go of, body and all, and its connect carried on alone, with the copy's
+/// place, until its bound, which sets the mirror's endpoint aside.
+#[tokio::test]
+async fn a_mirror_given_up_on_mid_connect_leaves_only_the_connect() {
+    use crate::upstream::dial::hold_connects;
+    use tokio::io::AsyncWriteExt;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (primary, _) = counting_upstream().await;
+            let (shadow, _) = counting_upstream().await;
+            hold_connects(shadow, Some(Duration::from_secs(60)));
+            let mut config = everything_config(primary);
+            let mut copy = config.upstreams["up"].clone();
+            copy.endpoints = vec![shadow];
+            config.upstreams.insert("shadow".to_owned(), copy);
+            config.routes[0].rules[0].filters.push(
+                serde_saphyr::from_str(
+                    "{ type: request_mirror, upstream: shadow, fraction: { numerator: 1, denominator: 1 } }",
+                )
+                .unwrap(),
+            );
+            let (front, worker) =
+                serving_connecting_within(&config, Duration::from_millis(1_500)).await;
+            let mut client = TcpStream::connect(front).await.unwrap();
+            client
+                .write_all(b"POST /a HTTP/1.1\r\nhost: shop.example.com\r\ncontent-length: 100\r\n\r\n0123456789")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(client);
+            soon(|| worker.watcher.watched() == 1 && worker.places.held() == 1).await;
+            // What the worker stores while the connect is carried on is what it stores
+            // after: none of it is the copy's, whose body went with it.
+            let stored = worker.blocks.borrow().storage().used();
+            assert_eq!(set_aside_of(&worker, "shadow"), 0);
+            soon(|| set_aside_of(&worker, "shadow") == 1).await;
+            soon(|| worker.watcher.watched() == 0 && worker.places.held() == 0).await;
+            assert_eq!(worker.blocks.borrow().storage().used(), stored);
+            assert_eq!(set_aside_of(&worker, "up"), 0);
+            hold_connects(shadow, None);
+        })
+        .await;
+}
+
+/// The destination at `address`, by the identity a compiled config gives it, with a place
+/// of `places` held for a try.
+fn try_at(
+    address: SocketAddr,
+    places: &Rc<crate::places::Places>,
+) -> (Proxy, Arc<ReuseIdentity>, Option<Admitted>) {
+    let proxy = Proxy::new(everything_to(address), NonZeroUsize::MIN).unwrap();
+    let identity = Arc::clone(proxy.current.load().destinations.at(0, 0).unwrap());
+    let holds = Rc::new(Cell::new(0));
+    let admitted = Admitted {
+        _place: places.take(&holds, false).unwrap(),
+        counted: None,
+    };
+    (proxy, identity, Some(admitted))
+}
+
+/// A connect that ends as its try goes is the try's: nothing is handed on, the place stays
+/// with the try, and the connection with whoever has it.
+#[tokio::test]
+async fn a_connect_that_ended_as_its_try_goes_hands_nothing_on() {
+    use crate::serve::watched::{Connecting, Watcher};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let places = crate::places::Places::new(2);
+            let (_proxy, identity, mut admitted) = try_at(listener.local_addr().unwrap(), &places);
+            let watcher = Rc::new(Watcher::default());
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let connecting = Connecting::new(&identity, deadline, &mut admitted, &watcher);
+            let connected = within(connecting).await.unwrap();
+            assert!(admitted.is_some(), "the place left the try");
+            assert_eq!((watcher.watched(), watcher.queued()), (0, 0));
+            drop(connected);
+            drop(admitted);
+            assert_eq!(places.held(), 0);
+        })
+        .await;
+}
+
+/// Connects let go of before the watcher has taken any up are coalesced as they are
+/// handed over, not once watched: the first queued with its place, the second ended at once
+/// with its own, so that tries let go of one after another queue no more than one.
+#[tokio::test]
+async fn connects_let_go_of_while_one_is_queued_are_not_queued_beside_it() {
+    use crate::serve::watched::{Connecting, Watcher};
+    use crate::upstream::dial::hold_connects;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            hold_connects(upstream, Some(Duration::from_secs(60)));
+            let places = crate::places::Places::new(4);
+            let (_proxy, identity, mut first) = try_at(upstream, &places);
+            let holds = Rc::new(Cell::new(0));
+            let mut second = Some(Admitted {
+                _place: places.take(&holds, false).unwrap(),
+                counted: None,
+            });
+            let watcher = Rc::new(Watcher::default());
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            {
+                let mut one = Box::pin(Connecting::new(&identity, deadline, &mut first, &watcher));
+                let mut two = Box::pin(Connecting::new(&identity, deadline, &mut second, &watcher));
+                std::future::poll_fn(|cx| {
+                    assert!(one.as_mut().poll(cx).is_pending());
+                    assert!(two.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                // Both let go of in one go, before the watcher's task has had a turn.
+            }
+            assert_eq!((watcher.watched(), watcher.queued()), (1, 1));
+            assert_eq!(places.held(), 1, "the second's place is held still");
+            assert!(first.is_none() && second.is_none());
+            hold_connects(upstream, None);
+        })
+        .await;
+}
+
+/// A connect let go of once its worker's watcher has ended is ended at once, all it holds
+/// with it: the socket, the place and the destination's registration.
+#[test]
+fn a_connect_let_go_of_after_its_watcher_ended_holds_nothing() {
+    use crate::serve::watched::{Connecting, Watcher};
+    use crate::upstream::dial::hold_connects;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let places = crate::places::Places::new(2);
+    let watcher = Rc::new(Watcher::default());
+    let local = tokio::task::LocalSet::new();
+    let (upstream, proxy, identity, mut admitted) = local.block_on(&runtime, async {
+        let (upstream, _) = counting_upstream().await;
+        hold_connects(upstream, Some(Duration::from_secs(60)));
+        let (proxy, identity, admitted) = try_at(upstream, &places);
+        (upstream, proxy, identity, admitted)
+    });
+    let deadline = local.block_on(&runtime, async {
+        tokio::time::Instant::now() + Duration::from_secs(30)
+    });
+    // Begun on the worker, which starts its watcher's task.
+    let mut connecting = {
+        let _runtime = runtime.enter();
+        let _local = local.enter();
+        Box::pin(Connecting::new(
+            &identity,
+            deadline,
+            &mut admitted,
+            &watcher,
+        ))
+    };
+    local.block_on(&runtime, async {
+        std::future::poll_fn(|cx| {
+            assert!(connecting.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // The watcher's task has its first turn.
+        tokio::task::yield_now().await;
+    });
+    // The worker ends, and its watcher's task with it.
+    drop(local);
+    drop(connecting);
+    assert_eq!((watcher.watched(), watcher.queued()), (0, 0));
+    assert!(admitted.is_none());
+    assert_eq!(places.held(), 0);
+    drop(proxy);
+    hold_connects(upstream, None);
+}
+
+/// Connects carried on are seen through side by side: one that hangs to its bound does not
+/// keep another, refused meanwhile, from setting its endpoint aside at once.
+#[tokio::test]
+async fn a_connect_carried_on_does_not_wait_for_another() {
+    use crate::upstream::dial::hold_connects;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (hanging, _) = counting_upstream().await;
+            let (_held, refusing) = refusing();
+            hold_connects(hanging, Some(Duration::from_secs(60)));
+            hold_connects(refusing, Some(Duration::from_millis(300)));
+            let mut config = trying(hanging, 100);
+            config.upstreams.get_mut("up").unwrap().endpoints = vec![hanging, refusing];
+            let (front, worker) = serving_connecting_within(&config, Duration::from_secs(3)).await;
+            let began = Instant::now();
+            // Until a try to each has been let go of: each draws either.
+            for _ in 0..40 {
+                if worker.watcher.watched() == 2 {
+                    break;
+                }
+                let answer = h1_answer(front, CLOSING_GET).await;
+                assert!(answer.starts_with("HTTP/1.1 504 "), "{answer}");
+            }
+            assert_eq!(worker.watcher.watched(), 2, "no try drew one of them");
+            let aside = |address: SocketAddr| {
+                let snapshot = worker.proxy().current.load();
+                (0..2)
+                    .filter_map(|at| snapshot.destinations.at(0, at))
+                    .find(|destination| destination.address() == address)
+                    .is_some_and(|destination| destination.aside().is_some())
+            };
+            soon(|| aside(refusing)).await;
+            assert!(!aside(hanging), "the hanging one already out of time");
+            assert!(
+                began.elapsed() < Duration::from_secs(3),
+                "{:?}",
+                began.elapsed()
+            );
+            soon(|| aside(hanging)).await;
+            soon(|| worker.watcher.watched() == 0 && worker.places.held() == 0).await;
+            hold_connects(hanging, None);
+            hold_connects(refusing, None);
+        })
+        .await;
+}

@@ -22,6 +22,7 @@ mod passthrough;
 mod plane;
 mod respond;
 mod tries;
+mod watched;
 mod worker;
 
 use crate::access_log::{Batches, CannotOpen, Logs, Sink};
@@ -191,7 +192,16 @@ async fn connect_within<S>(
     limit: Duration,
     opening: impl Future<Output = Result<S, Unconnected>>,
 ) -> Result<S, ExchangeError> {
-    match tokio::time::timeout(limit, opening).await {
+    connect_by(Instant::now() + limit, opening).await
+}
+
+/// The same, giving up at `deadline`: one set before the connect began, which nothing
+/// after it, such as the scheduling of a task, can move.
+async fn connect_by<S>(
+    deadline: Instant,
+    opening: impl Future<Output = Result<S, Unconnected>>,
+) -> Result<S, ExchangeError> {
+    match tokio::time::timeout_at(deadline, opening).await {
         Ok(socket) => socket.map_err(ExchangeError::Unconnected),
         Err(_) => Err(ExchangeError::Unconnected(Unconnected::Endpoint(
             io::ErrorKind::TimedOut.into(),
@@ -451,6 +461,8 @@ pub struct Worker {
     batches: Batches,
     /// What its sweep last said it holds.
     said: crate::metrics::Said,
+    /// The connects tries let go of, carried on to their bound (03 §6).
+    watcher: Rc<watched::Watcher>,
 }
 
 /// The client validation a listener's connections were accepted under on a worker, and the

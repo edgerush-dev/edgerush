@@ -94,6 +94,7 @@ async fn a_connection_that_finished_carries_the_next_request_too() {
                         None,
                         false,
                         false,
+                        &mut None,
                     )
                     .await
                     .unwrap();

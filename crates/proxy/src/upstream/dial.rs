@@ -76,6 +76,10 @@ pub fn connect_failed(error: io::Error) -> Unconnected {
 ///
 /// [`Unconnected`], saying whose the failure is.
 pub async fn connect(address: SocketAddr) -> Result<TcpStream, Unconnected> {
+    #[cfg(test)]
+    if let Some(held) = HELD.with_borrow(|held| held.get(&address).copied()) {
+        tokio::time::sleep(held).await;
+    }
     socket(address)?
         .connect(address)
         .await
@@ -106,6 +110,24 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn short_of_sockets(short: bool) {
     NO_SOCKETS.set(short);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How long a connect this thread makes to an address waits before it begins.
+    static HELD: std::cell::RefCell<std::collections::HashMap<SocketAddr, std::time::Duration>> =
+        std::cell::RefCell::default();
+}
+
+/// Has every connect this thread makes to `address` wait `held` before it begins, or none
+/// from now on: an endpoint whose connects hang, as one whose node has gone does, which a
+/// loopback cannot be made into.
+#[cfg(test)]
+pub(crate) fn hold_connects(address: SocketAddr, held: Option<std::time::Duration>) {
+    HELD.with_borrow_mut(|holding| match held {
+        Some(held) => holding.insert(address, held),
+        None => holding.remove(&address),
+    });
 }
 
 #[cfg(test)]

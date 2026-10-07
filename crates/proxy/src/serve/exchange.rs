@@ -3,7 +3,8 @@
 
 use super::logged::Logging;
 use super::{
-    Admitted, Body, Directed, Handshake, Timing, Toward, Watch, Worker, connect_within, why_stopped,
+    Admitted, Body, Directed, Handshake, Timing, Toward, Watch, Worker, connect_by, watched,
+    why_stopped,
 };
 use crate::downstream::h1::connection::Answered;
 use crate::gathered::Gathered;
@@ -16,7 +17,7 @@ use crate::timers::{Alarm, Timers};
 use crate::tunnel::{Backend, Bounds as TunnelBounds, Switched, Tunneled};
 use crate::upstream::balancing::InFlight;
 use crate::upstream::destination::ReuseIdentity;
-use crate::upstream::dial::{self, Unconnected};
+use crate::upstream::dial::Unconnected;
 use crate::upstream::h1::blocks::Block;
 use crate::upstream::h1::codec::{OutgoingFields, Sending, head_len};
 use crate::upstream::h1::exchange::{Exchange, ExchangeError, H1Body, Stalled, nothing_to_say};
@@ -64,6 +65,7 @@ impl Worker {
         interim: Option<Interim>,
         head_by_rule: bool,
         upgrading: bool,
+        admitted: &mut Option<Admitted>,
     ) -> Result<(RawAnswer, Box<H1Body<UpstreamSocket, B>>), ExchangeError>
     where
         F: OutgoingFields + ?Sized,
@@ -111,9 +113,13 @@ impl Worker {
                 // aside for, not a handshake that failed after it, and not the worker's own
                 // shortage of sockets (03 §6).
                 let connected = Cell::new(false);
-                // One bound for the connection and its handshake together.
+                // One bound for the connection and its handshake together. The connect is
+                // lent the try's place, and carried on with it if the try lets go first.
+                let deadline = Instant::now() + self.limits.connect;
                 let opening = async {
-                    let socket = dial::connect(identity.address()).await?;
+                    let socket =
+                        watched::Connecting::new(identity, deadline, admitted, &self.watcher)
+                            .await?;
                     connected.set(true);
                     // Worth having, not worth refusing an upstream over.
                     let _unset = socket.set_nodelay(true);
@@ -126,7 +132,7 @@ impl Worker {
                             .map_err(Unconnected::Endpoint),
                     }
                 };
-                let opened = connect_within(self.limits.connect, opening).await;
+                let opened = connect_by(deadline, opening).await;
                 if let Err(ExchangeError::Unconnected(unconnected)) = &opened
                     && let Some(why) = unconnected.aside()
                     && !connected.get()
@@ -339,10 +345,12 @@ impl Worker {
         nominated: &[HeaderName],
         sending: Sending,
         body: RequestBody,
-        mut admitted: Admitted,
+        admitted: Admitted,
         interim: Option<Interim>,
         head_by_rule: bool,
     ) -> Result<(RawAnswer, Body), Answer> {
+        // Lent to a connect the exchange opens, and given back with it.
+        let mut lent = Some(admitted);
         let answer = match self
             .through_h1(
                 endpoint,
@@ -355,6 +363,7 @@ impl Worker {
                 interim,
                 head_by_rule,
                 directed.websocket.is_some(),
+                &mut lent,
             )
             .await
         {
@@ -397,6 +406,11 @@ impl Worker {
                     _ => Answer::UpstreamFailed,
                 });
             }
+        };
+        // Never gone here: a connect lent it gives it back as it ends, and the exchange
+        // waits for that.
+        let Some(mut admitted) = lent else {
+            return Err(Answer::Exhausted);
         };
         let (read, mut body) = answer;
         if let Some(handshake) = &directed.websocket {

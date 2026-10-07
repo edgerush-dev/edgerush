@@ -139,6 +139,7 @@ impl Worker {
             routes: RefCell::default(),
             batches,
             said: Said::default(),
+            watcher: Rc::default(),
         })
     }
 
