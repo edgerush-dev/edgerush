@@ -8,9 +8,14 @@
 //! destination, and another endpoint has ports of its own: it sets the endpoint aside, under
 //! a name of its own. The rest — refused, reset, unreachable — is the endpoint's.
 
+use crate::descriptors::{Descriptor, Descriptors};
 use crate::upstream::destination::Aside;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpSocket, TcpStream};
 
 /// Why a connection to an endpoint was not opened.
@@ -84,6 +89,96 @@ pub async fn connect(address: SocketAddr) -> Result<TcpStream, Unconnected> {
         .connect(address)
         .await
         .map_err(connect_failed)
+}
+
+/// The same, for a worker, counted against its share of the open files (03 §9): a socket
+/// past the share, with no idle one to close for it, is not made, the worker's own
+/// shortage.
+///
+/// # Errors
+///
+/// As [`connect`], and [`Unconnected::Short`] past the worker's share.
+pub(crate) async fn connect_counted(
+    address: SocketAddr,
+    files: &Rc<Descriptors>,
+) -> Result<Counted, Unconnected> {
+    let Some(file) = files.take() else {
+        return Err(Unconnected::Short(io::Error::other(
+            "the worker's share of open files is spent",
+        )));
+    };
+    let stream = connect(address).await?;
+    Ok(Counted {
+        stream,
+        _file: file,
+    })
+}
+
+/// A connection to an upstream, its file counted against its worker's share until it is
+/// dropped.
+#[derive(Debug)]
+pub(crate) struct Counted {
+    stream: TcpStream,
+    _file: Descriptor,
+}
+
+impl Counted {
+    /// `stream`, counted against no worker: a health probe's, which the process's reserve
+    /// holds, or a test's.
+    pub(crate) fn uncounted(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            _file: Descriptor::uncounted(),
+        }
+    }
+}
+
+impl std::ops::Deref for Counted {
+    type Target = TcpStream;
+
+    fn deref(&self) -> &TcpStream {
+        &self.stream
+    }
+}
+
+impl AsyncRead for Counted {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Counted {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
 }
 
 /// Never, outside the tests.

@@ -162,7 +162,12 @@ impl Worker {
             logging.connecting(endpoint.address());
         }
         self.proxy.metrics.socket(Socket::Opened);
-        let connected = connect_within(self.limits.connect, dial::connect(endpoint.address()));
+        // Boxed: a tunnel's connect is part of its connection's future, which every
+        // connection's task makes room for (14 §3).
+        let connected = Box::pin(connect_within(
+            self.limits.connect,
+            dial::connect_counted(endpoint.address(), &self.files),
+        ));
         let mut backend = match connected.await {
             Ok(backend) => backend,
             Err(failed) => {

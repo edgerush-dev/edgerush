@@ -270,6 +270,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     let connections = crate::limits::connections_per_worker(open_files, memory, workers);
     let mut limits = limits;
     limits.storage = crate::limits::storage_per_worker(memory, workers);
+    limits.descriptors = crate::limits::descriptors_per_worker(open_files, workers);
     // One worker is alone on every listener's port and needs nothing of the kernel; it is
     // from the second on that they share one, which is what SO_REUSEPORT is for.
     let port = if workers == NonZeroUsize::MIN {

@@ -3,6 +3,7 @@
 
 use super::{Admitted, Deadlines, Proxy, Validation, Worker, h2_settings, unix_now};
 use crate::connections::Loads;
+use crate::descriptors::Descriptors;
 use crate::downstream::h1::connection as h1;
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h1::deadlines::Bounds;
@@ -113,9 +114,17 @@ impl Worker {
             (RefCell::new(validations), Cell::new(snapshot.generation))
         };
         let batches = proxy.logs.worker();
+        let pool = Rc::new(RefCell::new(Pool::default()));
+        // Room among the files is made by closing an idle socket of the worker's.
+        let files = Descriptors::new(limits.descriptors);
+        let idle = Rc::downgrade(&pool);
+        files.evicting(move || {
+            idle.upgrade()
+                .is_some_and(|pool| pool.try_borrow_mut().is_ok_and(|mut pool| pool.close_one()))
+        });
         Rc::new_cyclic(|me| Self {
             proxy,
-            pool: Rc::new(RefCell::new(Pool::default())),
+            pool,
             blocks,
             timers: Timers::new(),
             places: Places::new(limits.exchanges),
@@ -123,7 +132,11 @@ impl Worker {
             deadlines,
             date: Cell::new(HttpDate::from_unix(unix_now())),
             drain: Rc::new(Drain::default()),
-            h2: H2Client::new(h2_settings(&limits), Rc::clone(&received)),
+            h2: H2Client::new(
+                h2_settings(&limits),
+                Rc::clone(&received),
+                Rc::clone(&files),
+            ),
             balancing: RefCell::default(),
             accepted: Cell::new(0),
             body_limits,
@@ -140,6 +153,7 @@ impl Worker {
             batches,
             said: Said::default(),
             watcher: Rc::default(),
+            files,
         })
     }
 

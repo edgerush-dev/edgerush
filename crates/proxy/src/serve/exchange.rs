@@ -117,9 +117,14 @@ impl Worker {
                 // lent the try's place, and carried on with it if the try lets go first.
                 let deadline = Instant::now() + self.limits.connect;
                 let opening = async {
-                    let socket =
-                        watched::Connecting::new(identity, deadline, admitted, &self.watcher)
-                            .await?;
+                    let socket = watched::Connecting::new(
+                        identity,
+                        deadline,
+                        admitted,
+                        &self.watcher,
+                        &self.files,
+                    )
+                    .await?;
                     connected.set(true);
                     // Worth having, not worth refusing an upstream over.
                     let _unset = socket.set_nodelay(true);

@@ -9,6 +9,7 @@
 
 use crate::gathered::Gathered;
 use crate::tls::TlsError;
+use crate::upstream::dial::Counted;
 use crate::upstream::h1::pool::Close;
 use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
 use boring::x509::store::X509StoreBuilder;
@@ -17,7 +18,6 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 use tokio_boring::SslStream;
 
 /// The key exchanges offered, as a listener offers them.
@@ -104,7 +104,10 @@ impl Secure {
     ///
     /// An I/O error for a handshake that fails, a certificate that is not trusted or not
     /// the server's, or an HTTP/2 upstream that did not agree on `h2`.
-    pub(crate) async fn connect(&self, socket: TcpStream) -> io::Result<SslStream<TcpStream>> {
+    pub(crate) async fn connect<S>(&self, socket: S) -> io::Result<SslStream<S>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug,
+    {
         let refused = |why: String| io::Error::new(io::ErrorKind::ConnectionRefused, why);
         let configured = self
             .connector
@@ -127,9 +130,9 @@ impl Secure {
 #[derive(Debug)]
 pub(crate) enum Socket {
     /// Plain TCP.
-    Plain(TcpStream),
+    Plain(Counted),
     /// TLS over TCP, a request's pieces gathered into records ([`Gathered`]).
-    Secured(Gathered<SslStream<TcpStream>>),
+    Secured(Gathered<SslStream<Counted>>),
 }
 
 impl Close for Socket {

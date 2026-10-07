@@ -8,7 +8,7 @@
 use crate::gathered::Gathered;
 use crate::proxy_protocol;
 use crate::upstream::destination::ReuseIdentity;
-use crate::upstream::dial::{self, Unconnected};
+use crate::upstream::dial::{self, Counted, Unconnected};
 use crate::upstream::secure::Socket;
 use ::h2::client::SendRequest;
 use bytes::{Buf, Bytes};
@@ -90,6 +90,8 @@ async fn over(mut socket: TcpStream, destination: &ReuseIdentity, probe: &Probe)
         let header = proxy_protocol::own(version, ours, theirs);
         socket.write_all(header.as_bytes()).await.ok()?;
     }
+    // The checker's, out of the process's reserve of files, not a worker's share.
+    let socket = Counted::uncounted(socket);
     let (socket, authority) = match destination.secure() {
         None => (Socket::Plain(socket), destination.address().to_string()),
         Some(secure) => (

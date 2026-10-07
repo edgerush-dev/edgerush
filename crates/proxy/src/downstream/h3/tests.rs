@@ -2725,7 +2725,9 @@ async fn websocket_to(backend: SocketAddr) -> (Server, Client, u64, Ending) {
             let timers = Timers::new();
             tokio::task::spawn_local(Rc::clone(&timers).run());
             interim.switch(Switched {
-                backend: Backend::Socket(crate::upstream::secure::Socket::Plain(socket)),
+                backend: Backend::Socket(crate::upstream::secure::Socket::Plain(
+                    crate::upstream::dial::Counted::uncounted(socket),
+                )),
                 leftover: None,
                 bounds: Bounds {
                     idle: TUNNEL_IDLE,

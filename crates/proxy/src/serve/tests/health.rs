@@ -1229,7 +1229,13 @@ async fn a_connect_that_ended_as_its_try_goes_hands_nothing_on() {
             let (_proxy, identity, mut admitted) = try_at(listener.local_addr().unwrap(), &places);
             let watcher = Rc::new(Watcher::default());
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            let connecting = Connecting::new(&identity, deadline, &mut admitted, &watcher);
+            let connecting = Connecting::new(
+                &identity,
+                deadline,
+                &mut admitted,
+                &watcher,
+                &crate::descriptors::Descriptors::new(None),
+            );
             let connected = within(connecting).await.unwrap();
             assert!(admitted.is_some(), "the place left the try");
             assert_eq!((watcher.watched(), watcher.queued()), (0, 0));
@@ -1262,8 +1268,20 @@ async fn connects_let_go_of_while_one_is_queued_are_not_queued_beside_it() {
             let watcher = Rc::new(Watcher::default());
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             {
-                let mut one = Box::pin(Connecting::new(&identity, deadline, &mut first, &watcher));
-                let mut two = Box::pin(Connecting::new(&identity, deadline, &mut second, &watcher));
+                let mut one = Box::pin(Connecting::new(
+                    &identity,
+                    deadline,
+                    &mut first,
+                    &watcher,
+                    &crate::descriptors::Descriptors::new(None),
+                ));
+                let mut two = Box::pin(Connecting::new(
+                    &identity,
+                    deadline,
+                    &mut second,
+                    &watcher,
+                    &crate::descriptors::Descriptors::new(None),
+                ));
                 std::future::poll_fn(|cx| {
                     assert!(one.as_mut().poll(cx).is_pending());
                     assert!(two.as_mut().poll(cx).is_pending());
@@ -1311,6 +1329,7 @@ fn a_connect_let_go_of_after_its_watcher_ended_holds_nothing() {
             deadline,
             &mut admitted,
             &watcher,
+            &crate::descriptors::Descriptors::new(None),
         ))
     };
     local.block_on(&runtime, async {
@@ -1410,6 +1429,7 @@ fn a_worker_ending_before_its_watcher_ran_holds_nothing() {
             deadline,
             &mut admitted,
             &watcher,
+            &crate::descriptors::Descriptors::new(None),
         ));
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(waker);
@@ -1446,6 +1466,7 @@ async fn a_connect_let_go_of_past_its_bound_unpolled_sets_its_endpoint_aside() {
                     deadline,
                     &mut admitted,
                     &watcher,
+                    &crate::descriptors::Descriptors::new(None),
                 ));
                 std::future::poll_fn(|cx| {
                     assert!(connecting.as_mut().poll(cx).is_pending());
@@ -1458,6 +1479,137 @@ async fn a_connect_let_go_of_past_its_bound_unpolled_sets_its_endpoint_aside() {
             assert!(identity.aside().is_some(), "the endpoint was not set aside");
             assert_eq!((watcher.watched(), watcher.queued()), (0, 0));
             hold_connects(upstream, None);
+        })
+        .await;
+}
+
+/// A worker held to a share of `files` open files, serving `config`.
+async fn serving_within_files(config: &Config, files: usize) -> (SocketAddr, Rc<Worker>) {
+    let limits = H1Limits {
+        descriptors: Some(files),
+        ..H1Limits::default()
+    };
+    let proxy = Proxy::new(compile(config).unwrap(), NonZeroUsize::MIN).unwrap();
+    let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front = socket.local_addr().unwrap();
+    let _serving = serving(&worker, socket);
+    (front, worker)
+}
+
+/// A socket to an upstream that would take the worker past its share of open files — its
+/// client connections and upstream sockets counted together, as NGINX counts a worker's
+/// connections (03 §9) — is made room for by closing an idle socket of the worker's.
+#[tokio::test]
+async fn an_upstream_socket_past_the_workers_files_closes_an_idle_one_first() {
+    use std::sync::atomic::Ordering;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (first, opened_first) = counting_upstream().await;
+            let (second, opened_second) = counting_upstream().await;
+            let mut config = everything_config(first);
+            let up = config.upstreams.get_mut("up").unwrap();
+            up.endpoints = vec![first, second];
+            up.load_balancer = edgerush_config::LoadBalancer::RoundRobin;
+            // Room for a client connection and one upstream socket.
+            let (front, worker) = serving_within_files(&config, 2).await;
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+            until(|| worker.files.held() == 1).await;
+            assert_eq!(worker.idle_connections(), 1, "kept for the next request");
+            // The next goes to the other endpoint: its socket takes the idle one's file.
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+            assert_eq!(opened_first.load(Ordering::SeqCst), 1);
+            assert_eq!(opened_second.load(Ordering::SeqCst), 1);
+            until(|| worker.files.held() == 1).await;
+            assert_eq!(worker.idle_connections(), 1, "only the second's kept");
+        })
+        .await;
+}
+
+/// With nothing idle to close, a socket past the share is not made: the request is
+/// answered 503 `exhausted`, the worker's own shortage, its endpoint not set aside nor its
+/// upstream counted as failing (03 §9, 14 §8).
+#[tokio::test]
+async fn an_upstream_socket_past_the_workers_files_with_none_idle_is_its_shortage() {
+    use tokio::io::AsyncWriteExt;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, held) = scripted_upstream().await;
+            let (front, worker) = serving_within_files(&everything_config(upstream), 2).await;
+            // A request held at the upstream: its client's file and its socket's.
+            let mut waiting = TcpStream::connect(front).await.unwrap();
+            waiting
+                .write_all(b"GET /a/hold HTTP/1.1\r\nhost: shop.example.com\r\n\r\n")
+                .await
+                .unwrap();
+            until(|| held.borrow().len() == 1).await;
+            assert_eq!(worker.files.held(), 2);
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
+            let scrape = worker.proxy().metrics();
+            for line in [
+                "edgerush_upstream_set_aside_endpoints{upstream=\"up\"} 0\n",
+                "edgerush_upstream_failures_total{upstream=\"up\"} 0\n",
+                "edgerush_listener_local_answers_total{listener=\"web\",reason=\"exhausted\"} 1\n",
+            ] {
+                assert!(scrape.contains(line), "{line}{scrape}");
+            }
+            drop(waiting);
+        })
+        .await;
+}
+
+/// Every file a worker counts it gives back: client connections and HTTP/1 sockets, an
+/// HTTP/2 upstream's connection, a tunnel's two, each when it goes.
+#[tokio::test]
+async fn every_file_a_worker_counts_it_gives_back() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let (front, worker) = serving_within_files(&everything_config(upstream), 64).await;
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(worker.files.held(), 1, "the idle socket's file");
+            worker.pool.borrow_mut().sweep(&H1Limits {
+                idle_timeout: Duration::ZERO,
+                ..H1Limits::default()
+            });
+            assert_eq!(worker.files.held(), 0, "the idle socket's file");
+
+            let (h2, _, _gate) = h2_upstream(UpstreamH2::default()).await;
+            let mut config = everything_config(h2);
+            config.upstreams.get_mut("up").unwrap().protocol = UpstreamProtocol::Http2;
+            let (front, worker) = serving_within_files(&config, 64).await;
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+            // The client gone, the HTTP/2 connection kept: its file alone.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(worker.files.held(), 1, "the HTTP/2 connection's file");
+
+            let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config: Config =
+                serde_saphyr::from_str(&tcp_to(backend.local_addr().unwrap(), "")).unwrap();
+            let (front, worker) = serving_within_files(&config, 64).await;
+            let mut client = TcpStream::connect(front).await.unwrap();
+            client.write_all(b"x").await.unwrap();
+            let (mut accepted, _) = within(backend.accept()).await.unwrap();
+            let mut byte = [0; 1];
+            within(accepted.read_exact(&mut byte)).await.unwrap();
+            assert_eq!(
+                worker.files.held(),
+                2,
+                "a tunnel: its client and its backend"
+            );
+            drop(client);
+            drop(accepted);
+            until(|| worker.files.held() == 0).await;
         })
         .await;
 }

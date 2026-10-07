@@ -9,10 +9,11 @@
 //! crosses threads, and no `RefCell` borrow is held across an `.await` or a poll of h2.
 
 use super::pool::{Action, ConnectionId, Failure, Limits, Pool, Taken, WaiterId};
+use crate::descriptors::Descriptors;
 use crate::downstream::h2::writer::Outgoing;
 use crate::received::Received;
 use crate::upstream::destination::{Aside, ReuseIdentity};
-use crate::upstream::dial;
+use crate::upstream::dial::{self, Counted};
 use ::h2::client::{Connection, SendRequest};
 use edgerush_config::Keepalive;
 use std::cell::{Cell, RefCell};
@@ -23,7 +24,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::Instant;
 
@@ -97,8 +97,8 @@ const MOST_DOUBLINGS: u32 = 6;
 
 /// What a connection to an upstream is carried over, before HTTP/2 is spoken on it.
 enum Transport {
-    Plain(TcpStream),
-    Secured(tokio_boring::SslStream<TcpStream>),
+    Plain(Counted),
+    Secured(tokio_boring::SslStream<Counted>),
 }
 
 /// One connection, as this worker holds it.
@@ -148,6 +148,8 @@ pub(crate) struct Client {
     /// The worker's HTTP/2 connections, where each of these is charged what h2 holds of
     /// what its upstream sent (15 §3).
     received: Rc<Received>,
+    /// The worker's open files, which each connection's socket counts against (03 §9).
+    files: Rc<Descriptors>,
 }
 
 impl std::fmt::Debug for Client {
@@ -257,7 +259,11 @@ impl Drop for Waiting<'_> {
 
 impl Client {
     /// A client with no connections yet, whose connections are charged in `received`.
-    pub(crate) fn new(settings: Settings, received: Rc<Received>) -> Rc<Self> {
+    pub(crate) fn new(
+        settings: Settings,
+        received: Rc<Received>,
+        files: Rc<Descriptors>,
+    ) -> Rc<Self> {
         Rc::new(Self {
             settings,
             pool: RefCell::new(Pool::new(settings.pool)),
@@ -266,6 +272,7 @@ impl Client {
             destinations: RefCell::new(HashMap::new()),
             calmer: RefCell::new(HashMap::new()),
             received,
+            files,
         })
     }
 
@@ -453,7 +460,7 @@ impl Client {
         // What it is set aside for if it did not: out of connect time unless told otherwise.
         let why = Cell::new(Some(Aside::Connect));
         let opening = async {
-            let socket = match dial::connect(address).await {
+            let socket = match dial::connect_counted(address, &self.files).await {
                 Ok(socket) => socket,
                 Err(unconnected) => {
                     why.set(unconnected.aside());

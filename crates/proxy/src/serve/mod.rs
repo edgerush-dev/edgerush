@@ -463,6 +463,8 @@ pub struct Worker {
     said: crate::metrics::Said,
     /// The connects tries let go of, carried on to their bound (03 §6).
     watcher: Rc<watched::Watcher>,
+    /// Its open files, client connections and upstream sockets, held to its share (03 §9).
+    files: Rc<crate::descriptors::Descriptors>,
 }
 
 /// The client validation a listener's connections were accepted under on a worker, and the
@@ -1021,6 +1023,8 @@ struct Connection {
     /// Over HTTP/1, an answer was cut after its head went: the connection is reset rather
     /// than closed in order (13 §7).
     cut: Cell<bool>,
+    /// Its file, counted against the worker's share (03 §9).
+    _file: crate::descriptors::Descriptor,
 }
 
 /// What an HTTP/1 answer is counted as, kept from when the core hands it over until our
@@ -1047,12 +1051,14 @@ impl Connection {
             counters.accepted.inc();
             counters.active.inc();
         }
+        let _file = worker.files.count();
         Self {
             worker,
             listener,
             drain,
             owed: Owed::default(),
             cut: Cell::new(false),
+            _file,
         }
     }
 

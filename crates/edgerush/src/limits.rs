@@ -158,6 +158,20 @@ pub(crate) fn connections_per_worker(
     }
 }
 
+/// Each of `workers`' share of the open files: the limit less the reserve, divided among
+/// them. Its client connections and its sockets to upstreams count against it together, so
+/// that what the connection cap leaves of it goes to upstream sockets and no worker runs
+/// the process out of files under its cap (03 §9). None where there is no limit.
+pub(crate) fn descriptors_per_worker(
+    open_files: OpenFiles,
+    workers: NonZeroUsize,
+) -> Option<usize> {
+    let workers = u64::try_from(workers.get()).unwrap_or(u64::MAX);
+    open_files.limit().map(|limit| {
+        usize::try_from((limit - RESERVE.min(limit / 2)) / workers).unwrap_or(usize::MAX)
+    })
+}
+
 /// What an HTTP/3 connection counts as, in sixteenths of a connection ([`CONNECTION`]),
 /// against a cap of `each` connections where memory allows a worker `memory` of them
 /// (`None` with no limit): `3 × each / memory` connections, rounded up, and never less than
@@ -385,6 +399,32 @@ mod tests {
         assert_eq!(
             connections_per_worker(OpenFiles::NoLimit, limited(0), workers(1)),
             bound(1, "memory", QUIC_MOST)
+        );
+    }
+
+    /// A worker's share of the files is the limit less the reserve (half of a small limit),
+    /// divided among the workers: twice its cap where open files set the cap, so that
+    /// what the cap leaves goes to its upstream sockets. None with no limit.
+    #[test]
+    fn a_workers_share_of_the_files_is_the_limit_less_the_reserve_shared_out() {
+        assert_eq!(descriptors_per_worker(limit(1_024), workers(1)), Some(512));
+        assert_eq!(
+            descriptors_per_worker(limit(4_096), workers(2)),
+            Some(1_536)
+        );
+        assert_eq!(
+            descriptors_per_worker(limit(65_536), workers(8)),
+            Some(8_064)
+        );
+        assert_eq!(
+            descriptors_per_worker(limit(524_288), workers(8)),
+            Some(65_408)
+        );
+        assert_eq!(descriptors_per_worker(OpenFiles::NoLimit, workers(4)), None);
+        let cap = connections_per_worker(limit(4_096), Memory::NoLimit, workers(2));
+        assert_eq!(
+            Some(cap.each * 2),
+            descriptors_per_worker(limit(4_096), workers(2))
         );
     }
 

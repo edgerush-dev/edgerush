@@ -155,6 +155,22 @@ impl<S: Close> Pool<S> {
         before - self.total
     }
 
+    /// Closes one idle connection, the longest kept of its destination's, to give its open
+    /// file to a socket the worker has none for (03 §9); says whether there was one.
+    pub fn close_one(&mut self) -> bool {
+        let Some((&key, held)) = self.idle.iter_mut().find(|(_, held)| !held.is_empty()) else {
+            return false;
+        };
+        let closed = held.remove(0);
+        let emptied = held.is_empty();
+        if emptied {
+            self.idle.remove(&key);
+        }
+        self.total -= 1;
+        closed.socket.close();
+        true
+    }
+
     /// How many connections are idle here.
     pub fn idle(&self) -> usize {
         self.total

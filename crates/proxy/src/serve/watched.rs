@@ -22,8 +22,9 @@
 //! go of.
 
 use super::Admitted;
+use crate::descriptors::Descriptors;
 use crate::upstream::destination::ReuseIdentity;
-use crate::upstream::dial::{self, Unconnected};
+use crate::upstream::dial::{self, Counted, Unconnected};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::future::{Future, poll_fn};
@@ -31,11 +32,10 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use tokio::net::TcpStream;
 use tokio::time::{Instant, Sleep};
 
 /// A TCP connect, boxed so that it can move once begun.
-type Connect = Pin<Box<dyn Future<Output = Result<TcpStream, Unconnected>>>>;
+type Connect = Pin<Box<dyn Future<Output = Result<Counted, Unconnected>>>>;
 
 /// A worker's connects carried on for the tries that let go of them.
 #[derive(Default)]
@@ -172,7 +172,7 @@ fn out_of_time() -> Unconnected {
 
 /// What a connect nobody waits for came to: refused or out of time sets its endpoint
 /// aside, as the try's would have; a connection made is closed.
-fn settle(identity: &ReuseIdentity, ended: Result<TcpStream, Unconnected>) {
+fn settle(identity: &ReuseIdentity, ended: Result<Counted, Unconnected>) {
     if let Err(unconnected) = ended
         && let Some(why) = unconnected.aside()
     {
@@ -218,16 +218,22 @@ pub(super) struct Connecting<'a> {
 }
 
 impl<'a> Connecting<'a> {
-    /// The connect begun, by `deadline`, for a try whose place is in `admitted`.
+    /// The connect begun, by `deadline`, for a try whose place is in `admitted`, its socket
+    /// counted against the worker's `files`.
     pub(super) fn new(
         identity: &'a Arc<ReuseIdentity>,
         deadline: Instant,
         admitted: &'a mut Option<Admitted>,
         watcher: &'a Rc<Watcher>,
+        files: &Rc<Descriptors>,
     ) -> Self {
         watcher.start();
+        let address = identity.address();
+        let files = Rc::clone(files);
         Self {
-            connect: Some(Box::pin(dial::connect(identity.address()))),
+            connect: Some(Box::pin(async move {
+                dial::connect_counted(address, &files).await
+            })),
             identity,
             deadline,
             admitted,
@@ -237,7 +243,7 @@ impl<'a> Connecting<'a> {
 }
 
 impl Future for Connecting<'_> {
-    type Output = Result<TcpStream, Unconnected>;
+    type Output = Result<Counted, Unconnected>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
