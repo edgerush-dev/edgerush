@@ -96,6 +96,29 @@ impl Worker {
                 }
                 return outcome;
             };
+            // What may still refuse it first, and the budget last: the budget pays for the
+            // retries that are sent, as tower's is charged by linkerd's policy as it sends.
+            let wait = backoff(retry, retried);
+            if deadline.is_some_and(|deadline| Instant::now() + wait >= deadline) {
+                if let Some(upstream) = upstream() {
+                    upstream.retries_deadline.inc();
+                }
+                return outcome;
+            }
+            // A place for the next try before this one's is given back with its answer:
+            // a worker at its bound keeps the answer it has rather than lose it.
+            let Ok(next) = self.admit(&directed.upstream, directed.alone) else {
+                if let Some(upstream) = upstream() {
+                    upstream.retries_busy.inc();
+                }
+                return outcome;
+            };
+            let Some((target, drawn, at, counted)) = directed.draw(head.uri(), &tried) else {
+                if let Some(upstream) = upstream() {
+                    upstream.retries_nowhere.inc();
+                }
+                return outcome;
+            };
             if !directed
                 .upstream
                 .budget(|budget| budget.withdraw(Instant::now()))
@@ -105,18 +128,6 @@ impl Worker {
                 }
                 return outcome;
             }
-            let wait = backoff(retry, retried);
-            if deadline.is_some_and(|deadline| Instant::now() + wait >= deadline) {
-                return outcome;
-            }
-            // A place for the next try before this one's is given back with its answer:
-            // a worker at its bound keeps the answer it has rather than lose it.
-            let Ok(next) = self.admit(&directed.upstream, directed.alone) else {
-                return outcome;
-            };
-            let Some((target, drawn, at, counted)) = directed.draw(head.uri(), &tried) else {
-                return outcome;
-            };
             tried.add(at);
             drop(outcome);
             tokio::time::sleep(wait).await;

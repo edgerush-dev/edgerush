@@ -517,3 +517,97 @@ async fn a_status_in_a_head_that_goes_on_does_not_send_a_call_again() {
         })
         .await;
 }
+
+/// A retry with no place for it on the worker is not sent, takes nothing from the budget,
+/// and is counted `busy` (08 §1; review A08-02): the answer it would have replaced is the
+/// client's.
+#[tokio::test]
+async fn a_retry_with_no_place_on_the_worker_is_counted_busy() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, bodies) = statuses_upstream(vec![503, 200]).await;
+            // Room for one exchange: the retry's place would be a second.
+            let limits = H1Limits {
+                exchanges: 1,
+                ..H1Limits::default()
+            };
+            let retry = retrying(2, &[503], &[], 1);
+            let (front, worker) =
+                serving_worker_with(upstream, UpstreamProtocol::Http1, Some(retry), limits).await;
+            let answer = h1_answer(front, POSTING_HI).await;
+            assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
+            assert_eq!(bodies.borrow().len(), 1);
+            let scrape = worker.proxy().metrics();
+            for (reason, count) in [("busy", 1), ("budget", 0), ("deadline", 0)] {
+                let line = format!(
+                    "edgerush_upstream_retries_refused_total{{upstream=\"up\",reason=\"{reason}\"}} {count}"
+                );
+                assert!(scrape.lines().any(|shown| shown == line), "{line}");
+            }
+        })
+        .await;
+}
+
+/// A retry refused because its backoff would end past the call's deadline is not sent, and
+/// takes nothing from the upstream's budget: after many such calls, a call with no deadline
+/// whose answer the rule names is still sent again (A08-02).
+#[tokio::test]
+async fn a_retry_refused_for_its_deadline_spends_none_of_the_budget() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let asked = Rc::new(Cell::new(0_usize));
+            let asking = Rc::clone(&asked);
+            let script: Script = Rc::new(move |_request, mut respond| {
+                let asking = Rc::clone(&asking);
+                Box::pin(async move {
+                    asking.set(asking.get() + 1);
+                    let mut head = grpc_head();
+                    head.headers_mut()
+                        .insert("grpc-status", "14".parse().unwrap());
+                    let _ = respond.send_response(head, true);
+                })
+            });
+            let upstream = scripted_h2_upstream(script).await;
+            // A backoff of half a second at the least: longer than the calls' deadlines.
+            let (front, worker) = serving_retrying_worker(
+                upstream,
+                UpstreamProtocol::Http2,
+                retrying(1, &[], &["UNAVAILABLE"], 500),
+            )
+            .await;
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            // More calls than the budget's reserve of 100 retries and a fifth of the calls
+            // would pay for, were each refused retry withdrawn: none may be sent again.
+            for _ in 0..126 {
+                let (answer, _) = send
+                    .send_request(grpc_call("/pkg.Svc/Do", Some("100m")), true)
+                    .unwrap();
+                assert_eq!(grpc_outcome(answer).await.1, "14");
+            }
+            assert_eq!(asked.get(), 126, "a call past its deadline was sent again");
+            // A call with no deadline: its one retry is well within the budget.
+            asked.set(0);
+            let (answer, _) = send
+                .send_request(grpc_call("/pkg.Svc/Do", None), true)
+                .unwrap();
+            let _ = grpc_outcome(answer).await;
+            let scrape = worker.proxy().metrics();
+            assert_eq!(
+                asked.get(),
+                2,
+                "a retry within the budget was refused after retries that were never sent: {}",
+                scrape
+                    .lines()
+                    .filter(|line| line.starts_with("edgerush_upstream_retries"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            // Each refused retry counted by why (08 §1).
+            let line =
+                "edgerush_upstream_retries_refused_total{upstream=\"up\",reason=\"deadline\"} 126";
+            assert!(scrape.lines().any(|shown| shown == line), "{line}");
+        })
+        .await;
+}

@@ -641,6 +641,11 @@ pub(crate) struct UpstreamCounters {
     pub(crate) retries_over_budget: Counter,
     /// Retries a rule's retry wanted for a body not kept whole.
     pub(crate) retries_unkept: Counter,
+    /// Retries a rule's retry wanted that would have waited past the request's deadline, found
+    /// no place on the worker, or no endpoint to go to.
+    pub(crate) retries_deadline: Counter,
+    pub(crate) retries_busy: Counter,
+    pub(crate) retries_nowhere: Counter,
     /// Copies a mirror to this upstream did not get, by why: no place for them on the
     /// worker, fallen too far behind, no endpoint to send them to, credentials bound to
     /// the client's connection, or a WebSocket handshake, of which a mirror could never be
@@ -1056,10 +1061,18 @@ impl Metrics {
         let help = "Retries a rule's retry wanted and did not get, by why.";
         scrape.family(name, Kind::Counter, help);
         for (upstream, series) in upstreams() {
-            let over = series.sum(|shard| shard.retries_over_budget.get());
-            scrape.sample(name, &[("upstream", upstream), ("reason", "budget")], over);
-            let unkept = series.sum(|shard| shard.retries_unkept.get());
-            scrape.sample(name, &[("upstream", upstream), ("reason", "body")], unkept);
+            for (reason, count) in [
+                (
+                    "budget",
+                    series.sum(|shard| shard.retries_over_budget.get()),
+                ),
+                ("body", series.sum(|shard| shard.retries_unkept.get())),
+                ("deadline", series.sum(|shard| shard.retries_deadline.get())),
+                ("busy", series.sum(|shard| shard.retries_busy.get())),
+                ("nowhere", series.sum(|shard| shard.retries_nowhere.get())),
+            ] {
+                scrape.sample(name, &[("upstream", upstream), ("reason", reason)], count);
+            }
         }
 
         let name = "edgerush_upstream_mirrors_given_up_total";
