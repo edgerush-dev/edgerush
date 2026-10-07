@@ -145,6 +145,31 @@ async fn an_idle_tunnel_is_closed_at_its_bound() {
         .await;
 }
 
+/// The longest idle bound a config may state, 99,999 hours, is kept like any other: the
+/// tunnel carries what comes and stays open, its deadline within what the clock holds
+/// (review A02-03, C33).
+#[tokio::test]
+async fn a_tunnel_with_the_longest_idle_bound_carries_and_stays_open() {
+    use tokio::io::AsyncReadExt;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let backend = naming_backend("db").await;
+            let yaml = tcp_to(backend, ", tunnel_idle_seconds: 359996400");
+            let (front, worker) = passing(&yaml).await;
+            let mut client = TcpStream::connect(front).await.unwrap();
+            let mut said = [0; 2];
+            within(client.read_exact(&mut said)).await.unwrap();
+            assert_eq!(&said, b"db");
+            let mut more = [0; 1];
+            let quiet =
+                tokio::time::timeout(Duration::from_millis(300), client.read(&mut more)).await;
+            assert!(quiet.is_err(), "the tunnel ended: {quiet:?}");
+            drop(worker);
+        })
+        .await;
+}
+
 /// A backend that cannot be reached, or an upstream with no endpoint, closes the
 /// client's connection, counted by why.
 #[tokio::test]

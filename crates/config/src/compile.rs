@@ -455,6 +455,16 @@ pub(crate) const RETRY_STATUSES: std::ops::RangeInclusive<u16> = 400..=599;
 /// multiplier more than a remedy.
 pub(crate) const MOST_ATTEMPTS: u32 = 5;
 
+/// The largest a bound in seconds may be: 99,999 hours, the most a Gateway API duration
+/// says (GEP-2257). Each is added to a clock where it is used, which a larger one could
+/// overflow; this one fits however long the process has run.
+pub(crate) const MOST_SECONDS: u64 = 99_999 * 3_600;
+
+/// `field` and its `seconds`, if they are more than [`MOST_SECONDS`].
+fn too_long(field: &'static str, seconds: u64) -> Option<Problem> {
+    (seconds > MOST_SECONDS).then_some(Problem::TooLong { field, seconds })
+}
+
 fn timeouts(
     forward: &Forward,
     place: &Place,
@@ -686,6 +696,11 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                 || check.unhealthy_threshold == 0
             {
                 Some(Problem::HealthCheckZero)
+            } else if let Some(problem) =
+                too_long("health_check.interval_seconds", check.interval_seconds)
+                    .or_else(|| too_long("health_check.timeout_seconds", check.timeout_seconds))
+            {
+                Some(problem)
             } else if check.timeout_seconds > check.interval_seconds {
                 Some(Problem::HealthCheckOverlaps)
             } else {
@@ -713,7 +728,8 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             } else if keepalive.interval_seconds == 0 || keepalive.timeout_seconds == 0 {
                 Some(Problem::KeepaliveZero)
             } else {
-                None
+                too_long("keepalive.interval_seconds", keepalive.interval_seconds)
+                    .or_else(|| too_long("keepalive.timeout_seconds", keepalive.timeout_seconds))
             };
             if let Some(problem) = problem {
                 errors.push(Place::upstream(name).problem(problem));
@@ -781,6 +797,11 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
             }
             (_, Some(0)) => {
                 errors.push(Place::listener(name).problem(Problem::TunnelIdleZero));
+            }
+            (_, Some(seconds)) => {
+                if let Some(problem) = too_long("tunnel_idle_seconds", seconds) {
+                    errors.push(Place::listener(name).problem(problem));
+                }
             }
             _ => {}
         }
@@ -1906,6 +1927,14 @@ pub enum Problem {
     /// A tunnel that could never carry anything.
     #[error("`tunnel_idle_seconds` must be at least 1")]
     TunnelIdleZero,
+    /// A bound in seconds too long to be kept.
+    #[error("`{field}` is {seconds}: at most 359996400, 99,999 hours")]
+    TooLong {
+        /// The field, as the config names it.
+        field: &'static str,
+        /// What it says.
+        seconds: u64,
+    },
     /// An HTTP listener that does not say what it tells upstreams of a client.
     #[error("protocols `http` and `https` need `forwarding`")]
     NoForwarding,
@@ -4117,6 +4146,58 @@ routes:
                 "method-only listed {method_rule}, service-only {service_rule}"
             );
             assert_eq!(rule("/other.Svc/Do"), Some(method_rule));
+        }
+    }
+
+    /// A bound in seconds is added to a clock where it is used (a tunnel's idle deadline, a
+    /// health check's next probe, a keepalive's next PING), which one far larger than any
+    /// real bound would overflow: up to 99,999 hours, the most a Gateway API duration says,
+    /// is taken, and a second more refused, naming the field, so that a config that compiles
+    /// runs (review A02-03, C33).
+    #[test]
+    fn a_bound_in_seconds_is_at_most_99999_hours() {
+        let most = MOST_SECONDS;
+        assert_eq!(most, 359_996_400);
+        let tunnel = |seconds: u64| {
+            format!(
+                "listeners: {{ db: {{ address: \"[::]:5432\", protocol: tcp, proxy_protocol: off, tunnel_idle_seconds: {seconds} }} }}\nroutes: []\ntcp_routes: [{{ name: pg, listeners: [db], backends: [{{ upstream: u, weight: 1 }}] }}]\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}\n"
+            )
+        };
+        let health = |interval: u64, timeout: u64| {
+            format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: [], health_check: {{ interval_seconds: {interval}, timeout_seconds: {timeout}, healthy_threshold: 1, unhealthy_threshold: 1, probe: tcp }} }} }}\n"
+            )
+        };
+        let keepalive = |interval: u64, timeout: u64| {
+            format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: [], protocol: http2, keepalive: {{ interval_seconds: {interval}, timeout_seconds: {timeout}, without_calls: false }} }} }}\n"
+            )
+        };
+        let refused = |yaml: &str| {
+            compile(&config(yaml))
+                .err()
+                .map(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        for yaml in [tunnel(most), health(most, most), keepalive(most, most)] {
+            assert_eq!(refused(&yaml), None, "{yaml}");
+        }
+        for (yaml, field) in [
+            (tunnel(most + 1), "tunnel_idle_seconds"),
+            (tunnel(u64::MAX), "tunnel_idle_seconds"),
+            (health(most + 1, 1), "health_check.interval_seconds"),
+            (health(u64::MAX, 1), "health_check.interval_seconds"),
+            (health(most, most + 1), "health_check.timeout_seconds"),
+            (keepalive(most + 1, 1), "keepalive.interval_seconds"),
+            (keepalive(u64::MAX, 1), "keepalive.interval_seconds"),
+            (keepalive(300, most + 1), "keepalive.timeout_seconds"),
+        ] {
+            let errors = refused(&yaml).unwrap_or_default();
+            assert!(
+                errors.len() == 1
+                    && errors[0].contains(&format!("`{field}` is "))
+                    && errors[0].ends_with("at most 359996400, 99,999 hours"),
+                "{field}: {errors:?}"
+            );
         }
     }
 

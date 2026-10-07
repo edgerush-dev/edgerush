@@ -443,6 +443,7 @@
           "description": "Seconds between probes of an endpoint.",
           "type": "integer",
           "format": "uint64",
+          "maximum": 359996400,
           "minimum": 1
         },
         "probe": {
@@ -453,6 +454,7 @@
           "description": "Seconds a probe may take, connection and handshake included; no more than the\ninterval.",
           "type": "integer",
           "format": "uint64",
+          "maximum": 359996400,
           "minimum": 1
         },
         "unhealthy_threshold": {
@@ -533,12 +535,14 @@
           "description": "Seconds between PINGs: at least 300 unless `backend_allows_short_intervals` is said.",
           "type": "integer",
           "format": "uint64",
+          "maximum": 359996400,
           "minimum": 1
         },
         "timeout_seconds": {
           "description": "Seconds a PING's answer is waited for before the connection is taken for dead.",
           "type": "integer",
           "format": "uint64",
+          "maximum": 359996400,
           "minimum": 1
         },
         "without_calls": {
@@ -639,6 +643,7 @@
           ],
           "format": "uint64",
           "default": null,
+          "maximum": 359996400,
           "minimum": 1
         }
       },

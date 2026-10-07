@@ -73,7 +73,10 @@ pub struct Listener {
     /// as HAProxy's `timeout tunnel` is set in practice: what a tunnel carries (a database's
     /// connection, a long poll) can be quiet for long. For those listeners only.
     #[serde(default)]
-    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(range(min = 1, max = crate::compile::MOST_SECONDS))
+    )]
     pub tunnel_idle_seconds: Option<u64>,
     /// What an `http` or `https` listener, which must have it, tells its upstreams of a
     /// request's client; no other may.
@@ -326,11 +329,17 @@ pub struct SlowStart {
 #[serde(deny_unknown_fields)]
 pub struct HealthCheck {
     /// Seconds between probes of an endpoint.
-    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(range(min = 1, max = crate::compile::MOST_SECONDS))
+    )]
     pub interval_seconds: u64,
     /// Seconds a probe may take, connection and handshake included; no more than the
     /// interval.
-    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(range(min = 1, max = crate::compile::MOST_SECONDS))
+    )]
     pub timeout_seconds: u64,
     /// Passes in a row that make an unhealthy endpoint healthy.
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
@@ -375,10 +384,16 @@ pub enum Probe {
 #[serde(deny_unknown_fields)]
 pub struct Keepalive {
     /// Seconds between PINGs: at least 300 unless `backend_allows_short_intervals` is said.
-    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(range(min = 1, max = crate::compile::MOST_SECONDS))
+    )]
     pub interval_seconds: u64,
     /// Seconds a PING's answer is waited for before the connection is taken for dead.
-    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(range(min = 1, max = crate::compile::MOST_SECONDS))
+    )]
     pub timeout_seconds: u64,
     /// Whether to PING a connection with no call on it too; gRPC asks this be chosen on
     /// purpose.
