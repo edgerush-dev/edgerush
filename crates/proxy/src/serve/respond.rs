@@ -58,20 +58,20 @@ impl Worker {
     }
 
     /// The record of a request that came in on `listener` from `client`, if its listener
-    /// logs, made from its head as it came (21 §4). A request of a config that logs
-    /// nothing looks at one flag.
-    fn logging<H: Forwarded>(
+    /// logs in `snapshot`, the config that routes it (03 §4), made from its head as it came
+    /// (21 §4). A request of a listener that does not log looks at one entry.
+    pub(super) fn logging<H: Forwarded>(
         &self,
+        snapshot: &Snapshot,
         listener: usize,
         client: &Rc<Client>,
         head: &H,
     ) -> Option<Rc<Logging>> {
-        if !self.proxy.logs.on() {
+        if !matches!(snapshot.logs.get(listener), Some(Some(_))) {
             return None;
         }
         let worker = self.me.upgrade()?;
-        let snapshot = self.proxy.current.load();
-        Logging::start(&worker, &snapshot, listener, client, head)
+        Logging::start(&worker, snapshot, listener, client, head)
     }
 
     /// The same for a request's head of whatever kind: a map, or the raw head our own
@@ -146,7 +146,7 @@ impl Worker {
         // Its record, from its head as it came, and its body counted for it (21 §4).
         // Only ever moved from here on, never borrowed, so that this future keeps it no longer
         // than until `direct` takes it (14 §3).
-        let logging = match self.logging(listener, client, &head) {
+        let logging = match self.logging(&snapshot, listener, client, &head) {
             Some(logging) => {
                 logging.identified(id);
                 handed.set(Some(Rc::clone(&logging)));

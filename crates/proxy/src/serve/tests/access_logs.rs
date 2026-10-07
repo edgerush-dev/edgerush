@@ -160,6 +160,35 @@ async fn a_proxied_request_is_logged_with_where_it_went() {
         .await;
 }
 
+/// A request's record follows the config that routed it, as everything else of it does
+/// (03 §4: a request reads the snapshot once): one routed under a config that logs its
+/// listener is recorded, though a reload has since stopped the logging, and one routed
+/// under the newer config is not.
+#[tokio::test]
+async fn a_requests_record_follows_the_config_that_routed_it() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _held) = scripted_upstream().await;
+            let logged = recording("routed", everything_config(upstream)).await;
+            let proxy = Arc::clone(logged.worker.proxy());
+            let routed = proxy.current.load_full();
+            proxy
+                .reload(compile(&everything_config(upstream)).unwrap())
+                .unwrap();
+            let newer = proxy.current.load_full();
+            let head = Request::get("http://example.test/")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0;
+            let client = Rc::new(crate::forwarding::Client::new("127.0.0.1".parse().unwrap()));
+            assert!(logged.worker.logging(&routed, 0, &client, &head).is_some());
+            assert!(logged.worker.logging(&newer, 0, &client, &head).is_none());
+        })
+        .await;
+}
+
 /// The data plane's own answer says why it gave it, with as much of where the request
 /// was going as it got to.
 #[tokio::test]
