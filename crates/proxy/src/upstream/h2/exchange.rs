@@ -108,8 +108,10 @@ pub(crate) struct Bounds {
 /// A request the upstream shows it never processed — its stream refused, or above the
 /// last one a GOAWAY accepted, the only two signs of it ([15 §3]) — is sent once more if
 /// all of it can be: its body is kept as it goes, up to what [`replay`] keeps, and a body
-/// that grew past that or had not ended is not sent again. gRPC retries the same ones,
-/// the same once ("transparent" retries). `retrying` is told when it does.
+/// none of which went is given back whole; one that had partly gone and grew past what
+/// is kept, or had not ended, is not sent again. A continue wait the first stream began
+/// runs on for the second. gRPC retries the same ones, the same once ("transparent"
+/// retries). `retrying` is told when it does.
 ///
 /// [`replay`]: crate::retry::replay
 ///
@@ -145,6 +147,9 @@ pub(crate) async fn exchange<F: OutgoingFields + ?Sized>(
     let mut body = Some(body);
     let mut head = Some(first);
     let mut again = false;
+    // Begun by the first stream whose head goes, and run on by a stream sent again: the
+    // continue decision is the request's, made once.
+    let mut continue_wait = None;
     loop {
         // A head to send again is made again, from what the first was made from: kept for
         // a retry only when one happens, so no request pays for a copy it does not use.
@@ -159,15 +164,17 @@ pub(crate) async fn exchange<F: OutgoingFields + ?Sized>(
             storage,
             bounds,
             deadline,
-            again,
         };
-        match attempt.run(request, &mut body, &mut channel).await {
+        match attempt
+            .run(request, &mut body, &mut channel, &mut continue_wait)
+            .await
+        {
             Err(ExchangeError::H2(error)) if !again && unprocessed(&error) => {
                 if let Some(kept) = &kept {
-                    let Some(replayed) = kept.replay() else {
+                    let Some(whole) = whole_again(kept, body.take()) else {
                         return Err(ExchangeError::H2(error));
                     };
-                    body = Some(RequestBody::Replayed(replayed));
+                    body = Some(whole);
                 }
                 retrying();
                 again = true;
@@ -196,6 +203,17 @@ fn kept(
     }
     let (tee, kept) = Tee::new(body, storage);
     (RequestBody::Recorded(Box::new(tee)), Some(kept))
+}
+
+/// The whole of a body to send again, from what `kept` kept of it, if there is one: all of
+/// it, where it went and was kept; or the body itself, where none of it went. `body` is
+/// what is still here of it: a body no stream took is let go of as one a stream took and
+/// left untouched is, and given back the same way.
+fn whole_again(kept: &Recorded, body: Option<RequestBody>) -> Option<RequestBody> {
+    drop(body);
+    kept.replay()
+        .map(RequestBody::Replayed)
+        .or_else(|| kept.given_back())
 }
 
 /// What an error h2 gives a stream says of its exchange: the worker's own shortage where its
@@ -227,8 +245,6 @@ struct Attempt<'a> {
     storage: &'a Rc<Storage>,
     bounds: Bounds,
     deadline: Option<tokio::time::Instant>,
-    /// A second try: the continue wait, if any, was the first's to run.
-    again: bool,
 }
 
 impl Attempt<'_> {
@@ -237,6 +253,7 @@ impl Attempt<'_> {
         mut request: http::Request<()>,
         body: &mut Option<RequestBody>,
         channel: &mut Channel,
+        continue_wait: &mut Option<Pin<Box<tokio::time::Sleep>>>,
     ) -> Result<(Parts, Answer), ExchangeError> {
         let Self {
             client,
@@ -245,7 +262,6 @@ impl Attempt<'_> {
             storage,
             bounds,
             deadline,
-            again,
         } = self;
         let mut place = client.place(destination).await?;
         let failed = failed(place.shed());
@@ -275,9 +291,11 @@ impl Attempt<'_> {
             })
         };
 
-        // The head is out as far as this hop can tell once h2 has it.
-        let mut continue_wait = (!again && channel.head_sent())
-            .then(|| Box::pin(tokio::time::sleep(bounds.continue_wait)));
+        // The head is out as far as this hop can tell once h2 has it. The channel says so
+        // once a request: a stream sent again runs on with the wait the first began.
+        if channel.head_sent() {
+            *continue_wait = Some(Box::pin(tokio::time::sleep(bounds.continue_wait)));
+        }
         let mut may_send = channel.may_poll_upload();
         let (mut heads, mut bytes) = (0, 0);
         let waiting = poll_fn(|cx| {
@@ -298,7 +316,7 @@ impl Attempt<'_> {
             if let Some(wait) = continue_wait.as_mut()
                 && wait.as_mut().poll(cx).is_ready()
             {
-                continue_wait = None;
+                *continue_wait = None;
                 channel.wait_expired();
                 may_send = channel.may_poll_upload();
             }
@@ -556,5 +574,42 @@ mod tests {
         assert!(again.and_then(|kept| kept.replay()).is_some());
         let (_body, again) = kept(RequestBody::None, true, &storage);
         assert!(again.is_none());
+    }
+
+    /// What is sent again of a body: all of it, from what was kept, once it went whole; the
+    /// body itself where none of it went, whether a stream took it or none did; nothing
+    /// where only part of it went.
+    #[tokio::test]
+    async fn a_body_is_sent_again_whole_or_not_at_all() {
+        let storage = Storage::with_provision(1 << 20, 0);
+        let two = || {
+            RequestBody::Replayed(Replayed::of(vec![
+                Frame::data(Bytes::from_static(b"a")),
+                Frame::data(Bytes::from_static(b"b")),
+            ]))
+        };
+        async fn all_of(body: Option<RequestBody>) -> Vec<u8> {
+            body.unwrap().collect().await.unwrap().to_bytes().to_vec()
+        }
+
+        let (body, again) = kept(two(), false, &storage);
+        let recorded = again.unwrap();
+        assert_eq!(all_of(whole_again(&recorded, Some(body))).await, b"ab");
+
+        let (body, again) = kept(two(), false, &storage);
+        let recorded = again.unwrap();
+        drop(body);
+        assert_eq!(all_of(whole_again(&recorded, None)).await, b"ab");
+
+        let (body, again) = kept(two(), false, &storage);
+        let recorded = again.unwrap();
+        let _went = body.collect().await.unwrap();
+        assert_eq!(all_of(whole_again(&recorded, None)).await, b"ab");
+
+        let (mut body, again) = kept(two(), false, &storage);
+        let recorded = again.unwrap();
+        let _one = body.frame().await.unwrap().unwrap();
+        drop(body);
+        assert!(whole_again(&recorded, None).is_none());
     }
 }

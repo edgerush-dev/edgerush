@@ -1401,3 +1401,103 @@ async fn a_field_sent_never_indexed_stays_never_indexed_both_ways_through_an_htt
         })
         .await;
 }
+
+/// A request the upstream refuses unprocessed before any of its body has gone — the client
+/// has yet to send it — still has all of its body to send: it is sent once more, and the
+/// body goes with the second stream when the client sends it (03 §6: a body none of which
+/// went is given back whole).
+#[tokio::test]
+async fn a_request_refused_before_any_of_its_body_went_is_sent_once_more() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, asked, bodies) = refusing_the_first_stream().await;
+            let (front, worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
+            let mut client = TcpStream::connect(front).await.unwrap();
+            client
+                .write_all(b"POST / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\ncontent-length: 2\r\n\r\n")
+                .await
+                .unwrap();
+            // The body only once the first stream has been refused, and the refusal has had
+            // time to come back.
+            until(|| asked.get() == 1).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            client.write_all(b"hi").await.unwrap();
+            let mut answer = Vec::new();
+            let _ = within(client.read_to_end(&mut answer)).await;
+            let answer = String::from_utf8_lossy(&answer).into_owned();
+            assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+            assert_eq!(asked.get(), 2);
+            assert_eq!(*bodies.borrow(), vec![b"hi".to_vec()]);
+            let scrape = worker.proxy().metrics();
+            assert!(
+                scrape.contains("edgerush_upstream_retries_total{upstream=\"up\"} 1\n"),
+                "{scrape}"
+            );
+        })
+        .await;
+}
+
+/// The same for a body held back for `100 Continue`: the wait the first stream began runs
+/// on for the second, so when it runs out the client is told to send, and the body goes.
+#[tokio::test]
+async fn a_body_held_for_100_continue_goes_with_the_stream_sent_once_more() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, asked, bodies) = refusing_the_first_stream().await;
+            let limits = H1Limits {
+                continue_wait: Duration::from_millis(300),
+                ..H1Limits::default()
+            };
+            let (front, _worker) = serving_worker_to_h2(upstream, limits).await;
+            let mut client = TcpStream::connect(front).await.unwrap();
+            client
+                .write_all(b"POST / HTTP/1.1\r\nhost: a.test\r\nconnection: close\r\nexpect: 100-continue\r\ncontent-length: 2\r\n\r\n")
+                .await
+                .unwrap();
+            let mut first = vec![0; 64];
+            let got = within(client.read(&mut first)).await.unwrap();
+            let first = String::from_utf8_lossy(&first[..got]).into_owned();
+            assert!(first.starts_with("HTTP/1.1 100 "), "{first}");
+            assert_eq!(asked.get(), 2, "told to send before the stream was sent again");
+            client.write_all(b"hi").await.unwrap();
+            let mut answer = Vec::new();
+            let _ = within(client.read_to_end(&mut answer)).await;
+            let answer = String::from_utf8_lossy(&answer).into_owned();
+            assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+            assert_eq!(*bodies.borrow(), vec![b"hi".to_vec()]);
+        })
+        .await;
+}
+
+/// An HTTP/2 upstream that refuses the first stream it is sent, unprocessed, and answers
+/// every one after it once it has read its body; how many it was sent, and those bodies.
+async fn refusing_the_first_stream() -> (SocketAddr, Rc<Cell<usize>>, Rc<RefCell<Vec<Vec<u8>>>>) {
+    let asked = Rc::new(Cell::new(0_usize));
+    let asking = Rc::clone(&asked);
+    let bodies = Rc::new(RefCell::new(Vec::new()));
+    let taking = Rc::clone(&bodies);
+    let script: Script = Rc::new(move |request, mut respond| {
+        let asking = Rc::clone(&asking);
+        let taking = Rc::clone(&taking);
+        Box::pin(async move {
+            asking.set(asking.get() + 1);
+            if asking.get() == 1 {
+                respond.send_reset(::h2::Reason::REFUSED_STREAM);
+                return;
+            }
+            let mut body = request.into_body();
+            let mut all = Vec::new();
+            while let Some(Ok(chunk)) = within(body.data()).await {
+                let _ = body.flow_control().release_capacity(chunk.len());
+                all.extend_from_slice(&chunk);
+            }
+            taking.borrow_mut().push(all);
+            let _ = respond.send_response(ok_head(), true);
+        })
+    });
+    (scripted_h2_upstream(script).await, asked, bodies)
+}
