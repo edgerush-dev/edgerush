@@ -94,6 +94,50 @@ async fn an_http3_listener_forces_retry_as_the_config_in_force_says() {
         .await;
 }
 
+/// Live HTTP/3 connections carry on across reloads, as TCP ones do (a reload under load
+/// drops nothing): a request held open through 51 of them is answered, and a client asking
+/// once after each is served every time by the config that reload set, the route moving
+/// between two upstreams.
+#[tokio::test]
+async fn http3_connections_carry_on_across_reloads() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::{Client, get};
+            let (open, gate) = tokio::sync::oneshot::channel();
+            let holding =
+                gated_upstream(b"", gate, b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await;
+            let (old, to_old) = recording_upstream("200 OK");
+            let (new, to_new) = recording_upstream("200 OK");
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let (front, proxy) = serving_h3(&h3_config(holding, http3)).await;
+            let mut held = Client::connect(front, "a.test").await;
+            let id = held.request(&get("a.test", "/held"), true);
+            held.for_a_while(Duration::from_millis(100)).await;
+
+            let mut asking = Client::connect(front, "a.test").await;
+            for round in 1..=51 {
+                let upstream = if round % 2 == 1 { new } else { old };
+                proxy
+                    .reload(compile(&h3_config(upstream, http3)).unwrap())
+                    .unwrap();
+                let answer = asking.get("a.test", "/").await;
+                assert_eq!(answer.final_status(), Some("200"), "round {round}");
+                held.for_a_while(Duration::from_millis(5)).await;
+            }
+            assert_eq!((to_new.borrow().len(), to_old.borrow().len()), (26, 25));
+
+            open.send(()).unwrap();
+            let answer = held.answer(id).await;
+            assert_eq!(answer.final_status(), Some("200"));
+            assert_eq!(answer.body, b"ok");
+        })
+        .await;
+}
+
 /// An HTTP/3 request goes through the request core to an HTTP/1 upstream, and its
 /// answer comes back, as any request's does.
 #[tokio::test]
