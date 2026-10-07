@@ -1290,6 +1290,9 @@ where
 
         let mut framer = BodyFramer::new(written.delimited);
         let mut body_left = written.delimited != Delimited::Nothing;
+        // Whether `went` has been told, which it is as soon as the head is certain to be the
+        // core's, not once a body that may stream for as long as it likes has all gone.
+        let mut told = false;
         // Whether the body ended, or the error it failed with.
         let sent = poll_fn(|context| -> Poll<Result<Option<B::Error>, Stop>> {
             loop {
@@ -1342,6 +1345,11 @@ where
                     }
                 }
                 moved |= connection.poll_write_queued(context)?;
+                // Once a byte of the head has gone, nothing can take its place.
+                if !told && matches!(connection.outbound.on_failure(), OnFailure::Close) {
+                    told = true;
+                    went(Went::Core);
+                }
                 // An upload the answer did not wait for is still read for it, and its clock
                 // is kept as while the answer was worked out: running while it is waited
                 // on, put back by what arrives, and stopped once it is whole — or a clock
@@ -1372,20 +1380,26 @@ where
         // not kept across what is waited on next.
         let failed = match sent {
             Ok(None) => {
-                went(Went::Core);
+                if !told {
+                    went(Went::Core);
+                }
                 false
             }
             Ok(Some(error)) => {
-                let replacing = !matches!(connection.outbound.on_failure(), OnFailure::Close);
-                went(if replacing {
-                    Went::Replaced(&error)
-                } else {
-                    Went::Core
-                });
+                if !told {
+                    let replacing = !matches!(connection.outbound.on_failure(), OnFailure::Close);
+                    went(if replacing {
+                        Went::Replaced(&error)
+                    } else {
+                        Went::Core
+                    });
+                }
                 true
             }
             Err(stop) => {
-                went(Went::Core);
+                if !told {
+                    went(Went::Core);
+                }
                 drop(body);
                 break 'serving stop.into();
             }
@@ -2396,6 +2410,68 @@ mod tests {
                 assert!(!received.contains(" 200 "), "{received:?}");
             }
         }
+    }
+
+    /// An answer's body that sends one piece and then nothing, for as long as it is asked.
+    struct Streaming {
+        sent: bool,
+    }
+
+    impl Body for Streaming {
+        type Data = Bytes;
+        type Error = &'static str;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            if this.sent {
+                return Poll::Pending;
+            }
+            this.sent = true;
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"first")))))
+        }
+    }
+
+    /// The caller is told the head went as soon as a byte of it has, not once the body has
+    /// all gone: an answer that streams for as long as it likes — an event stream, a long
+    /// download — is counted when it begins, as over HTTP/2.
+    #[tokio::test]
+    async fn an_answer_still_streaming_is_told_as_the_cores_once_its_head_has_gone() {
+        let streaming = |_: Request<RequestBody>, _: Interim| async move {
+            Response::new(Streaming { sent: false })
+        };
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        client.write_all(GET).await.unwrap();
+        let said = RefCell::new(Vec::new());
+        let went = |went: Went<'_, &'static str>| {
+            said.borrow_mut().push(match went {
+                Went::Core => "core",
+                Went::Replaced(_) => "replaced",
+            });
+        };
+        let serving = serve_telling(server, settings(), blocks(), date, streaming, went);
+        let reading = async {
+            let mut received = Vec::new();
+            while !received.windows(5).any(|piece| piece == b"first") {
+                let mut piece = [0; 1024];
+                let read = client.read(&mut piece).await.unwrap();
+                assert!(read > 0, "closed");
+                received.extend_from_slice(&piece[..read]);
+            }
+            String::from_utf8(received).unwrap()
+        };
+        let received = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                ended = serving => panic!("the answer ended: {ended:?}"),
+                received = reading => received,
+            }
+        })
+        .await
+        .unwrap();
+        assert!(received.starts_with("HTTP/1.1 200 OK\r\n"), "{received:?}");
+        assert_eq!(said.take(), ["core"], "while its body still streams");
     }
 
     /// The 502 put in place of an answer whose body failed tells the client the request's
