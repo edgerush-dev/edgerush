@@ -24,7 +24,7 @@ use crate::downstream::h3::conn::Conn;
 use crate::downstream::h3::connection::drive;
 use crate::downstream::h3::send::Sending;
 use crate::drain::Drain;
-use crate::forwarding::Client;
+use crate::forwarding::{Client, Cut};
 use crate::interim::Interim;
 use crate::metrics::Quic;
 use crate::quic::header::{self, Header, VERSION_1};
@@ -270,6 +270,9 @@ pub(crate) struct Shared {
     /// Told of a request whose head was too large, which the driver answers 431 itself, with
     /// the client it came from: for its access-log record (21 §4).
     pub(crate) refused: Box<dyn Fn(Rc<Client>)>,
+    /// Told when the gateway closes one of the listener's connections with what was under
+    /// way on it, and why.
+    pub(crate) closed: Box<dyn Fn(Cut)>,
 }
 
 /// Why a listener cannot be served.
@@ -303,6 +306,7 @@ impl Shared {
         room: Option<Room>,
         count: Box<dyn Fn(Quic)>,
         refused: Box<dyn Fn(Rc<Client>)>,
+        closed: Box<dyn Fn(Cut)>,
     ) -> Result<Self, ListenerError> {
         Ok(Self {
             local: socket.local_addr()?,
@@ -324,6 +328,7 @@ impl Shared {
             room,
             count,
             refused,
+            closed,
         })
     }
 }

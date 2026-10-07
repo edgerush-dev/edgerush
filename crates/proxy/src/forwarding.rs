@@ -104,7 +104,10 @@ pub(crate) enum Cut {
 }
 
 impl Cut {
-    /// Its name in a record.
+    /// Every one, in the order a scrape shows them.
+    pub(crate) const ALL: [Self; 3] = [Self::Drained, Self::Exhausted, Self::TooManyResets];
+
+    /// Its name in a record, and in a scrape.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Drained => "drained",

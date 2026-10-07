@@ -411,6 +411,12 @@ impl Worker {
                 "head_too_long",
             );
         });
+        let closing = Arc::clone(&self.proxy);
+        let closed = Box::new(move |why| {
+            if let Some(counters) = closing.metrics.listener(listener) {
+                counters.closed(why);
+            }
+        });
         let shared = h3_listener::Shared::new(
             socket,
             settings,
@@ -423,6 +429,7 @@ impl Worker {
             room,
             count,
             refused,
+            closed,
         )
         .map_err(io::Error::other)?;
         let reading = Rc::clone(&self);

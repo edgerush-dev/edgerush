@@ -407,6 +407,14 @@ async fn a_stream_cut_at_the_drain_bound_is_logged_as_drained() {
             let record = &records[0];
             assert_eq!(record["reason"], "drained", "{record}");
             assert!(record["status"].is_null(), "{record}");
+            // And the closure counted, once (C31).
+            let scrape = logged.worker.proxy.metrics();
+            for (why, count) in [("drained", 1), ("exhausted", 0), ("too_many_resets", 0)] {
+                let line = format!(
+                    "edgerush_listener_connections_closed_total{{listener=\"web\",reason=\"{why}\"}} {count}"
+                );
+                assert!(scrape.lines().any(|shown| shown == line), "{line}");
+            }
         })
         .await;
 }
@@ -449,6 +457,9 @@ async fn a_stream_cut_off_with_a_rapid_reset_is_logged_as_such() {
             })
             .await;
             assert_eq!(kept["reason"], "too_many_resets", "{kept}");
+            let scrape = logged.worker.proxy.metrics();
+            let line = "edgerush_listener_connections_closed_total{listener=\"web\",reason=\"too_many_resets\"} 1";
+            assert!(scrape.lines().any(|shown| shown == line), "{line}");
         })
         .await;
 }

@@ -615,7 +615,12 @@ async fn serve_h2<S>(
         date,
         drain,
         respond,
-        |why| cutting.cut(why),
+        |why| {
+            cutting.cut(why);
+            if let Some(counters) = worker.proxy.metrics.listener(listener) {
+                counters.closed(why);
+            }
+        },
     )
     .await;
 }

@@ -240,6 +240,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
                     // Fails only for a connection already closing.
                     let _closing = state.quic.close(true, code::EXCESSIVE_LOAD, b"");
                 });
+                (shared.closed)(Cut::TooManyResets);
                 driving.closing = true;
                 conn.stir();
                 continue;
@@ -320,6 +321,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
                 // At the drain's bound, what is still under way is cut off.
                 if drain_due.is_some_and(|due| due <= now) {
                     conn.with(|state| state.cut(Cut::Drained));
+                    (shared.closed)(Cut::Drained);
                 }
                 close(&conn, &mut driving);
             }
@@ -369,6 +371,7 @@ fn account(conn: &Rc<Conn>, shared: &Shared) {
             .filter(|held| held.charged() > 0)
             .cloned();
         heaviest.as_ref().unwrap_or(conn).shed();
+        (shared.closed)(Cut::Exhausted);
     }
 }
 

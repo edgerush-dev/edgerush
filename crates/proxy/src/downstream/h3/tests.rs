@@ -58,6 +58,9 @@ struct Server {
     shared: Rc<Shared>,
     /// The client each request was from, in the order the requests were taken.
     clients: Rc<RefCell<Vec<Rc<crate::forwarding::Client>>>>,
+    /// Why each connection the server closed with what was under way on it was closed, as
+    /// the listener counts them.
+    closed: Rc<RefCell<Vec<Cut>>>,
 }
 
 impl Server {
@@ -225,6 +228,8 @@ where
         match never {}
     });
     let drain = Rc::new(Drain::default());
+    let closed = Rc::new(RefCell::new(Vec::new()));
+    let closing = Rc::clone(&closed);
     let shared = Rc::new(
         Shared::new(
             socket,
@@ -238,6 +243,7 @@ where
             None,
             Box::new(|_| {}),
             Box::new(|_| {}),
+            Box::new(move |why| closing.borrow_mut().push(why)),
         )
         .unwrap(),
     );
@@ -270,6 +276,7 @@ where
         accepted_with,
         shared,
         clients,
+        closed,
     }
 }
 
@@ -841,6 +848,7 @@ fn a_worker_that_runs_out_closes_its_heaviest_connection() {
             .map(|c| c.was_cut())
             .collect();
         assert_eq!(cut, [Some(Cut::Exhausted), None]);
+        assert_eq!(*server.closed.borrow(), [Cut::Exhausted]);
     });
 }
 
@@ -1074,6 +1082,7 @@ fn a_rapid_reset_is_cut_off_by_its_share_of_early_resets() {
             .last()
             .map(|client| client.was_cut());
         assert_eq!(last, Some(Some(Cut::TooManyResets)));
+        assert_eq!(*server.closed.borrow(), [Cut::TooManyResets]);
     });
 }
 
@@ -1098,6 +1107,7 @@ fn a_request_cut_at_the_drain_bound_is_told_it_was_drained() {
             .map(|c| c.was_cut())
             .collect();
         assert_eq!(cut, [Some(Cut::Drained)]);
+        assert_eq!(*server.closed.borrow(), [Cut::Drained]);
     });
 }
 
@@ -1119,6 +1129,7 @@ fn a_connection_drained_in_order_is_not_told_it_was_cut() {
             .map(|c| c.was_cut())
             .collect();
         assert_eq!(cut, [None]);
+        assert!(server.closed.borrow().is_empty());
     });
 }
 
@@ -1773,6 +1784,15 @@ fn an_idle_connection_is_told_to_go_at_its_keep_alive_deadline() {
         assert!(took <= settings.keep_alive + SLACK, "{took:?}");
         assert_eq!(client.goaway, Some(4));
         assert_eq!(client.closed_by_server(), Some((true, code::NO_ERROR)));
+        // Nothing was under way to be cut off.
+        assert!(server.closed.borrow().is_empty());
+        let cut: Vec<_> = server
+            .clients
+            .borrow()
+            .iter()
+            .map(|c| c.was_cut())
+            .collect();
+        assert_eq!(cut, [None]);
     });
 }
 

@@ -10,6 +10,7 @@
 //! arbitrarily many of.
 
 use crate::downstream::h1::codec::RequestError;
+use crate::forwarding::Cut;
 use crate::grpc::status::{Code, NAMES};
 use crate::request::Rejection;
 use edgerush_telemetry::{Counter, Exposition, Gauge, Histogram, Kind, Sharded};
@@ -531,6 +532,8 @@ pub(crate) struct ListenerCounters {
     paused: [Counter; AcceptPause::ALL.len()],
     responses: [Counter; 5],
     answers: [Counter; Answer::ALL.len()],
+    /// Connections the gateway closed with requests under way, by why.
+    closed: [Counter; Cut::ALL.len()],
     /// Heads refused before the core had a request, by the reasons of
     /// [`RequestError::NAMES`] that are not among [`Answer`]'s.
     refusals: [Counter; RequestError::NAMES.len()],
@@ -598,6 +601,15 @@ impl ListenerCounters {
         } else if let Some(position) = RequestError::NAMES.iter().position(|name| *name == why)
             && let Some(counter) = self.refusals.get(position)
         {
+            counter.inc();
+        }
+    }
+
+    /// The gateway closed one of the listener's connections, cutting off what was under way
+    /// on it, for `why`.
+    pub(crate) fn closed(&self, why: Cut) {
+        let position = Cut::ALL.iter().position(|other| *other == why);
+        if let Some(counter) = position.and_then(|position| self.closed.get(position)) {
             counter.inc();
         }
     }
@@ -883,6 +895,19 @@ impl Metrics {
                 let labels = [("listener", listener.as_str()), ("reason", *why)];
                 let count =
                     |shard: &ListenerCounters| shard.refusals.get(position).map_or(0, Counter::get);
+                scrape.sample(name, &labels, series.sum(count));
+            }
+        }
+        let name = "edgerush_listener_connections_closed_total";
+        let help = "HTTP/2 and HTTP/3 connections the gateway closed with what was under way \
+                    on them, by why: drained at the drain's bound, for the worker's storage \
+                    running out (exhausted), or for their clients' resets.";
+        scrape.family(name, Kind::Counter, help);
+        for (listener, series) in listeners() {
+            for (position, why) in Cut::ALL.iter().enumerate() {
+                let labels = [("listener", listener.as_str()), ("reason", why.label())];
+                let count =
+                    |shard: &ListenerCounters| shard.closed.get(position).map_or(0, Counter::get);
                 scrape.sample(name, &labels, series.sum(count));
             }
         }
