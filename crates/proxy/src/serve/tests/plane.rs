@@ -237,3 +237,62 @@ fn a_reload_is_counted_and_resets_nothing() {
         "{scrape}"
     );
 }
+
+/// Requests held open across many reloads keep no superseded snapshot alive (10 §1, 13 §1):
+/// what a request keeps across its waits is its endpoint and its rule, not the config it was
+/// routed by. One waiting for its answer's head, one in the middle of an endless answer,
+/// and an HTTP/2 stream waiting for its head, through twenty reloads: every snapshot a
+/// reload replaced is gone while they are all still open.
+#[tokio::test]
+async fn requests_held_across_reloads_keep_no_superseded_snapshot() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, held) = scripted_upstream().await;
+            let (front, worker) = serving_worker_and(upstream).await;
+            let proxy = Arc::clone(worker.proxy());
+
+            let mut waiting = TcpStream::connect(front).await.unwrap();
+            waiting
+                .write_all(b"GET /a/hold HTTP/1.1\r\nhost: a.test\r\n\r\n")
+                .await
+                .unwrap();
+            let mut streaming = TcpStream::connect(front).await.unwrap();
+            streaming
+                .write_all(b"GET /a/endless HTTP/1.1\r\nhost: a.test\r\n\r\n")
+                .await
+                .unwrap();
+            let mut some = [0; 4096];
+            let read = within(streaming.read(&mut some)).await.unwrap();
+            assert!(some[..read].starts_with(b"HTTP/1.1 200"));
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let request = Request::get("http://a.test/a/hold").body(()).unwrap();
+            let (answer, _stream) = send.send_request(request, true).unwrap();
+            until(|| held.borrow().len() == 2).await;
+
+            let mut superseded = Vec::new();
+            for _ in 0..20 {
+                superseded.push(Arc::downgrade(&proxy.current.load_full()));
+                proxy.reload(everything_to(upstream)).unwrap();
+                // The streaming answer goes on meanwhile.
+                let _read = within(streaming.read(&mut some)).await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let alive = superseded
+                .iter()
+                .filter(|snapshot| snapshot.strong_count() > 0)
+                .count();
+            assert_eq!(alive, 0, "superseded snapshots still alive");
+
+            // All three still open.
+            let mut nothing = [0; 1];
+            let waited =
+                tokio::time::timeout(Duration::from_millis(50), waiting.read(&mut nothing)).await;
+            assert!(waited.is_err(), "the waiting request ended: {waited:?}");
+            assert!(within(streaming.read(&mut some)).await.unwrap() > 0);
+            let answered = tokio::time::timeout(Duration::from_millis(50), answer).await;
+            assert!(answered.is_err(), "the HTTP/2 stream ended: {answered:?}");
+        })
+        .await;
+}
