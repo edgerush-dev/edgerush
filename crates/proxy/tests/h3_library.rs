@@ -977,5 +977,72 @@ fn a_stream_left_out_of_a_full_packet_is_sent_in_a_later_one() {
     }
 }
 
+/// A spurious migration (RFC 9000 §9.3.2): an on-path copy of the client's latest packet,
+/// sent on from another address, arrives first and moves the server; the client's next
+/// packet from its own address moves it back. What was in flight on the client's own path
+/// is sent again at once, as when a peer really moves (the Rebinding change), but its loss
+/// is no sign of congestion on that path, which keeps its window throughout, as Google's
+/// QUIC keeps the old path's: the copy costs the client a resend, not its throughput.
+#[test]
+fn a_spurious_migration_leaves_the_clients_own_path_its_window() {
+    let mut pipe = Pipe::new(&mut server_ids(), &id(0xa5, ID_LEN));
+    pipe.client.stream_send(0, b"get", true).unwrap();
+    pipe.advance();
+    let mut buf = vec![0; 64];
+    assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((3, true)));
+
+    // An answer on its way: the server's flight is out, not yet delivered.
+    pipe.server
+        .stream_send(0, &vec![b'x'; 100_000], true)
+        .unwrap();
+    let mut out = vec![0; 65_535];
+    let mut in_flight = 0;
+    while pipe.server.send(&mut out).is_ok() {
+        in_flight += 1;
+    }
+    assert!(in_flight >= 2, "{in_flight} datagrams in flight");
+    let own = |server: &quiche::Connection| {
+        server
+            .path_stats()
+            .find(|path| path.peer_addr == client_addr())
+            .expect("the client's own path")
+    };
+    let before = own(&pipe.server);
+    assert!(before.active);
+
+    // The client's next packet, copied and sent on from elsewhere, arrives first.
+    pipe.client.stream_send(4, b"a", false).unwrap();
+    let sent = pipe.client_flush();
+    assert_eq!(sent.len(), 1);
+    let elsewhere: std::net::SocketAddr = "192.0.2.66:4444".parse().unwrap();
+    pipe.deliver_to_server(Datagram {
+        bytes: sent[0].bytes.clone(),
+        from: elsewhere,
+        to: sent[0].to,
+    });
+    let moved = own(&pipe.server);
+    assert!(!moved.active, "the copy moved the server");
+    assert!(moved.lost > before.lost, "the flight is to be sent again");
+    // The original, a duplicate now, and then the client's next packet from its own address.
+    for datagram in sent {
+        pipe.deliver_to_server(datagram);
+    }
+    pipe.client.stream_send(4, b"b", false).unwrap();
+    for datagram in pipe.client_flush() {
+        pipe.deliver_to_server(datagram);
+    }
+
+    let after = own(&pipe.server);
+    assert!(after.active, "back on the client's own path");
+    assert_eq!(
+        (moved.cwnd, after.cwnd),
+        (before.cwnd, before.cwnd),
+        "the client's own path's window: before {}, while moved {}, after {}",
+        before.cwnd,
+        moved.cwnd,
+        after.cwnd,
+    );
+}
+
 // 17 bytes, the length 16 §3 gives server IDs, is within what QUIC allows and quiche takes.
 const _: () = assert!(ID_LEN <= quiche::MAX_CONN_ID_LEN);

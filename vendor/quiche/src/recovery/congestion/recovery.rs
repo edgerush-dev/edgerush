@@ -591,8 +591,8 @@ impl LegacyRecovery {
         self.account_losses(epoch, loss, now)
     }
 
-    /// EdgeRush: what `detect_lost_packets()` did with the losses it found,
-    /// for `on_peer_left()` to do the same.
+    /// EdgeRush: what `detect_lost_packets()` does with the losses it found;
+    /// `on_peer_left()` does the same but for the congestion event.
     fn account_losses(
         &mut self, epoch: Epoch, loss: LossDetectionResult, now: Instant,
     ) -> (usize, usize) {
@@ -932,11 +932,23 @@ impl RecoveryOps for LegacyRecovery {
         &mut self, epoch: Epoch, handshake_status: HandshakeStatus, now: Instant,
     ) -> (usize, usize) {
         let loss = self.epochs[epoch].lose_all(now);
-        let lost = self.account_losses(epoch, loss, now);
+
+        // EdgeRush: as `account_losses()`, but with no congestion event. The
+        // packets are not lost to congestion: the peer may not even have left,
+        // its packet from elsewhere a copy an attacker sent on (RFC 9000
+        // §9.3.2), and the path keeps its window for when it comes back to
+        // it, as the gcongestion recovery does.
+        self.bytes_in_flight
+            .saturating_subtract(loss.lost_bytes + loss.pmtud_lost_bytes, now);
+
+        self.epochs[epoch]
+            .drain_acked_and_lost_packets(now - self.rtt_stats.rtt());
+
+        self.congestion.lost_count += loss.lost_packets;
 
         self.set_loss_detection_timer(handshake_status, now);
 
-        lost
+        (loss.lost_packets, loss.lost_bytes)
     }
 
     fn loss_detection_timer(&self) -> Option<Instant> {

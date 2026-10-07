@@ -237,7 +237,9 @@ pub trait RecoveryOps {
     /// on the path the peer moved to: none of it will be acknowledged here,
     /// and an ACK on another path does not count towards loss on this one, so
     /// otherwise only this path's PTO, a probe or two at each doubling, would
-    /// send it again. Returns the packets and bytes lost.
+    /// send it again. They are not lost to congestion, and the path's window
+    /// is left as it was, for a peer that comes back to it. Returns the
+    /// packets and bytes lost.
     fn on_peer_left(
         &mut self, epoch: packet::Epoch, handshake_status: HandshakeStatus,
         now: Instant,

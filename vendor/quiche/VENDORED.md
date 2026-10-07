@@ -52,8 +52,13 @@ Every change is marked `EdgeRush:` in the source.
   path's PTO, a probe or two at each doubling: the gap in a download never closed. Now
   `on_peer_migrated` also has the old path's recovery declare everything in flight on it
   lost (`RecoveryOps::on_peer_left`, with a `lose_all` for each of the two recoveries,
-  `recovery/congestion` and `recovery/gcongestion`, accounted as their loss detection
-  accounts), and its frames go on the new path.
+  `recovery/congestion` and `recovery/gcongestion`), and its frames go on the new path.
+  The losses are not taken for congestion: the old path keeps its window, as the
+  gcongestion recovery already left it and as Google's QUIC keeps the old path's, so a
+  packet copied from another address by an attacker (RFC 9000 §9.3.2), which moves the
+  server until the client's next packet moves it back, costs the client a resend, not its
+  window. `a_spurious_migration_leaves_the_clients_own_path_its_window` in
+  `crates/proxy/tests/h3_library.rs` covers it.
 - Three tests (five cases) after `connection_migration_zero_length_cid` in
   `src/tests.rs` cover both, beside quiche's own `path_probing_dos` and
   `path_event_queue_bounded_on_port_rotation`, which still pass.
