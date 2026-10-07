@@ -126,6 +126,20 @@ impl Client {
         }
     }
 
+    /// A client of `server` asking for `name`, its handshake not yet begun, that resumes
+    /// `session` and would send early data if the server's ticket let it.
+    pub(crate) async fn resuming(server: SocketAddr, name: &str, session: &[u8]) -> Self {
+        let mut client = Self::offering(
+            server,
+            name,
+            quiche::h3::APPLICATION_PROTOCOL,
+            quiche::Config::enable_early_data,
+        )
+        .await;
+        client.quic.set_session(session).unwrap();
+        client
+    }
+
     /// A client of `server` asking for `name`, through its handshake, speaking HTTP/3.
     pub(crate) async fn connect(server: SocketAddr, name: &str) -> Self {
         Self::connect_with(server, name, |_| {}).await

@@ -2201,6 +2201,26 @@ fn a_short_initial_never_reaches_a_connection_under_way() {
     });
 }
 
+/// 0-RTT is refused (16 §1, RFC 9114 §10.9): a request sent in it could be replayed. A
+/// client that would send early data, resuming a session from an earlier connection, is
+/// never let: its ticket allows none. It does resume, so the ticket was taken.
+#[test]
+fn a_resumed_client_is_never_let_send_early_data() {
+    locally(async {
+        let server = serving(short(), echo).await;
+        let mut first =
+            Client::connect_with(server.address, "a.test", quiche::Config::enable_early_data).await;
+        first.until(|client| client.quic.session().is_some()).await;
+        let session = first.quic.session().unwrap().to_vec();
+        let mut again = Client::resuming(server.address, "a.test", &session).await;
+        again.flush().await;
+        assert!(!again.quic.is_in_early_data());
+        again.until(|client| client.quic.is_established()).await;
+        assert!(again.quic.is_resumed());
+        assert!(!again.quic.is_in_early_data());
+    });
+}
+
 /// The threshold is the worker's (16 §6): a handshake under way on one of its HTTP/3
 /// listeners counts on the others, and a client of another listener proves its address
 /// first.
