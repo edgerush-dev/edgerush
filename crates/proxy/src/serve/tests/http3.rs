@@ -435,10 +435,19 @@ async fn http3_connections_are_held_to_their_workers_connection_cap() {
             });
             assert!(dropped.is_some_and(|count| count > 0), "{dropped:?}");
 
-            // The first goes, and with it what it was counted.
+            // The first goes, and with it what it was counted: once its connection has
+            // drained, three probe timeouts after the close (RFC 9000 §10.2), which are
+            // made of the round trips measured, seconds long each on a loaded machine. So
+            // the wait is bounded by far more than `until`'s ten seconds.
             first.quic.close(true, 0x100, b"").unwrap();
             first.flush().await;
-            until(|| connections.now() == [0]).await;
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while connections.now() != [0] {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the first connection was never let go of");
             second.until(|client| client.quic.is_established()).await;
             assert_eq!(connections.now(), [3]);
         })
