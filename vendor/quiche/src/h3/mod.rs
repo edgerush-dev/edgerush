@@ -712,6 +712,15 @@ pub trait NameValue {
 
     /// Returns the object's value.
     fn value(&self) -> &[u8];
+
+    /// Whether the field is never to be indexed: sent, or to be sent, with QPACK's N bit
+    /// (RFC 9204 §4.5.4, §4.5.6), which an intermediary keeps when it sends the field on
+    /// (§7.1.3).
+    ///
+    /// Added by EdgeRush's vendored copy; not in quiche as published.
+    fn is_never_indexed(&self) -> bool {
+        false
+    }
 }
 
 impl<N, V> NameValue for (N, V)
@@ -733,8 +742,10 @@ where
 /// EdgeRush: a name or value the QPACK decoder takes from the static table is
 /// the table's own bytes, borrowed; anything else is owned. A field sent as a
 /// static entry, or a name sent as a reference to one, costs no allocation.
+///
+/// EdgeRush: and whether it is never to be indexed ([`NameValue::is_never_indexed`]).
 #[derive(Clone, PartialEq, Eq)]
-pub struct Header(Cow<'static, [u8]>, Cow<'static, [u8]>);
+pub struct Header(Cow<'static, [u8]>, Cow<'static, [u8]>, bool);
 
 fn try_print_as_readable(hdr: &[u8], f: &mut fmt::Formatter) -> fmt::Result {
     match std::str::from_utf8(hdr) {
@@ -758,7 +769,17 @@ impl Header {
     ///
     /// Both `name` and `value` will be cloned.
     pub fn new(name: &[u8], value: &[u8]) -> Self {
-        Self(Cow::Owned(name.to_vec()), Cow::Owned(value.to_vec()))
+        Self(Cow::Owned(name.to_vec()), Cow::Owned(value.to_vec()), false)
+    }
+
+    /// Creates a new header that is never to be indexed
+    /// ([`NameValue::is_never_indexed`]).
+    ///
+    /// Both `name` and `value` will be cloned.
+    ///
+    /// Added by EdgeRush's vendored copy; not in quiche as published.
+    pub fn never_indexed(name: &[u8], value: &[u8]) -> Self {
+        Self(Cow::Owned(name.to_vec()), Cow::Owned(value.to_vec()), true)
     }
 }
 
@@ -769,6 +790,10 @@ impl NameValue for Header {
 
     fn value(&self) -> &[u8] {
         &self.1
+    }
+
+    fn is_never_indexed(&self) -> bool {
+        self.2
     }
 }
 

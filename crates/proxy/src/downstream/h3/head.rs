@@ -82,7 +82,10 @@ pub fn request<F: NameValue>(fields: &[F], limit: usize) -> Result<RequestHead, 
             continue;
         }
         regular = true;
-        let (name, value) = regular_field(name, value)?;
+        let (name, mut value) = regular_field(name, value)?;
+        // Sent never to be indexed, it is never indexed on the next hop either: h2's
+        // encoder never indexes a sensitive value (RFC 9204 §7.1.3, 15 §3).
+        value.set_sensitive(field.is_never_indexed());
         if name == TE && !value.as_bytes().eq_ignore_ascii_case(b"trailers") {
             return Err(Refused::Malformed("`TE` other than `trailers`"));
         }
@@ -204,7 +207,8 @@ pub fn trailers<F: NameValue>(fields: &[F], limit: usize) -> Result<HeaderMap, R
         if name.starts_with(b":") {
             return Err(Refused::Malformed("a pseudo-header in trailers"));
         }
-        let (name, value) = regular_field(name, value)?;
+        let (name, mut value) = regular_field(name, value)?;
+        value.set_sensitive(field.is_never_indexed());
         trailers.append(name, value);
     }
     if size > limit {
@@ -318,6 +322,25 @@ mod tests {
             .iter()
             .map(|(name, value)| Header::new(name.as_bytes(), value.as_bytes()))
             .collect()
+    }
+
+    /// A field the client sent never to be indexed is handed on sensitive, in a request's
+    /// head and in its trailers, so that h2 never indexes it on the next hop (RFC 9204
+    /// §7.1.3); the rest are not.
+    #[test]
+    fn a_field_sent_never_indexed_is_handed_on_sensitive() {
+        let mut sent = fields(&get(&[("x-plain", "a")]));
+        sent.push(Header::never_indexed(b"x-api-key", b"secret"));
+        let head = request(&sent, LIMIT).unwrap();
+        assert!(head.parts.headers["x-api-key"].is_sensitive());
+        assert!(!head.parts.headers["x-plain"].is_sensitive());
+        let after = vec![
+            Header::never_indexed(b"x-sum", b"1"),
+            Header::new(b"x-note", b"n"),
+        ];
+        let trailers = trailers(&after, LIMIT).unwrap();
+        assert!(trailers["x-sum"].is_sensitive());
+        assert!(!trailers["x-note"].is_sensitive());
     }
 
     fn get(more: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {

@@ -453,3 +453,51 @@ async fn http3_connections_are_held_to_their_workers_connection_cap() {
         })
         .await;
 }
+
+/// A field an HTTP/3 client sends never to be indexed goes to an HTTP/2 upstream never
+/// indexed, out of the dynamic table of a connection other clients' requests share (RFC
+/// 9204 §7.1.3, 15 §3): the upstream's h2 decoder marks such a field sensitive, so the mark
+/// it sees is the representation the field came in.
+#[tokio::test]
+async fn a_field_an_http3_client_sends_never_indexed_stays_so_to_an_http2_upstream() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::Client;
+            let heard = Rc::new(RefCell::new(None::<(bool, bool)>));
+            let hearing = Rc::clone(&heard);
+            let script: Script = Rc::new(move |request, mut respond| {
+                let hearing = Rc::clone(&hearing);
+                Box::pin(async move {
+                    let fields = request.headers();
+                    *hearing.borrow_mut() = Some((
+                        fields["x-api-key"].is_sensitive(),
+                        fields["x-plain"].is_sensitive(),
+                    ));
+                    let _ = respond.send_response(ok_head(), true);
+                })
+            });
+            let upstream = scripted_h2_upstream(script).await;
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let mut config = h3_config(upstream, http3);
+            config.upstreams.get_mut("up").unwrap().protocol = UpstreamProtocol::Http2;
+            let (front, _proxy) = serving_h3(&config).await;
+            let mut client = Client::connect(front, "a.test").await;
+            let fields = [
+                quiche::h3::Header::new(b":method", b"GET"),
+                quiche::h3::Header::new(b":scheme", b"https"),
+                quiche::h3::Header::new(b":authority", b"a.test"),
+                quiche::h3::Header::new(b":path", b"/"),
+                quiche::h3::Header::never_indexed(b"x-api-key", b"secret"),
+                quiche::h3::Header::new(b"x-plain", b"a"),
+            ];
+            let id = client.request_of(&fields, true);
+            let answer = client.answer(id).await;
+            assert_eq!(answer.final_status(), Some("200"), "{answer:?}");
+            assert_eq!(*heard.borrow(), Some((true, false)));
+        })
+        .await;
+}

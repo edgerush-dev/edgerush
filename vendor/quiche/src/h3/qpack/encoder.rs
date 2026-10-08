@@ -55,26 +55,31 @@ impl Encoder {
         encode_int(0, 0, 7, &mut b)?;
 
         for h in headers {
+            // EdgeRush: a field never to be indexed is sent as a literal with the N bit
+            // set (RFC 9204 §4.5.4, §4.5.6), even one the static table holds whole.
+            let never = h.is_never_indexed();
             match lookup_static(h) {
-                Some((idx, true)) => {
+                Some((idx, true)) if !never => {
                     const STATIC: u8 = 0x40;
 
                     // Encode as statically indexed.
                     encode_int(idx, INDEXED | STATIC, 6, &mut b)?;
                 },
 
-                Some((idx, false)) => {
+                Some((idx, _)) => {
                     const STATIC: u8 = 0x10;
 
                     // Encode value as literal with static name reference.
-                    encode_int(idx, LITERAL_WITH_NAME_REF | STATIC, 4, &mut b)?;
+                    let n = if never { 0x20 } else { 0 };
+                    encode_int(idx, LITERAL_WITH_NAME_REF | STATIC | n, 4, &mut b)?;
                     encode_str::<false>(h.value(), 0, 7, &mut b)?;
                 },
 
                 None => {
                     // Encode as fully literal.
 
-                    encode_str::<true>(h.name(), LITERAL, 3, &mut b)?;
+                    let n = if never { 0x10 } else { 0 };
+                    encode_str::<true>(h.name(), LITERAL | n, 3, &mut b)?;
                     encode_str::<false>(h.value(), 0, 7, &mut b)?;
                 },
             };

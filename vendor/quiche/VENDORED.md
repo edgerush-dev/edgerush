@@ -140,6 +140,14 @@ Every change is marked `EdgeRush:` in the source.
   client's destination ID, as `retry()` writes a Retry (`packet::invalid_token_close` in
   `src/packet.rs`). `an_invalid_retry_token_is_told_with_a_close_the_client_reads` in
   `crates/proxy/tests/h3_library.rs` covers it.
+- **A field sent never indexed keeps the mark.** QPACK's N bit says a field is never to be
+  indexed, and an intermediary keeps it when it sends the field on (RFC 9204 §7.1.3);
+  quiche's decoder dropped it. `Header` now carries it, read by `NameValue::is_never_indexed`
+  (a provided method, false for anything else) and made by `Header::never_indexed`; the
+  decoder sets it from either literal representation, and the encoder sends such a field
+  as a literal with the bit set, even one the static table holds whole
+  (`src/h3/qpack/`). `never_indexed_fields_keep_the_mark` in `src/h3/qpack/mod.rs` covers
+  it.
 
 ## Why
 
@@ -233,7 +241,7 @@ client can start again rather than wait out its handshake timer. Published quich
 write that close only from a connection, and a connection writes nothing before it has
 processed the client's Initial, which runs the TLS handshake a Retry is there to spare.
 
-With all fourteen changes, quiche's own library tests pass (1,176 of 1,176, on Windows and
+With all fifteen changes, quiche's own library tests pass (1,177 of 1,177, on Windows and
 Linux, with `cargo test --no-default-features --features boringssl-boring-crate --lib`),
 and `check.sh` runs them, in a target directory of their own (`target/vendored`): the
 workspace's tests never reach this crate, which is not a member of it.

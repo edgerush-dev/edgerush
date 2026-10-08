@@ -178,7 +178,7 @@ impl Decoder {
 
                     // EdgeRush: the table's own bytes, not copies of them.
                     let hdr =
-                        Header(Cow::Borrowed(name), Cow::Borrowed(value));
+                        Header(Cow::Borrowed(name), Cow::Borrowed(value), false);
                     out.push(hdr);
                 },
 
@@ -221,7 +221,9 @@ impl Decoder {
 
                     // Instead of calling Header::new(), create Header directly
                     // from `name` and `value`.
-                    let hdr = Header(Cow::Owned(name), Cow::Owned(value));
+                    // EdgeRush: the N bit kept (RFC 9204 §4.5.6, §7.1.3).
+                    let never = first & 0x10 == 0x10;
+                    let hdr = Header(Cow::Owned(name), Cow::Owned(value), never);
                     out.push(hdr);
                 },
 
@@ -252,7 +254,9 @@ impl Decoder {
                     // Instead of calling Header::new(), create Header directly
                     // from `value`. EdgeRush: and `name` borrowed from the
                     // static table rather than cloned.
-                    let hdr = Header(Cow::Borrowed(name), Cow::Owned(value));
+                    // EdgeRush: the N bit kept (RFC 9204 §4.5.4, §7.1.3).
+                    let never = first & 0x20 == 0x20;
+                    let hdr = Header(Cow::Borrowed(name), Cow::Owned(value), never);
                     out.push(hdr);
                 },
 

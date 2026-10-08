@@ -109,6 +109,36 @@ mod tests {
         assert_eq!(dec.decode(&encoded, u64::MAX), Ok(headers));
     }
 
+    /// EdgeRush: a field never to be indexed keeps the mark both ways, as a literal with
+    /// the N bit set whatever the static table holds of it (RFC 9204 §4.5.4, §4.5.6,
+    /// §7.1.3); one that is not is sent as before.
+    #[test]
+    fn never_indexed_fields_keep_the_mark() {
+        use crate::h3::NameValue;
+
+        let mut encoded = [0u8; 128];
+
+        let headers = vec![
+            h3::Header::never_indexed(b"x-api-key", b"secret"),
+            h3::Header::never_indexed(b"authorization", b"basic Zm9v"),
+            h3::Header::never_indexed(b":method", b"GET"),
+            h3::Header::new(b"x-plain", b"a"),
+            h3::Header::new(b":method", b"GET"),
+        ];
+
+        let mut enc = Encoder::new();
+        let len = enc.encode(&headers, &mut encoded).unwrap();
+        // After the two-byte prefix: a literal with a literal name, N set.
+        assert_eq!(encoded[2] & 0xf0, 0x30);
+
+        let mut dec = Decoder::new();
+        let decoded = dec.decode(&encoded[..len], u64::MAX).unwrap();
+        assert_eq!(decoded, headers);
+        let marks: Vec<bool> =
+            decoded.iter().map(|h| h.is_never_indexed()).collect();
+        assert_eq!(marks, [true, true, true, false, false]);
+    }
+
     #[test]
     fn encode_decode_small_max_field_section_size() {
         let mut encoded = [0u8; 102];

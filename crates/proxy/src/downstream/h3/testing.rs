@@ -371,10 +371,15 @@ impl Client {
             .iter()
             .map(|(name, value)| quiche::h3::Header::new(name.as_bytes(), value.as_bytes()))
             .collect();
+        self.request_of(&fields, end)
+    }
+
+    /// The same, with fields as quiche's own, a field never to be indexed among them.
+    pub(crate) fn request_of(&mut self, fields: &[quiche::h3::Header], end: bool) -> u64 {
         self.h3
             .as_mut()
             .unwrap()
-            .send_request(&mut self.quic, &fields, end)
+            .send_request(&mut self.quic, fields, end)
             .unwrap()
     }
 
