@@ -83,6 +83,10 @@ pub struct Config {
     ///
     /// Default 25600 bytes
     pub data_frame_budget: usize,
+
+    /// EdgeRush: what the connection may allocate for its peer's streams before its owner
+    /// next looks, shared with the codec (15 §3).
+    pub grant: std::sync::Arc<crate::proto::grant::Grant>,
 }
 
 trait DebugStructExt<'a, 'b> {

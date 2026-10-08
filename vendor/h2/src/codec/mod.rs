@@ -134,6 +134,16 @@ impl<T, B> Codec<T, B> {
         self.inner.buffer_capacity()
     }
 
+    // EdgeRush: see `FramedRead::set_grant`.
+    pub(crate) fn set_grant(&mut self, grant: std::sync::Arc<crate::proto::grant::Grant>) {
+        self.inner.set_grant(grant);
+    }
+
+    // EdgeRush: see `FramedRead::held`.
+    pub(crate) fn held(&self) -> usize {
+        self.inner.held()
+    }
+
     /// Takes the data payload value that was fully written to the socket
     pub(crate) fn take_last_data_frame(&mut self) -> Option<Data<B>> {
         self.framed_write().take_last_data_frame()

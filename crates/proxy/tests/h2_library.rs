@@ -1851,3 +1851,483 @@ async fn an_answers_field_sent_never_indexed_is_handed_over_sensitive() {
     assert!(answer.headers()["x-token"].is_sensitive());
     assert!(!answer.headers()["x-plain"].is_sensitive());
 }
+
+// ===== What a server holds of what its peer sent, and what it may allocate =====
+//
+// EdgeRush's vendored h2 says what a server connection holds of what its peer sent
+// (`held`), takes each allocation for it from a grant its owner sets before polling
+// (`set_grant`), and says what a head it hands over held (`server::head_held`): 15 §3, and
+// `vendor/h2/VENDORED.md`.
+
+/// Polls `connection` until everything the peer has sent so far is read and acted on: the
+/// peer's PING comes back once it is. The frames the server sent meanwhile are returned.
+async fn processed(
+    connection: &mut server::Connection<DuplexStream, Bytes>,
+    peer: &mut Peer<DuplexStream>,
+) -> Vec<Frame> {
+    let driving = poll_fn(|cx| {
+        let _ = connection.poll_closed(cx);
+        Poll::<()>::Pending
+    });
+    tokio::select! {
+        frames = peer.barrier() => frames,
+        () = driving => unreachable!("the driving never ends"),
+    }
+}
+
+/// Polls `connection` a few times: enough to read what the peer has written, which waits
+/// whole in the wire's buffer. For a peer half way through a header block, which may send
+/// nothing else until the block is done (RFC 9113 §6.10), so [`processed`]'s PING may not.
+async fn polled(connection: &mut server::Connection<DuplexStream, Bytes>) {
+    for _ in 0..5 {
+        poll_fn(|cx| {
+            let _ = connection.poll_closed(cx);
+            Poll::Ready(())
+        })
+        .await;
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The GOAWAY `connection` sends, driving it until it does.
+async fn goaway_driven(
+    connection: &mut server::Connection<DuplexStream, Bytes>,
+    peer: &mut Peer<DuplexStream>,
+) -> (u32, u32) {
+    let driving = poll_fn(|cx| {
+        let _ = connection.poll_closed(cx);
+        Poll::<()>::Pending
+    });
+    tokio::select! {
+        (frame, _) = peer.until(|frame| frame.kind == kind::GOAWAY) => frame.goaway(),
+        () = driving => unreachable!("the driving never ends"),
+    }
+}
+
+/// A request's pseudo-fields, then `rest` as it is.
+fn request_then(rest: &[u8]) -> Vec<u8> {
+    let mut block = h2_peer::request("GET", "/");
+    block.extend_from_slice(rest);
+    block
+}
+
+/// A field with a literal name, added to the decoder's dynamic table (RFC 7541 §6.2.1).
+fn indexed_literal(name: &str, value: &str) -> Vec<u8> {
+    let mut out = vec![0x40, u8::try_from(name.len()).unwrap()];
+    out.extend_from_slice(name.as_bytes());
+    out.push(u8::try_from(value.len()).unwrap());
+    out.extend_from_slice(value.as_bytes());
+    out
+}
+
+/// A head h2 has decoded and not yet handed over is counted in what the connection holds;
+/// as it is accepted it leaves the count and says what it held, for its new owner to be
+/// charged as the connection stops counting it.
+#[tokio::test]
+async fn a_head_waiting_to_be_accepted_is_held_and_handed_over_with_its_count() {
+    let (mut connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    processed(&mut connection, &mut peer).await;
+    let idle = connection.held();
+    let many: Vec<(String, String)> = (0..20)
+        .map(|n| (format!("x-field-{n}"), "v".repeat(100)))
+        .collect();
+    let fields: Vec<(&str, &str)> = many.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+    peer.send(&h2_peer::headers(
+        1,
+        request_then(&h2_peer::block(&fields)),
+        true,
+    ))
+    .await;
+    processed(&mut connection, &mut peer).await;
+    let waiting = connection.held();
+    assert!(
+        waiting > idle + 20 * 100,
+        "{idle} idle, {waiting} with a head waiting"
+    );
+    let (request, _respond) = within(poll_fn(|cx| connection.poll_accept(cx)))
+        .await
+        .unwrap()
+        .unwrap();
+    let handed = h2::server::head_held(&request);
+    assert!(handed >= 20 * 100, "the head said it held {handed}");
+    assert_eq!(connection.held(), waiting - handed);
+}
+
+/// A stream whose head there is no grant to decode is refused with REFUSED_STREAM and
+/// takes nothing: the head is decoded all the same, so that what it added to the HPACK
+/// table is there for the next head that refers to it, and none of it is kept. The
+/// connection goes on.
+#[tokio::test]
+async fn a_head_with_no_grant_to_decode_is_refused_and_its_table_entries_kept() {
+    let (mut connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    processed(&mut connection, &mut peer).await;
+    let idle = connection.held();
+    connection.set_grant(0);
+    peer.send(&h2_peer::headers(
+        1,
+        request_then(&indexed_literal("x-kept", "v1")),
+        true,
+    ))
+    .await;
+    let mut frames = processed(&mut connection, &mut peer).await;
+    frames.extend(processed(&mut connection, &mut peer).await);
+    assert_eq!(resets_in(&frames), [(1, code::REFUSED_STREAM)]);
+    assert_eq!(goaway_in(&frames), None);
+    // Nothing kept but the entry the head added to the table — its own bytes and 32 more
+    // by RFC 7541's measure — and the table's room for its first entries; a stream's place
+    // alone would be far more.
+    let entry = 32 + "x-kept".len() + "v1".len();
+    assert!(
+        (idle + entry..=idle + entry + 512).contains(&connection.held()),
+        "{idle} idle, {} after a refused stream",
+        connection.held()
+    );
+    connection.set_grant(usize::MAX);
+    // The first entry of the dynamic table, index 62 (RFC 7541 §2.3.3).
+    peer.send(&h2_peer::headers(3, request_then(&[0x80 | 62]), true))
+        .await;
+    processed(&mut connection, &mut peer).await;
+    let (request, _respond) = within(poll_fn(|cx| connection.poll_accept(cx)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.headers()["x-kept"], "v1");
+}
+
+/// A header block left unfinished between polls is held — what is left of it undecoded, in
+/// a buffer of its own, and the fields decoded so far — until its last frame comes; then
+/// the head it makes is held instead.
+#[tokio::test]
+async fn an_unfinished_header_block_is_held_across_polls() {
+    let (mut connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    processed(&mut connection, &mut peer).await;
+    let idle = connection.held();
+    let value = "a".repeat(4000);
+    let block = request_then(&h2_peer::block(&[("x-big", &value)]));
+    let (first, rest) = block.split_at(3000);
+    peer.send(&Frame::new(
+        kind::HEADERS,
+        flag::END_STREAM,
+        1,
+        first.to_vec(),
+    ))
+    .await;
+    polled(&mut connection).await;
+    let unfinished = connection.held();
+    assert!(
+        unfinished >= idle + 2500,
+        "{idle} idle, {unfinished} with a block unfinished"
+    );
+    // And still after another poll with nothing new.
+    polled(&mut connection).await;
+    assert_eq!(connection.held(), unfinished);
+    peer.send(&Frame::new(
+        kind::CONTINUATION,
+        flag::END_HEADERS,
+        1,
+        rest.to_vec(),
+    ))
+    .await;
+    polled(&mut connection).await;
+    let (request, _respond) = within(poll_fn(|cx| connection.poll_accept(cx)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.headers()["x-big"].len(), 4000);
+}
+
+/// An unfinished header block whose remainder the grant does not cover closes the
+/// connection with ENHANCE_YOUR_CALM: it cannot be refused part way, and its HPACK state
+/// cannot be kept without it.
+#[tokio::test]
+async fn an_unfinished_header_block_past_the_grant_closes_the_connection() {
+    let (mut connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    processed(&mut connection, &mut peer).await;
+    let value = "a".repeat(12_000);
+    let block = request_then(&h2_peer::block(&[("x-big", &value)]));
+    let (first, rest) = block.split_at(3000);
+    let (second, _) = rest.split_at(6000);
+    peer.send(&Frame::new(
+        kind::HEADERS,
+        flag::END_STREAM,
+        1,
+        first.to_vec(),
+    ))
+    .await;
+    polled(&mut connection).await;
+    connection.set_grant(1000);
+    peer.send(&Frame::new(kind::CONTINUATION, 0, 1, second.to_vec()))
+        .await;
+    let (_, code) = goaway_driven(&mut connection, &mut peer).await;
+    assert_eq!(code, code::ENHANCE_YOUR_CALM);
+}
+
+/// Trailers the grant does not cover reset their stream with ENHANCE_YOUR_CALM rather than
+/// be kept; the connection goes on.
+#[tokio::test]
+async fn trailers_past_the_grant_reset_their_stream() {
+    let (mut connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    request(&mut peer, 1, false).await;
+    processed(&mut connection, &mut peer).await;
+    let (_request, _respond) = within(poll_fn(|cx| connection.poll_accept(cx)))
+        .await
+        .unwrap()
+        .unwrap();
+    connection.set_grant(0);
+    peer.send(&h2_peer::headers(
+        1,
+        h2_peer::block(&[("x-trailer", "t")]),
+        true,
+    ))
+    .await;
+    // A PING's acknowledgement may go ahead of a reset queued before it: two barriers.
+    let mut frames = processed(&mut connection, &mut peer).await;
+    frames.extend(processed(&mut connection, &mut peer).await);
+    assert_eq!(resets_in(&frames), [(1, code::ENHANCE_YOUR_CALM)]);
+    assert_eq!(goaway_in(&frames), None);
+}
+
+/// A stream's place is charged by the room the slab adds, once: streams taken one at a
+/// time reuse the place the first made, and the count stays; more at once than the slab
+/// has room for grow it, and the count with it.
+#[tokio::test]
+async fn a_streams_place_is_charged_by_the_room_it_adds() {
+    let (mut connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    let mut held = Vec::new();
+    for id in [1, 3, 5, 7] {
+        request(&mut peer, id, true).await;
+        processed(&mut connection, &mut peer).await;
+        let (request, mut respond) = within(poll_fn(|cx| connection.poll_accept(cx)))
+            .await
+            .unwrap()
+            .unwrap();
+        respond.send_response(Response::new(()), true).unwrap();
+        drop((request, respond));
+        processed(&mut connection, &mut peer).await;
+        held.push(connection.held());
+    }
+    assert!(held.windows(2).all(|pair| pair[0] == pair[1]), "{held:?}");
+    let one_at_a_time = held[0];
+    for id in (9..=25).step_by(2) {
+        request(&mut peer, id, false).await;
+    }
+    processed(&mut connection, &mut peer).await;
+    assert!(
+        connection.held() > one_at_a_time,
+        "{one_at_a_time} then {} with nine at once",
+        connection.held()
+    );
+}
+
+/// A stream is taken up only if the grant covers all it will hold — its head and the room
+/// its place adds to the stream slab, the id map and the event queue — not just its head:
+/// a grant a byte short of what one stream comes to hold refuses it, and one that covers it
+/// lets it in, holding no more than the grant. What a stream is charged as it opens may
+/// round its place's room up a little: the id map grows as its hash table does, and is
+/// counted as a vector would. Header lists are kept small, so that what decoding may
+/// allocate is less than what a stream holds and the stream is what is judged.
+#[tokio::test]
+async fn a_stream_is_taken_up_only_if_the_grant_covers_the_room_its_place_adds() {
+    let mut builder = server::Builder::new();
+    builder.max_header_list_size(192);
+    // What one stream comes to hold, with no limit to judge it by.
+    let (mut free, mut free_peer, _) = server_with(&builder, true).await;
+    processed(&mut free, &mut free_peer).await;
+    let idle = free.held();
+    request(&mut free_peer, 1, true).await;
+    processed(&mut free, &mut free_peer).await;
+    let one = free.held() - idle;
+
+    let (mut connection, mut peer, _) = server_with(&builder, true).await;
+    processed(&mut connection, &mut peer).await;
+    let idle = connection.held();
+    connection.set_grant(one - 1);
+    request(&mut peer, 1, true).await;
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(
+        resets_in(&frames),
+        [(1, code::REFUSED_STREAM)],
+        "one stream holds {one}"
+    );
+    assert_eq!(connection.held(), idle);
+    connection.set_grant(one + 64);
+    request(&mut peer, 3, true).await;
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(resets_in(&frames), [], "one stream holds {one}");
+    assert_eq!(connection.held(), idle + one);
+}
+
+/// The first frame of a header block left unfinished, with no grant for what is left of it,
+/// closes the connection with ENHANCE_YOUR_CALM, as the block's growth past the grant does:
+/// what is left undecoded must be kept for the HPACK state, and cannot be paid for.
+#[tokio::test]
+async fn an_unfinished_header_blocks_first_frame_past_the_grant_closes_the_connection() {
+    let (mut connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    processed(&mut connection, &mut peer).await;
+    let value = "a".repeat(4000);
+    let block = request_then(&h2_peer::block(&[("x-big", &value)]));
+    connection.set_grant(0);
+    peer.send(&Frame::new(
+        kind::HEADERS,
+        flag::END_STREAM,
+        1,
+        block[..3000].to_vec(),
+    ))
+    .await;
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(
+        goaway_in(&frames).map(|(_, code)| code),
+        Some(code::ENHANCE_YOUR_CALM)
+    );
+}
+
+/// A header block's last frame with no grant to decode it is decoded for the HPACK state
+/// with nothing kept, as a first frame is, and its stream refused: a grant that would pay
+/// for the head, and not for the most decoding the frame might allocate, is not enough.
+#[tokio::test]
+async fn a_header_blocks_last_frame_with_no_grant_to_decode_refuses_its_stream() {
+    let (mut connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    processed(&mut connection, &mut peer).await;
+    let value = "a".repeat(4000);
+    let block = request_then(&h2_peer::block(&[("x-big", &value)]));
+    let (first, rest) = block.split_at(3000);
+    peer.send(&Frame::new(
+        kind::HEADERS,
+        flag::END_STREAM,
+        1,
+        first.to_vec(),
+    ))
+    .await;
+    polled(&mut connection).await;
+    // Enough for the head and its place many times over; the most decoding may allocate
+    // under h2's default header-list limit, 16 MiB, is far more.
+    connection.set_grant(64 * 1024);
+    peer.send(&Frame::new(
+        kind::CONTINUATION,
+        flag::END_HEADERS,
+        1,
+        rest.to_vec(),
+    ))
+    .await;
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(resets_in(&frames), [(1, code::REFUSED_STREAM)]);
+    assert_eq!(goaway_in(&frames), None);
+}
+
+/// What an unfinished block was charged goes back to the grant as the block is finished,
+/// for the head it makes to be paid from: a grant a byte short of what the stream comes to
+/// hold, with the block's own charge given back to it, takes the stream in.
+#[tokio::test]
+async fn a_finished_blocks_charge_goes_back_to_pay_for_its_stream() {
+    let mut builder = server::Builder::new();
+    builder.max_header_list_size(192);
+    let (mut free, mut free_peer, _) = server_with(&builder, true).await;
+    processed(&mut free, &mut free_peer).await;
+    let idle = free.held();
+    request(&mut free_peer, 1, true).await;
+    processed(&mut free, &mut free_peer).await;
+    let one = free.held() - idle;
+
+    let (mut connection, mut peer, _) = server_with(&builder, true).await;
+    processed(&mut connection, &mut peer).await;
+    let idle = connection.held();
+    // Cut in the middle of `:authority`'s value, which waits undecoded for the rest.
+    let block = h2_peer::request("GET", "/");
+    let (first, rest) = block.split_at(40);
+    peer.send(&Frame::new(
+        kind::HEADERS,
+        flag::END_STREAM,
+        1,
+        first.to_vec(),
+    ))
+    .await;
+    polled(&mut connection).await;
+    let unfinished = connection.held() - idle;
+    connection.set_grant(one - 1);
+    peer.send(&Frame::new(
+        kind::CONTINUATION,
+        flag::END_HEADERS,
+        1,
+        rest.to_vec(),
+    ))
+    .await;
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(
+        resets_in(&frames),
+        [],
+        "one stream holds {one}, the unfinished block {unfinished}"
+    );
+    assert_eq!(connection.held(), idle + one);
+}
+
+/// The queue frames wait in to be sent is counted with the rest: its room, which never
+/// shrinks, is more after nine answers queued at once than after nine sent one at a time.
+#[tokio::test]
+async fn the_room_answers_waited_in_to_be_sent_is_held() {
+    let mut held = Vec::new();
+    for at_once in [false, true] {
+        let (mut connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+        for id in (1..=17).step_by(2) {
+            request(&mut peer, id, true).await;
+        }
+        processed(&mut connection, &mut peer).await;
+        let mut responders = Vec::new();
+        for _ in 0..9 {
+            let (_request, respond) = within(poll_fn(|cx| connection.poll_accept(cx)))
+                .await
+                .unwrap()
+                .unwrap();
+            responders.push(respond);
+        }
+        for mut respond in responders {
+            respond.send_response(Response::new(()), true).unwrap();
+            if !at_once {
+                processed(&mut connection, &mut peer).await;
+            }
+        }
+        processed(&mut connection, &mut peer).await;
+        held.push(connection.held());
+    }
+    assert!(
+        held[1] > held[0],
+        "one at a time {}, at once {}",
+        held[0],
+        held[1]
+    );
+}
+
+/// Decoding is let go ahead only with headroom for the most a header list may take, which
+/// a list of many small fields makes several times its bytes — every field a place in the
+/// map — not for its bytes alone: a grant that would pay for such a head whole, below
+/// that most, refuses it.
+#[tokio::test]
+async fn decoding_needs_headroom_for_every_fields_place_not_just_the_lists_bytes() {
+    let mut builder = server::Builder::new();
+    builder.max_header_list_size(16 * 1024);
+    let names: Vec<String> = (0..400).map(|n| format!("f{n:03}")).collect();
+    let fields: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "v")).collect();
+    let block = request_then(&h2_peer::block(&fields));
+    let (mut free, mut free_peer, _) = server_with(&builder, true).await;
+    processed(&mut free, &mut free_peer).await;
+    let idle = free.held();
+    free_peer
+        .send(&h2_peer::headers(1, block.clone(), true))
+        .await;
+    processed(&mut free, &mut free_peer).await;
+    let one = free.held() - idle;
+    assert!(
+        one > 2 * 16 * 1024,
+        "a head of 400 small fields holds {one}"
+    );
+
+    let (mut connection, mut peer, _) = server_with(&builder, true).await;
+    processed(&mut connection, &mut peer).await;
+    connection.set_grant(one + 64);
+    peer.send(&h2_peer::headers(1, block, true)).await;
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(
+        resets_in(&frames),
+        [(1, code::REFUSED_STREAM)],
+        "one stream holds {one}"
+    );
+}

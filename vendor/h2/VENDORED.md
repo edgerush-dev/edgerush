@@ -9,8 +9,8 @@ benchmarks, which are not here; nothing builds them.
 
 ## What is changed
 
-Every change is marked `EdgeRush:` in the source. Two additions, for idle connections
-(14 §3 of the design docs) and for charging what a connection holds (15 §3), checks RFC
+Every change is marked `EdgeRush:` in the source. Additions for idle connections (14 §3
+of the design docs) and for charging what a connection holds and allocates (15 §3), checks RFC
 9113 asks for that published h2 does not make (15 §3), the never-indexed mark RFC 7541 asks
 an intermediary to keep (15 §3), and one allowance, for fuzz builds:
 
@@ -37,6 +37,36 @@ an intermediary to keep (15 §3), and one allowance, for fuzz builds:
   over all its streams and not yet given back as credit — what h2 holds until it is read,
   and what readers hold until they release it — through `proto::Connection` and
   `Streams`, under the streams' lock. Nothing h2 does changes.
+- **A server connection says what it holds of everything else its peer sent.**
+  `server::Connection::held` counts a header block still being put together (what is left
+  of it undecoded and its fields so far), the HPACK decoder's buffer and dynamic table
+  (`hpack/decoder.rs`), the room the stream slab, the id map, the event queue and the send
+  queue hold (`proto/streams/store.rs`, `buffer.rs`; none ever shrinks), and the heads and
+  trailers queued and not yet taken (`recv.rs`, counted as each is queued and taken). Sizes
+  are by allocation, not by RFC 9113's measure of a header list: a map's capacity, and an
+  allocation for each name and value (`proto/grant.rs`, `held`).
+- **It allocates for its peer only what its owner has reserved.**
+  `server::Connection::set_grant` sets an amount (`proto/grant.rs`) the codec and the
+  streams share; it is unlimited until set, so a client, and a server whose owner never
+  sets it, behave as published h2 does. Each allocation for what the peer sent is taken
+  from it first: before a header block's frame is decoded, headroom for the most decoding
+  it may allocate, given back after (`codec/framed_read.rs`); for a new stream, its decoded
+  head and the room its place adds to the slabs (`streams.rs`, `Recv::open`); for a block
+  left unfinished, its remainder and fields, as they grow; for trailers, theirs
+  (`recv_trailers`). Without headroom a block is decoded with none of its fields kept
+  (`keep_no_fields`, `frame/headers.rs`), to keep the HPACK state, and its stream refused
+  with REFUSED_STREAM, as one past the stream limit is; a stream whose head and place the
+  grant cannot cover is refused the same way; trailers past it reset their stream with
+  ENHANCE_YOUR_CALM; an unfinished block it cannot cover closes the connection with
+  ENHANCE_YOUR_CALM, as a block cannot be refused part way.
+- **What an accepted head held can be asked.** `server::head_held` measures a request's
+  head as `held` counted it, so that as `accept` hands it over and the count falls by that
+  much, the owner passes that much of its charge on with it.
+- **Nothing decoded pins a buffer.** The pseudo-field values kept as they came —
+  `:authority`, `:path`, `:protocol`, and a `:scheme` other than `http` or `https`, which
+  are static — are copied out of the buffer they were decoded in (`hpack/header.rs`), and
+  an unfinished block's remainder out of the read buffer (`framed_read.rs`); each would
+  otherwise keep the whole buffer. Other field values were copied already.
 - **A field value with whitespace at either end is malformed.** RFC 9113 §8.2.1: "A field
   value MUST NOT start or end with an ASCII whitespace character". `HeaderValue` allows SP
   and HTAB anywhere, so published h2 takes such a value. `HeaderBlock::load`
@@ -81,6 +111,22 @@ out, or with the release doing nothing; the count of what is held by
 `a_server_connection_says_what_it_holds_of_what_was_sent` there, and through the proxy's
 charges by `an_upload_nobody_reads_is_charged_to_the_worker` and
 `an_answer_nobody_reads_from_an_http2_upstream_is_charged_to_the_worker`.
+What else a server holds, and the grant, are covered by the probes after "What a server
+holds of what its peer sent" there: `a_head_waiting_to_be_accepted_is_held_and_handed_over_with_its_count`,
+`a_head_with_no_grant_to_decode_is_refused_and_its_table_entries_kept`,
+`an_unfinished_header_block_is_held_across_polls`,
+`an_unfinished_header_block_past_the_grant_closes_the_connection`,
+`an_unfinished_header_blocks_first_frame_past_the_grant_closes_the_connection`,
+`trailers_past_the_grant_reset_their_stream`,
+`a_header_blocks_last_frame_with_no_grant_to_decode_refuses_its_stream`,
+`a_finished_blocks_charge_goes_back_to_pay_for_its_stream`,
+`the_room_answers_waited_in_to_be_sent_is_held`,
+`decoding_needs_headroom_for_every_fields_place_not_just_the_lists_bytes`,
+`a_streams_place_is_charged_by_the_room_it_adds` and
+`a_stream_is_taken_up_only_if_the_grant_covers_the_room_its_place_adds`; through the
+proxy by `a_stream_is_charged_the_head_h2_hands_over_with_it` and
+`unfinished_header_blocks_from_many_connections_stay_within_the_workers_storage`. The
+copies that unpin buffers change nothing the public API shows, and no test sees them.
 The refusal of whitespace at either end is covered by
 `a_request_field_value_with_whitespace_at_either_end_is_reset`,
 `resets_for_whitespace_at_either_end_are_bounded`,
@@ -111,8 +157,8 @@ version none of them affects.
 
 Read h2's advisories first (above). Copy the new version's `Cargo.toml`, `LICENSE`,
 `README.md` and `src/` over these, then make the changes marked `EdgeRush:` again
-(`grep -rl EdgeRush src` lists the twelve files); a refusal the new version makes itself is
+(`grep -rl EdgeRush src` lists the eighteen files); a refusal the new version makes itself is
 dropped, with its probe kept. The buffers' changes change nothing h2 does unless a
-connection's buffers are given back. Update the version here, in the workspace's `Cargo.toml`, in `fuzz/Cargo.toml` and in
+connection's buffers are given back, and the grant nothing unless it is set. Update the version here, in the workspace's `Cargo.toml`, in `fuzz/Cargo.toml` and in
 `vendor/bases/Cargo.toml` (then `cargo generate-lockfile` there), and run the tests above
 and a fuzz target's build.

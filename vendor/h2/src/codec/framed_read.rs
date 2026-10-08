@@ -2,6 +2,7 @@ use crate::frame::{self, Frame, Kind, Reason};
 use crate::frame::{
     DEFAULT_MAX_FRAME_SIZE, DEFAULT_SETTINGS_HEADER_TABLE_SIZE, MAX_MAX_FRAME_SIZE,
 };
+use crate::proto::grant::{held, Grant};
 use crate::proto::Error;
 
 use crate::hpack;
@@ -13,6 +14,7 @@ use bytes::{Buf, BytesMut};
 use std::io;
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::AsyncRead;
 use tokio_util::codec::FramedRead as InnerFramedRead;
@@ -34,6 +36,9 @@ pub struct FramedRead<T> {
     max_continuation_frames: usize,
 
     partial: Option<Partial>,
+
+    // EdgeRush: what the connection may allocate for header blocks (15 §3).
+    grant: Arc<Grant>,
 }
 
 /// Partially loaded headers frame
@@ -46,6 +51,9 @@ struct Partial {
     buf: BytesMut,
 
     continuation_frames_count: usize,
+
+    // EdgeRush: what it is charged — its buffer's capacity and its decoded fields.
+    charged: usize,
 }
 
 #[derive(Debug)]
@@ -65,7 +73,20 @@ impl<T> FramedRead<T> {
             max_header_list_size,
             max_continuation_frames,
             partial: None,
+            grant: Arc::new(Grant::unlimited()),
         }
+    }
+
+    /// EdgeRush: what the connection may allocate, shared with its streams.
+    pub(crate) fn set_grant(&mut self, grant: Arc<Grant>) {
+        self.grant = grant;
+    }
+
+    /// EdgeRush: what the codec holds of what the peer sent and the connection's owner is
+    /// charged for: a header block still being put together, and the HPACK decoder's
+    /// buffer and table. The read buffer is the connection's own, a frame at most.
+    pub(crate) fn held(&self) -> usize {
+        self.partial.as_ref().map_or(0, |partial| partial.charged) + self.hpack.held()
     }
 
     pub fn get_ref(&self) -> &T {
@@ -108,6 +129,26 @@ impl<T> FramedRead<T> {
     }
 }
 
+/// EdgeRush: the most decoding one frame of a header block may allocate: the fields it keeps,
+/// up to the header list's limit (past which it keeps none), a place in the map for every
+/// field so few bytes allow (32 each by RFC 9113's measure), with room for the map to double,
+/// and the Huffman decoder's buffer growing by up to twice the frame's payload.
+fn decode_headroom(max_header_list_size: usize, payload: usize) -> usize {
+    let places = (max_header_list_size / 32 + 1).saturating_mul(held::FIELD) * 2;
+    max_header_list_size
+        .saturating_add(places)
+        .saturating_add(payload.saturating_mul(2))
+        .saturating_add(4 * held::ALLOCATION)
+}
+
+/// EdgeRush: a header block still being put together whose remainder the connection's owner
+/// has not reserved for: the connection is closed, since the block cannot be refused part
+/// way and its HPACK state cannot be kept without it.
+fn over_grant() -> Error {
+    proto_err!(conn: "header block over what the connection may allocate");
+    Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "header_block_over_grant")
+}
+
 fn calc_max_continuation_frames(header_max: usize, frame_max: usize) -> usize {
     // At least this many frames needed to use max header list size
     let min_frames_for_list = (header_max / frame_max).max(1);
@@ -125,6 +166,7 @@ fn decode_frame(
     max_header_list_size: usize,
     max_continuation_frames: usize,
     partial_inout: &mut Option<Partial>,
+    grant: &Grant,
     mut bytes: BytesMut,
 ) -> Result<Option<Frame>, Error> {
     let span = tracing::trace_span!("FramedRead::decode_frame", offset = bytes.len());
@@ -167,8 +209,21 @@ fn decode_frame(
 
             let is_end_headers = frame.is_end_headers();
 
+            // EdgeRush: what decoding may allocate is taken before it is (15 §3). Without
+            // it the block is decoded all the same, to keep the HPACK state, and nothing of
+            // it kept: its stream is refused.
+            let headroom = decode_headroom(max_header_list_size, payload.len());
+            let reserved = grant.take(headroom);
+            if !reserved {
+                frame.keep_no_fields();
+            }
+            let decoded = frame.load_hpack(&mut payload, max_header_list_size, hpack);
+            if reserved {
+                grant.give(headroom);
+            }
+
             // Load the HPACK encoded headers
-            match frame.load_hpack(&mut payload, max_header_list_size, hpack) {
+            match decoded {
                 Ok(_) => {},
                 Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {},
                 Err(frame::Error::MalformedMessage) => {
@@ -193,11 +248,19 @@ fn decode_frame(
                 frame.into()
             } else {
                 tracing::trace!("loaded partial header block");
+                // EdgeRush: what is left undecoded is copied out of the read buffer, which
+                // it would otherwise hold whole, and the block is charged what it holds.
+                let buf = BytesMut::from(&payload[..]);
+                let charged = buf.capacity() + frame.allocated();
+                if !grant.take(charged) {
+                    return Err(over_grant());
+                }
                 // Defer returning the frame
                 *partial_inout = Some(Partial {
                     frame: Continuable::$frame(frame),
-                    buf: payload,
+                    buf,
                     continuation_frames_count: 0,
+                    charged,
                 });
 
                 return Ok(None);
@@ -318,9 +381,22 @@ fn decode_frame(
                 }
             }
 
+            // EdgeRush: what decoding may allocate is taken before it is; without it, the
+            // rest of the block is decoded and not kept, as above.
+            let headroom = if partial.frame.is_over_grant() {
+                0
+            } else {
+                decode_headroom(max_header_list_size, bytes.len())
+            };
+            let reserved = headroom > 0 && grant.take(headroom);
+            if !reserved {
+                partial.frame.keep_no_fields();
+            }
+
             // Extend the buf
             if partial.buf.is_empty() {
-                partial.buf = bytes.split_off(frame::HEADER_LEN);
+                // EdgeRush: copied out of the read buffer, as above.
+                partial.buf = BytesMut::from(&bytes[frame::HEADER_LEN..]);
             } else {
                 if partial.frame.is_over_size() {
                     // If there was left over bytes previously, they may be
@@ -344,10 +420,13 @@ fn decode_frame(
                 partial.buf.extend_from_slice(&bytes[frame::HEADER_LEN..]);
             }
 
-            match partial
+            let decoded = partial
                 .frame
-                .load_hpack(&mut partial.buf, max_header_list_size, hpack)
-            {
+                .load_hpack(&mut partial.buf, max_header_list_size, hpack);
+            if reserved {
+                grant.give(headroom);
+            }
+            match decoded {
                 Ok(_) => {}
                 Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {}
                 Err(frame::Error::MalformedMessage) => {
@@ -369,8 +448,21 @@ fn decode_frame(
             }
 
             if is_end_headers {
+                // EdgeRush: the block's charge goes with it; the stream it opens is charged
+                // what the whole head holds.
+                grant.give(partial.charged);
                 partial.frame.into()
             } else {
+                // EdgeRush: the charge follows what the block holds now.
+                let charged = partial.buf.capacity() + partial.frame.allocated();
+                if charged > partial.charged {
+                    if !grant.take(charged - partial.charged) {
+                        return Err(over_grant());
+                    }
+                } else {
+                    grant.give(partial.charged - charged);
+                }
+                partial.charged = charged;
                 *partial_inout = Some(partial);
                 return Ok(None);
             }
@@ -440,6 +532,7 @@ where
                 max_header_list_size,
                 ref mut partial,
                 max_continuation_frames,
+                ref grant,
                 ..
             } = *self;
             if let Some(frame) = decode_frame(
@@ -447,6 +540,7 @@ where
                 max_header_list_size,
                 max_continuation_frames,
                 partial,
+                grant,
                 bytes,
             )? {
                 tracing::debug!(?frame, "received");
@@ -481,6 +575,30 @@ impl Continuable {
         match *self {
             Continuable::Headers(ref h) => h.is_over_size(),
             Continuable::PushPromise(ref p) => p.is_over_size(),
+        }
+    }
+
+    // EdgeRush: what the decoded part of the block holds, by allocation.
+    fn allocated(&self) -> usize {
+        match *self {
+            Continuable::Headers(ref h) => h.allocated(),
+            Continuable::PushPromise(ref p) => p.allocated(),
+        }
+    }
+
+    // EdgeRush: see `Headers::keep_no_fields`.
+    fn keep_no_fields(&mut self) {
+        match *self {
+            Continuable::Headers(ref mut h) => h.keep_no_fields(),
+            Continuable::PushPromise(ref mut p) => p.keep_no_fields(),
+        }
+    }
+
+    // EdgeRush: see `Headers::is_over_grant`.
+    fn is_over_grant(&self) -> bool {
+        match *self {
+            Continuable::Headers(ref h) => h.is_over_grant(),
+            Continuable::PushPromise(ref p) => p.is_over_grant(),
         }
     }
 

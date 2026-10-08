@@ -79,6 +79,24 @@ pub(super) trait Resolve {
 // ===== impl Store =====
 
 impl Store {
+    /// EdgeRush: what the stream slab and the id map hold room for, in bytes; neither ever
+    /// shrinks, so a connection keeps what its busiest moment needed.
+    pub fn held(&self) -> usize {
+        self.slab.capacity() * Self::STREAM + self.ids.capacity() * Self::ID
+    }
+
+    /// EdgeRush: what one more stream would add to `held`.
+    pub fn growth(&self) -> usize {
+        super::buffer::grown(self.slab.len(), self.slab.capacity()) * Self::STREAM
+            + super::buffer::grown(self.ids.len(), self.ids.capacity()) * Self::ID
+    }
+
+    /// EdgeRush: a stream's place in the slab, with the slab's own word.
+    const STREAM: usize = std::mem::size_of::<Stream>() + std::mem::size_of::<usize>();
+
+    /// EdgeRush: an id's place in the map: its entry, its hash and its index.
+    const ID: usize = std::mem::size_of::<(StreamId, SlabIndex)>() + 2 * std::mem::size_of::<usize>();
+
     pub fn new() -> Self {
         Store {
             slab: slab::Slab::new(),

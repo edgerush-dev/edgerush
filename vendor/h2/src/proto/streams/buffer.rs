@@ -30,6 +30,19 @@ impl<T> Buffer<T> {
         Buffer { slab: Slab::new() }
     }
 
+    /// EdgeRush: what the buffer's slab holds room for, in bytes; it never shrinks.
+    pub fn held(&self) -> usize {
+        self.slab.capacity() * Self::SLOT
+    }
+
+    /// EdgeRush: what one more frame would add to `held`: nothing while there is room.
+    pub fn growth(&self) -> usize {
+        grown(self.slab.len(), self.slab.capacity()) * Self::SLOT
+    }
+
+    /// EdgeRush: a slot, with the slab's own word for each.
+    const SLOT: usize = std::mem::size_of::<Slot<T>>() + std::mem::size_of::<usize>();
+
     pub fn is_empty(&self) -> bool {
         self.slab.is_empty()
     }
@@ -95,5 +108,15 @@ impl Deque {
             }
             None => None,
         }
+    }
+}
+
+/// EdgeRush: the places a full vector of `capacity` adds to make room for one more, as `Vec`
+/// grows: it doubles, and makes four to begin with.
+pub(super) fn grown(len: usize, capacity: usize) -> usize {
+    if len < capacity {
+        0
+    } else {
+        capacity.max(4)
     }
 }

@@ -59,6 +59,13 @@ pub(super) struct Recv {
 
     /// If extended connect protocol is enabled.
     is_extended_connect_protocol_enabled: bool,
+
+    /// EdgeRush: what the connection may allocate for its peer's streams (15 §3).
+    grant: std::sync::Arc<crate::proto::grant::Grant>,
+
+    /// EdgeRush: what the decoded heads and trailers waiting in `buffer` hold, by
+    /// allocation, until they are taken.
+    held_events: usize,
 }
 
 #[derive(Debug)]
@@ -67,6 +74,24 @@ pub(super) enum Event {
     Data(DataEvent),
     Trailers(HeaderMap),
     InformationalHeaders(peer::PollMessage),
+}
+
+impl Event {
+    /// EdgeRush: what a decoded head or trailers hold, by allocation; DATA is counted apart,
+    /// as what was received and not yet given back.
+    fn held(&self) -> usize {
+        use crate::proto::grant::held;
+        use super::peer::PollMessage::{Client, Server};
+        match self {
+            Event::Headers(Server(request)) | Event::InformationalHeaders(Server(request)) => {
+                held::request(request)
+            }
+            Event::Headers(Client(response))
+            | Event::InformationalHeaders(Client(response)) => held::response(response),
+            Event::Trailers(trailers) => held::map(trailers),
+            Event::Data(_) => 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -114,7 +139,39 @@ impl Recv {
             refused: None,
             is_push_enabled: config.local_push_enabled,
             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
+            grant: std::sync::Arc::clone(&config.grant),
+            held_events: 0,
         }
+    }
+
+    /// EdgeRush: what the receiving side holds of what the peer sent, for the connection's
+    /// owner to be charged: the event buffer's room and the heads and trailers in it.
+    pub fn held(&self) -> usize {
+        self.buffer.held() + self.held_events
+    }
+
+    /// EdgeRush: what one more event would add to the buffer's room.
+    pub fn buffer_growth(&self) -> usize {
+        self.buffer.growth()
+    }
+
+    /// EdgeRush: queues `event` on a stream, counting what it holds.
+    fn push_back_event(&mut self, pending: &mut buffer::Deque, event: Event) {
+        self.held_events += event.held();
+        pending.push_back(&mut self.buffer, event);
+    }
+
+    /// EdgeRush: puts `event` back at the front of a stream's queue, counted again.
+    fn push_front_event(&mut self, pending: &mut buffer::Deque, event: Event) {
+        self.held_events += event.held();
+        pending.push_front(&mut self.buffer, event);
+    }
+
+    /// EdgeRush: takes a stream's next event, no longer counted.
+    fn pop_front_event(&mut self, pending: &mut buffer::Deque) -> Option<Event> {
+        let event = pending.pop_front(&mut self.buffer)?;
+        self.held_events = self.held_events.saturating_sub(event.held());
+        Some(event)
     }
 
     /// Returns the initial receive window size
@@ -140,6 +197,7 @@ impl Recv {
         id: StreamId,
         mode: Open,
         counts: &mut Counts,
+        cost: usize,
     ) -> Result<Option<StreamId>, Error> {
         assert!(self.refused.is_none());
 
@@ -154,6 +212,13 @@ impl Recv {
         self.next_stream_id = id.next_id();
 
         if !counts.can_inc_num_recv_streams() {
+            self.refused = Some(id);
+            return Ok(None);
+        }
+
+        // EdgeRush: a stream the connection's owner has not reserved for is refused before
+        // it is allocated; the peer may send it again (RFC 9113 §8.7).
+        if !self.grant.take(cost) {
             self.refused = Some(id);
             return Ok(None);
         }
@@ -267,9 +332,7 @@ impl Recv {
                 .convert_poll_message(pseudo, fields, stream_id)?;
 
             // Push the frame onto the stream's recv buffer
-            stream
-                .pending_recv
-                .push_back(&mut self.buffer, Event::Headers(message));
+            self.push_back_event(&mut stream.pending_recv, Event::Headers(message));
             stream.notify_recv();
 
             // Only servers can receive a headers frame that initiates the stream.
@@ -290,9 +353,7 @@ impl Recv {
 
             // Push the informational response onto the stream's recv buffer
             // with a special event type so it can be polled separately
-            stream
-                .pending_recv
-                .push_back(&mut self.buffer, Event::InformationalHeaders(message));
+            self.push_back_event(&mut stream.pending_recv, Event::InformationalHeaders(message));
             stream.notify_recv();
         }
 
@@ -308,7 +369,7 @@ impl Recv {
     pub fn take_request(&mut self, stream: &mut store::Ptr) -> Request<()> {
         use super::peer::PollMessage::*;
 
-        match stream.pending_recv.pop_front(&mut self.buffer) {
+        match self.pop_front_event(&mut stream.pending_recv) {
             Some(Event::Headers(Server(request))) => request,
             _ => unreachable!("server stream queue must start with Headers"),
         }
@@ -324,7 +385,7 @@ impl Recv {
 
         let mut ppp = stream.pending_push_promises.take();
         let pushed = ppp.pop(stream.store_mut()).map(|mut pushed| {
-            match pushed.pending_recv.pop_front(&mut self.buffer) {
+            match self.pop_front_event(&mut pushed.pending_recv) {
                 Some(Event::Headers(Server(headers))) => (headers, pushed.key()),
                 // When frames are pushed into the queue, it is verified that
                 // the first frame is a HEADERS frame.
@@ -356,7 +417,7 @@ impl Recv {
 
         // Skip over any interim informational headers to find the main response
         loop {
-            match stream.pending_recv.pop_front(&mut self.buffer) {
+            match self.pop_front_event(&mut stream.pending_recv) {
                 Some(Event::Headers(Client(response))) => return Poll::Ready(Ok(response)),
                 Some(Event::InformationalHeaders(_)) => {
                     tracing::trace!("Skipping informational response in poll_response - should be consumed via poll_informational; stream_id={:?}", stream.id);
@@ -389,13 +450,11 @@ impl Recv {
 
         // Try to pop the front event and check if it's an informational response
         // If it's not, we put it back
-        if let Some(event) = stream.pending_recv.pop_front(&mut self.buffer) {
+        if let Some(event) = self.pop_front_event(&mut stream.pending_recv) {
             match event {
                 Event::Headers(Client(response)) => {
                     // Final response
-                    stream
-                        .pending_recv
-                        .push_front(&mut self.buffer, Event::Headers(Client(response)));
+                    self.push_front_event(&mut stream.pending_recv, Event::Headers(Client(response)));
                     return Poll::Ready(None);
                 }
                 Event::InformationalHeaders(Client(response)) => {
@@ -404,7 +463,7 @@ impl Recv {
                 }
                 other => {
                     // Not an informational response, put it back at the front
-                    stream.pending_recv.push_front(&mut self.buffer, other);
+                    self.push_front_event(&mut stream.pending_recv, other);
                 }
             }
         }
@@ -449,12 +508,18 @@ impl Recv {
             return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
         }
 
+        // EdgeRush: trailers the connection's owner has not reserved for reset their stream
+        // rather than be kept (15 §3).
+        let over_grant = frame.is_over_grant();
         let trailers = frame.into_fields();
+        let cost = crate::proto::grant::held::map(&trailers) + self.buffer.growth();
+        if over_grant || !self.grant.take(cost) {
+            proto_err!(stream: "recv_trailers: over what the connection may allocate; stream={:?};", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::ENHANCE_YOUR_CALM));
+        }
 
         // Push the frame onto the stream's recv buffer
-        stream
-            .pending_recv
-            .push_back(&mut self.buffer, Event::Trailers(trailers));
+        self.push_back_event(&mut stream.pending_recv, Event::Trailers(trailers));
         stream.notify_recv();
 
         Ok(())
@@ -796,7 +861,7 @@ impl Recv {
         });
 
         // Push the frame onto the recv buffer
-        stream.pending_recv.push_back(&mut self.buffer, event);
+        self.push_back_event(&mut stream.pending_recv, event);
         stream.notify_recv();
 
         Ok(())
@@ -889,9 +954,7 @@ impl Recv {
         }
 
         use super::peer::PollMessage::*;
-        stream
-            .pending_recv
-            .push_back(&mut self.buffer, Event::Headers(Server(req)));
+        self.push_back_event(&mut stream.pending_recv, Event::Headers(Server(req)));
         stream.notify_recv();
         stream.notify_push();
         Ok(())
@@ -983,7 +1046,7 @@ impl Recv {
         counts: &mut Counts,
     ) {
         let mut to_release: WindowSize = 0;
-        while let Some(event) = stream.pending_recv.pop_front(&mut self.buffer) {
+        while let Some(event) = self.pop_front_event(&mut stream.pending_recv) {
             if let Event::Data(data) = &event {
                 if data.is_budgeted {
                     counts.release_data_frame(data.payload.len());
@@ -1261,11 +1324,11 @@ impl Recv {
         cx: &Context,
         stream: &mut Stream,
     ) -> Poll<Option<Result<DataEvent, proto::Error>>> {
-        match stream.pending_recv.pop_front(&mut self.buffer) {
+        match self.pop_front_event(&mut stream.pending_recv) {
             Some(Event::Data(data)) => Poll::Ready(Some(Ok(data))),
             Some(event) => {
                 // Frame is trailer
-                stream.pending_recv.push_front(&mut self.buffer, event);
+                self.push_front_event(&mut stream.pending_recv, event);
 
                 // Notify the recv task. This is done just in case
                 // `poll_trailers` was called.
@@ -1289,11 +1352,11 @@ impl Recv {
         cx: &Context,
         stream: &mut Stream,
     ) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
-        match stream.pending_recv.pop_front(&mut self.buffer) {
+        match self.pop_front_event(&mut stream.pending_recv) {
             Some(Event::Trailers(trailers)) => Poll::Ready(Some(Ok(trailers))),
             Some(event) => {
                 // Frame is not trailers.. not ready to poll trailers yet.
-                stream.pending_recv.push_front(&mut self.buffer, event);
+                self.push_front_event(&mut stream.pending_recv, event);
                 stream.recv_task = Some(cx.waker().clone());
                 Poll::Pending
             }

@@ -104,6 +104,12 @@ impl Storage {
         self.used.get()
     }
 
+    /// What is left under the limit; memory outlived and freed since the last sweep is not
+    /// counted back.
+    pub fn room(&self) -> usize {
+        self.limit.saturating_sub(self.used.get())
+    }
+
     /// Whether a byte more would fit under the limit, memory freed since the last sweep
     /// included. Asking charges nothing.
     pub fn has_room(&self) -> bool {
@@ -222,6 +228,26 @@ impl Charge {
     /// What it reserves.
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Splits off `bytes` of what it reserves, no more than it reserves, into a charge of
+    /// their own: what the account holds does not change, so nothing is let go of and
+    /// reserved again as memory changes hands.
+    pub fn split(&mut self, bytes: usize) -> Charge {
+        let bytes = bytes.min(self.bytes);
+        self.bytes -= bytes;
+        Charge {
+            storage: Rc::clone(&self.storage),
+            bytes,
+            ceiling: self.ceiling,
+        }
+    }
+
+    /// Takes over what `other`, a charge on the same account, reserves: again nothing is let
+    /// go of or reserved.
+    pub fn absorb(&mut self, mut other: Charge) {
+        debug_assert!(Rc::ptr_eq(&self.storage, &other.storage));
+        self.bytes += std::mem::take(&mut other.bytes);
     }
 
     /// Lets go of `memory`, which this pays for, keeping its charge if anything else still

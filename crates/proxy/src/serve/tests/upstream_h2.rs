@@ -1210,16 +1210,19 @@ async fn an_upload_to_an_http2_upstream_the_worker_cannot_pay_for_is_answered_50
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (upstream, _seen, _gate) = h2_upstream(UpstreamH2::default()).await;
-            let limits = H1Limits {
-                storage: FRAME + 1024,
-                ..H1Limits::default()
-            };
-            let (front, worker) = serving_worker_to_h2(upstream, limits).await;
+            let (upstream, seen, _gate) = h2_upstream(UpstreamH2::default()).await;
+            let (front, worker) = serving_worker_to_h2(upstream, H1Limits::default()).await;
             let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
             let request = Request::post("http://a.test/upload").body(()).unwrap();
             send = within(send.ready()).await.unwrap();
             let (answer, mut body) = send.send_request(request, false).unwrap();
+            // Once the upload's stream is open upstream, the worker is left room for what
+            // h2 holds of the frame to come, and not for sending it on.
+            until(|| seen.open.get() == 1).await;
+            let storage = Rc::clone(worker.blocks.borrow().storage());
+            let _most = storage
+                .reserve(storage.room() - (FRAME + FRAME / 8))
+                .unwrap();
             body.send_data(Bytes::from(vec![b'x'; FRAME]), true)
                 .unwrap();
             let answer = within(answer).await.unwrap();

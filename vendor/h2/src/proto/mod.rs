@@ -1,6 +1,8 @@
 mod connection;
 mod error;
 mod go_away;
+// EdgeRush: what a connection may allocate before its owner next looks.
+pub(crate) mod grant;
 mod peer;
 mod ping_pong;
 mod settings;

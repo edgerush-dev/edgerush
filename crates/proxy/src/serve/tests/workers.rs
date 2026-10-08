@@ -2,16 +2,6 @@
 
 use super::*;
 
-/// Where the futures hyper's HTTP/2 client spawns go: this worker's `LocalSet`.
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) struct OnThisWorker;
-
-impl<F: Future<Output = ()> + 'static> Executor<F> for OnThisWorker {
-    fn execute(&self, future: F) {
-        let _detached = tokio::task::spawn_local(future);
-    }
-}
-
 /// Deadlines short enough that the tests of them run on real sockets and real time: a
 /// stopped clock jumps ahead whenever every task waits on a socket, which a loopback
 /// round trip does, and that would fire a deadline nobody reached.

@@ -531,10 +531,9 @@ fn an_exchange_the_worker_could_not_pay_for_is_counted_as_that() {
 }
 
 /// And the client is answered 503, counted under an answer reason of its own and not
-/// against the upstream, which did not fail: the worker did (14 §8). Asked over HTTP/2,
-/// whose server keeps storage of its own, so that the request is read and it is the
-/// exchange that has nothing to pay with; our own HTTP/1 server could not read the head
-/// on nothing, and would close.
+/// against the upstream, which did not fail: the worker did (14 §8). The worker's storage is
+/// a small block's worth, room for the client's head to be read and none for the exchange's
+/// own block, so that it is the exchange that has nothing to pay with.
 #[test]
 fn an_exchange_the_worker_cannot_pay_for_is_answered_503() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -554,15 +553,21 @@ fn an_exchange_the_worker_cannot_pay_for_is_answered_503() {
                     let mut asked = [0; 1024];
                     let _read = stream.read(&mut asked).await;
                     let _said = stream
-                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                        .write_all(
+                            b"HTTP/1.1 200 OK
+content-length: 0
+
+",
+                        )
                         .await;
                 });
             }
         });
 
+        // Room for the block the request's head is read into, and none for the exchange's.
         let proxy = served(upstream);
         let limits = H1Limits {
-            storage: 0,
+            storage: crate::upstream::h1::blocks::SMALL,
             ..H1Limits::default()
         };
         let worker = Worker::with_limits(Arc::clone(&proxy), limits);
@@ -571,7 +576,7 @@ fn an_exchange_the_worker_cannot_pay_for_is_answered_503() {
         let _serving = serving(&worker, socket);
 
         assert_eq!(
-            status_over_http2(front).await,
+            status_over_http1(front).await,
             StatusCode::SERVICE_UNAVAILABLE
         );
         let up = proxy.metrics.upstream_slot("up");

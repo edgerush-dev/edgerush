@@ -567,6 +567,29 @@ where
         self.connection.received_unreleased()
     }
 
+    /// What the connection holds of what its peer sent besides its DATA, by allocation: its
+    /// streams' places and its queues' room (which never shrink), the decoded heads and
+    /// trailers waiting to be taken, a header block still being put together, and the HPACK
+    /// decoder's buffer and table. A head taken by [`accept`](Connection::accept) leaves
+    /// it, by what [`head_held`] says of it.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn held(&self) -> usize {
+        self.connection.held()
+    }
+
+    /// Sets what the connection may allocate for its peer's streams and header blocks
+    /// from now on, beyond what it [holds](Connection::held): each allocation is taken from
+    /// it before it is made. A stream it cannot cover, or whose head it has no room to
+    /// decode, is refused with REFUSED_STREAM; a header block left unfinished that it
+    /// cannot cover closes the connection with ENHANCE_YOUR_CALM; trailers reset their
+    /// stream. Unlimited until set.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn set_grant(&mut self, bytes: usize) {
+        self.connection.set_grant(bytes);
+    }
+
     /// Starts a [graceful shutdown][1] process.
     ///
     /// Must continue being polled to close connection.
@@ -1826,4 +1849,14 @@ where
             Handshaking::Done => f.write_str("Done"),
         }
     }
+}
+
+/// What a request's head held, by allocation, while the server connection that decoded it
+/// held it: as [`Connection::accept`] hands it over the connection's
+/// [`held`](Connection::held) falls by this much, for the head's new owner to be charged
+/// it instead.
+///
+/// Added by EdgeRush's vendored copy; not in h2 as published.
+pub fn head_held<B>(request: &Request<B>) -> usize {
+    crate::proto::grant::held::request(request)
 }

@@ -97,6 +97,11 @@ struct HeaderBlock {
     /// Set to true if decoding went over the max header list size.
     is_over_size: bool,
 
+    /// EdgeRush: set before decoding when the connection's owner has not reserved for
+    /// what keeping the fields would allocate: they are decoded, to keep the HPACK state,
+    /// and none is kept (15 §3).
+    is_over_grant: bool,
+
     /// Pseudo headers, these are broken out as they must be sent as part of the
     /// headers frame.
     pseudo: Pseudo,
@@ -125,6 +130,7 @@ impl Headers {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
+                is_over_grant: false,
                 pseudo,
             },
             flags: HeadersFlag::default(),
@@ -142,6 +148,7 @@ impl Headers {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
+                is_over_grant: false,
                 pseudo: Pseudo::default(),
             },
             flags,
@@ -207,6 +214,7 @@ impl Headers {
                 fields: HeaderMap::new(),
                 field_size: 0,
                 is_over_size: false,
+                is_over_grant: false,
                 pseudo: Pseudo::default(),
             },
             flags,
@@ -246,6 +254,23 @@ impl Headers {
 
     pub fn is_over_size(&self) -> bool {
         self.header_block.is_over_size
+    }
+
+    /// EdgeRush: what the decoded block holds, by allocation (15 §3).
+    pub(crate) fn allocated(&self) -> usize {
+        self.header_block.allocated()
+    }
+
+    /// EdgeRush: decode the rest of the block without keeping its fields: the connection's
+    /// owner has not reserved for them, and its stream is to be refused.
+    pub(crate) fn keep_no_fields(&mut self) {
+        self.header_block.is_over_grant = true;
+        self.header_block.is_over_size = true;
+    }
+
+    /// EdgeRush: whether its fields were not kept for want of a grant.
+    pub(crate) fn is_over_grant(&self) -> bool {
+        self.header_block.is_over_grant
     }
 
     pub fn into_parts(self) -> (Pseudo, HeaderMap) {
@@ -367,6 +392,7 @@ impl PushPromise {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
+                is_over_grant: false,
                 pseudo,
             },
             promised_id,
@@ -458,6 +484,7 @@ impl PushPromise {
                 fields: HeaderMap::new(),
                 field_size: 0,
                 is_over_size: false,
+                is_over_grant: false,
                 pseudo: Pseudo::default(),
             },
             promised_id,
@@ -493,6 +520,23 @@ impl PushPromise {
 
     pub fn is_over_size(&self) -> bool {
         self.header_block.is_over_size
+    }
+
+    /// EdgeRush: what the decoded block holds, by allocation (15 §3).
+    pub(crate) fn allocated(&self) -> usize {
+        self.header_block.allocated()
+    }
+
+    /// EdgeRush: decode the rest of the block without keeping its fields: the connection's
+    /// owner has not reserved for them, and its stream is to be refused.
+    pub(crate) fn keep_no_fields(&mut self) {
+        self.header_block.is_over_grant = true;
+        self.header_block.is_over_size = true;
+    }
+
+    /// EdgeRush: whether its fields were not kept for want of a grant.
+    pub(crate) fn is_over_grant(&self) -> bool {
+        self.header_block.is_over_grant
     }
 
     pub fn encode(
@@ -857,6 +901,19 @@ impl fmt::Debug for PushPromiseFlag {
 }
 
 // ===== HeaderBlock =====
+
+impl HeaderBlock {
+    /// EdgeRush: what the decoded fields and pseudo-fields hold, by allocation (15 §3).
+    fn allocated(&self) -> usize {
+        use crate::proto::grant::held;
+        let pseudo = &self.pseudo;
+        held::map(&self.fields)
+            + held::pseudo(pseudo.scheme.as_deref())
+            + held::pseudo(pseudo.authority.as_deref())
+            + held::pseudo(pseudo.path.as_deref())
+            + held::pseudo(pseudo.protocol.as_ref().map(|protocol| protocol.as_str()))
+    }
+}
 
 impl HeaderBlock {
     fn load(

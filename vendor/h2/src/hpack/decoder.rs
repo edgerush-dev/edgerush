@@ -175,6 +175,15 @@ impl Decoder {
         self.buffer.capacity()
     }
 
+    /// EdgeRush: what the decoder holds of what the peer sent, for the connection's owner
+    /// to be charged (15 §3): its buffer, and its dynamic table — each entry's place and,
+    /// by RFC 7541's measure, its bytes and 32 more.
+    pub fn held(&self) -> usize {
+        self.buffer.capacity()
+            + self.table.entries.capacity() * std::mem::size_of::<Header>()
+            + self.table.size
+    }
+
     /// Queues a potential size update
     #[allow(dead_code)]
     pub fn queue_size_update(&mut self, size: usize) {

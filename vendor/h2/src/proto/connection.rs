@@ -4,12 +4,14 @@ use crate::{client, server};
 
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
 use crate::proto::*;
+use crate::proto::grant::Grant;
 
 use bytes::Bytes;
 use futures_core::Stream;
 use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::AsyncRead;
@@ -22,6 +24,9 @@ where
 {
     /// Read / write frame values
     codec: Codec<T, Prioritized<B>>,
+
+    // EdgeRush: what the connection may allocate before its owner next looks (15 §3).
+    grant: Arc<Grant>,
 
     inner: ConnectionInner<P, B>,
 }
@@ -124,8 +129,11 @@ where
     P: Peer,
     B: Buf,
 {
-    pub fn new(codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
-        fn streams_config(config: &Config) -> streams::Config {
+    pub fn new(mut codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
+        // EdgeRush: one grant, taken from by the codec and the streams alike (15 §3).
+        let grant = Arc::new(Grant::unlimited());
+        codec.set_grant(Arc::clone(&grant));
+        fn streams_config(config: &Config, grant: &Arc<Grant>) -> streams::Config {
             streams::Config {
                 initial_max_send_streams: config.initial_max_send_streams,
                 local_max_buffer_size: config.max_send_buffer_size,
@@ -145,13 +153,15 @@ where
                     .map(|max| max as usize),
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
                 data_frame_budget: config.data_frame_budget,
+                grant: Arc::clone(grant),
             }
         }
-        let streams = Streams::new(streams_config(&config));
+        let streams = Streams::new(streams_config(&config, &grant));
         let span = tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
         span.follows_from(tracing::Span::current());
         Connection {
             codec,
+            grant,
             inner: ConnectionInner {
                 state: State::Open,
                 error: None,
@@ -201,6 +211,16 @@ where
     // EdgeRush: see `server::Connection::received_unreleased`.
     pub(crate) fn received_unreleased(&self) -> usize {
         self.inner.streams.received_unreleased()
+    }
+
+    // EdgeRush: see `server::Connection::held`.
+    pub(crate) fn held(&self) -> usize {
+        self.codec.held() + self.inner.streams.held()
+    }
+
+    // EdgeRush: see `server::Connection::set_grant`.
+    pub(crate) fn set_grant(&self, bytes: usize) {
+        self.grant.set(bytes);
     }
 
     #[cfg(feature = "unstable")]

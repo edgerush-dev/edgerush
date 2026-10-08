@@ -21,7 +21,6 @@ use edgerush_config::{Compiled, CompiledRetry, Config, UpstreamProtocol, compile
 use http::uri::Authority;
 use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, Version};
 use http_body_util::{BodyExt, Empty};
-use hyper::rt::Executor;
 use hyper_util::rt::TokioIo;
 use std::cell::{Cell, RefCell};
 use std::future::Future;

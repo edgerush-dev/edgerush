@@ -103,6 +103,31 @@ impl Account {
         }
     }
 
+    /// Adds what `charge` reserves to the connection's charge, without letting go of it or
+    /// reserving it again: a reservation made for what the connection may come to hold, to
+    /// be settled to what it does hold.
+    pub fn absorb(&self, charge: Charge) {
+        let bytes = charge.bytes();
+        let mut held = self.holding.charge.borrow_mut();
+        match held.as_mut() {
+            Some(held) => held.absorb(charge),
+            None => *held = Some(charge),
+        }
+        self.holding.charged.set(self.holding.charged.get() + bytes);
+    }
+
+    /// Splits `bytes` of the connection's charge off into a charge of their own, for memory
+    /// the connection hands over to whatever takes it on: what is held does not change, and
+    /// nothing is let go of and reserved again. Never more than the connection is charged.
+    pub fn split(&self, bytes: usize) -> Option<Charge> {
+        let mut held = self.holding.charge.borrow_mut();
+        let split = held.as_mut()?.split(bytes);
+        self.holding
+            .charged
+            .set(self.holding.charged.get() - split.bytes());
+        Some(split)
+    }
+
     /// Whether the connection was closed to make room: its driver closes it.
     pub fn is_shed(&self) -> bool {
         self.holding.shed.get()

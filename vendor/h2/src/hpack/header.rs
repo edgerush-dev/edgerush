@@ -66,9 +66,14 @@ impl Header {
             return Err(DecoderError::NeedMore(NeedMore::UnexpectedEndOfStream));
         }
         if name[0] == b':' {
+            // EdgeRush: a pseudo-field's value is a slice of the buffer it was decoded from —
+            // the read buffer, or the decoder's own for a Huffman-coded string — and would
+            // hold all of it for as long as the request lives. Those kept as they came are
+            // copied, to hold only themselves, which is what a connection's owner is charged
+            // for them (15 §3); a method and a status are parsed, and keep nothing of it.
             match &name[1..] {
                 b"authority" => {
-                    let value = BytesStr::try_from(value)?;
+                    let value = BytesStr::try_from(Bytes::copy_from_slice(&value))?;
                     Ok(Header::Authority(value))
                 }
                 b"method" => {
@@ -76,15 +81,21 @@ impl Header {
                     Ok(Header::Method(method))
                 }
                 b"scheme" => {
+                    // EdgeRush: the usual two need no allocation.
+                    let value = match &value[..] {
+                        b"https" => Bytes::from_static(b"https"),
+                        b"http" => Bytes::from_static(b"http"),
+                        _ => Bytes::copy_from_slice(&value),
+                    };
                     let value = BytesStr::try_from(value)?;
                     Ok(Header::Scheme(value))
                 }
                 b"path" => {
-                    let value = BytesStr::try_from(value)?;
+                    let value = BytesStr::try_from(Bytes::copy_from_slice(&value))?;
                     Ok(Header::Path(value))
                 }
                 b"protocol" => {
-                    let value = Protocol::try_from(value)?;
+                    let value = Protocol::try_from(Bytes::copy_from_slice(&value))?;
                     Ok(Header::Protocol(value))
                 }
                 b"status" => {

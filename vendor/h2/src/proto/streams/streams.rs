@@ -481,6 +481,16 @@ impl Inner {
             return Ok(());
         }
 
+        // EdgeRush: what a new stream will hold — its decoded head, and whatever room the
+        // stream slab, the id map and the event buffer would add — is taken before it is
+        // allocated (15 §3).
+        // A block whose fields were not kept for want of a grant refuses its stream.
+        let cost = if frame.is_over_grant() {
+            usize::MAX
+        } else {
+            frame.allocated() + self.store.growth() + self.actions.recv.buffer_growth()
+        };
+
         let key = match self.store.find_entry(id) {
             Entry::Occupied(e) => e.key(),
             Entry::Vacant(e) => {
@@ -504,7 +514,7 @@ impl Inner {
                 match self
                     .actions
                     .recv
-                    .open(id, Open::Headers, &mut self.counts)?
+                    .open(id, Open::Headers, &mut self.counts, cost)?
                 {
                     Some(stream_id) => {
                         let stream = Stream::new(
@@ -868,7 +878,7 @@ impl Inner {
         if self
             .actions
             .recv
-            .open(promised_id, Open::PushPromise, &mut self.counts)?
+            .open(promised_id, Open::PushPromise, &mut self.counts, 0)?
             .is_none()
         {
             return Ok(());
@@ -1122,6 +1132,13 @@ where
     // EdgeRush: see `server::Connection::received_unreleased`.
     pub(crate) fn received_unreleased(&self) -> usize {
         self.inner.lock().unwrap().actions.recv.in_flight_data() as usize
+    }
+
+    // EdgeRush: see `server::Connection::held`.
+    pub(crate) fn held(&self) -> usize {
+        let me = self.inner.lock().unwrap();
+        let sending = self.send_buffer.inner.lock().unwrap().held();
+        me.store.held() + me.actions.recv.held() + sending
     }
 
     #[cfg(feature = "unstable")]

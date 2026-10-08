@@ -238,19 +238,3 @@ pub(super) async fn status_of(address: SocketAddr, path: &str) -> StatusCode {
         .unwrap();
     sender.send_request(request).await.unwrap().status()
 }
-
-/// The status one HTTP/2 request to `address` is answered with.
-pub(super) async fn status_over_http2(address: SocketAddr) -> StatusCode {
-    let stream = TcpStream::connect(address).await.unwrap();
-    let (mut sender, connection) =
-        hyper::client::conn::http2::handshake(OnThisWorker, TokioIo::new(stream))
-            .await
-            .unwrap();
-    let _detached = tokio::task::spawn_local(async move {
-        let _closed = connection.await;
-    });
-    let mut request = Request::new(Empty::<Bytes>::new());
-    *request.version_mut() = Version::HTTP_2;
-    *request.uri_mut() = format!("http://{address}/").parse().unwrap();
-    sender.send_request(request).await.unwrap().status()
-}
