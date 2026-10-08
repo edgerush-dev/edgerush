@@ -599,6 +599,26 @@ where
         self.connection.wanted()
     }
 
+    /// Sets how much the connection may decode from now on before it gives its turn back:
+    /// a unit for each frame read, whatever becomes of it — a stream refused, a PING, a
+    /// reset — and for a frame of a header block one more for each whole KiB it carries,
+    /// which is what HPACK decodes. Once it is spent, no further frame is read: the
+    /// connection is woken and returns `Pending`, and goes on once more is set. A frame
+    /// already read is finished, and a header block left unfinished waits for its next
+    /// frame. Unlimited until set.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn set_work(&mut self, units: usize) {
+        self.connection.set_work(units);
+    }
+
+    /// What is left of what [`set_work`](Connection::set_work) allows.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn work_left(&self) -> usize {
+        self.connection.work_left()
+    }
+
     /// Starts a [graceful shutdown][1] process.
     ///
     /// Must continue being polled to close connection.

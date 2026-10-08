@@ -2378,3 +2378,130 @@ async fn a_stream_past_its_limit_wants_nothing_of_the_grant() {
     assert_eq!(resets_in(&frames), [(3, code::REFUSED_STREAM)]);
     assert_eq!(connection.wanted(), 0);
 }
+
+// ===== How much a server decodes before its owner next looks =====
+//
+// EdgeRush's vendored h2 reads no frame past an allowance its owner sets (`set_work`), so
+// that a connection with frames waiting gives its turn back rather than decode them all:
+// 15 §3, and `vendor/h2/VENDORED.md`.
+
+/// A waker that counts how often it is woken.
+struct Counted(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for Counted {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Polls `connection` once with a waker of its own, and says whether the poll woke it:
+/// what the peer has written waits whole in the wire, so a poll that reads to the end of it
+/// waits on the wire, and wakes nobody.
+fn woke_itself(connection: &mut server::Connection<DuplexStream, Bytes>) -> bool {
+    let counted = std::sync::Arc::new(Counted(std::sync::atomic::AtomicUsize::new(0)));
+    let waker = std::task::Waker::from(std::sync::Arc::clone(&counted));
+    let _ = connection.poll_closed(&mut Context::from_waker(&waker));
+    counted.0.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
+fn acks_in(frames: &[Frame]) -> usize {
+    frames
+        .iter()
+        .filter(|f| f.kind == kind::PING && f.has(flag::ACK))
+        .count()
+}
+
+/// A server reads no frame past what its owner allows, however many wait, and wakes its
+/// task to be polled again, as nothing else would; given more, it goes on from there.
+#[tokio::test]
+async fn a_server_reads_no_frame_past_its_work_and_wakes_itself_to_go_on() {
+    let (mut connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    processed(&mut connection, &mut peer).await;
+    connection.set_work(3);
+    for n in 0..10u8 {
+        peer.send(&h2_peer::ping([n; 8])).await;
+    }
+    assert!(woke_itself(&mut connection), "spent, and left to wait");
+    assert_eq!(connection.work_left(), 0);
+    assert_eq!(acks_in(&peer.drain_for(QUIET).await), 3);
+    // Spent, it reads nothing more however often it is polled.
+    assert!(woke_itself(&mut connection));
+    assert_eq!(acks_in(&peer.drain_for(QUIET).await), 0);
+    connection.set_work(7);
+    assert!(woke_itself(&mut connection));
+    assert_eq!(acks_in(&peer.drain_for(QUIET).await), 7);
+    connection.set_work(1 << 20);
+    assert!(!woke_itself(&mut connection), "woken with nothing to read");
+    assert_eq!(connection.work_left(), 1 << 20);
+}
+
+/// A frame of a header block counts one more for each whole KiB it carries, which HPACK
+/// decodes; a DATA frame counts one, however much it carries.
+#[tokio::test]
+async fn a_header_blocks_frame_counts_one_more_for_each_kib_it_carries() {
+    let (mut connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    processed(&mut connection, &mut peer).await;
+    connection.set_work(100);
+    let mut block = h2_peer::request("GET", "/");
+    block.extend_from_slice(&h2_peer::block(&[("x-big", &"a".repeat(5000))]));
+    let carried = block.len();
+    peer.send(&h2_peer::headers(1, block, false)).await;
+    woke_itself(&mut connection);
+    assert_eq!(connection.work_left(), 100 - 1 - carried / 1024);
+    peer.send(&h2_peer::data(1, &[0; 16_000], true)).await;
+    woke_itself(&mut connection);
+    assert_eq!(connection.work_left(), 100 - 2 - carried / 1024);
+}
+
+/// A stream refused for its stream limit spends the allowance as any frame does: refusing
+/// is decoding too.
+#[tokio::test]
+async fn streams_refused_for_their_limit_spend_the_work_as_others_do() {
+    let mut builder = server::Builder::new();
+    builder.max_concurrent_streams(1);
+    let (mut connection, mut peer, _) = server_with(&builder, true).await;
+    processed(&mut connection, &mut peer).await;
+    connection.set_work(4);
+    for id in [1, 3, 5, 7, 9, 11] {
+        request(&mut peer, id, false).await;
+    }
+    assert!(woke_itself(&mut connection));
+    let refused = |ids: &[u32]| {
+        ids.iter()
+            .map(|id| (*id, code::REFUSED_STREAM))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(resets_in(&peer.drain_for(QUIET).await), refused(&[3, 5, 7]));
+    connection.set_work(1 << 20);
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(resets_in(&frames), refused(&[9, 11]));
+}
+
+/// A header block whose first frame spends the allowance waits for its next frame until
+/// more is allowed, and is then finished and its stream handed over.
+#[tokio::test]
+async fn a_header_block_spent_part_way_is_finished_with_the_next_allowance() {
+    let (mut connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    processed(&mut connection, &mut peer).await;
+    let mut block = h2_peer::request("GET", "/");
+    block.extend_from_slice(&h2_peer::block(&[("x-split", "abcdef")]));
+    let rest = block.split_off(block.len() / 2);
+    peer.send(&Frame::new(kind::HEADERS, flag::END_STREAM, 1, block))
+        .await;
+    peer.send(&Frame::new(kind::CONTINUATION, flag::END_HEADERS, 1, rest))
+        .await;
+    connection.set_work(1);
+    let accepted = |connection: &mut server::Connection<DuplexStream, Bytes>| {
+        let counted = std::sync::Arc::new(Counted(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(counted);
+        match connection.poll_accept(&mut Context::from_waker(&waker)) {
+            Poll::Ready(Some(Ok((request, _)))) => Some(request),
+            _ => None,
+        }
+    };
+    assert!(accepted(&mut connection).is_none(), "taken on half a block");
+    assert_eq!(connection.work_left(), 0);
+    connection.set_work(1);
+    let request = accepted(&mut connection).expect("the block finished");
+    assert_eq!(request.headers()["x-split"], "abcdef");
+}

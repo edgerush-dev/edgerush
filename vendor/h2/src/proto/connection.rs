@@ -228,6 +228,16 @@ where
         self.grant.take_wanted()
     }
 
+    // EdgeRush: see `server::Connection::set_work`.
+    pub(crate) fn set_work(&mut self, units: usize) {
+        self.codec.set_work(units);
+    }
+
+    // EdgeRush: see `server::Connection::work_left`.
+    pub(crate) fn work_left(&self) -> usize {
+        self.codec.work()
+    }
+
     #[cfg(feature = "unstable")]
     pub fn num_wired_streams(&self) -> usize {
         self.inner.streams.num_wired_streams()

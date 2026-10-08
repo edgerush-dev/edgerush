@@ -10,9 +10,10 @@ benchmarks, which are not here; nothing builds them.
 ## What is changed
 
 Every change is marked `EdgeRush:` in the source. Additions for idle connections (14 §3
-of the design docs) and for charging what a connection holds and allocates (15 §3), checks RFC
-9113 asks for that published h2 does not make (15 §3), the never-indexed mark RFC 7541 asks
-an intermediary to keep (15 §3), and one allowance, for fuzz builds:
+of the design docs), for charging what a connection holds and allocates and bounding what
+it decodes a poll (15 §3), checks RFC 9113 asks for that published h2 does not make
+(15 §3), the never-indexed mark RFC 7541 asks an intermediary to keep (15 §3), and one
+allowance, for fuzz builds:
 
 - **A server connection can give back its buffers.** h2 makes three buffers for every
   connection when it is handshaken, and keeps them for the connection's life: the 16 KiB
@@ -62,6 +63,15 @@ an intermediary to keep (15 §3), and one allowance, for fuzz builds:
   says the largest allocation refused for want of the grant since it was last asked, for
   the owner to judge whether it was short of room; a stream refused for its stream limit
   adds nothing.
+- **It decodes only as much a poll as its owner allows.** Published h2 reads and decodes
+  frames until its socket has nothing more, so a peer with many frames waiting keeps its
+  task decoding while the worker's other tasks wait; a bound on the bytes read would not
+  help, as what is already buffered is decoded all the same. `server::Connection::set_work`
+  sets an allowance (`codec/framed_read.rs`), unlimited until set: each frame read spends
+  one unit, whatever becomes of it, and a frame of a header block one more for each whole
+  KiB it carries. Once it is spent no further frame is read: `FramedRead::poll_next` wakes
+  the task and returns `Pending`, as Tokio's own budget does, and a header block left part
+  way waits for its next frame as it does for a slow peer. `work_left` says what is left.
 - **What an accepted head held can be asked.** `server::head_held` measures a request's
   head as `held` counted it, so that as `accept` hands it over and the count falls by that
   much, the owner passes that much of its charge on with it.
@@ -132,6 +142,13 @@ holds of what its peer sent" there: `a_head_waiting_to_be_accepted_is_held_and_h
 proxy by `a_stream_is_charged_the_head_h2_hands_over_with_it` and
 `unfinished_header_blocks_from_many_connections_stay_within_the_workers_storage`. The
 copies that unpin buffers change nothing the public API shows, and no test sees them.
+The allowance is covered by the probes after "How much a server decodes" there:
+`a_server_reads_no_frame_past_its_work_and_wakes_itself_to_go_on`,
+`a_header_blocks_frame_counts_one_more_for_each_kib_it_carries`,
+`streams_refused_for_their_limit_spend_the_work_as_others_do` and
+`a_header_block_spent_part_way_is_finished_with_the_next_allowance`; through the proxy by
+`frames_waiting_in_a_connections_socket_are_decoded_a_turn_at_a_time` and
+`frames_sent_to_a_connection_told_to_go_are_decoded_a_turn_at_a_time`.
 The refusal of whitespace at either end is covered by
 `a_request_field_value_with_whitespace_at_either_end_is_reset`,
 `resets_for_whitespace_at_either_end_are_bounded`,
@@ -164,6 +181,6 @@ Read h2's advisories first (above). Copy the new version's `Cargo.toml`, `LICENS
 `README.md` and `src/` over these, then make the changes marked `EdgeRush:` again
 (`grep -rl EdgeRush src` lists the eighteen files); a refusal the new version makes itself is
 dropped, with its probe kept. The buffers' changes change nothing h2 does unless a
-connection's buffers are given back, and the grant nothing unless it is set. Update the version here, in the workspace's `Cargo.toml`, in `fuzz/Cargo.toml` and in
+connection's buffers are given back, and the grant and the allowance nothing unless they are set. Update the version here, in the workspace's `Cargo.toml`, in `fuzz/Cargo.toml` and in
 `vendor/bases/Cargo.toml` (then `cargo generate-lockfile` there), and run the tests above
 and a fuzz target's build.

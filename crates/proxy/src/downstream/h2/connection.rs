@@ -258,7 +258,7 @@ async fn drive<S, R, F, B, D>(
     let mut draining = false;
     // The connection's streams, run by this task, so many a turn (15 §3, `queue`).
     let mut queue = Queue::new();
-    let (mut accepts, mut polls) = (ACCEPTS, POLLS);
+    let mut turn = Turn::WHOLE;
     // A stream is charged its head as it is handed over and its task as that is made, on
     // its first turn: its future's size is its type's, known without making one, and a
     // stream the worker cannot pay for is answered then, with no task (15 §3).
@@ -327,17 +327,22 @@ async fn drive<S, R, F, B, D>(
                 idle_from_now = true;
             }
             *streams.driver.borrow_mut() = Some(cx.waker().clone());
-            polls -= queue.run(cx.waker(), polls, &mut made);
+            turn.polls -= queue.run(cx.waker(), turn.polls, &mut made);
             // Its allowance spent, with streams perhaps still in line, the turn is given back.
-            if accepts == 0 || polls == 0 {
-                return give_back(cx, &mut accepts, &mut polls);
+            if turn.spent() {
+                return give_back(cx, &mut turn);
             }
             // What h2 may allocate for what the client sends is reserved before it reads, so
             // that h2 refuses what the worker cannot pay for rather than hold it (15 §3).
             let grant = storage.reserve(storage.room().min(GRANT)).ok();
             let granted = grant.as_ref().map_or(0, Charge::bytes);
             connection.set_grant(granted);
+            // h2 decodes whatever the client has sent, however much waits: what is left of
+            // the turn's decoding goes with it, refused streams and all, and once that is
+            // spent h2 reads nothing more and wakes the task for its next turn.
+            connection.set_work(turn.work);
             let accepted = connection.poll_accept(cx);
+            turn.work = connection.work_left();
             connection.set_grant(0);
             let wanted = connection.wanted();
             account.drive_with(cx.waker());
@@ -364,11 +369,11 @@ async fn drive<S, R, F, B, D>(
             }
             match accepted {
                 Poll::Ready(accepted) => {
-                    accepts -= 1;
+                    turn.accepts -= 1;
                     Poll::Ready(Next::Accepted(accepted))
                 }
                 Poll::Pending => {
-                    (accepts, polls) = (ACCEPTS, POLLS);
+                    turn = Turn::WHOLE;
                     Poll::Pending
                 }
             }
@@ -425,21 +430,18 @@ async fn drive<S, R, F, B, D>(
         // regardless.
         Closing::Idle => {
             connection.graceful_shutdown();
-            let _closing =
-                tokio::time::timeout(settings.closing, poll_fn(|cx| connection.poll_closed(cx)))
-                    .await;
+            let _closing = tokio::time::timeout(settings.closing, closed(connection)).await;
         }
         Closing::Abrupt(reason) => {
             connection.abrupt_shutdown(reason);
-            let _closing =
-                tokio::time::timeout(settings.closing, poll_fn(|cx| connection.poll_closed(cx)))
-                    .await;
+            let _closing = tokio::time::timeout(settings.closing, closed(connection)).await;
         }
         // Closed to make room: told why if its socket takes the GOAWAY now, and gone either
         // way, its memory with it, without waiting on a client slow to read.
         Closing::Shed => {
             connection.abrupt_shutdown(::h2::Reason::ENHANCE_YOUR_CALM);
             poll_fn(|cx| {
+                connection.set_work(WORK);
                 let _closing = connection.poll_closed(cx);
                 Poll::Ready(())
             })
@@ -451,14 +453,50 @@ async fn drive<S, R, F, B, D>(
 /// Gives the worker's turn back with work left: woken again at once, the connection's task
 /// goes to the end of the worker's line, behind every other that is ready, and starts its
 /// next turn with its allowances whole.
-fn give_back<T>(
-    cx: &mut std::task::Context<'_>,
-    accepts: &mut usize,
-    polls: &mut usize,
-) -> Poll<T> {
-    (*accepts, *polls) = (ACCEPTS, POLLS);
+fn give_back<T>(cx: &mut std::task::Context<'_>, turn: &mut Turn) -> Poll<T> {
+    *turn = Turn::WHOLE;
     cx.waker().wake_by_ref();
     Poll::Pending
+}
+
+/// Polls a connection told to go until it has closed, a turn's decoding at a time: what its
+/// client still sends is read, as it may finish streams, but no more of it in one turn than
+/// in any other.
+async fn closed<S>(connection: &mut ::h2::server::Connection<S, Outgoing>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let _closed = poll_fn(|cx| {
+        connection.set_work(WORK);
+        connection.poll_closed(cx)
+    })
+    .await;
+}
+
+/// What a connection's task may still do in its turn before it gives the turn back.
+#[derive(Debug, Clone, Copy)]
+struct Turn {
+    /// Streams it may take up.
+    accepts: usize,
+    /// Streams it may poll.
+    polls: usize,
+    /// Decoding h2 may do, in frames, a header block's counting one more for each KiB it
+    /// carries.
+    work: usize,
+}
+
+impl Turn {
+    const WHOLE: Self = Self {
+        accepts: ACCEPTS,
+        polls: POLLS,
+        work: WORK,
+    };
+
+    /// Whether the turn is to be given back. Decoding spent ends it in h2, which then reads
+    /// nothing and wakes the task.
+    fn spent(&self) -> bool {
+        self.accepts == 0 || self.polls == 0
+    }
 }
 
 /// How many streams a connection's task takes up a turn before it gives the turn back.
@@ -468,6 +506,13 @@ const ACCEPTS: usize = 16;
 /// enough that a busy connection is not slowed by its own turns, few enough that a hundred
 /// busy streams do not keep a worker's other connections waiting.
 const POLLS: usize = 64;
+
+/// How much h2 may decode for a connection a turn, in frames, a frame of a header block
+/// counting one more for each whole KiB it carries: every frame, whatever becomes of it — a
+/// stream refused, a PING, a reset — so that a client with frames waiting cannot keep a worker
+/// decoding them while its other connections wait. Some 64 small requests, a hundred streams
+/// refused in two turns, a megabyte of uploads in 16 KiB frames; three 16 KiB header blocks.
+const WORK: usize = 64;
 
 /// A stream as h2 hands it over, with its count among the open ones and what it is charged
 /// until its task is made.
@@ -1800,6 +1845,120 @@ mod tests {
                 "streams left in line with nothing to wake them"
             );
             drop(answers);
+        });
+    }
+
+    /// The most bytes a client reads between two turns of another task of the worker's while
+    /// the connection, served with `settings`, answers `pings` PINGs that wait whole in its
+    /// socket — with a request before every nine if `asking`, which the core never answers —
+    /// once `ready` has done whatever the test puts first.
+    async fn acked_between_turns(
+        settings: Settings,
+        pings: usize,
+        asking: bool,
+        ready: impl AsyncFnOnce(&mut crate::h2_peer::Peer<tokio::io::DuplexStream>),
+    ) -> usize {
+        use crate::h2_peer::{self, Peer};
+        use tokio::io::{AsyncRead, ReadBuf};
+        /// A PING's acknowledgement: its frame's header and eight bytes.
+        const ACK: usize = 17;
+        let storage = Storage::new(crate::storage::LIMIT);
+        let (near, far) = wire();
+        let asked = Rc::new(Cell::new(0));
+        let respond = never(&asked);
+        tokio::task::spawn_local(async move {
+            if let Ok(mut connection) = settings.builder().handshake::<_, Outgoing>(near).await {
+                let received = Received::new(Rc::clone(&storage));
+                drive(
+                    &mut connection,
+                    settings,
+                    storage,
+                    &received,
+                    Rc::new(|| HttpDate::from_unix(0)),
+                    Rc::new(Drain::default()),
+                    Rc::new(respond),
+                    |_| {},
+                    |_, _| {},
+                )
+                .await;
+            }
+        });
+        let mut peer = Peer::open_as_client(far, &[]).await;
+        peer.send(&h2_peer::settings_ack()).await;
+        within(peer.barrier()).await;
+        ready(&mut peer).await;
+        let mut flood = Vec::new();
+        for n in 0..pings {
+            if asking && n % 9 == 0 {
+                let id = u32::try_from(2 * n / 9 + 1).unwrap();
+                flood.extend(h2_peer::headers(id, h2_peer::request("GET", "/"), true).encode());
+            }
+            flood.extend(h2_peer::ping(u64::try_from(n).unwrap().to_be_bytes()).encode());
+        }
+        // All of it in the socket before the connection's task is next polled.
+        peer.write_raw(&flood).await;
+        // Another task of the worker's, reading what came back between two of its turns: a
+        // task, as the test's own future is polled only once the worker has run dozens.
+        let (mut read, mut most) = (0, 0);
+        let mut buffer = vec![0u8; 1 << 20];
+        let reading = tokio::task::spawn_local(poll_fn(move |cx| {
+            let mut since = 0;
+            loop {
+                let mut filled = ReadBuf::new(&mut buffer);
+                match std::pin::Pin::new(peer.io_mut()).poll_read(cx, &mut filled) {
+                    Poll::Ready(Ok(())) if !filled.filled().is_empty() => {
+                        since += filled.filled().len();
+                    }
+                    _ => break,
+                }
+            }
+            read += since;
+            most = most.max(since);
+            if read >= pings * ACK {
+                return Poll::Ready(most);
+            }
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }));
+        within(reading).await.unwrap()
+    }
+
+    /// A connection's frames take its turns, not the worker's: with thousands of PINGs
+    /// waiting in its socket, and requests among them — taken up, then refused past the
+    /// stream limit — it answers no more of them than a turn's decoding between two turns of
+    /// another task, where h2 left to itself decodes all that waits in one, and a turn that
+    /// takes up streams decodes no more than one that does not (15 §3).
+    #[test]
+    fn frames_waiting_in_a_connections_socket_are_decoded_a_turn_at_a_time() {
+        locally(async {
+            const PINGS: usize = 5000;
+            let most = acked_between_turns(Settings::default(), PINGS, true, async |_| {}).await;
+            assert!(
+                most < PINGS * 17 / 10,
+                "{most} bytes of acknowledgements between two turns of another task"
+            );
+        });
+    }
+
+    /// A connection told to go is read a turn's decoding at a time too, while it has its
+    /// closing time to finish in, and goes on being read until it closes.
+    #[test]
+    fn frames_sent_to_a_connection_told_to_go_are_decoded_a_turn_at_a_time() {
+        use crate::h2_peer::kind;
+        locally(async {
+            const PINGS: usize = 5000;
+            let settings = Settings {
+                keep_alive: Duration::from_millis(50),
+                ..Settings::default()
+            };
+            let most = acked_between_turns(settings, PINGS, false, async |peer| {
+                within(peer.until(|frame| frame.kind == kind::GOAWAY)).await;
+            })
+            .await;
+            assert!(
+                most < PINGS * 17 / 10,
+                "{most} bytes of acknowledgements between two turns of another task"
+            );
         });
     }
 

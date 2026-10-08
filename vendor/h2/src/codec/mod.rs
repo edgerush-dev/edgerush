@@ -144,6 +144,16 @@ impl<T, B> Codec<T, B> {
         self.inner.held()
     }
 
+    // EdgeRush: see `FramedRead::set_work`.
+    pub(crate) fn set_work(&mut self, units: usize) {
+        self.inner.set_work(units);
+    }
+
+    // EdgeRush: see `FramedRead::work`.
+    pub(crate) fn work(&self) -> usize {
+        self.inner.work()
+    }
+
     /// Takes the data payload value that was fully written to the socket
     pub(crate) fn take_last_data_frame(&mut self) -> Option<Data<B>> {
         self.framed_write().take_last_data_frame()

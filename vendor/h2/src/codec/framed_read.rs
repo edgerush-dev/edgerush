@@ -39,6 +39,9 @@ pub struct FramedRead<T> {
 
     // EdgeRush: what the connection may allocate for header blocks (15 §3).
     grant: Arc<Grant>,
+
+    // EdgeRush: what is left of the decoding its owner allows before it next looks (15 §3).
+    work: usize,
 }
 
 /// Partially loaded headers frame
@@ -74,12 +77,25 @@ impl<T> FramedRead<T> {
             max_continuation_frames,
             partial: None,
             grant: Arc::new(Grant::unlimited()),
+            work: UNLIMITED_WORK,
         }
     }
 
     /// EdgeRush: what the connection may allocate, shared with its streams.
     pub(crate) fn set_grant(&mut self, grant: Arc<Grant>) {
         self.grant = grant;
+    }
+
+    /// EdgeRush: what may be decoded from now on before the owner next looks, in frames, a
+    /// header block's counting one more for each KiB it carries (`work`): once it is spent,
+    /// no further frame is read, and the task is woken to be polled again.
+    pub(crate) fn set_work(&mut self, units: usize) {
+        self.work = units;
+    }
+
+    /// EdgeRush: what is left of the decoding set by `set_work`.
+    pub(crate) fn work(&self) -> usize {
+        self.work
     }
 
     /// EdgeRush: what the codec holds of what the peer sent and the connection's owner is
@@ -126,6 +142,21 @@ impl<T> FramedRead<T> {
     #[inline]
     pub fn set_header_table_size(&mut self, val: usize) {
         self.hpack.queue_size_update(val);
+    }
+}
+
+/// EdgeRush: decoding without limit, as published h2 does: a client's, and a server's whose
+/// owner never sets one.
+const UNLIMITED_WORK: usize = usize::MAX;
+
+/// EdgeRush: what decoding the frame `bytes` counts for (`FramedRead::set_work`): one, and
+/// for a frame of a header block, which is what HPACK decodes, one more for each whole KiB it
+/// carries. Every frame counts, whatever becomes of it: a stream refused, a PING, a reset.
+fn work(bytes: &[u8]) -> usize {
+    let carried = bytes.len().saturating_sub(frame::HEADER_LEN);
+    match bytes.get(3).map(|kind| Kind::new(*kind)) {
+        Some(Kind::Headers | Kind::PushPromise | Kind::Continuation) => 1 + carried / 1024,
+        _ => 1,
     }
 }
 
@@ -512,6 +543,13 @@ where
         let _e = span.enter();
         loop {
             tracing::trace!("poll");
+            // EdgeRush: its owner's allowance spent, nothing more is read until it is set
+            // again; the task is woken, so that whatever else waits on the worker gets a
+            // turn first and this one is then polled again (15 §3).
+            if self.work == 0 {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             // EdgeRush: a read buffer given back (`release_buffers`) is made
             // again with room for a frame's header, and no more: a connection
             // that is polled and finds nothing to read goes on holding only that.
@@ -527,6 +565,9 @@ where
             };
 
             tracing::trace!(read.bytes = bytes.len());
+            if self.work != UNLIMITED_WORK {
+                self.work = self.work.saturating_sub(work(&bytes));
+            }
             let Self {
                 ref mut hpack,
                 max_header_list_size,
