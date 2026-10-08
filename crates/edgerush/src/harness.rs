@@ -424,11 +424,19 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
             format_args!("stopped while draining: {held} connections cut off"),
         ),
     }
-    if !proxy.finish_logs(LOGS) {
-        say(
+    let finishing = Arc::clone(&proxy);
+    match logs_written(&how, &stop, LOGS, move |within| {
+        finishing.finish_logs(within)
+    }) {
+        Logged::Written => {}
+        Logged::OutOfTime => say(
             stderr,
             format_args!("out of time writing the access logs: what was left is lost"),
-        );
+        ),
+        Logged::Stopped => say(
+            stderr,
+            format_args!("stopped: the access logs' records not yet written are lost"),
+        ),
     }
     // A panic as the workers drained fails the process all the same, once the drain has let
     // the other workers' requests finish (03 §2): an exit status of 0 would hide it.
@@ -447,6 +455,55 @@ enum Drained {
     OutOfTime(usize),
     /// Told to stop again, with this many still held.
     Stopped(usize),
+}
+
+/// What became of the access logs' last records.
+#[derive(Debug, PartialEq, Eq)]
+enum Logged {
+    /// Written.
+    Written,
+    /// Not all written within the wait.
+    OutOfTime,
+    /// Not waited for: told to stop again (03 §10).
+    Stopped,
+}
+
+/// Has the access logs' last records written by `finish`, given up to `within`, unless told
+/// to stop: after a drain a second signal stopped, not at all, and while they are being
+/// written, at once. A second signal exits at once (03 §10); whatever was not written is
+/// lost, and said to be.
+fn logs_written(
+    how: &Drained,
+    stop: &Receiver<Told>,
+    within: Duration,
+    finish: impl FnOnce(Duration) -> bool + Send + 'static,
+) -> Logged {
+    if matches!(how, Drained::Stopped(_)) {
+        return Logged::Stopped;
+    }
+    let (done, written) = mpsc::channel();
+    // On a thread of its own, so that this one still hears a signal; left behind if one
+    // comes, and ended with the process.
+    let _writing = thread::spawn(move || {
+        let _told = done.send(finish(within));
+    });
+    let mut listening = true;
+    loop {
+        match written.recv_timeout(DRAIN_POLL) {
+            Ok(true) => return Logged::Written,
+            Ok(false) | Err(RecvTimeoutError::Disconnected) => return Logged::OutOfTime,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        // With nobody left to say stop, the wait runs its course.
+        while listening {
+            match stop.try_recv() {
+                Ok(Told::Stop) => return Logged::Stopped,
+                Ok(Told::Ended(_)) => {}
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => listening = false,
+            }
+        }
+    }
 }
 
 /// What the main loop does next.
@@ -967,6 +1024,69 @@ mod tests {
             drained(|| loads.now().iter().sum(), &stop, within),
             (Drained::OutOfTime(1), None)
         );
+    }
+
+    /// After a drain a second signal stopped, the access logs are not waited for: the
+    /// process goes at once, what was not written lost (03 §10, C42).
+    #[test]
+    fn after_a_stopped_drain_the_logs_are_not_waited_for() {
+        let (_stopping, stop) = mpsc::channel();
+        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let asking = Arc::clone(&asked);
+        let began = Instant::now();
+        let logged = logs_written(
+            &Drained::Stopped(3),
+            &stop,
+            Duration::from_secs(5),
+            move |_| {
+                asking.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            },
+        );
+        assert_eq!(logged, Logged::Stopped);
+        assert!(
+            !asked.load(std::sync::atomic::Ordering::SeqCst),
+            "waited for the logs"
+        );
+        assert!(began.elapsed() < Duration::from_millis(100));
+    }
+
+    /// A signal while the logs are being written cuts the wait short; otherwise the wait
+    /// says whether they were written in time.
+    #[test]
+    fn a_signal_while_the_logs_are_written_cuts_the_wait_short() {
+        let (stopping, stop) = mpsc::channel();
+        let began = Instant::now();
+        let saying = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            stopping.send(Told::Stop).unwrap();
+            stopping
+        });
+        let logged = logs_written(&Drained::Empty, &stop, Duration::from_secs(5), |_| {
+            thread::sleep(Duration::from_secs(3));
+            true
+        });
+        assert_eq!(logged, Logged::Stopped);
+        let took = began.elapsed();
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        let stopping = saying.join().unwrap();
+
+        let written = logs_written(&Drained::Empty, &stop, Duration::from_secs(5), |_| true);
+        assert_eq!(written, Logged::Written);
+        let late = logs_written(
+            &Drained::OutOfTime(1),
+            &stop,
+            Duration::from_secs(5),
+            |_| false,
+        );
+        assert_eq!(late, Logged::OutOfTime);
+        drop(stopping);
+        // With nobody left to say stop, the wait runs its course.
+        let alone = logs_written(&Drained::Empty, &stop, Duration::from_secs(5), |_| {
+            thread::sleep(Duration::from_millis(50));
+            true
+        });
+        assert_eq!(alone, Logged::Written);
     }
 
     /// What ends as the workers drain — their accepting first of all — was meant to: the
