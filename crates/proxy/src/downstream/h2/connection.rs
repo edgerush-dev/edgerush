@@ -1,11 +1,12 @@
 //! One HTTP/2 connection, served over h2 with EdgeRush's own settings
 //! ([15 §3, step 2](../../../../../docs/15-http2-and-grpc.md)).
 //!
-//! The connection is driven by its accept loop, and every stream it accepts is a task of its
-//! own on the worker: the request goes to the request core as any request does, and its
-//! answer goes out through [`send_body`], within the room the client grants. A client that
-//! resets a stream before it is answered takes the stream's exchange with it: the future
-//! answering it is dropped where it stands, and with it whatever it held upstream.
+//! The connection is driven by its accept loop, and the streams it accepts run in its queue,
+//! polled by the connection's own task so many a turn ([`queue`](super::queue)): the request
+//! goes to the request core as any request does, and its answer goes out through
+//! [`send_body`], within the room the client grants. A client that resets a stream before it
+//! is answered takes the stream's exchange with it: the future answering it is dropped where
+//! it stands, and with it whatever it held upstream.
 //!
 //! A connection with no stream open for its keep-alive time is told to go, with a graceful
 //! GOAWAY, and closed once it has finished or its closing time is up
@@ -15,6 +16,7 @@
 use crate::downstream::h1::connection::{Answered, expects_continue};
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h2::body::IncomingH2;
+use crate::downstream::h2::queue::Queue;
 use crate::downstream::h2::writer::{Outgoing, Responder, send_body};
 use crate::drain::Drain;
 use crate::forwarding::Cut;
@@ -254,9 +256,37 @@ async fn drive<S, R, F, B, D>(
     let mut drain_heard = std::pin::pin!(drain.notified());
     let mut out_of_time = std::pin::pin!(tokio::time::sleep(settings.drain_within));
     let mut draining = false;
+    // The connection's streams, run by this task, so many a turn (15 §3, `queue`).
+    let mut queue = Queue::new();
+    let (mut accepts, mut polls) = (ACCEPTS, POLLS);
+    // A stream is charged its head as it is handed over and its task as that is made, on
+    // its first turn: its future's size is its type's, known without making one, and a
+    // stream the worker cannot pay for is answered then, with no task (15 §3).
+    let make = |(request, responder, open, charge)| {
+        stream_task(
+            request,
+            responder,
+            open,
+            Rc::clone(&respond),
+            Rc::clone(&storage),
+            Rc::clone(&date),
+            settings.idle,
+            charge,
+        )
+    };
+    let future = size_of_made(&make);
+    let mut made = |(request, send, open, mut charge): Waiting| {
+        if charge.grow(future).is_err() {
+            refuse(request, send, &storage, &*date, &refused);
+            return None;
+        }
+        #[cfg(test)]
+        MADE.set(MADE.get() + 1);
+        Some(make((request, Responder::new(send), open, charge)))
+    };
     // Accepting is what drives the connection: it is polled for as long as the connection
-    // lives, streams running beside it.
-    loop {
+    // lives, its streams run beside it.
+    let closing = loop {
         let accepted = poll_fn(|cx| {
             if streams.resetting(settings.reset_judged_after) {
                 return Poll::Ready(Next::Resetting);
@@ -291,6 +321,11 @@ async fn drive<S, R, F, B, D>(
                 idle_from_now = true;
             }
             *streams.driver.borrow_mut() = Some(cx.waker().clone());
+            polls -= queue.run(cx.waker(), polls, &mut made);
+            // Its allowance spent, with streams perhaps still in line, the turn is given back.
+            if accepts == 0 || polls == 0 {
+                return give_back(cx, &mut accepts, &mut polls);
+            }
             let accepted = connection.poll_accept(cx);
             // What h2 holds of what the client sent — uploads not yet read — is the worker's
             // storage as well (15 §3); a connection closed to make room for others goes now.
@@ -299,7 +334,16 @@ async fn drive<S, R, F, B, D>(
             if account.is_shed() {
                 return Poll::Ready(Next::Shed);
             }
-            accepted.map(Next::Accepted)
+            match accepted {
+                Poll::Ready(accepted) => {
+                    accepts -= 1;
+                    Poll::Ready(Next::Accepted(accepted))
+                }
+                Poll::Pending => {
+                    (accepts, polls) = (ACCEPTS, POLLS);
+                    Poll::Pending
+                }
+            }
         })
         .await;
         // Closing with streams under way, it says why first: their records end as they go.
@@ -312,8 +356,8 @@ async fn drive<S, R, F, B, D>(
         let (request, send) = match accepted {
             Next::Accepted(Some(Ok(stream))) => stream,
             // Closed, or failed: either way there is nothing left to serve.
-            Next::Accepted(_) => return,
-            Next::Idle => break,
+            Next::Accepted(_) => break Closing::Closed,
+            Next::Idle => break Closing::Idle,
             Next::Draining => {
                 // Told to go, gracefully: what it has sent is still taken and answered, and
                 // the connection closes once the last stream ends — or when time is up.
@@ -324,57 +368,82 @@ async fn drive<S, R, F, B, D>(
                     .reset(Instant::now() + settings.drain_within);
                 continue;
             }
-            Next::OutOfTime => {
-                connection.abrupt_shutdown(::h2::Reason::NO_ERROR);
-                let _closing = tokio::time::timeout(
-                    settings.closing,
-                    poll_fn(|cx| connection.poll_closed(cx)),
-                )
-                .await;
-                return;
-            }
+            Next::OutOfTime => break Closing::Abrupt(::h2::Reason::NO_ERROR),
             Next::Resetting | Next::Shed => {
-                connection.abrupt_shutdown(::h2::Reason::ENHANCE_YOUR_CALM);
-                let _closing = tokio::time::timeout(
-                    settings.closing,
-                    poll_fn(|cx| connection.poll_closed(cx)),
-                )
-                .await;
-                return;
+                break Closing::Abrupt(::h2::Reason::ENHANCE_YOUR_CALM);
             }
         };
         streams.seen.set(streams.seen.get() + 1);
-        // The task is paid for before it is made: its future's size is its type's, known
-        // without making one, and a stream the worker cannot pay for is answered here,
-        // with no task (15 §3).
-        let make = |(request, responder, open, charge)| {
-            stream_task(
-                request,
-                responder,
-                open,
-                Rc::clone(&respond),
-                Rc::clone(&storage),
-                Rc::clone(&date),
-                settings.idle,
-                charge,
-            )
-        };
-        let cost = stream_cost(size_of_made(&make), &request);
-        match storage.reserve(cost) {
+        match storage.reserve(stream_cost(0, &request)) {
             Ok(charge) => {
                 #[cfg(test)]
-                MADE.set(MADE.get() + 1);
-                let task = make((request, Responder::new(send), Open::new(&streams), charge));
-                let _detached = tokio::task::spawn_local(Box::pin(task));
+                TAKEN.set(TAKEN.get() + 1);
+                queue.push((request, send, Open::new(&streams), charge));
             }
             Err(_) => refuse(request, send, &storage, &*date, &refused),
         }
+    };
+    // Its streams still under way go with it, as a reset stream's do: their exchanges are
+    // given up at once, and their records say why the connection went (21 §3).
+    drop(queue);
+    match closing {
+        Closing::Closed => {}
+        // Idle for its keep-alive time: told to go, gracefully — a request already on its
+        // way is still taken — and given its closing time to finish before the socket goes
+        // regardless.
+        Closing::Idle => {
+            connection.graceful_shutdown();
+            let _closing =
+                tokio::time::timeout(settings.closing, poll_fn(|cx| connection.poll_closed(cx)))
+                    .await;
+        }
+        Closing::Abrupt(reason) => {
+            connection.abrupt_shutdown(reason);
+            let _closing =
+                tokio::time::timeout(settings.closing, poll_fn(|cx| connection.poll_closed(cx)))
+                    .await;
+        }
     }
-    // Idle for its keep-alive time: told to go, gracefully — a request already on its way is
-    // still taken — and given its closing time to finish before the socket goes regardless.
-    connection.graceful_shutdown();
-    let _closing =
-        tokio::time::timeout(settings.closing, poll_fn(|cx| connection.poll_closed(cx))).await;
+}
+
+/// Gives the worker's turn back with work left: woken again at once, the connection's task
+/// goes to the end of the worker's line, behind every other that is ready, and starts its
+/// next turn with its allowances whole.
+fn give_back<T>(
+    cx: &mut std::task::Context<'_>,
+    accepts: &mut usize,
+    polls: &mut usize,
+) -> Poll<T> {
+    (*accepts, *polls) = (ACCEPTS, POLLS);
+    cx.waker().wake_by_ref();
+    Poll::Pending
+}
+
+/// How many streams a connection's task takes up a turn before it gives the turn back.
+const ACCEPTS: usize = 16;
+
+/// How many of its streams a connection's task polls a turn before it gives the turn back:
+/// enough that a busy connection is not slowed by its own turns, few enough that a hundred
+/// busy streams do not keep a worker's other connections waiting.
+const POLLS: usize = 64;
+
+/// A stream as h2 hands it over, with its count among the open ones and what it is charged
+/// until its task is made.
+type Waiting = (
+    Request<::h2::RecvStream>,
+    ::h2::server::SendResponse<Outgoing>,
+    Open,
+    Charge,
+);
+
+/// How the accept loop ended, and so how the connection is closed.
+enum Closing {
+    /// It is closed already, or failed.
+    Closed,
+    /// No stream open for its keep-alive time: told to go, gracefully.
+    Idle,
+    /// Closed at once, with this reason: out of drain time, out of storage, too many resets.
+    Abrupt(::h2::Reason),
 }
 
 /// What a connection with no stream open waits for next.
@@ -497,6 +566,8 @@ fn size_of_made<A, F>(_make: &impl FnOnce(A) -> F) -> usize {
 thread_local! {
     /// The streams this thread has made a task for.
     static MADE: Cell<usize> = const { Cell::new(0) };
+    /// The streams this thread has taken into a connection's queue.
+    static TAKEN: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Answers a stream the worker cannot pay for, at once and with no task: `503 exhausted`,
@@ -1320,6 +1391,187 @@ mod tests {
             assert_eq!(MADE.get(), made);
             assert!(told.borrow().is_empty());
             assert_eq!(asked.get(), 0);
+        });
+    }
+
+    /// A connection's streams take its turns, not one each: between two turns of another
+    /// task of the worker's, a hundred streams that are always ready are polled no more than
+    /// one turn's allowance, where a task a stream would poll every one of them (15 §3,
+    /// `queue`).
+    #[test]
+    fn a_connections_busy_streams_take_its_turns_not_one_each() {
+        locally(async {
+            let storage = Storage::new(crate::storage::LIMIT);
+            let polls = Rc::new(Cell::new(0usize));
+            let counting = Rc::clone(&polls);
+            // Another task, counting the most stream polls between two of its own turns, from
+            // before the first stream comes.
+            let (most, turns) = (Rc::new(Cell::new(0usize)), Rc::new(Cell::new(0usize)));
+            let (largest, probing, seen) = (Rc::clone(&most), Rc::clone(&turns), Rc::clone(&polls));
+            let mut last = 0;
+            let probe = tokio::task::spawn_local(poll_fn(move |cx| {
+                let now = seen.get();
+                largest.set(largest.get().max(now - last));
+                last = now;
+                probing.set(probing.get() + 1);
+                cx.waker().wake_by_ref();
+                Poll::<()>::Pending
+            }));
+            let (mut send, _told) = charged(&storage, move |_, _| {
+                let counting = Rc::clone(&counting);
+                let mut left = 1000;
+                // Ready again as soon as it is polled: back in line at once, not at the end
+                // of the worker's tick as `yield_now` would put it. A thousand times, then
+                // quiet, so that a queue that never stops polling ends the test.
+                poll_fn(move |cx| {
+                    counting.set(counting.get() + 1);
+                    if left > 0 {
+                        left -= 1;
+                        cx.waker().wake_by_ref();
+                    }
+                    Poll::<Answered<Full<Bytes>>>::Pending
+                })
+            })
+            .await;
+            let mut answers = Vec::new();
+            for _ in 0..100 {
+                send = within(send.ready()).await.unwrap();
+                answers.push(send.send_request(get(), true).unwrap().0);
+            }
+            // Every stream polled to its quiet end.
+            within(async {
+                while polls.get() < 100 * 1001 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            probe.abort();
+            // Fewer than one each, whatever a turn's allowance is set to.
+            assert!(
+                most.get() < 100,
+                "{} stream polls between two turns of another task",
+                most.get()
+            );
+            drop(answers);
+        });
+    }
+
+    /// Streams waiting on their upstreams are not put in line behind each other: a hundred
+    /// waiting on as many answers all finish once the answers come.
+    #[test]
+    fn streams_waiting_on_their_upstreams_all_go_on_when_their_answers_come() {
+        locally(async {
+            let storage = Storage::new(crate::storage::LIMIT);
+            let gate = Rc::new(tokio::sync::Notify::new());
+            let waiting = Rc::clone(&gate);
+            let (mut send, _told) = charged(&storage, move |_, _| {
+                let waiting = Rc::clone(&waiting);
+                async move {
+                    waiting.notified().await;
+                    Answered::Map(Response::new(Full::new(Bytes::new())))
+                }
+            })
+            .await;
+            let mut answers = Vec::new();
+            for _ in 0..100 {
+                send = within(send.ready()).await.unwrap();
+                answers.push(send.send_request(get(), true).unwrap().0);
+            }
+            until_held(&storage, |used| used > 100 * TASK).await;
+            gate.notify_waiters();
+            for answer in answers {
+                assert_eq!(within(answer).await.unwrap().status(), StatusCode::OK);
+            }
+            until_held(&storage, |used| used == 0).await;
+        });
+    }
+
+    /// Streams ready past a turn's allowance are polled on the next turn, which the
+    /// connection's task gives itself: nothing else may wake it, as here, where a hundred
+    /// streams let go at once by a gate that takes none of Tokio's budget (whose own waits
+    /// wake a task that runs out of it) do nothing more that h2 would hear of.
+    #[test]
+    fn streams_ready_past_a_turns_allowance_get_the_next_turn() {
+        /// Open or not, and who waits for it to open.
+        #[derive(Default)]
+        struct Gate {
+            open: Cell<bool>,
+            waiting: RefCell<Vec<Waker>>,
+        }
+        locally(async {
+            let storage = Storage::new(crate::storage::LIMIT);
+            let gate = Rc::new(Gate::default());
+            let woken = Rc::new(Cell::new(0usize));
+            let (waiting, counting) = (Rc::clone(&gate), Rc::clone(&woken));
+            let (mut send, _told) = charged(&storage, move |_, _| {
+                let (waiting, counting) = (Rc::clone(&waiting), Rc::clone(&counting));
+                async move {
+                    poll_fn(|cx| {
+                        if waiting.open.get() {
+                            return Poll::Ready(());
+                        }
+                        waiting.waiting.borrow_mut().push(cx.waker().clone());
+                        Poll::Pending
+                    })
+                    .await;
+                    counting.set(counting.get() + 1);
+                    std::future::pending::<Answered<Full<Bytes>>>().await
+                }
+            })
+            .await;
+            let made = MADE.get();
+            let mut answers = Vec::new();
+            for _ in 0..100 {
+                send = within(send.ready()).await.unwrap();
+                answers.push(send.send_request(get(), true).unwrap().0);
+            }
+            // Every stream made and waiting at the gate before it opens.
+            within(async {
+                while MADE.get() < made + 100 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            gate.open.set(true);
+            for waker in gate.waiting.take() {
+                waker.wake();
+            }
+            // Two of the connection's turns, within a few of the worker's: no timer of h2's
+            // (a second, for reset streams) is let stand in for the turn not given back.
+            for _ in 0..50 {
+                if woken.get() == 100 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                woken.get(),
+                100,
+                "streams left in line with nothing to wake them"
+            );
+            drop(answers);
+        });
+    }
+
+    /// A stream the worker can pay to take in but not to make is answered `503` on its first
+    /// turn, its head's charge given back, with no task made.
+    #[test]
+    fn a_stream_the_worker_cannot_pay_to_make_is_answered_503_on_its_first_turn() {
+        locally(async {
+            // Room for a stream's head, not its future.
+            let head = stream_cost(0, &get());
+            let storage = Storage::new(head + 64);
+            let asked = Rc::new(Cell::new(0));
+            let (mut send, told) = charged(&storage, never(&asked)).await;
+            let (made, taken) = (MADE.get(), TAKEN.get());
+            let (answer, _) = send.send_request(get(), true).unwrap();
+            let answer = within(answer).await.unwrap();
+            assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(TAKEN.get(), taken + 1, "refused before it was taken in");
+            assert_eq!(MADE.get(), made);
+            assert_eq!(asked.get(), 0);
+            assert_eq!(*told.borrow(), [(StatusCode::SERVICE_UNAVAILABLE, false)]);
+            until_held(&storage, |used| used == 0).await;
         });
     }
 }
