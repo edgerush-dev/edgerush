@@ -18,11 +18,14 @@ use crate::downstream::h2::body::IncomingH2;
 use crate::downstream::h2::writer::{Outgoing, Responder, send_body};
 use crate::drain::Drain;
 use crate::forwarding::Cut;
+use crate::grpc::call::Call;
 use crate::h2_stream::H2Stream;
 use crate::interim::Interim;
+use crate::metrics::Answer;
 use crate::received::Received;
 use crate::request_body::RequestBody;
-use crate::storage::Storage;
+use crate::storage::{Charge, Storage};
+use crate::way_back::call_answer;
 use bytes::Bytes;
 use http::header::{DATE, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Version};
@@ -30,7 +33,6 @@ use http_body::Body;
 use std::cell::{Cell, RefCell};
 use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
-use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 use std::time::Duration;
@@ -180,6 +182,8 @@ impl Settings {
 /// go and the connection closes when its streams have ended or the drain's time is up
 /// (03 §10). `cut` is told why, before the streams under way go, when the connection is
 /// closed with them: at the drain's time, for the worker's storage, or for its resets.
+/// `refused` is told of each stream answered at once for want of storage, with the status
+/// sent and whether it was a gRPC call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve<S, R, F, B, D>(
     socket: S,
@@ -190,6 +194,7 @@ pub(crate) async fn serve<S, R, F, B, D>(
     drain: Rc<Drain>,
     respond: Rc<R>,
     cut: impl Fn(Cut),
+    refused: impl Fn(StatusCode, bool),
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
     R: Fn(Request<RequestBody>, Interim) -> F + 'static,
@@ -210,6 +215,7 @@ pub(crate) async fn serve<S, R, F, B, D>(
         drain,
         respond,
         cut,
+        refused,
     )
     .await;
 }
@@ -225,6 +231,7 @@ async fn drive<S, R, F, B, D>(
     drain: Rc<Drain>,
     respond: Rc<R>,
     cut: impl Fn(Cut),
+    refused: impl Fn(StatusCode, bool),
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
     R: Fn(Request<RequestBody>, Interim) -> F + 'static,
@@ -337,15 +344,31 @@ async fn drive<S, R, F, B, D>(
             }
         };
         streams.seen.set(streams.seen.get() + 1);
-        let _detached = tokio::task::spawn_local(stream_task(
-            request,
-            Responder::new(send),
-            Open::new(&streams),
-            Rc::clone(&respond),
-            Rc::clone(&storage),
-            Rc::clone(&date),
-            settings.idle,
-        ));
+        // The task is paid for before it is made: its future's size is its type's, known
+        // without making one, and a stream the worker cannot pay for is answered here,
+        // with no task (15 §3).
+        let make = |(request, responder, open, charge)| {
+            stream_task(
+                request,
+                responder,
+                open,
+                Rc::clone(&respond),
+                Rc::clone(&storage),
+                Rc::clone(&date),
+                settings.idle,
+                charge,
+            )
+        };
+        let cost = stream_cost(size_of_made(&make), &request);
+        match storage.reserve(cost) {
+            Ok(charge) => {
+                #[cfg(test)]
+                MADE.set(MADE.get() + 1);
+                let task = make((request, Responder::new(send), Open::new(&streams), charge));
+                let _detached = tokio::task::spawn_local(Box::pin(task));
+            }
+            Err(_) => refuse(request, send, &storage, &*date, &refused),
+        }
     }
     // Idle for its keep-alive time: told to go, gracefully — a request already on its way is
     // still taken — and given its closing time to finish before the socket goes regardless.
@@ -418,11 +441,109 @@ fn send_interim(responder: &mut Responder, interim: &Interim) {
     }
 }
 
-/// A stream's task: its answer, boxed, counted open while it lives. The answer's future is
-/// as large as its largest state, the exchange's included, several kilobytes; a task holds
-/// its future inline and moves all of it as the task is made and as it finishes. Boxed once
-/// here, what the task holds and moves is a pointer.
-fn stream_task<R, F, B, D>(
+/// What a task costs the worker besides its future: Tokio's cell around the boxed future —
+/// its header, scheduler handle, stage and trailer, some 130 bytes on x86-64 — rounded up,
+/// and the allocator's own room for the box.
+const TASK: usize = 256;
+
+/// What an answer allocates beside its future and the request's head, and nothing else
+/// charges: its interim heads' shared state and, where the listener logs, its record's
+/// line (160 bytes made, more as it grows).
+const ALONGSIDE: usize = 1024;
+
+/// The allocator's own room for one allocation, and what it rounds a small one up by.
+const ALLOCATION: usize = 16;
+
+/// What a field takes in a header map besides its bytes: its entry (name, value, hash and
+/// links) and its place in the map's index.
+const FIELD: usize =
+    std::mem::size_of::<http::HeaderName>() + std::mem::size_of::<HeaderValue>() + 16;
+
+/// A refusal, charged to the worker's provision for its own answers while it is made: its
+/// head goes into h2's queue, a few hundred bytes.
+const REFUSAL: usize = 1024;
+
+/// What a stream's task costs the worker while it lives: its future of `future` bytes, as
+/// large as the answer's largest state, the exchange's included (measured at 8.8 KB a
+/// stream; 15 §3), the task around it, and the request's head, which h2 hands over when it
+/// accepts the stream and which is the task's from then on. A map's capacity is charged, not
+/// just what is in it, and every field value is an allocation of its own.
+fn stream_cost<T>(future: usize, request: &Request<T>) -> usize {
+    let headers = request.headers();
+    let fields: usize = headers
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.len() + 2 * ALLOCATION)
+        .sum();
+    let uri = request.uri();
+    let target = uri.path_and_query().map_or(0, |path| path.as_str().len())
+        + uri
+            .authority()
+            .map_or(0, |authority| authority.as_str().len());
+    future
+        + TASK
+        + ALONGSIDE
+        + headers.capacity().saturating_mul(FIELD)
+        + fields
+        + target
+        + 2 * ALLOCATION
+}
+
+/// What a future `make` would return takes, without one being made.
+fn size_of_made<A, F>(_make: &impl FnOnce(A) -> F) -> usize {
+    std::mem::size_of::<F>()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The streams this thread has made a task for.
+    static MADE: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Answers a stream the worker cannot pay for, at once and with no task: `503 exhausted`,
+/// or `RESOURCE_EXHAUSTED` to a gRPC call, as the core answers one it has no storage for (14 §8),
+/// told to `refused` with the status sent and whether it was a call. A worker short of even
+/// its provision refuses the stream with REFUSED_STREAM, which a client may send again
+/// (RFC 9113 §8.7).
+fn refuse(
+    request: Request<::h2::RecvStream>,
+    mut send: ::h2::server::SendResponse<Outgoing>,
+    storage: &Rc<Storage>,
+    date: &impl Fn() -> HttpDate,
+    refused: &impl Fn(StatusCode, bool),
+) {
+    let Ok(_making) = storage.reserve_answer(REFUSAL) else {
+        send.send_reset(::h2::Reason::REFUSED_STREAM);
+        return;
+    };
+    let call = Call::of(
+        Version::HTTP_2,
+        request.method(),
+        request.headers(),
+        Instant::now,
+    )
+    .is_some();
+    let mut head = Response::new(());
+    *head.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    if call {
+        call_answer(&mut head, Answer::Exhausted);
+    }
+    if let Ok(now) = HeaderValue::from_bytes(date().as_bytes()) {
+        head.headers_mut().insert(DATE, now);
+    }
+    let status = head.status();
+    // A head h2 refuses is not sent, and the stream is reset when its responder goes.
+    if Responder::new(send).final_head(head, true).is_ok() {
+        refused(status, call);
+    }
+}
+
+/// A stream's task: its answer, counted open while it lives and holding `charge`, what it
+/// costs the worker, until it ends or is dropped. Unboxed: it is measured before it is
+/// made, then boxed as it is spawned, so that what Tokio holds and moves is a pointer — the
+/// answer's future is several kilobytes, and a task holds its future inline and moves all
+/// of it as the task is made and as it finishes.
+#[allow(clippy::too_many_arguments)]
+async fn stream_task<R, F, B, D>(
     request: Request<::h2::RecvStream>,
     responder: Responder,
     open: Open,
@@ -430,30 +551,29 @@ fn stream_task<R, F, B, D>(
     storage: Rc<Storage>,
     date: Rc<D>,
     idle: Duration,
-) -> Pin<Box<impl Future<Output = ()>>>
-where
+    charge: Charge,
+) where
     R: Fn(Request<RequestBody>, Interim) -> F,
     F: Future<Output = Answered<B>>,
     B: Body<Data = Bytes>,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     D: Fn() -> HttpDate,
 {
-    Box::pin(async move {
-        let answered = answer(
-            request,
-            responder,
-            &*respond,
-            &storage,
-            &*date,
-            idle,
-            &open.0.drain,
-        )
-        .await;
-        if answered == Ended::ResetEarly {
-            open.0.premature.set(open.0.premature.get() + 1);
-        }
-        drop(open);
-    })
+    let _paid = charge;
+    let answered = answer(
+        request,
+        responder,
+        &*respond,
+        &storage,
+        &*date,
+        idle,
+        &open.0.drain,
+    )
+    .await;
+    if answered == Ended::ResetEarly {
+        open.0.premature.set(open.0.premature.get() + 1);
+    }
+    drop(open);
 }
 
 /// Answers one stream; a WebSocket it opens drains with the connection's `drain`.
@@ -548,15 +668,11 @@ mod tests {
     };
     use http_body_util::{BodyExt, Full};
 
-    /// What a future `make` returns takes, without one being made.
-    fn size_of_made<A, F>(_make: impl FnOnce(A) -> F) -> usize {
-        std::mem::size_of::<F>()
-    }
-
-    /// A stream's task holds a pointer to its answer's future, not the future itself, which
-    /// the task would copy whole as it is made and as it finishes (14 §3).
+    /// A stream's task is charged its future whole, measured from its type before it is
+    /// made, and holds it boxed: what Tokio holds and moves is a pointer, not the future it
+    /// would copy whole as the task is made and as it finishes (14 §3).
     #[test]
-    fn a_stream_task_holds_its_answer_boxed() {
+    fn a_stream_task_is_charged_its_future_and_holds_it_boxed() {
         type Respond =
             fn(Request<RequestBody>, Interim) -> std::future::Ready<Answered<Full<Bytes>>>;
         type Date = fn() -> HttpDate;
@@ -567,31 +683,55 @@ mod tests {
             Rc<Respond>,
             Rc<Storage>,
             Rc<Date>,
+            Charge,
         );
-        let task = size_of_made(
-            |(request, responder, open, respond, storage, date): Asked| {
-                stream_task(request, responder, open, respond, storage, date, LONG)
-            },
-        );
-        let answer = size_of_made(
-            |(request, responder, open, respond, storage, date): Asked| async move {
-                answer(
-                    request,
-                    responder,
-                    &*respond,
-                    &storage,
-                    &*date,
-                    LONG,
-                    &open.0.drain,
+        let future = size_of_made(
+            &|(request, responder, open, respond, storage, date, charge): Asked| {
+                stream_task(
+                    request, responder, open, respond, storage, date, LONG, charge,
                 )
-                .await
             },
         );
-        assert_eq!(
-            task,
-            std::mem::size_of::<usize>(),
-            "a stream's task holds {task} bytes; its answer's future is {answer}"
+        let boxed = size_of_made(
+            &|(request, responder, open, respond, storage, date, charge): Asked| {
+                Box::pin(stream_task(
+                    request, responder, open, respond, storage, date, LONG, charge,
+                ))
+            },
         );
+        assert_eq!(boxed, std::mem::size_of::<usize>());
+        let cost = stream_cost(future, &Request::new(()));
+        assert!(
+            cost >= future + TASK + ALONGSIDE,
+            "{cost} for a future of {future}"
+        );
+    }
+
+    /// What a stream costs grows with its head: every field's bytes, the map's capacity —
+    /// room it was made with, used or not — and the target.
+    #[test]
+    fn a_streams_cost_grows_with_its_head() {
+        let bare = stream_cost(0, &Request::new(()));
+        let mut request = Request::get("https://example.com/a/longer/path?with=query")
+            .body(())
+            .unwrap();
+        let target = stream_cost(0, &request);
+        // The bare request's target is `/`, a byte already counted.
+        let more = "example.com".len() + "/a/longer/path?with=query".len() - "/".len();
+        assert!(target >= bare + more, "{bare} then {target}");
+        request
+            .headers_mut()
+            .insert("x-big", HeaderValue::from_static("v"));
+        let one = stream_cost(0, &request);
+        let value = "x".repeat(4096);
+        request
+            .headers_mut()
+            .insert("x-big", HeaderValue::from_str(&value).unwrap());
+        let large = stream_cost(0, &request);
+        assert!(large >= one + 4095, "{one} then {large}");
+        request.headers_mut().reserve(200);
+        let roomy = stream_cost(0, &request);
+        assert!(roomy >= large + 100 * FIELD, "{large} then {roomy}");
     }
 
     /// A stream whose upload nobody reads holds at most its stream window of the connection
@@ -651,7 +791,8 @@ mod tests {
                     let mut body = request.into_body();
                     let mut cx = std::task::Context::from_waker(Waker::noop());
                     let mut taken = 0;
-                    while let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut cx)
+                    while let Poll::Ready(Some(Ok(frame))) =
+                        std::pin::Pin::new(&mut body).poll_frame(&mut cx)
                     {
                         taken += frame.data_ref().map_or(0, Bytes::len);
                     }
@@ -696,6 +837,7 @@ mod tests {
                 drain,
                 respond,
                 |_| {},
+                |_, _| {},
             );
             let used = tokio::select! {
                 () = driving => panic!("the connection ended"),
@@ -755,6 +897,7 @@ mod tests {
                         Rc::new(Drain::default()),
                         respond,
                         |why| told.set(Some(why)),
+                        |_, _| {},
                     )
                     .await;
                     if let Some(ended) = ended {
@@ -916,6 +1059,7 @@ mod tests {
                     Rc::clone(&drain),
                     Rc::clone(&respond),
                     |_| {},
+                    |_, _| {},
                 );
                 tokio::select! {
                     () = driving => panic!("the connection ended"),
@@ -932,6 +1076,250 @@ mod tests {
                     assert!(held <= 16, "round {round}: {held} held after its time");
                 }
             }
+        });
+    }
+
+    /// What the driver told of the streams it refused: the status sent, and whether it was
+    /// a gRPC call.
+    type Told = Rc<RefCell<Vec<(StatusCode, bool)>>>;
+
+    /// A connection served against `storage` with `respond`, driven in the background, and
+    /// h2's client on the other end; what the driver tells of streams it refuses is kept.
+    async fn charged<R, F>(
+        storage: &Rc<Storage>,
+        respond: R,
+    ) -> (::h2::client::SendRequest<Bytes>, Told)
+    where
+        R: Fn(Request<RequestBody>, Interim) -> F + 'static,
+        F: Future<Output = Answered<Full<Bytes>>> + 'static,
+    {
+        let settings = Settings::default();
+        let (send, mut connection) = pair(&settings.builder()).await;
+        let told: Told = Rc::new(RefCell::new(Vec::new()));
+        let telling = Rc::clone(&told);
+        let storage = Rc::clone(storage);
+        tokio::task::spawn_local(async move {
+            let received = Received::new(Rc::clone(&storage));
+            drive(
+                &mut connection,
+                settings,
+                storage,
+                &received,
+                Rc::new(|| HttpDate::from_unix(0)),
+                Rc::new(Drain::default()),
+                Rc::new(respond),
+                |_| {},
+                move |status, call| telling.borrow_mut().push((status, call)),
+            )
+            .await;
+        });
+        (send, told)
+    }
+
+    /// Waits until `storage` holds what `held` asks of it.
+    async fn until_held(storage: &Storage, held: impl Fn(usize) -> bool) -> usize {
+        within(async {
+            loop {
+                let used = storage.used();
+                if held(used) {
+                    return used;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+    }
+
+    /// An answer that never comes, from a core that says when it was asked.
+    fn never(
+        asked: &Rc<Cell<usize>>,
+    ) -> impl Fn(Request<RequestBody>, Interim) -> std::future::Pending<Answered<Full<Bytes>>> + use<>
+    {
+        let asked = Rc::clone(asked);
+        move |_, _| {
+            asked.set(asked.get() + 1);
+            std::future::pending()
+        }
+    }
+
+    fn get() -> Request<()> {
+        Request::get("http://example.com/")
+            .version(Version::HTTP_2)
+            .body(())
+            .unwrap()
+    }
+
+    /// A stream's task is charged from before it is made until it ends: its future, the task
+    /// around it and its head, given back once the stream is answered (15 §3).
+    #[test]
+    fn a_streams_task_is_charged_while_it_lives_and_released_when_it_ends() {
+        locally(async {
+            let storage = Storage::new(crate::storage::LIMIT);
+            let gate = Rc::new(tokio::sync::Notify::new());
+            let opening = Rc::clone(&gate);
+            let (mut send, _told) = charged(&storage, move |_, _| {
+                let opening = Rc::clone(&opening);
+                async move {
+                    opening.notified().await;
+                    Answered::Map(Response::new(Full::new(Bytes::new())))
+                }
+            })
+            .await;
+            let (answer, _) = send.send_request(get(), true).unwrap();
+            let held = until_held(&storage, |used| used > 0).await;
+            assert!(
+                held > TASK + ALONGSIDE,
+                "{held} charged for a stream's task"
+            );
+            gate.notify_one();
+            assert_eq!(within(answer).await.unwrap().status(), StatusCode::OK);
+            until_held(&storage, |used| used == 0).await;
+        });
+    }
+
+    /// A stream the client resets gives its charge back as its task goes.
+    #[test]
+    fn a_streams_charge_goes_back_when_the_client_resets_it() {
+        locally(async {
+            let storage = Storage::new(crate::storage::LIMIT);
+            let asked = Rc::new(Cell::new(0));
+            let (mut send, _told) = charged(&storage, never(&asked)).await;
+            let (_answer, mut stream) = send.send_request(get(), false).unwrap();
+            until_held(&storage, |used| used > 0).await;
+            stream.send_reset(::h2::Reason::CANCEL);
+            until_held(&storage, |used| used == 0).await;
+            assert_eq!(asked.get(), 1);
+        });
+    }
+
+    /// A stream whose connection closes under it gives its charge back as its task goes.
+    #[test]
+    fn a_streams_charge_goes_back_when_its_connection_closes() {
+        locally(async {
+            let settings = Settings::default();
+            let storage = Storage::new(crate::storage::LIMIT);
+            let asked = Rc::new(Cell::new(0));
+            let (near, far) = wire();
+            let (client, server) = tokio::join!(
+                ::h2::client::handshake(far),
+                settings.builder().handshake::<_, Outgoing>(near)
+            );
+            let (mut send, client) = client.unwrap();
+            let client = tokio::task::spawn_local(client);
+            let mut connection = server.unwrap();
+            let serving = Rc::clone(&storage);
+            let respond = never(&asked);
+            tokio::task::spawn_local(async move {
+                let received = Received::new(Rc::clone(&serving));
+                drive(
+                    &mut connection,
+                    settings,
+                    serving,
+                    &received,
+                    Rc::new(|| HttpDate::from_unix(0)),
+                    Rc::new(Drain::default()),
+                    Rc::new(respond),
+                    |_| {},
+                    |_, _| {},
+                )
+                .await;
+            });
+            let (_answer, _stream) = send.send_request(get(), false).unwrap();
+            until_held(&storage, |used| used > 0).await;
+            // The client goes, and its socket with it.
+            client.abort();
+            until_held(&storage, |used| used == 0).await;
+        });
+    }
+
+    /// A stream's task dropped before it ends — its worker stopping — gives its charge back.
+    #[test]
+    fn a_streams_charge_goes_back_when_its_task_is_dropped_unfinished() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let storage = Storage::new(crate::storage::LIMIT);
+        let asked = Rc::new(Cell::new(0));
+        let kept = local.block_on(&runtime, async {
+            let (mut send, _told) = charged(&storage, never(&asked)).await;
+            let (answer, stream) = send.send_request(get(), false).unwrap();
+            until_held(&storage, |used| used > 0).await;
+            (send, answer, stream)
+        });
+        assert!(storage.used() > 0);
+        drop(local);
+        drop(kept);
+        assert_eq!(storage.used(), 0, "what the dropped tasks still held");
+    }
+
+    /// A stream the worker cannot pay for is answered `503` at once by the driver: no task is
+    /// made for it, the core is never asked, nothing stays charged, and the refusal is told.
+    #[test]
+    fn a_stream_the_worker_cannot_pay_for_is_answered_503_with_no_task() {
+        locally(async {
+            // Room for less than any stream's task; the provision for the refusal is there.
+            let storage = Storage::new(TASK);
+            let asked = Rc::new(Cell::new(0));
+            let (mut send, told) = charged(&storage, never(&asked)).await;
+            let made = MADE.get();
+            let (answer, _) = send.send_request(get(), true).unwrap();
+            let answer = within(answer).await.unwrap();
+            assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(answer.headers()[DATE], "Thu, 01 Jan 1970 00:00:00 GMT");
+            assert_eq!(
+                MADE.get(),
+                made,
+                "a task was made for a stream not paid for"
+            );
+            assert_eq!(asked.get(), 0);
+            assert_eq!(*told.borrow(), [(StatusCode::SERVICE_UNAVAILABLE, false)]);
+            assert_eq!(storage.used(), 0);
+        });
+    }
+
+    /// A gRPC call refused for want of storage is told so as a call: `RESOURCE_EXHAUSTED`,
+    /// as the core answers one it has no storage for (15 §6).
+    #[test]
+    fn a_grpc_call_the_worker_cannot_pay_for_is_told_resource_exhausted() {
+        locally(async {
+            let storage = Storage::new(TASK);
+            let asked = Rc::new(Cell::new(0));
+            let (mut send, told) = charged(&storage, never(&asked)).await;
+            let call = Request::post("http://example.com/helloworld.Greeter/SayHello")
+                .version(Version::HTTP_2)
+                .header("content-type", "application/grpc")
+                .body(())
+                .unwrap();
+            let (answer, _) = send.send_request(call, true).unwrap();
+            let answer = within(answer).await.unwrap();
+            assert_eq!(answer.status(), StatusCode::OK);
+            assert_eq!(answer.headers()["grpc-status"], "8");
+            assert_eq!(*told.borrow(), [(StatusCode::OK, true)]);
+            assert_eq!(asked.get(), 0);
+        });
+    }
+
+    /// A worker without even its provision left refuses the stream outright, with
+    /// REFUSED_STREAM, which tells the client it may send it again (RFC 9113 §8.7).
+    #[test]
+    fn a_worker_without_its_provision_refuses_the_stream() {
+        locally(async {
+            let storage = Storage::with_provision(0, 0);
+            let asked = Rc::new(Cell::new(0));
+            let made = MADE.get();
+            let (mut send, told) = charged(&storage, never(&asked)).await;
+            let (answer, _) = send.send_request(get(), true).unwrap();
+            let refused = within(answer).await.unwrap_err();
+            assert_eq!(
+                refused.reason(),
+                Some(::h2::Reason::REFUSED_STREAM),
+                "{refused:?}"
+            );
+            assert_eq!(MADE.get(), made);
+            assert!(told.borrow().is_empty());
+            assert_eq!(asked.get(), 0);
         });
     }
 }

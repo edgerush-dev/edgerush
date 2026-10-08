@@ -613,6 +613,7 @@ async fn serve_h2<S>(
     let dating = Rc::clone(&worker);
     let date = Rc::new(move || dating.date.get());
     let cutting = Rc::clone(&client);
+    let refusing = Rc::clone(&client);
     let respond = Rc::new(move |request: Request<RequestBody>, interim| {
         asking.set(true);
         Rc::clone(&ours.worker).handle(listener, Rc::clone(&client), request, Some(interim))
@@ -637,6 +638,21 @@ async fn serve_h2<S>(
             if let Some(counters) = worker.proxy.metrics.listener(listener) {
                 counters.closed(why);
             }
+        },
+        // A stream the worker could not pay for a task for, answered by the driver: counted
+        // and recorded as the core's own `503 exhausted` is (08 §1, 21 §3).
+        |status, call| {
+            if call && let Some(counters) = worker.proxy.metrics.listener(listener) {
+                counters.called(Answer::Exhausted.grpc().0 as usize);
+            }
+            refused(
+                &worker,
+                listener,
+                &refusing,
+                Some(edgerush_telemetry::access_log::Protocol::Http2),
+                status,
+                Answer::Exhausted.label(),
+            );
         },
     )
     .await;
