@@ -32,7 +32,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -1097,13 +1097,23 @@ async fn the_scrape_endpoint_serves_what_was_counted_and_nothing_else() {
     let scrape = scraped(Arc::clone(&proxy));
     assert_eq!(send(get(addresses["web"], "/")).await.0, 200);
 
-    let (status, headers, body) = send(get(scrape, "/metrics")).await;
+    // An HTTP/1 answer is counted once its head has gone (14 §4), on the worker's thread,
+    // and the client may read it, and scrape, first: the scrape is asked again until the
+    // count has come, a few seconds at most.
+    let web_2xx = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"}";
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (status, headers, body) = loop {
+        let scraped = send(get(scrape, "/metrics")).await;
+        if sample(&scraped.2, web_2xx) == 1 || Instant::now() > deadline {
+            break scraped;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     assert_eq!(status, 200);
     assert_eq!(
         headers["content-type"],
         "text/plain; version=0.0.4; charset=utf-8"
     );
-    let web_2xx = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"}";
     assert_eq!(sample(&body, web_2xx), 1);
 
     // A query is the scraper's business; any other path or method is not served.
