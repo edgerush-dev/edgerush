@@ -290,6 +290,10 @@ async fn drive<S, R, F, B, D>(
         // A stream's head, handed over by h2 with its charge.
         let mut handed = None;
         let accepted = poll_fn(|cx| {
+            // Closed to make room by another connection's shortage: h2 reads nothing more.
+            if account.is_shed() {
+                return Poll::Ready(Next::Shed);
+            }
             if streams.resetting(settings.reset_judged_after) {
                 return Poll::Ready(Next::Resetting);
             }
@@ -331,9 +335,11 @@ async fn drive<S, R, F, B, D>(
             // What h2 may allocate for what the client sends is reserved before it reads, so
             // that h2 refuses what the worker cannot pay for rather than hold it (15 §3).
             let grant = storage.reserve(storage.room().min(GRANT)).ok();
-            connection.set_grant(grant.as_ref().map_or(0, Charge::bytes));
+            let granted = grant.as_ref().map_or(0, Charge::bytes);
+            connection.set_grant(granted);
             let accepted = connection.poll_accept(cx);
             connection.set_grant(0);
+            let wanted = connection.wanted();
             account.drive_with(cx.waker());
             // The grant joins the connection's charge, and a head h2 hands over leaves it for
             // its stream's, never let go of between the two; then the connection is charged
@@ -347,6 +353,12 @@ async fn drive<S, R, F, B, D>(
                 handed = account.split(::h2::server::head_held(request));
             }
             account.settle(connection.received_unreleased() + connection.held());
+            // Something refused for want of room the worker did not have — not for want of
+            // what a full grant gives a poll, which the next poll gets afresh — makes the
+            // worker short by what it wanted.
+            if wanted > granted && granted < GRANT && wanted <= GRANT {
+                account.reclaim(wanted);
+            }
             if account.is_shed() {
                 return Poll::Ready(Next::Shed);
             }
@@ -385,9 +397,8 @@ async fn drive<S, R, F, B, D>(
                 continue;
             }
             Next::OutOfTime => break Closing::Abrupt(::h2::Reason::NO_ERROR),
-            Next::Resetting | Next::Shed => {
-                break Closing::Abrupt(::h2::Reason::ENHANCE_YOUR_CALM);
-            }
+            Next::Resetting => break Closing::Abrupt(::h2::Reason::ENHANCE_YOUR_CALM),
+            Next::Shed => break Closing::Shed,
         };
         streams.seen.set(streams.seen.get() + 1);
         // Its head's charge, handed over, and what the stream holds beside it.
@@ -423,6 +434,16 @@ async fn drive<S, R, F, B, D>(
             let _closing =
                 tokio::time::timeout(settings.closing, poll_fn(|cx| connection.poll_closed(cx)))
                     .await;
+        }
+        // Closed to make room: told why if its socket takes the GOAWAY now, and gone either
+        // way, its memory with it, without waiting on a client slow to read.
+        Closing::Shed => {
+            connection.abrupt_shutdown(::h2::Reason::ENHANCE_YOUR_CALM);
+            poll_fn(|cx| {
+                let _closing = connection.poll_closed(cx);
+                Poll::Ready(())
+            })
+            .await;
         }
     }
 }
@@ -463,8 +484,10 @@ enum Closing {
     Closed,
     /// No stream open for its keep-alive time: told to go, gracefully.
     Idle,
-    /// Closed at once, with this reason: out of drain time, out of storage, too many resets.
+    /// Closed at once, with this reason: out of drain time, too many resets.
     Abrupt(::h2::Reason),
+    /// Closed to make room in the worker: at once, waiting on nothing.
+    Shed,
 }
 
 /// What a connection with no stream open waits for next.
@@ -957,7 +980,11 @@ mod tests {
             assert!(storage.used() >= window, "{} charged", storage.used());
 
             light_send = within(light_send.ready()).await.unwrap();
+            // The light one's stream is made before its upload comes: once the worker is
+            // short, nothing new is made until the heaviest has gone.
+            let before = storage.used();
             let (_light_answer, mut light_body) = light_send.send_request(post(), false).unwrap();
+            until_held(&storage, |used| used > before + STREAM + 4096).await;
             light_body
                 .send_data(Bytes::from(vec![2u8; 2 << 20]), false)
                 .unwrap();
@@ -989,6 +1016,76 @@ mod tests {
                 (2 << 20..window).contains(&used),
                 "{used} charged: the light one's upload alone"
             );
+            assert!(
+                within(light_send.ready()).await.is_ok(),
+                "the light one was closed"
+            );
+        });
+    }
+
+    /// An upload that comes with its request, while the connection closed to make room for
+    /// it has not yet gone, finds nothing to make its stream with: the closed one stays
+    /// charged until it goes, so the request is answered 503 from the provision, its upload
+    /// let go of, and its connection carries on. The connection holding the most is closed
+    /// all the same.
+    #[test]
+    fn an_upload_that_comes_before_room_is_made_is_answered_503_and_let_go() {
+        locally(async {
+            let settings = Settings::default();
+            // Room for one stream window and some, not for a second; a provision for the
+            // worker's own answers.
+            let storage = Storage::new(5 << 20);
+            let received = Received::new(Rc::clone(&storage));
+            let date = Rc::new(|| HttpDate::from_unix(0));
+            let respond = Rc::new(|request: Request<RequestBody>, _: Interim| async move {
+                let _unread = request;
+                std::future::pending::<()>().await;
+                Answered::Map(Response::new(Full::new(Bytes::new())))
+            });
+            let (mut heavy_send, heavy) = pair(&settings.builder()).await;
+            let (mut light_send, light) = pair(&settings.builder()).await;
+            let heavy_ended = Rc::new(Cell::new(false));
+            for (mut connection, ended) in [(heavy, Some(Rc::clone(&heavy_ended))), (light, None)] {
+                let (storage, received) = (Rc::clone(&storage), Rc::clone(&received));
+                let (date, respond) = (Rc::clone(&date), Rc::clone(&respond));
+                tokio::task::spawn_local(async move {
+                    drive(
+                        &mut connection,
+                        settings,
+                        storage,
+                        &received,
+                        date,
+                        Rc::new(Drain::default()),
+                        respond,
+                        |_| {},
+                        |_, _| {},
+                    )
+                    .await;
+                    if let Some(ended) = ended {
+                        ended.set(true);
+                    }
+                });
+            }
+            let window = settings.stream_window as usize;
+            heavy_send = within(heavy_send.ready()).await.unwrap();
+            let (_heavy_answer, mut heavy_body) = heavy_send.send_request(post(), false).unwrap();
+            heavy_body
+                .send_data(Bytes::from(vec![1u8; window]), false)
+                .unwrap();
+            until_held(&storage, |used| used >= window).await;
+
+            // The request and its upload together: the upload is read before the stream's
+            // first turn, and makes the worker short.
+            light_send = within(light_send.ready()).await.unwrap();
+            let (light_answer, mut light_body) = light_send.send_request(post(), false).unwrap();
+            light_body
+                .send_data(Bytes::from(vec![2u8; 2 << 20]), false)
+                .unwrap();
+            let answer = within(light_answer).await.unwrap();
+            assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+            until_held(&storage, |_| heavy_ended.get()).await;
+            let used = settled(&storage).await;
+            assert!(used < 1 << 20, "{used} charged once both are let go of");
             assert!(
                 within(light_send.ready()).await.is_ok(),
                 "the light one was closed"
@@ -1703,6 +1800,289 @@ mod tests {
                 "streams left in line with nothing to wake them"
             );
             drop(answers);
+        });
+    }
+
+    /// A connection served beside the test's others, with small header lists, that has sent
+    /// the first `block` bytes of a request's header block and nothing more: it holds what
+    /// the unfinished block holds until it is closed. `ended` counts those whose driver has
+    /// returned.
+    async fn withholding(
+        storage: &Rc<Storage>,
+        received: &Rc<Received>,
+        ended: &Rc<Cell<usize>>,
+        block: usize,
+    ) -> crate::h2_peer::Peer<tokio::io::DuplexStream> {
+        use crate::h2_peer::{self, Frame, Peer, flag, kind};
+        let (near, far) = wire();
+        let settings = small_heads();
+        let (storage, received, ended) =
+            (Rc::clone(storage), Rc::clone(received), Rc::clone(ended));
+        let asked = Rc::new(Cell::new(0));
+        let respond = never(&asked);
+        tokio::task::spawn_local(async move {
+            if let Ok(mut connection) = settings.builder().handshake::<_, Outgoing>(near).await {
+                drive(
+                    &mut connection,
+                    settings,
+                    storage,
+                    &received,
+                    Rc::new(|| HttpDate::from_unix(0)),
+                    Rc::new(Drain::default()),
+                    Rc::new(respond),
+                    |_| {},
+                    |_, _| {},
+                )
+                .await;
+            }
+            ended.set(ended.get() + 1);
+        });
+        let mut peer = Peer::open_as_client(far, &[]).await;
+        peer.send(&h2_peer::settings_ack()).await;
+        let mut head = h2_peer::request("GET", "/");
+        head.extend_from_slice(&h2_peer::block(&[("x-big", &"a".repeat(4 * block))]));
+        head.truncate(block);
+        peer.send(&Frame::new(kind::HEADERS, flag::END_STREAM, 1, head))
+            .await;
+        peer
+    }
+
+    /// A client of `settings` served beside the others in `received`, its streams answered
+    /// by `respond`.
+    async fn served_beside<R, F>(
+        settings: Settings,
+        storage: &Rc<Storage>,
+        received: &Rc<Received>,
+        respond: R,
+    ) -> ::h2::client::SendRequest<Bytes>
+    where
+        R: Fn(Request<RequestBody>, Interim) -> F + 'static,
+        F: Future<Output = Answered<Full<Bytes>>> + 'static,
+    {
+        let (send, mut connection) = pair(&settings.builder()).await;
+        let (storage, received) = (Rc::clone(storage), Rc::clone(received));
+        tokio::task::spawn_local(async move {
+            drive(
+                &mut connection,
+                settings,
+                storage,
+                &received,
+                Rc::new(|| HttpDate::from_unix(0)),
+                Rc::new(Drain::default()),
+                Rc::new(respond),
+                |_| {},
+                |_, _| {},
+            )
+            .await;
+        });
+        send
+    }
+
+    /// Connections holding unfinished header blocks are closed to make room for a newcomer
+    /// the worker cannot otherwise pay for, one at a time: a burst of the newcomer's
+    /// requests, refused while the worker is short, closes no more of them than the room it
+    /// needs, the rest go on holding theirs, and the newcomer's requests then go through.
+    #[test]
+    fn stalled_header_blocks_are_closed_one_at_a_time_to_let_a_newcomer_in() {
+        locally(async {
+            const LIMIT: usize = 256 * 1024;
+            const BLOCK: usize = 12 * 1024;
+            const BURST: usize = 20;
+            let storage = Storage::new(LIMIT);
+            let received = Received::new(Rc::clone(&storage));
+            let ended = Rc::new(Cell::new(0));
+            let mut peers = Vec::new();
+            for _ in 0..12 {
+                peers.push(withholding(&storage, &received, &ended, BLOCK).await);
+            }
+            let held = settled(&storage).await;
+            assert_eq!(ended.get(), 0, "{held} held by twelve blocks of {BLOCK}");
+            // The newcomer, warmed up while there is room — its buffers, its decoder's and its
+            // streams' places grown to what its requests need — so that what it holds stays
+            // put, and only its requests ask for more.
+            let ok = |_, _| async { Answered::Map(Response::new(Full::new(Bytes::new()))) };
+            let mut send = served_beside(small_heads(), &storage, &received, ok).await;
+            for _ in 0..3 {
+                send = within(send.ready()).await.unwrap();
+                let (answer, _) = send.send_request(get(), true).unwrap();
+                assert_eq!(within(answer).await.unwrap().status(), StatusCode::OK);
+            }
+            settled(&storage).await;
+            // The rest is held elsewhere: its requests can be paid for only by closing one.
+            let _elsewhere = storage.reserve(storage.room()).unwrap();
+            let mut answers = Vec::new();
+            for _ in 0..BURST {
+                send = within(send.ready()).await.unwrap();
+                answers.push(send.send_request(get(), true).unwrap().0);
+            }
+            let mut refused = 0;
+            for answer in answers {
+                match within(answer).await {
+                    Ok(answer) => assert_eq!(answer.status(), StatusCode::OK),
+                    Err(error) => {
+                        assert_eq!(error.reason(), Some(::h2::Reason::REFUSED_STREAM));
+                        refused += 1;
+                    }
+                }
+            }
+            let closed = ended.get();
+            assert!(refused > 0, "nothing refused: the worker was never short");
+            assert!(
+                (1..=2).contains(&closed),
+                "{closed} closed for {refused} refused of {BURST}"
+            );
+            // Sent again, a request gets through.
+            let status = within(async {
+                loop {
+                    send = send.clone().ready().await.unwrap();
+                    match send.send_request(get(), true).unwrap().0.await {
+                        Ok(answer) => break answer.status(),
+                        Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                    }
+                }
+            })
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(ended.get() < peers.len(), "every block was closed");
+        });
+    }
+
+    /// A stream refused for its connection's own stream limit closes nobody, however short
+    /// the worker: room made elsewhere would not have let it in.
+    #[test]
+    fn streams_past_a_connections_own_limit_close_no_other_connection() {
+        locally(async {
+            const LIMIT: usize = 256 * 1024;
+            let storage = Storage::new(LIMIT);
+            let received = Received::new(Rc::clone(&storage));
+            let ended = Rc::new(Cell::new(0));
+            let mut peers = Vec::new();
+            for _ in 0..3 {
+                peers.push(withholding(&storage, &received, &ended, 12 * 1024).await);
+            }
+            settled(&storage).await;
+            // Short of a whole grant, with room enough for one stream and its future.
+            let _elsewhere = storage.reserve(storage.room() - 64 * 1024).unwrap();
+            // A client allowed one stream that opens six: the server refuses five for its
+            // limit, whatever the client was told.
+            use crate::h2_peer::{self, Peer, code};
+            let asked = Rc::new(Cell::new(0));
+            let settings = Settings {
+                streams: 1,
+                ..small_heads()
+            };
+            let (near, far) = wire();
+            let (serving, sharing) = (Rc::clone(&storage), Rc::clone(&received));
+            let respond = never(&asked);
+            tokio::task::spawn_local(async move {
+                if let Ok(mut connection) = settings.builder().handshake::<_, Outgoing>(near).await
+                {
+                    drive(
+                        &mut connection,
+                        settings,
+                        serving,
+                        &sharing,
+                        Rc::new(|| HttpDate::from_unix(0)),
+                        Rc::new(Drain::default()),
+                        Rc::new(respond),
+                        |_| {},
+                        |_, _| {},
+                    )
+                    .await;
+                }
+            });
+            let mut peer = Peer::open_as_client(far, &[]).await;
+            peer.send(&h2_peer::settings_ack()).await;
+            peer.send(&h2_peer::headers(1, h2_peer::request("GET", "/"), false))
+                .await;
+            until_held(&storage, |_| asked.get() == 1).await;
+            for id in [3, 5, 7, 9, 11] {
+                peer.send(&h2_peer::headers(id, h2_peer::request("GET", "/"), true))
+                    .await;
+            }
+            let frames = within(peer.barrier()).await;
+            let refused = frames
+                .iter()
+                .filter(|frame| frame.kind == h2_peer::kind::RST_STREAM)
+                .filter(|frame| frame.reset() == code::REFUSED_STREAM)
+                .count();
+            assert_eq!(refused, 5);
+            assert_eq!(
+                ended.get(),
+                0,
+                "a connection was closed for another's stream limit"
+            );
+        });
+    }
+
+    /// A connection closed to make room goes at once, its memory with it, though its client
+    /// reads nothing and the GOAWAY cannot be written: a slow reader does not hold the
+    /// worker's storage for the closing time.
+    #[test]
+    fn a_connection_closed_to_make_room_goes_at_once_though_its_client_reads_nothing() {
+        use crate::h2_peer::{self, Frame, Peer, flag, kind};
+        locally(async {
+            let storage = Storage::new(256 * 1024);
+            let received = Received::new(Rc::clone(&storage));
+            let ended = Rc::new(Cell::new(false));
+            // Little room each way: what the server writes backs up after a few frames.
+            let (near, far) = tokio::io::duplex(64);
+            let settings = small_heads();
+            let (serving, sharing, ending) =
+                (Rc::clone(&storage), Rc::clone(&received), Rc::clone(&ended));
+            let asked = Rc::new(Cell::new(0));
+            let respond = never(&asked);
+            tokio::task::spawn_local(async move {
+                if let Ok(mut connection) = settings.builder().handshake::<_, Outgoing>(near).await
+                {
+                    drive(
+                        &mut connection,
+                        settings,
+                        serving,
+                        &sharing,
+                        Rc::new(|| HttpDate::from_unix(0)),
+                        Rc::new(Drain::default()),
+                        Rc::new(respond),
+                        |_| {},
+                        |_, _| {},
+                    )
+                    .await;
+                }
+                ending.set(true);
+            });
+            let mut peer = Peer::open_as_client(far, &[]).await;
+            peer.send(&h2_peer::settings_ack()).await;
+            let mut head = h2_peer::request("GET", "/");
+            head.extend_from_slice(&h2_peer::block(&[("x-big", &"a".repeat(8000))]));
+            head.truncate(4000);
+            within(peer.send(&Frame::new(kind::HEADERS, flag::END_STREAM, 1, head))).await;
+            // PINGs whose acknowledgements nobody reads, until the server can write no more:
+            // past that, what is sent waits in the wire, and the test stops sending.
+            for n in 0..6u8 {
+                let ping = h2_peer::ping([n; 8]);
+                if tokio::time::timeout(Duration::from_millis(50), peer.send(&ping))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let held = settled(&storage).await;
+            assert!(held >= 4000, "{held} held by an unfinished block");
+            assert!(!ended.get());
+            // Another connection's shortage closes it, the one charged the most.
+            let asking = received.open();
+            asking.reclaim(1);
+            let started = Instant::now();
+            until_held(&storage, |_| ended.get()).await;
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "went after {:?}, its closing time is {:?}",
+                started.elapsed(),
+                Settings::default().closing
+            );
+            assert_eq!(storage.used(), 0, "its charge outlived it");
+            drop(peer);
         });
     }
 

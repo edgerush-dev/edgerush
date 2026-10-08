@@ -140,6 +140,18 @@ impl Storage {
         self.charge(bytes, Ceiling::Provision)
     }
 
+    /// Charges `bytes` of memory already held, which cannot be refused: counted whether or
+    /// not they fit, past the limit if need be, so that the account says what is held while
+    /// room is made by letting other memory go (15 §3).
+    pub fn reserve_past(self: &Rc<Self>, bytes: usize) -> Charge {
+        self.used.set(self.used.get().saturating_add(bytes));
+        Charge {
+            storage: Rc::clone(self),
+            bytes,
+            ceiling: Ceiling::Limit,
+        }
+    }
+
     fn charge(self: &Rc<Self>, bytes: usize, ceiling: Ceiling) -> Result<Charge, Exhausted> {
         self.take(bytes, ceiling)?;
         Ok(Charge {
@@ -215,6 +227,14 @@ impl Charge {
         self.storage.take(more, self.ceiling)?;
         self.bytes += more;
         Ok(())
+    }
+
+    /// Counts `more` besides for memory already held, which cannot be refused: past the limit
+    /// if need be, as [`Storage::reserve_past`].
+    pub fn grow_past(&mut self, more: usize) {
+        let storage = &self.storage;
+        storage.used.set(storage.used.get().saturating_add(more));
+        self.bytes += more;
     }
 
     /// Gives back `less` of what it reserves, for storage that has shrunk, and no more than
@@ -350,6 +370,25 @@ mod tests {
         let new = storage.reserve(60).unwrap();
         drop(old);
         assert_eq!(storage.used(), new.bytes());
+    }
+
+    /// Memory that is held already is counted whether or not it fits, past the limit if need
+    /// be, and while it is nothing else fits; it is let go of as any charge is.
+    #[test]
+    fn memory_already_held_is_counted_past_the_limit() {
+        let storage = Storage::with_provision(100, 0);
+        let mut held = storage.reserve_past(60);
+        assert_eq!(storage.used(), 60);
+        held.grow_past(90);
+        assert_eq!(
+            (storage.used(), storage.room(), held.bytes()),
+            (150, 0, 150)
+        );
+        assert!(storage.reserve(1).is_err());
+        held.shrink(100);
+        assert_eq!(storage.used(), 50);
+        drop(held);
+        assert_eq!(storage.used(), 0);
     }
 
     /// The provision above the limit is for the worker's own answers alone: an ordinary

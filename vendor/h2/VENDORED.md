@@ -58,7 +58,10 @@ an intermediary to keep (15 §3), and one allowance, for fuzz builds:
   with REFUSED_STREAM, as one past the stream limit is; a stream whose head and place the
   grant cannot cover is refused the same way; trailers past it reset their stream with
   ENHANCE_YOUR_CALM; an unfinished block it cannot cover closes the connection with
-  ENHANCE_YOUR_CALM, as a block cannot be refused part way.
+  ENHANCE_YOUR_CALM, as a block cannot be refused part way. `server::Connection::wanted`
+  says the largest allocation refused for want of the grant since it was last asked, for
+  the owner to judge whether it was short of room; a stream refused for its stream limit
+  adds nothing.
 - **What an accepted head held can be asked.** `server::head_held` measures a request's
   head as `held` counted it, so that as `accept` hands it over and the count falls by that
   much, the owner passes that much of its charge on with it.
@@ -123,7 +126,9 @@ holds of what its peer sent" there: `a_head_waiting_to_be_accepted_is_held_and_h
 `the_room_answers_waited_in_to_be_sent_is_held`,
 `decoding_needs_headroom_for_every_fields_place_not_just_the_lists_bytes`,
 `a_streams_place_is_charged_by_the_room_it_adds` and
-`a_stream_is_taken_up_only_if_the_grant_covers_the_room_its_place_adds`; through the
+`a_stream_is_taken_up_only_if_the_grant_covers_the_room_its_place_adds`,
+`what_was_refused_for_want_of_grant_is_said_once` and
+`a_stream_past_its_limit_wants_nothing_of_the_grant`; through the
 proxy by `a_stream_is_charged_the_head_h2_hands_over_with_it` and
 `unfinished_header_blocks_from_many_connections_stay_within_the_workers_storage`. The
 copies that unpin buffers change nothing the public API shows, and no test sees them.

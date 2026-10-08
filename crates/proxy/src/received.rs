@@ -8,13 +8,18 @@
 //! 16 MiB a connection on our server, 1 MiB and 16 MiB on our client. That is the worker's
 //! memory as much as anything the storage account counts, so after each turn of its
 //! driver a connection is charged what h2 says it holds: what it received and has not yet
-//! given back as credit. A charge that does not fit closes the connection charged the
-//! most, which lets go of its charge at once, and is tried again, as the HTTP/3 server
-//! does with what quiche holds (16 §6); if no other holds anything, the storage is other
-//! work's, and the connection that cannot be paid for is the one closed.
+//! given back as credit, and on a server what else h2 holds of what its client sent.
 //!
 //! The charge follows what came, since h2 takes a frame in before anyone can refuse it: a
-//! turn reads no more than tokio's budget lets it, and never past the windows.
+//! turn reads no more than tokio's budget lets it, and never past the windows. So a charge
+//! that does not fit is made all the same, past the limit, and the worker is short, as it is
+//! when h2 refuses a server's allocation for want of room (`reclaim`). Then the connection
+//! charged the most that could make the room is closed — the one asking, if it is that one
+//! — and stays charged until it goes, for marking it frees nothing. One at a time: a
+//! shortage while one is going closes nobody else, and once it has gone the next is closed
+//! only for a shortage seen after, so that nothing is closed that nobody is waiting for.
+//! Where no connection could make the room, the shortage is held elsewhere and nobody is
+//! closed.
 //!
 //! One per worker, and it never leaves it. Nothing here does I/O or reads a clock.
 
@@ -32,6 +37,8 @@ pub struct Received {
     /// By a number of the table's own, for as long as each connection is driven.
     open: RefCell<HashMap<u64, Rc<Holding>>>,
     next: Cell<u64>,
+    /// The connection closed to make room and not yet gone, by its number.
+    closing: Cell<Option<u64>>,
 }
 
 /// What one connection is charged, and whether it was closed to make room.
@@ -66,7 +73,30 @@ impl Received {
             storage,
             open: RefCell::new(HashMap::new()),
             next: Cell::new(0),
+            closing: Cell::new(None),
         })
+    }
+
+    /// The worker is `bytes` short: unless a connection is already going, the one charged
+    /// the most of those whose charge, with the room left, covers the shortage is closed.
+    /// With none, the shortage is held elsewhere, and nobody is.
+    fn short_by(&self, bytes: usize) {
+        if self.closing.get().is_some() {
+            return;
+        }
+        let room = self.storage.room();
+        let heaviest = self
+            .open
+            .borrow()
+            .iter()
+            .filter(|(_, holding)| !holding.shed.get() && holding.charged.get() > 0)
+            .filter(|(_, holding)| holding.charged.get().saturating_add(room) >= bytes)
+            .max_by_key(|(_, holding)| holding.charged.get())
+            .map(|(number, holding)| (*number, Rc::clone(holding)));
+        if let Some((number, holding)) = heaviest {
+            self.closing.set(Some(number));
+            holding.shed();
+        }
     }
 
     /// A connection's account, charged nothing yet.
@@ -84,23 +114,36 @@ impl Received {
 }
 
 impl Account {
-    /// Charges the connection what h2 says it holds now, `held`. Where the worker cannot
-    /// pay for it, the connection charged the most is closed and the charge tried again,
-    /// until it fits or this one is closed.
+    /// Charges the connection what h2 says it holds now, `held`. What does not fit is
+    /// charged past the limit all the same, since it is held already, and the worker is
+    /// short by that much. A connection closed to make room keeps what it is charged until
+    /// it goes.
     pub fn settle(&self, held: usize) {
         let holding = &self.holding;
-        while !holding.shed.get() && holding.charge_to(&self.table.storage, held).is_err() {
-            let heaviest = self
-                .table
-                .open
-                .borrow()
-                .values()
-                .filter(|other| !other.shed.get())
-                .max_by_key(|other| other.charged.get())
-                .filter(|other| other.charged.get() > 0)
-                .cloned();
-            heaviest.as_ref().unwrap_or(holding).shed();
+        if holding.shed.get() {
+            return;
         }
+        let storage = &self.table.storage;
+        let charged = holding.charged.get();
+        if holding.charge_to(storage, held).is_err() {
+            // Refused, so it is more than was charged and more than the room left.
+            let short = held - charged - storage.room();
+            {
+                let mut charge = holding.charge.borrow_mut();
+                match charge.as_mut() {
+                    Some(charge) => charge.grow_past(held - charged),
+                    None => *charge = Some(storage.reserve_past(held)),
+                }
+            }
+            holding.charged.set(held);
+            self.table.short_by(short);
+        }
+    }
+
+    /// h2 refused an allocation of `wanted` bytes for want of room in the worker: the
+    /// worker is short by that much, as when a charge does not fit.
+    pub fn reclaim(&self, wanted: usize) {
+        self.table.short_by(wanted);
     }
 
     /// Adds what `charge` reserves to the connection's charge, without letting go of it or
@@ -151,6 +194,12 @@ impl Account {
 impl Drop for Account {
     fn drop(&mut self) {
         self.table.open.borrow_mut().remove(&self.number);
+        // Its memory goes with it, and only now its charge.
+        self.holding.charge.borrow_mut().take();
+        self.holding.charged.set(0);
+        if self.table.closing.get() == Some(self.number) {
+            self.table.closing.set(None);
+        }
     }
 }
 
@@ -174,8 +223,6 @@ impl Holding {
 
     fn shed(&self) {
         self.shed.set(true);
-        self.charge.borrow_mut().take();
-        self.charged.set(0);
         if let Some(driver) = self.driver.borrow_mut().take() {
             driver.wake();
         }
@@ -221,10 +268,11 @@ mod tests {
         assert!(table.open.borrow().is_empty());
     }
 
-    /// Where the worker cannot pay, the connection charged the most is closed, lets go of its
-    /// charge and is woken, and the one asking is charged.
+    /// What does not fit is charged past the limit all the same, since it is held already,
+    /// and the connection charged the most is closed and woken. It keeps its charge until it
+    /// goes, for closing it frees nothing; then the charge goes, and only then.
     #[test]
-    fn at_the_limit_the_heaviest_other_is_closed() {
+    fn at_the_limit_the_heaviest_is_closed_and_stays_charged_until_it_goes() {
         let storage = Storage::with_provision(1000, 0);
         let table = Received::new(Rc::clone(&storage));
         let (light, heavy, asking) = (table.open(), table.open(), table.open());
@@ -240,17 +288,63 @@ mod tests {
             woken.0.load(Ordering::SeqCst),
             "the closed one was not woken"
         );
-        assert_eq!(heavy.charged(), 0);
-        assert_eq!(storage.used(), 600);
-        // Closed, it is charged nothing more.
+        assert_eq!((heavy.charged(), asking.charged()), (600, 400));
+        assert_eq!(storage.used(), 1200);
+        // Closing, it is charged no more and no less.
         heavy.settle(900);
+        heavy.settle(0);
+        assert_eq!(heavy.charged(), 600);
+        drop(heavy);
         assert_eq!(storage.used(), 600);
     }
 
-    /// The one asking is closed where it is itself the heaviest, or where nothing else holds
-    /// anything here and the storage is other work's.
+    /// One at a time: a shortage while a closed connection has not yet gone closes nobody
+    /// else, however many come, so that a burst cannot close many before any room is made.
     #[test]
-    fn the_one_asking_is_closed_when_it_is_the_heaviest_or_alone() {
+    fn a_shortage_while_one_is_going_closes_nobody_else() {
+        let storage = Storage::with_provision(1000, 0);
+        let table = Received::new(Rc::clone(&storage));
+        let accounts: Vec<Account> = (0..5).map(|_| table.open()).collect();
+        for (n, account) in accounts.iter().enumerate() {
+            account.settle(100 + 50 * n);
+        }
+        // 1000 held of 1000: every further byte is a shortage.
+        accounts[0].settle(250);
+        let closed = || accounts.iter().filter(|account| account.is_shed()).count();
+        assert_eq!(closed(), 1);
+        assert!(accounts[4].is_shed(), "the heaviest goes first");
+        for account in &accounts[..4] {
+            account.reclaim(64);
+        }
+        accounts[1].settle(500);
+        assert_eq!(closed(), 1, "a second closed before the first had gone");
+    }
+
+    /// Once the closed connection has gone, nobody more is closed until the worker is found
+    /// short again: then the next charged the most is.
+    #[test]
+    fn once_the_closed_one_has_gone_the_next_is_closed_only_for_a_new_shortage() {
+        let storage = Storage::with_provision(1000, 0);
+        let table = Received::new(Rc::clone(&storage));
+        let (a, b, c, asking) = (table.open(), table.open(), table.open(), table.open());
+        a.settle(400);
+        b.settle(300);
+        c.settle(200);
+        // 100 left; 250 asked: 150 short.
+        asking.settle(250);
+        assert!(a.is_shed() && !b.is_shed());
+        drop(a);
+        assert!(!b.is_shed() && !c.is_shed() && !asking.is_shed());
+        assert_eq!(storage.used(), 750);
+        // Short again: the next goes.
+        asking.reclaim(300);
+        assert!(b.is_shed() && !c.is_shed() && !asking.is_shed());
+    }
+
+    /// The one asking is closed when it is itself the heaviest: it may be the one holding
+    /// what the worker is short of.
+    #[test]
+    fn the_one_asking_is_closed_when_it_is_the_heaviest() {
         let storage = Storage::with_provision(1000, 0);
         let table = Received::new(Rc::clone(&storage));
         let (other, asking) = (table.open(), table.open());
@@ -258,15 +352,42 @@ mod tests {
         asking.settle(800);
         asking.settle(1200);
         assert!(asking.is_shed() && !other.is_shed());
+        assert_eq!(storage.used(), 1300);
+        drop(asking);
         assert_eq!(storage.used(), 100);
+    }
 
-        // Nothing held here any more; everything held by other work.
-        other.settle(0);
-        let elsewhere = storage.reserve(1000).unwrap();
-        let alone = table.open();
-        alone.settle(50);
-        assert!(alone.is_shed(), "charged past the limit");
-        assert!(!other.is_shed(), "closed for storage it does not hold");
+    /// Where no connection's charge, with the room left, could make the room the worker is
+    /// short of, the shortage is held elsewhere and nobody is closed.
+    #[test]
+    fn nobody_is_closed_when_no_connection_could_make_the_room() {
+        let storage = Storage::with_provision(1000, 0);
+        let table = Received::new(Rc::clone(&storage));
+        let (small, smaller) = (table.open(), table.open());
+        small.settle(50);
+        smaller.settle(20);
+        let elsewhere = storage.reserve(900).unwrap();
+        small.reclaim(500);
+        assert!(!small.is_shed() && !smaller.is_shed());
+        // Nothing of it lingers: a connection that could have made the room, opened after,
+        // is closed only for a shortage of its own.
         drop(elsewhere);
+        let heavy = table.open();
+        heavy.settle(600);
+        assert!(!heavy.is_shed());
+    }
+
+    /// h2 refusing an allocation for want of room makes the worker as short as a charge that
+    /// does not fit: the connection charged the most that could make the room is closed.
+    #[test]
+    fn a_refusal_for_want_of_room_closes_the_heaviest() {
+        let storage = Storage::with_provision(1000, 0);
+        let table = Received::new(Rc::clone(&storage));
+        let (heavy, light, asking) = (table.open(), table.open(), table.open());
+        heavy.settle(700);
+        light.settle(250);
+        asking.reclaim(300);
+        assert!(heavy.is_shed() && !light.is_shed() && !asking.is_shed());
+        assert_eq!(storage.used(), 950, "a refusal charges nothing");
     }
 }

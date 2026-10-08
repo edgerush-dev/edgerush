@@ -2331,3 +2331,50 @@ async fn decoding_needs_headroom_for_every_fields_place_not_just_the_lists_bytes
         "one stream holds {one}"
     );
 }
+
+/// What h2 refused for want of grant is said once, the largest refused since last asked:
+/// what its owner would have had to reserve. A head with no grant to decode it wants the
+/// most decoding might allocate; a stream whose place the grant cannot cover, what the
+/// stream would hold.
+#[tokio::test]
+async fn what_was_refused_for_want_of_grant_is_said_once() {
+    let mut builder = server::Builder::new();
+    builder.max_header_list_size(192);
+    let (mut connection, mut peer, _) = server_with(&builder, true).await;
+    processed(&mut connection, &mut peer).await;
+    assert_eq!(connection.wanted(), 0);
+    connection.set_grant(0);
+    request(&mut peer, 1, true).await;
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(resets_in(&frames), [(1, code::REFUSED_STREAM)]);
+    let decoding = connection.wanted();
+    assert!(decoding > 192, "{decoding} wanted to decode a head");
+    assert_eq!(connection.wanted(), 0, "said twice");
+    // Grant enough to decode, and not for the stream: with lists this small a stream's
+    // place is more than decoding its head might take.
+    connection.set_grant(decoding);
+    request(&mut peer, 3, true).await;
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(resets_in(&frames), [(3, code::REFUSED_STREAM)]);
+    let stream = connection.wanted();
+    assert!(
+        stream > decoding,
+        "{stream} wanted for a stream, {decoding} to decode"
+    );
+}
+
+/// A stream refused for its stream limit wants nothing of the grant: the limit is the
+/// connection's own, and room in the worker would not have let it in.
+#[tokio::test]
+async fn a_stream_past_its_limit_wants_nothing_of_the_grant() {
+    let mut builder = server::Builder::new();
+    builder.max_concurrent_streams(1);
+    let (mut connection, mut peer, _) = server_with(&builder, true).await;
+    processed(&mut connection, &mut peer).await;
+    connection.set_grant(1 << 30);
+    request(&mut peer, 1, false).await;
+    request(&mut peer, 3, false).await;
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(resets_in(&frames), [(3, code::REFUSED_STREAM)]);
+    assert_eq!(connection.wanted(), 0);
+}

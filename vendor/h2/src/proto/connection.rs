@@ -223,6 +223,11 @@ where
         self.grant.set(bytes);
     }
 
+    // EdgeRush: see `server::Connection::wanted`.
+    pub(crate) fn wanted(&self) -> usize {
+        self.grant.take_wanted()
+    }
+
     #[cfg(feature = "unstable")]
     pub fn num_wired_streams(&self) -> usize {
         self.inner.streams.num_wired_streams()

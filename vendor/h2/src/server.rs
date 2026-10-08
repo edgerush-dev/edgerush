@@ -590,6 +590,15 @@ where
         self.connection.set_grant(bytes);
     }
 
+    /// The largest allocation refused for want of [grant](Connection::set_grant) since this
+    /// was last asked, or 0: what the connection's owner would have had to reserve for it.
+    /// A stream refused for any other reason — its stream limit, say — adds nothing.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn wanted(&self) -> usize {
+        self.connection.wanted()
+    }
+
     /// Starts a [graceful shutdown][1] process.
     ///
     /// Must continue being polled to close connection.

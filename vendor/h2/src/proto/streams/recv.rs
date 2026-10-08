@@ -197,7 +197,7 @@ impl Recv {
         id: StreamId,
         mode: Open,
         counts: &mut Counts,
-        cost: usize,
+        cost: Option<usize>,
     ) -> Result<Option<StreamId>, Error> {
         assert!(self.refused.is_none());
 
@@ -218,7 +218,7 @@ impl Recv {
 
         // EdgeRush: a stream the connection's owner has not reserved for is refused before
         // it is allocated; the peer may send it again (RFC 9113 §8.7).
-        if !self.grant.take(cost) {
+        if !cost.is_some_and(|cost| self.grant.take(cost)) {
             self.refused = Some(id);
             return Ok(None);
         }

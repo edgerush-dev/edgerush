@@ -484,11 +484,12 @@ impl Inner {
         // EdgeRush: what a new stream will hold — its decoded head, and whatever room the
         // stream slab, the id map and the event buffer would add — is taken before it is
         // allocated (15 §3).
-        // A block whose fields were not kept for want of a grant refuses its stream.
+        // A block whose fields were not kept for want of a grant refuses its stream, with
+        // nothing more asked of the grant: what it wanted was noted as decoding was refused.
         let cost = if frame.is_over_grant() {
-            usize::MAX
+            None
         } else {
-            frame.allocated() + self.store.growth() + self.actions.recv.buffer_growth()
+            Some(frame.allocated() + self.store.growth() + self.actions.recv.buffer_growth())
         };
 
         let key = match self.store.find_entry(id) {
@@ -878,7 +879,7 @@ impl Inner {
         if self
             .actions
             .recv
-            .open(promised_id, Open::PushPromise, &mut self.counts, 0)?
+            .open(promised_id, Open::PushPromise, &mut self.counts, Some(0))?
             .is_none()
         {
             return Ok(());

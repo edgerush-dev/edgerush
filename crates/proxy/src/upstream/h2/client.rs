@@ -584,6 +584,12 @@ impl Client {
         // it once its streams are done, and it has so long to do so.
         let mut closing: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
         poll_fn(|cx| {
+            // Closed to make room by another connection's shortage: h2 reads nothing more,
+            // and the connection goes now, whatever is on it with it.
+            if account.is_shed() {
+                link.shed.set(true);
+                return Poll::Ready(());
+            }
             if closing.is_none() && letting_go.as_mut().poll(cx).is_ready() {
                 watch = None;
                 closing = Some(Box::pin(tokio::time::sleep(self.settings.closing)));

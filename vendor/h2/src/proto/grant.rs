@@ -15,12 +15,15 @@ const UNLIMITED: usize = usize::MAX;
 #[derive(Debug)]
 pub(crate) struct Grant {
     left: AtomicUsize,
+    /// The largest allocation refused since the owner last asked.
+    wanted: AtomicUsize,
 }
 
 impl Grant {
     pub(crate) fn unlimited() -> Self {
         Grant {
             left: AtomicUsize::new(UNLIMITED),
+            wanted: AtomicUsize::new(0),
         }
     }
 
@@ -29,9 +32,11 @@ impl Grant {
         self.left.store(bytes, Ordering::Relaxed);
     }
 
-    /// Takes `bytes` for an allocation about to be made, if they are left.
+    /// Takes `bytes` for an allocation about to be made, if they are left; if not, notes
+    /// them as wanted.
     pub(crate) fn take(&self, bytes: usize) -> bool {
-        self.left
+        let taken = self
+            .left
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                 if left == UNLIMITED {
                     Some(UNLIMITED)
@@ -39,7 +44,16 @@ impl Grant {
                     left.checked_sub(bytes)
                 }
             })
-            .is_ok()
+            .is_ok();
+        if !taken {
+            self.wanted.fetch_max(bytes, Ordering::Relaxed);
+        }
+        taken
+    }
+
+    /// The largest allocation refused since this was last asked, or 0.
+    pub(crate) fn take_wanted(&self) -> usize {
+        self.wanted.swap(0, Ordering::Relaxed)
     }
 
     /// Gives back `bytes` taken for what has since been let go of.
