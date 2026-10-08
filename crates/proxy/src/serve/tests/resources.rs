@@ -1209,3 +1209,67 @@ fn only_the_upstreams_cuts_count_against_it() {
     let reset = crate::request_body::RequestBodyError::TimedOut;
     assert!(BodyError::H2(reset).is_the_upstreams());
 }
+
+/// A sample of `name` with `labels`, by the worker's scrape; none if there is none.
+fn sampled(worker: &Worker, series: &str) -> Option<u64> {
+    worker
+        .proxy()
+        .metrics()
+        .lines()
+        .find_map(|line| line.strip_prefix(series))
+        .and_then(|count| count.trim().parse().ok())
+}
+
+/// `edgerush_upstream_requests_total` counts the requests sent to the upstream, from
+/// where the first try goes (C43): one refused before it — the worker out of places — is
+/// counted under its own reason and not as sent, and nor is a mirror's copy refused for
+/// want of a place.
+#[tokio::test]
+async fn requests_refused_before_they_are_sent_are_not_counted_as_sent() {
+    use tokio::io::AsyncWriteExt;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, held) = scripted_upstream().await;
+            let (shadow, _) = counting_upstream().await;
+            let mut config = everything_config(upstream);
+            let mut copy = config.upstreams["up"].clone();
+            copy.endpoints = vec![shadow];
+            config.upstreams.insert("shadow".to_owned(), copy);
+            config.routes[0].rules[0].filters.push(
+                serde_saphyr::from_str(
+                    "{ type: request_mirror, upstream: shadow, fraction: { numerator: 1, denominator: 1 } }",
+                )
+                .unwrap(),
+            );
+            let limits = H1Limits {
+                exchanges: 1,
+                ..H1Limits::default()
+            };
+            let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+            let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+
+            // The one place taken by a request held at the upstream; its copy finds none.
+            let mut waiting = TcpStream::connect(front).await.unwrap();
+            waiting
+                .write_all(b"GET /a/hold HTTP/1.1\r\nhost: shop.example.com\r\n\r\n")
+                .await
+                .unwrap();
+            until(|| held.borrow().len() == 1).await;
+            // And none for the next.
+            let answer = h1_answer(front, CLOSING_GET).await;
+            assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
+
+            let sent = "edgerush_upstream_requests_total{upstream=\"up\"} ";
+            let copies = "edgerush_upstream_requests_total{upstream=\"shadow\"} ";
+            assert_eq!(sampled(&worker, sent), Some(1), "the refused request counted as sent");
+            assert_eq!(sampled(&worker, copies), Some(0), "a copy with no place counted as sent");
+            let busy = "edgerush_listener_local_answers_total{listener=\"web\",reason=\"too_busy\"} ";
+            assert_eq!(sampled(&worker, busy), Some(1));
+            drop(waiting);
+        })
+        .await;
+}

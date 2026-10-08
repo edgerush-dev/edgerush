@@ -275,6 +275,11 @@ impl Worker {
             Ok(admitted) => admitted,
             Err(refused) => return self.proxy.answer_to(listener, refused, call).into(),
         };
+        // Sent from here on: its first try goes now, whatever becomes of it, and nothing
+        // above refused it (08 §1, C43).
+        if let Some(counters) = self.proxy.metrics.upstream(directed.upstream.slot()) {
+            counters.requests.inc();
+        }
         let admitted = admitted.counting(directed.counted.take());
         let body = if directed.mirrors.is_empty() {
             body
@@ -521,9 +526,6 @@ impl Proxy {
                     .key(came_on, Through::Http(forward.id.route), upstream),
             }))
         });
-        if let Some(counters) = self.metrics.upstream(balance.slot()) {
-            counters.requests.inc();
-        }
         let mut mirrors = Vec::new();
         // The mirrors that take this request were drawn with it, and a copy made for each
         // placed before a change (18 §5).
@@ -564,9 +566,6 @@ impl Proxy {
                 }
                 continue;
             };
-            if let Some(counters) = counters {
-                counters.requests.inc();
-            }
             mirrors.push(Mirrored {
                 upstream: balance,
                 endpoint: Arc::clone(destination),

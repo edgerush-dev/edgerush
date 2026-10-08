@@ -194,6 +194,10 @@ impl Worker {
             .into_iter()
             .filter_map(|mut mirror| match self.admit(&mirror.upstream, alone) {
                 Ok(admitted) => {
+                    // Sent: a copy with a place goes (08 §1).
+                    if let Some(counters) = self.proxy.metrics.upstream(mirror.upstream.slot()) {
+                        counters.requests.inc();
+                    }
                     let counted = mirror.counted.take();
                     Some((mirror, admitted.counting(counted)))
                 }
