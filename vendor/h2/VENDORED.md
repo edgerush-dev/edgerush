@@ -63,6 +63,15 @@ allowance, for fuzz builds:
   says the largest allocation refused for want of the grant since it was last asked, for
   the owner to judge whether it was short of room; a stream refused for its stream limit
   adds nothing.
+- **A server says how many streams it has refused for its limit, and whether the limit is
+  acknowledged.** `server::Connection::refused` counts the streams `Recv::open` refused for
+  the stream limit (`proto/streams/recv.rs`), for the owner to close a peer that goes on past
+  the limit it was given: those refused before the peer acknowledged the settings that set
+  it, in the connection's life, as it may not have heard of it yet, and those refused in a
+  row since, until one is opened. `server::Connection::settings_acked` says whether it has
+  (`Recv::apply_local_settings`, which runs on the acknowledgement). A stream refused for
+  want of the grant is the owner's shortage, not the peer's doing: it is in neither count,
+  and ends no run.
 - **It decodes only as much a poll as its owner allows.** Published h2 reads and decodes
   frames until its socket has nothing more, so a peer with many frames waiting keeps its
   task decoding while the worker's other tasks wait; a bound on the bytes read would not
@@ -142,6 +151,13 @@ holds of what its peer sent" there: `a_head_waiting_to_be_accepted_is_held_and_h
 proxy by `a_stream_is_charged_the_head_h2_hands_over_with_it` and
 `unfinished_header_blocks_from_many_connections_stay_within_the_workers_storage`. The
 copies that unpin buffers change nothing the public API shows, and no test sees them.
+The counts of refusals are covered by
+`streams_refused_for_their_limit_are_counted_in_a_row_until_one_opens` and
+`streams_refused_before_the_limit_is_acknowledged_are_counted_apart` there, and through the
+proxy by `a_client_refused_a_hundred_streams_in_a_row_for_its_limit_is_closed`,
+`a_burst_past_the_limit_before_it_is_acknowledged_leaves_the_client_open`,
+`a_client_that_never_acknowledges_is_closed_after_a_thousand_refused` and
+`a_client_that_never_acknowledges_is_closed_when_its_time_is_up`.
 The allowance is covered by the probes after "How much a server decodes" there:
 `a_server_reads_no_frame_past_its_work_and_wakes_itself_to_go_on`,
 `a_header_blocks_frame_counts_one_more_for_each_kib_it_carries`,

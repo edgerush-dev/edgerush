@@ -2379,6 +2379,71 @@ async fn a_stream_past_its_limit_wants_nothing_of_the_grant() {
     assert_eq!(connection.wanted(), 0);
 }
 
+/// Streams refused for the stream limit are counted in a row, for the owner to judge a
+/// client that goes on past the limit it was given, until one is opened; one refused for want
+/// of grant, the owner's shortage, neither counts nor ends the run.
+#[tokio::test]
+async fn streams_refused_for_their_limit_are_counted_in_a_row_until_one_opens() {
+    let mut builder = server::Builder::new();
+    builder.max_concurrent_streams(1);
+    let (mut connection, mut peer, _) = server_with(&builder, true).await;
+    processed(&mut connection, &mut peer).await;
+    assert_eq!(connection.refused().in_a_row, 0);
+    request(&mut peer, 1, false).await;
+    for id in [3, 5, 7] {
+        request(&mut peer, id, false).await;
+    }
+    processed(&mut connection, &mut peer).await;
+    assert_eq!(connection.refused().in_a_row, 3);
+    // Its one stream gone, the next fits the limit and not the grant.
+    peer.send(&h2_peer::rst_stream(1, code::CANCEL)).await;
+    connection.set_grant(0);
+    request(&mut peer, 9, false).await;
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(resets_in(&frames), [(9, code::REFUSED_STREAM)]);
+    assert_eq!(connection.refused().in_a_row, 3);
+    connection.set_grant(1 << 30);
+    request(&mut peer, 11, false).await;
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(resets_in(&frames), []);
+    assert_eq!(connection.refused().in_a_row, 0);
+}
+
+/// Streams refused for the stream limit before the client acknowledged the settings that
+/// set it, which it may not have heard of yet, are counted apart, in the connection's life;
+/// once it has, refusals are counted in a row from none.
+#[tokio::test]
+async fn streams_refused_before_the_limit_is_acknowledged_are_counted_apart() {
+    let mut builder = server::Builder::new();
+    builder.max_concurrent_streams(1);
+    let (mut connection, mut peer, _) = server_with(&builder, false).await;
+    processed(&mut connection, &mut peer).await;
+    assert!(!connection.settings_acked());
+    for id in [1, 3, 5, 7] {
+        request(&mut peer, id, false).await;
+    }
+    let frames = processed(&mut connection, &mut peer).await;
+    assert_eq!(resets_in(&frames).len(), 3);
+    let before = server::Refused {
+        before_ack: 3,
+        in_a_row: 0,
+    };
+    assert_eq!(connection.refused(), before);
+    peer.send(&h2_peer::settings_ack()).await;
+    processed(&mut connection, &mut peer).await;
+    assert!(connection.settings_acked());
+    assert_eq!(connection.refused(), before);
+    for id in [9, 11] {
+        request(&mut peer, id, false).await;
+    }
+    processed(&mut connection, &mut peer).await;
+    let after = server::Refused {
+        before_ack: 3,
+        in_a_row: 2,
+    };
+    assert_eq!(connection.refused(), after);
+}
+
 // ===== How much a server decodes before its owner next looks =====
 //
 // EdgeRush's vendored h2 reads no frame past an allowance its owner sets (`set_work`), so

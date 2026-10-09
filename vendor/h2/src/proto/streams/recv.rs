@@ -66,6 +66,16 @@ pub(super) struct Recv {
     /// EdgeRush: what the decoded heads and trailers waiting in `buffer` hold, by
     /// allocation, until they are taken.
     held_events: usize,
+
+    /// EdgeRush: the streams refused for the stream limit since one was last opened, once
+    /// the peer has acknowledged the limit.
+    refused_in_a_row: usize,
+
+    /// EdgeRush: the streams refused for the stream limit before the peer acknowledged it.
+    refused_before_ack: usize,
+
+    /// EdgeRush: whether the peer has acknowledged the local settings.
+    acked: bool,
 }
 
 #[derive(Debug)]
@@ -141,7 +151,21 @@ impl Recv {
             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
             grant: std::sync::Arc::clone(&config.grant),
             held_events: 0,
+            refused_in_a_row: 0,
+            refused_before_ack: 0,
+            acked: false,
         }
+    }
+
+    /// EdgeRush: see `server::Connection::refused`: before the peer acknowledged the limit,
+    /// and in a row since.
+    pub fn refused_past_limit(&self) -> (usize, usize) {
+        (self.refused_before_ack, self.refused_in_a_row)
+    }
+
+    /// EdgeRush: see `server::Connection::settings_acked`.
+    pub fn settings_acked(&self) -> bool {
+        self.acked
     }
 
     /// EdgeRush: what the receiving side holds of what the peer sent, for the connection's
@@ -213,16 +237,26 @@ impl Recv {
 
         if !counts.can_inc_num_recv_streams() {
             self.refused = Some(id);
+            // EdgeRush: counted for the owner to judge a peer that goes on past its limit: a
+            // peer that has not acknowledged it may not have heard of it yet.
+            if self.acked {
+                self.refused_in_a_row += 1;
+            } else {
+                self.refused_before_ack += 1;
+            }
             return Ok(None);
         }
 
         // EdgeRush: a stream the connection's owner has not reserved for is refused before
-        // it is allocated; the peer may send it again (RFC 9113 §8.7).
+        // it is allocated; the peer may send it again (RFC 9113 §8.7). The shortage is the
+        // owner's, not the peer's doing: counted in neither count, and ending no run.
         if !cost.is_some_and(|cost| self.grant.take(cost)) {
             self.refused = Some(id);
             return Ok(None);
         }
 
+        // EdgeRush: a stream opened ends a run of refusals.
+        self.refused_in_a_row = 0;
         Ok(Some(id))
     }
 
@@ -662,6 +696,9 @@ impl Recv {
         settings: &frame::Settings,
         store: &mut Store,
     ) -> Result<(), proto::Error> {
+        // EdgeRush: applied as the peer acknowledges them, and only then.
+        self.acked = true;
+
         if let Some(val) = settings.is_extended_connect_protocol_enabled() {
             self.is_extended_connect_protocol_enabled = val;
         }

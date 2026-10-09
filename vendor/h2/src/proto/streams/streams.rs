@@ -1135,6 +1135,16 @@ where
         self.inner.lock().unwrap().actions.recv.in_flight_data() as usize
     }
 
+    // EdgeRush: see `server::Connection::refused`.
+    pub(crate) fn refused_past_limit(&self) -> (usize, usize) {
+        self.inner.lock().unwrap().actions.recv.refused_past_limit()
+    }
+
+    // EdgeRush: see `server::Connection::settings_acked`.
+    pub(crate) fn settings_acked(&self) -> bool {
+        self.inner.lock().unwrap().actions.recv.settings_acked()
+    }
+
     // EdgeRush: see `server::Connection::held`.
     pub(crate) fn held(&self) -> usize {
         let me = self.inner.lock().unwrap();

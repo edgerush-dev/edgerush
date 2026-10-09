@@ -228,6 +228,16 @@ where
         self.grant.take_wanted()
     }
 
+    // EdgeRush: see `server::Connection::refused`.
+    pub(crate) fn refused_past_limit(&self) -> (usize, usize) {
+        self.inner.streams.refused_past_limit()
+    }
+
+    // EdgeRush: see `server::Connection::settings_acked`.
+    pub(crate) fn settings_acked(&self) -> bool {
+        self.inner.streams.settings_acked()
+    }
+
     // EdgeRush: see `server::Connection::set_work`.
     pub(crate) fn set_work(&mut self, units: usize) {
         self.codec.set_work(units);

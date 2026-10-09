@@ -438,7 +438,13 @@ async fn a_stream_cut_at_the_drain_bound_is_logged_as_drained() {
             assert!(record["status"].is_null(), "{record}");
             // And the closure counted, once (C31).
             let scrape = logged.worker.proxy.metrics();
-            for (why, count) in [("drained", 1), ("exhausted", 0), ("too_many_resets", 0)] {
+            for (why, count) in [
+                ("drained", 1),
+                ("exhausted", 0),
+                ("too_many_resets", 0),
+                ("too_many_refused", 0),
+                ("settings_timeout", 0),
+            ] {
                 let line = format!(
                     "edgerush_listener_connections_closed_total{{listener=\"web\",reason=\"{why}\"}} {count}"
                 );

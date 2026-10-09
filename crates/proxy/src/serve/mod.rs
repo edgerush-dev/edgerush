@@ -623,6 +623,8 @@ async fn serve_h2<S>(
         closing: Bounds::default().next_head.min(deadlines.next_request),
         idle: deadlines.idle,
         drain_within: deadlines.drain,
+        // As long as its first request's head has.
+        ack_within: deadlines.first_request,
         ..h2::connection::Settings::default()
     };
     h2::connection::serve(

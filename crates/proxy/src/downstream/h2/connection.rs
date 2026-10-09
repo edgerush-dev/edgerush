@@ -72,6 +72,18 @@ pub(crate) struct Settings {
     pub(crate) idle: Duration,
     /// How many streams a connection must have had before its share reset early is judged.
     pub(crate) reset_judged_after: u64,
+    /// How many streams refused in a row for the connection's stream limit close it, once
+    /// the client has acknowledged the limit: a client that goes on past the limit it was
+    /// given. Refusals for want of the worker's storage are not counted: a shortage is the
+    /// worker's, and closes connections by its own rule (15 §3).
+    pub(crate) refused_in_a_row: usize,
+    /// How many streams refused for the stream limit before the client acknowledged it
+    /// close the connection, in its life: a client may open more than the limit before it
+    /// has heard of it, h2's own guessing no limit until then, but no more than this.
+    pub(crate) refused_before_ack: usize,
+    /// How long after the connection starts the client has to acknowledge its settings,
+    /// whatever it does meanwhile.
+    pub(crate) ack_within: Duration,
     /// How long a draining connection's streams have to finish before it is closed
     /// regardless (03 §10).
     pub(crate) drain_within: Duration,
@@ -90,6 +102,9 @@ impl Default for Settings {
             closing: Duration::from_secs(10),
             idle: Duration::from_secs(30),
             reset_judged_after: 500,
+            refused_in_a_row: 100,
+            refused_before_ack: 1000,
+            ack_within: Duration::from_secs(10),
             drain_within: Duration::from_secs(25),
         }
     }
@@ -183,7 +198,8 @@ impl Settings {
 /// what the client sent is charged in `received`. Once `drain` starts, the client is told to
 /// go and the connection closes when its streams have ended or the drain's time is up
 /// (03 §10). `cut` is told why, before the streams under way go, when the connection is
-/// closed with them: at the drain's time, for the worker's storage, or for its resets.
+/// closed with them: at the drain's time, for the worker's storage, for its resets, for
+/// streams opened past its limit, or for settings it did not acknowledge in time.
 /// `refused` is told of each stream answered at once for want of storage, with the status
 /// sent and whether it was a gRPC call.
 #[allow(clippy::too_many_arguments)]
@@ -254,7 +270,11 @@ async fn drive<S, R, F, B, D>(
     ));
     let mut idle_from_now = false;
     let mut drain_heard = std::pin::pin!(drain.notified());
-    let mut out_of_time = std::pin::pin!(tokio::time::sleep(settings.drain_within));
+    // One timer for the two bounds a connection may be held to: until its client has
+    // acknowledged its settings, the time it has to, set as it starts and renewed by nothing;
+    // once it drains, the drain's, which takes over from the first if it is still running.
+    let mut out_of_time = std::pin::pin!(tokio::time::sleep(settings.ack_within));
+    let mut acked = false;
     let mut draining = false;
     // The connection's streams, run by this task, so many a turn (15 §3, `queue`).
     let mut queue = Queue::new();
@@ -296,6 +316,12 @@ async fn drive<S, R, F, B, D>(
             }
             if streams.resetting(settings.reset_judged_after) {
                 return Poll::Ready(Next::Resetting);
+            }
+            if !acked && !draining {
+                acked = connection.settings_acked();
+                if !acked && out_of_time.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Next::Unacknowledged);
+                }
             }
             if !draining {
                 if drain.poll_on(drain_heard.as_mut(), cx).is_ready() {
@@ -367,6 +393,14 @@ async fn drive<S, R, F, B, D>(
             if account.is_shed() {
                 return Poll::Ready(Next::Shed);
             }
+            // A client that goes on opening streams past its limit: a hundred in a row once it
+            // has acknowledged it, a thousand in all before.
+            let refused = connection.refused();
+            if refused.in_a_row >= settings.refused_in_a_row
+                || refused.before_ack >= settings.refused_before_ack
+            {
+                return Poll::Ready(Next::Refusing);
+            }
             match accepted {
                 Poll::Ready(accepted) => {
                     turn.accepts -= 1;
@@ -384,6 +418,8 @@ async fn drive<S, R, F, B, D>(
             Next::OutOfTime => cut(Cut::Drained),
             Next::Shed => cut(Cut::Exhausted),
             Next::Resetting => cut(Cut::TooManyResets),
+            Next::Refusing => cut(Cut::TooManyRefused),
+            Next::Unacknowledged => cut(Cut::SettingsTimeout),
             Next::Accepted(_) | Next::Idle | Next::Draining => {}
         }
         let (request, send) = match accepted {
@@ -402,7 +438,10 @@ async fn drive<S, R, F, B, D>(
                 continue;
             }
             Next::OutOfTime => break Closing::Abrupt(::h2::Reason::NO_ERROR),
-            Next::Resetting => break Closing::Abrupt(::h2::Reason::ENHANCE_YOUR_CALM),
+            Next::Resetting | Next::Refusing => {
+                break Closing::Abrupt(::h2::Reason::ENHANCE_YOUR_CALM);
+            }
+            Next::Unacknowledged => break Closing::Abrupt(::h2::Reason::SETTINGS_TIMEOUT),
             Next::Shed => break Closing::Shed,
         };
         streams.seen.set(streams.seen.get() + 1);
@@ -562,6 +601,10 @@ enum Next<T> {
     Idle,
     /// Too many of its streams reset before their answer.
     Resetting,
+    /// Too many of its streams refused for its stream limit.
+    Refusing,
+    /// Its settings not acknowledged in time.
+    Unacknowledged,
     /// The worker has begun to drain.
     Draining,
     /// Draining, and its streams have not finished within the drain's time.
@@ -1932,7 +1975,12 @@ mod tests {
     fn frames_waiting_in_a_connections_socket_are_decoded_a_turn_at_a_time() {
         locally(async {
             const PINGS: usize = 5000;
-            let most = acked_between_turns(Settings::default(), PINGS, true, async |_| {}).await;
+            // Kept open past its refusals, which would otherwise close it at a hundred.
+            let settings = Settings {
+                refused_in_a_row: usize::MAX,
+                ..Settings::default()
+            };
+            let most = acked_between_turns(settings, PINGS, true, async |_| {}).await;
             assert!(
                 most < PINGS * 17 / 10,
                 "{most} bytes of acknowledgements between two turns of another task"
@@ -2171,6 +2219,173 @@ mod tests {
                 0,
                 "a connection was closed for another's stream limit"
             );
+        });
+    }
+
+    /// A connection allowed one stream, served with defaults otherwise, whose client has
+    /// opened it and acknowledged the settings if `ack`; what the driver says of why it closed
+    /// is kept.
+    async fn limited(
+        ack: bool,
+    ) -> (
+        crate::h2_peer::Peer<tokio::io::DuplexStream>,
+        Rc<RefCell<Vec<Cut>>>,
+    ) {
+        use crate::h2_peer::{self, Peer};
+        let storage = Storage::new(crate::storage::LIMIT);
+        let asked = Rc::new(Cell::new(0));
+        let settings = Settings {
+            streams: 1,
+            ..Settings::default()
+        };
+        let (near, far) = wire();
+        let told = Rc::new(RefCell::new(Vec::new()));
+        let (respond, telling) = (never(&asked), Rc::clone(&told));
+        let serving = Rc::clone(&storage);
+        tokio::task::spawn_local(async move {
+            if let Ok(mut connection) = settings.builder().handshake::<_, Outgoing>(near).await {
+                let received = Received::new(Rc::clone(&serving));
+                drive(
+                    &mut connection,
+                    settings,
+                    serving,
+                    &received,
+                    Rc::new(|| HttpDate::from_unix(0)),
+                    Rc::new(Drain::default()),
+                    Rc::new(respond),
+                    move |why| telling.borrow_mut().push(why),
+                    |_, _| {},
+                )
+                .await;
+            }
+        });
+        let mut peer = Peer::open_as_client(far, &[]).await;
+        if ack {
+            peer.send(&h2_peer::settings_ack()).await;
+        }
+        peer.send(&h2_peer::headers(1, h2_peer::request("GET", "/"), true))
+            .await;
+        while asked.get() == 0 {
+            tokio::task::yield_now().await;
+        }
+        (peer, told)
+    }
+
+    /// Sends `count` requests past a limit of one, from stream `first` on, and says how
+    /// many were refused and whether the connection was told to go.
+    async fn past_the_limit(
+        peer: &mut crate::h2_peer::Peer<tokio::io::DuplexStream>,
+        first: u32,
+        count: u32,
+    ) -> (usize, bool) {
+        use crate::h2_peer::{self, code, kind};
+        for n in 0..count {
+            let id = first + 2 * n;
+            peer.send(&h2_peer::headers(id, h2_peer::request("GET", "/"), true))
+                .await;
+        }
+        let frames = within(peer.barrier()).await;
+        let refused = frames
+            .iter()
+            .filter(|frame| frame.kind == kind::RST_STREAM)
+            .filter(|frame| frame.reset() == code::REFUSED_STREAM)
+            .count();
+        let told = frames.iter().any(|frame| frame.kind == kind::GOAWAY);
+        (refused, told)
+    }
+
+    /// The GOAWAY's code, once it comes.
+    async fn goaway(peer: &mut crate::h2_peer::Peer<tokio::io::DuplexStream>) -> u32 {
+        use crate::h2_peer::kind;
+        let (goaway, _) = within(peer.until(|frame| frame.kind == kind::GOAWAY)).await;
+        goaway.goaway().1
+    }
+
+    /// A client that goes on opening streams past the limit it was given is closed once a
+    /// hundred in a row have been refused after it acknowledged the limit, ENHANCE_YOUR_CALM,
+    /// and told why; ninety-nine leave it open (15 §3).
+    #[test]
+    fn a_client_refused_a_hundred_streams_in_a_row_for_its_limit_is_closed() {
+        use crate::h2_peer::{self, code};
+        locally(async {
+            let (mut peer, told) = limited(true).await;
+            assert_eq!(past_the_limit(&mut peer, 3, 99).await, (99, false));
+            assert!(told.borrow().is_empty());
+            peer.send(&h2_peer::headers(201, h2_peer::request("GET", "/"), true))
+                .await;
+            assert_eq!(goaway(&mut peer).await, code::ENHANCE_YOUR_CALM);
+            assert_eq!(*told.borrow(), [Cut::TooManyRefused]);
+        });
+    }
+
+    /// A client may open more streams than the limit before it has heard of it: a burst of
+    /// hundreds refused before it acknowledges the limit leaves it open, and counts nothing
+    /// towards the hundred in a row it may be refused after.
+    #[test]
+    fn a_burst_past_the_limit_before_it_is_acknowledged_leaves_the_client_open() {
+        use crate::h2_peer::{self, code};
+        locally(async {
+            let (mut peer, told) = limited(false).await;
+            assert_eq!(past_the_limit(&mut peer, 3, 299).await, (299, false));
+            peer.send(&h2_peer::settings_ack()).await;
+            assert_eq!(past_the_limit(&mut peer, 601, 99).await, (99, false));
+            assert!(told.borrow().is_empty());
+            peer.send(&h2_peer::headers(799, h2_peer::request("GET", "/"), true))
+                .await;
+            assert_eq!(goaway(&mut peer).await, code::ENHANCE_YOUR_CALM);
+            assert_eq!(*told.borrow(), [Cut::TooManyRefused]);
+        });
+    }
+
+    /// A client that never acknowledges the limit is refused no more than a thousand
+    /// streams past it before it is closed.
+    #[test]
+    fn a_client_that_never_acknowledges_is_closed_after_a_thousand_refused() {
+        use crate::h2_peer::{self, code};
+        locally(async {
+            let (mut peer, told) = limited(false).await;
+            assert_eq!(past_the_limit(&mut peer, 3, 999).await, (999, false));
+            assert!(told.borrow().is_empty());
+            peer.send(&h2_peer::headers(2001, h2_peer::request("GET", "/"), true))
+                .await;
+            assert_eq!(goaway(&mut peer).await, code::ENHANCE_YOUR_CALM);
+            assert_eq!(*told.borrow(), [Cut::TooManyRefused]);
+        });
+    }
+
+    /// A client that never acknowledges its settings is closed with SETTINGS_TIMEOUT when its
+    /// time is up, ten seconds from the start, however busy it keeps the connection
+    /// meanwhile; one that acknowledged them is not.
+    #[test]
+    fn a_client_that_never_acknowledges_is_closed_when_its_time_is_up() {
+        use crate::h2_peer::{self, code, kind};
+        locally_paused(async {
+            let started = Instant::now();
+            let (mut silent, told) = limited(false).await;
+            let (mut acking, acked_told) = limited(true).await;
+            let mut goaway = None;
+            // A PING a second, which renews nothing; thirty at most.
+            for n in 1..=30u8 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                silent.send_if_open(&h2_peer::ping([n; 8])).await;
+                let (frame, _) = silent
+                    .until(|frame| frame.kind == kind::GOAWAY || frame.kind == kind::PING)
+                    .await;
+                if frame.kind == kind::GOAWAY {
+                    goaway = Some(frame.goaway().1);
+                    break;
+                }
+            }
+            let after = started.elapsed();
+            assert_eq!(goaway, Some(code::SETTINGS_TIMEOUT), "after {after:?}");
+            assert!(
+                (Duration::from_secs(10)..Duration::from_secs(12)).contains(&after),
+                "closed after {after:?}"
+            );
+            assert_eq!(*told.borrow(), [Cut::SettingsTimeout]);
+            let frames = acking.barrier().await;
+            assert!(frames.iter().all(|frame| frame.kind != kind::GOAWAY));
+            assert!(acked_told.borrow().is_empty());
         });
     }
 

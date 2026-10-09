@@ -101,11 +101,21 @@ pub(crate) enum Cut {
     Exhausted,
     /// Its client had too many of its streams reset.
     TooManyResets,
+    /// Its client went on opening streams past its stream limit.
+    TooManyRefused,
+    /// Its client did not acknowledge its settings in time.
+    SettingsTimeout,
 }
 
 impl Cut {
     /// Every one, in the order a scrape shows them.
-    pub(crate) const ALL: [Self; 3] = [Self::Drained, Self::Exhausted, Self::TooManyResets];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Drained,
+        Self::Exhausted,
+        Self::TooManyResets,
+        Self::TooManyRefused,
+        Self::SettingsTimeout,
+    ];
 
     /// Its name in a record, and in a scrape.
     pub(crate) fn label(self) -> &'static str {
@@ -113,6 +123,8 @@ impl Cut {
             Self::Drained => "drained",
             Self::Exhausted => "exhausted",
             Self::TooManyResets => "too_many_resets",
+            Self::TooManyRefused => "too_many_refused",
+            Self::SettingsTimeout => "settings_timeout",
         }
     }
 }

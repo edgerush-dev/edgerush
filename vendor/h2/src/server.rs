@@ -599,6 +599,30 @@ where
         self.connection.wanted()
     }
 
+    /// The streams the peer opened that were refused with REFUSED_STREAM for the
+    /// connection's stream limit, for the owner to judge a peer that goes on past the limit
+    /// it was given: those refused before the peer acknowledged the settings that set it,
+    /// which it may not have heard of yet, and those refused in a row since, until one is
+    /// opened. A stream refused for want of [grant](Connection::set_grant) — the owner's
+    /// shortage, not the peer's doing — is in neither, and ends no run.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn refused(&self) -> Refused {
+        let (before_ack, in_a_row) = self.connection.refused_past_limit();
+        Refused {
+            before_ack,
+            in_a_row,
+        }
+    }
+
+    /// Whether the peer has acknowledged the connection's settings, its stream limit among
+    /// them.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn settings_acked(&self) -> bool {
+        self.connection.settings_acked()
+    }
+
     /// Sets how much the connection may decode from now on before it gives its turn back:
     /// a unit for each frame read, whatever becomes of it — a stream refused, a PING, a
     /// reset — and for a frame of a header block one more for each whole KiB it carries,
@@ -1888,4 +1912,16 @@ where
 /// Added by EdgeRush's vendored copy; not in h2 as published.
 pub fn head_held<B>(request: &Request<B>) -> usize {
     crate::proto::grant::held::request(request)
+}
+
+/// The streams a server connection refused for its stream limit (`Connection::refused`).
+///
+/// Added by EdgeRush's vendored copy; not in h2 as published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refused {
+    /// Refused before the peer acknowledged the settings that set the limit, in the
+    /// connection's life.
+    pub before_ack: usize,
+    /// Refused in a row since then, until one was opened.
+    pub in_a_row: usize,
 }

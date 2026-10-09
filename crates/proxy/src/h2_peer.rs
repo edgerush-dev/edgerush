@@ -69,6 +69,7 @@ pub(crate) mod code {
     pub(crate) const PROTOCOL_ERROR: u32 = 0x1;
     pub(crate) const INTERNAL_ERROR: u32 = 0x2;
     pub(crate) const FLOW_CONTROL_ERROR: u32 = 0x3;
+    pub(crate) const SETTINGS_TIMEOUT: u32 = 0x4;
     pub(crate) const STREAM_CLOSED: u32 = 0x5;
     pub(crate) const REFUSED_STREAM: u32 = 0x7;
     pub(crate) const CANCEL: u32 = 0x8;
