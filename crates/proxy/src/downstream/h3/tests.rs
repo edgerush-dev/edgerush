@@ -15,7 +15,7 @@ use crate::downstream::h3::Settings;
 use crate::downstream::h3::body::IncomingH3;
 use crate::downstream::h3::code;
 use crate::downstream::h3::conn::State;
-use crate::downstream::h3::listener::{self, Forwarding, InForce, Secrets, Shared};
+use crate::downstream::h3::listener::{self, Forwarding, InForce, Refusal, Secrets, Shared};
 use crate::downstream::h3::testing::{Client, PATIENCE, get};
 use crate::drain::Drain;
 use crate::forwarding::Cut;
@@ -61,6 +61,8 @@ struct Server {
     /// Why each connection the server closed with what was under way on it was closed, as
     /// the listener counts them.
     closed: Rc<RefCell<Vec<Cut>>>,
+    /// Why each request the driver answered itself was, as the listener records them.
+    refused: Rc<RefCell<Vec<Refusal>>>,
 }
 
 impl Server {
@@ -230,6 +232,8 @@ where
     let drain = Rc::new(Drain::default());
     let closed = Rc::new(RefCell::new(Vec::new()));
     let closing = Rc::clone(&closed);
+    let refused = Rc::new(RefCell::new(Vec::new()));
+    let refusing = Rc::clone(&refused);
     let shared = Rc::new(
         Shared::new(
             socket,
@@ -242,7 +246,7 @@ where
             handshakes,
             None,
             Box::new(|_| {}),
-            Box::new(|_| {}),
+            Box::new(move |_, refusal| refusing.borrow_mut().push(refusal)),
             Box::new(move |why| closing.borrow_mut().push(why)),
         )
         .unwrap(),
@@ -277,6 +281,7 @@ where
         shared,
         clients,
         closed,
+        refused,
     }
 }
 
@@ -735,17 +740,21 @@ async fn piece_in_hand(dropped: bool) {
     client.until(|_| step.get() == 1).await;
     // A turn of the driver, which charges what the connection holds.
     client.for_a_while(Duration::from_millis(50)).await;
-    let charged = storage.used();
+    let in_hand = storage.used();
     assert!(
-        charged >= IncomingH3::PIECE,
-        "{charged} charged for a piece in hand"
+        in_hand >= IncomingH3::PIECE,
+        "{in_hand} charged for a piece in hand"
     );
 
     gate.notify_one();
     client.until(|_| step.get() == 2).await;
     client.for_a_while(Duration::from_millis(50)).await;
+    // The request's task is charged until it ends; the piece no longer.
     let charged = storage.used();
-    assert!(charged < 4 << 10, "{charged} charged for a piece let go of");
+    assert!(
+        charged + IncomingH3::PIECE < in_hand + (4 << 10),
+        "{charged} charged for a piece let go of, {in_hand} while it was in hand"
+    );
     gate.notify_one();
     assert_eq!(body_of(&client.answer(id).await), "read");
 }
@@ -2869,5 +2878,226 @@ fn a_quiet_h3_websocket_is_closed_as_idle() {
         assert_eq!(carried, crate::tunnel::Carried::Idle);
         assert!(at - began >= TUNNEL_IDLE, "{:?}", at - began);
         assert!(at - began < TUNNEL_IDLE + SLACK, "{:?}", at - began);
+    });
+}
+
+/// A core that answers each request once `gate` lets it, an empty 200, and counts in
+/// `asked` the requests it was asked.
+fn held_at(
+    gate: &Rc<tokio::sync::Semaphore>,
+    asked: &Rc<Cell<usize>>,
+) -> impl Fn(Request<RequestBody>, Interim) -> Answering + 'static {
+    let (gate, asked) = (Rc::clone(gate), Rc::clone(asked));
+    move |_, _| {
+        asked.set(asked.get() + 1);
+        let gate = Rc::clone(&gate);
+        Box::pin(async move {
+            gate.acquire().await.unwrap().forget();
+            Answered::Map(Response::new(Full::new(Bytes::new())))
+        })
+    }
+}
+
+/// What `storage` holds once the client has heard nothing new for a while.
+async fn settled_in(client: &mut Client, storage: &Storage) -> usize {
+    let mut last = storage.used();
+    for _ in 0..50 {
+        client.for_a_while(Duration::from_millis(20)).await;
+        let now = storage.used();
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+    last
+}
+
+/// A request's task is charged to the worker's storage from before it is made until it
+/// ends: its answer's future, kilobytes, the task around it and its head (16 §6).
+#[test]
+fn a_requests_task_is_charged_while_it_lives_and_released_when_it_ends() {
+    use crate::downstream::h3::connection::MADE;
+    locally(async {
+        let storage = Storage::new(LIMIT);
+        let (gate, asked) = (Rc::new(tokio::sync::Semaphore::new(1)), Rc::default());
+        let server = serving_in(short(), Rc::clone(&storage), held_at(&gate, &asked)).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        // One answered first: what the connection holds between requests settles.
+        assert_eq!(client.get("a.test", "/").await.final_status(), Some("200"));
+        let between = settled_in(&mut client, &storage).await;
+        let made = MADE.get();
+        let id = client.request(&get("a.test", "/"), true);
+        client.until(|_| MADE.get() > made).await;
+        let during = settled_in(&mut client, &storage).await;
+        assert!(
+            during >= between + 4096,
+            "{during} held with a request under way, {between} between"
+        );
+        gate.add_permits(1);
+        assert_eq!(client.answer(id).await.final_status(), Some("200"));
+        let after = settled_in(&mut client, &storage).await;
+        assert!(
+            after + 4096 <= during,
+            "{after} held once answered, {during} while under way"
+        );
+        drop(server);
+    });
+}
+
+/// A request the client resets gives its task's charge back as the task goes.
+#[test]
+fn a_requests_charge_goes_back_when_the_client_resets_it() {
+    use crate::downstream::h3::connection::MADE;
+    locally(async {
+        let storage = Storage::new(LIMIT);
+        let (gate, asked) = (Rc::new(tokio::sync::Semaphore::new(1)), Rc::default());
+        let server = serving_in(short(), Rc::clone(&storage), held_at(&gate, &asked)).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        assert_eq!(client.get("a.test", "/").await.final_status(), Some("200"));
+        settled_in(&mut client, &storage).await;
+        let made = MADE.get();
+        let id = client.request(&get("a.test", "/"), true);
+        client.until(|_| MADE.get() > made).await;
+        let during = settled_in(&mut client, &storage).await;
+        client
+            .quic
+            .stream_shutdown(id, quiche::Shutdown::Read, code::REQUEST_CANCELLED)
+            .unwrap();
+        client.flush().await;
+        let after = settled_in(&mut client, &storage).await;
+        assert!(
+            after + 4096 <= during,
+            "{after} held once reset, {during} while under way"
+        );
+        drop(server);
+    });
+}
+
+/// A request the worker cannot pay a task for is answered at once, with no task and
+/// without asking the core: 503, from the provision for the worker's own answers, dated,
+/// and recorded as the core's own `503 exhausted` is (16 §6, 21 §3).
+#[test]
+fn a_request_the_worker_cannot_pay_for_is_answered_503_with_no_task() {
+    use crate::downstream::h3::connection::MADE;
+    locally(async {
+        let storage = Storage::new(LIMIT);
+        let (gate, asked) = (Rc::new(tokio::sync::Semaphore::new(1)), Rc::default());
+        let server = serving_in(short(), Rc::clone(&storage), held_at(&gate, &asked)).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        assert_eq!(client.get("a.test", "/").await.final_status(), Some("200"));
+        settled_in(&mut client, &storage).await;
+        // Room for what quiche holds, and none for a request's task, nor for its refusal
+        // but from the provision.
+        let _elsewhere = storage.reserve(storage.room() - 512).unwrap();
+        let made = MADE.get();
+        let answer = client.get("a.test", "/").await;
+        assert_eq!(answer.final_status(), Some("503"), "{answer:?}");
+        assert!(answer.heads[0].iter().any(|(name, _)| name == "date"));
+        assert_eq!(
+            MADE.get(),
+            made,
+            "a task was made for a request not paid for"
+        );
+        assert_eq!(asked.get(), 1);
+        assert_eq!(
+            *server.refused.borrow(),
+            [Refusal::Exhausted { call: false }]
+        );
+        assert_eq!(client.closed_by_server(), None);
+        assert!(storage.used() <= LIMIT);
+        // Nothing left of it in the connection: its slot went with the answer.
+        assert!(server.connection(|state| state.streams.is_empty()));
+    });
+}
+
+/// A request's head is charged with its task, by what it holds: one with a 16 KB field is
+/// charged that much more than one without (16 §6). What quiche holds of the head while it
+/// is decoded is charged apart, as quiche's.
+#[test]
+fn a_requests_head_is_charged_with_its_task() {
+    use crate::downstream::h3::connection::{CHARGED, MADE};
+    locally(async {
+        let storage = Storage::new(LIMIT);
+        let (gate, asked) = (Rc::new(tokio::sync::Semaphore::new(0)), Rc::default());
+        let server = serving_in(short(), Rc::clone(&storage), held_at(&gate, &asked)).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        let made = MADE.get();
+        let plain = client.request(&get("a.test", "/"), true);
+        client.until(|_| MADE.get() > made).await;
+        let small = CHARGED.get();
+        let big = "a".repeat(16_000);
+        let mut head = get("a.test", "/");
+        head.push(("x-big", &big));
+        let large = client.request(&head, true);
+        client.until(|_| MADE.get() > made + 1).await;
+        let charged = CHARGED.get();
+        assert!(
+            charged >= small + 16_000,
+            "{charged} charged with a 16 KB field, {small} without"
+        );
+        gate.add_permits(2);
+        assert_eq!(client.answer(plain).await.final_status(), Some("200"));
+        assert_eq!(client.answer(large).await.final_status(), Some("200"));
+        drop(server);
+    });
+}
+
+/// A gRPC call the worker cannot pay a task for is told so as a call: `RESOURCE_EXHAUSTED`
+/// in a trailers-only answer, as the core answers one it has no storage for (15 §6).
+#[test]
+fn a_grpc_call_the_worker_cannot_pay_for_is_told_resource_exhausted() {
+    locally(async {
+        let storage = Storage::new(LIMIT);
+        let (gate, asked) = (Rc::new(tokio::sync::Semaphore::new(1)), Rc::default());
+        let server = serving_in(short(), Rc::clone(&storage), held_at(&gate, &asked)).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        assert_eq!(client.get("a.test", "/").await.final_status(), Some("200"));
+        settled_in(&mut client, &storage).await;
+        let _elsewhere = storage.reserve(storage.room() - 512).unwrap();
+        let call = [
+            (":method", "POST"),
+            (":scheme", "https"),
+            (":authority", "a.test"),
+            (":path", "/pkg.Service/Method"),
+            ("content-type", "application/grpc"),
+            ("te", "trailers"),
+        ];
+        let id = client.request(&call, true);
+        let answer = client.answer(id).await;
+        assert_eq!(answer.final_status(), Some("200"), "{answer:?}");
+        assert!(
+            answer.heads[0]
+                .iter()
+                .any(|(name, value)| name == "grpc-status" && value == "8"),
+            "{answer:?}"
+        );
+        assert_eq!(asked.get(), 1);
+        assert_eq!(
+            *server.refused.borrow(),
+            [Refusal::Exhausted { call: true }]
+        );
+    });
+}
+
+/// A worker short of even its provision for its own answers refuses the request with
+/// `H3_REQUEST_REJECTED`, which says it was not processed: the client may send it again
+/// (RFC 9114 §8.1). Nothing is answered, so nothing is recorded.
+#[test]
+fn a_worker_without_its_provision_rejects_the_request_it_cannot_pay_for() {
+    use crate::downstream::h3::connection::MADE;
+    locally(async {
+        let storage = Storage::with_provision(LIMIT, 0);
+        let (gate, asked) = (Rc::new(tokio::sync::Semaphore::new(1)), Rc::default());
+        let server = serving_in(short(), Rc::clone(&storage), held_at(&gate, &asked)).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        assert_eq!(client.get("a.test", "/").await.final_status(), Some("200"));
+        settled_in(&mut client, &storage).await;
+        let _elsewhere = storage.reserve(storage.room() - 512).unwrap();
+        let made = MADE.get();
+        let answer = client.get("a.test", "/").await;
+        assert_eq!(answer.reset, Some(code::REQUEST_REJECTED), "{answer:?}");
+        assert_eq!(MADE.get(), made);
+        assert_eq!(asked.get(), 1);
+        assert!(server.refused.borrow().is_empty());
     });
 }

@@ -267,12 +267,25 @@ pub(crate) struct Shared {
     room: Option<Room>,
     /// Where what the listener does is counted.
     count: Box<dyn Fn(Quic)>,
-    /// Told of a request whose head was too large, which the driver answers 431 itself, with
-    /// the client it came from: for its access-log record (21 §4).
-    pub(crate) refused: Box<dyn Fn(Rc<Client>)>,
+    /// Told of a request the driver answered itself, with the client it came from and why:
+    /// for its access-log record and its count (21 §4, 08 §1).
+    pub(crate) refused: Box<dyn Fn(Rc<Client>, Refusal)>,
     /// Told when the gateway closes one of the listener's connections with what was under
     /// way on it, and why.
     pub(crate) closed: Box<dyn Fn(Cut)>,
+}
+
+/// Why the driver answered a request itself, with no task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// Its head was too large: 431.
+    TooLarge,
+    /// The worker had no storage for its task: 503 `exhausted`, or `RESOURCE_EXHAUSTED` to
+    /// a gRPC call if it was one.
+    Exhausted {
+        /// Whether it was a gRPC call.
+        call: bool,
+    },
 }
 
 /// Why a listener cannot be served.
@@ -305,7 +318,7 @@ impl Shared {
         handshakes: Rc<Cell<usize>>,
         room: Option<Room>,
         count: Box<dyn Fn(Quic)>,
-        refused: Box<dyn Fn(Rc<Client>)>,
+        refused: Box<dyn Fn(Rc<Client>, Refusal)>,
         closed: Box<dyn Fn(Cut)>,
     ) -> Result<Self, ListenerError> {
         Ok(Self {

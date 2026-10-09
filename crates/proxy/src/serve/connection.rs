@@ -403,17 +403,26 @@ impl Worker {
             listener,
         });
         let refusing = Rc::clone(&self);
-        let refused = Box::new(move |client: Rc<Client>| {
-            let status = http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE;
+        let refused = Box::new(move |client: Rc<Client>, refusal| {
             let protocol = Some(edgerush_telemetry::access_log::Protocol::Http3);
-            super::refused(
-                &refusing,
-                listener,
-                &client,
-                protocol,
-                status,
-                "head_too_long",
-            );
+            let (status, why) = match refusal {
+                h3_listener::Refusal::TooLarge => (
+                    http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                    "head_too_long",
+                ),
+                // A request the worker could not pay for a task for: counted and recorded
+                // as the core's own `503 exhausted` is (08 §1, 21 §3).
+                h3_listener::Refusal::Exhausted { call } => {
+                    if call && let Some(counters) = refusing.proxy.metrics.listener(listener) {
+                        counters.called(crate::metrics::Answer::Exhausted.grpc().0 as usize);
+                    }
+                    (
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        crate::metrics::Answer::Exhausted.label(),
+                    )
+                }
+            };
+            super::refused(&refusing, listener, &client, protocol, status, why);
         });
         let closing = Arc::clone(&self.proxy);
         let closed = Box::new(move |why| {

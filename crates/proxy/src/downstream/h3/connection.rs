@@ -24,15 +24,19 @@ use crate::downstream::h3::body::IncomingH3;
 use crate::downstream::h3::code;
 use crate::downstream::h3::conn::{Conn, Slot, State, Stream};
 use crate::downstream::h3::head::{self, Refused, RequestHead};
-use crate::downstream::h3::listener::Shared;
+use crate::downstream::h3::listener::{Refusal, Shared};
 use crate::downstream::h3::send::{Unsent, flush};
 use crate::downstream::h3::stream::H3Stream;
 use crate::downstream::h3::writer::{Responder, SendError};
 use crate::forwarding::{Client, Cut};
+use crate::grpc::call::Call;
 use crate::interim::Interim;
+use crate::metrics::Answer;
 use crate::request_body::RequestBody;
+use crate::storage::{Charge, Storage};
 use crate::timers::Alarm;
 use crate::tunnel::Carried;
+use crate::way_back::call_answer;
 use bytes::Bytes;
 use http::header::{DATE, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Version};
@@ -41,7 +45,7 @@ use quiche::h3::Event;
 use std::error::Error as StdError;
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
-use std::pin::{Pin, pin};
+use std::pin::pin;
 use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
@@ -84,7 +88,7 @@ struct Driving {
     to_close: bool,
     /// Heads too large that were answered 431 since the last turn, to be told to the
     /// listener with the client they came from.
-    refused: u32,
+    refused: Vec<Refusal>,
     /// The connection is closing: only quiche's own deadline is left to keep.
     closing: bool,
     unsent: Unsent,
@@ -150,7 +154,7 @@ pub(crate) async fn drive<R, F, B, D, G>(
         drain_by: None,
         proved: from,
         to_close: false,
-        refused: 0,
+        refused: Vec::new(),
         closing: false,
         unsent: Unsent::new(),
         #[cfg(any(test, feature = "interop"))]
@@ -163,6 +167,22 @@ pub(crate) async fn drive<R, F, B, D, G>(
     // `poll_send_ready` keeps only the last task's waker.
     let mut room = pin!(shared.socket.writable());
     let mut found = Vec::new();
+    // A request is charged its task before it is made: its future's size is its type's,
+    // known without making one, and a request the worker cannot pay for is answered at
+    // once, with no task (16 §6).
+    let make = |(stream, head, ended, client, charge): (_, _, _, _, Charge)| {
+        answer(
+            stream,
+            head,
+            ended,
+            client,
+            Rc::clone(&respond),
+            Rc::clone(&date),
+            settings.stream_idle,
+            charge,
+        )
+    };
+    let future = size_of_made(&make);
     poll_fn(|cx| {
         conn.drive_with(cx.waker());
         loop {
@@ -181,18 +201,18 @@ pub(crate) async fn drive<R, F, B, D, G>(
                     Some(conn.with(|state| client_now(proved, &mut state.client)))
                 };
                 // A head answered 431 here has a record all the same (21 §4).
-                for _ in 0..std::mem::take(&mut driving.refused) {
-                    (shared.refused)(conn.with(|state| client_now(proved, &mut state.client)));
+                for refusal in driving.refused.drain(..) {
+                    let client = conn.with(|state| client_now(proved, &mut state.client));
+                    (shared.refused)(client, refusal);
                 }
                 for request in found.drain(..) {
                     // Made above whenever there is a request.
                     let Some(client) = &client else { break };
                     driving.asked = true;
-                    let stream = Stream::adopt(&conn, request.id);
                     #[cfg(any(test, feature = "interop"))]
                     if request.hq {
                         let _detached = tokio::task::spawn_local(super::hq::answer(
-                            stream,
+                            Stream::adopt(&conn, request.id),
                             request.head,
                             Rc::clone(client),
                             Rc::clone(&respond),
@@ -201,15 +221,34 @@ pub(crate) async fn drive<R, F, B, D, G>(
                         continue;
                     }
                     conn.asked();
-                    let _detached = tokio::task::spawn_local(request_task(
-                        stream,
-                        request.head,
+                    let (head, held) = head_held(request.head);
+                    let Ok(charge) = shared.storage.reserve(future + TASK + held) else {
+                        let call = Call::of(
+                            Version::HTTP_3,
+                            &head.parts.method,
+                            &head.parts.headers,
+                            Instant::now,
+                        )
+                        .is_some();
+                        if exhausted(&conn, &shared.storage, request.id, call, &*date) {
+                            (shared.refused)(Rc::clone(client), Refusal::Exhausted { call });
+                        }
+                        continue;
+                    };
+                    #[cfg(test)]
+                    {
+                        MADE.set(MADE.get() + 1);
+                        CHARGED.set(charge.bytes());
+                    }
+                    // Adopted only now: a stream given up resets its request as it goes.
+                    let task = Box::pin(make((
+                        Stream::adopt(&conn, request.id),
+                        head,
                         request.ended,
                         Rc::clone(client),
-                        Rc::clone(&respond),
-                        Rc::clone(&date),
-                        settings.stream_idle,
-                    ));
+                        charge,
+                    )));
+                    let _detached = tokio::task::spawn_local(task);
                 }
                 flush(&conn, &shared, settings.datagram, &mut driving.unsent);
                 if driving.to_close && !driving.closing && driving.unsent.is_empty() {
@@ -572,7 +611,7 @@ fn events(
     head_limit: usize,
     seen: &mut Seen,
     found: &mut Vec<Found>,
-    refused: &mut u32,
+    refused: &mut Vec<Refusal>,
     provoked: &mut u32,
 ) {
     loop {
@@ -620,7 +659,7 @@ fn events(
                     Err(Refused::TooLarge) => {
                         if too_large(quic, h3, id) {
                             delivering.push(id);
-                            *refused += 1;
+                            refused.push(Refusal::TooLarge);
                         }
                         *provoked += 1;
                     }
@@ -725,30 +764,98 @@ fn client_now(peer: SocketAddr, made: &mut Option<Rc<Client>>) -> Rc<Client> {
     }
 }
 
-/// A request's task: its answer, boxed. The answer's future is as large as its largest
-/// state, the exchange's included, several kilobytes; a task holds its future inline and
-/// moves all of it as the task is made and as it finishes. Boxed once here, what the task
-/// holds and moves is a pointer.
-fn request_task<R, F, B, D>(
-    stream: Stream,
-    head: RequestHead,
-    ended: bool,
-    client: Rc<Client>,
-    respond: Rc<R>,
-    date: Rc<D>,
-    idle: Duration,
-) -> Pin<Box<impl Future<Output = ()>>>
-where
-    R: Fn(Request<RequestBody>, Interim, Rc<Client>) -> F,
-    F: Future<Output = Answered<B>>,
-    B: Body<Data = Bytes>,
-    B::Error: Into<Box<dyn StdError + Send + Sync>>,
-    D: Fn() -> HttpDate,
-{
-    Box::pin(answer(stream, head, ended, client, respond, date, idle))
+/// What a request's task costs the worker besides its future and its head: the task Tokio
+/// makes for it and the box its future is made in, its slot among the connection's streams,
+/// and what its answer allocates beside — its interim heads' shared state and, where the
+/// listener logs, its record's line — rounded up, with the allocator's own room.
+const TASK: usize = 256 + std::mem::size_of::<(u64, Slot)>() + 1024;
+
+/// A refusal, charged to the worker's provision for its own answers while it is made: its
+/// head, encoded into quiche's stream, a few hundred bytes.
+const REFUSAL: usize = 1024;
+
+/// What a future `make` would return takes, without one being made.
+fn size_of_made<A, F>(_make: &impl FnOnce(A) -> F) -> usize {
+    std::mem::size_of::<F>()
 }
 
-/// Answers one request.
+#[cfg(test)]
+thread_local! {
+    /// The requests this thread has made a task for.
+    pub(super) static MADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// What the last of them was charged as its task was made.
+    pub(super) static CHARGED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `head`, and what it holds by allocation: measured as an HTTP/2 request's head is
+/// (`h2::server::head_held`), a map's capacity and each field's allocation, so that a
+/// request is charged alike whichever protocol brought it.
+fn head_held(head: RequestHead) -> (RequestHead, usize) {
+    let request = Request::from_parts(head.parts, ());
+    let held = ::h2::server::head_held(&request);
+    let (parts, ()) = request.into_parts();
+    (
+        RequestHead {
+            parts,
+            length: head.length,
+        },
+        held,
+    )
+}
+
+/// Answers request `id`, which the worker cannot pay a task for, at once: `503 exhausted`,
+/// or `RESOURCE_EXHAUSTED` to a gRPC call, as the core answers one it has no storage for
+/// (14 §8), made from the provision for the worker's own answers, and reads no more of it:
+/// true if the answer went. With the provision gone too, or no room in the stream, it is
+/// reset with `H3_REQUEST_REJECTED`, which says it was not processed, so that the client may
+/// send it again (RFC 9114 §8.1).
+fn exhausted(
+    conn: &Conn,
+    storage: &Rc<Storage>,
+    id: u64,
+    call: bool,
+    date: &impl Fn() -> HttpDate,
+) -> bool {
+    conn.with(|state| {
+        state.streams.remove(&id);
+        let quic = &mut state.quic;
+        let Ok(_making) = storage.reserve_answer(REFUSAL) else {
+            shut(quic, id, code::REQUEST_REJECTED);
+            return false;
+        };
+        let mut head = Response::new(());
+        *head.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        if call {
+            call_answer(&mut head, Answer::Exhausted);
+        }
+        if let Ok(now) = HeaderValue::from_bytes(date().as_bytes()) {
+            head.headers_mut().insert(DATE, now);
+        }
+        let status = head.status();
+        let fields = head::answer(&status, head.headers());
+        let Some(h3) = state.h3.as_mut() else {
+            shut(quic, id, code::REQUEST_REJECTED);
+            return false;
+        };
+        if h3.send_response(quic, id, &fields, true).is_err() {
+            shut(quic, id, code::REQUEST_REJECTED);
+            return false;
+        }
+        let _stopped = quic.stream_shutdown(id, quiche::Shutdown::Read, code::NO_ERROR);
+        state.delivering.push(id);
+        true
+    })
+}
+
+/// Answers one request, holding `charge`, what its task costs the worker, until it ends or
+/// is dropped. Unboxed: it is measured before it is made, then boxed as it is spawned, so
+/// that what Tokio holds and moves is a pointer — the answer's future is several kilobytes,
+/// and a task holds its future inline and moves all of it as the task is made and as it
+/// finishes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "what one request is answered with, handed over once as its task is made"
+)]
 async fn answer<R, F, B, D>(
     stream: Stream,
     head: RequestHead,
@@ -757,6 +864,7 @@ async fn answer<R, F, B, D>(
     respond: Rc<R>,
     date: Rc<D>,
     idle: Duration,
+    charge: Charge,
 ) where
     R: Fn(Request<RequestBody>, Interim, Rc<Client>) -> F,
     F: Future<Output = Answered<B>>,
@@ -764,6 +872,7 @@ async fn answer<R, F, B, D>(
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     D: Fn() -> HttpDate,
 {
+    let _paid = charge;
     // Read before any filter touches the head, as for HTTP/1 and HTTP/2 (14 §5).
     let interim = Interim::listened(
         expects_continue(&head.parts.headers),
@@ -918,7 +1027,7 @@ mod tests {
             64 << 10,
             &mut seen,
             &mut found,
-            &mut 0,
+            &mut Vec::new(),
             &mut 0,
         );
         let mut taken: Vec<u64> = found.iter().map(|found| found.id).collect();
@@ -928,31 +1037,50 @@ mod tests {
     }
 
     /// What a future `make` returns takes, without one being made.
-    fn size_of_made<A, F>(_make: impl FnOnce(A) -> F) -> usize {
-        std::mem::size_of::<F>()
-    }
-
-    /// A request's task holds a pointer to its answer's future, not the future itself, which
-    /// the task would copy whole as it is made and as it finishes (16 §4).
+    /// A request's answer is measured from its type before it is made, and its task holds
+    /// it boxed: what the task holds and moves is a pointer, not the future, kilobytes,
+    /// copied whole as it is made and as it finishes (16 §4).
     #[test]
-    fn a_request_task_holds_its_answer_boxed() {
+    fn a_requests_future_is_measured_unmade_and_held_boxed() {
         type Respond = fn(
             Request<RequestBody>,
             Interim,
             Rc<Client>,
         ) -> std::future::Ready<Answered<http_body_util::Full<Bytes>>>;
         type Date = fn() -> HttpDate;
-        type Asked = (Stream, RequestHead, Rc<Client>, Rc<Respond>, Rc<Date>);
-        let task = size_of_made(|(stream, head, client, respond, date): Asked| {
-            request_task(stream, head, true, client, respond, date, Duration::ZERO)
-        });
-        let answer = size_of_made(|(stream, head, client, respond, date): Asked| {
-            answer(stream, head, true, client, respond, date, Duration::ZERO)
-        });
-        assert_eq!(
-            task,
-            std::mem::size_of::<usize>(),
-            "a request's task holds {task} bytes; its answer's future is {answer}"
+        type Asked = (
+            Stream,
+            RequestHead,
+            Rc<Client>,
+            Rc<Respond>,
+            Rc<Date>,
+            Charge,
         );
+        let future = size_of_made(&|(stream, head, client, respond, date, charge): Asked| {
+            answer(
+                stream,
+                head,
+                true,
+                client,
+                respond,
+                date,
+                Duration::ZERO,
+                charge,
+            )
+        });
+        let boxed = size_of_made(&|(stream, head, client, respond, date, charge): Asked| {
+            Box::pin(answer(
+                stream,
+                head,
+                true,
+                client,
+                respond,
+                date,
+                Duration::ZERO,
+                charge,
+            ))
+        });
+        assert_eq!(boxed, std::mem::size_of::<usize>());
+        assert!(future > TASK, "a request's future of {future} bytes");
     }
 }
