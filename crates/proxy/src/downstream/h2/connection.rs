@@ -224,7 +224,8 @@ pub(crate) async fn serve<S, R, F, B, D>(
     let Ok(mut connection) = settings.builder().handshake::<_, Outgoing>(socket).await else {
         return;
     };
-    drive(
+    // What wakes it as it runs has it run again only once the worker has looked for I/O.
+    super::gate::gated(drive(
         &mut connection,
         settings,
         storage,
@@ -234,7 +235,7 @@ pub(crate) async fn serve<S, R, F, B, D>(
         respond,
         cut,
         refused,
-    )
+    ))
     .await;
 }
 
@@ -250,6 +251,42 @@ async fn drive<S, R, F, B, D>(
     respond: Rc<R>,
     cut: impl Fn(Cut),
     refused: impl Fn(StatusCode, bool),
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+    R: Fn(Request<RequestBody>, Interim) -> F + 'static,
+    F: Future<Output = Answered<B>> + 'static,
+    B: Body<Data = Bytes> + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    D: Fn() -> HttpDate + 'static,
+{
+    drive_with_clock(
+        connection,
+        settings,
+        storage,
+        received,
+        date,
+        drain,
+        respond,
+        cut,
+        refused,
+        std::time::Instant::now,
+    )
+    .await;
+}
+
+/// The serving loop with an injected monotonic clock; protocol timers remain on Tokio.
+#[allow(clippy::too_many_arguments)]
+async fn drive_with_clock<S, R, F, B, D>(
+    connection: &mut ::h2::server::Connection<S, Outgoing>,
+    settings: Settings,
+    storage: Rc<Storage>,
+    received: &Rc<Received>,
+    date: Rc<D>,
+    drain: Rc<Drain>,
+    respond: Rc<R>,
+    cut: impl Fn(Cut),
+    refused: impl Fn(StatusCode, bool),
+    now: fn() -> std::time::Instant,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
     R: Fn(Request<RequestBody>, Interim) -> F + 'static,
@@ -279,6 +316,13 @@ async fn drive<S, R, F, B, D>(
     // The connection's streams, run by this task, so many a turn (15 §3, `queue`).
     let mut queue = Queue::new();
     let mut turn = Turn::WHOLE;
+    let mut phase = Phase::Receive;
+    let mut quiet_phases = 0;
+    // When its output was last written: a turn ending with work left writes only once
+    // `HOLD` has passed since, or when the worker is short of room.
+    let mut written = now();
+    // Heads taken in the admission phase under way: it keeps its place for a batch of them.
+    let mut admitted = 0;
     // A stream is charged its head as it is handed over and its task as that is made, on
     // its first turn: its future's size is its type's, known without making one, and a
     // stream the worker cannot pay for is answered then, with no task (15 §3).
@@ -304,12 +348,20 @@ async fn drive<S, R, F, B, D>(
         MADE.set(MADE.get() + 1);
         Some(make((request, Responder::new(send), open, charge)))
     };
-    // Accepting is what drives the connection: it is polled for as long as the connection
-    // lives, its streams run beside it.
+    // Ready returns advance internal phases or hand over requests without returning to
+    // the executor. Only Pending clears the budget; all phases share that absolute end.
     let closing = loop {
         // A stream's head, handed over by h2 with its charge.
         let mut handed = None;
         let accepted = poll_fn(|cx| {
+            let budget = *turn.budget.get_or_insert_with(|| {
+                quiet_phases = 0;
+                let budget = ::h2::TurnBudget::with_clock(now() + share(received), now);
+                connection.set_turn(Some(budget));
+                // Its phases' output is written once, as the turn ends (`ends`).
+                connection.set_corked(true);
+                budget
+            });
             // Closed to make room by another connection's shortage: h2 reads nothing more.
             if account.is_shed() {
                 return Poll::Ready(Next::Shed);
@@ -353,22 +405,79 @@ async fn drive<S, R, F, B, D>(
                 idle_from_now = true;
             }
             *streams.driver.borrow_mut() = Some(cx.waker().clone());
-            turn.entries -= queue.run(cx.waker(), turn.entries, &mut made);
-            // Its allowance spent, with streams perhaps still in line, the turn is given back.
-            if turn.spent() {
-                return give_back(cx, &mut turn);
+            if turn.spent() || budget.expired() {
+                account.busy(true);
+                let write = due(&storage, &mut written, now);
+                return give_back(cx, connection, &mut turn, write);
+            }
+            // Advance before doing work: an exhausted phase cannot take first place again.
+            let current = phase;
+            phase = phase.next();
+            quiet_phases += 1;
+            match current {
+                Phase::Application => {
+                    let entries =
+                        queue.run_while(cx.waker(), turn.entries.min(BATCH), &mut made, || {
+                            !budget.expired()
+                        });
+                    turn.entries -= entries;
+                    if entries != 0 {
+                        quiet_phases = 0;
+                    }
+                }
+                Phase::Send => {
+                    if let Poll::Ready(Err(_)) = connection.poll_send(cx) {
+                        return Poll::Ready(Next::Accepted(None));
+                    }
+                }
+                Phase::Receive | Phase::Admission => {}
+            }
+            if matches!(current, Phase::Application | Phase::Send) {
+                if budget.expired() || connection.turn_exhausted() {
+                    account.busy(true);
+                    let write = due(&storage, &mut written, now);
+                    return give_back(cx, connection, &mut turn, write);
+                }
+                if quiet_phases >= 4 {
+                    turn = Turn::WHOLE;
+                    ends(cx, connection);
+                    written = now();
+                    account.busy(false);
+                    return Poll::Pending;
+                }
+                return Poll::Ready(Next::Again);
             }
             // What h2 may allocate for what the client sends is reserved before it reads, so
             // that h2 refuses what the worker cannot pay for rather than hold it (15 §3).
-            let grant = storage.reserve(storage.room().min(GRANT)).ok();
+            let grant = if matches!(current, Phase::Receive) {
+                storage.reserve(storage.room().min(GRANT)).ok()
+            } else {
+                None
+            };
             let granted = grant.as_ref().map_or(0, Charge::bytes);
             connection.set_grant(granted);
-            // h2 decodes whatever the client has sent, however much waits: what is left of
-            // the turn's decoding goes with it, refused streams and all, and once that is
-            // spent h2 reads nothing more and wakes the task for its next turn.
-            connection.set_work(turn.work);
-            let accepted = connection.poll_accept(cx);
-            turn.work = connection.work_left();
+            // A receive batch has both a deadline and decode units. Admission is separate:
+            // continuously ready input must not prevent already decoded heads being taken.
+            let accepted = if matches!(current, Phase::Receive) {
+                let work = turn.work.min(BATCH);
+                connection.set_work(work);
+                let closed = connection.poll_closed(cx);
+                let used = work - connection.work_left();
+                turn.work -= used;
+                if used != 0 {
+                    quiet_phases = 0;
+                }
+                if closed.is_ready() {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Pending
+                }
+            } else {
+                match connection.poll_accept_pending(cx) {
+                    Poll::Ready(Some(stream)) => Poll::Ready(Some(Ok::<_, ::h2::Error>(stream))),
+                    Poll::Ready(None) | Poll::Pending => Poll::Pending,
+                }
+            };
             connection.set_grant(0);
             let wanted = connection.wanted();
             account.drive_with(cx.waker());
@@ -387,7 +496,11 @@ async fn drive<S, R, F, B, D>(
             // Something refused for want of room the worker did not have — not for want of
             // what a full grant gives a poll, which the next poll gets afresh — makes the
             // worker short by what it wanted.
-            if wanted > granted && granted < GRANT && wanted <= GRANT {
+            if matches!(current, Phase::Receive)
+                && wanted > granted
+                && granted < GRANT
+                && wanted <= GRANT
+            {
                 account.reclaim(wanted);
             }
             if account.is_shed() {
@@ -404,11 +517,32 @@ async fn drive<S, R, F, B, D>(
             match accepted {
                 Poll::Ready(accepted) => {
                     turn.accepts -= 1;
+                    quiet_phases = 0;
+                    if matches!(current, Phase::Admission) {
+                        admitted += 1;
+                        if admitted < ADMITS {
+                            phase = Phase::Admission;
+                        } else {
+                            admitted = 0;
+                        }
+                    }
                     Poll::Ready(Next::Accepted(accepted))
                 }
                 Poll::Pending => {
-                    turn = Turn::WHOLE;
-                    Poll::Pending
+                    admitted = 0;
+                    if budget.expired() || connection.turn_exhausted() || turn.work == 0 {
+                        account.busy(true);
+                        let write = due(&storage, &mut written, now);
+                        give_back(cx, connection, &mut turn, write)
+                    } else if quiet_phases >= 4 {
+                        turn = Turn::WHOLE;
+                        ends(cx, connection);
+                        written = now();
+                        account.busy(false);
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Next::Again)
+                    }
                 }
             }
         })
@@ -420,9 +554,10 @@ async fn drive<S, R, F, B, D>(
             Next::Resetting => cut(Cut::TooManyResets),
             Next::Refusing => cut(Cut::TooManyRefused),
             Next::Unacknowledged => cut(Cut::SettingsTimeout),
-            Next::Accepted(_) | Next::Idle | Next::Draining => {}
+            Next::Accepted(_) | Next::Idle | Next::Draining | Next::Again => {}
         }
         let (request, send) = match accepted {
+            Next::Again => continue,
             Next::Accepted(Some(Ok(stream))) => stream,
             // Closed, or failed: either way there is nothing left to serve.
             Next::Accepted(_) => break Closing::Closed,
@@ -462,6 +597,7 @@ async fn drive<S, R, F, B, D>(
     // Its streams still under way go with it, as a reset stream's do: their exchanges are
     // given up at once, and their records say why the connection went (21 §3).
     drop(queue);
+    connection.set_corked(false);
     match closing {
         Closing::Closed => {}
         // Idle for its keep-alive time: told to go, gracefully — a request already on its
@@ -469,45 +605,150 @@ async fn drive<S, R, F, B, D>(
         // regardless.
         Closing::Idle => {
             connection.graceful_shutdown();
-            let _closing = tokio::time::timeout(settings.closing, closed(connection)).await;
+            let _closing = tokio::time::timeout(
+                settings.closing,
+                closed(connection, turn.budget, now, share(received)),
+            )
+            .await;
         }
         Closing::Abrupt(reason) => {
             connection.abrupt_shutdown(reason);
-            let _closing = tokio::time::timeout(settings.closing, closed(connection)).await;
+            let _closing = tokio::time::timeout(
+                settings.closing,
+                closed(connection, turn.budget, now, share(received)),
+            )
+            .await;
         }
-        // Closed to make room: told why if its socket takes the GOAWAY now, and gone either
-        // way, its memory with it, without waiting on a client slow to read.
+        // Closed to make room: try output without waiting for socket readiness. Deadline
+        // exhaustion resumes next turn; actual I/O Pending ends the attempt immediately.
         Closing::Shed => {
             connection.abrupt_shutdown(::h2::Reason::ENHANCE_YOUR_CALM);
-            poll_fn(|cx| {
-                connection.set_work(WORK);
-                let _closing = connection.poll_closed(cx);
-                Poll::Ready(())
-            })
-            .await;
+            shed(connection, turn.budget, now, share(received)).await;
         }
     }
 }
 
-/// Gives the worker's turn back with work left: woken again at once, the connection's task
-/// goes to the end of the worker's line, behind every other that is ready, and starts its
-/// next turn with its allowances whole.
-fn give_back<T>(cx: &mut std::task::Context<'_>, turn: &mut Turn) -> Poll<T> {
+/// Completes immediately on socket Pending, but resumes a deadline-only suspension.
+async fn shed<S>(
+    connection: &mut ::h2::server::Connection<S, Outgoing>,
+    mut budget: Option<::h2::TurnBudget>,
+    now: fn() -> std::time::Instant,
+    quantum: Duration,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    poll_fn(|cx| {
+        let active = budget
+            .take()
+            .unwrap_or_else(|| ::h2::TurnBudget::with_clock(now() + quantum, now));
+        // Never replace an exhausted serving deadline inside the same poll.
+        if active.expired() {
+            // Work left: polled again after the worker's next look for I/O, behind the gate.
+            super::gate::defer();
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        connection.set_turn(Some(active));
+        let _closing = connection.poll_send(cx);
+        if connection.turn_exhausted() {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await;
+}
+
+/// Yields with work left and requests another poll. Executor ordering is not promised.
+fn give_back<S, T>(
+    cx: &mut std::task::Context<'_>,
+    connection: &mut ::h2::server::Connection<S, Outgoing>,
+    turn: &mut Turn,
+    write: bool,
+) -> Poll<T>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     *turn = Turn::WHOLE;
+    if write {
+        ends(cx, connection);
+    }
+    // Work left: polled again after the worker's next look for I/O, behind the gate.
+    super::gate::defer();
     cx.waker().wake_by_ref();
     Poll::Pending
+}
+
+/// Whether a turn cut with work left writes what it encoded: once `HOLD` has passed since the
+/// connection last wrote, or at once while the worker has less room than a receive grant, for
+/// what waits to be written is memory held. Otherwise it stays corked for the connection's
+/// next turn: a busy connection's turns are short, and a write each would cost more than the
+/// rest of the turn (step 4: HTTP/2 saturation through a backend −29% with one, −20% with
+/// `HOLD`). A turn that ends with nothing left writes at once, and h2 still writes whenever
+/// its buffer fills.
+fn due(
+    storage: &Storage,
+    written: &mut std::time::Instant,
+    now: fn() -> std::time::Instant,
+) -> bool {
+    let at = now();
+    let due = storage.room() < GRANT || at.duration_since(*written) >= HOLD;
+    if due {
+        *written = at;
+    }
+    due
+}
+
+/// How long a busy connection's output may wait, corked, across its turns.
+const HOLD: Duration = Duration::from_micros(1000);
+
+/// A serving turn's end: what its phases encoded is written now, at most a buffer's worth;
+/// a socket that takes no more has h2 write the rest once it is writable.
+fn ends<S>(cx: &mut std::task::Context<'_>, connection: &mut ::h2::server::Connection<S, Outgoing>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // An error is the connection's, and its next poll meets it.
+    let _written = connection.poll_flush_encoded(cx);
 }
 
 /// Polls a connection told to go until it has closed, a turn's decoding at a time: what its
 /// client still sends is read, as it may finish streams, but no more of it in one turn than
 /// in any other.
-async fn closed<S>(connection: &mut ::h2::server::Connection<S, Outgoing>)
-where
+async fn closed<S>(
+    connection: &mut ::h2::server::Connection<S, Outgoing>,
+    mut budget: Option<::h2::TurnBudget>,
+    now: fn() -> std::time::Instant,
+    quantum: Duration,
+) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut sending = true;
     let _closed = poll_fn(|cx| {
+        let active = budget
+            .take()
+            .unwrap_or_else(|| ::h2::TurnBudget::with_clock(now() + quantum, now));
+        connection.set_turn(Some(active));
         connection.set_work(WORK);
-        connection.poll_closed(cx)
+        // Flush independently of receiving, including when input keeps exhausting turns.
+        for _ in 0..2 {
+            if active.expired() {
+                // Work left: polled again after the worker's next look for I/O, behind the gate.
+                super::gate::defer();
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let send = sending;
+            sending = !sending;
+            if send {
+                if let Poll::Ready(Err(error)) = connection.poll_send(cx) {
+                    return Poll::Ready(Err(error));
+                }
+            } else if let Poll::Ready(closed) = connection.poll_closed(cx) {
+                return Poll::Ready(closed);
+            }
+        }
+        Poll::Pending
     })
     .await;
 }
@@ -515,6 +756,8 @@ where
 /// What a connection's task may still do in its turn before it gives the turn back.
 #[derive(Debug, Clone, Copy)]
 struct Turn {
+    /// Retained across internal Ready returns, cleared only when the owner yields.
+    budget: Option<::h2::TurnBudget>,
     /// Streams it may take up.
     accepts: usize,
     /// Ready entries it may examine, including refusals and stale wakes.
@@ -526,6 +769,7 @@ struct Turn {
 
 impl Turn {
     const WHOLE: Self = Self {
+        budget: None,
         accepts: ACCEPTS,
         entries: ENTRIES,
         work: WORK,
@@ -535,6 +779,47 @@ impl Turn {
     /// nothing and wakes the task.
     fn spent(&self) -> bool {
         self.accepts == 0 || self.entries == 0
+    }
+}
+
+/// A worker's round: shared among its HTTP/2 connections whose last turn ended with work
+/// left, so that a lone busy connection keeps long turns and many busy ones short ones, and
+/// what waits on the worker — an HTTP/1 request among them — waits about a round (15 §3).
+const ROUND: Duration = Duration::from_micros(160);
+/// The shortest share of a round: past some number of busy connections, the round grows
+/// rather than each turn shrink to nothing but its fixed cost.
+const SHARE_FLOOR: Duration = Duration::from_micros(10);
+
+/// A turn's time: the round shared among the worker's busy connections, this one among them
+/// or about to be.
+fn share(received: &Received) -> Duration {
+    let busy = u32::try_from(received.busy().max(1)).unwrap_or(u32::MAX);
+    (ROUND / busy).max(SHARE_FLOOR)
+}
+/// Count backstop between phase opportunities, not a separate turn allowance.
+const BATCH: usize = 4;
+/// Heads h2 has already decoded that one admission phase takes before the next phase: the
+/// receive batch above decodes at most `BATCH` units, so admission cannot run further ahead
+/// of making streams than that, and a burst does not cost a rotation of all four phases a
+/// request.
+const ADMITS: usize = 16;
+
+#[derive(Clone, Copy)]
+enum Phase {
+    Receive,
+    Admission,
+    Application,
+    Send,
+}
+
+impl Phase {
+    fn next(self) -> Self {
+        match self {
+            Self::Receive => Self::Admission,
+            Self::Admission => Self::Application,
+            Self::Application => Self::Send,
+            Self::Send => Self::Receive,
+        }
     }
 }
 
@@ -596,6 +881,8 @@ fn quiet(since: Instant, released: bool, settings: &Settings) -> (Quiet, Instant
 
 /// What the driver was woken for.
 enum Next<T> {
+    /// Advance an internal phase without renewing the executor turn.
+    Again,
     Accepted(T),
     /// No stream open for the keep-alive time.
     Idle,
@@ -847,6 +1134,416 @@ mod tests {
         LONG, locally, locally_paused, pair, post, serving, wire, within,
     };
     use http_body_util::{BodyExt, Full};
+
+    thread_local! {
+        static TURN_NOW: Cell<std::time::Instant> = Cell::new(std::time::Instant::now());
+    }
+
+    fn turn_now() -> std::time::Instant {
+        TURN_NOW.get()
+    }
+
+    fn turn_tick() -> std::time::Instant {
+        let now = turn_now();
+        TURN_NOW.set(now + Duration::from_micros(4));
+        now
+    }
+
+    /// Application work accumulates across several phase cycles within one executor poll.
+    /// Internal Ready returns cannot renew its deadline; I/O wakes still resume all phases.
+    #[test]
+    fn expensive_streams_share_one_deadline_and_leave_other_phases_a_turn() {
+        locally(async {
+            let settings = Settings::default();
+            let (mut send, mut connection) = pair(&settings.builder()).await;
+            let storage = Storage::new(crate::storage::LIMIT);
+            let received = Received::new(Rc::clone(&storage));
+            let asked = Rc::new(Cell::new(0));
+            let counted = Rc::clone(&asked);
+            let respond = Rc::new(move |_: Request<RequestBody>, _: Interim| {
+                counted.set(counted.get() + 1);
+                TURN_NOW.set(turn_now() + ROUND / 5);
+                std::future::ready(Answered::Map(Response::new(Full::new(Bytes::from_static(
+                    b"ok",
+                )))))
+            });
+            let mut driving = std::pin::pin!(drive_with_clock(
+                &mut connection,
+                settings,
+                Rc::clone(&storage),
+                &received,
+                Rc::new(|| HttpDate::from_unix(0)),
+                Rc::new(Drain::default()),
+                respond,
+                |_| {},
+                |_, _| {},
+                turn_now,
+            ));
+            let serving = poll_fn(|cx| {
+                let before = turn_now();
+                let result = driving.as_mut().poll(cx);
+                assert!(
+                    turn_now() - before <= ROUND,
+                    "deadline renewed inside one executor poll"
+                );
+                result
+            });
+            let asking = async {
+                let mut answers = Vec::new();
+                for _ in 0..20 {
+                    send = within(send.ready()).await.unwrap();
+                    answers.push(send.send_request(get(), true).unwrap().0);
+                }
+                for answer in answers {
+                    let mut body = within(answer).await.unwrap().into_body();
+                    assert_eq!(within(body.data()).await.unwrap().unwrap(), "ok");
+                }
+                assert_eq!(asked.get(), 20);
+                // Go quiet before another socket wake: no-progress accounting belongs to
+                // the new poll, not the four empty phases of the old one.
+                tokio::task::yield_now().await;
+                send = within(send.ready()).await.unwrap();
+                let (answer, _) = send.send_request(get(), true).unwrap();
+                assert_eq!(within(answer).await.unwrap().status(), StatusCode::OK);
+                assert_eq!(asked.get(), 21);
+            };
+            tokio::select! {
+                () = within(asking) => {},
+                () = serving => panic!("driver closed before answering"),
+            }
+        });
+    }
+
+    /// A busy connection's turn writes once `HOLD` has passed since it last wrote, and every
+    /// time while the worker has less room than a receive grant.
+    #[test]
+    fn a_busy_turn_writes_once_its_hold_is_up_or_the_worker_is_short() {
+        let storage = Storage::new(crate::storage::LIMIT);
+        let mut written = turn_now();
+        TURN_NOW.set(turn_now() + HOLD / 2);
+        assert!(
+            !due(&storage, &mut written, turn_now),
+            "wrote before its hold was up"
+        );
+        TURN_NOW.set(turn_now() + HOLD / 2);
+        assert!(due(&storage, &mut written, turn_now));
+        assert_eq!(written, turn_now(), "the hold starts again from the write");
+        assert!(!due(&storage, &mut written, turn_now));
+        let _held = storage.reserve(storage.room() - GRANT + 1).unwrap();
+        assert!(
+            due(&storage, &mut written, turn_now),
+            "held output while short"
+        );
+    }
+
+    /// A lone busy connection has the whole round, two half of it each, and many no less than
+    /// the floor.
+    #[test]
+    fn the_round_is_shared_among_the_workers_busy_connections() {
+        let received = Received::new(Storage::new(crate::storage::LIMIT));
+        assert_eq!(
+            share(&received),
+            ROUND,
+            "nobody busy yet: the asker's own turn"
+        );
+        let accounts: Vec<_> = (0..64).map(|_| received.open()).collect();
+        accounts[0].busy(true);
+        assert_eq!(share(&received), ROUND);
+        accounts[1].busy(true);
+        assert_eq!(share(&received), ROUND / 2);
+        for account in &accounts {
+            account.busy(true);
+        }
+        assert_eq!(share(&received), SHARE_FLOOR);
+    }
+
+    /// A connection whose streams always leave it work, behind the gate as `serve` runs it,
+    /// lets the worker look for I/O between its turns: a task waiting on a socket with bytes
+    /// already in it gets its turn after a few of the connection's, not after a `LocalSet`'s
+    /// round of them.
+    #[test]
+    fn a_busy_connection_lets_the_worker_look_for_io_between_its_turns() {
+        locally(async {
+            let settings = Settings::default();
+            let (mut send, mut connection) = pair(&settings.builder()).await;
+            let storage = Storage::new(crate::storage::LIMIT);
+            let received = Received::new(Rc::clone(&storage));
+            // A stream that spends a whole turn each time it is polled, and is never done.
+            let respond = Rc::new(|_: Request<RequestBody>, _: Interim| async {
+                poll_fn(|cx| {
+                    TURN_NOW.set(turn_now() + ROUND);
+                    cx.waker().wake_by_ref();
+                    Poll::<()>::Pending
+                })
+                .await;
+                Answered::Map(Response::new(Full::new(Bytes::new())))
+            });
+            let polls = Rc::new(Cell::new(0));
+            let counting = Rc::clone(&polls);
+            let driver = tokio::task::spawn_local(async move {
+                let mut driving = std::pin::pin!(super::super::gate::gated(drive_with_clock(
+                    &mut connection,
+                    settings,
+                    Rc::clone(&storage),
+                    &received,
+                    Rc::new(|| HttpDate::from_unix(0)),
+                    Rc::new(Drain::default()),
+                    respond,
+                    |_| {},
+                    |_, _| {},
+                    turn_now,
+                )));
+                poll_fn(|cx| {
+                    counting.set(counting.get() + 1);
+                    driving.as_mut().poll(cx)
+                })
+                .await;
+            });
+            send = within(send.ready()).await.unwrap();
+            let (_answer, _) = send.send_request(get(), true).unwrap();
+            // The stream is under way, and its connection busy.
+            while polls.get() < 4 {
+                tokio::task::yield_now().await;
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut client, b"x")
+                .await
+                .unwrap();
+            let before = polls.get();
+            let reader = tokio::task::spawn_local(async move {
+                server.readable().await.unwrap();
+            });
+            // Give the kernel the byte before anything is polled again.
+            std::thread::sleep(Duration::from_millis(20));
+            within(reader).await.unwrap();
+            let between = polls.get() - before;
+            driver.abort();
+            assert!(
+                between <= 4,
+                "{between} turns of a busy connection before the socket's task"
+            );
+        });
+    }
+
+    /// A connection whose turns end with work left counts among the worker's busy ones, and no
+    /// longer once it goes quiet.
+    #[test]
+    fn a_connection_is_busy_while_its_turns_end_with_work_left() {
+        locally(async {
+            let settings = Settings::default();
+            let (mut send, mut connection) = pair(&settings.builder()).await;
+            let storage = Storage::new(crate::storage::LIMIT);
+            let received = Received::new(Rc::clone(&storage));
+            let respond = Rc::new(|_: Request<RequestBody>, _: Interim| async {
+                // Each poll spends a whole turn and leaves the stream ready again, five times.
+                let mut left = 5;
+                poll_fn(|cx| {
+                    if left == 0 {
+                        return Poll::Ready(());
+                    }
+                    left -= 1;
+                    TURN_NOW.set(turn_now() + ROUND);
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                })
+                .await;
+                Answered::Map(Response::new(Full::new(Bytes::new())))
+            });
+            let busiest = Rc::new(Cell::new(0));
+            let (noting, table) = (Rc::clone(&busiest), Rc::clone(&received));
+            let mut driving = std::pin::pin!(drive_with_clock(
+                &mut connection,
+                settings,
+                Rc::clone(&storage),
+                &received,
+                Rc::new(|| HttpDate::from_unix(0)),
+                Rc::new(Drain::default()),
+                respond,
+                |_| {},
+                |_, _| {},
+                turn_now,
+            ));
+            let serving = poll_fn(|cx| {
+                let polled = driving.as_mut().poll(cx);
+                noting.set(noting.get().max(table.busy()));
+                polled
+            });
+            let asking = async {
+                send = within(send.ready()).await.unwrap();
+                let (answer, _) = send.send_request(get(), true).unwrap();
+                assert_eq!(within(answer).await.unwrap().status(), StatusCode::OK);
+            };
+            tokio::select! {
+                () = within(asking) => {},
+                () = serving => panic!("driver closed before answering"),
+            }
+            assert_eq!(busiest.get(), 1, "never counted busy");
+            assert_eq!(received.busy(), 0, "still counted busy once quiet");
+        });
+    }
+
+    /// Heads h2 has already decoded are taken several in one admission phase, not one a
+    /// rotation of all four phases.
+    #[test]
+    fn decoded_heads_are_taken_together_before_the_first_is_answered() {
+        locally(async {
+            let settings = Settings::default();
+            let (mut send, mut connection) = pair(&settings.builder()).await;
+            let storage = Storage::new(crate::storage::LIMIT);
+            let received = Received::new(Rc::clone(&storage));
+            let before = TAKEN.get();
+            let at_first = Rc::new(Cell::new(None));
+            let noting = Rc::clone(&at_first);
+            let respond = Rc::new(move |_: Request<RequestBody>, _: Interim| {
+                if noting.get().is_none() {
+                    noting.set(Some(TAKEN.get() - before));
+                }
+                std::future::ready(Answered::Map(Response::new(Full::new(Bytes::new()))))
+            });
+            // Every request is on the wire before the driver first runs.
+            let mut answers = Vec::new();
+            for _ in 0..8 {
+                send = within(send.ready()).await.unwrap();
+                answers.push(send.send_request(get(), true).unwrap().0);
+            }
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            // A clock that stands still: no deadline cuts a phase short.
+            let driving = drive_with_clock(
+                &mut connection,
+                settings,
+                Rc::clone(&storage),
+                &received,
+                Rc::new(|| HttpDate::from_unix(0)),
+                Rc::new(Drain::default()),
+                respond,
+                |_| {},
+                |_, _| {},
+                turn_now,
+            );
+            let asking = async {
+                for answer in answers {
+                    within(answer).await.unwrap();
+                }
+            };
+            tokio::select! {
+                () = within(asking) => {},
+                () = driving => panic!("driver closed before answering"),
+            }
+            let taken = at_first.get().unwrap();
+            assert!(
+                taken >= 2,
+                "{taken} head taken before the first was answered"
+            );
+        });
+    }
+
+    #[test]
+    fn closing_uses_the_remaining_turn_before_renewing_it() {
+        locally(async {
+            let (_send, mut connection) = pair(&Settings::default().builder()).await;
+            connection.abrupt_shutdown(::h2::Reason::NO_ERROR);
+            let exhausted = ::h2::TurnBudget::with_clock(turn_now(), turn_now);
+            let mut closing =
+                std::pin::pin!(closed(&mut connection, Some(exhausted), turn_now, ROUND));
+            let mut cx = std::task::Context::from_waker(Waker::noop());
+            assert!(
+                closing.as_mut().poll(&mut cx).is_pending(),
+                "shutdown renewed an exhausted serving turn"
+            );
+            assert!(
+                closing.as_mut().poll(&mut cx).is_ready(),
+                "shutdown did not resume in the next turn"
+            );
+        });
+    }
+
+    #[test]
+    fn shedding_resumes_expiry_during_its_goaway_attempt() {
+        locally(async {
+            let (_send, mut connection) = pair(&Settings::default().builder()).await;
+            connection.abrupt_shutdown(::h2::Reason::ENHANCE_YOUR_CALM);
+            // Enough to enter poll_send, but not to stage and write GOAWAY. This is
+            // deadline Pending inside h2, rather than expiry before the attempt starts.
+            let remaining =
+                ::h2::TurnBudget::with_clock(turn_now() + Duration::from_micros(8), turn_tick);
+            let mut shutting =
+                std::pin::pin!(shed(&mut connection, Some(remaining), turn_tick, ROUND));
+            let mut cx = std::task::Context::from_waker(Waker::noop());
+            assert!(
+                shutting.as_mut().poll(&mut cx).is_pending(),
+                "deadline Pending was mistaken for a blocked socket"
+            );
+            within(shutting).await;
+        });
+    }
+
+    /// The busy stream spends every application slice while input remains buffered.
+    /// Its neighbour's response must be flushed before that input has been drained.
+    #[test]
+    fn a_busy_application_and_buffered_input_cannot_starve_sending() {
+        use crate::h2_peer::{self, Peer, kind};
+        locally(async {
+            let (near, far) = wire();
+            let serving = tokio::task::spawn_local(async move {
+                let settings = Settings::default();
+                let mut connection = settings
+                    .builder()
+                    .handshake::<_, Outgoing>(near)
+                    .await
+                    .unwrap();
+                let storage = Storage::new(crate::storage::LIMIT);
+                let received = Received::new(Rc::clone(&storage));
+                let respond = Rc::new(|request: Request<RequestBody>, _: Interim| async move {
+                    if request.uri().path() == "/busy" {
+                        poll_fn(|cx| {
+                            TURN_NOW.set(turn_now() + ROUND);
+                            cx.waker().wake_by_ref();
+                            Poll::<()>::Pending
+                        })
+                        .await;
+                    }
+                    Answered::Map(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                });
+                drive_with_clock(
+                    &mut connection,
+                    settings,
+                    storage,
+                    &received,
+                    Rc::new(|| HttpDate::from_unix(0)),
+                    Rc::new(Drain::default()),
+                    respond,
+                    |_| {},
+                    |_, _| {},
+                    turn_tick,
+                )
+                .await;
+            });
+            let mut peer = Peer::open_as_client(far, &[]).await;
+            peer.send(&h2_peer::settings_ack()).await;
+            within(peer.barrier()).await;
+            let mut input = h2_peer::headers(1, h2_peer::request("GET", "/busy"), true).encode();
+            input.extend(h2_peer::headers(3, h2_peer::request("GET", "/"), true).encode());
+            for n in 0..5000u64 {
+                input.extend(h2_peer::ping(n.to_be_bytes()).encode());
+            }
+            peer.write_raw(&input).await;
+            let (answer, before) =
+                within(peer.until(|frame| frame.kind == kind::DATA && frame.stream == 3)).await;
+            let pings = before
+                .iter()
+                .filter(|frame| frame.kind == kind::PING)
+                .count();
+            assert_eq!(answer.payload, b"ok");
+            assert!(pings < 100, "response waited behind {pings} input frames");
+            serving.abort();
+        });
+    }
 
     /// A stream's future is measured from its type before it is made, and held boxed: what
     /// is held and moved is a pointer, not the future, kilobytes, copied whole as it is made
@@ -1119,7 +1816,7 @@ mod tests {
     #[test]
     fn an_upload_that_comes_before_room_is_made_is_answered_503_and_let_go() {
         locally(async {
-            let settings = Settings::default();
+            let settings = small_heads();
             // Room for one stream window and some, not for a second; a provision for the
             // worker's own answers.
             let storage = Storage::new(5 << 20);
@@ -1137,7 +1834,7 @@ mod tests {
                 let (storage, received) = (Rc::clone(&storage), Rc::clone(&received));
                 let (date, respond) = (Rc::clone(&date), Rc::clone(&respond));
                 tokio::task::spawn_local(async move {
-                    drive(
+                    drive_with_clock(
                         &mut connection,
                         settings,
                         storage,
@@ -1147,6 +1844,7 @@ mod tests {
                         respond,
                         |_| {},
                         |_, _| {},
+                        turn_now,
                     )
                     .await;
                     if let Some(ended) = ended {
@@ -1162,8 +1860,10 @@ mod tests {
                 .unwrap();
             until_held(&storage, |used| used >= window).await;
 
-            // The request and its upload together: the upload is read before the stream's
-            // first turn, and makes the worker short.
+            // Leave room to decode the small head but not the first receive batch's DATA.
+            // A short batch no longer consumes a megabyte before admitting a request.
+            // The injected clock keeps this ordering independent of test-machine load.
+            let elsewhere = storage.reserve(storage.room() - 32 * 1024).unwrap();
             light_send = within(light_send.ready()).await.unwrap();
             let (light_answer, mut light_body) = light_send.send_request(post(), false).unwrap();
             light_body
@@ -1171,6 +1871,7 @@ mod tests {
                 .unwrap();
             let answer = within(light_answer).await.unwrap();
             assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+            drop(elsewhere);
             until_held(&storage, |_| heavy_ended.get()).await;
             let used = settled(&storage).await;
             assert!(used < 1 << 20, "{used} charged once both are let go of");
@@ -1905,7 +2606,10 @@ mod tests {
         use tokio::io::{AsyncRead, ReadBuf};
         /// A PING's acknowledgement: its frame's header and eight bytes.
         const ACK: usize = 17;
-        let storage = Storage::new(crate::storage::LIMIT);
+        // Less room than a receive grant: a turn cut with work left then writes at once rather
+        // than holding its output (`due`), so what is written between two turns of another task
+        // is what one turn decoded. PINGs take no room.
+        let storage = Storage::new(GRANT / 2);
         let (near, far) = wire();
         let asked = Rc::new(Cell::new(0));
         let respond = never(&asked);
@@ -2029,7 +2733,11 @@ mod tests {
         let respond = never(&asked);
         tokio::task::spawn_local(async move {
             if let Ok(mut connection) = settings.builder().handshake::<_, Outgoing>(near).await {
-                drive(
+                // A clock that stands still: no turn is cut by wall time, so what the ledger
+                // sees does not depend on the machine's speed. A turn cut between a head's
+                // charge and its stream's can let another connection take the room, and the
+                // stream is then answered 503.
+                drive_with_clock(
                     &mut connection,
                     settings,
                     storage,
@@ -2039,6 +2747,7 @@ mod tests {
                     Rc::new(respond),
                     |_| {},
                     |_, _| {},
+                    turn_now,
                 )
                 .await;
             }
@@ -2069,7 +2778,11 @@ mod tests {
         let (send, mut connection) = pair(&settings.builder()).await;
         let (storage, received) = (Rc::clone(storage), Rc::clone(received));
         tokio::task::spawn_local(async move {
-            drive(
+            // A clock that stands still: no turn is cut by wall time, so what the ledger
+            // sees does not depend on the machine's speed. A turn cut between a head's
+            // charge and its stream's can let another connection take the room, and the
+            // stream is then answered 503.
+            drive_with_clock(
                 &mut connection,
                 settings,
                 storage,
@@ -2079,6 +2792,7 @@ mod tests {
                 Rc::new(respond),
                 |_| {},
                 |_, _| {},
+                turn_now,
             )
             .await;
         });

@@ -47,9 +47,11 @@ Not yet: anything Kubernetes (the control plane, the operator, translating Ingre
 Gateway API), rate limiting, authentication. The request path comes first, then rate
 limiting, then the control plane and the operator.
 
-HTTP/2 connections examine at most 64 ready stream entries per turn, including requests
-refused before their futures are made and stale wakes of completed streams. This bounds
-queue work by count; latency isolation from a saturating HTTP/2 flood is still being fixed.
+HTTP/2 connections take turns on a worker: a worker's 160 µs round is shared among its busy
+HTTP/2 connections, and a connection whose turn ends with work left runs again only after
+the worker has looked for I/O, so an HTTP/2 flood keeps HTTP/1 clients on the same worker
+within about twice their usual latency. The price is HTTP/2 throughput at saturation, about
+a fifth below letting a connection run as long as it has work.
 
 ## Trying it
 

@@ -107,7 +107,6 @@ allowance, for fuzz builds:
   was flushed or the connection closed, not necessarily that it closed. The owner must
   rotate receive and send opportunities across turns. Normal connection polling retains
   its existing control-frame order; shared control processing lives in `poll_control`.
-  This support is inactive in EdgeRush's production driver until the scheduler integration.
 - **A turn's output can leave in one write.** `server::Connection::set_corked(true)` keeps
   what the turn encodes in the write buffer: a flush returns at once while the buffer has
   room for another frame and no DATA payload waits (`framed_write.rs`), so the phases of

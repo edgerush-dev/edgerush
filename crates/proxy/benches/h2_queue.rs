@@ -42,10 +42,15 @@ fn waiting() -> Queue<usize, Ready<()>> {
 fn completed(mut queue: Queue<usize, Ready<()>>) -> (Queue<usize, Ready<()>>, usize) {
     let mut examined = 0;
     for _ in 0..ENTRIES.div_ceil(BATCH) {
-        examined += queue.run(Waker::noop(), black_box(BATCH), |entry| {
-            black_box(entry);
-            Some(ready(()))
-        });
+        examined += queue.run_while(
+            Waker::noop(),
+            black_box(BATCH),
+            |entry| {
+                black_box(entry);
+                Some(ready(()))
+            },
+            || true,
+        );
     }
     (queue, black_box(examined))
 }
@@ -55,13 +60,32 @@ fn completed(mut queue: Queue<usize, Ready<()>>) -> (Queue<usize, Ready<()>>, us
 fn refused(mut queue: Queue<usize, Ready<()>>) -> (Queue<usize, Ready<()>>, usize) {
     let mut examined = 0;
     for _ in 0..ENTRIES.div_ceil(BATCH) {
-        examined += queue.run(Waker::noop(), black_box(BATCH), |entry| {
-            black_box(entry);
-            None
-        });
+        examined += queue.run_while(
+            Waker::noop(),
+            black_box(BATCH),
+            |entry| {
+                black_box(entry);
+                None
+            },
+            || true,
+        );
     }
     (queue, black_box(examined))
 }
 
-library_benchmark_group!(name = h2_queue; benchmarks = completed, refused);
+#[library_benchmark]
+#[bench::hundred(waiting())]
+fn deadline(mut queue: Queue<usize, Ready<()>>) -> (Queue<usize, Ready<()>>, usize) {
+    let budget =
+        h2::TurnBudget::new(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    let examined = queue.run_while(
+        Waker::noop(),
+        black_box(BATCH),
+        |_| Some(ready(())),
+        || !budget.expired(),
+    );
+    (queue, black_box(examined))
+}
+
+library_benchmark_group!(name = h2_queue; benchmarks = completed, refused, deadline);
 main!(library_benchmark_groups = h2_queue);

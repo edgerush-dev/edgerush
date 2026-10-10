@@ -4,6 +4,7 @@
 
 pub(crate) mod body;
 pub(crate) mod connection;
+mod gate;
 pub(crate) mod idle;
 mod queue;
 pub(crate) mod writer;

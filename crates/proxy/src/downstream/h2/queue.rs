@@ -140,11 +140,24 @@ impl<W, F: Future<Output = ()>> Queue<W, F> {
     /// stale wakes and streams refused by `make`. A live stream is made if needed and polled;
     /// `None` from `make` leaves the queue. A full allowance may leave entries for the next
     /// turn; the caller must arrange that turn. `driver` is woken when a stream joins the line.
+    #[cfg(test)]
     pub(crate) fn run(
         &mut self,
         driver: &Waker,
         most: usize,
+        make: impl FnMut(W) -> Option<F>,
+    ) -> usize {
+        self.run_while(driver, most, make, || true)
+    }
+
+    /// Checks the owner's turn before every entry, including stale wakes and refusals.
+    /// Stopping leaves the next entry queued; the owner arranges another turn.
+    pub(crate) fn run_while(
+        &mut self,
+        driver: &Waker,
+        most: usize,
         mut make: impl FnMut(W) -> Option<F>,
+        mut keep_going: impl FnMut() -> bool,
     ) -> usize {
         {
             let mut held = self
@@ -157,7 +170,7 @@ impl<W, F: Future<Output = ()>> Queue<W, F> {
             }
         }
         let mut examined = 0;
-        while examined < most {
+        while examined < most && keep_going() {
             let Some(index) = self.ready.pop() else {
                 break;
             };
@@ -222,6 +235,26 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::task::Poll;
+
+    #[test]
+    fn a_deadline_stops_inside_a_batch_and_leaves_the_next_entry_queued() {
+        let mut queue = Queue::<usize, std::future::Ready<()>>::new();
+        for entry in 0..8 {
+            queue.push(entry);
+        }
+        let now = Cell::new(0);
+        let mut refuse = |_| {
+            now.set(now.get() + 1);
+            None
+        };
+        assert_eq!(
+            queue.run_while(Waker::noop(), 8, &mut refuse, || now.get() < 2),
+            2
+        );
+        assert_eq!(queue.run_while(Waker::noop(), 8, &mut refuse, || false), 0);
+        assert_eq!(queue.run(Waker::noop(), 8, refuse), 6);
+        assert!(queue.ready.is_empty());
+    }
 
     /// A stream that is ready again as soon as it is polled, `left` times, saying each poll:
     /// bounded, so that a queue that never stops polling ends the test rather than running on.

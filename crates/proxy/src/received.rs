@@ -21,6 +21,9 @@
 //! Where no connection could make the room, the shortage is held elsewhere and nobody is
 //! closed.
 //!
+//! It also counts the worker's connections whose last turn ended with work left, among which
+//! the worker's round is shared ([15 §3](../../docs/15-http2-and-grpc.md), Turns).
+//!
 //! One per worker, and it never leaves it. Nothing here does I/O or reads a clock.
 
 #![cfg_attr(not(feature = "fuzzing"), allow(unreachable_pub))]
@@ -39,6 +42,8 @@ pub struct Received {
     next: Cell<u64>,
     /// The connection closed to make room and not yet gone, by its number.
     closing: Cell<Option<u64>>,
+    /// Connections whose last turn ended with work left.
+    busy: Cell<usize>,
 }
 
 /// What one connection is charged, and whether it was closed to make room.
@@ -48,6 +53,7 @@ struct Holding {
     charged: Cell<usize>,
     shed: Cell<bool>,
     driver: RefCell<Option<Waker>>,
+    busy: Cell<bool>,
 }
 
 /// One connection's place in the table, for as long as it is driven; dropping it takes the
@@ -74,7 +80,13 @@ impl Received {
             open: RefCell::new(HashMap::new()),
             next: Cell::new(0),
             closing: Cell::new(None),
+            busy: Cell::new(0),
         })
+    }
+
+    /// How many of its connections ended their last turn with work left.
+    pub fn busy(&self) -> usize {
+        self.busy.get()
     }
 
     /// The worker is `bytes` short: unless a connection is already going, the one charged
@@ -171,6 +183,17 @@ impl Account {
         Some(split)
     }
 
+    /// Whether the connection's last turn ended with work left: counted among the worker's
+    /// busy connections until it says otherwise, or goes.
+    pub fn busy(&self, busy: bool) {
+        if self.holding.busy.replace(busy) != busy {
+            let count = self.table.busy.get();
+            self.table
+                .busy
+                .set(if busy { count + 1 } else { count - 1 });
+        }
+    }
+
     /// Whether the connection was closed to make room: its driver closes it.
     pub fn is_shed(&self) -> bool {
         self.holding.shed.get()
@@ -193,6 +216,7 @@ impl Account {
 
 impl Drop for Account {
     fn drop(&mut self) {
+        self.busy(false);
         self.table.open.borrow_mut().remove(&self.number);
         // Its memory goes with it, and only now its charge.
         self.holding.charge.borrow_mut().take();
@@ -248,6 +272,26 @@ mod tests {
     fn noted() -> (Arc<Noted>, Waker) {
         let noted = Arc::new(Noted(AtomicBool::new(false)));
         (Arc::clone(&noted), Waker::from(Arc::clone(&noted)))
+    }
+
+    /// The connections whose turns end with work left are counted, each once however often it
+    /// says so, until it goes quiet or goes.
+    #[test]
+    fn busy_connections_are_counted_once_until_they_go_quiet_or_go() {
+        let table = Received::new(Storage::with_provision(1 << 20, 0));
+        let (one, two) = (table.open(), table.open());
+        assert_eq!(table.busy(), 0);
+        one.busy(true);
+        one.busy(true);
+        two.busy(true);
+        assert_eq!(table.busy(), 2);
+        one.busy(false);
+        one.busy(false);
+        assert_eq!(table.busy(), 1);
+        drop(two);
+        assert_eq!(table.busy(), 0);
+        drop(one);
+        assert_eq!(table.busy(), 0);
     }
 
     /// A connection is charged what it holds now, up and down, and nothing once it goes.
