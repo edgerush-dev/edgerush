@@ -84,6 +84,37 @@ allowance, for fuzz builds:
 - **What an accepted head held can be asked.** `server::head_held` measures a request's
   head as `held` counted it, so that as `accept` hands it over and the count falls by that
   much, the owner passes that much of its charge on with it.
+- **A server can stop at its owner's turn deadline.** `TurnBudget` (`turn.rs`) holds an
+  absolute `std::time::Instant` and a monotonic clock function, injectable for tests.
+  `server::Connection::set_turn(Some(budget))` installs that same deadline in both codec
+  halves; copying, accepting, writing or yielding never renews it. `None`, the default,
+  disables it and reads no clock. No allocation or synchronization is added. The owner
+  supplies a new budget only at the start of its task's next poll. Protocol timers and
+  the independent `set_work` decode allowance are unchanged.
+  Receive checks before each frame, including buffered CONTINUATIONs (`framed_read.rs`).
+  Send checks before staging frames and examining skipped send entries (`prioritize.rs`),
+  between short writes and before encoding another continuation (`framed_write.rs`).
+  Existing capacity checks also cover refusal and WINDOW_UPDATE staging. Exhaustion
+  wakes the driver and yields with state retained; `turn_exhausted` reports the latched
+  reason without reading the clock, until `set_turn` resets it. It is neither a refusal
+  nor a connection error. `poll_accept` leaves queued heads in place after exhaustion.
+  Closing flushes and shutdown use the same deadline. One decode, encode, stream cleanup
+  or underlying I/O operation already in progress may overrun: this is cooperative,
+  not a hard execution bound.
+- **Sending can progress without receiving.** `server::Connection::poll_send` drives
+  pending control frames, responses and flow-control output without reading or accepting.
+  It uses the installed budget, including while closing; `Ready(Ok(()))` means output
+  was flushed or the connection closed, not necessarily that it closed. The owner must
+  rotate receive and send opportunities across turns. Normal connection polling retains
+  its existing control-frame order; shared control processing lives in `poll_control`.
+  This support is inactive in EdgeRush's production driver until the scheduler integration.
+- **A decoded request can be handed over without driving the protocol.**
+  `poll_accept_pending` respects the installed budget but performs no reads or flushes.
+  `Ready(None)` means the queue is empty or the connection is closing, not end-of-stream;
+  it registers no interest in future input. The owner continues driving the protocol
+  separately. This avoids a continuously readable connection spending every deadline
+  before `poll_accept` reaches its already decoded requests. Normal `poll_accept` behavior
+  is otherwise unchanged.
 - **Nothing decoded pins a buffer.** The pseudo-field values kept as they came —
   `:authority`, `:path`, `:protocol`, and a `:scheme` other than `http` or `https`, which
   are static — are copied out of the buffer they were decoded in (`hpack/header.rs`), and
@@ -124,6 +155,15 @@ allowance, for fuzz builds:
   but allows it there only with its `unstable` feature. The lints of a registry dependency
   are capped at warnings; a path dependency's are not, so the vendored copy stopped every
   fuzz build of the workspace's crates. The allowance is now unconditional (`lib.rs`).
+
+The turn deadline and separate send/admission entry points are covered by nine probes in
+`crates/proxy/tests/h2_library/turn.rs`: deadline equality and copying; exhaustion across
+accept/send/close polls and waking; the independent decode-unit backstop; buffered header
+continuations; pending output with continuous input; cancelled send entries; partial DATA
+writes; a partial GOAWAY resumed through send-only driving; and pending admission without
+reading more input. A scripted monotonic clock
+makes expiry deterministic. The `h2_turn` benchmark measures disabled, active and exhausted
+checkpoints; it does not measure mixed-traffic latency or establish a quantum.
 
 h2's own tests are not carried: they need dependencies the workspace does not have. The
 buffers' release is covered by `a_server_connection_gives_back_its_buffers_and_serves_on`

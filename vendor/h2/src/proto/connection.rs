@@ -248,6 +248,23 @@ where
         self.codec.work()
     }
 
+    // EdgeRush: the owner supplies one budget for the whole task poll.
+    pub(crate) fn set_turn(&mut self, budget: Option<crate::TurnBudget>) {
+        self.codec.set_turn(budget);
+    }
+
+    pub(crate) fn turn_exhausted(&self) -> bool {
+        self.codec.turn_exhausted()
+    }
+
+    pub(crate) fn poll_turn(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        self.codec.poll_turn(cx)
+    }
+
+    pub(crate) fn is_closing(&self) -> bool {
+        !matches!(self.inner.state, State::Open)
+    }
+
     #[cfg(feature = "unstable")]
     pub fn num_wired_streams(&self) -> usize {
         self.inner.streams.num_wired_streams()
@@ -345,6 +362,10 @@ where
 
         loop {
             tracing::trace!(connection.state = ?self.inner.state);
+            // EdgeRush: a completed connection remains observable without more work.
+            if !matches!(self.inner.state, State::Closed(..)) {
+                ready!(self.codec.poll_turn(cx));
+            }
             // TODO: probably clean up this glob of code
             match self.inner.state {
                 // When open, continue to poll a frame
@@ -353,6 +374,8 @@ where
                         Poll::Ready(result) => result,
                         // The connection is not ready to make progress
                         Poll::Pending => {
+                            // EdgeRush: receive exhaustion must not start an unbounded flush.
+                            ready!(self.codec.poll_turn(cx));
                             // Ensure all window updates have been sent.
                             //
                             // This will also handle flushing `self.codec`
@@ -387,6 +410,52 @@ where
         }
     }
 
+    // EdgeRush: no receives here. The owner can give output its own phase even when
+    // continuous input would consume every normal connection poll's deadline.
+    pub(crate) fn poll_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        loop {
+            match self.inner.state {
+                State::Open => {
+                    ready!(self.codec.poll_turn(cx));
+                    let result = match ready!(self.poll_control(cx)) {
+                        Ok(false) => {
+                            return self.inner.streams.poll_complete(cx, &mut self.codec)
+                                .map_err(Into::into);
+                        }
+                        Ok(true) => Ok(()),
+                        Err(error) => Err(error),
+                    };
+                    self.inner.as_dyn().handle_poll2_result(result)?;
+                }
+                State::Closing(reason, initiator) => {
+                    ready!(self.codec.poll_turn(cx));
+                    ready!(self.codec.shutdown(cx))?;
+                    self.inner.state = State::Closed(reason, initiator);
+                }
+                State::Closed(reason, initiator) => {
+                    return Poll::Ready(self.take_error(reason, initiator));
+                }
+            }
+        }
+    }
+
+    // EdgeRush: shared control output for normal and send-only driving. True means
+    // the connection should transition to closing, with the existing error handling.
+    fn poll_control(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool, Error>> {
+        if let Some(reason) = ready!(self.poll_go_away(cx)?) {
+            if self.inner.go_away.should_close_now() {
+                if self.inner.go_away.is_user_initiated() {
+                    return Poll::Ready(Ok(true));
+                } else {
+                    return Poll::Ready(Err(Error::library_go_away(reason)));
+                }
+            }
+            debug_assert_eq!(reason, Reason::NO_ERROR);
+        }
+        ready!(self.poll_ready(cx))?;
+        Poll::Ready(Ok(false))
+    }
+
     fn poll2(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         // This happens outside of the loop to prevent needing to do a clock
         // check and then comparison of the queue possibly multiple times a
@@ -394,29 +463,10 @@ where
         self.clear_expired_reset_streams();
 
         loop {
-            // First, ensure that the `Connection` is able to receive a frame
-            //
-            // The order here matters:
-            // - poll_go_away may buffer a graceful shutdown GOAWAY frame
-            // - If it has, we've also added a PING to be sent in poll_ready
-            if let Some(reason) = ready!(self.poll_go_away(cx)?) {
-                if self.inner.go_away.should_close_now() {
-                    if self.inner.go_away.is_user_initiated() {
-                        // A user initiated abrupt shutdown shouldn't return
-                        // the same error back to the user.
-                        return Poll::Ready(Ok(()));
-                    } else {
-                        return Poll::Ready(Err(Error::library_go_away(reason)));
-                    }
-                }
-                // Only NO_ERROR should be waiting for idle
-                debug_assert_eq!(
-                    reason,
-                    Reason::NO_ERROR,
-                    "graceful GOAWAY should be NO_ERROR"
-                );
+            // EdgeRush: preserve control ordering (GOAWAY before its PING).
+            if ready!(self.poll_control(cx))? {
+                return Poll::Ready(Ok(()));
             }
-            ready!(self.poll_ready(cx))?;
 
             match self
                 .inner

@@ -42,6 +42,8 @@ pub struct FramedRead<T> {
 
     // EdgeRush: what is left of the decoding its owner allows before it next looks (15 §3).
     work: usize,
+    // EdgeRush: the same absolute deadline as the write half, unset by default.
+    pub(crate) turn: crate::turn::Turn,
 }
 
 /// Partially loaded headers frame
@@ -78,6 +80,7 @@ impl<T> FramedRead<T> {
             partial: None,
             grant: Arc::new(Grant::unlimited()),
             work: UNLIMITED_WORK,
+            turn: crate::turn::Turn::default(),
         }
     }
 
@@ -543,6 +546,8 @@ where
         let _e = span.enter();
         loop {
             tracing::trace!("poll");
+            // EdgeRush: check each frame, including CONTINUATIONs decoded in this loop.
+            ready!(self.turn.poll(cx));
             // EdgeRush: its owner's allowance spent, nothing more is read until it is set
             // again; the task is woken, so that whatever else waits on the worker gets a
             // turn first and this one is then polled again (15 §3).

@@ -24,6 +24,8 @@ pub struct FramedWrite<T, B> {
     /// Upstream `AsyncWrite`
     inner: T,
     final_flush_done: bool,
+    // EdgeRush: bounds frame staging and partial writes with one owner deadline.
+    pub(crate) turn: crate::turn::Turn,
 
     encoder: Encoder<B>,
 }
@@ -91,6 +93,7 @@ where
         FramedWrite {
             inner,
             final_flush_done: false,
+            turn: crate::turn::Turn::default(),
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
                 buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
@@ -108,6 +111,8 @@ where
     /// Calling this function may result in the current contents of the buffer
     /// to be flushed to `T`.
     pub fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        // EdgeRush: capacity is not permission to continue after the turn ends.
+        ready!(self.turn.poll(cx));
         if !self.encoder.has_capacity() {
             // Try flushing
             ready!(self.flush(cx))?;
@@ -122,8 +127,10 @@ where
 
     /// Returns whether a frame can be buffered without first flushing the
     /// underlying I/O object.
-    pub(crate) fn has_capacity(&self) -> bool {
-        self.encoder.has_capacity()
+    pub(crate) fn has_capacity(&mut self) -> bool {
+        // EdgeRush: staging loops use this before removing their next queued frame.
+        // False routes them to poll_ready, which wakes the task on exhaustion.
+        !self.turn.expired() && self.encoder.has_capacity()
     }
 
     // EdgeRush: gives the write buffer back when nothing is in it, for a
@@ -154,7 +161,11 @@ where
         let _e = span.enter();
 
         loop {
+            // EdgeRush: preserve encoder state before starting another continuation.
+            ready!(self.turn.poll(cx));
             while !self.encoder.is_empty() {
+                // EdgeRush: a writable socket can make many short writes in one poll.
+                ready!(self.turn.poll(cx));
                 let n = match self.encoder.next {
                     Some(Next::Data(ref mut frame)) => {
                         tracing::trace!(queued_data_frame = true);
@@ -177,6 +188,8 @@ where
                 }
             }
 
+            // EdgeRush: unset_frame may encode the next CONTINUATION.
+            ready!(self.turn.poll(cx));
             match self.encoder.unset_frame() {
                 ControlFlow::Continue => (),
                 ControlFlow::Break => break,
@@ -184,6 +197,7 @@ where
         }
 
         tracing::trace!("flushing buffer");
+        ready!(self.turn.poll(cx));
         // Flush the upstream
         ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
 
@@ -196,6 +210,7 @@ where
             ready!(self.flush(cx))?;
             self.final_flush_done = true;
         }
+        ready!(self.turn.poll(cx));
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }

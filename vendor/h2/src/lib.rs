@@ -129,6 +129,9 @@ pub mod frame;
 pub mod client;
 pub mod ext;
 pub mod server;
+// EdgeRush: optional cooperative deadlines for server connection work.
+mod turn;
+pub use crate::turn::TurnBudget;
 mod share;
 
 // EdgeRush: allowed whatever the features. cargo-fuzz builds with `--cfg fuzzing`, and the

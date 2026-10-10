@@ -154,6 +154,24 @@ impl<T, B> Codec<T, B> {
         self.inner.work()
     }
 
+    // EdgeRush: installing a turn copies its absolute deadline, never renews it.
+    pub(crate) fn set_turn(&mut self, budget: Option<crate::TurnBudget>) {
+        self.inner.turn.set(budget);
+        self.inner.get_mut().turn.set(budget);
+    }
+
+    pub(crate) fn turn_exhausted(&self) -> bool {
+        self.inner.turn.exhausted() || self.inner.get_ref().turn.exhausted()
+    }
+
+    pub(crate) fn poll_turn(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.turn_exhausted() {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        self.inner.get_mut().turn.poll(cx)
+    }
+
     /// Takes the data payload value that was fully written to the socket
     pub(crate) fn take_last_data_frame(&mut self) -> Option<Data<B>> {
         self.framed_write().take_last_data_frame()

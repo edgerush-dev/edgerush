@@ -93,6 +93,10 @@ name = "h2_queue"
 harness = false
 
 [[bench]]
+name = "h2_turn"
+harness = false
+
+[[bench]]
 name = "kept"
 harness = false
 required-features = ["fuzzing"]

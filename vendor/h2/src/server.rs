@@ -434,6 +434,20 @@ where
             return Poll::Ready(None);
         }
 
+        // EdgeRush: do not hand over queued heads after protocol work spent the turn.
+        if self.turn_exhausted() {
+            return Poll::Pending;
+        }
+
+        if let Some(request) = self.take_pending_request() {
+            return Poll::Ready(Some(Ok(request)));
+        }
+
+        Poll::Pending
+    }
+
+    // EdgeRush: separate handing over a decoded head from advancing protocol work.
+    fn take_pending_request(&mut self) -> Option<(Request<RecvStream>, SendResponse<B>)> {
         if let Some(inner) = self.connection.next_incoming() {
             tracing::trace!("received incoming");
             let (head, _) = inner.take_request().into_parts();
@@ -442,10 +456,30 @@ where
             let request = Request::from_parts(head, body);
             let respond = SendResponse { inner };
 
-            return Poll::Ready(Some(Ok((request, respond))));
+            return Some((request, respond));
         }
 
-        Poll::Pending
+        None
+    }
+
+    /// Takes one already decoded request without reading input or flushing output.
+    /// `Ready(None)` means no request is queued (or the connection is closing), not
+    /// end-of-connection. `Pending` means the turn expired and the driver was woken.
+    /// Does not register interest in future requests: the owner must continue driving
+    /// the protocol with `poll_closed` or `poll_accept` to receive requests and wakes.
+    /// This lets an owner alternate admission with protocol work without continuous
+    /// input consuming every deadline before a queued head can be handed over.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn poll_accept_pending(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<(Request<RecvStream>, SendResponse<B>)>> {
+        if self.connection.is_closing() {
+            return Poll::Ready(None);
+        }
+        ready!(self.connection.poll_turn(cx));
+        Poll::Ready(self.take_pending_request())
     }
 
     /// Sets the target window size for the whole connection.
@@ -641,6 +675,37 @@ where
     /// Added by EdgeRush's vendored copy; not in h2 as published.
     pub fn work_left(&self) -> usize {
         self.connection.work_left()
+    }
+
+    /// Installs one absolute budget for an owner task poll, or disables it with `None`.
+    /// Unset by default. Repeated accepts, sending and closing share this deadline;
+    /// only the owner installs the next turn. Neither a yield nor I/O replenishes it.
+    /// Does not change the independent decode-unit allowance set by `set_work`.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn set_turn(&mut self, budget: Option<crate::TurnBudget>) {
+        self.connection.set_turn(budget);
+    }
+
+    /// Whether a checkpoint stopped work for the installed turn's deadline. Latched
+    /// until `set_turn`, without reading the clock. Ordinary I/O `Pending` does not
+    /// set this flag. Exhaustion wakes the driver to arrange another turn; it never
+    /// refuses a stream or closes the connection.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn turn_exhausted(&self) -> bool {
+        self.connection.turn_exhausted()
+    }
+
+    /// Drives pending control frames, responses and flow-control output without reading
+    /// input or accepting requests. `Ready(Ok(()))` means output was flushed (or the
+    /// connection closed), not that the connection is necessarily closed. Uses the same
+    /// turn as `poll_accept` and `poll_closed`, without renewing it. The owner must still
+    /// give receive work opportunities, and rotate send/receive across exhausted turns.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn poll_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), crate::Error>> {
+        self.connection.poll_send(cx).map_err(Into::into)
     }
 
     /// Starts a [graceful shutdown][1] process.
