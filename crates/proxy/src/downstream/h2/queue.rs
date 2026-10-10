@@ -136,28 +136,15 @@ impl<W, F: Future<Output = ()>> Queue<W, F> {
         self.ready.push(index);
     }
 
-    /// Examines at most `most` ready entries and returns how many it examined, including
-    /// stale wakes and streams refused by `make`. A live stream is made if needed and polled;
-    /// `None` from `make` leaves the queue. A full allowance may leave entries for the next
-    /// turn; the caller must arrange that turn. `driver` is woken when a stream joins the line.
-    #[cfg(test)]
+    /// Polls the streams in line, at most `most` of them, making each that has not been made
+    /// with `make` first — `None` from it, a stream answered without one, leaves the queue —
+    /// and says how many it polled: as many as it may, with streams perhaps left in line for
+    /// the next turn, or fewer, with none. `driver` is woken when a stream is put in line again.
     pub(crate) fn run(
         &mut self,
         driver: &Waker,
         most: usize,
-        make: impl FnMut(W) -> Option<F>,
-    ) -> usize {
-        self.run_while(driver, most, make, || true)
-    }
-
-    /// Checks the owner's turn before every entry, including stale wakes and refusals.
-    /// Stopping leaves the next entry queued; the owner arranges another turn.
-    pub(crate) fn run_while(
-        &mut self,
-        driver: &Waker,
-        most: usize,
         mut make: impl FnMut(W) -> Option<F>,
-        mut keep_going: impl FnMut() -> bool,
     ) -> usize {
         {
             let mut held = self
@@ -169,13 +156,11 @@ impl<W, F: Future<Output = ()>> Queue<W, F> {
                 *held = Some(driver.clone());
             }
         }
-        let mut examined = 0;
-        while examined < most && keep_going() {
+        let mut polled = 0;
+        while polled < most {
             let Some(index) = self.ready.pop() else {
                 break;
             };
-            // Refusals and stale wakes cost work even when no future is polled.
-            examined += 1;
             // A waker outlives its stream: its place may be empty, or another's since.
             let Some(Some(entry)) = self.entries.get_mut(index) else {
                 continue;
@@ -194,6 +179,7 @@ impl<W, F: Future<Output = ()>> Queue<W, F> {
                     }
                 }
             }
+            polled += 1;
             let State::Running(future) = &mut entry.state else {
                 continue;
             };
@@ -202,7 +188,7 @@ impl<W, F: Future<Output = ()>> Queue<W, F> {
                 self.leave(index);
             }
         }
-        examined
+        polled
     }
 
     fn leave(&mut self, index: usize) {
@@ -235,26 +221,6 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::task::Poll;
-
-    #[test]
-    fn a_deadline_stops_inside_a_batch_and_leaves_the_next_entry_queued() {
-        let mut queue = Queue::<usize, std::future::Ready<()>>::new();
-        for entry in 0..8 {
-            queue.push(entry);
-        }
-        let now = Cell::new(0);
-        let mut refuse = |_| {
-            now.set(now.get() + 1);
-            None
-        };
-        assert_eq!(
-            queue.run_while(Waker::noop(), 8, &mut refuse, || now.get() < 2),
-            2
-        );
-        assert_eq!(queue.run_while(Waker::noop(), 8, &mut refuse, || false), 0);
-        assert_eq!(queue.run(Waker::noop(), 8, refuse), 6);
-        assert!(queue.ready.is_empty());
-    }
 
     /// A stream that is ready again as soon as it is polled, `left` times, saying each poll:
     /// bounded, so that a queue that never stops polling ends the test rather than running on.
@@ -425,70 +391,9 @@ mod tests {
         let mut queue: Queue<usize, std::future::Pending<()>> = Queue::new();
         queue.push(0);
         queue.push(1);
-        assert_eq!(queue.run(Waker::noop(), 10, |_| None), 2);
+        assert_eq!(queue.run(Waker::noop(), 10, |_| None), 0);
         assert_eq!(queue.free.len(), 2);
         let (running, waiting) = queue.into_left();
         assert!(running.is_empty() && waiting.is_empty());
-    }
-
-    /// Refusing requests at construction still spends the turn: the remaining requests
-    /// keep their places until the next turn.
-    #[test]
-    fn refused_entries_spend_the_turns_allowance() {
-        let mut queue: Queue<usize, std::future::Pending<()>> = Queue::new();
-        for name in 0..5 {
-            queue.push(name);
-        }
-        let mut refused = Vec::new();
-        let examined = queue.run(Waker::noop(), 2, |name| {
-            refused.push(name);
-            None
-        });
-        assert_eq!(refused, [0, 1], "refusals ran past the allowance");
-        assert_eq!(examined, 2);
-        assert_eq!(queue.free.len(), 2);
-        let examined = queue.run(Waker::noop(), 2, |name| {
-            refused.push(name);
-            None
-        });
-        assert_eq!(refused, [0, 1, 2, 3]);
-        assert_eq!(examined, 2);
-        assert_eq!(queue.run(Waker::noop(), 2, |_| None), 1);
-        assert_eq!(queue.free.len(), 5);
-        assert!(queue.ready.is_empty());
-    }
-
-    /// Late wakes of completed streams also spend the turn, even though no future is
-    /// constructed or polled for their empty places.
-    #[test]
-    fn stale_entries_spend_the_turns_allowance() {
-        let polled = Rc::new(RefCell::new(Vec::new()));
-        let mut queue = Queue::new();
-        for name in 0..5 {
-            queue.push(name);
-        }
-        let wakers: Vec<_> = queue
-            .entries
-            .iter()
-            .flatten()
-            .map(|e| e.waker.clone())
-            .collect();
-        let mut make = busy(&polled, 0);
-        assert_eq!(queue.run(Waker::noop(), 5, &mut make), 5);
-        assert_eq!(queue.free.len(), 5);
-        for waker in wakers {
-            waker.wake();
-        }
-        let examined = queue.run(Waker::noop(), 2, &mut make);
-        assert!(
-            !queue.ready.is_empty(),
-            "stale wakes ran past the allowance"
-        );
-        assert_eq!(examined, 2);
-        assert_eq!(queue.run(Waker::noop(), 2, &mut make), 2);
-        assert!(!queue.ready.is_empty());
-        assert_eq!(queue.run(Waker::noop(), 2, &mut make), 1);
-        assert!(queue.ready.is_empty());
-        assert_eq!(*polled.borrow(), [0, 1, 2, 3, 4]);
     }
 }

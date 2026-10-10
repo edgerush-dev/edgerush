@@ -18,9 +18,6 @@
 #[path = "../src/h2_peer.rs"]
 mod h2_peer;
 
-#[path = "h2_library/turn.rs"]
-mod turn;
-
 use bytes::Bytes;
 use h2::client::{self, ResponseFuture, SendRequest};
 use h2::server;

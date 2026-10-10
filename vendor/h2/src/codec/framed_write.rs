@@ -24,10 +24,6 @@ pub struct FramedWrite<T, B> {
     /// Upstream `AsyncWrite`
     inner: T,
     final_flush_done: bool,
-    // EdgeRush: bounds frame staging and partial writes with one owner deadline.
-    pub(crate) turn: crate::turn::Turn,
-    // EdgeRush: corked for its owner's turn, see `flush`.
-    pub(crate) corked: bool,
 
     encoder: Encoder<B>,
 }
@@ -95,8 +91,6 @@ where
         FramedWrite {
             inner,
             final_flush_done: false,
-            turn: crate::turn::Turn::default(),
-            corked: false,
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
                 buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
@@ -114,8 +108,6 @@ where
     /// Calling this function may result in the current contents of the buffer
     /// to be flushed to `T`.
     pub fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        // EdgeRush: capacity is not permission to continue after the turn ends.
-        ready!(self.turn.poll(cx));
         if !self.encoder.has_capacity() {
             // Try flushing
             ready!(self.flush(cx))?;
@@ -130,10 +122,8 @@ where
 
     /// Returns whether a frame can be buffered without first flushing the
     /// underlying I/O object.
-    pub(crate) fn has_capacity(&mut self) -> bool {
-        // EdgeRush: staging loops use this before removing their next queued frame.
-        // False routes them to poll_ready, which wakes the task on exhaustion.
-        !self.turn.expired() && self.encoder.has_capacity()
+    pub(crate) fn has_capacity(&self) -> bool {
+        self.encoder.has_capacity()
     }
 
     // EdgeRush: gives the write buffer back when nothing is in it, for a
@@ -163,20 +153,8 @@ where
         let span = tracing::trace_span!("FramedWrite::flush");
         let _e = span.enter();
 
-        // EdgeRush: corked for its owner's turn, what still leaves room for another frame
-        // stays in the buffer until the turn ends (`flush_encoded`): one write a turn
-        // rather than one each time a phase of it sends. A full buffer, or a frame waiting
-        // for its payload to be written, is written as before.
-        if self.corked && self.encoder.has_capacity() {
-            return Poll::Ready(Ok(()));
-        }
-
         loop {
-            // EdgeRush: preserve encoder state before starting another continuation.
-            ready!(self.turn.poll(cx));
             while !self.encoder.is_empty() {
-                // EdgeRush: a writable socket can make many short writes in one poll.
-                ready!(self.turn.poll(cx));
                 let n = match self.encoder.next {
                     Some(Next::Data(ref mut frame)) => {
                         tracing::trace!(queued_data_frame = true);
@@ -199,8 +177,6 @@ where
                 }
             }
 
-            // EdgeRush: unset_frame may encode the next CONTINUATION.
-            ready!(self.turn.poll(cx));
             match self.encoder.unset_frame() {
                 ControlFlow::Continue => (),
                 ControlFlow::Break => break,
@@ -208,7 +184,6 @@ where
         }
 
         tracing::trace!("flushing buffer");
-        ready!(self.turn.poll(cx));
         // Flush the upstream
         ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
 
@@ -216,26 +191,11 @@ where
     }
 
     /// Close the codec
-    /// EdgeRush: writes what is already encoded once the owner's turn has ended, whatever
-    /// its deadline: at most the buffer, one frame's payload and the CONTINUATIONs of a
-    /// header block begun. Nothing new is taken from the streams.
-    pub(crate) fn flush_encoded(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        let corked = std::mem::replace(&mut self.corked, false);
-        let turn = std::mem::take(&mut self.turn);
-        let flushed = self.flush(cx);
-        self.turn = turn;
-        self.corked = corked;
-        flushed
-    }
-
     pub fn shutdown(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        // EdgeRush: closing writes everything, a GOAWAY first of all; it is never corked.
-        self.corked = false;
         if !self.final_flush_done {
             ready!(self.flush(cx))?;
             self.final_flush_done = true;
         }
-        ready!(self.turn.poll(cx));
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }

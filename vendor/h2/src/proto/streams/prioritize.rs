@@ -534,11 +534,8 @@ impl Prioritize {
                 self.try_assign_capacity(&mut stream);
             }
 
-            match self.pop_frame(buffer, store, max_frame_len, counts, || dst.has_send_capacity()) {
-                // EdgeRush: the inner scan can spend its turn skipping cancelled or
-                // blocked streams. Route the yield through poll_ready to wake the owner.
-                std::task::Poll::Pending => return Ok(BufferStatus::CodecFull),
-                std::task::Poll::Ready(Some(frame)) => {
+            match self.pop_frame(buffer, store, max_frame_len, counts) {
+                Some(frame) => {
                     tracing::trace!(?frame, "writing");
 
                     debug_assert_eq!(self.in_flight_data_frame, InFlightData::Nothing);
@@ -553,7 +550,7 @@ impl Prioritize {
                     // overwritten.
                     self.reclaim_frame(buffer, store, dst);
                 }
-                std::task::Poll::Ready(None) => {
+                None => {
                     return Ok(BufferStatus::Complete);
                 }
             }
@@ -709,8 +706,7 @@ impl Prioritize {
         store: &mut Store,
         max_len: usize,
         counts: &mut Counts,
-        mut can_continue: impl FnMut() -> bool,
-    ) -> std::task::Poll<Option<Frame<Prioritized<B>>>>
+    ) -> Option<Frame<Prioritized<B>>>
     where
         B: Buf,
     {
@@ -718,10 +714,6 @@ impl Prioritize {
         let _e = span.enter();
 
         loop {
-            // EdgeRush: every examined stream costs work, even when no frame is emitted.
-            if !can_continue() {
-                return std::task::Poll::Pending;
-            }
             match self.pending_send.pop(store) {
                 Some(mut stream) => {
                     let span = tracing::trace_span!("popped", ?stream.id, ?stream.state);
@@ -907,9 +899,9 @@ impl Prioritize {
 
                     counts.transition_after(stream, is_pending_reset);
 
-                    return std::task::Poll::Ready(Some(frame));
+                    return Some(frame);
                 }
-                None => return std::task::Poll::Ready(None),
+                None => return None,
             }
         }
     }
