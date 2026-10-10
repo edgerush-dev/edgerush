@@ -261,6 +261,14 @@ where
         self.codec.poll_turn(cx)
     }
 
+    pub(crate) fn set_corked(&mut self, corked: bool) {
+        self.codec.set_corked(corked);
+    }
+
+    pub(crate) fn poll_flush_encoded(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.codec.flush_encoded(cx).map_err(Into::into)
+    }
+
     pub(crate) fn is_closing(&self) -> bool {
         !matches!(self.inner.state, State::Open)
     }

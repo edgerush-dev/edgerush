@@ -412,3 +412,44 @@ async fn closing_keeps_a_partial_goaway_until_the_next_turn() {
         Some(code::ENHANCE_YOUR_CALM)
     );
 }
+
+#[tokio::test]
+async fn corked_output_waits_for_the_turns_end_and_then_leaves_whatever_the_deadline() {
+    let (mut connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    processed(&mut connection, &mut peer).await;
+    request(&mut peer, 1, true).await;
+    let (_, mut send) = within(connection.accept()).await.unwrap().unwrap();
+    connection.set_corked(true);
+    send.send_response(Response::new(()), true).unwrap();
+    connection.set_turn(Some(budget(100, false)));
+    within(poll_fn(|cx| connection.poll_send(cx)))
+        .await
+        .unwrap();
+    let frames = peer.drain_for(QUIET).await;
+    assert_eq!(
+        frames.iter().filter(|f| f.kind == kind::HEADERS).count(),
+        0,
+        "a corked answer left before the turn's end"
+    );
+    // The turn is over, and so is its deadline: what was encoded leaves all the same.
+    connection.set_turn(Some(budget(0, false)));
+    within(poll_fn(|cx| connection.poll_flush_encoded(cx)))
+        .await
+        .unwrap();
+    let frames = peer.drain_for(QUIET).await;
+    assert_eq!(frames.iter().filter(|f| f.kind == kind::HEADERS).count(), 1);
+}
+
+#[tokio::test]
+async fn a_corked_connection_closing_still_says_goaway() {
+    let (mut connection, mut peer, _) = server_with(&server::Builder::new(), true).await;
+    processed(&mut connection, &mut peer).await;
+    connection.set_corked(true);
+    connection.abrupt_shutdown(Reason::ENHANCE_YOUR_CALM);
+    let _closed = within(poll_fn(|cx| connection.poll_closed(cx))).await;
+    let frames = peer.drain_for(QUIET).await;
+    assert_eq!(
+        goaway_in(&frames).map(|(_, reason)| reason),
+        Some(code::ENHANCE_YOUR_CALM)
+    );
+}

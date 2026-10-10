@@ -164,6 +164,11 @@ impl<T, B> Codec<T, B> {
         self.inner.turn.exhausted() || self.inner.get_ref().turn.exhausted()
     }
 
+    // EdgeRush: see `FramedWrite::flush`.
+    pub(crate) fn set_corked(&mut self, corked: bool) {
+        self.inner.get_mut().corked = corked;
+    }
+
     pub(crate) fn poll_turn(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if self.turn_exhausted() {
             cx.waker().wake_by_ref();
@@ -211,6 +216,11 @@ where
     /// Flush buffered data to the wire
     pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         self.framed_write().flush(cx)
+    }
+
+    // EdgeRush: see `FramedWrite::flush_encoded`.
+    pub(crate) fn flush_encoded(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.framed_write().flush_encoded(cx)
     }
 
     /// Shutdown the send half

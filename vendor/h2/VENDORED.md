@@ -108,6 +108,14 @@ allowance, for fuzz builds:
   rotate receive and send opportunities across turns. Normal connection polling retains
   its existing control-frame order; shared control processing lives in `poll_control`.
   This support is inactive in EdgeRush's production driver until the scheduler integration.
+- **A turn's output can leave in one write.** `server::Connection::set_corked(true)` keeps
+  what the turn encodes in the write buffer: a flush returns at once while the buffer has
+  room for another frame and no DATA payload waits (`framed_write.rs`), so the phases of
+  a turn do not each make a write; a full buffer or a waiting payload is written as
+  before. `poll_flush_encoded` writes what is already encoded whatever the turn's
+  deadline — at most the buffer, one frame's payload and the CONTINUATIONs of a header
+  block begun — and takes nothing new from the streams; the owner calls it as a turn
+  ends. Shutdown always uncorks, so a GOAWAY is written. Uncorked by default.
 - **A decoded request can be handed over without driving the protocol.**
   `poll_accept_pending` respects the installed budget but performs no reads or flushes.
   `Ready(None)` means the queue is empty or the connection is closing, not end-of-stream;
@@ -156,12 +164,13 @@ allowance, for fuzz builds:
   are capped at warnings; a path dependency's are not, so the vendored copy stopped every
   fuzz build of the workspace's crates. The allowance is now unconditional (`lib.rs`).
 
-The turn deadline and separate send/admission entry points are covered by nine probes in
-`crates/proxy/tests/h2_library/turn.rs`: deadline equality and copying; exhaustion across
-accept/send/close polls and waking; the independent decode-unit backstop; buffered header
-continuations; pending output with continuous input; cancelled send entries; partial DATA
-writes; a partial GOAWAY resumed through send-only driving; and pending admission without
-reading more input. A scripted monotonic clock
+The turn deadline, the separate send/admission entry points and the cork are covered by
+eleven probes in `crates/proxy/tests/h2_library/turn.rs`: deadline equality and copying;
+exhaustion across accept/send/close polls and waking; the independent decode-unit
+backstop; buffered header continuations; pending output with continuous input; cancelled
+send entries; partial DATA writes; a partial GOAWAY resumed through send-only driving;
+pending admission without reading more input; corked output held until the turn's end and
+then written past the deadline; and a corked connection's GOAWAY. A scripted monotonic clock
 makes expiry deterministic. The `h2_turn` benchmark measures disabled, active and exhausted
 checkpoints; it does not measure mixed-traffic latency or establish a quantum.
 

@@ -708,6 +708,24 @@ where
         self.connection.poll_send(cx).map_err(Into::into)
     }
 
+    /// Corks output for the owner's turn: frames are encoded as before, but written only
+    /// once the buffer is full or a frame's payload waits, until `poll_flush_encoded`
+    /// writes the rest. Uncorked by default; the owner must flush before it waits.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn set_corked(&mut self, corked: bool) {
+        self.connection.set_corked(corked);
+    }
+
+    /// Writes what is already encoded, whatever the turn's deadline: at most the write
+    /// buffer, one frame's payload and the CONTINUATIONs of a header block begun. Takes
+    /// nothing new from the streams. For the owner's turn's end, corked or not.
+    ///
+    /// Added by EdgeRush's vendored copy; not in h2 as published.
+    pub fn poll_flush_encoded(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), crate::Error>> {
+        self.connection.poll_flush_encoded(cx).map_err(Into::into)
+    }
+
     /// Starts a [graceful shutdown][1] process.
     ///
     /// Must continue being polled to close connection.
