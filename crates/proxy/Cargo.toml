@@ -89,6 +89,10 @@ harness = false
 required-features = ["fuzzing"]
 
 [[bench]]
+name = "h2_queue"
+harness = false
+
+[[bench]]
 name = "kept"
 harness = false
 required-features = ["fuzzing"]

@@ -353,7 +353,7 @@ async fn drive<S, R, F, B, D>(
                 idle_from_now = true;
             }
             *streams.driver.borrow_mut() = Some(cx.waker().clone());
-            turn.polls -= queue.run(cx.waker(), turn.polls, &mut made);
+            turn.entries -= queue.run(cx.waker(), turn.entries, &mut made);
             // Its allowance spent, with streams perhaps still in line, the turn is given back.
             if turn.spent() {
                 return give_back(cx, &mut turn);
@@ -517,8 +517,8 @@ where
 struct Turn {
     /// Streams it may take up.
     accepts: usize,
-    /// Streams it may poll.
-    polls: usize,
+    /// Ready entries it may examine, including refusals and stale wakes.
+    entries: usize,
     /// Decoding h2 may do, in frames, a header block's counting one more for each KiB it
     /// carries.
     work: usize,
@@ -527,24 +527,24 @@ struct Turn {
 impl Turn {
     const WHOLE: Self = Self {
         accepts: ACCEPTS,
-        polls: POLLS,
+        entries: ENTRIES,
         work: WORK,
     };
 
     /// Whether the turn is to be given back. Decoding spent ends it in h2, which then reads
     /// nothing and wakes the task.
     fn spent(&self) -> bool {
-        self.accepts == 0 || self.polls == 0
+        self.accepts == 0 || self.entries == 0
     }
 }
 
 /// How many streams a connection's task takes up a turn before it gives the turn back.
 const ACCEPTS: usize = 16;
 
-/// How many of its streams a connection's task polls a turn before it gives the turn back:
-/// enough that a busy connection is not slowed by its own turns, few enough that a hundred
-/// busy streams do not keep a worker's other connections waiting.
-const POLLS: usize = 64;
+/// How many ready entries a connection examines a turn before it gives the turn back,
+/// including requests refused before their future is made and wakes of streams already gone.
+/// This bounds the count of operations, not the elapsed work of a turn.
+const ENTRIES: usize = 64;
 
 /// How much h2 may decode for a connection a turn, in frames, a frame of a header block
 /// counting one more for each whole KiB it carries: every frame, whatever becomes of it — a

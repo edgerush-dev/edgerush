@@ -47,6 +47,10 @@ Not yet: anything Kubernetes (the control plane, the operator, translating Ingre
 Gateway API), rate limiting, authentication. The request path comes first, then rate
 limiting, then the control plane and the operator.
 
+HTTP/2 connections examine at most 64 ready stream entries per turn, including requests
+refused before their futures are made and stale wakes of completed streams. This bounds
+queue work by count; latency isolation from a saturating HTTP/2 flood is still being fixed.
+
 ## Trying it
 
 With a backend on port 9000, save this as `edgerush.yaml`:
