@@ -1144,6 +1144,35 @@ async fn the_scrape_endpoint_serves_what_was_counted_and_nothing_else() {
     assert_eq!(sample(&proxy.metrics(), web_2xx), 1);
 }
 
+/// A scrape that starts within a second of the last render is given the same text, what
+/// was counted since included or not; one that starts later is given a new one (08 §4).
+#[tokio::test(flavor = "multi_thread")]
+async fn scrapes_within_a_second_share_one_render() {
+    let up = upstream("up").await;
+    let (proxy, addresses) = reloadable_proxy(&everything_to(&[("web", up)], "0")).await;
+    let scrape = scraped(Arc::clone(&proxy));
+    let web_2xx = "edgerush_listener_responses_total{listener=\"web\",class=\"2xx\"}";
+
+    let rendered = Instant::now();
+    let first = send(get(scrape, "/metrics")).await.2;
+    assert_eq!(sample(&first, web_2xx), 0);
+    assert_eq!(send(get(addresses["web"], "/")).await.0, 200);
+    // Counted once its head has gone, on the worker's thread (14 §4).
+    while sample(&proxy.metrics(), web_2xx) != 1 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let second = send(get(scrape, "/metrics")).await.2;
+    // A machine slow enough to take a second over this has started a new render, and the
+    // test cannot tell: it holds the text to the first only when inside the second.
+    if rendered.elapsed() < Duration::from_millis(900) {
+        assert_eq!(second, first);
+    }
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let third = send(get(scrape, "/metrics")).await.2;
+    assert_eq!(sample(&third, web_2xx), 1);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_scrape_endpoint_speaks_http1_only() {
     let up = upstream("up").await;

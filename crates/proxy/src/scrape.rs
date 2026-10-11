@@ -8,7 +8,8 @@
 //!
 //! It serves [`MOST`] connections at once, and its account holds what that many can need,
 //! so that whoever reaches its address can take no more of the process's descriptors and
-//! memory than that (08 §4).
+//! memory than that (08 §4). The text is rendered at most once in [`FRESH`] and shared by
+//! the scrapes that start within it.
 
 use crate::downstream::h1::connection::{self as h1, Answered, STAGING};
 use crate::downstream::h1::date::HttpDate;
@@ -32,8 +33,10 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 /// The Prometheus text format, as its scrapers ask to be told.
 const TEXT_FORMAT: HeaderValue =
@@ -46,6 +49,12 @@ const ALLOWED: HeaderValue = HeaderValue::from_static("GET, HEAD");
 /// ten the same way — and the descriptors they hold come out of what the process keeps
 /// back from its workers (03 §9).
 pub(crate) const MOST: usize = 10;
+
+/// How long a metrics text is kept after it was made: a scrape that starts within it is
+/// given that text, not a render of its own. Scrapes that arrive together, a pair kept for
+/// availability or several scrapers on one schedule, then hold one text between them, and
+/// what any of them reads is never more than this old.
+pub(crate) const FRESH: Duration = Duration::from_secs(1);
 
 /// The pieces the metrics text is handed to the server in. What the server has queued for
 /// the socket is charged to the account until it has gone, and the text, made whole, would
@@ -86,6 +95,39 @@ impl Drop for Served {
     }
 }
 
+/// The newest metrics text and when it was made, kept for [`FRESH`] and then let go of, so
+/// that a data plane nobody is scraping holds no copy.
+#[derive(Default)]
+struct Rendered(RefCell<Option<(Instant, Bytes)>>);
+
+impl Rendered {
+    /// The text made less than [`FRESH`] ago, or a new one from `render`, kept from now.
+    ///
+    /// # Panics
+    ///
+    /// Runs inside a `LocalSet`: the text is let go of by a task of its own.
+    fn text(self: &Rc<Self>, render: impl FnOnce() -> Bytes) -> Bytes {
+        let now = Instant::now();
+        if let Some((made, text)) = &*self.0.borrow()
+            && now < *made + FRESH
+        {
+            return text.clone();
+        }
+        let text = render();
+        *self.0.borrow_mut() = Some((now, text.clone()));
+        let kept = Rc::clone(self);
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep_until(now + FRESH).await;
+            let mut held = kept.0.borrow_mut();
+            // A text made since is another's to let go of.
+            if held.as_ref().is_some_and(|(made, _)| *made == now) {
+                *held = None;
+            }
+        });
+        text
+    }
+}
+
 impl Proxy {
     /// Serves [`Proxy::metrics`] at `/metrics` to whoever connects to `socket`, and nothing
     /// else, to ten connections at once. Never returns; dropping the future stops
@@ -110,6 +152,7 @@ impl Proxy {
         let timers = Timers::new();
         let _timing = tokio::task::spawn_local(Rc::clone(&timers).run());
         let open = Rc::new(Open::default());
+        let rendered = Rc::new(Rendered::default());
         loop {
             // One thread, so nothing ends between the look and the wait; and a connection
             // that ended with nobody waiting has left its wake behind.
@@ -129,13 +172,14 @@ impl Proxy {
             let blocks = Rc::clone(&blocks);
             let timers = Rc::clone(&timers);
             let settings = Rc::clone(&settings);
+            let rendered = Rc::clone(&rendered);
             let served = Served::new(&open);
             tokio::task::spawn_local(async move {
                 // Dated as each answer is written: scrapes are too few for a worker's
                 // cached date to be worth keeping here.
                 let date = || HttpDate::from_unix(unix_now());
                 let respond = |head: RawHead, _, _| {
-                    let answer = Answered::Map(proxy.scrape(&head));
+                    let answer = Answered::Map(proxy.scrape(&head, &rendered));
                     async move { answer }
                 };
                 // How it ended is the scraper's business; the socket is closed either way.
@@ -170,7 +214,7 @@ impl Proxy {
         }
     }
 
-    fn scrape(&self, head: &RawHead) -> Response<Pieces> {
+    fn scrape(&self, head: &RawHead, rendered: &Rc<Rendered>) -> Response<Pieces> {
         if head.uri().path() != "/metrics" {
             return empty(StatusCode::NOT_FOUND);
         }
@@ -179,7 +223,8 @@ impl Proxy {
             response.headers_mut().insert(ALLOW, ALLOWED);
             return response;
         }
-        let mut response = Response::new(Pieces(Bytes::from(self.metrics())));
+        let text = rendered.text(|| Bytes::from(self.metrics()));
+        let mut response = Response::new(Pieces(text));
         response.headers_mut().insert(CONTENT_TYPE, TEXT_FORMAT);
         local(response)
     }
@@ -231,6 +276,68 @@ impl Body for Pieces {
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
+
+    /// Runs `test` on a clock that moves only when told, inside a `LocalSet`.
+    fn paused(test: impl std::future::Future<Output = ()>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, test);
+    }
+
+    /// A scrape that starts less than [`FRESH`] after the last render is given that text,
+    /// the same bytes and not a copy; one that starts at [`FRESH`] or later renders anew.
+    #[test]
+    fn a_render_is_shared_by_the_scrapes_that_start_within_a_second() {
+        paused(async {
+            let rendered = Rc::new(Rendered::default());
+            let renders = Cell::new(0);
+            let render = || {
+                renders.set(renders.get() + 1);
+                Bytes::from(format!("render {}", renders.get()))
+            };
+            let first = rendered.text(render);
+            tokio::time::advance(FRESH - Duration::from_millis(1)).await;
+            let shared = rendered.text(render);
+            assert_eq!((shared.as_ptr(), renders.get()), (first.as_ptr(), 1));
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert_eq!(rendered.text(render), "render 2");
+        });
+    }
+
+    /// A text is let go of [`FRESH`] after it was made, whether or not anyone scrapes
+    /// again, so that a data plane nobody is scraping holds none.
+    #[test]
+    fn a_render_is_let_go_of_a_second_after_it_was_made() {
+        paused(async {
+            let rendered = Rc::new(Rendered::default());
+            rendered.text(|| Bytes::from_static(b"text"));
+            tokio::time::advance(FRESH - Duration::from_millis(1)).await;
+            assert!(rendered.0.borrow().is_some());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            assert!(rendered.0.borrow().is_none());
+        });
+    }
+
+    /// The task letting go of an older text leaves a newer one alone. A newer text is made
+    /// only once the older is due to go, and which of the two then comes first is the
+    /// scheduler's; here the newer is put in place before the older's task runs.
+    #[test]
+    fn a_newer_render_outlives_the_older_ones_letting_go() {
+        paused(async {
+            let rendered = Rc::new(Rendered::default());
+            rendered.text(|| Bytes::from_static(b"older"));
+            tokio::time::advance(FRESH - Duration::from_millis(1)).await;
+            *rendered.0.borrow_mut() = Some((Instant::now(), Bytes::from_static(b"newer")));
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            let held = rendered.0.borrow().as_ref().map(|(_, text)| text.clone());
+            assert_eq!(held.as_deref(), Some(&b"newer"[..]));
+        });
+    }
 
     /// The text goes a piece at a time, every piece no larger than [`PIECE`], all of it and
     /// nothing else, and its length is known before the first piece, so the answer says it.
