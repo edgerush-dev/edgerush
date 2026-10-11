@@ -511,7 +511,7 @@ async fn an_http3_upload_goes_up_with_the_length_it_stated() {
     local
         .run_until(async {
             use crate::downstream::h3::testing::{Client, get};
-            let (upstream, heads) = recording_upstream("200 OK");
+            let (upstream, requests) = whole_reading_upstream();
             let http3 = edgerush_config::Http3 {
                 alt_svc_max_age: 60,
                 force_retry: false,
@@ -528,18 +528,71 @@ async fn an_http3_upload_goes_up_with_the_length_it_stated() {
                 client.body(id, b"hello", true).await;
                 let answer = client.answer(id).await;
                 assert_eq!(answer.final_status(), Some("200"), "{length:?}");
-                let head = heads.borrow()[at].clone();
+                let request = requests.borrow()[at].clone();
                 if length.is_some() {
-                    assert!(head.contains("\r\ncontent-length: 5\r\n"), "{head}");
-                    assert!(!head.contains("transfer-encoding"), "{head}");
+                    assert!(request.contains("\r\ncontent-length: 5\r\n"), "{request}");
+                    assert!(!request.contains("transfer-encoding"), "{request}");
+                    assert!(request.ends_with("\r\n\r\nhello"), "{request}");
                 } else {
                     assert!(
-                        head.contains("\r\ntransfer-encoding: chunked\r\n"),
-                        "{head}"
+                        request.contains("\r\ntransfer-encoding: chunked\r\n"),
+                        "{request}"
                     );
-                    assert!(!head.contains("content-length"), "{head}");
+                    assert!(!request.contains("content-length"), "{request}");
+                    assert!(
+                        request.ends_with("\r\n\r\n5\r\nhello\r\n0\r\n\r\n"),
+                        "{request}"
+                    );
                 }
             }
         })
         .await;
+}
+
+/// An upstream that reads each request whole, its body by the length its head states or to
+/// its last chunk, before it answers 200 and closes; and keeps each request as text.
+/// Answering first and closing on an upload still coming has the socket reset, and the reset
+/// can take the answer with it, which is a 502 and not what these tests ask about.
+fn whole_reading_upstream() -> (SocketAddr, Rc<RefCell<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let address = socket.local_addr().unwrap();
+    let socket = TcpListener::from_std(socket).unwrap();
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::clone(&requests);
+    let _accepting = tokio::task::spawn_local(async move {
+        while let Ok((mut stream, _)) = socket.accept().await {
+            let whole = |read: &[u8]| {
+                let Some(end) = read.windows(4).position(|four| four == b"\r\n\r\n") else {
+                    return false;
+                };
+                let head = String::from_utf8_lossy(&read[..end]).to_lowercase();
+                let body = &read[end + 4..];
+                match head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                {
+                    Some(length) => body.len() >= length.trim().parse::<usize>().unwrap(),
+                    None if head.contains("transfer-encoding: chunked") => {
+                        body.ends_with(b"0\r\n\r\n")
+                    }
+                    None => true,
+                }
+            };
+            let mut read = Vec::new();
+            let mut chunk = [0; 4096];
+            while !whole(&read) {
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => read.extend_from_slice(&chunk[..n]),
+                }
+            }
+            seen.borrow_mut()
+                .push(String::from_utf8_lossy(&read).to_lowercase());
+            let answer = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            let _ = stream.write_all(answer).await;
+        }
+    });
+    (address, requests)
 }
