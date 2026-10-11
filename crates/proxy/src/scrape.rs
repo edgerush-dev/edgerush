@@ -9,7 +9,8 @@
 //! It serves [`MOST`] connections at once, and its account holds what that many can need,
 //! so that whoever reaches its address can take no more of the process's descriptors and
 //! memory than that (08 §4). The text is rendered at most once in [`FRESH`] and shared by
-//! the scrapes that start within it.
+//! the scrapes that start within it, and an answer that has not gone within
+//! [`ANSWERED_WITHIN`] of its request ends its connection.
 
 use crate::downstream::h1::connection::{self as h1, Answered, STAGING};
 use crate::downstream::h1::date::HttpDate;
@@ -29,14 +30,16 @@ use http::{HeaderValue, Method, Response, StatusCode};
 use http_body::{Body, Frame, SizeHint};
 use std::cell::{Cell, RefCell};
 use std::convert::Infallible;
+use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
-use tokio::time::Instant;
+use tokio::time::{Instant, Sleep};
 
 /// The Prometheus text format, as its scrapers ask to be told.
 const TEXT_FORMAT: HeaderValue =
@@ -55,6 +58,12 @@ pub(crate) const MOST: usize = 10;
 /// availability or several scrapers on one schedule, then hold one text between them, and
 /// what any of them reads is never more than this old.
 pub(crate) const FRESH: Duration = Duration::from_secs(1);
+
+/// How long a scrape answer may take to go, from its request's head being read:
+/// Prometheus' default `scrape_timeout`, after which its scraper has given up on it. A
+/// connection still sending one then is ended, so that a reader that takes a piece now and
+/// then holds the text no longer than this (08 §4).
+const ANSWERED_WITHIN: Duration = Duration::from_secs(10);
 
 /// The pieces the metrics text is handed to the server in. What the server has queued for
 /// the socket is charged to the account until it has gone, and the text, made whole, would
@@ -128,6 +137,98 @@ impl Rendered {
     }
 }
 
+/// A scrape connection's socket, whose writes fail once the answer being written is due.
+/// Only writes: a connection between requests writes nothing, and the next request's head
+/// sets a new time.
+struct Bounded<S> {
+    socket: S,
+    /// When the answer being written must have gone, set as its request's head is read.
+    due: Rc<Cell<Option<Instant>>>,
+    /// Waits for `due`, so that a write the socket cannot take is woken when it passes.
+    sleep: Option<(Instant, Pin<Box<Sleep>>)>,
+}
+
+impl<S> Bounded<S> {
+    fn new(socket: S, due: Rc<Cell<Option<Instant>>>) -> Self {
+        Self {
+            socket,
+            due,
+            sleep: None,
+        }
+    }
+
+    /// Whether the answer being written is due, waking the task when it falls due if not.
+    fn overdue(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(due) = self.due.get() else {
+            return false;
+        };
+        let sleep = match &mut self.sleep {
+            Some((at, sleep)) => {
+                if *at != due {
+                    sleep.as_mut().reset(due);
+                    *at = due;
+                }
+                sleep
+            }
+            None => {
+                &mut self
+                    .sleep
+                    .insert((due, Box::pin(tokio::time::sleep_until(due))))
+                    .1
+            }
+        };
+        sleep.as_mut().poll(cx).is_ready()
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Bounded<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().socket).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Bounded<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let bounded = self.get_mut();
+        if bounded.overdue(cx) {
+            return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
+        }
+        Pin::new(&mut bounded.socket).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let bounded = self.get_mut();
+        if bounded.overdue(cx) {
+            return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
+        }
+        Pin::new(&mut bounded.socket).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.socket.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().socket).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().socket).poll_shutdown(cx)
+    }
+}
+
 impl Proxy {
     /// Serves [`Proxy::metrics`] at `/metrics` to whoever connects to `socket`, and nothing
     /// else, to ten connections at once. Never returns; dropping the future stops
@@ -138,6 +239,11 @@ impl Proxy {
     /// Runs inside a `LocalSet`, where each connection's task goes: our server's
     /// connections are not `Send`.
     pub async fn serve_metrics(self: Arc<Self>, socket: TcpListener) {
+        self.serve_metrics_within(socket, ANSWERED_WITHIN).await;
+    }
+
+    /// [`Proxy::serve_metrics`], each answer given `within` to go.
+    async fn serve_metrics_within(self: Arc<Self>, socket: TcpListener, within: Duration) {
         let limits = H1Limits::default();
         let blocks = Rc::new(RefCell::new(Blocks::new(
             Sizes::within(&limits, SMALL),
@@ -178,7 +284,9 @@ impl Proxy {
                 // Dated as each answer is written: scrapes are too few for a worker's
                 // cached date to be worth keeping here.
                 let date = || HttpDate::from_unix(unix_now());
+                let due = Rc::new(Cell::new(None));
                 let respond = |head: RawHead, _, _| {
+                    due.set(Some(Instant::now() + within));
                     let answer = Answered::Map(proxy.scrape(&head, &rendered));
                     async move { answer }
                 };
@@ -188,7 +296,7 @@ impl Proxy {
                 // Scrapes are too few for slots of the worker's to be worth keeping.
                 let slots = Slots::default();
                 let _ended = h1::serve(
-                    &mut stream,
+                    &mut Bounded::new(&mut stream, Rc::clone(&due)),
                     &settings,
                     blocks,
                     timers,
@@ -337,6 +445,130 @@ mod tests {
             let held = rendered.0.borrow().as_ref().map(|(_, text)| text.clone());
             assert_eq!(held.as_deref(), Some(&b"newer"[..]));
         });
+    }
+
+    /// A write the socket cannot take waits as long as it must while no answer is due,
+    /// and fails once the answer it belongs to is due; a write within the bound goes.
+    #[test]
+    fn a_write_still_waiting_when_its_answer_is_due_fails() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        paused(async {
+            let (near, mut far) = tokio::io::duplex(64);
+            let due = Rc::new(Cell::new(None));
+            let mut bounded = Bounded::new(near, Rc::clone(&due));
+            bounded.write_all(&[0; 64]).await.unwrap();
+            {
+                let mut write = std::pin::pin!(bounded.write_all(&[1; 64]));
+                // Nothing due: it waits for room however long.
+                let waited = tokio::time::timeout(Duration::from_secs(600), &mut write).await;
+                assert!(waited.is_err(), "{waited:?}");
+                due.set(Some(Instant::now() + ANSWERED_WITHIN));
+                let failed = tokio::time::timeout(ANSWERED_WITHIN * 2, &mut write)
+                    .await
+                    .expect("woken when its answer is due");
+                assert_eq!(
+                    failed.map_err(|error| error.kind()),
+                    Err(std::io::ErrorKind::TimedOut)
+                );
+            }
+            // The next answer is given its own bound: room made within it is taken.
+            let mut read = [0; 64];
+            far.read_exact(&mut read).await.unwrap();
+            due.set(Some(Instant::now() + ANSWERED_WITHIN));
+            tokio::time::advance(ANSWERED_WITHIN - Duration::from_millis(1)).await;
+            bounded.write_all(&[2; 64]).await.unwrap();
+        });
+    }
+
+    /// A scrape answer that has not all gone within its bound of its head being read ends
+    /// its connection, so that a reader that takes a little now and then holds the text no
+    /// longer than that; one taken at once is not cut (08 §4). The text is made several MB,
+    /// more than the sockets between client and server hold.
+    #[test]
+    fn a_scrape_answer_still_going_when_due_ends_its_connection() {
+        use std::io::{Read, Write};
+        let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
+        for at in 0..4_000 {
+            yaml.push_str(&format!(
+                "  upstream-{at}: {{ load_balancer: p2c, endpoints: [\"127.0.0.1:{}\"] }}\n",
+                1_000 + at
+            ));
+        }
+        let config: edgerush_config::Config = serde_saphyr::from_str(&yaml).unwrap();
+        let compiled = edgerush_config::compile(&config).unwrap();
+        let proxy = Arc::new(Proxy::new(compiled, std::num::NonZeroUsize::MIN).unwrap());
+        let length = proxy.metrics().len();
+        assert!(length > 4_000_000, "{length}");
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let address = socket.local_addr().unwrap();
+        const WITHIN: Duration = Duration::from_millis(500);
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let socket = {
+                let _entered = runtime.enter();
+                TcpListener::from_std(socket).unwrap()
+            };
+            // Serving never ends, so neither does this: the thread goes with the process.
+            tokio::task::LocalSet::new()
+                .block_on(&runtime, proxy.serve_metrics_within(socket, WITHIN));
+        });
+        let ask = |stream: &mut std::net::TcpStream| {
+            stream
+                .write_all(b"GET /metrics HTTP/1.1\r\nhost: scrape.test\r\n\r\n")
+                .unwrap();
+        };
+
+        // Read at once, it all comes.
+        let mut quick = std::net::TcpStream::connect(address).unwrap();
+        quick
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        ask(&mut quick);
+        let mut answer = Vec::new();
+        let mut buffer = vec![0; 64 * 1024];
+        let whole = loop {
+            let read = quick.read(&mut buffer).unwrap();
+            assert_ne!(read, 0, "closed after {} bytes", answer.len());
+            answer.extend_from_slice(&buffer[..read]);
+            let Some(end) = answer.windows(4).position(|end| end == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&answer[..end]).to_ascii_lowercase();
+            let stated = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .and_then(|length| length.trim().parse::<usize>().ok())
+                .unwrap();
+            if answer.len() >= end + 4 + stated {
+                break stated;
+            }
+        };
+        assert!(whole > 4_000_000, "{whole}");
+
+        // Read a little, then nothing past the bound: the connection is ended.
+        let mut slow = std::net::TcpStream::connect(address).unwrap();
+        slow.set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        ask(&mut slow);
+        let mut taken = slow.read(&mut buffer).unwrap();
+        assert!(taken > 0);
+        std::thread::sleep(WITHIN * 3);
+        let ended = loop {
+            match slow.read(&mut buffer) {
+                Ok(0) => break true,
+                Ok(read) => taken += read,
+                Err(error) => {
+                    assert_ne!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
+                    assert_ne!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+                    break true;
+                }
+            }
+        };
+        assert!(ended && taken < length, "{taken} of {length}");
     }
 
     /// The text goes a piece at a time, every piece no larger than [`PIECE`], all of it and
