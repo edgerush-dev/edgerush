@@ -142,7 +142,7 @@ pub(crate) fn is_chunked_request<F: Fields + ?Sized>(headers: &F) -> bool {
 
 /// Takes the hop-by-hop headers off a request; `TE: trailers` stays if it was said.
 /// Allocates only for a request with more than one `Connection` field.
-pub(crate) fn strip_request(headers: &mut HeaderMap) {
+pub(crate) fn strip_request(headers: &mut HeaderMap) -> bool {
     let accepts_trailers = headers
         .get_all(TE)
         .iter()
@@ -154,6 +154,7 @@ pub(crate) fn strip_request(headers: &mut HeaderMap) {
     if accepts_trailers {
         headers.insert(TE, TE_TRAILERS);
     }
+    accepts_trailers
 }
 
 /// Takes the hop-by-hop headers off a response.

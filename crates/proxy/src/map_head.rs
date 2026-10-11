@@ -36,6 +36,8 @@ pub struct MapHead {
     added: Vec<(HeaderName, HeaderValue)>,
     /// Where the list's room came from, and goes back to when the head is done with.
     lent_by: Option<Rc<RefCell<Blocks>>>,
+    /// Whether it goes on saying `TE: trailers`, as the request core noted.
+    trailers: bool,
 }
 
 impl MapHead {
@@ -48,6 +50,7 @@ impl MapHead {
             parts,
             added: Vec::new(),
             lent_by: None,
+            trailers: false,
         }
     }
 
@@ -60,6 +63,7 @@ impl MapHead {
             parts,
             added,
             lent_by: Some(Rc::clone(blocks)),
+            trailers: false,
         }
     }
 
@@ -164,6 +168,10 @@ impl OutgoingFields for MapHead {
             .map(|(name, value)| name.as_str().len() + 2 + value.len() + 2)
             .sum();
         self.parts.headers.written_len() + added
+    }
+
+    fn says_te(&self) -> bool {
+        self.trailers
     }
 
     fn write_fields(&self, out: &mut Vec<u8>) {
@@ -277,12 +285,16 @@ impl Head for MapHead {
         hop_by_hop::check_connection_values(self.values(&CONNECTION), id)
     }
 
-    fn strip_request(&mut self) -> Result<(), Rejection> {
-        hop_by_hop::strip_request(&mut self.parts.headers);
+    fn strip_request(&mut self) -> Result<bool, Rejection> {
+        let trailers = hop_by_hop::strip_request(&mut self.parts.headers);
         // Nothing added is about the connection — the core adds none of those, and what
         // `Connection` names may not be one it adds — but a list is held to the same rule.
         self.added.retain(|(name, _)| !is_hop_by_hop(name));
-        Ok(())
+        Ok(trailers)
+    }
+
+    fn note_trailers(&mut self, accepted: bool) {
+        self.trailers = accepted;
     }
 
     fn apply(&mut self, changes: &HeaderModifier) -> Result<(), Rejection> {

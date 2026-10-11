@@ -498,6 +498,13 @@ pub trait OutgoingFields: edgerush_router::Fields {
     /// Appends them to `out`, one line each.
     fn write_fields(&self, out: &mut Vec<u8>);
 
+    /// Whether they say `TE`. A head the request core went through has it noted
+    /// ([`crate::head::Head::note_trailers`]), since the core already
+    /// passed over every field; anything else looks.
+    fn says_te(&self) -> bool {
+        self.values(&http::header::TE).next().is_some()
+    }
+
     /// Hands every field to `visit`, its name as it arrived and its value, in order: for a
     /// hop that sends them as something other than lines. The framing fields included.
     fn each_field(&self, visit: impl FnMut(&[u8], &[u8]));
@@ -580,7 +587,61 @@ pub fn head_len<F: OutgoingFields + ?Sized>(
         Sending::Length(length) => b"content-length: ".len() + decimal_len(length) + 2,
         Sending::Chunked => b"transfer-encoding: chunked\r\n".len(),
     };
-    line + fields + framing + 2
+    let te = match names_te(headers) {
+        NamesTe::No => 0,
+        NamesTe::Alone => CONNECTION_TE.len(),
+        NamesTe::Joined => JOINED_TE.len(),
+    };
+    line + fields + te + framing + 2
+}
+
+/// How a request's `TE` is named in its `Connection`. Over HTTP/1.1 `TE` is about the
+/// connection it is sent on alone, so its sender names it there, for an intermediary that
+/// does not know the field to take it off rather than pass it further in (RFC 9112 §7.4;
+/// 03 §11). The only `Connection` a head can carry here is the gateway's own — a `close`
+/// for credentials, an `upgrade` for a WebSocket's handshake — since the client's went with
+/// the other hop-by-hop fields and no rule may set one; `te` joins it.
+enum NamesTe {
+    /// No `TE`, so nothing to name.
+    No,
+    /// In a `Connection` of its own.
+    Alone,
+    /// After the gateway's own options.
+    Joined,
+}
+
+/// The field naming `TE` where the head has no `Connection`.
+const CONNECTION_TE: &[u8] = b"connection: te\r\n";
+/// What names `TE` after the options already in the head's `Connection`.
+const JOINED_TE: &[u8] = b", te";
+
+fn names_te<F: OutgoingFields + ?Sized>(headers: &F) -> NamesTe {
+    if !headers.says_te() {
+        NamesTe::No
+    } else if headers.values(&http::header::CONNECTION).next().is_none() {
+        NamesTe::Alone
+    } else {
+        NamesTe::Joined
+    }
+}
+
+/// Puts `te` at the end of the first `Connection` line written to `out` from `from` on:
+/// the gateway's own, which [`names_te`] found in the head.
+fn join_te(out: &mut Vec<u8>, from: usize) {
+    let mut start = from;
+    while let Some(length) = out
+        .get(start..)
+        .and_then(|rest| rest.windows(2).position(|pair| pair == b"\r\n"))
+    {
+        let end = start + length;
+        let line = out.get(start..end).unwrap_or_default();
+        let name = line.split(|byte| *byte == b':').next().unwrap_or_default();
+        if name.eq_ignore_ascii_case(b"connection") {
+            out.splice(end..end, JOINED_TE.iter().copied());
+            return;
+        }
+        start = end + 2;
+    }
 }
 
 /// How many decimal digits `number` is written with.
@@ -620,7 +681,13 @@ pub fn write_head<F: OutgoingFields + ?Sized>(
     out.push(b' ');
     out.extend_from_slice(target.as_bytes());
     out.extend_from_slice(b" HTTP/1.1\r\n");
+    let fields = out.len();
     headers.write_fields(out);
+    match names_te(headers) {
+        NamesTe::No => {}
+        NamesTe::Alone => out.extend_from_slice(CONNECTION_TE),
+        NamesTe::Joined => join_te(out, fields),
+    }
     match sending {
         Sending::None => {}
         Sending::Length(length) => {
@@ -2603,7 +2670,52 @@ mod tests {
             &H1Limits::default(),
         )
         .unwrap();
+        // What was paid for is what was written.
+        assert_eq!(len, out.len());
         String::from_utf8(out).unwrap()
+    }
+
+    /// `TE` is about the connection it is sent on alone, so over HTTP/1.1 its sender names
+    /// it in `Connection`, lest an intermediary that does not know it pass it further in
+    /// (RFC 9112 §7.4).
+    #[test]
+    fn a_request_that_says_te_names_it_in_connection() {
+        let head = written(
+            "POST",
+            "/x",
+            &[("host", "shop.test"), ("te", "trailers")],
+            Sending::None,
+        );
+        assert!(head.contains("\r\nte: trailers\r\n"), "{head}");
+        assert!(head.contains("\r\nconnection: te\r\n"), "{head}");
+        assert_eq!(head.matches("connection").count(), 1, "{head}");
+
+        // Nothing to name without it.
+        let head = written("POST", "/x", &[("host", "shop.test")], Sending::None);
+        assert!(!head.contains("connection"), "{head}");
+    }
+
+    /// The gateway's own `Connection`, a `close` where credentials bind the connection to
+    /// one client or an `upgrade` for a WebSocket's handshake, is one list with `te` in it.
+    #[test]
+    fn te_joins_the_gateways_own_connection_options() {
+        for own in ["close", "upgrade"] {
+            let head = written(
+                "GET",
+                "/x",
+                &[
+                    ("connection", own),
+                    ("host", "shop.test"),
+                    ("te", "trailers"),
+                ],
+                Sending::None,
+            );
+            assert!(
+                head.contains(&format!("\r\nconnection: {own}, te\r\n")),
+                "{head}"
+            );
+            assert_eq!(head.matches("connection").count(), 1, "{head}");
+        }
     }
 
     /// The target is the path and query alone. Sending the whole URI is how a request is

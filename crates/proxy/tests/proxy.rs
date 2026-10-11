@@ -821,7 +821,10 @@ async fn what_is_said_about_one_connection_does_not_reach_the_next() {
     // What the upstream saw of the request.
     assert!(seen.contains("x-kept: 1\n"), "{seen}");
     assert!(seen.contains("te: trailers\n"), "{seen}");
-    for gone in ["x-hop", "keep-alive", "connection", "gzip"] {
+    // The one `Connection` it saw is the gateway's, naming the `TE` it sent (RFC 9112 §7.4).
+    assert!(seen.contains("connection: te\n"), "{seen}");
+    assert_eq!(seen.matches("connection").count(), 1, "{seen}");
+    for gone in ["x-hop", "keep-alive", "close", "gzip"] {
         assert!(!seen.contains(gone), "{gone} in {seen}");
     }
     // What the client sees of the response; its own connection is closed as it asked.

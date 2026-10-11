@@ -424,9 +424,12 @@ pub fn decide_routed<'a, H: Head>(
     if let Some(target) = target {
         head.set_uri(target);
     }
-    if found.hop_by_hop {
-        head.strip_request()?;
-    }
+    let trailers = if found.hop_by_hop {
+        head.strip_request()?
+    } else {
+        found.trailers
+    };
+    head.note_trailers(trailers);
     // A request's trailers go no further than the gateway (03 §11), and nor does the
     // declaration of what they would hold.
     if found.trailer {
@@ -2255,6 +2258,10 @@ upstreams:
                 if carries_credentials(&raw) {
                     prop_assert_eq!(raw.close_connection(), map.close_connection());
                 }
+                // The note of `TE` the writer reads in place of the field is the field.
+                use crate::upstream::h1::codec::OutgoingFields;
+                let te = Fields::values(&map.headers, &http::header::TE).next().is_some();
+                prop_assert_eq!(raw.says_te(), te);
             }
             let edited = raw.fields();
             for name in every_name() {
@@ -2277,6 +2284,10 @@ upstreams:
                 prop_assert_eq!(beside.uri(), map.uri());
                 if by_map.is_ok() && carries_credentials(beside.outgoing()) {
                     prop_assert_eq!(beside.close_connection(), Ok(()));
+                }
+                if by_map.is_ok() {
+                    let te = Fields::values(&map.headers, &http::header::TE).next().is_some();
+                    prop_assert_eq!(beside.says_te(), te);
                 }
                 let fields = beside.fields();
                 for name in every_name() {
@@ -2432,6 +2443,57 @@ upstreams:
             written.contains("\r\nAuthorization: NTLM TlRMTVNTUAABAAAA\r\n"),
             "{written}"
         );
+    }
+
+    /// A raw head that goes on saying `TE: trailers` names `TE` in the `Connection` its
+    /// upstream gets (RFC 9112 §7.4), alone or after the gateway's own `close`, written
+    /// to the length paid for — whether the core left the client's field as it was or put it
+    /// back after taking the hop-by-hop fields off.
+    #[test]
+    fn a_raw_head_that_says_te_names_it_in_its_upstreams_connection() {
+        use crate::head::Forwarded;
+        use crate::upstream::h1::codec::{Sending, head_len, write_head};
+        let cases: [(&[u8], &str); 3] = [
+            (
+                b"GET /a HTTP/1.1\r\nHost: shop.example.com\r\nTE: trailers\r\n\r\n",
+                "\r\nconnection: te\r\n",
+            ),
+            (
+                b"GET /a HTTP/1.1\r\nHost: shop.example.com\r\nConnection: TE\r\nTE: gzip, trailers\r\n\r\n",
+                "\r\nconnection: te\r\n",
+            ),
+            (
+                b"GET /a HTTP/1.1\r\nHost: shop.example.com\r\nTE: trailers\r\nAuthorization: NTLM TlRMTVNTUAABAAAA\r\n\r\n",
+                "\r\nconnection: close, te\r\n",
+            ),
+        ];
+        for (sent, said) in cases {
+            let (_, mut raw) = both_heads(sent).unwrap();
+            assert_eq!(decide_on("web", &mut raw, 0).as_deref(), Ok("fallback"));
+            if crate::upstream::auth::carries_credentials(&raw) {
+                assert_eq!(raw.close_connection(), Ok(()));
+            }
+            let mut out = Vec::new();
+            let len = head_len(raw.method(), raw.uri(), &raw, Sending::None);
+            write_head(
+                &mut out,
+                raw.method(),
+                raw.uri(),
+                &raw,
+                Sending::None,
+                len,
+                &crate::upstream::h1::H1Limits::default(),
+            )
+            .unwrap();
+            assert_eq!(len, out.len());
+            let written = String::from_utf8(out).unwrap();
+            assert!(written.contains(said), "{written}");
+            assert_eq!(
+                written.to_ascii_lowercase().matches("connection").count(),
+                1,
+                "{written}"
+            );
+        }
     }
 
     /// What the core does not change is left as it came: a head whose `Host` already says

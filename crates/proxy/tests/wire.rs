@@ -287,6 +287,52 @@ async fn a_requests_trailers_do_not_reach_the_upstream() {
     assert_eq!(body, "5\r\nhello\r\n0\r\n\r\n");
 }
 
+/// A request that accepts trailers reaches an HTTP/1.1 upstream saying `TE: trailers`, with
+/// `TE` named in its `Connection` (RFC 9112 §7.4): alone, or after the `close` the gateway
+/// sends for credentials that bind the connection to one client
+/// ([03 §11](../../../docs/03-data-plane.md)).
+#[tokio::test]
+async fn te_reaches_an_http1_upstream_named_in_its_connection() {
+    let (saw, mut seen) = reporter();
+    let upstream = raw_upstream(move |mut wire| {
+        let saw = saw.clone();
+        async move {
+            let head = wire.head().await;
+            saw.send(head).unwrap();
+            // One request a connection, so that each case is written on a new one.
+            wire.write("HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    let proxy = proxy_to(upstream).await;
+    for (asked, said) in [
+        (
+            "GET /up HTTP/1.1\r\nhost: a.test\r\nte: trailers\r\n\r\n",
+            "\r\nconnection: te\r\n",
+        ),
+        (
+            "GET /up HTTP/1.1\r\nhost: a.test\r\nconnection: te, keep-alive\r\nte: deflate, trailers\r\n\r\n",
+            "\r\nconnection: te\r\n",
+        ),
+        (
+            "GET /up HTTP/1.1\r\nhost: a.test\r\nauthorization: NTLM TlRMTVNTUAABAAAA\r\nte: trailers\r\n\r\n",
+            "\r\nconnection: close, te\r\n",
+        ),
+    ] {
+        let mut client = Wire::to(proxy).await;
+        client.write(asked).await;
+        let head = within(seen.recv()).await.unwrap();
+        assert!(head.contains("\r\nte: trailers\r\n"), "{head}");
+        assert!(head.contains(said), "{head}");
+        assert_eq!(
+            head.to_ascii_lowercase().matches("connection").count(),
+            1,
+            "{head}"
+        );
+        assert!(client.head().await.starts_with("HTTP/1.1 200 "));
+    }
+}
+
 /// A request's trailers go no further than the gateway, and neither does its `Trailer`
 /// declaration, which would name what will not follow: not a field the request's own
 /// `Connection` named, and not one it did not ([03 §11](../../../docs/03-data-plane.md)).
@@ -2471,6 +2517,26 @@ fn reporting_upstream() -> (SocketAddr, mpsc::UnboundedReceiver<String>) {
         }
     });
     (upstream, seen)
+}
+
+/// An HTTP/2 client's `te: trailers`, as every gRPC client sends it, reaches an HTTP/1.1
+/// upstream with `TE` named in its `Connection` (RFC 9112 §7.4), as an HTTP/1.1 client's
+/// does ([03 §11](../../../docs/03-data-plane.md)).
+#[tokio::test]
+async fn te_from_an_http2_client_reaches_an_http1_upstream_named_in_its_connection() {
+    let (upstream, mut seen) = reporting_upstream();
+    let proxy = proxy_to(upstream).await;
+    let mut sender = h2_to(proxy).await;
+    let request = http::Request::get(format!("http://{proxy}/x"))
+        .header("te", "trailers")
+        .body(Upload::None)
+        .unwrap();
+    let answer = within(sender.send_request(request)).await.unwrap();
+    assert_eq!(answer.status(), 200);
+    let seen = within(seen.recv()).await.unwrap().to_ascii_lowercase();
+    assert!(seen.contains("\r\nte: trailers\r\n"), "{seen}");
+    assert!(seen.contains("\r\nconnection: te\r\n"), "{seen}");
+    assert_eq!(seen.matches("connection").count(), 1, "{seen}");
 }
 
 /// A request whose HEADERS frame ends the stream has no body, and goes upstream with no

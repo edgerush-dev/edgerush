@@ -29,6 +29,9 @@ pub struct Survey {
     pub cookie_fields: usize,
     /// Whether it declares trailers (`Trailer`), which go no further than the gateway.
     pub trailer: bool,
+    /// Whether it says `TE: trailers` in one field and nothing else of `TE`: the one form in
+    /// which `TE` goes on, as it is.
+    pub trailers: bool,
 }
 
 /// A request's head, as the request core reads and changes it.
@@ -93,12 +96,18 @@ pub trait Head {
     /// gateway keeps: `X-Request-ID` among them if the gateway gave the request its `id`.
     fn check_connection(&self, id: bool) -> Result<(), ConnectionError>;
 
-    /// Takes the hop-by-hop headers off; `TE: trailers` stays if it was said.
+    /// Takes the hop-by-hop headers off; `TE: trailers` stays if it was said, and whether it
+    /// did is the answer.
     ///
     /// # Errors
     ///
     /// [`Rejection::Edits`] if the head cannot take the change.
-    fn strip_request(&mut self) -> Result<(), Rejection>;
+    fn strip_request(&mut self) -> Result<bool, Rejection>;
+
+    /// Notes whether the head goes on saying `TE: trailers`, so that the HTTP/1.1 writer can
+    /// name it in `Connection` (RFC 9112 §7.4) without looking for the field again (the
+    /// writer asks `says_te`). A head that does not keep the note looks.
+    fn note_trailers(&mut self, _accepted: bool) {}
 
     /// Carries out a rule's changes to the headers.
     ///
@@ -217,9 +226,8 @@ impl Head for Parts {
         hop_by_hop::check_connection(&self.headers, id)
     }
 
-    fn strip_request(&mut self) -> Result<(), Rejection> {
-        hop_by_hop::strip_request(&mut self.headers);
-        Ok(())
+    fn strip_request(&mut self) -> Result<bool, Rejection> {
+        Ok(hop_by_hop::strip_request(&mut self.headers))
     }
 
     fn apply(&mut self, changes: &HeaderModifier) -> Result<(), Rejection> {
@@ -333,5 +341,6 @@ pub(crate) fn survey(headers: &HeaderMap) -> Survey {
         }
     }
     found.hop_by_hop |= plain_te_fields > 1;
+    found.trailers = plain_te_fields == 1;
     found
 }

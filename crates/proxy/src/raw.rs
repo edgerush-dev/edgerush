@@ -43,6 +43,8 @@ pub struct RawHead {
     overlay: Overlay,
     /// Where the overlay's room came from, and goes back to when the head is done with.
     lent_by: Option<Rc<RefCell<Blocks>>>,
+    /// Whether it goes on saying `TE: trailers`, as the request core noted.
+    trailers: bool,
 }
 
 impl RawHead {
@@ -58,6 +60,7 @@ impl RawHead {
             lines,
             overlay: Overlay::default(),
             lent_by: None,
+            trailers: false,
         }
     }
 
@@ -80,6 +83,7 @@ impl RawHead {
             lines,
             overlay: Overlay::in_room(room),
             lent_by: Some(Rc::clone(blocks)),
+            trailers: false,
         }
     }
 
@@ -117,6 +121,10 @@ impl OutgoingFields for RawHead {
                 Piece::Field(name, value) => name.as_str().len() + 2 + value.len() + 2,
             })
             .sum()
+    }
+
+    fn says_te(&self) -> bool {
+        self.trailers
     }
 
     fn write_fields(&self, out: &mut Vec<u8>) {
@@ -194,6 +202,7 @@ impl Head for RawHead {
             }
         }
         found.hop_by_hop |= plain_te_fields > 1;
+        found.trailers = plain_te_fields == 1;
         found
     }
 
@@ -262,7 +271,7 @@ impl Head for RawHead {
         hop_by_hop::check_connection_values(self.fields().values(&CONNECTION), id)
     }
 
-    fn strip_request(&mut self) -> Result<(), Rejection> {
+    fn strip_request(&mut self) -> Result<bool, Rejection> {
         let view = self.lines.view(&self.head);
         let accepts_trailers = self
             .overlay
@@ -278,7 +287,11 @@ impl Head for RawHead {
                 .set(&view, TE, crate::hop_by_hop::TE_TRAILERS)
                 .map_err(|_| Rejection::Edits)?;
         }
-        Ok(())
+        Ok(accepts_trailers)
+    }
+
+    fn note_trailers(&mut self, accepted: bool) {
+        self.trailers = accepted;
     }
 
     fn apply(&mut self, changes: &HeaderModifier) -> Result<(), Rejection> {
