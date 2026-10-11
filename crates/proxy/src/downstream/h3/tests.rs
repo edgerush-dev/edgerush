@@ -14,8 +14,10 @@ use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h3::Settings;
 use crate::downstream::h3::body::IncomingH3;
 use crate::downstream::h3::code;
-use crate::downstream::h3::conn::State;
-use crate::downstream::h3::listener::{self, Forwarding, InForce, Refusal, Secrets, Shared};
+use crate::downstream::h3::conn::{Conn, State};
+use crate::downstream::h3::listener::{
+    self, Common, Forwarding, InForce, Refusal, Secrets, Shared,
+};
 use crate::downstream::h3::testing::{Client, PATIENCE, get};
 use crate::drain::Drain;
 use crate::forwarding::Cut;
@@ -76,6 +78,17 @@ impl Server {
     /// quiche's counts for the one connection the server holds.
     fn stats(&self) -> quiche::Stats {
         self.connection(|state| state.quic.stats())
+    }
+
+    /// Every connection the server holds, once each: its table has one by each of its IDs.
+    fn conns(&self) -> Vec<Rc<Conn>> {
+        let mut conns: Vec<Rc<Conn>> = Vec::new();
+        for conn in self.shared.table.borrow().values() {
+            if !conns.iter().any(|kept| Rc::ptr_eq(kept, conn)) {
+                conns.push(Rc::clone(conn));
+            }
+        }
+        conns
     }
 }
 
@@ -199,15 +212,15 @@ where
     .await
 }
 
-/// The same, for a worker whose storage is `storage` and whose handshakes under way, on
-/// all its HTTP/3 listeners, are counted in `handshakes`.
+/// The same, for a worker whose storage is `storage` and whose HTTP/3 listeners share
+/// `common`.
 async fn serving_on<F, B>(
     settings: Settings,
     respond: impl Fn(Request<RequestBody>, Interim) -> F + 'static,
     secrets: &Secrets,
     forwarding: Forwarding,
     storage: Rc<Storage>,
-    handshakes: Rc<Cell<usize>>,
+    common: Rc<Common>,
 ) -> Server
 where
     F: Future<Output = Answered<B>> + 'static,
@@ -244,7 +257,7 @@ where
             timers,
             Rc::clone(&drain),
             storage,
-            handshakes,
+            common,
             None,
             Box::new(|_| {}),
             Box::new(move |_, refusal| refusing.borrow_mut().push(refusal)),
@@ -822,12 +835,15 @@ fn a_connection_asking_nothing_more_is_kept_past_the_limit() {
 }
 
 /// A worker that runs out closes its QUIC connection holding the most, with
-/// H3_EXCESSIVE_LOAD, and lets go of its charge at once: the connection that asked for
-/// more goes on (16 §6).
+/// H3_EXCESSIVE_LOAD: the connection that asked for more goes on (16 §6). The one closed
+/// keeps its charge until it has gone, for closing it frees nothing, and what quiche holds
+/// for the one asking is charged past the limit meanwhile, so that the ledger never reads
+/// less than is held; once the closed one has gone, its charge goes with it.
 #[test]
 fn a_worker_that_runs_out_closes_its_heaviest_connection() {
     locally(async {
-        let storage = Storage::new(1 << 20);
+        let limit = 1 << 20;
+        let storage = Storage::new(limit);
         let exchanges = Exchanges::default();
         let server = serving_in(short(), Rc::clone(&storage), exchanges.core()).await;
         let mut heavy = Client::connect(server.address, "a.test").await;
@@ -835,6 +851,12 @@ fn a_worker_that_runs_out_closes_its_heaviest_connection() {
         let id = heavy.request(&post("/heavy"), false);
         heavy.body(id, &vec![1; 700 << 10], false).await;
         heavy.until(|_| storage.used() >= 700 << 10).await;
+        // Held here as well as by the server, so that it cannot go while it is looked at.
+        let heavier = server
+            .conns()
+            .into_iter()
+            .max_by_key(|conn| conn.charged())
+            .unwrap();
 
         // Both driven, so that what the server's socket had no room for is sent again.
         let id = light.request(&post("/light"), false);
@@ -846,9 +868,33 @@ fn a_worker_that_runs_out_closes_its_heaviest_connection() {
             heavy.for_a_while(Duration::from_millis(20)).await;
         }
         assert_eq!(heavy.closed_by_server(), Some((true, code::EXCESSIVE_LOAD)));
+        assert!(heavier.is_shed());
+        let asking = server
+            .conns()
+            .into_iter()
+            .find(|conn| !Rc::ptr_eq(conn, &heavier))
+            .unwrap();
+        let (closed, asked) = (heavier.charged(), asking.charged());
+        assert!(closed >= 700 << 10, "{closed} charged once closed");
+        assert!(
+            storage.used() > limit && storage.used() >= closed + asked,
+            "{} held, {closed} and {asked} charged",
+            storage.used()
+        );
+        // Gone from the server: only this holds it, and its charge goes with it.
+        let started = tokio::time::Instant::now();
+        while Rc::strong_count(&heavier) > 1 {
+            assert!(started.elapsed() < PATIENCE, "the closed one did not go");
+            light.for_a_while(Duration::from_millis(20)).await;
+        }
+        let closed = heavier.charged();
+        assert!(closed > 0, "let go of before it went");
+        let before = storage.used();
+        drop(heavier);
+        assert_eq!(storage.used(), before - closed);
         light.for_a_while(Duration::from_millis(100)).await;
         assert_eq!(light.closed_by_server(), None);
-        assert!(storage.used() <= 1 << 20);
+        assert!(storage.used() <= limit);
         // The heavy one's request, the first taken, is told it was cut for the worker's
         // storage; the light one's is not (21 §3).
         let cut: Vec<_> = server
@@ -859,6 +905,127 @@ fn a_worker_that_runs_out_closes_its_heaviest_connection() {
             .collect();
         assert_eq!(cut, [Some(Cut::Exhausted), None]);
         assert_eq!(*server.closed.borrow(), [Cut::Exhausted]);
+    });
+}
+
+/// Two connections, each with an upload of its size held in quiche, and what the server
+/// holds of each, the heavier first.
+async fn two_holding(
+    server: &Server,
+    storage: &Storage,
+    sizes: [usize; 2],
+) -> (Client, Client, Rc<Conn>, Rc<Conn>) {
+    let mut first = Client::connect(server.address, "a.test").await;
+    let mut second = Client::connect(server.address, "a.test").await;
+    for (client, size) in [(&mut first, sizes[0]), (&mut second, sizes[1])] {
+        let id = client.request(&post("/up"), false);
+        client.body(id, &vec![1; size], false).await;
+    }
+    // Both driven, so that what the server's socket had no room for is sent again.
+    let started = tokio::time::Instant::now();
+    while storage.used() < sizes[0] + sizes[1] {
+        assert!(started.elapsed() < PATIENCE, "the uploads never came");
+        first.for_a_while(Duration::from_millis(20)).await;
+        second.for_a_while(Duration::from_millis(20)).await;
+    }
+    let mut conns = server.conns();
+    conns.sort_by_key(|conn| std::cmp::Reverse(conn.charged()));
+    let lighter = conns.pop().unwrap();
+    let heavier = conns.pop().unwrap();
+    (first, second, heavier, lighter)
+}
+
+/// One at a time: a shortage closes the QUIC connection charged the most, and another
+/// while it has not gone closes nobody else, so that a burst cannot close many before any
+/// room is made. Once it has gone, nobody more is closed until the worker is found short
+/// again (16 §6).
+#[test]
+fn a_shortage_while_one_is_closing_closes_nobody_else() {
+    use crate::downstream::h3::connection::short_by;
+    locally(async {
+        let storage = Storage::new(4 << 20);
+        let server = serving_in(short(), Rc::clone(&storage), Exchanges::default().core()).await;
+        let (_first, mut second, heavier, lighter) =
+            two_holding(&server, &storage, [500 << 10, 300 << 10]).await;
+        let held = storage.used();
+        short_by(&server.shared, 64 << 10);
+        assert!(heavier.is_shed() && !lighter.is_shed());
+        assert_eq!(storage.used(), held, "closing one counted as room made");
+        short_by(&server.shared, 64 << 10);
+        assert!(
+            !lighter.is_shed(),
+            "a second closed before the first had gone"
+        );
+        let started = tokio::time::Instant::now();
+        while server.shared.common.closing.get() {
+            assert!(started.elapsed() < PATIENCE, "the closed one did not go");
+            second.for_a_while(Duration::from_millis(20)).await;
+        }
+        assert!(!lighter.is_shed(), "closed ahead of a shortage");
+        // Short again: the next goes.
+        short_by(&server.shared, 64 << 10);
+        assert!(lighter.is_shed());
+        assert_eq!(*server.closed.borrow(), [Cut::Exhausted, Cut::Exhausted]);
+    });
+}
+
+/// Where no connection's charge, with the room left, could make the room the worker is
+/// short of, the shortage is held elsewhere and nobody is closed; one that could is closed
+/// (16 §6).
+#[test]
+fn nobody_is_closed_when_no_connection_could_make_the_room() {
+    use crate::downstream::h3::connection::short_by;
+    locally(async {
+        let storage = Storage::new(4 << 20);
+        let server = serving_in(short(), Rc::clone(&storage), Exchanges::default().core()).await;
+        let (_first, _second, heavier, lighter) =
+            two_holding(&server, &storage, [500 << 10, 300 << 10]).await;
+        let _elsewhere = storage.reserve(storage.room() - 1000).unwrap();
+        short_by(&server.shared, heavier.charged() + 1001);
+        assert!(!heavier.is_shed() && !lighter.is_shed());
+        assert!(!server.shared.common.closing.get());
+        assert!(server.closed.borrow().is_empty());
+        short_by(&server.shared, lighter.charged() + 1000);
+        assert!(heavier.is_shed() && !lighter.is_shed());
+    });
+}
+
+/// While a connection closed to make room has not gone, the worker is short: a new
+/// connection's Initial is dropped, as at the connection bound, and a new request is
+/// answered 503 with no task, rather than another connection closed. Once it has gone, both
+/// are taken (16 §6).
+#[test]
+fn while_one_is_closing_no_connection_and_no_request_is_taken() {
+    use crate::downstream::h3::connection::MADE;
+    locally(async {
+        let storage = Storage::new(LIMIT);
+        let server = serving_in(short(), Rc::clone(&storage), echo).await;
+        let mut client = Client::connect(server.address, "a.test").await;
+        assert_eq!(client.get("a.test", "/").await.final_status(), Some("200"));
+        // As the closing of a connection elsewhere on the worker leaves it.
+        server.shared.common.closing.set(true);
+        let made = MADE.get();
+        let answer = client.get("a.test", "/").await;
+        assert_eq!(answer.final_status(), Some("503"), "{answer:?}");
+        assert_eq!(MADE.get(), made, "a task was made while one is closing");
+        assert_eq!(
+            *server.refused.borrow(),
+            [Refusal::Exhausted { call: false }]
+        );
+        let mut newcomer = Client::new(server.address, "a.test").await;
+        newcomer.for_a_while(Duration::from_millis(300)).await;
+        assert!(!newcomer.quic.is_established());
+        assert_eq!(server.shared.connections.get(), 1);
+
+        server.shared.common.closing.set(false);
+        newcomer.until(|client| client.quic.is_established()).await;
+        let config = quiche::h3::Config::new().unwrap();
+        newcomer.h3 =
+            Some(quiche::h3::Connection::with_transport(&mut newcomer.quic, &config).unwrap());
+        assert_eq!(
+            newcomer.get("a.test", "/").await.final_status(),
+            Some("200")
+        );
     });
 }
 
@@ -2285,7 +2452,7 @@ fn a_retry_token_that_fails_is_answered_invalid_token_below_the_threshold() {
         // The first handshake done, none is under way: no token is asked any more.
         waiting.until(|waiting| waiting.quic.is_established()).await;
         waiting.for_a_while(Duration::from_millis(100)).await;
-        assert_eq!(server.shared.handshakes.get(), 0);
+        assert_eq!(server.shared.common.handshakes.get(), 0);
         client.rebind().await;
         client
             .until(|client| client.quic.peer_error().is_some())
@@ -2309,7 +2476,7 @@ fn the_retry_threshold_counts_every_handshake_of_the_worker() {
         // handshakes under way.
         let secrets = Secrets::new().unwrap();
         let storage = Storage::new(LIMIT);
-        let handshakes = Rc::new(Cell::new(0));
+        let common = Rc::new(Common::default());
         let alone = || Forwarding::group(1).remove(0);
         let first = serving_on(
             settings,
@@ -2317,15 +2484,15 @@ fn the_retry_threshold_counts_every_handshake_of_the_worker() {
             &secrets,
             alone(),
             Rc::clone(&storage),
-            Rc::clone(&handshakes),
+            Rc::clone(&common),
         )
         .await;
-        let second = serving_on(settings, echo, &secrets, alone(), storage, handshakes).await;
+        let second = serving_on(settings, echo, &secrets, alone(), storage, common).await;
         // A handshake begun on the first listener and left under way.
         let mut waiting = Client::new(first.address, "a.test").await;
         waiting.flush().await;
         waiting.hear_for(Duration::from_millis(300)).await;
-        assert_eq!(first.shared.handshakes.get(), 1);
+        assert_eq!(first.shared.common.handshakes.get(), 1);
         let client = Client::connect(second.address, "a.test").await;
         let heard = &client.received[0];
         // A long header of version 1 whose type is Retry (RFC 9000 §17.2.5).

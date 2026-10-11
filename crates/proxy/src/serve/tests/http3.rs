@@ -375,11 +375,11 @@ async fn a_workers_http3_listeners_share_its_count_of_handshakes() {
                 client.hear_for(Duration::from_millis(300)).await;
                 clients.push(client);
             }
-            assert_eq!(worker.handshakes.get(), 2);
+            assert_eq!(worker.h3_listeners.handshakes.get(), 2);
             for client in &mut clients {
                 client.until(|client| client.quic.is_established()).await;
             }
-            until(|| worker.handshakes.get() == 0).await;
+            until(|| worker.h3_listeners.handshakes.get() == 0).await;
         })
         .await;
 }

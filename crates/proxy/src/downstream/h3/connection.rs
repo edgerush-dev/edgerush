@@ -222,7 +222,14 @@ pub(crate) async fn drive<R, F, B, D, G>(
                     }
                     conn.asked();
                     let (head, held) = head_held(request.head);
-                    let Ok(charge) = shared.storage.reserve(future + TASK + held) else {
+                    // While a connection closed to make room has not gone, the worker is
+                    // short: a request is refused, rather than another connection closed.
+                    let charge = if shared.common.closing.get() {
+                        None
+                    } else {
+                        shared.storage.reserve(future + TASK + held).ok()
+                    };
+                    let Some(charge) = charge else {
                         let call = Call::of(
                             Version::HTTP_3,
                             &head.parts.method,
@@ -368,7 +375,11 @@ pub(crate) async fn drive<R, F, B, D, G>(
     })
     .await;
     // Closed: every stream's task learns it, and the connection's IDs find nothing more.
-    // Its charge goes when the last thing holding it lets go of it, with quiche's memory.
+    // Its charge goes when the last thing holding it lets go of it, with quiche's memory;
+    // one closed to make room lets the next be closed, for a shortage seen from now on.
+    if conn.is_shed() {
+        shared.common.closing.set(false);
+    }
     conn.with(|state| {
         state.closed = true;
         for slot in state.streams.values_mut() {
@@ -383,8 +394,9 @@ pub(crate) async fn drive<R, F, B, D, G>(
     }
     if driving.handshaking {
         shared
+            .common
             .handshakes
-            .set(shared.handshakes.get().saturating_sub(1));
+            .set(shared.common.handshakes.get().saturating_sub(1));
     }
     shared
         .connections
@@ -396,20 +408,35 @@ pub(crate) async fn drive<R, F, B, D, G>(
     drop(opened);
 }
 
-/// Charges the worker what quiche holds for `conn` (16 §6). A worker that has run out closes
-/// its QUIC connection charged the most, which lets go of its charge at once, and tries
-/// again, until the charge fits or `conn` is the one closed. If none holds anything, the
-/// storage is the other protocols', and `conn`, which cannot be paid for, is closed.
+/// Charges the worker what quiche holds for `conn` (16 §6), past the limit if need be, since
+/// quiche holds it already; a worker then short is short by what did not fit.
 fn account(conn: &Rc<Conn>, shared: &Shared) {
-    while conn.charge(&shared.storage).is_err() {
-        let heaviest = shared
-            .table
-            .borrow()
-            .values()
-            .max_by_key(|held| held.charged())
-            .filter(|held| held.charged() > 0)
-            .cloned();
-        heaviest.as_ref().unwrap_or(conn).shed();
+    if let Some(short) = conn.charge(&shared.storage) {
+        short_by(shared, short);
+    }
+}
+
+/// The worker is `bytes` short: unless a connection closed to make room has not yet gone,
+/// the listener's QUIC connection charged the most of those whose charge, with the room
+/// left, covers the shortage is closed, with H3_EXCESSIVE_LOAD — the one asking, if it is
+/// that one. It keeps its charge until it goes, for closing it frees nothing. With none
+/// that could make the room, the shortage is held elsewhere, and nobody is closed (16 §6).
+pub(super) fn short_by(shared: &Shared, bytes: usize) {
+    if shared.common.closing.get() {
+        return;
+    }
+    let room = shared.storage.room();
+    let heaviest = shared
+        .table
+        .borrow()
+        .values()
+        .filter(|held| held.charged() > 0)
+        .filter(|held| held.charged().saturating_add(room) >= bytes)
+        .max_by_key(|held| held.charged())
+        .cloned();
+    if let Some(heaviest) = heaviest {
+        shared.common.closing.set(true);
+        heaviest.shed();
         (shared.closed)(Cut::Exhausted);
     }
 }
@@ -588,8 +615,9 @@ fn turn(conn: &Rc<Conn>, shared: &Shared, driving: &mut Driving, found: &mut Vec
             driving.handshaking = false;
             driving.established_at = Some(Instant::now());
             shared
+                .common
                 .handshakes
-                .set(shared.handshakes.get().saturating_sub(1));
+                .set(shared.common.handshakes.get().saturating_sub(1));
         }
     }
 }

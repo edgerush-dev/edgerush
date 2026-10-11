@@ -11,7 +11,7 @@ use crate::connections::Held;
 use crate::downstream::h3::head::Refused;
 use crate::drain::Drain;
 use crate::forwarding::{Client, Cut};
-use crate::storage::{Charge, Exhausted, Storage};
+use crate::storage::{Charge, Storage};
 use http::HeaderMap;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -39,7 +39,8 @@ pub(crate) struct Conn {
     /// each is let go of: charged with what quiche holds, as nothing else pays for them once
     /// read (14 §8).
     in_hand: Cell<usize>,
-    /// Closed to make room for the rest: charged nothing from then on.
+    /// Closed to make room for the rest: still charged what quiche holds for it, until it
+    /// goes.
     shed: Cell<bool>,
     /// Requests the connection has had.
     requests: Cell<u64>,
@@ -196,15 +197,10 @@ impl Conn {
     /// Charges `storage` what quiche holds for the connection now: what it received that
     /// has not been read, `PIECE` bytes more for each piece that is held in, and the HTTP/3
     /// layer's frame buffers, a head held whole until it has all come; and the pieces read
-    /// out of it that its bodies have handed on.
-    ///
-    /// # Errors
-    ///
-    /// [`Exhausted`] if the worker cannot pay for more; the charge is then as it was.
-    pub(crate) fn charge(&self, storage: &Rc<Storage>) -> Result<(), Exhausted> {
-        if self.shed.get() {
-            return Ok(());
-        }
+    /// out of it that its bodies have handed on. What does not fit is charged past the limit
+    /// all the same, since quiche holds it already, and the worker is then short by the
+    /// part of it that did not fit: that is returned.
+    pub(crate) fn charge(&self, storage: &Rc<Storage>) -> Option<usize> {
         let held = self.with(|state| {
             let quiche::Held { bytes, pieces } = state.quic.received_held();
             let frames = state
@@ -218,16 +214,34 @@ impl Conn {
         });
         let charged = self.charged.get();
         let mut charge = self.charge.borrow_mut();
-        match charge.as_mut() {
+        let fitted = match charge.as_mut() {
             // Nothing asked for: past the limit, as the worker's own answers may take it,
             // even nothing more would be refused.
-            _ if held == charged => {}
-            Some(charge) if held > charged => charge.grow(held - charged)?,
-            Some(charge) => charge.shrink(charged - held),
-            None => *charge = Some(storage.reserve(held)?),
-        }
+            _ if held == charged => Ok(()),
+            Some(charge) if held > charged => charge.grow(held - charged),
+            Some(charge) => {
+                charge.shrink(charged - held);
+                Ok(())
+            }
+            None => storage.reserve(held).map(|made| *charge = Some(made)),
+        };
         self.charged.set(held);
-        Ok(())
+        if fitted.is_ok() {
+            return None;
+        }
+        // Refused, so it is more than was charged, and more than the room left.
+        let more = held - charged;
+        let short = more.saturating_sub(storage.room());
+        match charge.as_mut() {
+            Some(charge) => charge.grow_past(more),
+            None => *charge = Some(storage.reserve_past(held)),
+        }
+        Some(short)
+    }
+
+    /// Whether the connection was closed to make room.
+    pub(crate) fn is_shed(&self) -> bool {
+        self.shed.get()
     }
 
     /// A body has handed on `bytes` it read out of quiche: charged from the driver's next
@@ -248,13 +262,11 @@ impl Conn {
         self.charged.get()
     }
 
-    /// Closes the connection so that the worker has room for the rest, and lets go of its
-    /// charge at once: what quiche holds for it goes as the connection does, within its
-    /// closing period.
+    /// Closes the connection so that the worker has room for the rest. It keeps its charge
+    /// until it goes, for closing it frees nothing: what quiche holds for it goes only with
+    /// the connection, after its closing period.
     pub(crate) fn shed(&self) {
         self.shed.set(true);
-        self.charge.borrow_mut().take();
-        self.charged.set(0);
         self.with(|state| {
             state.cut(Cut::Exhausted);
             // Fails only for a connection already closing.

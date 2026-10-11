@@ -233,6 +233,17 @@ pub(crate) struct Room {
     pub(crate) listener: usize,
 }
 
+/// What a worker's HTTP/3 listeners share.
+#[derive(Debug, Default)]
+pub(crate) struct Common {
+    /// Connections not yet through their handshake, on any of them: what the Retry
+    /// threshold is held to, a worker's (16 §6).
+    pub(crate) handshakes: Cell<usize>,
+    /// A connection was closed to make room, and its driver has not yet ended: until it
+    /// has, nobody else is closed, and no Initial and no request is taken (16 §6).
+    pub(crate) closing: Cell<bool>,
+}
+
 /// What a worker's listener and its connections share.
 pub(crate) struct Shared {
     pub(crate) socket: UdpSocket,
@@ -248,9 +259,8 @@ pub(crate) struct Shared {
     /// The worker's account of what it holds for requests, charged what quiche holds for
     /// the listener's connections (16 §6).
     pub(crate) storage: Rc<Storage>,
-    /// Connections not yet through their handshake, on any of the worker's HTTP/3
-    /// listeners: what the Retry threshold is held to, a worker's (16 §6).
-    pub(crate) handshakes: Rc<Cell<usize>>,
+    /// What the worker's HTTP/3 listeners share.
+    pub(crate) common: Rc<Common>,
     /// Connections held.
     pub(crate) connections: Cell<usize>,
     /// A connection ended while the worker drains: the listener looks whether it was the
@@ -301,8 +311,8 @@ pub(crate) enum ListenerError {
 
 impl Shared {
     /// A listener on `socket`, as the `worker`th worker of those `secrets` are shared by,
-    /// charging what its connections hold to `storage`, counting them in `room`, and its
-    /// handshakes under way in the worker's `handshakes`.
+    /// charging what its connections hold to `storage`, counting them in `room`, and
+    /// sharing with the worker's other HTTP/3 listeners `common`.
     #[expect(
         clippy::too_many_arguments,
         reason = "each is the worker's, handed in once when the listener is made"
@@ -315,7 +325,7 @@ impl Shared {
         timers: Rc<Timers>,
         drain: Rc<Drain>,
         storage: Rc<Storage>,
-        handshakes: Rc<Cell<usize>>,
+        common: Rc<Common>,
         room: Option<Room>,
         count: Box<dyn Fn(Quic)>,
         refused: Box<dyn Fn(Rc<Client>, Refusal)>,
@@ -332,7 +342,7 @@ impl Shared {
             timers,
             drain,
             storage,
-            handshakes,
+            common,
             connections: Cell::new(0),
             ended: tokio::sync::Notify::new(),
             forwarded: Cell::new(0),
@@ -582,11 +592,13 @@ fn admit<T: Fn() -> Option<InForce>>(
         }
         return None;
     }
-    // A worker whose storage is full takes no one, as at its bound (16 §6). An Initial too
-    // small to start one never came this far (`destination`).
+    // A worker whose storage is full takes no one, as at its bound, nor one with a
+    // connection closed to make room not yet gone (16 §6). An Initial too small to start one
+    // never came this far (`destination`).
     if !long.is_initial()
         || shared.drain.is_on()
         || shared.connections.get() >= shared.settings.connections
+        || shared.common.closing.get()
         || !shared.storage.has_room()
     {
         return None;
@@ -613,7 +625,8 @@ fn admit<T: Fn() -> Option<InForce>>(
     let scid_of_client = header.scid.to_vec();
     let token = header.token.unwrap_or_default();
     let now = unix_now();
-    let must_prove = in_force.force_retry || shared.handshakes.get() >= shared.settings.retry_above;
+    let must_prove =
+        in_force.force_retry || shared.common.handshakes.get() >= shared.settings.retry_above;
     let mut retried = None;
     if !token.is_empty() {
         match token::validate(&shared.retry_key, now, from, &token) {
@@ -660,7 +673,10 @@ fn admit<T: Fn() -> Option<InForce>>(
         // chose, which reaches this worker by the same addresses.
         table.insert(dcid, Rc::clone(&conn));
     }
-    shared.handshakes.set(shared.handshakes.get() + 1);
+    shared
+        .common
+        .handshakes
+        .set(shared.common.handshakes.get() + 1);
     shared.connections.set(shared.connections.get() + 1);
     Some(conn)
 }

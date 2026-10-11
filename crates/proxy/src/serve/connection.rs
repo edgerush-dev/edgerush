@@ -438,7 +438,7 @@ impl Worker {
             Rc::clone(&self.timers),
             Rc::clone(&self.drain),
             Rc::clone(self.blocks.borrow().storage()),
-            Rc::clone(&self.handshakes),
+            Rc::clone(&self.h3_listeners),
             room,
             count,
             refused,

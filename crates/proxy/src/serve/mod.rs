@@ -445,9 +445,10 @@ pub struct Worker {
     /// Its HTTP/2 connections, server's and client's, each charged what h2 holds of what
     /// its peer sent; the one charged most is closed when the storage runs out (15 §3).
     received: Rc<Received>,
-    /// Its HTTP/3 connections still in their handshake, on all its HTTP/3 listeners: past
-    /// a threshold of them a client proves its address first (16 §6).
-    handshakes: Rc<Cell<usize>>,
+    /// What its HTTP/3 listeners share: the connections still in their handshake, past a
+    /// threshold of which a client proves its address first, and the connection closed to
+    /// make room until it has gone (16 §6).
+    h3_listeners: Rc<h3_listener::Common>,
     /// By position in [`Proxy::listeners`]: the client validation its connections here are
     /// accepted under, and the drain they hear.
     validations: RefCell<Vec<Validation>>,

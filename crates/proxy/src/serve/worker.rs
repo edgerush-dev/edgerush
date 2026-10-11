@@ -146,7 +146,7 @@ impl Worker {
             h1,
             connections,
             received,
-            handshakes: Rc::default(),
+            h3_listeners: Rc::default(),
             validations,
             validated,
             routes: RefCell::default(),
