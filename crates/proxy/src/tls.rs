@@ -403,8 +403,11 @@ fn tcp_settings(builder: &mut SslContextBuilder) -> Result<(), TlsError> {
     let setup = |error: ErrorStack| TlsError::Setup(error.to_string());
     builder.set_curves_list(GROUPS).map_err(setup)?;
     builder.set_session_cache_mode(SslSessionCacheMode::OFF);
+    // Called only for a client that offers ALPN: one that offers none of ours is refused
+    // with no_application_protocol (RFC 7301 §3.2, RFC 9325 §3.8), and one that offers no
+    // ALPN at all is served HTTP/1.1 (03 §3).
     builder.set_alpn_select_callback(|_ssl, offered| {
-        select_next_proto(PROTOCOLS, offered).ok_or(AlpnError::NOACK)
+        select_next_proto(PROTOCOLS, offered).ok_or(AlpnError::ALERT_FATAL)
     });
     Ok(())
 }

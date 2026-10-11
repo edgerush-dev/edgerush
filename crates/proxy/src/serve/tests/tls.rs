@@ -120,6 +120,29 @@ async fn an_answer_over_tls_is_one_record() {
         .await;
 }
 
+/// A client that offers ALPN but none of the listener's protocols is refused in the
+/// handshake with a fatal no_application_protocol alert, as RFC 7301 §3.2 has a server
+/// do and RFC 9325 §3.8 advises against cross-protocol attacks; one that offers no ALPN
+/// at all is still served HTTP/1.1 (below). As NGINX (03 §3).
+#[tokio::test]
+async fn a_client_offering_only_protocols_the_listener_lacks_is_refused() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let certificates = vec![crate::tls::testing::certificate(&["example.test"])];
+            let (front, _worker) = serving_secured_worker(upstream, certificates).await;
+            for offered in [&b"\x06spdy/3"[..], b"\x02h3\x08http/1.0"] {
+                let refused = tls_client(front, "example.test", Some(offered), |_| {}).await;
+                let Err(error) = refused else {
+                    panic!("{offered:?} was not refused");
+                };
+                assert!(error.contains("NO_APPLICATION_PROTOCOL"), "{error}");
+            }
+        })
+        .await;
+}
+
 /// An `https` listener speaks HTTP/2 to a client that agreed on it in the handshake,
 /// and HTTP/1.1 to one that agreed on that or on nothing (RFC 9113 §3.2).
 #[tokio::test]
