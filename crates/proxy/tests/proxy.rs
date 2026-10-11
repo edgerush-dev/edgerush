@@ -298,6 +298,17 @@ fn get(proxy: SocketAddr, target: &str) -> Request<ClientBody> {
         .unwrap()
 }
 
+/// `request` as sent in `version`. An HTTP/2 client names its host in `:authority` alone:
+/// the `Host` the builders above give, which is not the address dialled, would be a `Host`
+/// naming another entity, which is refused (RFC 9113 §8.3.1; 15 §5).
+fn in_version(mut request: Request<ClientBody>, version: Version) -> Request<ClientBody> {
+    *request.version_mut() = version;
+    if version == Version::HTTP_2 {
+        request.headers_mut().remove("host");
+    }
+    request
+}
+
 /// Sends the request and reads the whole answer: status, headers and body as text.
 async fn send(request: Request<ClientBody>) -> (StatusCode, HeaderMap, String) {
     let http2 = request.version() == Version::HTTP_2;
@@ -495,16 +506,14 @@ upstreams:
 async fn a_redirect_is_answered_here_over_either_protocol() {
     let (proxy, web, reached) = moved().await;
     for version in [Version::HTTP_11, Version::HTTP_2] {
-        let mut old = get(web, "/old/./a%61?x=%2f&y");
-        *old.version_mut() = version;
+        let old = in_version(get(web, "/old/./a%61?x=%2f&y"), version);
         let (status, headers, body) = send(old).await;
         assert_eq!(status, StatusCode::MOVED_PERMANENTLY, "{version:?}");
         assert_eq!(headers["location"], "/new/aa?x=%2f&y", "{version:?}");
         assert_eq!(headers["cache-control"], "no-store", "{version:?}");
         assert_eq!(body, "", "{version:?}");
 
-        let mut secure = get(web, "/secure/p?q=1");
-        *secure.version_mut() = version;
+        let secure = in_version(get(web, "/secure/p?q=1"), version);
         let (status, headers, _) = send(secure).await;
         assert_eq!(status, StatusCode::PERMANENT_REDIRECT, "{version:?}");
         // The host routed on: over HTTP/2 the client's `:authority`, the address it dialled.
@@ -534,12 +543,12 @@ async fn a_redirect_is_answered_here_over_either_protocol() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_grpc_call_that_meets_a_redirect_is_told_so_as_a_call() {
     let (_, web, reached) = moved().await;
-    let mut call = request(Method::POST, web, "/old/pkg.Service/Method")
+    let call = request(Method::POST, web, "/old/pkg.Service/Method")
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(Empty::new().boxed())
         .unwrap();
-    *call.version_mut() = Version::HTTP_2;
+    let call = in_version(call, Version::HTTP_2);
     let (status, headers, _) = send(call).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers["grpc-status"], "12");
@@ -1518,13 +1527,16 @@ async fn cancelling_one_http2_stream_leaves_the_rest_of_its_connection_alone() {
     // A stream that will never be answered, left in flight.
     let hanging = {
         let mut sender = sender.clone();
-        tokio::spawn(async move { sender.send_request(get(web, "/hang")).await })
+        tokio::spawn(async move {
+            let hang = in_version(get(web, "/hang"), Version::HTTP_2);
+            sender.send_request(hang).await
+        })
     };
     // Waited for rather than slept on: the upstream says when it has the request.
     within(upstream.asked.recv()).await.unwrap();
 
     // Another stream on that same connection, answered while the first still waits.
-    let answered = within(sender.send_request(get(web, "/quick")))
+    let answered = within(sender.send_request(in_version(get(web, "/quick"), Version::HTTP_2)))
         .await
         .unwrap();
     assert_eq!(answered.status(), StatusCode::OK);
@@ -1542,7 +1554,7 @@ async fn cancelling_one_http2_stream_leaves_the_rest_of_its_connection_alone() {
     within(upstream.released.recv()).await.unwrap();
 
     // And the connection is still the connection.
-    let answered = within(sender.send_request(get(web, "/quick")))
+    let answered = within(sender.send_request(in_version(get(web, "/quick"), Version::HTTP_2)))
         .await
         .unwrap();
     assert_eq!(

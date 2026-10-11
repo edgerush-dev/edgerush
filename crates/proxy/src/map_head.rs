@@ -16,7 +16,7 @@ use crate::cookies;
 use crate::fields::MOST_ADDED;
 use crate::head::{Forwarded, Head, Survey, survey};
 use crate::hop_by_hop::{self, ConnectionError, is_hop_by_hop};
-use crate::host::HostError;
+use crate::host::{self, HostError};
 use crate::request::Rejection;
 use crate::upstream::h1::blocks::Blocks;
 use crate::upstream::h1::codec::{OutgoingFields, is_framing};
@@ -250,15 +250,20 @@ impl Head for MapHead {
         let Some(authority) = self.parts.uri.authority() else {
             return Ok(());
         };
-        let named = {
+        let (said, named) = {
             let view = self.view();
             let mut fields = view.values(&HOST);
-            fields
-                .next()
-                .is_some_and(|field| field == authority.as_str().as_bytes())
-                && fields.next().is_none()
+            let first = fields.next();
+            let named = first.is_some_and(|field| field == authority.as_str().as_bytes())
+                && fields.next().is_none();
+            (first.is_some(), named)
         };
         if !named {
+            // Over HTTP/2 a `Host` naming another entity is malformed (RFC 9113 §8.3.1);
+            // over HTTP/1 the target's host wins (RFC 9112 §3.2.2).
+            if said && self.parts.version == Version::HTTP_2 {
+                host::hold_to_target(&self.parts.uri, self.view().values(&HOST))?;
+            }
             let host = HeaderValue::from_str(authority.as_str()).map_err(|_| HostError::Invalid)?;
             self.set(HOST, host)?;
         }

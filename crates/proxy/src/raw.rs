@@ -230,6 +230,8 @@ impl Head for RawHead {
     }
 
     fn agree_host(&mut self) -> Result<(), Rejection> {
+        // A raw head is HTTP/1's, whose target's host wins over the field (RFC 9112 §3.2.2):
+        // nothing here is held to it as an HTTP/2 head's `Host` is.
         let Some(authority) = self.uri.authority() else {
             return Ok(());
         };

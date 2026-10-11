@@ -7,8 +7,9 @@
 //! a registered name — has no honest use in a request and is how two readers of one
 //! request come to see two hosts.
 
-use http::HeaderMap;
 use http::header::HOST;
+use http::uri::Scheme;
+use http::{HeaderMap, Uri};
 use std::net::Ipv6Addr;
 
 /// The only `Host` field of a request, as text.
@@ -70,6 +71,66 @@ pub fn bare_host(authority: &str) -> Result<&str, HostError> {
     Ok(host)
 }
 
+/// Whether `host`, a `Host` field, names the same entity as `authority`, a request's
+/// `:authority`, once both are normalised as their scheme says (RFC 9113 §8.3.1, RFC 3986
+/// §6.2.3): the same host without regard to case, and the same port, an empty one or
+/// `default` — the scheme's, if it is known — being none. Nothing else is taken away.
+///
+/// # Errors
+///
+/// [`HostError::Invalid`] if `host` is not a `host[:port]` ([`bare_host`]).
+pub fn same_entity(authority: &str, host: &str, default: Option<u16>) -> Result<bool, HostError> {
+    bare_host(host)?;
+    let (one, one_port) = split_port(authority);
+    let (other, other_port) = split_port(host);
+    let port = |port: Option<&str>| match port {
+        None | Some("") => default,
+        Some(digits) => digits.parse::<u16>().ok(),
+    };
+    Ok(one.eq_ignore_ascii_case(other) && port(one_port) == port(other_port))
+}
+
+/// A `host[:port]` as its host, an IPv6 address with its brackets, and what follows the
+/// colon, if there is one.
+fn split_port(authority: &str) -> (&str, Option<&str>) {
+    let end = if authority.starts_with('[') {
+        authority.find(']').map_or(authority.len(), |at| at + 1)
+    } else {
+        authority.find(':').unwrap_or(authority.len())
+    };
+    let (host, rest) = authority.split_at(end);
+    (host, rest.strip_prefix(':'))
+}
+
+/// Holds an HTTP/2 request's `Host` fields to its target: each must name the entity the
+/// target's authority names, as [`same_entity`] compares them with the scheme's default
+/// port (RFC 9113 §8.3.1). A target without an authority holds them to nothing.
+///
+/// # Errors
+///
+/// [`HostError::Differs`] for a field naming another entity, [`HostError::Invalid`] for
+/// one that names none.
+pub(crate) fn hold_to_target<'a>(
+    target: &Uri,
+    fields: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<(), HostError> {
+    let Some(authority) = target.authority() else {
+        return Ok(());
+    };
+    let default = match target.scheme() {
+        Some(scheme) if *scheme == Scheme::HTTPS => Some(443),
+        Some(scheme) if *scheme == Scheme::HTTP => Some(80),
+        _ => None,
+    };
+    for field in fields {
+        let field = std::str::from_utf8(field).map_err(|_| HostError::Invalid)?;
+        if !same_entity(authority.as_str(), field, default)? {
+            return Err(HostError::Differs);
+        }
+    }
+    Ok(())
+}
+
 /// Why a request's host cannot be told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HostError {
@@ -82,6 +143,9 @@ pub enum HostError {
     /// Not a DNS name or an IP address with an optional port.
     #[error("host is not a name or an address with an optional port")]
     Invalid,
+    /// An HTTP/2 request's `Host` field names another entity than its `:authority`.
+    #[error("the Host field names another host than :authority")]
+    Differs,
 }
 
 #[cfg(test)]
@@ -98,6 +162,44 @@ mod tests {
         assert_eq!(bare_host("my_service.internal"), Ok("my_service.internal"));
         assert_eq!(bare_host("xn--caf-dma.example"), Ok("xn--caf-dma.example"));
         assert_eq!(bare_host("127.0.0.1"), Ok("127.0.0.1"));
+    }
+
+    /// RFC 9113 §8.3.1 has `Host` and `:authority` compared after scheme-based normalisation
+    /// (RFC 3986 §6.2.3): the host without regard to case, an empty port or the scheme's
+    /// default the same as none. Nothing else is taken away: a trailing dot stays.
+    #[test]
+    fn the_same_entity_is_told_from_another_by_its_schemes_normal_form() {
+        let https = Some(443);
+        for (authority, host) in [
+            ("a.test", "A.Test"),
+            ("a.test", "a.test:443"),
+            ("a.test:443", "a.test"),
+            ("a.test", "a.test:"),
+            ("a.test", "a.test:0443"),
+            ("[::1]", "[::1]:443"),
+            ("[::A]", "[::a]"),
+            ("10.0.0.1:8443", "10.0.0.1:8443"),
+        ] {
+            assert_eq!(same_entity(authority, host, https), Ok(true), "{host}");
+        }
+        for (authority, host) in [
+            ("a.test", "a.test:80"),
+            ("a.test", "b.test"),
+            ("a.test", "a.test."),
+            ("a.test:8443", "a.test"),
+            ("[::1]", "[::2]"),
+            ("a.test", "a.testx"),
+        ] {
+            assert_eq!(same_entity(authority, host, https), Ok(false), "{host}");
+        }
+        // With no scheme known, no port stands for none but none.
+        assert_eq!(same_entity("a.test", "a.test:80", None), Ok(false));
+        assert_eq!(same_entity("a.test", "a.test:", None), Ok(true));
+        // A field that is no host is not compared.
+        assert_eq!(
+            same_entity("a.test", "user@a.test", https),
+            Err(HostError::Invalid)
+        );
     }
 
     #[test]
@@ -237,6 +339,19 @@ mod tests {
                 let theirs = authority.unwrap();
                 let theirs = theirs.host();
                 prop_assert_eq!(host, theirs.strip_suffix('.').unwrap_or(theirs), "{:?}", text);
+            }
+        }
+
+        /// The same entity both ways, and every host the same as itself.
+        #[test]
+        fn the_same_entity_is_the_same_whichever_way_it_is_asked(
+            one in nearly_an_authority(),
+            other in nearly_an_authority(),
+            default in prop::option::of(any::<u16>()),
+        ) {
+            if bare_host(&one).is_ok() && bare_host(&other).is_ok() {
+                prop_assert_eq!(same_entity(&one, &other, default), same_entity(&other, &one, default));
+                prop_assert_eq!(same_entity(&one, &one, default), Ok(true));
             }
         }
 

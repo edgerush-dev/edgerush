@@ -2539,6 +2539,33 @@ async fn te_from_an_http2_client_reaches_an_http1_upstream_named_in_its_connecti
     assert_eq!(seen.matches("connection").count(), 1, "{seen}");
 }
 
+/// An HTTP/2 request whose `Host` names another entity than its `:authority` is answered
+/// 400 and never reaches the upstream; one whose `Host` names the same entity goes on with
+/// the `Host` its `:authority` says (RFC 9113 §8.3.1; 15 §5).
+#[tokio::test]
+async fn an_http2_host_naming_another_entity_is_refused() {
+    let (upstream, mut seen) = reporting_upstream();
+    let proxy = proxy_to(upstream).await;
+    let mut sender = h2_to(proxy).await;
+    let authority = "shop.test";
+    for (host, status) in [("other.example.org", 400), ("SHOP.Test:80", 200)] {
+        let request = http::Request::get(format!("http://{authority}/x"))
+            .header("host", host)
+            .body(Upload::None)
+            .unwrap();
+        let answer = within(sender.send_request(request)).await.unwrap();
+        assert_eq!(answer.status(), status, "{host}");
+    }
+    // Only the second reached the upstream, saying `:authority`'s host.
+    let reached = within(seen.recv()).await.unwrap().to_ascii_lowercase();
+    assert!(
+        reached.contains(&format!("\r\nhost: {authority}\r\n")),
+        "{reached}"
+    );
+    assert!(!reached.contains("other.example.org"), "{reached}");
+    assert!(seen.try_recv().is_err());
+}
+
 /// A request whose HEADERS frame ends the stream has no body, and goes upstream with no
 /// framing at all (nginx's `h2_request_body.t`).
 #[tokio::test]

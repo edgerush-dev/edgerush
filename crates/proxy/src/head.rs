@@ -207,11 +207,17 @@ impl Head for Parts {
             return Ok(());
         };
         let mut fields = self.headers.get_all(HOST).iter();
-        let named = fields
-            .next()
-            .is_some_and(|field| field == authority.as_str())
-            && fields.next().is_none();
+        let first = fields.next();
+        let said = first.is_some();
+        let named =
+            first.is_some_and(|field| field == authority.as_str()) && fields.next().is_none();
         if !named {
+            // Over HTTP/2 a `Host` naming another entity is malformed (RFC 9113 §8.3.1);
+            // over HTTP/1 the target's host wins (RFC 9112 §3.2.2).
+            if said && self.version == Version::HTTP_2 {
+                let fields = self.headers.get_all(HOST).iter().map(HeaderValue::as_bytes);
+                host::hold_to_target(&self.uri, fields)?;
+            }
             let host = HeaderValue::from_str(authority.as_str()).map_err(|_| HostError::Invalid)?;
             self.headers.insert(HOST, host);
         }

@@ -1466,6 +1466,74 @@ upstreams:
         assert_eq!(absolute.uri, "http://shop.example.com:8080/cart");
     }
 
+    /// An HTTP/2 request whose `Host` names another entity than its `:authority` is
+    /// malformed and refused before anything is matched (RFC 9113 §8.3.1, as NGINX and
+    /// Pingora refuse it, and as HTTP/3 does in its head, 16 §5). One that names the same
+    /// entity once normalised by its scheme — the host without regard to case, the scheme's
+    /// default port the same as none — goes on, the field made to say what `:authority`
+    /// says (15 §5).
+    #[test]
+    fn an_http2_host_naming_another_entity_than_the_authority_is_refused() {
+        let h2 = |target: &str, hosts: &[&str]| {
+            let fields: Vec<(&str, &str)> = hosts.iter().map(|host| ("host", *host)).collect();
+            let mut request = head(target, &fields);
+            request.version = http::Version::HTTP_2;
+            request
+        };
+        for (target, hosts) in [
+            ("http://shop.example.com/cart", &["other.example.org"][..]),
+            ("http://shop.example.com/cart", &["shop.example.com:8080"]),
+            ("http://shop.example.com/cart", &["shop.example.com:443"]),
+            ("https://shop.example.com/cart", &["shop.example.com:80"]),
+            ("http://shop.example.com:8080/cart", &["shop.example.com"]),
+            // A trailing dot is a spelling scheme-based normalisation does not take away.
+            ("http://shop.example.com/cart", &["shop.example.com."]),
+            ("http://[::1]/cart", &["[::2]"]),
+            // Every field is held to it, not only the first.
+            (
+                "http://shop.example.com/cart",
+                &["shop.example.com", "other.example.org"],
+            ),
+        ] {
+            let mut request = h2(target, hosts);
+            assert_eq!(
+                decide_on("web", &mut request, 0),
+                Err(Rejection::Host(HostError::Differs)),
+                "{target} {hosts:?}"
+            );
+        }
+        let mut request = h2("http://shop.example.com/cart", &["invalid/host"]);
+        assert_eq!(
+            decide_on("web", &mut request, 0),
+            Err(Rejection::Host(HostError::Invalid))
+        );
+
+        for (target, hosts) in [
+            ("http://shop.example.com/cart", &["SHOP.Example.COM"][..]),
+            ("http://shop.example.com/cart", &["shop.example.com:80"]),
+            ("http://shop.example.com:80/cart", &["shop.example.com"]),
+            ("http://shop.example.com/cart", &["shop.example.com:"]),
+            ("http://shop.example.com/cart", &["shop.example.com:0080"]),
+            (
+                "http://shop.example.com/cart",
+                &["shop.example.com", "Shop.example.com:80"],
+            ),
+        ] {
+            let mut request = h2(target, hosts);
+            assert_eq!(
+                decide_on("web", &mut request, 0).as_deref(),
+                Ok("cart"),
+                "{target} {hosts:?}"
+            );
+            let authority = request.uri.authority().unwrap().as_str().to_owned();
+            assert_eq!(
+                request.headers.get_all(HOST).iter().collect::<Vec<_>>(),
+                [authority.as_str()],
+                "{target} {hosts:?}"
+            );
+        }
+    }
+
     /// The target's host wins over the `Host` field only once the field has been found to
     /// be one, and one that could be a host: an HTTP/1 request with more than one `Host`
     /// field line or an invalid one is refused, whatever its target names, and so is an
