@@ -7,7 +7,7 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_router::{NormaliseError, normalise_path};
+use edgerush_router::{EncodedSlash, NormaliseError, normalise_path, normalise_path_with};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::borrow::Cow;
 use std::hint::black_box;
@@ -24,5 +24,20 @@ fn normalise(path: &str) -> Result<Cow<'_, str>, NormaliseError> {
     black_box(normalise_path(black_box(path)))
 }
 
-library_benchmark_group!(name = normalise_group; benchmarks = normalise);
+// A path with an encoded slash takes two passes, the first stopping at it: what a request
+// to a rule that keeps one pays (03 §11).
+#[library_benchmark]
+#[bench::kept("/api/v4/projects/group%2Fproject/issues")]
+#[bench::kept_and_decoded("/api/v4/projects/group%2fproject/%69ssues")]
+fn encoded_slash(path: &str) -> Result<Cow<'_, str>, NormaliseError> {
+    let path = black_box(path);
+    match normalise_path(path) {
+        Err(NormaliseError::EncodedSlash) => {
+            black_box(normalise_path_with(path, EncodedSlash::Keep))
+        }
+        refused_or_not => black_box(refused_or_not),
+    }
+}
+
+library_benchmark_group!(name = normalise_group; benchmarks = normalise, encoded_slash);
 main!(library_benchmark_groups = normalise_group);

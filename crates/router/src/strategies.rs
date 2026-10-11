@@ -267,6 +267,7 @@ pub(crate) fn nasty_path() -> impl Strategy<Value = String> {
         1 => Just("%2e"),
         1 => Just("%2E"),
         1 => Just("%2f"),
+        1 => Just("%2F"),
         1 => Just("%5C"),
         1 => Just("%61"),
         1 => Just("%20"),

@@ -31,7 +31,7 @@ pub use explain::{Considered, Explanation, Failure, Key, Seen, Verdict, Wanted, 
 pub use header::{Fields, HeaderPredicate, HeaderPredicateError, HeaderPredicates};
 pub use host::{HostPattern, HostPatternError, WildcardLabels};
 pub use host_index::{HostClaim, HostIndex};
-pub use normalise::{NormaliseError, normalise_path};
+pub use normalise::{EncodedSlash, NormaliseError, normalise_path, normalise_path_with};
 pub use path::{PathPattern, PathPatternError};
 pub use path_index::{PathCandidates, PathIndex};
 pub use query::{QueryPredicate, QueryPredicateError, QueryPredicates};

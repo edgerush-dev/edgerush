@@ -4,8 +4,9 @@
 
 use crate::backends::{UpstreamId, WeightedBackends};
 use crate::route::{
-    Filter, Forward, Fraction, GrpcMethod, HeaderChanges, Hostname, Match, PathChange, PathMatch,
-    Query, Redirect, Route, Scheme, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
+    EncodedSlash, Filter, Forward, Fraction, GrpcMethod, HeaderChanges, Hostname, Match,
+    PathChange, PathMatch, Query, Redirect, Route, RulePaths, Scheme, UrlRewrite, ValueMatch,
+    ValuePredicate, Wildcard,
 };
 use crate::{
     AccessLog, Backend, Certificate, ClientValidation, Config, Forwarding, HealthCheck, Http3,
@@ -286,6 +287,9 @@ pub struct CompiledRule {
     pub outcome: Outcome,
     /// Where copies of its requests go, if anywhere.
     pub mirrors: Vec<CompiledMirror>,
+    /// Whether it takes a request whose path holds an encoded slash inside a segment
+    /// (`paths: { encoded_slash: keep }`); every other rule refuses one (03 §11).
+    pub keeps_encoded_slash: bool,
 }
 
 impl CompiledRule {
@@ -928,7 +932,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                     rule: id,
                     position: match_at,
                 };
-                match route_match(matching, &hosts, id) {
+                match route_match(matching, &hosts, id, encoded_slash(rule)) {
                     Ok(route_match) => {
                         for listener in &listeners {
                             if let Some(matches) = matches.get_mut(listener) {
@@ -955,6 +959,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                 steps,
                 outcome: outcome(rule, &upstream_ids, &place, &mut errors),
                 mirrors,
+                keeps_encoded_slash: encoded_slash(rule) == edgerush_router::EncodedSlash::Keep,
             }));
         }
         rules.push(compiled_rules);
@@ -1419,17 +1424,31 @@ fn host_claim(hostname: &Hostname) -> Result<HostClaim<()>, Problem> {
     })
 }
 
+/// What a rule does with an encoded slash inside a path segment, as the router has it.
+fn encoded_slash(rule: &Rule) -> edgerush_router::EncodedSlash {
+    match rule.paths {
+        Some(RulePaths {
+            encoded_slash: EncodedSlash::Keep,
+        }) => edgerush_router::EncodedSlash::Keep,
+        Some(RulePaths {
+            encoded_slash: EncodedSlash::Refuse,
+        })
+        | None => edgerush_router::EncodedSlash::Refuse,
+    }
+}
+
 fn route_match(
     matching: &Match,
     hosts: &[HostClaim<()>],
     value: MatchId,
+    slash: edgerush_router::EncodedSlash,
 ) -> Result<RouteMatch<MatchId>, Vec<Problem>> {
     let mut problems = Vec::new();
 
     let path = match (&matching.path, &matching.grpc) {
         (Some(path), None) => match path {
-            PathMatch::Exact(path) => PathPattern::exact(path),
-            PathMatch::Prefix(path) => PathPattern::prefix(path),
+            PathMatch::Exact(path) => PathPattern::exact_with(path, slash),
+            PathMatch::Prefix(path) => PathPattern::prefix_with(path, slash),
             PathMatch::Regex(pattern) => PathPattern::regex(pattern),
         }
         .map_err(|reason| problems.push(Problem::Path(reason)))
@@ -1791,7 +1810,7 @@ fn path_modifier(rule: &Rule, change: &PathChange) -> Result<Option<PathModifier
             else {
                 return Err(Problem::ReplacePrefixMatch);
             };
-            let Ok(prefix) = PathPattern::prefix(prefix) else {
+            let Ok(prefix) = PathPattern::prefix_with(prefix, encoded_slash(rule)) else {
                 return Ok(None);
             };
             PathModifier::prefix(&prefix, replacement)
@@ -2842,6 +2861,71 @@ upstreams:
             .map_or_else(Vec::new, |errors| {
                 errors.iter().map(ToString::to_string).collect()
             })
+    }
+
+    /// A rule may keep an encoded slash inside a segment (`paths: { encoded_slash: keep }`),
+    /// and only such a rule may name one in its patterns, the prefix a rewrite replaces
+    /// included, matched as spelt; a rule that says nothing refuses it, as one that says
+    /// `refuse` (03 §11, review C8).
+    #[test]
+    fn only_a_rule_that_keeps_encoded_slashes_may_name_one() {
+        let compiled = compile(&config(
+            r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+routes:
+  - name: gitlab
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: /api/v4/projects/group%2fproject } }]
+        paths: { encoded_slash: keep }
+        filters: [{ type: url_rewrite, path: { replace_prefix: /p } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+      - matches: [{ path: { prefix: /api } }]
+        paths: { encoded_slash: refuse }
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+upstreams:
+  u: { load_balancer: p2c, endpoints: [] }
+"#,
+        ))
+        .unwrap();
+        let kept = |rule| {
+            compiled
+                .rule(RuleId { route: 0, rule })
+                .unwrap()
+                .keeps_encoded_slash
+        };
+        assert_eq!((kept(0), kept(1), kept(2)), (true, false, false));
+        let project = "/api/v4/projects/group%2Fproject/issues";
+        assert_eq!(route(&compiled, "git.example.com", project), Some((0, 0)));
+        let rewrite = compiled.rule(RuleId { route: 0, rule: 0 }).unwrap();
+        let mut path = String::new();
+        let rewrite = rewrite.rewrite.as_ref().unwrap();
+        rewrite.path().unwrap().write(project, &mut path);
+        assert_eq!(path, "/p/issues");
+
+        let problems = rule_problems(
+            r#"      - matches: [{ path: { exact: /a%2Fb } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+      - matches: [{ path: { prefix: /a%2Fb } }]
+        paths: { encoded_slash: refuse }
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+      - matches: [{ path: { prefix: /a%2F..%2Fb } }]
+        paths: { encoded_slash: keep }
+        forward: { backends: [{ upstream: u, weight: 1 }] }"#,
+        );
+        assert_eq!(
+            problems,
+            [
+                "route `a`, rules[0], matches[0]: path: path contains an encoded slash",
+                "route `a`, rules[1], matches[0]: path: path contains an encoded slash",
+                "route `a`, rules[2], matches[0]: path: path contains an encoded slash beside \
+                 an empty or dot piece",
+            ]
+        );
     }
 
     #[test]

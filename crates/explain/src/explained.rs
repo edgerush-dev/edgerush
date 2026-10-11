@@ -9,8 +9,8 @@
 
 use crate::asked::{Asked, Invalid};
 use edgerush_config::{
-    Compiled, CompiledListener, Config, ConfigError, Filter, HeaderChanges, MatchId, Matches,
-    PathChange, Protocol, RequestId, Rule, compile_with_matches,
+    Compiled, CompiledListener, Config, ConfigError, EncodedSlash, Filter, HeaderChanges, MatchId,
+    Matches, PathChange, Protocol, RequestId, Rule, compile_with_matches,
 };
 use edgerush_proxy::{Client, Decision, Rejection, decide_routed};
 use edgerush_router::{Explanation, Failure, Key, Seen, Verdict, Wanted, explain};
@@ -279,6 +279,13 @@ fn text(
     if let Some((id, rule)) = rule {
         lines.push(format!("{:<10}{}", "rule", label(id)));
         field(&mut lines, "filters", filters(rule));
+        if let Some(paths) = &rule.paths {
+            let said = match paths.encoded_slash {
+                EncodedSlash::Keep => "encoded slash kept",
+                EncodedSlash::Refuse => "encoded slash refused",
+            };
+            field(&mut lines, "paths", vec![said.to_owned()]);
+        }
         if let Some(forward) = &rule.forward {
             if let Some(timeouts) = &forward.timeouts {
                 let stated = [
@@ -637,6 +644,9 @@ routes:
     listeners: [passing]
     hostnames: [{ name: "*", falls_through: true }]
     rules:
+      - matches: [{ path: { prefix: /git } }]
+        paths: { encoded_slash: keep }
+        forward: { backends: [{ upstream: fallback, weight: 1 }] }
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: fallback, weight: 1 }] }
   - name: everything-else
@@ -932,6 +942,32 @@ upstreams: { u: { load_balancer: p2c, endpoints: [] } }
         assert!(
             passed.contains("\n          + x-forwarded-for: 203.0.113.7\n"),
             "{passed}"
+        );
+    }
+
+    /// A rule that keeps an encoded slash says so, and sends it on as `%2F`; a request with
+    /// one that reaches a rule that does not is refused after it is routed, below the rule
+    /// that refused it (03 §11).
+    #[test]
+    fn an_encoded_slash_is_explained_by_the_rule_it_reaches() {
+        let explained_get = |url: &str| explained("passing", "1.1", "GET", url, &[]);
+        let kept = explained_get("http://x.example.net/git/group%2fproject");
+        assert!(
+            kept.contains(
+                "\nrule      passed rule 0 match 0\nfilters   none\npaths     encoded slash kept\n"
+            ),
+            "{kept}"
+        );
+        assert!(
+            kept.contains("\nupstream  GET /git/group%2Fproject\n"),
+            "{kept}"
+        );
+        let refused = explained_get("http://x.example.net/other%2Fproject");
+        assert!(
+            refused.ends_with(
+                "\nrule      passed rule 1 match 0\nfilters   none\nanswer    400 bad_path\n"
+            ),
+            "{refused}"
         );
     }
 

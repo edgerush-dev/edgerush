@@ -108,6 +108,41 @@ pub struct Rule {
     /// only `response_header_modifier` goes with it.
     #[serde(default)]
     pub redirect: Option<Redirect>,
+    /// How the rule takes request paths. Left out, as `{ encoded_slash: refuse }`.
+    #[serde(default)]
+    pub paths: Option<RulePaths>,
+}
+
+/// How a rule takes request paths.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RulePaths {
+    /// An encoded slash (`%2F`) inside a path segment, as APIs that carry a slash inside
+    /// one identifier send it (GitLab's `/api/v4/projects/group%2Fproject`). `refuse`
+    /// answers 400, as a rule that does not say does. `keep` takes it as part of its
+    /// segment: matched as spelt, so the rule's patterns may name it and a prefix of the
+    /// part before it does not match, and forwarded as `%2F`. A segment that, split at its
+    /// encoded slashes, has an empty piece or a `.` or `..` piece, however spelt, is refused
+    /// all the same: an upstream that decodes `%2F` would merge or resolve it. Only a rule
+    /// that keeps it takes it: a request with one that is routed to any other rule is
+    /// refused, so no rule that does not keep it is reached by one. Under a rule that keeps
+    /// it, `%2F` can stand for a deeper path to an upstream that decodes it:
+    /// `/projects/secret%2Fadmin` is under `/projects`, not under `/projects/secret`. A rule
+    /// that guards a path below one that keeps encoded slashes is not protected by its own
+    /// prefix; keep them only on rules with nothing guarded beneath.
+    pub encoded_slash: EncodedSlash,
+}
+
+/// What a rule does with an encoded slash inside a path segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum EncodedSlash {
+    /// Answered 400.
+    Refuse,
+    /// Taken as part of its segment.
+    Keep,
 }
 
 /// A redirect (Gateway API's `RequestRedirect`): the client is sent elsewhere, and nothing

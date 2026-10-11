@@ -160,6 +160,14 @@ routes:
         forward:
           backends: [{ upstream: web_backend, weight: 1 }]
 
+      # Rule 5: an API that carries a slash inside one identifier, as GitLab's
+      # /api/v4/projects/group%2Fproject does. This rule alone takes an encoded slash, and
+      # sends it on as %2F; a request with one that reaches any other rule is a 400.
+      - matches: [{ path: { prefix: /projects } }]
+        paths: { encoded_slash: keep }
+        forward:
+          backends: [{ upstream: web_backend, weight: 1 }]
+
   # A one-label wildcard host with a regex path: cdn.example.net, not a.b.example.net. A
   # request it does not match falls through to application's "*".
   - name: assets

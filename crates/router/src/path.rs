@@ -3,8 +3,8 @@
 //! which GRPCRoute ranks where no path pattern of those three kinds would.
 //!
 //! Patterns are compared case-sensitively with the *normalised* request path
-//! ([`normalise_path`]). Normalising the request path is not done here: the caller does it
-//! once per request. Exact and prefix patterns get the same canonical percent-encoding when
+//! ([`normalise_path`](crate::normalise_path)). Normalising the request path is not done
+//! here: the caller does it once per request. Exact and prefix patterns get the same canonical percent-encoding when
 //! they are built, so `/café`, `/caf%c3%a9` and `/caf%C3%A9` are one pattern; but a pattern
 //! with `//` or dot segments, which says something other than what it would match, is
 //! rejected rather than quietly rewritten.
@@ -13,7 +13,7 @@
 //! whatever the pattern and the path ([`RegexError`] says what is refused).
 
 use crate::whole_regex::WholeRegex;
-use crate::{NormaliseError, RegexError, normalise_path};
+use crate::{EncodedSlash, NormaliseError, RegexError, normalise_path_with};
 use std::hash::{Hash, Hasher};
 use std::mem::discriminant;
 
@@ -61,9 +61,19 @@ impl PathPattern {
     /// Returns a [`PathPatternError`] if `path` is not absolute, has empty or dot segments, or is
     /// a path that requests are rejected for.
     pub fn exact(path: &str) -> Result<Self, PathPatternError> {
+        Self::exact_with(path, EncodedSlash::Refuse)
+    }
+
+    /// [`PathPattern::exact`] for a rule that takes encoded slashes as `slash` says: one
+    /// that keeps them may name `%2F` inside a segment, matched as spelt.
+    ///
+    /// # Errors
+    ///
+    /// As [`PathPattern::exact`], an encoded slash rejected or kept as `slash` says.
+    pub fn exact_with(path: &str, slash: EncodedSlash) -> Result<Self, PathPatternError> {
         Ok(Self {
             kind: Kind::Exact,
-            path: canonical(path)?.into(),
+            path: canonical(path, slash)?.into(),
         })
     }
 
@@ -76,7 +86,18 @@ impl PathPattern {
     /// Returns a [`PathPatternError`] if `prefix` is not absolute, has empty or dot segments, or
     /// is a path that requests are rejected for.
     pub fn prefix(prefix: &str) -> Result<Self, PathPatternError> {
-        let prefix = canonical(prefix)?;
+        Self::prefix_with(prefix, EncodedSlash::Refuse)
+    }
+
+    /// [`PathPattern::prefix`] for a rule that takes encoded slashes as `slash` says: one
+    /// that keeps them may name `%2F` inside a segment, matched as spelt. An encoded slash
+    /// ends no segment, so `/a` is no prefix of `/a%2Fb`.
+    ///
+    /// # Errors
+    ///
+    /// As [`PathPattern::prefix`], an encoded slash rejected or kept as `slash` says.
+    pub fn prefix_with(prefix: &str, slash: EncodedSlash) -> Result<Self, PathPatternError> {
+        let prefix = canonical(prefix, slash)?;
         Ok(Self {
             kind: Kind::Prefix,
             path: prefix.strip_suffix('/').unwrap_or(&prefix).into(),
@@ -125,7 +146,7 @@ impl PathPattern {
             return Err(PathPatternError::NotOneSegment);
         }
         let path = format!("/{name}");
-        let path = canonical(&path)?;
+        let path = canonical(&path, EncodedSlash::Refuse)?;
         Ok(Self {
             kind: Kind::GrpcMethod,
             path: path.strip_prefix('/').unwrap_or(&path).into(),
@@ -191,9 +212,12 @@ pub(crate) fn grpc_method_of(path: &str) -> Option<&str> {
 
 /// The pattern text in the normal form request paths have: structure checked, not changed;
 /// percent-encoding made canonical.
-fn canonical(path: &str) -> Result<std::borrow::Cow<'_, str>, PathPatternError> {
+fn canonical(
+    path: &str,
+    slash: EncodedSlash,
+) -> Result<std::borrow::Cow<'_, str>, PathPatternError> {
     validate(path)?;
-    Ok(normalise_path(path)?)
+    Ok(normalise_path_with(path, slash)?)
 }
 
 /// Checks that `path` is absolute and has the structure the normaliser produces.
@@ -240,8 +264,8 @@ pub enum PathPatternError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reference;
     use crate::strategies::{host_label, nasty_path, path_near, path_pattern_text, valid_label};
+    use crate::{normalise_path, reference};
     use proptest::prelude::*;
 
     fn exact(path: &str) -> PathPattern {
@@ -363,11 +387,52 @@ mod tests {
         assert!(!exact("/café").matches("/café"));
     }
 
+    /// A rule that takes encoded slashes may name one in a pattern, which then matches it as
+    /// spelt, inside its segment (03 §11).
+    #[test]
+    fn a_pattern_may_hold_an_encoded_slash_where_one_is_taken() {
+        use crate::{EncodedSlash, NormaliseError};
+        let keep = EncodedSlash::Keep;
+        let exact = PathPattern::exact_with("/api/v4/projects/group%2fproject", keep).unwrap();
+        assert_eq!(exact.as_str(), "/api/v4/projects/group%2Fproject");
+        assert!(exact.matches("/api/v4/projects/group%2Fproject"));
+        assert!(!exact.matches("/api/v4/projects/group/project"));
+        let prefix = PathPattern::prefix_with("/api/v4/projects/group%2Fproject/", keep).unwrap();
+        assert!(prefix.matches("/api/v4/projects/group%2Fproject"));
+        assert!(prefix.matches("/api/v4/projects/group%2Fproject/issues"));
+        assert!(!prefix.matches("/api/v4/projects/group%2Fprojects"));
+        // An encoded slash ends no segment: a prefix of the part before it is no prefix.
+        let group = PathPattern::prefix("/api/v4/projects/group").unwrap();
+        assert!(!group.matches("/api/v4/projects/group%2Fproject"));
+        // Nowhere else.
+        assert_eq!(
+            PathPattern::exact("/a%2Fb"),
+            Err(PathPatternError::Ambiguous(NormaliseError::EncodedSlash))
+        );
+        assert_eq!(
+            PathPattern::prefix("/a%2Fb"),
+            Err(PathPatternError::Ambiguous(NormaliseError::EncodedSlash))
+        );
+        // Nor beside an empty or dot piece where it is.
+        for (pattern, built) in [
+            ("/a%2F..%2Fb", PathPattern::exact_with("/a%2F..%2Fb", keep)),
+            ("/a%2F%2Fb", PathPattern::prefix_with("/a%2F%2Fb", keep)),
+        ] {
+            assert_eq!(
+                built,
+                Err(PathPatternError::Ambiguous(
+                    NormaliseError::AmbiguousEncodedSlash
+                )),
+                "{pattern:?}"
+            );
+        }
+    }
+
     #[test]
     fn patterns_no_request_path_could_be_normalised_to_are_rejected() {
         use crate::NormaliseError;
         let cases = [
-            ("/a%2Fb", NormaliseError::EncodedSeparator),
+            ("/a%2Fb", NormaliseError::EncodedSlash),
             ("/a\\b", NormaliseError::Backslash),
             ("/a%zz", NormaliseError::InvalidPercentEncoding),
             ("/a%00", NormaliseError::ControlCharacter),
@@ -466,7 +531,7 @@ mod tests {
             ("..", PathPatternError::DotSegment),
             (
                 "a%2Fb",
-                PathPatternError::Ambiguous(crate::NormaliseError::EncodedSeparator),
+                PathPatternError::Ambiguous(crate::NormaliseError::EncodedSlash),
             ),
         ] {
             assert_eq!(PathPattern::grpc_method(name), Err(reason), "{name:?}");

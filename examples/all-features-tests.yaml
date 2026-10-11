@@ -67,6 +67,16 @@ tests:
       route: application
       rule: 3
       forward: { backends: [{ upstream: web_backend, weight: 1 }], mirrors: [] }
+  - name: an encoded slash is taken by the rule that keeps it
+    request: { listener: web, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://localhost:8080/projects/group%2fproject/issues", headers: [] }
+    expect:
+      route: application
+      rule: 5
+      forward: { backends: [{ upstream: web_backend, weight: 1 }], mirrors: [] }
+      upstream_request: { target: "/projects/group%2Fproject/issues" }
+  - name: an encoded slash is refused by every other rule
+    request: { listener: web, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://localhost:8080/files/group%2Fproject", headers: [] }
+    expect: { route: application, rule: 4, answer: bad_path }
   - name: wildcard hostname regex path and predicates choose assets
     request: { listener: web, client: 203.0.113.7, protocol: "1.1", method: GET, url: "http://cdn.example.net/assets/main.css?version=2", headers: [{ name: x-client, value: mobile }] }
     expect:

@@ -4,7 +4,7 @@
 //! Only built for tests and with the `reference` feature. Nothing here is shared with the
 //! code it checks, and nothing here minds its cost.
 
-use crate::WildcardLabels;
+use crate::{EncodedSlash, WildcardLabels};
 use std::cmp::Reverse;
 
 /// Whether `host` falls under a hostname pattern, worked out label by label. `pattern` is
@@ -166,10 +166,21 @@ pub fn path_candidates(entries: &[PathSpec], matches: impl Fn(usize) -> bool) ->
 /// percent-encoding canonical, then resolve the list of segments with a stack.
 #[must_use]
 pub fn normalise_path(path: &str) -> Option<String> {
+    normalise_path_with(path, EncodedSlash::Refuse)
+}
+
+/// What [`normalise_path_with`](crate::normalise_path_with) must return, the same way. A
+/// segment that takes encoded slashes is split at them first, each piece made canonical and
+/// held to being neither empty nor dots, and the pieces joined again with `%2F`.
+#[must_use]
+pub fn normalise_path_with(path: &str, slash: EncodedSlash) -> Option<String> {
     let segments: Vec<(String, bool)> = path
         .strip_prefix('/')?
         .split('/')
-        .map(canonical_segment)
+        .map(|segment| match slash {
+            EncodedSlash::Refuse => canonical_segment(segment),
+            EncodedSlash::Keep => slashed_segment(segment),
+        })
         .collect::<Option<_>>()?;
 
     let mut stack: Vec<&str> = Vec::new();
@@ -195,6 +206,36 @@ pub fn normalise_path(path: &str) -> Option<String> {
         normal.push('/');
     }
     Some(normal)
+}
+
+/// What a server that knows path parameters takes for the name of a segment: up to the
+/// first `;`, which to a server that decodes first may have been written `%3B`.
+fn is_dots(canonical: &str) -> bool {
+    let decoded = canonical.replace("%3B", ";");
+    let name = decoded.split_once(';').map_or(&*decoded, |(name, _)| name);
+    name == "." || name == ".."
+}
+
+/// [`canonical_segment`] for a segment that may hold encoded slashes, kept as `%2F`.
+fn slashed_segment(segment: &str) -> Option<(String, bool)> {
+    let pieces: Vec<&str> = segment
+        .split("%2F")
+        .flat_map(|part| part.split("%2f"))
+        .collect();
+    let pieces: Vec<(String, bool)> = pieces
+        .into_iter()
+        .map(canonical_segment)
+        .collect::<Option<_>>()?;
+    if pieces.len() > 1
+        && pieces
+            .iter()
+            .any(|(piece, _)| piece.is_empty() || is_dots(piece))
+    {
+        return None;
+    }
+    let encoded_dot = pieces.iter().any(|(_, encoded_dot)| *encoded_dot);
+    let pieces: Vec<String> = pieces.into_iter().map(|(piece, _)| piece).collect();
+    Some((pieces.join("%2F"), encoded_dot))
 }
 
 /// The segment with canonical percent-encoding, and whether an encoded dot was decoded.

@@ -156,6 +156,21 @@
       },
       "additionalProperties": false
     },
+    "EncodedSlash": {
+      "description": "What a rule does with an encoded slash inside a path segment.",
+      "oneOf": [
+        {
+          "description": "Answered 400.",
+          "type": "string",
+          "const": "refuse"
+        },
+        {
+          "description": "Taken as part of its segment.",
+          "type": "string",
+          "const": "keep"
+        }
+      ]
+    },
     "Filter": {
       "description": "Something done to a request or its response.",
       "oneOf": [
@@ -1149,6 +1164,17 @@
           },
           "minItems": 1
         },
+        "paths": {
+          "description": "How the rule takes request paths. Left out, as `{ encoded_slash: refuse }`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RulePaths"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "redirect": {
           "description": "Its requests answered with a redirect, said in place of `forward`. Of the filters,\nonly `response_header_modifier` goes with it.",
           "anyOf": [
@@ -1164,6 +1190,20 @@
       "additionalProperties": false,
       "required": [
         "matches"
+      ]
+    },
+    "RulePaths": {
+      "description": "How a rule takes request paths.",
+      "type": "object",
+      "properties": {
+        "encoded_slash": {
+          "description": "An encoded slash (`%2F`) inside a path segment, as APIs that carry a slash inside\none identifier send it (GitLab's `/api/v4/projects/group%2Fproject`). `refuse`\nanswers 400, as a rule that does not say does. `keep` takes it as part of its\nsegment: matched as spelt, so the rule's patterns may name it and a prefix of the\npart before it does not match, and forwarded as `%2F`. A segment that, split at its\nencoded slashes, has an empty piece or a `.` or `..` piece, however spelt, is refused\nall the same: an upstream that decodes `%2F` would merge or resolve it. Only a rule\nthat keeps it takes it: a request with one that is routed to any other rule is\nrefused, so no rule that does not keep it is reached by one. Under a rule that keeps\nit, `%2F` can stand for a deeper path to an upstream that decodes it:\n`/projects/secret%2Fadmin` is under `/projects`, not under `/projects/secret`. A rule\nthat guards a path below one that keeps encoded slashes is not protected by its own\nprefix; keep them only on rules with nothing guarded beneath.",
+          "$ref": "#/$defs/EncodedSlash"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "encoded_slash"
       ]
     },
     "Scheme": {

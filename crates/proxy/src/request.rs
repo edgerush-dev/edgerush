@@ -24,7 +24,9 @@ use edgerush_config::{
     Compiled, CompiledListener, CompiledRule, Outcome, Protocol, RuleId, Step, UpstreamId,
 };
 use edgerush_filters::{Requested, Scheme, UrlRewrite};
-use edgerush_router::{Fields, NormaliseError, RequestParts, normalise_path};
+use edgerush_router::{
+    EncodedSlash, Fields, NormaliseError, RequestParts, normalise_path, normalise_path_with,
+};
 use http::header::{HeaderMap, HeaderName};
 use http::uri::PathAndQuery;
 use http::{HeaderValue, Method, StatusCode, Uri, Version};
@@ -315,7 +317,16 @@ pub fn decide_routed<'a, H: Head>(
         }
         _ => bare_host(head.host_field()?)?,
     };
-    let path = normalise_path(head.uri().path())?;
+    // An encoded slash inside a segment is kept for routing, and refused below by every
+    // rule but one that takes it (03 §11); the usual path never takes the second pass.
+    let (path, encoded_slash) = match normalise_path(head.uri().path()) {
+        Ok(path) => (path, false),
+        Err(NormaliseError::EncodedSlash) => (
+            normalise_path_with(head.uri().path(), EncodedSlash::Keep)?,
+            true,
+        ),
+        Err(error) => return Err(error.into()),
+    };
     if found.hop_by_hop {
         head.check_connection(id.is_some())?;
     }
@@ -348,6 +359,12 @@ pub fn decide_routed<'a, H: Head>(
     };
     // A router only ever yields rules of the snapshot it was compiled into.
     let rule = snapshot.rule(id).ok_or(Rejection::NoBackend)?;
+    // Refused by the rule it reached, not by the listener, so that a rule that does not
+    // keep it cannot be reached by one: `/admin%2Fusers` is not under `/admin`, and would
+    // otherwise land on a catch-all.
+    if encoded_slash && !rule.keeps_encoded_slash {
+        return Err(NormaliseError::EncodedSlash.into());
+    }
     let backends = match &rule.outcome {
         Outcome::Forward { backends, .. } => backends,
         Outcome::Redirect(redirect) => {
@@ -1706,12 +1723,111 @@ upstreams:
         );
     }
 
+    /// A path with an encoded slash inside a segment is routed as spelt, and taken only by
+    /// a rule that keeps it, which forwards it as `%2F`; routed to any other rule it is
+    /// refused, so that a catch-all cannot be used to reach `/admin/users`. One whose pieces
+    /// between encoded slashes are dots or empty is refused before routing, wherever it
+    /// would have gone (03 §11, review C8).
+    #[test]
+    fn only_a_rule_that_keeps_an_encoded_slash_takes_it() {
+        const GIT: &str = r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+routes:
+  - name: git
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: /api/v4/projects } }]
+        paths: { encoded_slash: keep }
+        forward: { backends: [{ upstream: gitlab, weight: 1 }] }
+      - matches: [{ path: { prefix: /admin } }]
+        forward: { backends: [{ upstream: guarded, weight: 1 }] }
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: open, weight: 1 }] }
+upstreams:
+  gitlab: { load_balancer: p2c, endpoints: ["127.0.0.1:9001"] }
+  guarded: { load_balancer: p2c, endpoints: ["127.0.0.1:9002"] }
+  open: { load_balancer: p2c, endpoints: ["127.0.0.1:9003"] }
+"#;
+        let config: Config = serde_saphyr::from_str(GIT).unwrap();
+        let compiled = compile(&config).unwrap();
+        let web = compiled
+            .listeners()
+            .iter()
+            .find(|l| l.name == "web")
+            .unwrap();
+        // The upstream and the target it is sent, or the rejection.
+        let decided = |target: &str| {
+            let target = format!("http://git.example.com{target}");
+            let mut head = head(&target, &[("host", "git.example.com")]);
+            let decided = decide(&compiled, web, &mut head, &peer(), &mut || 0, None)
+                .map(|decided| forwarding(decided).upstream);
+            decided.map(|upstream| {
+                (
+                    compiled.upstream(upstream).unwrap().name.clone(),
+                    head.uri.path_and_query().unwrap().as_str().to_owned(),
+                )
+            })
+        };
+        let to = |upstream: &str, target: &str| Ok((upstream.to_owned(), target.to_owned()));
+
+        assert_eq!(
+            decided("/api/v4/projects/group%2fproject/issues?state=open"),
+            to(
+                "gitlab",
+                "/api/v4/projects/group%2Fproject/issues?state=open"
+            )
+        );
+        assert_eq!(
+            decided("/api/v4/projects/a%2Fb%2Fc"),
+            to("gitlab", "/api/v4/projects/a%2Fb%2Fc")
+        );
+        // One segment, `admin%2Fusers`: not under `/admin`, so routed to the open rule,
+        // which does not keep it.
+        assert_eq!(
+            decided("/admin%2Fusers"),
+            Err(Rejection::Path(NormaliseError::EncodedSlash))
+        );
+        assert_eq!(
+            decided("/x/admin%2Fusers"),
+            Err(Rejection::Path(NormaliseError::EncodedSlash))
+        );
+        assert_eq!(decided("/admin/users"), to("guarded", "/admin/users"));
+        // Before routing, wherever it would go.
+        for target in [
+            "/api/v4/projects/a%2F..%2Fb",
+            "/api/v4/projects/a%2F%2E%2E",
+            "/api/v4/projects/a%2F%2Fb",
+            "/api/v4/projects/%2Fb",
+        ] {
+            assert_eq!(
+                decided(target),
+                Err(Rejection::Path(NormaliseError::AmbiguousEncodedSlash)),
+                "{target}"
+            );
+        }
+        assert_eq!(
+            decided("/api/v4/projects/a%2Fb%5Cc"),
+            Err(Rejection::Path(NormaliseError::EncodedBackslash))
+        );
+    }
+
     #[test]
     fn a_path_without_a_normal_form_is_rejected() {
         let host = [("host", "shop.example.com")];
+        // No rule of the shop's keeps an encoded slash.
+        assert_eq!(
+            upstream_for("/cart%2Fadmin", &host),
+            Err(Rejection::Path(NormaliseError::EncodedSlash))
+        );
         assert_eq!(
             upstream_for("/cart/..%2Fadmin", &host),
-            Err(Rejection::Path(NormaliseError::EncodedSeparator))
+            Err(Rejection::Path(NormaliseError::AmbiguousEncodedSlash))
+        );
+        assert_eq!(
+            upstream_for("/cart%5Cadmin", &host),
+            Err(Rejection::Path(NormaliseError::EncodedBackslash))
         );
         assert_eq!(
             upstream_for("/../cart", &host),
@@ -2226,7 +2342,17 @@ upstreams:
         fn whatever_is_forwarded_has_the_normal_path_and_the_rest_as_it_came(target in target()) {
             let mut head = head("/", &[("host", "shop.example.com")]);
             head.uri = target.clone();
-            match (decide_on("web", &mut head, 0), normalise_path(target.path())) {
+            // No rule of the shop's keeps an encoded slash: a path with one is refused by the
+            // pass that keeps it, or else by the rule it is routed to (03 §11).
+            let normal = match normalise_path(target.path()) {
+                Err(NormaliseError::EncodedSlash) => Err(
+                    normalise_path_with(target.path(), EncodedSlash::Keep)
+                        .err()
+                        .unwrap_or(NormaliseError::EncodedSlash),
+                ),
+                normal => normal,
+            };
+            match (decide_on("web", &mut head, 0), normal) {
                 (Ok(_), Ok(normal)) => {
                     let forwarded = match normal.strip_prefix("/v1") {
                         Some(rest) if rest.is_empty() || rest.starts_with('/') => {

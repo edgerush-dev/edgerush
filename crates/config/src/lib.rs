@@ -34,7 +34,7 @@ pub use config::{
 };
 pub use harness_file::{CertificateFiles, HarnessFile};
 pub use route::{
-    Backend, Filter, Forward, Fraction, GrpcMethod, Header, HeaderChanges, Hostname, Match, Mirror,
-    PathChange, PathMatch, Query, Redirect, Retry, Route, Rule, Scheme, TcpRoute, Timeouts,
-    TlsRoute, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
+    Backend, EncodedSlash, Filter, Forward, Fraction, GrpcMethod, Header, HeaderChanges, Hostname,
+    Match, Mirror, PathChange, PathMatch, Query, Redirect, Retry, Route, Rule, RulePaths, Scheme,
+    TcpRoute, Timeouts, TlsRoute, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
 };

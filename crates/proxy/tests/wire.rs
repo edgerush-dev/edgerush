@@ -2539,6 +2539,28 @@ async fn te_from_an_http2_client_reaches_an_http1_upstream_named_in_its_connecti
     assert_eq!(seen.matches("connection").count(), 1, "{seen}");
 }
 
+/// A rule that keeps an encoded slash takes a path with one inside a segment and sends it
+/// upstream as `%2F`; a rule that does not answers it 400, and nothing reaches the upstream
+/// (03 §11).
+#[tokio::test]
+async fn an_encoded_slash_reaches_the_upstream_only_through_a_rule_that_keeps_it() {
+    let (upstream, mut seen) = reporting_upstream();
+    let keeping = proxy_to_with_filters(upstream, "        paths: { encoded_slash: keep }").await;
+    let refusing = proxy_to(upstream).await;
+    let mut client = Wire::to(refusing).await;
+    let refused = asks(&mut client, "/group%2fproject/issues").await;
+    assert!(refused.starts_with("HTTP/1.1 400 "), "{refused}");
+    let mut client = Wire::to(keeping).await;
+    let taken = asks(&mut client, "/group%2fproject/issues").await;
+    assert!(taken.starts_with("HTTP/1.1 200 "), "{taken}");
+    let reached = within(seen.recv()).await.unwrap();
+    assert!(
+        reached.starts_with("GET /group%2Fproject/issues HTTP/1.1\r\n"),
+        "{reached}"
+    );
+    assert!(seen.try_recv().is_err());
+}
+
 /// An HTTP/2 request whose `Host` names another entity than its `:authority` is answered
 /// 400 and never reaches the upstream; one whose `Host` names the same entity goes on with
 /// the `Host` its `:authority` says (RFC 9113 §8.3.1; 15 §5).

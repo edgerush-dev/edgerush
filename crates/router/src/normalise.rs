@@ -17,10 +17,38 @@
 //! upper-case hex that stand for anything but an unreserved character, a control character,
 //! a slash or a backslash. Every path has at most one normal form, and paths the upstream
 //! could split or resolve otherwise have none: they are rejected.
+//!
+//! Where a rule takes them ([`EncodedSlash::Keep`]), an encoded slash (`%2F`) may stand
+//! inside a segment, for APIs that carry one there (GitLab's `group%2Fproject`): it is part
+//! of its segment, matched and forwarded as `%2F`. Split at its encoded slashes, such a
+//! segment has no empty piece and no `.` or `..` piece however spelt, which an upstream that
+//! decodes it would merge or resolve.
 
 use std::borrow::Cow;
 
-/// Brings a request path into normal form, or rejects it as ambiguous.
+/// Whether an encoded slash (`%2F`) may stand inside a path segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EncodedSlash {
+    /// Rejected: a separator to some servers, an ordinary character to others.
+    #[default]
+    Refuse,
+    /// Part of its segment, kept as `%2F`.
+    Keep,
+}
+
+/// Brings a request path into normal form, or rejects it as ambiguous: an encoded slash
+/// among the rest ([`normalise_path_with`] with [`EncodedSlash::Refuse`]).
+///
+/// # Errors
+///
+/// Returns a [`NormaliseError`] for paths that are not absolute or are ambiguous; the
+/// request should be answered with 400.
+pub fn normalise_path(path: &str) -> Result<Cow<'_, str>, NormaliseError> {
+    normalise_path_with(path, EncodedSlash::Refuse)
+}
+
+/// Brings a request path into normal form, or rejects it as ambiguous; an encoded slash
+/// inside a segment is rejected or kept as `slash` says.
 ///
 /// `path` is the path alone, without the query string. Dot segments are resolved, duplicate
 /// slashes merged, percent-encoded unreserved characters decoded (`%61` is `a`), other
@@ -31,7 +59,10 @@ use std::borrow::Cow;
 ///
 /// Returns a [`NormaliseError`] for paths that are not absolute or are ambiguous; the
 /// request should be answered with 400.
-pub fn normalise_path(path: &str) -> Result<Cow<'_, str>, NormaliseError> {
+pub fn normalise_path_with(
+    path: &str,
+    slash: EncodedSlash,
+) -> Result<Cow<'_, str>, NormaliseError> {
     let segments = path.strip_prefix('/').ok_or(NormaliseError::NotAbsolute)?;
     if is_normal(segments) {
         return Ok(Cow::Borrowed(path));
@@ -42,7 +73,7 @@ pub fn normalise_path(path: &str) -> Result<Cow<'_, str>, NormaliseError> {
     for segment in segments.split('/') {
         let start = normal.len();
         normal.push('/');
-        let encoded_dot = write_segment(segment, &mut normal)?;
+        let encoded_dot = write_segment(segment, &mut normal, slash)?;
         let written = normal.get(start + 1..).unwrap_or_default();
 
         let dots = dot_segment(written.as_bytes());
@@ -91,10 +122,17 @@ fn is_normal(segments: &str) -> bool {
 
 /// Appends `segment` with canonical percent-encoding. Says whether an encoded dot was
 /// decoded on the way: a dot segment spelt that way is an attempt to hide it.
-fn write_segment(segment: &str, normal: &mut String) -> Result<bool, NormaliseError> {
+fn write_segment(
+    segment: &str,
+    normal: &mut String,
+    slash: EncodedSlash,
+) -> Result<bool, NormaliseError> {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
     let mut encoded_dot = false;
+    // Where the piece being written began, and whether an encoded slash has ended one.
+    let mut piece = normal.len();
+    let mut slashed = false;
     let mut bytes = segment.bytes();
     while let Some(byte) = bytes.next() {
         let encoded = byte == b'%';
@@ -108,7 +146,16 @@ fn write_segment(segment: &str, normal: &mut String) -> Result<bool, NormaliseEr
             byte
         };
         match byte {
-            b'/' | b'\\' if encoded => return Err(NormaliseError::EncodedSeparator),
+            b'/' if encoded => {
+                if slash == EncodedSlash::Refuse {
+                    return Err(NormaliseError::EncodedSlash);
+                }
+                check_piece(normal.get(piece..).unwrap_or_default())?;
+                normal.push_str("%2F");
+                piece = normal.len();
+                slashed = true;
+            }
+            b'\\' if encoded => return Err(NormaliseError::EncodedBackslash),
             b'\\' => return Err(NormaliseError::Backslash),
             0..=0x1F | 0x7F => return Err(NormaliseError::ControlCharacter),
             _ if is_unreserved(byte) || (!encoded && is_plain(byte)) => {
@@ -123,7 +170,20 @@ fn write_segment(segment: &str, normal: &mut String) -> Result<bool, NormaliseEr
             }
         }
     }
+    if slashed {
+        check_piece(normal.get(piece..).unwrap_or_default())?;
+    }
     Ok(encoded_dot)
+}
+
+/// Holds a piece of a segment between encoded slashes to what an upstream that decodes
+/// them would take for a segment of its own: neither empty nor dots, however spelt (the
+/// piece is canonical by now, an encoded dot decoded).
+fn check_piece(piece: &str) -> Result<(), NormaliseError> {
+    if piece.is_empty() || dot_segment(piece.as_bytes()).is_some() {
+        return Err(NormaliseError::AmbiguousEncodedSlash);
+    }
+    Ok(())
 }
 
 /// The value of one hex digit of a percent-encoding.
@@ -203,10 +263,19 @@ pub enum NormaliseError {
     /// A `%` that is not followed by two hex digits.
     #[error("path contains a malformed percent-encoding")]
     InvalidPercentEncoding,
-    /// An encoded slash or backslash (`%2F`, `%5C`): a separator to some servers, an
+    /// An encoded slash (`%2F`) where none is taken: a separator to some servers, an
     /// ordinary character to others.
-    #[error("path contains an encoded slash or backslash")]
-    EncodedSeparator,
+    #[error("path contains an encoded slash")]
+    EncodedSlash,
+    /// An encoded backslash (`%5C`): a separator to some servers, an ordinary character to
+    /// others.
+    #[error("path contains an encoded backslash")]
+    EncodedBackslash,
+    /// An encoded slash taken where it stands beside an empty, `.` or `..` piece of its
+    /// segment (`a%2F..%2Fb`, `a%2F%2Fb`), which an upstream that decodes it would resolve
+    /// or merge.
+    #[error("path contains an encoded slash beside an empty or dot piece")]
+    AmbiguousEncodedSlash,
     /// A backslash, which some servers read as a slash.
     #[error("path contains a backslash")]
     Backslash,
@@ -333,10 +402,10 @@ mod tests {
             ("/a%+1", NormaliseError::InvalidPercentEncoding),
             ("/a%%41", NormaliseError::InvalidPercentEncoding),
             ("/a%é", NormaliseError::InvalidPercentEncoding),
-            ("/a%2Fb", NormaliseError::EncodedSeparator),
-            ("/a%2fb", NormaliseError::EncodedSeparator),
-            ("/a%5Cb", NormaliseError::EncodedSeparator),
-            ("/a%5c..%5cb", NormaliseError::EncodedSeparator),
+            ("/a%2Fb", NormaliseError::EncodedSlash),
+            ("/a%2fb", NormaliseError::EncodedSlash),
+            ("/a%5Cb", NormaliseError::EncodedBackslash),
+            ("/a%5c..%5cb", NormaliseError::EncodedBackslash),
             ("/a\\b", NormaliseError::Backslash),
             ("/a/..\\b", NormaliseError::Backslash),
             ("/a\0", NormaliseError::ControlCharacter),
@@ -368,6 +437,87 @@ mod tests {
         }
     }
 
+    fn kept(path: &str) -> String {
+        normalise_path_with(path, EncodedSlash::Keep)
+            .unwrap()
+            .into_owned()
+    }
+
+    /// Where an encoded slash is taken, it is part of its segment: kept, in upper-case hex,
+    /// and the rest of the path normalised as anywhere else (03 §11).
+    #[test]
+    fn an_encoded_slash_is_kept_inside_its_segment_where_it_is_taken() {
+        assert_eq!(
+            kept("/api/v4/projects/group%2Fproject"),
+            "/api/v4/projects/group%2Fproject"
+        );
+        assert_eq!(
+            kept("/api/v4/projects/group%2fproject/./x//y/../z"),
+            "/api/v4/projects/group%2Fproject/x/z"
+        );
+        assert_eq!(kept("/a%2F%61/b%2Fc%2Fd"), "/a%2Fa/b%2Fc%2Fd");
+        // Names that merely have dots in them are names.
+        assert_eq!(kept("/a%2F...%2F.b%2Fc."), "/a%2F...%2F.b%2Fc.");
+        // A path in normal form is still returned as it is.
+        assert!(matches!(
+            normalise_path_with("/shop/cart", EncodedSlash::Keep),
+            Ok(Cow::Borrowed("/shop/cart"))
+        ));
+    }
+
+    /// Split at its encoded slashes, a segment holds no empty piece and no dot piece,
+    /// however spelt: an upstream that decodes `%2F` would merge the one and resolve the
+    /// other, where the gateway sees one segment (03 §11).
+    #[test]
+    fn an_encoded_slash_beside_an_empty_or_dot_piece_is_rejected() {
+        for path in [
+            "/a%2F..%2Fb",
+            "/a%2F%2E%2E%2Fb",
+            "/a%2F%2e%2E%2Fb",
+            "/a%2F.%2Fb",
+            "/a%2F%2e",
+            "/a%2F..",
+            "/..%2Fa",
+            "/.%2Fa",
+            "/a%2F..;x%2Fb",
+            "/a%2F..%3Bx%2Fb",
+            "/a%2F.%3bx",
+            "/a%2F%2Fb",
+            "/%2Fa",
+            "/a%2F",
+            "/%2F",
+            "/a/%2F/b",
+        ] {
+            assert_eq!(
+                normalise_path_with(path, EncodedSlash::Keep),
+                Err(NormaliseError::AmbiguousEncodedSlash),
+                "{path:?}"
+            );
+        }
+    }
+
+    /// Taking an encoded slash takes nothing else.
+    #[test]
+    fn what_else_is_rejected_stays_rejected_where_an_encoded_slash_is_taken() {
+        let cases = [
+            ("/a%5Cb", NormaliseError::EncodedBackslash),
+            ("/a%2Fb%5Cc", NormaliseError::EncodedBackslash),
+            ("/a%2Fb\\c", NormaliseError::Backslash),
+            ("/a%2F%00", NormaliseError::ControlCharacter),
+            ("/a%2F%4", NormaliseError::InvalidPercentEncoding),
+            ("/a%2Fb/%2e%2e/c", NormaliseError::AmbiguousDotSegment),
+            ("/a%2Fb/../..", NormaliseError::AboveRoot),
+            ("a%2Fb", NormaliseError::NotAbsolute),
+        ];
+        for (path, reason) in cases {
+            assert_eq!(
+                normalise_path_with(path, EncodedSlash::Keep),
+                Err(reason),
+                "{path:?}"
+            );
+        }
+    }
+
     #[test]
     fn errors_describe_themselves() {
         assert_eq!(
@@ -378,15 +528,29 @@ mod tests {
 
     /// The definition of normal form from the module documentation, checked directly.
     fn is_in_normal_form(path: &str) -> bool {
+        is_in_normal_form_with(path, EncodedSlash::Refuse)
+    }
+
+    /// The same, with encoded slashes taken where `slash` says.
+    fn is_in_normal_form_with(path: &str, slash: EncodedSlash) -> bool {
         let Some(rest) = path.strip_prefix('/') else {
             return false;
         };
         let segments: Vec<&str> = rest.split('/').collect();
         let (last, others) = segments.split_last().unwrap();
-        let well_formed = |segment: &str| {
-            // Up to the first `;`, however it is written.
-            let name = segment.split(';').next().unwrap();
+        // Up to the first `;`, however it is written.
+        let is_dots = |text: &str| {
+            let name = text.split(';').next().unwrap();
             let name = name.split("%3B").next().unwrap();
+            name == "." || name == ".."
+        };
+        let well_formed = |segment: &str| {
+            // Split at encoded slashes, where they are taken: no piece empty or dots.
+            let pieces: Vec<&str> = segment.split("%2F").collect();
+            let pieces_well_formed = pieces.len() == 1
+                || pieces
+                    .iter()
+                    .all(|piece| !piece.is_empty() && !is_dots(piece));
             let mut rest = segment.as_bytes();
             let mut encodings_are_canonical = true;
             while let Some((&byte, tail)) = rest.split_first() {
@@ -403,13 +567,13 @@ mod tests {
                     encodings_are_canonical &= canonical
                         && !is_unreserved(value)
                         && !value.is_ascii_control()
-                        && value != b'/'
+                        && (value != b'/' || slash == EncodedSlash::Keep)
                         && value != b'\\';
                 } else {
                     encodings_are_canonical &= is_plain(byte);
                 }
             }
-            name != "." && name != ".." && encodings_are_canonical
+            !is_dots(segment) && pieces_well_formed && encodings_are_canonical
         };
         others
             .iter()
@@ -446,6 +610,36 @@ mod tests {
         fn arbitrary_text_never_panics(path in any::<String>()) {
             let absolute = format!("/{path}");
             let _ = (normalise_path(&path), normalise_path(&absolute));
+            let keep = EncodedSlash::Keep;
+            let _ = (normalise_path_with(&path, keep), normalise_path_with(&absolute, keep));
+        }
+
+        #[test]
+        fn keeping_encoded_slashes_agrees_with_the_step_by_step_reference(path in nasty_path()) {
+            let normal = normalise_path_with(&path, EncodedSlash::Keep).ok().map(Cow::into_owned);
+            prop_assert_eq!(normal, reference::normalise_path_with(&path, EncodedSlash::Keep));
+        }
+
+        #[test]
+        fn output_keeping_encoded_slashes_is_in_normal_form_and_stays_so(path in nasty_path()) {
+            let keep = EncodedSlash::Keep;
+            if let Ok(normal) = normalise_path_with(&path, keep) {
+                prop_assert!(is_in_normal_form_with(&normal, keep), "{normal:?}");
+                let again = normalise_path_with(&normal, keep);
+                prop_assert_eq!(again.as_deref(), Ok(&*normal));
+            }
+        }
+
+        /// Keeping encoded slashes changes nothing for a path without one: the two agree on
+        /// every path but those the one rejects for an encoded slash alone.
+        #[test]
+        fn keeping_encoded_slashes_changes_only_paths_with_one(path in nasty_path()) {
+            match normalise_path(&path) {
+                Err(NormaliseError::EncodedSlash) => {}
+                refused_or_not => {
+                    prop_assert_eq!(normalise_path_with(&path, EncodedSlash::Keep), refused_or_not);
+                }
+            }
         }
     }
 }
