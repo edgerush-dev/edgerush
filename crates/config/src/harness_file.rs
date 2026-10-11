@@ -79,7 +79,7 @@ mod tests {
 
     const SECTIONS: &str = r#"
 listeners:
-  web: { address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [shop] } }
+  web: { address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [shop], without_sni: shop } }
 routes: []
 tcp_routes: []
 tls_routes: []

@@ -117,6 +117,7 @@ pub(super) fn secured(
     let web = config.listeners.get_mut("web").unwrap();
     web.protocol = edgerush_config::Protocol::Https;
     web.tls = Some(edgerush_config::Tls {
+        without_sni: names[0].clone(),
         certificates: names,
         client_validation,
     });

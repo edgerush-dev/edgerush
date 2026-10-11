@@ -229,8 +229,8 @@ mod tests {
     const LISTENERS: &str = r#"
 listeners:
   web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
-  secure: { address: "[::]:8443", protocol: https, proxy_protocol: off, tls: { certificates: [site] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
-  quic: { address: "[::]:9443", protocol: https, proxy_protocol: off, tls: { certificates: [site] }, http3: {}, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
+  secure: { address: "[::]:8443", protocol: https, proxy_protocol: off, tls: { certificates: [site], without_sni: site }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
+  quic: { address: "[::]:9443", protocol: https, proxy_protocol: off, tls: { certificates: [site], without_sni: site }, http3: {}, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
 routes: []
 upstreams: {}
 "#;

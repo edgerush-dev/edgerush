@@ -276,7 +276,7 @@ plain = 'web: { address: "127.0.0.1:8080", protocol: http, proxy_protocol: off, 
 assert plain in text and "\ncertificates:" not in text
 http3 = "http3: {}, " if h3 else ""
 text = text.replace(plain, 'web: { address: "127.0.0.1:8080", protocol: https, proxy_protocol: off, '
-                    f'tls: {{ certificates: [web] }}, {http3}')
+                    f'tls: {{ certificates: [web], without_sni: web }}, {http3}')
 # The config names the certificate's files; it never holds the key (07 §1 in the docs).
 chain, key = json.dumps(f"{tls}/cert.pem"), json.dumps(f"{tls}/key.pem")
 text += f"certificates: {{ web: {{ chain_file: {chain}, key_file: {key} }} }}\n"

@@ -1,7 +1,7 @@
 listeners:
   web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: [Forwarded, X-Real-IP, "X-Forwarded-*"] }, request_id: generate }
   admin: { address: "[::]:9090", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
-  secure: { address: "[::]:8443", protocol: https, proxy_protocol: off, tls: { certificates: [secure] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+  secure: { address: "[::]:8443", protocol: https, proxy_protocol: off, tls: { certificates: [secure], without_sni: secure }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
 routes:
   - name: shop
     listeners: [web, secure]

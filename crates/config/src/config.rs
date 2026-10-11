@@ -218,11 +218,17 @@ pub enum Protocol {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Tls {
-    /// The names of the certificates it can present. A client is given the
-    /// one whose names cover the name it asked for (SNI), and the first when none does or
-    /// it asked for none. No name twice.
+    /// The names of the certificates it can present. A client is given the one whose
+    /// names cover the name it asked for (SNI); a client that asked for a name none of them
+    /// carries is refused in the handshake with an `unrecognized_name` alert. No name
+    /// twice.
     #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
     pub certificates: Vec<String>,
+    /// The certificate for a client that asks for no name (no SNI): one of
+    /// `certificates`, or `none` to refuse such a client in the handshake. Said on every
+    /// listener with TLS, so that which one is never left to their order. It holds for the
+    /// listener's HTTP/3 socket too.
+    pub without_sni: String,
     /// Clients must show a certificate these authorities vouch for (mTLS); none, and any
     /// client is served.
     #[serde(default)]

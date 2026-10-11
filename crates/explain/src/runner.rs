@@ -691,7 +691,7 @@ upstreams:
         let mut config: edgerush_config::Config = serde_saphyr::from_str(
             r#"
 listeners:
-  quic: { address: "[::]:9443", protocol: https, proxy_protocol: off, tls: { certificates: [site] }, http3: { alt_svc_max_age: 60 }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
+  quic: { address: "[::]:9443", protocol: https, proxy_protocol: off, tls: { certificates: [site], without_sni: site }, http3: { alt_svc_max_age: 60 }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: pass }
 routes: []
 upstreams: {}
 "#,

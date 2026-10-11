@@ -1,5 +1,5 @@
 listeners:
-  web: { address: "[::]:8443", protocol: https, proxy_protocol: { senders: ["10.0.0.0/8"] }, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: [Forwarded, X-Real-IP] }, request_id: pass, tls: { certificates: [site, other], client_validation: { authorities: ["CA"] } }, http3: { alt_svc_max_age: 60, force_retry: false } }
+  web: { address: "[::]:8443", protocol: https, proxy_protocol: { senders: ["10.0.0.0/8"] }, forwarding: { trusted_proxies: ["10.0.0.0/8"], trusted_only_headers: [Forwarded, X-Real-IP] }, request_id: pass, tls: { certificates: [site, other], without_sni: site, client_validation: { authorities: ["CA"] } }, http3: { alt_svc_max_age: 60, force_retry: false } }
   db: { address: "[::]:5432", protocol: tcp, proxy_protocol: off, tunnel_idle_seconds: 600 }
 routes:
   - name: api

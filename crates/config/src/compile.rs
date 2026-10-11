@@ -591,8 +591,11 @@ pub struct NamedCertificate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledTls {
     /// Its certificates, in the order it names them. A client is given the one whose names
-    /// cover the name it asked for (SNI), and the first when none does or it asked for none.
+    /// cover the name it asked for (SNI), and is refused when none does.
     pub certificates: Vec<NamedCertificate>,
+    /// Which of them a client that asks for no name is given; none, and such a client is
+    /// refused.
+    pub without_sni: Option<usize>,
     /// Clients must show a certificate these authorities vouch for (mTLS); none, and any
     /// client is served.
     pub client_validation: Option<ClientValidation>,
@@ -608,6 +611,9 @@ pub struct CompiledUpstreamTls {
     /// What the data plane shows an endpoint that asks who it is (mTLS), if anything.
     pub client_certificate: Option<NamedCertificate>,
 }
+
+/// What a listener's `without_sni` says to refuse a client that asks for no name.
+const WITHOUT_SNI_REFUSED: &str = "none";
 
 /// The certificate of `name` among `config`'s, if there is one.
 fn named(config: &Config, name: &str) -> Option<NamedCertificate> {
@@ -794,6 +800,14 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                 };
                 errors.push(Place::listener(name).problem(problem));
             }
+            if tls.without_sni != WITHOUT_SNI_REFUSED
+                && !tls.certificates.contains(&tls.without_sni)
+            {
+                errors.push(
+                    Place::listener(name)
+                        .problem(Problem::WithoutSniUnknown(tls.without_sni.clone())),
+                );
+            }
         }
         // QUIC is always TLS: there is no HTTP/3 in the clear (RFC 9114 §3.1).
         if listener.http3.is_some() && listener.protocol != Protocol::Https {
@@ -972,6 +986,14 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                             .iter()
                             .filter_map(|name| named(config, name))
                             .collect(),
+                        // `none` refuses, even beside a certificate that has that name.
+                        without_sni: (tls.without_sni != WITHOUT_SNI_REFUSED)
+                            .then(|| {
+                                tls.certificates
+                                    .iter()
+                                    .position(|named| *named == tls.without_sni)
+                            })
+                            .flatten(),
                         client_validation: tls.client_validation.clone(),
                     }),
                     http3: listener.http3,
@@ -1923,6 +1945,9 @@ pub enum Problem {
     /// A certificate a listener names more than once.
     #[error("certificate `{0}` is named twice")]
     CertificateTwice(String),
+    /// A certificate for clients without SNI that is not one of the listener's.
+    #[error("`without_sni` names `{0}`, which is not one of the listener's certificates")]
+    WithoutSniUnknown(String),
     /// TLS on a listener that does not speak it.
     #[error("`tls` is for protocol `https`")]
     TlsUnwanted,
@@ -3107,7 +3132,7 @@ upstreams: {}
                 &["one"],
             )
         };
-        let one = r#"{ certificates: [one] }"#;
+        let one = r#"{ certificates: [one], without_sni: one }"#;
 
         let compiled = compile(&with(&format!(
             r#"{{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {one} }}"#
@@ -3121,7 +3146,7 @@ upstreams: {}
         assert_eq!(tls.certificates[0].certificate.key, "key of one");
         assert_eq!(tls.client_validation, None);
         let validated = compile(&with(
-            r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [one], client_validation: { authorities: ["CA"] } } }"#,
+            r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [one], without_sni: one, client_validation: { authorities: ["CA"] } } }"#,
         ))
         .unwrap();
         let validation = validated.listeners[0].tls.as_ref().unwrap();
@@ -3131,7 +3156,7 @@ upstreams: {}
         );
         assert!(
             compile(&with(
-                r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [one], client_validation: { authorities: [] } } }"#,
+                r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [one], without_sni: one, client_validation: { authorities: [] } } }"#,
             ))
             .unwrap_err()[0]
                 .to_string()
@@ -3151,7 +3176,7 @@ upstreams: {}
         );
         assert_eq!(
             problems(
-                r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [] } }"#.to_owned()
+                r#"{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [], without_sni: none } }"#.to_owned()
             ),
             ["listener `l`: protocol `https` needs `tls` with a certificate"]
         );
@@ -3177,7 +3202,7 @@ upstreams: {}
     fn a_named_certificate_is_found_or_refused_where_it_is_named() {
         let yaml = r#"
 listeners:
-  l: { address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [b, a] } }
+  l: { address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [b, a], without_sni: b } }
 routes: []
 upstreams:
   u: { load_balancer: p2c, endpoints: [], tls: { server_name: backend.internal, authorities: ["CA"], client_certificate: c } }
@@ -3219,6 +3244,43 @@ upstreams:
         assert_eq!(problems, ["listener `l`: certificate `a` is named twice"]);
     }
 
+    /// Every listener with TLS says which of its certificates a client that asks for no
+    /// name is given, or `none` to refuse it: never left to their order (07 §1, 03 §3).
+    /// One that is not among the listener's is refused where it is named, even when the
+    /// config has it; `none` refuses even beside a certificate of that name.
+    #[test]
+    fn the_certificate_for_a_client_without_sni_is_named_or_none() {
+        let yaml = |without_sni: &str| {
+            format!(
+                r#"
+listeners:
+  l: {{ address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [b, a, none], without_sni: {without_sni} }} }}
+routes: []
+upstreams: {{}}
+"#
+            )
+        };
+        let certificates = ["a", "b", "c", "none"];
+        let without_sni = |said: &str| {
+            compile(&with_certificates(config(&yaml(said)), &certificates))
+                .map(|compiled| compiled.listeners[0].tls.as_ref().unwrap().without_sni)
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        assert_eq!(without_sni("a"), Ok(Some(1)));
+        assert_eq!(without_sni("b"), Ok(Some(0)));
+        assert_eq!(without_sni("none"), Ok(None));
+        assert_eq!(
+            without_sni("c"),
+            Err(vec![
+                "listener `l`: `without_sni` names `c`, which is not one of the listener's certificates"
+                    .to_owned()
+            ])
+        );
+        // Said on every listener with TLS: a config without it is not read.
+        let unsaid = yaml("a").replace(", without_sni: a", "");
+        assert!(serde_saphyr::from_str::<Config>(&unsaid).is_err());
+    }
+
     /// Certificates reach a data plane apart from the rest of its config, so no file a
     /// config is read from can carry one: the harness reads them from files of their own.
     #[test]
@@ -3249,7 +3311,7 @@ upstreams: {{}}
                 &["c"],
             )
         };
-        let https = r#"address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [c] }"#;
+        let https = r#"address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [c], without_sni: c }"#;
 
         let compiled = compile(&with(&format!("{{ {https}, http3: {{}} }}"))).unwrap();
         assert_eq!(
@@ -3607,7 +3669,7 @@ upstreams:
         );
         assert_eq!(
             refused(
-                r#"t: { address: "[::]:1", protocol: tcp, proxy_protocol: off, tls: { certificates: [c] } }"#,
+                r#"t: { address: "[::]:1", protocol: tcp, proxy_protocol: off, tls: { certificates: [c], without_sni: c } }"#,
                 &format!("routes: []\ntcp_routes: [{}]", tcp_route("a", "t", up))
             ),
             ["listener `t`: `tls` is for protocol `https`"]

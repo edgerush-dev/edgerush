@@ -1272,7 +1272,7 @@
       "type": "object",
       "properties": {
         "certificates": {
-          "description": "The names of the certificates it can present. A client is given the\none whose names cover the name it asked for (SNI), and the first when none does or\nit asked for none. No name twice.",
+          "description": "The names of the certificates it can present. A client is given the one whose\nnames cover the name it asked for (SNI); a client that asked for a name none of them\ncarries is refused in the handshake with an `unrecognized_name` alert. No name\ntwice.",
           "type": "array",
           "items": {
             "type": "string"
@@ -1289,11 +1289,16 @@
               "type": "null"
             }
           ]
+        },
+        "without_sni": {
+          "description": "The certificate for a client that asks for no name (no SNI): one of\n`certificates`, or `none` to refuse such a client in the handshake. Said on every\nlistener with TLS, so that which one is never left to their order. It holds for the\nlistener's HTTP/3 socket too.",
+          "type": "string"
         }
       },
       "additionalProperties": false,
       "required": [
-        "certificates"
+        "certificates",
+        "without_sni"
       ]
     },
     "TlsRoute": {

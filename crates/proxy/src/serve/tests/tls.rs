@@ -8,7 +8,11 @@ async fn serving_secured_worker(
     upstream: SocketAddr,
     certificates: Vec<edgerush_config::Certificate>,
 ) -> (SocketAddr, Rc<Worker>) {
-    let config = everything_secured_to(upstream, certificates);
+    serving_compiled(everything_secured_to(upstream, certificates)).await
+}
+
+/// A worker serving `config` on a TCP socket of its own.
+async fn serving_compiled(config: Compiled) -> (SocketAddr, Rc<Worker>) {
     let proxy = Proxy::new(config, NonZeroUsize::MIN).unwrap();
     let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -562,8 +566,11 @@ async fn new_certificates_are_served_from_the_reload_on() {
         .await;
 }
 
-/// The certificate a client is given is the one whose names cover the name it asked
-/// for, and the first when none does.
+/// The certificate a client is given is the one whose names cover the name it asked for.
+/// A client that asks for a name none of them carries is refused in the handshake with a
+/// fatal unrecognized_name alert (RFC 9325 §3.7), never given another; one that asks for
+/// no name is given the certificate the listener names for that, or refused alike where
+/// it names `none` (03 §3, 07 §1).
 #[tokio::test]
 async fn the_certificate_is_chosen_by_the_name_asked_for() {
     let local = tokio::task::LocalSet::new();
@@ -584,18 +591,40 @@ async fn the_certificate_is_chosen_by_the_name_asked_for() {
                         .unwrap()
                 })
                 .collect();
-            let (front, _worker) = serving_secured_worker(upstream, certificates).await;
+            // For a client that asks for no name: the second, so that it is plainly not
+            // the first that is given.
+            let serving = |without_sni: &str| {
+                let mut config = everything_config(upstream);
+                secured(&mut config, certificates.clone(), None);
+                let tls = config.listeners.get_mut("web").unwrap().tls.as_mut();
+                tls.unwrap().without_sni = without_sni.to_owned();
+                serving_compiled(compile(&config).unwrap())
+            };
+            let (front, _worker) = serving("web1").await;
+            // An address asks for no name: a client sends none for one (RFC 6066 §3).
             for (name, expected) in [
                 ("b.test", 1),
                 ("B.Test", 1),
                 ("x.c.test", 2),
                 ("first.test", 0),
-                ("nobody.test", 0),
+                ("127.0.0.1", 1),
             ] {
                 let client = tls_client(front, name, None, |_| {}).await.unwrap();
                 let given = client.ssl().peer_certificate().unwrap().to_der().unwrap();
                 assert_eq!(given, leaves[expected], "asked for {name}");
             }
+            for name in ["nobody.test", "c.test", "y.x.c.test"] {
+                let Err(refused) = tls_client(front, name, None, |_| {}).await else {
+                    panic!("{name} was served");
+                };
+                assert!(refused.contains("UNRECOGNIZED_NAME"), "{name}: {refused}");
+            }
+            let (front, _worker) = serving("none").await;
+            let Err(refused) = tls_client(front, "127.0.0.1", None, |_| {}).await else {
+                panic!("a client asking for no name was served");
+            };
+            assert!(refused.contains("UNRECOGNIZED_NAME"), "{refused}");
+            assert!(tls_client(front, "b.test", None, |_| {}).await.is_ok());
         })
         .await;
 }

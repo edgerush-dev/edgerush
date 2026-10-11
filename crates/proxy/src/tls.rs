@@ -23,7 +23,7 @@ use arc_swap::ArcSwap;
 use boring::error::ErrorStack;
 use boring::pkey::PKey;
 use boring::ssl::{
-    AlpnError, NameType, SslAcceptor, SslContext, SslContextBuilder, SslMethod,
+    AlpnError, NameType, SniError, SslAcceptor, SslAlert, SslContext, SslContextBuilder, SslMethod,
     SslSessionCacheMode, SslVerifyMode, SslVersion, select_next_proto,
 };
 use boring::x509::X509;
@@ -97,6 +97,8 @@ struct Front {
 struct Certificates {
     names: Names,
     contexts: Vec<SslContext>,
+    /// The one for a client that asks for no name; none, and such a client is refused.
+    without_sni: Option<usize>,
 }
 
 impl std::fmt::Debug for Tls {
@@ -289,18 +291,25 @@ impl Front {
 }
 
 /// Moves every connection a front starts to the context of the certificate for the name it
-/// asked for, among those `serving` holds at the time.
+/// asked for, among those `serving` holds at the time, or of the listener's certificate
+/// for a client that asked for none. A name no certificate carries, or no name where the
+/// listener has no certificate for that, is refused with a fatal unrecognized_name alert
+/// (RFC 9325 §3.7), as NGINX's `ssl_reject_handshake` does: never one of the others.
 fn choose_by_name(builder: &mut SslContextBuilder, serving: &Arc<ArcSwap<Certificates>>) {
     let serving = Arc::clone(serving);
     // Called for every handshake, a name asked for or not.
-    builder.set_servername_callback(move |ssl, _alert| {
+    builder.set_servername_callback(move |ssl, alert| {
         let certificates = serving.load();
-        let asked = ssl.servername(NameType::HOST_NAME).unwrap_or("");
-        let chosen = certificates.names.choose(asked);
-        if let Some(context) = certificates.contexts.get(chosen) {
-            // Only fails for a context with no certificate, which none of these is.
-            let _moved = ssl.set_ssl_context(context);
-        }
+        let chosen = match ssl.servername(NameType::HOST_NAME) {
+            Some(asked) => certificates.names.choose(asked),
+            None => certificates.without_sni,
+        };
+        let Some(context) = chosen.and_then(|at| certificates.contexts.get(at)) else {
+            *alert = SslAlert::UNRECOGNIZED_NAME;
+            return Err(SniError::ALERT_FATAL);
+        };
+        // Only fails for a context with no certificate, which none of these is.
+        let _moved = ssl.set_ssl_context(context);
         Ok(())
     });
 }
@@ -344,7 +353,11 @@ impl Certificates {
         if contexts.is_empty() {
             return Err(TlsError::NoCertificate);
         }
-        Ok(Self { names, contexts })
+        Ok(Self {
+            names,
+            contexts,
+            without_sni: source.without_sni,
+        })
     }
 }
 
@@ -497,7 +510,7 @@ impl Identity {
 
 /// Which certificate answers for which name: by the DNS names in each one's subject
 /// alternative names, exact names before wildcards, and among certificates that carry the
-/// same name, the first. A name no certificate carries is answered by the first.
+/// same name, the first. A name no certificate carries is answered by none.
 #[derive(Debug, Default)]
 struct Names {
     /// By the name, in lower case.
@@ -525,18 +538,17 @@ impl Names {
         };
     }
 
-    /// The certificate for a client that asked for `name`.
-    fn choose(&self, name: &str) -> usize {
+    /// The certificate for a client that asked for `name`, if one carries it.
+    fn choose(&self, name: &str) -> Option<usize> {
         // Once for a handshake, which does far more than this.
         let name = name.to_ascii_lowercase();
         if let Some(&index) = self.exact.get(&name) {
-            return index;
+            return Some(index);
         }
         name.split_once('.')
             .filter(|(label, _)| !label.is_empty())
             .and_then(|(_, parent)| self.wildcard.get(parent))
             .copied()
-            .unwrap_or(0)
     }
 }
 
@@ -623,26 +635,26 @@ mod tests {
     #[test]
     fn a_name_is_answered_by_the_certificate_that_carries_it() {
         let names = names(&[&["default.test"], &["a.test", "*.b.test"], &["c.test"]]);
-        assert_eq!(names.choose("a.test"), 1);
-        assert_eq!(names.choose("c.test"), 2);
-        assert_eq!(names.choose("default.test"), 0);
+        assert_eq!(names.choose("a.test"), Some(1));
+        assert_eq!(names.choose("c.test"), Some(2));
+        assert_eq!(names.choose("default.test"), Some(0));
         // Names are not told apart by case.
-        assert_eq!(names.choose("A.Test"), 1);
+        assert_eq!(names.choose("A.Test"), Some(1));
         // A wildcard stands for one whole label: not none, not two.
-        assert_eq!(names.choose("x.b.test"), 1);
-        assert_eq!(names.choose("b.test"), 0);
-        assert_eq!(names.choose("y.x.b.test"), 0);
-        assert_eq!(names.choose(".b.test"), 0);
-        // Nobody's name: the first.
-        assert_eq!(names.choose("elsewhere.test"), 0);
-        assert_eq!(names.choose(""), 0);
+        assert_eq!(names.choose("x.b.test"), Some(1));
+        assert_eq!(names.choose("b.test"), None);
+        assert_eq!(names.choose("y.x.b.test"), None);
+        assert_eq!(names.choose(".b.test"), None);
+        // Nobody's name: none, not the first (RFC 9325 §3.7).
+        assert_eq!(names.choose("elsewhere.test"), None);
+        assert_eq!(names.choose(""), None);
     }
 
     #[test]
     fn an_exact_name_comes_before_a_wildcard_and_the_first_before_the_rest() {
         let names = names(&[&["*.x.test"], &["a.x.test"], &["a.x.test", "*.x.test"]]);
-        assert_eq!(names.choose("a.x.test"), 1);
-        assert_eq!(names.choose("b.x.test"), 0);
+        assert_eq!(names.choose("a.x.test"), Some(1));
+        assert_eq!(names.choose("b.x.test"), Some(0));
     }
 
     proptest! {
@@ -673,7 +685,7 @@ mod tests {
                     })
                 })
             });
-            prop_assert_eq!(chosen, exact.or(wildcard).unwrap_or(0));
+            prop_assert_eq!(chosen, exact.or(wildcard));
         }
     }
 
@@ -684,12 +696,14 @@ mod tests {
                 named("a", certificate(&["a.test"])),
                 named("b", certificate(&["b.test"])),
             ],
+            without_sni: Some(0),
             client_validation: None,
         };
         let tls = Tls::new(&source).unwrap();
         assert!(tls.is_for(&source));
         let other = CompiledTls {
             certificates: vec![named("a", certificate(&["a.test"]))],
+            without_sni: Some(0),
             client_validation: None,
         };
         assert!(!tls.is_for(&other));
@@ -706,6 +720,7 @@ mod tests {
                     .zip(["good", "bad"])
                     .map(|(certificate, name)| named(name, certificate))
                     .collect(),
+                without_sni: Some(0),
                 client_validation: None,
             })
             .map(|_| ())
@@ -751,6 +766,7 @@ mod tests {
         let validated = |authorities: Vec<String>| {
             Tls::new(&CompiledTls {
                 certificates: vec![named("a", certificate(&["a.test"]))],
+                without_sni: Some(0),
                 client_validation: Some(edgerush_config::ClientValidation { authorities }),
             })
             .map(|_| ())
@@ -794,25 +810,49 @@ mod tests {
                 .unwrap()
         }
 
-        /// The certificate for the name asked for, the first for any other, and HTTP/3 the
-        /// protocol agreed: the certificate's own context speaks QUIC's, not TCP's, whose
-        /// protocols would refuse `h3` once the handshake had moved to it.
+        /// The certificate for the name asked for, the one named for a client that asks
+        /// for none, and HTTP/3 the protocol agreed: the certificate's own context speaks
+        /// QUIC's, not TCP's, whose protocols would refuse `h3` once the handshake had
+        /// moved to it. A name no certificate carries is refused with unrecognized_name, as
+        /// over TCP: QUIC's CRYPTO_ERROR for alert 112 (RFC 9001 §4.8), and so is no name
+        /// where the listener names no certificate for it.
         #[test]
         fn a_client_is_shown_the_certificate_for_its_name_and_speaks_http3() {
             let (a, b) = (certificate(&["a.test"]), certificate(&["b.test"]));
-            let tls = Tls::new(&CompiledTls {
-                certificates: vec![named("a", a.clone()), named("b", b.clone())],
-                client_validation: None,
-            })
-            .unwrap();
-            for (name, shown) in [("a.test", &a), ("b.test", &b), ("c.test", &a)] {
-                let pipe = handshake(
-                    client_for(name, &mut client_config()),
-                    &mut worker_config(&tls),
+            let listener = |without_sni| {
+                Tls::new(&CompiledTls {
+                    certificates: vec![named("a", a.clone()), named("b", b.clone())],
+                    without_sni,
+                    client_validation: None,
+                })
+                .unwrap()
+            };
+            let tls = listener(Some(1));
+            let client = |name: Option<&str>| {
+                quiche::connect(
+                    name,
+                    &id(0xc1, 16),
+                    client_addr(),
+                    server_addr(),
+                    &mut client_config(),
+                )
+                .unwrap()
+            };
+            for (name, shown) in [(Some("a.test"), &a), (Some("b.test"), &b), (None, &b)] {
+                let pipe = handshake(client(name), &mut worker_config(&tls));
+                assert!(pipe.server.is_established(), "{name:?}");
+                assert_eq!(pipe.client.application_proto(), b"h3", "{name:?}");
+                assert_eq!(pipe.client.peer_cert(), Some(&der(shown)[..]), "{name:?}");
+            }
+            const UNRECOGNIZED_NAME: u64 = 0x100 + 112;
+            for (tls, name) in [(&tls, Some("c.test")), (&listener(None), None)] {
+                let pipe = handshake(client(name), &mut worker_config(tls));
+                assert!(!pipe.server.is_established(), "{name:?}");
+                assert_eq!(
+                    pipe.client.peer_error().map(|error| error.error_code),
+                    Some(UNRECOGNIZED_NAME),
+                    "{name:?}"
                 );
-                assert!(pipe.server.is_established(), "{name}");
-                assert_eq!(pipe.client.application_proto(), b"h3", "{name}");
-                assert_eq!(pipe.client.peer_cert(), Some(&der(shown)[..]), "{name}");
             }
         }
 
@@ -826,6 +866,7 @@ mod tests {
                     named("a", certificate(&["a.test"])),
                     named("b", certificate(&["b.test"])),
                 ],
+                without_sni: Some(0),
                 client_validation: Some(edgerush_config::ClientValidation {
                     authorities: vec![trusted.chain.clone()],
                 }),
@@ -863,6 +904,7 @@ mod tests {
         fn a_session_resumes_on_any_worker_and_across_a_rotation() {
             let source = CompiledTls {
                 certificates: vec![named("a", certificate(&["a.test"]))],
+                without_sni: Some(0),
                 client_validation: None,
             };
             let tls = Tls::new(&source).unwrap();
@@ -875,6 +917,7 @@ mod tests {
                 &tls,
                 &CompiledTls {
                     certificates: vec![named("a", certificate(&["a.test"]))],
+                    without_sni: Some(0),
                     client_validation: None,
                 },
             )

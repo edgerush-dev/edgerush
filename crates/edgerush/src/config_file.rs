@@ -390,7 +390,7 @@ certificates:
     fn presenting_shop(chain_file: &str, key_file: &str) -> String {
         format!(
             r#"listeners:
-  web: {{ address: "127.0.0.1:8443", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [shop] }} }}
+  web: {{ address: "127.0.0.1:8443", protocol: https, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate, tls: {{ certificates: [shop], without_sni: shop }} }}
 routes: []
 upstreams: {{}}
 certificates:

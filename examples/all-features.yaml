@@ -47,6 +47,8 @@ listeners:
   #   access_log: stdout
   #   tls:
   #     certificates: [server]
+  #     # The certificate for a client that asks for no name (no SNI), or `none` to refuse it.
+  #     without_sni: server
   #     # mTLS: clients must show a certificate these authorities vouch for (PEM contents).
   #     # client_validation:
   #     #   authorities:

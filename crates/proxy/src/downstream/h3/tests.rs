@@ -217,6 +217,7 @@ where
     let tls = Arc::new(
         Tls::new(&edgerush_config::CompiledTls {
             certificates: vec![named("a", certificate(&["a.test"]))],
+            without_sni: Some(0),
             client_validation: None,
         })
         .unwrap(),

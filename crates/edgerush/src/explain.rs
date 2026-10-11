@@ -386,7 +386,7 @@ redirect  301 to /open
 
     #[test]
     fn certificate_files_are_never_opened() {
-        let secure = "  secure: { address: \"[::]:8443\", protocol: https, proxy_protocol: off, tls: { certificates: [site] }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n  db: {";
+        let secure = "  secure: { address: \"[::]:8443\", protocol: https, proxy_protocol: off, tls: { certificates: [site], without_sni: site }, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }\n  db: {";
         let mut https = CONFIG.replace("  db: {", secure);
         https.push_str("certificates:\n  site: { chain_file: /nowhere/site.pem, key_file: /nowhere/site.key }\n");
         let args = request("secure", "1.1", "GET", "https://shop.example.com/");
