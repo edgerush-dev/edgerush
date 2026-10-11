@@ -83,3 +83,17 @@ pub(super) fn post() -> http::Request<()> {
         .body(())
         .expect("a request")
 }
+
+/// A socket with a byte in it, the byte known to have arrived and the socket only then
+/// given to the runtime, which hears of it at its next look for I/O. The thread blocks on
+/// the arrival, so nothing else is polled meanwhile, however long it takes.
+pub(super) fn readable_socket() -> tokio::net::TcpStream {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    client.write_all(b"x").unwrap();
+    assert_eq!(server.peek(&mut [0u8; 1]).unwrap(), 1);
+    server.set_nonblocking(true).unwrap();
+    tokio::net::TcpStream::from_std(server).unwrap()
+}

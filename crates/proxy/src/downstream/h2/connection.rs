@@ -16,6 +16,7 @@
 use crate::downstream::h1::connection::{Answered, expects_continue};
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h2::body::IncomingH2;
+use crate::downstream::h2::gate;
 use crate::downstream::h2::queue::Queue;
 use crate::downstream::h2::writer::{Outgoing, Responder, send_body};
 use crate::drain::Drain;
@@ -224,7 +225,8 @@ pub(crate) async fn serve<S, R, F, B, D>(
     let Ok(mut connection) = settings.builder().handshake::<_, Outgoing>(socket).await else {
         return;
     };
-    drive(
+    // A turn given back with work left runs again only once the worker has looked for I/O.
+    gate::gated(drive(
         &mut connection,
         settings,
         storage,
@@ -234,7 +236,7 @@ pub(crate) async fn serve<S, R, F, B, D>(
         respond,
         cut,
         refused,
-    )
+    ))
     .await;
 }
 
@@ -407,6 +409,10 @@ async fn drive<S, R, F, B, D>(
                     Poll::Ready(Next::Accepted(accepted))
                 }
                 Poll::Pending => {
+                    // Its decoding spent, h2 has woken the task for the next turn.
+                    if turn.work == 0 {
+                        gate::defer();
+                    }
                     turn = Turn::WHOLE;
                     Poll::Pending
                 }
@@ -489,11 +495,11 @@ async fn drive<S, R, F, B, D>(
     }
 }
 
-/// Gives the worker's turn back with work left: woken again at once, the connection's task
-/// goes to the end of the worker's line, behind every other that is ready, and starts its
-/// next turn with its allowances whole.
+/// Gives the worker's turn back with work left: the connection's task runs again once the
+/// worker has looked for I/O (`gate`), and starts its next turn with its allowances whole.
 fn give_back<T>(cx: &mut std::task::Context<'_>, turn: &mut Turn) -> Poll<T> {
     *turn = Turn::WHOLE;
+    gate::defer();
     cx.waker().wake_by_ref();
     Poll::Pending
 }
@@ -507,7 +513,12 @@ where
 {
     let _closed = poll_fn(|cx| {
         connection.set_work(WORK);
-        connection.poll_closed(cx)
+        let closed = connection.poll_closed(cx);
+        // Its decoding spent, h2 has woken the task for the next turn.
+        if closed.is_pending() && connection.work_left() == 0 {
+            gate::defer();
+        }
+        closed
     })
     .await;
 }
@@ -1335,7 +1346,8 @@ mod tests {
         let storage = Rc::clone(storage);
         tokio::task::spawn_local(async move {
             let received = Received::new(Rc::clone(&storage));
-            drive(
+            // Behind the gate, as `serve` runs it.
+            gate::gated(drive(
                 &mut connection,
                 settings,
                 storage,
@@ -1345,7 +1357,7 @@ mod tests {
                 Rc::new(respond),
                 |_| {},
                 move |status, call| telling.borrow_mut().push((status, call)),
-            )
+            ))
             .await;
         });
         (send, told)
@@ -1801,11 +1813,15 @@ mod tests {
         locally(async {
             let storage = Storage::new(crate::storage::LIMIT);
             let gate = Rc::new(tokio::sync::Notify::new());
-            let waiting = Rc::clone(&gate);
+            let started = Rc::new(Cell::new(0usize));
+            let (waiting, counting) = (Rc::clone(&gate), Rc::clone(&started));
             let (mut send, _told) = charged(&storage, move |_, _| {
-                let waiting = Rc::clone(&waiting);
+                let (waiting, counting) = (Rc::clone(&waiting), Rc::clone(&counting));
                 async move {
-                    waiting.notified().await;
+                    // Waiting from here: `notify_waiters` wakes only what waits already.
+                    let notified = waiting.notified();
+                    counting.set(counting.get() + 1);
+                    notified.await;
                     Answered::Map(Response::new(Full::new(Bytes::new())))
                 }
             })
@@ -1815,6 +1831,14 @@ mod tests {
                 send = within(send.ready()).await.unwrap();
                 answers.push(send.send_request(get(), true).unwrap().0);
             }
+            // Every stream waiting on its answer, not only charged: a stream's future is made on
+            // its first turn, after its charge, and a turn polls 64.
+            within(async {
+                while started.get() < 100 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
             let peak = until_held(&storage, |used| used > 100 * STREAM).await;
             gate.notify_waiters();
             for answer in answers {
@@ -1912,7 +1936,8 @@ mod tests {
         tokio::task::spawn_local(async move {
             if let Ok(mut connection) = settings.builder().handshake::<_, Outgoing>(near).await {
                 let received = Received::new(Rc::clone(&storage));
-                drive(
+                // Behind the gate, as `serve` runs it.
+                gate::gated(drive(
                     &mut connection,
                     settings,
                     storage,
@@ -1922,7 +1947,7 @@ mod tests {
                     Rc::new(respond),
                     |_| {},
                     |_, _| {},
-                )
+                ))
                 .await;
             }
         });
@@ -2006,6 +2031,165 @@ mod tests {
             assert!(
                 most < PINGS * 17 / 10,
                 "{most} bytes of acknowledgements between two turns of another task"
+            );
+        });
+    }
+
+    /// How far `progress` moves between a byte known to be in a socket and the turn of a task
+    /// waiting on it: what a busy connection does before the worker next looks for I/O.
+    async fn progress_before_io(progress: impl Fn() -> usize) -> usize {
+        let server = super::super::testing::readable_socket();
+        let before = progress();
+        let reader = tokio::task::spawn_local(async move {
+            server.readable().await.unwrap();
+        });
+        within(reader).await.unwrap();
+        progress() - before
+    }
+
+    /// Serves `near` as `serve` does, `respond` answering, on a worker with room to spare.
+    fn served<R, F>(near: tokio::io::DuplexStream, settings: Settings, respond: R)
+    where
+        R: Fn(Request<RequestBody>, Interim) -> F + 'static,
+        F: Future<Output = Answered<Full<Bytes>>> + 'static,
+    {
+        tokio::task::spawn_local(async move {
+            let storage = Storage::new(crate::storage::LIMIT);
+            let received = Received::new(Rc::clone(&storage));
+            serve(
+                near,
+                settings,
+                storage,
+                &received,
+                Rc::new(|| HttpDate::from_unix(0)),
+                Rc::new(Drain::default()),
+                Rc::new(respond),
+                |_| {},
+                |_, _| {},
+            )
+            .await;
+        });
+    }
+
+    /// A connection whose streams are always ready gives its turn back with work left, and
+    /// runs again only once the worker has looked for I/O: a task waiting on a socket with
+    /// bytes in it gets its turn after a turn or two of the connection's, not after a
+    /// `LocalSet`'s round of them (61), as when the connection woke itself (15 §3).
+    #[test]
+    fn a_connection_whose_streams_spend_its_turns_lets_the_worker_look_for_io() {
+        locally(async {
+            let polls = Rc::new(Cell::new(0usize));
+            let counting = Rc::clone(&polls);
+            let (near, far) = wire();
+            // Ready again as soon as it is polled, and never done.
+            served(near, Settings::default(), move |_, _| {
+                let counting = Rc::clone(&counting);
+                poll_fn(move |cx| {
+                    counting.set(counting.get() + 1);
+                    cx.waker().wake_by_ref();
+                    Poll::<Answered<Full<Bytes>>>::Pending
+                })
+            });
+            let (mut send, client) = ::h2::client::handshake(far).await.unwrap();
+            tokio::task::spawn_local(client);
+            send = within(send.ready()).await.unwrap();
+            let (_answer, _) = send.send_request(get(), true).unwrap();
+            // The connection busy, its turns spent on its stream.
+            within(async {
+                while polls.get() < 4 * POLLS {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let between = progress_before_io(|| polls.get()).await;
+            assert!(
+                between <= 4 * POLLS,
+                "{between} stream polls before a task waiting on a socket got its turn"
+            );
+            drop(send);
+        });
+    }
+
+    /// How many of thousands of PINGs waiting in a connection's socket, served as `serve`
+    /// does, it answers between bytes reaching another socket and the turn of a task waiting
+    /// on it, once `ready` has seen the connection to the state to measure.
+    async fn pings_answered_before_io(
+        settings: Settings,
+        ready: impl AsyncFnOnce(&mut crate::h2_peer::Peer<tokio::io::DuplexStream>),
+    ) -> usize {
+        use crate::h2_peer::{self, Peer};
+        use tokio::io::AsyncReadExt;
+        const PINGS: usize = 5000;
+        /// A PING's acknowledgement: its frame's header and eight bytes.
+        const ACK: usize = 17;
+        let (near, far) = wire();
+        let asked = Rc::new(Cell::new(0));
+        served(near, settings, never(&asked));
+        let mut peer = Peer::open_as_client(far, &[]).await;
+        peer.send(&h2_peer::settings_ack()).await;
+        within(peer.barrier()).await;
+        ready(&mut peer).await;
+        let mut flood = Vec::new();
+        for n in 0..PINGS {
+            flood.extend(h2_peer::ping(u64::try_from(n).unwrap().to_be_bytes()).encode());
+        }
+        peer.write_raw(&flood).await;
+        // The acknowledgements as they come, read by a task the connection's writes wake.
+        let acked = Rc::new(Cell::new(0usize));
+        let counting = Rc::clone(&acked);
+        let reading = tokio::task::spawn_local(async move {
+            let mut buffer = vec![0u8; 1 << 16];
+            while let Ok(read) = peer.io_mut().read(&mut buffer).await
+                && read > 0
+            {
+                counting.set(counting.get() + read);
+            }
+        });
+        // The connection busy, its turns spent decoding.
+        within(async {
+            while acked.get() < 4 * WORK * ACK {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let between = progress_before_io(|| acked.get() / ACK).await;
+        assert!(
+            acked.get() < PINGS * ACK,
+            "every PING was answered before the test looked"
+        );
+        reading.abort();
+        between
+    }
+
+    /// The same for a connection whose turns h2 cuts short, its decoding spent on frames
+    /// waiting in its socket: the worker looks for I/O between its turns.
+    #[test]
+    fn a_connection_whose_frames_spend_its_turns_lets_the_worker_look_for_io() {
+        locally(async {
+            let between = pings_answered_before_io(Settings::default(), async |_| {}).await;
+            assert!(
+                between <= 4 * WORK,
+                "{between} PINGs answered before a task waiting on a socket got its turn"
+            );
+        });
+    }
+
+    /// And for one told to go, decoding what its client still sends while it closes.
+    #[test]
+    fn a_closing_connection_whose_frames_spend_its_turns_lets_the_worker_look_for_io() {
+        use crate::h2_peer::kind;
+        locally(async {
+            let settings = Settings {
+                keep_alive: Duration::from_millis(50),
+                ..Settings::default()
+            };
+            let between = pings_answered_before_io(settings, async |peer| {
+                within(peer.until(|frame| frame.kind == kind::GOAWAY)).await;
+            })
+            .await;
+            assert!(
+                between <= 4 * WORK,
+                "{between} PINGs answered before a task waiting on a socket got its turn"
             );
         });
     }
