@@ -501,3 +501,45 @@ async fn a_field_an_http3_client_sends_never_indexed_stays_so_to_an_http2_upstre
         })
         .await;
 }
+
+/// An HTTP/3 upload that states its length goes to an HTTP/1.1 upstream with that length,
+/// as an HTTP/1.1 client's does; one that states none goes in chunks (13 §4). Its trailers,
+/// which a length could not carry, go no further than the gateway anyway (03 §11).
+#[tokio::test]
+async fn an_http3_upload_goes_up_with_the_length_it_stated() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::downstream::h3::testing::{Client, get};
+            let (upstream, heads) = recording_upstream("200 OK");
+            let http3 = edgerush_config::Http3 {
+                alt_svc_max_age: 60,
+                force_retry: false,
+            };
+            let (front, _) = serving_h3(&h3_config(upstream, http3)).await;
+            let mut client = Client::connect(front, "a.test").await;
+            for (at, length) in [Some("5"), None].into_iter().enumerate() {
+                let mut fields = get("a.test", "/up");
+                fields[0].1 = "POST";
+                if let Some(length) = length {
+                    fields.push(("content-length", length));
+                }
+                let id = client.request(&fields, false);
+                client.body(id, b"hello", true).await;
+                let answer = client.answer(id).await;
+                assert_eq!(answer.final_status(), Some("200"), "{length:?}");
+                let head = heads.borrow()[at].clone();
+                if length.is_some() {
+                    assert!(head.contains("\r\ncontent-length: 5\r\n"), "{head}");
+                    assert!(!head.contains("transfer-encoding"), "{head}");
+                } else {
+                    assert!(
+                        head.contains("\r\ntransfer-encoding: chunked\r\n"),
+                        "{head}"
+                    );
+                    assert!(!head.contains("content-length"), "{head}");
+                }
+            }
+        })
+        .await;
+}

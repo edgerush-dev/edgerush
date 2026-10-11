@@ -622,9 +622,8 @@ fn timed(answered: Answered<Body>, deadline: Instant, timers: &Rc<Timers>) -> An
 /// How a request's body is to be sent on.
 ///
 /// Read from the request as it arrived rather than from the body's own account of itself:
-/// a body that says how long it is may still end with trailers, and over HTTP/2 it always
-/// may. What is certain is what the client framed it as
-/// ([13 §4](../../docs/13-http1-upstream.md)).
+/// what is certain is what the client framed it as, and the length it stated, which goes
+/// on as it is whichever protocol it came in ([13 §4](../../docs/13-http1-upstream.md)).
 fn sending_for<H: Forwarded>(head: &H, body: &RequestBody) -> Sending {
     // The engine says outright when there is no body, and that is the one thing a length
     // alone would not settle. A client that said its body is a length of nothing goes on
@@ -638,9 +637,14 @@ fn sending_for<H: Forwarded>(head: &H, body: &RequestBody) -> Sending {
         };
     }
     if matches!(head.version(), Version::HTTP_2 | Version::HTTP_3) {
-        // Framed as frames, with trailers allowed after any of them. There is no length
-        // here that would still be true by the end.
-        return Sending::Chunked;
+        // Framed as frames. A length it stated is held true by its library, which resets
+        // the stream whose frames do not add up to it, and is sent on as an HTTP/1.1
+        // client's would be: its trailers, which a length could not carry, have been
+        // dropped already. Without one, nothing else says where it ends.
+        return match request_length(head.outgoing()) {
+            Some(length) => Sending::Length(length),
+            None => Sending::Chunked,
+        };
     }
     if crate::hop_by_hop::is_chunked_request(head.outgoing()) {
         return Sending::Chunked;

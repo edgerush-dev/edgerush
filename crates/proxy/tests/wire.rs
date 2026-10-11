@@ -2578,9 +2578,9 @@ async fn an_http2_request_that_ends_with_an_empty_frame_is_ended_in_chunks() {
 }
 
 /// An HTTP/2 request that says its length and then sends trailers is carried and answered
-/// (linkerd2-proxy #15414, where one hung). Its body is framed in chunks, with the length
-/// removed, as every HTTP/2 body is (13 §4); its trailers go no further than the gateway
-/// (03 §11), and the chunks end where they were.
+/// (linkerd2-proxy #15414, where one hung). Its trailers go no further than the gateway
+/// (03 §11), so nothing it carries needs chunks: it goes to an HTTP/1.1 upstream with the
+/// length it stated, as an HTTP/1.1 client's would (13 §4).
 #[tokio::test]
 async fn an_http2_request_with_a_length_and_trailers_is_carried() {
     let (saw, mut seen) = reporter();
@@ -2625,6 +2625,24 @@ async fn an_http2_request_with_a_length_and_trailers_is_carried() {
     let answer = within(sender.send_request(request)).await.unwrap();
     assert_eq!(answer.status(), 200);
 
+    let seen = within(seen.recv()).await.unwrap().to_ascii_lowercase();
+    assert!(seen.contains("\r\ncontent-length: 5\r\n"), "{seen}");
+    assert!(!seen.contains("transfer-encoding"), "{seen}");
+    assert!(seen.ends_with("\r\n\r\nhello"), "{seen}");
+}
+
+/// An HTTP/2 request that states no length goes to an HTTP/1.1 upstream in chunks: nothing
+/// else says where its body ends (13 §4).
+#[tokio::test]
+async fn an_http2_request_without_a_length_goes_up_in_chunks() {
+    let (upstream, mut seen) = reporting_upstream();
+    let proxy = proxy_to(upstream).await;
+    let mut sender = h2_to(proxy).await;
+    let request = http::Request::post(format!("http://{proxy}/x"))
+        .body(Upload::Trailed(Some(Bytes::from_static(b"hello")), None))
+        .unwrap();
+    let answer = within(sender.send_request(request)).await.unwrap();
+    assert_eq!(answer.status(), 200);
     let seen = within(seen.recv()).await.unwrap().to_ascii_lowercase();
     assert!(!seen.contains("content-length"), "{seen}");
     assert!(seen.contains("transfer-encoding: chunked\r\n"), "{seen}");
