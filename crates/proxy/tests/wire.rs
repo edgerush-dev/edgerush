@@ -2566,6 +2566,30 @@ async fn an_http2_host_naming_another_entity_is_refused() {
     assert!(seen.try_recv().is_err());
 }
 
+/// An HTTP/2 request with two `Host` fields is answered 400 and never reaches the upstream,
+/// even when both name its `:authority`, as HTTP/1 and HTTP/3 refuse a repeat (15 §5).
+#[tokio::test]
+async fn an_http2_request_with_two_hosts_is_refused() {
+    let (upstream, mut seen) = reporting_upstream();
+    let proxy = proxy_to(upstream).await;
+    let mut sender = h2_to(proxy).await;
+    let authority = "shop.test";
+    for (hosts, status) in [(&[authority, authority][..], 400), (&[authority], 200)] {
+        let mut request = http::Request::get(format!("http://{authority}/x"));
+        for host in hosts {
+            request = request.header("host", *host);
+        }
+        let answer = within(sender.send_request(request.body(Upload::None).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(answer.status(), status, "{hosts:?}");
+    }
+    // Only the second reached the upstream.
+    let reached = within(seen.recv()).await.unwrap().to_ascii_lowercase();
+    assert_eq!(reached.matches("\r\nhost: ").count(), 1, "{reached}");
+    assert!(seen.try_recv().is_err());
+}
+
 /// A request whose HEADERS frame ends the stream has no body, and goes upstream with no
 /// framing at all (nginx's `h2_request_body.t`).
 #[tokio::test]

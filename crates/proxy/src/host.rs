@@ -102,14 +102,15 @@ fn split_port(authority: &str) -> (&str, Option<&str>) {
     (host, rest.strip_prefix(':'))
 }
 
-/// Holds an HTTP/2 request's `Host` fields to its target: each must name the entity the
-/// target's authority names, as [`same_entity`] compares them with the scheme's default
-/// port (RFC 9113 §8.3.1). A target without an authority holds them to nothing.
+/// Holds an HTTP/2 request's `Host` fields to its target: there is one at most, as HTTP/1
+/// and HTTP/3 allow, and it must name the entity the target's authority names, as
+/// [`same_entity`] compares them with the scheme's default port (RFC 9113 §8.3.1). A
+/// target without an authority holds them to nothing.
 ///
 /// # Errors
 ///
-/// [`HostError::Differs`] for a field naming another entity, [`HostError::Invalid`] for
-/// one that names none.
+/// [`HostError::Repeated`] for more than one field, [`HostError::Differs`] for one naming
+/// another entity, [`HostError::Invalid`] for one that names none.
 pub(crate) fn hold_to_target<'a>(
     target: &Uri,
     fields: impl IntoIterator<Item = &'a [u8]>,
@@ -117,16 +118,21 @@ pub(crate) fn hold_to_target<'a>(
     let Some(authority) = target.authority() else {
         return Ok(());
     };
+    let mut fields = fields.into_iter();
+    let Some(field) = fields.next() else {
+        return Ok(());
+    };
+    if fields.next().is_some() {
+        return Err(HostError::Repeated);
+    }
     let default = match target.scheme() {
         Some(scheme) if *scheme == Scheme::HTTPS => Some(443),
         Some(scheme) if *scheme == Scheme::HTTP => Some(80),
         _ => None,
     };
-    for field in fields {
-        let field = std::str::from_utf8(field).map_err(|_| HostError::Invalid)?;
-        if !same_entity(authority.as_str(), field, default)? {
-            return Err(HostError::Differs);
-        }
+    let field = std::str::from_utf8(field).map_err(|_| HostError::Invalid)?;
+    if !same_entity(authority.as_str(), field, default)? {
+        return Err(HostError::Differs);
     }
     Ok(())
 }

@@ -212,8 +212,8 @@ impl Head for Parts {
         let named =
             first.is_some_and(|field| field == authority.as_str()) && fields.next().is_none();
         if !named {
-            // Over HTTP/2 a `Host` naming another entity is malformed (RFC 9113 §8.3.1);
-            // over HTTP/1 the target's host wins (RFC 9112 §3.2.2).
+            // Over HTTP/2 a repeated `Host`, or one naming another entity, is refused (RFC
+            // 9113 §8.3.1); over HTTP/1 the target's host wins (RFC 9112 §3.2.2).
             if said && self.version == Version::HTTP_2 {
                 let fields = self.headers.get_all(HOST).iter().map(HeaderValue::as_bytes);
                 host::hold_to_target(&self.uri, fields)?;

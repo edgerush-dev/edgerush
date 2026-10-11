@@ -1584,11 +1584,6 @@ upstreams:
             // A trailing dot is a spelling scheme-based normalisation does not take away.
             ("http://shop.example.com/cart", &["shop.example.com."]),
             ("http://[::1]/cart", &["[::2]"]),
-            // Every field is held to it, not only the first.
-            (
-                "http://shop.example.com/cart",
-                &["shop.example.com", "other.example.org"],
-            ),
         ] {
             let mut request = h2(target, hosts);
             assert_eq!(
@@ -1609,10 +1604,6 @@ upstreams:
             ("http://shop.example.com:80/cart", &["shop.example.com"]),
             ("http://shop.example.com/cart", &["shop.example.com:"]),
             ("http://shop.example.com/cart", &["shop.example.com:0080"]),
-            (
-                "http://shop.example.com/cart",
-                &["shop.example.com", "Shop.example.com:80"],
-            ),
         ] {
             let mut request = h2(target, hosts);
             assert_eq!(
@@ -1625,6 +1616,28 @@ upstreams:
                 request.headers.get_all(HOST).iter().collect::<Vec<_>>(),
                 [authority.as_str()],
                 "{target} {hosts:?}"
+            );
+        }
+    }
+
+    /// An HTTP/2 request says its host once: more than one `Host` field is refused, whether
+    /// they name the same entity as `:authority` or not, as HTTP/1 and HTTP/3 refuse a
+    /// repeat (16 §5).
+    #[test]
+    fn an_http2_request_with_more_than_one_host_is_refused() {
+        for hosts in [
+            &["shop.example.com", "shop.example.com"][..],
+            &["shop.example.com", "Shop.example.com:80"],
+            &["shop.example.com", "other.example.org"],
+            &["other.example.org", "shop.example.com"],
+        ] {
+            let fields: Vec<(&str, &str)> = hosts.iter().map(|host| ("host", *host)).collect();
+            let mut request = head("http://shop.example.com/cart", &fields);
+            request.version = http::Version::HTTP_2;
+            assert_eq!(
+                decide_on("web", &mut request, 0),
+                Err(Rejection::Host(HostError::Repeated)),
+                "{hosts:?}"
             );
         }
     }

@@ -259,8 +259,8 @@ impl Head for MapHead {
             (first.is_some(), named)
         };
         if !named {
-            // Over HTTP/2 a `Host` naming another entity is malformed (RFC 9113 §8.3.1);
-            // over HTTP/1 the target's host wins (RFC 9112 §3.2.2).
+            // Over HTTP/2 a repeated `Host`, or one naming another entity, is refused (RFC
+            // 9113 §8.3.1); over HTTP/1 the target's host wins (RFC 9112 §3.2.2).
             if said && self.parts.version == Version::HTTP_2 {
                 host::hold_to_target(&self.parts.uri, self.view().values(&HOST))?;
             }
