@@ -30,6 +30,22 @@ pub(crate) const UPGRADE_OPTION: HeaderValue = HeaderValue::from_static("upgrade
 /// What RFC 6455 §4.2.2 has a server append to the key before it hashes it.
 const GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+/// The method an opening handshake is routed and logged by, whatever the client spoke.
+pub(crate) static OPENING: Method = Method::GET;
+
+/// The method a request is routed and logged by: an extended CONNECT for WebSocket is the
+/// GET of RFC 6455 it replaces (RFC 8441 §5, RFC 9220 §3; 19 §3), and any other request
+/// its own. Only the protocol adapters see the wire's `CONNECT`.
+pub(crate) fn routed_method<'a>(method: &'a Method, protocol: Option<&str>) -> &'a Method {
+    if method == Method::CONNECT
+        && protocol.is_some_and(|said| said.eq_ignore_ascii_case("websocket"))
+    {
+        &OPENING
+    } else {
+        method
+    }
+}
+
 /// A `Sec-WebSocket-Key`: 16 bytes in base64, 24 characters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Key([u8; 24]);

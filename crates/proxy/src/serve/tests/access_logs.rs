@@ -1046,7 +1046,7 @@ async fn a_drained_websocket_counts_only_what_it_carried() {
 }
 
 /// The same over HTTP/2, as an extended CONNECT: its handshake's record, once its 200 has
-/// gone, and its tunnel's when the client ends its stream.
+/// gone, with the method routing saw, and its tunnel's when the client ends its stream.
 #[tokio::test]
 async fn an_http2_websocket_is_logged_when_it_opens_and_when_it_closes() {
     let local = tokio::task::LocalSet::new();
@@ -1087,7 +1087,8 @@ async fn an_http2_websocket_is_logged_when_it_opens_and_when_it_closes() {
             assert_eq!(opened["kind"], "websocket_open", "{opened}");
             assert_eq!(opened["protocol"], "2");
             assert_eq!(opened["status"], 200);
-            assert_eq!(opened["method"], "CONNECT");
+            // The GET the extended CONNECT replaces, as routing saw it (19 §3).
+            assert_eq!(opened["method"], "GET");
 
             stream.send_data(Bytes::new(), true).unwrap();
             while let Some(data) = within(body.data()).await {

@@ -94,7 +94,10 @@ impl Logging {
         let compiled = snapshot.listener(listener)?;
         let mut texts = String::with_capacity(160);
         let listener = keep(&mut texts, &compiled.name);
-        let method = keep(&mut texts, head.method().as_str());
+        let method = keep(
+            &mut texts,
+            crate::websocket::routed_method(head.method(), head.protocol()).as_str(),
+        );
         let host = head
             .uri()
             .authority()

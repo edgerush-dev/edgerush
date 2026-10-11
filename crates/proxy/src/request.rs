@@ -336,7 +336,12 @@ pub fn decide_routed<'a, H: Head>(
             host,
             path: &path,
             query: head.uri().query().unwrap_or_default(),
-            method: head.method(),
+            // An extended CONNECT for WebSocket is routed as the GET it replaces (19 §3).
+            method: if connect {
+                &crate::websocket::OPENING
+            } else {
+                head.method()
+            },
             headers: &fields,
         };
         route(&request).ok_or(Rejection::NoRoute)?
@@ -685,6 +690,96 @@ upstreams:
                 .clone()
         });
         (upstream, given)
+    }
+
+    /// An extended CONNECT for WebSocket replaces RFC 6455's GET (RFC 8441 §5, RFC 9220 §3):
+    /// routing, and a rule's method match with it, is given `GET`, as for the same WebSocket
+    /// opened over HTTP/1.1, so that one rule takes it whatever the client spoke. The head
+    /// keeps its `CONNECT` for the protocol adapters (19 §3).
+    #[test]
+    fn an_extended_connect_for_websocket_is_routed_as_the_get_it_replaces() {
+        let mut connect = head("http://shop.example.com/chat", &[]);
+        connect.version = http::Version::HTTP_2;
+        connect.method = Method::CONNECT;
+        connect
+            .extensions
+            .insert(::h2::ext::Protocol::from("websocket"));
+        let (_, given) = decide_routed_on(&mut connect, |_| None);
+        assert_eq!(given.len(), 1);
+        assert_eq!(given[0].3, Method::GET);
+        assert_eq!(connect.method, Method::CONNECT);
+
+        let mut upgrade = head(
+            "/chat",
+            &[
+                ("host", "shop.example.com"),
+                ("connection", "upgrade"),
+                ("upgrade", "websocket"),
+                ("sec-websocket-version", "13"),
+                ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ],
+        );
+        let (_, by_http1) = decide_routed_on(&mut upgrade, |_| None);
+        assert_eq!(by_http1[0].3, given[0].3);
+    }
+
+    /// A rule that asks for `GET` takes a WebSocket opened by an extended CONNECT, as it
+    /// takes one opened by HTTP/1.1's upgrade, and a rule that asks for `CONNECT` takes
+    /// neither (19 §3, 07 §1).
+    #[test]
+    fn a_rule_for_get_takes_a_websocket_whatever_its_client_spoke() {
+        const BY_METHOD: &str = r#"
+listeners:
+  web: { address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+routes:
+  - name: chat
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { exact: /chat }, method: CONNECT }]
+        forward: { backends: [{ upstream: connect, weight: 1 }] }
+      - matches: [{ path: { exact: /chat }, method: GET }]
+        forward: { backends: [{ upstream: get, weight: 1 }] }
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: other, weight: 1 }] }
+upstreams:
+  connect: { load_balancer: p2c, endpoints: ["127.0.0.1:9001"] }
+  get: { load_balancer: p2c, endpoints: ["127.0.0.1:9002"] }
+  other: { load_balancer: p2c, endpoints: ["127.0.0.1:9003"] }
+"#;
+        let config: Config = serde_saphyr::from_str(BY_METHOD).unwrap();
+        let compiled = compile(&config).unwrap();
+        let web = compiled
+            .listeners()
+            .iter()
+            .find(|l| l.name == "web")
+            .unwrap();
+        let upstream = |head: &mut Parts| {
+            let decided = decide(&compiled, web, head, &peer(), &mut || 0, None).unwrap();
+            compiled
+                .upstream(forwarding(decided).upstream)
+                .unwrap()
+                .name
+                .clone()
+        };
+        let mut connect = head("http://shop.example.com/chat", &[]);
+        connect.version = http::Version::HTTP_2;
+        connect.method = Method::CONNECT;
+        connect
+            .extensions
+            .insert(::h2::ext::Protocol::from("websocket"));
+        assert_eq!(upstream(&mut connect), "get");
+        let mut upgrade = head(
+            "/chat",
+            &[
+                ("host", "shop.example.com"),
+                ("connection", "upgrade"),
+                ("upgrade", "websocket"),
+                ("sec-websocket-version", "13"),
+                ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ],
+        );
+        assert_eq!(upstream(&mut upgrade), "get");
     }
 
     #[test]
