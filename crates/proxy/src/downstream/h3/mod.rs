@@ -15,6 +15,11 @@ pub mod head;
 #[cfg(any(test, feature = "interop"))]
 pub(crate) mod hq;
 pub(crate) mod listener;
+// Replying from the right source on a wildcard bind, through IP_PKTINFO (16 §3): Linux only,
+// since it is the kernel feature a wildcard bind needs there, and a wildcard bind is a Linux
+// deployment's.
+#[cfg(target_os = "linux")]
+pub(crate) mod pktinfo;
 pub(crate) mod send;
 pub(crate) mod stream;
 #[cfg(test)]

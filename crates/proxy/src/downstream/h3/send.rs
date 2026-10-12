@@ -96,6 +96,8 @@ pub(crate) struct Run {
     bytes: Vec<u8>,
     segment: usize,
     to: SocketAddr,
+    /// The source to send from, which matters only on a wildcard bind (16 §3).
+    from: SocketAddr,
 }
 
 /// Where the datagram quiche has just made goes, given the run gathered before it, and
@@ -165,7 +167,7 @@ impl Gathering {
 pub(crate) fn flush(conn: &Conn, shared: &Shared, datagram: usize, unsent: &mut Unsent) {
     while !unsent.is_empty() {
         let run = &unsent[0];
-        if !send(shared, &run.bytes, run.segment, run.to) {
+        if !send(shared, &run.bytes, run.segment, run.to, run.from) {
             return;
         }
         unsent.remove(0);
@@ -175,6 +177,9 @@ pub(crate) fn flush(conn: &Conn, shared: &Shared, datagram: usize, unsent: &mut 
     gathered.clear();
     let mut gathering = Gathering::default();
     let most = sending.segments.get();
+    // The local address quiche last sent from, the source a wildcard bind replies from
+    // (16 §3); the whole flush is one connection's, so it does not change within it.
+    let mut from = shared.local;
     loop {
         let start = gathered.len();
         gathered.resize(start + datagram, 0);
@@ -183,22 +188,24 @@ pub(crate) fn flush(conn: &Conn, shared: &Shared, datagram: usize, unsent: &mut 
             gathered.truncate(start);
             break;
         };
+        from = info.from;
         gathered.truncate(start + len);
         match gathering.admit(len, info.to, most, datagram) {
             Joins::Run => {}
             Joins::RunAndEnds { segment } => {
-                if !send_or_keep(shared, &gathered, segment, info.to, unsent) {
+                if !send_or_keep(shared, &gathered, segment, info.to, from, unsent) {
                     return;
                 }
                 gathered.clear();
             }
             Joins::Next { segment, to } => {
-                if !send_or_keep(shared, &gathered[..start], segment, to, unsent) {
+                if !send_or_keep(shared, &gathered[..start], segment, to, from, unsent) {
                     // The datagram that did not join is kept too, after the run.
                     unsent.push(Run {
                         bytes: gathered[start..].to_vec(),
                         segment: len,
                         to: info.to,
+                        from,
                     });
                     return;
                 }
@@ -210,7 +217,7 @@ pub(crate) fn flush(conn: &Conn, shared: &Shared, datagram: usize, unsent: &mut 
     if let Some(to) = gathering.to
         && !gathered.is_empty()
     {
-        send_or_keep(shared, &gathered, gathering.segment, to, unsent);
+        send_or_keep(shared, &gathered, gathering.segment, to, from, unsent);
     }
 }
 
@@ -220,24 +227,35 @@ fn send_or_keep(
     bytes: &[u8],
     segment: usize,
     to: SocketAddr,
+    from: SocketAddr,
     unsent: &mut Unsent,
 ) -> bool {
-    if send(shared, bytes, segment, to) {
+    if send(shared, bytes, segment, to, from) {
         return true;
     }
     unsent.push(Run {
         bytes: bytes.to_vec(),
         segment,
         to,
+        from,
     });
     false
 }
 
-/// Sends a run: false if the socket has no room.
-fn send(shared: &Shared, bytes: &[u8], segment: usize, to: SocketAddr) -> bool {
-    let sent = if refused(shared) {
-        Err(io::ErrorKind::WouldBlock.into())
-    } else if bytes.len() > segment {
+/// Sends a run: false if the socket has no room. `from` is the source to send from, which
+/// matters only on a wildcard bind (16 §3).
+fn send(shared: &Shared, bytes: &[u8], segment: usize, to: SocketAddr, from: SocketAddr) -> bool {
+    if refused(shared) {
+        return false;
+    }
+    // A wildcard bind sets the source, except where the local address is the unspecified one
+    // — a dual-stack socket's IPv4-mapped peer, left to the kernel's routing (16 §3).
+    #[cfg(target_os = "linux")]
+    if shared.wildcard && !from.ip().is_unspecified() {
+        return send_from(shared, bytes, segment, to, from);
+    }
+    let _ = from;
+    let sent = if bytes.len() > segment {
         send_segmented(&shared.socket, bytes, segment, to)
     } else {
         shared.socket.try_send_to(bytes, to).map(drop)
@@ -257,6 +275,34 @@ fn send(shared: &Shared, bytes: &[u8], segment: usize, to: SocketAddr) -> bool {
             true
         }
         // Lost, as a datagram may be on any path: quiche sends it again.
+        Err(_) => true,
+    }
+}
+
+/// Sends a run from `from`, for a wildcard bind: a packet-info control message sets the
+/// source so the reply leaves from the address the client reached (16 §3). The GSO fallback
+/// is the plain path's, each datagram sent with its own source.
+#[cfg(target_os = "linux")]
+fn send_from(
+    shared: &Shared,
+    bytes: &[u8],
+    segment: usize,
+    to: SocketAddr,
+    from: SocketAddr,
+) -> bool {
+    let cut = (bytes.len() > segment)
+        .then(|| u16::try_from(segment).ok())
+        .flatten();
+    match super::pktinfo::send(&shared.socket, bytes, to, from.ip(), cut) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
+        Err(error) if cut.is_some() && refused_segmenting(&error) => {
+            shared.sending.segments.set(1);
+            for one in bytes.chunks(segment) {
+                let _sent = super::pktinfo::send(&shared.socket, one, to, from.ip(), None);
+            }
+            true
+        }
         Err(_) => true,
     }
 }

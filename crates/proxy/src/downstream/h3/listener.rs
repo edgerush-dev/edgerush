@@ -67,6 +67,9 @@ pub(crate) const INBOX_BYTES: usize = 2 << 20;
 pub(crate) struct Forwarded {
     datagram: Box<[u8]>,
     from: SocketAddr,
+    /// The address it arrived on, for the owning worker to give quiche as the local one: a
+    /// wildcard bind's real destination, which only the receiving worker learned (16 §3).
+    to: SocketAddr,
 }
 
 /// One worker's inbox on a listener, as the other workers see it.
@@ -132,8 +135,10 @@ impl Forwarding {
         self.worker
     }
 
-    /// Hands `datagram` to worker `to`'s inbox: false if it is full.
-    fn forward(&self, to: usize, datagram: &[u8], from: SocketAddr) -> bool {
+    /// Hands `datagram`, which arrived from `from` on `on`, to worker `to`'s inbox: false if
+    /// it is full. The address it arrived on is carried too, since the owning worker reads it
+    /// from here, not from a socket of its own (16 §3).
+    fn forward(&self, to: usize, datagram: &[u8], from: SocketAddr, on: SocketAddr) -> bool {
         let Some(inbox) = self.inboxes.get(to) else {
             return false;
         };
@@ -145,6 +150,7 @@ impl Forwarding {
         let forwarded = Forwarded {
             datagram: datagram.into(),
             from,
+            to: on,
         };
         if inbox.sender.try_send(forwarded).is_err() {
             inbox.bytes.fetch_sub(len, Ordering::Relaxed);
@@ -247,7 +253,12 @@ pub(crate) struct Common {
 /// What a worker's listener and its connections share.
 pub(crate) struct Shared {
     pub(crate) socket: UdpSocket,
-    local: SocketAddr,
+    pub(crate) local: SocketAddr,
+    /// Whether the socket is bound to a wildcard address (`0.0.0.0` or `[::]`), where the
+    /// datagram's real destination must be read and set back as the reply's source
+    /// (16 §3): the plain path otherwise. Read only where that is done, on Linux.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) wildcard: bool,
     pub(crate) settings: Settings,
     pub(crate) h3: quiche::h3::Config,
     /// Every connection, by every ID it is known by.
@@ -303,6 +314,9 @@ pub(crate) enum Refusal {
 pub(crate) enum ListenerError {
     #[error("the socket has no address: {0}")]
     Address(#[from] io::Error),
+    #[cfg(target_os = "linux")]
+    #[error("the socket cannot report datagram destinations for a wildcard bind: {0}")]
+    PacketInfo(io::Error),
     #[error(transparent)]
     Ids(#[from] IdError),
     #[error("HTTP/3 settings: {0}")]
@@ -331,8 +345,18 @@ impl Shared {
         refused: Box<dyn Fn(Rc<Client>, Refusal)>,
         closed: Box<dyn Fn(Cut)>,
     ) -> Result<Self, ListenerError> {
+        let local = socket.local_addr()?;
+        let wildcard = local.ip().is_unspecified();
+        // On a wildcard bind, have the kernel report each datagram's destination, so a reply
+        // can go from it (16 §3). Only on Linux; elsewhere a wildcard bind keeps the plain
+        // path and the reply's source is the kernel's to choose.
+        #[cfg(target_os = "linux")]
+        if wildcard {
+            super::pktinfo::enable(&socket, local.is_ipv6()).map_err(ListenerError::PacketInfo)?;
+        }
         Ok(Self {
-            local: socket.local_addr()?,
+            local,
+            wildcard,
             socket,
             settings,
             h3: settings.h3()?,
@@ -397,6 +421,13 @@ pub(crate) async fn serve<T, R, F, B, D, O, G>(
     G: 'static,
 {
     let mut buffer = vec![0; DATAGRAM];
+    // Reused room for the control message that carries a datagram's destination on a
+    // wildcard bind (16 §3); empty and untouched otherwise.
+    let mut control: Vec<u8> = Vec::new();
+    #[cfg(target_os = "linux")]
+    if shared.wildcard {
+        control = super::pktinfo::control_space();
+    }
     let mut serving = Serving {
         shared: &shared,
         in_force: &in_force,
@@ -415,16 +446,11 @@ pub(crate) async fn serve<T, R, F, B, D, O, G>(
         serving.admitted = 0;
         let mut read = 0;
         while read < shared.settings.batch {
-            let (len, from) = match shared.socket.try_recv_from(&mut buffer) {
-                Ok(received) => received,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                // An ICMP error for something sent earlier, which Windows reports on the next
-                // read: about one datagram, and nothing to stop for.
-                Err(error) if error.kind() == io::ErrorKind::ConnectionReset => continue,
-                Err(_) => break,
+            let Some((len, from, to)) = recv_datagram(&shared, &mut buffer, &mut control) else {
+                break;
             };
             read += 1;
-            serving.datagram(&mut buffer[..len], from, Some(&forwarding));
+            serving.datagram(&mut buffer[..len], from, to, Some(&forwarding));
         }
         let mut taken = 0;
         while taken < shared.settings.batch {
@@ -434,8 +460,10 @@ pub(crate) async fn serve<T, R, F, B, D, O, G>(
             };
             taken += 1;
             forwarding.taken(&forwarded);
-            // Forwarded once and no more: here it is found, admitted or dropped.
-            serving.datagram(&mut forwarded.datagram, forwarded.from, None);
+            // Forwarded once and no more: here it is found, admitted or dropped. Its
+            // destination was read by the worker that received it (16 §3).
+            let (from, to) = (forwarded.from, forwarded.to);
+            serving.datagram(&mut forwarded.datagram, from, to, None);
         }
         if read == shared.settings.batch || taken == shared.settings.batch {
             // A full batch: everything else the worker has goes first.
@@ -461,6 +489,51 @@ pub(crate) async fn serve<T, R, F, B, D, O, G>(
             shared.socket.poll_recv_ready(cx).map(|_| ())
         })
         .await;
+    }
+}
+
+/// One datagram from the socket, with the address it arrived from and the one it arrived on
+/// (`to`): the bound address, except on a wildcard bind, where the kernel reports the real
+/// destination (16 §3). `None` once the socket has nothing more ready.
+#[allow(
+    clippy::ptr_arg,
+    reason = "the control buffer is an owned Vec that nix's recvmsg fills (pktinfo::recv)"
+)]
+fn recv_datagram(
+    shared: &Shared,
+    buffer: &mut [u8],
+    control: &mut Vec<u8>,
+) -> Option<(usize, SocketAddr, SocketAddr)> {
+    #[cfg(target_os = "linux")]
+    if shared.wildcard {
+        return match super::pktinfo::recv(&shared.socket, buffer, control) {
+            Ok(Some((len, from, dst))) => {
+                // An IPv4 peer on a dual-stack `[::]` socket is IPv4-mapped, and its IPv4
+                // destination cannot be set back as an IPv6 source; so for it, and for any
+                // datagram whose destination went unread, the reply is left to the kernel's
+                // routing, the bound address given as before pktinfo (16 §3). A pure-family
+                // wildcard (IPv4 on 0.0.0.0, IPv6 on `[::]`) uses the real destination.
+                let mapped = shared.local.is_ipv6() && from.ip().to_canonical().is_ipv4();
+                let to = match dst {
+                    Some(dst) if !mapped => SocketAddr::new(dst, shared.local.port()),
+                    _ => shared.local,
+                };
+                Some((len, from, to))
+            }
+            // Nothing ready, or a read error: the batch stops here.
+            Ok(None) | Err(_) => None,
+        };
+    }
+    let _ = control;
+    loop {
+        return match shared.socket.try_recv_from(buffer) {
+            Ok((len, from)) => Some((len, from, shared.local)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+            // An ICMP error for something sent earlier, which Windows reports on the next
+            // read: about one datagram, and nothing to stop for.
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => continue,
+            Err(_) => None,
+        };
     }
 }
 
@@ -490,7 +563,13 @@ where
     /// Routes one datagram: to its connection here; to another worker's inbox, if its ID
     /// names another worker and `forwarding` allows (not for one already forwarded); or to
     /// admission.
-    fn datagram(&mut self, datagram: &mut [u8], from: SocketAddr, forwarding: Option<&Forwarding>) {
+    fn datagram(
+        &mut self,
+        datagram: &mut [u8],
+        from: SocketAddr,
+        to: SocketAddr,
+        forwarding: Option<&Forwarding>,
+    ) {
         let shared = self.shared;
         let Some(dcid) = destination(datagram) else {
             return;
@@ -499,7 +578,7 @@ where
             .as_ref()
             .and_then(|dcid| shared.table.borrow().get(dcid.as_slice()).cloned());
         if let Some(conn) = found {
-            deliver(&conn, datagram, from, shared.local);
+            deliver(&conn, datagram, from, to);
             return;
         }
         if let (Some(forwarding), Some(dcid)) = (forwarding, &dcid) {
@@ -507,7 +586,7 @@ where
             if let Some(owner) =
                 owner.filter(|&owner| owner != forwarding.worker && owner < forwarding.workers())
             {
-                if forwarding.forward(owner, datagram, from) {
+                if forwarding.forward(owner, datagram, from, to) {
                     shared.forwarded.set(shared.forwarded.get() + 1);
                     (shared.count)(Quic::Forwarded);
                 } else {
@@ -520,11 +599,18 @@ where
         if self.admitted >= shared.settings.admit_per_batch {
             return;
         }
-        let Some(conn) = admit(shared, self.in_force, &mut self.accepting, datagram, from) else {
+        let Some(conn) = admit(
+            shared,
+            self.in_force,
+            &mut self.accepting,
+            datagram,
+            from,
+            to,
+        ) else {
             return;
         };
         self.admitted += 1;
-        deliver(&conn, datagram, from, shared.local);
+        deliver(&conn, datagram, from, to);
         let guard = (self.opened)(&conn.drain);
         let chosen = dcid
             .as_ref()
@@ -579,6 +665,7 @@ fn admit<T: Fn() -> Option<InForce>>(
     accepting: &mut Option<Accepting>,
     datagram: &mut [u8],
     from: SocketAddr,
+    to: SocketAddr,
 ) -> Option<Rc<Conn>> {
     let Header::Long(long) = header::read(datagram, id::LEN)? else {
         // A short header for no connection of ours: one that is gone, or never was.
@@ -658,11 +745,11 @@ fn admit<T: Fn() -> Option<InForce>>(
                 original_destination_cid: &quiche::ConnectionId::from_ref(original),
                 retry_source_cid: &quiche::ConnectionId::from_ref(&dcid),
             },
-            shared.local,
+            to,
             from,
             &mut accepting.config,
         ),
-        None => quiche::accept(&scid, None, shared.local, from, &mut accepting.config),
+        None => quiche::accept(&scid, None, to, from, &mut accepting.config),
     }
     .ok()?;
     let conn = Conn::new(quic, in_force.drain, held);
@@ -797,6 +884,11 @@ mod tests {
         "192.0.2.1:4433".parse().unwrap()
     }
 
+    /// The address a forwarded datagram arrived on: any, for an inbox-bounds test.
+    fn on() -> SocketAddr {
+        "198.51.100.1:443".parse().unwrap()
+    }
+
     /// An inbox takes datagrams up to its count and its bytes, and drops the rest; what is
     /// taken out of it makes room again.
     #[test]
@@ -805,12 +897,15 @@ mod tests {
         let mut owner = group.remove(1);
         let sender = group.remove(0);
         for _ in 0..INBOX_DATAGRAMS {
-            assert!(sender.forward(1, &[0; 100], from()));
+            assert!(sender.forward(1, &[0; 100], from(), on()));
         }
-        assert!(!sender.forward(1, &[0; 100], from()), "past the count");
+        assert!(
+            !sender.forward(1, &[0; 100], from(), on()),
+            "past the count"
+        );
         let taken = owner.inbox.try_recv().unwrap();
         owner.taken(&taken);
-        assert!(sender.forward(1, &[0; 100], from()), "room made");
+        assert!(sender.forward(1, &[0; 100], from(), on()), "room made");
 
         let mut group = Forwarding::group(2);
         let mut owner = group.remove(1);
@@ -818,13 +913,13 @@ mod tests {
         let big = vec![0; 60_000];
         let fits = INBOX_BYTES / big.len();
         for _ in 0..fits {
-            assert!(sender.forward(1, &big, from()));
+            assert!(sender.forward(1, &big, from(), on()));
         }
-        assert!(!sender.forward(1, &big, from()), "past the bytes");
+        assert!(!sender.forward(1, &big, from(), on()), "past the bytes");
         let taken = owner.inbox.try_recv().unwrap();
         owner.taken(&taken);
-        assert!(sender.forward(1, &big, from()), "room made");
+        assert!(sender.forward(1, &big, from(), on()), "room made");
         // No worker past the group.
-        assert!(!sender.forward(2, &[0; 1], from()));
+        assert!(!sender.forward(2, &[0; 1], from(), on()));
     }
 }

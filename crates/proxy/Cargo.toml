@@ -42,9 +42,11 @@ tokio = { workspace = true, features = ["sync"] }
 tokio-boring.workspace = true
 
 # Sending a run of QUIC datagrams in one call for the kernel to cut apart (UDP GSO), which
-# needs a control message that neither std nor tokio can send.
+# needs a control message that neither std nor tokio can send; and, for a wildcard HTTP/3
+# bind, reading a datagram's real destination and replying from it (IP_PKTINFO, via `nix`).
 [target.'cfg(target_os = "linux")'.dependencies]
 socket2.workspace = true
+nix.workspace = true
 
 [dev-dependencies]
 # The engine's clients and its either-version server, for tests only: what talks to the
