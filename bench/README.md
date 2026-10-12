@@ -73,6 +73,9 @@ bench/run.sh summary bench/results/<run>
 bench/window.sh [RTTS] [VARIANTS]   # HTTP/2 uploads over a delayed path, by stream window
                                     # and against NGINX: the client in a network namespace
                                     # behind a router that adds the delay (15 §3)
+bench/rebind.sh [OUTDIR]            # HTTP/3 datagrams forwarded between workers: the client
+                                    # behind a NAT whose table is emptied to rebind every
+                                    # client at once, and connection churn (16 §3)
 ```
 
 Results go to `bench/results/<time>/` (not committed): the raw output of every
