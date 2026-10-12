@@ -1,0 +1,19 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0b4b3cba7c1d58feda1b5eb1cabc96104affb80d79423575bda9d8018b1da5c6 # shrinks to times = [0, 1], limit = 1, window = 1
+cc 6ed20e97da2fdaa30ac26ee2e63c16707a12fc7cd5f3f8f551084cef1e0c2f61 # shrinks to times = [0, 4, 24, 24, 24], limit = 1, window = 25
+cc 0943de0c0fd71cd3ff596294f83e85abdd70d6264d8dd879c9bdb012b47595dc # shrinks to (mut model, last) = (Fixed(FixedWindow { limit: 1, window: 1, alignment: Clock, start: Some(0), count: 1, last: 0 }), 0), rest = [0]
+cc 3f02ebc9a6b03944040cdc39a06b2cc0cf85c7ff92e2a6d82d5b4ca9736c0e39 # shrinks to (mut model, last) = (Fixed(FixedWindow { limit: 1, window: 1, alignment: FirstRequest, start: Some(0), count: 1, last: 0 }), 0), rest = [0]
+cc 696c53ccac5d34156df31edcd35af33e2f40ce611931569aeb85a927eea26047 # shrinks to (mut model, last) = (Rolling(RollingWindow { limit: 1, window: 1, admitted: [0], last: 0 }), 0), rest = [0]
+cc b1cd55524557105eae3217527384739783ecbe7e7e681b350ee48f4d7cd40917 # shrinks to (mut model, last) = (Approximate(ApproximateRollingWindow { limit: 1, window: 1, index: Some(0), previous: 0, current: 1, last: 0 }), 0), rest = [0]
+cc ffd2786602729b2a1c300f97757905d259f7859c4550a3a6138ef9f2f427a2bd # shrinks to (mut model, last) = (Bucket(TokenBucket { limit: 4, window: 495, tolerance: 0, arrival: Some(495), last: 0 }), 0), rest = [0]
+cc bfc208c6226087db9abe621748c54de5d87f5fe6afdf2373ab2cce5686cd8957 # shrinks to (model, last) = (Rolling(RollingWindow { limit: 1, window: 126, admitted: [0], last: 0 }), 0), later = 0
+cc 5edc1015c5c59f1fb0fc9cd9485eb740d9b739ff69fb7c66f51c8555441742a9 # shrinks to (model, last) = (Approximate(ApproximateRollingWindow { limit: 1, window: 171, index: Some(0), previous: 0, current: 1, last: 0 }), 0), later = 0
+cc 5c63f39fc6461ba2b41024305b32e3d4916cbae2644263458e4924976999b846 # shrinks to limit = 2, window = 189, capacity = 1, steps = [(0, 0)]
+cc 825749927bf9f0587e48f16d79d71521f379a3e768207650691f04200c5a55df # shrinks to kind = 0, limit = 1, window = 118, before = [9, 47, 66, 76, 76, 95, 142, 178, 222, 249, 289, 322, 361, 394], gap = 1376, between = [0], rest = [0]
+cc ea5c0fa673f2a1bcf8b2138b85b09186f260dc5828714051760c444b0b73b610 # shrinks to kind = 2, limit = 1, window = 118, before = [0], gap = 118, between = [0], rest = [0]
+cc 9b3a0f76c1ffd33a0070344b4e91994377346111fdd7ee50d3a661fd8b4c18cd # shrinks to kind = 3, limit = 2, window = 1185, before = [139, 187, 1688, 1725, 1756, 1797, 2836, 2869, 2916, 2956, 5030, 6434, 7694, 7729, 9547, 9585, 9620, 9644, 9661, 9694, 12200, 13201, 13214, 16064, 16086, 16272, 17011, 17413, 18299, 18323, 18353], gap = 2934, between = [43], rest = [0]

@@ -306,6 +306,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-ratelimit"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "edgerush-router"
 version = "0.0.0"
 dependencies = [

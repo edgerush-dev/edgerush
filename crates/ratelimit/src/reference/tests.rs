@@ -1,0 +1,460 @@
+use super::*;
+use proptest::prelude::*;
+
+fn nz(n: u64) -> NonZeroU64 {
+    NonZeroU64::new(n).unwrap()
+}
+
+/// Arrival times, non-decreasing, with many requests landing together.
+fn arrivals() -> impl Strategy<Value = Vec<u64>> {
+    prop::collection::vec(
+        prop_oneof![3 => Just(0u64), 2 => 1u64..50, 1 => 50u64..3000],
+        1..120,
+    )
+    .prop_map(|gaps| {
+        gaps.iter()
+            .scan(0u64, |at, gap| {
+                *at += gap;
+                Some(*at)
+            })
+            .collect()
+    })
+}
+
+fn run(model: &mut impl Model, times: &[u64]) -> Vec<bool> {
+    times.iter().map(|&at| model.decide(at)).collect()
+}
+
+proptest! {
+    /// A request is admitted exactly when fewer than `limit` were admitted in the
+    /// `window` before it.
+    #[test]
+    fn rolling_window_is_its_definition(times in arrivals(), limit in 1u64..8, window in 1u64..2000) {
+        let admitted = run(&mut RollingWindow::new(nz(limit), nz(window)), &times);
+        for (i, &at) in times.iter().enumerate() {
+            let inside = (0..i).filter(|&j| admitted[j] && at - times[j] < window).count() as u64;
+            prop_assert_eq!(admitted[i], inside < limit, "request {} at {}", i, at);
+        }
+    }
+
+    /// A request is admitted exactly when fewer than `limit` were admitted in its window
+    /// of the clock.
+    #[test]
+    fn clock_window_is_its_definition(times in arrivals(), limit in 1u64..8, window in 1u64..2000) {
+        let admitted = run(&mut FixedWindow::new(nz(limit), nz(window), Alignment::Clock), &times);
+        for (i, &at) in times.iter().enumerate() {
+            let inside = (0..i)
+                .filter(|&j| admitted[j] && times[j] / window == at / window)
+                .count() as u64;
+            prop_assert_eq!(admitted[i], inside < limit, "request {} at {}", i, at);
+        }
+    }
+
+    /// A window opens with the first request that finds none open and lasts `window`; a
+    /// request is admitted exactly when fewer than `limit` were admitted in it.
+    #[test]
+    fn first_request_window_is_its_definition(times in arrivals(), limit in 1u64..8, window in 1u64..2000) {
+        let admitted = run(&mut FixedWindow::new(nz(limit), nz(window), Alignment::FirstRequest), &times);
+        let mut opened = times[0];
+        for (i, &at) in times.iter().enumerate() {
+            if at - opened >= window {
+                opened = at;
+            }
+            let inside = (0..i)
+                .filter(|&j| admitted[j] && times[j] >= opened)
+                .count() as u64;
+            prop_assert_eq!(admitted[i], inside < limit, "request {} at {}", i, at);
+        }
+    }
+
+    /// GCRA and the counting bucket are one contract written two ways.
+    #[test]
+    fn token_bucket_is_a_counting_bucket(
+        times in arrivals(), limit in 1u64..8, window in 1u64..2000, capacity in 1u64..12,
+    ) {
+        let gcra = run(&mut TokenBucket::new(nz(limit), nz(window), nz(capacity)), &times);
+        let counting = run(&mut CountingBucket::new(nz(limit), nz(window), nz(capacity)), &times);
+        prop_assert_eq!(gcra, counting);
+    }
+
+    /// In any span from one admission to another, at most the rate over the span plus the
+    /// bucket are admitted.
+    #[test]
+    fn token_bucket_admits_at_most_rate_plus_capacity(
+        times in arrivals(), limit in 1u64..8, window in 1u64..2000, capacity in 1u64..12,
+    ) {
+        let admitted = run(&mut TokenBucket::new(nz(limit), nz(window), nz(capacity)), &times);
+        let at: Vec<u64> = times.iter().zip(&admitted).filter(|(_, a)| **a).map(|(t, _)| *t).collect();
+        for first in 0..at.len() {
+            for last in first..at.len() {
+                let count = u128::try_from(last - first + 1).unwrap();
+                let span = u128::from(at[last] - at[first]);
+                prop_assert!(
+                    count * u128::from(window) <= u128::from(limit) * span + u128::from(capacity) * u128::from(window),
+                    "{} admitted in {} ns", count, span,
+                );
+            }
+        }
+    }
+
+    /// Traffic with at most `limit` in any `window` is never refused by a bucket that holds
+    /// one window's worth: such a bucket shaves nothing an exact rolling window admits.
+    #[test]
+    fn a_window_sized_bucket_admits_all_a_rolling_window_admits(
+        times in arrivals(), limit in 1u64..8, window in 1u64..2000,
+    ) {
+        let admitted = run(&mut RollingWindow::new(nz(limit), nz(window)), &times);
+        let conforming: Vec<u64> = times.iter().zip(&admitted).filter(|(_, a)| **a).map(|(t, _)| *t).collect();
+        let bucket = run(&mut TokenBucket::new(nz(limit), nz(window), nz(limit)), &conforming);
+        prop_assert!(bucket.iter().all(|a| *a), "{:?} refused some of {:?}", bucket, conforming);
+    }
+}
+
+#[test]
+fn a_new_token_bucket_admits_its_capacity_at_once() {
+    let mut bucket = TokenBucket::new(nz(100), nz(1_000_000_000), nz(20));
+    let at_once = (0..30).filter(|_| bucket.decide(0)).count();
+    assert_eq!(at_once, 20);
+    assert!(!bucket.decide(9_999_999), "a request's interval is 10 ms");
+    assert!(bucket.decide(10_000_000));
+}
+
+#[test]
+fn a_time_that_goes_back_is_taken_as_the_last() {
+    let mut window = RollingWindow::new(nz(1), nz(100));
+    assert!(window.decide(1_000));
+    assert!(
+        !window.decide(10),
+        "still inside the window of the request at 1,000"
+    );
+    assert!(window.decide(1_100));
+}
+
+/// Ten admitted at the start of one window count as five halfway through the next, though
+/// a whole window has passed: the approximation refuses what the exact window admits.
+#[test]
+fn the_approximation_refuses_what_a_rolling_window_admits() {
+    let (limit, window) = (nz(10), nz(1_000));
+    let mut approximate = ApproximateRollingWindow::new(limit, window);
+    let mut exact = RollingWindow::new(limit, window);
+    for _ in 0..10 {
+        assert!(approximate.decide(0));
+        assert!(exact.decide(0));
+    }
+    let approximate = (0..10).filter(|_| approximate.decide(1_500)).count();
+    let exact = (0..10).filter(|_| exact.decide(1_500)).count();
+    assert_eq!((approximate, exact), (5, 10));
+}
+
+/// Ten admitted at the end of one window count as five halfway through the next, though
+/// they are still inside the last window: the approximation admits what the exact window
+/// refuses.
+#[test]
+fn the_approximation_admits_what_a_rolling_window_refuses() {
+    let (limit, window) = (nz(10), nz(1_000));
+    let mut approximate = ApproximateRollingWindow::new(limit, window);
+    let mut exact = RollingWindow::new(limit, window);
+    for _ in 0..10 {
+        assert!(approximate.decide(990));
+        assert!(exact.decide(990));
+    }
+    let approximate = (0..10).filter(|_| approximate.decide(1_500)).count();
+    let exact = (0..10).filter(|_| exact.decide(1_500)).count();
+    assert_eq!((approximate, exact), (5, 0));
+}
+
+/// A window's worth at the end of one window and another at the start of the next.
+#[test]
+fn a_clock_window_admits_twice_its_limit_across_a_boundary() {
+    let mut window = FixedWindow::new(nz(100), nz(1_000), Alignment::Clock);
+    let end = (0..100).filter(|_| window.decide(999)).count();
+    let start = (0..100).filter(|_| window.decide(1_000)).count();
+    assert_eq!(end + start, 200);
+}
+
+/// Every model, behind one type, so that one property can be checked against all of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Any {
+    Fixed(FixedWindow),
+    Rolling(RollingWindow),
+    Approximate(ApproximateRollingWindow),
+    Bucket(TokenBucket),
+    Counting(CountingBucket),
+}
+
+macro_rules! each {
+    ($any:expr, $model:ident => $body:expr) => {
+        match $any {
+            Any::Fixed($model) => $body,
+            Any::Rolling($model) => $body,
+            Any::Approximate($model) => $body,
+            Any::Bucket($model) => $body,
+            Any::Counting($model) => $body,
+        }
+    };
+}
+
+impl Model for Any {
+    fn remaining(&self, now: u64) -> u64 {
+        each!(self, model => model.remaining(now))
+    }
+    fn charge(&mut self, now: u64) -> Charge {
+        each!(self, model => model.charge(now))
+    }
+    fn release(&mut self, charge: Charge) {
+        each!(self, model => model.release(charge))
+    }
+    fn retry_at(&self, now: u64) -> Option<u64> {
+        each!(self, model => model.retry_at(now))
+    }
+    fn forgettable_at(&self) -> u64 {
+        each!(self, model => model.forgettable_at())
+    }
+}
+
+/// The kinds of model, by number: 0 and 1 fixed windows on the clock and from the first
+/// request, 2 rolling, 3 approximate, 4 the bucket, 5 the counting bucket.
+const KINDS: u8 = 6;
+
+fn make(kind: u8, limit: u64, window: u64, capacity: u64) -> Any {
+    let (limit, window, capacity) = (nz(limit), nz(window), nz(capacity));
+    match kind {
+        0 => Any::Fixed(FixedWindow::new(limit, window, Alignment::Clock)),
+        1 => Any::Fixed(FixedWindow::new(limit, window, Alignment::FirstRequest)),
+        2 => Any::Rolling(RollingWindow::new(limit, window)),
+        3 => Any::Approximate(ApproximateRollingWindow::new(limit, window)),
+        4 => Any::Bucket(TokenBucket::new(limit, window, capacity)),
+        _ => Any::Counting(CountingBucket::new(limit, window, capacity)),
+    }
+}
+
+/// A new model of the same kind and settings.
+fn new_like(model: &Any) -> Any {
+    match model {
+        Any::Fixed(m) => Any::Fixed(FixedWindow {
+            start: None,
+            count: 0,
+            last: 0,
+            ..m.clone()
+        }),
+        Any::Rolling(m) => Any::Rolling(RollingWindow {
+            admitted: VecDeque::new(),
+            last: 0,
+            ..m.clone()
+        }),
+        Any::Approximate(m) => Any::Approximate(ApproximateRollingWindow {
+            index: None,
+            previous: 0,
+            current: 0,
+            last: 0,
+            ..m.clone()
+        }),
+        Any::Bucket(m) => Any::Bucket(TokenBucket {
+            arrival: None,
+            last: 0,
+            ..m.clone()
+        }),
+        Any::Counting(m) => Any::Counting(CountingBucket {
+            tokens: m.capacity,
+            owed: 0,
+            last: 0,
+            ..m.clone()
+        }),
+    }
+}
+
+/// A model of any kind with a history behind it, and the last time in that history.
+fn used() -> impl Strategy<Value = (Any, u64)> {
+    (0..KINDS, 1u64..8, 1u64..2000, 1u64..12, arrivals()).prop_map(
+        |(kind, limit, window, capacity, times)| {
+            let mut model = make(kind, limit, window, capacity);
+            run(&mut model, &times);
+            (model, *times.last().unwrap())
+        },
+    )
+}
+
+/// `times`, moved on to start at `from`.
+fn from(from: u64, times: Vec<u64>) -> Vec<u64> {
+    times.into_iter().map(|at| at + from).collect()
+}
+
+/// Two copies of `model`: one that took `before`, reserved a request `gap` later, took
+/// `between` and released the reservation; and one that took `before` and only what the
+/// first admitted of `between`, charged without asking. The first is `None` if the
+/// reservation found no room. Also returns the latest time either saw.
+fn released(model: Any, before: &[u64], gap: u64, between: Vec<u64>) -> (Option<Any>, Any, u64) {
+    let (mut with, mut without) = (model.clone(), model);
+    run(&mut with, before);
+    run(&mut without, before);
+    let reserved = before.last().unwrap() + gap;
+    if !with.admits(reserved) {
+        return (None, without, reserved);
+    }
+    let receipt = with.charge(reserved);
+    let between = from(reserved, between);
+    for (&at, admitted) in between.iter().zip(run(&mut with, &between)) {
+        if admitted {
+            without.charge(at);
+        }
+    }
+    with.release(receipt);
+    (Some(with), without, *between.last().unwrap())
+}
+
+proptest! {
+    /// Asking a model anything changes nothing in it.
+    #[test]
+    fn questions_change_nothing((model, last) in used(), later in 0u64..5000) {
+        let now = last + later;
+        let before = model.clone();
+        let _ = (model.admits(now), model.remaining(now), model.retry_at(now), model.forgettable_at());
+        prop_assert_eq!(model, before);
+    }
+
+    /// What remains is how many are admitted one after another at that moment.
+    #[test]
+    fn remaining_is_how_many_are_admitted((mut model, last) in used(), later in 0u64..5000) {
+        let now = last + later;
+        let remaining = model.remaining(now);
+        for i in 0..remaining {
+            prop_assert!(model.decide(now), "request {} of {} remaining refused", i + 1, remaining);
+        }
+        prop_assert!(!model.decide(now), "one more than the {} remaining admitted", remaining);
+    }
+
+    /// A refused request would be admitted at the time it is told to retry, and not a
+    /// nanosecond before.
+    #[test]
+    fn retry_at_is_the_first_moment_with_room((model, last) in used(), later in 0u64..5000) {
+        let now = last + later;
+        match model.retry_at(now) {
+            None => prop_assert!(model.admits(now)),
+            Some(at) => {
+                prop_assert!(at > now);
+                prop_assert!(!model.admits(at - 1), "room before {}", at);
+                prop_assert!(model.admits(at), "no room at {}", at);
+            }
+        }
+    }
+
+    /// Once forgettable, a key decides as a new one would.
+    #[test]
+    fn a_forgettable_key_is_as_new((mut model, last) in used(), rest in arrivals()) {
+        let rest = from(model.forgettable_at().max(last), rest);
+        let mut fresh = new_like(&model);
+        prop_assert_eq!(run(&mut model, &rest), run(&mut fresh, &rest));
+    }
+
+    /// Several rules are charged together or not at all.
+    #[test]
+    fn rules_are_charged_all_or_nothing(
+        (first, last) in used(), (second, other) in used(), later in 0u64..5000,
+    ) {
+        let now = last.max(other) + later;
+        let (mut a, mut b) = (first.clone(), second.clone());
+        let admitted = decide_all(&mut [&mut a, &mut b], now);
+        prop_assert_eq!(admitted, first.admits(now) && second.admits(now));
+        let (mut expected_a, mut expected_b) = (first, second);
+        if admitted {
+            expected_a.charge(now);
+            expected_b.charge(now);
+        }
+        prop_assert_eq!((a, b), (expected_a, expected_b));
+    }
+
+    /// The bucket written two ways stays one contract through charges made without room
+    /// and releases too.
+    #[test]
+    fn the_buckets_agree_on_everything(
+        limit in 1u64..8, window in 1u64..2000, capacity in 1u64..12,
+        steps in prop::collection::vec((0u64..3000, 0u8..4), 1..100),
+    ) {
+        let mut gcra = TokenBucket::new(nz(limit), nz(window), nz(capacity));
+        let mut counting = CountingBucket::new(nz(limit), nz(window), nz(capacity));
+        let (mut now, mut receipts) = (0, Vec::new());
+        for (gap, step) in steps {
+            now += gap;
+            match step {
+                0 => prop_assert_eq!(gcra.decide(now), counting.decide(now)),
+                1 => receipts.push((gcra.charge(now), counting.charge(now))),
+                2 => {
+                    if let Some((a, b)) = receipts.pop() {
+                        gcra.release(a);
+                        counting.release(b);
+                    }
+                }
+                _ => {}
+            }
+            prop_assert_eq!(gcra.remaining(now), counting.remaining(now));
+            prop_assert_eq!(gcra.retry_at(now), counting.retry_at(now));
+            // Any time already past says the same: forgettable now.
+            prop_assert_eq!(gcra.forgettable_at().max(now), counting.forgettable_at().max(now));
+        }
+    }
+
+    /// Releasing a reservation leaves a window on the clock or a rolling window as if it
+    /// had never been made, whatever came between.
+    #[test]
+    fn a_released_charge_is_as_if_never_made(
+        kind in prop::sample::select(vec![0u8, 2, 3]), limit in 1u64..8, window in 1u64..2000,
+        before in arrivals(), gap in 0u64..3000, between in arrivals(), rest in arrivals(),
+    ) {
+        let (with, mut without, latest) = released(make(kind, limit, window, 1), &before, gap, between);
+        prop_assume!(with.is_some());
+        let mut with = with.unwrap();
+        prop_assert_eq!(with.remaining(latest), without.remaining(latest));
+        prop_assert_eq!(with.retry_at(latest), without.retry_at(latest));
+        let rest = from(latest, rest);
+        prop_assert_eq!(run(&mut with, &rest), run(&mut without, &rest));
+    }
+
+    /// A released bucket charge gives back at most one request more than never charging.
+    #[test]
+    fn a_released_bucket_charge_gives_back_at_most_one_more(
+        limit in 1u64..8, window in 1u64..2000, capacity in 1u64..12,
+        before in arrivals(), gap in 0u64..3000, between in arrivals(),
+    ) {
+        let (with, without, now) = released(make(4, limit, window, capacity), &before, gap, between);
+        prop_assume!(with.is_some());
+        let (got, owed) = (with.unwrap().remaining(now), without.remaining(now));
+        prop_assert!(owed <= got && got <= owed + 1, "{} remaining after the release, {} without the charge", got, owed);
+    }
+}
+
+/// A reservation released once its window has become the one before no longer counts in
+/// the share carried over.
+#[test]
+fn a_released_charge_from_the_window_before_no_longer_counts() {
+    let (limit, window) = (nz(2), nz(1_000));
+    let mut with = ApproximateRollingWindow::new(limit, window);
+    let receipt = with.charge(900);
+    assert!(with.decide(1_000));
+    with.release(receipt);
+    let mut without = ApproximateRollingWindow::new(limit, window);
+    assert!(without.decide(1_000));
+    assert!(
+        without.decide(1_000),
+        "nothing carried over from the window before"
+    );
+    assert!(
+        with.decide(1_000),
+        "the released charge is not carried over either"
+    );
+}
+
+/// A released reservation that opened a window leaves it open: what follows counts in
+/// it, where without the reservation the next request opens a window of its own.
+#[test]
+fn a_released_charge_leaves_its_first_request_window_open() {
+    let mut with = FixedWindow::new(nz(1), nz(1_000), Alignment::FirstRequest);
+    let receipt = with.charge(0);
+    with.release(receipt);
+    let mut without = FixedWindow::new(nz(1), nz(1_000), Alignment::FirstRequest);
+    assert!(with.decide(900) && without.decide(900));
+    assert!(with.decide(1_000), "the window opened at 0 has ended");
+    assert!(
+        !without.decide(1_000),
+        "the window opened at 900 runs to 1,900"
+    );
+}

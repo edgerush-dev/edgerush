@@ -184,6 +184,9 @@ crates/explain     where a request would go and why (`edgerush-explain`): what `
                    prints and `edgerush test` checks, worked out by the request core without a
                    data plane; no I/O
 crates/filters     built-in filters (`edgerush-filters`): pure, on plain `http` types
+crates/ratelimit   rate limiting (`edgerush-ratelimit`): pure, no I/O; so far the admission models
+                   as reference implementations behind one interface, and an example that runs the
+                   same clients through each (`cargo run -p edgerush-ratelimit --example timelines`)
 crates/proxy       the data plane (`edgerush-proxy`): listeners, TLS, our HTTP/1 server and client,
                    HTTP/2 on h2, HTTP/3 on quiche, upstream pools and the request core between them
 crates/router      request matching (`edgerush-router`): pure logic, no I/O
