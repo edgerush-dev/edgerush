@@ -157,6 +157,12 @@ impl Settings {
         // An ACK alone waits for a second packet or for the answer it can go with, at most
         // 20 ms, 5 short of the 25 ms advertised (16 §2, RFC 9000 §13.2).
         config.enable_delayed_ack(true);
+        // quiche paces by default, holding each packet back in `send` until its release time
+        // (`SendInfo.at`). The driver sends at once and does not wait on that clock, so pacing
+        // only throttles it — measured on a real path it halved uploads and cut throughput
+        // threefold under loss, for no gain a downstream gateway could show (16 §6). Off until
+        // the release time is honoured through `SO_TXTIME` (16 §6).
+        config.enable_pacing(false);
         Ok(config)
     }
 
