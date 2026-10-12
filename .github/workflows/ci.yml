@@ -23,7 +23,9 @@ jobs:
     # check.sh itself, so that CI and a local run cannot ask for different things. On Linux
     # alone: it is the platform EdgeRush is for, and Windows is only where it is developed.
     name: check.sh
-    runs-on: ubuntu-latest
+    # A named release rather than ubuntu-latest, which GitHub moves on its own date: the
+    # system the checks run on changes deliberately, in its own commit, as the toolchain does.
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       # Pinned to a commit; Dependabot moves the pin and the version after it together.
