@@ -55,9 +55,10 @@ The code is held to a few rules. Lints enforce what they can; review holds the r
 - No `unsafe`: the workspace forbids it.
 - No `unwrap`, `expect` or `panic!` outside tests, except for an invariant proven where it
   is used, with a comment saying why. Libraries return typed errors (`thiserror`).
-- The pure crates, `edgerush-router`, `edgerush-config`, `edgerush-filters` and
-  `edgerush-ratelimit`, do no I/O: no sockets, clocks, randomness or async runtime. Those
-  are passed in, which keeps the crates deterministic and easy to test.
+- The pure crates, `edgerush-router`, `edgerush-config`, `edgerush-filters`,
+  `edgerush-ratelimit` and `edgerush-ratelimit-sim`, do no I/O: no sockets, clocks,
+  randomness or async runtime. Those are passed in, which keeps the crates deterministic
+  and easy to test.
 - On the request path: no locks, no allocation that can be avoided, no string formatting,
   no lookups by name, nothing that blocks. A feature that is not configured costs nothing.
 - Dependencies are a cost. Propose a new one in an issue first, with its licence and how

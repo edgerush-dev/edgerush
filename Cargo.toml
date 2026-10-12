@@ -26,6 +26,7 @@ edgerush-config = { path = "crates/config" }
 edgerush-explain = { path = "crates/explain" }
 edgerush-filters = { path = "crates/filters" }
 edgerush-proxy = { path = "crates/proxy" }
+edgerush-ratelimit = { path = "crates/ratelimit" }
 edgerush-router = { path = "crates/router" }
 edgerush-telemetry = { path = "crates/telemetry" }
 # HTTP/2 on both hops, used directly rather than through hyper (15 §3). The version is the

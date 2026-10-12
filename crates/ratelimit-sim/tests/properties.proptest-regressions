@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 56f94e21aba82c291ad913d3f6afdeee5ae1e3ae255078d352122a60914e9161 # shrinks to run = Run { contract: Contract { limit: 1, window: 1000000000, burst: 1 }, pods: 1, workload: Workload { shape: Spread { per_window: 3 }, span: 3000000000, conforming: false }, approach: Independent, seed: 0 }
+cc 7378063afad478f32a8f4539b9bb776850ca24ecb0d776f3f17c762b7e3424b4 # shrinks to run = Run { contract: Contract { limit: 1, window: 1000000000, burst: 1 }, pods: 1, workload: Workload { shape: Spread { per_window: 1 }, span: 3000000000, conforming: true }, approach: Central, seed: 0 }, independent = false
+cc c95dec450b3977145196c429d8c3cb0fcfa3b5a1e9f5e63a5f41848e43f223af # shrinks to run = Run { contract: Contract { limit: 1, window: 1000000000, burst: 1 }, pods: 1, workload: Workload { shape: Spread { per_window: 2 }, span: 3000000000, conforming: false }, approach: Central, seed: 8546731174734653985 }
+cc 31e85dc5265ea1904abb6714d2327954a3bb0fab6951163b88dd6e77377e69ca # shrinks to run = Run { contract: Contract { limit: 1, window: 1000000000, burst: 1 }, pods: 1, workload: Workload { shape: Spread { per_window: 3 }, span: 3000000000, conforming: false }, approach: Split, seed: 0 }

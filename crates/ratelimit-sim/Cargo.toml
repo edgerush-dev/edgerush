@@ -1,0 +1,17 @@
+[package]
+name = "edgerush-ratelimit-sim"
+description = "EdgeRush rate-limit simulator: ways of limiting across pods against the contract, deterministic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+edgerush-ratelimit.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
