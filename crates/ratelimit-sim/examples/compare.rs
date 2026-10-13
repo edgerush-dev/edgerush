@@ -4,7 +4,7 @@
 //! counters, and a rate-limiting service of its own.
 //!
 //! `cargo run --release -p edgerush-ratelimit-sim --example compare [seeds] [lost in 1,000]
-//! [owner-lost|partition|restart|owner-restart]`
+//! [none|owner-lost|partition|restart|owner-restart] [delay in µs] [pods, as 2,4,8]`
 
 use edgerush_ratelimit_sim::{
     Approach, Bound, Contract, Counting, Excess, Fault, Network, OnOwnerChange, Run, Serving,
@@ -74,6 +74,11 @@ fn main() {
         "owner-restart" => Fault::OwnerRestart { at: 5 * SECOND },
         _ => Fault::None,
     };
+    // How long a message takes, give or take half as much again.
+    let delay_us: u64 = std::env::args()
+        .nth(4)
+        .and_then(|arg| arg.parse().ok())
+        .unwrap_or(1_000);
     let n = |n: u64| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN);
     let contract = Contract {
         limit: n(100),
@@ -82,7 +87,7 @@ fn main() {
     };
     let network = Network {
         loss_per_mille,
-        ..Network::reliable(MS, MS / 2)
+        ..Network::reliable(delay_us * 1_000, delay_us * 500)
     };
     let approaches = [
         ("central", Approach::Central),
@@ -213,29 +218,36 @@ fn main() {
             false,
         ),
     ];
-    let pods = [2usize, 4, 8];
+    let pods: Vec<usize> = std::env::args()
+        .nth(5)
+        .map(|arg| arg.split(',').filter_map(|n| n.parse().ok()).collect())
+        .filter(|pods: &Vec<usize>| !pods.is_empty())
+        .unwrap_or_else(|| vec![2, 4, 8]);
 
     println!(
         "Contract: 100 a second, burst 100. Runs of 10 s, {seeds} seeds each; messages take \
-         1 ms, give or take 0.5 ms, {loss_per_mille} in 1,000 lost. Each cell: share of \
+         {delay} ms, give or take {jitter} ms, {loss_per_mille} in 1,000 lost. Each cell: \
+         share of \
          requests refused (for conforming traffic every refusal is false) / admitted against \
          one bucket for the fleet / the most over the contract in any span, worst seed / \
          share of admitted requests the fleet's count never saw / share it counted twice / \
          messages a second for each pod (all a run sends, a service's answers among them, \
          over its pods and its ten seconds). \
-         Fault: {fault_name}.\n"
+         Fault: {fault_name}.\n",
+        delay = delay_us as f64 / 1_000.0,
+        jitter = delay_us as f64 / 2_000.0,
     );
     for (title, shape, conforming) in workloads {
         println!("**{title}**\n");
         print!("| Approach |");
-        for p in pods {
+        for &p in &pods {
             print!(" {p} pods |");
         }
         println!();
         println!("|---|{}", "---|".repeat(pods.len()));
         for (name, approach) in approaches {
             print!("| {name} |");
-            for p in pods {
+            for &p in &pods {
                 let (mut sent, mut refused, mut admitted, mut central, mut over) =
                     (0, 0, 0, 0, i64::MIN);
                 let (mut lost, mut twice, mut messages) = (0, 0, 0);
