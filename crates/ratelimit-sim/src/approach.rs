@@ -58,7 +58,24 @@ pub enum Approach {
         /// taking the broadcast over as it comes. With it, a batch not seen applied within
         /// four cycles is sent again.
         ledger: bool,
+        /// How much of what it sees a pod may admit in one cycle.
+        bound: Bound,
     },
+}
+
+/// How much of what it sees a pod may admit in one cycle, against bursts that land on every
+/// pod in the same instant, before any of them can hear of the others (06 §4). A pod's
+/// share is what its view has left plus what the cycle refills, divided by the pods the
+/// owner has seen admit the key lately — this one counted — and never less than one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bound {
+    /// No bound: whatever the pod's view admits.
+    Unbounded,
+    /// 06 §4 as written: a pod the owner has not seen admit the key lately is held to its
+    /// share; one that has been admitting it may spend all it sees.
+    NewPods,
+    /// Every pod held to its share.
+    Every,
 }
 
 /// What the owner of a key does with reported hits that do not fit in its bucket.
@@ -96,7 +113,10 @@ impl Approach {
                 cycle,
                 excess,
                 ledger,
-            } => Box::new(Ownership::new(contract, pods, *cycle, *excess, *ledger)),
+                bound,
+            } => Box::new(Ownership::new(
+                contract, pods, *cycle, *excess, *ledger, *bound,
+            )),
         }
     }
 }

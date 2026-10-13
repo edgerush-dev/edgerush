@@ -18,7 +18,7 @@ mod ownership;
 mod rng;
 mod workload;
 
-pub use approach::{Approach, Cluster, Excess};
+pub use approach::{Approach, Bound, Cluster, Excess};
 pub use measure::{Outcome, worst_excess};
 pub use network::{Message, Network, Outbox};
 pub use rng::Rng;

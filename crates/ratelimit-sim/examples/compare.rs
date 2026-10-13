@@ -4,7 +4,9 @@
 //!
 //! `cargo run --release -p edgerush-ratelimit-sim --example compare [seeds]`
 
-use edgerush_ratelimit_sim::{Approach, Contract, Excess, Network, Run, Shape, Workload, run};
+use edgerush_ratelimit_sim::{
+    Approach, Bound, Contract, Excess, Network, Run, Shape, Workload, run,
+};
 use std::num::NonZeroU64;
 
 const MS: u64 = 1_000_000;
@@ -15,6 +17,7 @@ fn owned(cycle: u64, excess: Excess) -> Approach {
         cycle,
         excess,
         ledger: false,
+        bound: Bound::Unbounded,
     }
 }
 
@@ -23,6 +26,16 @@ fn ledger(cycle: u64, excess: Excess) -> Approach {
         cycle,
         excess,
         ledger: true,
+        bound: Bound::Unbounded,
+    }
+}
+
+fn bounded(cycle: u64, excess: Excess, bound: Bound) -> Approach {
+    Approach::Ownership {
+        cycle,
+        excess,
+        ledger: true,
+        bound,
     }
 }
 
@@ -70,6 +83,18 @@ fn main() {
         (
             "ledger, debt up to 1 s, 10 ms",
             ledger(10 * MS, Excess::DebtUpTo(SECOND)),
+        ),
+        (
+            "ledger, debt up to 1 s, 10 ms, new pods bounded",
+            bounded(10 * MS, Excess::DebtUpTo(SECOND), Bound::NewPods),
+        ),
+        (
+            "ledger, debt up to 1 s, 10 ms, every pod bounded",
+            bounded(10 * MS, Excess::DebtUpTo(SECOND), Bound::Every),
+        ),
+        (
+            "ledger, drain, 10 ms, every pod bounded",
+            bounded(10 * MS, Excess::Drain, Bound::Every),
         ),
     ];
     let workloads = [

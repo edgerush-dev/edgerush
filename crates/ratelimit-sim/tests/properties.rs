@@ -7,7 +7,7 @@
 )]
 
 use edgerush_ratelimit_sim::{
-    Approach, Contract, Excess, Network, Run, Shape, Workload, decisions, run,
+    Approach, Bound, Contract, Excess, Network, Run, Shape, Workload, decisions, run,
 };
 use proptest::prelude::*;
 use std::num::NonZeroU64;
@@ -92,7 +92,7 @@ proptest! {
     /// Property 6: the same run decides the same way every time, messages and their
     /// delays included.
     #[test]
-    fn a_run_is_deterministic(run in runs(Approach::Ownership { cycle: 10_000_000, excess: Excess::Drain, ledger: true }, false)) {
+    fn a_run_is_deterministic(run in runs(Approach::Ownership { cycle: 10_000_000, excess: Excess::Drain, ledger: true, bound: Bound::Every }, false)) {
         prop_assert_eq!(decisions(&run), decisions(&run));
     }
 }
@@ -172,6 +172,7 @@ fn ownership_keeps_sharing_through_a_run() {
             cycle: 10_000_000,
             excess: Excess::Drain,
             ledger: false,
+            bound: Bound::Unbounded,
         },
         2,
         shape,
@@ -195,6 +196,7 @@ fn lossy(ledger: bool, loss_per_mille: u64, seed: u64) -> Run {
             cycle: 10_000_000,
             excess: Excess::Drain,
             ledger,
+            bound: Bound::Unbounded,
         },
         network: Network {
             loss_per_mille,
@@ -226,4 +228,35 @@ fn a_reliable_network_loses_nothing() {
     for ledger in [false, true] {
         assert_eq!(run(&lossy(ledger, 0, 1)).lost, 0);
     }
+}
+
+fn shared(bound: Bound, shape: Shape, conforming: bool) -> Run {
+    Run {
+        approach: Approach::Ownership {
+            cycle: 10_000_000,
+            excess: Excess::DebtUpTo(SECOND),
+            ledger: true,
+            bound,
+        },
+        ..fixed(Approach::Central, 8, shape, conforming)
+    }
+}
+
+/// Bounding every pod's share of a cycle holds bursts that land on every pod at once to a
+/// fraction of what they reach unbounded, and costs a client on one pod nothing.
+#[test]
+fn a_bound_on_every_pod_holds_simultaneous_bursts_without_shaving_skew() {
+    let bursts = Shape::Bursts { each: 100 };
+    let unbounded = run(&shared(Bound::Unbounded, bursts, false));
+    let every = run(&shared(Bound::Every, bursts, false));
+    assert!(
+        every.admitted * 2 < unbounded.admitted,
+        "{every:?} against {unbounded:?}"
+    );
+    let skewed = run(&shared(
+        Bound::Every,
+        Shape::Skewed { per_window: 300 },
+        true,
+    ));
+    assert!(skewed.refused * 100 < skewed.sent, "{skewed:?}");
 }

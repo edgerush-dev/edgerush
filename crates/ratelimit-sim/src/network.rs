@@ -51,6 +51,8 @@ pub enum Message {
         bucket: TokenBucket,
         /// For each pod, the highest batch of its hits the bucket has applied.
         applied: Vec<u64>,
+        /// For each pod, whether the owner has seen it admit the key lately.
+        active: Vec<bool>,
     },
 }
 
