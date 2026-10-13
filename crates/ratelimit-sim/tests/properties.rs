@@ -7,8 +7,8 @@
 )]
 
 use edgerush_ratelimit_sim::{
-    Approach, Bound, Contract, Counting, Excess, Fault, Network, OnOwnerChange, Run, Shape,
-    Sharing, Workload, decisions, run,
+    Approach, Bound, Contract, Counting, Excess, Fault, Network, OnOwnerChange, Run, Serving,
+    Shape, Sharing, Workload, decisions, run,
 };
 use proptest::prelude::*;
 use std::num::NonZeroU64;
@@ -259,6 +259,14 @@ fn counted(bound: Bound) -> Approach {
     })
 }
 
+fn served(bound: Bound) -> Approach {
+    Approach::Service(Serving {
+        cycle: 10_000_000,
+        excess: Excess::DebtUpTo(SECOND),
+        bound,
+    })
+}
+
 fn shared(approach: Approach, shape: Shape, conforming: bool) -> Run {
     Run {
         approach,
@@ -268,10 +276,10 @@ fn shared(approach: Approach, shape: Shape, conforming: bool) -> Run {
 
 /// Bounding every pod's share of a cycle holds bursts that land on every pod at once to a
 /// fraction of what they reach unbounded, and costs a client on one pod nothing — whether
-/// pods share by ownership or by counters.
+/// pods share by ownership, by counters or through a service.
 #[test]
 fn a_bound_on_every_pod_holds_simultaneous_bursts_without_shaving_skew() {
-    for approach in [owned, counted] {
+    for approach in [owned, counted, served] {
         let bursts = Shape::Bursts { each: 100 };
         let unbounded = run(&shared(approach(Bound::Unbounded), bursts, false));
         let every = run(&shared(approach(Bound::Every), bursts, false));
@@ -455,5 +463,112 @@ fn counters_refuse_no_conforming_traffic_over_a_restart() {
             assert_eq!(outcome.refused, 0, "pod {pod}, seed {seed}: {outcome:?}");
             assert!(outcome.lost <= 2, "pod {pod}, seed {seed}: {outcome:?}");
         }
+    }
+}
+
+/// Through a service, under loss, under steady overload: batches are sent again until
+/// applied, so nothing admitted is lost or counted twice, and the fleet keeps the contract.
+#[test]
+fn a_service_loses_nothing_when_messages_are_lost() {
+    for seed in 0..5 {
+        let lossy = Run {
+            approach: served(Bound::Every),
+            network: Network {
+                loss_per_mille: 100,
+                ..NETWORK
+            },
+            seed,
+            ..fixed(
+                Approach::Central,
+                4,
+                Shape::Spread { per_window: 300 },
+                false,
+            )
+        };
+        let outcome = run(&lossy);
+        assert_eq!((outcome.lost, outcome.counted_twice), (0, 0), "seed {seed}");
+        assert!(outcome.worst_excess < 100, "{outcome:?}");
+    }
+}
+
+/// Through a service, conforming traffic is refused by no fault short of a partition: a
+/// data plane restarting, or the service pod owning the key going or restarting, costs it
+/// nothing.
+#[test]
+fn a_service_refuses_no_conforming_traffic_over_its_faults() {
+    let faults = [
+        Fault::None,
+        Fault::Restart {
+            at: 5 * SECOND,
+            pod: 3,
+        },
+        Fault::OwnerLost { at: 5 * SECOND },
+        Fault::OwnerRestart { at: 5 * SECOND },
+    ];
+    for fault in faults {
+        for seed in 0..5 {
+            let served = Run {
+                approach: served(Bound::Every),
+                fault,
+                seed,
+                ..fixed(
+                    Approach::Central,
+                    4,
+                    Shape::Spread { per_window: 100 },
+                    true,
+                )
+            };
+            let outcome = run(&served);
+            assert_eq!(outcome.refused, 0, "{fault:?}, seed {seed}: {outcome:?}");
+        }
+    }
+}
+
+/// The service pod owning the key going or restarting under steady overload costs about a
+/// bucket: the next starts full.
+#[test]
+fn a_service_owner_lost_or_restarted_costs_about_a_bucket() {
+    for fault in [
+        Fault::OwnerLost { at: 5 * SECOND },
+        Fault::OwnerRestart { at: 5 * SECOND },
+    ] {
+        let served = Run {
+            approach: served(Bound::Every),
+            fault,
+            ..fixed(
+                Approach::Central,
+                4,
+                Shape::Spread { per_window: 300 },
+                false,
+            )
+        };
+        let outcome = run(&served);
+        assert!(outcome.worst_excess <= 110, "{fault:?}: {outcome:?}");
+        assert_eq!(outcome.counted_twice, 0, "{fault:?}: {outcome:?}");
+    }
+}
+
+/// With ownership and counters the owner restarting is the first pod restarting: the owner
+/// at the start, and the pod counters take in its place.
+#[test]
+fn the_owner_restarting_is_the_first_pod_restarting_without_a_service() {
+    for approach in [owned(Bound::Every), counted(Bound::Every)] {
+        let with = |fault| Run {
+            approach,
+            fault,
+            ..fixed(
+                Approach::Central,
+                4,
+                Shape::Spread { per_window: 300 },
+                false,
+            )
+        };
+        let owner = decisions(&with(Fault::OwnerRestart { at: 5 * SECOND }));
+        let first = decisions(&with(Fault::Restart {
+            at: 5 * SECOND,
+            pod: 0,
+        }));
+        assert_eq!(owner, first, "{approach:?}");
+        assert_ne!(owner, decisions(&with(Fault::None)), "{approach:?}");
     }
 }

@@ -1,14 +1,14 @@
 //! Ways of limiting one key across pods, side by side over many seeds, printed as Markdown:
 //! the baselines (one bucket for the fleet, which keeps the contract exactly; pods sharing
-//! nothing; pods with a share each) and the ways of sharing counts: ownership and per-pod
-//! counters.
+//! nothing; pods with a share each) and the ways of sharing counts: ownership, per-pod
+//! counters, and a rate-limiting service of its own.
 //!
 //! `cargo run --release -p edgerush-ratelimit-sim --example compare [seeds] [lost in 1,000]
 //! [owner-lost|partition|restart|owner-restart]`
 
 use edgerush_ratelimit_sim::{
-    Approach, Bound, Contract, Counting, Excess, Fault, Network, OnOwnerChange, Run, Shape,
-    Sharing, Workload, run,
+    Approach, Bound, Contract, Counting, Excess, Fault, Network, OnOwnerChange, Run, Serving,
+    Shape, Sharing, Workload, run,
 };
 use std::num::NonZeroU64;
 
@@ -57,8 +57,8 @@ fn main() {
     // `owner-lost`: the pod owning the key goes away half way through each run; with
     // counters, which have no owner, the first pod.
     // `partition`: half the pods are cut off from the others from 3 s to 7 s.
-    // `restart`, `owner-restart`: the last pod, or the owner (the first pod), restarts half
-    // way through.
+    // `restart`: the last pod restarts half way through; `owner-restart`: the owner does —
+    // with counters the first pod, with the service the service pod owning the key.
     let fault_name = std::env::args().nth(3).unwrap_or_default();
     let fault = |pods: usize| match fault_name.as_str() {
         "owner-lost" => Fault::OwnerLost { at: 5 * SECOND },
@@ -71,10 +71,7 @@ fn main() {
             at: 5 * SECOND,
             pod: pods - 1,
         },
-        "owner-restart" => Fault::Restart {
-            at: 5 * SECOND,
-            pod: 0,
-        },
+        "owner-restart" => Fault::OwnerRestart { at: 5 * SECOND },
         _ => Fault::None,
     };
     let n = |n: u64| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN);
@@ -151,6 +148,30 @@ fn main() {
                 bound: Bound::Every,
             }),
         ),
+        (
+            "service, debt up to 1 s, 10 ms",
+            Approach::Service(Serving {
+                cycle: 10 * MS,
+                excess: Excess::DebtUpTo(SECOND),
+                bound: Bound::Unbounded,
+            }),
+        ),
+        (
+            "service, debt up to 1 s, 10 ms, every pod bounded",
+            Approach::Service(Serving {
+                cycle: 10 * MS,
+                excess: Excess::DebtUpTo(SECOND),
+                bound: Bound::Every,
+            }),
+        ),
+        (
+            "service, debt up to 1 s, 100 ms, every pod bounded",
+            Approach::Service(Serving {
+                cycle: 100 * MS,
+                excess: Excess::DebtUpTo(SECOND),
+                bound: Bound::Every,
+            }),
+        ),
     ];
     let workloads = [
         (
@@ -200,7 +221,8 @@ fn main() {
          requests refused (for conforming traffic every refusal is false) / admitted against \
          one bucket for the fleet / the most over the contract in any span, worst seed / \
          share of admitted requests the fleet's count never saw / share it counted twice / \
-         messages a pod sends a second. \
+         messages a second for each pod (all a run sends, a service's answers among them, \
+         over its pods and its ten seconds). \
          Fault: {fault_name}.\n"
     );
     for (title, shape, conforming) in workloads {
@@ -250,7 +272,7 @@ fn main() {
                 let ratio = admitted as f64 / central.max(1) as f64;
                 let lost = 100.0 * lost as f64 / admitted.max(1) as f64;
                 let twice = 100.0 * twice as f64 / admitted.max(1) as f64;
-                // Messages a pod sends a second, over the ten seconds of a run.
+                // Messages a second for each pod, over the ten seconds of a run.
                 let rate = messages as f64 / (seeds.max(1) * 10 * p as u64) as f64;
                 print!(
                     " {refused:.1}% / {ratio:.2}× / {over} / {lost:.1}% / {twice:.1}% / {rate:.0} |"

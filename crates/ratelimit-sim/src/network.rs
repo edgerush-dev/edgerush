@@ -69,6 +69,13 @@ pub enum Message {
         /// How many it has admitted in that life.
         total: u64,
     },
+    /// A data plane with no hits to report asks the rate-limiting service for a copy.
+    Poll {
+        /// The data plane asking.
+        from: usize,
+        /// Which life of it.
+        instance: u64,
+    },
 }
 
 impl Message {
@@ -76,7 +83,10 @@ impl Message {
     #[must_use]
     pub fn sender(&self) -> usize {
         match self {
-            Self::Hits { from, .. } | Self::State { from, .. } | Self::Counts { from, .. } => *from,
+            Self::Hits { from, .. }
+            | Self::State { from, .. }
+            | Self::Counts { from, .. }
+            | Self::Poll { from, .. } => *from,
         }
     }
 }

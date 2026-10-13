@@ -17,9 +17,10 @@ mod measure;
 mod network;
 mod ownership;
 mod rng;
+mod service;
 mod workload;
 
-pub use approach::{Approach, Bound, Cluster, Counting, Excess, OnOwnerChange, Sharing};
+pub use approach::{Approach, Bound, Cluster, Counting, Excess, OnOwnerChange, Serving, Sharing};
 pub use measure::{Outcome, worst_excess};
 pub use network::{Message, Network, Outbox};
 pub use rng::Rng;
@@ -89,6 +90,13 @@ pub enum Fault {
         /// Which pod.
         pod: usize,
     },
+    /// At `at` nanoseconds the owner of the key restarts, holding nothing: with ownership,
+    /// the pod owning it; with counters, which have no owner, the first pod; with a
+    /// rate-limiting service, the service pod owning it.
+    OwnerRestart {
+        /// When.
+        at: u64,
+    },
 }
 
 impl Fault {
@@ -126,6 +134,8 @@ pub enum FaultEvent {
         /// Which pod.
         pod: usize,
     },
+    /// The owner restarts.
+    OwnerRestarts,
 }
 
 /// Every request of a run with the decision it got, in the order they arrived: what a
@@ -185,6 +195,7 @@ fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> Played {
             queue.push(until, Event::Fault(FaultEvent::PartitionHeals { split }));
         }
         Fault::Restart { at, pod } => queue.push(at, Event::Fault(FaultEvent::Restart { pod })),
+        Fault::OwnerRestart { at } => queue.push(at, Event::Fault(FaultEvent::OwnerRestarts)),
     }
     let cycle = cluster.cycle();
     if let Some(cycle) = cycle {

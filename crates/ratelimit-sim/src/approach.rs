@@ -2,6 +2,7 @@
 
 use crate::counters::Counters;
 use crate::ownership::Ownership;
+use crate::service::Service;
 use crate::{Contract, FaultEvent, Message, Outbox};
 use edgerush_ratelimit::reference::{Model, TokenBucket};
 use std::num::NonZeroU64;
@@ -62,6 +63,22 @@ pub enum Approach {
     /// Per-pod counters (06 §5): no owner; every pod sends the others the total it has
     /// admitted every cycle, and charges its own view with what it learns of theirs.
     Counters(Counting),
+    /// A rate-limiting service of its own, a candidate not yet chosen: a few service pods
+    /// own the keys between them, and the data planes, which never talk to each other,
+    /// decide from copies of the owner's bucket; every cycle each sends the owner its hits,
+    /// or asks for a copy, and is answered with the bucket as it stands.
+    Service(Serving),
+}
+
+/// How data planes share a key through a rate-limiting service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Serving {
+    /// The time between a data plane's messages to the service.
+    pub cycle: u64,
+    /// What the owner does with hits that do not fit.
+    pub excess: Excess,
+    /// How much of what it sees a data plane may admit in one cycle.
+    pub bound: Bound,
 }
 
 /// How pods share a key by per-pod counters.
@@ -152,6 +169,7 @@ impl Approach {
             }
             Self::Ownership(sharing) => Box::new(Ownership::new(contract, pods, *sharing)),
             Self::Counters(counting) => Box::new(Counters::new(contract, pods, *counting)),
+            Self::Service(serving) => Box::new(Service::new(contract, pods, *serving)),
         }
     }
 }

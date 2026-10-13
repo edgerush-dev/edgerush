@@ -461,6 +461,7 @@ impl Cluster for Ownership {
                 self.restart(pod, now, outbox);
             }
             FaultEvent::Restart { .. } => {}
+            FaultEvent::OwnerRestarts => self.restart(self.main_owner(), now, outbox),
         }
     }
 

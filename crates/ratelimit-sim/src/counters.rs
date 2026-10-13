@@ -137,6 +137,21 @@ impl Counters {
         at.total + at.earlier_lives[pod] + others
     }
 
+    /// `pod` restarts: it comes back as another life of itself, holding nothing.
+    fn restart(&mut self, pod: usize) {
+        let pods = self.pods.len();
+        let fresh = self.fresh.clone();
+        let at = &mut self.pods[pod];
+        at.instance += 1;
+        at.bucket = fresh;
+        at.total = 0;
+        at.heard = vec![None; pods];
+        at.grew = vec![None; pods];
+        at.spent = 0;
+        at.allowance = None;
+        at.earlier_lives = vec![0; pods];
+    }
+
     /// The fleet's count: what the best-informed pod still there holds.
     fn known(&self) -> u64 {
         (0..self.pods.len())
@@ -237,18 +252,10 @@ impl Cluster for Counters {
             }
             // Nothing to elect: messages across the cut are lost, and the totals heal it.
             FaultEvent::PartitionStarts { .. } | FaultEvent::PartitionHeals { .. } => {}
+            // No owner to restart either: the first pod does.
+            FaultEvent::OwnerRestarts => self.restart(self.serving(0)),
             FaultEvent::Restart { pod } if pod < self.pods.len() && self.alive[pod] => {
-                let pods = self.pods.len();
-                let fresh = self.fresh.clone();
-                let at = &mut self.pods[pod];
-                at.instance += 1;
-                at.bucket = fresh;
-                at.total = 0;
-                at.heard = vec![None; pods];
-                at.grew = vec![None; pods];
-                at.spent = 0;
-                at.allowance = None;
-                at.earlier_lives = vec![0; pods];
+                self.restart(pod);
             }
             FaultEvent::Restart { .. } => {}
         }
