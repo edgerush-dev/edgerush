@@ -60,6 +60,16 @@ pub enum Message {
     },
 }
 
+impl Message {
+    /// The pod that sent it.
+    #[must_use]
+    pub fn sender(&self) -> usize {
+        match self {
+            Self::Hits { from, .. } | Self::State { from, .. } => *from,
+        }
+    }
+}
+
 /// What a pod sends while handling an event, collected for the network to carry.
 #[derive(Debug, Default)]
 pub struct Outbox {

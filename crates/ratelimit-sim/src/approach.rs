@@ -1,7 +1,7 @@
 //! Ways of limiting one key across several pods.
 
 use crate::ownership::Ownership;
-use crate::{Contract, Fault, Message, Outbox};
+use crate::{Contract, FaultEvent, Message, Outbox};
 use edgerush_ratelimit::reference::{Model, TokenBucket};
 use std::num::NonZeroU64;
 
@@ -35,8 +35,8 @@ pub trait Cluster {
         0
     }
 
-    /// `fault` happens at `now`.
-    fn on_fault(&mut self, _fault: &Fault, _now: u64, _outbox: &mut Outbox) {}
+    /// Part of the run's fault happens at `now`.
+    fn on_fault(&mut self, _event: FaultEvent, _now: u64, _outbox: &mut Outbox) {}
 }
 
 /// How the pods limit a key between them.

@@ -70,6 +70,48 @@ pub enum Fault {
         /// When.
         at: u64,
     },
+    /// From `from` to `until` nanoseconds, the pods from `split` on cannot reach those
+    /// before it: messages between the two sides are lost, sent or on their way.
+    Partition {
+        /// When it starts.
+        from: u64,
+        /// When it heals.
+        until: u64,
+        /// The first pod of the side cut off from the first pod.
+        split: usize,
+    },
+}
+
+impl Fault {
+    /// Whether a message from pod `from` to pod `to` is cut off at `now`.
+    #[must_use]
+    pub fn cuts(&self, now: u64, from: usize, to: usize) -> bool {
+        match *self {
+            Self::Partition {
+                from: start,
+                until,
+                split,
+            } => (start..until).contains(&now) && (from < split) != (to < split),
+            _ => false,
+        }
+    }
+}
+
+/// A moment of a run's fault, as the pods learn of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultEvent {
+    /// The owner has gone.
+    OwnerLost,
+    /// The pods from `split` on can no longer reach the others.
+    PartitionStarts {
+        /// The first pod of the side cut off.
+        split: usize,
+    },
+    /// They can again.
+    PartitionHeals {
+        /// The first pod of the side that was cut off.
+        split: usize,
+    },
 }
 
 /// Every request of a run with the decision it got, in the order they arrived: what a
@@ -101,18 +143,28 @@ const SETTLING_CYCLES: u64 = 10;
 
 /// The decisions of a run, the hits it left unapplied, and those counted twice.
 fn play(run: &Run) -> (Vec<(Arrival, bool)>, u64, u64) {
+    let cluster = run.approach.build(&run.contract, run.pods.max(1));
+    play_with(run, cluster)
+}
+
+/// [`play`], on pods given rather than made from the run's approach.
+fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> (Vec<(Arrival, bool)>, u64, u64) {
     let pods = run.pods.max(1);
     let mut rng = Rng::new(run.seed);
     let arrivals = run.workload.arrivals(&run.contract, pods, &mut rng);
     let mut network_rng = Rng::new(run.seed ^ 0x6E65_7477_6F72_6B00);
-    let mut cluster = run.approach.build(&run.contract, pods);
     let mut queue = Queue::default();
     for (index, arrival) in arrivals.iter().enumerate() {
         queue.push(arrival.at, Event::Arrival(index));
     }
     let end = arrivals.last().map_or(0, |arrival| arrival.at);
-    if let Fault::OwnerLost { at } = run.fault {
-        queue.push(at, Event::Fault);
+    match run.fault {
+        Fault::None => {}
+        Fault::OwnerLost { at } => queue.push(at, Event::Fault(FaultEvent::OwnerLost)),
+        Fault::Partition { from, until, split } => {
+            queue.push(from, Event::Fault(FaultEvent::PartitionStarts { split }));
+            queue.push(until, Event::Fault(FaultEvent::PartitionHeals { split }));
+        }
     }
     let cycle = cluster.cycle();
     if let Some(cycle) = cycle {
@@ -136,8 +188,12 @@ fn play(run: &Run) -> (Vec<(Arrival, bool)>, u64, u64) {
                     queue.push(now + cycle, Event::Timer(pod));
                 }
             }
-            Event::Deliver(to, message) => cluster.on_message(to, message, now, &mut outbox),
-            Event::Fault => cluster.on_fault(&run.fault, now, &mut outbox),
+            Event::Deliver(to, message) => {
+                if !run.fault.cuts(now, message.sender(), to) {
+                    cluster.on_message(to, message, now, &mut outbox);
+                }
+            }
+            Event::Fault(event) => cluster.on_fault(event, now, &mut outbox),
         }
         for (to, message) in outbox.sent.drain(..) {
             if let Some(at) = run.network.carry(now, &mut network_rng) {
@@ -157,8 +213,8 @@ enum Event {
     Timer(usize),
     /// A message reaches this pod.
     Deliver(usize, Message),
-    /// The run's fault happens.
-    Fault,
+    /// Part of the run's fault happens.
+    Fault(FaultEvent),
 }
 
 /// Events by time, and at the same time by the order they were made.
@@ -196,9 +252,85 @@ mod tests {
             .map(|(at, event)| match event {
                 Event::Timer(n) | Event::Arrival(n) => (at, n),
                 Event::Deliver(n, _) => (at, n),
-                Event::Fault => (at, usize::MAX),
+                Event::Fault(_) => (at, usize::MAX),
             })
             .collect();
         assert_eq!(order, vec![(3, 2), (3, 4), (5, 1), (5, 3)]);
+    }
+
+    #[test]
+    fn a_partition_cuts_only_across_its_sides_and_only_while_it_lasts() {
+        let fault = Fault::Partition {
+            from: 10,
+            until: 20,
+            split: 2,
+        };
+        assert!(fault.cuts(10, 0, 2) && fault.cuts(19, 3, 1));
+        assert!(
+            !fault.cuts(15, 0, 1) && !fault.cuts(15, 2, 3),
+            "within a side"
+        );
+        assert!(
+            !fault.cuts(9, 0, 2) && !fault.cuts(20, 0, 2),
+            "before and after"
+        );
+        assert!(!Fault::None.cuts(15, 0, 2));
+    }
+
+    /// Pod 1 sends pod 0 a message every millisecond, and pod 0 notes when each arrives.
+    struct Chatter(std::rc::Rc<std::cell::RefCell<Vec<u64>>>);
+
+    impl Cluster for Chatter {
+        fn decide(&mut self, _: usize, _: u64, _: &mut Outbox) -> bool {
+            true
+        }
+        fn cycle(&self) -> Option<u64> {
+            Some(1_000_000)
+        }
+        fn on_timer(&mut self, pod: usize, _: u64, outbox: &mut Outbox) {
+            if pod == 1 {
+                let hits = Message::Hits {
+                    from: 1,
+                    sequence: 0,
+                    count: 0,
+                };
+                outbox.send(0, hits);
+            }
+        }
+        fn on_message(&mut self, _: usize, _: Message, now: u64, _: &mut Outbox) {
+            self.0.borrow_mut().push(now);
+        }
+    }
+
+    #[test]
+    fn nothing_crosses_a_partition_while_it_lasts() {
+        let second = 1_000_000_000;
+        let n = |n| NonZeroU64::new(n).unwrap();
+        let run = Run {
+            contract: Contract {
+                limit: n(10),
+                window: n(second),
+                burst: n(10),
+            },
+            pods: 2,
+            workload: Workload {
+                shape: Shape::Spread { per_window: 10 },
+                span: 3 * second,
+                conforming: false,
+            },
+            approach: Approach::Central,
+            network: Network::reliable(100_000, 0),
+            fault: Fault::Partition {
+                from: second,
+                until: 2 * second,
+                split: 1,
+            },
+            seed: 1,
+        };
+        let heard = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let _ = play_with(&run, Box::new(Chatter(heard.clone())));
+        let heard = heard.borrow();
+        assert!(heard.iter().any(|at| *at < second) && heard.iter().any(|at| *at > 2 * second));
+        assert!(heard.iter().all(|at| !(second..2 * second).contains(at)));
     }
 }

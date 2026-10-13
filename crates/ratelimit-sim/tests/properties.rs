@@ -304,3 +304,53 @@ fn an_owner_lost_costs_at_most_a_few_cycles_of_hits() {
         assert_eq!(run(&owner_lost(OnOwnerChange::SendAgain, seed)).lost, 0);
     }
 }
+
+/// Four seconds of half the pods cut off from the others under steady overload: each side
+/// counts alone, so the fleet admits up to twice the contract while it lasts; healed, the
+/// side gives up what it counted, and nothing is owed afterwards — the last two seconds are
+/// back at the contract.
+#[test]
+fn a_partition_doubles_the_contract_while_it_lasts_and_leaves_nothing_owed() {
+    let shape = Shape::Spread { per_window: 300 };
+    let run_with = |fault| Run {
+        approach: Approach::Ownership(Sharing {
+            cycle: 10_000_000,
+            excess: Excess::DebtUpTo(SECOND),
+            ledger: true,
+            bound: Bound::Every,
+            on_owner_change: OnOwnerChange::SendAgain,
+        }),
+        fault,
+        ..fixed(Approach::Central, 4, shape, false)
+    };
+    let partition = Fault::Partition {
+        from: 3 * SECOND,
+        until: 7 * SECOND,
+        split: 2,
+    };
+    let whole = decisions(&run_with(Fault::None));
+    let cut = decisions(&run_with(partition));
+    let admitted = |decided: &[(edgerush_ratelimit_sim::Arrival, bool)], from: u64, until: u64| {
+        decided
+            .iter()
+            .filter(|(arrival, admitted)| *admitted && (from..until).contains(&arrival.at))
+            .count()
+    };
+    let (during, during_whole) = (
+        admitted(&cut, 4 * SECOND, 7 * SECOND),
+        admitted(&whole, 4 * SECOND, 7 * SECOND),
+    );
+    assert!(
+        during * 10 > during_whole * 18,
+        "{during} against {during_whole}"
+    );
+    let (after, after_whole) = (
+        admitted(&cut, 8 * SECOND, 10 * SECOND),
+        admitted(&whole, 8 * SECOND, 10 * SECOND),
+    );
+    assert!(after <= after_whole + 10, "{after} against {after_whole}");
+    assert!(
+        run(&run_with(partition)).lost > 0,
+        "what one side counted alone"
+    );
+}

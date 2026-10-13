@@ -53,8 +53,15 @@ fn main() {
         .and_then(|arg| arg.parse().ok())
         .unwrap_or(0);
     // `owner-lost`: the pod owning the key goes away half way through each run.
-    let fault = match std::env::args().nth(3).as_deref() {
-        Some("owner-lost") => Fault::OwnerLost { at: 5 * SECOND },
+    // `partition`: half the pods are cut off from the others from 3 s to 7 s.
+    let fault_name = std::env::args().nth(3).unwrap_or_default();
+    let fault = |pods: usize| match fault_name.as_str() {
+        "owner-lost" => Fault::OwnerLost { at: 5 * SECOND },
+        "partition" => Fault::Partition {
+            from: 3 * SECOND,
+            until: 7 * SECOND,
+            split: pods / 2,
+        },
         _ => Fault::None,
     };
     let n = |n: u64| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN);
@@ -164,7 +171,7 @@ fn main() {
          requests refused (for conforming traffic every refusal is false) / admitted against \
          one bucket for the fleet / the most over the contract in any span, worst seed / \
          share of admitted requests the fleet's count never saw / share it counted twice. \
-         Fault: {fault:?}.\n"
+         Fault: {fault_name}.\n"
     );
     for (title, shape, conforming) in workloads {
         println!("**{title}**\n");
@@ -192,7 +199,7 @@ fn main() {
                         workload,
                         approach,
                         network,
-                        fault,
+                        fault: fault(p),
                         seed,
                     };
                     let outcome = run(&this);
