@@ -1,13 +1,18 @@
-//! The baselines every way of sharing counts between pods is measured against, over many
-//! seeds, printed as Markdown: one bucket for the fleet (the contract kept exactly), pods
-//! that share nothing, and pods that each hold a share.
+//! Ways of limiting one key across pods, side by side over many seeds, printed as Markdown:
+//! the baselines (one bucket for the fleet, which keeps the contract exactly; pods sharing
+//! nothing; pods with a share each) and the ways of sharing counts.
 //!
-//! `cargo run --release -p edgerush-ratelimit-sim --example baselines [seeds]`
+//! `cargo run --release -p edgerush-ratelimit-sim --example compare [seeds]`
 
-use edgerush_ratelimit_sim::{Approach, Contract, Run, Shape, Workload, run};
+use edgerush_ratelimit_sim::{Approach, Contract, Excess, Network, Run, Shape, Workload, run};
 use std::num::NonZeroU64;
 
-const SECOND: u64 = 1_000_000_000;
+const MS: u64 = 1_000_000;
+const SECOND: u64 = 1_000 * MS;
+
+fn owned(cycle: u64, excess: Excess) -> Approach {
+    Approach::Ownership { cycle, excess }
+}
 
 fn main() {
     let seeds: u64 = std::env::args()
@@ -20,34 +25,57 @@ fn main() {
         window: n(SECOND),
         burst: n(100),
     };
+    let network = Network::reliable(MS, MS / 2);
     let approaches = [
         ("central", Approach::Central),
-        ("independent", Approach::Independent),
-        ("split", Approach::Split),
+        ("sharing nothing", Approach::Independent),
+        ("a share each", Approach::Split),
+        ("ownership, drain, 100 ms", owned(100 * MS, Excess::Drain)),
+        ("ownership, drain, 10 ms", owned(10 * MS, Excess::Drain)),
+        ("ownership, debt, 100 ms", owned(100 * MS, Excess::Debt)),
+        ("ownership, debt, 10 ms", owned(10 * MS, Excess::Debt)),
+        (
+            "ownership, debt up to 1 s, 100 ms",
+            owned(100 * MS, Excess::DebtUpTo(SECOND)),
+        ),
+        (
+            "ownership, debt up to 1 s, 10 ms",
+            owned(10 * MS, Excess::DebtUpTo(SECOND)),
+        ),
     ];
     let workloads = [
         (
-            "spread at the limit, conforming",
+            "Within the contract, spread",
             Shape::Spread { per_window: 100 },
             true,
         ),
         (
-            "all on one pod at the limit, conforming",
+            "Within the contract, all on one pod",
             Shape::Skewed { per_window: 100 },
             true,
         ),
         (
-            "spread at 3× the limit",
+            "On the contract's edge, spread (three times the limit, kept to what one bucket admits)",
+            Shape::Spread { per_window: 300 },
+            true,
+        ),
+        (
+            "On the contract's edge, all on one pod",
+            Shape::Skewed { per_window: 300 },
+            true,
+        ),
+        (
+            "Three times the limit, spread",
             Shape::Spread { per_window: 300 },
             false,
         ),
         (
-            "a bucket on every pod at once, every second",
+            "A whole bucket on every pod at once, every second",
             Shape::Bursts { each: 100 },
             false,
         ),
         (
-            "one pod at the limit, then bursts",
+            "One pod at the limit, then such bursts",
             Shape::SkewedThenBursts {
                 per_window: 100,
                 each: 100,
@@ -55,21 +83,19 @@ fn main() {
             false,
         ),
     ];
-    let pods = [1usize, 2, 4, 8];
+    let pods = [2usize, 4, 8];
 
-    println!("Contract: 100 a second, burst 100. Runs of 10 s, {seeds} seeds each.");
     println!(
-        "Refused: share of requests refused (for conforming traffic, every refusal is false)."
+        "Contract: 100 a second, burst 100. Runs of 10 s, {seeds} seeds each; messages take \
+         1 ms, give or take 0.5 ms. Each cell: share of requests refused (for conforming \
+         traffic every refusal is false) / admitted against one bucket for the fleet / the \
+         most over the contract in any span, worst seed.\n"
     );
-    println!(
-        "Admitted: against what one bucket for the fleet admits. Over: the most admitted over"
-    );
-    println!("the contract in any span, worst seed.\n");
     for (title, shape, conforming) in workloads {
         println!("**{title}**\n");
         print!("| Approach |");
         for p in pods {
-            print!(" {p} pod{} |", if p == 1 { "" } else { "s" });
+            print!(" {p} pods |");
         }
         println!();
         println!("|---|{}", "---|".repeat(pods.len()));
@@ -89,6 +115,7 @@ fn main() {
                         pods: p,
                         workload,
                         approach,
+                        network,
                         seed,
                     };
                     let outcome = run(&this);
@@ -104,7 +131,7 @@ fn main() {
                 }
                 let refused = 100.0 * refused as f64 / sent.max(1) as f64;
                 let ratio = admitted as f64 / central.max(1) as f64;
-                print!(" refused {refused:.1}%, admitted {ratio:.2}×, over {over} |");
+                print!(" {refused:.1}% / {ratio:.2}× / {over} |");
             }
             println!();
         }

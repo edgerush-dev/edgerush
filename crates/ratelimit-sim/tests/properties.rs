@@ -6,11 +6,19 @@
     reason = "test set-up: the helpers make contracts from constants known not to be zero"
 )]
 
-use edgerush_ratelimit_sim::{Approach, Contract, Run, Shape, Workload, decisions, run};
+use edgerush_ratelimit_sim::{
+    Approach, Contract, Excess, Network, Run, Shape, Workload, decisions, run,
+};
 use proptest::prelude::*;
 use std::num::NonZeroU64;
 
 const SECOND: u64 = 1_000_000_000;
+/// A millisecond, give or take half of one.
+const NETWORK: Network = Network {
+    delay: 1_000_000,
+    jitter: 500_000,
+    loss_per_mille: 0,
+};
 
 fn shape() -> impl Strategy<Value = Shape> {
     prop_oneof![
@@ -41,6 +49,7 @@ fn runs(approach: Approach, conforming: bool) -> impl Strategy<Value = Run> {
                 conforming,
             },
             approach,
+            network: NETWORK,
             seed,
         }
     })
@@ -80,9 +89,10 @@ proptest! {
         prop_assert!(outcome.worst_excess <= rounding, "{} over: {:?}", outcome.worst_excess, run);
     }
 
-    /// Property 6: the same run decides the same way every time.
+    /// Property 6: the same run decides the same way every time, messages and their
+    /// delays included.
     #[test]
-    fn a_run_is_deterministic(run in runs(Approach::Independent, false)) {
+    fn a_run_is_deterministic(run in runs(Approach::Ownership { cycle: 10_000_000, excess: Excess::Drain }, false)) {
         prop_assert_eq!(decisions(&run), decisions(&run));
     }
 }
@@ -102,6 +112,7 @@ fn fixed(approach: Approach, pods: usize, shape: Shape, conforming: bool) -> Run
             conforming,
         },
         approach,
+        network: NETWORK,
         seed: 1,
     }
 }
@@ -148,4 +159,31 @@ fn skewed_conforming_traffic_is_shaved_by_shares() {
         true,
     ));
     assert_eq!(independent.refused, 0);
+}
+
+/// Pods that keep sharing their counts, cycle after cycle, admit clearly less under steady
+/// overload than pods that share nothing — though, as Gubernator's model forgives each
+/// cycle's excess, far more than the contract.
+#[test]
+fn ownership_keeps_sharing_through_a_run() {
+    let shape = Shape::Spread { per_window: 300 };
+    let owned = run(&fixed(
+        Approach::Ownership {
+            cycle: 10_000_000,
+            excess: Excess::Drain,
+        },
+        2,
+        shape,
+        false,
+    ));
+    let nothing = run(&fixed(Approach::Independent, 2, shape, false));
+    let central = run(&fixed(Approach::Central, 2, shape, false));
+    assert!(
+        owned.admitted * 10 < nothing.admitted * 8,
+        "{owned:?} against {nothing:?}"
+    );
+    assert!(
+        owned.admitted > central.admitted,
+        "{owned:?} against {central:?}"
+    );
 }

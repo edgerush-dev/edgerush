@@ -1,13 +1,27 @@
 //! Ways of limiting one key across several pods.
 
-use crate::Contract;
+use crate::ownership::Ownership;
+use crate::{Contract, Message, Outbox};
 use edgerush_ratelimit::reference::{Model, TokenBucket};
 use std::num::NonZeroU64;
 
-/// The pods of a fleet limiting one key, however they share what they know.
+/// The pods of a fleet limiting one key, however they share what they know. A pod never
+/// waits on another: it decides at once, and what it learns from its peers comes later, in
+/// messages.
 pub trait Cluster {
     /// Decides a request arriving at `pod` at `now`: `true` admits it.
-    fn decide(&mut self, pod: usize, now: u64) -> bool;
+    fn decide(&mut self, pod: usize, now: u64, outbox: &mut Outbox) -> bool;
+
+    /// How often each pod's timer fires, if the pods have work to do in the background.
+    fn cycle(&self) -> Option<u64> {
+        None
+    }
+
+    /// `pod`'s timer fired at `now`.
+    fn on_timer(&mut self, _pod: usize, _now: u64, _outbox: &mut Outbox) {}
+
+    /// `message` reached `pod` at `now`.
+    fn on_message(&mut self, _pod: usize, _message: Message, _now: u64, _outbox: &mut Outbox) {}
 }
 
 /// How the pods limit a key between them.
@@ -23,6 +37,28 @@ pub enum Approach {
     /// burst rounded up): never far over the contract, at the price of refusing traffic
     /// that lands unevenly (06 §4).
     Split,
+    /// Gubernator's `GLOBAL` behaviour (06 §4): the first pod owns the key; every other pod
+    /// answers from a copy of the owner's bucket and, every `cycle` nanoseconds, sends the
+    /// owner the hits it admitted; the owner applies them, and every `cycle` sends its
+    /// bucket to every pod, which takes it over in place of its copy.
+    Ownership {
+        /// The time between a pod's reports, and between the owner's broadcasts.
+        cycle: u64,
+        /// What the owner does with hits that do not fit.
+        excess: Excess,
+    },
+}
+
+/// What the owner of a key does with reported hits that do not fit in its bucket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Excess {
+    /// Forgives them: the bucket is left empty, and refills from there (06 §4, Gubernator).
+    Drain,
+    /// Charges them all: the bucket owes them, and admits nothing until they are paid back.
+    Debt,
+    /// Charges them while what is owed would be paid back within this many nanoseconds,
+    /// and forgives the rest.
+    DebtUpTo(u64),
 }
 
 impl Approach {
@@ -44,6 +80,9 @@ impl Approach {
                 let share = || TokenBucket::new(contract.limit, window, burst);
                 Box::new(Pods((0..pods).map(|_| share()).collect()))
             }
+            Self::Ownership { cycle, excess } => {
+                Box::new(Ownership::new(contract, pods, *cycle, *excess))
+            }
         }
     }
 }
@@ -52,7 +91,7 @@ impl Approach {
 struct Pods(Vec<TokenBucket>);
 
 impl Cluster for Pods {
-    fn decide(&mut self, pod: usize, now: u64) -> bool {
+    fn decide(&mut self, pod: usize, now: u64, _: &mut Outbox) -> bool {
         let count = self.0.len();
         self.0[pod % count].decide(now)
     }
@@ -74,7 +113,9 @@ mod tests {
     }
 
     fn at_once(cluster: &mut dyn Cluster, pod: usize, count: u64) -> u64 {
-        (0..count).filter(|_| cluster.decide(pod, 0)).count() as u64
+        (0..count)
+            .filter(|_| cluster.decide(pod, 0, &mut Outbox::default()))
+            .count() as u64
     }
 
     #[test]
@@ -99,7 +140,7 @@ mod tests {
         let each: Vec<u64> = (0..4).map(|pod| at_once(&mut *cluster, pod, 30)).collect();
         assert_eq!(each, vec![6, 6, 6, 6]);
         // A share of the rate too: a quarter of 100 a second is one every 40 ms.
-        assert!(!cluster.decide(0, 39_999_999));
-        assert!(cluster.decide(0, 40_000_000));
+        assert!(!cluster.decide(0, 39_999_999, &mut Outbox::default()));
+        assert!(cluster.decide(0, 40_000_000, &mut Outbox::default()));
     }
 }

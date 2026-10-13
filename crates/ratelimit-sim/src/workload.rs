@@ -21,8 +21,9 @@ pub enum Shape {
         /// Requests a window, on average.
         per_window: u64,
     },
-    /// The same, all to the first pod: maximal skew, one client on a few long-lived
-    /// connections.
+    /// The same, all to the last pod: maximal skew, one client on a few long-lived
+    /// connections. The last, because a way of sharing that gives the first pod a part of
+    /// its own (an owner) must not be measured at its best.
     Skewed {
         /// Requests a window, on average.
         per_window: u64,
@@ -63,36 +64,23 @@ impl Workload {
         let pods = pods.max(1);
         let start = rng.below(window);
         let mut arrivals = Vec::new();
+        let span = start + self.span;
+        let last = Target::Only(pods - 1);
         match self.shape {
             Shape::Spread { per_window } => {
-                spread(
-                    &mut arrivals,
-                    rng,
-                    start,
-                    start + self.span,
-                    window,
-                    per_window,
-                    Some(pods),
-                );
+                let any = Target::Any(pods);
+                spread(&mut arrivals, rng, start, span, window, per_window, any);
             }
             Shape::Skewed { per_window } => {
-                spread(
-                    &mut arrivals,
-                    rng,
-                    start,
-                    start + self.span,
-                    window,
-                    per_window,
-                    None,
-                );
+                spread(&mut arrivals, rng, start, span, window, per_window, last);
             }
             Shape::Bursts { each } => {
-                bursts(&mut arrivals, start, start + self.span, window, each, pods);
+                bursts(&mut arrivals, start, span, window, each, pods);
             }
             Shape::SkewedThenBursts { per_window, each } => {
                 let middle = start + self.span / 2;
-                spread(&mut arrivals, rng, start, middle, window, per_window, None);
-                bursts(&mut arrivals, middle, start + self.span, window, each, pods);
+                spread(&mut arrivals, rng, start, middle, window, per_window, last);
+                bursts(&mut arrivals, middle, span, window, each, pods);
             }
         }
         if self.conforming {
@@ -104,9 +92,18 @@ impl Workload {
     }
 }
 
+/// Which pods traffic lands on.
+#[derive(Clone, Copy)]
+enum Target {
+    /// Any of the first this many, at random.
+    Any(usize),
+    /// Only this one.
+    Only(usize),
+}
+
 /// About `per_window` requests a window from `from` to `until`, each gap between half and
-/// one and a half times the mean, to a pod chosen at random among `pods`, or all to the
-/// first. Integers only, so that every machine draws the same traffic.
+/// one and a half times the mean, landing as `target` says. Integers only, so that every
+/// machine draws the same traffic.
 fn spread(
     arrivals: &mut Vec<Arrival>,
     rng: &mut Rng,
@@ -114,7 +111,7 @@ fn spread(
     until: u64,
     window: u64,
     per_window: u64,
-    pods: Option<usize>,
+    target: Target,
 ) {
     if per_window == 0 {
         return;
@@ -122,9 +119,10 @@ fn spread(
     let mean = (window / per_window).max(1);
     let mut at = from;
     while at < until {
-        let pod = pods.map_or(0, |pods| {
-            usize::try_from(rng.below(pods as u64)).unwrap_or(0)
-        });
+        let pod = match target {
+            Target::Any(pods) => usize::try_from(rng.below(pods as u64)).unwrap_or(0),
+            Target::Only(pod) => pod,
+        };
         arrivals.push(Arrival { at, pod });
         at += mean / 2 + rng.below(mean + 1);
     }
@@ -190,7 +188,7 @@ mod tests {
             4,
             &mut Rng::new(3),
         );
-        assert!(!arrivals.is_empty() && arrivals.iter().all(|a| a.pod == 0));
+        assert!(!arrivals.is_empty() && arrivals.iter().all(|a| a.pod == 3));
     }
 
     #[test]
