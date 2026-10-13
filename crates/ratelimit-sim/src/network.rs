@@ -40,6 +40,8 @@ pub enum Message {
     Hits {
         /// The pod that admitted them.
         from: usize,
+        /// Which life of that pod: a restart begins another (10 §2, identity safety).
+        instance: u64,
         /// The batch's number among the sender's batches, counted from 1.
         sequence: u64,
         /// How many.

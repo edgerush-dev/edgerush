@@ -80,6 +80,14 @@ pub enum Fault {
         /// The first pod of the side cut off from the first pod.
         split: usize,
     },
+    /// At `at` nanoseconds pod `pod` restarts: everything it held is gone, and it comes
+    /// back as another instance of itself.
+    Restart {
+        /// When.
+        at: u64,
+        /// Which pod.
+        pod: usize,
+    },
 }
 
 impl Fault {
@@ -111,6 +119,11 @@ pub enum FaultEvent {
     PartitionHeals {
         /// The first pod of the side that was cut off.
         split: usize,
+    },
+    /// A pod restarts.
+    Restart {
+        /// Which pod.
+        pod: usize,
     },
 }
 
@@ -165,6 +178,7 @@ fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> (Vec<(Arrival, bool)>,
             queue.push(from, Event::Fault(FaultEvent::PartitionStarts { split }));
             queue.push(until, Event::Fault(FaultEvent::PartitionHeals { split }));
         }
+        Fault::Restart { at, pod } => queue.push(at, Event::Fault(FaultEvent::Restart { pod })),
     }
     let cycle = cluster.cycle();
     if let Some(cycle) = cycle {
@@ -291,6 +305,7 @@ mod tests {
             if pod == 1 {
                 let hits = Message::Hits {
                     from: 1,
+                    instance: 0,
                     sequence: 0,
                     count: 0,
                 };

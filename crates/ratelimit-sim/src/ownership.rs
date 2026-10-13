@@ -22,6 +22,8 @@ const ACTIVE_CYCLES: u64 = 4;
 /// A fleet sharing one key by ownership.
 pub(crate) struct Ownership {
     sharing: Sharing,
+    /// A new bucket, full: what a pod comes back with from a restart.
+    fresh: TokenBucket,
     /// What a cycle refills, in requests, rounded down.
     refill: u64,
     pods: Vec<Pod>,
@@ -46,6 +48,9 @@ struct Owned {
     /// Hits its count holds: its own, and those reported to it, each once — and those it
     /// held on taking over.
     counted: u64,
+    /// For each pod: the latest of its instances heard from. A batch from an earlier one is
+    /// from a life that has ended, and is ignored.
+    instances: Vec<u64>,
 }
 
 impl Owned {
@@ -55,12 +60,15 @@ impl Owned {
             applied: vec![0; pods],
             waiting: vec![BTreeMap::new(); pods],
             counted: 0,
+            instances: vec![0; pods],
         }
     }
 }
 
 /// What one pod holds of the key.
 struct Pod {
+    /// Which life of the pod this is: a restart begins another.
+    instance: u64,
     /// The pod it takes to own the key.
     owner: usize,
     /// Its own bucket while it owns the key; otherwise its view, answered from at once.
@@ -89,6 +97,7 @@ impl Ownership {
         let pods = pods.max(1);
         let cycle = sharing.cycle.max(1);
         let pod = || Pod {
+            instance: 0,
             owner: OWNER,
             bucket: TokenBucket::new(contract.limit, contract.window, contract.burst),
             unsent: 0,
@@ -104,6 +113,7 @@ impl Ownership {
             / u128::from(contract.window.get());
         Self {
             sharing: Sharing { cycle, ..sharing },
+            fresh: TokenBucket::new(contract.limit, contract.window, contract.burst),
             refill: u64::try_from(refill).unwrap_or(u64::MAX),
             pods: (0..pods).map(|_| pod()).collect(),
             owned: vec![Owned::new(pods); pods],
@@ -196,29 +206,67 @@ impl Ownership {
             at.changed = true;
             at.owner = new;
         }
-        for &pod in group.iter().filter(|pod| **pod != new && self.alive[**pod]) {
-            let at = &mut self.pods[pod];
-            if at.owner == new {
-                continue;
+        let followers: Vec<usize> = group
+            .iter()
+            .copied()
+            .filter(|pod| *pod != new && self.alive[*pod] && self.pods[*pod].owner != new)
+            .collect();
+        for pod in followers {
+            self.follow(pod, new, now, outbox);
+        }
+    }
+
+    /// `pod` takes `owner` to own the key, as a new owner or one that has restarted: it
+    /// numbers its batches afresh, and drops or sends again those not yet seen applied.
+    fn follow(&mut self, pod: usize, owner: usize, now: u64, outbox: &mut Outbox) {
+        let at = &mut self.pods[pod];
+        at.owner = owner;
+        at.sent = 0;
+        // Numbered afresh, so an owner this pod had before forgets its old numbers, or it
+        // would take the new batches for ones it had applied.
+        self.owned[owner].applied[pod] = 0;
+        self.owned[owner].waiting[pod].clear();
+        let batches: Vec<(u64, u64, u64)> = at.unacknowledged.drain(..).collect();
+        if self.sharing.on_owner_change == OnOwnerChange::SendAgain {
+            for (_, count, _) in batches {
+                at.sent += 1;
+                let hits = Message::Hits {
+                    from: pod,
+                    instance: at.instance,
+                    sequence: at.sent,
+                    count,
+                };
+                outbox.send(owner, hits);
+                at.unacknowledged.push_back((at.sent, count, now));
             }
-            at.owner = new;
-            at.sent = 0;
-            // Numbered afresh, so an owner this pod had before forgets its old numbers, or
-            // it would take the new batches for ones it had applied.
-            self.owned[new].applied[pod] = 0;
-            self.owned[new].waiting[pod].clear();
-            let batches: Vec<(u64, u64, u64)> = at.unacknowledged.drain(..).collect();
-            if self.sharing.on_owner_change == OnOwnerChange::SendAgain {
-                for (_, count, _) in batches {
-                    at.sent += 1;
-                    let hits = Message::Hits {
-                        from: pod,
-                        sequence: at.sent,
-                        count,
-                    };
-                    outbox.send(new, hits);
-                    at.unacknowledged.push_back((at.sent, count, now));
-                }
+        }
+    }
+
+    /// `pod` restarts: it comes back as another instance, holding nothing — a full view,
+    /// no hits unsent or unacknowledged. If it owned the key it owns it still, from
+    /// nothing, and the pods that took it as owner number their batches afresh for it.
+    fn restart(&mut self, pod: usize, now: u64, outbox: &mut Outbox) {
+        let pods = self.pods.len();
+        let fresh = self.fresh.clone();
+        let at = &mut self.pods[pod];
+        at.instance += 1;
+        at.bucket = fresh;
+        at.unsent = 0;
+        at.sent = 0;
+        at.unacknowledged.clear();
+        at.spent = 0;
+        at.allowance = None;
+        at.active = vec![false; pods];
+        at.counted = 0;
+        at.changed = false;
+        if at.owner == pod {
+            at.changed = true;
+            self.owned[pod] = Owned::new(pods);
+            let followers: Vec<usize> = (0..pods)
+                .filter(|f| *f != pod && self.alive[*f] && self.pods[*f].owner == pod)
+                .collect();
+            for follower in followers {
+                self.follow(follower, pod, now, outbox);
             }
         }
     }
@@ -274,6 +322,7 @@ impl Cluster for Ownership {
                     *sent = now;
                     let again = Message::Hits {
                         from: pod,
+                        instance: at.instance,
                         sequence: *sequence,
                         count: *count,
                     };
@@ -284,6 +333,7 @@ impl Cluster for Ownership {
                 at.sent += 1;
                 let hits = Message::Hits {
                     from: pod,
+                    instance: at.instance,
                     sequence: at.sent,
                     count: at.unsent,
                 };
@@ -316,10 +366,22 @@ impl Cluster for Ownership {
             // Only a pod that takes itself to own the key applies hits.
             Message::Hits {
                 from,
+                instance,
                 sequence,
                 count,
             } if self.pods[pod].owner == pod => {
-                self.owned[pod].last_admitted[from] = Some(now);
+                let owned = &mut self.owned[pod];
+                // A batch from a life of the pod that has ended is ignored; the first from a
+                // new one starts its numbering again (10 §2, identity safety).
+                if instance < owned.instances[from] {
+                    return;
+                }
+                if instance > owned.instances[from] {
+                    owned.instances[from] = instance;
+                    owned.applied[from] = 0;
+                    owned.waiting[from].clear();
+                }
+                owned.last_admitted[from] = Some(now);
                 if !self.sharing.ledger {
                     self.apply(pod, count, now);
                     return;
@@ -395,6 +457,10 @@ impl Cluster for Ownership {
                 let owner = self.main_owner();
                 self.change_owner(&side, owner, now, outbox);
             }
+            FaultEvent::Restart { pod } if pod < pods && self.alive[pod] => {
+                self.restart(pod, now, outbox);
+            }
+            FaultEvent::Restart { .. } => {}
         }
     }
 
@@ -945,5 +1011,56 @@ mod tests {
             5,
             "two before, three after"
         );
+    }
+
+    /// Pod 2 restarts with its old life's second batch still on its way: the owner ignores
+    /// it, though its number is above any the new life has sent, and takes the new life's
+    /// first batch as its first.
+    #[test]
+    fn a_batch_from_a_life_that_has_ended_is_ignored() {
+        let mut fleet = ledger(3);
+        let mut outbox = Outbox::default();
+        admits(&mut fleet, 2, 1, 0);
+        fleet.on_timer(2, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        admits(&mut fleet, 2, 4, 0);
+        fleet.on_timer(2, 0, &mut outbox);
+        let old = outbox.sent.remove(0);
+        fleet.on_fault(FaultEvent::Restart { pod: 2 }, 0, &mut outbox);
+        assert_eq!(
+            fleet.pods[2].bucket.remaining(0),
+            10,
+            "it comes back with nothing"
+        );
+        admits(&mut fleet, 2, 3, 0);
+        fleet.on_timer(2, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        fleet.on_message(old.0, old.1, 0, &mut outbox);
+        assert_eq!(
+            fleet.pods[OWNER].bucket.remaining(0),
+            6,
+            "one and three, not the four"
+        );
+        assert_eq!(fleet.unapplied(), 4, "the old life's four are lost");
+    }
+
+    /// The owner restarts: it owns the key still, from nothing, and the other pods number
+    /// their batches afresh for it.
+    #[test]
+    fn an_owner_that_restarts_starts_from_nothing() {
+        let mut fleet = ledger(3);
+        let mut outbox = Outbox::default();
+        admits(&mut fleet, OWNER, 6, 0);
+        admits(&mut fleet, 1, 2, 0);
+        fleet.on_timer(1, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        fleet.on_fault(FaultEvent::Restart { pod: OWNER }, 0, &mut outbox);
+        assert_eq!(fleet.pods[OWNER].bucket.remaining(0), 10);
+        assert_eq!((fleet.pods[1].owner, fleet.pods[1].sent), (OWNER, 0));
+        admits(&mut fleet, 1, 1, 0);
+        fleet.on_timer(1, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        assert_eq!(fleet.pods[OWNER].bucket.remaining(0), 9);
+        assert_eq!(fleet.unapplied(), 8, "the count from before is gone");
     }
 }

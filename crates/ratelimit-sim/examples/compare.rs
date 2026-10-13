@@ -54,6 +54,7 @@ fn main() {
         .unwrap_or(0);
     // `owner-lost`: the pod owning the key goes away half way through each run.
     // `partition`: half the pods are cut off from the others from 3 s to 7 s.
+    // `restart`, `owner-restart`: the last pod, or the owner, restarts half way through.
     let fault_name = std::env::args().nth(3).unwrap_or_default();
     let fault = |pods: usize| match fault_name.as_str() {
         "owner-lost" => Fault::OwnerLost { at: 5 * SECOND },
@@ -61,6 +62,14 @@ fn main() {
             from: 3 * SECOND,
             until: 7 * SECOND,
             split: pods / 2,
+        },
+        "restart" => Fault::Restart {
+            at: 5 * SECOND,
+            pod: pods - 1,
+        },
+        "owner-restart" => Fault::Restart {
+            at: 5 * SECOND,
+            pod: 0,
         },
         _ => Fault::None,
     };

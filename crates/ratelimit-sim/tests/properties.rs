@@ -354,3 +354,38 @@ fn a_partition_doubles_the_contract_while_it_lasts_and_leaves_nothing_owed() {
         "what one side counted alone"
     );
 }
+
+fn restarted(pod: usize) -> Run {
+    Run {
+        approach: Approach::Ownership(Sharing {
+            cycle: 10_000_000,
+            excess: Excess::DebtUpTo(SECOND),
+            ledger: true,
+            bound: Bound::Every,
+            on_owner_change: OnOwnerChange::SendAgain,
+        }),
+        fault: Fault::Restart {
+            at: 5 * SECOND,
+            pod,
+        },
+        ..fixed(
+            Approach::Central,
+            4,
+            Shape::Spread { per_window: 300 },
+            false,
+        )
+    }
+}
+
+/// A pod restarting half way through under steady overload loses at most what it had not
+/// yet seen applied, a few cycles of its hits, and lets through at most its full view more
+/// than the contract; the owner restarting forgets the whole count, and lets through at
+/// most a bucket more.
+#[test]
+fn a_restart_costs_at_most_a_bucket() {
+    let pod = run(&restarted(3));
+    assert!(pod.lost <= 20, "{pod:?}");
+    assert!(pod.worst_excess <= 100, "{pod:?}");
+    let owner = run(&restarted(0));
+    assert!(owner.worst_excess <= 110, "{owner:?}");
+}
