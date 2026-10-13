@@ -37,6 +37,11 @@ pub trait Cluster {
         None
     }
 
+    /// Nodes beyond the `pods` that take traffic which have timers too: a service's own pods.
+    fn helpers(&self) -> usize {
+        0
+    }
+
     /// `pod`'s timer fired at `now`.
     fn on_timer(&mut self, _pod: usize, _now: u64, _outbox: &mut Outbox) {}
 
@@ -101,6 +106,23 @@ pub struct Serving {
     /// the owner, which decides them against the one bucket (06 §4), rather than being
     /// decided from a full bucket.
     pub ask_when_cold: bool,
+    /// How the owning service pod keeps a secondary's copy of what it holds, so that the
+    /// secondary can take over from it.
+    pub replicate: Replicate,
+}
+
+/// How the service pod owning a key keeps a copy of its state on a secondary, the next
+/// service pod, which owns the key should the owner go or restart; a new secondary is then
+/// the next after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Replicate {
+    /// No copy: the next service pod starts from a full bucket, and an owner that restarts
+    /// owns the key still, from nothing.
+    None,
+    /// Every cycle, if anything changed: a takeover loses up to a cycle.
+    EveryCycle,
+    /// With every change, before the next is made: a takeover loses what was on its way.
+    EveryChange,
 }
 
 /// How pods share a key by per-pod counters.

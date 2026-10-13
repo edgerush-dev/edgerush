@@ -5,9 +5,10 @@
 //! Every cycle it sends the owner the hits it admitted or, with none to send while the key
 //! is in use, asks for a copy; the owner applies hits in order, once each, and answers
 //! every message with its bucket as it stands. As a setting, requests for a key a data plane
-//! holds no fresh copy of wait while it asks the owner, which decides them (06 §4).
+//! holds no fresh copy of wait while it asks the owner, which decides them (06 §4); and the
+//! owner can keep a copy of what it holds on a secondary, which takes over should it go.
 
-use crate::{Bound, Cluster, Contract, Excess, FaultEvent, Message, Outbox, Serving};
+use crate::{Bound, Cluster, Contract, Excess, FaultEvent, Message, Outbox, Replicate, Serving};
 use edgerush_ratelimit::reference::{Model, TokenBucket};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -41,6 +42,10 @@ pub(crate) struct Service {
     serving_pods: Vec<bool>,
     /// The service pod that owns the key, as every data plane knows it.
     owner: usize,
+    /// The service pod keeping a copy of the owner's state, if it replicates.
+    secondary: Option<usize>,
+    /// Whether the owner's state changed since it last sent its secondary a copy.
+    changed: bool,
     /// Hits admitted anywhere.
     admitted: u64,
     /// Decisions made for requests that waited, not yet taken.
@@ -58,6 +63,8 @@ struct Plane {
     unsent: u64,
     /// Batches sent to the present owner so far.
     sent: u64,
+    /// The highest of them the owner has been seen to apply.
+    seen: u64,
     /// Batches sent and not yet seen applied, as `(sequence, count, first sent, last
     /// sent)`.
     unacknowledged: VecDeque<(u64, u64, u64, u64)>,
@@ -135,6 +142,7 @@ impl Service {
             bucket: fresh.clone(),
             unsent: 0,
             sent: 0,
+            seen: 0,
             unacknowledged: VecDeque::new(),
             spent: 0,
             allowance: None,
@@ -163,6 +171,8 @@ impl Service {
                 .collect(),
             serving_pods: vec![true; SERVICE_PODS],
             owner: 0,
+            secondary: (serving.replicate != Replicate::None).then_some(1),
+            changed: false,
             fresh,
             admitted: 0,
             decided: Vec::new(),
@@ -250,6 +260,47 @@ impl Service {
         admitted
     }
 
+    /// The owner's state changed: its secondary gets a copy now, or with the next cycle.
+    fn owner_changed(&mut self, outbox: &mut Outbox) {
+        match self.serving.replicate {
+            Replicate::None => {}
+            Replicate::EveryCycle => self.changed = true,
+            Replicate::EveryChange => self.replicate(outbox),
+        }
+    }
+
+    /// The owner sends its secondary a copy of what it holds of the key.
+    fn replicate(&mut self, outbox: &mut Outbox) {
+        self.changed = false;
+        let Some(secondary) = self.secondary else {
+            return;
+        };
+        let owner = &self.owners[self.owner];
+        let replica = Message::Replica {
+            from: self.address(self.owner),
+            bucket: owner.bucket.clone(),
+            applied: owner.applied.clone(),
+            counted: owner.counted,
+            instances: owner.instances.clone(),
+            last_admitted: owner.last_admitted.clone(),
+        };
+        outbox.send(self.address(secondary), replica);
+    }
+
+    /// The secondary takes over: it owns the key from the copy it holds, and the next
+    /// service pod still there after it becomes the secondary, sent a copy at once.
+    fn take_over(&mut self, now: u64, outbox: &mut Outbox) {
+        let Some(secondary) = self.secondary else {
+            return;
+        };
+        self.owner = secondary;
+        self.secondary = (1..SERVICE_PODS)
+            .map(|step| (secondary + step) % SERVICE_PODS)
+            .find(|pod| self.serving_pods[*pod]);
+        self.follow(true, false, now, outbox);
+        self.replicate(outbox);
+    }
+
     /// `plane` asks the owner about the requests in `asked`, from `now`.
     fn ask(&mut self, plane: usize, now: u64, outbox: &mut Outbox) {
         let to = self.address(self.owner);
@@ -270,7 +321,9 @@ impl Service {
     /// again about requests still waiting, as the old one will not answer; one that has
     /// restarted is not, as an ask on its way may still reach it — and one that does not is
     /// given up after four cycles.
-    fn follow(&mut self, moved: bool, now: u64, outbox: &mut Outbox) {
+    /// A new owner taking over from a copy knows the batches applied as the old one did:
+    /// they are sent again as they were numbered, and those it has applied are ignored.
+    fn follow(&mut self, moved: bool, renumber: bool, now: u64, outbox: &mut Outbox) {
         let to = self.address(self.owner);
         for plane in 0..self.planes.len() {
             if moved {
@@ -284,16 +337,22 @@ impl Service {
             if !self.alive[plane] {
                 continue;
             }
-            at.sent = 0;
+            if renumber {
+                at.sent = 0;
+                at.seen = 0;
+            }
             for (sequence, count, _, last) in &mut at.unacknowledged {
-                at.sent += 1;
-                *sequence = at.sent;
+                if renumber {
+                    at.sent += 1;
+                    *sequence = at.sent;
+                }
                 *last = now;
                 let hits = Message::Hits {
                     from: plane,
                     instance: at.instance,
-                    sequence: at.sent,
+                    sequence: *sequence,
                     count: *count,
+                    seen: at.seen,
                 };
                 outbox.send(to, hits);
             }
@@ -322,18 +381,49 @@ impl Service {
         if !self.serving_pods[pod] {
             return;
         }
+        if let Message::Replica {
+            bucket,
+            applied,
+            counted,
+            instances,
+            last_admitted,
+            ..
+        } = message
+        {
+            if self.secondary == Some(pod) {
+                let copy = &mut self.owners[pod];
+                copy.bucket = bucket;
+                copy.applied = applied;
+                copy.counted = counted;
+                copy.instances = instances;
+                copy.last_admitted = last_admitted;
+                copy.waiting.iter_mut().for_each(BTreeMap::clear);
+            }
+            return;
+        }
+        // Only the owner: one restarted and taken over from hears from data planes late.
+        if pod != self.owner {
+            return;
+        }
         match message {
             Message::Hits {
                 from,
                 instance,
                 sequence,
                 count,
+                seen,
             } if from < self.planes.len() => {
                 if !self.current_life(pod, from, instance) {
                     return;
                 }
                 let owner = &mut self.owners[pod];
                 owner.last_admitted[from] = Some(now);
+                // Taken over from a copy that had not caught up: batches the data plane saw
+                // applied and will not send again are skipped, their hits lost to the count.
+                if seen > owner.applied[from] {
+                    owner.applied[from] = seen;
+                    owner.waiting[from].retain(|sequence, _| *sequence > seen);
+                }
                 // In order, once each: a batch already applied is ignored, and one that came
                 // ahead of a missing one waits for it. Either way the answer goes back, so
                 // that a data plane whose earlier answer was lost learns what is applied.
@@ -348,6 +438,7 @@ impl Service {
                     self.owners[pod].applied[from] = next;
                     self.apply(pod, count, now);
                 }
+                self.owner_changed(outbox);
                 self.answer(pod, from, None, outbox);
             }
             Message::Ask {
@@ -357,6 +448,7 @@ impl Service {
                 count,
             } if from < self.planes.len() && self.current_life(pod, from, instance) => {
                 let admitted = self.decide_asked(pod, from, count, now);
+                self.owner_changed(outbox);
                 self.answer(pod, from, Some((sequence, admitted)), outbox);
             }
             Message::Poll { from, instance }
@@ -392,7 +484,10 @@ impl Service {
         at.active = active;
         // The owner's bucket, plus what this data plane admitted that it has not seen:
         // batches the answer's applied mark does not cover, and hits unsent.
-        let seen = applied.get(plane).copied().unwrap_or(0);
+        // No more of this life's batches can have been applied than it has sent: a higher
+        // mark is from an earlier life's answer, arriving late.
+        let seen = applied.get(plane).copied().unwrap_or(0).min(at.sent);
+        at.seen = at.seen.max(seen);
         at.unacknowledged
             .retain(|(sequence, _, _, _)| *sequence > seen);
         let unseen: u64 = at.unacknowledged.iter().map(|(_, count, _, _)| count).sum();
@@ -434,6 +529,7 @@ impl Service {
         at.bucket = self.fresh.clone();
         at.unsent = 0;
         at.sent = 0;
+        at.seen = 0;
         at.unacknowledged.clear();
         at.spent = 0;
         at.allowance = None;
@@ -496,9 +592,22 @@ impl Cluster for Service {
         Some(self.serving.cycle)
     }
 
-    /// Only data planes have timers: the service only answers.
+    fn helpers(&self) -> usize {
+        SERVICE_PODS
+    }
+
+    /// A service pod's timer: the owner sends its secondary a copy, if it replicates every
+    /// cycle and anything changed.
     fn on_timer(&mut self, plane: usize, now: u64, outbox: &mut Outbox) {
-        if plane >= self.planes.len() || !self.alive[plane] {
+        if plane >= self.planes.len() {
+            let pod = plane - self.planes.len();
+            if pod == self.owner && self.changed && self.serving.replicate == Replicate::EveryCycle
+            {
+                self.replicate(outbox);
+            }
+            return;
+        }
+        if !self.alive[plane] {
             return;
         }
         let allowance = self.allowance(plane, now);
@@ -540,6 +649,7 @@ impl Cluster for Service {
                     instance: at.instance,
                     sequence: *sequence,
                     count: *count,
+                    seen: at.seen,
                 };
                 outbox.send(to, again);
                 asked = true;
@@ -552,6 +662,7 @@ impl Cluster for Service {
                 instance: at.instance,
                 sequence: at.sent,
                 count: at.unsent,
+                seen: at.seen,
             };
             outbox.send(to, hits);
             at.unacknowledged.push_back((at.sent, at.unsent, now, now));
@@ -582,17 +693,25 @@ impl Cluster for Service {
         match event {
             // The service pod owning the key goes for good: the key's hash leads to the next,
             // which starts from a full bucket.
+            // With a secondary, it takes over from its copy.
             FaultEvent::OwnerLost => {
                 self.serving_pods[self.owner] = false;
-                if let Some(next) = (0..SERVICE_PODS).find(|pod| self.serving_pods[*pod]) {
+                if self.secondary.is_some() {
+                    self.take_over(now, outbox);
+                } else if let Some(next) = (0..SERVICE_PODS).find(|pod| self.serving_pods[*pod]) {
                     self.owner = next;
-                    self.follow(true, now, outbox);
+                    self.follow(true, true, now, outbox);
                 }
             }
-            // It restarts, holding nothing.
+            // It restarts, holding nothing: with a secondary, the secondary takes over;
+            // without, it owns the key still, from nothing.
             FaultEvent::OwnerRestarts => {
                 self.owners[self.owner] = Owner::new(&self.fresh, self.planes.len());
-                self.follow(false, now, outbox);
+                if self.secondary.is_some() {
+                    self.take_over(now, outbox);
+                } else {
+                    self.follow(false, true, now, outbox);
+                }
             }
             // Nothing to elect: data planes cut off from the service go on from their copies,
             // and their messages are lost until it heals.
@@ -635,8 +754,17 @@ mod tests {
             excess: Excess::DebtUpTo(100 * MS),
             bound,
             ask_when_cold: false,
+            replicate: Replicate::None,
         };
         Service::new(&contract, planes, serving)
+    }
+
+    /// A fleet whose owning service pod keeps a copy on a secondary.
+    fn replicated(planes: usize, replicate: Replicate) -> Service {
+        let mut fleet = fleet(planes, Bound::Unbounded);
+        fleet.serving.replicate = replicate;
+        fleet.secondary = Some(1);
+        fleet
     }
 
     /// A fleet whose data planes ask the owner about keys they hold no fresh copy of.
@@ -1119,6 +1247,213 @@ mod tests {
                 "{event:?}: decided once"
             );
         }
+    }
+
+    /// Replicating every cycle, the owner sends its secondary a copy on its timer when
+    /// anything changed, and nothing when nothing did; no other service pod sends one.
+    #[test]
+    fn every_cycle_the_owner_sends_its_secondary_a_copy_of_what_changed() {
+        let mut fleet = replicated(2, Replicate::EveryCycle);
+        let mut outbox = Outbox::default();
+        admits(&mut fleet, 1, 4, 0);
+        fleet.on_timer(1, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        assert_eq!(fleet.owners[1].counted, 0, "not yet");
+        let (owner, other) = (fleet.address(0), fleet.address(1));
+        fleet.on_timer(other, 10 * MS, &mut outbox);
+        assert!(outbox.sent.is_empty(), "only the owner replicates");
+        fleet.on_timer(owner, 10 * MS, &mut outbox);
+        assert!(
+            matches!(outbox.sent.as_slice(), [(to, Message::Replica { .. })] if *to == other),
+            "{:?}",
+            outbox.sent
+        );
+        deliver(&mut fleet, &mut outbox, 10 * MS);
+        assert_eq!(fleet.owners[1].counted, 4);
+        assert_eq!(fleet.owners[1].bucket, fleet.owners[0].bucket);
+        assert_eq!(fleet.owners[1].applied, fleet.owners[0].applied);
+        fleet.on_timer(owner, 20 * MS, &mut outbox);
+        assert!(outbox.sent.is_empty(), "nothing changed since");
+    }
+
+    /// Replicating with every change, the secondary holds each as it is made.
+    #[test]
+    fn with_every_change_the_secondary_holds_each_as_it_is_made() {
+        let mut fleet = replicated(2, Replicate::EveryChange);
+        let mut outbox = Outbox::default();
+        admits(&mut fleet, 1, 4, 0);
+        fleet.on_timer(1, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        assert_eq!(fleet.owners[1].counted, 4);
+    }
+
+    /// The owner goes or restarts: the secondary takes over from its copy, the next service
+    /// pod becomes the secondary, batches not seen applied are sent again as numbered, and
+    /// none is counted twice; one that restarted hears from data planes no more.
+    #[test]
+    fn the_secondary_takes_over_from_its_copy() {
+        for event in [FaultEvent::OwnerLost, FaultEvent::OwnerRestarts] {
+            let mut fleet = replicated(2, Replicate::EveryChange);
+            let mut outbox = Outbox::default();
+            admits(&mut fleet, 1, 4, 0);
+            fleet.on_timer(1, 0, &mut outbox);
+            deliver(&mut fleet, &mut outbox, 0);
+            admits(&mut fleet, 1, 2, 0);
+            fleet.on_timer(1, 0, &mut outbox);
+            let late = std::mem::take(&mut outbox.sent);
+            fleet.on_fault(event, 0, &mut outbox);
+            assert_eq!((fleet.owner, fleet.secondary), (1, Some(2)), "{event:?}");
+            assert!(
+                outbox.sent.iter().any(|(_, m)| matches!(
+                    m,
+                    Message::Hits {
+                        sequence: 2,
+                        count: 2,
+                        ..
+                    }
+                )),
+                "{event:?}: sent again as numbered: {:?}",
+                outbox.sent
+            );
+            deliver(&mut fleet, &mut outbox, 0);
+            assert_eq!(fleet.owners[1].counted, 6, "{event:?}");
+            assert_eq!(fleet.owners[1].bucket.remaining(0), 4, "{event:?}");
+            assert_eq!(
+                fleet.owners[2].counted, 6,
+                "{event:?}: the new secondary's copy"
+            );
+            let before = fleet.owners[0].counted;
+            for (to, message) in late {
+                fleet.on_message(to, message, 0, &mut outbox);
+            }
+            assert!(
+                outbox.sent.is_empty(),
+                "{event:?}: the old owner answers nothing"
+            );
+            assert_eq!(
+                fleet.owners[0].counted, before,
+                "{event:?}: the old owner applies nothing"
+            );
+            assert_eq!(fleet.owners[1].counted, 6, "{event:?}: nothing twice");
+            assert_eq!(
+                (fleet.unapplied(), fleet.counted_twice()),
+                (0, 0),
+                "{event:?}"
+            );
+        }
+    }
+
+    /// An answer from before a data plane restarted, arriving after, tells of batches of
+    /// its earlier life: the new life sees none of them applied, and its own are applied.
+    #[test]
+    fn an_answer_from_an_earlier_life_does_not_mark_batches_seen() {
+        let mut fleet = fleet(2, Bound::Unbounded);
+        let mut outbox = Outbox::default();
+        for batch in 0..3 {
+            admits(&mut fleet, 1, 1, 0);
+            fleet.on_timer(1, batch * 10 * MS, &mut outbox);
+        }
+        let mut answers = Outbox::default();
+        for (to, message) in std::mem::take(&mut outbox.sent) {
+            fleet.on_message(to, message, 0, &mut answers);
+        }
+        fleet.on_fault(FaultEvent::Restart { pod: 1 }, 0, &mut outbox);
+        deliver(&mut fleet, &mut answers, 0);
+        assert_eq!(fleet.planes[1].seen, 0, "nothing of this life applied");
+        admits(&mut fleet, 1, 2, 0);
+        fleet.on_timer(1, 40 * MS, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 40 * MS);
+        assert_eq!(fleet.owners[0].counted, 5, "three, and the new life's two");
+    }
+
+    /// The secondary takes over from a copy older than what a data plane saw applied: it
+    /// skips the batches the data plane will not send again, losing their hits, rather than
+    /// wait for them and hold back every batch after.
+    #[test]
+    fn a_new_owner_skips_the_batches_its_copy_missed() {
+        let mut fleet = replicated(2, Replicate::EveryCycle);
+        let mut outbox = Outbox::default();
+        admits(&mut fleet, 1, 4, 0);
+        fleet.on_timer(1, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        assert_eq!(fleet.planes[1].seen, 1);
+        fleet.on_fault(FaultEvent::OwnerLost, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        admits(&mut fleet, 1, 2, 0);
+        fleet.on_timer(1, 10 * MS, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 10 * MS);
+        assert_eq!(fleet.owners[1].counted, 2, "the second batch applied");
+        assert_eq!(fleet.unapplied(), 4, "the first lost with the old owner");
+        assert!(fleet.planes[1].unacknowledged.is_empty());
+    }
+
+    /// Replicating every cycle, the new secondary gets a copy as the takeover happens, not
+    /// a cycle later.
+    #[test]
+    fn a_new_secondary_gets_a_copy_at_once() {
+        let mut fleet = replicated(2, Replicate::EveryCycle);
+        let mut outbox = Outbox::default();
+        admits(&mut fleet, 1, 4, 0);
+        fleet.on_timer(1, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        let owner = fleet.address(0);
+        fleet.on_timer(owner, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        fleet.on_fault(FaultEvent::OwnerLost, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        assert_eq!(fleet.owners[2].counted, 4);
+    }
+
+    /// A copy on its way from an owner that has since been taken over from does not
+    /// overwrite what the new owner holds.
+    #[test]
+    fn a_late_copy_is_ignored_by_the_owner_it_reaches() {
+        let mut fleet = replicated(2, Replicate::EveryChange);
+        let mut outbox = Outbox::default();
+        admits(&mut fleet, 1, 4, 0);
+        fleet.on_timer(1, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        admits(&mut fleet, 1, 3, 0);
+        fleet.on_timer(1, 0, &mut outbox);
+        let mut copies = Outbox::default();
+        for (to, message) in std::mem::take(&mut outbox.sent) {
+            fleet.on_message(to, message, 0, &mut copies);
+        }
+        let late: Vec<(usize, Message)> = copies
+            .sent
+            .into_iter()
+            .filter(|(_, m)| matches!(m, Message::Replica { .. }))
+            .collect();
+        assert_eq!(late.len(), 1);
+        fleet.on_fault(FaultEvent::OwnerLost, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        let held = fleet.owners[1].counted;
+        let late_copy = Message::Replica {
+            from: fleet.address(0),
+            bucket: fleet.fresh.clone(),
+            applied: vec![0, 0],
+            counted: 0,
+            instances: vec![0, 0],
+            last_admitted: vec![None, None],
+        };
+        fleet.on_message(fleet.address(1), late_copy, 0, &mut outbox);
+        assert_eq!(fleet.owners[1].counted, held, "still what it held");
+    }
+
+    /// The owner lost twice: the third service pod owns the key, and with no other left
+    /// there is no secondary, and no copy goes to one that has gone.
+    #[test]
+    fn with_no_service_pod_left_there_is_no_secondary() {
+        let mut fleet = replicated(2, Replicate::EveryChange);
+        let mut outbox = Outbox::default();
+        fleet.on_fault(FaultEvent::OwnerLost, 0, &mut outbox);
+        fleet.on_fault(FaultEvent::OwnerLost, 0, &mut outbox);
+        assert_eq!((fleet.owner, fleet.secondary), (2, None));
+        outbox.sent.clear();
+        admits(&mut fleet, 1, 2, 0);
+        fleet.on_timer(1, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        assert_eq!(fleet.owners[2].counted, 2);
     }
 
     /// Data planes never talk to each other: every message goes to the service, and every

@@ -4,11 +4,15 @@
 //! counters, and a rate-limiting service of its own.
 //!
 //! `cargo run --release -p edgerush-ratelimit-sim --example compare [seeds] [lost in 1,000]
-//! [none|owner-lost|partition|restart|owner-restart] [delay in µs] [pods, as 2,4,8]`
+//! [none|owner-lost|partition|restart|owner-restart] [delay in µs] [pods, as 2,4,8]
+//! [contract, as limit/window in ms/burst]`
+//!
+//! The workloads scale with the contract — its limit a window, three times it, its whole
+//! bucket at once — and a run lasts ten windows.
 
 use edgerush_ratelimit_sim::{
-    Approach, Bound, Contract, Counting, Excess, Fault, Network, OnOwnerChange, Run, Serving,
-    Shape, Sharing, Workload, run,
+    Approach, Bound, Contract, Counting, Excess, Fault, Network, OnOwnerChange, Replicate, Run,
+    Serving, Shape, Sharing, Workload, run,
 };
 use std::num::NonZeroU64;
 
@@ -54,6 +58,24 @@ fn main() {
         .nth(2)
         .and_then(|arg| arg.parse().ok())
         .unwrap_or(0);
+    let n = |n: u64| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN);
+    let terms: Vec<u64> = std::env::args()
+        .nth(6)
+        .map(|arg| arg.split('/').filter_map(|n| n.parse().ok()).collect())
+        .unwrap_or_default();
+    let (limit, window_ms, burst) = match terms.as_slice() {
+        [limit, window, burst] => (*limit, *window, *burst),
+        _ => (100, 1_000, 100),
+    };
+    let contract = Contract {
+        limit: n(limit),
+        window: n(window_ms * MS),
+        burst: n(burst),
+    };
+    // Ten windows a run; faults strike at its middle, a partition from 3 to 7 tenths.
+    let span = 10 * contract.window.get();
+    // Debt is owed up to one bucket's refill time.
+    let cap = burst * contract.window.get() / limit.max(1);
     // `owner-lost`: the pod owning the key goes away half way through each run; with
     // counters, which have no owner, the first pod.
     // `partition`: half the pods are cut off from the others from 3 s to 7 s.
@@ -61,17 +83,17 @@ fn main() {
     // with counters the first pod, with the service the service pod owning the key.
     let fault_name = std::env::args().nth(3).unwrap_or_default();
     let fault = |pods: usize| match fault_name.as_str() {
-        "owner-lost" => Fault::OwnerLost { at: 5 * SECOND },
+        "owner-lost" => Fault::OwnerLost { at: span / 2 },
         "partition" => Fault::Partition {
-            from: 3 * SECOND,
-            until: 7 * SECOND,
+            from: span * 3 / 10,
+            until: span * 7 / 10,
             split: pods / 2,
         },
         "restart" => Fault::Restart {
-            at: 5 * SECOND,
+            at: span / 2,
             pod: pods - 1,
         },
-        "owner-restart" => Fault::OwnerRestart { at: 5 * SECOND },
+        "owner-restart" => Fault::OwnerRestart { at: span / 2 },
         _ => Fault::None,
     };
     // How long a message takes, give or take half as much again.
@@ -79,12 +101,7 @@ fn main() {
         .nth(4)
         .and_then(|arg| arg.parse().ok())
         .unwrap_or(1_000);
-    let n = |n: u64| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN);
-    let contract = Contract {
-        limit: n(100),
-        window: n(SECOND),
-        burst: n(100),
-    };
+
     let network = Network {
         loss_per_mille,
         ..Network::reliable(delay_us * 1_000, delay_us * 500)
@@ -99,29 +116,29 @@ fn main() {
         ("ownership, debt, 10 ms", owned(10 * MS, Excess::Debt)),
         (
             "ownership, debt up to 1 s, 100 ms",
-            owned(100 * MS, Excess::DebtUpTo(SECOND)),
+            owned(100 * MS, Excess::DebtUpTo(cap)),
         ),
         (
             "ownership, debt up to 1 s, 10 ms",
-            owned(10 * MS, Excess::DebtUpTo(SECOND)),
+            owned(10 * MS, Excess::DebtUpTo(cap)),
         ),
         ("ledger, drain, 100 ms", ledger(100 * MS, Excess::Drain)),
         ("ledger, drain, 10 ms", ledger(10 * MS, Excess::Drain)),
         (
             "ledger, debt up to 1 s, 100 ms",
-            ledger(100 * MS, Excess::DebtUpTo(SECOND)),
+            ledger(100 * MS, Excess::DebtUpTo(cap)),
         ),
         (
             "ledger, debt up to 1 s, 10 ms",
-            ledger(10 * MS, Excess::DebtUpTo(SECOND)),
+            ledger(10 * MS, Excess::DebtUpTo(cap)),
         ),
         (
             "ledger, debt up to 1 s, 10 ms, new pods bounded",
-            bounded(10 * MS, Excess::DebtUpTo(SECOND), Bound::NewPods),
+            bounded(10 * MS, Excess::DebtUpTo(cap), Bound::NewPods),
         ),
         (
             "ledger, debt up to 1 s, 10 ms, every pod bounded",
-            bounded(10 * MS, Excess::DebtUpTo(SECOND), Bound::Every),
+            bounded(10 * MS, Excess::DebtUpTo(cap), Bound::Every),
         ),
         (
             "ledger, drain, 10 ms, every pod bounded",
@@ -131,7 +148,7 @@ fn main() {
             "ledger, debt up to 1 s, 10 ms, every pod bounded, sent again to a new owner",
             Approach::Ownership(Sharing {
                 cycle: 10 * MS,
-                excess: Excess::DebtUpTo(SECOND),
+                excess: Excess::DebtUpTo(cap),
                 ledger: true,
                 bound: Bound::Every,
                 on_owner_change: OnOwnerChange::SendAgain,
@@ -141,7 +158,7 @@ fn main() {
             "counters, debt up to 1 s, 10 ms",
             Approach::Counters(Counting {
                 cycle: 10 * MS,
-                excess: Excess::DebtUpTo(SECOND),
+                excess: Excess::DebtUpTo(cap),
                 bound: Bound::Unbounded,
             }),
         ),
@@ -149,7 +166,7 @@ fn main() {
             "counters, debt up to 1 s, 10 ms, every pod bounded",
             Approach::Counters(Counting {
                 cycle: 10 * MS,
-                excess: Excess::DebtUpTo(SECOND),
+                excess: Excess::DebtUpTo(cap),
                 bound: Bound::Every,
             }),
         ),
@@ -157,75 +174,105 @@ fn main() {
             "service, debt up to 1 s, 10 ms",
             Approach::Service(Serving {
                 cycle: 10 * MS,
-                excess: Excess::DebtUpTo(SECOND),
+                excess: Excess::DebtUpTo(cap),
                 bound: Bound::Unbounded,
                 ask_when_cold: false,
+                replicate: Replicate::None,
             }),
         ),
         (
             "service, debt up to 1 s, 10 ms, every pod bounded",
             Approach::Service(Serving {
                 cycle: 10 * MS,
-                excess: Excess::DebtUpTo(SECOND),
+                excess: Excess::DebtUpTo(cap),
                 bound: Bound::Every,
                 ask_when_cold: false,
+                replicate: Replicate::None,
             }),
         ),
         (
             "service, debt up to 1 s, 100 ms, every pod bounded",
             Approach::Service(Serving {
                 cycle: 100 * MS,
-                excess: Excess::DebtUpTo(SECOND),
+                excess: Excess::DebtUpTo(cap),
                 bound: Bound::Every,
                 ask_when_cold: false,
+                replicate: Replicate::None,
             }),
         ),
         (
             "service, debt up to 1 s, 10 ms, every pod bounded, the owner asked when cold",
             Approach::Service(Serving {
                 cycle: 10 * MS,
-                excess: Excess::DebtUpTo(SECOND),
+                excess: Excess::DebtUpTo(cap),
                 bound: Bound::Every,
                 ask_when_cold: true,
+                replicate: Replicate::None,
+            }),
+        ),
+        (
+            "service, debt up to 1 s, 10 ms, every pod bounded, the owner asked when cold, copied to a secondary every cycle",
+            Approach::Service(Serving {
+                cycle: 10 * MS,
+                excess: Excess::DebtUpTo(cap),
+                bound: Bound::Every,
+                ask_when_cold: true,
+                replicate: Replicate::EveryCycle,
+            }),
+        ),
+        (
+            "service, debt up to 1 s, 10 ms, every pod bounded, the owner asked when cold, copied to a secondary with every change",
+            Approach::Service(Serving {
+                cycle: 10 * MS,
+                excess: Excess::DebtUpTo(cap),
+                bound: Bound::Every,
+                ask_when_cold: true,
+                replicate: Replicate::EveryChange,
             }),
         ),
     ];
     let workloads = [
         (
             "Within the contract, spread",
-            Shape::Spread { per_window: 100 },
+            Shape::Spread { per_window: limit },
             true,
         ),
         (
             "Within the contract, all on one pod",
-            Shape::Skewed { per_window: 100 },
+            Shape::Skewed { per_window: limit },
             true,
         ),
         (
             "On the contract's edge, spread (three times the limit, kept to what one bucket admits)",
-            Shape::Spread { per_window: 300 },
+            Shape::Spread {
+                per_window: 3 * limit,
+            },
             true,
         ),
         (
             "On the contract's edge, all on one pod",
-            Shape::Skewed { per_window: 300 },
+            Shape::Skewed {
+                per_window: 3 * limit,
+            },
             true,
         ),
         (
             "Three times the limit, spread",
-            Shape::Spread { per_window: 300 },
+            Shape::Spread {
+                per_window: 3 * limit,
+            },
             false,
         ),
         (
-            "A whole bucket on every pod at once, every second",
-            Shape::Bursts { each: 100 },
+            "A whole bucket on every pod at once, every window",
+            Shape::Bursts { each: burst },
             false,
         ),
         (
             "One pod at the limit, then such bursts",
             Shape::SkewedThenBursts {
-                per_window: 100,
-                each: 100,
+                per_window: limit,
+                each: burst,
             },
             false,
         ),
@@ -237,14 +284,15 @@ fn main() {
         .unwrap_or_else(|| vec![2, 4, 8]);
 
     println!(
-        "Contract: 100 a second, burst 100. Runs of 10 s, {seeds} seeds each; messages take \
+        "Contract: {limit} every {window_ms} ms, burst {burst}. Runs of ten windows, {seeds} \
+         seeds each; messages take \
          {delay} ms, give or take {jitter} ms, {loss_per_mille} in 1,000 lost. Each cell: \
          share of \
          requests refused (for conforming traffic every refusal is false) / admitted against \
          one bucket for the fleet / the most over the contract in any span, worst seed / \
          share of admitted requests the fleet's count never saw / share it counted twice / \
          messages a second for each pod (all a run sends, a service's answers among them, \
-         over its pods and its ten seconds) / share of requests that waited for their \
+         over its pods and its length) / share of requests that waited for their \
          decision / how long they waited, on average. \
          Fault: {fault_name}.\n",
         delay = delay_us as f64 / 1_000.0,
@@ -268,7 +316,7 @@ fn main() {
                 for seed in 0..seeds {
                     let workload = Workload {
                         shape,
-                        span: 10 * SECOND,
+                        span,
                         conforming,
                     };
                     let this = Run {
@@ -300,8 +348,9 @@ fn main() {
                 let ratio = admitted as f64 / central.max(1) as f64;
                 let lost = 100.0 * lost as f64 / admitted.max(1) as f64;
                 let twice = 100.0 * twice as f64 / admitted.max(1) as f64;
-                // Messages a second for each pod, over the ten seconds of a run.
-                let rate = messages as f64 / (seeds.max(1) * 10 * p as u64) as f64;
+                // Messages a second for each pod, over the run.
+                let seconds = span as f64 / SECOND as f64;
+                let rate = messages as f64 / (seeds.max(1) * p as u64) as f64 / seconds;
                 let wait = 100.0 * waited as f64 / sent.max(1) as f64;
                 let mean = waited_for as f64 / waited.max(1) as f64 / MS as f64;
                 print!(

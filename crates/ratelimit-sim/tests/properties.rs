@@ -7,8 +7,8 @@
 )]
 
 use edgerush_ratelimit_sim::{
-    Approach, Bound, Contract, Counting, Excess, Fault, Network, OnOwnerChange, Run, Serving,
-    Shape, Sharing, Workload, decisions, run,
+    Approach, Bound, Contract, Counting, Excess, Fault, Network, OnOwnerChange, Replicate, Run,
+    Serving, Shape, Sharing, Workload, decisions, run,
 };
 use proptest::prelude::*;
 use std::num::NonZeroU64;
@@ -265,6 +265,7 @@ fn served(bound: Bound) -> Approach {
         excess: Excess::DebtUpTo(SECOND),
         bound,
         ask_when_cold: false,
+        replicate: Replicate::None,
     })
 }
 
@@ -276,6 +277,7 @@ fn asked() -> Approach {
         excess: Excess::DebtUpTo(SECOND),
         bound: Bound::Every,
         ask_when_cold: true,
+        replicate: Replicate::None,
     })
 }
 
@@ -636,5 +638,29 @@ fn asking_the_owner_refuses_no_conforming_traffic() {
             outcome.waited_for <= outcome.waited * 4_000_000,
             "{shape:?}: {outcome:?}"
         );
+    }
+}
+
+/// Through a service, a data plane restarting loses at most what it had admitted and not
+/// yet sent, whether it asks the owner about cold keys or not: what came before, answered
+/// late, does not hold back what it sends after.
+#[test]
+fn a_restarted_data_plane_loses_only_its_last_cycle() {
+    for approach in [served(Bound::Every), asked()] {
+        for shape in [
+            Shape::Spread { per_window: 300 },
+            Shape::Skewed { per_window: 300 },
+        ] {
+            let restarted = Run {
+                approach,
+                fault: Fault::Restart {
+                    at: 5 * SECOND,
+                    pod: 3,
+                },
+                ..fixed(Approach::Central, 4, shape, false)
+            };
+            let outcome = run(&restarted);
+            assert!(outcome.lost <= 5, "{shape:?}: {outcome:?}");
+        }
     }
 }

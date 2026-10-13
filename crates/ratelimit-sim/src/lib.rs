@@ -20,7 +20,9 @@ mod rng;
 mod service;
 mod workload;
 
-pub use approach::{Approach, Bound, Cluster, Counting, Excess, OnOwnerChange, Serving, Sharing};
+pub use approach::{
+    Approach, Bound, Cluster, Counting, Excess, OnOwnerChange, Replicate, Serving, Sharing,
+};
 pub use measure::{Outcome, worst_excess};
 pub use network::{Message, Network, Outbox};
 pub use rng::Rng;
@@ -217,6 +219,13 @@ fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> Played {
             // Timers spread over the cycle, as pods started at different moments are.
             queue.push(cycle * pod as u64 / pods as u64, Event::Timer(pod));
         }
+        let helpers = cluster.helpers();
+        for helper in 0..helpers {
+            queue.push(
+                cycle * helper as u64 / helpers as u64,
+                Event::Timer(pods + helper),
+            );
+        }
     }
     let mut decided = vec![false; arrivals.len()];
     let (mut messages, mut waited, mut waited_for) = (0, 0, 0);
@@ -354,6 +363,7 @@ mod tests {
                     instance: 0,
                     sequence: 0,
                     count: 0,
+                    seen: 0,
                 };
                 outbox.send(0, hits);
             }

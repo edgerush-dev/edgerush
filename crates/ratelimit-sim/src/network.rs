@@ -46,6 +46,10 @@ pub enum Message {
         sequence: u64,
         /// How many.
         count: u64,
+        /// The highest of its batches the sender has seen applied: a new owner taking over
+        /// from a copy older than that skips to it rather than wait for batches the sender
+        /// will not send again. Zero where unused.
+        seen: u64,
     },
     /// The owner's bucket as it stands, for every other pod to take over.
     State {
@@ -85,6 +89,21 @@ pub enum Message {
         /// How many requests wait.
         count: u64,
     },
+    /// The service pod owning a key, to its secondary: what it holds of the key.
+    Replica {
+        /// The owner that sent it.
+        from: usize,
+        /// Its bucket.
+        bucket: TokenBucket,
+        /// For each data plane, the highest batch of its hits applied.
+        applied: Vec<u64>,
+        /// Hits its count holds.
+        counted: u64,
+        /// For each data plane, the latest of its lives heard from.
+        instances: Vec<u64>,
+        /// For each data plane, when it was last seen to admit the key.
+        last_admitted: Vec<Option<u64>>,
+    },
     /// A data plane with no hits to report asks the rate-limiting service for a copy.
     Poll {
         /// The data plane asking.
@@ -103,6 +122,7 @@ impl Message {
             | Self::State { from, .. }
             | Self::Counts { from, .. }
             | Self::Ask { from, .. }
+            | Self::Replica { from, .. }
             | Self::Poll { from, .. } => *from,
         }
     }

@@ -235,6 +235,7 @@ impl Ownership {
                     instance: at.instance,
                     sequence: at.sent,
                     count,
+                    seen: 0,
                 };
                 outbox.send(owner, hits);
                 at.unacknowledged.push_back((at.sent, count, now));
@@ -325,6 +326,7 @@ impl Cluster for Ownership {
                         instance: at.instance,
                         sequence: *sequence,
                         count: *count,
+                        seen: 0,
                     };
                     outbox.send(owner, again);
                 }
@@ -336,6 +338,7 @@ impl Cluster for Ownership {
                     instance: at.instance,
                     sequence: at.sent,
                     count: at.unsent,
+                    seen: 0,
                 };
                 outbox.send(owner, hits);
                 if self.sharing.ledger {
@@ -370,6 +373,7 @@ impl Cluster for Ownership {
                 instance,
                 sequence,
                 count,
+                ..
             } if self.pods[pod].owner == pod => {
                 let owned = &mut self.owned[pod];
                 // A batch from a life of the pod that has ended is ignored; the first from a
