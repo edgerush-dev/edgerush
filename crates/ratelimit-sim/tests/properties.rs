@@ -188,3 +188,42 @@ fn ownership_keeps_sharing_through_a_run() {
         "{owned:?} against {central:?}"
     );
 }
+
+fn lossy(ledger: bool, loss_per_mille: u64, seed: u64) -> Run {
+    Run {
+        approach: Approach::Ownership {
+            cycle: 10_000_000,
+            excess: Excess::Drain,
+            ledger,
+        },
+        network: Network {
+            loss_per_mille,
+            ..NETWORK
+        },
+        seed,
+        ..fixed(
+            Approach::Central,
+            4,
+            Shape::Spread { per_window: 300 },
+            false,
+        )
+    }
+}
+
+/// Property 3: with the ledger, every hit reaches the owner in the end, though one message
+/// in ten is lost; without it, as in Gubernator, hits lost with a message stay lost.
+#[test]
+fn with_the_ledger_no_hit_is_lost_for_good() {
+    for seed in 0..5 {
+        assert_eq!(run(&lossy(true, 100, seed)).lost, 0, "seed {seed}");
+        assert!(run(&lossy(false, 100, seed)).lost > 0, "seed {seed}");
+    }
+}
+
+/// With no message lost, no hit is either.
+#[test]
+fn a_reliable_network_loses_nothing() {
+    for ledger in [false, true] {
+        assert_eq!(run(&lossy(ledger, 0, 1)).lost, 0);
+    }
+}

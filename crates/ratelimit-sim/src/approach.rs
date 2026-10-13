@@ -22,6 +22,13 @@ pub trait Cluster {
 
     /// `message` reached `pod` at `now`.
     fn on_message(&mut self, _pod: usize, _message: Message, _now: u64, _outbox: &mut Outbox) {}
+
+    /// Hits admitted that never reached the count that decides for the whole fleet — lost
+    /// with a message, or never sent — as the run ends: usage no bucket saw (10 §2,
+    /// property 3), apart from any excess a bucket saw and forgave.
+    fn unapplied(&self) -> u64 {
+        0
+    }
 }
 
 /// How the pods limit a key between them.
@@ -48,7 +55,8 @@ pub enum Approach {
         excess: Excess,
         /// Whether pods keep their own hits apart with the hit ledger (06 §4) — a pod's view
         /// the owner's bucket plus its hits the owner has not yet applied — rather than
-        /// taking the broadcast over as it comes.
+        /// taking the broadcast over as it comes. With it, a batch not seen applied within
+        /// four cycles is sent again.
         ledger: bool,
     },
 }

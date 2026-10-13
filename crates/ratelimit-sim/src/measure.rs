@@ -16,6 +16,9 @@ pub struct Outcome {
     pub worst_excess: i64,
     /// The same for the pod that came nearest to it on its own.
     pub worst_pod_excess: i64,
+    /// Admitted requests that never reached the count deciding for the whole fleet
+    /// ([`Cluster::unapplied`](crate::Cluster::unapplied)).
+    pub lost: u64,
 }
 
 impl Outcome {
@@ -46,6 +49,7 @@ impl Outcome {
             refused: sent - admitted_count,
             worst_excess: worst_excess(contract, &times(None)),
             worst_pod_excess,
+            lost: 0,
         }
     }
 }

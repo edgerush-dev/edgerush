@@ -31,13 +31,20 @@ fn main() {
         .nth(1)
         .and_then(|arg| arg.parse().ok())
         .unwrap_or(200);
+    let loss_per_mille: u64 = std::env::args()
+        .nth(2)
+        .and_then(|arg| arg.parse().ok())
+        .unwrap_or(0);
     let n = |n: u64| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN);
     let contract = Contract {
         limit: n(100),
         window: n(SECOND),
         burst: n(100),
     };
-    let network = Network::reliable(MS, MS / 2);
+    let network = Network {
+        loss_per_mille,
+        ..Network::reliable(MS, MS / 2)
+    };
     let approaches = [
         ("central", Approach::Central),
         ("sharing nothing", Approach::Independent),
@@ -109,9 +116,10 @@ fn main() {
 
     println!(
         "Contract: 100 a second, burst 100. Runs of 10 s, {seeds} seeds each; messages take \
-         1 ms, give or take 0.5 ms. Each cell: share of requests refused (for conforming \
-         traffic every refusal is false) / admitted against one bucket for the fleet / the \
-         most over the contract in any span, worst seed.\n"
+         1 ms, give or take 0.5 ms, {loss_per_mille} in 1,000 lost. Each cell: share of \
+         requests refused (for conforming traffic every refusal is false) / admitted against \
+         one bucket for the fleet / the most over the contract in any span, worst seed / \
+         share of admitted requests the fleet's count never saw.\n"
     );
     for (title, shape, conforming) in workloads {
         println!("**{title}**\n");
@@ -124,8 +132,8 @@ fn main() {
         for (name, approach) in approaches {
             print!("| {name} |");
             for p in pods {
-                let (mut sent, mut refused, mut admitted, mut central, mut over) =
-                    (0, 0, 0, 0, i64::MIN);
+                let (mut sent, mut refused, mut admitted, mut central, mut over, mut lost) =
+                    (0, 0, 0, 0, i64::MIN, 0);
                 for seed in 0..seeds {
                     let workload = Workload {
                         shape,
@@ -150,10 +158,12 @@ fn main() {
                     admitted += outcome.admitted;
                     central += baseline.admitted;
                     over = over.max(outcome.worst_excess);
+                    lost += outcome.lost;
                 }
                 let refused = 100.0 * refused as f64 / sent.max(1) as f64;
                 let ratio = admitted as f64 / central.max(1) as f64;
-                print!(" {refused:.1}% / {ratio:.2}× / {over} |");
+                let lost = 100.0 * lost as f64 / admitted.max(1) as f64;
+                print!(" {refused:.1}% / {ratio:.2}× / {over} / {lost:.1}% |");
             }
             println!();
         }

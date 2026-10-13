@@ -66,6 +66,25 @@ pub struct Run {
 /// that changing it leaves the traffic as it was.
 #[must_use]
 pub fn decisions(run: &Run) -> Vec<(Arrival, bool)> {
+    play(run).0
+}
+
+/// Plays a run and measures it against its contract.
+#[must_use]
+pub fn run(run: &Run) -> Outcome {
+    let (decisions, lost) = play(run);
+    Outcome {
+        lost,
+        ..Outcome::of(&run.contract, run.pods, &decisions)
+    }
+}
+
+/// How many cycles timers go on firing after the last request, so that what is still on
+/// its way — batches sent again among them — can arrive.
+const SETTLING_CYCLES: u64 = 10;
+
+/// The decisions of a run, and the hits it left unapplied.
+fn play(run: &Run) -> (Vec<(Arrival, bool)>, u64) {
     let pods = run.pods.max(1);
     let mut rng = Rng::new(run.seed);
     let arrivals = run.workload.arrivals(&run.contract, pods, &mut rng);
@@ -93,7 +112,7 @@ pub fn decisions(run: &Run) -> Vec<(Arrival, bool)> {
             Event::Timer(pod) => {
                 cluster.on_timer(pod, now, &mut outbox);
                 if let Some(cycle) = cycle
-                    && now <= end
+                    && now <= end + SETTLING_CYCLES * cycle
                 {
                     queue.push(now + cycle, Event::Timer(pod));
                 }
@@ -106,7 +125,8 @@ pub fn decisions(run: &Run) -> Vec<(Arrival, bool)> {
             }
         }
     }
-    arrivals.into_iter().zip(decided).collect()
+    let lost = cluster.unapplied();
+    (arrivals.into_iter().zip(decided).collect(), lost)
 }
 
 /// Something that happens at a moment of a run.
@@ -137,12 +157,6 @@ impl Queue {
         let event = self.events.get_mut(usize::try_from(made).ok()?)?.take()?;
         Some((at, event))
     }
-}
-
-/// Plays a run and measures it against its contract.
-#[must_use]
-pub fn run(run: &Run) -> Outcome {
-    Outcome::of(&run.contract, run.pods, &decisions(run))
 }
 
 #[cfg(test)]

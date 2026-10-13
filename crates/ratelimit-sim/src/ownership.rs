@@ -22,7 +22,14 @@ pub(crate) struct Ownership {
     /// On the owner, for each pod: batches that came ahead of one still missing, held until
     /// it comes, so that a pod's batches are applied in order.
     waiting: Vec<BTreeMap<u64, u64>>,
+    /// Hits admitted by pods other than the owner.
+    admitted_elsewhere: u64,
+    /// Of those, how many reached the owner, each counted once.
+    reached: u64,
 }
+
+/// How many cycles a pod waits to see a batch applied before sending it again.
+const RESEND_AFTER_CYCLES: u64 = 4;
 
 /// What one pod holds of the key.
 struct Pod {
@@ -33,8 +40,8 @@ struct Pod {
     /// Batches sent so far.
     sent: u64,
     /// With the ledger: batches sent and not yet seen applied in a broadcast, as
-    /// `(sequence, count)`.
-    unacknowledged: VecDeque<(u64, u64)>,
+    /// `(sequence, count, last sent)`.
+    unacknowledged: VecDeque<(u64, u64, u64)>,
     /// On the owner: whether the bucket changed since the last broadcast.
     changed: bool,
 }
@@ -62,6 +69,8 @@ impl Ownership {
             pods: (0..pods).map(|_| pod()).collect(),
             applied: vec![0; pods],
             waiting: vec![BTreeMap::new(); pods],
+            admitted_elsewhere: 0,
+            reached: 0,
         }
     }
 
@@ -95,6 +104,7 @@ impl Cluster for Ownership {
                 at.changed = true;
             } else {
                 at.unsent += 1;
+                self.admitted_elsewhere += 1;
             }
         }
         admitted
@@ -104,10 +114,22 @@ impl Cluster for Ownership {
         Some(self.cycle)
     }
 
-    fn on_timer(&mut self, pod: usize, _: u64, outbox: &mut Outbox) {
+    fn on_timer(&mut self, pod: usize, now: u64, outbox: &mut Outbox) {
         let pods = self.pods.len();
+        let resend_after = RESEND_AFTER_CYCLES * self.cycle;
         let at = &mut self.pods[pod];
         if pod != OWNER {
+            for (sequence, count, sent) in &mut at.unacknowledged {
+                if now - *sent >= resend_after {
+                    *sent = now;
+                    let again = Message::Hits {
+                        from: pod,
+                        sequence: *sequence,
+                        count: *count,
+                    };
+                    outbox.send(OWNER, again);
+                }
+            }
             if at.unsent > 0 {
                 at.sent += 1;
                 let hits = Message::Hits {
@@ -117,7 +139,7 @@ impl Cluster for Ownership {
                 };
                 outbox.send(OWNER, hits);
                 if self.ledger {
-                    at.unacknowledged.push_back((at.sent, at.unsent));
+                    at.unacknowledged.push_back((at.sent, at.unsent, now));
                 }
                 at.unsent = 0;
             }
@@ -141,18 +163,22 @@ impl Cluster for Ownership {
                 count,
             } if pod == OWNER => {
                 if !self.ledger {
+                    self.reached += count;
                     self.apply(count, now);
                     return;
                 }
                 // In order, once each: a batch already applied is ignored, and one that came
-                // ahead of a missing one waits for it.
+                // ahead of a missing one waits for it. Either way the next broadcast goes
+                // out, so that a pod whose earlier one was lost learns what is applied.
                 if sequence > self.applied[from] {
                     self.waiting[from].insert(sequence, count);
                 }
                 while let Some(count) = self.waiting[from].remove(&(self.applied[from] + 1)) {
                     self.applied[from] += 1;
+                    self.reached += count;
                     self.apply(count, now);
                 }
+                self.pods[OWNER].changed = true;
             }
             Message::State { bucket, applied } if pod != OWNER => {
                 let at = &mut self.pods[pod];
@@ -161,8 +187,9 @@ impl Cluster for Ownership {
                     // The owner's bucket, plus what this pod admitted that it has not seen:
                     // batches the broadcast's applied mark does not cover, and hits unsent.
                     let seen = applied.get(pod).copied().unwrap_or(0);
-                    at.unacknowledged.retain(|(sequence, _)| *sequence > seen);
-                    let unseen: u64 = at.unacknowledged.iter().map(|(_, count)| count).sum();
+                    at.unacknowledged
+                        .retain(|(sequence, _, _)| *sequence > seen);
+                    let unseen: u64 = at.unacknowledged.iter().map(|(_, count, _)| count).sum();
                     for _ in 0..unseen + at.unsent {
                         at.bucket.charge(now);
                     }
@@ -172,6 +199,10 @@ impl Cluster for Ownership {
             }
             _ => {}
         }
+    }
+
+    fn unapplied(&self) -> u64 {
+        self.admitted_elsewhere - self.reached
     }
 }
 
@@ -383,5 +414,43 @@ mod tests {
         );
         fleet.on_message(batch.0, batch.1, 0, &mut outbox);
         assert_eq!(fleet.applied[1], 1);
+    }
+
+    #[test]
+    fn a_lost_batch_is_sent_again_and_applied_once() {
+        let mut fleet = ledger(2);
+        let mut outbox = Outbox::default();
+        admits(&mut fleet, 1, 4, 0);
+        fleet.on_timer(1, 0, &mut outbox);
+        outbox.sent.clear();
+        fleet.on_timer(1, 40 * MS - 1, &mut outbox);
+        assert!(outbox.sent.is_empty(), "not before four cycles");
+        fleet.on_timer(1, 40 * MS, &mut outbox);
+        assert_eq!(outbox.sent.len(), 1, "sent again");
+        deliver(&mut fleet, &mut outbox, 40 * MS);
+        assert_eq!((fleet.applied[1], fleet.unapplied()), (1, 0));
+    }
+
+    /// The broadcast that would have told the pod its batch was applied is lost: the pod
+    /// sends it again, the owner ignores it but broadcasts, and the pod stops counting it.
+    #[test]
+    fn a_batch_sent_again_after_it_was_applied_is_acknowledged() {
+        let mut fleet = ledger(2);
+        let mut outbox = Outbox::default();
+        admits(&mut fleet, 1, 4, 0);
+        fleet.on_timer(1, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        fleet.on_timer(OWNER, 0, &mut outbox);
+        outbox.sent.clear();
+        fleet.on_timer(1, 40 * MS, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 40 * MS);
+        assert_eq!(
+            fleet.pods[OWNER].bucket.remaining(40 * MS),
+            10,
+            "applied once"
+        );
+        fleet.on_timer(OWNER, 40 * MS, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 40 * MS);
+        assert!(fleet.pods[1].unacknowledged.is_empty());
     }
 }
