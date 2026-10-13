@@ -1,12 +1,14 @@
 //! Ways of limiting one key across pods, side by side over many seeds, printed as Markdown:
 //! the baselines (one bucket for the fleet, which keeps the contract exactly; pods sharing
-//! nothing; pods with a share each) and the ways of sharing counts.
+//! nothing; pods with a share each) and the ways of sharing counts: ownership and per-pod
+//! counters.
 //!
-//! `cargo run --release -p edgerush-ratelimit-sim --example compare [seeds]`
+//! `cargo run --release -p edgerush-ratelimit-sim --example compare [seeds] [lost in 1,000]
+//! [owner-lost|partition|restart|owner-restart]`
 
 use edgerush_ratelimit_sim::{
-    Approach, Bound, Contract, Excess, Fault, Network, OnOwnerChange, Run, Shape, Sharing,
-    Workload, run,
+    Approach, Bound, Contract, Counting, Excess, Fault, Network, OnOwnerChange, Run, Shape,
+    Sharing, Workload, run,
 };
 use std::num::NonZeroU64;
 
@@ -52,9 +54,11 @@ fn main() {
         .nth(2)
         .and_then(|arg| arg.parse().ok())
         .unwrap_or(0);
-    // `owner-lost`: the pod owning the key goes away half way through each run.
+    // `owner-lost`: the pod owning the key goes away half way through each run; with
+    // counters, which have no owner, the first pod.
     // `partition`: half the pods are cut off from the others from 3 s to 7 s.
-    // `restart`, `owner-restart`: the last pod, or the owner, restarts half way through.
+    // `restart`, `owner-restart`: the last pod, or the owner (the first pod), restarts half
+    // way through.
     let fault_name = std::env::args().nth(3).unwrap_or_default();
     let fault = |pods: usize| match fault_name.as_str() {
         "owner-lost" => Fault::OwnerLost { at: 5 * SECOND },
@@ -131,6 +135,22 @@ fn main() {
                 on_owner_change: OnOwnerChange::SendAgain,
             }),
         ),
+        (
+            "counters, debt up to 1 s, 10 ms",
+            Approach::Counters(Counting {
+                cycle: 10 * MS,
+                excess: Excess::DebtUpTo(SECOND),
+                bound: Bound::Unbounded,
+            }),
+        ),
+        (
+            "counters, debt up to 1 s, 10 ms, every pod bounded",
+            Approach::Counters(Counting {
+                cycle: 10 * MS,
+                excess: Excess::DebtUpTo(SECOND),
+                bound: Bound::Every,
+            }),
+        ),
     ];
     let workloads = [
         (
@@ -179,7 +199,8 @@ fn main() {
          1 ms, give or take 0.5 ms, {loss_per_mille} in 1,000 lost. Each cell: share of \
          requests refused (for conforming traffic every refusal is false) / admitted against \
          one bucket for the fleet / the most over the contract in any span, worst seed / \
-         share of admitted requests the fleet's count never saw / share it counted twice. \
+         share of admitted requests the fleet's count never saw / share it counted twice / \
+         messages a pod sends a second. \
          Fault: {fault_name}.\n"
     );
     for (title, shape, conforming) in workloads {
@@ -195,7 +216,7 @@ fn main() {
             for p in pods {
                 let (mut sent, mut refused, mut admitted, mut central, mut over) =
                     (0, 0, 0, 0, i64::MIN);
-                let (mut lost, mut twice) = (0, 0);
+                let (mut lost, mut twice, mut messages) = (0, 0, 0);
                 for seed in 0..seeds {
                     let workload = Workload {
                         shape,
@@ -223,12 +244,17 @@ fn main() {
                     over = over.max(outcome.worst_excess);
                     lost += outcome.lost;
                     twice += outcome.counted_twice;
+                    messages += outcome.messages;
                 }
                 let refused = 100.0 * refused as f64 / sent.max(1) as f64;
                 let ratio = admitted as f64 / central.max(1) as f64;
                 let lost = 100.0 * lost as f64 / admitted.max(1) as f64;
                 let twice = 100.0 * twice as f64 / admitted.max(1) as f64;
-                print!(" {refused:.1}% / {ratio:.2}× / {over} / {lost:.1}% / {twice:.1}% |");
+                // Messages a pod sends a second, over the ten seconds of a run.
+                let rate = messages as f64 / (seeds.max(1) * 10 * p as u64) as f64;
+                print!(
+                    " {refused:.1}% / {ratio:.2}× / {over} / {lost:.1}% / {twice:.1}% / {rate:.0} |"
+                );
             }
             println!();
         }

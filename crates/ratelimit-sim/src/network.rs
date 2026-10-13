@@ -60,6 +60,15 @@ pub enum Message {
         /// Hits the owner's count holds.
         counted: u64,
     },
+    /// A pod's total of admissions, for every other pod.
+    Counts {
+        /// The pod that admitted them.
+        from: usize,
+        /// Which life of that pod.
+        instance: u64,
+        /// How many it has admitted in that life.
+        total: u64,
+    },
 }
 
 impl Message {
@@ -67,7 +76,7 @@ impl Message {
     #[must_use]
     pub fn sender(&self) -> usize {
         match self {
-            Self::Hits { from, .. } | Self::State { from, .. } => *from,
+            Self::Hits { from, .. } | Self::State { from, .. } | Self::Counts { from, .. } => *from,
         }
     }
 }

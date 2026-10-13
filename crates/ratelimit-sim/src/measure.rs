@@ -22,6 +22,8 @@ pub struct Outcome {
     /// Admitted requests that count held more than once
     /// ([`Cluster::counted_twice`](crate::Cluster::counted_twice)).
     pub counted_twice: u64,
+    /// Messages the pods sent each other.
+    pub messages: u64,
 }
 
 impl Outcome {
@@ -54,6 +56,7 @@ impl Outcome {
             worst_pod_excess,
             lost: 0,
             counted_twice: 0,
+            messages: 0,
         }
     }
 }

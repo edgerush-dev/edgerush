@@ -12,13 +12,14 @@
 //! over what the contract allows in any span of time.
 
 mod approach;
+mod counters;
 mod measure;
 mod network;
 mod ownership;
 mod rng;
 mod workload;
 
-pub use approach::{Approach, Bound, Cluster, Excess, OnOwnerChange, Sharing};
+pub use approach::{Approach, Bound, Cluster, Counting, Excess, OnOwnerChange, Sharing};
 pub use measure::{Outcome, worst_excess};
 pub use network::{Message, Network, Outbox};
 pub use rng::Rng;
@@ -142,10 +143,11 @@ pub fn decisions(run: &Run) -> Vec<(Arrival, bool)> {
 /// Plays a run and measures it against its contract.
 #[must_use]
 pub fn run(run: &Run) -> Outcome {
-    let (decisions, lost, counted_twice) = play(run);
+    let (decisions, lost, counted_twice, messages) = play(run);
     Outcome {
         lost,
         counted_twice,
+        messages,
         ..Outcome::of(&run.contract, run.pods, &decisions)
     }
 }
@@ -154,14 +156,18 @@ pub fn run(run: &Run) -> Outcome {
 /// its way — batches sent again among them — can arrive.
 const SETTLING_CYCLES: u64 = 10;
 
-/// The decisions of a run, the hits it left unapplied, and those counted twice.
-fn play(run: &Run) -> (Vec<(Arrival, bool)>, u64, u64) {
+/// What playing a run gives: its decisions, the hits it left unapplied, those counted
+/// twice, and the messages sent.
+type Played = (Vec<(Arrival, bool)>, u64, u64, u64);
+
+/// Plays a run.
+fn play(run: &Run) -> Played {
     let cluster = run.approach.build(&run.contract, run.pods.max(1));
     play_with(run, cluster)
 }
 
 /// [`play`], on pods given rather than made from the run's approach.
-fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> (Vec<(Arrival, bool)>, u64, u64) {
+fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> Played {
     let pods = run.pods.max(1);
     let mut rng = Rng::new(run.seed);
     let arrivals = run.workload.arrivals(&run.contract, pods, &mut rng);
@@ -188,6 +194,7 @@ fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> (Vec<(Arrival, bool)>,
         }
     }
     let mut decided = vec![false; arrivals.len()];
+    let mut messages = 0;
     let mut outbox = Outbox::default();
     while let Some((now, event)) = queue.pop() {
         match event {
@@ -209,6 +216,7 @@ fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> (Vec<(Arrival, bool)>,
             }
             Event::Fault(event) => cluster.on_fault(event, now, &mut outbox),
         }
+        messages += outbox.sent.len() as u64;
         for (to, message) in outbox.sent.drain(..) {
             if let Some(at) = run.network.carry(now, &mut network_rng) {
                 queue.push(at, Event::Deliver(to, message));
@@ -216,7 +224,12 @@ fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> (Vec<(Arrival, bool)>,
         }
     }
     let (lost, twice) = (cluster.unapplied(), cluster.counted_twice());
-    (arrivals.into_iter().zip(decided).collect(), lost, twice)
+    (
+        arrivals.into_iter().zip(decided).collect(),
+        lost,
+        twice,
+        messages,
+    )
 }
 
 /// Something that happens at a moment of a run.

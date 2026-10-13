@@ -1,5 +1,6 @@
 //! Ways of limiting one key across several pods.
 
+use crate::counters::Counters;
 use crate::ownership::Ownership;
 use crate::{Contract, FaultEvent, Message, Outbox};
 use edgerush_ratelimit::reference::{Model, TokenBucket};
@@ -58,6 +59,20 @@ pub enum Approach {
     /// which takes it over in place of its copy — with the changes 06 §4 proposes as
     /// settings.
     Ownership(Sharing),
+    /// Per-pod counters (06 §5): no owner; every pod sends the others the total it has
+    /// admitted every cycle, and charges its own view with what it learns of theirs.
+    Counters(Counting),
+}
+
+/// How pods share a key by per-pod counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Counting {
+    /// The time between a pod's sending its total.
+    pub cycle: u64,
+    /// What a pod does with others' hits that do not fit in its view.
+    pub excess: Excess,
+    /// How much of what it sees a pod may admit in one cycle.
+    pub bound: Bound,
 }
 
 /// How pods share a key by ownership.
@@ -136,6 +151,7 @@ impl Approach {
                 Box::new(Pods((0..pods).map(|_| share()).collect()))
             }
             Self::Ownership(sharing) => Box::new(Ownership::new(contract, pods, *sharing)),
+            Self::Counters(counting) => Box::new(Counters::new(contract, pods, *counting)),
         }
     }
 }

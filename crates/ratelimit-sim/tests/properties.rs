@@ -7,8 +7,8 @@
 )]
 
 use edgerush_ratelimit_sim::{
-    Approach, Bound, Contract, Excess, Fault, Network, OnOwnerChange, Run, Shape, Sharing,
-    Workload, decisions, run,
+    Approach, Bound, Contract, Counting, Excess, Fault, Network, OnOwnerChange, Run, Shape,
+    Sharing, Workload, decisions, run,
 };
 use proptest::prelude::*;
 use std::num::NonZeroU64;
@@ -241,36 +241,51 @@ fn a_reliable_network_loses_nothing() {
     }
 }
 
-fn shared(bound: Bound, shape: Shape, conforming: bool) -> Run {
+fn owned(bound: Bound) -> Approach {
+    Approach::Ownership(Sharing {
+        cycle: 10_000_000,
+        excess: Excess::DebtUpTo(SECOND),
+        ledger: true,
+        bound,
+        on_owner_change: OnOwnerChange::Drop,
+    })
+}
+
+fn counted(bound: Bound) -> Approach {
+    Approach::Counters(Counting {
+        cycle: 10_000_000,
+        excess: Excess::DebtUpTo(SECOND),
+        bound,
+    })
+}
+
+fn shared(approach: Approach, shape: Shape, conforming: bool) -> Run {
     Run {
-        approach: Approach::Ownership(Sharing {
-            cycle: 10_000_000,
-            excess: Excess::DebtUpTo(SECOND),
-            ledger: true,
-            bound,
-            on_owner_change: OnOwnerChange::Drop,
-        }),
+        approach,
         ..fixed(Approach::Central, 8, shape, conforming)
     }
 }
 
 /// Bounding every pod's share of a cycle holds bursts that land on every pod at once to a
-/// fraction of what they reach unbounded, and costs a client on one pod nothing.
+/// fraction of what they reach unbounded, and costs a client on one pod nothing — whether
+/// pods share by ownership or by counters.
 #[test]
 fn a_bound_on_every_pod_holds_simultaneous_bursts_without_shaving_skew() {
-    let bursts = Shape::Bursts { each: 100 };
-    let unbounded = run(&shared(Bound::Unbounded, bursts, false));
-    let every = run(&shared(Bound::Every, bursts, false));
-    assert!(
-        every.admitted * 2 < unbounded.admitted,
-        "{every:?} against {unbounded:?}"
-    );
-    let skewed = run(&shared(
-        Bound::Every,
-        Shape::Skewed { per_window: 300 },
-        true,
-    ));
-    assert!(skewed.refused * 100 < skewed.sent, "{skewed:?}");
+    for approach in [owned, counted] {
+        let bursts = Shape::Bursts { each: 100 };
+        let unbounded = run(&shared(approach(Bound::Unbounded), bursts, false));
+        let every = run(&shared(approach(Bound::Every), bursts, false));
+        assert!(
+            every.admitted * 2 < unbounded.admitted,
+            "{every:?} against {unbounded:?}"
+        );
+        let skewed = run(&shared(
+            approach(Bound::Every),
+            Shape::Skewed { per_window: 300 },
+            true,
+        ));
+        assert!(skewed.refused * 100 < skewed.sent, "{skewed:?}");
+    }
 }
 
 fn owner_lost(on_owner_change: OnOwnerChange, seed: u64) -> Run {
@@ -388,4 +403,57 @@ fn a_restart_costs_at_most_a_bucket() {
     assert!(pod.worst_excess <= 100, "{pod:?}");
     let owner = run(&restarted(0));
     assert!(owner.worst_excess <= 110, "{owner:?}");
+}
+
+/// Per-pod counters lose nothing to lost messages, and count nothing twice: a total only
+/// grows, so the next one carries what a lost one did.
+#[test]
+fn counters_lose_nothing_when_messages_are_lost() {
+    for seed in 0..5 {
+        let lossy = Run {
+            approach: counted(Bound::Every),
+            network: Network {
+                loss_per_mille: 100,
+                ..NETWORK
+            },
+            seed,
+            ..fixed(
+                Approach::Central,
+                4,
+                Shape::Spread { per_window: 300 },
+                false,
+            )
+        };
+        let outcome = run(&lossy);
+        assert_eq!((outcome.lost, outcome.counted_twice), (0, 0), "seed {seed}");
+        assert!(outcome.worst_excess < 100, "{outcome:?}");
+    }
+}
+
+/// With counters, a pod restarting refuses no conforming traffic, the pod that restarts
+/// starting from the totals it hears rather than charging them; what it forgot of its own
+/// earlier life the others still count, all but what it admitted in the cycle it went.
+#[test]
+fn counters_refuse_no_conforming_traffic_over_a_restart() {
+    for pod in [0, 3] {
+        for seed in 0..5 {
+            let restart = Run {
+                approach: counted(Bound::Every),
+                fault: Fault::Restart {
+                    at: 5 * SECOND,
+                    pod,
+                },
+                seed,
+                ..fixed(
+                    Approach::Central,
+                    4,
+                    Shape::Spread { per_window: 100 },
+                    true,
+                )
+            };
+            let outcome = run(&restart);
+            assert_eq!(outcome.refused, 0, "pod {pod}, seed {seed}: {outcome:?}");
+            assert!(outcome.lost <= 2, "pod {pod}, seed {seed}: {outcome:?}");
+        }
+    }
 }
