@@ -59,6 +59,10 @@ pub enum Message {
         active: Vec<bool>,
         /// Hits the owner's count holds.
         counted: u64,
+        /// To a data plane that asked: which of its asks this answers, and how many of the
+        /// requests it was about the owner admitted, the first so many; the rest it
+        /// refused.
+        decided: Option<(u64, u64)>,
     },
     /// A pod's total of admissions, for every other pod.
     Counts {
@@ -68,6 +72,18 @@ pub enum Message {
         instance: u64,
         /// How many it has admitted in that life.
         total: u64,
+    },
+    /// A data plane holding no fresh copy of a key asks the owner to decide the requests
+    /// waiting for it.
+    Ask {
+        /// The data plane asking.
+        from: usize,
+        /// Which life of it.
+        instance: u64,
+        /// The ask's number among that data plane's asks, counted from 1.
+        sequence: u64,
+        /// How many requests wait.
+        count: u64,
     },
     /// A data plane with no hits to report asks the rate-limiting service for a copy.
     Poll {
@@ -86,6 +102,7 @@ impl Message {
             Self::Hits { from, .. }
             | Self::State { from, .. }
             | Self::Counts { from, .. }
+            | Self::Ask { from, .. }
             | Self::Poll { from, .. } => *from,
         }
     }

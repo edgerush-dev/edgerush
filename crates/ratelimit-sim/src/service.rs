@@ -4,7 +4,8 @@
 //! owner's bucket as last heard, plus its own hits not yet seen applied — and never waits.
 //! Every cycle it sends the owner the hits it admitted or, with none to send while the key
 //! is in use, asks for a copy; the owner applies hits in order, once each, and answers
-//! every message with its bucket as it stands.
+//! every message with its bucket as it stands. As a setting, requests for a key a data plane
+//! holds no fresh copy of wait while it asks the owner, which decides them (06 §4).
 
 use crate::{Bound, Cluster, Contract, Excess, FaultEvent, Message, Outbox, Serving};
 use edgerush_ratelimit::reference::{Model, TokenBucket};
@@ -42,6 +43,8 @@ pub(crate) struct Service {
     owner: usize,
     /// Hits admitted anywhere.
     admitted: u64,
+    /// Decisions made for requests that waited, not yet taken.
+    decided: Vec<(usize, bool)>,
 }
 
 /// What one data plane holds of the key.
@@ -66,6 +69,19 @@ struct Plane {
     active: Vec<bool>,
     /// When a request for the key last came.
     last_request: Option<u64>,
+    /// When the owner last answered: its copy is fresh for a bucket's refill time after.
+    heard: Option<u64>,
+    /// When the ask in flight was sent, if one is.
+    asking: Option<u64>,
+    /// Asks sent so far: the one in flight is the last, and an answer to any other is late.
+    asks: u64,
+    /// Whether an ask went unanswered since the owner was last heard from: until it is,
+    /// requests are decided here, from the copy, as when cut off (06 §6).
+    unreachable: bool,
+    /// The requests the ask in flight is about.
+    asked: Vec<usize>,
+    /// Requests that came while it was in flight: the next ask is about them.
+    waiting: Vec<usize>,
 }
 
 /// What a service pod keeps of the key while it owns it.
@@ -124,6 +140,12 @@ impl Service {
             allowance: None,
             active: vec![false; planes],
             last_request: None,
+            heard: None,
+            asking: None,
+            asks: 0,
+            unreachable: false,
+            asked: Vec::new(),
+            waiting: Vec::new(),
         };
         let per = |span: u64| {
             u128::from(contract.limit.get()) * u128::from(span) / u128::from(contract.window.get())
@@ -143,6 +165,7 @@ impl Service {
             owner: 0,
             fresh,
             admitted: 0,
+            decided: Vec::new(),
         }
     }
 
@@ -201,8 +224,9 @@ impl Service {
         }
     }
 
-    /// Service pod `pod` answers `plane` with its bucket as it stands.
-    fn answer(&self, pod: usize, plane: usize, outbox: &mut Outbox) {
+    /// Service pod `pod` answers `plane` with its bucket as it stands and, to an ask, how
+    /// many of the requests it asked about were admitted.
+    fn answer(&self, pod: usize, plane: usize, decided: Option<(u64, u64)>, outbox: &mut Outbox) {
         let owner = &self.owners[pod];
         let state = Message::State {
             from: self.address(pod),
@@ -210,14 +234,52 @@ impl Service {
             applied: owner.applied.clone(),
             active: owner.active(ACTIVE_CYCLES * self.serving.cycle),
             counted: owner.counted,
+            decided,
         };
         outbox.send(plane, state);
     }
 
-    /// Every data plane takes a new owner, or one that has restarted: it numbers its
-    /// batches afresh and sends again those it has not seen applied.
-    fn follow(&mut self, now: u64, outbox: &mut Outbox) {
+    /// Service pod `pod` decides `count` requests data plane `from` asked about, in order,
+    /// against the bucket that counts: how many it admitted. The asker counts as admitting
+    /// the key from now, so that what other data planes may admit is bounded with it.
+    fn decide_asked(&mut self, pod: usize, from: usize, count: u64, now: u64) -> u64 {
+        let owner = &mut self.owners[pod];
+        let admitted = (0..count).filter(|_| owner.bucket.decide(now)).count() as u64;
+        owner.counted += admitted;
+        owner.last_admitted[from] = Some(now);
+        admitted
+    }
+
+    /// `plane` asks the owner about the requests in `asked`, from `now`.
+    fn ask(&mut self, plane: usize, now: u64, outbox: &mut Outbox) {
         let to = self.address(self.owner);
+        let at = &mut self.planes[plane];
+        at.asking = Some(now);
+        at.asks += 1;
+        let ask = Message::Ask {
+            from: plane,
+            instance: at.instance,
+            sequence: at.asks,
+            count: at.asked.len() as u64,
+        };
+        outbox.send(to, ask);
+    }
+
+    /// Every data plane takes a new owner, or one that has restarted: it numbers its
+    /// batches afresh and sends again those it has not seen applied. A new owner is asked
+    /// again about requests still waiting, as the old one will not answer; one that has
+    /// restarted is not, as an ask on its way may still reach it — and one that does not is
+    /// given up after four cycles.
+    fn follow(&mut self, moved: bool, now: u64, outbox: &mut Outbox) {
+        let to = self.address(self.owner);
+        for plane in 0..self.planes.len() {
+            if moved {
+                self.planes[plane].unreachable = false;
+            }
+            if moved && self.alive[plane] && self.planes[plane].asking.is_some() {
+                self.ask(plane, now, outbox);
+            }
+        }
         for (plane, at) in self.planes.iter_mut().enumerate() {
             if !self.alive[plane] {
                 continue;
@@ -286,25 +348,35 @@ impl Service {
                     self.owners[pod].applied[from] = next;
                     self.apply(pod, count, now);
                 }
-                self.answer(pod, from, outbox);
+                self.answer(pod, from, None, outbox);
+            }
+            Message::Ask {
+                from,
+                instance,
+                sequence,
+                count,
+            } if from < self.planes.len() && self.current_life(pod, from, instance) => {
+                let admitted = self.decide_asked(pod, from, count, now);
+                self.answer(pod, from, Some((sequence, admitted)), outbox);
             }
             Message::Poll { from, instance }
                 if from < self.planes.len() && self.current_life(pod, from, instance) =>
             {
-                self.answer(pod, from, outbox);
+                self.answer(pod, from, None, outbox);
             }
             _ => {}
         }
     }
 
     /// Data plane `plane` hears from the service.
-    fn at_plane(&mut self, plane: usize, message: Message, now: u64) {
+    fn at_plane(&mut self, plane: usize, message: Message, now: u64, outbox: &mut Outbox) {
         let owner = self.address(self.owner);
         let Message::State {
             from,
             bucket,
             applied,
             active,
+            decided,
             ..
         } = message
         else {
@@ -327,6 +399,49 @@ impl Service {
         for _ in 0..unseen + at.unsent {
             at.bucket.charge(now);
         }
+        at.heard = Some(now);
+        at.unreachable = false;
+        // The answer to the ask in flight: the owner admitted the first so many of the
+        // requests it was about. Those that came meanwhile are asked about next. An answer
+        // to an earlier ask, given up on, is late.
+        if let Some((sequence, admitted)) = decided
+            && at.asking.is_some()
+            && sequence == at.asks
+        {
+            let asked = std::mem::take(&mut at.asked);
+            at.asking = None;
+            for (index, request) in asked.into_iter().enumerate() {
+                self.decided.push((request, (index as u64) < admitted));
+            }
+            self.admitted += admitted;
+            let at = &mut self.planes[plane];
+            if !at.waiting.is_empty() {
+                at.asked = std::mem::take(&mut at.waiting);
+                self.ask(plane, now, outbox);
+            }
+        }
+    }
+
+    /// `plane` restarts, holding nothing: the requests waiting on it go with it, refused.
+    fn restart(&mut self, plane: usize) {
+        let planes = self.planes.len();
+        let at = &mut self.planes[plane];
+        let lost = std::mem::take(&mut at.asked)
+            .into_iter()
+            .chain(std::mem::take(&mut at.waiting));
+        self.decided.extend(lost.map(|request| (request, false)));
+        at.instance += 1;
+        at.bucket = self.fresh.clone();
+        at.unsent = 0;
+        at.sent = 0;
+        at.unacknowledged.clear();
+        at.spent = 0;
+        at.allowance = None;
+        at.active = vec![false; planes];
+        at.last_request = None;
+        at.heard = None;
+        at.asking = None;
+        at.unreachable = false;
     }
 }
 
@@ -347,6 +462,36 @@ impl Cluster for Service {
         admitted
     }
 
+    fn arrive(
+        &mut self,
+        request: usize,
+        plane: usize,
+        now: u64,
+        outbox: &mut Outbox,
+    ) -> Option<bool> {
+        let plane = self.serving_plane(plane);
+        let at = &self.planes[plane];
+        let cold = self.serving.ask_when_cold
+            && !at.unreachable
+            && (at.asking.is_some() || at.heard.is_none_or(|heard| now - heard > self.hold));
+        if !cold {
+            return Some(self.decide(plane, now, outbox));
+        }
+        let at = &mut self.planes[plane];
+        at.last_request = Some(now);
+        if at.asking.is_some() {
+            at.waiting.push(request);
+        } else {
+            at.asked.push(request);
+            self.ask(plane, now, outbox);
+        }
+        None
+    }
+
+    fn take_decided(&mut self) -> Vec<(usize, bool)> {
+        std::mem::take(&mut self.decided)
+    }
+
     fn cycle(&self) -> Option<u64> {
         Some(self.serving.cycle)
     }
@@ -362,6 +507,21 @@ impl Cluster for Service {
         let at = &mut self.planes[plane];
         at.spent = 0;
         at.allowance = allowance;
+        // An ask unanswered for as long as a batch waits to be sent again: the owner is
+        // gone or out of reach, and the requests waiting are decided here, from the copy.
+        if at.asking.is_some_and(|asked| now - asked >= resend_after) {
+            let waited: Vec<usize> = std::mem::take(&mut at.asked)
+                .into_iter()
+                .chain(std::mem::take(&mut at.waiting))
+                .collect();
+            at.asking = None;
+            at.unreachable = true;
+            for request in waited {
+                let admitted = self.decide(plane, now, outbox);
+                self.decided.push((request, admitted));
+            }
+        }
+        let at = &mut self.planes[plane];
         // A batch not seen applied within a bucket's refill time is emptied: its hits no
         // longer weigh on the bucket, and applied now they would only refuse traffic that
         // came since. It goes on being sent, empty, as the owner applies batches in order
@@ -414,7 +574,7 @@ impl Cluster for Service {
         if to >= planes {
             self.at_service(to - planes, message, now, outbox);
         } else if self.alive[to] {
-            self.at_plane(to, message, now);
+            self.at_plane(to, message, now, outbox);
         }
     }
 
@@ -426,29 +586,19 @@ impl Cluster for Service {
                 self.serving_pods[self.owner] = false;
                 if let Some(next) = (0..SERVICE_PODS).find(|pod| self.serving_pods[*pod]) {
                     self.owner = next;
-                    self.follow(now, outbox);
+                    self.follow(true, now, outbox);
                 }
             }
             // It restarts, holding nothing.
             FaultEvent::OwnerRestarts => {
                 self.owners[self.owner] = Owner::new(&self.fresh, self.planes.len());
-                self.follow(now, outbox);
+                self.follow(false, now, outbox);
             }
             // Nothing to elect: data planes cut off from the service go on from their copies,
             // and their messages are lost until it heals.
             FaultEvent::PartitionStarts { .. } | FaultEvent::PartitionHeals { .. } => {}
             FaultEvent::Restart { pod } if pod < self.planes.len() && self.alive[pod] => {
-                let planes = self.planes.len();
-                let at = &mut self.planes[pod];
-                at.instance += 1;
-                at.bucket = self.fresh.clone();
-                at.unsent = 0;
-                at.sent = 0;
-                at.unacknowledged.clear();
-                at.spent = 0;
-                at.allowance = None;
-                at.active = vec![false; planes];
-                at.last_request = None;
+                self.restart(pod);
             }
             FaultEvent::Restart { .. } => {}
         }
@@ -484,8 +634,34 @@ mod tests {
             cycle: 10 * MS,
             excess: Excess::DebtUpTo(100 * MS),
             bound,
+            ask_when_cold: false,
         };
         Service::new(&contract, planes, serving)
+    }
+
+    /// A fleet whose data planes ask the owner about keys they hold no fresh copy of.
+    fn asking(planes: usize) -> Service {
+        let mut fleet = fleet(planes, Bound::Every);
+        fleet.serving.ask_when_cold = true;
+        fleet
+    }
+
+    /// Requests `requests` arrive at `plane` at `now`: those decided at once, as
+    /// `(request, admitted)`; the rest wait.
+    fn arrive(
+        fleet: &mut Service,
+        plane: usize,
+        requests: std::ops::Range<usize>,
+        now: u64,
+        outbox: &mut Outbox,
+    ) -> Vec<(usize, bool)> {
+        requests
+            .filter_map(|request| {
+                fleet
+                    .arrive(request, plane, now, outbox)
+                    .map(|admitted| (request, admitted))
+            })
+            .collect()
     }
 
     fn admits(fleet: &mut Service, plane: usize, count: u64, now: u64) -> u64 {
@@ -783,6 +959,166 @@ mod tests {
             "still waiting for the new owner"
         );
         assert_eq!(fleet.planes[1].bucket.remaining(0), 7);
+    }
+
+    /// Two data planes holding no copy each get six requests at once: they wait, the owner
+    /// decides them against the one bucket of ten, and ten are admitted in all — not a
+    /// bucket each. A request arriving during an ask is asked about next.
+    #[test]
+    fn requests_for_a_cold_key_wait_and_the_owner_decides_them() {
+        let mut fleet = asking(2);
+        let mut outbox = Outbox::default();
+        assert!(
+            arrive(&mut fleet, 0, 0..6, 0, &mut outbox).is_empty(),
+            "all wait"
+        );
+        assert!(arrive(&mut fleet, 1, 6..12, 0, &mut outbox).is_empty());
+        let asks: Vec<u64> = outbox
+            .sent
+            .iter()
+            .filter_map(|(_, message)| match message {
+                Message::Ask { count, .. } => Some(*count),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asks,
+            vec![1, 1],
+            "the first request asks; the rest come during it"
+        );
+        deliver(&mut fleet, &mut outbox, 0);
+        let mut decided = fleet.take_decided();
+        decided.sort_unstable();
+        assert_eq!(decided.len(), 12, "every request decided");
+        assert_eq!(decided.iter().filter(|(_, admitted)| *admitted).count(), 10);
+        assert_eq!(fleet.owners[0].counted, 10);
+        assert_eq!(fleet.admitted, 10);
+        let decided_here = arrive(&mut fleet, 0, 12..13, 0, &mut outbox);
+        assert_eq!(
+            decided_here.len(),
+            1,
+            "answered: decided here, from the copy"
+        );
+    }
+
+    /// A copy no answer has refreshed for a bucket's refill time is cold again.
+    #[test]
+    fn a_copy_goes_cold_a_refill_time_after_the_last_answer() {
+        let mut fleet = asking(2);
+        let mut outbox = Outbox::default();
+        arrive(&mut fleet, 0, 0..1, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        fleet.take_decided();
+        assert_eq!(arrive(&mut fleet, 0, 1..2, 100 * MS, &mut outbox).len(), 1);
+        assert!(arrive(&mut fleet, 0, 2..3, 100 * MS + 1, &mut outbox).is_empty());
+    }
+
+    /// An ask unanswered for four cycles: the requests waiting are decided from the copy.
+    #[test]
+    fn an_unanswered_ask_is_decided_here_after_four_cycles() {
+        let mut fleet = asking(2);
+        let mut outbox = Outbox::default();
+        arrive(&mut fleet, 0, 0..2, 0, &mut outbox);
+        // The ask reaches the owner, but its answer is held back.
+        let mut answers = Outbox::default();
+        for (to, message) in std::mem::take(&mut outbox.sent) {
+            fleet.on_message(to, message, 0, &mut answers);
+        }
+        fleet.on_timer(0, 39 * MS, &mut outbox);
+        assert!(fleet.take_decided().is_empty(), "still waiting");
+        outbox.sent.clear();
+        fleet.on_timer(0, 40 * MS, &mut outbox);
+        assert_eq!(fleet.take_decided(), vec![(0, true), (1, true)]);
+        assert!(
+            matches!(
+                outbox.sent.as_slice(),
+                [(_, Message::Hits { count: 2, .. })]
+            ),
+            "reported as its own hits: {:?}",
+            outbox.sent
+        );
+        // Heard from again, then cold a refill time later, the next request asks again;
+        // the first ask's answer, late, does not answer it.
+        deliver(&mut fleet, &mut outbox, 40 * MS);
+        assert!(arrive(&mut fleet, 0, 2..3, 140 * MS + 1, &mut outbox).is_empty());
+        for (to, message) in answers.sent {
+            fleet.on_message(to, message, 140 * MS + 1, &mut outbox);
+        }
+        assert!(
+            fleet.take_decided().is_empty(),
+            "the late answer decides nothing"
+        );
+        assert!(fleet.planes[0].asking.is_some());
+    }
+
+    /// After an ask goes unanswered the owner is taken to be out of reach: requests are
+    /// decided here at once, without asking, until the owner is heard from again.
+    #[test]
+    fn after_an_unanswered_ask_requests_are_decided_here_until_the_owner_answers() {
+        let mut fleet = asking(2);
+        let mut outbox = Outbox::default();
+        arrive(&mut fleet, 0, 0..1, 0, &mut outbox);
+        outbox.sent.clear();
+        fleet.on_timer(0, 40 * MS, &mut outbox);
+        fleet.take_decided();
+        outbox.sent.clear();
+        assert_eq!(
+            arrive(&mut fleet, 0, 1..2, 50 * MS, &mut outbox),
+            vec![(1, true)],
+            "decided at once"
+        );
+        assert!(outbox.sent.is_empty(), "nothing asked");
+        fleet.on_timer(0, 60 * MS, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 60 * MS);
+        assert_eq!(arrive(&mut fleet, 0, 2..3, 70 * MS, &mut outbox).len(), 1);
+        assert!(
+            arrive(&mut fleet, 0, 3..4, 160 * MS + 1, &mut outbox).is_empty(),
+            "heard from, the copy goes cold again a refill time later, and is asked about"
+        );
+    }
+
+    /// A data plane restarting refuses the requests waiting on it.
+    #[test]
+    fn a_restart_refuses_the_requests_waiting() {
+        let mut fleet = asking(2);
+        let mut outbox = Outbox::default();
+        arrive(&mut fleet, 1, 0..3, 0, &mut outbox);
+        fleet.on_fault(FaultEvent::Restart { pod: 1 }, 0, &mut outbox);
+        let mut decided = fleet.take_decided();
+        decided.sort_unstable();
+        assert_eq!(decided, vec![(0, false), (1, false), (2, false)]);
+        assert!(fleet.planes[1].asking.is_none());
+    }
+
+    /// The owner goes while an ask is in flight: the ask goes again, to the new owner. One
+    /// that restarts is not asked again: the ask on its way reaches it, and is decided once.
+    #[test]
+    fn an_ask_in_flight_goes_again_only_to_a_new_owner() {
+        for (event, asks) in [(FaultEvent::OwnerLost, 2), (FaultEvent::OwnerRestarts, 1)] {
+            let mut fleet = asking(2);
+            let mut outbox = Outbox::default();
+            arrive(&mut fleet, 1, 0..3, 0, &mut outbox);
+            fleet.on_fault(event, 0, &mut outbox);
+            let sent = outbox
+                .sent
+                .iter()
+                .filter(|(_, message)| matches!(message, Message::Ask { .. }))
+                .count();
+            assert_eq!(sent, asks, "{event:?}: {:?}", outbox.sent);
+            let owner = fleet.address(fleet.owner);
+            assert!(
+                matches!(outbox.sent.last(), Some((to, Message::Ask { count: 1, .. })) if *to == owner),
+                "{event:?}: {:?}",
+                outbox.sent
+            );
+            deliver(&mut fleet, &mut outbox, 0);
+            let decided = fleet.take_decided();
+            assert_eq!(decided.len(), 3, "{event:?}: {decided:?}");
+            assert_eq!(
+                fleet.owners[fleet.owner].counted, 3,
+                "{event:?}: decided once"
+            );
+        }
     }
 
     /// Data planes never talk to each other: every message goes to the service, and every

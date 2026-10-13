@@ -159,6 +159,7 @@ fn main() {
                 cycle: 10 * MS,
                 excess: Excess::DebtUpTo(SECOND),
                 bound: Bound::Unbounded,
+                ask_when_cold: false,
             }),
         ),
         (
@@ -167,6 +168,7 @@ fn main() {
                 cycle: 10 * MS,
                 excess: Excess::DebtUpTo(SECOND),
                 bound: Bound::Every,
+                ask_when_cold: false,
             }),
         ),
         (
@@ -175,6 +177,16 @@ fn main() {
                 cycle: 100 * MS,
                 excess: Excess::DebtUpTo(SECOND),
                 bound: Bound::Every,
+                ask_when_cold: false,
+            }),
+        ),
+        (
+            "service, debt up to 1 s, 10 ms, every pod bounded, the owner asked when cold",
+            Approach::Service(Serving {
+                cycle: 10 * MS,
+                excess: Excess::DebtUpTo(SECOND),
+                bound: Bound::Every,
+                ask_when_cold: true,
             }),
         ),
     ];
@@ -232,7 +244,8 @@ fn main() {
          one bucket for the fleet / the most over the contract in any span, worst seed / \
          share of admitted requests the fleet's count never saw / share it counted twice / \
          messages a second for each pod (all a run sends, a service's answers among them, \
-         over its pods and its ten seconds). \
+         over its pods and its ten seconds) / share of requests that waited for their \
+         decision / how long they waited, on average. \
          Fault: {fault_name}.\n",
         delay = delay_us as f64 / 1_000.0,
         jitter = delay_us as f64 / 2_000.0,
@@ -251,6 +264,7 @@ fn main() {
                 let (mut sent, mut refused, mut admitted, mut central, mut over) =
                     (0, 0, 0, 0, i64::MIN);
                 let (mut lost, mut twice, mut messages) = (0, 0, 0);
+                let (mut waited, mut waited_for) = (0, 0);
                 for seed in 0..seeds {
                     let workload = Workload {
                         shape,
@@ -279,6 +293,8 @@ fn main() {
                     lost += outcome.lost;
                     twice += outcome.counted_twice;
                     messages += outcome.messages;
+                    waited += outcome.waited;
+                    waited_for += outcome.waited_for;
                 }
                 let refused = 100.0 * refused as f64 / sent.max(1) as f64;
                 let ratio = admitted as f64 / central.max(1) as f64;
@@ -286,8 +302,11 @@ fn main() {
                 let twice = 100.0 * twice as f64 / admitted.max(1) as f64;
                 // Messages a second for each pod, over the ten seconds of a run.
                 let rate = messages as f64 / (seeds.max(1) * 10 * p as u64) as f64;
+                let wait = 100.0 * waited as f64 / sent.max(1) as f64;
+                let mean = waited_for as f64 / waited.max(1) as f64 / MS as f64;
                 print!(
-                    " {refused:.1}% / {ratio:.2}× / {over} / {lost:.1}% / {twice:.1}% / {rate:.0} |"
+                    " {refused:.1}% / {ratio:.2}× / {over} / {lost:.1}% / {twice:.1}% / {rate:.0} \
+                     / {wait:.1}% / {mean:.1} ms |"
                 );
             }
             println!();

@@ -352,6 +352,7 @@ impl Cluster for Ownership {
                     applied: applied.clone(),
                     active: active.clone(),
                     counted,
+                    decided: None,
                 };
                 outbox.send(to, state);
             }
@@ -409,6 +410,7 @@ impl Cluster for Ownership {
                 applied,
                 active,
                 counted,
+                ..
             } if self.pods[pod].owner == from && from != pod => {
                 let at = &mut self.pods[pod];
                 at.bucket = bucket;

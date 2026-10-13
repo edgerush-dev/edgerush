@@ -264,6 +264,18 @@ fn served(bound: Bound) -> Approach {
         cycle: 10_000_000,
         excess: Excess::DebtUpTo(SECOND),
         bound,
+        ask_when_cold: false,
+    })
+}
+
+/// Through a service, with data planes asking the owner about keys they hold no fresh
+/// copy of.
+fn asked() -> Approach {
+    Approach::Service(Serving {
+        cycle: 10_000_000,
+        excess: Excess::DebtUpTo(SECOND),
+        bound: Bound::Every,
+        ask_when_cold: true,
     })
 }
 
@@ -570,5 +582,59 @@ fn the_owner_restarting_is_the_first_pod_restarting_without_a_service() {
         }));
         assert_eq!(owner, first, "{approach:?}");
         assert_ne!(owner, decisions(&with(Fault::None)), "{approach:?}");
+    }
+}
+
+/// Asking the owner about a key a data plane holds nothing of holds bursts on every pod at
+/// once to the contract from the very first, at any fleet size — the cold start that
+/// deciding from a full bucket lets through on every pod — and data planes joining a busy
+/// key to about a bucket.
+#[test]
+fn asking_the_owner_holds_a_cold_key_to_the_contract_at_any_fleet_size() {
+    for pods in [8, 32] {
+        for seed in 0..3 {
+            let bursts = Run {
+                approach: asked(),
+                pods,
+                seed,
+                ..fixed(Approach::Central, 8, Shape::Bursts { each: 100 }, false)
+            };
+            let outcome = run(&bursts);
+            assert!(outcome.worst_excess <= 0, "{pods} pods: {outcome:?}");
+            assert!(outcome.waited > 0, "{outcome:?}");
+            let joining = Run {
+                workload: Workload {
+                    shape: Shape::SkewedThenBursts {
+                        per_window: 100,
+                        each: 100,
+                    },
+                    ..bursts.workload
+                },
+                ..bursts
+            };
+            let outcome = run(&joining);
+            assert!(outcome.worst_excess <= 100, "{pods} pods: {outcome:?}");
+        }
+    }
+}
+
+/// Asking the owner refuses no conforming traffic, and a request waits a round trip or
+/// two at most.
+#[test]
+fn asking_the_owner_refuses_no_conforming_traffic() {
+    for shape in [
+        Shape::Spread { per_window: 100 },
+        Shape::Skewed { per_window: 100 },
+    ] {
+        let conforming = Run {
+            approach: asked(),
+            ..fixed(Approach::Central, 8, shape, true)
+        };
+        let outcome = run(&conforming);
+        assert_eq!(outcome.refused, 0, "{shape:?}: {outcome:?}");
+        assert!(
+            outcome.waited_for <= outcome.waited * 4_000_000,
+            "{shape:?}: {outcome:?}"
+        );
     }
 }

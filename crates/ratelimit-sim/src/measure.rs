@@ -24,6 +24,11 @@ pub struct Outcome {
     pub counted_twice: u64,
     /// Messages the pods sent each other.
     pub messages: u64,
+    /// Requests that waited for their decision ([`Cluster::arrive`](crate::Cluster::arrive)).
+    /// Their admissions are measured at arrival, a few round trips early at most.
+    pub waited: u64,
+    /// Nanoseconds they waited, all together.
+    pub waited_for: u64,
 }
 
 impl Outcome {
@@ -57,6 +62,8 @@ impl Outcome {
             lost: 0,
             counted_twice: 0,
             messages: 0,
+            waited: 0,
+            waited_for: 0,
         }
     }
 }

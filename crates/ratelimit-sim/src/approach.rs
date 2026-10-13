@@ -14,6 +14,24 @@ pub trait Cluster {
     /// Decides a request arriving at `pod` at `now`: `true` admits it.
     fn decide(&mut self, pod: usize, now: u64, outbox: &mut Outbox) -> bool;
 
+    /// Request `request` arrives at `pod` at `now`: decided at once, or `None` if it waits
+    /// — its decision then comes later, from [`take_decided`](Self::take_decided).
+    fn arrive(
+        &mut self,
+        request: usize,
+        pod: usize,
+        now: u64,
+        outbox: &mut Outbox,
+    ) -> Option<bool> {
+        let _ = request;
+        Some(self.decide(pod, now, outbox))
+    }
+
+    /// Decisions made since last asked for requests that waited, as `(request, admitted)`.
+    fn take_decided(&mut self) -> Vec<(usize, bool)> {
+        Vec::new()
+    }
+
     /// How often each pod's timer fires, if the pods have work to do in the background.
     fn cycle(&self) -> Option<u64> {
         None
@@ -79,6 +97,10 @@ pub struct Serving {
     pub excess: Excess,
     /// How much of what it sees a data plane may admit in one cycle.
     pub bound: Bound,
+    /// Whether requests for a key a data plane holds no fresh copy of wait while it asks
+    /// the owner, which decides them against the one bucket (06 §4), rather than being
+    /// decided from a full bucket.
+    pub ask_when_cold: bool,
 }
 
 /// How pods share a key by per-pod counters.

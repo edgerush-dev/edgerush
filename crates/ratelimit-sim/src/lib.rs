@@ -147,18 +147,20 @@ pub enum FaultEvent {
 /// that changing it leaves the traffic as it was.
 #[must_use]
 pub fn decisions(run: &Run) -> Vec<(Arrival, bool)> {
-    play(run).0
+    play(run).decisions
 }
 
 /// Plays a run and measures it against its contract.
 #[must_use]
 pub fn run(run: &Run) -> Outcome {
-    let (decisions, lost, counted_twice, messages) = play(run);
+    let played = play(run);
     Outcome {
-        lost,
-        counted_twice,
-        messages,
-        ..Outcome::of(&run.contract, run.pods, &decisions)
+        lost: played.lost,
+        counted_twice: played.counted_twice,
+        messages: played.messages,
+        waited: played.waited,
+        waited_for: played.waited_for,
+        ..Outcome::of(&run.contract, run.pods, &played.decisions)
     }
 }
 
@@ -166,9 +168,21 @@ pub fn run(run: &Run) -> Outcome {
 /// its way — batches sent again among them — can arrive.
 const SETTLING_CYCLES: u64 = 10;
 
-/// What playing a run gives: its decisions, the hits it left unapplied, those counted
-/// twice, and the messages sent.
-type Played = (Vec<(Arrival, bool)>, u64, u64, u64);
+/// What playing a run gives.
+struct Played {
+    /// Every request with its decision.
+    decisions: Vec<(Arrival, bool)>,
+    /// Hits left unapplied.
+    lost: u64,
+    /// Hits counted twice.
+    counted_twice: u64,
+    /// Messages sent.
+    messages: u64,
+    /// Requests that waited for their decision.
+    waited: u64,
+    /// Nanoseconds they waited, all together.
+    waited_for: u64,
+}
 
 /// Plays a run.
 fn play(run: &Run) -> Played {
@@ -205,12 +219,15 @@ fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> Played {
         }
     }
     let mut decided = vec![false; arrivals.len()];
-    let mut messages = 0;
+    let (mut messages, mut waited, mut waited_for) = (0, 0, 0);
     let mut outbox = Outbox::default();
     while let Some((now, event)) = queue.pop() {
         match event {
             Event::Arrival(index) => {
-                decided[index] = cluster.decide(arrivals[index].pod, now, &mut outbox);
+                match cluster.arrive(index, arrivals[index].pod, now, &mut outbox) {
+                    Some(admitted) => decided[index] = admitted,
+                    None => waited += 1,
+                }
             }
             Event::Timer(pod) => {
                 cluster.on_timer(pod, now, &mut outbox);
@@ -227,6 +244,10 @@ fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> Played {
             }
             Event::Fault(event) => cluster.on_fault(event, now, &mut outbox),
         }
+        for (index, admitted) in cluster.take_decided() {
+            decided[index] = admitted;
+            waited_for += now - arrivals[index].at;
+        }
         messages += outbox.sent.len() as u64;
         for (to, message) in outbox.sent.drain(..) {
             if let Some(at) = run.network.carry(now, &mut network_rng) {
@@ -234,13 +255,14 @@ fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> Played {
             }
         }
     }
-    let (lost, twice) = (cluster.unapplied(), cluster.counted_twice());
-    (
-        arrivals.into_iter().zip(decided).collect(),
-        lost,
-        twice,
+    Played {
+        lost: cluster.unapplied(),
+        counted_twice: cluster.counted_twice(),
+        decisions: arrivals.into_iter().zip(decided).collect(),
         messages,
-    )
+        waited,
+        waited_for,
+    }
 }
 
 /// Something that happens at a moment of a run.
