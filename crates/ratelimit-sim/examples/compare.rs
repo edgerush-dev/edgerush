@@ -5,7 +5,8 @@
 //! `cargo run --release -p edgerush-ratelimit-sim --example compare [seeds]`
 
 use edgerush_ratelimit_sim::{
-    Approach, Bound, Contract, Excess, Network, Run, Shape, Workload, run,
+    Approach, Bound, Contract, Excess, Fault, Network, OnOwnerChange, Run, Shape, Sharing,
+    Workload, run,
 };
 use std::num::NonZeroU64;
 
@@ -13,30 +14,33 @@ const MS: u64 = 1_000_000;
 const SECOND: u64 = 1_000 * MS;
 
 fn owned(cycle: u64, excess: Excess) -> Approach {
-    Approach::Ownership {
+    Approach::Ownership(Sharing {
         cycle,
         excess,
         ledger: false,
         bound: Bound::Unbounded,
-    }
+        on_owner_change: OnOwnerChange::Drop,
+    })
 }
 
 fn ledger(cycle: u64, excess: Excess) -> Approach {
-    Approach::Ownership {
+    Approach::Ownership(Sharing {
         cycle,
         excess,
         ledger: true,
         bound: Bound::Unbounded,
-    }
+        on_owner_change: OnOwnerChange::Drop,
+    })
 }
 
 fn bounded(cycle: u64, excess: Excess, bound: Bound) -> Approach {
-    Approach::Ownership {
+    Approach::Ownership(Sharing {
         cycle,
         excess,
         ledger: true,
         bound,
-    }
+        on_owner_change: OnOwnerChange::Drop,
+    })
 }
 
 fn main() {
@@ -48,6 +52,11 @@ fn main() {
         .nth(2)
         .and_then(|arg| arg.parse().ok())
         .unwrap_or(0);
+    // `owner-lost`: the pod owning the key goes away half way through each run.
+    let fault = match std::env::args().nth(3).as_deref() {
+        Some("owner-lost") => Fault::OwnerLost { at: 5 * SECOND },
+        _ => Fault::None,
+    };
     let n = |n: u64| NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN);
     let contract = Contract {
         limit: n(100),
@@ -95,6 +104,16 @@ fn main() {
         (
             "ledger, drain, 10 ms, every pod bounded",
             bounded(10 * MS, Excess::Drain, Bound::Every),
+        ),
+        (
+            "ledger, debt up to 1 s, 10 ms, every pod bounded, sent again to a new owner",
+            Approach::Ownership(Sharing {
+                cycle: 10 * MS,
+                excess: Excess::DebtUpTo(SECOND),
+                ledger: true,
+                bound: Bound::Every,
+                on_owner_change: OnOwnerChange::SendAgain,
+            }),
         ),
     ];
     let workloads = [
@@ -144,7 +163,8 @@ fn main() {
          1 ms, give or take 0.5 ms, {loss_per_mille} in 1,000 lost. Each cell: share of \
          requests refused (for conforming traffic every refusal is false) / admitted against \
          one bucket for the fleet / the most over the contract in any span, worst seed / \
-         share of admitted requests the fleet's count never saw.\n"
+         share of admitted requests the fleet's count never saw / share it counted twice. \
+         Fault: {fault:?}.\n"
     );
     for (title, shape, conforming) in workloads {
         println!("**{title}**\n");
@@ -157,8 +177,9 @@ fn main() {
         for (name, approach) in approaches {
             print!("| {name} |");
             for p in pods {
-                let (mut sent, mut refused, mut admitted, mut central, mut over, mut lost) =
-                    (0, 0, 0, 0, i64::MIN, 0);
+                let (mut sent, mut refused, mut admitted, mut central, mut over) =
+                    (0, 0, 0, 0, i64::MIN);
+                let (mut lost, mut twice) = (0, 0);
                 for seed in 0..seeds {
                     let workload = Workload {
                         shape,
@@ -171,6 +192,7 @@ fn main() {
                         workload,
                         approach,
                         network,
+                        fault,
                         seed,
                     };
                     let outcome = run(&this);
@@ -184,11 +206,13 @@ fn main() {
                     central += baseline.admitted;
                     over = over.max(outcome.worst_excess);
                     lost += outcome.lost;
+                    twice += outcome.counted_twice;
                 }
                 let refused = 100.0 * refused as f64 / sent.max(1) as f64;
                 let ratio = admitted as f64 / central.max(1) as f64;
                 let lost = 100.0 * lost as f64 / admitted.max(1) as f64;
-                print!(" {refused:.1}% / {ratio:.2}× / {over} / {lost:.1}% |");
+                let twice = 100.0 * twice as f64 / admitted.max(1) as f64;
+                print!(" {refused:.1}% / {ratio:.2}× / {over} / {lost:.1}% / {twice:.1}% |");
             }
             println!();
         }

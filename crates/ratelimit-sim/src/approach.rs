@@ -1,7 +1,7 @@
 //! Ways of limiting one key across several pods.
 
 use crate::ownership::Ownership;
-use crate::{Contract, Message, Outbox};
+use crate::{Contract, Fault, Message, Outbox};
 use edgerush_ratelimit::reference::{Model, TokenBucket};
 use std::num::NonZeroU64;
 
@@ -29,6 +29,14 @@ pub trait Cluster {
     fn unapplied(&self) -> u64 {
         0
     }
+
+    /// Hits the count deciding for the fleet holds more than once, as the run ends.
+    fn counted_twice(&self) -> u64 {
+        0
+    }
+
+    /// `fault` happens at `now`.
+    fn on_fault(&mut self, _fault: &Fault, _now: u64, _outbox: &mut Outbox) {}
 }
 
 /// How the pods limit a key between them.
@@ -45,22 +53,40 @@ pub enum Approach {
     /// that lands unevenly (06 §4).
     Split,
     /// Gubernator's `GLOBAL` behaviour (06 §4): the first pod owns the key; every other pod
-    /// answers from a copy of the owner's bucket and, every `cycle` nanoseconds, sends the
-    /// owner the hits it admitted; the owner applies them, and every `cycle` sends its
-    /// bucket to every pod, which takes it over in place of its copy.
-    Ownership {
-        /// The time between a pod's reports, and between the owner's broadcasts.
-        cycle: u64,
-        /// What the owner does with hits that do not fit.
-        excess: Excess,
-        /// Whether pods keep their own hits apart with the hit ledger (06 §4) — a pod's view
-        /// the owner's bucket plus its hits the owner has not yet applied — rather than
-        /// taking the broadcast over as it comes. With it, a batch not seen applied within
-        /// four cycles is sent again.
-        ledger: bool,
-        /// How much of what it sees a pod may admit in one cycle.
-        bound: Bound,
-    },
+    /// answers from a copy of the owner's bucket and, every cycle, sends the owner the hits
+    /// it admitted; the owner applies them, and every cycle sends its bucket to every pod,
+    /// which takes it over in place of its copy — with the changes 06 §4 proposes as
+    /// settings.
+    Ownership(Sharing),
+}
+
+/// How pods share a key by ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sharing {
+    /// The time between a pod's reports, and between the owner's broadcasts.
+    pub cycle: u64,
+    /// What the owner does with hits that do not fit.
+    pub excess: Excess,
+    /// Whether pods keep their own hits apart with the hit ledger (06 §4) — a pod's view
+    /// the owner's bucket plus its hits the owner has not yet applied — rather than taking
+    /// the broadcast over as it comes. With it, a batch not seen applied within four cycles
+    /// is sent again.
+    pub ledger: bool,
+    /// How much of what it sees a pod may admit in one cycle.
+    pub bound: Bound,
+    /// What pods do, when the owner changes, with batches it had not yet been seen to apply.
+    pub on_owner_change: OnOwnerChange,
+}
+
+/// What a pod does, when the owner changes, with batches the old owner was not yet seen to
+/// apply (06 §4: what the ledger cannot settle).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnOwnerChange {
+    /// Forgets them: never counted twice, but lost if the old owner never applied them.
+    Drop,
+    /// Sends them to the new owner: never lost, but counted twice if the new owner's copy
+    /// already held them.
+    SendAgain,
 }
 
 /// How much of what it sees a pod may admit in one cycle, against bursts that land on every
@@ -109,14 +135,7 @@ impl Approach {
                 let share = || TokenBucket::new(contract.limit, window, burst);
                 Box::new(Pods((0..pods).map(|_| share()).collect()))
             }
-            Self::Ownership {
-                cycle,
-                excess,
-                ledger,
-                bound,
-            } => Box::new(Ownership::new(
-                contract, pods, *cycle, *excess, *ledger, *bound,
-            )),
+            Self::Ownership(sharing) => Box::new(Ownership::new(contract, pods, *sharing)),
         }
     }
 }

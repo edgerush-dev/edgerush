@@ -7,7 +7,8 @@
 )]
 
 use edgerush_ratelimit_sim::{
-    Approach, Bound, Contract, Excess, Network, Run, Shape, Workload, decisions, run,
+    Approach, Bound, Contract, Excess, Fault, Network, OnOwnerChange, Run, Shape, Sharing,
+    Workload, decisions, run,
 };
 use proptest::prelude::*;
 use std::num::NonZeroU64;
@@ -50,6 +51,7 @@ fn runs(approach: Approach, conforming: bool) -> impl Strategy<Value = Run> {
             },
             approach,
             network: NETWORK,
+            fault: Fault::None,
             seed,
         }
     })
@@ -92,7 +94,13 @@ proptest! {
     /// Property 6: the same run decides the same way every time, messages and their
     /// delays included.
     #[test]
-    fn a_run_is_deterministic(run in runs(Approach::Ownership { cycle: 10_000_000, excess: Excess::Drain, ledger: true, bound: Bound::Every }, false)) {
+    fn a_run_is_deterministic(run in runs(Approach::Ownership(Sharing {
+            cycle: 10_000_000,
+            excess: Excess::Drain,
+            ledger: true,
+            bound: Bound::Every,
+            on_owner_change: OnOwnerChange::Drop,
+        }), false)) {
         prop_assert_eq!(decisions(&run), decisions(&run));
     }
 }
@@ -113,6 +121,7 @@ fn fixed(approach: Approach, pods: usize, shape: Shape, conforming: bool) -> Run
         },
         approach,
         network: NETWORK,
+        fault: Fault::None,
         seed: 1,
     }
 }
@@ -168,12 +177,13 @@ fn skewed_conforming_traffic_is_shaved_by_shares() {
 fn ownership_keeps_sharing_through_a_run() {
     let shape = Shape::Spread { per_window: 300 };
     let owned = run(&fixed(
-        Approach::Ownership {
+        Approach::Ownership(Sharing {
             cycle: 10_000_000,
             excess: Excess::Drain,
             ledger: false,
             bound: Bound::Unbounded,
-        },
+            on_owner_change: OnOwnerChange::Drop,
+        }),
         2,
         shape,
         false,
@@ -192,12 +202,13 @@ fn ownership_keeps_sharing_through_a_run() {
 
 fn lossy(ledger: bool, loss_per_mille: u64, seed: u64) -> Run {
     Run {
-        approach: Approach::Ownership {
+        approach: Approach::Ownership(Sharing {
             cycle: 10_000_000,
             excess: Excess::Drain,
             ledger,
             bound: Bound::Unbounded,
-        },
+            on_owner_change: OnOwnerChange::Drop,
+        }),
         network: Network {
             loss_per_mille,
             ..NETWORK
@@ -232,12 +243,13 @@ fn a_reliable_network_loses_nothing() {
 
 fn shared(bound: Bound, shape: Shape, conforming: bool) -> Run {
     Run {
-        approach: Approach::Ownership {
+        approach: Approach::Ownership(Sharing {
             cycle: 10_000_000,
             excess: Excess::DebtUpTo(SECOND),
             ledger: true,
             bound,
-        },
+            on_owner_change: OnOwnerChange::Drop,
+        }),
         ..fixed(Approach::Central, 8, shape, conforming)
     }
 }
@@ -259,4 +271,36 @@ fn a_bound_on_every_pod_holds_simultaneous_bursts_without_shaving_skew() {
         true,
     ));
     assert!(skewed.refused * 100 < skewed.sent, "{skewed:?}");
+}
+
+fn owner_lost(on_owner_change: OnOwnerChange, seed: u64) -> Run {
+    Run {
+        approach: Approach::Ownership(Sharing {
+            cycle: 10_000_000,
+            excess: Excess::DebtUpTo(SECOND),
+            ledger: true,
+            bound: Bound::Every,
+            on_owner_change,
+        }),
+        fault: Fault::OwnerLost { at: 5 * SECOND },
+        seed,
+        ..fixed(
+            Approach::Central,
+            4,
+            Shape::Spread { per_window: 300 },
+            false,
+        )
+    }
+}
+
+/// The owner goes half way through: dropping what it had not been seen to apply loses a
+/// few cycles of hits and counts none twice; sending them again loses none.
+#[test]
+fn an_owner_lost_costs_at_most_a_few_cycles_of_hits() {
+    for seed in 0..5 {
+        let dropped = run(&owner_lost(OnOwnerChange::Drop, seed));
+        assert!(dropped.lost <= 30, "{dropped:?}");
+        assert_eq!(dropped.counted_twice, 0);
+        assert_eq!(run(&owner_lost(OnOwnerChange::SendAgain, seed)).lost, 0);
+    }
 }

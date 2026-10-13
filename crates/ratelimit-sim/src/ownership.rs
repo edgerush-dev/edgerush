@@ -1,24 +1,31 @@
 //! Ownership as Gubernator shares counts (06 §4): one owner applies every pod's hits to the
-//! bucket that counts, and broadcasts it — and, as a setting, the hit ledger 06 §4 proposes
-//! in place of Gubernator's overwrite.
+//! bucket that counts, and broadcasts it — and, as settings, the hit ledger and the per-cycle
+//! bound 06 §4 proposes, and what pods do with their batches when the owner changes.
 
-use crate::{Bound, Cluster, Contract, Excess, Message, Outbox};
+use crate::{Bound, Cluster, Contract, Excess, Fault, Message, OnOwnerChange, Outbox, Sharing};
 use edgerush_ratelimit::reference::{Model, TokenBucket};
 use std::collections::{BTreeMap, VecDeque};
 
-/// The pod that owns the key. With one key there is one owner; which pod it is changes
-/// nothing, so it is the first.
+/// The pod that owns the key at the start. With one key there is one owner; which pod it
+/// is changes nothing, so it is the first.
 const OWNER: usize = 0;
+
+/// How many cycles a pod waits to see a batch applied before sending it again.
+const RESEND_AFTER_CYCLES: u64 = 4;
+
+/// For how many cycles a pod counts as admitting the key after it last did.
+const ACTIVE_CYCLES: u64 = 4;
 
 /// A fleet sharing one key by ownership.
 pub(crate) struct Ownership {
-    cycle: u64,
-    excess: Excess,
-    ledger: bool,
-    bound: Bound,
+    sharing: Sharing,
     /// What a cycle refills, in requests, rounded down.
     refill: u64,
     pods: Vec<Pod>,
+    /// Which pods are still there.
+    alive: Vec<bool>,
+    /// The pod that owns the key now.
+    owner: usize,
     /// On the owner, for each pod: when it last saw the pod admit the key.
     last_admitted: Vec<Option<u64>>,
     /// On the owner, for each pod: the highest of its batches applied, every one before it
@@ -27,17 +34,12 @@ pub(crate) struct Ownership {
     /// On the owner, for each pod: batches that came ahead of one still missing, held until
     /// it comes, so that a pod's batches are applied in order.
     waiting: Vec<BTreeMap<u64, u64>>,
-    /// Hits admitted by pods other than the owner.
-    admitted_elsewhere: u64,
-    /// Of those, how many reached the owner, each counted once.
-    reached: u64,
+    /// Hits admitted anywhere.
+    admitted: u64,
+    /// Hits the owner's count holds: its own, and those reported to it, each once — and,
+    /// after an owner change, those its new owner held on taking over.
+    counted: u64,
 }
-
-/// How many cycles a pod waits to see a batch applied before sending it again.
-const RESEND_AFTER_CYCLES: u64 = 4;
-
-/// For how many cycles a pod counts as admitting the key after it last did.
-const ACTIVE_CYCLES: u64 = 4;
 
 /// What one pod holds of the key.
 struct Pod {
@@ -45,7 +47,7 @@ struct Pod {
     bucket: TokenBucket,
     /// Hits admitted here and not yet sent to the owner.
     unsent: u64,
-    /// Batches sent so far.
+    /// Batches sent to the present owner so far.
     sent: u64,
     /// With the ledger: batches sent and not yet seen applied in a broadcast, as
     /// `(sequence, count, last sent)`.
@@ -58,19 +60,14 @@ struct Pod {
     allowance: Option<u64>,
     /// Which pods the owner last said were admitting the key.
     active: Vec<bool>,
+    /// What the owner's count held at its last broadcast to this pod.
+    counted: u64,
 }
 
 impl Ownership {
-    pub(crate) fn new(
-        contract: &Contract,
-        pods: usize,
-        cycle: u64,
-        excess: Excess,
-        ledger: bool,
-        bound: Bound,
-    ) -> Self {
+    pub(crate) fn new(contract: &Contract, pods: usize, sharing: Sharing) -> Self {
         let pods = pods.max(1);
-        let cycle = cycle.max(1);
+        let cycle = sharing.cycle.max(1);
         let pod = || Pod {
             bucket: TokenBucket::new(contract.limit, contract.window, contract.burst),
             unsent: 0,
@@ -80,22 +77,32 @@ impl Ownership {
             spent: 0,
             allowance: None,
             active: vec![false; pods],
+            counted: 0,
         };
         let refill = u128::from(contract.limit.get()) * u128::from(cycle)
             / u128::from(contract.window.get());
         Self {
-            cycle,
-            excess,
-            ledger,
-            bound,
+            sharing: Sharing { cycle, ..sharing },
             refill: u64::try_from(refill).unwrap_or(u64::MAX),
             pods: (0..pods).map(|_| pod()).collect(),
+            alive: vec![true; pods],
+            owner: OWNER,
             last_admitted: vec![None; pods],
             applied: vec![0; pods],
             waiting: vec![BTreeMap::new(); pods],
-            admitted_elsewhere: 0,
-            reached: 0,
+            admitted: 0,
+            counted: 0,
         }
+    }
+
+    /// The pod a request for `pod` is decided on: itself, or, if it has gone, the next that
+    /// is still there, as a load balancer sends its traffic on.
+    fn serving(&self, pod: usize) -> usize {
+        let pods = self.pods.len();
+        (0..pods)
+            .map(|step| (pod + step) % pods)
+            .find(|candidate| self.alive[*candidate])
+            .unwrap_or(pod)
     }
 
     /// What `pod` may admit in the cycle starting at `now`.
@@ -105,7 +112,7 @@ impl Ownership {
             let sees = at.bucket.remaining(now).saturating_add(self.refill);
             Some((sees / pods.max(1) as u64).max(1))
         };
-        match self.bound {
+        match self.sharing.bound {
             Bound::Unbounded => None,
             Bound::NewPods if at.active[pod] => None,
             Bound::NewPods => share(self.pods.len()),
@@ -120,7 +127,7 @@ impl Ownership {
 
     /// Which pods the owner has seen admit the key within the last few cycles.
     fn active(&self, now: u64) -> Vec<bool> {
-        let lately = ACTIVE_CYCLES * self.cycle;
+        let lately = ACTIVE_CYCLES * self.sharing.cycle;
         self.last_admitted
             .iter()
             .map(|last| last.is_some_and(|at| now - at <= lately))
@@ -130,10 +137,12 @@ impl Ownership {
     /// The owner applies `count` reported hits, each charged if there is room, and beyond
     /// that as its handling of excess says.
     fn apply(&mut self, count: u64, now: u64) {
-        let bucket = &mut self.pods[OWNER].bucket;
+        self.counted += count;
+        let owner = self.owner;
+        let bucket = &mut self.pods[owner].bucket;
         for _ in 0..count {
             let room = bucket.admits(now);
-            let owe = match self.excess {
+            let owe = match self.sharing.excess {
                 Excess::Drain => false,
                 Excess::Debt => true,
                 Excess::DebtUpTo(most) => {
@@ -144,12 +153,50 @@ impl Ownership {
                 bucket.charge(now);
             }
         }
-        self.pods[OWNER].changed = true;
+        self.pods[owner].changed = true;
+    }
+
+    /// The owner has gone: the next pod still there owns the key from now on, carrying on
+    /// from its own view, which already counts its own hits; every other pod numbers its
+    /// batches afresh for the new owner, and drops or sends again those still unapplied.
+    fn owner_lost(&mut self, now: u64, outbox: &mut Outbox) {
+        let old = self.owner;
+        self.alive[old] = false;
+        let new = self.serving(old);
+        self.owner = new;
+        let pods = self.pods.len();
+        let at = &mut self.pods[new];
+        let held: u64 = at.unacknowledged.iter().map(|(_, count, _)| count).sum();
+        self.counted = at.counted + held + at.unsent;
+        at.unacknowledged.clear();
+        at.unsent = 0;
+        at.changed = true;
+        self.applied = vec![0; pods];
+        self.waiting = vec![BTreeMap::new(); pods];
+        self.last_admitted = vec![None; pods];
+        for pod in (0..pods).filter(|pod| *pod != new && self.alive[*pod]) {
+            let at = &mut self.pods[pod];
+            at.sent = 0;
+            let batches: Vec<(u64, u64, u64)> = at.unacknowledged.drain(..).collect();
+            if self.sharing.on_owner_change == OnOwnerChange::SendAgain {
+                for (_, count, _) in batches {
+                    at.sent += 1;
+                    let hits = Message::Hits {
+                        from: pod,
+                        sequence: at.sent,
+                        count,
+                    };
+                    outbox.send(new, hits);
+                    at.unacknowledged.push_back((at.sent, count, now));
+                }
+            }
+        }
     }
 }
 
 impl Cluster for Ownership {
     fn decide(&mut self, pod: usize, now: u64, _: &mut Outbox) -> bool {
+        let pod = self.serving(pod);
         let at = &mut self.pods[pod];
         if at.allowance.is_some_and(|allowance| at.spent >= allowance) {
             return false;
@@ -157,33 +204,39 @@ impl Cluster for Ownership {
         let admitted = at.bucket.decide(now);
         if admitted {
             at.spent += 1;
-            if pod == OWNER {
+            self.admitted += 1;
+            if pod == self.owner {
                 at.changed = true;
-                self.last_admitted[OWNER] = Some(now);
+                self.counted += 1;
+                self.last_admitted[pod] = Some(now);
             } else {
                 at.unsent += 1;
-                self.admitted_elsewhere += 1;
             }
         }
         admitted
     }
 
     fn cycle(&self) -> Option<u64> {
-        Some(self.cycle)
+        Some(self.sharing.cycle)
     }
 
     fn on_timer(&mut self, pod: usize, now: u64, outbox: &mut Outbox) {
+        if !self.alive[pod] {
+            return;
+        }
         let pods = self.pods.len();
-        let resend_after = RESEND_AFTER_CYCLES * self.cycle;
-        if pod == OWNER {
-            self.pods[OWNER].active = self.active(now);
+        let owner = self.owner;
+        let resend_after = RESEND_AFTER_CYCLES * self.sharing.cycle;
+        if pod == owner {
+            self.pods[owner].active = self.active(now);
         }
         let allowance = self.allowance(pod, now);
         let active = self.active(now);
+        let (applied, counted) = (self.applied.clone(), self.counted);
         let at = &mut self.pods[pod];
         at.spent = 0;
         at.allowance = allowance;
-        if pod != OWNER {
+        if pod != owner {
             for (sequence, count, sent) in &mut at.unacknowledged {
                 if now - *sent >= resend_after {
                     *sent = now;
@@ -192,7 +245,7 @@ impl Cluster for Ownership {
                         sequence: *sequence,
                         count: *count,
                     };
-                    outbox.send(OWNER, again);
+                    outbox.send(owner, again);
                 }
             }
             if at.unsent > 0 {
@@ -202,19 +255,21 @@ impl Cluster for Ownership {
                     sequence: at.sent,
                     count: at.unsent,
                 };
-                outbox.send(OWNER, hits);
-                if self.ledger {
+                outbox.send(owner, hits);
+                if self.sharing.ledger {
                     at.unacknowledged.push_back((at.sent, at.unsent, now));
                 }
                 at.unsent = 0;
             }
         } else if at.changed {
             at.changed = false;
-            for to in (0..pods).filter(|to| *to != OWNER) {
+            for to in (0..pods).filter(|to| *to != owner && self.alive[*to]) {
                 let state = Message::State {
+                    from: owner,
                     bucket: at.bucket.clone(),
-                    applied: self.applied.clone(),
+                    applied: applied.clone(),
                     active: active.clone(),
+                    counted,
                 };
                 outbox.send(to, state);
             }
@@ -222,15 +277,17 @@ impl Cluster for Ownership {
     }
 
     fn on_message(&mut self, pod: usize, message: Message, now: u64, _: &mut Outbox) {
+        if !self.alive[pod] {
+            return;
+        }
         match message {
             Message::Hits {
                 from,
                 sequence,
                 count,
-            } if pod == OWNER => {
+            } if pod == self.owner => {
                 self.last_admitted[from] = Some(now);
-                if !self.ledger {
-                    self.reached += count;
+                if !self.sharing.ledger {
                     self.apply(count, now);
                     return;
                 }
@@ -242,20 +299,23 @@ impl Cluster for Ownership {
                 }
                 while let Some(count) = self.waiting[from].remove(&(self.applied[from] + 1)) {
                     self.applied[from] += 1;
-                    self.reached += count;
                     self.apply(count, now);
                 }
-                self.pods[OWNER].changed = true;
+                self.pods[pod].changed = true;
             }
+            // Only from the present owner: a broadcast from one that has gone is stale.
             Message::State {
+                from,
                 bucket,
                 applied,
                 active,
-            } if pod != OWNER => {
+                counted,
+            } if pod != self.owner && from == self.owner => {
                 let at = &mut self.pods[pod];
                 at.bucket = bucket;
                 at.active = active;
-                if self.ledger {
+                at.counted = counted;
+                if self.sharing.ledger {
                     // The owner's bucket, plus what this pod admitted that it has not seen:
                     // batches the broadcast's applied mark does not cover, and hits unsent.
                     let seen = applied.get(pod).copied().unwrap_or(0);
@@ -273,14 +333,34 @@ impl Cluster for Ownership {
         }
     }
 
+    fn on_fault(&mut self, fault: &Fault, now: u64, outbox: &mut Outbox) {
+        if let Fault::OwnerLost { .. } = fault {
+            self.owner_lost(now, outbox);
+        }
+    }
+
     fn unapplied(&self) -> u64 {
-        self.admitted_elsewhere - self.reached
+        self.admitted.saturating_sub(self.counted)
+    }
+
+    fn counted_twice(&self) -> u64 {
+        self.counted.saturating_sub(self.admitted)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sharing(cycle: u64, excess: Excess, ledger: bool, bound: Bound) -> Sharing {
+        Sharing {
+            cycle,
+            excess,
+            ledger,
+            bound,
+            on_owner_change: OnOwnerChange::Drop,
+        }
+    }
     use std::num::NonZeroU64;
 
     const MS: u64 = 1_000_000;
@@ -295,10 +375,7 @@ mod tests {
         Ownership::new(
             &contract,
             pods,
-            10 * MS,
-            Excess::Drain,
-            false,
-            Bound::Unbounded,
+            sharing(10 * MS, Excess::Drain, false, Bound::Unbounded),
         )
     }
 
@@ -359,7 +436,11 @@ mod tests {
             window: n(1_000 * MS),
             burst: n(10),
         };
-        Ownership::new(&contract, 3, 10 * MS, excess, false, Bound::Unbounded)
+        Ownership::new(
+            &contract,
+            3,
+            sharing(10 * MS, excess, false, Bound::Unbounded),
+        )
     }
 
     /// Twenty hits reported on a bucket of ten, then what the owner admits a tenth of a
@@ -417,10 +498,7 @@ mod tests {
         Ownership::new(
             &contract,
             pods,
-            10 * MS,
-            Excess::Drain,
-            true,
-            Bound::Unbounded,
+            sharing(10 * MS, Excess::Drain, true, Bound::Unbounded),
         )
     }
 
@@ -547,7 +625,11 @@ mod tests {
             window: n(1_000 * MS),
             burst: n(10),
         };
-        Ownership::new(&contract, pods, 10 * MS, Excess::Drain, true, bound)
+        Ownership::new(
+            &contract,
+            pods,
+            sharing(10 * MS, Excess::Drain, true, bound),
+        )
     }
 
     /// Tells every pod, as the owner's broadcast would, that `active` pods are admitting.
@@ -630,12 +712,102 @@ mod tests {
             window: n(1_000 * MS),
             burst: n(10),
         };
-        let mut fleet = Ownership::new(&contract, 3, 10 * MS, Excess::Drain, true, Bound::Every);
+        let mut fleet = Ownership::new(
+            &contract,
+            3,
+            sharing(10 * MS, Excess::Drain, true, Bound::Every),
+        );
         let mut outbox = Outbox::default();
         say_active(&mut fleet, &[false, true, true]);
         fleet.on_timer(1, 0, &mut outbox);
         assert_eq!(admits(&mut fleet, 1, 20, 0), 10);
         fleet.on_timer(1, 10 * MS, &mut outbox);
         assert_eq!(admits(&mut fleet, 1, 20, 10 * MS), 10);
+    }
+
+    fn changing(on_owner_change: OnOwnerChange) -> Ownership {
+        let n = |n| NonZeroU64::new(n).unwrap();
+        let contract = Contract {
+            limit: n(100),
+            window: n(1_000 * MS),
+            burst: n(10),
+        };
+        let sharing = Sharing {
+            on_owner_change,
+            ..sharing(10 * MS, Excess::Drain, true, Bound::Unbounded)
+        };
+        Ownership::new(&contract, 3, sharing)
+    }
+
+    const LOST: Fault = Fault::OwnerLost { at: 0 };
+
+    #[test]
+    fn when_the_owner_goes_the_next_pod_owns_the_key_and_takes_its_traffic() {
+        let mut fleet = changing(OnOwnerChange::Drop);
+        let mut outbox = Outbox::default();
+        fleet.on_fault(&LOST, 0, &mut outbox);
+        assert_eq!(fleet.owner, 1);
+        assert_eq!(admits(&mut fleet, OWNER, 3, 0), 3, "decided on pod 1");
+        assert_eq!(fleet.pods[1].bucket.remaining(0), 7);
+        admits(&mut fleet, 2, 2, 0);
+        fleet.on_timer(2, 0, &mut outbox);
+        assert_eq!(outbox.sent[0].0, 1, "hits go to the new owner");
+        deliver(&mut fleet, &mut outbox, 0);
+        assert_eq!(fleet.pods[1].bucket.remaining(0), 5);
+        fleet.on_timer(1, 0, &mut outbox);
+        assert!(
+            outbox.sent.iter().all(|(to, _)| *to == 2),
+            "broadcast to the pod left"
+        );
+        fleet.on_timer(OWNER, 0, &mut outbox);
+        assert_eq!(outbox.sent.len(), 1, "the old owner does nothing");
+    }
+
+    /// A batch pod 2 sent the old owner, never seen applied: dropped, it is lost; sent
+    /// again, numbered afresh, it reaches the new owner.
+    #[test]
+    fn unapplied_batches_are_dropped_or_sent_again() {
+        for (on_owner_change, lost) in [(OnOwnerChange::Drop, 4), (OnOwnerChange::SendAgain, 0)] {
+            let mut fleet = changing(on_owner_change);
+            let mut outbox = Outbox::default();
+            admits(&mut fleet, 2, 4, 0);
+            fleet.on_timer(2, 0, &mut outbox);
+            outbox.sent.clear();
+            fleet.on_fault(&LOST, 0, &mut outbox);
+            deliver(&mut fleet, &mut outbox, 0);
+            assert_eq!(fleet.unapplied(), lost, "{on_owner_change:?}");
+            assert_eq!(fleet.counted_twice(), 0, "{on_owner_change:?}");
+        }
+    }
+
+    /// The old owner applied pod 2's batch and broadcast it to pod 1, but the broadcast
+    /// saying so never reached pod 2: sent again, the batch is counted twice.
+    #[test]
+    fn a_batch_sent_again_can_be_counted_twice() {
+        let mut fleet = changing(OnOwnerChange::SendAgain);
+        let mut outbox = Outbox::default();
+        admits(&mut fleet, 2, 4, 0);
+        fleet.on_timer(2, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        fleet.on_timer(OWNER, 0, &mut outbox);
+        let to_pod_1 = outbox.sent.remove(0);
+        outbox.sent.clear();
+        fleet.on_message(to_pod_1.0, to_pod_1.1, 0, &mut outbox);
+        fleet.on_fault(&LOST, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        assert_eq!((fleet.unapplied(), fleet.counted_twice()), (0, 4));
+    }
+
+    #[test]
+    fn a_broadcast_from_an_owner_that_has_gone_is_ignored() {
+        let mut fleet = changing(OnOwnerChange::Drop);
+        let mut outbox = Outbox::default();
+        admits(&mut fleet, OWNER, 5, 0);
+        fleet.on_timer(OWNER, 0, &mut outbox);
+        let stale = outbox.sent.pop().unwrap();
+        outbox.sent.clear();
+        fleet.on_fault(&LOST, 0, &mut outbox);
+        fleet.on_message(stale.0, stale.1, 0, &mut outbox);
+        assert_eq!(fleet.pods[2].bucket.remaining(0), 10);
     }
 }

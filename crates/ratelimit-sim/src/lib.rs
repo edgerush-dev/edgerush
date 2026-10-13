@@ -18,7 +18,7 @@ mod ownership;
 mod rng;
 mod workload;
 
-pub use approach::{Approach, Bound, Cluster, Excess};
+pub use approach::{Approach, Bound, Cluster, Excess, OnOwnerChange, Sharing};
 pub use measure::{Outcome, worst_excess};
 pub use network::{Message, Network, Outbox};
 pub use rng::Rng;
@@ -53,8 +53,23 @@ pub struct Run {
     pub approach: Approach,
     /// How messages between them travel.
     pub network: Network,
+    /// What goes wrong, and when.
+    pub fault: Fault,
     /// The seed every random choice comes from.
     pub seed: u64,
+}
+
+/// Something that goes wrong during a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// Nothing does.
+    None,
+    /// At `at` nanoseconds the pod that owns the key goes away for good: its traffic goes to
+    /// the next pod, which owns the key from then on.
+    OwnerLost {
+        /// When.
+        at: u64,
+    },
 }
 
 /// Every request of a run with the decision it got, in the order they arrived: what a
@@ -72,9 +87,10 @@ pub fn decisions(run: &Run) -> Vec<(Arrival, bool)> {
 /// Plays a run and measures it against its contract.
 #[must_use]
 pub fn run(run: &Run) -> Outcome {
-    let (decisions, lost) = play(run);
+    let (decisions, lost, counted_twice) = play(run);
     Outcome {
         lost,
+        counted_twice,
         ..Outcome::of(&run.contract, run.pods, &decisions)
     }
 }
@@ -83,8 +99,8 @@ pub fn run(run: &Run) -> Outcome {
 /// its way — batches sent again among them — can arrive.
 const SETTLING_CYCLES: u64 = 10;
 
-/// The decisions of a run, and the hits it left unapplied.
-fn play(run: &Run) -> (Vec<(Arrival, bool)>, u64) {
+/// The decisions of a run, the hits it left unapplied, and those counted twice.
+fn play(run: &Run) -> (Vec<(Arrival, bool)>, u64, u64) {
     let pods = run.pods.max(1);
     let mut rng = Rng::new(run.seed);
     let arrivals = run.workload.arrivals(&run.contract, pods, &mut rng);
@@ -95,6 +111,9 @@ fn play(run: &Run) -> (Vec<(Arrival, bool)>, u64) {
         queue.push(arrival.at, Event::Arrival(index));
     }
     let end = arrivals.last().map_or(0, |arrival| arrival.at);
+    if let Fault::OwnerLost { at } = run.fault {
+        queue.push(at, Event::Fault);
+    }
     let cycle = cluster.cycle();
     if let Some(cycle) = cycle {
         for pod in 0..pods {
@@ -118,6 +137,7 @@ fn play(run: &Run) -> (Vec<(Arrival, bool)>, u64) {
                 }
             }
             Event::Deliver(to, message) => cluster.on_message(to, message, now, &mut outbox),
+            Event::Fault => cluster.on_fault(&run.fault, now, &mut outbox),
         }
         for (to, message) in outbox.sent.drain(..) {
             if let Some(at) = run.network.carry(now, &mut network_rng) {
@@ -125,8 +145,8 @@ fn play(run: &Run) -> (Vec<(Arrival, bool)>, u64) {
             }
         }
     }
-    let lost = cluster.unapplied();
-    (arrivals.into_iter().zip(decided).collect(), lost)
+    let (lost, twice) = (cluster.unapplied(), cluster.counted_twice());
+    (arrivals.into_iter().zip(decided).collect(), lost, twice)
 }
 
 /// Something that happens at a moment of a run.
@@ -137,6 +157,8 @@ enum Event {
     Timer(usize),
     /// A message reaches this pod.
     Deliver(usize, Message),
+    /// The run's fault happens.
+    Fault,
 }
 
 /// Events by time, and at the same time by the order they were made.
@@ -174,6 +196,7 @@ mod tests {
             .map(|(at, event)| match event {
                 Event::Timer(n) | Event::Arrival(n) => (at, n),
                 Event::Deliver(n, _) => (at, n),
+                Event::Fault => (at, usize::MAX),
             })
             .collect();
         assert_eq!(order, vec![(3, 2), (3, 4), (5, 1), (5, 3)]);

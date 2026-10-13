@@ -47,12 +47,16 @@ pub enum Message {
     },
     /// The owner's bucket as it stands, for every other pod to take over.
     State {
+        /// The owner that sent it.
+        from: usize,
         /// The owner's bucket.
         bucket: TokenBucket,
         /// For each pod, the highest batch of its hits the bucket has applied.
         applied: Vec<u64>,
         /// For each pod, whether the owner has seen it admit the key lately.
         active: Vec<bool>,
+        /// Hits the owner's count holds.
+        counted: u64,
     },
 }
 

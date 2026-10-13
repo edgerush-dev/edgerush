@@ -19,6 +19,9 @@ pub struct Outcome {
     /// Admitted requests that never reached the count deciding for the whole fleet
     /// ([`Cluster::unapplied`](crate::Cluster::unapplied)).
     pub lost: u64,
+    /// Admitted requests that count held more than once
+    /// ([`Cluster::counted_twice`](crate::Cluster::counted_twice)).
+    pub counted_twice: u64,
 }
 
 impl Outcome {
@@ -50,6 +53,7 @@ impl Outcome {
             worst_excess: worst_excess(contract, &times(None)),
             worst_pod_excess,
             lost: 0,
+            counted_twice: 0,
         }
     }
 }
