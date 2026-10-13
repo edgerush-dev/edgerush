@@ -11,7 +11,19 @@ const MS: u64 = 1_000_000;
 const SECOND: u64 = 1_000 * MS;
 
 fn owned(cycle: u64, excess: Excess) -> Approach {
-    Approach::Ownership { cycle, excess }
+    Approach::Ownership {
+        cycle,
+        excess,
+        ledger: false,
+    }
+}
+
+fn ledger(cycle: u64, excess: Excess) -> Approach {
+    Approach::Ownership {
+        cycle,
+        excess,
+        ledger: true,
+    }
 }
 
 fn main() {
@@ -41,6 +53,16 @@ fn main() {
         (
             "ownership, debt up to 1 s, 10 ms",
             owned(10 * MS, Excess::DebtUpTo(SECOND)),
+        ),
+        ("ledger, drain, 100 ms", ledger(100 * MS, Excess::Drain)),
+        ("ledger, drain, 10 ms", ledger(10 * MS, Excess::Drain)),
+        (
+            "ledger, debt up to 1 s, 100 ms",
+            ledger(100 * MS, Excess::DebtUpTo(SECOND)),
+        ),
+        (
+            "ledger, debt up to 1 s, 10 ms",
+            ledger(10 * MS, Excess::DebtUpTo(SECOND)),
         ),
     ];
     let workloads = [

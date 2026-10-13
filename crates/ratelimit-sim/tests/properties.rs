@@ -92,7 +92,7 @@ proptest! {
     /// Property 6: the same run decides the same way every time, messages and their
     /// delays included.
     #[test]
-    fn a_run_is_deterministic(run in runs(Approach::Ownership { cycle: 10_000_000, excess: Excess::Drain }, false)) {
+    fn a_run_is_deterministic(run in runs(Approach::Ownership { cycle: 10_000_000, excess: Excess::Drain, ledger: true }, false)) {
         prop_assert_eq!(decisions(&run), decisions(&run));
     }
 }
@@ -171,6 +171,7 @@ fn ownership_keeps_sharing_through_a_run() {
         Approach::Ownership {
             cycle: 10_000_000,
             excess: Excess::Drain,
+            ledger: false,
         },
         2,
         shape,

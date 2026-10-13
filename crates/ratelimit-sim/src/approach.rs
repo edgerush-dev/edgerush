@@ -46,6 +46,10 @@ pub enum Approach {
         cycle: u64,
         /// What the owner does with hits that do not fit.
         excess: Excess,
+        /// Whether pods keep their own hits apart with the hit ledger (06 §4) — a pod's view
+        /// the owner's bucket plus its hits the owner has not yet applied — rather than
+        /// taking the broadcast over as it comes.
+        ledger: bool,
     },
 }
 
@@ -80,9 +84,11 @@ impl Approach {
                 let share = || TokenBucket::new(contract.limit, window, burst);
                 Box::new(Pods((0..pods).map(|_| share()).collect()))
             }
-            Self::Ownership { cycle, excess } => {
-                Box::new(Ownership::new(contract, pods, *cycle, *excess))
-            }
+            Self::Ownership {
+                cycle,
+                excess,
+                ledger,
+            } => Box::new(Ownership::new(contract, pods, *cycle, *excess, *ledger)),
         }
     }
 }
