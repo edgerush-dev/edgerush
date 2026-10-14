@@ -10,7 +10,12 @@ publish.workspace = true
 [dependencies]
 
 [dev-dependencies]
+iai-callgrind.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "decide"
+harness = false
 
 [lints]
 workspace = true

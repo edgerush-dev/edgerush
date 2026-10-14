@@ -444,6 +444,13 @@ impl TokenBucket {
 }
 
 impl Model for TokenBucket {
+    /// Room for one more: the arrival time no further ahead than the bucket allows. The
+    /// same as `remaining(now) > 0`, without its division; it is on the request path.
+    fn admits(&self, now: u64) -> bool {
+        let (_, now) = self.scaled(now);
+        self.ahead(now) <= self.tolerance
+    }
+
     fn remaining(&self, now: u64) -> u64 {
         let (_, now) = self.scaled(now);
         let ahead = self.ahead(now);

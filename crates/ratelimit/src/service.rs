@@ -279,6 +279,8 @@ pub enum Decision {
 /// What a data plane holds of one key.
 struct PlaneKey {
     contract: Contract,
+    /// Its contract's refill time, worked out once: how long a copy stays fresh.
+    hold: u64,
     /// The service pod it sends to.
     owner: Option<PodId>,
     /// The owner's bucket as last heard, charged with its own hits not yet seen applied,
@@ -326,6 +328,7 @@ impl PlaneKey {
     fn new(contract: Contract, owner: Option<PodId>) -> Self {
         Self {
             contract,
+            hold: contract.refill_time(),
             owner,
             bucket: contract.bucket(),
             unsent: 0,
@@ -416,43 +419,19 @@ impl<S: BuildHasher + Default> DataPlane<S> {
     /// with no fresh copy waits while the owner is asked; the ask is among the messages
     /// [`take_outgoing`](Self::take_outgoing) gives, to be sent at once.
     pub fn decide(&mut self, key: &[u8], contract: Contract, now: u64) -> Decision {
-        // Any change to a key's contract starts it afresh (06 §3).
-        if !matches!(self.keys.get(key), Some(at) if at.contract == contract) {
-            let owner = self.view.owners(key).0;
-            self.keys.insert(key.into(), PlaneKey::new(contract, owner));
+        // The common case, with one lookup: a key held under the same contract.
+        if let Some(at) = self.keys.get_mut(key)
+            && at.contract == contract
+        {
+            return decide_held(at, key, now, &mut self.outgoing, &mut self.next_ticket);
         }
-        let Some(at) = self.keys.get_mut(key) else {
-            return Decision::Refuse;
-        };
-        let hold = contract.refill_time();
-        // Cold: no copy fresh enough, or none bounded yet. A copy an ask just brought is
-        // not bounded until a cycle after it shares out what it holds among the data
-        // planes admitting the key, as the owner's answers say them; until then another
-        // data plane may hold the same copy, and the owner decides. Requests come over a few milliseconds, not all at once: the first
-        // ask's answer comes back while the rest of a burst is still arriving.
-        let cold = at.owner.is_some()
-            && !at.unreachable
-            && (at.asking.is_some()
-                || !at.bounded
-                || at.heard.is_none_or(|heard| now - heard > hold));
-        if !cold {
-            return if at.decide(now) {
-                Decision::Admit
-            } else {
-                Decision::Refuse
-            };
+        // New, or its contract changed: any change starts a key afresh (06 §3).
+        let owner = self.view.owners(key).0;
+        self.keys.insert(key.into(), PlaneKey::new(contract, owner));
+        match self.keys.get_mut(key) {
+            Some(at) => decide_held(at, key, now, &mut self.outgoing, &mut self.next_ticket),
+            None => Decision::Refuse,
         }
-        at.last_request = Some(now);
-        let ticket = self.next_ticket;
-        self.next_ticket += 1;
-        if at.asking.is_some() {
-            at.waiting.push(ticket);
-        } else {
-            at.follow_up = false;
-            at.asked.push(ticket);
-            ask(&mut self.outgoing, key, at, now);
-        }
-        Decision::Wait(ticket)
     }
 
     /// The cycle's work at `now`: allowances set for the next cycle, asks sent again or
@@ -706,6 +685,45 @@ impl<S: BuildHasher + Default> DataPlane<S> {
             })
             .collect()
     }
+}
+
+/// Decides a request for a key `at` holds: from its copy, or, cold, by asking the owner.
+fn decide_held(
+    at: &mut PlaneKey,
+    key: &[u8],
+    now: u64,
+    outgoing: &mut BTreeMap<PodId, Vec<Entry>>,
+    next_ticket: &mut Ticket,
+) -> Decision {
+    // Cold: no copy fresh enough, or none bounded yet. A copy an ask just brought is not
+    // bounded until a cycle after it shares out what it holds among the data planes
+    // admitting the key, as the owner's answers say them; until then another data plane
+    // may hold the same copy, and the owner decides. Requests come over a few milliseconds,
+    // not all at once: the first ask's answer comes back while the rest of a burst is still
+    // arriving.
+    let cold = at.owner.is_some()
+        && !at.unreachable
+        && (at.asking.is_some()
+            || !at.bounded
+            || at.heard.is_none_or(|heard| now - heard > at.hold));
+    if !cold {
+        return if at.decide(now) {
+            Decision::Admit
+        } else {
+            Decision::Refuse
+        };
+    }
+    at.last_request = Some(now);
+    let ticket = *next_ticket;
+    *next_ticket += 1;
+    if at.asking.is_some() {
+        at.waiting.push(ticket);
+    } else {
+        at.follow_up = false;
+        at.asked.push(ticket);
+        ask(outgoing, key, at, now);
+    }
+    Decision::Wait(ticket)
 }
 
 /// Sends the owner an ask about the requests in `asked`.
