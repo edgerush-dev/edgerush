@@ -5,7 +5,8 @@
 //!
 //! `cargo run --release -p edgerush-ratelimit-sim --example compare [seeds] [lost in 1,000]
 //! [none|owner-lost|partition|restart|owner-restart|rolling] [delay in µs] [pods, as 2,4,8]
-//! [contract, as limit/window in ms/burst] [clock skew in µs] [service cycle in ms]`
+//! [contract, as limit/window in ms/burst] [clock skew in µs] [service cycle in ms]
+//! [debt cap, % of a refill time]`; `ROWS=service;central` keeps only matching rows.
 //!
 //! The workloads scale with the contract — its limit a window, three times it, its whole
 //! bucket at once — and a run lasts ten windows.
@@ -75,7 +76,12 @@ fn main() {
     // Ten windows a run; faults strike at its middle, a partition from 3 to 7 tenths.
     let span = 10 * contract.window.get();
     // Debt is owed up to one bucket's refill time.
-    let cap = burst * contract.window.get() / limit.max(1);
+    // As a percentage of that, if given: how sensitive the results are to the cap.
+    let cap_percent: u64 = std::env::args()
+        .nth(9)
+        .and_then(|arg| arg.parse().ok())
+        .unwrap_or(100);
+    let cap = burst * contract.window.get() / limit.max(1) * cap_percent / 100;
     // `owner-lost`: the pod owning the key goes away half way through each run; with
     // counters, which have no owner, the first pod.
     // `partition`: half the pods are cut off from the others from 3 s to 7 s.
@@ -372,7 +378,11 @@ fn main() {
         }
         println!();
         println!("|---|{}", "---|".repeat(pods.len()));
-        for (name, approach) in approaches {
+        // `ROWS=service;central` keeps only the rows whose name holds one of these.
+        let rows = std::env::var("ROWS").unwrap_or_default();
+        let wanted =
+            |name: &str| rows.is_empty() || rows.split(';').any(|part| name.contains(part));
+        for (name, approach) in approaches.iter().copied().filter(|(name, _)| wanted(name)) {
             print!("| {name} |");
             for &p in &pods {
                 let (mut sent, mut refused, mut admitted, mut central, mut over) =
