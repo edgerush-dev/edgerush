@@ -27,6 +27,7 @@ edgerush-explain = { path = "crates/explain" }
 edgerush-filters = { path = "crates/filters" }
 edgerush-proxy = { path = "crates/proxy" }
 edgerush-ratelimit = { path = "crates/ratelimit" }
+edgerush-ratelimit-service = { path = "crates/ratelimit-service" }
 edgerush-router = { path = "crates/router" }
 edgerush-telemetry = { path = "crates/telemetry" }
 # HTTP/2 on both hops, used directly rather than through hyper (15 §3). The version is the
@@ -81,6 +82,14 @@ regex = { version = "1.13", default-features = false, features = ["std", "perf"]
 # Finding the line feeds of a head a vector at a time; regex brings it in already.
 memchr = "2.8"
 thiserror = "2.0"
+# gRPC between data planes and the rate-limiting service (a prototype, not yet chosen):
+# tonic was in the tree already for the proxy's gRPC tests; prost encodes its messages,
+# derived from Rust structs so the build needs no protoc. Version skew between data planes
+# and the service is what protobuf is for. Only the rate-limiting service crate may depend
+# on these three; tower-service is the trait tonic serves through.
+prost = "0.14"
+tonic = { version = "0.14", default-features = false, features = ["transport"] }
+tower-service = "0.3"
 # A BoringSSL connection as a tokio stream: the handshake and the records, nothing more.
 tokio-boring = "5.2"
 # QUIC and HTTP/3 to clients (16 §2), driven by a worker of ours: it does no I/O and keeps

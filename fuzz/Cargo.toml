@@ -26,12 +26,17 @@ edgerush-config = { path = "../crates/config" }
 edgerush-explain = { path = "../crates/explain" }
 edgerush-filters = { path = "../crates/filters", features = ["reference"] }
 edgerush-proxy = { path = "../crates/proxy", features = ["fuzzing"] }
+# The rate-limiting service's messages, decoded as the service decodes them.
+edgerush-ratelimit = { path = "../crates/ratelimit" }
+edgerush-ratelimit-service = { path = "../crates/ratelimit-service" }
 edgerush-router = { path = "../crates/router", features = ["reference"] }
 # The reading of a request's host is compared with this crate's own.
 http = "1.5"
 # The field lines of a head are taken from what this parser finds, as the proxy's are.
 httparse = "1.10"
 libfuzzer-sys = "0.4"
+# The rate-limiting service's wire, at the version the workspace uses.
+prost = "0.14"
 # The connection IDs a datagram carries are read as this crate's parser reads them, at the
 # version the proxy pins.
 quiche = { version = "=0.30.0", default-features = false, features = ["boringssl-boring-crate"] }
@@ -183,3 +188,9 @@ path = "fuzz_targets/test_file.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ratelimit_wire"
+path = "fuzz_targets/ratelimit_wire.rs"
+test = false
+doc = false

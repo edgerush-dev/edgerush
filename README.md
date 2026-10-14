@@ -184,13 +184,18 @@ crates/explain     where a request would go and why (`edgerush-explain`): what `
                    prints and `edgerush test` checks, worked out by the request core without a
                    data plane; no I/O
 crates/filters     built-in filters (`edgerush-filters`): pure, on plain `http` types
-crates/ratelimit   rate limiting (`edgerush-ratelimit`): pure, no I/O; so far the admission models
-                   as reference implementations behind one interface, and an example that runs the
-                   same clients through each (`cargo run -p edgerush-ratelimit --example timelines`)
+crates/ratelimit   rate limiting (`edgerush-ratelimit`): pure, no I/O; the admission models as
+                   reference implementations behind one interface, an example that runs the same
+                   clients through each (`cargo run -p edgerush-ratelimit --example timelines`),
+                   and the rate-limiting service's protocol as two state machines
 crates/ratelimit-sim
                    the rate-limit simulator (`edgerush-ratelimit-sim`): ways of limiting one key
                    across pods run against the contract, deterministic, no I/O; side by side
                    with `cargo run --release -p edgerush-ratelimit-sim --example compare`
+crates/ratelimit-service
+                   the rate-limiting service, a prototype (`edgerush-ratelimit-service`): service
+                   pods running the protocol of `edgerush-ratelimit` over gRPC, the client data
+                   planes reach them with, and the `edgerush-ratelimit-service` binary
 crates/proxy       the data plane (`edgerush-proxy`): listeners, TLS, our HTTP/1 server and client,
                    HTTP/2 on h2, HTTP/3 on quiche, upstream pools and the request core between them
 crates/router      request matching (`edgerush-router`): pure logic, no I/O
