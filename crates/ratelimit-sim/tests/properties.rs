@@ -265,6 +265,7 @@ fn served(bound: Bound) -> Approach {
         excess: Excess::DebtUpTo(SECOND),
         bound,
         ask_when_cold: false,
+        ask_when_short: false,
         replicate: Replicate::None,
         skew: 0,
     })
@@ -278,6 +279,7 @@ fn asked() -> Approach {
         excess: Excess::DebtUpTo(SECOND),
         bound: Bound::Every,
         ask_when_cold: true,
+        ask_when_short: false,
         replicate: Replicate::None,
         skew: 0,
     })
@@ -706,6 +708,7 @@ fn a_service_holds_the_contract_with_skewed_clocks() {
                 excess: Excess::DebtUpTo(SECOND),
                 bound: Bound::Every,
                 ask_when_cold: true,
+                ask_when_short: false,
                 replicate: Replicate::EveryChange,
                 skew: 50_000_000,
             }),

@@ -99,7 +99,7 @@ impl Counters {
             Bound::Unbounded => None,
             Bound::NewPods if active(pod) => None,
             Bound::NewPods => share(self.pods.len()),
-            Bound::Every | Bound::EveryCarrying | Bound::Granted => {
+            Bound::Every | Bound::EveryCarrying | Bound::Granted | Bound::Credit => {
                 let others = (0..self.pods.len())
                     .filter(|p| *p != pod && active(*p))
                     .count();

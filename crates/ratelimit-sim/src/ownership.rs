@@ -149,7 +149,7 @@ impl Ownership {
             Bound::Unbounded => None,
             Bound::NewPods if at.active[pod] => None,
             Bound::NewPods => share(self.pods.len()),
-            Bound::Every | Bound::EveryCarrying | Bound::Granted => {
+            Bound::Every | Bound::EveryCarrying | Bound::Granted | Bound::Credit => {
                 let others = (0..at.active.len())
                     .filter(|p| *p != pod && at.active[*p])
                     .count();

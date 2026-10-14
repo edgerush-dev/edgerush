@@ -106,6 +106,10 @@ pub struct Serving {
     /// the owner, which decides them against the one bucket (06 §4), rather than being
     /// decided from a full bucket.
     pub ask_when_cold: bool,
+    /// Whether a request that the copy has room for but the per-cycle bound would refuse
+    /// waits while the owner decides it, rather than being refused: a fleet with more data
+    /// planes than a cycle refills cannot share it out in whole requests.
+    pub ask_when_short: bool,
     /// How the owning service pod keeps a secondary's copy of what it holds, so that the
     /// secondary can take over from it.
     pub replicate: Replicate,
@@ -192,6 +196,11 @@ pub enum Bound {
     /// part in the hits of the last few cycles; one that has not been admitting gets an
     /// equal share, as if joining. Elsewhere, as [`Bound::Every`].
     Granted,
+    /// With a rate-limiting service: every data plane earns its share each cycle as a
+    /// fraction, with no floor of one request, and admits as many whole requests as it has
+    /// earned, banking at most one ahead: a fleet larger than a cycle's refill is held to
+    /// it, not to a request a pod. Elsewhere, as [`Bound::Every`].
+    Credit,
 }
 
 impl Bound {

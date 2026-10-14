@@ -80,6 +80,9 @@ struct Plane {
     active: Vec<bool>,
     /// What the owner last granted it a cycle, with [`Bound::Granted`].
     grant: Option<u64>,
+    /// With [`Bound::Credit`], in thousandths of a request: what it has earned and not
+    /// spent.
+    credit: u64,
     /// When a request for the key last came.
     last_request: Option<u64>,
     /// When the owner last answered: its copy is fresh for a bucket's refill time after.
@@ -169,6 +172,7 @@ impl Service {
             allowance: None,
             active: vec![false; planes],
             grant: None,
+            credit: 1_000,
             last_request: None,
             heard: None,
             asking: None,
@@ -249,13 +253,27 @@ impl Service {
             Bound::NewPods if at.active[plane] => None,
             Bound::NewPods => share(self.planes.len()),
             Bound::Granted if at.grant.is_some() => at.grant,
-            Bound::Every | Bound::EveryCarrying | Bound::Granted => {
+            Bound::Every | Bound::EveryCarrying | Bound::Granted | Bound::Credit => {
                 let others = (0..at.active.len())
                     .filter(|p| *p != plane && at.active[*p])
                     .count();
                 share(others + 1)
             }
         }
+    }
+
+    /// With [`Bound::Credit`]: `plane`'s share of what it sees for the cycle starting at
+    /// `now`, in thousandths of a request, with no floor.
+    fn earned(&self, plane: usize, now: u64) -> u64 {
+        let at = &self.planes[plane];
+        let sees = at
+            .bucket
+            .remaining(self.clock(plane, now))
+            .saturating_add(self.refill);
+        let others = (0..at.active.len())
+            .filter(|p| *p != plane && at.active[*p])
+            .count() as u64;
+        sees.saturating_mul(1_000) / (others + 1)
     }
 
     /// Service pod `pod` applies `count` reported hits, each charged if there is room, and
@@ -632,6 +650,7 @@ impl Service {
         at.allowance = None;
         at.active = vec![false; planes];
         at.grant = None;
+        at.credit = 1_000;
         at.last_request = None;
         at.heard = None;
         at.asking = None;
@@ -670,7 +689,12 @@ impl Cluster for Service {
         let cold = self.serving.ask_when_cold
             && !at.unreachable
             && (at.asking.is_some() || at.heard.is_none_or(|heard| now - heard > self.hold));
-        if !cold {
+        let short = self.serving.ask_when_short
+            && !at.unreachable
+            && (at.asking.is_some()
+                || (at.allowance.is_some_and(|allowance| at.spent >= allowance)
+                    && at.bucket.admits(self.clock(plane, now))));
+        if !cold && !short {
             return Some(self.decide(plane, now, outbox));
         }
         let at = &mut self.planes[plane];
@@ -720,11 +744,20 @@ impl Cluster for Service {
             return;
         }
         let allowance = self.allowance(plane, now);
+        let earned = self.earned(plane, now);
         let bound = self.serving.bound;
         let (to, hold) = (self.address(self.owner), self.hold);
         let resend_after = RESEND_AFTER_CYCLES * self.serving.cycle;
         let at = &mut self.planes[plane];
-        at.allowance = bound.carry(allowance, at.allowance, at.spent);
+        if bound == Bound::Credit {
+            // What it spent comes off what it had; what it earns comes on, up to one request
+            // banked beyond a cycle's earning.
+            let left = at.credit.saturating_sub(at.spent.saturating_mul(1_000));
+            at.credit = (left + earned).min(earned + 1_000);
+            at.allowance = Some(at.credit / 1_000);
+        } else {
+            at.allowance = bound.carry(allowance, at.allowance, at.spent);
+        }
         at.spent = 0;
         // An ask unanswered half as long is sent again once, as it was: a lost ask or answer
         // costs a resend rather than the wait in full. The owner answers it alike.
@@ -881,6 +914,7 @@ mod tests {
             excess: Excess::DebtUpTo(100 * MS),
             bound,
             ask_when_cold: false,
+            ask_when_short: false,
             replicate: Replicate::None,
             skew: 0,
         };
@@ -1785,6 +1819,74 @@ mod tests {
             admits(&mut fleet, 1, 10, 0),
             5,
             "fifty milliseconds ahead: five refilled"
+        );
+    }
+
+    /// Earning credit, a data plane gains its share of what it sees each cycle as a
+    /// fraction, admits the whole requests it has, and banks at most one beyond a cycle's
+    /// earning.
+    #[test]
+    fn credit_is_earned_as_a_fraction_and_banked_up_to_one() {
+        let mut fleet = fleet(2, Bound::Credit);
+        let mut outbox = Outbox::default();
+        // Eight active: a share of the one a cycle refills, from an empty bucket, is an
+        // eighth of a request.
+        fleet.planes[0].active = vec![true; 2];
+        fleet.planes[0].bucket = fleet.fresh.clone();
+        for _ in 0..10 {
+            fleet.planes[0].bucket.charge(0);
+        }
+        assert_eq!(
+            fleet.earned(0, 0),
+            500,
+            "an empty bucket and one refilled, halved"
+        );
+        fleet.on_timer(0, 0, &mut outbox);
+        assert_eq!(
+            fleet.planes[0].allowance,
+            Some(1),
+            "banked one, plus a half"
+        );
+        assert!(fleet.decide(0, 10 * MS, &mut outbox));
+        fleet.on_timer(0, 10 * MS, &mut outbox);
+        // A half left of the one and a half; the bucket again empty after that request,
+        // so a half earned.
+        assert_eq!(
+            fleet.planes[0].credit,
+            500 + 500,
+            "what was left, and earned"
+        );
+        fleet.planes[0].credit = 99_000;
+        fleet.on_timer(0, 20 * MS, &mut outbox);
+        assert!(
+            fleet.planes[0].credit <= fleet.earned(0, 20 * MS) + 1_000,
+            "banked up to one"
+        );
+    }
+
+    /// Asking when short, a request the copy has room for but the bound would refuse waits
+    /// while the owner decides it.
+    #[test]
+    fn a_request_the_bound_would_refuse_is_asked_about_when_short() {
+        let mut fleet = fleet(2, Bound::Every);
+        fleet.serving.ask_when_short = true;
+        let mut outbox = Outbox::default();
+        fleet.planes[0].allowance = Some(1);
+        assert_eq!(arrive(&mut fleet, 0, 0..1, 0, &mut outbox), vec![(0, true)]);
+        assert!(
+            arrive(&mut fleet, 0, 1..2, 0, &mut outbox).is_empty(),
+            "the bound spent, the copy with room: asked"
+        );
+        deliver(&mut fleet, &mut outbox, 0);
+        assert_eq!(fleet.take_decided(), vec![(1, true)]);
+        // With no room in the copy either, refused here, not asked about.
+        for _ in 0..10 {
+            fleet.planes[0].bucket.charge(0);
+        }
+        fleet.planes[0].spent = 1;
+        assert_eq!(
+            arrive(&mut fleet, 0, 2..3, 0, &mut outbox),
+            vec![(2, false)]
         );
     }
 
