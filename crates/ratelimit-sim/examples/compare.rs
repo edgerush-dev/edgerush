@@ -6,7 +6,7 @@
 //! `cargo run --release -p edgerush-ratelimit-sim --example compare [seeds] [lost in 1,000]
 //! [none|owner-lost|partition|restart|owner-restart|rolling] [delay in µs] [pods, as 2,4,8]
 //! [contract, as limit/window in ms/burst] [clock skew in µs] [service cycle in ms]
-//! [debt cap, % of a refill time]`; `ROWS=service;central` keeps only matching rows.
+//! [debt cap, % of a refill time] [refill times kept warm]`; `ROWS=service;central` keeps only matching rows.
 //!
 //! The workloads scale with the contract — its limit a window, three times it, its whole
 //! bucket at once — and a run lasts ten windows.
@@ -201,6 +201,7 @@ fn main() {
                 ask_when_short: false,
                 replicate: Replicate::None,
                 skew: 0,
+                warm: 1,
             }),
         ),
         (
@@ -213,6 +214,7 @@ fn main() {
                 ask_when_short: false,
                 replicate: Replicate::None,
                 skew: 0,
+                warm: 1,
             }),
         ),
         (
@@ -225,6 +227,7 @@ fn main() {
                 ask_when_short: false,
                 replicate: Replicate::None,
                 skew: 0,
+                warm: 1,
             }),
         ),
         (
@@ -237,6 +240,7 @@ fn main() {
                 ask_when_short: false,
                 replicate: Replicate::None,
                 skew: 0,
+                warm: 1,
             }),
         ),
         (
@@ -249,6 +253,7 @@ fn main() {
                 ask_when_short: false,
                 replicate: Replicate::EveryCycle,
                 skew: 0,
+                warm: 1,
             }),
         ),
         (
@@ -261,6 +266,7 @@ fn main() {
                 ask_when_short: false,
                 replicate: Replicate::EveryChange,
                 skew: 0,
+                warm: 1,
             }),
         ),
         (
@@ -273,6 +279,7 @@ fn main() {
                 ask_when_short: false,
                 replicate: Replicate::EveryChange,
                 skew: 0,
+                warm: 1,
             }),
         ),
         (
@@ -285,6 +292,7 @@ fn main() {
                 ask_when_short: false,
                 replicate: Replicate::EveryChange,
                 skew: 0,
+                warm: 1,
             }),
         ),
         (
@@ -297,6 +305,7 @@ fn main() {
                 ask_when_short: true,
                 replicate: Replicate::EveryChange,
                 skew: 0,
+                warm: 1,
             }),
         ),
         (
@@ -309,6 +318,7 @@ fn main() {
                 ask_when_short: true,
                 replicate: Replicate::EveryChange,
                 skew: 0,
+                warm: 1,
             }),
         ),
         (
@@ -321,6 +331,7 @@ fn main() {
                 ask_when_short: false,
                 replicate: Replicate::EveryChange,
                 skew: 0,
+                warm: 1,
             }),
         ),
     ];
@@ -329,6 +340,11 @@ fn main() {
         .nth(7)
         .and_then(|arg| arg.parse().ok())
         .unwrap_or(0);
+    // How many refill times data planes go on asking for copies after their last request.
+    let warm: u64 = std::env::args()
+        .nth(10)
+        .and_then(|arg| arg.parse().ok())
+        .unwrap_or(1);
     // The service's cycle instead of the rows' own, if given, in ms.
     let service_cycle: Option<u64> = std::env::args().nth(8).and_then(|arg| arg.parse().ok());
     for (_, approach) in &mut approaches {
@@ -337,6 +353,7 @@ fn main() {
             if let Some(cycle) = service_cycle {
                 serving.cycle = cycle * MS;
             }
+            serving.warm = warm;
         }
     }
     let workloads = [

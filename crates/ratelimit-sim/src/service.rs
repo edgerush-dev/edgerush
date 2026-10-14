@@ -746,7 +746,11 @@ impl Cluster for Service {
         let allowance = self.allowance(plane, now);
         let earned = self.earned(plane, now);
         let bound = self.serving.bound;
-        let (to, hold) = (self.address(self.owner), self.hold);
+        let (to, hold, warm) = (
+            self.address(self.owner),
+            self.hold,
+            self.serving.warm.max(1),
+        );
         let resend_after = RESEND_AFTER_CYCLES * self.serving.cycle;
         let at = &mut self.planes[plane];
         if bound == Bound::Credit {
@@ -829,8 +833,10 @@ impl Cluster for Service {
             at.unsent = 0;
             asked = true;
         }
-        let in_use =
-            at.last_request.is_some_and(|last| now - last <= hold) || !at.unacknowledged.is_empty();
+        let in_use = at
+            .last_request
+            .is_some_and(|last| now - last <= hold.saturating_mul(warm))
+            || !at.unacknowledged.is_empty();
         if !asked && in_use {
             let poll = Message::Poll {
                 from: plane,
@@ -917,6 +923,7 @@ mod tests {
             ask_when_short: false,
             replicate: Replicate::None,
             skew: 0,
+            warm: 1,
         };
         Service::new(&contract, planes, serving)
     }
@@ -1888,6 +1895,22 @@ mod tests {
             arrive(&mut fleet, 0, 2..3, 0, &mut outbox),
             vec![(2, false)]
         );
+    }
+
+    /// Kept warm for longer, a data plane goes on asking for copies that much longer after
+    /// its last request.
+    #[test]
+    fn a_data_plane_kept_warm_asks_for_copies_longer() {
+        for (warm, asks) in [(1, false), (3, true)] {
+            let mut fleet = fleet(2, Bound::Unbounded);
+            fleet.serving.warm = warm;
+            let mut outbox = Outbox::default();
+            admits(&mut fleet, 0, 1, 0);
+            fleet.on_timer(0, 0, &mut outbox);
+            deliver(&mut fleet, &mut outbox, 0);
+            fleet.on_timer(0, 250 * MS, &mut outbox);
+            assert_eq!(!outbox.sent.is_empty(), asks, "warm {warm}");
+        }
     }
 
     /// Data planes never talk to each other: every message goes to the service, and every

@@ -268,6 +268,7 @@ fn served(bound: Bound) -> Approach {
         ask_when_short: false,
         replicate: Replicate::None,
         skew: 0,
+        warm: 1,
     })
 }
 
@@ -282,6 +283,7 @@ fn asked() -> Approach {
         ask_when_short: false,
         replicate: Replicate::None,
         skew: 0,
+        warm: 1,
     })
 }
 
@@ -711,6 +713,7 @@ fn a_service_holds_the_contract_with_skewed_clocks() {
                 ask_when_short: false,
                 replicate: Replicate::EveryChange,
                 skew: 50_000_000,
+                warm: 1,
             }),
             ..fixed(Approach::Central, 8, shape, conforming)
         };

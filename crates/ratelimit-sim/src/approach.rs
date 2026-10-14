@@ -117,6 +117,10 @@ pub struct Serving {
     /// evenly from this much behind to this much ahead: a copy of the owner's bucket is
     /// read with the data plane's own clock.
     pub skew: u64,
+    /// For how many of a bucket's refill times after its last request a data plane goes on
+    /// asking for copies: longer keeps sparse traffic's copies fresh, so fewer requests
+    /// wait on the owner, for more messages.
+    pub warm: u64,
 }
 
 /// How the service pod owning a key keeps a copy of its state on a secondary, the next
