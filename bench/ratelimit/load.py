@@ -94,6 +94,12 @@ class Connections:
     def give(self, i, connection):
         self.idle[i].append(connection)
 
+    def drop(self, i):
+        """Closes every idle connection to instance `i`."""
+        for _, writer in self.idle[i]:
+            writer.close()
+        self.idle[i] = []
+
     def close(self):
         for connections in self.idle.values():
             for _, writer in connections:
@@ -127,11 +133,19 @@ async def play_async(pod, arrivals, targets, ask, key, t0, route, warm):
             break
     payload = http_request(ask, key)
     results, tasks = [], []
+    steered = False
     for at in arrivals:
         delay = (t0 + at - time.monotonic_ns()) / 1e9
         if delay > 0:
             await asyncio.sleep(delay)
         target = route[pod]
+        # Back on its own instance after it restarted: the connections kept to it died with
+        # the process it had, and a client would open new ones, as a load balancer's would.
+        if target != pod:
+            steered = True
+        elif steered:
+            steered = False
+            connections.drop(pod)
         tasks.append(
             asyncio.create_task(one(connections, target, payload, ask, t0, at, pod, results))
         )
