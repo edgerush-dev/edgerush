@@ -87,6 +87,8 @@ async fn start() -> Service {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+    // A pod taken in makes no key afresh for three heartbeats, in case one is handed to it.
+    tokio::time::sleep(Duration::from_millis(80)).await;
     Service { pods, clients }
 }
 
@@ -271,6 +273,74 @@ async fn the_secondary_takes_over_when_the_owner_stops() {
     assert_eq!(
         service.pods[secondary as usize].counted(b"k").await,
         Some(6),
+        "nothing counted twice"
+    );
+}
+
+/// The owner of a key restarts, holding nothing, in a new life: the others take it out of
+/// the view and its secondary carries on from its copy; when it is taken in again, the pod
+/// that held the key hands it back, and the data plane follows. Nothing lost, nothing
+/// counted twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_owner_is_handed_its_keys_back_when_it_rejoins() {
+    let service = start().await;
+    let start = Instant::now();
+    let cycle = u64::try_from(CYCLE.as_nanos()).unwrap();
+    let mut plane: DataPlane = DataPlane::new(13, cycle, view());
+    plane.decide(b"k", contract(), now(start));
+    exchange(&mut plane, &service, start).await;
+    plane.take_decided();
+    plane.on_cycle(now(start));
+    exchange(&mut plane, &service, start).await;
+    for _ in 0..3 {
+        assert_eq!(plane.decide(b"k", contract(), now(start)), Decision::Admit);
+    }
+    plane.on_cycle(now(start));
+    exchange(&mut plane, &service, start).await;
+    let (owner, secondary) = view().owners(b"k");
+    let (owner, secondary) = (owner.unwrap() as usize, secondary.unwrap() as usize);
+    assert_eq!(counted(&service.pods[owner], b"k", 4).await, Some(4));
+
+    service.pods[owner].restart(2).await;
+    assert_eq!(
+        service.pods[owner].counted(b"k").await,
+        None,
+        "it holds nothing"
+    );
+    let mut admitted = 4;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // Keeps admitting while the pods agree, until the restarted owner serves again and
+    // counts everything.
+    loop {
+        if plane.decide(b"k", contract(), now(start)) == Decision::Admit {
+            admitted += 1;
+        }
+        admitted += plane.take_decided().iter().filter(|(_, a)| *a).count() as u64;
+        plane.on_cycle(now(start));
+        send(&mut plane, &service, start).await;
+        let serving = service.pods[owner]
+            .view()
+            .await
+            .is_some_and(|(_, serving)| serving);
+        if serving && service.pods[owner].counted(b"k").await == Some(admitted) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never back: secondary {:?}, owner {:?} of {admitted}",
+            service.pods[secondary].counted(b"k").await,
+            service.pods[owner].counted(b"k").await
+        );
+        tokio::time::sleep(CYCLE).await;
+    }
+    for _ in 0..20 {
+        plane.on_cycle(now(start));
+        send(&mut plane, &service, start).await;
+        tokio::time::sleep(CYCLE).await;
+    }
+    assert_eq!(
+        service.pods[owner].counted(b"k").await,
+        Some(admitted),
         "nothing counted twice"
     );
 }

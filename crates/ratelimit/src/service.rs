@@ -263,6 +263,9 @@ pub struct Replicas {
     /// Whether these are keys handed over to their new owner, by the pod that owned them
     /// before a view change, rather than copies for a secondary.
     pub handover: bool,
+    /// The epoch of the view the sender held: a handover can reach a pod joining before
+    /// the view that takes it in does, and is kept until it has.
+    pub epoch: u64,
 }
 
 /// How a request was decided.
@@ -851,6 +854,13 @@ pub struct ServicePod<S = FixedState> {
     handovers: BTreeMap<PodId, Vec<Replica>>,
     /// Whether the view it holds took it in: until then it answers with its view alone.
     serving: bool,
+    /// Handovers made under a view later than its own, kept until it holds that view.
+    pending: Vec<Replicas>,
+    /// How long after joining it makes no key afresh: what it is to own may still be on
+    /// its way to it, handed over.
+    grace: u64,
+    /// Until when it makes no key afresh.
+    fresh_from: u64,
 }
 
 impl<S: BuildHasher + Default> ServicePod<S> {
@@ -866,7 +876,18 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             replicas: BTreeMap::new(),
             handovers: BTreeMap::new(),
             serving: true,
+            pending: Vec::new(),
+            grace: 0,
+            fresh_from: 0,
         }
+    }
+
+    /// How long after joining a view it makes no key afresh, but answers nothing for a key
+    /// it does not hold: data planes go on from their copies meanwhile, and the pod that
+    /// held the key has time to hand it over. A few heartbeats, as a view reaches every pod
+    /// in one.
+    pub fn set_join_grace(&mut self, grace: u64) {
+        self.grace = grace;
     }
 
     /// Whether it serves: a pod the agreed view has not taken in, in this life, answers
@@ -900,6 +921,10 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             }
             if !matches!(self.keys.get(&entry.key), Some(owned) if owned.contract == entry.contract)
             {
+                // Just joined: the key may be on its way, handed over.
+                if now < self.fresh_from {
+                    continue;
+                }
                 self.keys
                     .insert(entry.key.clone(), Owned::new(entry.contract, now));
             }
@@ -979,6 +1004,10 @@ impl<S: BuildHasher + Default> ServicePod<S> {
     /// the owner it knows of; or keys handed over to it as their new owner, taken over —
     /// with whatever it has applied of them meanwhile charged on top.
     pub fn on_replicas(&mut self, replicas: Replicas, now: u64) {
+        if replicas.handover && replicas.epoch > self.view.epoch {
+            self.pending.push(replicas);
+            return;
+        }
         for replica in replicas.entries {
             let (owner, secondary) = self.view.owners(&replica.key);
             let wanted = if replicas.handover {
@@ -1058,6 +1087,17 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                     .push(owned.replica(key, now));
             }
         }
+        if !before.pods.contains(&self.me) && self.view.pods.contains(&self.me) {
+            self.fresh_from = now.saturating_add(self.grace);
+        }
+        let epoch = self.view.epoch;
+        let (ready, later) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|handover| handover.epoch <= epoch);
+        self.pending = later;
+        for handover in ready {
+            self.on_replicas(handover, now);
+        }
     }
 
     /// The pod's timer at `now`: keys it neither owns nor keeps a copy of any more, and
@@ -1077,6 +1117,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
     /// Copies to send: one message per secondary, and one per pod keys are handed over to.
     pub fn take_replicas(&mut self) -> Vec<(PodId, Replicas)> {
         let me = self.me;
+        let epoch = self.view.epoch;
         let message = |handover| {
             move |(pod, entries)| {
                 (
@@ -1085,6 +1126,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                         from: me,
                         entries,
                         handover,
+                        epoch,
                     },
                 )
             }

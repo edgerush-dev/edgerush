@@ -557,6 +557,7 @@ fn a_copy_from_a_pod_that_no_longer_owns_the_key_is_ignored() {
             from: owner,
             entries: vec![replica],
             handover: false,
+            epoch: 0,
         },
         0,
     );
@@ -695,6 +696,7 @@ fn a_secondary_keeps_copies_only_from_the_owner() {
             from: third,
             entries: vec![replica],
             handover: false,
+            epoch: 0,
         },
         0,
     );
@@ -766,6 +768,7 @@ fn a_handover_arriving_late_keeps_what_the_new_owner_applied() {
             from: secondary,
             entries: vec![handed],
             handover: true,
+            epoch: 0,
         },
         0,
     );
@@ -794,6 +797,7 @@ fn a_handover_to_a_pod_that_does_not_own_the_key_is_ignored() {
                 planes: Vec::new(),
             }],
             handover: true,
+            epoch: 0,
         },
         0,
     );
@@ -935,4 +939,43 @@ fn a_burst_arriving_after_the_first_answer_is_held_to_one_bucket() {
         .filter(|(_, admitted)| *admitted)
         .count();
     assert_eq!(admitted + waited, 10, "one bucket, not two");
+}
+
+/// A handover can reach a pod joining before the view that takes it in: it is kept, and
+/// taken once the pod holds that view.
+#[test]
+fn a_handover_ahead_of_the_view_is_kept_until_the_view_comes() {
+    let (owner, secondary, _) = roles(b"k");
+    let mut joining: ServicePod = ServicePod::new(owner, CYCLE, without(owner));
+    let handover = Replicas {
+        from: secondary,
+        entries: vec![Replica {
+            key: b"k"[..].into(),
+            contract: contract(),
+            behind: 0,
+            counted: 8,
+            planes: Vec::new(),
+        }],
+        handover: true,
+        epoch: 3,
+    };
+    joining.on_replicas(handover, 0);
+    assert_eq!(joining.counted(b"k"), None, "not its key yet");
+    joining.on_view(view(&[0, 1, 2], 3), CYCLE);
+    assert_eq!(joining.counted(b"k"), Some(8), "taken with the view");
+}
+
+/// A pod just joined makes no key afresh for a while: what it is to own may still be on its
+/// way to it. Keys it holds it answers for at once.
+#[test]
+fn a_pod_just_joined_waits_before_making_a_key_afresh() {
+    let (owner, _, _) = roles(b"k");
+    let mut joining: ServicePod = ServicePod::new(owner, CYCLE, without(owner));
+    joining.set_join_grace(5 * CYCLE);
+    joining.on_view(view(&[0, 1, 2], 3), 0);
+    let answers = joining.on_batch(batch(1, Report::Poll), 4 * CYCLE);
+    assert!(answers.entries.is_empty(), "within the grace: nothing made");
+    assert_eq!(joining.counted(b"k"), None);
+    let answers = joining.on_batch(batch(1, Report::Poll), 5 * CYCLE);
+    assert_eq!(answers.entries.len(), 1, "after it: made afresh");
 }

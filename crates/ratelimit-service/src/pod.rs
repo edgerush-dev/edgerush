@@ -61,6 +61,7 @@ enum Command {
     Heartbeat(Heartbeat),
     Counted(Vec<u8>, oneshot::Sender<Option<u64>>),
     View(oneshot::Sender<(View, bool)>),
+    Restart(u64),
     Stop,
 }
 
@@ -83,29 +84,30 @@ impl Pod {
     ) -> Self {
         let (commands, received) = mpsc::channel(QUEUE);
         let start = Instant::now();
-        let membership = Membership::new(
-            me,
-            incarnation,
-            members,
-            nanos(timing.silence),
-            nanos(timing.settle),
-            0,
-        );
-        let mut node: ServicePod<RandomState> =
-            ServicePod::new(me, nanos(timing.cycle), membership.view().clone());
-        node.set_serving(false);
+        let (node, membership) = fresh(me, &members, incarnation, timing, 0);
         let senders = peers
             .into_iter()
             .map(|(pod, client)| (pod, Sender::spawn(client)))
             .collect();
         let running = Running {
+            me,
+            members,
+            timing,
             node,
             membership,
             senders,
             start,
         };
-        tokio::spawn(running.run(received, timing));
+        tokio::spawn(running.run(received));
         Self { commands }
+    }
+
+    /// Restarts it in place, as a process restarted on the same address would: everything
+    /// it held is gone, and it comes back as `incarnation`, a new life, serving nothing
+    /// until the others take it in again. For tests, where a port cannot be counted on to
+    /// be free again at once.
+    pub async fn restart(&self, incarnation: u64) {
+        let _stopped = self.commands.send(Command::Restart(incarnation)).await;
     }
 
     async fn ask<T>(&self, command: impl FnOnce(oneshot::Sender<T>) -> Command) -> Option<T> {
@@ -147,7 +149,34 @@ impl Pod {
     }
 }
 
+/// A pod's state from nothing, in life `incarnation`, at `now`.
+fn fresh(
+    me: PodId,
+    members: &[PodId],
+    incarnation: u64,
+    timing: Timing,
+    now: u64,
+) -> (ServicePod<RandomState>, Membership) {
+    let membership = Membership::new(
+        me,
+        incarnation,
+        members.to_vec(),
+        nanos(timing.silence),
+        nanos(timing.settle),
+        now,
+    );
+    let mut node = ServicePod::new(me, nanos(timing.cycle), membership.view().clone());
+    node.set_serving(false);
+    // A view reaches every pod within a heartbeat or so, and the handovers it starts soon
+    // after.
+    node.set_join_grace(nanos(timing.heartbeat).saturating_mul(3));
+    (node, membership)
+}
+
 struct Running {
+    me: PodId,
+    members: Vec<PodId>,
+    timing: Timing,
     node: ServicePod<RandomState>,
     membership: Membership,
     senders: BTreeMap<PodId, Sender>,
@@ -168,7 +197,8 @@ impl Running {
         self.node.set_serving(self.membership.serving());
     }
 
-    async fn run(mut self, mut commands: mpsc::Receiver<Command>, timing: Timing) {
+    async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
+        let timing = self.timing;
         let mut cycle = tokio::time::interval(timing.cycle);
         cycle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut heartbeat = tokio::time::interval(timing.heartbeat);
@@ -177,6 +207,13 @@ impl Running {
             tokio::select! {
                 command = commands.recv() => match command {
                     None | Some(Command::Stop) => return,
+                    Some(Command::Restart(incarnation)) => {
+                        let now = self.now();
+                        let (node, membership) =
+                            fresh(self.me, &self.members, incarnation, self.timing, now);
+                        self.node = node;
+                        self.membership = membership;
+                    }
                     Some(Command::Batch(batch, answer)) => {
                         let now = self.now();
                         let _gone = answer.send(self.node.on_batch(batch, now));
@@ -238,8 +275,10 @@ impl Sender {
             while let Some(first) = waiting.recv().await {
                 // The latest of each key, of everything waiting, copies and handovers apart.
                 let from = first.from;
+                let mut epoch = first.epoch;
                 let mut latest: BTreeMap<(bool, Box<[u8]>), service::Replica> = BTreeMap::new();
                 let mut take = |replicas: service::Replicas| {
+                    epoch = epoch.max(replicas.epoch);
                     for replica in replicas.entries {
                         latest.insert((replicas.handover, replica.key.clone()), replica);
                     }
@@ -261,6 +300,7 @@ impl Sender {
                         from,
                         entries,
                         handover,
+                        epoch,
                     };
                     // Lost if the call fails: the next change sends the key again, and a
                     // secondary that missed copies is what the data planes' `seen` marks

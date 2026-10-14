@@ -92,6 +92,8 @@ async fn service() -> Vec<String> {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+    // A pod taken in makes no key afresh for three heartbeats, in case one is handed to it.
+    tokio::time::sleep(Duration::from_millis(80)).await;
     addresses
 }
 

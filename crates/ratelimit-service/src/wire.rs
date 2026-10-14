@@ -200,6 +200,9 @@ pub struct Replicas {
     /// Whether the keys are handed over.
     #[prost(bool, tag = "3")]
     pub handover: bool,
+    /// The epoch of the view the sender held.
+    #[prost(uint64, tag = "4")]
+    pub epoch: u64,
 }
 
 /// A pod in one of its lives.
@@ -486,6 +489,7 @@ impl From<service::Replicas> for Replicas {
                 })
                 .collect(),
             handover: replicas.handover,
+            epoch: replicas.epoch,
         }
     }
 }
@@ -520,6 +524,7 @@ impl TryFrom<Replicas> for service::Replicas {
             from: replicas.from,
             entries,
             handover: replicas.handover,
+            epoch: replicas.epoch,
         })
     }
 }
@@ -634,11 +639,13 @@ mod tests {
             any::<u32>(),
             prop::collection::vec(replica, 0..4),
             any::<bool>(),
+            any::<u64>(),
         )
-            .prop_map(|(from, entries, handover)| service::Replicas {
+            .prop_map(|(from, entries, handover, epoch)| service::Replicas {
                 from,
                 entries,
                 handover,
+                epoch,
             })
     }
 
