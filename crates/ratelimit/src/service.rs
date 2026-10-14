@@ -394,6 +394,9 @@ pub struct DataPlane<S = FixedState> {
     outgoing: BTreeMap<PodId, Vec<Entry>>,
     /// Views asked for so far, to ask the pods in turn.
     polls: u64,
+    /// How long an ask may go unanswered before it is given up and what waits is decided
+    /// here; sent again once half way.
+    ask_timeout: u64,
 }
 
 impl<S: BuildHasher + Default> DataPlane<S> {
@@ -409,7 +412,15 @@ impl<S: BuildHasher + Default> DataPlane<S> {
             decided: Vec::new(),
             outgoing: BTreeMap::new(),
             polls: 0,
+            ask_timeout: RESEND_AFTER_CYCLES * cycle.max(1),
         }
+    }
+
+    /// How long an ask may go unanswered before it is given up: four cycles unless said
+    /// otherwise. Over TCP a lost segment is sent again only after some 200 ms, and an ask
+    /// given up sooner leaves its requests to a copy that has heard nothing.
+    pub fn set_ask_timeout(&mut self, timeout: u64) {
+        self.ask_timeout = timeout.max(1);
     }
 
     /// Its id.
@@ -441,6 +452,7 @@ impl<S: BuildHasher + Default> DataPlane<S> {
     /// given up, batches and polls for every owner.
     pub fn on_cycle(&mut self, now: u64) {
         let resend_after = RESEND_AFTER_CYCLES * self.cycle;
+        let ask_timeout = self.ask_timeout;
         let cycle = self.cycle;
         let mut decided = Vec::new();
         let mut cut_off = false;
@@ -466,7 +478,7 @@ impl<S: BuildHasher + Default> DataPlane<S> {
             // An ask unanswered half as long is sent again once, as it was.
             if at
                 .asking
-                .is_some_and(|asked| now - asked >= resend_after / 2)
+                .is_some_and(|asked| now - asked >= ask_timeout / 2)
                 && !at.ask_resent
             {
                 at.ask_resent = true;
@@ -481,7 +493,7 @@ impl<S: BuildHasher + Default> DataPlane<S> {
             }
             // Unanswered as long as a batch waits to be sent again: the owner is gone or out
             // of reach, and what waits is decided here.
-            if at.asking.is_some_and(|asked| now - asked >= resend_after) {
+            if at.asking.is_some_and(|asked| now - asked >= ask_timeout) {
                 at.asking = None;
                 at.unreachable = true;
                 let waited: Vec<Ticket> = std::mem::take(&mut at.asked)

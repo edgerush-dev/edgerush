@@ -979,3 +979,20 @@ fn a_pod_just_joined_waits_before_making_a_key_afresh() {
     let answers = joining.on_batch(batch(1, Report::Poll), 5 * CYCLE);
     assert_eq!(answers.entries.len(), 1, "after it: made afresh");
 }
+
+/// An ask's timeout can be set longer than four cycles: until it passes, what waits waits.
+#[test]
+fn an_ask_waits_as_long_as_its_timeout_says() {
+    let mut net = Net::new(1);
+    net.planes[0].set_ask_timeout(30 * CYCLE);
+    net.planes[0].decide(b"k", contract(), 0);
+    net.planes[0].take_outgoing(); // lost
+    net.planes[0].on_cycle(29 * CYCLE);
+    assert!(net.planes[0].take_decided().is_empty(), "still waiting");
+    net.planes[0].on_cycle(30 * CYCLE);
+    assert_eq!(
+        net.planes[0].take_decided(),
+        vec![(0, true)],
+        "given up, decided here"
+    );
+}

@@ -17,6 +17,11 @@ use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, oneshot};
 
+/// How long a worker waits for the owner's answer to an ask before deciding what waits from
+/// its copy: long enough for TCP to send a lost segment again (some 200 ms on Linux), as the
+/// comparison harness found that the protocol's own four cycles, 40 ms, were not.
+const ASK_TIMEOUT: u64 = 300_000_000;
+
 /// How a request fared against its rule's limit.
 pub(crate) enum Limited {
     /// Within it.
@@ -67,9 +72,11 @@ impl Limiter {
             pods: (0..pods).collect(),
         };
         let cycle = u64::try_from(service.cycle.as_nanos()).unwrap_or(u64::MAX);
+        let mut plane = DataPlane::new(id, cycle, view);
+        plane.set_ask_timeout(ASK_TIMEOUT);
         let limiter = Rc::new(Self {
             service: service.clone(),
-            plane: RefCell::new(DataPlane::new(id, cycle, view)),
+            plane: RefCell::new(plane),
             clients,
             waiting: RefCell::new(HashMap::new()),
             key: RefCell::new(Vec::new()),
