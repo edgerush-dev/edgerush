@@ -19,6 +19,11 @@ use tokio::sync::{mpsc, oneshot};
 /// How many requests may wait for the pod's task.
 const QUEUE: usize = 4_096;
 
+/// How many messages of copies may wait for one other pod. Beyond it a copy is dropped:
+/// the key's next change sends it whole again, and a secondary that missed copies is what
+/// the data planes' `seen` marks are for.
+const COPIES_WAITING: usize = 1_024;
+
 /// How the pods watch each other.
 #[derive(Clone, Copy, Debug)]
 pub struct Timing {
@@ -221,13 +226,13 @@ impl Running {
 /// Sends one pod its copies, in order, coalescing what waits; and its heartbeats, which
 /// need no order and are not worth waiting for.
 struct Sender {
-    queue: mpsc::UnboundedSender<service::Replicas>,
+    queue: mpsc::Sender<service::Replicas>,
     client: Client,
 }
 
 impl Sender {
     fn spawn(client: Client) -> Self {
-        let (queue, mut waiting) = mpsc::unbounded_channel::<service::Replicas>();
+        let (queue, mut waiting) = mpsc::channel::<service::Replicas>(COPIES_WAITING);
         let sending = client.clone();
         tokio::spawn(async move {
             while let Some(first) = waiting.recv().await {
@@ -268,7 +273,7 @@ impl Sender {
     }
 
     fn send(&self, replicas: service::Replicas) {
-        let _stopped = self.queue.send(replicas);
+        let _full_or_stopped = self.queue.try_send(replicas);
     }
 
     fn heartbeat(&self, beat: Heartbeat) {
