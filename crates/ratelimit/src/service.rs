@@ -29,6 +29,8 @@
 //! and the secondary of a key are the two pods ranking highest for it (rendezvous hashing),
 //! so a pod leaving moves only the keys it held.
 
+pub mod membership;
+
 use crate::reference::{Model, TokenBucket};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
@@ -219,6 +221,8 @@ pub struct Answers {
     pub from: PodId,
     /// One per entry it owns.
     pub entries: Vec<Answer>,
+    /// The view it holds: a data plane holding an earlier one takes it over.
+    pub view: Option<View>,
 }
 
 /// What the owner knows of one data plane, for one key.
@@ -252,10 +256,13 @@ pub struct Replica {
 /// The owner's copies of keys that changed, to their secondary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Replicas {
-    /// The owner.
+    /// The owner, or the pod that was.
     pub from: PodId,
     /// One per key.
     pub entries: Vec<Replica>,
+    /// Whether these are keys handed over to their new owner, by the pod that owned them
+    /// before a view change, rather than copies for a secondary.
+    pub handover: bool,
 }
 
 /// How a request was decided.
@@ -375,6 +382,8 @@ pub struct DataPlane<S = FixedState> {
     next_ticket: Ticket,
     decided: Vec<(Ticket, bool)>,
     outgoing: BTreeMap<PodId, Vec<Entry>>,
+    /// Views asked for so far, to ask the pods in turn.
+    polls: u64,
 }
 
 impl<S: BuildHasher + Default> DataPlane<S> {
@@ -389,6 +398,7 @@ impl<S: BuildHasher + Default> DataPlane<S> {
             next_ticket: 0,
             decided: Vec::new(),
             outgoing: BTreeMap::new(),
+            polls: 0,
         }
     }
 
@@ -440,6 +450,7 @@ impl<S: BuildHasher + Default> DataPlane<S> {
         let resend_after = RESEND_AFTER_CYCLES * self.cycle;
         let cycle = self.cycle;
         let mut decided = Vec::new();
+        let mut cut_off = false;
         for (key, at) in &mut self.keys {
             let hold = at.contract.refill_time();
             // Its share of what the copy has left and the cycle refills, at least one, and
@@ -457,7 +468,7 @@ impl<S: BuildHasher + Default> DataPlane<S> {
             let Some(owner) = at.owner else {
                 continue;
             };
-            let entries = self.outgoing.entry(owner).or_default();
+            let mut entries = Vec::new();
             // An ask unanswered half as long is sent again once, as it was.
             if at
                 .asking
@@ -534,6 +545,20 @@ impl<S: BuildHasher + Default> DataPlane<S> {
                     report: Report::Poll,
                 });
             }
+            // Cut off: an ask given up, or a key in use whose owner has not answered for as
+            // long as an ask is given up after.
+            cut_off |= at.unreachable
+                || (in_use && at.heard.is_none_or(|heard| now - heard >= resend_after));
+            if !entries.is_empty() {
+                self.outgoing.entry(owner).or_default().extend(entries);
+            }
+        }
+        // An owner out of reach may have gone: the pods are asked for their view in turn,
+        // an empty batch each cycle, until one has a later view or the owner answers.
+        if cut_off && !self.view.pods.is_empty() {
+            let at = usize::try_from(self.polls).unwrap_or(0) % self.view.pods.len();
+            self.polls += 1;
+            self.outgoing.entry(self.view.pods[at]).or_default();
         }
         self.decided.extend(decided);
         self.keys.retain(|_, at| !at.idle(now));
@@ -541,12 +566,17 @@ impl<S: BuildHasher + Default> DataPlane<S> {
 
     /// An owner's answers reach it at `now`.
     pub fn on_answers(&mut self, answers: Answers, now: u64) {
-        for answer in answers.entries {
+        let Answers {
+            from,
+            entries,
+            view,
+        } = answers;
+        for answer in entries {
             let Some(at) = self.keys.get_mut(&answer.key) else {
                 continue;
             };
             // Only the owner it sends to: an answer from one that has gone is stale.
-            if at.owner != Some(answers.from) {
+            if at.owner != Some(from) {
                 continue;
             }
             at.bucket.set_behind(now, answer.behind);
@@ -588,6 +618,9 @@ impl<S: BuildHasher + Default> DataPlane<S> {
                 ask(&mut self.outgoing, &answer.key, at, now);
             }
         }
+        if let Some(view) = view {
+            self.on_view(view, now);
+        }
     }
 
     /// The service's pods change at `now`. Keys whose owner moved send it again every
@@ -627,11 +660,10 @@ impl<S: BuildHasher + Default> DataPlane<S> {
         }
     }
 
-    /// Messages to send: one batch per service pod.
+    /// Messages to send: one batch per service pod; an empty one asks only for the view.
     pub fn take_outgoing(&mut self) -> Vec<(PodId, Batch)> {
         std::mem::take(&mut self.outgoing)
             .into_iter()
-            .filter(|(_, entries)| !entries.is_empty())
             .map(|(pod, entries)| {
                 (
                     pod,
@@ -742,6 +774,20 @@ impl Owned {
             .count() as u64
     }
 
+    /// Takes in what `mine` applied of the key while this copy was on its way: its hits
+    /// charged on top, and the furthest of each data plane's marks.
+    fn merge(&mut self, mine: Owned, now: u64) {
+        self.apply(mine.counted, now);
+        for (plane, record) in mine.planes {
+            let ours = self.planes.entry(plane).or_default();
+            ours.applied = ours.applied.max(record.applied);
+            ours.last_admitted = ours.last_admitted.max(record.last_admitted);
+            if record.last_ask.0 > ours.last_ask.0 {
+                ours.last_ask = record.last_ask;
+            }
+        }
+    }
+
     fn replica(&self, key: &[u8], now: u64) -> Replica {
         Replica {
             key: key.into(),
@@ -770,6 +816,9 @@ pub struct ServicePod<S = FixedState> {
     view: View,
     keys: HashMap<Box<[u8]>, Owned, S>,
     replicas: BTreeMap<PodId, Vec<Replica>>,
+    handovers: BTreeMap<PodId, Vec<Replica>>,
+    /// Whether the view it holds took it in: until then it answers with its view alone.
+    serving: bool,
 }
 
 impl<S: BuildHasher + Default> ServicePod<S> {
@@ -783,7 +832,15 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             view,
             keys: HashMap::default(),
             replicas: BTreeMap::new(),
+            handovers: BTreeMap::new(),
+            serving: true,
         }
+    }
+
+    /// Whether it serves: a pod the agreed view has not taken in, in this life, answers
+    /// batches with its view and nothing more.
+    pub fn set_serving(&mut self, serving: bool) {
+        self.serving = serving;
     }
 
     /// Hits the count of `key` holds, each once, if it holds the key.
@@ -799,7 +856,12 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         let lately = ACTIVE_CYCLES * self.cycle;
         let mut answers = Vec::new();
         let from = batch.from;
-        for entry in batch.entries {
+        let entries = if self.serving {
+            batch.entries
+        } else {
+            Vec::new()
+        };
+        for entry in entries {
             let (owner, secondary) = self.view.owners(&entry.key);
             if owner != Some(self.me) {
                 continue;
@@ -877,15 +939,22 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         Answers {
             from: self.me,
             entries: answers,
+            view: Some(self.view.clone()),
         }
     }
 
-    /// An owner's copies reach it at `now`: kept for the keys it is the secondary of, from
-    /// the owner it knows of.
+    /// Copies reach it at `now`: an owner's, kept for the keys it is the secondary of from
+    /// the owner it knows of; or keys handed over to it as their new owner, taken over —
+    /// with whatever it has applied of them meanwhile charged on top.
     pub fn on_replicas(&mut self, replicas: Replicas, now: u64) {
         for replica in replicas.entries {
             let (owner, secondary) = self.view.owners(&replica.key);
-            if owner != Some(replicas.from) || secondary != Some(self.me) {
+            let wanted = if replicas.handover {
+                owner == Some(self.me)
+            } else {
+                owner == Some(replicas.from) && secondary == Some(self.me)
+            };
+            if !wanted {
                 continue;
             }
             let mut bucket = replica.contract.bucket();
@@ -905,16 +974,20 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                     )
                 })
                 .collect();
-            self.keys.insert(
-                replica.key,
-                Owned {
-                    contract: replica.contract,
-                    bucket,
-                    counted: replica.counted,
-                    planes,
-                    touched: now,
-                },
-            );
+            let mut copy = Owned {
+                contract: replica.contract,
+                bucket,
+                counted: replica.counted,
+                planes,
+                touched: now,
+            };
+            if replicas.handover
+                && let Some(mine) = self.keys.remove(&replica.key)
+                && mine.contract == copy.contract
+            {
+                copy.merge(mine, now);
+            }
+            self.keys.insert(replica.key, copy);
         }
     }
 
@@ -927,6 +1000,19 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         let before = std::mem::replace(&mut self.view, view);
         for (key, owned) in &self.keys {
             let (owner, secondary) = self.view.owners(key);
+            // Owned until now, and from now another pod's that held no copy of it — one
+            // joining, not the secondary taking over: handed over.
+            let (owned_before, secondary_before) = before.owners(key);
+            if owned_before == Some(self.me)
+                && let Some(owner) = owner
+                && owner != self.me
+                && secondary_before != Some(owner)
+            {
+                self.handovers
+                    .entry(owner)
+                    .or_default()
+                    .push(owned.replica(key, now));
+            }
             if owner != Some(self.me) {
                 continue;
             }
@@ -956,19 +1042,28 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         });
     }
 
-    /// Copies to send: one message per secondary.
+    /// Copies to send: one message per secondary, and one per pod keys are handed over to.
     pub fn take_replicas(&mut self) -> Vec<(PodId, Replicas)> {
-        std::mem::take(&mut self.replicas)
-            .into_iter()
-            .map(|(pod, entries)| {
+        let me = self.me;
+        let message = |handover| {
+            move |(pod, entries)| {
                 (
                     pod,
                     Replicas {
-                        from: self.me,
+                        from: me,
                         entries,
+                        handover,
                     },
                 )
-            })
+            }
+        };
+        let handovers = std::mem::take(&mut self.handovers)
+            .into_iter()
+            .map(message(true));
+        std::mem::take(&mut self.replicas)
+            .into_iter()
+            .map(message(false))
+            .chain(handovers)
             .collect()
     }
 }

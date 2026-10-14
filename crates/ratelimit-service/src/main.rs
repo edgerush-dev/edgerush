@@ -5,16 +5,16 @@
 //!     --pod 0=rl-0:7000 --pod 1=rl-1:7000 --pod 2=rl-2:7000 [--cycle-ms 10]
 //! ```
 //!
-//! `--pod` names every service pod, this one too; the view of the service is fixed for the
-//! process's life until the pods agree on changes between them (not built yet).
+//! `--pod` names every service pod, this one too: the members among which a majority agrees
+//! which of them serve (`edgerush_ratelimit::service::membership`).
 
-use edgerush_ratelimit::service::{PodId, View};
+use edgerush_ratelimit::service::PodId;
 use edgerush_ratelimit_service::grpc::{Client, Server};
-use edgerush_ratelimit_service::pod::Pod;
+use edgerush_ratelimit_service::pod::{Pod, Timing};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct Args {
     id: PodId,
@@ -79,17 +79,26 @@ fn main() -> ExitCode {
 }
 
 async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let view = View {
-        epoch: 1,
-        pods: args.pods.keys().copied().collect(),
-    };
+    let members = args.pods.keys().copied().collect();
+    // A new life at every start: the time it began, which no earlier life shares.
+    let incarnation = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1, |since| {
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        });
     let mut peers = BTreeMap::new();
     for (id, address) in &args.pods {
         if *id != args.id {
             peers.insert(*id, Client::new(address)?);
         }
     }
-    let pod = Pod::spawn(args.id, args.cycle, view, peers);
+    let pod = Pod::spawn(
+        args.id,
+        members,
+        incarnation,
+        Timing::with_cycle(args.cycle),
+        peers,
+    );
     eprintln!(
         "edgerush-ratelimit-service: pod {} on {}",
         args.id, args.listen

@@ -2,12 +2,13 @@
 //! generated, as its two methods are small.
 //!
 //! - `Exchange`: a data plane's batch, answered by the service pod's answers.
-//! - `Replicate`: an owner's copies, for the secondary.
+//! - `Replicate`: an owner's copies, for the secondary, or keys handed over.
+//! - `Heartbeat`: a pod's heartbeat, for every other.
 
 use crate::pod::Pod;
 use crate::wire;
 use bytes::Buf;
-use edgerush_ratelimit::service;
+use edgerush_ratelimit::service::{self, membership};
 use http::uri::PathAndQuery;
 use std::convert::Infallible;
 use std::future::Future;
@@ -24,6 +25,7 @@ use tonic::{Request, Response, Status};
 pub const SERVICE: &str = "edgerush.ratelimit.v1.RateLimit";
 const EXCHANGE: &str = "/edgerush.ratelimit.v1.RateLimit/Exchange";
 const REPLICATE: &str = "/edgerush.ratelimit.v1.RateLimit/Replicate";
+const HEARTBEAT: &str = "/edgerush.ratelimit.v1.RateLimit/Heartbeat";
 
 /// How long a call may take before it is given up: the protocol sends again what matters.
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -136,6 +138,23 @@ impl tonic::server::UnaryService<wire::Replicas> for Replicate {
     }
 }
 
+struct Beat(Pod);
+
+impl tonic::server::UnaryService<wire::Heartbeat> for Beat {
+    type Response = wire::Empty;
+    type Future = Boxed<Result<Response<wire::Empty>, Status>>;
+
+    fn call(&mut self, request: Request<wire::Heartbeat>) -> Self::Future {
+        let pod = self.0.clone();
+        Box::pin(async move {
+            let beat = membership::Heartbeat::try_from(request.into_inner())
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            pod.heartbeat(beat).await;
+            Ok(Response::new(wire::Empty {}))
+        })
+    }
+}
+
 impl tower_service::Service<http::Request<tonic::body::Body>> for Server {
     type Response = http::Response<tonic::body::Body>;
     type Error = Infallible;
@@ -153,6 +172,11 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for Server {
                     let mut grpc =
                         tonic::server::Grpc::new(Prost::<wire::Answers, wire::Batch>::default());
                     grpc.unary(Exchange(pod), request).await
+                }
+                HEARTBEAT => {
+                    let mut grpc =
+                        tonic::server::Grpc::new(Prost::<wire::Empty, wire::Heartbeat>::default());
+                    grpc.unary(Beat(pod), request).await
                 }
                 REPLICATE => {
                     let mut grpc =
@@ -230,7 +254,17 @@ impl Client {
         Ok(answers.into())
     }
 
-    /// Sends an owner's copies to a secondary.
+    /// Sends a pod's heartbeat.
+    ///
+    /// # Errors
+    ///
+    /// When the call fails.
+    pub async fn heartbeat(&self, beat: membership::Heartbeat) -> Result<(), Error> {
+        let _: wire::Empty = self.call(wire::Heartbeat::from(beat), HEARTBEAT).await?;
+        Ok(())
+    }
+
+    /// Sends copies to a secondary, or keys handed over to their new owner.
     ///
     /// # Errors
     ///

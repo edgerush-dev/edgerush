@@ -229,8 +229,14 @@ fn a_data_plane_polls_while_the_key_is_in_use() {
     warmed(&mut net, 0, b"k", 0);
     net.planes[0].on_cycle(100 * MS);
     let sent = net.planes[0].take_outgoing();
+    let owner = Net::owner(b"k") as PodId;
+    let to_owner: Vec<&Batch> = sent
+        .iter()
+        .filter(|(pod, batch)| *pod == owner && !batch.entries.is_empty())
+        .map(|(_, batch)| batch)
+        .collect();
     assert!(
-        matches!(sent.as_slice(), [(_, batch)] if batch.entries[0].report == Report::Poll),
+        matches!(to_owner.as_slice(), [batch] if batch.entries[0].report == Report::Poll),
         "{sent:?}"
     );
     net.planes[0].on_cycle(100 * MS + 1);
@@ -537,6 +543,7 @@ fn a_copy_from_a_pod_that_no_longer_owns_the_key_is_ignored() {
         Replicas {
             from: owner,
             entries: vec![replica],
+            handover: false,
         },
         0,
     );
@@ -572,6 +579,7 @@ fn an_answer_from_a_pod_that_is_not_the_owner_is_ignored() {
                 others: 5,
                 decided: None,
             }],
+            view: None,
         },
         CYCLE,
     );
@@ -673,6 +681,7 @@ fn a_secondary_keeps_copies_only_from_the_owner() {
         Replicas {
             from: third,
             entries: vec![replica],
+            handover: false,
         },
         0,
     );
@@ -690,4 +699,186 @@ fn a_batch_applied_arriving_again_is_not_kept() {
     assert_eq!(answer.entries[0].applied, 1);
     assert_eq!(pod.counted(b"k"), Some(2));
     assert!(pod.keys[&b"k"[..]].planes[&1].waiting.is_empty());
+}
+
+/// A pod that leaves and comes back owns its keys again: the pod that held them meanwhile
+/// hands them over, so the count goes on where it was.
+#[test]
+fn a_pod_back_in_the_view_is_handed_its_keys() {
+    let (owner, secondary, _) = roles(b"k");
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, b"k", 0);
+    net.set_view(&without(owner), CYCLE);
+    net.pods[owner as usize] = ServicePod::new(owner, CYCLE, without(owner)); // restarted
+    net.admits(0, b"k", 3, CYCLE);
+    net.planes[0].on_cycle(CYCLE);
+    net.settle(CYCLE);
+    assert_eq!(net.pods[secondary as usize].counted(b"k"), Some(4));
+    let all = view(&[0, 1, 2], 3);
+    net.set_view(&all, 2 * CYCLE);
+    net.settle(2 * CYCLE);
+    assert_eq!(
+        net.pods[owner as usize].counted(b"k"),
+        Some(4),
+        "handed over by the pod that held it"
+    );
+    net.admits(0, b"k", 2, 3 * CYCLE);
+    net.planes[0].on_cycle(3 * CYCLE);
+    net.settle(3 * CYCLE);
+    assert_eq!(net.pods[owner as usize].counted(b"k"), Some(6));
+    assert_eq!(net.copy(0, b"k").owner, Some(owner));
+}
+
+/// Hits that reach the new owner before the handover are charged on top of what it is
+/// handed, not lost under it.
+#[test]
+fn a_handover_arriving_late_keeps_what_the_new_owner_applied() {
+    let (owner, secondary, _) = roles(b"k");
+    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 3));
+    pod.on_batch(batch(9, hits(1, 2, 0)), 0);
+    let handed = Replica {
+        key: b"k"[..].into(),
+        contract: contract(),
+        behind: contract().bucket().behind(0) + 5 * u128::from(1_000 * MS),
+        counted: 5,
+        planes: vec![PlaneRecord {
+            plane: 9,
+            applied: 0,
+            admitted_ago: Some(0),
+            last_ask: (0, 0),
+        }],
+    };
+    pod.on_replicas(
+        Replicas {
+            from: secondary,
+            entries: vec![handed],
+            handover: true,
+        },
+        0,
+    );
+    assert_eq!(pod.counted(b"k"), Some(7));
+    assert_eq!(
+        pod.keys[&b"k"[..]].bucket.remaining(0),
+        3,
+        "ten less five less two"
+    );
+    assert_eq!(pod.keys[&b"k"[..]].planes[&9].applied, 1);
+}
+
+/// A handover reaching a pod that does not own the key is ignored.
+#[test]
+fn a_handover_to_a_pod_that_does_not_own_the_key_is_ignored() {
+    let (_, secondary, third) = roles(b"k");
+    let mut pod: ServicePod = ServicePod::new(third, CYCLE, view(&[0, 1, 2], 3));
+    pod.on_replicas(
+        Replicas {
+            from: secondary,
+            entries: vec![Replica {
+                key: b"k"[..].into(),
+                contract: contract(),
+                behind: 0,
+                counted: 5,
+                planes: Vec::new(),
+            }],
+            handover: true,
+        },
+        0,
+    );
+    assert_eq!(pod.counted(b"k"), None);
+}
+
+/// A pod not yet taken into the view answers with its view and decides nothing.
+#[test]
+fn a_pod_not_serving_answers_with_its_view_alone() {
+    let (owner, _, _) = roles(b"k");
+    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 4));
+    pod.set_serving(false);
+    let answers = pod.on_batch(
+        batch(
+            1,
+            Report::Ask {
+                sequence: 1,
+                count: 3,
+            },
+        ),
+        0,
+    );
+    assert!(answers.entries.is_empty());
+    assert_eq!(answers.view, Some(view(&[0, 1, 2], 4)));
+    assert_eq!(pod.counted(b"k"), None);
+    pod.set_serving(true);
+    let answers = pod.on_batch(
+        batch(
+            1,
+            Report::Ask {
+                sequence: 1,
+                count: 3,
+            },
+        ),
+        0,
+    );
+    assert_eq!(answers.entries[0].decided, Some((1, 3)));
+}
+
+/// A data plane takes over a later view from any answer, and moves its keys with it.
+#[test]
+fn a_data_plane_takes_a_later_view_from_an_answer() {
+    let (owner, secondary, _) = roles(b"k");
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, b"k", 0);
+    let later = without(owner);
+    for pod in &mut net.pods {
+        pod.on_view(later.clone(), CYCLE);
+    }
+    // The plane hears of it only in an answer about another key.
+    let other = (0..100)
+        .map(|k| format!("o{k}").into_bytes())
+        .find(|k| roles(k).0 == secondary)
+        .unwrap();
+    net.planes[0].decide(&other, contract(), CYCLE);
+    net.settle(CYCLE);
+    assert_eq!(net.planes[0].view, later);
+    assert_eq!(net.copy(0, b"k").owner, Some(secondary));
+}
+
+/// Cut off from an owner, a data plane asks the pods in turn for their view.
+#[test]
+fn a_data_plane_cut_off_asks_the_pods_for_their_view() {
+    let mut net = Net::new(1);
+    net.planes[0].decide(b"k", contract(), 0);
+    net.planes[0].take_outgoing();
+    net.planes[0].on_cycle(4 * CYCLE);
+    assert!(net.copy(0, b"k").unreachable);
+    let first = net.planes[0].take_outgoing();
+    net.planes[0].on_cycle(5 * CYCLE);
+    let second = net.planes[0].take_outgoing();
+    let polled = |sent: &[(PodId, Batch)]| {
+        sent.iter()
+            .filter(|(_, batch)| batch.entries.is_empty())
+            .map(|(pod, _)| *pod)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(polled(&first).len(), 1);
+    assert_eq!(polled(&second).len(), 1);
+    assert_ne!(polled(&first), polled(&second), "in turn");
+}
+
+/// An owner that has stopped answering a key in use, with no ask in flight, cuts the data
+/// plane off as surely as an ask given up: it asks the pods for their view.
+#[test]
+fn an_owner_silent_for_four_cycles_sends_the_data_plane_asking_for_the_view() {
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, b"k", 0);
+    let empty = |sent: &[(PodId, Batch)]| sent.iter().filter(|(_, b)| b.entries.is_empty()).count();
+    for cycle in 0..4 {
+        net.admits(0, b"k", 1, cycle * CYCLE);
+        net.planes[0].on_cycle(cycle * CYCLE);
+        assert_eq!(
+            empty(&net.planes[0].take_outgoing()),
+            0,
+            "cycle {cycle}: still in time"
+        );
+    }
+    net.planes[0].on_cycle(4 * CYCLE);
+    assert_eq!(empty(&net.planes[0].take_outgoing()), 1);
 }

@@ -5,7 +5,7 @@
 //! takes its default. A message the protocol cannot use — a key with no contract, a
 //! contract of zero — is refused whole rather than guessed at.
 
-use edgerush_ratelimit::service;
+use edgerush_ratelimit::service::{self, membership};
 use std::num::NonZeroU64;
 
 /// A limit's contract.
@@ -123,6 +123,17 @@ pub struct Answer {
     pub decided: Option<Decided>,
 }
 
+/// Which service pods serve, as they agree.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct View {
+    /// Counted up with each change.
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+    /// The pods serving.
+    #[prost(uint32, repeated, tag = "2")]
+    pub pods: Vec<u32>,
+}
+
 /// A service pod's answers to a batch.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct Answers {
@@ -132,6 +143,9 @@ pub struct Answers {
     /// One per entry it owns.
     #[prost(message, repeated, tag = "2")]
     pub entries: Vec<Answer>,
+    /// The view it holds.
+    #[prost(message, optional, tag = "3")]
+    pub view: Option<View>,
 }
 
 /// What an owner knows of one data plane.
@@ -174,15 +188,57 @@ pub struct Replica {
     pub planes: Vec<PlaneRecord>,
 }
 
-/// An owner's copies, to a secondary.
+/// An owner's copies, to a secondary; or keys handed over to a new owner.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct Replicas {
-    /// The owner.
+    /// The owner, or the pod that was.
     #[prost(uint32, tag = "1")]
     pub from: u32,
     /// One per key.
     #[prost(message, repeated, tag = "2")]
     pub entries: Vec<Replica>,
+    /// Whether the keys are handed over.
+    #[prost(bool, tag = "3")]
+    pub handover: bool,
+}
+
+/// A pod in one of its lives.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
+pub struct Life {
+    /// The pod.
+    #[prost(uint32, tag = "1")]
+    pub pod: u32,
+    /// Its incarnation.
+    #[prost(uint64, tag = "2")]
+    pub incarnation: u64,
+}
+
+/// A view, and the life of each pod it took in.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Agreed {
+    /// The view.
+    #[prost(message, optional, tag = "1")]
+    pub view: Option<View>,
+    /// The lives taken in.
+    #[prost(message, repeated, tag = "2")]
+    pub incarnations: Vec<Life>,
+}
+
+/// A pod's heartbeat.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Heartbeat {
+    /// The pod.
+    #[prost(uint32, tag = "1")]
+    pub from: u32,
+    /// Its life.
+    #[prost(uint64, tag = "2")]
+    pub incarnation: u64,
+    /// The view it holds.
+    #[prost(message, optional, tag = "3")]
+    pub agreed: Option<Agreed>,
+    /// The pods it hears from.
+    #[prost(message, repeated, tag = "4")]
+    pub hears: Vec<Life>,
 }
 
 /// Nothing.
@@ -201,6 +257,72 @@ pub enum Invalid {
     /// An entry that reports nothing.
     #[error("an entry that reports nothing")]
     NoReport,
+    /// A heartbeat without a view.
+    #[error("a heartbeat without a view")]
+    NoView,
+}
+
+impl From<service::View> for View {
+    fn from(view: service::View) -> Self {
+        Self {
+            epoch: view.epoch,
+            pods: view.pods,
+        }
+    }
+}
+
+impl From<View> for service::View {
+    fn from(view: View) -> Self {
+        Self {
+            epoch: view.epoch,
+            pods: view.pods,
+        }
+    }
+}
+
+fn lives(lives: Vec<(u32, u64)>) -> Vec<Life> {
+    lives
+        .into_iter()
+        .map(|(pod, incarnation)| Life { pod, incarnation })
+        .collect()
+}
+
+fn pairs(lives: Vec<Life>) -> Vec<(u32, u64)> {
+    lives
+        .into_iter()
+        .map(|life| (life.pod, life.incarnation))
+        .collect()
+}
+
+impl From<membership::Heartbeat> for Heartbeat {
+    fn from(beat: membership::Heartbeat) -> Self {
+        Self {
+            from: beat.from,
+            incarnation: beat.incarnation,
+            agreed: Some(Agreed {
+                view: Some(beat.agreed.view.into()),
+                incarnations: lives(beat.agreed.incarnations),
+            }),
+            hears: lives(beat.hears),
+        }
+    }
+}
+
+impl TryFrom<Heartbeat> for membership::Heartbeat {
+    type Error = Invalid;
+
+    fn try_from(beat: Heartbeat) -> Result<Self, Invalid> {
+        let agreed = beat.agreed.ok_or(Invalid::NoView)?;
+        Ok(Self {
+            from: beat.from,
+            incarnation: beat.incarnation,
+            agreed: membership::Agreed {
+                view: agreed.view.ok_or(Invalid::NoView)?.into(),
+                incarnations: pairs(agreed.incarnations),
+            },
+            hears: pairs(beat.hears),
+        })
+    }
 }
 
 impl From<service::Contract> for Contract {
@@ -311,6 +433,7 @@ impl From<service::Answers> for Answers {
                         .map(|(sequence, admitted)| Decided { sequence, admitted }),
                 })
                 .collect(),
+            view: answers.view.map(View::from),
         }
     }
 }
@@ -332,6 +455,7 @@ impl From<Answers> for service::Answers {
                         .map(|decided| (decided.sequence, decided.admitted)),
                 })
                 .collect(),
+            view: answers.view.map(service::View::from),
         }
     }
 }
@@ -361,6 +485,7 @@ impl From<service::Replicas> for Replicas {
                         .collect(),
                 })
                 .collect(),
+            handover: replicas.handover,
         }
     }
 }
@@ -394,6 +519,7 @@ impl TryFrom<Replicas> for service::Replicas {
         Ok(Self {
             from: replicas.from,
             entries,
+            handover: replicas.handover,
         })
     }
 }
@@ -460,8 +586,17 @@ mod tests {
                 others,
                 decided,
             });
-        (any::<u32>(), prop::collection::vec(answer, 0..8))
-            .prop_map(|(from, entries)| service::Answers { from, entries })
+        let view = prop::option::of(
+            (any::<u64>(), prop::collection::vec(any::<u32>(), 0..4))
+                .prop_map(|(epoch, pods)| service::View { epoch, pods }),
+        );
+        (any::<u32>(), prop::collection::vec(answer, 0..8), view).prop_map(
+            |(from, entries, view)| service::Answers {
+                from,
+                entries,
+                view,
+            },
+        )
     }
 
     fn replicas() -> impl Strategy<Value = service::Replicas> {
@@ -495,11 +630,49 @@ mod tests {
                     planes,
                 },
             );
-        (any::<u32>(), prop::collection::vec(replica, 0..4))
-            .prop_map(|(from, entries)| service::Replicas { from, entries })
+        (
+            any::<u32>(),
+            prop::collection::vec(replica, 0..4),
+            any::<bool>(),
+        )
+            .prop_map(|(from, entries, handover)| service::Replicas {
+                from,
+                entries,
+                handover,
+            })
+    }
+
+    fn heartbeat() -> impl Strategy<Value = membership::Heartbeat> {
+        let lives = || prop::collection::vec(any::<(u32, u64)>(), 0..4);
+        (
+            any::<u32>(),
+            any::<u64>(),
+            any::<u64>(),
+            prop::collection::vec(any::<u32>(), 0..4),
+            lives(),
+            lives(),
+        )
+            .prop_map(|(from, incarnation, epoch, pods, incarnations, hears)| {
+                membership::Heartbeat {
+                    from,
+                    incarnation,
+                    agreed: membership::Agreed {
+                        view: service::View { epoch, pods },
+                        incarnations,
+                    },
+                    hears,
+                }
+            })
     }
 
     proptest! {
+        #[test]
+        fn a_heartbeat_comes_through_the_wire_as_it_was_sent(beat in heartbeat()) {
+            let bytes = Heartbeat::from(beat.clone()).encode_to_vec();
+            let decoded = Heartbeat::decode(bytes.as_slice()).unwrap();
+            prop_assert_eq!(membership::Heartbeat::try_from(decoded).unwrap(), beat);
+        }
+
         #[test]
         fn a_batch_comes_through_the_wire_as_it_was_sent(batch in batch()) {
             let bytes = Batch::from(batch.clone()).encode_to_vec();
