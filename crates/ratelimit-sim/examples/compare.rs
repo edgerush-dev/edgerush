@@ -433,6 +433,23 @@ fn main() {
             false,
         ),
     ];
+    // `BURST_SPREAD_MS=30`: bursts too that arrive over this long, as a real client's do.
+    let spread_ms: Option<u64> = std::env::var("BURST_SPREAD_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok());
+    let spread_title;
+    let mut workloads = workloads.to_vec();
+    if let Some(ms) = spread_ms {
+        spread_title = format!("A whole bucket on every pod, arriving over {ms} ms, every window");
+        workloads.push((
+            spread_title.as_str(),
+            Shape::SpreadBursts {
+                each: burst,
+                over: ms * MS,
+            },
+            false,
+        ));
+    }
     let pods: Vec<usize> = std::env::args()
         .nth(5)
         .map(|arg| arg.split(',').filter_map(|n| n.parse().ok()).collect())

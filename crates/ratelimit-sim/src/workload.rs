@@ -42,6 +42,15 @@ pub enum Shape {
         /// Requests on each pod at each burst.
         each: u64,
     },
+    /// `each` requests on every pod once a window, as `Bursts`, but arriving evenly over
+    /// `over` nanoseconds rather than in one instant: as a real client's burst comes, a few
+    /// milliseconds from first to last.
+    SpreadBursts {
+        /// Requests on each pod at each burst.
+        each: u64,
+        /// How long, in nanoseconds, each burst takes to arrive.
+        over: u64,
+    },
     /// `Skewed` for the first half of the run, then `Bursts`: the case that sets a bound on
     /// bursts against skewed traffic.
     SkewedThenBursts {
@@ -88,6 +97,21 @@ impl Workload {
             }
             Shape::Bursts { each } => {
                 bursts(&mut arrivals, start, span, window, each, pods);
+            }
+            Shape::SpreadBursts { each, over } => {
+                let mut at = start;
+                while at < span {
+                    for k in 0..each {
+                        for pod in 0..pods {
+                            let offset = over * k / each.max(1);
+                            arrivals.push(Arrival {
+                                at: at + offset,
+                                pod,
+                            });
+                        }
+                    }
+                    at += window;
+                }
             }
             Shape::SkewedThenBursts { per_window, each } => {
                 let middle = start + self.span / 2;
@@ -231,6 +255,18 @@ mod tests {
             &mut Rng::new(3),
         );
         assert!(!arrivals.is_empty() && arrivals.iter().all(|a| a.pod == 3));
+    }
+
+    #[test]
+    fn spread_bursts_arrive_evenly_over_their_span_on_every_pod() {
+        let sent = workload(Shape::SpreadBursts { each: 4, over: 40 }, false).arrivals(
+            &contract(),
+            2,
+            &mut Rng::new(3),
+        );
+        let first: Vec<u64> = sent.iter().take(8).map(|a| a.at - sent[0].at).collect();
+        assert_eq!(first, vec![0, 0, 10, 10, 20, 20, 30, 30]);
+        assert_eq!(sent.iter().filter(|a| a.pod == 1).count(), sent.len() / 2);
     }
 
     #[test]
