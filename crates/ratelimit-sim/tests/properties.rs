@@ -19,6 +19,7 @@ const NETWORK: Network = Network {
     delay: 1_000_000,
     jitter: 500_000,
     loss_per_mille: 0,
+    retransmit: None,
 };
 
 fn shape() -> impl Strategy<Value = Shape> {
@@ -442,6 +443,7 @@ fn counters_lose_nothing_when_messages_are_lost() {
             approach: counted(Bound::Every),
             network: Network {
                 loss_per_mille: 100,
+                retransmit: None,
                 ..NETWORK
             },
             seed,
@@ -495,6 +497,7 @@ fn a_service_loses_nothing_when_messages_are_lost() {
             approach: served(Bound::Every),
             network: Network {
                 loss_per_mille: 100,
+                retransmit: None,
                 ..NETWORK
             },
             seed,

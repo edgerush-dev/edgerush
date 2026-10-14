@@ -13,6 +13,11 @@ pub struct Network {
     pub jitter: u64,
     /// Of every thousand messages, how many are lost.
     pub loss_per_mille: u64,
+    /// As TCP carries them: a message lost is not lost but sent again, arriving this many
+    /// nanoseconds later (a retransmission timeout), and nothing sent after it between the
+    /// same two pods arrives before it, as on one connection. `None`: a message lost is
+    /// gone, and messages overtake each other.
+    pub retransmit: Option<u64>,
 }
 
 impl Network {
@@ -23,14 +28,24 @@ impl Network {
             delay,
             jitter,
             loss_per_mille: 0,
+            retransmit: None,
         }
     }
 
-    /// When a message sent at `now` arrives, or `None` if it is lost.
-    pub(crate) fn carry(&self, now: u64, rng: &mut Rng) -> Option<u64> {
+    /// When a message sent at `now` arrives, or `None` if it is lost; `link` is when the
+    /// last message between the same two pods arrives, which one sent as TCP sends it does
+    /// not overtake.
+    pub(crate) fn carry(&self, now: u64, rng: &mut Rng, link: &mut u64) -> Option<u64> {
         let lost = rng.below(1000) < self.loss_per_mille;
         let at = now + self.delay + rng.below(self.jitter + 1);
-        (!lost).then_some(at)
+        match self.retransmit {
+            None => (!lost).then_some(at),
+            Some(timeout) => {
+                let at = if lost { at + timeout } else { at }.max(*link);
+                *link = at;
+                Some(at)
+            }
+        }
     }
 }
 
@@ -178,7 +193,7 @@ mod tests {
         let network = Network::reliable(1_000, 500);
         let mut rng = Rng::new(4);
         let delays: Vec<u64> = (0..1000)
-            .map(|_| network.carry(10, &mut rng).unwrap() - 10)
+            .map(|_| network.carry(10, &mut rng, &mut 0).unwrap() - 10)
             .collect();
         assert!(delays.iter().all(|d| (1_000..=1_500).contains(d)));
         assert!(delays.iter().any(|d| *d < 1_010));
@@ -191,16 +206,43 @@ mod tests {
             delay: 0,
             jitter: 0,
             loss_per_mille: 200,
+            retransmit: None,
         };
         let mut rng = Rng::new(4);
         let lost = (0..10_000)
-            .filter(|_| network.carry(0, &mut rng).is_none())
+            .filter(|_| network.carry(0, &mut rng, &mut 0).is_none())
             .count();
         assert!((1_800..=2_200).contains(&lost), "{lost}");
         let none = Network {
             loss_per_mille: 0,
+            retransmit: None,
             ..network
         };
-        assert!((0..1000).all(|_| none.carry(0, &mut rng).is_some()));
+        assert!((0..1000).all(|_| none.carry(0, &mut rng, &mut 0).is_some()));
+    }
+
+    /// Carried as TCP carries it, a message lost arrives a retransmission timeout late,
+    /// and nothing sent after it between the same two pods arrives before it.
+    #[test]
+    fn a_message_lost_over_tcp_arrives_late_and_holds_back_the_rest() {
+        let network = Network {
+            delay: 1_000,
+            jitter: 0,
+            loss_per_mille: 1_000,
+            retransmit: Some(200_000),
+        };
+        let mut rng = Rng::new(4);
+        let mut link = 0;
+        assert_eq!(network.carry(0, &mut rng, &mut link), Some(201_000));
+        let reliable = Network {
+            loss_per_mille: 0,
+            ..network
+        };
+        assert_eq!(
+            reliable.carry(5_000, &mut rng, &mut link),
+            Some(201_000),
+            "not before the one ahead of it"
+        );
+        assert_eq!(reliable.carry(300_000, &mut rng, &mut link), Some(301_000));
     }
 }

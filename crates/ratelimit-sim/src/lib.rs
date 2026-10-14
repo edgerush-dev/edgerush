@@ -208,6 +208,10 @@ fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> Played {
     let mut rng = Rng::new(run.seed);
     let arrivals = run.workload.arrivals(&run.contract, pods, &mut rng);
     let mut network_rng = Rng::new(run.seed ^ 0x6E65_7477_6F72_6B00);
+    // When the last message between two pods arrives, for a network that keeps them in
+    // order.
+    let mut links: std::collections::BTreeMap<(usize, usize), u64> =
+        std::collections::BTreeMap::new();
     let mut queue = Queue::default();
     for (index, arrival) in arrivals.iter().enumerate() {
         queue.push(arrival.at, Event::Arrival(index));
@@ -275,7 +279,8 @@ fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> Played {
         }
         messages += outbox.sent.len() as u64;
         for (to, message) in outbox.sent.drain(..) {
-            if let Some(at) = run.network.carry(now, &mut network_rng) {
+            let link = links.entry((message.sender(), to)).or_insert(0);
+            if let Some(at) = run.network.carry(now, &mut network_rng, link) {
                 queue.push(at, Event::Deliver(to, message));
             }
         }

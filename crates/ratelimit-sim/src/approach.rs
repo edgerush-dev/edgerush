@@ -98,6 +98,8 @@ pub enum Approach {
     Nodes {
         /// The time between a data plane's batches.
         cycle: u64,
+        /// How long an ask may go unanswered before it is given up; 0 for four cycles.
+        ask_timeout: u64,
     },
 }
 
@@ -264,7 +266,9 @@ impl Approach {
             Self::Ownership(sharing) => Box::new(Ownership::new(contract, pods, *sharing)),
             Self::Counters(counting) => Box::new(Counters::new(contract, pods, *counting)),
             Self::Service(serving) => Box::new(Service::new(contract, pods, *serving)),
-            Self::Nodes { cycle } => Box::new(Nodes::new(contract, pods, *cycle)),
+            Self::Nodes { cycle, ask_timeout } => {
+                Box::new(Nodes::new(contract, pods, *cycle, *ask_timeout))
+            }
         }
     }
 }

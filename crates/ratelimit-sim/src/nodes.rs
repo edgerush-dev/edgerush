@@ -20,6 +20,8 @@ const KEY: &[u8] = b"key";
 pub(crate) struct Nodes {
     contract: service::Contract,
     cycle: u64,
+    /// How long a data plane waits for an ask's answer; 0 for four cycles.
+    ask_timeout: u64,
     view: View,
     planes: Vec<DataPlane>,
     /// How many times each data plane has restarted: its id is its index and its life.
@@ -36,7 +38,7 @@ pub(crate) struct Nodes {
 }
 
 impl Nodes {
-    pub(crate) fn new(contract: &Contract, planes: usize, cycle: u64) -> Self {
+    pub(crate) fn new(contract: &Contract, planes: usize, cycle: u64, ask_timeout: u64) -> Self {
         let view = View {
             epoch: 1,
             pods: (0..SERVICE_PODS).collect(),
@@ -48,8 +50,9 @@ impl Nodes {
                 burst: contract.burst,
             },
             cycle,
+            ask_timeout,
             planes: (0..planes)
-                .map(|plane| DataPlane::new(id(plane, 0), cycle, view.clone()))
+                .map(|plane| plane_of(id(plane, 0), cycle, ask_timeout, view.clone()))
                 .collect(),
             lives: vec![0; planes],
             pods: (0..SERVICE_PODS)
@@ -117,6 +120,15 @@ impl Nodes {
     fn owner(&self) -> Option<usize> {
         self.view.owners(KEY).0.map(|pod| pod as usize)
     }
+}
+
+/// A data plane `id`, waiting `ask_timeout` for an ask's answer (0: four cycles).
+fn plane_of(id: PlaneId, cycle: u64, ask_timeout: u64, view: View) -> DataPlane {
+    let mut plane = DataPlane::new(id, cycle, view);
+    if ask_timeout > 0 {
+        plane.set_ask_timeout(ask_timeout);
+    }
+    plane
 }
 
 /// A data plane's id: its index and its life.
@@ -224,8 +236,12 @@ impl Cluster for Nodes {
                     }
                 }
                 self.lives[pod] += 1;
-                self.planes[pod] =
-                    DataPlane::new(id(pod, self.lives[pod]), self.cycle, self.view.clone());
+                self.planes[pod] = plane_of(
+                    id(pod, self.lives[pod]),
+                    self.cycle,
+                    self.ask_timeout,
+                    self.view.clone(),
+                );
             }
             _ => {}
         }
@@ -263,7 +279,10 @@ mod tests {
                 span: 6 * SECOND,
                 conforming: false,
             },
-            approach: Approach::Nodes { cycle: 10_000_000 },
+            approach: Approach::Nodes {
+                cycle: 10_000_000,
+                ask_timeout: 0,
+            },
             network: Network::reliable(1_000_000, 500_000),
             fault,
             seed,
