@@ -146,11 +146,14 @@ impl Net {
     }
 }
 
-/// A data plane asks about its first request and hears back: its copy is fresh.
+/// A data plane asks about its first request and hears back, and a cycle bounds the copy:
+/// warm, it decides at once. What the cycle has to send is left unsent.
 fn warmed(net: &mut Net, plane: usize, key: &[u8], now: u64) {
     net.planes[plane].decide(key, contract(), now);
     net.settle(now);
     net.planes[plane].take_decided();
+    net.planes[plane].on_cycle(now);
+    net.planes[plane].take_outgoing();
 }
 
 fn waits(decision: Decision) -> bool {
@@ -331,7 +334,10 @@ fn the_owner_counts_those_admitting_as_of_its_latest_traffic() {
 fn a_data_plane_is_bounded_to_its_share_and_carries_one_over() {
     let mut net = Net::new(1);
     warmed(&mut net, 0, b"k", 0);
-    net.planes[0].keys.get_mut(&b"k"[..]).unwrap().others = 2;
+    let at = net.planes[0].keys.get_mut(&b"k"[..]).unwrap();
+    at.others = 2;
+    // A first cycle: nothing carried from one before.
+    at.allowance = None;
     net.planes[0].on_cycle(0);
     // Nine left, one refilled, among three.
     assert_eq!(net.copy(0, b"k").allowance, Some(3));
@@ -374,13 +380,19 @@ fn requests_for_a_cold_key_wait_and_the_owner_decides_them() {
     assert_eq!(decided.iter().filter(|(_, a)| *a).count(), 10);
     assert_eq!(net.pods[Net::owner(b"k")].counted(b"k"), Some(10));
     assert!(
+        waits(net.planes[0].decide(b"k", contract(), 0)),
+        "answered, but not yet bounded by a cycle: still asked about"
+    );
+    net.settle(0);
+    net.planes[0].on_cycle(0);
+    assert!(
         !waits(net.planes[0].decide(b"k", contract(), 0)),
-        "answered: decided here"
+        "answered and bounded: decided here"
     );
 }
 
 /// Requests coming faster than a round trip: the first asks, those during it are asked
-/// about once more, and from then on requests are decided here.
+/// about once more, and once a cycle has bounded the copy requests are decided here.
 #[test]
 fn a_busy_data_plane_stops_asking_after_the_cold_burst() {
     let mut net = Net::new(1);
@@ -393,6 +405,7 @@ fn a_busy_data_plane_stops_asking_after_the_cold_burst() {
         waits(net.planes[0].decide(b"k", contract(), 3 * MS)),
         "the second is asked about"
     );
+    net.planes[0].on_cycle(3 * MS);
     net.hop(4 * MS);
     assert_eq!(
         net.planes[0].take_decided().len(),
@@ -881,4 +894,45 @@ fn an_owner_silent_for_four_cycles_sends_the_data_plane_asking_for_the_view() {
     }
     net.planes[0].on_cycle(4 * CYCLE);
     assert_eq!(empty(&net.planes[0].take_outgoing()), 1);
+}
+
+/// A burst arrives over a few milliseconds, not at once: the first ask is answered while
+/// the rest is still coming. Until a cycle has shared out the copy among the data planes
+/// admitting the key, every request goes to the owner: two data planes each holding the
+/// copy the first answer brought would each spend it.
+#[test]
+fn a_burst_arriving_after_the_first_answer_is_held_to_one_bucket() {
+    let mut net = Net::new(2);
+    let mut admitted = 0;
+    let mut now = 0;
+    // One request on each, answered before the next arrives; then the rest, one at a time,
+    // each answered before the next. A cycle runs at once, before any answer, as a new
+    // data plane's first does: it bounds nothing.
+    for plane in &mut net.planes {
+        plane.decide(b"k", contract(), now);
+        plane.on_cycle(now);
+    }
+    net.settle(now);
+    admitted += net
+        .planes
+        .iter_mut()
+        .flat_map(DataPlane::take_decided)
+        .filter(|(_, a)| *a)
+        .count();
+    for _ in 0..8 {
+        for plane in 0..2 {
+            if net.planes[plane].decide(b"k", contract(), now) == Decision::Admit {
+                admitted += 1;
+            }
+            net.settle(now);
+        }
+        now += MS / 2;
+    }
+    let waited: usize = net
+        .planes
+        .iter_mut()
+        .flat_map(DataPlane::take_decided)
+        .filter(|(_, admitted)| *admitted)
+        .count();
+    assert_eq!(admitted + waited, 10, "one bucket, not two");
 }

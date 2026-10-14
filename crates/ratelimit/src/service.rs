@@ -296,6 +296,9 @@ struct PlaneKey {
     spent: u64,
     /// The most it may admit in the cycle under way, once a cycle has set it.
     allowance: Option<u64>,
+    /// Whether a cycle has set the allowance from a copy the owner answered with: until
+    /// then the copy is shared out among no one, and the owner decides.
+    bounded: bool,
     /// How many other data planes the owner last said were admitting the key.
     others: u64,
     /// When a request for the key last came.
@@ -331,6 +334,7 @@ impl PlaneKey {
             unacknowledged: VecDeque::new(),
             spent: 0,
             allowance: None,
+            bounded: false,
             others: 0,
             last_request: None,
             heard: None,
@@ -421,9 +425,16 @@ impl<S: BuildHasher + Default> DataPlane<S> {
             return Decision::Refuse;
         };
         let hold = contract.refill_time();
+        // Cold: no copy fresh enough, or none bounded yet. A copy an ask just brought is
+        // not bounded until a cycle after it shares out what it holds among the data
+        // planes admitting the key, as the owner's answers say them; until then another
+        // data plane may hold the same copy, and the owner decides. Requests come over a few milliseconds, not all at once: the first
+        // ask's answer comes back while the rest of a burst is still arriving.
         let cold = at.owner.is_some()
             && !at.unreachable
-            && (at.asking.is_some() || at.heard.is_none_or(|heard| now - heard > hold));
+            && (at.asking.is_some()
+                || !at.bounded
+                || at.heard.is_none_or(|heard| now - heard > hold));
         if !cold {
             return if at.decide(now) {
                 Decision::Admit
@@ -464,6 +475,7 @@ impl<S: BuildHasher + Default> DataPlane<S> {
                 .allowance
                 .map_or(0, |before| before.saturating_sub(at.spent));
             at.allowance = Some(share + left.min(1));
+            at.bounded |= at.heard.is_some();
             at.spent = 0;
             let Some(owner) = at.owner else {
                 continue;
@@ -603,10 +615,12 @@ impl<S: BuildHasher + Default> DataPlane<S> {
                 self.decided.push((ticket, (index as u64) < admitted));
             }
             // Those that came during the first ask are asked about once more — the tail of
-            // a cold burst — and any after that are decided here.
+            // a cold burst — and, once a cycle has bounded the copy, any after that are
+            // decided here: asking again and again would keep a data plane whose requests
+            // come faster than a round trip waiting on every one.
             if at.waiting.is_empty() {
                 at.follow_up = false;
-            } else if at.follow_up {
+            } else if at.follow_up && at.bounded {
                 at.follow_up = false;
                 for ticket in std::mem::take(&mut at.waiting) {
                     let admitted = at.decide(now);

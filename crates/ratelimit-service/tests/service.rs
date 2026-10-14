@@ -173,6 +173,9 @@ async fn hits_admitted_locally_reach_the_owner_each_cycle() {
     plane.decide(b"k", contract(), now(start));
     exchange(&mut plane, &service, start).await;
     plane.take_decided();
+    // A cycle after the owner's answer bounds the copy: from then on, decided here.
+    plane.on_cycle(now(start));
+    exchange(&mut plane, &service, start).await;
     let admitted = (0..5)
         .filter(|_| plane.decide(b"k", contract(), now(start)) == Decision::Admit)
         .count() as u64;
@@ -228,6 +231,9 @@ async fn the_secondary_takes_over_when_the_owner_stops() {
     plane.decide(b"k", contract(), now(start));
     exchange(&mut plane, &service, start).await;
     plane.take_decided();
+    // A cycle after the owner's answer bounds the copy: from then on, decided here.
+    plane.on_cycle(now(start));
+    exchange(&mut plane, &service, start).await;
     for _ in 0..3 {
         assert_eq!(plane.decide(b"k", contract(), now(start)), Decision::Admit);
     }
