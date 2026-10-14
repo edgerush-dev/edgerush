@@ -310,4 +310,41 @@ mod tests {
             }
         }
     }
+
+    /// Over TCP a lost message holds back what follows it on its connection for a
+    /// retransmission timeout: a data plane whose batches are held up must still count as
+    /// admitting, or every other one's share grows while it is stalled; and an ask must
+    /// wait longer than one retransmission, or what waits is decided from a copy that has
+    /// heard nothing.
+    #[test]
+    fn bursts_hold_with_one_packet_in_ten_lost_over_tcp() {
+        let tcp = Network {
+            loss_per_mille: 100,
+            retransmit: Some(200_000_000),
+            ..Network::reliable(1_000_000, 500_000)
+        };
+        let (mut admitted, mut central) = (0, 0);
+        for seed in 0..10 {
+            // As the proxy runs it: an ask waits 300 ms, one retransmission.
+            let run = Run {
+                pods: 8,
+                network: tcp,
+                approach: Approach::Nodes {
+                    cycle: 10_000_000,
+                    ask_timeout: 300_000_000,
+                },
+                ..bursts(Fault::None, seed)
+            };
+            admitted += crate::run(&run).admitted;
+            central += crate::run(&Run {
+                approach: Approach::Central,
+                ..run
+            })
+            .admitted;
+        }
+        assert!(
+            admitted * 100 <= central * 110,
+            "{admitted} against {central}"
+        );
+    }
 }

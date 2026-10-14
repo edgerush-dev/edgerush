@@ -41,8 +41,11 @@ use std::num::NonZeroU64;
 pub const RESEND_AFTER_CYCLES: u64 = 4;
 
 /// For how many cycles before the latest admission the owner knows of a data plane counts
-/// as admitting the key.
-pub const ACTIVE_CYCLES: u64 = 4;
+/// as admitting the key: 300 ms at a 10 ms cycle, longer than TCP takes to send a lost
+/// segment again. A data plane whose batches are held up behind a lost one must not drop out
+/// of the count, or every other one's share grows while it is stalled: four cycles let bursts
+/// through at 1.44 times the contract with one packet in ten lost (simulator, TCP-like loss).
+pub const ACTIVE_CYCLES: u64 = 30;
 
 /// A data plane: one worker of one EdgeRush pod, in one life of it. A restarted worker is a
 /// new data plane, with a new id.
