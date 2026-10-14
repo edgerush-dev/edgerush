@@ -344,6 +344,11 @@ def summarise(results, counted, n):
         "failed": len(failed),
         "admitted_by_instance": [sum(1 for r in results if r[2] == i and r[5] == "admitted")
                                  for i in range(n)],
+        # By the second it was due in: which burst, or which part of a run, went over.
+        "admitted_by_second": [
+            sum(1 for r in results if r[5] == "admitted" and r[0] // workloads.SECOND == second)
+            for second in range(workloads.SPAN // workloads.SECOND)
+        ],
         "failures": sorted(set(failed))[:5],
         "one_bucket": workloads.one_bucket(sent_times),
         "worst_excess": workloads.worst_excess(admitted_times),
