@@ -109,6 +109,10 @@ pub struct Serving {
     /// How the owning service pod keeps a secondary's copy of what it holds, so that the
     /// secondary can take over from it.
     pub replicate: Replicate,
+    /// How far, in nanoseconds, the data planes' clocks are off the service's, spread
+    /// evenly from this much behind to this much ahead: a copy of the owner's bucket is
+    /// read with the data plane's own clock.
+    pub skew: u64,
 }
 
 /// How the service pod owning a key keeps a copy of its state on a secondary, the next
@@ -178,6 +182,31 @@ pub enum Bound {
     NewPods,
     /// Every pod held to its share.
     Every,
+    /// Every pod held to its share, plus one request more if it left one unspent in the
+    /// cycle before: traffic spread at random gives a pod two requests in one cycle and
+    /// none in the next more often than a share of one allows. Carrying a whole share
+    /// would double the first cycle of a burst.
+    EveryCarrying,
+    /// With a rate-limiting service: every data plane held to what the owner grants it in
+    /// each answer — a share of what the owner's bucket has, weighted by the data plane's
+    /// part in the hits of the last few cycles; one that has not been admitting gets an
+    /// equal share, as if joining. Elsewhere, as [`Bound::Every`].
+    Granted,
+}
+
+impl Bound {
+    /// The allowance for a cycle: `share`, and with [`Bound::EveryCarrying`] one request
+    /// more if `before` was not all `spent`.
+    #[must_use]
+    pub fn carry(self, share: Option<u64>, before: Option<u64>, spent: u64) -> Option<u64> {
+        match (self, share) {
+            (Self::EveryCarrying, Some(share)) => {
+                let left = before.map_or(0, |before| before.saturating_sub(spent));
+                Some(share + left.min(1))
+            }
+            _ => share,
+        }
+    }
 }
 
 /// What the owner of a key does with reported hits that do not fit in its bucket.
@@ -247,6 +276,19 @@ mod tests {
         (0..count)
             .filter(|_| cluster.decide(pod, 0, &mut Outbox::default()))
             .count() as u64
+    }
+
+    /// Carrying, a pod's allowance is its share plus what it left of the last, at most one
+    /// request more; without, its share alone.
+    #[test]
+    fn a_carrying_bound_adds_at_most_one_request_left_unspent() {
+        let carry = Bound::EveryCarrying;
+        assert_eq!(carry.carry(Some(1), Some(1), 0), Some(2));
+        assert_eq!(carry.carry(Some(1), Some(1), 1), Some(1), "nothing left");
+        assert_eq!(carry.carry(Some(12), Some(12), 0), Some(13), "at most one");
+        assert_eq!(carry.carry(Some(3), None, 0), Some(3), "nothing before");
+        assert_eq!(carry.carry(None, Some(5), 0), None, "unbounded");
+        assert_eq!(Bound::Every.carry(Some(1), Some(1), 0), Some(1));
     }
 
     #[test]

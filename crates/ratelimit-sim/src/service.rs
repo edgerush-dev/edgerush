@@ -46,10 +46,14 @@ pub(crate) struct Service {
     secondary: Option<usize>,
     /// Whether the owner's state changed since it last sent its secondary a copy.
     changed: bool,
+    /// The owner's timer ticks, for turning its hit tallies over every few cycles.
+    ticks: u64,
     /// Hits admitted anywhere.
     admitted: u64,
     /// Decisions made for requests that waited, not yet taken.
     decided: Vec<(usize, bool)>,
+    /// How far each data plane's clock is off the service's, in nanoseconds.
+    skews: Vec<i64>,
 }
 
 /// What one data plane holds of the key.
@@ -74,6 +78,8 @@ struct Plane {
     allowance: Option<u64>,
     /// Which data planes the owner last said were admitting the key.
     active: Vec<bool>,
+    /// What the owner last granted it a cycle, with [`Bound::Granted`].
+    grant: Option<u64>,
     /// When a request for the key last came.
     last_request: Option<u64>,
     /// When the owner last answered: its copy is fresh for a bucket's refill time after.
@@ -89,6 +95,9 @@ struct Plane {
     asked: Vec<usize>,
     /// Requests that came while it was in flight: the next ask is about them.
     waiting: Vec<usize>,
+    /// Whether the ask in flight is about requests that came during an earlier one: after
+    /// its answer, those still waiting are decided here.
+    follow_up: bool,
 }
 
 /// What a service pod keeps of the key while it owns it.
@@ -105,6 +114,10 @@ struct Owner {
     counted: u64,
     /// For each data plane: the latest of its lives heard from.
     instances: Vec<u64>,
+    /// For each data plane: hits applied in the present span of a few cycles, and in the
+    /// one before — its part in the traffic, for grants.
+    recent: Vec<u64>,
+    earlier: Vec<u64>,
 }
 
 impl Owner {
@@ -116,6 +129,8 @@ impl Owner {
             waiting: vec![BTreeMap::new(); planes],
             counted: 0,
             instances: vec![0; planes],
+            recent: vec![0; planes],
+            earlier: vec![0; planes],
         }
     }
 
@@ -147,6 +162,7 @@ impl Service {
             spent: 0,
             allowance: None,
             active: vec![false; planes],
+            grant: None,
             last_request: None,
             heard: None,
             asking: None,
@@ -154,6 +170,7 @@ impl Service {
             unreachable: false,
             asked: Vec::new(),
             waiting: Vec::new(),
+            follow_up: false,
         };
         let per = |span: u64| {
             u128::from(contract.limit.get()) * u128::from(span) / u128::from(contract.window.get())
@@ -173,10 +190,27 @@ impl Service {
             owner: 0,
             secondary: (serving.replicate != Replicate::None).then_some(1),
             changed: false,
+            ticks: 0,
             fresh,
             admitted: 0,
             decided: Vec::new(),
+            skews: (0..planes)
+                .map(|plane| {
+                    let skew = i128::from(serving.skew);
+                    let spread = if planes > 1 {
+                        skew * (2 * plane as i128 - (planes as i128 - 1)) / (planes as i128 - 1)
+                    } else {
+                        0
+                    };
+                    i64::try_from(spread).unwrap_or(0)
+                })
+                .collect(),
         }
+    }
+
+    /// The time `plane`'s own clock shows at `now`.
+    fn clock(&self, plane: usize, now: u64) -> u64 {
+        now.saturating_add_signed(self.skews[plane])
     }
 
     /// The node a service pod is reached at: after the data planes.
@@ -197,14 +231,18 @@ impl Service {
     fn allowance(&self, plane: usize, now: u64) -> Option<u64> {
         let at = &self.planes[plane];
         let share = |planes: usize| {
-            let sees = at.bucket.remaining(now).saturating_add(self.refill);
+            let sees = at
+                .bucket
+                .remaining(self.clock(plane, now))
+                .saturating_add(self.refill);
             Some((sees / planes.max(1) as u64).max(1))
         };
         match self.serving.bound {
             Bound::Unbounded => None,
             Bound::NewPods if at.active[plane] => None,
             Bound::NewPods => share(self.planes.len()),
-            Bound::Every => {
+            Bound::Granted if at.grant.is_some() => at.grant,
+            Bound::Every | Bound::EveryCarrying | Bound::Granted => {
                 let others = (0..at.active.len())
                     .filter(|p| *p != plane && at.active[*p])
                     .count();
@@ -215,9 +253,10 @@ impl Service {
 
     /// Service pod `pod` applies `count` reported hits, each charged if there is room, and
     /// beyond that as its handling of excess says.
-    fn apply(&mut self, pod: usize, count: u64, now: u64) {
+    fn apply(&mut self, pod: usize, from: usize, count: u64, now: u64) {
         let owner = &mut self.owners[pod];
         owner.counted += count;
+        owner.recent[from] += count;
         for _ in 0..count {
             let room = owner.bucket.admits(now);
             let owe = match self.serving.excess {
@@ -236,15 +275,37 @@ impl Service {
 
     /// Service pod `pod` answers `plane` with its bucket as it stands and, to an ask, how
     /// many of the requests it asked about were admitted.
-    fn answer(&self, pod: usize, plane: usize, decided: Option<(u64, u64)>, outbox: &mut Outbox) {
+    fn answer(
+        &self,
+        pod: usize,
+        plane: usize,
+        decided: Option<(u64, u64)>,
+        now: u64,
+        outbox: &mut Outbox,
+    ) {
         let owner = &self.owners[pod];
+        let active = owner.active(ACTIVE_CYCLES * self.serving.cycle);
+        let grant = (self.serving.bound == Bound::Granted).then(|| {
+            let total = owner.bucket.remaining(now).saturating_add(self.refill);
+            let weight = |p: usize| owner.recent[p] + owner.earlier[p];
+            let weights: u64 = (0..active.len()).filter(|p| active[*p]).map(weight).sum();
+            let share = if active[plane] && weights > 0 {
+                u64::try_from(u128::from(total) * u128::from(weight(plane)) / u128::from(weights))
+                    .unwrap_or(total)
+            } else {
+                let others = active.iter().filter(|a| **a).count() as u64;
+                total / (others + 1)
+            };
+            share.max(1)
+        });
         let state = Message::State {
             from: self.address(pod),
             bucket: owner.bucket.clone(),
             applied: owner.applied.clone(),
-            active: owner.active(ACTIVE_CYCLES * self.serving.cycle),
+            active,
             counted: owner.counted,
             decided,
+            grant,
         };
         outbox.send(plane, state);
     }
@@ -256,6 +317,7 @@ impl Service {
         let owner = &mut self.owners[pod];
         let admitted = (0..count).filter(|_| owner.bucket.decide(now)).count() as u64;
         owner.counted += admitted;
+        owner.recent[from] += admitted;
         owner.last_admitted[from] = Some(now);
         admitted
     }
@@ -436,10 +498,10 @@ impl Service {
                         break;
                     };
                     self.owners[pod].applied[from] = next;
-                    self.apply(pod, count, now);
+                    self.apply(pod, from, count, now);
                 }
                 self.owner_changed(outbox);
-                self.answer(pod, from, None, outbox);
+                self.answer(pod, from, None, now, outbox);
             }
             Message::Ask {
                 from,
@@ -449,12 +511,12 @@ impl Service {
             } if from < self.planes.len() && self.current_life(pod, from, instance) => {
                 let admitted = self.decide_asked(pod, from, count, now);
                 self.owner_changed(outbox);
-                self.answer(pod, from, Some((sequence, admitted)), outbox);
+                self.answer(pod, from, Some((sequence, admitted)), now, outbox);
             }
             Message::Poll { from, instance }
                 if from < self.planes.len() && self.current_life(pod, from, instance) =>
             {
-                self.answer(pod, from, None, outbox);
+                self.answer(pod, from, None, now, outbox);
             }
             _ => {}
         }
@@ -469,6 +531,7 @@ impl Service {
             applied,
             active,
             decided,
+            grant,
             ..
         } = message
         else {
@@ -482,6 +545,7 @@ impl Service {
         let at = &mut self.planes[plane];
         at.bucket = bucket;
         at.active = active;
+        at.grant = grant;
         // The owner's bucket, plus what this data plane admitted that it has not seen:
         // batches the answer's applied mark does not cover, and hits unsent.
         // No more of this life's batches can have been applied than it has sent: a higher
@@ -491,8 +555,9 @@ impl Service {
         at.unacknowledged
             .retain(|(sequence, _, _, _)| *sequence > seen);
         let unseen: u64 = at.unacknowledged.iter().map(|(_, count, _, _)| count).sum();
+        let local = now.saturating_add_signed(self.skews[plane]);
         for _ in 0..unseen + at.unsent {
-            at.bucket.charge(now);
+            at.bucket.charge(local);
         }
         at.heard = Some(now);
         at.unreachable = false;
@@ -509,10 +574,27 @@ impl Service {
                 self.decided.push((request, (index as u64) < admitted));
             }
             self.admitted += admitted;
+            // Those that came during the first ask are asked about once more — the tail of a
+            // cold burst — and any after that are decided here: the copy is fresh, and the
+            // owner has counted every data plane that asked as admitting, which bounds them.
+            // Asking again and again would keep a data plane whose requests come faster than a
+            // round trip waiting on every one.
             let at = &mut self.planes[plane];
             if !at.waiting.is_empty() {
-                at.asked = std::mem::take(&mut at.waiting);
-                self.ask(plane, now, outbox);
+                if at.follow_up {
+                    at.follow_up = false;
+                    let waiting = std::mem::take(&mut at.waiting);
+                    for request in waiting {
+                        let admitted = self.decide(plane, now, outbox);
+                        self.decided.push((request, admitted));
+                    }
+                } else {
+                    at.follow_up = true;
+                    at.asked = std::mem::take(&mut at.waiting);
+                    self.ask(plane, now, outbox);
+                }
+            } else {
+                at.follow_up = false;
             }
         }
     }
@@ -534,6 +616,7 @@ impl Service {
         at.spent = 0;
         at.allowance = None;
         at.active = vec![false; planes];
+        at.grant = None;
         at.last_request = None;
         at.heard = None;
         at.asking = None;
@@ -549,7 +632,9 @@ impl Cluster for Service {
         if at.allowance.is_some_and(|allowance| at.spent >= allowance) {
             return false;
         }
-        let admitted = at.bucket.decide(now);
+        let admitted = at
+            .bucket
+            .decide(now.saturating_add_signed(self.skews[plane]));
         if admitted {
             at.spent += 1;
             at.unsent += 1;
@@ -578,6 +663,7 @@ impl Cluster for Service {
         if at.asking.is_some() {
             at.waiting.push(request);
         } else {
+            at.follow_up = false;
             at.asked.push(request);
             self.ask(plane, now, outbox);
         }
@@ -601,6 +687,14 @@ impl Cluster for Service {
     fn on_timer(&mut self, plane: usize, now: u64, outbox: &mut Outbox) {
         if plane >= self.planes.len() {
             let pod = plane - self.planes.len();
+            if pod == self.owner {
+                self.ticks += 1;
+                if self.ticks.is_multiple_of(ACTIVE_CYCLES) {
+                    let owner = &mut self.owners[pod];
+                    owner.earlier =
+                        std::mem::replace(&mut owner.recent, vec![0; self.planes.len()]);
+                }
+            }
             if pod == self.owner && self.changed && self.serving.replicate == Replicate::EveryCycle
             {
                 self.replicate(outbox);
@@ -611,11 +705,12 @@ impl Cluster for Service {
             return;
         }
         let allowance = self.allowance(plane, now);
+        let bound = self.serving.bound;
         let (to, hold) = (self.address(self.owner), self.hold);
         let resend_after = RESEND_AFTER_CYCLES * self.serving.cycle;
         let at = &mut self.planes[plane];
+        at.allowance = bound.carry(allowance, at.allowance, at.spent);
         at.spent = 0;
-        at.allowance = allowance;
         // An ask unanswered for as long as a batch waits to be sent again: the owner is
         // gone or out of reach, and the requests waiting are decided here, from the copy.
         if at.asking.is_some_and(|asked| now - asked >= resend_after) {
@@ -755,6 +850,7 @@ mod tests {
             bound,
             ask_when_cold: false,
             replicate: Replicate::None,
+            skew: 0,
         };
         Service::new(&contract, planes, serving)
     }
@@ -1129,6 +1225,42 @@ mod tests {
         );
     }
 
+    /// Traffic coming faster than an ask's round trip does not keep a data plane asking:
+    /// those that came during the first ask are asked about once more, and from then on
+    /// requests are decided here.
+    #[test]
+    fn a_busy_data_plane_stops_asking_after_the_cold_burst() {
+        let mut fleet = asking(2);
+        let mut outbox = Outbox::default();
+        // One hop of the network at a time: what is sent now arrives at the next step.
+        let hop = |fleet: &mut Service, outbox: &mut Outbox, now: u64| {
+            for (to, message) in std::mem::take(&mut outbox.sent) {
+                fleet.on_message(to, message, now, outbox);
+            }
+        };
+        assert!(arrive(&mut fleet, 0, 0..1, 0, &mut outbox).is_empty());
+        assert!(arrive(&mut fleet, 0, 1..2, MS, &mut outbox).is_empty());
+        hop(&mut fleet, &mut outbox, 2 * MS);
+        hop(&mut fleet, &mut outbox, 2 * MS);
+        assert_eq!(fleet.take_decided().len(), 1, "the first answered");
+        assert!(
+            arrive(&mut fleet, 0, 2..3, 3 * MS, &mut outbox).is_empty(),
+            "the second is being asked about"
+        );
+        hop(&mut fleet, &mut outbox, 4 * MS);
+        hop(&mut fleet, &mut outbox, 4 * MS);
+        assert_eq!(
+            fleet.take_decided().len(),
+            2,
+            "the second answered, and the third decided here"
+        );
+        assert_eq!(
+            arrive(&mut fleet, 0, 3..4, 5 * MS, &mut outbox).len(),
+            1,
+            "and the next at once"
+        );
+    }
+
     /// A copy no answer has refreshed for a bucket's refill time is cold again.
     #[test]
     fn a_copy_goes_cold_a_refill_time_after_the_last_answer() {
@@ -1454,6 +1586,93 @@ mod tests {
         fleet.on_timer(1, 0, &mut outbox);
         deliver(&mut fleet, &mut outbox, 0);
         assert_eq!(fleet.owners[2].counted, 2);
+    }
+
+    /// With grants, the owner gives each data plane a share of what its bucket has by its
+    /// part in recent hits, and one that has not been admitting an equal share, as if
+    /// joining; a data plane holds itself to its grant.
+    #[test]
+    fn the_owner_grants_shares_by_recent_hits() {
+        let mut fleet = fleet(3, Bound::Granted);
+        let mut outbox = Outbox::default();
+        admits(&mut fleet, 1, 3, 0);
+        admits(&mut fleet, 2, 1, 0);
+        fleet.on_timer(1, 0, &mut outbox);
+        fleet.on_timer(2, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        // Both asking again a cycle on: ten less four and a cycle's refill is seven, and
+        // a cycle's more makes eight, given three parts to one.
+        fleet.on_timer(1, 10 * MS, &mut outbox);
+        fleet.on_timer(2, 10 * MS, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 10 * MS);
+        assert_eq!(fleet.planes[1].grant, Some(6));
+        assert_eq!(fleet.planes[2].grant, Some(2));
+        // Plane 0 has not been admitting: an equal share, as if joining the two.
+        fleet.answer(0, 0, None, 10 * MS, &mut outbox);
+        assert!(
+            matches!(
+                outbox.sent.as_slice(),
+                [(0, Message::State { grant: Some(2), .. })]
+            ),
+            "{:?}",
+            outbox.sent
+        );
+        outbox.sent.clear();
+        fleet.on_timer(1, 20 * MS, &mut outbox);
+        assert_eq!(fleet.planes[1].allowance, Some(6), "held to its grant");
+    }
+
+    /// The owner's hit tallies turn over every few cycles of its own timer, so that a grant
+    /// weighs the last two spans' traffic and no older; requests it decides when asked are
+    /// counted in them too.
+    #[test]
+    fn the_owners_tallies_cover_the_last_two_spans() {
+        let mut fleet = asking(2);
+        fleet.serving.bound = Bound::Granted;
+        let mut outbox = Outbox::default();
+        arrive(&mut fleet, 1, 0..3, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        assert_eq!(fleet.owners[0].recent[1], 3, "decided when asked");
+        let owner = fleet.address(0);
+        for tick in 0..ACTIVE_CYCLES {
+            fleet.on_timer(owner, tick * 10 * MS, &mut outbox);
+        }
+        assert_eq!(
+            (fleet.owners[0].recent[1], fleet.owners[0].earlier[1]),
+            (0, 3)
+        );
+        for tick in 0..ACTIVE_CYCLES {
+            fleet.on_timer(owner, (ACTIVE_CYCLES + tick) * 10 * MS, &mut outbox);
+        }
+        assert_eq!(
+            (fleet.owners[0].recent[1], fleet.owners[0].earlier[1]),
+            (0, 0)
+        );
+    }
+
+    /// A data plane reads its copy with its own clock: one ahead of the service's sees
+    /// the bucket refilled further.
+    #[test]
+    fn a_data_plane_reads_its_copy_with_its_own_clock() {
+        let mut fleet = fleet(2, Bound::Unbounded);
+        fleet.skews = vec![0, 50 * MS as i64];
+        let mut outbox = Outbox::default();
+        assert_eq!(admits(&mut fleet, 0, 10, 0), 10);
+        fleet.on_timer(0, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        // The owner's bucket, empty at the service's 0, sent to data plane 1 too.
+        fleet.answer(0, 1, None, 0, &mut outbox);
+        deliver(&mut fleet, &mut outbox, 0);
+        assert_eq!(
+            admits(&mut fleet, 0, 10, 0),
+            0,
+            "empty on the service's clock"
+        );
+        assert_eq!(
+            admits(&mut fleet, 1, 10, 0),
+            5,
+            "fifty milliseconds ahead: five refilled"
+        );
     }
 
     /// Data planes never talk to each other: every message goes to the service, and every

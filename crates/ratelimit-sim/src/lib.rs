@@ -92,6 +92,15 @@ pub enum Fault {
         /// Which pod.
         pod: usize,
     },
+    /// A rolling restart, as a rollout does: from `from` nanoseconds every pod taking
+    /// traffic restarts in turn, the first first, `every` nanoseconds apart — the owner
+    /// among them where pods own keys.
+    Rolling {
+        /// When the first restarts.
+        from: u64,
+        /// The time between one and the next.
+        every: u64,
+    },
     /// At `at` nanoseconds the owner of the key restarts, holding nothing: with ownership,
     /// the pod owning it; with counters, which have no owner, the first pod; with a
     /// rate-limiting service, the service pod owning it.
@@ -212,6 +221,12 @@ fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> Played {
         }
         Fault::Restart { at, pod } => queue.push(at, Event::Fault(FaultEvent::Restart { pod })),
         Fault::OwnerRestart { at } => queue.push(at, Event::Fault(FaultEvent::OwnerRestarts)),
+        Fault::Rolling { from, every } => {
+            for pod in 0..pods {
+                let at = from + every * pod as u64;
+                queue.push(at, Event::Fault(FaultEvent::Restart { pod }));
+            }
+        }
     }
     let cycle = cluster.cycle();
     if let Some(cycle) = cycle {
@@ -344,6 +359,52 @@ mod tests {
             "before and after"
         );
         assert!(!Fault::None.cuts(15, 0, 2));
+    }
+
+    /// Notes when each pod is told to restart.
+    struct Restarts(std::rc::Rc<std::cell::RefCell<Vec<(u64, usize)>>>);
+
+    impl Cluster for Restarts {
+        fn decide(&mut self, _: usize, _: u64, _: &mut Outbox) -> bool {
+            true
+        }
+        fn on_fault(&mut self, event: FaultEvent, now: u64, _: &mut Outbox) {
+            if let FaultEvent::Restart { pod } = event {
+                self.0.borrow_mut().push((now, pod));
+            }
+        }
+    }
+
+    #[test]
+    fn a_rolling_restart_restarts_every_pod_in_turn() {
+        let second = 1_000_000_000;
+        let n = |n| NonZeroU64::new(n).unwrap();
+        let run = Run {
+            contract: Contract {
+                limit: n(10),
+                window: n(second),
+                burst: n(10),
+            },
+            pods: 4,
+            workload: Workload {
+                shape: Shape::Spread { per_window: 10 },
+                span: 3 * second,
+                conforming: false,
+            },
+            approach: Approach::Central,
+            network: Network::reliable(100_000, 0),
+            fault: Fault::Rolling {
+                from: second,
+                every: 100,
+            },
+            seed: 1,
+        };
+        let restarts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let _ = play_with(&run, Box::new(Restarts(restarts.clone())));
+        let restarts = restarts.borrow();
+        let expected: Vec<(u64, usize)> =
+            (0..4).map(|pod| (second + 100 * pod as u64, pod)).collect();
+        assert_eq!(*restarts, expected);
     }
 
     /// Pod 1 sends pod 0 a message every millisecond, and pod 0 notes when each arrives.

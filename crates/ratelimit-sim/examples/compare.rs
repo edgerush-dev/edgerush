@@ -4,8 +4,8 @@
 //! counters, and a rate-limiting service of its own.
 //!
 //! `cargo run --release -p edgerush-ratelimit-sim --example compare [seeds] [lost in 1,000]
-//! [none|owner-lost|partition|restart|owner-restart] [delay in µs] [pods, as 2,4,8]
-//! [contract, as limit/window in ms/burst]`
+//! [none|owner-lost|partition|restart|owner-restart|rolling] [delay in µs] [pods, as 2,4,8]
+//! [contract, as limit/window in ms/burst] [clock skew in µs] [service cycle in ms]`
 //!
 //! The workloads scale with the contract — its limit a window, three times it, its whole
 //! bucket at once — and a run lasts ten windows.
@@ -94,6 +94,11 @@ fn main() {
             pod: pods - 1,
         },
         "owner-restart" => Fault::OwnerRestart { at: span / 2 },
+        // `rolling`: every pod restarts in turn between 3 and 7 tenths of the run.
+        "rolling" => Fault::Rolling {
+            from: span * 3 / 10,
+            every: span * 4 / 10 / pods as u64,
+        },
         _ => Fault::None,
     };
     // How long a message takes, give or take half as much again.
@@ -106,7 +111,7 @@ fn main() {
         loss_per_mille,
         ..Network::reliable(delay_us * 1_000, delay_us * 500)
     };
-    let approaches = [
+    let mut approaches = [
         ("central", Approach::Central),
         ("sharing nothing", Approach::Independent),
         ("a share each", Approach::Split),
@@ -155,6 +160,16 @@ fn main() {
             }),
         ),
         (
+            "ledger, debt up to 1 s, 10 ms, every pod bounded carrying, sent again to a new owner",
+            Approach::Ownership(Sharing {
+                cycle: 10 * MS,
+                excess: Excess::DebtUpTo(cap),
+                ledger: true,
+                bound: Bound::EveryCarrying,
+                on_owner_change: OnOwnerChange::SendAgain,
+            }),
+        ),
+        (
             "counters, debt up to 1 s, 10 ms",
             Approach::Counters(Counting {
                 cycle: 10 * MS,
@@ -178,6 +193,7 @@ fn main() {
                 bound: Bound::Unbounded,
                 ask_when_cold: false,
                 replicate: Replicate::None,
+                skew: 0,
             }),
         ),
         (
@@ -188,6 +204,7 @@ fn main() {
                 bound: Bound::Every,
                 ask_when_cold: false,
                 replicate: Replicate::None,
+                skew: 0,
             }),
         ),
         (
@@ -198,6 +215,7 @@ fn main() {
                 bound: Bound::Every,
                 ask_when_cold: false,
                 replicate: Replicate::None,
+                skew: 0,
             }),
         ),
         (
@@ -208,6 +226,7 @@ fn main() {
                 bound: Bound::Every,
                 ask_when_cold: true,
                 replicate: Replicate::None,
+                skew: 0,
             }),
         ),
         (
@@ -218,6 +237,7 @@ fn main() {
                 bound: Bound::Every,
                 ask_when_cold: true,
                 replicate: Replicate::EveryCycle,
+                skew: 0,
             }),
         ),
         (
@@ -228,9 +248,47 @@ fn main() {
                 bound: Bound::Every,
                 ask_when_cold: true,
                 replicate: Replicate::EveryChange,
+                skew: 0,
+            }),
+        ),
+        (
+            "service, debt up to 1 s, 10 ms, every pod bounded carrying, the owner asked when cold, copied to a secondary with every change",
+            Approach::Service(Serving {
+                cycle: 10 * MS,
+                excess: Excess::DebtUpTo(cap),
+                bound: Bound::EveryCarrying,
+                ask_when_cold: true,
+                replicate: Replicate::EveryChange,
+                skew: 0,
+            }),
+        ),
+        (
+            "service, debt up to 1 s, 10 ms, every pod granted by the owner, the owner asked when cold, copied to a secondary with every change",
+            Approach::Service(Serving {
+                cycle: 10 * MS,
+                excess: Excess::DebtUpTo(cap),
+                bound: Bound::Granted,
+                ask_when_cold: true,
+                replicate: Replicate::EveryChange,
+                skew: 0,
             }),
         ),
     ];
+    // The data planes' clocks off the service's by up to this many µs, either way.
+    let skew_us: u64 = std::env::args()
+        .nth(7)
+        .and_then(|arg| arg.parse().ok())
+        .unwrap_or(0);
+    // The service's cycle instead of the rows' own, if given, in ms.
+    let service_cycle: Option<u64> = std::env::args().nth(8).and_then(|arg| arg.parse().ok());
+    for (_, approach) in &mut approaches {
+        if let Approach::Service(serving) = approach {
+            serving.skew = skew_us * 1_000;
+            if let Some(cycle) = service_cycle {
+                serving.cycle = cycle * MS;
+            }
+        }
+    }
     let workloads = [
         (
             "Within the contract, spread",
@@ -253,6 +311,14 @@ fn main() {
             "On the contract's edge, all on one pod",
             Shape::Skewed {
                 per_window: 3 * limit,
+            },
+            true,
+        ),
+        (
+            "On the contract's edge, uneven (half on one pod, the rest spread)",
+            Shape::Uneven {
+                per_window: 3 * limit,
+                hot: 50,
             },
             true,
         ),

@@ -99,7 +99,7 @@ impl Counters {
             Bound::Unbounded => None,
             Bound::NewPods if active(pod) => None,
             Bound::NewPods => share(self.pods.len()),
-            Bound::Every => {
+            Bound::Every | Bound::EveryCarrying | Bound::Granted => {
                 let others = (0..self.pods.len())
                     .filter(|p| *p != pod && active(*p))
                     .count();
@@ -188,10 +188,11 @@ impl Cluster for Counters {
             return;
         }
         let allowance = self.allowance(pod, now);
+        let bound = self.counting.bound;
         let pods = self.pods.len();
         let at = &mut self.pods[pod];
+        at.allowance = bound.carry(allowance, at.allowance, at.spent);
         at.spent = 0;
-        at.allowance = allowance;
         if at.total == 0 {
             return;
         }

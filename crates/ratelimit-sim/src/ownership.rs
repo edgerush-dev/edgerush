@@ -149,7 +149,7 @@ impl Ownership {
             Bound::Unbounded => None,
             Bound::NewPods if at.active[pod] => None,
             Bound::NewPods => share(self.pods.len()),
-            Bound::Every => {
+            Bound::Every | Bound::EveryCarrying | Bound::Granted => {
                 let others = (0..at.active.len())
                     .filter(|p| *p != pod && at.active[*p])
                     .count();
@@ -310,13 +310,14 @@ impl Cluster for Ownership {
             self.pods[pod].active = active.clone();
         }
         let allowance = self.allowance(pod, now);
+        let bound = self.sharing.bound;
         let followers: Vec<usize> = (0..self.pods.len())
             .filter(|to| *to != pod && self.alive[*to] && self.pods[*to].owner == pod)
             .collect();
         let (applied, counted) = (self.owned[owner].applied.clone(), self.owned[owner].counted);
         let at = &mut self.pods[pod];
+        at.allowance = bound.carry(allowance, at.allowance, at.spent);
         at.spent = 0;
-        at.allowance = allowance;
         if pod != owner {
             for (sequence, count, sent) in &mut at.unacknowledged {
                 if now - *sent >= resend_after {
@@ -356,6 +357,7 @@ impl Cluster for Ownership {
                     active: active.clone(),
                     counted,
                     decided: None,
+                    grant: None,
                 };
                 outbox.send(to, state);
             }

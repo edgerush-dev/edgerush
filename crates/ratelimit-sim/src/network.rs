@@ -67,6 +67,9 @@ pub enum Message {
         /// requests it was about the owner admitted, the first so many; the rest it
         /// refused.
         decided: Option<(u64, u64)>,
+        /// With [`Bound::Granted`](crate::Bound::Granted): how many the receiver may admit
+        /// a cycle until the next answer.
+        grant: Option<u64>,
     },
     /// A pod's total of admissions, for every other pod.
     Counts {

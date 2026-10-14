@@ -266,6 +266,7 @@ fn served(bound: Bound) -> Approach {
         bound,
         ask_when_cold: false,
         replicate: Replicate::None,
+        skew: 0,
     })
 }
 
@@ -278,6 +279,7 @@ fn asked() -> Approach {
         bound: Bound::Every,
         ask_when_cold: true,
         replicate: Replicate::None,
+        skew: 0,
     })
 }
 
@@ -663,4 +665,76 @@ fn a_restarted_data_plane_loses_only_its_last_cycle() {
             assert!(outcome.lost <= 5, "{shape:?}: {outcome:?}");
         }
     }
+}
+
+/// Asking the owner about cold keys, a data plane whose requests come faster than an
+/// ask's round trip waits on the cold burst only, not on every request after it.
+#[test]
+fn a_busy_data_plane_waits_on_the_cold_burst_only() {
+    let n = |n| NonZeroU64::new(n).unwrap();
+    let busy = Run {
+        contract: Contract {
+            limit: n(1_000),
+            window: n(SECOND),
+            burst: n(50),
+        },
+        approach: asked(),
+        ..fixed(
+            Approach::Central,
+            8,
+            Shape::Skewed { per_window: 1_000 },
+            true,
+        )
+    };
+    let outcome = run(&busy);
+    assert_eq!(outcome.refused, 0, "{outcome:?}");
+    assert!(outcome.waited * 100 < outcome.sent, "{outcome:?}");
+}
+
+/// Data planes' clocks off the service's by up to 50 ms either way: a copy read with a
+/// clock ahead sees more refilled than there is, one behind less; the contract holds to
+/// within what the skew refills, and conforming traffic is barely refused.
+#[test]
+fn a_service_holds_the_contract_with_skewed_clocks() {
+    for shape in [
+        Shape::Spread { per_window: 300 },
+        Shape::Skewed { per_window: 300 },
+    ] {
+        let skewed = |conforming| Run {
+            approach: Approach::Service(Serving {
+                cycle: 10_000_000,
+                excess: Excess::DebtUpTo(SECOND),
+                bound: Bound::Every,
+                ask_when_cold: true,
+                replicate: Replicate::EveryChange,
+                skew: 50_000_000,
+            }),
+            ..fixed(Approach::Central, 8, shape, conforming)
+        };
+        let over = run(&skewed(false));
+        assert!(over.worst_excess <= 20, "{shape:?}: {over:?}");
+        let conforming = run(&skewed(true));
+        assert!(
+            conforming.refused * 20 <= conforming.sent,
+            "{shape:?}: {conforming:?}"
+        );
+    }
+}
+
+/// A rolling restart of every data plane leaves no mark when a data plane holding no copy
+/// asks the owner before deciding; without asking, each restarted pod spends a bucket.
+#[test]
+fn a_rolling_restart_leaves_no_mark_when_data_planes_ask() {
+    let rolling = |approach| Run {
+        approach,
+        fault: Fault::Rolling {
+            from: 3 * SECOND,
+            every: SECOND / 2,
+        },
+        ..fixed(Approach::Central, 8, Shape::Bursts { each: 100 }, false)
+    };
+    let asking = run(&rolling(asked()));
+    assert!(asking.worst_excess <= 120, "{asking:?}");
+    let deciding = run(&rolling(served(Bound::Every)));
+    assert!(deciding.worst_excess > 500, "{deciding:?}");
 }

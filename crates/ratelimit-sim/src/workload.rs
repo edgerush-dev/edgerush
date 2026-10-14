@@ -21,6 +21,14 @@ pub enum Shape {
         /// Requests a window, on average.
         per_window: u64,
     },
+    /// The same, `hot` in a hundred of them to the last pod and the rest at random:
+    /// uneven traffic, one large client on a few connections among smaller ones.
+    Uneven {
+        /// Requests a window, on average.
+        per_window: u64,
+        /// Of every hundred, how many go to the last pod.
+        hot: u64,
+    },
     /// The same, all to the last pod: maximal skew, one client on a few long-lived
     /// connections. The last, because a way of sharing that gives the first pod a part of
     /// its own (an owner) must not be measured at its best.
@@ -74,6 +82,10 @@ impl Workload {
             Shape::Skewed { per_window } => {
                 spread(&mut arrivals, rng, start, span, window, per_window, last);
             }
+            Shape::Uneven { per_window, hot } => {
+                let uneven = Target::Uneven(pods, hot);
+                spread(&mut arrivals, rng, start, span, window, per_window, uneven);
+            }
             Shape::Bursts { each } => {
                 bursts(&mut arrivals, start, span, window, each, pods);
             }
@@ -99,6 +111,8 @@ enum Target {
     Any(usize),
     /// Only this one.
     Only(usize),
+    /// The last of this many in so many of every hundred, any of them otherwise.
+    Uneven(usize, u64),
 }
 
 /// About `per_window` requests a window from `from` to `until`, each gap between half and
@@ -122,6 +136,13 @@ fn spread(
         let pod = match target {
             Target::Any(pods) => usize::try_from(rng.below(pods as u64)).unwrap_or(0),
             Target::Only(pod) => pod,
+            Target::Uneven(pods, hot) => {
+                if rng.below(100) < hot {
+                    pods - 1
+                } else {
+                    usize::try_from(rng.below(pods as u64)).unwrap_or(0)
+                }
+            }
         };
         arrivals.push(Arrival { at, pod });
         at += mean / 2 + rng.below(mean + 1);
@@ -178,6 +199,27 @@ mod tests {
         for pod in 0..4 {
             let count = arrivals.iter().filter(|a| a.pod == pod).count();
             assert!((150..=350).contains(&count), "pod {pod}: {count}");
+        }
+    }
+
+    /// Uneven traffic sends about `hot` in a hundred to the last pod, and the rest at
+    /// random to any.
+    #[test]
+    fn uneven_traffic_sends_its_share_to_the_last_pod() {
+        let arrivals = workload(
+            Shape::Uneven {
+                per_window: 400,
+                hot: 50,
+            },
+            false,
+        )
+        .arrivals(&contract(), 4, &mut Rng::new(3));
+        let last = arrivals.iter().filter(|a| a.pod == 3).count() * 100 / arrivals.len();
+        // Half, plus a quarter of the other half landing there at random.
+        assert!((57..=68).contains(&last), "{last}%");
+        for pod in 0..3 {
+            let count = arrivals.iter().filter(|a| a.pod == pod).count() * 100 / arrivals.len();
+            assert!((9..=16).contains(&count), "pod {pod}: {count}%");
         }
     }
 
