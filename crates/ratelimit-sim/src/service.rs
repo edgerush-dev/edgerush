@@ -98,6 +98,8 @@ struct Plane {
     /// Whether the ask in flight is about requests that came during an earlier one: after
     /// its answer, those still waiting are decided here.
     follow_up: bool,
+    /// Whether the ask in flight has been sent again, half way to giving it up.
+    ask_resent: bool,
 }
 
 /// What a service pod keeps of the key while it owns it.
@@ -118,6 +120,9 @@ struct Owner {
     /// one before — its part in the traffic, for grants.
     recent: Vec<u64>,
     earlier: Vec<u64>,
+    /// For each data plane: the last ask it decided and how many it admitted, so that
+    /// the same ask sent again is answered alike rather than decided twice.
+    last_ask: Vec<(u64, u64)>,
 }
 
 impl Owner {
@@ -131,6 +136,7 @@ impl Owner {
             instances: vec![0; planes],
             recent: vec![0; planes],
             earlier: vec![0; planes],
+            last_ask: vec![(0, 0); planes],
         }
     }
 
@@ -171,6 +177,7 @@ impl Service {
             asked: Vec::new(),
             waiting: Vec::new(),
             follow_up: false,
+            ask_resent: false,
         };
         let per = |span: u64| {
             u128::from(contract.limit.get()) * u128::from(span) / u128::from(contract.window.get())
@@ -368,6 +375,7 @@ impl Service {
         let to = self.address(self.owner);
         let at = &mut self.planes[plane];
         at.asking = Some(now);
+        at.ask_resent = false;
         at.asks += 1;
         let ask = Message::Ask {
             from: plane,
@@ -509,7 +517,14 @@ impl Service {
                 sequence,
                 count,
             } if from < self.planes.len() && self.current_life(pod, from, instance) => {
-                let admitted = self.decide_asked(pod, from, count, now);
+                let (last, decided) = self.owners[pod].last_ask[from];
+                let admitted = if sequence == last {
+                    decided
+                } else {
+                    let admitted = self.decide_asked(pod, from, count, now);
+                    self.owners[pod].last_ask[from] = (sequence, admitted);
+                    admitted
+                };
                 self.owner_changed(outbox);
                 self.answer(pod, from, Some((sequence, admitted)), now, outbox);
             }
@@ -711,6 +726,23 @@ impl Cluster for Service {
         let at = &mut self.planes[plane];
         at.allowance = bound.carry(allowance, at.allowance, at.spent);
         at.spent = 0;
+        // An ask unanswered half as long is sent again once, as it was: a lost ask or answer
+        // costs a resend rather than the wait in full. The owner answers it alike.
+        if at
+            .asking
+            .is_some_and(|asked| now - asked >= resend_after / 2)
+            && !at.ask_resent
+        {
+            at.ask_resent = true;
+            let again = Message::Ask {
+                from: plane,
+                instance: at.instance,
+                sequence: at.asks,
+                count: at.asked.len() as u64,
+            };
+            outbox.send(self.address(self.owner), again);
+        }
+        let at = &mut self.planes[plane];
         // An ask unanswered for as long as a batch waits to be sent again: the owner is
         // gone or out of reach, and the requests waiting are decided here, from the copy.
         if at.asking.is_some_and(|asked| now - asked >= resend_after) {
@@ -1309,6 +1341,87 @@ mod tests {
             "the late answer decides nothing"
         );
         assert!(fleet.planes[0].asking.is_some());
+    }
+
+    /// An ask whose answer is lost is sent again once, half way to giving it up; the owner
+    /// answers it alike, deciding nothing twice.
+    #[test]
+    fn an_ask_is_sent_again_once_and_decided_once() {
+        let mut fleet = asking(2);
+        let mut outbox = Outbox::default();
+        arrive(&mut fleet, 0, 0..3, 0, &mut outbox);
+        let mut lost = Outbox::default();
+        for (to, message) in std::mem::take(&mut outbox.sent) {
+            fleet.on_message(to, message, 0, &mut lost);
+        }
+        assert_eq!(fleet.owners[0].counted, 1, "decided; its answer lost");
+        fleet.on_timer(0, 19 * MS, &mut outbox);
+        assert!(
+            !outbox
+                .sent
+                .iter()
+                .any(|(_, m)| matches!(m, Message::Ask { .. })),
+            "not yet"
+        );
+        outbox.sent.clear();
+        fleet.on_timer(0, 20 * MS, &mut outbox);
+        let again: Vec<&Message> = outbox
+            .sent
+            .iter()
+            .map(|(_, m)| m)
+            .filter(|m| {
+                matches!(
+                    m,
+                    Message::Ask {
+                        sequence: 1,
+                        count: 1,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(again.len(), 1, "sent again as it was");
+        fleet.on_timer(0, 30 * MS, &mut outbox);
+        assert_eq!(
+            outbox
+                .sent
+                .iter()
+                .filter(|(_, m)| matches!(m, Message::Ask { .. }))
+                .count(),
+            1,
+            "only once"
+        );
+        deliver(&mut fleet, &mut outbox, 30 * MS);
+        assert_eq!(
+            fleet.owners[0].counted, 3,
+            "the first once, then the two waiting"
+        );
+        assert_eq!(fleet.take_decided().len(), 3);
+    }
+
+    /// Every ask can be sent again once, not only the first a data plane makes.
+    #[test]
+    fn each_ask_is_sent_again_once() {
+        let mut fleet = asking(2);
+        let mut outbox = Outbox::default();
+        let asks_sent = |outbox: &Outbox| {
+            outbox
+                .sent
+                .iter()
+                .filter(|(_, m)| matches!(m, Message::Ask { .. }))
+                .count()
+        };
+        arrive(&mut fleet, 0, 0..1, 0, &mut outbox);
+        outbox.sent.clear();
+        fleet.on_timer(0, 20 * MS, &mut outbox);
+        assert_eq!(asks_sent(&outbox), 1, "the first, sent again");
+        deliver(&mut fleet, &mut outbox, 20 * MS);
+        fleet.take_decided();
+        // Cold again a refill time on: the next ask is lost too, and sent again too.
+        arrive(&mut fleet, 0, 1..2, 200 * MS, &mut outbox);
+        outbox.sent.clear();
+        fleet.on_timer(0, 220 * MS, &mut outbox);
+        assert_eq!(asks_sent(&outbox), 1, "the second, sent again");
     }
 
     /// After an ask goes unanswered the owner is taken to be out of reach: requests are
