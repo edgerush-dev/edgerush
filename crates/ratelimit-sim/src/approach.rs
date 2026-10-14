@@ -1,6 +1,7 @@
 //! Ways of limiting one key across several pods.
 
 use crate::counters::Counters;
+use crate::nodes::Nodes;
 use crate::ownership::Ownership;
 use crate::service::Service;
 use crate::{Contract, FaultEvent, Message, Outbox};
@@ -91,6 +92,13 @@ pub enum Approach {
     /// decide from copies of the owner's bucket; every cycle each sends the owner its hits,
     /// or asks for a copy, and is answered with the bucket as it stands.
     Service(Serving),
+    /// The rate-limiting service as the prototype runs it: the protocol's own state
+    /// machines (`edgerush_ratelimit::service`), with every data plane sending each
+    /// `cycle` nanoseconds — what [`Service`](Self::Service) measured best, built once.
+    Nodes {
+        /// The time between a data plane's batches.
+        cycle: u64,
+    },
 }
 
 /// How data planes share a key through a rate-limiting service.
@@ -256,6 +264,7 @@ impl Approach {
             Self::Ownership(sharing) => Box::new(Ownership::new(contract, pods, *sharing)),
             Self::Counters(counting) => Box::new(Counters::new(contract, pods, *counting)),
             Self::Service(serving) => Box::new(Service::new(contract, pods, *serving)),
+            Self::Nodes { cycle } => Box::new(Nodes::new(contract, pods, *cycle)),
         }
     }
 }

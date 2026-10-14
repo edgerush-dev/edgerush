@@ -15,6 +15,7 @@ mod approach;
 mod counters;
 mod measure;
 mod network;
+mod nodes;
 mod ownership;
 mod rng;
 mod service;

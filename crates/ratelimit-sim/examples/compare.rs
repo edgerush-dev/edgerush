@@ -322,6 +322,10 @@ fn main() {
             }),
         ),
         (
+            "service as the prototype's nodes, 10 ms",
+            Approach::Nodes { cycle: 10 * MS },
+        ),
+        (
             "service, debt up to 1 s, 10 ms, every pod granted by the owner, the owner asked when cold, copied to a secondary with every change",
             Approach::Service(Serving {
                 cycle: 10 * MS,
@@ -348,6 +352,11 @@ fn main() {
     // The service's cycle instead of the rows' own, if given, in ms.
     let service_cycle: Option<u64> = std::env::args().nth(8).and_then(|arg| arg.parse().ok());
     for (_, approach) in &mut approaches {
+        if let Approach::Nodes { cycle } = approach
+            && let Some(service_cycle) = service_cycle
+        {
+            *cycle = service_cycle * MS;
+        }
         if let Approach::Service(serving) = approach {
             serving.skew = skew_us * 1_000;
             if let Some(cycle) = service_cycle {

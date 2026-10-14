@@ -2,6 +2,7 @@
 
 use crate::Rng;
 use edgerush_ratelimit::reference::TokenBucket;
+use edgerush_ratelimit::service;
 
 /// How the network between the pods behaves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +115,27 @@ pub enum Message {
         /// Which life of it.
         instance: u64,
     },
+    /// The protocol's own message from a data plane to a service pod.
+    Batch {
+        /// The data plane.
+        from: usize,
+        /// What it says.
+        batch: service::Batch,
+    },
+    /// The protocol's own answer from a service pod to a data plane.
+    Answers {
+        /// The service pod.
+        from: usize,
+        /// What it says.
+        answers: service::Answers,
+    },
+    /// The protocol's own copies from a key's owner to its secondary.
+    Replicas {
+        /// The owner.
+        from: usize,
+        /// What it sends.
+        replicas: service::Replicas,
+    },
 }
 
 impl Message {
@@ -126,7 +148,10 @@ impl Message {
             | Self::Counts { from, .. }
             | Self::Ask { from, .. }
             | Self::Replica { from, .. }
-            | Self::Poll { from, .. } => *from,
+            | Self::Poll { from, .. }
+            | Self::Batch { from, .. }
+            | Self::Answers { from, .. }
+            | Self::Replicas { from, .. } => *from,
         }
     }
 }

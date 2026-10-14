@@ -423,6 +423,24 @@ impl TokenBucket {
     fn ahead(&self, now: u128) -> u128 {
         self.arrival.unwrap_or(now).max(now) - now
     }
+
+    /// How far the bucket is from full at `now`, in time multiplied by `limit` (one
+    /// request's interval is exactly `window`): zero when full, more than the bucket holds
+    /// when it owes. The bucket's state relative to the moment, so that a copy can be set
+    /// from it on another machine's clock with [`set_behind`](Self::set_behind).
+    #[must_use]
+    pub fn behind(&self, now: u64) -> u128 {
+        let (_, now) = self.scaled(now);
+        self.ahead(now)
+    }
+
+    /// Sets the bucket to be `behind` from full at `now`, as [`behind`](Self::behind) says
+    /// it; earlier times are taken as `now` from then on.
+    pub fn set_behind(&mut self, now: u64, behind: u128) {
+        let (at, scaled) = self.scaled(now);
+        self.last = at;
+        self.arrival = (behind > 0).then(|| scaled + behind);
+    }
 }
 
 impl Model for TokenBucket {
