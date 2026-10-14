@@ -41,13 +41,34 @@ impl Network {
         match self.retransmit {
             None => (!lost).then_some(at),
             Some(timeout) => {
-                let at = if lost { at + timeout } else { at }.max(*link);
+                // Each retransmission may be lost too, and TCP waits twice as long before
+                // the next, up to a limit; after so many it gives the connection up, and
+                // the message is lost.
+                let (mut at, mut lost, mut wait) = (at, lost, timeout);
+                let mut retransmissions = 0;
+                while lost {
+                    if retransmissions == TCP_RETRANSMISSIONS {
+                        return None;
+                    }
+                    retransmissions += 1;
+                    at += wait;
+                    wait = wait.saturating_mul(2).min(TCP_LONGEST_WAIT);
+                    lost = rng.below(1000) < self.loss_per_mille;
+                }
+                let at = at.max(*link);
                 *link = at;
                 Some(at)
             }
         }
     }
 }
+
+/// How many times TCP sends a segment again before giving the connection up (Linux's
+/// `tcp_retries2`).
+const TCP_RETRANSMISSIONS: u32 = 15;
+
+/// The longest TCP waits between retransmissions (Linux's `TCP_RTO_MAX`), in nanoseconds.
+const TCP_LONGEST_WAIT: u64 = 120_000_000_000;
 
 /// What one pod tells another.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,18 +243,32 @@ mod tests {
     }
 
     /// Carried as TCP carries it, a message lost arrives a retransmission timeout late,
-    /// and nothing sent after it between the same two pods arrives before it.
+    /// each retransmission lost waiting twice as long again, and nothing sent after it
+    /// between the same two pods arrives before it.
     #[test]
     fn a_message_lost_over_tcp_arrives_late_and_holds_back_the_rest() {
         let network = Network {
             delay: 1_000,
             jitter: 0,
-            loss_per_mille: 1_000,
+            loss_per_mille: 500,
             retransmit: Some(200_000),
         };
         let mut rng = Rng::new(4);
+        let mut most = 0;
+        for _ in 0..1_000 {
+            let at = network.carry(0, &mut rng, &mut 0).unwrap();
+            // 1 µs on the wire, then 200 µs, 400 µs, 800 µs… for each one lost.
+            let waited = (at - 1_000) / 200_000 + 1;
+            assert!(waited.is_power_of_two(), "{at}");
+            assert_eq!((at - 1_000) % 200_000, 0, "{at}");
+            most = most.max(waited);
+        }
+        assert!(most >= 8, "three lost in a row, in a thousand: {most}");
+        // One lost once, ahead of the rest.
         let mut link = 0;
-        assert_eq!(network.carry(0, &mut rng, &mut link), Some(201_000));
+        while network.carry(0, &mut rng, &mut link) != Some(201_000) {
+            link = 0;
+        }
         let reliable = Network {
             loss_per_mille: 0,
             ..network
@@ -244,5 +279,18 @@ mod tests {
             "not before the one ahead of it"
         );
         assert_eq!(reliable.carry(300_000, &mut rng, &mut link), Some(301_000));
+    }
+
+    /// TCP gives a connection up after so many retransmissions: what never got through is
+    /// lost.
+    #[test]
+    fn a_message_tcp_cannot_get_through_is_lost() {
+        let network = Network {
+            delay: 1_000,
+            jitter: 0,
+            loss_per_mille: 1_000,
+            retransmit: Some(200_000),
+        };
+        assert_eq!(network.carry(0, &mut Rng::new(4), &mut 0), None);
     }
 }
