@@ -14,6 +14,14 @@ simulator's numbers have real systems beside them.
 | `traefik` | `rateLimit` with Redis | average 100, period 1 s, burst 100 |
 | `tyk` | its distributed rate limiter: the limit divided among the gateways it knows of | rate 100 per 1 s |
 | `haproxy` | stick tables copied between instances by `peers` (not added up) | `http_req_rate(1s)` over 100 refused |
+| `envoy-wait` | as `envoy`, with a 1 s timeout on the ratelimit service rather than 20 ms | the same |
+| `envoy-local` | Envoy's own token bucket, the limit divided among its instances (`local_cluster_rate_limit`) | 100 a second, bucket of 100 |
+| `edgerush` | EdgeRush's rate-limiting service prototype: each worker decides from its copies, three service pods own the keys | token bucket, 100 a second, burst 100 |
+
+`edgerush` runs from binaries built on the host (`cargo build --release -p edgerush -p
+edgerush-ratelimit-service`, copied to `$RLH_BIN`, `/home/claude/rlh-bin` by default) in an
+image with the host's glibc; faults on its owner strike the service pod that owns the run's
+key, found as the protocol finds it.
 
 Every instance gets one CPU. Clients reach instances on a front network; instances reach
 Redis, the ratelimit service or each other on a back network, which is what faults touch.

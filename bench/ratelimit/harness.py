@@ -206,7 +206,7 @@ def cut(container, addresses):
 
 def owner_of(system, n, key):
     """The instance a fault on the owner strikes, or None when the owner is the store."""
-    if system.owner == "store":
+    if system.owner in ("store", "service"):
         return None
     if system.owner == "first":
         return 0
@@ -247,9 +247,12 @@ async def restart_instance(system, n, i, route, stay_down=False):
     route[i] = i
 
 
-async def strike(fault, system, n, owner, t0, route, events):
+async def strike(fault, system, n, owner, t0, route, events, key):
     span = workloads.SPAN / 1e9
     store = f"{PROJECT}-{system.stores[0]}" if system.stores else None
+    # EdgeRush's service: the pod that owns the run's key.
+    if system.owner == "service":
+        store = f"{PROJECT}-rl{systems.service_owner(key)}"
     if fault in ("owner-lost", "owner-restart"):
         await at(t0, span / 2 - (0 if owner is None else DRAIN))
         events.append(("strike", time.monotonic_ns() - t0))
@@ -313,7 +316,7 @@ def play(system, n, traffic, fault, seed, key):
         workers.append(process)
     events = []
     if fault not in ("none", "loss"):
-        asyncio.run(strike(fault, system, n, owner, t0, route, events))
+        asyncio.run(strike(fault, system, n, owner, t0, route, events, key))
     results = []
     for _ in workers:
         results.extend(out.get())

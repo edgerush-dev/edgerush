@@ -6,11 +6,15 @@ back network, the one faults touch. Addresses are fixed so that faults can name 
 """
 
 import json
+import os
 
 PROJECT = "rlh"
 FRONT, BACK = "172.31.10", "172.31.20"
 UPSTREAM_IP = f"{FRONT}.5"
 REDIS_IP, RATELIMIT_IP = f"{BACK}.2", f"{BACK}.3"
+# EdgeRush's rate-limiting service: three pods, and where the binaries built on the host are.
+SERVICE_IPS = [f"{BACK}.{4 + pod}" for pod in range(3)]
+BINARIES = os.environ.get("RLH_BIN", "/home/claude/rlh-bin")
 
 IMAGES = {
     "envoy": "envoyproxy/envoy:v1.38.7",
@@ -23,6 +27,8 @@ IMAGES = {
     "haproxy": "haproxy:3.2",
     "redis": "redis:8.6.7",
     "upstream": "nginx:1.29",
+    # EdgeRush runs from binaries built on the host, in an image with the host's glibc.
+    "edgerush": "ubuntu:26.04",
 }
 
 
@@ -503,6 +509,75 @@ def build_haproxy(n):
     return services, {"haproxy.cfg": HAPROXY % {"peers": peers, "upstream": UPSTREAM_IP}}
 
 
+EDGERUSH = """listeners:
+  web: { address: "0.0.0.0:8080", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate }
+routes:
+  - name: rl
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: / } }]
+        forward: { backends: [{ upstream: up, weight: 1 }] }
+        rate_limit: { key: { header: x-key }, limit: 100, window_ms: 1000, burst: 100 }
+upstreams:
+  up: { load_balancer: p2c, endpoints: ["%(upstream)s:80"] }
+rate_limit_service: { pods: [%(pods)s], cycle_ms: 10 }
+"""
+
+
+def build_edgerush(n):
+    """EdgeRush with the rate-limiting service: three service pods, and proxies of one
+    worker each, every worker a data plane of the service."""
+    pods = [f"{pod}={SERVICE_IPS[pod]}:7000" for pod in range(3)]
+    services = {}
+    for pod in range(3):
+        command = ["/opt/bin/edgerush-ratelimit-service", "--id", str(pod),
+                   "--listen", "0.0.0.0:7000", "--cycle-ms", "10"]
+        for named in pods:
+            command += ["--pod", named]
+        services[f"rl{pod}"] = {
+            "image": IMAGES["edgerush"],
+            "container_name": f"{PROJECT}-rl{pod}",
+            "command": command,
+            "volumes": [f"{BINARIES}:/opt/bin:ro"],
+            "networks": {"back": {"ipv4_address": SERVICE_IPS[pod]}},
+        }
+    for i in range(n):
+        services[f"gw{i + 1}"] = gateway(
+            i,
+            IMAGES["edgerush"],
+            command=["/opt/bin/edgerush", "proxy", "--config", "/etc/edgerush.yaml",
+                     "--workers", "1"],
+            volumes=[f"{BINARIES}:/opt/bin:ro", "./edgerush.yaml:/etc/edgerush.yaml:ro"],
+        )
+    files = {"edgerush.yaml": EDGERUSH % {
+        "upstream": UPSTREAM_IP,
+        "pods": ", ".join(f'"{ip}:7000"' for ip in SERVICE_IPS),
+    }}
+    return services, files
+
+
+def fnv1a(data):
+    h = 0xcbf29ce484222325
+    for byte in data:
+        h ^= byte
+        h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def mix(x):
+    x = ((x ^ (x >> 30)) * 0xbf58476d1ce4e5b9) & 0xFFFFFFFFFFFFFFFF
+    x = ((x ^ (x >> 27)) * 0x94d049bb133111eb) & 0xFFFFFFFFFFFFFFFF
+    return x ^ (x >> 31)
+
+
+def service_owner(key, pods=(0, 1, 2)):
+    """The service pod owning `key` (the run's `x-key` value under the rule `rl/0`), as
+    `edgerush_ratelimit::service::View::owners` ranks them."""
+    h = fnv1a(b"rl/0\0" + key.encode())
+    return max(pods, key=lambda pod: (mix(h ^ mix(pod + 1)), pod))
+
+
 SYSTEMS = {
     s.key: s
     for s in [
@@ -530,7 +605,10 @@ SYSTEMS = {
         System("traefik", 8000, "http", "store", ["redis"], build_traefik),
         System("tyk", 8080, "http", "first", ["redis"], build_tyk),
         System("haproxy", 8080, "http", "first", [], build_haproxy),
+        System("edgerush", 8080, "http", "service", ["rl0", "rl1", "rl2"], build_edgerush),
     ]
 }
 
-STORE_IPS = {"redis": REDIS_IP, "ratelimit": RATELIMIT_IP}
+STORE_IPS = {"redis": REDIS_IP, "ratelimit": RATELIMIT_IP} | {
+    f"rl{pod}": ip for pod, ip in enumerate(SERVICE_IPS)
+}
