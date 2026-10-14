@@ -112,6 +112,9 @@ routes:
     listeners: [web]
     hostnames: [{{ name: "*", falls_through: true }}]
     rules:
+      - matches: [{{ path: {{ prefix: /by-address }} }}]
+        forward: {{ backends: [{{ upstream: web, weight: 1 }}] }}
+        rate_limit: {{ key: client_address, limit: 10, window_ms: 3600000, burst: 10 }}
       - matches: [{{ path: {{ prefix: /api }} }}]
         forward: {{ backends: [{{ upstream: web, weight: 1 }}] }}
         rate_limit: {{ key: {{ header: x-key }}, limit: 10, window_ms: 3600000, burst: 10 }}
@@ -190,6 +193,14 @@ async fn a_rule_limits_each_key_to_its_bucket_and_refuses_the_rest_with_429() {
                 tally(&none),
                 (15, 0),
                 "a request without the key is not limited"
+            );
+            let by_address = statuses(front, "/by-address", None, 15).await;
+            assert_eq!(tally(&by_address), (10, 5), "keyed on the client's address");
+            let again = statuses(front, "/by-address", Some("other"), 2).await;
+            assert_eq!(
+                tally(&again),
+                (0, 2),
+                "the same address, whatever its header"
             );
             let free = statuses(front, "/elsewhere", Some("a"), 5).await;
             assert_eq!(
