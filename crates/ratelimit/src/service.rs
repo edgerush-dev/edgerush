@@ -12,7 +12,9 @@
 //!   charged with its own hits the owner has not been seen to apply, and bounded each cycle
 //!   to its share of what the copy has left and the cycle refills — the share divided among
 //!   the data planes the owner has seen admit the key lately, at least one request, and one
-//!   more carried if it left one unspent the cycle before.
+//!   more carried if it left one unspent the cycle before. The cycle after such a share,
+//!   while the others' hits under it are still on their way, gets its share of the refill
+//!   only, and keeps what it left unspent.
 //! - Every cycle it sends each owner, in one batch over all the keys that owner holds, the
 //!   hits it admitted, numbered; or, with none to send while the key is in use, a poll. Each
 //!   is answered with the bucket as it stands. A batch not seen applied is sent again after
@@ -304,6 +306,8 @@ struct PlaneKey {
     spent: u64,
     /// The most it may admit in the cycle under way, once a cycle has set it.
     allowance: Option<u64>,
+    /// When a cycle last shared out what the copy has left.
+    shared: Option<u64>,
     /// Whether a cycle has set the allowance from a copy the owner answered with: until
     /// then the copy is shared out among no one, and the owner decides.
     bounded: bool,
@@ -343,6 +347,7 @@ impl PlaneKey {
             unacknowledged: VecDeque::new(),
             spent: 0,
             allowance: None,
+            shared: None,
             bounded: false,
             others: 0,
             last_request: None,
@@ -461,17 +466,26 @@ impl<S: BuildHasher + Default> DataPlane<S> {
         let mut cut_off = false;
         for (key, at) in &mut self.keys {
             let hold = at.contract.refill_time();
-            // Its share of what the copy has left and the cycle refills, at least one, and
-            // one more if it left one unspent.
-            let sees = at
-                .bucket
-                .remaining(now)
-                .saturating_add(at.contract.refilled(cycle));
-            let share = (sees / (at.others + 1)).max(1);
+            let refill = at.contract.refilled(cycle);
             let left = at
                 .allowance
                 .map_or(0, |before| before.saturating_sub(at.spent));
-            at.allowance = Some(share + left.min(1));
+            // What the others admit under the shares given out at a cycle reaches the copy
+            // only with the answers to the batches they send at the next, as this one sends
+            // its own: sharing out again at once what the copy has left would give it out
+            // twice. So the cycle after a share gets its share of the refill only, and keeps
+            // what it left unspent; the one after that shares out the copy afresh — its
+            // share of what the copy has left and the cycle refills, at least one, and one
+            // more if it left one unspent.
+            let after_share =
+                at.others > 0 && at.shared.is_some_and(|shared| now - shared < 2 * cycle);
+            at.allowance = Some(if after_share {
+                (refill / (at.others + 1)).max(1) + left
+            } else {
+                at.shared = Some(now);
+                let sees = at.bucket.remaining(now).saturating_add(refill);
+                (sees / (at.others + 1)).max(1) + left.min(1)
+            });
             at.bounded |= at.heard.is_some();
             at.spent = 0;
             let Some(owner) = at.owner else {

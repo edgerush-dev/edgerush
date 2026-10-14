@@ -311,6 +311,38 @@ mod tests {
         }
     }
 
+    /// A whole bucket on every pod arriving over 30 ms, as a real client's burst does,
+    /// spans three of a data plane's cycles: a share given out at one cycle shows in the
+    /// others' copies only after the next, which must not share out the copy again.
+    #[test]
+    fn bursts_arriving_over_a_few_cycles_hold_near_one_bucket() {
+        let (mut admitted, mut central) = (0, 0);
+        for seed in 0..10 {
+            let run = Run {
+                pods: 8,
+                workload: Workload {
+                    shape: Shape::SpreadBursts {
+                        each: 100,
+                        over: 30_000_000,
+                    },
+                    span: 10 * SECOND,
+                    conforming: false,
+                },
+                ..bursts(Fault::None, seed)
+            };
+            admitted += crate::run(&run).admitted;
+            central += crate::run(&Run {
+                approach: Approach::Central,
+                ..run
+            })
+            .admitted;
+        }
+        assert!(
+            admitted * 100 <= central * 107,
+            "{admitted} against {central}"
+        );
+    }
+
     /// Over TCP a lost message holds back what follows it on its connection for a
     /// retransmission timeout: a data plane whose batches are held up must still count as
     /// admitting, or every other one's share grows while it is stalled; and an ask must

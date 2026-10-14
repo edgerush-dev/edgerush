@@ -336,8 +336,9 @@ fn a_data_plane_is_bounded_to_its_share_and_carries_one_over() {
     warmed(&mut net, 0, b"k", 0);
     let at = net.planes[0].keys.get_mut(&b"k"[..]).unwrap();
     at.others = 2;
-    // A first cycle: nothing carried from one before.
+    // A first cycle: nothing carried from one before, nothing shared.
     at.allowance = None;
+    at.shared = None;
     net.planes[0].on_cycle(0);
     // Nine left, one refilled, among three.
     assert_eq!(net.copy(0, b"k").allowance, Some(3));
@@ -352,12 +353,90 @@ fn a_data_plane_is_bounded_to_its_share_and_carries_one_over() {
         "one carried, not the whole share left unspent"
     );
     net.planes[0].keys.get_mut(&b"k"[..]).unwrap().others = 50;
+    // The cycle after a share is held back; the one after that shares afresh.
     net.planes[0].on_cycle(3 * CYCLE);
+    net.planes[0].on_cycle(4 * CYCLE);
     assert_eq!(
         net.copy(0, b"k").allowance,
         Some(2),
         "at least one, plus one carried"
     );
+}
+
+/// What the others admit under a share shows in the copy only a cycle later: the cycle
+/// after a share gets its share of the refill and keeps what it left unspent, and the one
+/// after that shares out the copy afresh.
+#[test]
+fn the_cycle_after_a_share_gets_the_refill_and_what_was_left() {
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, b"k", 0);
+    let at = net.planes[0].keys.get_mut(&b"k"[..]).unwrap();
+    at.others = 1;
+    at.allowance = None;
+    at.shared = None;
+    net.planes[0].on_cycle(0);
+    // Nine left, one refilled, between two.
+    assert_eq!(net.copy(0, b"k").allowance, Some(5));
+    assert_eq!(net.admits(0, b"k", 2, 0), 2);
+    net.planes[0].on_cycle(CYCLE);
+    assert_eq!(
+        net.copy(0, b"k").allowance,
+        Some(1 + 3),
+        "half the one refilled, at least one, and the three left; not (8 + 1) / 2 + 1"
+    );
+    net.planes[0].on_cycle(2 * CYCLE);
+    let at = net.copy(0, b"k");
+    // What is left and one refilled, between two.
+    let sees = at.bucket.remaining(2 * CYCLE) + 1;
+    assert_eq!(
+        at.allowance,
+        Some(sees / 2 + 1),
+        "shared afresh, one carried"
+    );
+}
+
+/// Alone in admitting the key, a data plane has no one else's hits to wait for: every cycle
+/// shares out the copy.
+#[test]
+fn a_data_plane_admitting_alone_shares_every_cycle() {
+    let mut net = Net::new(1);
+    // Warmed, it has shared out the copy at 0.
+    warmed(&mut net, 0, b"k", 0);
+    assert_eq!(net.admits(0, b"k", 4, 0), 4);
+    net.planes[0].on_cycle(CYCLE);
+    let at = net.copy(0, b"k");
+    assert_eq!(at.others, 0);
+    let sees = at.bucket.remaining(CYCLE) + 1;
+    assert_eq!(
+        at.allowance,
+        Some(sees + 1),
+        "the copy shared afresh, one carried; not the refill and the six left"
+    );
+}
+
+/// Cut off from the owner, a data plane holds back no more than every other cycle, and what
+/// it carries does not build up while it is quiet: quiet cycles do not leave it a bucket's
+/// worth to admit at once.
+#[test]
+fn a_cut_off_data_plane_does_not_build_up_what_it_carries() {
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, b"k", 0);
+    let at = net.planes[0].keys.get_mut(&b"k"[..]).unwrap();
+    at.others = 7;
+    at.allowance = None;
+    at.shared = None;
+    net.planes[0].on_cycle(0);
+    // Heard just after the share, and never again.
+    net.planes[0].keys.get_mut(&b"k"[..]).unwrap().heard = Some(1);
+    let mut most = 0;
+    // Twenty cycles: the key is forgotten after two refill times without a request.
+    for cycle in 1..20 {
+        net.planes[0].on_cycle(cycle * CYCLE);
+        net.planes[0].take_outgoing();
+        most = most.max(net.copy(0, b"k").allowance.unwrap_or(0));
+    }
+    // A share of a full bucket among eight, one carried, and one held-back cycle's floor.
+    assert!(most <= 11 / 8 + 1 + 1, "{most}");
 }
 
 /// Two data planes holding no copy each get six requests at once: they wait, the owner
