@@ -2,4 +2,5 @@
 /bench/results
 /bench/wsbench/target
 /bench/__pycache__
+/bench/ratelimit/__pycache__
 /examples/certs/
