@@ -16,6 +16,7 @@ use crate::interim::Interim;
 use crate::map_head::MapHead;
 use crate::metrics::Answer;
 use crate::random::{random, unguessable};
+use crate::ratelimit::{Limited, Limiter};
 use crate::request::{Decision, Opening, Rejection, decide};
 use crate::request_body::{Counts, RequestBody};
 use crate::routed::Through;
@@ -25,7 +26,7 @@ use crate::upstream::h1::codec::Sending;
 use crate::way_back;
 use crate::websocket::{self, Key};
 use arc_swap::Guard;
-use edgerush_config::{RequestId, UpstreamProtocol};
+use edgerush_config::{CompiledRateLimit, RequestId, UpstreamProtocol};
 use edgerush_filters::request_id;
 use edgerush_router::Fields;
 use http::{HeaderValue, Method, Request, Response, Version};
@@ -128,6 +129,63 @@ impl Worker {
         answered
     }
 
+    /// How a request fares against its rule's rate limit: keyed on a header's value, or on
+    /// the client's address. A request without the header is not limited.
+    fn rate_limit<H: Forwarded>(
+        &self,
+        limit: &CompiledRateLimit,
+        client: &Client,
+        head: &H,
+    ) -> Limited {
+        let mut address = [0; 16];
+        let value: &[u8] = match &limit.header {
+            Some(name) => match head.outgoing().values(name).next() {
+                Some(value) => value,
+                None => return Limited::Admit,
+            },
+            None => match client.address() {
+                std::net::IpAddr::V4(v4) => {
+                    address[..4].copy_from_slice(&v4.octets());
+                    &address[..4]
+                }
+                std::net::IpAddr::V6(v6) => {
+                    address = v6.octets();
+                    &address
+                }
+            },
+        };
+        match self.limiter() {
+            Some(limiter) => limiter.decide(limit, value),
+            None => Limited::Admit,
+        }
+    }
+
+    /// The worker's limiter, made when first needed and again when the service's settings
+    /// change; `None` with no service to reach, which a config that limits always names.
+    fn limiter(&self) -> Option<Rc<Limiter>> {
+        let snapshot = self.proxy.current.load();
+        let mut held = self.limiter.borrow_mut();
+        if let Some((generation, limiter)) = held.as_ref()
+            && *generation == snapshot.generation
+        {
+            return Some(Rc::clone(limiter));
+        }
+        let service = snapshot.config.rate_limit_service()?;
+        if let Some((_, limiter)) = held.as_ref()
+            && limiter.serves(service)
+        {
+            let limiter = Rc::clone(limiter);
+            *held = Some((snapshot.generation, Rc::clone(&limiter)));
+            return Some(limiter);
+        }
+        if let Some((_, old)) = held.take() {
+            old.stop();
+        }
+        let limiter = Limiter::start(service, self.position)?;
+        *held = Some((snapshot.generation, Rc::clone(&limiter)));
+        Some(limiter)
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "each is a different thing the request needs, as for `through_h1`"
@@ -198,6 +256,25 @@ impl Worker {
             }
             Err(answer) => return self.proxy.answer_to(listener, answer, call).into(),
         };
+        // Its rule's rate limit, if it has one (experimental): decided at once from the
+        // worker's copy, or, for a key it holds no fresh copy of, by the key's owner.
+        if let Some(limit) = directed
+            .rule
+            .as_ref()
+            .and_then(|rule| rule.rate_limit.as_ref())
+        {
+            let admitted = match self.rate_limit(limit, client, &head) {
+                Limited::Admit => true,
+                Limited::Refuse => false,
+                Limited::Wait(decided) => decided.await.unwrap_or(false),
+            };
+            if !admitted {
+                return self
+                    .proxy
+                    .answer_to(listener, Answer::RateLimited, call)
+                    .into();
+            }
+        }
         // A WebSocket that an HTTP/2 or HTTP/3 client asks for holds a backend of its own
         // beside the client's one connection, which may carry a hundred: it counts as one
         // of the worker's connections for as long as it is open, and is refused, before
@@ -576,7 +653,8 @@ impl Proxy {
         }
         let kept = forward.rule.response_headers.is_some()
             || forward.rule.retry().is_some()
-            || forward.rule.timeouts().is_some();
+            || forward.rule.timeouts().is_some()
+            || forward.rule.rate_limit.is_some();
         // Only a request that may be sent again keeps where else it could go.
         let others = forward.rule.retry().map(|_| {
             Box::new(Others {

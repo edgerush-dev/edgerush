@@ -423,6 +423,9 @@ pub struct Worker {
     h2: Rc<H2Client>,
     /// What it has in flight to each endpoint, and whose turn it is (03 §6).
     balancing: RefCell<Balancing>,
+    /// Its rules' rate limits (experimental), made when a rule first limits, with the
+    /// generation of the config it was last checked against.
+    limiter: RefCell<Option<(u64, Rc<crate::ratelimit::Limiter>)>>,
     /// Connections accepted since everything else last had a turn.
     accepted: Cell<usize>,
     /// Its limits again, for the bodies of answers to share rather than copy.

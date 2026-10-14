@@ -381,10 +381,12 @@ pub(crate) enum Answer {
     /// A TRACE or OPTIONS that may be forwarded no further, answered by the gateway as its
     /// final recipient ([03 §11](../../docs/03-data-plane.md)).
     MaxForwards,
+    /// Over its rule's rate limit (experimental).
+    RateLimited,
 }
 
 impl Answer {
-    const ALL: [Self; 24] = [
+    const ALL: [Self; 25] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -409,6 +411,7 @@ impl Answer {
         Self::Redirected,
         Self::UnknownProtocol,
         Self::MaxForwards,
+        Self::RateLimited,
     ];
 
     /// The status that is answered with.
@@ -436,6 +439,7 @@ impl Answer {
             Self::Redirected => StatusCode::FOUND,
             // OPTIONS is answered 200 in its place.
             Self::MaxForwards => StatusCode::METHOD_NOT_ALLOWED,
+            Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -465,6 +469,7 @@ impl Answer {
             Self::Redirected => "redirected",
             Self::UnknownProtocol => "unknown_protocol",
             Self::MaxForwards => "max_forwards",
+            Self::RateLimited => "rate_limited",
         }
     }
 
@@ -517,6 +522,7 @@ impl Answer {
             Self::UnknownProtocol => (Code::Unimplemented, "no protocol but WebSocket is carried"),
             // Not a gRPC call's method; said for completeness.
             Self::MaxForwards => (Code::Unimplemented, "answered here, as the final recipient"),
+            Self::RateLimited => (Code::ResourceExhausted, "the call is over its rate limit"),
         }
     }
 }

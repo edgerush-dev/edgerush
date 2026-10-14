@@ -23,18 +23,21 @@ mod route;
 pub use backends::{UpstreamId, WeightedBackends};
 pub use compile::{
     Compiled, CompiledDataPlane, CompiledForwarding, CompiledListener, CompiledMirror,
-    CompiledRetry, CompiledRule, CompiledTimeouts, CompiledTls, CompiledUpstream,
-    CompiledUpstreamTls, ConfigError, L4, L4Route, MatchId, Matches, NamedCertificate, Object,
-    Outcome, Place, Problem, RuleId, SniRouter, Step, Timeout, compile, compile_with_matches,
+    CompiledRateLimit, CompiledRateLimitService, CompiledRetry, CompiledRule, CompiledTimeouts,
+    CompiledTls, CompiledUpstream, CompiledUpstreamTls, ConfigError, L4, L4Route, MatchId, Matches,
+    NamedCertificate, Object, Outcome, Place, Problem, RuleId, SniRouter, Step, Timeout, compile,
+    compile_with_matches,
 };
 pub use config::{
     AccessLog, Certificate, ClientValidation, Config, DataPlane, Forwarding, HealthCheck, Http3,
     Keepalive, Listener, ListenerProxyProtocol, LoadBalancer, Probe, Protocol,
-    ProxyProtocolVersion, RequestId, SlowStart, Tls, Upstream, UpstreamProtocol, UpstreamTls,
+    ProxyProtocolVersion, RateLimitService, RequestId, SlowStart, Tls, Upstream, UpstreamProtocol,
+    UpstreamTls,
 };
 pub use harness_file::{CertificateFiles, HarnessFile};
 pub use route::{
     Backend, EncodedSlash, Filter, Forward, Fraction, GrpcMethod, Header, HeaderChanges, Hostname,
-    Match, Mirror, PathChange, PathMatch, Query, Redirect, Retry, Route, Rule, RulePaths, Scheme,
-    TcpRoute, Timeouts, TlsRoute, UrlRewrite, ValueMatch, ValuePredicate, Wildcard,
+    Match, Mirror, PathChange, PathMatch, Query, RateLimit, RateLimitKey, Redirect, Retry, Route,
+    Rule, RulePaths, Scheme, TcpRoute, Timeouts, TlsRoute, UrlRewrite, ValueMatch, ValuePredicate,
+    Wildcard,
 };

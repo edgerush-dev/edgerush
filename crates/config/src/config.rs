@@ -28,6 +28,10 @@ pub struct Config {
     /// The data plane's own settings; left out, each has its value.
     #[serde(default)]
     pub data_plane: DataPlane,
+    /// Experimental: the rate-limiting service rules' `rate_limit` share their counts
+    /// through. Needed by any rule that limits.
+    #[serde(default)]
+    pub rate_limit_service: Option<RateLimitService>,
     /// The certificates listeners and upstreams name, by name: a resource of their own
     /// ([07 §1](../../../docs/07-config-and-dsl.md)), which reaches a data plane apart from
     /// the rest of its config and is never read with it, so that no file a config is read
@@ -49,6 +53,21 @@ pub struct DataPlane {
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub set_aside_ms: Option<u64>,
+}
+
+/// The rate-limiting service (experimental): its pods, and how often each worker sends
+/// them what it admitted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitService {
+    /// The address (`host:port`) of each of its pods, the first being pod 0.
+    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
+    pub pods: Vec<String>,
+    /// Milliseconds between a worker's messages to the service; 10 when left out.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    pub cycle_ms: Option<u64>,
 }
 
 /// A place where requests come in. Hostnames are to come; until a listener can be told

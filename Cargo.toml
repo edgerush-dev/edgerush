@@ -86,7 +86,8 @@ thiserror = "2.0"
 # tonic was in the tree already for the proxy's gRPC tests; prost encodes its messages,
 # derived from Rust structs so the build needs no protoc. Version skew between data planes
 # and the service is what protobuf is for. Only the rate-limiting service crate may depend
-# on these three; tower-service is the trait tonic serves through.
+# on these three (the proxy reaches the service through that crate's client); tower-service
+# is the trait tonic serves through.
 prost = "0.14"
 tonic = { version = "0.14", default-features = false, features = ["transport"] }
 tower-service = "0.3"

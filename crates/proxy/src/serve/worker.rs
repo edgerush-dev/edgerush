@@ -138,6 +138,7 @@ impl Worker {
                 Rc::clone(&files),
             ),
             balancing: RefCell::default(),
+            limiter: RefCell::new(None),
             accepted: Cell::new(0),
             body_limits,
             me: Weak::clone(me),

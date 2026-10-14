@@ -5,7 +5,9 @@
 //! The harness stands in for the control plane, which will read them from Secrets, by
 //! reading them from the files named here: the file itself holds no key.
 
-use crate::{Certificate, Config, DataPlane, Listener, Route, TcpRoute, TlsRoute, Upstream};
+use crate::{
+    Certificate, Config, DataPlane, Listener, RateLimitService, Route, TcpRoute, TlsRoute, Upstream,
+};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -38,6 +40,10 @@ pub struct HarnessFile {
     /// The data plane's own settings; left out, each has its value.
     #[serde(default)]
     pub data_plane: DataPlane,
+    /// Experimental: the rate-limiting service rules' `rate_limit` share their counts
+    /// through. Needed by any rule that limits.
+    #[serde(default)]
+    pub rate_limit_service: Option<RateLimitService>,
     /// The files of each certificate that listeners and upstreams name, by its name. A key
     /// is never written into the config file itself.
     #[serde(default)]
@@ -68,6 +74,7 @@ impl HarnessFile {
             tls_routes: self.tls_routes,
             upstreams: self.upstreams,
             data_plane: self.data_plane,
+            rate_limit_service: self.rate_limit_service,
             certificates: read,
         }
     }

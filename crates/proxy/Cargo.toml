@@ -25,6 +25,10 @@ boring.workspace = true
 bytes.workspace = true
 edgerush-config.workspace = true
 edgerush-filters.workspace = true
+# Rules' rate limits (experimental): each worker a data plane of the rate-limiting
+# service's protocol, reaching the service through that crate's gRPC client.
+edgerush-ratelimit.workspace = true
+edgerush-ratelimit-service.workspace = true
 edgerush-router.workspace = true
 edgerush-telemetry.workspace = true
 h2.workspace = true

@@ -91,6 +91,7 @@ pub mod received;
 #[cfg(not(feature = "fuzzing"))]
 mod received;
 // Private, save when the fuzz targets and benchmarks are being built.
+mod ratelimit;
 #[cfg(feature = "fuzzing")]
 pub mod raw;
 #[cfg(not(feature = "fuzzing"))]

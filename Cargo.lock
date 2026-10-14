@@ -286,6 +286,8 @@ dependencies = [
  "bytes",
  "edgerush-config",
  "edgerush-filters",
+ "edgerush-ratelimit",
+ "edgerush-ratelimit-service",
  "edgerush-router",
  "edgerush-telemetry",
  "h2",

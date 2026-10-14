@@ -22,6 +22,17 @@
         "$ref": "#/$defs/Listener"
       }
     },
+    "rate_limit_service": {
+      "description": "Experimental: the rate-limiting service rules' `rate_limit` share their counts\nthrough. Needed by any rule that limits.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RateLimitService"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "routes": {
       "description": "The routes of `http` and `https` listeners, in order of precedence among otherwise\nequal matches; empty for none.",
       "type": "array",
@@ -952,6 +963,92 @@
         }
       ]
     },
+    "RateLimit": {
+      "description": "A limit on a rule's requests (experimental): a token bucket of `burst` requests,\nrefilled at `limit` every `window_ms`, one for each value of the key, shared by every\ndata plane. A request over it is answered 429.",
+      "type": "object",
+      "properties": {
+        "burst": {
+          "description": "How many requests a client can send at once, from idle, before its traffic is\nspread out at the rate: the whole bucket.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "key": {
+          "description": "Whose requests are counted together.",
+          "$ref": "#/$defs/RateLimitKey"
+        },
+        "limit": {
+          "description": "Requests a window, on average.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "window_ms": {
+          "description": "The window, in milliseconds.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "limit",
+        "window_ms",
+        "burst"
+      ]
+    },
+    "RateLimitKey": {
+      "description": "What a rate limit counts requests by.",
+      "oneOf": [
+        {
+          "description": "The value of this request header. A request without it is not limited.",
+          "type": "object",
+          "properties": {
+            "header": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "header"
+          ]
+        },
+        {
+          "description": "The address of the client the data plane sees: the peer, or the client a trusted\nPROXY protocol header names.",
+          "type": "string",
+          "const": "client_address"
+        }
+      ]
+    },
+    "RateLimitService": {
+      "description": "The rate-limiting service (experimental): its pods, and how often each worker sends\nthem what it admitted.",
+      "type": "object",
+      "properties": {
+        "cycle_ms": {
+          "description": "Milliseconds between a worker's messages to the service; 10 when left out.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        },
+        "pods": {
+          "description": "The address (`host:port`) of each of its pods, the first being pod 0.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pods"
+      ]
+    },
     "Redirect": {
       "description": "A redirect (Gateway API's `RequestRedirect`): the client is sent elsewhere, and nothing\ngoes upstream. The `Location` holds what is said here and only what it needs besides:\nrelative when none of scheme, host and port is said, and otherwise absolute, the scheme\nunsaid taken from the listener and the host from the request.",
       "type": "object",
@@ -1169,6 +1266,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/RulePaths"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rate_limit": {
+          "description": "Experimental, while how limits are written is still open: the rule's requests\nlimited, counted together by every data plane through the rate-limiting service\n(`rate_limit_service`, which it needs). Only with `forward`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateLimit"
             },
             {
               "type": "null"
