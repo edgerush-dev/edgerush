@@ -10,11 +10,15 @@
 //!   limit of its own of 80 a second, under the run's limit over the whole data plane, 100;
 //! - **two routes, the routes binding**: the same with routes of 20 under 200.
 //!
-//! The limits' keys are owned by different service pods.
+//! The limits' keys are owned by different service pods. Besides bursts, a client steadily
+//! a quarter over the limit shows whether what goes over in a burst is made up for over a
+//! run.
 //!
 //! `cargo run --release -p edgerush-ratelimit-sim --example two_limits [seeds]
 //! [none|owner-lost|owner-restart|restart|rolling|partition] [pods, as 2,4,8] [lost in
-//! 1,000]`; `RETRANSMIT_MS=200` carries messages as TCP does.
+//! 1,000]`; `RETRANSMIT_MS=200` carries messages as TCP does; `CASES=routes:500/625,
+//! global:400/5000` runs other limits in place of those above, and `ONLY=steady` the steady
+//! client alone.
 
 use edgerush_ratelimit_sim::{
     Approach, Arrival, Beside, Contract, Fault, Network, Order, Run, Shape, Workload, decisions,
@@ -38,6 +42,7 @@ fn contract(limit: u64, burst: u64) -> Contract {
 /// Totals over the seeds of one cell.
 #[derive(Default)]
 struct Cell {
+    runs: u64,
     sent: u64,
     refused: u64,
     admitted: u64,
@@ -55,7 +60,9 @@ impl Cell {
         let lost = 100.0 * self.lost as f64 / self.admitted.max(1) as f64;
         let twice = 100.0 * self.twice as f64 / self.admitted.max(1) as f64;
         let over = self.over.unwrap_or(0);
-        print!(" {refused:.1}% / {ratio:.2}× / {over}");
+        // Over a run, on average, how many more than one bucket holding the limit admits.
+        let surplus = (self.admitted as f64 - self.central as f64) / self.runs.max(1) as f64;
+        print!(" {refused:.1}% / {ratio:.3}× ({surplus:+.0}) / {over}");
         if routes {
             print!(" / {}", self.route_over.unwrap_or(0));
         }
@@ -115,27 +122,57 @@ fn main() {
         },
         _ => Fault::None,
     };
-    let scenarios = [
+    let mut scenarios = vec![
         (
-            "20 a second, bucket 20, under 200 a second over the data plane",
+            "20 a second, bucket 20, under 200 a second over the data plane".to_owned(),
             contract(20, 20),
             Beside::Global(contract(200, 200)),
         ),
         (
-            "Two routes of 80 a second each under 100 a second over the data plane (both bind)",
+            "Two routes of 80 a second each under 100 a second over the data plane (both bind)"
+                .to_owned(),
             contract(100, 100),
             Beside::Routes(contract(80, 80)),
         ),
         (
-            "Two routes of 20 a second each under 200 a second over the data plane (the routes bind)",
+            "Two routes of 20 a second each under 200 a second over the data plane (the routes bind)"
+                .to_owned(),
             contract(200, 200),
             Beside::Routes(contract(20, 20)),
         ),
     ];
+    // `CASES=routes:500/625,global:400/5000`: in place of those, two routes of so many a
+    // second under so many over the data plane, or one limit of so many under so many over
+    // the data plane; each bucket a second's worth.
+    if let Ok(cases) = std::env::var("CASES") {
+        scenarios = cases
+            .split(',')
+            .filter_map(|case| {
+                let (kind, pair) = case.split_once(':')?;
+                let (one, global) = pair.split_once('/')?;
+                let (one, global): (u64, u64) = (one.parse().ok()?, global.parse().ok()?);
+                Some(match kind {
+                    "routes" => (
+                        format!("Two routes of {one} a second each under {global} a second over the data plane"),
+                        contract(global, global),
+                        Beside::Routes(contract(one, one)),
+                    ),
+                    _ => (
+                        format!("{one} a second under {global} a second over the data plane"),
+                        contract(one, one),
+                        Beside::Global(contract(global, global)),
+                    ),
+                })
+            })
+            .collect();
+    }
+    // `ONLY=steady`: only a client steadily over the limit.
+    let only_steady = std::env::var("ONLY").is_ok_and(|only| only == "steady");
     println!(
         "Runs of ten seconds, {seeds} seeds each; messages take 1 ms, give or take 0.5 ms, \
          {loss_per_mille} in 1,000 lost; fault: {fault_name}. Each cell, for the run's limit: \
-         share of requests refused / admitted against one bucket holding it / the most over it \
+         share of requests refused / admitted against one bucket holding it, over the whole \
+         run (how many more a run, on average) / the most over it \
          in any span, worst seed / (two routes: the most over a route's own limit) / share of \
          admissions some owner never counted — a key forgotten once full and quiet takes its \
          count with it — / share counted twice, over every limit.\n"
@@ -180,7 +217,32 @@ fn main() {
                 },
                 false,
             ),
+            (
+                "a quarter over it, steadily, spread",
+                Shape::Spread {
+                    per_window: 5 * l / 4,
+                },
+                false,
+            ),
+            (
+                "a quarter over it, steadily, all on one pod",
+                Shape::Skewed {
+                    per_window: 5 * l / 4,
+                },
+                false,
+            ),
+            (
+                "a quarter over it, steadily, uneven",
+                Shape::Uneven {
+                    per_window: 5 * l / 4,
+                    hot: 50,
+                },
+                false,
+            ),
         ];
+        let workloads = workloads
+            .into_iter()
+            .filter(|(name, _, _)| !only_steady || name.contains("steadily"));
         println!("**{title}**\n");
         print!("| Workload | Limits |");
         for &p in &pods {
@@ -228,6 +290,7 @@ fn main() {
                             approach: Approach::Central,
                             ..this
                         });
+                        cell.runs += 1;
                         cell.sent += outcome.sent;
                         cell.refused += outcome.refused;
                         cell.admitted += outcome.admitted;
