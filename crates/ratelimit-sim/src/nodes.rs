@@ -2,9 +2,9 @@
 //! (`edgerush_ratelimit::service`), one data plane per pod and three service pods, with the
 //! simulator carrying their messages. Its results should match [`Service`](crate::service)
 //! with the same choices, which it was taken from; where they differ, the nodes are what is
-//! built.
+//! built. Requests can be under other limits beside the run's ([`Beside`]).
 
-use crate::{Cluster, Contract, FaultEvent, Message, Outbox};
+use crate::{Beside, Cluster, Contract, FaultEvent, Message, Order, Outbox};
 use edgerush_ratelimit::service::{
     self, DataPlane, Decision, PlaneId, PodId, ServicePod, Ticket, View,
 };
@@ -13,12 +13,16 @@ use std::collections::BTreeMap;
 /// The service's pods.
 const SERVICE_PODS: u32 = 3;
 
-/// The key every request is for.
+/// The key of the run's contract, which every request is under.
 const KEY: &[u8] = b"key";
 
-/// A fleet of data planes sharing one key through the protocol's nodes.
+/// A fleet of data planes sharing keys through the protocol's nodes.
 pub(crate) struct Nodes {
-    contract: service::Contract,
+    /// Every key requests are under, with its contract: the run's first.
+    keys: Vec<(Box<[u8]>, service::Contract)>,
+    /// The limits of each kind of request, as positions in `keys`, smallest bucket first:
+    /// request `n` is of the kind at `n` modulo their number.
+    kinds: Vec<Vec<usize>>,
     cycle: u64,
     /// How long a data plane waits for an ask's answer; 0 for four cycles.
     ask_timeout: u64,
@@ -33,22 +37,67 @@ pub(crate) struct Nodes {
     tickets: Vec<BTreeMap<Ticket, usize>>,
     /// Decisions for requests that waited, not yet taken.
     decided: Vec<(usize, bool)>,
-    /// Hits admitted anywhere.
-    admitted: u64,
+    /// Requests admitted anywhere, under each key.
+    admitted: Vec<u64>,
+}
+
+/// The protocol's contract for the simulator's.
+fn contract_of(contract: &Contract) -> service::Contract {
+    service::Contract {
+        limit: contract.limit,
+        window: contract.window,
+        burst: contract.burst,
+    }
 }
 
 impl Nodes {
-    pub(crate) fn new(contract: &Contract, planes: usize, cycle: u64, ask_timeout: u64) -> Self {
+    pub(crate) fn new(
+        contract: &Contract,
+        planes: usize,
+        cycle: u64,
+        ask_timeout: u64,
+        beside: Option<(Beside, Order)>,
+    ) -> Self {
         let view = View {
             epoch: 1,
             pods: (0..SERVICE_PODS).collect(),
         };
+        // A key named after `name`, owned by another pod than the run's key.
+        let apart = |name: &str| -> Box<[u8]> {
+            (0_u32..)
+                .map(|n| format!("{name}-{n}").into_bytes())
+                .find(|key| view.owners(key).0 != view.owners(KEY).0)
+                .unwrap_or_default()
+                .into_boxed_slice()
+        };
+        let run = contract_of(contract);
+        let mut keys = vec![(Box::from(KEY), run)];
+        // The limits of a request, `specific` and the one over the data plane, `shared`.
+        let ordered = |keys: &[(Box<[u8]>, service::Contract)], specific, shared, order| {
+            let (a, b): (usize, usize) = (specific, shared);
+            let first = match order {
+                Order::SharedFirst => b,
+                Order::SmallestFirst if keys[a].1.burst <= keys[b].1.burst => a,
+                Order::SmallestFirst => b,
+            };
+            if first == a { vec![a, b] } else { vec![b, a] }
+        };
+        let kinds = match beside {
+            None => vec![vec![0]],
+            Some((Beside::Global(global), order)) => {
+                keys.push((apart("global"), contract_of(&global)));
+                vec![ordered(&keys, 0, 1, order)]
+            }
+            Some((Beside::Routes(each), order)) => {
+                keys.push((apart("route-a"), contract_of(&each)));
+                keys.push((apart("route-b"), contract_of(&each)));
+                vec![ordered(&keys, 1, 0, order), ordered(&keys, 2, 0, order)]
+            }
+        };
         Self {
-            contract: service::Contract {
-                limit: contract.limit,
-                window: contract.window,
-                burst: contract.burst,
-            },
+            admitted: vec![0; keys.len()],
+            keys,
+            kinds,
             cycle,
             ask_timeout,
             planes: (0..planes)
@@ -61,7 +110,6 @@ impl Nodes {
             gone: vec![false; SERVICE_PODS as usize],
             tickets: vec![BTreeMap::new(); planes],
             decided: Vec::new(),
-            admitted: 0,
             view,
         }
     }
@@ -78,9 +126,24 @@ impl Nodes {
         }
         for (ticket, admitted) in self.planes[plane].take_decided() {
             if let Some(request) = self.tickets[plane].remove(&ticket) {
-                self.admitted += u64::from(admitted);
+                if admitted {
+                    self.count(request);
+                }
                 self.decided.push((request, admitted));
             }
+        }
+    }
+
+    /// The limits of request `request`, as positions in `keys`.
+    fn kind(&self, request: usize) -> &[usize] {
+        &self.kinds[request % self.kinds.len()]
+    }
+
+    /// Request `request` admitted: one more under each of its keys.
+    fn count(&mut self, request: usize) {
+        let kind = request % self.kinds.len();
+        for &key in &self.kinds[kind] {
+            self.admitted[key] += 1;
         }
     }
 
@@ -120,6 +183,18 @@ impl Nodes {
     fn owner(&self) -> Option<usize> {
         self.view.owners(KEY).0.map(|pod| pod as usize)
     }
+
+    /// For each key, what was admitted under it and what its owner counted.
+    fn tallies(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.keys
+            .iter()
+            .zip(&self.admitted)
+            .map(|((key, _), admitted)| {
+                let owner = self.view.owners(key).0.map(|pod| pod as usize);
+                let counted = owner.and_then(|owner| self.pods[owner].counted(key));
+                (*admitted, counted.unwrap_or(0))
+            })
+    }
 }
 
 /// A data plane `id`, waiting `ask_timeout` for an ask's answer (0: four cycles).
@@ -148,10 +223,15 @@ impl Cluster for Nodes {
         now: u64,
         outbox: &mut Outbox,
     ) -> Option<bool> {
-        let decision = self.planes[plane].decide(KEY, self.contract, now);
+        let limits: Vec<(&[u8], service::Contract)> = self
+            .kind(request)
+            .iter()
+            .map(|&key| (&*self.keys[key].0, self.keys[key].1))
+            .collect();
+        let decision = self.planes[plane].decide_all(&limits, now);
         let decided = match decision {
             Decision::Admit => {
-                self.admitted += 1;
+                self.count(request);
                 Some(true)
             }
             Decision::Refuse => Some(false),
@@ -248,19 +328,21 @@ impl Cluster for Nodes {
     }
 
     fn unapplied(&self) -> u64 {
-        let counted = self.owner().and_then(|owner| self.pods[owner].counted(KEY));
-        self.admitted.saturating_sub(counted.unwrap_or(0))
+        self.tallies()
+            .map(|(admitted, counted)| admitted.saturating_sub(counted))
+            .sum()
     }
 
     fn counted_twice(&self) -> u64 {
-        let counted = self.owner().and_then(|owner| self.pods[owner].counted(KEY));
-        counted.unwrap_or(0).saturating_sub(self.admitted)
+        self.tallies()
+            .map(|(admitted, counted)| counted.saturating_sub(admitted))
+            .sum()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Approach, Fault, Network, Run, Shape, Workload, run};
+    use crate::{Approach, Beside, Fault, Network, Order, Run, Shape, Workload, run};
     use std::num::NonZeroU64;
 
     const SECOND: u64 = 1_000_000_000;
@@ -307,6 +389,100 @@ mod tests {
                     central.admitted
                 );
                 assert_eq!(outcome.counted_twice, 0, "{fault:?}");
+            }
+        }
+    }
+
+    /// A request under a limit over the whole data plane too is decided under both: the
+    /// tighter binds, whichever of the two is the run's, and every admission is counted once
+    /// under each.
+    #[test]
+    fn a_request_under_a_limit_over_the_data_plane_too_is_held_to_the_tighter() {
+        let n = |n| NonZeroU64::new(n).unwrap();
+        let limit = |limit, burst| crate::Contract {
+            limit: n(limit),
+            window: n(SECOND),
+            burst: n(burst),
+        };
+        for seed in 0..3 {
+            let base = Run {
+                contract: limit(20, 20),
+                workload: Workload {
+                    shape: Shape::Bursts { each: 20 },
+                    span: 6 * SECOND,
+                    conforming: false,
+                },
+                ..bursts(Fault::None, seed)
+            };
+            let alone = run(&base);
+            let under = |global| {
+                run(&Run {
+                    approach: Approach::NodesUnder {
+                        cycle: 10_000_000,
+                        ask_timeout: 0,
+                        beside: Beside::Global(global),
+                        order: Order::SmallestFirst,
+                    },
+                    ..base
+                })
+            };
+            let wider = under(limit(200, 200));
+            assert_eq!(wider.admitted, alone.admitted, "{seed}: the run's binds");
+            assert_eq!((wider.lost, wider.counted_twice), (0, 0));
+            let tighter = under(limit(10, 10));
+            let global_alone = run(&Run {
+                contract: limit(10, 10),
+                ..base
+            });
+            assert_eq!(
+                tighter.admitted, global_alone.admitted,
+                "{seed}: the global binds, as it would alone"
+            );
+            assert_eq!((tighter.lost, tighter.counted_twice), (0, 0));
+        }
+    }
+
+    /// Two routes under one limit over the data plane, their own limits smaller, bursts on
+    /// every pod at once, cold each time. Smallest first, each route's cold requests ask that
+    /// route's owner, and two pods decide the shared limit from their copies: it goes over by
+    /// what each admits from a full copy, no more. The shared limit first, every cold ask
+    /// comes to its owner, which holds it as it would alone. Every admission is counted once
+    /// under each limit.
+    #[test]
+    fn routes_sharing_a_limit_hold_it_as_alone_only_if_it_goes_first() {
+        let route = crate::Contract {
+            limit: NonZeroU64::new(80).unwrap(),
+            window: NonZeroU64::new(SECOND).unwrap(),
+            burst: NonZeroU64::new(80).unwrap(),
+        };
+        for seed in 0..3 {
+            let base = Run {
+                pods: 2,
+                ..bursts(Fault::None, seed)
+            };
+            let alone = run(&base);
+            let under = |order| {
+                run(&Run {
+                    approach: Approach::NodesUnder {
+                        cycle: 10_000_000,
+                        ask_timeout: 0,
+                        beside: Beside::Routes(route),
+                        order,
+                    },
+                    ..base
+                })
+            };
+            let smallest = under(Order::SmallestFirst);
+            assert!(
+                smallest.worst_excess > alone.worst_excess && smallest.worst_excess <= 2 * 80 - 100,
+                "{seed}: {} against {} alone",
+                smallest.worst_excess,
+                alone.worst_excess
+            );
+            let shared = under(Order::SharedFirst);
+            assert_eq!(shared.worst_excess, alone.worst_excess, "{seed}");
+            for outcome in [smallest, shared] {
+                assert_eq!((outcome.lost, outcome.counted_twice), (0, 0));
             }
         }
     }

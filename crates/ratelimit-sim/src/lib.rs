@@ -22,7 +22,8 @@ mod service;
 mod workload;
 
 pub use approach::{
-    Approach, Bound, Cluster, Counting, Excess, OnOwnerChange, Replicate, Serving, Sharing,
+    Approach, Beside, Bound, Cluster, Counting, Excess, OnOwnerChange, Order, Replicate, Serving,
+    Sharing,
 };
 pub use measure::{Outcome, worst_excess};
 pub use network::{Message, Network, Outbox};

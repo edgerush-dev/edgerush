@@ -101,6 +101,42 @@ pub enum Approach {
         /// How long an ask may go unanswered before it is given up; 0 for four cycles.
         ask_timeout: u64,
     },
+    /// [`Nodes`](Self::Nodes) with every request under another limit beside the run's,
+    /// decided under both, all or none (06 §4). The run's contract is the one measured.
+    NodesUnder {
+        /// The time between a data plane's batches.
+        cycle: u64,
+        /// How long an ask may go unanswered before it is given up; 0 for four cycles.
+        ask_timeout: u64,
+        /// The limits beside the run's.
+        beside: Beside,
+        /// Which of a request's limits goes first.
+        order: Order,
+    },
+}
+
+/// Which of a request's limits goes first: a cold request's ask goes to its key's owner,
+/// which decides that key exactly and the others from its copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    /// The smallest bucket first, ties to the most specific (06 §4): the limit most likely
+    /// at its edge decided exactly.
+    SmallestFirst,
+    /// The limit over the whole data plane first: shared by every route, it brings all of
+    /// a client's cold asks to one pod.
+    SharedFirst,
+}
+
+/// Limits a request is under beside the run's contract, each counted by a key owned by
+/// another service pod than the run's key, so that one pod cannot decide them all exactly;
+/// in the order an [`Order`] says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Beside {
+    /// Every request under one more limit, over the whole data plane.
+    Global(Contract),
+    /// Requests alternate between two routes, each with a limit of its own, `Contract`;
+    /// the run's contract is a limit over the whole data plane, shared by both.
+    Routes(Contract),
 }
 
 /// How data planes share a key through a rate-limiting service.
@@ -267,8 +303,20 @@ impl Approach {
             Self::Counters(counting) => Box::new(Counters::new(contract, pods, *counting)),
             Self::Service(serving) => Box::new(Service::new(contract, pods, *serving)),
             Self::Nodes { cycle, ask_timeout } => {
-                Box::new(Nodes::new(contract, pods, *cycle, *ask_timeout))
+                Box::new(Nodes::new(contract, pods, *cycle, *ask_timeout, None))
             }
+            Self::NodesUnder {
+                cycle,
+                ask_timeout,
+                beside,
+                order,
+            } => Box::new(Nodes::new(
+                contract,
+                pods,
+                *cycle,
+                *ask_timeout,
+                Some((*beside, *order)),
+            )),
         }
     }
 }
