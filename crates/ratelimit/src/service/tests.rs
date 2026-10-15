@@ -1311,3 +1311,41 @@ fn any_number_of_limits_is_decided_and_a_key_named_twice_is_no_panic() {
     let twice = [&keys[1][..], &keys[1][..]];
     assert_eq!(net.planes[0].decide_all(&under(&twice), 0), Decision::Admit);
 }
+
+/// A pod answering an ask from its copy of a key it does not own may hold a copy fresher
+/// than the owner's own state — after a failover, the new owner took over from an older
+/// one — so what it says was applied is not taken: only the owner's word lets a batch go.
+#[test]
+fn a_copy_answering_an_ask_does_not_say_which_batches_were_applied() {
+    let (a, b) = apart();
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, &b, 0);
+    net.admits(0, &b, 2, 0);
+    net.planes[0].on_cycle(CYCLE);
+    net.planes[0].take_outgoing(); // the batch's answer never comes
+    assert_eq!(net.copy(0, &b).unacknowledged.len(), 1);
+    let copy = Answer {
+        key: b.clone().into_boxed_slice(),
+        behind: 0,
+        applied: 1,
+        others: 0,
+        owned: false,
+    };
+    let not_owner = roles(&a).0;
+    assert_ne!(Some(not_owner), roles(&b).0.into());
+    net.planes[0].on_answers(
+        Answers {
+            from: not_owner,
+            entries: vec![copy],
+            decided: Vec::new(),
+            view: None,
+        },
+        CYCLE,
+    );
+    assert_eq!(
+        net.copy(0, &b).unacknowledged.len(),
+        1,
+        "still waiting for the owner to say it applied it"
+    );
+    assert_eq!(net.copy(0, &b).seen, 0);
+}

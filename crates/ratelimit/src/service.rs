@@ -969,11 +969,15 @@ impl<S: BuildHasher + Default> DataPlane<S> {
             }
             at.bucket.set_behind(now, answer.behind);
             at.others = answer.others;
-            // No more of this data plane's batches can have been applied than it has sent.
-            let seen = answer.applied.min(at.sent);
-            at.seen = at.seen.max(seen);
-            at.unacknowledged
-                .retain(|(sequence, _, _, _)| *sequence > seen);
+            // Only the owner says which batches it applied: another pod's copy may be fresher
+            // than the owner's own state, which after a failover went on from an older one.
+            if answer.owned {
+                // No more of this data plane's batches can have been applied than it has sent.
+                let seen = answer.applied.min(at.sent);
+                at.seen = at.seen.max(seen);
+                at.unacknowledged
+                    .retain(|(sequence, _, _, _)| *sequence > seen);
+            }
             let unseen: u64 = at.unacknowledged.iter().map(|(_, count, _, _)| count).sum();
             for _ in 0..unseen + at.unsent + at.held {
                 at.bucket.charge(now);
