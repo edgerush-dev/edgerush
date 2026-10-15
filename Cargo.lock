@@ -359,6 +359,7 @@ dependencies = [
 name = "edgerush-rules"
 version = "0.0.0"
 dependencies = [
+ "edgerush-ratelimit",
  "iai-callgrind",
  "proptest",
  "thiserror",

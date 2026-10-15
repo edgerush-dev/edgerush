@@ -11,6 +11,8 @@ publish.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The limiter's decision, timed beside a rule's in the timing example.
+edgerush-ratelimit.workspace = true
 iai-callgrind.workspace = true
 proptest.workspace = true
 
