@@ -36,17 +36,6 @@ pub struct Hits {
     pub seen: u64,
 }
 
-/// Requests waiting for the owner to decide them.
-#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
-pub struct Ask {
-    /// The ask's number for the key, from 1.
-    #[prost(uint64, tag = "1")]
-    pub sequence: u64,
-    /// How many requests wait.
-    #[prost(uint64, tag = "2")]
-    pub count: u64,
-}
-
 /// Nothing to report; a fresh copy, please.
 #[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
 pub struct Poll {}
@@ -57,9 +46,6 @@ pub enum Report {
     /// Hits.
     #[prost(message, tag = "3")]
     Hits(Hits),
-    /// An ask.
-    #[prost(message, tag = "4")]
-    Ask(Ask),
     /// A poll.
     #[prost(message, tag = "5")]
     Poll(Poll),
@@ -75,8 +61,33 @@ pub struct Entry {
     #[prost(message, optional, tag = "2")]
     pub contract: Option<Contract>,
     /// What about it.
-    #[prost(oneof = "Report", tags = "3, 4, 5")]
+    #[prost(oneof = "Report", tags = "3, 5")]
     pub report: Option<Report>,
+}
+
+/// A key an ask is about.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct AskKey {
+    /// The key.
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: Vec<u8>,
+    /// Its contract.
+    #[prost(message, optional, tag = "2")]
+    pub contract: Option<Contract>,
+}
+
+/// Requests waiting for a service pod to decide them, each under all its keys or none.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Ask {
+    /// The ask's number among the data plane's asks, from 1.
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    /// How many requests wait.
+    #[prost(uint64, tag = "2")]
+    pub count: u64,
+    /// The keys, in their limits' order.
+    #[prost(message, repeated, tag = "3")]
+    pub keys: Vec<AskKey>,
 }
 
 /// A data plane's batch.
@@ -88,6 +99,9 @@ pub struct Batch {
     /// One entry per key, or a few.
     #[prost(message, repeated, tag = "2")]
     pub entries: Vec<Entry>,
+    /// Requests waiting for a decision.
+    #[prost(message, repeated, tag = "3")]
+    pub asks: Vec<Ask>,
 }
 
 /// An ask's decision.
@@ -95,19 +109,19 @@ pub struct Batch {
 pub struct Decided {
     /// Which ask.
     #[prost(uint64, tag = "1")]
-    pub sequence: u64,
+    pub id: u64,
     /// How many were admitted, the first so many.
     #[prost(uint64, tag = "2")]
     pub admitted: u64,
 }
 
-/// The owner's answer about one key.
+/// A service pod's answer about one key.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct Answer {
     /// The key.
     #[prost(bytes = "vec", tag = "1")]
     pub key: Vec<u8>,
-    /// How far the owner's bucket is from full, in time multiplied by the limit. Beyond
+    /// How far the pod's bucket is from full, in time multiplied by the limit. Beyond
     /// what 64 bits hold it is sent as the most they do, which only a bucket owing for
     /// centuries reaches.
     #[prost(uint64, tag = "2")]
@@ -118,9 +132,9 @@ pub struct Answer {
     /// How many other data planes are admitting the key.
     #[prost(uint64, tag = "4")]
     pub others: u64,
-    /// To an ask, its decision.
-    #[prost(message, optional, tag = "5")]
-    pub decided: Option<Decided>,
+    /// Whether the pod owns the key, rather than answering an ask from its copy.
+    #[prost(bool, tag = "6")]
+    pub owned: bool,
 }
 
 /// Which service pods serve, as they agree.
@@ -140,12 +154,15 @@ pub struct Answers {
     /// The service pod.
     #[prost(uint32, tag = "1")]
     pub from: u32,
-    /// One per entry it owns.
+    /// One per entry it owns, and one per key of each ask it decided.
     #[prost(message, repeated, tag = "2")]
     pub entries: Vec<Answer>,
     /// The view it holds.
     #[prost(message, optional, tag = "3")]
     pub view: Option<View>,
+    /// To each ask decided, its decision.
+    #[prost(message, repeated, tag = "4")]
+    pub decided: Vec<Decided>,
 }
 
 /// What an owner knows of one data plane.
@@ -374,11 +391,24 @@ impl From<service::Batch> for Batch {
                             count,
                             seen,
                         }),
-                        service::Report::Ask { sequence, count } => {
-                            Report::Ask(Ask { sequence, count })
-                        }
                         service::Report::Poll => Report::Poll(Poll {}),
                     }),
+                })
+                .collect(),
+            asks: batch
+                .asks
+                .into_iter()
+                .map(|ask| Ask {
+                    id: ask.id,
+                    count: ask.count,
+                    keys: ask
+                        .keys
+                        .into_iter()
+                        .map(|(key, contract)| AskKey {
+                            key: key.into_vec(),
+                            contract: Some(contract.into()),
+                        })
+                        .collect(),
                 })
                 .collect(),
         }
@@ -399,10 +429,6 @@ impl TryFrom<Batch> for service::Batch {
                         count: hits.count,
                         seen: hits.seen,
                     },
-                    Report::Ask(ask) => service::Report::Ask {
-                        sequence: ask.sequence,
-                        count: ask.count,
-                    },
                     Report::Poll(_) => service::Report::Poll,
                 };
                 Ok(service::Entry {
@@ -412,9 +438,26 @@ impl TryFrom<Batch> for service::Batch {
                 })
             })
             .collect::<Result<_, Invalid>>()?;
+        let asks = batch
+            .asks
+            .into_iter()
+            .map(|ask| {
+                let keys = ask
+                    .keys
+                    .into_iter()
+                    .map(|at| Ok((at.key.into_boxed_slice(), contract(at.contract)?)))
+                    .collect::<Result<_, Invalid>>()?;
+                Ok(service::Ask {
+                    id: ask.id,
+                    count: ask.count,
+                    keys,
+                })
+            })
+            .collect::<Result<_, Invalid>>()?;
         Ok(Self {
             from: batch.from,
             entries,
+            asks,
         })
     }
 }
@@ -431,12 +474,15 @@ impl From<service::Answers> for Answers {
                     behind: narrow(answer.behind),
                     applied: answer.applied,
                     others: answer.others,
-                    decided: answer
-                        .decided
-                        .map(|(sequence, admitted)| Decided { sequence, admitted }),
+                    owned: answer.owned,
                 })
                 .collect(),
             view: answers.view.map(View::from),
+            decided: answers
+                .decided
+                .into_iter()
+                .map(|(id, admitted)| Decided { id, admitted })
+                .collect(),
         }
     }
 }
@@ -453,10 +499,13 @@ impl From<Answers> for service::Answers {
                     behind: u128::from(answer.behind),
                     applied: answer.applied,
                     others: answer.others,
-                    decided: answer
-                        .decided
-                        .map(|decided| (decided.sequence, decided.admitted)),
+                    owned: answer.owned,
                 })
+                .collect(),
+            decided: answers
+                .decided
+                .into_iter()
+                .map(|decided| (decided.id, decided.admitted))
                 .collect(),
             view: answers.view.map(service::View::from),
         }
@@ -555,8 +604,6 @@ mod tests {
                     seen,
                 }
             }),
-            (any::<u64>(), any::<u64>())
-                .prop_map(|(sequence, count)| service::Report::Ask { sequence, count }),
             Just(service::Report::Poll),
         ]
     }
@@ -572,8 +619,22 @@ mod tests {
                 contract,
                 report,
             });
-        (any::<u64>(), prop::collection::vec(entry, 0..8))
-            .prop_map(|(from, entries)| service::Batch { from, entries })
+        let ask = (
+            any::<u64>(),
+            any::<u64>(),
+            prop::collection::vec((key(), contract()), 0..4),
+        )
+            .prop_map(|(id, count, keys)| service::Ask { id, count, keys });
+        (
+            any::<u64>(),
+            prop::collection::vec(entry, 0..8),
+            prop::collection::vec(ask, 0..3),
+        )
+            .prop_map(|(from, entries, asks)| service::Batch {
+                from,
+                entries,
+                asks,
+            })
     }
 
     fn answers() -> impl Strategy<Value = service::Answers> {
@@ -582,26 +643,31 @@ mod tests {
             any::<u64>(),
             any::<u64>(),
             any::<u64>(),
-            prop::option::of((any::<u64>(), any::<u64>())),
+            any::<bool>(),
         )
-            .prop_map(|(key, behind, applied, others, decided)| service::Answer {
+            .prop_map(|(key, behind, applied, others, owned)| service::Answer {
                 key,
                 behind: u128::from(behind),
                 applied,
                 others,
-                decided,
+                owned,
             });
         let view = prop::option::of(
             (any::<u64>(), prop::collection::vec(any::<u32>(), 0..4))
                 .prop_map(|(epoch, pods)| service::View { epoch, pods }),
         );
-        (any::<u32>(), prop::collection::vec(answer, 0..8), view).prop_map(
-            |(from, entries, view)| service::Answers {
+        (
+            any::<u32>(),
+            prop::collection::vec(answer, 0..8),
+            prop::collection::vec(any::<(u64, u64)>(), 0..3),
+            view,
+        )
+            .prop_map(|(from, entries, decided, view)| service::Answers {
                 from,
                 entries,
+                decided,
                 view,
-            },
-        )
+            })
     }
 
     fn replicas() -> impl Strategy<Value = service::Replicas> {
@@ -723,6 +789,7 @@ mod tests {
         let batch = |entry| Batch {
             from: 1,
             entries: vec![entry],
+            asks: Vec::new(),
         };
         assert_eq!(
             service::Batch::try_from(batch(entry(None))),

@@ -34,11 +34,7 @@ fn without(pod: PodId) -> View {
 }
 
 fn asks(batches: &[(PodId, Batch)]) -> usize {
-    batches
-        .iter()
-        .flat_map(|(_, batch)| &batch.entries)
-        .filter(|entry| matches!(entry.report, Report::Ask { .. }))
-        .count()
+    batches.iter().map(|(_, batch)| batch.asks.len()).sum()
 }
 
 fn hits(sequence: u64, count: u64, seen: u64) -> Report {
@@ -56,6 +52,20 @@ fn batch(from: PlaneId, report: Report) -> Batch {
             key: b"k"[..].into(),
             contract: contract(),
             report,
+        }],
+        asks: Vec::new(),
+    }
+}
+
+/// An ask from `from` about `count` requests under `keys`.
+fn ask(from: PlaneId, id: u64, count: u64, keys: &[&[u8]]) -> Batch {
+    Batch {
+        from,
+        entries: Vec::new(),
+        asks: vec![Ask {
+            id,
+            count,
+            keys: keys.iter().map(|key| ((*key).into(), contract())).collect(),
         }],
     }
 }
@@ -709,8 +719,9 @@ fn an_answer_from_a_pod_that_is_not_the_owner_is_ignored() {
                 behind: 0,
                 applied: 0,
                 others: 5,
-                decided: None,
+                owned: true,
             }],
+            decided: Vec::new(),
             view: None,
         },
         CYCLE,
@@ -926,31 +937,14 @@ fn a_pod_not_serving_answers_with_its_view_alone() {
     let (owner, _, _) = roles(b"k");
     let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 4));
     pod.set_serving(false);
-    let answers = pod.on_batch(
-        batch(
-            1,
-            Report::Ask {
-                sequence: 1,
-                count: 3,
-            },
-        ),
-        0,
-    );
+    let answers = pod.on_batch(ask(1, 1, 3, &[b"k"]), 0);
     assert!(answers.entries.is_empty());
+    assert!(answers.decided.is_empty());
     assert_eq!(answers.view, Some(view(&[0, 1, 2], 4)));
     assert_eq!(pod.counted(b"k"), None);
     pod.set_serving(true);
-    let answers = pod.on_batch(
-        batch(
-            1,
-            Report::Ask {
-                sequence: 1,
-                count: 3,
-            },
-        ),
-        0,
-    );
-    assert_eq!(answers.entries[0].decided, Some((1, 3)));
+    let answers = pod.on_batch(ask(1, 1, 3, &[b"k"]), 0);
+    assert_eq!(answers.decided, vec![(1, 3)]);
 }
 
 /// A data plane takes over a later view from any answer, and moves its keys with it.
@@ -1111,4 +1105,209 @@ fn an_ask_waits_as_long_as_its_timeout_says() {
         vec![(0, true)],
         "given up, decided here"
     );
+}
+
+/// Two keys owned by different pods.
+fn apart() -> (Vec<u8>, Vec<u8>) {
+    let a = b"limit-a".to_vec();
+    let b = (0..)
+        .map(|n| format!("limit-b{n}").into_bytes())
+        .find(|b| roles(b).0 != roles(&a).0)
+        .unwrap();
+    (a, b)
+}
+
+fn under<'a>(keys: &[&'a [u8]]) -> Vec<(&'a [u8], Contract)> {
+    keys.iter().map(|key| (*key, contract())).collect()
+}
+
+/// Limits whose keys it holds fresh copies of are decided here: one refusing refuses, and
+/// the others are not charged.
+#[test]
+fn several_limits_decided_here_are_charged_to_all_or_none() {
+    let (a, b) = apart();
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, &a, 0);
+    warmed(&mut net, 0, &b, 0);
+    assert_eq!(net.admits(0, &b, 9, 0), 9);
+    let before = net.copy(0, &a).bucket.remaining(0);
+    assert_eq!(
+        net.planes[0].decide_all(&under(&[&a, &b]), 0),
+        Decision::Refuse
+    );
+    assert_eq!(net.copy(0, &a).bucket.remaining(0), before, "a not charged");
+    net.planes[0].on_cycle(CYCLE);
+    net.planes[0].take_outgoing();
+    assert_eq!(
+        net.planes[0].decide_all(&under(&[&a, &b]), CYCLE),
+        Decision::Admit
+    );
+    assert_eq!(net.copy(0, &a).bucket.remaining(CYCLE), before, "a charged");
+    assert_eq!(net.copy(0, &b).bucket.remaining(CYCLE), 0, "b charged");
+}
+
+/// A request with one cold limit: the warm one is decided here and held, and the cold
+/// one's owner is asked about it alone; admitted, the held hit goes to its own owner.
+#[test]
+fn a_warm_limit_is_held_while_the_cold_ones_owner_decides() {
+    let (a, b) = apart();
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, &a, 0);
+    let before = net.copy(0, &a).bucket.remaining(0);
+    assert!(waits(net.planes[0].decide_all(&under(&[&a, &b]), 0)));
+    assert_eq!(net.copy(0, &a).bucket.remaining(0), before - 1, "held");
+    let sent = net.planes[0].take_outgoing();
+    assert_eq!(asks(&sent), 1);
+    let (pod, batch) = sent.iter().find(|(_, b)| !b.asks.is_empty()).unwrap();
+    assert_eq!(*pod as usize, Net::owner(&b));
+    assert_eq!(batch.asks[0].keys.len(), 1, "the cold key alone");
+    net.to_pods.extend(sent);
+    net.settle(0);
+    assert_eq!(net.planes[0].take_decided(), vec![(1, true)]);
+    assert_eq!(net.pods[Net::owner(&b)].counted(&b), Some(1));
+    net.planes[0].on_cycle(CYCLE);
+    net.settle(CYCLE);
+    assert_eq!(
+        net.pods[Net::owner(&a)].counted(&a),
+        Some(2),
+        "the first request's ask, and the held hit"
+    );
+    assert_eq!(
+        net.pods[Net::owner(&b)].counted(&b),
+        Some(1),
+        "counted by its owner when it decided: not sent again"
+    );
+}
+
+/// The cold limit's owner refusing gives the held charge back: nothing is sent for it.
+#[test]
+fn a_refusal_from_the_cold_ones_owner_gives_the_held_charge_back() {
+    let (a, b) = apart();
+    let mut net = Net::new(2);
+    warmed(&mut net, 0, &a, 0);
+    for _ in 0..10 {
+        net.planes[1].decide(&b, contract(), 0);
+    }
+    net.settle(0);
+    assert_eq!(net.pods[Net::owner(&b)].counted(&b), Some(10), "b spent");
+    let before = net.copy(0, &a).bucket.remaining(0);
+    assert!(waits(net.planes[0].decide_all(&under(&[&a, &b]), 0)));
+    net.settle(0);
+    assert_eq!(net.planes[0].take_decided(), vec![(1, false)]);
+    assert_eq!(net.copy(0, &a).bucket.remaining(0), before, "given back");
+    net.planes[0].on_cycle(CYCLE);
+    net.settle(CYCLE);
+    assert_eq!(
+        net.pods[Net::owner(&a)].counted(&a),
+        Some(1),
+        "nothing sent"
+    );
+}
+
+/// Cold limits are asked about together, of the owner of the first in their order; it
+/// decides its own key and charges its copy of the other, whose hit the data plane then
+/// sends that key's owner.
+#[test]
+fn cold_limits_are_asked_together_of_the_first_ones_owner() {
+    let (a, b) = apart();
+    let mut net = Net::new(2);
+    for (plane, keys) in [(0, [&a[..], &b[..]]), (1, [&b[..], &a[..]])] {
+        assert!(waits(net.planes[plane].decide_all(&under(&keys), 0)));
+        let sent = net.planes[plane].take_outgoing();
+        assert_eq!(sent.len(), 1, "one pod asked");
+        assert_eq!(sent[0].0 as usize, Net::owner(keys[0]), "the first's owner");
+        assert_eq!(sent[0].1.asks[0].keys.len(), 2);
+        if plane == 0 {
+            net.to_pods.extend(sent);
+        }
+    }
+    net.settle(0);
+    assert_eq!(net.planes[0].take_decided(), vec![(0, true)]);
+    assert_eq!(net.pods[Net::owner(&a)].counted(&a), Some(1));
+    assert_eq!(
+        net.pods[Net::owner(&b)].counted(&b),
+        None,
+        "decided on a's owner's copy"
+    );
+    net.planes[0].on_cycle(CYCLE);
+    net.settle(CYCLE);
+    assert_eq!(
+        net.pods[Net::owner(&b)].counted(&b),
+        Some(1),
+        "sent its owner"
+    );
+    assert_eq!(net.pods[Net::owner(&a)].counted(&a), Some(1), "once");
+}
+
+/// A pod decides an ask's requests each under all its keys or none, charging its copies,
+/// so that the asks it decides after see the requests it admitted.
+#[test]
+fn a_pod_decides_an_ask_whole_and_its_copies_see_each_ask() {
+    let (a, b) = apart();
+    let mut pod: ServicePod = ServicePod::new(roles(&a).0, CYCLE, view(&[0, 1, 2], 1));
+    let answers = pod.on_batch(ask(1, 1, 6, &[&a, &b]), 0);
+    assert_eq!(answers.decided, vec![(1, 6)]);
+    let owned: Vec<bool> = answers.entries.iter().map(|answer| answer.owned).collect();
+    assert_eq!(owned, vec![true, false]);
+    let answers = pod.on_batch(ask(2, 1, 6, &[&b]), 0);
+    assert_eq!(answers.decided, vec![(1, 4)], "b's copy holds the six");
+    let answers = pod.on_batch(ask(3, 1, 3, &[&a, &b]), 0);
+    assert_eq!(answers.decided, vec![(1, 0)], "b's copy empty");
+    assert_eq!(
+        pod.keys[&a[..]].bucket.remaining(0),
+        4,
+        "a charged six only"
+    );
+    assert_eq!(pod.counted(&a), Some(6));
+}
+
+/// An ask given up: what waits is decided here under every limit, the held ones admitted
+/// with the rest.
+#[test]
+fn an_ask_given_up_decides_its_requests_here_under_every_limit() {
+    let (a, b) = apart();
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, &a, 0);
+    assert!(waits(net.planes[0].decide_all(&under(&[&a, &b]), 0)));
+    net.planes[0].take_outgoing(); // lost
+    net.planes[0].on_cycle(4 * CYCLE);
+    assert_eq!(net.planes[0].take_decided(), vec![(1, true)]);
+    assert_eq!(net.copy(0, &a).held, 0);
+    let sent: Vec<(Vec<u8>, Report)> = net.planes[0]
+        .take_outgoing()
+        .into_iter()
+        .flat_map(|(_, batch)| batch.entries)
+        .map(|entry| (entry.key.to_vec(), entry.report))
+        .collect();
+    assert!(
+        sent.contains(&(a.clone(), hits(1, 1, 0))) && sent.contains(&(b.clone(), hits(1, 1, 0))),
+        "both sent their owners in the same cycle: {sent:?}"
+    );
+}
+
+/// Any number of limits is decided all or none, and the same key named twice — a caller's
+/// mistake — is decided rather than refused by the map.
+#[test]
+fn any_number_of_limits_is_decided_and_a_key_named_twice_is_no_panic() {
+    let keys: Vec<Vec<u8>> = (0..5).map(|k| format!("limit-{k}").into_bytes()).collect();
+    let mut net = Net::new(1);
+    for key in &keys {
+        warmed(&mut net, 0, key, 0);
+    }
+    for count in 2..=5 {
+        let list: Vec<&[u8]> = keys[..count].iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            net.planes[0].decide_all(&under(&list), 0),
+            Decision::Admit,
+            "{count}"
+        );
+    }
+    assert_eq!(net.copy(0, &keys[4]).bucket.remaining(0), 8);
+    assert_eq!(net.copy(0, &keys[0]).bucket.remaining(0), 5);
+    assert_eq!(net.admits(0, &keys[4], 8, 0), 8);
+    let list: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    assert_eq!(net.planes[0].decide_all(&under(&list), 0), Decision::Refuse);
+    assert_eq!(net.copy(0, &keys[0]).bucket.remaining(0), 5, "none charged");
+    let twice = [&keys[1][..], &keys[1][..]];
+    assert_eq!(net.planes[0].decide_all(&under(&twice), 0), Decision::Admit);
 }
