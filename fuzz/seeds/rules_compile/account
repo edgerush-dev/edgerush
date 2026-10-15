@@ -1,0 +1,3 @@
+
+auth.account
+table("accounts")[auth.account].rps ?? 10

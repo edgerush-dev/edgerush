@@ -30,6 +30,8 @@ edgerush-proxy = { path = "../crates/proxy", features = ["fuzzing"] }
 edgerush-ratelimit = { path = "../crates/ratelimit" }
 edgerush-ratelimit-service = { path = "../crates/ratelimit-service" }
 edgerush-router = { path = "../crates/router", features = ["reference"] }
+# Limit rules' expressions, compiled and decided.
+edgerush-rules = { path = "../crates/rules" }
 # The reading of a request's host is compared with this crate's own.
 http = "1.5"
 # The field lines of a head are taken from what this parser finds, as the proxy's are.
@@ -192,5 +194,11 @@ bench = false
 [[bin]]
 name = "ratelimit_wire"
 path = "fuzz_targets/ratelimit_wire.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rules_compile"
+path = "fuzz_targets/rules_compile.rs"
 test = false
 doc = false

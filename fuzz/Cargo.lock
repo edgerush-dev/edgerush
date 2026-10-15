@@ -239,6 +239,7 @@ dependencies = [
  "edgerush-ratelimit",
  "edgerush-ratelimit-service",
  "edgerush-router",
+ "edgerush-rules",
  "http",
  "httparse",
  "libfuzzer-sys",
@@ -300,6 +301,13 @@ version = "0.0.0"
 dependencies = [
  "http",
  "regex",
+ "thiserror",
+]
+
+[[package]]
+name = "edgerush-rules"
+version = "0.0.0"
+dependencies = [
  "thiserror",
 ]
 

@@ -1,0 +1,3 @@
+!(client in [cidr("10.0.0.0/8"), cidr("192.168.0.0/16")]) && method in ["POST", "PUT"] && headers["x-env"] != "test"
+client
+50

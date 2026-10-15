@@ -1,0 +1,3 @@
+method == "POST" && path.startsWith("/v1/orders/")
+client
+10

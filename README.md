@@ -168,7 +168,9 @@ the filters' `reference` modules, the same ones the property tests use; `request
 compares with the `http` crate's reading instead, and `quic_header` with quiche's parser.
 `config` reads a harness config file and compiles it, holding both to not failing and what
 compiles to being whole; `test_file` reads, checks and runs a file of `edgerush test`'s
-tests against a fixed config, holding all three to not failing. An input that fails is saved under `fuzz/artifacts/`; fix the bug
+tests against a fixed config, holding all three to not failing; `rules_compile` compiles
+a limit rule's three parts and decides a request with what compiles, holding an error to
+its place in the part it is about. An input that fails is saved under `fuzz/artifacts/`; fix the bug
 and add the input to the unit tests. Run a target after changing the code it covers. Being
 outside the workspace, the package is formatted on its own:
 `cargo fmt --manifest-path fuzz/Cargo.toml`.
@@ -199,6 +201,9 @@ crates/ratelimit-service
 crates/proxy       the data plane (`edgerush-proxy`): listeners, TLS, our HTTP/1 server and client,
                    HTTP/2 on h2, HTTP/3 on quiche, upstream pools and the request core between them
 crates/router      request matching (`edgerush-router`): pure logic, no I/O
+crates/rules       limit rules (`edgerush-rules`), a spike of the DSL question: expressions over the
+                   request context in CEL's syntax for the part rules need, and rules as plain
+                   fields, checked when compiled and decided without allocating; pure, no I/O
 crates/telemetry   metrics and access logs (`edgerush-telemetry`): counters sharded by thread, the
                    Prometheus text format, an access-log record as a line of JSON
 bench              the macro benchmark: load generator, proxy and backend on one Linux machine

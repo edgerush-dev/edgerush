@@ -1,0 +1,22 @@
+[package]
+name = "edgerush-rules"
+description = "EdgeRush limit rules: expressions over the request context, checked when compiled; pure, no I/O"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+iai-callgrind.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "evaluate"
+harness = false
+
+[lints]
+workspace = true

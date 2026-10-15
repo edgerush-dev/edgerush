@@ -1,0 +1,3 @@
+has(auth.api_key)
+auth.api_key
+100
