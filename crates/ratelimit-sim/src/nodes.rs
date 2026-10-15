@@ -216,7 +216,7 @@ impl Cluster for Nodes {
     fn on_fault(&mut self, event: FaultEvent, now: u64, outbox: &mut Outbox) {
         match event {
             // The owning service pod goes for good, or restarts holding nothing: either way
-            // the others agree it is gone and its secondary takes over from its copy.
+            // the others agree it is gone and the next in rank takes over from its copy.
             FaultEvent::OwnerLost | FaultEvent::OwnerRestarts => {
                 let Some(owner) = self.owner() else {
                     return;

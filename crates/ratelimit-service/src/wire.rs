@@ -188,7 +188,7 @@ pub struct Replica {
     pub planes: Vec<PlaneRecord>,
 }
 
-/// An owner's copies, to a secondary; or keys handed over to a new owner.
+/// An owner's copies, to another pod; or keys handed over to a new owner.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct Replicas {
     /// The owner, or the pod that was.

@@ -5,8 +5,8 @@
 //! Everything the pod does goes through its task, one message at a time, as the state
 //! machines want; the gRPC server and the tests reach it through a [`Pod`] handle. Copies
 //! to each other pod go out in the order they were made, by a task per pod, so that a
-//! secondary never takes an older copy over a newer; what piles up while one is on its way
-//! goes as one message, the latest copy of each key.
+//! pod never takes an older copy over a newer; what piles up while one is on its way goes
+//! as one message, the latest copy of each key.
 
 use crate::grpc::Client;
 use edgerush_ratelimit::service::membership::{Heartbeat, Membership};
@@ -20,8 +20,8 @@ use tokio::sync::{mpsc, oneshot};
 const QUEUE: usize = 4_096;
 
 /// How many messages of copies may wait for one other pod. Beyond it a copy is dropped:
-/// the key's next change sends it whole again, and a secondary that missed copies is what
-/// the data planes' `seen` marks are for.
+/// the key's next change sends it whole again, and a pod taking over from a copy that
+/// missed some is what the data planes' `seen` marks are for.
 const COPIES_WAITING: usize = 1_024;
 
 /// How the pods watch each other.
@@ -303,8 +303,8 @@ impl Sender {
                         epoch,
                     };
                     // Lost if the call fails: the next change sends the key again, and a
-                    // secondary that missed copies is what the data planes' `seen` marks
-                    // are for.
+                    // pod taking over from a copy that missed some is what the data planes'
+                    // `seen` marks are for.
                     let _lost = sending.replicate(replicas).await;
                 }
             }

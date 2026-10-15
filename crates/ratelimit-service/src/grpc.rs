@@ -2,7 +2,7 @@
 //! generated, as its two methods are small.
 //!
 //! - `Exchange`: a data plane's batch, answered by the service pod's answers.
-//! - `Replicate`: an owner's copies, for the secondary, or keys handed over.
+//! - `Replicate`: an owner's copies, for every other pod, or keys handed over.
 //! - `Heartbeat`: a pod's heartbeat, for every other.
 
 use crate::pod::Pod;
@@ -264,7 +264,7 @@ impl Client {
         Ok(())
     }
 
-    /// Sends copies to a secondary, or keys handed over to their new owner.
+    /// Sends copies to another pod, or keys handed over to their new owner.
     ///
     /// # Errors
     ///

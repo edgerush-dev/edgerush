@@ -165,7 +165,7 @@ pub enum Message {
         /// What it says.
         answers: service::Answers,
     },
-    /// The protocol's own copies from a key's owner to its secondary.
+    /// The protocol's own copies from a key's owner to the other service pods.
     Replicas {
         /// The owner.
         from: usize,

@@ -644,17 +644,56 @@ fn a_copy_from_a_pod_that_no_longer_owns_the_key_is_ignored() {
 }
 
 #[test]
-fn a_new_secondary_gets_a_copy_at_once() {
+fn every_change_is_copied_to_every_other_pod() {
     let (owner, secondary, third) = roles(b"k");
-    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 1));
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, b"k", 0);
+    net.admits(0, b"k", 3, 0);
+    net.planes[0].on_cycle(0);
+    net.settle(0);
+    for pod in [secondary, third] {
+        assert_eq!(net.pods[pod as usize].counted(b"k"), Some(4), "pod {pod}");
+    }
+    assert_eq!(net.pods[owner as usize].counted(b"k"), Some(4));
+}
+
+/// A pod joining holds no copies: the owners send it one of each key at once.
+#[test]
+fn a_pod_joining_gets_a_copy_of_every_key_at_once() {
+    let (owner, secondary, third) = roles(b"k");
+    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, without(third));
     pod.on_batch(batch(1, hits(1, 2, 0)), 0);
     assert!(matches!(pod.take_replicas().as_slice(), [(to, _)] if *to == secondary));
-    pod.on_view(without(secondary), CYCLE);
+    pod.on_view(view(&[0, 1, 2], 3), CYCLE);
     let copies = pod.take_replicas();
     assert!(
-        matches!(copies.as_slice(), [(to, r)] if *to == third && r.entries[0].counted == 2),
+        matches!(copies.as_slice(), [(to, r)] if *to == third && !r.handover && r.entries[0].counted == 2),
         "{copies:?}"
     );
+}
+
+/// With a copy on every pod, the owner lost and then the pod that took over lost too
+/// leaves the last pod going on from its own copy: nothing had to be sent between.
+#[test]
+fn the_owner_lost_twice_in_turn_loses_nothing() {
+    let (owner, _, third) = roles(b"k");
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, b"k", 0);
+    net.admits(0, b"k", 3, 0);
+    net.planes[0].on_cycle(0);
+    net.settle(0);
+    net.set_view(&without(owner), CYCLE);
+    // The second pod goes before anything was sent at the change.
+    net.collect();
+    net.replicas.clear();
+    net.set_view(&view(&[third], 3), CYCLE);
+    net.settle(CYCLE);
+    assert_eq!(net.pods[third as usize].counted(b"k"), Some(4));
+    net.admits(0, b"k", 2, 2 * CYCLE);
+    net.planes[0].on_cycle(2 * CYCLE);
+    net.settle(2 * CYCLE);
+    assert_eq!(net.pods[third as usize].counted(b"k"), Some(6));
+    assert_eq!(net.copy(0, b"k").owner, Some(third));
 }
 
 #[test]
@@ -757,29 +796,27 @@ fn an_ask_is_sent_again_no_more_than_once() {
     assert_eq!(asks(&net.planes[0].take_outgoing()), 0);
 }
 
-/// Only the owner's copies are kept: one from another pod is ignored even by the
-/// secondary.
+/// Only the owner's copies are kept: one from another pod is ignored.
 #[test]
-fn a_secondary_keeps_copies_only_from_the_owner() {
-    let (_, secondary, third) = roles(b"k");
-    let mut pod: ServicePod = ServicePod::new(secondary, CYCLE, view(&[0, 1, 2], 1));
-    let replica = Replica {
-        key: b"k"[..].into(),
-        contract: contract(),
-        behind: 0,
-        counted: 5,
-        planes: Vec::new(),
+fn a_pod_keeps_copies_only_from_the_owner() {
+    let (owner, secondary, third) = roles(b"k");
+    let replica = |from| Replicas {
+        from,
+        entries: vec![Replica {
+            key: b"k"[..].into(),
+            contract: contract(),
+            behind: 0,
+            counted: 5,
+            planes: Vec::new(),
+        }],
+        handover: false,
+        epoch: 0,
     };
-    pod.on_replicas(
-        Replicas {
-            from: third,
-            entries: vec![replica],
-            handover: false,
-            epoch: 0,
-        },
-        0,
-    );
+    let mut pod: ServicePod = ServicePod::new(third, CYCLE, view(&[0, 1, 2], 1));
+    pod.on_replicas(replica(secondary), 0);
     assert_eq!(pod.counted(b"k"), None);
+    pod.on_replicas(replica(owner), 0);
+    assert_eq!(pod.counted(b"k"), Some(5), "the third pod keeps one too");
 }
 
 /// A batch the owner has applied, arriving again, is answered and nothing more: it is not

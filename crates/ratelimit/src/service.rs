@@ -25,11 +25,12 @@
 //!   from the copy until the owner is heard from again.
 //! - The owner applies hits in order, once each, charging what does not fit as debt while
 //!   it would be paid back within one bucket's refill time, and copies every change it makes
-//!   to the key's secondary, which takes over from that copy should the owner go.
+//!   to every other service pod: the next to own the key takes over from its copy should
+//!   the owner go, with nothing to send anyone.
 //!
 //! Which pods own which keys follows from the [`View`] the service pods agree on: the owner
-//! and the secondary of a key are the two pods ranking highest for it (rendezvous hashing),
-//! so a pod leaving moves only the keys it held.
+//! of a key is the pod ranking highest for it (rendezvous hashing), and the next in rank
+//! takes it over, so a pod leaving moves only the keys it held.
 
 pub mod membership;
 
@@ -107,7 +108,8 @@ pub struct View {
 }
 
 impl View {
-    /// The owner of `key` and its secondary: the pods ranking highest and next for it.
+    /// The owner of `key` and the pod next in rank for it, which takes it over should the
+    /// owner go.
     #[must_use]
     pub fn owners(&self, key: &[u8]) -> (Option<PodId>, Option<PodId>) {
         let hash = fnv1a(key);
@@ -243,7 +245,7 @@ pub struct PlaneRecord {
     pub last_ask: (u64, u64),
 }
 
-/// The owner's copy of one key, for its secondary.
+/// The owner's copy of one key, for the other service pods.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Replica {
     /// The key.
@@ -258,7 +260,7 @@ pub struct Replica {
     pub planes: Vec<PlaneRecord>,
 }
 
-/// The owner's copies of keys that changed, to their secondary.
+/// The owner's copies of keys that changed, to another service pod.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Replicas {
     /// The owner, or the pod that was.
@@ -266,7 +268,7 @@ pub struct Replicas {
     /// One per key.
     pub entries: Vec<Replica>,
     /// Whether these are keys handed over to their new owner, by the pod that owned them
-    /// before a view change, rather than copies for a secondary.
+    /// before a view change, rather than copies.
     pub handover: bool,
     /// The epoch of the view the sender held: a handover can reach a pod joining before
     /// the view that takes it in does, and is kept until it has.
@@ -649,8 +651,8 @@ impl<S: BuildHasher + Default> DataPlane<S> {
     }
 
     /// The service's pods change at `now`. Keys whose owner moved send it again every
-    /// batch not seen applied, numbered as before — a secondary taking over knows what the
-    /// old owner applied — and ask again about requests waiting.
+    /// batch not seen applied, numbered as before — a pod taking over from its copy knows
+    /// what the old owner applied — and ask again about requests waiting.
     pub fn on_view(&mut self, view: View, now: u64) {
         if view.epoch <= self.view.epoch {
             return;
@@ -786,7 +788,7 @@ struct Record {
     last_ask: (u64, u64),
 }
 
-/// What a service pod holds of a key, as its owner or its secondary.
+/// What a service pod holds of a key, as its owner or as a copy.
 struct Owned {
     contract: Contract,
     bucket: TokenBucket,
@@ -872,8 +874,8 @@ impl Owned {
     }
 }
 
-/// A service pod's side of the protocol: the keys it owns, and the copies it keeps as a
-/// secondary.
+/// A service pod's side of the protocol: the keys it owns, and a copy of every other key
+/// the service holds.
 pub struct ServicePod<S = FixedState> {
     me: PodId,
     cycle: u64,
@@ -932,7 +934,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
     }
 
     /// A data plane's batch reaches it at `now`: the answers go back to that data plane,
-    /// and the copies of what changed to secondaries, from
+    /// and the copies of what changed to every other pod, from
     /// [`take_replicas`](Self::take_replicas).
     pub fn on_batch(&mut self, batch: Batch, now: u64) -> Answers {
         let lately = ACTIVE_CYCLES * self.cycle;
@@ -944,7 +946,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             Vec::new()
         };
         for entry in entries {
-            let (owner, secondary) = self.view.owners(&entry.key);
+            let (owner, _) = self.view.owners(&entry.key);
             if owner != Some(self.me) {
                 continue;
             }
@@ -1014,12 +1016,17 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 others: owned.others(from, lately),
                 decided,
             });
-            if changed && let Some(secondary) = secondary {
+            if changed {
                 let replica = owned.replica(&entry.key, now);
-                let copies = self.replicas.entry(secondary).or_default();
-                // One copy of a key a batch: the last made holds the others.
-                copies.retain(|copy| copy.key != replica.key);
-                copies.push(replica);
+                for &pod in &self.view.pods {
+                    if pod == self.me {
+                        continue;
+                    }
+                    let copies = self.replicas.entry(pod).or_default();
+                    // One copy of a key a batch: the last made holds the others.
+                    copies.retain(|copy| copy.key != replica.key);
+                    copies.push(replica.clone());
+                }
             }
         }
         Answers {
@@ -1029,20 +1036,20 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         }
     }
 
-    /// Copies reach it at `now`: an owner's, kept for the keys it is the secondary of from
-    /// the owner it knows of; or keys handed over to it as their new owner, taken over —
-    /// with whatever it has applied of them meanwhile charged on top.
+    /// Copies reach it at `now`: an owner's, kept for every key whose owner it knows that
+    /// pod to be; or keys handed over to it as their new owner, taken over — with whatever
+    /// it has applied of them meanwhile charged on top.
     pub fn on_replicas(&mut self, replicas: Replicas, now: u64) {
         if replicas.handover && replicas.epoch > self.view.epoch {
             self.pending.push(replicas);
             return;
         }
         for replica in replicas.entries {
-            let (owner, secondary) = self.view.owners(&replica.key);
+            let (owner, _) = self.view.owners(&replica.key);
             let wanted = if replicas.handover {
                 owner == Some(self.me)
             } else {
-                owner == Some(replicas.from) && secondary == Some(self.me)
+                owner == Some(replicas.from) && owner != Some(self.me)
             };
             if !wanted {
                 continue;
@@ -1082,21 +1089,27 @@ impl<S: BuildHasher + Default> ServicePod<S> {
     }
 
     /// The service's pods change at `now`: keys it owns now go on from the copies it holds,
-    /// and each gets its new secondary a copy at once.
+    /// and a pod joining, which holds none, is sent a copy of each at once — or the key
+    /// itself, handed over, if the pod joining is its owner now.
     pub fn on_view(&mut self, view: View, now: u64) {
         if view.epoch <= self.view.epoch {
             return;
         }
         let before = std::mem::replace(&mut self.view, view);
+        let joining: Vec<PodId> = self
+            .view
+            .pods
+            .iter()
+            .copied()
+            .filter(|pod| *pod != self.me && !before.pods.contains(pod))
+            .collect();
         for (key, owned) in &self.keys {
-            let (owner, secondary) = self.view.owners(key);
-            // Owned until now, and from now another pod's that held no copy of it — one
-            // joining, not the secondary taking over: handed over.
-            let (owned_before, secondary_before) = before.owners(key);
-            if owned_before == Some(self.me)
+            let (owner, _) = self.view.owners(key);
+            // Owned until now, and from now a pod's that was not serving, so holds no copy
+            // of it: handed over.
+            if before.owners(key).0 == Some(self.me)
                 && let Some(owner) = owner
-                && owner != self.me
-                && secondary_before != Some(owner)
+                && joining.contains(&owner)
             {
                 self.handovers
                     .entry(owner)
@@ -1106,12 +1119,9 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             if owner != Some(self.me) {
                 continue;
             }
-            let Some(secondary) = secondary else {
-                continue;
-            };
-            if before.owners(key) != (owner, Some(secondary)) {
+            for &pod in &joining {
                 self.replicas
-                    .entry(secondary)
+                    .entry(pod)
                     .or_default()
                     .push(owned.replica(key, now));
             }
@@ -1129,21 +1139,16 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         }
     }
 
-    /// The pod's timer at `now`: keys it neither owns nor keeps a copy of any more, and
-    /// keys full again and quiet for a refill time, are dropped.
+    /// The pod's timer at `now`: keys full again and quiet for a refill time are dropped,
+    /// owned or copies.
     pub fn on_timer(&mut self, now: u64) {
-        let view = &self.view;
-        let me = self.me;
-        self.keys.retain(|key, owned| {
-            let (owner, secondary) = view.owners(key);
-            let mine = owner == Some(me) || secondary == Some(me);
-            let quiet = now.saturating_sub(owned.touched) > owned.contract.refill_time()
-                && owned.bucket.forgettable_at() <= now;
-            mine && !quiet
+        self.keys.retain(|_, owned| {
+            now.saturating_sub(owned.touched) <= owned.contract.refill_time()
+                || owned.bucket.forgettable_at() > now
         });
     }
 
-    /// Copies to send: one message per secondary, and one per pod keys are handed over to.
+    /// Copies to send: one message per other pod, and one per pod keys are handed over to.
     pub fn take_replicas(&mut self) -> Vec<(PodId, Replicas)> {
         let me = self.me;
         let epoch = self.view.epoch;

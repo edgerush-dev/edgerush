@@ -125,7 +125,7 @@ async fn counted(pod: &Pod, key: &[u8], expected: u64) -> Option<u64> {
 }
 
 /// Two data planes holding no copy each get six requests at once: they ask, the owner
-/// decides against its one bucket of ten, and copies every change to the secondary.
+/// decides against its one bucket of ten, and copies every change to every other pod.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cold_burst_on_two_data_planes_is_held_to_one_bucket() {
     let service = start().await;
@@ -152,16 +152,9 @@ async fn a_cold_burst_on_two_data_planes_is_held_to_one_bucket() {
         .collect();
     assert_eq!(decided.len(), 12);
     assert_eq!(decided.iter().filter(|(_, admitted)| *admitted).count(), 10);
-    let (owner, secondary) = view().owners(b"k");
-    let (owner, secondary) = (owner.unwrap() as usize, secondary.unwrap() as usize);
-    assert_eq!(counted(&service.pods[owner], b"k", 10).await, Some(10));
-    assert_eq!(
-        counted(&service.pods[secondary], b"k", 10).await,
-        Some(10),
-        "copied to the secondary"
-    );
-    let third = 3 - owner - secondary;
-    assert_eq!(service.pods[third].counted(b"k").await, None);
+    for pod in &service.pods {
+        assert_eq!(counted(pod, b"k", 10).await, Some(10), "owned or copied");
+    }
 }
 
 /// Hits admitted locally go to the owner with the next cycle, and the copy that comes back
@@ -191,7 +184,8 @@ async fn hits_admitted_locally_reach_the_owner_each_cycle() {
     );
 }
 
-/// Keys spread over the pods: each batch goes to the key's owner, and only it counts the key.
+/// Keys spread over the pods: each batch goes to the key's owner alone, which counts the
+/// key and copies it to the others.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keys_are_counted_by_their_owners_only() {
     let service = start().await;
@@ -202,13 +196,24 @@ async fn keys_are_counted_by_their_owners_only() {
     for key in &keys {
         plane.decide(key, contract(), now(start));
     }
-    exchange(&mut plane, &service, start).await;
+    let sent = plane.take_outgoing();
+    for (pod, batch) in &sent {
+        for entry in &batch.entries {
+            assert_eq!(
+                view().owners(&entry.key).0,
+                Some(*pod),
+                "to the owner alone"
+            );
+        }
+    }
+    for (pod, batch) in sent {
+        let answers = service.clients[&pod].exchange(batch).await.unwrap();
+        plane.on_answers(answers, now(start));
+    }
     for key in &keys {
-        let (owner, secondary) = view().owners(key);
-        let (owner, secondary) = (owner.unwrap() as usize, secondary.unwrap() as usize);
-        assert_eq!(counted(&service.pods[owner], key, 1).await, Some(1));
-        let third = 3 - owner - secondary;
-        assert_eq!(service.pods[third].counted(key).await, None);
+        for pod in &service.pods {
+            assert_eq!(counted(pod, key, 1).await, Some(1), "owned or copied");
+        }
     }
 }
 
