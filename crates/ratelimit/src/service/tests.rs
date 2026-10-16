@@ -1496,3 +1496,82 @@ fn a_refusal_decided_here_names_its_key_as_the_copy_has_it() {
             .all(|d| d.refused_by.is_empty())
     );
 }
+
+/// Keys `k0`… `k{n-1}`, each decided once by `plane`, its ask answered and the cycle's
+/// batch acknowledged, the `n`th a millisecond after the one before.
+fn used_in_turn(net: &mut Net, plane: usize, n: u64) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|at| {
+            let key = format!("k{at}").into_bytes();
+            let now = at * MS;
+            net.planes[plane].decide(&key, contract(), now);
+            net.settle(now);
+            net.planes[plane].take_decided();
+            net.planes[plane].on_cycle(now);
+            net.settle(now);
+            key
+        })
+        .collect()
+}
+
+/// Past its capacity, a data plane evicts the keys it used least recently down to nine
+/// tenths of it, never one with hits still to be acknowledged.
+#[test]
+fn a_data_plane_past_its_capacity_evicts_the_least_recently_used() {
+    let mut net = Net::new(1);
+    let keys = used_in_turn(&mut net, 0, 5);
+    let each = plane_key_bytes(&keys[0]);
+    assert_eq!(net.planes[0].holding(), 5 * each);
+    // Room for three, nine tenths of that for two: the two used last stay.
+    net.planes[0].set_capacity(3 * each);
+    net.planes[0].on_cycle(5 * MS);
+    let kept = |plane: &DataPlane| -> Vec<bool> {
+        keys.iter()
+            .map(|key| plane.keys.contains_key(&key[..]))
+            .collect()
+    };
+    assert_eq!(kept(&net.planes[0]), [false, false, false, true, true]);
+    assert_eq!(net.planes[0].holding(), 2 * each);
+    assert_eq!(net.planes[0].evicted(), 3);
+    // The newest has a hit not yet acknowledged: room for less than one, and it stays.
+    net.planes[0].decide(&keys[4], contract(), 6 * MS);
+    net.planes[0].set_capacity(each / 2);
+    net.planes[0].on_cycle(6 * MS);
+    assert_eq!(kept(&net.planes[0]), [false, false, false, false, true]);
+    assert_eq!(net.planes[0].evicted(), 4);
+    // Acknowledged and quiet past twice its refill time, it is forgotten, and gives its
+    // bytes back.
+    net.settle(6 * MS);
+    net.planes[0].on_cycle(10_000 * MS);
+    assert_eq!(kept(&net.planes[0]), [false; 5]);
+    assert_eq!(net.planes[0].holding(), 0);
+}
+
+/// Past its capacity, a service pod evicts the keys that changed least recently down to
+/// nine tenths of it.
+#[test]
+fn a_service_pod_past_its_capacity_evicts_the_least_recently_changed() {
+    // The only pod: it owns every key.
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    let keys: Vec<Vec<u8>> = (0..5_u64).map(|at| format!("k{at}").into_bytes()).collect();
+    for (at, key) in (0_u64..).zip(&keys) {
+        pod.on_batch(ask(100, at, 1, &[key]), at * MS);
+    }
+    let now = 5 * MS;
+    pod.on_timer(now);
+    let bytes: Vec<u64> = keys
+        .iter()
+        .map(|key| pod_key_bytes(key, &pod.keys[&key[..]]))
+        .collect();
+    assert_eq!(pod.holding(), bytes.iter().sum::<u64>());
+    // Room for the newest three; nine tenths of that holds the newest two.
+    pod.set_capacity(bytes[2..].iter().sum());
+    pod.on_timer(now);
+    let kept: Vec<bool> = keys
+        .iter()
+        .map(|key| pod.keys.contains_key(&key[..]))
+        .collect();
+    assert_eq!(kept, [false, false, false, true, true]);
+    assert_eq!(pod.holding(), bytes[3] + bytes[4]);
+    assert_eq!(pod.evicted(), 3);
+}

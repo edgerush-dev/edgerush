@@ -531,6 +531,44 @@ pub struct DataPlane<S = FixedState> {
     /// How long an ask may go unanswered before it is given up and what waits is decided
     /// here; sent again once half way.
     ask_timeout: u64,
+    /// The bytes its keys may hold, as [`plane_key_bytes`] counts them, and what they hold.
+    capacity: u64,
+    holding: u64,
+    /// Keys it has evicted to stay within its capacity, all told.
+    evicted: u64,
+}
+
+/// What a data plane counts a key as holding: its entry in the table, the table's control
+/// byte for it, and the key. An estimate of its own data, not of what the allocator takes.
+fn plane_key_bytes(key: &[u8]) -> u64 {
+    (size_of::<(Box<[u8]>, PlaneKey)>() + 1 + key.len()) as u64
+}
+
+/// What a service pod counts a key as holding: as a data plane does, and its records of
+/// the data planes admitting it, kept in a B-tree whose nodes have room for eleven.
+fn pod_key_bytes(key: &[u8], owned: &Owned) -> u64 {
+    let records = owned.planes.len().div_ceil(11) * 11 * size_of::<(PlaneId, Record)>();
+    (size_of::<(Box<[u8]>, Owned)>() + 1 + key.len() + records) as u64
+}
+
+/// Of `keys`, those evictable with when each was last used, the least recently used going
+/// first until what is left holds no more than `target` of `holding`: what to evict.
+fn least_recently_used(
+    mut quiet: Vec<(u64, Box<[u8]>, u64)>,
+    holding: u64,
+    target: u64,
+) -> Vec<Box<[u8]>> {
+    quiet.sort_unstable_by_key(|(used, _, _)| *used);
+    let mut left = holding;
+    quiet
+        .into_iter()
+        .take_while(|(_, _, bytes)| {
+            let over = left > target;
+            left = left.saturating_sub(*bytes);
+            over
+        })
+        .map(|(_, key, _)| key)
+        .collect()
 }
 
 impl<S: BuildHasher + Default + Clone> DataPlane<S> {
@@ -562,6 +600,9 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             asks: BTreeMap::new(),
             polls: 0,
             ask_timeout: RESEND_AFTER_CYCLES * cycle.max(1),
+            capacity: u64::MAX,
+            holding: 0,
+            evicted: 0,
         }
     }
 
@@ -570,6 +611,25 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
     /// given up sooner leaves its requests to a copy that has heard nothing.
     pub fn set_ask_timeout(&mut self, timeout: u64) {
         self.ask_timeout = timeout.max(1);
+    }
+
+    /// The bytes its keys may hold: past them, each cycle evicts the least recently used
+    /// keys with nothing in flight, down to nine tenths of it. A key evicted starts again
+    /// full, as one forgotten does. No bound unless set.
+    pub fn set_capacity(&mut self, bytes: u64) {
+        self.capacity = bytes;
+    }
+
+    /// The bytes its keys hold, as it counts them.
+    #[must_use]
+    pub fn holding(&self) -> u64 {
+        self.holding
+    }
+
+    /// The keys it has evicted to stay within its capacity, all told.
+    #[must_use]
+    pub fn evicted(&self) -> u64 {
+        self.evicted
     }
 
     /// Its id.
@@ -665,7 +725,13 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             // New, or its contract changed: any change starts a key afresh (06 §3).
             if !matches!(self.keys.get(key), Some(at) if at.contract == contract) {
                 let owner = self.view.owners(key).0;
-                self.keys.insert(key.into(), PlaneKey::new(contract, owner));
+                if self
+                    .keys
+                    .insert(key.into(), PlaneKey::new(contract, owner))
+                    .is_none()
+                {
+                    self.holding += plane_key_bytes(key);
+                }
             }
             let Some(at) = self.keys.get_mut(key) else {
                 return Decision::Refuse;
@@ -1002,7 +1068,35 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             self.polls += 1;
             self.outgoing.entry(self.view.pods[at]).or_default();
         }
-        self.keys.retain(|_, at| !at.idle(now));
+        let mut freed = 0;
+        self.keys.retain(|key, at| {
+            let idle = at.idle(now);
+            if idle {
+                freed += plane_key_bytes(key);
+            }
+            !idle
+        });
+        self.holding = self.holding.saturating_sub(freed);
+        if self.holding > self.capacity {
+            let quiet = self
+                .keys
+                .iter()
+                .filter(|(_, at)| {
+                    at.unsent == 0 && at.held == 0 && at.asking == 0 && at.unacknowledged.is_empty()
+                })
+                .map(|(key, at)| {
+                    let used = at.last_request.unwrap_or(0);
+                    (used, key.clone(), plane_key_bytes(key))
+                })
+                .collect();
+            let target = self.capacity - self.capacity / 10;
+            for key in least_recently_used(quiet, self.holding, target) {
+                if self.keys.remove(&key).is_some() {
+                    self.holding = self.holding.saturating_sub(plane_key_bytes(&key));
+                    self.evicted += 1;
+                }
+            }
+        }
     }
 
     /// A service pod's answers reach it at `now`.
@@ -1384,6 +1478,11 @@ pub struct ServicePod<S = FixedState> {
     grace: u64,
     /// Until when it makes no key afresh.
     fresh_from: u64,
+    /// The bytes its keys may hold, as [`pod_key_bytes`] counts them, what they held at the
+    /// last timer, and the keys it has evicted to stay within it, all told.
+    capacity: u64,
+    holding: u64,
+    evicted: u64,
 }
 
 impl<S: BuildHasher + Default> ServicePod<S> {
@@ -1402,6 +1501,9 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             pending: Vec::new(),
             grace: 0,
             fresh_from: 0,
+            capacity: u64::MAX,
+            holding: 0,
+            evicted: 0,
         }
     }
 
@@ -1411,6 +1513,25 @@ impl<S: BuildHasher + Default> ServicePod<S> {
     /// in one.
     pub fn set_join_grace(&mut self, grace: u64) {
         self.grace = grace;
+    }
+
+    /// The bytes its keys may hold, owned and copies alike: past them, its timer evicts the
+    /// least recently changed keys down to nine tenths of it. A key evicted starts again
+    /// full, as one forgotten does: at most a bucket forgiven. No bound unless set.
+    pub fn set_capacity(&mut self, bytes: u64) {
+        self.capacity = bytes;
+    }
+
+    /// The bytes its keys held at its last timer, as it counts them.
+    #[must_use]
+    pub fn holding(&self) -> u64 {
+        self.holding
+    }
+
+    /// The keys it has evicted to stay within its capacity, all told.
+    #[must_use]
+    pub fn evicted(&self) -> u64 {
+        self.evicted
     }
 
     /// Whether it serves: a pod the agreed view has not taken in, in this life, answers
@@ -1699,10 +1820,30 @@ impl<S: BuildHasher + Default> ServicePod<S> {
     /// The pod's timer at `now`: keys full again and quiet for a refill time are dropped,
     /// owned or copies.
     pub fn on_timer(&mut self, now: u64) {
-        self.keys.retain(|_, owned| {
-            now.saturating_sub(owned.touched) <= owned.contract.refill_time()
-                || owned.bucket.forgettable_at() > now
+        let mut holding = 0;
+        self.keys.retain(|key, owned| {
+            let keep = now.saturating_sub(owned.touched) <= owned.contract.refill_time()
+                || owned.bucket.forgettable_at() > now;
+            if keep {
+                holding += pod_key_bytes(key, owned);
+            }
+            keep
         });
+        self.holding = holding;
+        if self.holding > self.capacity {
+            let all = self
+                .keys
+                .iter()
+                .map(|(key, owned)| (owned.touched, key.clone(), pod_key_bytes(key, owned)))
+                .collect();
+            let target = self.capacity - self.capacity / 10;
+            for key in least_recently_used(all, self.holding, target) {
+                if let Some(owned) = self.keys.remove(&key) {
+                    self.holding = self.holding.saturating_sub(pod_key_bytes(&key, &owned));
+                    self.evicted += 1;
+                }
+            }
+        }
     }
 
     /// Copies to send: one message per other pod, and one per pod keys are handed over to.
