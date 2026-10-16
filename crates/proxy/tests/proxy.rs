@@ -970,6 +970,24 @@ fn sample(scrape: &str, series: &str) -> u64 {
     line.rsplit(' ').next().unwrap().parse().unwrap()
 }
 
+/// `proxy`'s scrape once each of `settled` reads its value: an answer is counted as it
+/// goes, which a client that has read all of it can come before.
+async fn scrape_when(proxy: &Proxy, settled: &[(&str, u64)]) -> String {
+    within(async {
+        loop {
+            let scrape = proxy.metrics();
+            if settled
+                .iter()
+                .all(|(series, value)| sample(&scrape, series) == *value)
+            {
+                return scrape;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn what_happens_is_counted_and_a_reload_resets_nothing() {
     let (up, nowhere) = (upstream("up").await, dead_endpoint().await);
@@ -983,7 +1001,10 @@ async fn what_happens_is_counted_and_a_reload_resets_nothing() {
     assert_eq!(send(get(web, "/..%2f")).await.0, 400);
     assert_eq!(send(get(dead, "/")).await.0, 502);
 
-    let scrape = proxy.metrics();
+    let head_time = "edgerush_listener_time_to_response_head_seconds";
+    let web_counted = format!("{head_time}_count{{listener=\"web\"}}");
+    let dead_counted = format!("{head_time}_count{{listener=\"dead\"}}");
+    let scrape = scrape_when(&proxy, &[(&web_counted, 4), (&dead_counted, 1)]).await;
     let web_responses = "edgerush_listener_responses_total{listener=\"web\",class=";
     assert_eq!(sample(&scrape, &format!("{web_responses}\"2xx\"}}")), 3);
     assert_eq!(sample(&scrape, &format!("{web_responses}\"4xx\"}}")), 1);
@@ -1000,11 +1021,7 @@ async fn what_happens_is_counted_and_a_reload_resets_nothing() {
         ),
         1
     );
-    let head_time = "edgerush_listener_time_to_response_head_seconds";
-    assert_eq!(
-        sample(&scrape, &format!("{head_time}_count{{listener=\"web\"}}")),
-        4
-    );
+    assert_eq!(sample(&scrape, &web_counted), 4);
     assert_eq!(
         sample(
             &scrape,
@@ -1067,7 +1084,7 @@ async fn what_happens_is_counted_and_a_reload_resets_nothing() {
     let reloaded = everything_to(&[("dead", nowhere), ("web", up)], "1");
     proxy.reload(compiled(&reloaded)).unwrap();
     assert_eq!(send(get(web, "/")).await.0, 200);
-    let scrape = proxy.metrics();
+    let scrape = scrape_when(&proxy, &[(&web_counted, 5)]).await;
     assert_eq!(sample(&scrape, &format!("{web_responses}\"2xx\"}}")), 4);
     assert_eq!(
         sample(
