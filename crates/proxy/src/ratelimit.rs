@@ -11,7 +11,9 @@
 use crate::forwarding::Client as Requester;
 use crate::request::NoTables;
 use edgerush_config::{CompiledLimit, CompiledRateLimitService};
-use edgerush_ratelimit::service::{Contract, DataPlane, Decision, Keyed, Ticket, View};
+use edgerush_ratelimit::service::{
+    Contract, DataPlane, Decided, Decision, Keyed, Ticket, View, longest,
+};
 use edgerush_ratelimit_service::grpc::Client;
 use edgerush_rules::{Address, Context, KeyValue, Named, Outcome, Text};
 use http::HeaderName;
@@ -29,6 +31,17 @@ use tokio::sync::{Notify, oneshot};
 /// its copy: long enough for TCP to send a lost segment again (some 200 ms on Linux), as the
 /// comparison harness found that the protocol's own four cycles, 40 ms, were not.
 const ASK_TIMEOUT: u64 = 300_000_000;
+
+/// Why a request was refused, as the worker's copies have it.
+pub(crate) struct Refusal<'a> {
+    /// The limits that refused it, bit `n` for the rule's `n`th: those out of room. None
+    /// when the copies show room under every one, the service pod having refused it from
+    /// counts the copies have yet to catch up with.
+    pub(crate) by: u64,
+    /// The limit that waits longest to admit it, the first of those that wait as long, and
+    /// how long: when to come back.
+    pub(crate) longest: Option<(&'a CompiledLimit, Duration)>,
+}
 
 /// The IETF `RateLimit` field (draft-ietf-httpapi-ratelimit-headers): on a refusal, the
 /// limit that refused, none of it left, and for how long.
@@ -77,9 +90,9 @@ pub(crate) enum Limited {
     Admit,
     /// Over it.
     Refuse,
-    /// Asked about: the owner's decision comes, `true` admitting it. A sender dropped (the
-    /// limiter gone) refuses it.
-    Wait(oneshot::Receiver<bool>),
+    /// Asked about: the owner's decision comes, with which keys refused it if it did. A
+    /// sender dropped (the limiter gone) refuses it.
+    Wait(oneshot::Receiver<Decided>),
 }
 
 /// A worker's limiter: its data plane and the clients of the service's pods.
@@ -89,7 +102,7 @@ pub(crate) struct Limiter {
     clients: Vec<Client>,
     /// The requests waiting for an owner's decision, by ticket: dropped with the limiter,
     /// which refuses them.
-    waiting: RefCell<HashMap<Ticket, oneshot::Sender<bool>>>,
+    waiting: RefCell<HashMap<Ticket, oneshot::Sender<Decided>>>,
     /// Where each of a request's keys is put together, one for each limit it can be under,
     /// kept so that no request makes them afresh; and their contracts.
     keys: RefCell<Vec<Vec<u8>>>,
@@ -186,24 +199,43 @@ impl Limiter {
         }
     }
 
-    /// How long a request from `client` refused under those of `limits` that `limited`
-    /// marks should wait to be admitted under all of them, and the limit that waits that
-    /// long: the longest of their waits, as the worker's copies have them, the first of the
-    /// limits that wait as long (06 §2). `None` if none says.
-    pub(crate) fn retry_after<'a>(
+    /// Which of `limits` refused a request from `client` that was under those `limited`
+    /// marks, and how long it should wait to be admitted under all of them (06 §2): as
+    /// `told` says, by position among the request's keys, where a service pod decided it
+    /// and said; otherwise as the worker's copies have them.
+    pub(crate) fn refusal<'a>(
         &self,
         limits: &'a [Arc<CompiledLimit>],
         limited: u64,
         client: &Requester,
-    ) -> Option<(&'a CompiledLimit, Duration)> {
+        told: &[(usize, u64)],
+    ) -> Refusal<'a> {
         let now = self.now();
         self.with_keys(limits, limited, client, |plane, parts| {
-            let (position, wait) = plane.retry_after(parts, now)?;
             // A key begins with its limit's name and a zero.
-            let (key, _) = parts.get(position)?;
-            let name = key.split(|&byte| byte == 0).next()?;
-            let limit = limits.iter().find(|limit| limit.name.as_bytes() == name)?;
-            Some((&**limit, Duration::from_nanos(wait)))
+            let at = |part: usize| {
+                let (key, _) = parts.get(part)?;
+                let name = key.split(|&byte| byte == 0).next()?;
+                limits
+                    .iter()
+                    .position(|limit| limit.name.as_bytes() == name)
+            };
+            let mut by = 0;
+            // The copies only where no pod said.
+            let from_copies = told.is_empty();
+            let waits = plane.waits(parts, now).filter(|_| from_copies);
+            let waits = waits.chain(told.iter().copied()).inspect(|(part, _)| {
+                if let Some(bit) =
+                    at(*part).and_then(|at| 1_u64.checked_shl(u32::try_from(at).ok()?))
+                {
+                    by |= bit;
+                }
+            });
+            let longest = longest(waits).and_then(|(part, wait)| {
+                let limit = limits.get(at(part)?)?;
+                Some((&**limit, Duration::from_nanos(wait)))
+            });
+            Refusal { by, longest }
         })
     }
 
@@ -273,11 +305,11 @@ impl Limiter {
 
     /// Hands the requests the data plane decided their decisions.
     fn settle(&self) {
-        let decided = self.plane.borrow_mut().take_decided();
+        let decided = self.plane.borrow_mut().take_decisions();
         let mut waiting = self.waiting.borrow_mut();
-        for (ticket, admitted) in decided {
-            if let Some(waiter) = waiting.remove(&ticket) {
-                let _gone = waiter.send(admitted);
+        for decided in decided {
+            if let Some(waiter) = waiting.remove(&decided.ticket) {
+                let _gone = waiter.send(decided);
             }
         }
     }

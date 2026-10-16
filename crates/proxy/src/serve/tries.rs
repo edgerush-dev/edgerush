@@ -244,6 +244,7 @@ impl Worker {
                 let directed = Directed {
                     rule: None,
                     limited: 0,
+                    limit_slots: None,
                     upstream: Rc::clone(&mirror.upstream),
                     alone,
                     endpoint: Arc::clone(&mirror.endpoint),

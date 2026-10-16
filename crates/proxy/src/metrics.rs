@@ -7,7 +7,8 @@
 //! counting is a load and an add — no lock, no reference count, no name. Slots are never
 //! handed back, and there are [`UPSTREAM_SLOTS`] of them; upstreams beyond that are
 //! counted together in one series, as docs/08 wants of anything that a config can make
-//! arbitrarily many of.
+//! arbitrarily many of. A rate limit's are found the same way, by a slot of its name, of
+//! [`LIMIT_SLOTS`].
 
 use crate::downstream::h1::codec::RequestError;
 use crate::forwarding::Cut;
@@ -24,8 +25,11 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 /// How many upstream names get series of their own over the life of a data plane.
 pub(crate) const UPSTREAM_SLOTS: usize = 4096;
 
+/// How many rate limits' names get series of their own over the life of a data plane.
+pub(crate) const LIMIT_SLOTS: usize = 1024;
+
 /// The slot of the series that upstreams beyond [`UPSTREAM_SLOTS`] share, and the name it
-/// is shown under.
+/// is shown under; the same for limits beyond [`LIMIT_SLOTS`].
 const OVERFLOW_SLOT: usize = 0;
 const OVERFLOW_NAME: &str = "_overflow";
 
@@ -690,6 +694,15 @@ impl UpstreamCounters {
     }
 }
 
+/// What is counted per rate limit (06 §2): requests admitted under it, each counted under
+/// every limit it was under, and refused by it, each counted under every limit that was
+/// out of room.
+#[derive(Debug, Default)]
+pub(crate) struct LimitCounters {
+    pub(crate) admitted: Counter,
+    pub(crate) refused: Counter,
+}
+
 /// The position of a status in [`CLASSES`]. `http` has no status below 100 or above 999;
 /// what is above 599 counts as 5xx.
 fn class_of(status: StatusCode) -> usize {
@@ -706,6 +719,9 @@ pub(crate) struct Metrics {
     upstreams: Box<[OnceLock<Sharded<UpstreamCounters>>]>,
     /// Which slot an upstream's name has. Only reloads and scrapes come here.
     slots: Mutex<HashMap<String, usize>>,
+    /// The same for rate limits.
+    limits: Box<[OnceLock<Sharded<LimitCounters>>]>,
+    limit_slots: Mutex<HashMap<String, usize>>,
     pub(crate) reloads: Counter,
     /// Seconds since the Unix epoch; zero before the first reload.
     pub(crate) last_reload: AtomicU64,
@@ -771,6 +787,8 @@ impl Metrics {
             listeners: (0..listeners).map(|_| Sharded::new(shards)).collect(),
             upstreams: (0..UPSTREAM_SLOTS).map(|_| OnceLock::new()).collect(),
             slots: Mutex::default(),
+            limits: (0..LIMIT_SLOTS).map(|_| OnceLock::new()).collect(),
+            limit_slots: Mutex::default(),
             reloads: Counter::default(),
             last_reload: AtomicU64::new(0),
             stopped: Sharded::new(shards),
@@ -817,6 +835,70 @@ impl Metrics {
     /// This thread's shard of the counters in an upstream's slot.
     pub(crate) fn upstream(&self, slot: usize) -> Option<&UpstreamCounters> {
         self.upstreams.get(slot)?.get().map(Sharded::local)
+    }
+
+    /// This thread's shard of the counters in a rate limit's slot.
+    pub(crate) fn limit(&self, slot: usize) -> Option<&LimitCounters> {
+        self.limits.get(slot)?.get().map(Sharded::local)
+    }
+
+    /// The slot of the rate limit of that name, which it keeps for good. For reloads: it
+    /// takes a lock and may allocate.
+    pub(crate) fn limit_slot(&self, name: &str) -> usize {
+        let mut slots = self
+            .limit_slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let slot = match slots.get(name) {
+            Some(slot) => *slot,
+            None => {
+                // Slot zero is the one that is shared, so names start at one.
+                let next = slots.len() + 1;
+                if next >= self.limits.len() {
+                    OVERFLOW_SLOT
+                } else {
+                    slots.insert(name.to_owned(), next);
+                    next
+                }
+            }
+        };
+        if let Some(series) = self.limits.get(slot) {
+            series.get_or_init(|| Sharded::new(self.shards));
+        }
+        slot
+    }
+
+    /// The scrape's rate limits: those of the current config by their names, each with the
+    /// slot it has.
+    pub(crate) fn render_limits(&self, limits: &[(&str, usize)]) -> String {
+        let mut scrape = Exposition::new();
+        // Limits that share a series are shown once, under a name of its own.
+        let mut shown: Vec<(&str, usize)> = Vec::new();
+        for (limit, slot) in limits {
+            let limit = if *slot == OVERFLOW_SLOT {
+                OVERFLOW_NAME
+            } else {
+                limit
+            };
+            if !shown.contains(&(limit, *slot)) {
+                shown.push((limit, *slot));
+            }
+        }
+        let name = "edgerush_rate_limit_decisions_total";
+        let help = "Requests decided under the rate limit, by outcome: admitted, counted under \
+                    every limit a request was under; refused, counted under every limit that \
+                    was out of room.";
+        scrape.family(name, Kind::Counter, help);
+        for (limit, slot) in shown {
+            let Some(series) = self.limits.get(slot).and_then(OnceLock::get) else {
+                continue;
+            };
+            let labels = [("limit", limit), ("outcome", "admitted")];
+            scrape.sample(name, &labels, series.sum(|shard| shard.admitted.get()));
+            let labels = [("limit", limit), ("outcome", "refused")];
+            scrape.sample(name, &labels, series.sum(|shard| shard.refused.get()));
+        }
+        scrape.finish()
     }
 
     /// The slot of the upstream of that name, which it keeps for good. For reloads: it
@@ -1316,6 +1398,40 @@ mod tests {
         );
         let line = "edgerush_upstream_requests_total{upstream=\"_overflow\"} 1\n";
         assert_eq!(scrape.matches(line).count(), 1, "{scrape}");
+        assert!(!scrape.contains("late-a"), "{scrape}");
+    }
+
+    /// A limit's name keeps its slot, so its counts go on through a reload; limits beyond the
+    /// slots share one series.
+    #[test]
+    fn a_limit_keeps_its_slot_and_those_beyond_the_slots_share_one() {
+        let metrics = metrics();
+        let writes = metrics.limit_slot("writes");
+        assert_ne!(writes, OVERFLOW_SLOT);
+        assert_eq!(metrics.limit_slot("writes"), writes);
+        metrics.limit(writes).unwrap().admitted.inc();
+        metrics.limit(writes).unwrap().refused.inc();
+        metrics.limit(writes).unwrap().refused.inc();
+        let slots: Vec<usize> = (0..LIMIT_SLOTS + 10)
+            .map(|limit| metrics.limit_slot(&format!("limit-{limit}")))
+            .collect();
+        let own = slots.iter().filter(|slot| **slot != OVERFLOW_SLOT).count();
+        assert_eq!(own, LIMIT_SLOTS - 2, "writes holds one");
+        assert_eq!(slots.last(), Some(&OVERFLOW_SLOT));
+
+        metrics.limit(OVERFLOW_SLOT).unwrap().admitted.inc();
+        let scrape = metrics.render_limits(&[
+            ("writes", writes),
+            ("late-a", OVERFLOW_SLOT),
+            ("late-b", OVERFLOW_SLOT),
+        ]);
+        for line in [
+            "edgerush_rate_limit_decisions_total{limit=\"writes\",outcome=\"admitted\"} 1\n",
+            "edgerush_rate_limit_decisions_total{limit=\"writes\",outcome=\"refused\"} 2\n",
+            "edgerush_rate_limit_decisions_total{limit=\"_overflow\",outcome=\"admitted\"} 1\n",
+        ] {
+            assert_eq!(scrape.matches(line).count(), 1, "{line}{scrape}");
+        }
         assert!(!scrape.contains("late-a"), "{scrape}");
     }
 

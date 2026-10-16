@@ -14,7 +14,7 @@ use crate::grpc::call::Call;
 use crate::head::Forwarded;
 use crate::interim::Interim;
 use crate::map_head::MapHead;
-use crate::metrics::Answer;
+use crate::metrics::{Answer, LimitCounters};
 use crate::random::{random, unguessable};
 use crate::ratelimit::{Limited, Limiter, RATELIMIT};
 use crate::request::{Decision, Opening, Rejection, decide};
@@ -138,23 +138,53 @@ impl Worker {
         }
     }
 
-    /// The answer to a request the rate limits of `rule` it is under refused: 429, with
-    /// `Retry-After` in whole seconds, rounded up and at least one — the longest any of
-    /// them waits — and `RateLimit` naming the limit that waits that long, none left, for
-    /// as long (06 §2). A gRPC call is answered `RESOURCE_EXHAUSTED`, which says no more.
+    /// Counts a request under those of `rule`'s limits that `marked` marks, bit `n` for
+    /// the `n`th, in the counter `which` picks; `slots` are the limits' slots by position.
+    fn count_limits(
+        &self,
+        rule: &CompiledRule,
+        marked: u64,
+        slots: &[usize],
+        which: fn(&LimitCounters) -> &edgerush_telemetry::Counter,
+    ) {
+        let mut marked = marked;
+        while marked != 0 {
+            let at = marked.trailing_zeros() as usize;
+            marked &= marked - 1;
+            if let Some(limit) = rule.limits.get(at)
+                && let Some(&slot) = slots.get(limit.position)
+                && let Some(counters) = self.proxy.metrics.limit(slot)
+            {
+                which(counters).inc();
+            }
+        }
+    }
+
+    /// The answer to `directed`, a request from `client` the rate limits of `rule` it is
+    /// under refused: 429, with `Retry-After` in whole seconds, rounded up and at least
+    /// one — the longest any of them waits — and `RateLimit` naming the limit that waits
+    /// that long, none left, for as long (06 §2). A gRPC call is answered
+    /// `RESOURCE_EXHAUSTED`, which says no more. Counted under each limit that refused it:
+    /// as `told`, where the service pod that decided it said, by position among its keys;
+    /// otherwise as the copies have them.
     fn refused(
         &self,
         listener: usize,
+        directed: &Directed,
         rule: &CompiledRule,
-        limited: u64,
         client: &Client,
         call: Option<Call>,
+        told: &[(usize, u64)],
     ) -> Response<Body> {
         let mut response = self.proxy.answer_to(listener, Answer::RateLimited, call);
+        let Some(limiter) = self.limiter() else {
+            return response;
+        };
+        let refusal = limiter.refusal(&rule.limits, directed.limited, client, told);
+        let slots = directed.limit_slots.as_deref().unwrap_or_default();
+        self.count_limits(rule, refusal.by, slots, |counters| &counters.refused);
         if call.is_none()
-            && let Some((limit, wait)) = self
-                .limiter()
-                .and_then(|limiter| limiter.retry_after(&rule.limits, limited, client))
+            && let Some((limit, wait)) = refusal.longest
         {
             let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
             let seconds = HeaderValue::from(seconds.max(1));
@@ -273,16 +303,28 @@ impl Worker {
         if directed.limited != 0
             && let Some(rule) = &directed.rule
         {
-            let admitted = match self.rate_limits(rule, directed.limited, client) {
-                Limited::Admit => true,
-                Limited::Refuse => false,
-                Limited::Wait(decided) => decided.await.unwrap_or(false),
+            let (admitted, told) = match self.rate_limits(rule, directed.limited, client) {
+                Limited::Admit => (true, None),
+                Limited::Refuse => (false, None),
+                Limited::Wait(decided) => match decided.await {
+                    Ok(decided) => (decided.admitted, Some(decided.refused_by)),
+                    Err(_) => (false, None),
+                },
             };
             if !admitted {
                 return self
-                    .refused(listener, rule, directed.limited, client, call)
+                    .refused(
+                        listener,
+                        &directed,
+                        rule,
+                        client,
+                        call,
+                        told.as_deref().unwrap_or_default(),
+                    )
                     .into();
             }
+            let slots = directed.limit_slots.as_deref().unwrap_or_default();
+            self.count_limits(rule, directed.limited, slots, |counters| &counters.admitted);
         }
         // A WebSocket that an HTTP/2 or HTTP/3 client asks for holds a backend of its own
         // beside the client's one connection, which may carry a hundred: it counts as one
@@ -675,6 +717,7 @@ impl Proxy {
         Ok(Directing::Upstream(Directed {
             rule: kept.then(|| Arc::clone(forward.rule)),
             limited: forward.limited,
+            limit_slots: (forward.limited != 0).then(|| Arc::clone(&snapshot.limit_slots)),
             upstream: balance,
             endpoint: Arc::clone(identity),
             counted: Some(counted),

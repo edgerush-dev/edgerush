@@ -119,6 +119,69 @@ async fn http2_requests_are_held_to_their_limit() {
         .await;
 }
 
+/// Each limit counts what it decided: a request admitted under every limit it was under, a
+/// refusal under the limits that were out of room alone, gRPC calls too. A config with no
+/// limit shows none.
+#[tokio::test]
+async fn each_limit_counts_what_it_admitted_and_refused() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let service = service().await;
+            let (upstream, _) = counting_upstream().await;
+            let quiet = everything_config(upstream);
+            let proxy = Proxy::new(compile(&quiet).unwrap(), NonZeroUsize::MIN).unwrap();
+            assert!(!proxy.metrics().contains("edgerush_rate_limit"));
+            let mut config = limited(everything_config(upstream), &service);
+            config.routes[0].rules[0].rate_limits =
+                vec!["per-client".to_owned(), "wide".to_owned()];
+            config.limits = Some(
+                serde_saphyr::from_str(
+                    "limits:
+  - { name: per-client, key: client, model: { bucket: { rate: 10/h, burst: 10 } } }
+  - { name: wide, key: client, model: { bucket: { rate: 100/h, burst: 100 } } }
+  - { name: unused, key: client, model: { bucket: { rate: 1/h, burst: 1 } } }
+",
+                )
+                .unwrap(),
+            );
+            let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+            let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            for _ in 0..12 {
+                send = within(send.ready()).await.unwrap();
+                let request = Request::get("http://example.test/")
+                    .version(Version::HTTP_2)
+                    .body(())
+                    .unwrap();
+                let (response, _) = send.send_request(request, true).unwrap();
+                within(response).await.unwrap();
+            }
+            send = within(send.ready()).await.unwrap();
+            let (answer, _) = send.send_request(grpc_call("/", None), true).unwrap();
+            assert_eq!(within(answer).await.unwrap().headers()["grpc-status"], "8");
+            let scrape = worker.proxy().metrics();
+            for line in [
+                "edgerush_rate_limit_decisions_total{limit=\"per-client\",outcome=\"admitted\"} 10
+",
+                "edgerush_rate_limit_decisions_total{limit=\"per-client\",outcome=\"refused\"} 3
+",
+                "edgerush_rate_limit_decisions_total{limit=\"wide\",outcome=\"admitted\"} 10
+",
+                "edgerush_rate_limit_decisions_total{limit=\"wide\",outcome=\"refused\"} 0
+",
+                "edgerush_rate_limit_decisions_total{limit=\"unused\",outcome=\"admitted\"} 0
+",
+            ] {
+                assert!(scrape.contains(line), "{line}{scrape}");
+            }
+        })
+        .await;
+}
+
 /// Fifteen requests over HTTP/3 from one client, on one connection: ten admitted, the
 /// rest refused 429.
 #[tokio::test]
@@ -143,6 +206,47 @@ async fn http3_requests_are_held_to_their_limit() {
                 statuses.push(status.unwrap_or(0));
             }
             assert_eq!(tally(&statuses), (10, 5), "{statuses:?}");
+        })
+        .await;
+}
+
+/// A refusal a service pod decided is put down to the limits the pod said refused it, by
+/// their keys' positions, whatever the worker's copies show: here they know nothing of
+/// either key.
+#[tokio::test]
+async fn a_refusal_is_put_down_to_the_limits_the_pod_named() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut config = limited(
+                everything_config("127.0.0.1:9".parse().unwrap()),
+                &["127.0.0.1:9".to_owned()],
+            );
+            config.routes[0].rules[0].rate_limits =
+                vec!["per-client".to_owned(), "wide".to_owned()];
+            config.limits = Some(
+                serde_saphyr::from_str(
+                    "limits:
+  - { name: per-client, key: client, model: { bucket: { rate: 10/h, burst: 10 } } }
+  - { name: wide, key: client, model: { bucket: { rate: 100/h, burst: 100 } } }
+",
+                )
+                .unwrap(),
+            );
+            let compiled = compile(&config).unwrap();
+            let service = compiled.rate_limit_service().unwrap().clone();
+            let limiter = crate::ratelimit::Limiter::start(&service, 0).unwrap();
+            let rule = Arc::clone(&compiled.rules_of(0)[0]);
+            let client = crate::forwarding::Client::new("203.0.113.7".parse().unwrap());
+            let told = [(1, 5_000_000_000)];
+            let refusal = limiter.refusal(&rule.limits, 0b11, &client, &told);
+            assert_eq!(refusal.by, 0b10, "wide, the second");
+            let (limit, wait) = refusal.longest.unwrap();
+            assert_eq!(limit.name, "wide");
+            assert_eq!(wait, Duration::from_secs(5));
+            let unsaid = limiter.refusal(&rule.limits, 0b11, &client, &[]);
+            assert_eq!(unsaid.by, 0, "the copies know nothing");
+            limiter.stop();
         })
         .await;
 }

@@ -117,6 +117,9 @@ pub struct CompiledLimit {
     /// Its name as a header's quoted string, `"writes"`: what the `RateLimit` header calls
     /// it.
     pub quoted: String,
+    /// Its place among the engine's limits, in the file's order: what the data plane finds
+    /// its series by.
+    pub position: usize,
     /// When it applies, its key and its rate: requests a window.
     pub rule: Rule,
     /// Its rate as it was written, `100/s`: for telling a person.
@@ -218,6 +221,7 @@ pub(crate) fn compile_limits(
             let compiled = CompiledLimit {
                 name: limit.name.clone(),
                 quoted: quoted(&limit.name),
+                position: by_name.len(),
                 rule,
                 rate: bucket.rate.clone(),
                 window,
@@ -267,6 +271,13 @@ fn named(
 }
 
 impl CompiledLimits {
+    /// Every limit, in the order of its position.
+    pub(crate) fn all(&self) -> Vec<Arc<CompiledLimit>> {
+        let mut all: Vec<Arc<CompiledLimit>> = self.by_name.values().cloned().collect();
+        all.sort_by_key(|limit| limit.position);
+        all
+    }
+
     /// The limits a route rule's requests are under — the data plane's, its route's, its
     /// own — each once, in the order a decision takes them: the smallest bucket first, the
     /// limit most likely at its edge, ties going to the most specific (06 §4). Names with no

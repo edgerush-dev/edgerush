@@ -709,6 +709,8 @@ struct Snapshot {
     endpoints: Vec<Vec<Authority>>,
     /// By position of the upstream: the slot of its counters.
     upstream_slots: Vec<usize>,
+    /// By position of the rate limit: the slot of its counters.
+    limit_slots: Arc<[usize]>,
     /// By position of the upstream: what became of it at this reload, worked out once for
     /// every worker to follow (03 §6).
     carried: Vec<balancing::Carry>,
@@ -770,6 +772,8 @@ struct Directed {
     rule: Option<Arc<CompiledRule>>,
     /// Which of its rule's rate limits it is under ([`crate::request::Forward::limited`]).
     limited: u64,
+    /// The slots of the config's rate limits, by position, for a request under any.
+    limit_slots: Option<Arc<[usize]>>,
     /// The worker's state for its upstream: where it is counted, the places it holds, its
     /// retry budget and its balancer.
     upstream: Rc<balancing::Upstream>,

@@ -295,6 +295,19 @@ pub struct Replicas {
     pub epoch: u64,
 }
 
+/// The decision on a request that waited.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decided {
+    /// The request.
+    pub ticket: Ticket,
+    /// Whether it was admitted.
+    pub admitted: bool,
+    /// Refused, those of its keys that refused it, by position in its list, each with how
+    /// long from the decision it waits to admit one: as the service pod that decided held
+    /// them, or, decided here, as the copies have them. Empty when admitted.
+    pub refused_by: Box<[(usize, u64)]>,
+}
+
 /// How a request was decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
@@ -392,6 +405,22 @@ impl PlaneKey {
         self.allowance
             .is_none_or(|allowance| self.spent < allowance)
             && self.bucket.admits(now)
+    }
+
+    /// How long from `now` the copy waits to admit a request, if it would refuse one: its
+    /// bucket's refill to one request, or, with room but its share of the cycle spent, the
+    /// next `cycle`.
+    fn wait(&self, cycle: u64, now: u64) -> Option<u64> {
+        match self.bucket.retry_at(now) {
+            Some(retry) => Some(retry.saturating_sub(now)),
+            None if self
+                .allowance
+                .is_some_and(|allowance| self.spent >= allowance) =>
+            {
+                Some(cycle)
+            }
+            None => None,
+        }
     }
 
     /// Charges a request admitted here, sent to the owner with the next batch.
@@ -494,7 +523,7 @@ pub struct DataPlane<S = FixedState> {
     in_flight: BTreeMap<u64, Box<[u8]>>,
     next_ticket: Ticket,
     asks_sent: u64,
-    decided: Vec<(Ticket, bool)>,
+    decided: Vec<Decided>,
     outgoing: BTreeMap<PodId, Vec<Entry>>,
     asks: BTreeMap<PodId, Vec<Ask>>,
     /// Views asked for so far, to ask the pods in turn.
@@ -803,8 +832,24 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 }
             }
         }
+        let refused_by = if admitted {
+            Box::default()
+        } else {
+            group
+                .cold
+                .iter()
+                .filter_map(|at| {
+                    let wait = self.keys.get(&group.keys[*at].0)?.wait(self.cycle, now)?;
+                    Some((*at, wait))
+                })
+                .collect()
+        };
         self.settle_held(name, ticket, admitted);
-        self.decided.push((ticket, admitted));
+        self.decided.push(Decided {
+            ticket,
+            admitted,
+            refused_by,
+        });
     }
 
     /// The charges held for `ticket`, of the group `name`, as its decision says.
@@ -971,6 +1016,9 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         // Keys the pod decided asks under without owning them: the requests it admitted
         // are charged on its copy, and still to be sent to their owners.
         let mut copies = Vec::new();
+        // Keys whose state the pod sent but the copies did not take, for saying which of
+        // them refused the asks it decided.
+        let mut untaken: Vec<(Box<[u8]>, u128)> = Vec::new();
         for answer in entries {
             let Some(at) = self.keys.get_mut(&answer.key) else {
                 continue;
@@ -978,6 +1026,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             // Only the owner it sends to, or a pod answering an ask from its copy: an answer
             // from an owner that has gone is stale.
             if answer.owned && at.owner != Some(from) {
+                untaken.push((answer.key, answer.behind));
                 continue;
             }
             at.bucket.set_behind(now, answer.behind);
@@ -1010,6 +1059,29 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 continue;
             };
             let asked = std::mem::take(&mut group.asked);
+            // Those of the keys asked about that refused, as the pod held them: from the copy,
+            // which took its state, or from the state the copy did not take.
+            let refused_by: Box<[(usize, u64)]> = if (asked.len() as u64) > admitted {
+                group
+                    .cold
+                    .iter()
+                    .filter_map(|at| {
+                        let key = &group.keys[*at].0;
+                        let copy = self.keys.get(key)?;
+                        let wait = match untaken.iter().find(|(untaken, _)| untaken == key) {
+                            Some((_, behind)) => {
+                                let mut held = copy.bucket.clone();
+                                held.set_behind(now, *behind);
+                                held.retry_at(now).map(|retry| retry.saturating_sub(now))
+                            }
+                            None => copy.wait(self.cycle, now),
+                        }?;
+                        Some((*at, wait))
+                    })
+                    .collect()
+            } else {
+                Box::default()
+            };
             let charged: Vec<Box<[u8]>> = group
                 .cold
                 .iter()
@@ -1026,7 +1098,15 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                     }
                 }
                 self.settle_held(&name, ticket, admitted);
-                self.decided.push((ticket, admitted));
+                self.decided.push(Decided {
+                    ticket,
+                    admitted,
+                    refused_by: if admitted {
+                        Box::default()
+                    } else {
+                        refused_by.clone()
+                    },
+                });
             }
             // Those that came during the first ask are asked about once more — the tail of
             // a cold burst — and, once a cycle has bounded the copies, any after that are
@@ -1109,31 +1189,31 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         }
     }
 
-    /// How long, from `now`, a request refused under `keys` should wait before it would be
-    /// admitted under all of them, as its copies have it, and which of `keys`, by position,
-    /// waits that long: the longest any key waits — its bucket's refill to one request, or,
-    /// a key with room whose share of the cycle is spent, the next cycle — the first of
-    /// those that wait as long. `None` if every key it holds would admit one now, or it
-    /// holds none of them.
-    #[must_use]
-    pub fn retry_after(&self, keys: &[(&[u8], Contract)], now: u64) -> Option<(usize, u64)> {
+    /// Those of `keys` that would refuse a request at `now`, as the copies have them, each
+    /// by its position in `keys` with how long from `now` it waits to admit one: its
+    /// bucket's refill to one request, or, a key with room whose share of the cycle is
+    /// spent, the next cycle. A key it holds no copy of is not among them.
+    pub fn waits<'a>(
+        &'a self,
+        keys: &'a [(&[u8], Contract)],
+        now: u64,
+    ) -> impl Iterator<Item = (usize, u64)> + 'a {
         keys.iter()
             .enumerate()
-            .filter_map(|(position, (key, contract))| {
+            .filter_map(move |(position, (key, contract))| {
                 let at = self.keys.get(*key).filter(|at| at.contract == *contract)?;
-                let wait = match at.bucket.retry_at(now) {
-                    Some(retry) => retry.saturating_sub(now),
-                    None if at.allowance.is_some_and(|allowance| at.spent >= allowance) => {
-                        self.cycle
-                    }
-                    None => return None,
-                };
-                Some((position, wait))
+                Some((position, at.wait(self.cycle, now)?))
             })
-            .fold(None, |longest, (position, wait)| match longest {
-                Some((_, most)) if most >= wait => longest,
-                _ => Some((position, wait)),
-            })
+    }
+
+    /// How long, from `now`, a request refused under `keys` should wait before it would be
+    /// admitted under all of them, as its copies have it, and which of `keys`, by position,
+    /// waits that long: the longest of their [`waits`](Self::waits), the first of those
+    /// that wait as long. `None` if every key it holds would admit one now, or it holds
+    /// none of them.
+    #[must_use]
+    pub fn retry_after(&self, keys: &[(&[u8], Contract)], now: u64) -> Option<(usize, u64)> {
+        longest(self.waits(keys, now))
     }
 
     /// Messages to send: one batch per service pod; an empty one asks only for the view.
@@ -1168,6 +1248,14 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
 
     /// Requests that waited, decided since last asked: `(ticket, admitted)`.
     pub fn take_decided(&mut self) -> Vec<(Ticket, bool)> {
+        self.take_decisions()
+            .into_iter()
+            .map(|decided| (decided.ticket, decided.admitted))
+            .collect()
+    }
+
+    /// The same, with which keys refused those refused.
+    pub fn take_decisions(&mut self) -> Vec<Decided> {
         std::mem::take(&mut self.decided)
     }
 
@@ -1643,6 +1731,15 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             .chain(handovers)
             .collect()
     }
+}
+
+/// The longest of `waits`, by position and wait, the first of those that wait as long.
+#[must_use]
+pub fn longest(waits: impl Iterator<Item = (usize, u64)>) -> Option<(usize, u64)> {
+    waits.fold(None, |longest, (position, wait)| match longest {
+        Some((_, most)) if most >= wait => longest,
+        _ => Some((position, wait)),
+    })
 }
 
 #[cfg(test)]

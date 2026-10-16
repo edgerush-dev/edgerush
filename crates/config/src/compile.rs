@@ -104,6 +104,8 @@ pub struct Compiled {
     data_plane: CompiledDataPlane,
     /// The rate-limiting service, if rules limit requests.
     rate_limit_service: Option<CompiledRateLimitService>,
+    /// The engine's limits, each at its position.
+    limits: Vec<Arc<CompiledLimit>>,
 }
 
 /// The rate-limiting service, checked (experimental).
@@ -155,6 +157,12 @@ impl Compiled {
     #[must_use]
     pub fn rate_limit_service(&self) -> Option<&CompiledRateLimitService> {
         self.rate_limit_service.as_ref()
+    }
+
+    /// The engine's limits, each at its [position](CompiledLimit::position).
+    #[must_use]
+    pub fn limits(&self) -> &[Arc<CompiledLimit>] {
+        &self.limits
     }
 
     /// What to do with a request that was routed to `id`.
@@ -1124,6 +1132,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                 .collect(),
             data_plane,
             rate_limit_service,
+            limits: engine.all(),
         };
         let sni = if keep {
             sni.into_iter()
@@ -4767,6 +4776,25 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
             ),
             ["route `api`, rules[0]: `rate_limits`: under 65 limits, at most 64"]
         );
+    }
+
+    /// The engine's limits are kept in the file's order, each knowing its position, those no
+    /// rule names too: what the data plane finds their series by.
+    #[test]
+    fn the_limits_are_kept_by_their_position_in_the_file() {
+        let limits = "limits:
+  - { name: zeta, key: client, model: { bucket: { rate: 1/s, burst: 1 } } }
+  - { name: alpha, key: client, model: { bucket: { rate: 1/s, burst: 1 } } }
+  - { name: mid, key: client, model: { bucket: { rate: 1/s, burst: 1 } } }
+";
+        let (_, _, compiled) = limited("", "alpha", "", limits, true).unwrap();
+        let kept: Vec<(&str, usize)> = compiled
+            .limits()
+            .iter()
+            .map(|limit| (limit.name.as_str(), limit.position))
+            .collect();
+        assert_eq!(kept, [("zeta", 0), ("alpha", 1), ("mid", 2)]);
+        assert_eq!(compiled.rules[0][0].limits[0].position, 1);
     }
 
     #[test]

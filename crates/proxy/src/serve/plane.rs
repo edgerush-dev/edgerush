@@ -91,6 +91,11 @@ impl Snapshot {
             .iter()
             .map(|upstream| metrics.upstream_slot(&upstream.name))
             .collect();
+        let limit_slots = config
+            .limits()
+            .iter()
+            .map(|limit| metrics.limit_slot(&limit.name))
+            .collect();
         let secure: Vec<Option<Arc<Secure>>> = config
             .upstreams()
             .iter()
@@ -134,6 +139,7 @@ impl Snapshot {
             listeners,
             endpoints,
             upstream_slots,
+            limit_slots,
             carried,
             destinations,
             tls,
@@ -295,7 +301,19 @@ impl Proxy {
                 (upstream.name.as_str(), serving, aside)
             })
             .collect();
-        self.metrics.render(&self.listeners, &upstreams, &endpoints)
+        let limits: Vec<(&str, usize)> = snapshot
+            .config
+            .limits()
+            .iter()
+            .zip(snapshot.limit_slots.iter())
+            .map(|(limit, slot)| (limit.name.as_str(), *slot))
+            .collect();
+        let mut scrape = self.metrics.render(&self.listeners, &upstreams, &endpoints);
+        // Only a config with limits shows them.
+        if !limits.is_empty() {
+            scrape.push_str(&self.metrics.render_limits(&limits));
+        }
+        scrape
     }
 
     /// How many connections are open, on every listener and every worker, over TCP and

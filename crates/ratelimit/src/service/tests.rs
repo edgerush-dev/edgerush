@@ -1427,3 +1427,72 @@ fn a_key_refused_for_its_share_waits_for_the_next_cycle() {
         Some((0, CYCLE))
     );
 }
+
+/// A pod that decided an ask but that the data plane no longer takes for the key's owner
+/// refuses it: the copy does not take the pod's state, and still shows room, yet the
+/// decision names the key that refused, with its wait, as the pod held it.
+#[test]
+fn a_refusal_names_its_key_as_the_deciding_pod_held_it() {
+    let mut net = Net::new(2);
+    // Another data plane spends the whole bucket through the owner.
+    for _ in 0..12 {
+        net.planes[1].decide(b"k", contract(), 0);
+    }
+    net.settle(0);
+    net.planes[1].take_decided();
+    assert_eq!(net.pods[Net::owner(b"k")].counted(b"k"), Some(10));
+    // This one, cold, asks the owner; while the answer is on its way, a view comes that
+    // leaves the owner out.
+    let ticket = match net.planes[0].decide(b"k", contract(), 0) {
+        Decision::Wait(ticket) => ticket,
+        other => panic!("{other:?}"),
+    };
+    let owner = Net::owner(b"k");
+    let (pod, batch) = net.planes[0]
+        .take_outgoing()
+        .into_iter()
+        .find(|(pod, batch)| *pod as usize == owner && !batch.asks.is_empty())
+        .unwrap();
+    let answers = net.pods[pod as usize].on_batch(batch, 0);
+    net.planes[0].on_view(without(pod), 0);
+    net.planes[0].on_answers(answers, 0);
+    assert!(net.copy(0, b"k").bucket.admits(0), "the copy took nothing");
+    let decided = net.planes[0].take_decisions();
+    assert_eq!(
+        decided,
+        [Decided {
+            ticket,
+            admitted: false,
+            // A hundred a second: one back in 10 ms.
+            refused_by: [(0, 10 * MS)].into(),
+        }]
+    );
+}
+
+/// Requests whose ask goes unanswered are decided here, from the copy, and those refused
+/// name the key that refused them, as the copy has it.
+#[test]
+fn a_refusal_decided_here_names_its_key_as_the_copy_has_it() {
+    let mut net = Net::new(1);
+    for _ in 0..12 {
+        net.planes[0].decide(b"k", contract(), 0);
+    }
+    net.planes[0].take_outgoing();
+    net.planes[0].on_cycle(3 * CYCLE);
+    net.planes[0].take_outgoing();
+    net.planes[0].on_cycle(4 * CYCLE);
+    let decided = net.planes[0].take_decisions();
+    assert_eq!(decided.len(), 12);
+    let refused: Vec<&Decided> = decided.iter().filter(|d| !d.admitted).collect();
+    assert!(!refused.is_empty(), "{decided:?}");
+    for decided in refused {
+        // A hundred a second: one back in 10 ms.
+        assert_eq!(&*decided.refused_by, [(0, 10 * MS)], "{decided:?}");
+    }
+    assert!(
+        decided
+            .iter()
+            .filter(|d| d.admitted)
+            .all(|d| d.refused_by.is_empty())
+    );
+}
