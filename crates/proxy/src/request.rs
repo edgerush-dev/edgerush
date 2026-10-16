@@ -27,10 +27,12 @@ use edgerush_filters::{Requested, Scheme, UrlRewrite};
 use edgerush_router::{
     EncodedSlash, Fields, NormaliseError, RequestParts, normalise_path, normalise_path_with,
 };
+use edgerush_rules::{Address, Context, Named, Tables, Text};
 use http::header::{HeaderMap, HeaderName};
 use http::uri::PathAndQuery;
 use http::{HeaderValue, Method, StatusCode, Uri, Version};
 use std::borrow::Cow;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 /// What becomes of a request.
@@ -76,6 +78,65 @@ pub struct Forward<'a> {
     /// taken off with the other hop-by-hop fields all the same; what goes upstream in their
     /// place is for whoever sends it.
     pub websocket: Option<Opening>,
+    /// Which of the rule's rate limits the request is under, by their positions in
+    /// [`CompiledRule::limits`]: bit `n` for the `n`th. A limit's match is read on what
+    /// was routed — the method, the host, the normalised path — before any rewrite
+    /// ([07 §2](../../../docs/07-config-and-dsl.md)).
+    pub limited: u64,
+}
+
+/// What a limit's match reads of a request while it is routed (07 §2): no headers, which a
+/// limit of plain fields does not read.
+struct Routed<'a> {
+    method: &'a str,
+    host: &'a str,
+    path: &'a str,
+    client: &'a Client,
+}
+
+impl Context for Routed<'_> {
+    fn text(&self, field: Text) -> Option<&str> {
+        match field {
+            Text::Method => Some(self.method),
+            Text::Host => Some(self.host),
+            Text::Path => Some(self.path),
+            _ => None,
+        }
+    }
+
+    fn address(&self, field: Address) -> Option<IpAddr> {
+        match field {
+            Address::Client => Some(self.client.address()),
+            Address::Peer => self.client.peer().map(|peer| peer.ip()),
+        }
+    }
+
+    fn named(&self, _: Named, _: &str) -> Option<&str> {
+        None
+    }
+}
+
+/// The tables a limit's numbers are looked up in: none until Tables come (stage 8).
+pub(crate) struct NoTables;
+
+impl Tables for NoTables {
+    fn number(&self, _: usize, _: usize, _: &str) -> Option<i64> {
+        None
+    }
+}
+
+/// Which of `rule`'s limits a request is under, as [`Forward::limited`] has it.
+fn limited(rule: &CompiledRule, routed: &Routed<'_>) -> u64 {
+    rule.limits
+        .iter()
+        .enumerate()
+        .filter(|(_, limit)| limit.rule.applies(routed, &NoTables))
+        .fold(0, |under, (at, _)| {
+            under
+                | 1_u64
+                    .checked_shl(u32::try_from(at).unwrap_or(u32::MAX))
+                    .unwrap_or(0)
+        })
 }
 
 /// A WebSocket's opening handshake, as its client sent it.
@@ -389,6 +450,22 @@ pub fn decide_routed<'a, H: Head>(
         }
     };
     let upstream = backends.pick(random()).ok_or(Rejection::NoBackend)?;
+    let limited = if rule.limits.is_empty() {
+        0
+    } else {
+        let routed = Routed {
+            // An extended CONNECT for WebSocket is the GET it replaces here too (19 §3).
+            method: if connect {
+                crate::websocket::OPENING.as_str()
+            } else {
+                head.method().as_str()
+            },
+            host,
+            path: &path,
+            client,
+        };
+        limited(rule, &routed)
+    };
     // Which of the rule's mirrors take this request, drawn here, where what each is sent
     // is made: only a mirror that takes it has a copy made. A rule without mirrors draws
     // nothing and holds nothing for them.
@@ -491,6 +568,7 @@ pub fn decide_routed<'a, H: Head>(
         upstream,
         mirrors,
         websocket,
+        limited,
     }))
 }
 

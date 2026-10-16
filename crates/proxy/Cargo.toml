@@ -30,6 +30,7 @@ edgerush-filters.workspace = true
 edgerush-ratelimit.workspace = true
 edgerush-ratelimit-service.workspace = true
 edgerush-router.workspace = true
+edgerush-rules.workspace = true
 edgerush-telemetry.workspace = true
 h2.workspace = true
 http.workspace = true

@@ -1,19 +1,26 @@
-//! Rules' rate limits (experimental): each worker is a data plane of the rate-limiting
-//! service's protocol (`edgerush_ratelimit::service`), deciding every request from its
-//! copies, asking the key's owner about a key it holds no fresh copy of, and sending the
-//! service, every cycle, what it admitted — over gRPC, from a task of the worker's own.
+//! The rate limits route rules are under (07 §2): each worker is a data plane of the
+//! rate-limiting service's protocol (`edgerush_ratelimit::service`), deciding every request
+//! under all its limits at once from its copies, asking a service pod about keys it holds no
+//! fresh copy of, and sending the service, every cycle, what it admitted — over gRPC, from a
+//! task of the worker's own.
 //!
 //! Nothing here runs unless a rule limits: the worker makes its limiter the first time one
 //! does, and makes it again when the service's settings change, which starts every key
 //! afresh, as any change to a limit does.
 
-use edgerush_config::{CompiledRateLimit, CompiledRateLimitService};
+use crate::forwarding::Client as Requester;
+use crate::request::NoTables;
+use edgerush_config::{CompiledLimit, CompiledRateLimitService};
 use edgerush_ratelimit::service::{Contract, DataPlane, Decision, Keyed, Ticket, View};
 use edgerush_ratelimit_service::grpc::Client;
+use edgerush_rules::{Address, Context, KeyValue, Named, Outcome, Text};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
+use std::net::IpAddr;
+use std::num::NonZeroU64;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, oneshot};
 
@@ -22,7 +29,30 @@ use tokio::sync::{Notify, oneshot};
 /// comparison harness found that the protocol's own four cycles, 40 ms, were not.
 const ASK_TIMEOUT: u64 = 300_000_000;
 
-/// How a request fared against its rule's limit.
+/// What a limit's key reads of a request: the client's address, until authentication
+/// gives the rest (stage 9).
+struct ByKey<'a> {
+    client: &'a Requester,
+}
+
+impl Context for ByKey<'_> {
+    fn text(&self, _: Text) -> Option<&str> {
+        None
+    }
+
+    fn address(&self, field: Address) -> Option<IpAddr> {
+        match field {
+            Address::Client => Some(self.client.address()),
+            Address::Peer => self.client.peer().map(|peer| peer.ip()),
+        }
+    }
+
+    fn named(&self, _: Named, _: &str) -> Option<&str> {
+        None
+    }
+}
+
+/// How a request fared against the limits it is under.
 pub(crate) enum Limited {
     /// Within it.
     Admit,
@@ -41,8 +71,10 @@ pub(crate) struct Limiter {
     /// The requests waiting for an owner's decision, by ticket: dropped with the limiter,
     /// which refuses them.
     waiting: RefCell<HashMap<Ticket, oneshot::Sender<bool>>>,
-    /// Where a key is put together, kept so that no request makes one afresh.
-    key: RefCell<Vec<u8>>,
+    /// Where each of a request's keys is put together, one for each limit it can be under,
+    /// kept so that no request makes them afresh; and their contracts.
+    keys: RefCell<Vec<Vec<u8>>>,
+    contracts: RefCell<Vec<Contract>>,
     start: Instant,
     /// Wakes the task to send what a decision asked for at once.
     asked: Notify,
@@ -82,7 +114,8 @@ impl Limiter {
             plane: RefCell::new(plane),
             clients,
             waiting: RefCell::new(HashMap::new()),
-            key: RefCell::new(Vec::new()),
+            keys: RefCell::new(Vec::new()),
+            contracts: RefCell::new(Vec::new()),
             start: Instant::now(),
             asked: Notify::new(),
             stopped: Cell::new(false),
@@ -106,19 +139,75 @@ impl Limiter {
         u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
-    /// Decides a request whose key under `limit` is `value`.
-    pub(crate) fn decide(&self, limit: &CompiledRateLimit, value: &[u8]) -> Limited {
-        let mut key = self.key.borrow_mut();
-        key.clear();
-        key.extend_from_slice(&limit.name);
-        key.push(0);
-        key.extend_from_slice(value);
-        let contract = Contract {
-            limit: limit.limit,
-            window: limit.window,
-            burst: limit.burst,
+    /// Decides a request from `client` under those of `limits` that `limited` marks, bit `n`
+    /// for the `n`th: each counted by its key — the limit's name, a zero, the key's value —
+    /// and all decided at once, admitted under all of them or none (06 §2). A limit the
+    /// request has no key for lets it through, as one whose number came out below one.
+    pub(crate) fn decide_all(
+        &self,
+        limits: &[Arc<CompiledLimit>],
+        limited: u64,
+        client: &Requester,
+    ) -> Limited {
+        let mut keys = self.keys.borrow_mut();
+        let mut contracts = self.contracts.borrow_mut();
+        contracts.clear();
+        let context = ByKey { client };
+        let mut used = 0;
+        for (at, limit) in limits.iter().enumerate() {
+            let bit = 1_u64.checked_shl(u32::try_from(at).unwrap_or(u32::MAX));
+            if bit.is_none_or(|bit| limited & bit == 0) {
+                continue;
+            }
+            let Outcome::Applies { key, limit: count } = limit.rule.counted(&context, &NoTables)
+            else {
+                continue;
+            };
+            let Some(count) = NonZeroU64::new(count) else {
+                continue;
+            };
+            if keys.len() <= used {
+                keys.push(Vec::new());
+            }
+            let Some(buffer) = keys.get_mut(used) else {
+                continue;
+            };
+            buffer.clear();
+            buffer.extend_from_slice(limit.name.as_bytes());
+            buffer.push(0);
+            match key {
+                KeyValue::Text(text) => buffer.extend_from_slice(text.as_bytes()),
+                KeyValue::Address(IpAddr::V4(v4)) => buffer.extend_from_slice(&v4.octets()),
+                KeyValue::Address(IpAddr::V6(v6)) => buffer.extend_from_slice(&v6.octets()),
+            }
+            contracts.push(Contract {
+                limit: count,
+                window: limit.window,
+                burst: limit.burst,
+            });
+            used += 1;
+        }
+        let now = self.now();
+        let mut plane = self.plane.borrow_mut();
+        // The usual few at once without a list made for them.
+        let decision = match (&keys[..used], &contracts[..]) {
+            ([], _) => return Limited::Admit,
+            ([a], [ca]) => plane.decide(a, *ca, now),
+            ([a, b], [ca, cb]) => plane.decide_all(&[(a, *ca), (b, *cb)], now),
+            ([a, b, c], [ca, cb, cc]) => plane.decide_all(&[(a, *ca), (b, *cb), (c, *cc)], now),
+            ([a, b, c, d], [ca, cb, cc, cd]) => {
+                plane.decide_all(&[(a, *ca), (b, *cb), (c, *cc), (d, *cd)], now)
+            }
+            (many, contracts) => {
+                let parts: Vec<(&[u8], Contract)> = many
+                    .iter()
+                    .map(Vec::as_slice)
+                    .zip(contracts.iter().copied())
+                    .collect();
+                plane.decide_all(&parts, now)
+            }
         };
-        let decision = self.plane.borrow_mut().decide(&key, contract, self.now());
+        drop(plane);
         match decision {
             Decision::Admit => Limited::Admit,
             Decision::Refuse => Limited::Refuse,

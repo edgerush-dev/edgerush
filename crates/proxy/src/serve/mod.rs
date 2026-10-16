@@ -768,6 +768,8 @@ struct Redirect {
 /// What a request keeps of the snapshot it was directed on.
 struct Directed {
     rule: Option<Arc<CompiledRule>>,
+    /// Which of its rule's rate limits it is under ([`crate::request::Forward::limited`]).
+    limited: u64,
     /// The worker's state for its upstream: where it is counted, the places it holds, its
     /// retry budget and its balancer.
     upstream: Rc<balancing::Upstream>,

@@ -153,11 +153,23 @@ impl Rule {
         context: &'a C,
         tables: &T,
     ) -> Outcome<'a> {
-        if let Some(when) = &self.when
-            && !when.evaluate(context, tables)
-        {
+        if !self.applies(context, tables) {
             return Outcome::NotApplicable;
         }
+        self.counted(context, tables)
+    }
+
+    /// Whether it applies to a request: its `when` holds, or it has none. Apart from
+    /// [`counted`](Self::counted), for a caller that knows the request's routed facts — its
+    /// path before a rewrite — only while it routes.
+    pub fn applies<C: Context, T: Tables>(&self, context: &C, tables: &T) -> bool {
+        self.when
+            .as_ref()
+            .is_none_or(|when| when.evaluate(context, tables))
+    }
+
+    /// What a request it applies to is counted by and against, its `when` not asked.
+    pub fn counted<'a, C: Context, T: Tables>(&'a self, context: &'a C, tables: &T) -> Outcome<'a> {
         let key = match &self.key {
             Key::Constant(text) => Some(KeyValue::Text(text)),
             Key::Text(node) => node.evaluate(context).map(KeyValue::Text),

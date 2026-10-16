@@ -26,7 +26,7 @@ use crate::upstream::h1::codec::Sending;
 use crate::way_back;
 use crate::websocket::{self, Key};
 use arc_swap::Guard;
-use edgerush_config::{CompiledRateLimit, RequestId, UpstreamProtocol};
+use edgerush_config::{CompiledRule, RequestId, UpstreamProtocol};
 use edgerush_filters::request_id;
 use edgerush_router::Fields;
 use http::{HeaderValue, Method, Request, Response, Version};
@@ -129,33 +129,11 @@ impl Worker {
         answered
     }
 
-    /// How a request fares against its rule's rate limit: keyed on a header's value, or on
-    /// the client's address. A request without the header is not limited.
-    fn rate_limit<H: Forwarded>(
-        &self,
-        limit: &CompiledRateLimit,
-        client: &Client,
-        head: &H,
-    ) -> Limited {
-        let mut address = [0; 16];
-        let value: &[u8] = match &limit.header {
-            Some(name) => match head.outgoing().values(name).next() {
-                Some(value) => value,
-                None => return Limited::Admit,
-            },
-            None => match client.address() {
-                std::net::IpAddr::V4(v4) => {
-                    address[..4].copy_from_slice(&v4.octets());
-                    &address[..4]
-                }
-                std::net::IpAddr::V6(v6) => {
-                    address = v6.octets();
-                    &address
-                }
-            },
-        };
+    /// How a request from `client` fares against the rate limits of `rule` it is under,
+    /// `limited` marking them.
+    fn rate_limits(&self, rule: &CompiledRule, limited: u64, client: &Client) -> Limited {
         match self.limiter() {
-            Some(limiter) => limiter.decide(limit, value),
+            Some(limiter) => limiter.decide_all(&rule.limits, limited, client),
             None => Limited::Admit,
         }
     }
@@ -256,14 +234,12 @@ impl Worker {
             }
             Err(answer) => return self.proxy.answer_to(listener, answer, call).into(),
         };
-        // Its rule's rate limit, if it has one (experimental): decided at once from the
-        // worker's copy, or, for a key it holds no fresh copy of, by the key's owner.
-        if let Some(limit) = directed
-            .rule
-            .as_ref()
-            .and_then(|rule| rule.rate_limit.as_ref())
+        // The rate limits it is under, if any: decided at once from the worker's copies, or,
+        // for keys it holds no fresh copy of, by a service pod (06 §4).
+        if directed.limited != 0
+            && let Some(rule) = &directed.rule
         {
-            let admitted = match self.rate_limit(limit, client, &head) {
+            let admitted = match self.rate_limits(rule, directed.limited, client) {
                 Limited::Admit => true,
                 Limited::Refuse => false,
                 Limited::Wait(decided) => decided.await.unwrap_or(false),
@@ -654,7 +630,7 @@ impl Proxy {
         let kept = forward.rule.response_headers.is_some()
             || forward.rule.retry().is_some()
             || forward.rule.timeouts().is_some()
-            || forward.rule.rate_limit.is_some();
+            || forward.limited != 0;
         // Only a request that may be sent again keeps where else it could go.
         let others = forward.rule.retry().map(|_| {
             Box::new(Others {
@@ -665,6 +641,7 @@ impl Proxy {
         });
         Ok(Directing::Upstream(Directed {
             rule: kept.then(|| Arc::clone(forward.rule)),
+            limited: forward.limited,
             upstream: balance,
             endpoint: Arc::clone(identity),
             counted: Some(counted),

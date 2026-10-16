@@ -6,8 +6,8 @@ use crate::backends::{UpstreamId, WeightedBackends};
 use crate::limits::{CompiledLimit, compile_limits};
 use crate::route::{
     EncodedSlash, Filter, Forward, Fraction, GrpcMethod, HeaderChanges, Hostname, Match,
-    PathChange, PathMatch, Query, RateLimitKey, Redirect, Route, RulePaths, Scheme, UrlRewrite,
-    ValueMatch, ValuePredicate, Wildcard,
+    PathChange, PathMatch, Query, Redirect, Route, RulePaths, Scheme, UrlRewrite, ValueMatch,
+    ValuePredicate, Wildcard,
 };
 use crate::{
     AccessLog, Backend, Certificate, ClientValidation, Config, Forwarding, HealthCheck, Http3,
@@ -24,11 +24,10 @@ use edgerush_router::{
     HostPatternError, PathPattern, PathPatternError, QueryPredicate, QueryPredicateError,
     QueryPredicates, RouteMatch, Router, WildcardLabels,
 };
-use http::{HeaderName, Method};
+use http::Method;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
-use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -119,22 +118,6 @@ pub struct CompiledRateLimitService {
 impl CompiledRateLimitService {
     /// What `cycle_ms` is when left out.
     const CYCLE: Duration = Duration::from_millis(10);
-}
-
-/// A rule's rate limit, checked (experimental).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompiledRateLimit {
-    /// The header whose value requests are counted by, or `None` for the client's address.
-    pub header: Option<HeaderName>,
-    /// Requests a window, on average.
-    pub limit: NonZeroU64,
-    /// The window, in nanoseconds.
-    pub window: NonZeroU64,
-    /// The whole bucket.
-    pub burst: NonZeroU64,
-    /// What its keys are counted under: the route's name and the rule's position, so that
-    /// every data plane counts the rule's requests together.
-    pub name: Box<[u8]>,
 }
 
 /// The data plane's own settings, each at the value it runs with.
@@ -330,8 +313,6 @@ pub struct CompiledRule {
     /// Whether it takes a request whose path holds an encoded slash inside a segment
     /// (`paths: { encoded_slash: keep }`); every other rule refuses one (03 §11).
     pub keeps_encoded_slash: bool,
-    /// Its rate limit, if it has one (experimental).
-    pub rate_limit: Option<CompiledRateLimit>,
     /// The limits its requests are under — the data plane's, its route's and its own —
     /// in the order a decision takes them, the smallest bucket first; empty for none.
     pub limits: Box<[Arc<CompiledLimit>]>,
@@ -514,66 +495,6 @@ fn too_long(field: &'static str, seconds: u64) -> Option<Problem> {
     (seconds > MOST_SECONDS).then_some(Problem::TooLong { field, seconds })
 }
 
-/// A rule's rate limit, checked: every number at least 1, a valid header name, a rule that
-/// forwards, and a service to share the count through.
-fn rate_limit(
-    config: &Config,
-    route: &Route,
-    rule_at: usize,
-    rule: &Rule,
-    place: &Place,
-    errors: &mut Vec<ConfigError>,
-) -> Option<CompiledRateLimit> {
-    let limit = rule.rate_limit.as_ref()?;
-    let before = errors.len();
-    if rule.forward.is_none() {
-        errors.push(place.problem(Problem::RateLimitWithoutForward));
-    }
-    if config.rate_limit_service.is_none() {
-        errors.push(place.problem(Problem::RateLimitWithoutService));
-    }
-    let header = match &limit.key {
-        RateLimitKey::Header(name) => match HeaderName::from_bytes(name.as_bytes()) {
-            Ok(header) => Some(header),
-            Err(_) => {
-                errors.push(place.problem(Problem::RateLimitHeader(name.clone())));
-                None
-            }
-        },
-        RateLimitKey::ClientAddress => None,
-    };
-    let nonzero = |field: &'static str, value: u64, errors: &mut Vec<ConfigError>| {
-        let value = NonZeroU64::new(value);
-        if value.is_none() {
-            errors.push(place.problem(Problem::RateLimitZero(field)));
-        }
-        value
-    };
-    let window_ms = nonzero("window_ms", limit.window_ms, errors);
-    let window = window_ms.and_then(|ms| ms.checked_mul(NonZeroU64::new(1_000_000)?));
-    let seconds = limit.window_ms / 1_000;
-    if let Some(problem) = too_long("window_ms", seconds) {
-        errors.push(place.problem(problem));
-    } else if window_ms.is_some() && window.is_none() {
-        errors.push(place.problem(Problem::TooLong {
-            field: "window_ms",
-            seconds,
-        }));
-    }
-    let limit_of = nonzero("limit", limit.limit, errors);
-    let burst = nonzero("burst", limit.burst, errors);
-    let compiled = CompiledRateLimit {
-        header,
-        limit: limit_of?,
-        window: window?,
-        burst: burst?,
-        name: format!("{}/{rule_at}", route.name)
-            .into_bytes()
-            .into_boxed_slice(),
-    };
-    (errors.len() == before).then_some(compiled)
-}
-
 /// The limits a rule's requests are under ([`crate::limits`]): only a rule that forwards
 /// has any, a limit named on a rule that does not being a problem, and they need a service to
 /// share their counts through.
@@ -602,8 +523,15 @@ fn rule_limits(
     if !limits.is_empty() && config.rate_limit_service.is_none() {
         errors.push(place.problem(Problem::LimitsWithoutService));
     }
+    if limits.len() > MOST_LIMITS {
+        errors.push(place.problem(Problem::LimitsTooMany(limits.len())));
+    }
     limits
 }
+
+/// The most limits a rule's requests can be under: which of them a request is under is
+/// told in 64 bits.
+pub(crate) const MOST_LIMITS: usize = 64;
 
 /// The rate-limiting service, checked: a pod at least, and a cycle of at least 1 ms.
 fn rate_limit_service(
@@ -1119,7 +1047,6 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                 outcome: outcome(rule, &upstream_ids, &place, &mut errors),
                 mirrors,
                 keeps_encoded_slash: encoded_slash(rule) == edgerush_router::EncodedSlash::Keep,
-                rate_limit: rate_limit(config, route, rule_at, rule, &place, &mut errors),
                 limits: rule_limits(config, &engine, route, rule, &place, &mut errors),
             }));
         }
@@ -2259,18 +2186,9 @@ pub enum Problem {
     /// `timeouts` stated with nothing in it.
     #[error("`timeouts` states no timeout")]
     TimeoutsEmpty,
-    /// A rate limit on a rule that does not forward.
-    #[error("`rate_limit` is for a rule that forwards")]
-    RateLimitWithoutForward,
-    /// A rate limit with no service to share its count through.
-    #[error("`rate_limit` needs `rate_limit_service`")]
-    RateLimitWithoutService,
-    /// A rate limit keyed on a header name that is not one.
-    #[error("`rate_limit`: `{0}` is not a header name")]
-    RateLimitHeader(String),
-    /// A rate limit with a number of zero.
-    #[error("`rate_limit`: `{0}` is 0: at least 1")]
-    RateLimitZero(&'static str),
+    /// More limits on a rule than a request can be decided under.
+    #[error("`rate_limits`: under {0} limits, at most {MOST_LIMITS}")]
+    LimitsTooMany(usize),
     /// A limit named by a rule that does not forward.
     #[error("`rate_limits` is for a rule that forwards")]
     LimitsWithoutForward,
@@ -4706,95 +4624,29 @@ routes:
         assert!(unknown.is_err());
     }
 
-    /// A rule's rate limit (experimental), compiled with what every data plane counts it
-    /// under, and checked: a service to count through, a rule that forwards, numbers of at
-    /// least 1, a header name that is one.
+    /// The rate-limiting service: its pods, and a cycle of at least 1 ms, 10 when left out.
     #[test]
-    fn a_rate_limit_is_compiled_and_checked() {
-        let with = |rule_extra: &str, service: &str| {
-            let yaml = format!(
-                r#"
-listeners: {{ web: {{ address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }} }}
-routes:
-  - name: api
-    listeners: [web]
-    hostnames: [{{ name: a.example.com, falls_through: true }}]
-    rules:
-      - {{ matches: [{{ path: {{ prefix: /free }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}] }} }}
-      - {{ matches: [{{ path: {{ prefix: /api }} }}], {rule_extra} }}
-upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
-{service}"#
-            );
+    fn the_rate_limit_service_is_checked() {
+        let with = |service: &str| {
+            let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{}}\n{service}\n");
             compile(&config(&yaml))
-                .map(|compiled| {
-                    (
-                        compiled.rules[0][1].rate_limit.clone(),
-                        compiled.rate_limit_service().cloned(),
-                    )
-                })
+                .map(|compiled| compiled.rate_limit_service().cloned())
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
-        let forward = "forward: { backends: [{ upstream: u, weight: 1 }] }";
-        let service = "rate_limit_service: { pods: [\"rl-0:7000\", \"rl-1:7000\"] }";
-        let limit = |key: &str, limit: u64, window_ms: u64, burst: u64| {
-            format!(
-                "{forward}, rate_limit: {{ key: {key}, limit: {limit}, window_ms: {window_ms}, burst: {burst} }}"
-            )
-        };
-        let (limit_of, service_of) =
-            with(&limit("{ header: X-Api-Key }", 100, 1_000, 50), service).unwrap();
-        let limit_of = limit_of.unwrap();
-        assert_eq!(limit_of.header, Some(HeaderName::from_static("x-api-key")));
-        assert_eq!(limit_of.limit.get(), 100);
-        assert_eq!(limit_of.window.get(), 1_000_000_000);
-        assert_eq!(limit_of.burst.get(), 50);
-        assert_eq!(&*limit_of.name, b"api/1");
-        let service_of = service_of.unwrap();
-        assert_eq!(service_of.pods, ["rl-0:7000", "rl-1:7000"]);
-        assert_eq!(service_of.cycle, Duration::from_millis(10));
-        let (by_address, _) = with(&limit("client_address", 5, 60_000, 1), service).unwrap();
-        assert_eq!(by_address.unwrap().header, None);
-        let (none, _) = with(forward, "").unwrap();
-        assert_eq!(none, None, "a rule that does not say has none");
-
-        let refused = |rule: &str, service: &str| with(rule, service).unwrap_err();
+        let service = with(r#"rate_limit_service: { pods: ["rl-0:7000", "rl-1:7000"] }"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(service.pods, ["rl-0:7000", "rl-1:7000"]);
+        assert_eq!(service.cycle, Duration::from_millis(10));
+        assert_eq!(with("").unwrap(), None);
         assert_eq!(
-            refused(&limit("client_address", 5, 1_000, 5), ""),
-            ["route `api`, rules[1]: `rate_limit` needs `rate_limit_service`"]
-        );
-        assert_eq!(
-            refused(
-                "redirect: { status: 301, query: keep }, rate_limit: { key: client_address, limit: 1, window_ms: 1, burst: 1 }",
-                service
-            ),
-            ["route `api`, rules[1]: `rate_limit` is for a rule that forwards"]
-        );
-        assert_eq!(
-            refused(&limit("client_address", 0, 0, 0), service),
-            [
-                "route `api`, rules[1]: `rate_limit`: `window_ms` is 0: at least 1",
-                "route `api`, rules[1]: `rate_limit`: `limit` is 0: at least 1",
-                "route `api`, rules[1]: `rate_limit`: `burst` is 0: at least 1",
-            ]
-        );
-        assert_eq!(
-            refused(&limit("{ header: \"bad header\" }", 1, 1, 1), service),
-            ["route `api`, rules[1]: `rate_limit`: `bad header` is not a header name"]
-        );
-        assert_eq!(
-            refused(forward, "rate_limit_service: { pods: [] }"),
+            with("rate_limit_service: { pods: [] }").unwrap_err(),
             ["the data plane: `rate_limit_service` names no pods"]
         );
         assert_eq!(
-            refused(
-                forward,
-                "rate_limit_service: { pods: [\"a:1\"], cycle_ms: 0 }"
-            ),
+            with(r#"rate_limit_service: { pods: ["a:1"], cycle_ms: 0 }"#).unwrap_err(),
             ["the data plane: `rate_limit_service`: `cycle_ms` is 0: at least 1"]
         );
-        let too_long = refused(&limit("client_address", 1, u64::MAX, 1), service);
-        assert_eq!(too_long.len(), 1);
-        assert!(too_long[0].contains("window_ms"), "{too_long:?}");
     }
 
     const LIMITS: &str = r"
@@ -4896,6 +4748,24 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
         assert_eq!(
             refused("", "", "small", LIMITS, true),
             ["route `api`, rules[1]: `rate_limits` is for a rule that forwards"]
+        );
+        let many: String = (0..=MOST_LIMITS)
+            .map(|n| format!("  - {{ name: l{n}, key: client, model: {{ bucket: {{ rate: 1/s, burst: 1 }} }} }}
+"))
+            .collect();
+        let names: Vec<String> = (0..=MOST_LIMITS).map(|n| format!("l{n}")).collect();
+        assert_eq!(
+            refused(
+                "",
+                &names.join(", "),
+                "",
+                &format!(
+                    "limits:
+{many}"
+                ),
+                true
+            ),
+            ["route `api`, rules[0]: `rate_limits`: under 65 limits, at most 64"]
         );
     }
 

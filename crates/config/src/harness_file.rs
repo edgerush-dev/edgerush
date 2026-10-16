@@ -43,8 +43,8 @@ pub struct HarnessFile {
     /// The data plane's own settings; left out, each has its value.
     #[serde(default)]
     pub data_plane: DataPlane,
-    /// Experimental: the rate-limiting service rules' `rate_limit` share their counts
-    /// through. Needed by any rule that limits.
+    /// Experimental: the rate-limiting service the rate limits rules are under share their
+    /// counts through. Needed by any rule under one.
     #[serde(default)]
     pub rate_limit_service: Option<RateLimitService>,
     /// The files of each certificate that listeners and upstreams name, by its name. A key

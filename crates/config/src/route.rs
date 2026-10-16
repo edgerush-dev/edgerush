@@ -115,49 +115,11 @@ pub struct Rule {
     /// How the rule takes request paths. Left out, as `{ encoded_slash: refuse }`.
     #[serde(default)]
     pub paths: Option<RulePaths>,
-    /// Experimental, while how limits are written is still open: the rule's requests
-    /// limited, counted together by every data plane through the rate-limiting service
-    /// (`rate_limit_service`, which it needs). Only with `forward`.
-    #[serde(default)]
-    pub rate_limit: Option<RateLimit>,
     /// The rate-limiting engine's limits the rule's requests are under, by name, beside its
     /// route's and those over the whole data plane: each request admitted under all of them
     /// or none, and charged to all or none. Only with `forward`.
     #[serde(default)]
     pub rate_limits: Vec<String>,
-}
-
-/// A limit on a rule's requests (experimental): a token bucket of `burst` requests,
-/// refilled at `limit` every `window_ms`, one for each value of the key, shared by every
-/// data plane. A request over it is answered 429.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
-pub struct RateLimit {
-    /// Whose requests are counted together.
-    pub key: RateLimitKey,
-    /// Requests a window, on average.
-    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
-    pub limit: u64,
-    /// The window, in milliseconds.
-    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
-    pub window_ms: u64,
-    /// How many requests a client can send at once, from idle, before its traffic is
-    /// spread out at the rate: the whole bucket.
-    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
-    pub burst: u64,
-}
-
-/// What a rate limit counts requests by.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum RateLimitKey {
-    /// The value of this request header. A request without it is not limited.
-    Header(String),
-    /// The address of the client the data plane sees: the peer, or the client a trusted
-    /// PROXY protocol header names.
-    ClientAddress,
 }
 
 /// How a rule takes request paths.

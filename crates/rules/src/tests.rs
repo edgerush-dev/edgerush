@@ -281,6 +281,29 @@ fn the_six_rules_decide_alike_in_both_forms() {
 
 /// Case 5, a malformed value: every mistake a config can make in a rule is refused when it
 /// is compiled, where it goes wrong.
+/// Whether a rule applies and what it counts by are apart: the first read while routing,
+/// before a rewrite changes the path, the second after; together they are `evaluate`.
+#[test]
+fn whether_a_rule_applies_and_what_it_counts_by_are_apart() {
+    let rule = rule(Some(r#"method == "POST""#), "client", "10");
+    let get = Request::default();
+    let post = Request {
+        method: "POST".into(),
+        ..Request::default()
+    };
+    let data = accounts(&[]);
+    assert!(!rule.applies(&get, &data));
+    assert!(rule.applies(&post, &data));
+    let client = KeyValue::Address(get.client);
+    assert_eq!(
+        rule.counted(&get, &data),
+        applies(client, 10),
+        "its when not asked"
+    );
+    assert_eq!(rule.evaluate(&get, &data), Outcome::NotApplicable);
+    assert_eq!(rule.evaluate(&post, &data), applies(client, 10));
+}
+
 #[test]
 fn malformed_rules_are_refused_when_compiled() {
     for (when, key, limit, part, at, message) in [

@@ -243,6 +243,7 @@ impl Worker {
             let _copying = tokio::task::spawn_local(async move {
                 let directed = Directed {
                     rule: None,
+                    limited: 0,
                     upstream: Rc::clone(&mirror.upstream),
                     alone,
                     endpoint: Arc::clone(&mirror.endpoint),
