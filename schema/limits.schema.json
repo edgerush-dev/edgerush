@@ -63,7 +63,7 @@
       "type": "object",
       "properties": {
         "key": {
-          "description": "Whose requests are counted together: `client`, the address the data plane sees — the\npeer, or the client a trusted PROXY protocol header names. Never what a client says.",
+          "description": "Whose requests are counted together: `client`, the address the data plane sees — the\npeer, or the client a trusted PROXY protocol header names — an IPv6 client by its\n/64, which one client holds whole. Never what a client says.",
           "type": "string"
         },
         "match": {

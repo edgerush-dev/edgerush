@@ -53,7 +53,8 @@ pub struct Limit {
     #[serde(default, rename = "match")]
     pub matches: Option<LimitMatch>,
     /// Whose requests are counted together: `client`, the address the data plane sees — the
-    /// peer, or the client a trusted PROXY protocol header names. Never what a client says.
+    /// peer, or the client a trusted PROXY protocol header names — an IPv6 client by its
+    /// /64, which one client holds whole. Never what a client says.
     pub key: String,
     /// How the requests are counted.
     pub model: Model,

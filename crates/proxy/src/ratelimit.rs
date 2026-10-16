@@ -52,6 +52,20 @@ impl Context for ByKey<'_> {
     }
 }
 
+/// Puts together in `buffer` the key a request is counted by under the limit `name`: the
+/// name, a zero, and the key's value — an IPv6 client by its /64, not its whole address,
+/// which one client holds 2^64 of (06 §2).
+fn key_into(buffer: &mut Vec<u8>, name: &str, key: KeyValue<'_>) {
+    buffer.clear();
+    buffer.extend_from_slice(name.as_bytes());
+    buffer.push(0);
+    match key {
+        KeyValue::Text(text) => buffer.extend_from_slice(text.as_bytes()),
+        KeyValue::Address(IpAddr::V4(v4)) => buffer.extend_from_slice(&v4.octets()),
+        KeyValue::Address(IpAddr::V6(v6)) => buffer.extend_from_slice(&v6.octets()[..8]),
+    }
+}
+
 /// How a request fared against the limits it is under.
 pub(crate) enum Limited {
     /// Within it.
@@ -172,14 +186,7 @@ impl Limiter {
             let Some(buffer) = keys.get_mut(used) else {
                 continue;
             };
-            buffer.clear();
-            buffer.extend_from_slice(limit.name.as_bytes());
-            buffer.push(0);
-            match key {
-                KeyValue::Text(text) => buffer.extend_from_slice(text.as_bytes()),
-                KeyValue::Address(IpAddr::V4(v4)) => buffer.extend_from_slice(&v4.octets()),
-                KeyValue::Address(IpAddr::V6(v6)) => buffer.extend_from_slice(&v6.octets()),
-            }
+            key_into(buffer, &limit.name, key);
             contracts.push(Contract {
                 limit: count,
                 window: limit.window,
@@ -277,5 +284,47 @@ impl std::fmt::Debug for Limiter {
             .field("service", &self.service)
             .field("waiting", &self.waiting.borrow().len())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(name: &str, value: KeyValue<'_>) -> Vec<u8> {
+        let mut buffer = b"left over".to_vec();
+        key_into(&mut buffer, name, value);
+        buffer
+    }
+
+    fn address(text: &str) -> KeyValue<'static> {
+        KeyValue::Address(text.parse().unwrap())
+    }
+
+    /// A key is the limit's name, a zero and the value: another limit's key for the same
+    /// client is another key.
+    #[test]
+    fn a_key_is_the_limits_name_a_zero_and_the_value() {
+        let mut expected = b"per-client".to_vec();
+        expected.extend_from_slice(&[0, 192, 0, 2, 10]);
+        assert_eq!(key("per-client", address("192.0.2.10")), expected);
+        assert_eq!(key("acct", KeyValue::Text("acme")), b"acct\0acme");
+        assert_ne!(
+            key("a", address("192.0.2.10")),
+            key("b", address("192.0.2.10"))
+        );
+    }
+
+    /// An IPv6 client is counted by its /64: addresses in it are one client, the next /64
+    /// another.
+    #[test]
+    fn an_ipv6_client_is_counted_by_its_slash_64() {
+        let one = key("per-client", address("2001:db8:1:2::1"));
+        assert_eq!(one.len(), "per-client".len() + 1 + 8);
+        assert_eq!(
+            one,
+            key("per-client", address("2001:db8:1:2:ffff:ffff:ffff:ffff"))
+        );
+        assert_ne!(one, key("per-client", address("2001:db8:1:3::1")));
     }
 }
