@@ -15,6 +15,7 @@ schema = ["dep:schemars"]
 [dependencies]
 edgerush-filters.workspace = true
 edgerush-router.workspace = true
+edgerush-rules.workspace = true
 http.workspace = true
 schemars = { workspace = true, optional = true }
 serde.workspace = true

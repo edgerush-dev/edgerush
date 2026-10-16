@@ -1,0 +1,3 @@
+limits:
+  - { name: k, key: auth.api_key, model: { bucket: { rate: 0/s, burst: 0 } } }
+  - { name: k, key: client, model: { bucket: { rate: 5/d, burst: 1 } } }

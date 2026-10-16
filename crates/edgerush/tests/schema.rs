@@ -1,8 +1,9 @@
-//! The config file's JSON Schema, `schema/config.schema.json`, is the one the config model's
-//! types make: every section, field and choice, each described by its rustdoc. A change to
-//! the model that the published schema does not have fails here.
+//! The config file's JSON Schema, `schema/config.schema.json`, and the rate-limiting engine's
+//! limits file's, `schema/limits.schema.json`, are the ones the config model's types make:
+//! every section, field and choice, each described by its rustdoc. A change to the model that
+//! a published schema does not have fails here.
 //!
-//! To write it again after such a change, from the repository root:
+//! To write them again after such a change, from the repository root:
 //! `EDGERUSH_WRITE_SCHEMA=1 cargo test -p edgerush --test schema`.
 
 #![allow(
@@ -10,19 +11,24 @@
     reason = "test set-up: the helper that makes the schema fails the tests the way they would"
 )]
 
-use edgerush_config::HarnessFile;
+use edgerush_config::{HarnessFile, Limits};
+use schemars::JsonSchema;
 use schemars::generate::SchemaSettings;
 use schemars::transform::RecursiveTransform;
 use std::path::Path;
 
-const PUBLISHED: &str = concat!(
+const CONFIG: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../schema/config.schema.json"
 );
+const LIMITS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../schema/limits.schema.json"
+);
 
-/// The schema as the types make it, with the rustdoc's references to the design docs, which
-/// are not published with it, taken out of every description.
-fn schema() -> String {
+/// The schema of `T` as the types make it, with the rustdoc's references to the design docs,
+/// which are not published with it, taken out of every description.
+fn schema<T: JsonSchema>() -> String {
     let settings = SchemaSettings::draft2020_12().with_transform(RecursiveTransform(
         |schema: &mut schemars::Schema| {
             let described = schema
@@ -34,9 +40,7 @@ fn schema() -> String {
             }
         },
     ));
-    let schema = settings
-        .into_generator()
-        .into_root_schema_for::<HarnessFile>();
+    let schema = settings.into_generator().into_root_schema_for::<T>();
     let mut text = serde_json::to_string_pretty(&schema).expect("a schema is JSON");
     text.push('\n');
     text
@@ -83,34 +87,45 @@ fn closing(text: &str) -> Option<usize> {
     None
 }
 
-#[test]
-fn the_published_schema_is_the_one_the_types_make() {
-    let made = schema();
+/// Fails unless the schema published at `path` is `made`; or writes it there, with
+/// `EDGERUSH_WRITE_SCHEMA` set.
+fn published_is(path: &str, made: &str) {
     if std::env::var_os("EDGERUSH_WRITE_SCHEMA").is_some() {
-        std::fs::write(PUBLISHED, &made).unwrap();
+        std::fs::write(path, made).expect("the schema is written");
         return;
     }
-    let published = std::fs::read_to_string(Path::new(PUBLISHED))
+    let published = std::fs::read_to_string(Path::new(path))
         .unwrap_or_default()
         .replace("\r\n", "\n");
     assert!(
         published == made,
-        "schema/config.schema.json is not the schema the config types make; write it again \
-         with EDGERUSH_WRITE_SCHEMA=1 cargo test -p edgerush --test schema"
+        "{path} is not the schema the config types make; write it again with \
+         EDGERUSH_WRITE_SCHEMA=1 cargo test -p edgerush --test schema"
     );
 }
 
 #[test]
+fn the_published_schema_is_the_one_the_types_make() {
+    published_is(CONFIG, &schema::<HarnessFile>());
+}
+
+#[test]
+fn the_published_limits_schema_is_the_one_the_types_make() {
+    published_is(LIMITS, &schema::<Limits>());
+}
+
+#[test]
 fn no_description_points_into_the_design_docs() {
-    let made = schema();
-    assert!(
-        !made.contains("docs/"),
-        "a link into the design docs is left"
-    );
-    assert!(
-        !made.contains(" in the docs"),
-        "a reference to the design docs is left"
-    );
+    for made in [schema::<HarnessFile>(), schema::<Limits>()] {
+        assert!(
+            !made.contains("docs/"),
+            "a link into the design docs is left"
+        );
+        assert!(
+            !made.contains(" in the docs"),
+            "a reference to the design docs is left"
+        );
+    }
 }
 
 #[test]

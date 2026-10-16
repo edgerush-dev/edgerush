@@ -3,6 +3,7 @@
 //! the first.
 
 use crate::backends::{UpstreamId, WeightedBackends};
+use crate::limits::{CompiledLimit, compile_limits};
 use crate::route::{
     EncodedSlash, Filter, Forward, Fraction, GrpcMethod, HeaderChanges, Hostname, Match,
     PathChange, PathMatch, Query, RateLimitKey, Redirect, Route, RulePaths, Scheme, UrlRewrite,
@@ -331,6 +332,9 @@ pub struct CompiledRule {
     pub keeps_encoded_slash: bool,
     /// Its rate limit, if it has one (experimental).
     pub rate_limit: Option<CompiledRateLimit>,
+    /// The limits its requests are under — the data plane's, its route's and its own —
+    /// in the order a decision takes them, the smallest bucket first; empty for none.
+    pub limits: Box<[Arc<CompiledLimit>]>,
 }
 
 impl CompiledRule {
@@ -568,6 +572,37 @@ fn rate_limit(
             .into_boxed_slice(),
     };
     (errors.len() == before).then_some(compiled)
+}
+
+/// The limits a rule's requests are under ([`crate::limits`]): only a rule that forwards
+/// has any, a limit named on a rule that does not being a problem, and they need a service to
+/// share their counts through.
+fn rule_limits(
+    config: &Config,
+    engine: &crate::limits::CompiledLimits,
+    route: &Route,
+    rule: &Rule,
+    place: &Place,
+    errors: &mut Vec<ConfigError>,
+) -> Box<[Arc<CompiledLimit>]> {
+    let route_place = Place::route(&route.name);
+    if rule.forward.is_none() {
+        if !rule.rate_limits.is_empty() {
+            errors.push(place.problem(Problem::LimitsWithoutForward));
+        }
+        return Box::default();
+    }
+    let limits = engine.for_rule(
+        &route.rate_limits,
+        &rule.rate_limits,
+        &route_place,
+        place,
+        errors,
+    );
+    if !limits.is_empty() && config.rate_limit_service.is_none() {
+        errors.push(place.problem(Problem::LimitsWithoutService));
+    }
+    limits
 }
 
 /// The rate-limiting service, checked: a pod at least, and a cycle of at least 1 ms.
@@ -1008,6 +1043,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
         .keys()
         .map(|name| (name.as_str(), Vec::new()))
         .collect();
+    let engine = compile_limits(config.limits.as_ref(), &mut errors);
     let mut rules = Vec::new();
     let mut names = HashSet::new();
     // The routes of every listener, by the listener's name.
@@ -1084,6 +1120,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                 mirrors,
                 keeps_encoded_slash: encoded_slash(rule) == edgerush_router::EncodedSlash::Keep,
                 rate_limit: rate_limit(config, route, rule_at, rule, &place, &mut errors),
+                limits: rule_limits(config, &engine, route, rule, &place, &mut errors),
             }));
         }
         rules.push(compiled_rules);
@@ -1992,6 +2029,10 @@ pub enum Object {
     Upstream(String),
     /// The data plane's own settings.
     DataPlane,
+    /// The rate-limiting engine's limit of this name.
+    Limit(String),
+    /// The rate-limiting engine's configuration as a whole.
+    Limits,
 }
 
 /// A place in a config: a listener, or a route, a rule in it, a match or a backend in the
@@ -2024,7 +2065,7 @@ impl Place {
         Self::of(Object::Upstream(name.to_owned()))
     }
 
-    fn of(object: Object) -> Self {
+    pub(crate) fn of(object: Object) -> Self {
         Self {
             object,
             rule: None,
@@ -2034,7 +2075,7 @@ impl Place {
         }
     }
 
-    fn problem(&self, problem: Problem) -> ConfigError {
+    pub(crate) fn problem(&self, problem: Problem) -> ConfigError {
         ConfigError {
             place: self.clone(),
             problem,
@@ -2049,6 +2090,8 @@ impl fmt::Display for Place {
             Object::Route(name) => write!(f, "route `{name}`")?,
             Object::Upstream(name) => write!(f, "upstream `{name}`")?,
             Object::DataPlane => write!(f, "the data plane")?,
+            Object::Limit(name) => write!(f, "limit `{name}`")?,
+            Object::Limits => write!(f, "the rate limits")?,
         }
         if let Some(rule) = self.rule {
             write!(f, ", rules[{rule}]")?;
@@ -2228,6 +2271,40 @@ pub enum Problem {
     /// A rate limit with a number of zero.
     #[error("`rate_limit`: `{0}` is 0: at least 1")]
     RateLimitZero(&'static str),
+    /// A limit named by a rule that does not forward.
+    #[error("`rate_limits` is for a rule that forwards")]
+    LimitsWithoutForward,
+    /// Limits with no service to share their counts through.
+    #[error("`rate_limits` needs `rate_limit_service`")]
+    LimitsWithoutService,
+    /// A name that no limit has.
+    #[error("`rate_limits`: no limit is named `{0}`")]
+    LimitUnknown(String),
+    /// A limit with no name, or one no key can be made with.
+    #[error("`name` is empty or holds a NUL")]
+    LimitName,
+    /// A limit with the name of another.
+    #[error("another limit has the same name")]
+    LimitTwice,
+    /// A key other than the client's address, the only one before authentication.
+    #[error("`key`: `{0}` is not a key: `client`, until authentication comes")]
+    LimitKey(String),
+    /// A rate that is not one.
+    #[error(
+        "`model.bucket.rate`: `{0}` is not a rate: a number of at least 1, `/`, and `s`, `min`, `h` or `d`"
+    )]
+    LimitRate(String),
+    /// A bucket of nothing.
+    #[error("`model.bucket.burst` is 0: at least 1")]
+    LimitBurstZero,
+    /// A limit whose match does not compile.
+    #[error("`match`, {field}: {message}")]
+    LimitRule {
+        /// The field.
+        field: &'static str,
+        /// What is wrong.
+        message: String,
+    },
     /// A rate-limiting service with no pods.
     #[error("`rate_limit_service` names no pods")]
     RateLimitServiceNoPods,
@@ -4718,6 +4795,153 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
         let too_long = refused(&limit("client_address", 1, u64::MAX, 1), service);
         assert_eq!(too_long.len(), 1);
         assert!(too_long[0].contains("window_ms"), "{too_long:?}");
+    }
+
+    const LIMITS: &str = r"
+global: { rate_limits: [wide] }
+limits:
+  - { name: wide, key: client, model: { bucket: { rate: 1000/s, burst: 1000 } } }
+  - { name: per-route, key: client, model: { bucket: { rate: 100/s, burst: 100 } } }
+  - { name: writes, key: client, match: { methods: [POST], path_prefix: /api/orders }, model: { bucket: { rate: 100/min, burst: 100 } } }
+  - { name: small, key: client, model: { bucket: { rate: 5/s, burst: 5 } } }
+";
+
+    /// A config whose route `api` names `route` limits, its forwarding rule `rule` ones and
+    /// its redirecting rule `redirect` ones, with the engine's `limits` and, if `service`,
+    /// a rate-limiting service: the names of each rule's limits, compiled, or the problems.
+    fn limited(
+        route: &str,
+        rule: &str,
+        redirect: &str,
+        limits: &str,
+        service: bool,
+    ) -> Result<(Vec<String>, Vec<String>, Compiled), Vec<String>> {
+        let service = if service {
+            "rate_limit_service: { pods: [\"rl-0:7000\"] }"
+        } else {
+            ""
+        };
+        let yaml = format!(
+            r#"
+listeners: {{ web: {{ address: "[::]:8080", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }} }}
+routes:
+  - name: api
+    listeners: [web]
+    hostnames: [{{ name: a.example.com, falls_through: true }}]
+    rate_limits: [{route}]
+    rules:
+      - {{ matches: [{{ path: {{ prefix: /api }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}] }}, rate_limits: [{rule}] }}
+      - {{ matches: [{{ path: {{ prefix: /old }} }}], redirect: {{ status: 301, query: keep }}, rate_limits: [{redirect}] }}
+upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
+{service}"#
+        );
+        let mut config = config(&yaml);
+        config.limits = Some(serde_saphyr::from_str(limits).unwrap());
+        let names = |rule: &CompiledRule| rule.limits.iter().map(|l| l.name.clone()).collect();
+        compile(&config)
+            .map(|compiled| {
+                (
+                    names(&compiled.rules[0][0]),
+                    names(&compiled.rules[0][1]),
+                    compiled,
+                )
+            })
+            .map_err(|errors| errors.iter().map(ToString::to_string).collect())
+    }
+
+    /// Each rule that forwards is under its own limits, its route's and the data plane's,
+    /// each once, the smallest bucket first and of equal buckets the most specific first;
+    /// a rule that does not forward is under none.
+    #[test]
+    fn a_rule_gathers_its_limits_its_routes_and_the_data_planes() {
+        let (forwarding, redirecting, compiled) =
+            limited("per-route, small, wide", "writes", "", LIMITS, true).unwrap();
+        assert_eq!(forwarding, ["small", "writes", "per-route", "wide"]);
+        assert!(redirecting.is_empty(), "not even the data plane's");
+        let writes = &compiled.rules[0][0].limits[1];
+        assert_eq!(writes.window.get(), 60_000_000_000);
+        assert_eq!(writes.burst.get(), 100);
+        let (alone, _, _) = limited("", "", "", LIMITS, true).unwrap();
+        assert_eq!(alone, ["wide"]);
+        let (none, _, _) = limited("", "", "", "limits: []", false).unwrap();
+        assert!(none.is_empty(), "no limits, no service needed");
+    }
+
+    #[test]
+    fn a_limit_named_must_be_one_and_needs_a_service_and_a_rule_that_forwards() {
+        let refused = |route, rule, redirect, limits, service| {
+            limited(route, rule, redirect, limits, service).unwrap_err()
+        };
+        assert_eq!(
+            refused("nope", "none-either", "", LIMITS, true),
+            [
+                "route `api`, rules[0]: `rate_limits`: no limit is named `none-either`",
+                "route `api`: `rate_limits`: no limit is named `nope`",
+            ]
+        );
+        assert_eq!(
+            refused(
+                "",
+                "",
+                "",
+                "global: { rate_limits: [gone] }\nlimits: []",
+                true
+            ),
+            ["the rate limits: `rate_limits`: no limit is named `gone`"]
+        );
+        assert_eq!(
+            refused("", "", "", LIMITS, false),
+            ["route `api`, rules[0]: `rate_limits` needs `rate_limit_service`"]
+        );
+        assert_eq!(
+            refused("", "", "small", LIMITS, true),
+            ["route `api`, rules[1]: `rate_limits` is for a rule that forwards"]
+        );
+    }
+
+    #[test]
+    fn a_limit_is_checked() {
+        let refused = |limit: &str| {
+            let limits = format!("limits:\n  - {limit}\n");
+            limited("", "", "", &limits, true).unwrap_err()
+        };
+        let bucket = "model: { bucket: { rate: 10/s, burst: 10 } }";
+        assert_eq!(
+            refused(&format!("{{ name: '', key: client, {bucket} }}")),
+            ["limit ``: `name` is empty or holds a NUL"]
+        );
+        assert_eq!(
+            refused(&format!("{{ name: k, key: auth.api_key, {bucket} }}")),
+            ["limit `k`: `key`: `auth.api_key` is not a key: `client`, until authentication comes"]
+        );
+        for rate in ["10/m", "0/s", "ten/s"] {
+            let limit = format!(
+                "{{ name: k, key: client, model: {{ bucket: {{ rate: {rate}, burst: 1 }} }} }}"
+            );
+            assert_eq!(
+                refused(&limit),
+                [format!(
+                    "limit `k`: `model.bucket.rate`: `{rate}` is not a rate: a number of at least 1, `/`, and `s`, `min`, `h` or `d`"
+                )]
+            );
+        }
+        assert_eq!(
+            refused("{ name: k, key: client, model: { bucket: { rate: 1/s, burst: 0 } } }"),
+            ["limit `k`: `model.bucket.burst` is 0: at least 1"]
+        );
+        assert_eq!(
+            refused(&format!(
+                "{{ name: k, key: client, match: {{ methods: [post] }}, {bucket} }}"
+            )),
+            ["limit `k`: `match`, methods: `post` is not a method"]
+        );
+        let twice = format!(
+            "limits:\n  - {{ name: k, key: client, {bucket} }}\n  - {{ name: k, key: client, {bucket} }}\n"
+        );
+        assert_eq!(
+            limited("", "", "", &twice, true).unwrap_err(),
+            ["limit `k`: another limit has the same name"]
+        );
     }
 
     /// A health check says everything it does, and nothing that cannot work.

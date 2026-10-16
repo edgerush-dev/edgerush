@@ -3,31 +3,35 @@
 //! The file names the files of each certificate rather than holding it
 //! ([07 §1](../../../docs/07-config-and-dsl.md)): the harness reads them, as the control
 //! plane will read Secrets, each relative to the config file's directory unless its path
-//! is absolute.
+//! is absolute. So it names the file of the rate-limiting engine's limits (07 §2), read
+//! the same way.
 //!
-//! A change is a change of the bytes of the file, or of a certificate file it names: that is
-//! how a certificate is rotated, with the config file untouched. Time stamps are not
+//! A change is a change of the bytes of the file, or of a file it names: that is how a
+//! certificate is rotated, or a limit changed, with the config file untouched. Time stamps are not
 //! trusted: they are coarse on some file systems and a restored file brings its old one
 //! along.
 
-use edgerush_config::{Certificate, CertificateFiles, Compiled, ConfigError, HarnessFile, compile};
+use edgerush_config::{
+    Certificate, CertificateFiles, Compiled, ConfigError, HarnessFile, Limits, compile,
+};
 use edgerush_explain::Snapshot;
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-/// A config file, and what it and the certificate files it named held when last looked at.
+/// A config file, and what it and the files it named held when last looked at.
 #[derive(Debug)]
 pub(crate) struct ConfigFile {
     path: PathBuf,
     /// The config file's bytes, or why there were none.
     seen: Result<Vec<u8>, io::ErrorKind>,
-    /// Each certificate file the config named, as it was read for it.
-    certificates: Vec<Seen>,
+    /// Each file the config named — certificates', the limits' — as it was read for it.
+    named: Vec<Seen>,
 }
 
-/// A certificate file as it was last read: where from, and its bytes or why there were none.
+/// A file the config named, as it was last read: where from, and its bytes or why there
+/// were none.
 struct Seen {
     path: PathBuf,
     bytes: Result<Vec<u8>, io::ErrorKind>,
@@ -56,18 +60,14 @@ impl ConfigFile {
     /// Reads the file for the first time.
     pub(crate) fn open(path: PathBuf) -> Result<(Self, Compiled), Rejected> {
         let bytes = fs::read(&path).map_err(Rejected::Read)?;
-        let (certificates, compiled) = compiled(&bytes, directory(&path));
+        let (named, compiled) = compiled(&bytes, directory(&path));
         let compiled = compiled?;
         let seen = Ok(bytes);
-        let file = Self {
-            path,
-            seen,
-            certificates,
-        };
+        let file = Self { path, seen, named };
         Ok((file, compiled))
     }
 
-    /// Reads the file again, and the certificate files it named. `None` while all are as
+    /// Reads the file again, and the files it named. `None` while all are as
     /// they were the last time — whether that was a config, one that was rejected or no
     /// file at all, so that nothing is said twice. A file caught half written is rejected,
     /// and read again when it is whole; so is a certificate caught half rotated, which the
@@ -76,21 +76,21 @@ impl ConfigFile {
         let read = fs::read(&self.path);
         let as_it_was = same(&read, &self.seen)
             && self
-                .certificates
+                .named
                 .iter()
                 .all(|seen| same(&fs::read(&seen.path), &seen.bytes));
         if as_it_was {
             return None;
         }
-        let (seen, certificates, outcome) = match read {
+        let (seen, named, outcome) = match read {
             Ok(bytes) => {
-                let (certificates, outcome) = compiled(&bytes, directory(&self.path));
-                (Ok(bytes), certificates, outcome)
+                let (named, outcome) = compiled(&bytes, directory(&self.path));
+                (Ok(bytes), named, outcome)
             }
             Err(error) => (Err(error.kind()), Vec::new(), Err(Rejected::Read(error))),
         };
         self.seen = seen;
-        self.certificates = certificates;
+        self.named = named;
         Some(outcome)
     }
 }
@@ -100,21 +100,52 @@ fn directory(path: &Path) -> &Path {
     path.parent().unwrap_or(Path::new(""))
 }
 
-/// Compiles the config `yaml` states, with the certificates read from the files it names,
-/// relative to `directory`; and says what was read of each of those files, for the next
-/// look to compare with. What compiles is what was read: a file that changes after is
-/// another change.
+/// Compiles the config `yaml` states, with the certificates and the limits read from the
+/// files it names, relative to `directory`; and says what was read of each of those files,
+/// for the next look to compare with. What compiles is what was read: a file that changes
+/// after is another change.
 fn compiled(yaml: &[u8], directory: &Path) -> (Vec<Seen>, Result<Compiled, Rejected>) {
     let file = match parsed(yaml) {
         Ok(file) => file,
         Err(rejected) => return (Vec::new(), Err(rejected)),
     };
-    let (seen, certificates) = certificates(&file.certificates, directory);
+    let (mut seen, certificates) = certificates(&file.certificates, directory);
+    let limits = limits(file.limits_file.as_deref(), directory, &mut seen);
     let outcome = certificates.and_then(|certificates| {
-        let config = file.into_config(certificates);
+        let config = file.into_config(certificates, limits?);
         compile(&config).map_err(|problems| Rejected::Invalid(Problems(problems)))
     });
     (seen, outcome)
+}
+
+/// The engine's limits from the file `named`, relative to `directory`, if the config names
+/// one; what was read of it pushed to `seen`.
+fn limits(
+    named: Option<&Path>,
+    directory: &Path,
+    seen: &mut Vec<Seen>,
+) -> Result<Option<Limits>, Rejected> {
+    let Some(file) = named else {
+        return Ok(None);
+    };
+    let path = directory.join(file);
+    let bytes = fs::read(&path);
+    seen.push(Seen {
+        path: path.clone(),
+        bytes: bytes.as_ref().map(Clone::clone).map_err(io::Error::kind),
+    });
+    let bytes = bytes.map_err(|error| Rejected::LimitsRead {
+        path: path.clone(),
+        error,
+    })?;
+    // As a config file is read: no lines quoted around a mistake.
+    let options = serde_saphyr::options! { with_snippet: false };
+    serde_saphyr::from_slice_with_options(&bytes, options)
+        .map(Some)
+        .map_err(|error| Rejected::LimitsParse {
+            path,
+            error: Box::new(error),
+        })
 }
 
 /// The file `yaml` states.
@@ -145,7 +176,12 @@ pub(crate) fn offline(path: &Path) -> Result<Snapshot, Rejected> {
             (name.clone(), unread)
         })
         .collect();
-    let config = file.into_config(named);
+    let limits = limits(
+        file.limits_file.as_deref(),
+        directory(path),
+        &mut Vec::new(),
+    )?;
+    let config = file.into_config(named, limits);
     Snapshot::new(config).map_err(|problems| Rejected::Invalid(Problems(problems)))
 }
 
@@ -207,6 +243,22 @@ pub(crate) enum Rejected {
     /// Files of its certificates cannot be read.
     #[error("{0}")]
     Certificates(Unreadable),
+    /// The file of its limits cannot be read.
+    #[error("limits file {}: it cannot be read: {error}", path.display())]
+    LimitsRead {
+        /// Where it was looked for.
+        path: PathBuf,
+        /// Why it could not be read.
+        error: io::Error,
+    },
+    /// The file of its limits is not YAML, or not limits.
+    #[error("limits file {}: {error}", path.display())]
+    LimitsParse {
+        /// Where it was read from.
+        path: PathBuf,
+        /// The mistake, told by its line and column.
+        error: Box<serde_saphyr::Error>,
+    },
     /// The config has problems.
     #[error("{0}")]
     Invalid(Problems),
@@ -486,6 +538,88 @@ certificates:
             shop_after_change(&mut file),
             ("chain 2".into(), "key 2".into())
         );
+    }
+
+    /// A config whose route forwards to nothing in particular under the limit `per-client`,
+    /// its limits in `limits_file`.
+    fn limited(limits_file: &str) -> String {
+        format!(
+            r#"listeners:
+  web: {{ address: "127.0.0.1:8080", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}
+routes:
+  - name: api
+    listeners: [web]
+    hostnames: [{{ name: "*", falls_through: true }}]
+    rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}] }}, rate_limits: [per-client] }}]
+upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
+rate_limit_service: {{ pods: ["rl-0:7000"] }}
+limits_file: '{limits_file}'
+"#
+        )
+    }
+
+    /// The limit `per-client` with a bucket of `burst`.
+    fn per_client(burst: u64) -> String {
+        format!(
+            "limits:
+  - {{ name: per-client, key: client, model: {{ bucket: {{ rate: 10/s, burst: {burst} }} }} }}
+"
+        )
+    }
+
+    /// The bucket of the first limit of the first rule.
+    fn burst(compiled: &Compiled) -> u64 {
+        let id = edgerush_config::RuleId { route: 0, rule: 0 };
+        compiled.rule(id).unwrap().limits[0].burst.get()
+    }
+
+    /// The limits are read from the file the config names, relative to its directory, and a
+    /// change to that file alone is a change; files as they were are none.
+    #[test]
+    fn the_limits_file_is_read_and_looked_at_again() {
+        let scratch = ScratchDir::new("limits-file");
+        scratch.write("limits.yaml", &per_client(10));
+        let config = scratch.write("config.yaml", &limited("limits.yaml"));
+        let (mut file, compiled) = ConfigFile::open(config).unwrap();
+        assert_eq!(burst(&compiled), 10);
+        assert!(file.changed().is_none());
+        scratch.write("limits.yaml", &per_client(20));
+        let compiled = file.changed().expect("a change").unwrap();
+        assert_eq!(burst(&compiled), 20);
+        assert!(file.changed().is_none());
+    }
+
+    /// A limits file that cannot be read, or is not limits, refuses the config, told by its
+    /// path and, for a mistake, its line, the lines around it not quoted.
+    #[test]
+    fn a_limits_file_that_cannot_be_read_or_is_not_limits_is_refused_by_its_path() {
+        let scratch = ScratchDir::new("limits-unread");
+        let config = scratch.write("config.yaml", &limited("limits.yaml"));
+        let rejected = ConfigFile::open(config.clone()).unwrap_err();
+        assert!(
+            matches!(rejected, Rejected::LimitsRead { .. }),
+            "{rejected}"
+        );
+        let path = scratch.0.join("limits.yaml");
+        assert!(
+            rejected.to_string().contains(&path.display().to_string()),
+            "{rejected}"
+        );
+        scratch.write(
+            "limits.yaml",
+            "limits:
+  - { name: per-client, SECRETWORD: 1 }
+",
+        );
+        let rejected = ConfigFile::open(config).unwrap_err();
+        assert!(
+            matches!(rejected, Rejected::LimitsParse { .. }),
+            "{rejected}"
+        );
+        let told = rejected.to_string();
+        assert!(told.contains(&path.display().to_string()), "{told}");
+        assert!(told.contains("line 2"), "{told}");
+        assert!(!told.contains("SECRETWORD:"), "{told}");
     }
 
     /// What the harness holds of a certificate's files, to compare with, is printed without

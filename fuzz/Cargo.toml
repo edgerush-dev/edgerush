@@ -185,6 +185,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "limits"
+path = "fuzz_targets/limits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "test_file"
 path = "fuzz_targets/test_file.rs"
 test = false

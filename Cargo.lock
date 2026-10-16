@@ -244,6 +244,7 @@ version = "0.0.0"
 dependencies = [
  "edgerush-filters",
  "edgerush-router",
+ "edgerush-rules",
  "http",
  "iai-callgrind",
  "proptest",

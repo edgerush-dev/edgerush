@@ -29,6 +29,7 @@ edgerush-proxy = { path = "crates/proxy" }
 edgerush-ratelimit = { path = "crates/ratelimit" }
 edgerush-ratelimit-service = { path = "crates/ratelimit-service" }
 edgerush-router = { path = "crates/router" }
+edgerush-rules = { path = "crates/rules" }
 edgerush-telemetry = { path = "crates/telemetry" }
 # HTTP/2 on both hops, used directly rather than through hyper (15 §3). The version is the
 # one already locked under hyper; its behaviour is pinned by the probes in

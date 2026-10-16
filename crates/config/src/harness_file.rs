@@ -1,12 +1,15 @@
 //! What the development harness reads from its config file: a config as the model states it,
-//! and the files its certificates are read from ([07 §1](../../../docs/07-config-and-dsl.md)).
+//! the files its certificates are read from ([07 §1](../../../docs/07-config-and-dsl.md)),
+//! and the file of the rate-limiting engine's limits (07 §2).
 //!
 //! Certificates are a resource of their own, which a [`Config`] never reads with the rest.
 //! The harness stands in for the control plane, which will read them from Secrets, by
-//! reading them from the files named here: the file itself holds no key.
+//! reading them from the files named here: the file itself holds no key. The engine's
+//! limits are a resource of their own too, read from the file named here.
 
 use crate::{
-    Certificate, Config, DataPlane, Listener, RateLimitService, Route, TcpRoute, TlsRoute, Upstream,
+    Certificate, Config, DataPlane, Limits, Listener, RateLimitService, Route, TcpRoute, TlsRoute,
+    Upstream,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -48,6 +51,11 @@ pub struct HarnessFile {
     /// is never written into the config file itself.
     #[serde(default)]
     pub certificates: BTreeMap<String, CertificateFiles>,
+    /// The file of the rate-limiting engine's limits, which routes and route rules name,
+    /// relative to the config file's directory unless it is absolute: read and looked at
+    /// again with the config file. Left out, rate limiting is off and no limit can be named.
+    #[serde(default)]
+    pub limits_file: Option<PathBuf>,
 }
 
 /// The two files a certificate is read from, each relative to the config file's directory
@@ -63,9 +71,14 @@ pub struct CertificateFiles {
 }
 
 impl HarnessFile {
-    /// The config the file states, with the certificates `read` from their files.
+    /// The config the file states, with the certificates `read` from their files and the
+    /// engine's `limits` read from theirs.
     #[must_use]
-    pub fn into_config(self, read: BTreeMap<String, Certificate>) -> Config {
+    pub fn into_config(
+        self,
+        read: BTreeMap<String, Certificate>,
+        limits: Option<Limits>,
+    ) -> Config {
         // Every section by name, so that one the model gains cannot be left out here.
         Config {
             listeners: self.listeners,
@@ -76,6 +89,7 @@ impl HarnessFile {
             data_plane: self.data_plane,
             rate_limit_service: self.rate_limit_service,
             certificates: read,
+            limits,
         }
     }
 }
@@ -113,7 +127,7 @@ data_plane: { set_aside_ms: 7 }
             chain: "C".to_owned(),
             key: "K".to_owned(),
         };
-        let config = file.into_config(BTreeMap::from([("shop".to_owned(), shop.clone())]));
+        let config = file.into_config(BTreeMap::from([("shop".to_owned(), shop.clone())]), None);
         let mut stated: Config = serde_saphyr::from_str(SECTIONS).unwrap();
         stated.certificates.insert("shop".to_owned(), shop);
         assert_eq!(config, stated);

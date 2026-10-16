@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EdgeRush rate limits",
+  "description": "The rate-limiting engine's configuration: its limits, and those that apply to every\nrequest.",
+  "type": "object",
+  "properties": {
+    "global": {
+      "description": "What applies to every request through the data plane that a route rule forwards.",
+      "$ref": "#/$defs/Global"
+    },
+    "limits": {
+      "description": "The limits, each by its name; routes and route rules name those that apply to them.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Limit"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "limits"
+  ],
+  "$defs": {
+    "Bucket": {
+      "description": "A token bucket's numbers.",
+      "type": "object",
+      "properties": {
+        "burst": {
+          "description": "How many requests a client can send at once, from idle, before its traffic is\nspread out at the rate: the whole bucket.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "rate": {
+          "description": "Requests a second, minute, hour or day, on average: `100/s`, `1000/min`, `10/h`,\n`500/d`.",
+          "type": "string",
+          "pattern": "^[1-9][0-9]*/(s|min|h|d)$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "rate",
+        "burst"
+      ]
+    },
+    "Global": {
+      "description": "What applies to every request through the data plane.",
+      "type": "object",
+      "properties": {
+        "rate_limits": {
+          "description": "The limits every request is under, by name.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Limit": {
+      "description": "A limit: whose requests it counts together, and how many it allows.",
+      "type": "object",
+      "properties": {
+        "key": {
+          "description": "Whose requests are counted together: `client`, the address the data plane sees — the\npeer, or the client a trusted PROXY protocol header names. Never what a client says.",
+          "type": "string"
+        },
+        "match": {
+          "description": "The requests it applies to, among those of the route rules it is named for; all of\nthem when left out.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LimitMatch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "description": "How the requests are counted.",
+          "$ref": "#/$defs/Model"
+        },
+        "name": {
+          "description": "Its name, unique among the limits: what routes name it by, and what its counts are\nkept under, so that they go on through a reload that leaves the limit as it was.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "key",
+        "model"
+      ]
+    },
+    "LimitMatch": {
+      "description": "The requests a limit applies to: each of what it states holds.",
+      "type": "object",
+      "properties": {
+        "methods": {
+          "description": "One of these methods, in capitals; any when left out.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "path_prefix": {
+          "description": "A path beginning with this.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "pattern": "^/"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Model": {
+      "description": "How a limit counts requests: its numbers inside it, as each model has its own.",
+      "oneOf": [
+        {
+          "description": "A token bucket: requests at `rate` on average, at most `burst` at once.",
+          "type": "object",
+          "properties": {
+            "bucket": {
+              "$ref": "#/$defs/Bucket"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "bucket"
+          ]
+        }
+      ]
+    }
+  }
+}

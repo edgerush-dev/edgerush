@@ -15,6 +15,14 @@
       "description": "The data plane's own settings; left out, each has its value.",
       "$ref": "#/$defs/DataPlane"
     },
+    "limits_file": {
+      "description": "The file of the rate-limiting engine's limits, which routes and route rules name,\nrelative to the config file's directory unless it is absolute: read and looked at\nagain with the config file. Left out, rate limiting is off and no limit can be named.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
     "listeners": {
       "description": "Where requests come in, by name.",
       "type": "object",
@@ -1214,6 +1222,14 @@
           "description": "Unique among every kind of route; what errors, status and metrics refer to.",
           "type": "string"
         },
+        "rate_limits": {
+          "description": "The rate-limiting engine's limits every rule of the route that forwards is under, by\nname.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "rules": {
           "description": "The rules, in order.",
           "type": "array",
@@ -1282,6 +1298,14 @@
               "type": "null"
             }
           ]
+        },
+        "rate_limits": {
+          "description": "The rate-limiting engine's limits the rule's requests are under, by name, beside its\nroute's and those over the whole data plane: each request admitted under all of them\nor none, and charged to all or none. Only with `forward`.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "redirect": {
           "description": "Its requests answered with a redirect, said in place of `forward`. Of the filters,\nonly `response_header_modifier` goes with it.",

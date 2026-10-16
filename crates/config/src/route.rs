@@ -22,6 +22,10 @@ pub struct Route {
     /// The rules, in order.
     #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
     pub rules: Vec<Rule>,
+    /// The rate-limiting engine's limits every rule of the route that forwards is under, by
+    /// name.
+    #[serde(default)]
+    pub rate_limits: Vec<String>,
 }
 
 /// A route for a `tcp` listener: every connection it takes goes to these backends, as
@@ -116,6 +120,11 @@ pub struct Rule {
     /// (`rate_limit_service`, which it needs). Only with `forward`.
     #[serde(default)]
     pub rate_limit: Option<RateLimit>,
+    /// The rate-limiting engine's limits the rule's requests are under, by name, beside its
+    /// route's and those over the whole data plane: each request admitted under all of them
+    /// or none, and charged to all or none. Only with `forward`.
+    #[serde(default)]
+    pub rate_limits: Vec<String>,
 }
 
 /// A limit on a rule's requests (experimental): a token bucket of `burst` requests,

@@ -38,6 +38,11 @@ pub struct Config {
     /// from can carry a key.
     #[serde(skip)]
     pub certificates: BTreeMap<String, Certificate>,
+    /// The rate-limiting engine's configuration, if rate limiting is on: a resource of its
+    /// own as certificates are ([07 §2](../../../docs/07-config-and-dsl.md)), whose limits
+    /// routes and route rules name.
+    #[serde(skip)]
+    pub limits: Option<crate::Limits>,
 }
 
 /// The whole data plane's own settings ([07 §1](../../../docs/07-config-and-dsl.md)):

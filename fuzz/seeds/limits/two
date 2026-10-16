@@ -1,0 +1,4 @@
+global: { rate_limits: [wide] }
+limits:
+  - { name: wide, key: client, model: { bucket: { rate: 1000/s, burst: 1000 } } }
+  - { name: writes, key: client, match: { methods: [POST], path_prefix: /api }, model: { bucket: { rate: 10/min, burst: 20 } } }

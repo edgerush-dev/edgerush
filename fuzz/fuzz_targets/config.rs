@@ -38,7 +38,7 @@ fuzz_target!(|data: &[u8]| {
             (name.clone(), certificate)
         })
         .collect();
-    let config = file.into_config(certificates);
+    let config = file.into_config(certificates, None);
     match compile(&config) {
         Ok(compiled) => {
             assert_eq!(compiled.listeners().len(), config.listeners.len());
