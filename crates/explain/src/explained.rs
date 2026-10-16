@@ -361,6 +361,32 @@ fn text(
                 };
                 field(&mut lines, "mirrors", vec![mirrors]);
             }
+            // A rule under no limit says nothing of limits.
+            if !forward.rule.limits.is_empty() {
+                let under: Vec<String> = forward
+                    .rule
+                    .limits
+                    .iter()
+                    .enumerate()
+                    .filter(|(at, _)| {
+                        1_u64
+                            .checked_shl(u32::try_from(*at).unwrap_or(u32::MAX))
+                            .is_some_and(|bit| forward.limited & bit != 0)
+                    })
+                    .map(|(_, limit)| {
+                        format!(
+                            "{} ({}, a bucket of {})",
+                            limit.name, limit.rate, limit.burst
+                        )
+                    })
+                    .collect();
+                let under = if under.is_empty() {
+                    "none of the rule's applies".to_owned()
+                } else {
+                    under.join(", ")
+                };
+                field(&mut lines, "limits", vec![under]);
+            }
         }
         Ok(Decision::Redirect(redirected)) => {
             let location = String::from_utf8_lossy(redirected.location.as_bytes());
@@ -867,6 +893,56 @@ upstreams: { u: { load_balancer: p2c, endpoints: [] } }
                 "\n  rpc rule 2 match 0  path /pkg.Svc/Other is not /pkg.Svc/Do\n→ rpc rule 1 match 0  chosen\n  rpc rule 0 match 0  path /pkg.Svc/Other does not call method Do\n"
             ),
             "{text}"
+        );
+    }
+
+    /// A forwarded request under rate limits says which, in the order they are decided,
+    /// a limit narrower than its rule only when it matches; a rule under limits none of
+    /// which applies says so.
+    #[test]
+    fn a_request_under_limits_says_which() {
+        let config = r#"
+listeners: { web: { address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
+routes:
+  - name: api
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: /api } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+        rate_limits: [per-client, writes]
+      - matches: [{ path: { prefix: /admin } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+        rate_limits: [writes]
+upstreams: { u: { load_balancer: p2c, endpoints: [] } }
+rate_limit_service: { pods: ["rl-0:7000"] }
+"#;
+        let limits = "limits:
+  - { name: per-client, key: client, model: { bucket: { rate: 100/s, burst: 100 } } }
+  - { name: writes, key: client, match: { methods: [POST] }, model: { bucket: { rate: 10/min, burst: 5 } } }
+";
+        let mut config: edgerush_config::Config = serde_saphyr::from_str(config).unwrap();
+        config.limits = Some(serde_saphyr::from_str(limits).unwrap());
+        let snapshot = Snapshot::new(config).unwrap();
+        let listener = snapshot.listener("web").unwrap();
+        let line = |method: &str, path: &str| {
+            let asked = asked("1.1", method, &format!("http://a.test{path}"), &[]);
+            let text = snapshot.explain(listener, &asked).unwrap().text();
+            text.lines()
+                .find(|line| line.starts_with("limits"))
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            line("GET", "/api/x").as_deref(),
+            Some("limits    per-client (100/s, a bucket of 100)")
+        );
+        assert_eq!(
+            line("POST", "/api/x").as_deref(),
+            Some("limits    writes (10/min, a bucket of 5), per-client (100/s, a bucket of 100)")
+        );
+        assert_eq!(
+            line("GET", "/admin").as_deref(),
+            Some("limits    none of the rule's applies")
         );
     }
 

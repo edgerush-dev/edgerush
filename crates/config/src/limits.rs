@@ -109,6 +109,8 @@ pub struct CompiledLimit {
     pub name: String,
     /// When it applies, its key and its rate: requests a window.
     pub rule: Rule,
+    /// Its rate as it was written, `100/s`: for telling a person.
+    pub rate: String,
     /// The window its rate is a number of requests in, in nanoseconds.
     pub window: NonZeroU64,
     /// The whole bucket.
@@ -206,6 +208,7 @@ pub(crate) fn compile_limits(
             let compiled = CompiledLimit {
                 name: limit.name.clone(),
                 rule,
+                rate: bucket.rate.clone(),
                 window,
                 burst,
             };
