@@ -76,6 +76,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -378,6 +379,9 @@ pub struct Proxy {
     current: ArcSwap<Snapshot>,
     /// Outside the snapshot, so that a reload resets no counter.
     metrics: Metrics,
+    /// How many workers it runs on: what shares out what the data plane as a whole may
+    /// hold.
+    workers: NonZeroUsize,
     /// Outside it for a different reason: a key must not come round again when a config
     /// does, so what hands them out lives as long as the process.
     keys: Keys,
@@ -465,6 +469,8 @@ pub struct Worker {
     batches: Batches,
     /// What its sweep last said it holds.
     said: crate::metrics::Said,
+    /// What its sweep last said its rate limiter's keys hold.
+    limiter_said: crate::metrics::LimiterSaid,
     /// The connects tries let go of, carried on to their bound (03 §6).
     watcher: Rc<watched::Watcher>,
     /// Its open files, client connections and upstream sockets, held to its share (03 §9).

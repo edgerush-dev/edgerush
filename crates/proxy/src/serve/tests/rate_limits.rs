@@ -65,6 +65,7 @@ fn limited(mut config: Config, service: &[String]) -> Config {
     config.rate_limit_service = Some(edgerush_config::RateLimitService {
         pods: service.to_vec(),
         cycle_ms: Some(10),
+        max_key_bytes: None,
     });
     config
 }
@@ -191,6 +192,136 @@ async fn a_dry_run_counts_what_it_would_refuse_and_refuses_nothing() {
         .await;
 }
 
+/// The scrape shows what the workers' keys hold against the data plane's bound; a bound
+/// too small to keep any key evicts each once its requests are over; and the bound is the
+/// data plane's, shared among its workers: one and a half keys' worth on two leaves each
+/// room for none.
+#[tokio::test]
+async fn the_keys_held_are_shown_and_kept_within_their_bound() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let service = service().await;
+            let (upstream, _) = counting_upstream().await;
+            // What the one key holds, as the first case's scrape says.
+            let mut one_key = 0;
+            for (case, workers, held) in [(0, 1, true), (1, 1, false), (2, 2, false)] {
+                let max = match case {
+                    0 => None,
+                    1 => Some(1),
+                    _ => Some(one_key * 3 / 2),
+                };
+                let mut config = limited(everything_config(upstream), &service);
+                if let Some(service) = &mut config.rate_limit_service {
+                    service.max_key_bytes = max;
+                }
+                let workers = NonZeroUsize::new(workers).unwrap();
+                let proxy = Proxy::new(compile(&config).unwrap(), workers).unwrap();
+                // Swept often: the sweep is what says what the keys hold.
+                let limits = H1Limits {
+                    sweep: Duration::from_millis(20),
+                    ..H1Limits::default()
+                };
+                let worker = Worker::with_deadlines(Arc::new(proxy), limits, SHORT);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _maintained = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                for _ in 0..3 {
+                    send = within(send.ready()).await.unwrap();
+                    let request = Request::get("http://example.test/")
+                        .version(Version::HTTP_2)
+                        .body(())
+                        .unwrap();
+                    let (response, _) = send.send_request(request, true).unwrap();
+                    within(response).await.unwrap();
+                }
+                let wanted = if held {
+                    "edgerush_rate_limit_keys 1\n"
+                } else {
+                    "edgerush_rate_limit_keys_evicted_total 1\n"
+                };
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let scrape = loop {
+                    let scrape = worker.proxy().metrics();
+                    if scrape.contains(wanted) || Instant::now() > deadline {
+                        break scrape;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                assert!(scrape.contains(wanted), "{wanted}{scrape}");
+                let bound = format!(
+                    "edgerush_rate_limit_max_key_bytes {}\n",
+                    max.unwrap_or(256 << 20)
+                );
+                assert!(scrape.contains(&bound), "{bound}{scrape}");
+                if held {
+                    one_key = scrape
+                        .lines()
+                        .find_map(|line| line.strip_prefix("edgerush_rate_limit_key_bytes "))
+                        .and_then(|bytes| bytes.parse().ok())
+                        .unwrap_or(0);
+                    assert!(one_key > 0, "{scrape}");
+                    assert!(
+                        scrape.contains("edgerush_rate_limit_keys_evicted_total 0\n"),
+                        "{scrape}"
+                    );
+                }
+            }
+        })
+        .await;
+}
+
+/// A reload that changes only what the keys may hold keeps them: a client that spent its
+/// bucket before it is still refused after.
+#[tokio::test]
+async fn a_new_bound_on_the_keys_keeps_them() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let service = service().await;
+            let (upstream, _) = counting_upstream().await;
+            let config = limited(everything_config(upstream), &service);
+            let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+            let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let ask = async |send: ::h2::client::SendRequest<bytes::Bytes>| {
+                let mut send = within(send.ready()).await.unwrap();
+                let request = Request::get("http://example.test/")
+                    .version(Version::HTTP_2)
+                    .body(())
+                    .unwrap();
+                let (response, _) = send.send_request(request, true).unwrap();
+                (send, within(response).await.unwrap().status().as_u16())
+            };
+            let mut statuses = Vec::new();
+            for _ in 0..10 {
+                let status;
+                (send, status) = ask(send).await;
+                statuses.push(status);
+            }
+            assert_eq!(tally(&statuses), (10, 0), "{statuses:?}");
+            let mut wider = config.clone();
+            if let Some(service) = &mut wider.rate_limit_service {
+                service.max_key_bytes = Some(128 << 20);
+            }
+            worker.proxy().reload(compile(&wider).unwrap()).unwrap();
+            let (_, status) = ask(send).await;
+            assert_eq!(status, 429, "the spent bucket kept");
+            assert!(
+                worker
+                    .proxy()
+                    .metrics()
+                    .contains("edgerush_rate_limit_max_key_bytes 134217728\n")
+            );
+        })
+        .await;
+}
+
 /// Each limit counts what it decided: a request admitted under every limit it was under, a
 /// refusal under the limits that were out of room alone, gRPC calls too. A config with no
 /// limit shows none.
@@ -307,7 +438,7 @@ async fn a_refusal_is_put_down_to_the_limits_the_pod_named() {
             );
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
-            let limiter = crate::ratelimit::Limiter::start(&service, 0).unwrap();
+            let limiter = crate::ratelimit::Limiter::start(&service, 0, u64::MAX).unwrap();
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = crate::forwarding::Client::new("203.0.113.7".parse().unwrap());
             let told = [(1, 5_000_000_000)];

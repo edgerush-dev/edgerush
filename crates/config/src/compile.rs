@@ -115,11 +115,15 @@ pub struct CompiledRateLimitService {
     pub pods: Vec<String>,
     /// The time between a worker's messages to the service.
     pub cycle: Duration,
+    /// The bytes the keys may hold on the data plane, all its workers together.
+    pub max_key_bytes: u64,
 }
 
 impl CompiledRateLimitService {
     /// What `cycle_ms` is when left out.
     const CYCLE: Duration = Duration::from_millis(10);
+    /// What `max_key_bytes` is when left out: 256 MiB.
+    const MAX_KEY_BYTES: u64 = 256 << 20;
 }
 
 /// The data plane's own settings, each at the value it runs with.
@@ -559,6 +563,9 @@ fn rate_limit_service(
         cycle: service
             .cycle_ms
             .map_or(CompiledRateLimitService::CYCLE, Duration::from_millis),
+        max_key_bytes: service
+            .max_key_bytes
+            .unwrap_or(CompiledRateLimitService::MAX_KEY_BYTES),
     })
 }
 

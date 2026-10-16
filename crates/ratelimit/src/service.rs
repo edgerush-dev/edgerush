@@ -632,6 +632,12 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         self.evicted
     }
 
+    /// How many keys it holds.
+    #[must_use]
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
+
     /// Its id.
     #[must_use]
     pub fn id(&self) -> PlaneId {

@@ -114,9 +114,14 @@ pub(crate) struct Limiter {
 }
 
 impl Limiter {
-    /// A limiter for worker `worker` reaching `service`, its task started; `None` if an
-    /// address cannot be made into one to connect to.
-    pub(crate) fn start(service: &CompiledRateLimitService, worker: u16) -> Option<Rc<Self>> {
+    /// A limiter for worker `worker` reaching `service`, its keys holding at most
+    /// `max_key_bytes`, its task started; `None` if an address cannot be made into one to
+    /// connect to.
+    pub(crate) fn start(
+        service: &CompiledRateLimitService,
+        worker: u16,
+        max_key_bytes: u64,
+    ) -> Option<Rc<Self>> {
         let clients = service
             .pods
             .iter()
@@ -141,6 +146,7 @@ impl Limiter {
         let hasher = Keyed::new([entropy.hash_one(0_u8), entropy.hash_one(1_u8)]);
         let mut plane = DataPlane::with_hasher(id, cycle, view, hasher);
         plane.set_ask_timeout(ASK_TIMEOUT);
+        plane.set_capacity(max_key_bytes);
         let limiter = Rc::new(Self {
             service: service.clone(),
             plane: RefCell::new(plane),
@@ -156,9 +162,22 @@ impl Limiter {
         Some(limiter)
     }
 
-    /// Whether it reaches `service` as it is set now.
+    /// Whether it reaches `service` as it is set now: the same pods, the same cycle. A
+    /// change of what its keys may hold is taken as it is ([`Self::set_capacity`]).
     pub(crate) fn serves(&self, service: &CompiledRateLimitService) -> bool {
-        self.service == *service
+        self.service.pods == service.pods && self.service.cycle == service.cycle
+    }
+
+    /// The bytes its keys may hold from now on.
+    pub(crate) fn set_capacity(&self, max_key_bytes: u64) {
+        self.plane.borrow_mut().set_capacity(max_key_bytes);
+    }
+
+    /// What its keys hold, in bytes, how many there are, and how many it has evicted, all
+    /// told: for the worker's sweep to say.
+    pub(crate) fn usage(&self) -> (u64, usize, u64) {
+        let plane = self.plane.borrow();
+        (plane.holding(), plane.key_count(), plane.evicted())
     }
 
     /// Stops its task: a limiter for other settings takes its place.

@@ -73,6 +73,13 @@ pub struct RateLimitService {
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub cycle_ms: Option<u64>,
+    /// Bytes the rate limits' keys may hold on this data plane, divided evenly among its
+    /// workers, as an estimate of their own data: past it, each worker evicts its least
+    /// recently used keys, which start again full ([06 §8](../../../docs/06-rate-limiting.md)).
+    /// 268,435,456 (256 MiB) when left out.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    pub max_key_bytes: Option<u64>,
 }
 
 /// A place where requests come in. Hostnames are to come; until a listener can be told

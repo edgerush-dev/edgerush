@@ -192,6 +192,7 @@ impl Proxy {
             listeners,
             current: ArcSwap::from_pointee(snapshot),
             metrics,
+            workers,
             keys,
             draining: AtomicBool::new(false),
             quic,
@@ -310,8 +311,10 @@ impl Proxy {
             .collect();
         let mut scrape = self.metrics.render(&self.listeners, &upstreams, &endpoints);
         // Only a config with limits shows them.
-        if !limits.is_empty() {
-            scrape.push_str(&self.metrics.render_limits(&limits));
+        if let Some(service) = snapshot.config.rate_limit_service()
+            && !limits.is_empty()
+        {
+            scrape.push_str(&self.metrics.render_limits(&limits, service.max_key_bytes));
         }
         scrape
     }

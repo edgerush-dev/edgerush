@@ -8,7 +8,7 @@ use crate::downstream::h1::connection as h1;
 use crate::downstream::h1::date::HttpDate;
 use crate::downstream::h1::deadlines::Bounds;
 use crate::drain::Drain;
-use crate::metrics::{Answer, Said, Socket};
+use crate::metrics::{Answer, LimiterSaid, Said, Socket};
 use crate::places::{Places, Refused};
 use crate::received::Received;
 use crate::slots::WorkerSlots;
@@ -153,6 +153,7 @@ impl Worker {
             routes: RefCell::default(),
             batches,
             said: Said::default(),
+            limiter_said: LimiterSaid::default(),
             watcher: Rc::default(),
             files,
         })
@@ -360,6 +361,13 @@ impl Worker {
                 self.idle_connections(),
                 storage,
             );
+            // And its rate limiter's keys, none when it has none (06 §8).
+            let usage = self
+                .limiter
+                .borrow()
+                .as_ref()
+                .map_or((0, 0, 0), |(_, limiter)| limiter.usage());
+            metrics.limiter().holding(&self.limiter_said, usage);
             // What its listeners logged since the last sweep goes to be written, so that a
             // quiet worker holds no record for longer than a sweep (21 §4).
             self.batches.hand_over(&self.proxy.logs);

@@ -732,6 +732,8 @@ pub(crate) struct Metrics {
     connections: Sharded<[Counter; 3]>,
     /// What each worker has in hand, sampled by the worker itself as it sweeps.
     workers: Sharded<WorkerGauges>,
+    /// What each worker's rate limiter holds, as the worker last looked.
+    limiters: Sharded<LimiterGauges>,
     /// Access-log records dropped, by why: counted by the workers and by the logger.
     pub(crate) logs_dropped: crate::access_log::Dropped,
 }
@@ -759,6 +761,42 @@ impl WorkerGauges {
         said.idle.move_to(&self.idle, idle);
         said.storage.move_to(&self.storage, storage);
     }
+}
+
+/// What one worker's rate limiter holds, as the worker last looked (06 §8): its keys'
+/// bytes, how many there are, and those it has evicted to stay within its share.
+#[derive(Debug, Default)]
+pub(crate) struct LimiterGauges {
+    key_bytes: Gauge,
+    keys: Gauge,
+    evicted: Counter,
+}
+
+impl LimiterGauges {
+    /// What this worker's limiter holds now — bytes, keys and evictions all told, as
+    /// [`crate::ratelimit::Limiter::usage`] says — `said` being what it last said. A
+    /// limiter made afresh counts its evictions from nothing again.
+    pub(crate) fn holding(&self, said: &LimiterSaid, (bytes, keys, evicted): (u64, usize, u64)) {
+        said.bytes.move_to(
+            &self.key_bytes,
+            usize::try_from(bytes).unwrap_or(usize::MAX),
+        );
+        said.keys.move_to(&self.keys, keys);
+        let before = said.evicted.replace(evicted);
+        self.evicted.add(if evicted >= before {
+            evicted - before
+        } else {
+            evicted
+        });
+    }
+}
+
+/// What one worker last said its rate limiter holds, kept by the worker.
+#[derive(Debug, Default)]
+pub(crate) struct LimiterSaid {
+    bytes: SaidOne,
+    keys: SaidOne,
+    evicted: Cell<u64>,
 }
 
 /// What one worker last said it holds, kept by the worker.
@@ -795,6 +833,7 @@ impl Metrics {
             stopped: Sharded::new(shards),
             connections: Sharded::new(shards),
             workers: Sharded::new(shards),
+            limiters: Sharded::new(shards),
             logs_dropped: Arc::new(Sharded::new(shards)),
         }
     }
@@ -816,6 +855,11 @@ impl Metrics {
     /// This worker's gauges, for it to say what it is holding.
     pub(crate) fn worker(&self) -> &WorkerGauges {
         self.workers.local()
+    }
+
+    /// This worker's gauges of its rate limiter's keys.
+    pub(crate) fn limiter(&self) -> &LimiterGauges {
+        self.limiters.local()
     }
 
     /// This thread's shard of a listener's counters.
@@ -870,9 +914,37 @@ impl Metrics {
     }
 
     /// The scrape's rate limits: those of the current config by their names, each with the
-    /// slot it has and whether it is a dry run, which alone shows `dry_run_refused`.
-    pub(crate) fn render_limits(&self, limits: &[(&str, usize, bool)]) -> String {
+    /// slot it has and whether it is a dry run, which alone shows `dry_run_refused`; and
+    /// what the workers' keys hold against `max_key_bytes`, the data plane's.
+    pub(crate) fn render_limits(
+        &self,
+        limits: &[(&str, usize, bool)],
+        max_key_bytes: u64,
+    ) -> String {
         let mut scrape = Exposition::new();
+        let name = "edgerush_rate_limit_key_bytes";
+        let help = "Bytes the rate limits' keys hold, every worker's, as an estimate of their \
+                    own data.";
+        scrape.family(name, Kind::Gauge, help);
+        let bytes = self.limiters.sum(|shard| shard.key_bytes.get());
+        scrape.sample(name, &[], bytes.max(0).cast_unsigned());
+        let name = "edgerush_rate_limit_max_key_bytes";
+        let help = "Bytes the rate limits' keys may hold, shared evenly among the workers.";
+        scrape.family(name, Kind::Gauge, help);
+        scrape.sample(name, &[], max_key_bytes);
+        let name = "edgerush_rate_limit_keys";
+        scrape.family(
+            name,
+            Kind::Gauge,
+            "Keys the rate limits hold, every worker's.",
+        );
+        let keys = self.limiters.sum(|shard| shard.keys.get());
+        scrape.sample(name, &[], keys.max(0).cast_unsigned());
+        let name = "edgerush_rate_limit_keys_evicted_total";
+        let help = "Keys evicted, least recently used first, to keep within the bytes they \
+                    may hold; each starts again full.";
+        scrape.family(name, Kind::Counter, help);
+        scrape.sample(name, &[], self.limiters.sum(|shard| shard.evicted.get()));
         // Limits that share a series are shown once, under a name of its own.
         let mut shown: Vec<(&str, usize, bool)> = Vec::new();
         for (limit, slot, dry_run) in limits {
@@ -1438,11 +1510,14 @@ mod tests {
         assert_eq!(slots.last(), Some(&OVERFLOW_SLOT));
 
         metrics.limit(OVERFLOW_SLOT).unwrap().admitted.inc();
-        let scrape = metrics.render_limits(&[
-            ("writes", writes, false),
-            ("late-a", OVERFLOW_SLOT, false),
-            ("late-b", OVERFLOW_SLOT, false),
-        ]);
+        let scrape = metrics.render_limits(
+            &[
+                ("writes", writes, false),
+                ("late-a", OVERFLOW_SLOT, false),
+                ("late-b", OVERFLOW_SLOT, false),
+            ],
+            1 << 20,
+        );
         for line in [
             "edgerush_rate_limit_decisions_total{limit=\"writes\",outcome=\"admitted\"} 1\n",
             "edgerush_rate_limit_decisions_total{limit=\"writes\",outcome=\"refused\"} 2\n",
@@ -1453,6 +1528,28 @@ mod tests {
         assert!(!scrape.contains("late-a"), "{scrape}");
     }
 
+    /// A worker's limiter says what its keys hold; the scrape adds the workers up and shows
+    /// the data plane's bound beside it. A limiter made afresh counts its evictions anew,
+    /// and none are lost or counted twice.
+    #[test]
+    fn the_rate_limits_keys_are_shown_against_their_bound() {
+        let metrics = metrics();
+        let said = LimiterSaid::default();
+        metrics.limiter().holding(&said, (7_000, 20, 3));
+        metrics.limiter().holding(&said, (5_000, 14, 5));
+        // Made afresh: its count starts again.
+        metrics.limiter().holding(&said, (1_000, 3, 1));
+        let scrape = metrics.render_limits(&[], 1 << 20);
+        for line in [
+            "edgerush_rate_limit_key_bytes 1000\n",
+            "edgerush_rate_limit_max_key_bytes 1048576\n",
+            "edgerush_rate_limit_keys 3\n",
+            "edgerush_rate_limit_keys_evicted_total 6\n",
+        ] {
+            assert!(scrape.contains(line), "{line}{scrape}");
+        }
+    }
+
     /// Every family's help is one sentence as written, with no run of spaces left in it by a
     /// line of the source that lost its `\` and carried its indentation into the text.
     #[test]
@@ -1460,7 +1557,7 @@ mod tests {
         let metrics = metrics();
         let writes = metrics.limit_slot("writes");
         let scrape = metrics.render(&["web".to_owned()], &[("cart", 1)], &[("cart", 1, 0)])
-            + &metrics.render_limits(&[("writes", writes, true)]);
+            + &metrics.render_limits(&[("writes", writes, true)], 1 << 20);
         let broken: Vec<&str> = scrape
             .lines()
             .filter(|line| line.starts_with("# HELP") && line.contains("  "))

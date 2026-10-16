@@ -273,17 +273,20 @@ impl Worker {
             return Some(Rc::clone(limiter));
         }
         let service = snapshot.config.rate_limit_service()?;
+        // The data plane's keys, shared evenly among its workers (06 §8).
+        let share = service.max_key_bytes / self.proxy.workers.get() as u64;
         if let Some((_, limiter)) = held.as_ref()
             && limiter.serves(service)
         {
             let limiter = Rc::clone(limiter);
+            limiter.set_capacity(share);
             *held = Some((snapshot.generation, Rc::clone(&limiter)));
             return Some(limiter);
         }
         if let Some((_, old)) = held.take() {
             old.stop();
         }
-        let limiter = Limiter::start(service, self.position)?;
+        let limiter = Limiter::start(service, self.position, share)?;
         *held = Some((snapshot.generation, Rc::clone(&limiter)));
         Some(limiter)
     }
