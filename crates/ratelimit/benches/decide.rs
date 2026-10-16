@@ -12,9 +12,8 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_ratelimit::service::{Contract, DataPlane, Decision, ServicePod, View};
+use edgerush_ratelimit::service::{Contract, DataPlane, Decision, Keyed, ServicePod, View};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
-use std::hash::RandomState;
 use std::hint::black_box;
 use std::num::NonZeroU64;
 
@@ -35,8 +34,8 @@ fn contract(burst: u64) -> Contract {
 }
 
 /// A data plane, boxed, so that handing it to what is measured copies no more than a
-/// pointer.
-type Plane = Box<DataPlane<RandomState>>;
+/// pointer, hashing its keys as the proxy's does.
+type Plane = Box<DataPlane<Keyed>>;
 
 /// A data plane holding a thousand keys and `KEY`, `ROUTE` and `GLOBAL` warm: asked about,
 /// answered, and bounded by a cycle after the answer.
@@ -46,7 +45,8 @@ fn warm(burst: u64) -> (Plane, Contract) {
         pods: vec![0],
     };
     let mut pod: ServicePod = ServicePod::new(0, 10 * MS, view.clone());
-    let mut plane: Plane = Box::new(DataPlane::new(1, 10 * MS, view));
+    let hasher = Keyed::new([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
+    let mut plane: Plane = Box::new(DataPlane::with_hasher(1, 10 * MS, view, hasher));
     let contract = contract(burst);
     let keys = (0..1_000).map(|k| format!("api/0\0key-{k}").into_bytes());
     for key in keys.chain([KEY, ROUTE, GLOBAL].map(<[u8]>::to_vec)) {

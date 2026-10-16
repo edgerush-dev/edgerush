@@ -36,7 +36,10 @@
 //! of a key is the pod ranking highest for it (rendezvous hashing), and the next in rank
 //! takes it over, so a pod leaving moves only the keys it held.
 
+pub mod keyed;
 pub mod membership;
+
+pub use keyed::Keyed;
 
 use crate::reference::{Charge, Model, TokenBucket};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -501,16 +504,26 @@ pub struct DataPlane<S = FixedState> {
     ask_timeout: u64,
 }
 
-impl<S: BuildHasher + Default> DataPlane<S> {
-    /// A data plane `id` sending every `cycle` nanoseconds, knowing the service as `view`.
+impl<S: BuildHasher + Default + Clone> DataPlane<S> {
+    /// A data plane `id` sending every `cycle` nanoseconds, knowing the service as `view`,
+    /// its maps hashed by `S` made by default: the simulator's, which runs alike every time.
     #[must_use]
     pub fn new(id: PlaneId, cycle: u64, view: View) -> Self {
+        Self::with_hasher(id, cycle, view, S::default())
+    }
+}
+
+impl<S: BuildHasher + Clone> DataPlane<S> {
+    /// A data plane `id` sending every `cycle` nanoseconds, knowing the service as `view`,
+    /// its maps hashed by `hasher`: a keyed one ([`Keyed`]) where clients choose the keys.
+    #[must_use]
+    pub fn with_hasher(id: PlaneId, cycle: u64, view: View, hasher: S) -> Self {
         Self {
             id,
             cycle: cycle.max(1),
             view,
-            keys: HashMap::default(),
-            groups: HashMap::default(),
+            keys: HashMap::with_hasher(hasher.clone()),
+            groups: HashMap::with_hasher(hasher),
             holds: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             next_ticket: 0,
@@ -1135,9 +1148,9 @@ impl<S: BuildHasher + Default> DataPlane<S> {
     pub fn abandon(&mut self) -> Vec<Ticket> {
         self.holds.clear();
         self.in_flight.clear();
-        std::mem::take(&mut self.groups)
-            .into_values()
-            .flat_map(|group| group.asked.into_iter().chain(group.waiting))
+        self.groups
+            .drain()
+            .flat_map(|(_, group)| group.asked.into_iter().chain(group.waiting))
             .collect()
     }
 }

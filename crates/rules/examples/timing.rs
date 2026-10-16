@@ -5,10 +5,9 @@
 //! most 150 ns for an existing key). Release builds only:
 //! `cargo run --release -p edgerush-rules --example timing`.
 
-use edgerush_ratelimit::service::{Contract, DataPlane, Decision, ServicePod, View};
+use edgerush_ratelimit::service::{Contract, DataPlane, Decision, Keyed, ServicePod, View};
 use edgerush_rules::{Address, Context, KeyValue, Named, Outcome, Rule, Schema, Tables, Text};
 use std::collections::HashMap;
-use std::hash::RandomState;
 use std::hint::black_box;
 use std::net::IpAddr;
 use std::num::NonZeroU64;
@@ -166,13 +165,14 @@ fn contract() -> Contract {
 
 /// A data plane holding a thousand keys and each rule's key warm, as the proxy's worker
 /// would.
-fn warm(keys: &[Vec<u8>]) -> DataPlane<RandomState> {
+fn warm(keys: &[Vec<u8>]) -> DataPlane<Keyed> {
     let view = View {
         epoch: 1,
         pods: vec![0],
     };
     let mut pod: ServicePod = ServicePod::new(0, 10 * MS, view.clone());
-    let mut plane: DataPlane<RandomState> = DataPlane::new(1, 10 * MS, view);
+    let hasher = Keyed::new([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
+    let mut plane = DataPlane::with_hasher(1, 10 * MS, view, hasher);
     let others = (0..1_000).map(|k| format!("other\0key-{k}").into_bytes());
     for key in others.chain(keys.iter().cloned()) {
         plane.decide(&key, contract(), 0);

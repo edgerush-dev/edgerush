@@ -8,11 +8,11 @@
 //! afresh, as any change to a limit does.
 
 use edgerush_config::{CompiledRateLimit, CompiledRateLimitService};
-use edgerush_ratelimit::service::{Contract, DataPlane, Decision, Ticket, View};
+use edgerush_ratelimit::service::{Contract, DataPlane, Decision, Keyed, Ticket, View};
 use edgerush_ratelimit_service::grpc::Client;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::hash::RandomState;
+use std::hash::{BuildHasher, RandomState};
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, oneshot};
@@ -36,7 +36,7 @@ pub(crate) enum Limited {
 /// A worker's limiter: its data plane and the clients of the service's pods.
 pub(crate) struct Limiter {
     service: CompiledRateLimitService,
-    plane: RefCell<DataPlane<RandomState>>,
+    plane: RefCell<DataPlane<Keyed>>,
     clients: Vec<Client>,
     /// The requests waiting for an owner's decision, by ticket: dropped with the limiter,
     /// which refuses them.
@@ -72,7 +72,10 @@ impl Limiter {
             pods: (0..pods).collect(),
         };
         let cycle = u64::try_from(service.cycle.as_nanos()).unwrap_or(u64::MAX);
-        let mut plane = DataPlane::new(id, cycle, view);
+        // Keys are what clients send: hashed under a key of the worker's own, drawn at random.
+        let entropy = RandomState::new();
+        let hasher = Keyed::new([entropy.hash_one(0_u8), entropy.hash_one(1_u8)]);
+        let mut plane = DataPlane::with_hasher(id, cycle, view, hasher);
         plane.set_ask_timeout(ASK_TIMEOUT);
         let limiter = Rc::new(Self {
             service: service.clone(),
