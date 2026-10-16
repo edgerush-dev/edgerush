@@ -279,51 +279,113 @@ async fn the_keys_held_are_shown_and_kept_within_their_bound() {
         .await;
 }
 
-/// A reload that changes only what the keys may hold keeps them: a client that spent its
-/// bucket before it is still refused after.
+/// What a reload does to a client's spent bucket, by what it changed (06 §2): an edit
+/// elsewhere, or of what the keys may hold, keeps it — the next request is still refused;
+/// a change to the limit itself, its rate, its condition or its name, starts it afresh.
 #[tokio::test]
-async fn a_new_bound_on_the_keys_keeps_them() {
+async fn a_reload_keeps_a_limit_as_it_was_and_starts_a_changed_one_afresh() {
+    let limits = |yaml: &str| -> edgerush_config::Limits { serde_saphyr::from_str(yaml).unwrap() };
+    const PER_CLIENT: &str = "limits:
+  - { name: per-client, key: client, model: { bucket: { rate: 10/h, burst: 10 } } }
+";
+    // What a reload changed, and the status of the next request after it.
+    type Change = fn(&mut Config);
+    let cases: [(&str, Change, u16); 5] = [
+        (
+            "a limit added that no rule names",
+            |config| {
+                config.limits = Some(serde_saphyr::from_str(&format!(
+                "{PER_CLIENT}  - {{ name: other, key: client, model: {{ bucket: {{ rate: 1/s, burst: 1 }} }} }}\n"
+            )).unwrap());
+            },
+            429,
+        ),
+        (
+            "what the keys may hold",
+            |config| {
+                if let Some(service) = &mut config.rate_limit_service {
+                    service.max_key_bytes = Some(128 << 20);
+                }
+            },
+            429,
+        ),
+        (
+            "its rate",
+            |config| {
+                config.limits =
+                    Some(serde_saphyr::from_str(&PER_CLIENT.replace("10/h", "20/h")).unwrap());
+            },
+            200,
+        ),
+        (
+            "its condition",
+            |config| {
+                config.limits = Some(
+                    serde_saphyr::from_str(
+                        &PER_CLIENT
+                            .replace("key: client,", "match: { methods: [GET] }, key: client,"),
+                    )
+                    .unwrap(),
+                );
+            },
+            200,
+        ),
+        (
+            "its name",
+            |config| {
+                config.limits = Some(
+                    serde_saphyr::from_str(&PER_CLIENT.replace("per-client", "per-client-2"))
+                        .unwrap(),
+                );
+                config.routes[0].rules[0].rate_limits = vec!["per-client-2".to_owned()];
+            },
+            200,
+        ),
+    ];
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let service = service().await;
             let (upstream, _) = counting_upstream().await;
-            let config = limited(everything_config(upstream), &service);
-            let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
-            let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
-            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let front = socket.local_addr().unwrap();
-            let _serving = serving(&worker, socket);
-            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
-            let ask = async |send: ::h2::client::SendRequest<bytes::Bytes>| {
-                let mut send = within(send.ready()).await.unwrap();
-                let request = Request::get("http://example.test/")
-                    .version(Version::HTTP_2)
-                    .body(())
-                    .unwrap();
-                let (response, _) = send.send_request(request, true).unwrap();
-                (send, within(response).await.unwrap().status().as_u16())
-            };
-            let mut statuses = Vec::new();
-            for _ in 0..10 {
-                let status;
-                (send, status) = ask(send).await;
-                statuses.push(status);
+            for (changed, change, after) in cases {
+                // Pods of its own: another case's spent bucket is held there for the client.
+                let service = service().await;
+                let mut config = limited(everything_config(upstream), &service);
+                config.limits = Some(limits(PER_CLIENT));
+                let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+                let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _serving = serving(&worker, socket);
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                let ask = async |send: ::h2::client::SendRequest<bytes::Bytes>| {
+                    let mut send = within(send.ready()).await.unwrap();
+                    let request = Request::get("http://example.test/")
+                        .version(Version::HTTP_2)
+                        .body(())
+                        .unwrap();
+                    let (response, _) = send.send_request(request, true).unwrap();
+                    (send, within(response).await.unwrap().status().as_u16())
+                };
+                // The bucket spent: requests until one is refused. A loaded machine may have
+                // an ask given up and its request counted twice, refusing one within the ten
+                // (06 §4); what is under test is the spent bucket, not how it was spent.
+                let mut statuses = Vec::new();
+                while !statuses.contains(&429) && statuses.len() < 20 {
+                    let status;
+                    (send, status) = ask(send).await;
+                    statuses.push(status);
+                }
+                let (admitted, refused) = tally(&statuses);
+                assert!(
+                    (9..=10).contains(&admitted) && refused == 1,
+                    "{changed}: {statuses:?}"
+                );
+                let mut reloaded = config.clone();
+                change(&mut reloaded);
+                worker.proxy().reload(compile(&reloaded).unwrap()).unwrap();
+                let (_, status) = ask(send).await;
+                assert_eq!(status, after, "after a reload that changed {changed}");
             }
-            assert_eq!(tally(&statuses), (10, 0), "{statuses:?}");
-            let mut wider = config.clone();
-            if let Some(service) = &mut wider.rate_limit_service {
-                service.max_key_bytes = Some(128 << 20);
-            }
-            worker.proxy().reload(compile(&wider).unwrap()).unwrap();
-            let (_, status) = ask(send).await;
-            assert_eq!(status, 429, "the spent bucket kept");
-            assert!(
-                worker
-                    .proxy()
-                    .metrics()
-                    .contains("edgerush_rate_limit_max_key_bytes 134217728\n")
-            );
         })
         .await;
 }

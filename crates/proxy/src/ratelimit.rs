@@ -70,13 +70,15 @@ impl Context for ByKey<'_> {
     }
 }
 
-/// Puts together in `buffer` the key a request is counted by under the limit `name`: the
-/// name, a zero, and the key's value — an IPv6 client by its /64, not its whole address,
-/// which one client holds 2^64 of (06 §2).
-fn key_into(buffer: &mut Vec<u8>, name: &str, key: KeyValue<'_>) {
+/// Puts together in `buffer` the key a request is counted by under the limit `name`
+/// defined as `definition` says: the name, a zero, the definition's digest, and the key's
+/// value — an IPv6 client by its /64, not its whole address, which one client holds 2^64
+/// of (06 §2). A limit changed has keys of its own, which start afresh.
+fn key_into(buffer: &mut Vec<u8>, name: &str, definition: [u8; 8], key: KeyValue<'_>) {
     buffer.clear();
     buffer.extend_from_slice(name.as_bytes());
     buffer.push(0);
+    buffer.extend_from_slice(&definition);
     match key {
         KeyValue::Text(text) => buffer.extend_from_slice(text.as_bytes()),
         KeyValue::Address(IpAddr::V4(v4)) => buffer.extend_from_slice(&v4.octets()),
@@ -293,7 +295,7 @@ impl Limiter {
             let Some(buffer) = keys.get_mut(used) else {
                 continue;
             };
-            key_into(buffer, &limit.name, key);
+            key_into(buffer, &limit.name, limit.definition, key);
             contracts.push(Contract {
                 limit: count,
                 window: limit.window,
@@ -386,9 +388,12 @@ impl std::fmt::Debug for Limiter {
 mod tests {
     use super::*;
 
+    /// A definition's digest for the tests: what it is matters only in being the same.
+    const DEFINED: [u8; 8] = [7; 8];
+
     fn key(name: &str, value: KeyValue<'_>) -> Vec<u8> {
         let mut buffer = b"left over".to_vec();
-        key_into(&mut buffer, name, value);
+        key_into(&mut buffer, name, DEFINED, value);
         buffer
     }
 
@@ -396,18 +401,27 @@ mod tests {
         KeyValue::Address(text.parse().unwrap())
     }
 
-    /// A key is the limit's name, a zero and the value: another limit's key for the same
-    /// client is another key.
+    /// A key is the limit's name, a zero, its definition's digest and the value: another
+    /// limit's key for the same client is another key, and so is the same limit's once it
+    /// is defined otherwise.
     #[test]
-    fn a_key_is_the_limits_name_a_zero_and_the_value() {
-        let mut expected = b"per-client".to_vec();
-        expected.extend_from_slice(&[0, 192, 0, 2, 10]);
+    fn a_key_is_the_limits_name_a_zero_its_definition_and_the_value() {
+        let mut expected = b"per-client\0".to_vec();
+        expected.extend_from_slice(&DEFINED);
+        expected.extend_from_slice(&[192, 0, 2, 10]);
         assert_eq!(key("per-client", address("192.0.2.10")), expected);
-        assert_eq!(key("acct", KeyValue::Text("acme")), b"acct\0acme");
+        let mut expected = b"acct\0".to_vec();
+        expected.extend_from_slice(&DEFINED);
+        expected.extend_from_slice(b"acme");
+        assert_eq!(key("acct", KeyValue::Text("acme")), expected);
         assert_ne!(
             key("a", address("192.0.2.10")),
             key("b", address("192.0.2.10"))
         );
+        // The same limit defined otherwise: another key.
+        let mut other = Vec::new();
+        key_into(&mut other, "a", [8; 8], address("192.0.2.10"));
+        assert_ne!(key("a", address("192.0.2.10")), other);
     }
 
     /// An IPv6 client is counted by its /64: addresses in it are one client, the next /64
@@ -415,7 +429,7 @@ mod tests {
     #[test]
     fn an_ipv6_client_is_counted_by_its_slash_64() {
         let one = key("per-client", address("2001:db8:1:2::1"));
-        assert_eq!(one.len(), "per-client".len() + 1 + 8);
+        assert_eq!(one.len(), "per-client".len() + 1 + DEFINED.len() + 8);
         assert_eq!(
             one,
             key("per-client", address("2001:db8:1:2:ffff:ffff:ffff:ffff"))

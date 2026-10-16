@@ -125,6 +125,10 @@ pub struct CompiledLimit {
     /// Its place among the engine's limits, in the file's order: what the data plane finds
     /// its series by.
     pub position: usize,
+    /// A digest of what defines it apart from its name — its condition, its key, its model
+    /// as written — which every key of its carries: a limit changed counts apart from the
+    /// one it replaces, afresh, and never mixed with it while pods take the change (06 §2).
+    pub definition: [u8; 8],
     /// When it applies, its key and its rate: requests a window.
     pub rule: Rule,
     /// Its rate as it was written, `100/s`: for telling a person.
@@ -229,6 +233,7 @@ pub(crate) fn compile_limits(
                 name: limit.name.clone(),
                 quoted: quoted(&limit.name),
                 position: by_name.len(),
+                definition: definition(limit),
                 rule,
                 rate: bucket.rate.clone(),
                 window,
@@ -241,6 +246,37 @@ pub(crate) fn compile_limits(
     let place = Place::of(Object::Limits);
     let global = named(&limits.global.rate_limits, &by_name, &place, errors);
     CompiledLimits { by_name, global }
+}
+
+/// The digest of what defines `limit` apart from its name, the same on every data plane
+/// that reads it: FNV-1a over each field, each after its length, so that no two
+/// definitions run together into the same bytes.
+fn definition(limit: &Limit) -> [u8; 8] {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for byte in (bytes.len() as u64).to_le_bytes().iter().chain(bytes) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    let matches = limit.matches.clone().unwrap_or_default();
+    feed(&(matches.methods.len() as u64).to_le_bytes());
+    for method in &matches.methods {
+        feed(method.as_bytes());
+    }
+    match &matches.path_prefix {
+        Some(prefix) => {
+            feed(b"prefix");
+            feed(prefix.as_bytes());
+        }
+        None => feed(b""),
+    }
+    feed(limit.key.as_bytes());
+    let Model::Bucket(bucket) = &limit.model;
+    feed(b"bucket");
+    feed(bucket.rate.as_bytes());
+    feed(&bucket.burst.to_le_bytes());
+    hash.to_le_bytes()
 }
 
 /// `name` as a structured field's string (RFC 9651 §3.3.3): in quotes, with a backslash
@@ -321,6 +357,35 @@ impl CompiledLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two limits defined alike have one digest; any change to the condition, the key or
+    /// the model gives another. The name is not in it: a key carries the name apart.
+    #[test]
+    fn a_limit_is_digested_by_all_that_defines_it() {
+        let limit = |yaml: &str| -> Limit { serde_saphyr::from_str(yaml).unwrap() };
+        let base = "{ name: a, key: client, model: { bucket: { rate: 10/s, burst: 20 } } }";
+        let digest = |yaml: &str| definition(&limit(yaml));
+        assert_eq!(digest(base), digest(&base.replace("name: a", "name: b")));
+        for changed in [
+            base.replace("10/s", "11/s"),
+            base.replace("burst: 20", "burst: 21"),
+            base.replace("key: client", "key: auth.api_key"),
+            base.replace("key: client,", "match: { methods: [GET] }, key: client,"),
+            base.replace("key: client,", "match: { path_prefix: /v1 }, key: client,"),
+        ] {
+            assert_ne!(digest(base), digest(&changed), "{changed}");
+        }
+        let methods = |methods: &str| {
+            digest(&base.replace(
+                "key: client,",
+                &format!("match: {{ methods: [{methods}] }}, key: client,"),
+            ))
+        };
+        // As many methods, other ones: another condition.
+        assert_ne!(methods("GET"), methods("POST"));
+        // Fields kept apart: the same bytes split otherwise are not one condition.
+        assert_ne!(methods("GET, POST"), methods("GETP, OST"));
+    }
 
     #[test]
     fn a_name_is_quoted_as_a_header_string() {
