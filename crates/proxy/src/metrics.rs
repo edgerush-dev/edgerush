@@ -1008,7 +1008,10 @@ impl Metrics {
         let name = "edgerush_listener_connections_closed_total";
         let help = "HTTP/2 and HTTP/3 connections the gateway closed with what was under way \
                     on them, by why: drained at the drain's bound, for the worker's storage \
-                    running out (exhausted), for their clients' resets, or for their                     clients going on opening streams past their limit (too_many_refused), or                     for their clients not acknowledging their settings in time                     (settings_timeout).";
+                    running out (exhausted), for their clients' resets, or for their \
+                    clients going on opening streams past their limit (too_many_refused), or \
+                    for their clients not acknowledging their settings in time \
+                    (settings_timeout).";
         scrape.family(name, Kind::Counter, help);
         for (listener, series) in listeners() {
             for (position, why) in Cut::ALL.iter().enumerate() {
@@ -1433,6 +1436,21 @@ mod tests {
             assert_eq!(scrape.matches(line).count(), 1, "{line}{scrape}");
         }
         assert!(!scrape.contains("late-a"), "{scrape}");
+    }
+
+    /// Every family's help is one sentence as written, with no run of spaces left in it by a
+    /// line of the source that lost its `\` and carried its indentation into the text.
+    #[test]
+    fn help_has_no_runs_of_spaces() {
+        let metrics = metrics();
+        let writes = metrics.limit_slot("writes");
+        let scrape = metrics.render(&["web".to_owned()], &[("cart", 1)], &[("cart", 1, 0)])
+            + &metrics.render_limits(&[("writes", writes)]);
+        let broken: Vec<&str> = scrape
+            .lines()
+            .filter(|line| line.starts_with("# HELP") && line.contains("  "))
+            .collect();
+        assert!(broken.is_empty(), "{broken:#?}");
     }
 
     #[test]
