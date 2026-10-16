@@ -155,8 +155,13 @@ async fn ask(stream: &mut TcpStream, method: &str, path: &str) -> u16 {
     answer(stream, method, path).await.0
 }
 
-/// The status of `method path` through `stream`, and its `Retry-After`, if it has one.
-async fn answer(stream: &mut TcpStream, method: &str, path: &str) -> (u16, Option<u64>) {
+/// The status of `method path` through `stream`, its `Retry-After` and its `RateLimit`, if
+/// it has them.
+async fn answer(
+    stream: &mut TcpStream,
+    method: &str,
+    path: &str,
+) -> (u16, Option<u64>, Option<String>) {
     let request =
         format!("{method} {path} HTTP/1.1\r\nhost: example.com\r\ncontent-length: 0\r\n\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
@@ -177,7 +182,11 @@ async fn answer(stream: &mut TcpStream, method: &str, path: &str) -> (u16, Optio
         .lines()
         .find_map(|line| line.strip_prefix("retry-after:"))
         .map(|value| value.trim().parse().unwrap());
-    (text[9..12].parse().unwrap(), retry)
+    let field = text
+        .lines()
+        .find_map(|line| line.strip_prefix("ratelimit:"))
+        .map(|value| value.trim().to_owned());
+    (text[9..12].parse().unwrap(), retry, field)
 }
 
 /// The statuses of `count` requests `method path` from the client at `client`, a loopback
@@ -286,7 +295,8 @@ async fn two_data_planes_share_a_key_through_the_service() {
 }
 
 /// A refusal says when to come back: `Retry-After`, in seconds, when the refusing limit
-/// would first admit the request — refused by several at once, the latest of them.
+/// would first admit the request — refused by several at once, the latest of them — and
+/// `RateLimit` names that limit, none of it left for as long.
 #[tokio::test]
 async fn a_refusal_says_when_the_request_would_be_admitted() {
     with_proxy(|front| async move {
@@ -295,23 +305,47 @@ async fn a_refusal_says_when_the_request_would_be_admitted() {
         socket.bind(SocketAddr::from((client, 0))).unwrap();
         let mut stream = socket.connect(front).await.unwrap();
         for _ in 0..10 {
-            assert_eq!(answer(&mut stream, "GET", "/by-client").await, (200, None));
+            assert_eq!(
+                answer(&mut stream, "GET", "/by-client").await,
+                (200, None, None)
+            );
         }
         // Ten an hour: one back every 360 seconds.
         assert_eq!(
             answer(&mut stream, "GET", "/by-client").await,
-            (429, Some(360))
+            (429, Some(360), Some(r#""per-client";r=0;t=360"#.into()))
         );
         // Three POSTs an hour spent, with three of the twenty an hour over everything; then
         // the rest of the twenty: both refuse, `writes` for 1,200 s, `everything` for 180.
         for _ in 0..3 {
             assert_eq!(answer(&mut stream, "POST", "/api/orders").await.0, 200);
         }
-        while answer(&mut stream, "GET", "/elsewhere").await.0 == 200 {}
+        let refused = loop {
+            let answer = answer(&mut stream, "GET", "/elsewhere").await;
+            if answer.0 != 200 {
+                break answer;
+            }
+        };
+        assert_eq!(
+            refused,
+            (429, Some(180), Some(r#""everything";r=0;t=180"#.into()))
+        );
         assert_eq!(
             answer(&mut stream, "POST", "/api/orders").await,
-            (429, Some(1_200)),
+            (429, Some(1_200), Some(r#""writes";r=0;t=1200"#.into())),
             "the latest of the two"
+        );
+        // Another client spends everything elsewhere: `/by-client`, its own bucket full, is
+        // refused by the second of its limits.
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind(SocketAddr::from(([127, 0, 0, 7], 0))).unwrap();
+        let mut stream = socket.connect(front).await.unwrap();
+        for _ in 0..20 {
+            assert_eq!(answer(&mut stream, "GET", "/elsewhere").await.0, 200);
+        }
+        assert_eq!(
+            answer(&mut stream, "GET", "/by-client").await,
+            (429, Some(180), Some(r#""everything";r=0;t=180"#.into()))
         );
     })
     .await;

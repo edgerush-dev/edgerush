@@ -1110,24 +1110,30 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
     }
 
     /// How long, from `now`, a request refused under `keys` should wait before it would be
-    /// admitted under all of them, as its copies have it: the longest any key waits — its
-    /// bucket's refill to one request, or, a key with room whose share of the cycle is
-    /// spent, the next cycle. `None` if every key it holds would admit one now, or it holds
-    /// none of them.
+    /// admitted under all of them, as its copies have it, and which of `keys`, by position,
+    /// waits that long: the longest any key waits — its bucket's refill to one request, or,
+    /// a key with room whose share of the cycle is spent, the next cycle — the first of
+    /// those that wait as long. `None` if every key it holds would admit one now, or it
+    /// holds none of them.
     #[must_use]
-    pub fn retry_after(&self, keys: &[(&[u8], Contract)], now: u64) -> Option<u64> {
+    pub fn retry_after(&self, keys: &[(&[u8], Contract)], now: u64) -> Option<(usize, u64)> {
         keys.iter()
-            .filter_map(|(key, contract)| {
+            .enumerate()
+            .filter_map(|(position, (key, contract))| {
                 let at = self.keys.get(*key).filter(|at| at.contract == *contract)?;
-                match at.bucket.retry_at(now) {
-                    Some(retry) => Some(retry.saturating_sub(now)),
+                let wait = match at.bucket.retry_at(now) {
+                    Some(retry) => retry.saturating_sub(now),
                     None if at.allowance.is_some_and(|allowance| at.spent >= allowance) => {
-                        Some(self.cycle)
+                        self.cycle
                     }
-                    None => None,
-                }
+                    None => return None,
+                };
+                Some((position, wait))
             })
-            .max()
+            .fold(None, |longest, (position, wait)| match longest {
+                Some((_, most)) if most >= wait => longest,
+                _ => Some((position, wait)),
+            })
     }
 
     /// Messages to send: one batch per service pod; an empty one asks only for the view.

@@ -1351,7 +1351,8 @@ fn a_copy_answering_an_ask_does_not_say_which_batches_were_applied() {
 }
 
 /// A refused request waits as long as the longest of its keys: its bucket's refill to one,
-/// the latest when several refuse, whatever their order.
+/// the latest when several refuse, whatever their order; that key is named, the first of
+/// those that wait as long.
 #[test]
 fn a_refused_request_waits_for_the_latest_of_its_keys() {
     let (a, b) = apart();
@@ -1372,11 +1373,21 @@ fn a_refused_request_waits_for_the_latest_of_its_keys() {
     assert_eq!(plane.retry_after(&both, 0), None, "both admit");
     // A hundred a second: one request back every 10 ms.
     while plane.decide(&a, contract(), 0) == Decision::Admit {}
-    assert_eq!(plane.retry_after(&both, 0), Some(10 * MS));
+    assert_eq!(plane.retry_after(&both, 0), Some((0, 10 * MS)));
+    let twice = [(&a[..], contract()), (&a[..], contract())];
+    assert_eq!(
+        plane.retry_after(&twice, 0),
+        Some((0, 10 * MS)),
+        "the first"
+    );
     while plane.decide(&b, slow, 0) == Decision::Admit {}
-    assert_eq!(plane.retry_after(&both, 0), Some(100 * MS), "the latest");
+    assert_eq!(
+        plane.retry_after(&both, 0),
+        Some((1, 100 * MS)),
+        "the latest"
+    );
     let reversed = [(&b[..], slow), (&a[..], contract())];
-    assert_eq!(plane.retry_after(&reversed, 0), Some(100 * MS));
+    assert_eq!(plane.retry_after(&reversed, 0), Some((0, 100 * MS)));
 }
 
 /// A key with room whose share of the cycle is spent waits for the next cycle.
@@ -1411,5 +1422,8 @@ fn a_key_refused_for_its_share_waits_for_the_next_cycle() {
         copy.bucket.admits(3 * CYCLE),
         "room in the bucket: refused for its share"
     );
-    assert_eq!(plane.retry_after(&[(b"k", big)], 3 * CYCLE), Some(CYCLE));
+    assert_eq!(
+        plane.retry_after(&[(b"k", big)], 3 * CYCLE),
+        Some((0, CYCLE))
+    );
 }

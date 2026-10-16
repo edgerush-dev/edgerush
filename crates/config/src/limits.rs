@@ -44,9 +44,11 @@ pub struct Global {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Limit {
-    /// Its name, unique among the limits: what routes name it by, and what its counts are
-    /// kept under, so that they go on through a reload that leaves the limit as it was.
-    #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
+    /// Its name, unique among the limits: what routes name it by, what its counts are kept
+    /// under, so that they go on through a reload that leaves the limit as it was, and what
+    /// the `RateLimit` header of a request it refuses calls it. Printable ASCII, which is
+    /// all the header can hold.
+    #[cfg_attr(feature = "schema", schemars(regex(pattern = NAME_PATTERN)))]
     pub name: String,
     /// The requests it applies to, among those of the route rules it is named for; all of
     /// them when left out.
@@ -102,12 +104,19 @@ pub struct Bucket {
 #[cfg(feature = "schema")]
 const RATE_PATTERN: &str = "^[1-9][0-9]*/(s|min|h|d)$";
 
+/// What a limit's name looks like: printable ASCII, at least one character.
+#[cfg(feature = "schema")]
+const NAME_PATTERN: &str = "^[ -~]+$";
+
 /// A limit, compiled: when it applies to a request and what the request is counted by, and
 /// its contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledLimit {
     /// Its name, which its keys are counted under.
     pub name: String,
+    /// Its name as a header's quoted string, `"writes"`: what the `RateLimit` header calls
+    /// it.
+    pub quoted: String,
     /// When it applies, its key and its rate: requests a window.
     pub rule: Rule,
     /// Its rate as it was written, `100/s`: for telling a person.
@@ -168,7 +177,7 @@ pub(crate) fn compile_limits(
     for limit in &limits.limits {
         let place = Place::of(Object::Limit(limit.name.clone()));
         let before = errors.len();
-        if limit.name.is_empty() || limit.name.contains('\0') {
+        if limit.name.is_empty() || !limit.name.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
             errors.push(place.problem(Problem::LimitName));
         }
         if by_name.contains_key(&limit.name) {
@@ -208,6 +217,7 @@ pub(crate) fn compile_limits(
         {
             let compiled = CompiledLimit {
                 name: limit.name.clone(),
+                quoted: quoted(&limit.name),
                 rule,
                 rate: bucket.rate.clone(),
                 window,
@@ -219,6 +229,21 @@ pub(crate) fn compile_limits(
     let place = Place::of(Object::Limits);
     let global = named(&limits.global.rate_limits, &by_name, &place, errors);
     CompiledLimits { by_name, global }
+}
+
+/// `name` as a structured field's string (RFC 9651 §3.3.3): in quotes, with a backslash
+/// before each quote or backslash in it.
+fn quoted(name: &str) -> String {
+    let mut quoted = String::with_capacity(name.len() + 2);
+    quoted.push('"');
+    for character in name.chars() {
+        if matches!(character, '"' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// The limits `names` name, each looked up in `by_name`; a name with no limit a problem at
@@ -277,6 +302,12 @@ impl CompiledLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_is_quoted_as_a_header_string() {
+        assert_eq!(quoted("writes"), r#""writes""#);
+        assert_eq!(quoted(r#"say "hi" \o/"#), r#""say \"hi\" \\o/""#);
+    }
 
     #[test]
     fn a_rate_is_a_count_of_at_least_one_in_a_unit_of_time() {

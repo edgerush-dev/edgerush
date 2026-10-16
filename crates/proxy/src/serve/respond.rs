@@ -16,7 +16,7 @@ use crate::interim::Interim;
 use crate::map_head::MapHead;
 use crate::metrics::Answer;
 use crate::random::{random, unguessable};
-use crate::ratelimit::{Limited, Limiter};
+use crate::ratelimit::{Limited, Limiter, RATELIMIT};
 use crate::request::{Decision, Opening, Rejection, decide};
 use crate::request_body::{Counts, RequestBody};
 use crate::routed::Through;
@@ -140,7 +140,8 @@ impl Worker {
 
     /// The answer to a request the rate limits of `rule` it is under refused: 429, with
     /// `Retry-After` in whole seconds, rounded up and at least one — the longest any of
-    /// them waits (06 §2). A gRPC call is answered `RESOURCE_EXHAUSTED`, which says no more.
+    /// them waits — and `RateLimit` naming the limit that waits that long, none left, for
+    /// as long (06 §2). A gRPC call is answered `RESOURCE_EXHAUSTED`, which says no more.
     fn refused(
         &self,
         listener: usize,
@@ -151,14 +152,22 @@ impl Worker {
     ) -> Response<Body> {
         let mut response = self.proxy.answer_to(listener, Answer::RateLimited, call);
         if call.is_none()
-            && let Some(wait) = self
+            && let Some((limit, wait)) = self
                 .limiter()
                 .and_then(|limiter| limiter.retry_after(&rule.limits, limited, client))
         {
             let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
-            response
-                .headers_mut()
-                .insert(http::header::RETRY_AFTER, HeaderValue::from(seconds.max(1)));
+            let seconds = HeaderValue::from(seconds.max(1));
+            let mut field = Vec::with_capacity(limit.quoted.len() + 7 + seconds.len());
+            field.extend_from_slice(limit.quoted.as_bytes());
+            field.extend_from_slice(b";r=0;t=");
+            field.extend_from_slice(seconds.as_bytes());
+            let headers = response.headers_mut();
+            // A name is printable ASCII, so the field always makes a header value.
+            if let Ok(field) = HeaderValue::from_bytes(&field) {
+                headers.insert(RATELIMIT, field);
+            }
+            headers.insert(http::header::RETRY_AFTER, seconds);
         }
         response
     }

@@ -2198,8 +2198,8 @@ pub enum Problem {
     /// A name that no limit has.
     #[error("`rate_limits`: no limit is named `{0}`")]
     LimitUnknown(String),
-    /// A limit with no name, or one no key can be made with.
-    #[error("`name` is empty or holds a NUL")]
+    /// A limit with no name, or one the `RateLimit` header cannot carry.
+    #[error("`name` is empty or holds more than printable ASCII")]
     LimitName,
     /// A limit with the name of another.
     #[error("another limit has the same name")]
@@ -4776,9 +4776,18 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
             limited("", "", "", &limits, true).unwrap_err()
         };
         let bucket = "model: { bucket: { rate: 10/s, burst: 10 } }";
-        assert_eq!(
-            refused(&format!("{{ name: '', key: client, {bucket} }}")),
-            ["limit ``: `name` is empty or holds a NUL"]
+        for (name, written) in [("''", ""), ("café", "café"), (r#""tab\t""#, "tab\t")] {
+            assert_eq!(
+                refused(&format!("{{ name: {name}, key: client, {bucket} }}")),
+                [format!(
+                    "limit `{written}`: `name` is empty or holds more than printable ASCII"
+                )]
+            );
+        }
+        let limits = format!(r#"limits: [{{ name: ' "~\', key: client, {bucket} }}]"#);
+        assert!(
+            limited("", "", "", &limits, true).is_ok(),
+            "any printable ASCII, a quote and a backslash too"
         );
         assert_eq!(
             refused(&format!("{{ name: k, key: auth.api_key, {bucket} }}")),

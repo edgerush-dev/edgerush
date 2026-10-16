@@ -77,7 +77,7 @@ fn tally(statuses: &[u16]) -> (usize, usize) {
 }
 
 /// Fifteen requests over HTTP/2 from one client, on one connection: ten admitted, the
-/// rest refused 429.
+/// rest refused 429, saying when to come back; then a gRPC call, refused as gRPC is.
 #[tokio::test]
 async fn http2_requests_are_held_to_their_limit() {
     let local = tokio::task::LocalSet::new();
@@ -100,9 +100,21 @@ async fn http2_requests_are_held_to_their_limit() {
                     .body(())
                     .unwrap();
                 let (response, _) = send.send_request(request, true).unwrap();
-                statuses.push(within(response).await.unwrap().status().as_u16());
+                let response = within(response).await.unwrap();
+                if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                    assert_eq!(response.headers()["retry-after"], "360");
+                    assert_eq!(response.headers()["ratelimit"], r#""per-client";r=0;t=360"#);
+                }
+                statuses.push(response.status().as_u16());
             }
             assert_eq!(tally(&statuses), (10, 5), "{statuses:?}");
+            // A gRPC call is told its status, and nothing of when to come back.
+            send = within(send.ready()).await.unwrap();
+            let (answer, _) = send.send_request(grpc_call("/", None), true).unwrap();
+            let answer = within(answer).await.unwrap();
+            assert_eq!(answer.headers()["grpc-status"], "8");
+            assert!(answer.headers().get("retry-after").is_none());
+            assert!(answer.headers().get("ratelimit").is_none());
         })
         .await;
 }

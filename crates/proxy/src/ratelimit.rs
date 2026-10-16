@@ -14,6 +14,7 @@ use edgerush_config::{CompiledLimit, CompiledRateLimitService};
 use edgerush_ratelimit::service::{Contract, DataPlane, Decision, Keyed, Ticket, View};
 use edgerush_ratelimit_service::grpc::Client;
 use edgerush_rules::{Address, Context, KeyValue, Named, Outcome, Text};
+use http::HeaderName;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
@@ -28,6 +29,10 @@ use tokio::sync::{Notify, oneshot};
 /// its copy: long enough for TCP to send a lost segment again (some 200 ms on Linux), as the
 /// comparison harness found that the protocol's own four cycles, 40 ms, were not.
 const ASK_TIMEOUT: u64 = 300_000_000;
+
+/// The IETF `RateLimit` field (draft-ietf-httpapi-ratelimit-headers): on a refusal, the
+/// limit that refused, none of it left, and for how long.
+pub(crate) const RATELIMIT: HeaderName = HeaderName::from_static("ratelimit");
 
 /// What a limit's key reads of a request: the client's address, until authentication
 /// gives the rest (stage 9).
@@ -182,19 +187,24 @@ impl Limiter {
     }
 
     /// How long a request from `client` refused under those of `limits` that `limited`
-    /// marks should wait to be admitted under all of them: the longest of their waits, as
-    /// the worker's copies have them (06 §2). `None` if none says.
-    pub(crate) fn retry_after(
+    /// marks should wait to be admitted under all of them, and the limit that waits that
+    /// long: the longest of their waits, as the worker's copies have them, the first of the
+    /// limits that wait as long (06 §2). `None` if none says.
+    pub(crate) fn retry_after<'a>(
         &self,
-        limits: &[Arc<CompiledLimit>],
+        limits: &'a [Arc<CompiledLimit>],
         limited: u64,
         client: &Requester,
-    ) -> Option<Duration> {
+    ) -> Option<(&'a CompiledLimit, Duration)> {
         let now = self.now();
         self.with_keys(limits, limited, client, |plane, parts| {
-            plane.retry_after(parts, now)
+            let (position, wait) = plane.retry_after(parts, now)?;
+            // A key begins with its limit's name and a zero.
+            let (key, _) = parts.get(position)?;
+            let name = key.split(|&byte| byte == 0).next()?;
+            let limit = limits.iter().find(|limit| limit.name.as_bytes() == name)?;
+            Some((&**limit, Duration::from_nanos(wait)))
         })
-        .map(Duration::from_nanos)
     }
 
     /// Calls `then` with the data plane and the keys of a request from `client` under

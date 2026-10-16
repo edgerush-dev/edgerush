@@ -82,9 +82,9 @@
           "$ref": "#/$defs/Model"
         },
         "name": {
-          "description": "Its name, unique among the limits: what routes name it by, and what its counts are\nkept under, so that they go on through a reload that leaves the limit as it was.",
+          "description": "Its name, unique among the limits: what routes name it by, what its counts are kept\nunder, so that they go on through a reload that leaves the limit as it was, and what\nthe `RateLimit` header of a request it refuses calls it. Printable ASCII, which is\nall the header can hold.",
           "type": "string",
-          "minLength": 1
+          "pattern": "^[ -~]+$"
         }
       },
       "additionalProperties": false,
