@@ -21,7 +21,7 @@ use std::net::IpAddr;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, oneshot};
 
 /// How long a worker waits for the owner's answer to an ask before deciding what waits from
@@ -163,6 +163,52 @@ impl Limiter {
         limited: u64,
         client: &Requester,
     ) -> Limited {
+        let now = self.now();
+        let decision = self.with_keys(limits, limited, client, |plane, parts| match parts {
+            [] => None,
+            [(key, contract)] => Some(plane.decide(key, *contract, now)),
+            parts => Some(plane.decide_all(parts, now)),
+        });
+        match decision {
+            None | Some(Decision::Admit) => Limited::Admit,
+            Some(Decision::Refuse) => Limited::Refuse,
+            Some(Decision::Wait(ticket)) => {
+                let (decided, waited) = oneshot::channel();
+                self.waiting.borrow_mut().insert(ticket, decided);
+                self.asked.notify_one();
+                Limited::Wait(waited)
+            }
+        }
+    }
+
+    /// How long a request from `client` refused under those of `limits` that `limited`
+    /// marks should wait to be admitted under all of them: the longest of their waits, as
+    /// the worker's copies have them (06 §2). `None` if none says.
+    pub(crate) fn retry_after(
+        &self,
+        limits: &[Arc<CompiledLimit>],
+        limited: u64,
+        client: &Requester,
+    ) -> Option<Duration> {
+        let now = self.now();
+        self.with_keys(limits, limited, client, |plane, parts| {
+            plane.retry_after(parts, now)
+        })
+        .map(Duration::from_nanos)
+    }
+
+    /// Calls `then` with the data plane and the keys of a request from `client` under
+    /// those of `limits` that `limited` marks, bit `n` for the `n`th: each the limit's name,
+    /// a zero and the key's value, with its contract, put together in the worker's buffers.
+    /// A limit the request has no key for is left out, as one whose number came out below
+    /// one: it lets the request through.
+    fn with_keys<R>(
+        &self,
+        limits: &[Arc<CompiledLimit>],
+        limited: u64,
+        client: &Requester,
+        then: impl FnOnce(&mut DataPlane<Keyed>, &[(&[u8], Contract)]) -> R,
+    ) -> R {
         let mut keys = self.keys.borrow_mut();
         let mut contracts = self.contracts.borrow_mut();
         contracts.clear();
@@ -194,16 +240,15 @@ impl Limiter {
             });
             used += 1;
         }
-        let now = self.now();
         let mut plane = self.plane.borrow_mut();
         // The usual few at once without a list made for them.
-        let decision = match (&keys[..used], &contracts[..]) {
-            ([], _) => return Limited::Admit,
-            ([a], [ca]) => plane.decide(a, *ca, now),
-            ([a, b], [ca, cb]) => plane.decide_all(&[(a, *ca), (b, *cb)], now),
-            ([a, b, c], [ca, cb, cc]) => plane.decide_all(&[(a, *ca), (b, *cb), (c, *cc)], now),
+        match (&keys[..used], &contracts[..]) {
+            ([], _) => then(&mut plane, &[]),
+            ([a], [ca]) => then(&mut plane, &[(a, *ca)]),
+            ([a, b], [ca, cb]) => then(&mut plane, &[(a, *ca), (b, *cb)]),
+            ([a, b, c], [ca, cb, cc]) => then(&mut plane, &[(a, *ca), (b, *cb), (c, *cc)]),
             ([a, b, c, d], [ca, cb, cc, cd]) => {
-                plane.decide_all(&[(a, *ca), (b, *cb), (c, *cc), (d, *cd)], now)
+                then(&mut plane, &[(a, *ca), (b, *cb), (c, *cc), (d, *cd)])
             }
             (many, contracts) => {
                 let parts: Vec<(&[u8], Contract)> = many
@@ -211,18 +256,7 @@ impl Limiter {
                     .map(Vec::as_slice)
                     .zip(contracts.iter().copied())
                     .collect();
-                plane.decide_all(&parts, now)
-            }
-        };
-        drop(plane);
-        match decision {
-            Decision::Admit => Limited::Admit,
-            Decision::Refuse => Limited::Refuse,
-            Decision::Wait(ticket) => {
-                let (decided, waited) = oneshot::channel();
-                self.waiting.borrow_mut().insert(ticket, decided);
-                self.asked.notify_one();
-                Limited::Wait(waited)
+                then(&mut plane, &parts)
             }
         }
     }

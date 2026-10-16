@@ -152,6 +152,11 @@ rate_limit_service: {{ pods: [{pods}], cycle_ms: 10 }}
 
 /// The status of `method path` through `stream`.
 async fn ask(stream: &mut TcpStream, method: &str, path: &str) -> u16 {
+    answer(stream, method, path).await.0
+}
+
+/// The status of `method path` through `stream`, and its `Retry-After`, if it has one.
+async fn answer(stream: &mut TcpStream, method: &str, path: &str) -> (u16, Option<u64>) {
     let request =
         format!("{method} {path} HTTP/1.1\r\nhost: example.com\r\ncontent-length: 0\r\n\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
@@ -168,7 +173,11 @@ async fn ask(stream: &mut TcpStream, method: &str, path: &str) -> u16 {
         .map_or(0, |value| value.trim().parse().unwrap());
     let mut body = vec![0; length];
     stream.read_exact(&mut body).await.unwrap();
-    text[9..12].parse().unwrap()
+    let retry = text
+        .lines()
+        .find_map(|line| line.strip_prefix("retry-after:"))
+        .map(|value| value.trim().parse().unwrap());
+    (text[9..12].parse().unwrap(), retry)
 }
 
 /// The statuses of `count` requests `method path` from the client at `client`, a loopback
@@ -274,4 +283,36 @@ async fn two_data_planes_share_a_key_through_the_service() {
             assert_eq!(admitted, 10, "{one:?} {other:?}");
         })
         .await;
+}
+
+/// A refusal says when to come back: `Retry-After`, in seconds, when the refusing limit
+/// would first admit the request — refused by several at once, the latest of them.
+#[tokio::test]
+async fn a_refusal_says_when_the_request_would_be_admitted() {
+    with_proxy(|front| async move {
+        let client = [127, 0, 0, 6];
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind(SocketAddr::from((client, 0))).unwrap();
+        let mut stream = socket.connect(front).await.unwrap();
+        for _ in 0..10 {
+            assert_eq!(answer(&mut stream, "GET", "/by-client").await, (200, None));
+        }
+        // Ten an hour: one back every 360 seconds.
+        assert_eq!(
+            answer(&mut stream, "GET", "/by-client").await,
+            (429, Some(360))
+        );
+        // Three POSTs an hour spent, with three of the twenty an hour over everything; then
+        // the rest of the twenty: both refuse, `writes` for 1,200 s, `everything` for 180.
+        for _ in 0..3 {
+            assert_eq!(answer(&mut stream, "POST", "/api/orders").await.0, 200);
+        }
+        while answer(&mut stream, "GET", "/elsewhere").await.0 == 200 {}
+        assert_eq!(
+            answer(&mut stream, "POST", "/api/orders").await,
+            (429, Some(1_200)),
+            "the latest of the two"
+        );
+    })
+    .await;
 }

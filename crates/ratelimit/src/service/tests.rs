@@ -1349,3 +1349,67 @@ fn a_copy_answering_an_ask_does_not_say_which_batches_were_applied() {
     );
     assert_eq!(net.copy(0, &b).seen, 0);
 }
+
+/// A refused request waits as long as the longest of its keys: its bucket's refill to one,
+/// the latest when several refuse, whatever their order.
+#[test]
+fn a_refused_request_waits_for_the_latest_of_its_keys() {
+    let (a, b) = apart();
+    // Ten a second: one request back every 100 ms.
+    let slow = Contract {
+        limit: NonZeroU64::new(10).unwrap(),
+        ..contract()
+    };
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, &a, 0);
+    net.planes[0].decide(&b, slow, 0);
+    net.settle(0);
+    net.planes[0].take_decided();
+    net.planes[0].on_cycle(0);
+    net.planes[0].take_outgoing();
+    let both = [(&a[..], contract()), (&b[..], slow)];
+    let plane = &mut net.planes[0];
+    assert_eq!(plane.retry_after(&both, 0), None, "both admit");
+    // A hundred a second: one request back every 10 ms.
+    while plane.decide(&a, contract(), 0) == Decision::Admit {}
+    assert_eq!(plane.retry_after(&both, 0), Some(10 * MS));
+    while plane.decide(&b, slow, 0) == Decision::Admit {}
+    assert_eq!(plane.retry_after(&both, 0), Some(100 * MS), "the latest");
+    let reversed = [(&b[..], slow), (&a[..], contract())];
+    assert_eq!(plane.retry_after(&reversed, 0), Some(100 * MS));
+}
+
+/// A key with room whose share of the cycle is spent waits for the next cycle.
+#[test]
+fn a_key_refused_for_its_share_waits_for_the_next_cycle() {
+    // A bucket of a hundred, which two data planes admitting share half each.
+    let big = Contract {
+        burst: NonZeroU64::new(100).unwrap(),
+        ..contract()
+    };
+    let mut net = Net::new(2);
+    for plane in 0..2 {
+        net.planes[plane].decide(b"k", big, 0);
+        net.settle(0);
+        net.planes[plane].take_decided();
+    }
+    net.planes[1].decide(b"k", big, 0);
+    net.planes[1].on_cycle(CYCLE);
+    net.settle(CYCLE);
+    net.planes[0].on_cycle(CYCLE);
+    net.settle(CYCLE);
+    // The cycle after a share keeps what was left; the one after that shares afresh,
+    // halving what the copy holds between the two data planes.
+    net.planes[0].on_cycle(2 * CYCLE);
+    net.settle(2 * CYCLE);
+    net.planes[0].on_cycle(3 * CYCLE);
+    net.planes[0].take_outgoing();
+    let plane = &mut net.planes[0];
+    while plane.decide(b"k", big, 3 * CYCLE) == Decision::Admit {}
+    let copy = &plane.keys[&b"k"[..]];
+    assert!(
+        copy.bucket.admits(3 * CYCLE),
+        "room in the bucket: refused for its share"
+    );
+    assert_eq!(plane.retry_after(&[(b"k", big)], 3 * CYCLE), Some(CYCLE));
+}

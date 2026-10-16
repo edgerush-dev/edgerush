@@ -1109,6 +1109,27 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         }
     }
 
+    /// How long, from `now`, a request refused under `keys` should wait before it would be
+    /// admitted under all of them, as its copies have it: the longest any key waits — its
+    /// bucket's refill to one request, or, a key with room whose share of the cycle is
+    /// spent, the next cycle. `None` if every key it holds would admit one now, or it holds
+    /// none of them.
+    #[must_use]
+    pub fn retry_after(&self, keys: &[(&[u8], Contract)], now: u64) -> Option<u64> {
+        keys.iter()
+            .filter_map(|(key, contract)| {
+                let at = self.keys.get(*key).filter(|at| at.contract == *contract)?;
+                match at.bucket.retry_at(now) {
+                    Some(retry) => Some(retry.saturating_sub(now)),
+                    None if at.allowance.is_some_and(|allowance| at.spent >= allowance) => {
+                        Some(self.cycle)
+                    }
+                    None => None,
+                }
+            })
+            .max()
+    }
+
     /// Messages to send: one batch per service pod; an empty one asks only for the view.
     pub fn take_outgoing(&mut self) -> Vec<(PodId, Batch)> {
         let mut asks = std::mem::take(&mut self.asks);

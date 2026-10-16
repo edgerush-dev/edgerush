@@ -138,6 +138,31 @@ impl Worker {
         }
     }
 
+    /// The answer to a request the rate limits of `rule` it is under refused: 429, with
+    /// `Retry-After` in whole seconds, rounded up and at least one — the longest any of
+    /// them waits (06 §2). A gRPC call is answered `RESOURCE_EXHAUSTED`, which says no more.
+    fn refused(
+        &self,
+        listener: usize,
+        rule: &CompiledRule,
+        limited: u64,
+        client: &Client,
+        call: Option<Call>,
+    ) -> Response<Body> {
+        let mut response = self.proxy.answer_to(listener, Answer::RateLimited, call);
+        if call.is_none()
+            && let Some(wait) = self
+                .limiter()
+                .and_then(|limiter| limiter.retry_after(&rule.limits, limited, client))
+        {
+            let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+            response
+                .headers_mut()
+                .insert(http::header::RETRY_AFTER, HeaderValue::from(seconds.max(1)));
+        }
+        response
+    }
+
     /// The worker's limiter, made when first needed and again when the service's settings
     /// change; `None` with no service to reach, which a config that limits always names.
     fn limiter(&self) -> Option<Rc<Limiter>> {
@@ -246,8 +271,7 @@ impl Worker {
             };
             if !admitted {
                 return self
-                    .proxy
-                    .answer_to(listener, Answer::RateLimited, call)
+                    .refused(listener, rule, directed.limited, client, call)
                     .into();
             }
         }
