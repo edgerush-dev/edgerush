@@ -10,11 +10,16 @@ publish.workspace = true
 [dependencies]
 bytes.workspace = true
 edgerush-ratelimit.workspace = true
+edgerush-telemetry.workspace = true
 http.workspace = true
+http-body-util.workspace = true
+# `/metrics`, served as tonic serves gRPC: by hyper.
+hyper.workspace = true
+hyper-util.workspace = true
 prost.workspace = true
 thiserror.workspace = true
 # The service pod is a process of its own: a multi-thread runtime, told to stop by a signal.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tonic.workspace = true
 tower-service.workspace = true
 

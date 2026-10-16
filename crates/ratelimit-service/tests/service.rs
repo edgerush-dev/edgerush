@@ -349,3 +349,69 @@ async fn a_restarted_owner_is_handed_its_keys_back_when_it_rejoins() {
         "nothing counted twice"
     );
 }
+
+/// What a pod's keys hold is at `/metrics` on the address it is given; a pod allowed less
+/// than a key holds none, evicting each at its timer. Nothing else is served there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_shows_what_its_keys_hold_and_keeps_them_within_their_bound() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let service = start().await;
+    let start = Instant::now();
+    let cycle = u64::try_from(CYCLE.as_nanos()).unwrap();
+    for pod in &service.pods {
+        pod.set_capacity(1).await;
+    }
+    let mut plane: DataPlane = DataPlane::new(7, cycle, view());
+    plane.decide(b"k", contract(), now(start));
+    exchange(&mut plane, &service, start).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let pod = service.pods[0].clone();
+    tokio::spawn(edgerush_ratelimit_service::scrape::serve(listener, pod, 1));
+    let get = async |path: &str| {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!("GET {path} HTTP/1.1\r\nhost: pod\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).await.unwrap();
+        answer
+    };
+    let evicted = "edgerush_rate_limit_keys_evicted_total 1\n";
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let scrape = loop {
+        let scrape = get("/metrics").await;
+        if scrape.contains(evicted) || Instant::now() > deadline {
+            break scrape;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(scrape.starts_with("HTTP/1.1 200"), "{scrape}");
+    for line in [
+        evicted,
+        "edgerush_rate_limit_keys 0\n",
+        "edgerush_rate_limit_key_bytes 0\n",
+        "edgerush_rate_limit_max_key_bytes 1\n",
+    ] {
+        assert!(scrape.contains(line), "{line}{scrape}");
+    }
+    assert!(get("/").await.starts_with("HTTP/1.1 404"));
+    // Restarted, a new life, it keeps its bound: its next key is evicted too.
+    service.pods[0].restart(2).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(service.pods[0].view().await, Some((_, true))) {
+        assert!(Instant::now() < deadline, "never taken in again");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    plane.decide(b"k2", contract(), now(start));
+    exchange(&mut plane, &service, start).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let scrape = loop {
+        let scrape = get("/metrics").await;
+        if scrape.contains(evicted) || Instant::now() > deadline {
+            break scrape;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(scrape.contains(evicted), "{scrape}");
+}

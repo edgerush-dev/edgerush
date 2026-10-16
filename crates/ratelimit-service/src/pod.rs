@@ -61,8 +61,21 @@ enum Command {
     Heartbeat(Heartbeat),
     Counted(Vec<u8>, oneshot::Sender<Option<u64>>),
     View(oneshot::Sender<(View, bool)>),
+    Capacity(u64),
+    Usage(oneshot::Sender<Usage>),
     Restart(u64),
     Stop,
+}
+
+/// What a pod's keys hold, as of its last timer (06 §8).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Their bytes, as an estimate of their own data.
+    pub key_bytes: u64,
+    /// How many there are, owned and copies.
+    pub keys: usize,
+    /// How many it has evicted to stay within what they may hold, all told, in this life.
+    pub evicted: u64,
 }
 
 /// A handle on a running service pod. Cheap to clone.
@@ -97,6 +110,7 @@ impl Pod {
             membership,
             senders,
             start,
+            capacity: u64::MAX,
         };
         tokio::spawn(running.run(received));
         Self { commands }
@@ -143,6 +157,17 @@ impl Pod {
         self.ask(Command::View).await
     }
 
+    /// The bytes its keys may hold, in this life and after a restart: past them its timer
+    /// evicts the least recently changed (06 §8). No bound unless set.
+    pub async fn set_capacity(&self, bytes: u64) {
+        let _stopped = self.commands.send(Command::Capacity(bytes)).await;
+    }
+
+    /// What its keys hold; `None` if it has stopped.
+    pub async fn usage(&self) -> Option<Usage> {
+        self.ask(Command::Usage).await
+    }
+
     /// Stops it, as a pod gone.
     pub async fn stop(&self) {
         let _stopped = self.commands.send(Command::Stop).await;
@@ -181,6 +206,8 @@ struct Running {
     membership: Membership,
     senders: BTreeMap<PodId, Sender>,
     start: Instant,
+    /// The bytes its keys may hold, kept for a life after a restart.
+    capacity: u64,
 }
 
 impl Running {
@@ -209,8 +236,9 @@ impl Running {
                     None | Some(Command::Stop) => return,
                     Some(Command::Restart(incarnation)) => {
                         let now = self.now();
-                        let (node, membership) =
+                        let (mut node, membership) =
                             fresh(self.me, &self.members, incarnation, self.timing, now);
+                        node.set_capacity(self.capacity);
                         self.node = node;
                         self.membership = membership;
                     }
@@ -235,6 +263,17 @@ impl Running {
                             self.membership.view().clone(),
                             self.membership.serving(),
                         ));
+                    }
+                    Some(Command::Capacity(bytes)) => {
+                        self.capacity = bytes;
+                        self.node.set_capacity(bytes);
+                    }
+                    Some(Command::Usage(answer)) => {
+                        let _gone = answer.send(Usage {
+                            key_bytes: self.node.holding(),
+                            keys: self.node.key_count(),
+                            evicted: self.node.evicted(),
+                        });
                     }
                 },
                 _ = cycle.tick() => {

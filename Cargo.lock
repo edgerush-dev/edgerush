@@ -329,7 +329,11 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "edgerush-ratelimit",
+ "edgerush-telemetry",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "proptest",
  "prost",
  "thiserror",

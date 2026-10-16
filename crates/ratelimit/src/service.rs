@@ -1534,6 +1534,12 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         self.holding
     }
 
+    /// How many keys it holds, owned and copies.
+    #[must_use]
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
+
     /// The keys it has evicted to stay within its capacity, all told.
     #[must_use]
     pub fn evicted(&self) -> u64 {
