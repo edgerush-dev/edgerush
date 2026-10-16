@@ -11,6 +11,8 @@ import os
 PROJECT = "rlh"
 FRONT, BACK = "172.31.10", "172.31.20"
 UPSTREAM_IP = f"{FRONT}.5"
+# Where the load comes from as instances see it: the host, the front network's gateway.
+CLIENT_IP = f"{FRONT}.1"
 REDIS_IP, RATELIMIT_IP = f"{BACK}.2", f"{BACK}.3"
 # EdgeRush's rate-limiting service: three pods, and where the binaries built on the host are.
 SERVICE_IPS = [f"{BACK}.{4 + pod}" for pod in range(3)]
@@ -518,10 +520,18 @@ routes:
     rules:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: up, weight: 1 }] }
-        rate_limit: { key: { header: x-key }, limit: 100, window_ms: 1000, burst: 100 }
+        rate_limits: [per-client]
 upstreams:
   up: { load_balancer: p2c, endpoints: ["%(upstream)s:80"] }
 rate_limit_service: { pods: [%(pods)s], cycle_ms: 10 }
+limits_file: limits.yaml
+"""
+
+# Keyed by the client's address: until authentication, the only key EdgeRush takes. Every
+# run's load comes from the host, so every run is the one key; a bucket of 100 at 100 a
+# second is full again between runs.
+EDGERUSH_LIMITS = """limits:
+  - { name: per-client, key: client, model: { bucket: { rate: 100/s, burst: 100 } } }
 """
 
 
@@ -548,12 +558,16 @@ def build_edgerush(n):
             IMAGES["edgerush"],
             command=["/opt/bin/edgerush", "proxy", "--config", "/etc/edgerush.yaml",
                      "--workers", "1"],
-            volumes=[f"{BINARIES}:/opt/bin:ro", "./edgerush.yaml:/etc/edgerush.yaml:ro"],
+            volumes=[f"{BINARIES}:/opt/bin:ro", "./edgerush.yaml:/etc/edgerush.yaml:ro",
+                     "./limits.yaml:/etc/limits.yaml:ro"],
         )
-    files = {"edgerush.yaml": EDGERUSH % {
-        "upstream": UPSTREAM_IP,
-        "pods": ", ".join(f'"{ip}:7000"' for ip in SERVICE_IPS),
-    }}
+    files = {
+        "edgerush.yaml": EDGERUSH % {
+            "upstream": UPSTREAM_IP,
+            "pods": ", ".join(f'"{ip}:7000"' for ip in SERVICE_IPS),
+        },
+        "limits.yaml": EDGERUSH_LIMITS,
+    }
     return services, files
 
 
@@ -571,10 +585,11 @@ def mix(x):
     return x ^ (x >> 31)
 
 
-def service_owner(key, pods=(0, 1, 2)):
-    """The service pod owning `key` (the run's `x-key` value under the rule `rl/0`), as
-    `edgerush_ratelimit::service::View::owners` ranks them."""
-    h = fnv1a(b"rl/0\0" + key.encode())
+def service_owner(pods=(0, 1, 2)):
+    """The service pod owning the load's key — the limit's name, a zero, and the client's
+    address, the host's — as `edgerush_ratelimit::service::View::owners` ranks them."""
+    address = bytes(int(octet) for octet in CLIENT_IP.split("."))
+    h = fnv1a(b"per-client" + bytes([0]) + address)
     return max(pods, key=lambda pod: (mix(h ^ mix(pod + 1)), pod))
 
 
