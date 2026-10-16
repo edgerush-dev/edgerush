@@ -54,6 +54,7 @@ mod mirrors;
 mod passthrough;
 mod plane;
 mod proxy_headers;
+mod rate_limits;
 mod resources;
 mod retries;
 mod timeouts;
