@@ -36,6 +36,15 @@ pub enum Shape {
         /// Requests a window, on average.
         per_window: u64,
     },
+    /// The same, each to one of the last `last` pods at random: one client on many
+    /// connections to one data-plane pod, which land on its workers, each a data plane of
+    /// the protocol — so `last` is the pod's workers.
+    Within {
+        /// Requests a window, on average.
+        per_window: u64,
+        /// Among how many of the last pods.
+        last: usize,
+    },
     /// `each` requests on every pod at the same instant, once a window: synchronised
     /// bursts.
     Bursts {
@@ -95,6 +104,10 @@ impl Workload {
                 let uneven = Target::Uneven(pods, hot);
                 spread(&mut arrivals, rng, start, span, window, per_window, uneven);
             }
+            Shape::Within { per_window, last } => {
+                let within = Target::Last(pods, last.clamp(1, pods));
+                spread(&mut arrivals, rng, start, span, window, per_window, within);
+            }
             Shape::Bursts { each } => {
                 bursts(&mut arrivals, start, span, window, each, pods);
             }
@@ -137,6 +150,8 @@ enum Target {
     Only(usize),
     /// The last of this many in so many of every hundred, any of them otherwise.
     Uneven(usize, u64),
+    /// Of this many, any of the last so many, at random.
+    Last(usize, usize),
 }
 
 /// About `per_window` requests a window from `from` to `until`, each gap between half and
@@ -166,6 +181,9 @@ fn spread(
                 } else {
                     usize::try_from(rng.below(pods as u64)).unwrap_or(0)
                 }
+            }
+            Target::Last(pods, last) => {
+                pods - last + usize::try_from(rng.below(last as u64)).unwrap_or(0)
             }
         };
         arrivals.push(Arrival { at, pod });
@@ -244,6 +262,24 @@ mod tests {
         for pod in 0..3 {
             let count = arrivals.iter().filter(|a| a.pod == pod).count() * 100 / arrivals.len();
             assert!((9..=16).contains(&count), "pod {pod}: {count}%");
+        }
+    }
+
+    /// Traffic within the last pods lands on each of them and on no other.
+    #[test]
+    fn traffic_within_the_last_pods_lands_on_each_of_them_alone() {
+        let arrivals = workload(
+            Shape::Within {
+                per_window: 400,
+                last: 4,
+            },
+            false,
+        )
+        .arrivals(&contract(), 16, &mut Rng::new(3));
+        assert!(arrivals.iter().all(|a| (12..16).contains(&a.pod)));
+        for pod in 12..16 {
+            let count = arrivals.iter().filter(|a| a.pod == pod).count() * 100 / arrivals.len();
+            assert!((20..=30).contains(&count), "pod {pod}: {count}%");
         }
     }
 

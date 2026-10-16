@@ -101,6 +101,20 @@ pub enum Approach {
         /// How long an ask may go unanswered before it is given up; 0 for four cycles.
         ask_timeout: u64,
     },
+    /// [`Nodes`](Self::Nodes) layered (12 item 3): each data plane of the protocol is a
+    /// process whose `workers` decide its requests from allowances it gives them every
+    /// `sync` nanoseconds, a worker with none asking the process, which decides from its
+    /// view and the allowances out. The run's pods are the workers, `workers` to a process.
+    Layered {
+        /// The time between a process's batches to the service.
+        cycle: u64,
+        /// How long an ask may go unanswered before it is given up; 0 for four cycles.
+        ask_timeout: u64,
+        /// The workers of a process.
+        workers: usize,
+        /// The time between a process's syncs with its workers.
+        sync: u64,
+    },
     /// [`Nodes`](Self::Nodes) with every request under another limit beside the run's,
     /// decided under both, all or none (06 §4). The run's contract is the one measured.
     NodesUnder {
@@ -304,6 +318,17 @@ impl Approach {
             Self::Service(serving) => Box::new(Service::new(contract, pods, *serving)),
             Self::Nodes { cycle, ask_timeout } => {
                 Box::new(Nodes::new(contract, pods, *cycle, *ask_timeout, None))
+            }
+            Self::Layered {
+                cycle,
+                ask_timeout,
+                workers,
+                sync,
+            } => {
+                let workers = (*workers).max(1);
+                let processes = pods.div_ceil(workers);
+                let nodes = Nodes::new(contract, processes, *cycle, *ask_timeout, None);
+                Box::new(nodes.layered(workers, *sync))
             }
             Self::NodesUnder {
                 cycle,
