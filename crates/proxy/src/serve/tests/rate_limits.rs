@@ -237,36 +237,42 @@ async fn the_keys_held_are_shown_and_kept_within_their_bound() {
                     let (response, _) = send.send_request(request, true).unwrap();
                     within(response).await.unwrap();
                 }
-                let wanted = if held {
-                    "edgerush_rate_limit_keys 1\n"
-                } else {
-                    "edgerush_rate_limit_keys_evicted_total 1\n"
+                let sample = |scrape: &str, name: &str| -> u64 {
+                    scrape
+                        .lines()
+                        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0)
+                };
+                // Held: the one key, never evicted. Bounded below one key: none held, and
+                // evicted at least once — a slow run may evict it between the requests and
+                // make it again.
+                let wanted = |scrape: &str| {
+                    let keys = sample(scrape, "edgerush_rate_limit_keys");
+                    let evicted = sample(scrape, "edgerush_rate_limit_keys_evicted_total");
+                    if held {
+                        keys == 1 && evicted == 0
+                    } else {
+                        keys == 0 && evicted >= 1
+                    }
                 };
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let scrape = loop {
                     let scrape = worker.proxy().metrics();
-                    if scrape.contains(wanted) || Instant::now() > deadline {
+                    if wanted(&scrape) || Instant::now() > deadline {
                         break scrape;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 };
-                assert!(scrape.contains(wanted), "{wanted}{scrape}");
+                assert!(wanted(&scrape), "{scrape}");
                 let bound = format!(
                     "edgerush_rate_limit_max_key_bytes {}\n",
                     max.unwrap_or(256 << 20)
                 );
                 assert!(scrape.contains(&bound), "{bound}{scrape}");
                 if held {
-                    one_key = scrape
-                        .lines()
-                        .find_map(|line| line.strip_prefix("edgerush_rate_limit_key_bytes "))
-                        .and_then(|bytes| bytes.parse().ok())
-                        .unwrap_or(0);
+                    one_key = sample(&scrape, "edgerush_rate_limit_key_bytes");
                     assert!(one_key > 0, "{scrape}");
-                    assert!(
-                        scrape.contains("edgerush_rate_limit_keys_evicted_total 0\n"),
-                        "{scrape}"
-                    );
                 }
             }
         })
