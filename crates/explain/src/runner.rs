@@ -3,7 +3,7 @@
 //! expected beside got; a test with none passed.
 
 use crate::asked::{self, Asked};
-use crate::explained::{STAND_IN_ID, Snapshot, Unexplained};
+use crate::explained::{STAND_IN_ID, Snapshot, Unexplained, limits_under};
 use crate::test_file::{
     Asking, Backend, Expect, Fraction, HeaderExpected, Mirror, Prepared, UpstreamAnswer,
 };
@@ -98,18 +98,33 @@ fn request(
 
     let decided = explained.decided();
     match (&expect.forward, &expect.redirect, &expect.answer, decided) {
-        (Some(forward), _, _, Ok(Decision::Forward(_))) => {
+        (Some(forward), _, _, Ok(Decision::Forward(decided))) => {
             let rule = routed.map(|(_, rule, _)| rule);
             differ(
                 "backends",
                 backends(&forward.backends),
                 backends(&rule.map_or_else(Vec::new, rule_backends)),
             );
-            differ(
-                "mirrors",
-                mirrors(forward.mirrors.as_deref().unwrap_or_default()),
-                mirrors(&rule.map_or_else(Vec::new, rule_mirrors)),
-            );
+            if let Some(expected) = &forward.mirrors {
+                differ(
+                    "mirrors",
+                    mirrors(expected),
+                    mirrors(&rule.map_or_else(Vec::new, rule_mirrors)),
+                );
+            }
+            if let Some(expected) = &forward.rate_limits {
+                let mut expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+                let mut got: Vec<&str> = limits_under(decided)
+                    .map(|limit| limit.name.as_str())
+                    .collect();
+                expected.sort_unstable();
+                got.sort_unstable();
+                differ(
+                    "rate_limits",
+                    listed(expected.into_iter().map(str::to_owned)),
+                    listed(got.into_iter().map(str::to_owned)),
+                );
+            }
             if let Some(upstream) = &expect.upstream_request {
                 let head = explained.upstream();
                 if let Some(target) = &upstream.target {
@@ -540,6 +555,9 @@ upstreams:
                 "mirrors: expected none, got shadow (1/10)"
             ]
         );
+        // Mirrors left out are not checked; the backends always are.
+        let unstated = format!("{{ route: shop, rule: 0, forward: {{ {BACKENDS} }} }}");
+        assert_eq!(differences(CART, "[]", &unstated), Vec::<String>::new());
     }
 
     #[test]
@@ -732,6 +750,67 @@ upstreams: {}
         );
         assert_eq!(
             ran(&shop(), &over_h2, Some(refusal), &not_offered),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The rate limits a request is under are held to those stated, by name, whole and in
+    /// any order: a limit narrower than its rule only when it matches. Left out, they are
+    /// not checked.
+    #[test]
+    fn the_rate_limits_are_held_whole_in_any_order() {
+        let config = r#"
+listeners: { web: { address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
+routes:
+  - name: api
+    listeners: [web]
+    hostnames: [{ name: "*", falls_through: true }]
+    rules:
+      - matches: [{ path: { prefix: /api } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+        rate_limits: [per-client, writes]
+      - matches: [{ path: { prefix: /admin } }]
+        forward: { backends: [{ upstream: u, weight: 1 }] }
+        rate_limits: [writes]
+upstreams: { u: { load_balancer: p2c, endpoints: [] } }
+rate_limit_service: { pods: ["rl-0:7000"] }
+"#;
+        let limits = "limits:
+  - { name: per-client, key: client, model: { bucket: { rate: 100/s, burst: 100 } } }
+  - { name: writes, key: client, match: { methods: [POST] }, model: { bucket: { rate: 10/min, burst: 5 } } }
+";
+        let mut config: edgerush_config::Config = serde_saphyr::from_str(config).unwrap();
+        config.limits = Some(serde_saphyr::from_str(limits).unwrap());
+        let snapshot = Snapshot::new(config).unwrap();
+        let check = |method: &str, path: &str, rule: u32, limits: &str| {
+            let request = format!(
+                "{{ listener: web, client: 203.0.113.7, protocol: \"1.1\", method: {method}, url: \"http://a.test{path}\", headers: [] }}"
+            );
+            let expect = format!(
+                "{{ route: api, rule: {rule}, forward: {{ backends: [{{ upstream: u, weight: 1 }}], mirrors: [], rate_limits: {limits} }} }}"
+            );
+            ran(&snapshot, &request, None, &expect)
+        };
+        // Decided `writes` first, the smaller bucket; stated the other way round.
+        assert!(check("POST", "/api/x", 0, "[per-client, writes]").is_empty());
+        assert_eq!(
+            check("GET", "/api/x", 0, "[per-client, writes]"),
+            ["rate_limits: expected per-client, writes, got per-client"]
+        );
+        assert_eq!(
+            check("POST", "/api/x", 0, "[writes]"),
+            ["rate_limits: expected writes, got per-client, writes"]
+        );
+        assert!(check("GET", "/admin", 1, "[]").is_empty());
+        assert_eq!(
+            check("GET", "/admin", 1, "[writes]"),
+            ["rate_limits: expected writes, got none"]
+        );
+        let request = "{ listener: web, client: 203.0.113.7, protocol: \"1.1\", method: POST, url: \"http://a.test/api/x\", headers: [] }";
+        let unstated =
+            "{ route: api, rule: 0, forward: { backends: [{ upstream: u, weight: 1 }] } }";
+        assert_eq!(
+            ran(&snapshot, request, None, unstated),
             Vec::<String>::new()
         );
     }

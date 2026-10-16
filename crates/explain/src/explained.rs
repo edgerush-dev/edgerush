@@ -9,8 +9,8 @@
 
 use crate::asked::{Asked, Invalid};
 use edgerush_config::{
-    Compiled, CompiledListener, Config, ConfigError, EncodedSlash, Filter, HeaderChanges, MatchId,
-    Matches, PathChange, Protocol, RequestId, Rule, compile_with_matches,
+    Compiled, CompiledLimit, CompiledListener, Config, ConfigError, EncodedSlash, Filter,
+    HeaderChanges, MatchId, Matches, PathChange, Protocol, RequestId, Rule, compile_with_matches,
 };
 use edgerush_proxy::{Client, Decision, Rejection, decide_routed};
 use edgerush_router::{Explanation, Failure, Key, Seen, Verdict, Wanted, explain};
@@ -363,17 +363,8 @@ fn text(
             }
             // A rule under no limit says nothing of limits.
             if !forward.rule.limits.is_empty() {
-                let under: Vec<String> = forward
-                    .rule
-                    .limits
-                    .iter()
-                    .enumerate()
-                    .filter(|(at, _)| {
-                        1_u64
-                            .checked_shl(u32::try_from(*at).unwrap_or(u32::MAX))
-                            .is_some_and(|bit| forward.limited & bit != 0)
-                    })
-                    .map(|(_, limit)| {
+                let under: Vec<String> = limits_under(forward)
+                    .map(|limit| {
                         format!(
                             "{} ({}, a bucket of {})",
                             limit.name, limit.rate, limit.burst
@@ -401,6 +392,24 @@ fn text(
     let mut text = lines.join("\n");
     text.push('\n');
     text
+}
+
+/// The rate limits a forwarded request is under, of its rule's, in the order they are
+/// decided.
+pub(crate) fn limits_under<'a>(
+    forward: &'a edgerush_proxy::Forward<'_>,
+) -> impl Iterator<Item = &'a CompiledLimit> {
+    forward
+        .rule
+        .limits
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| {
+            1_u64
+                .checked_shl(u32::try_from(*at).unwrap_or(u32::MAX))
+                .is_some_and(|bit| forward.limited & bit != 0)
+        })
+        .map(|(_, limit)| &**limit)
 }
 
 /// Adds a field of the rule's: its name, then its lines beside it.

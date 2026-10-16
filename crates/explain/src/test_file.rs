@@ -143,17 +143,22 @@ pub struct Expect {
     pub response: Option<Response>,
 }
 
-/// The rule's backends and mirrors, each list whole: what is drawn at random is asserted
-/// as the list it is drawn from.
+/// The rule's backends and mirrors, and the rate limits the request is under, each list
+/// whole — the backends always, the others only when stated: what is drawn at random is
+/// asserted as the list it is drawn from.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Forward {
     /// The backends, in the rule's order.
     pub backends: Vec<Backend>,
-    /// The mirrors, in the rule's order; `[]` for none. Stated for a request, and never for
-    /// a connection, which has no mirrors.
+    /// The mirrors, in the rule's order; `[]` for none, and not checked when left out.
+    /// Never stated for a connection, which has no mirrors.
     #[serde(default)]
     pub mirrors: Option<Vec<Mirror>>,
+    /// The rate limits the request is under, by name, in any order; `[]` for none, and not
+    /// checked when left out. Never stated for a connection, which has none.
+    #[serde(default)]
+    pub rate_limits: Option<Vec<String>>,
 }
 
 /// A backend and its weight.
@@ -292,9 +297,6 @@ pub enum Problem {
     /// A forwarded connection without its route.
     #[error("a forwarded connection has a route: state it")]
     NoConnectionRoute,
-    /// A forwarded request without its mirrors.
-    #[error("a forwarded request states its mirrors: [] for none")]
-    NoMirrors,
     /// An answer the gateway never gives itself.
     #[error("'{0}' is not an answer the gateway gives: one of {list}", list = ANSWERS.join(", "))]
     Answer(String),
@@ -566,8 +568,8 @@ fn kind(protocol: Protocol) -> &'static str {
 }
 
 /// What is wrong with a test for a listener of `protocol`: a request's has a rule beside
-/// its route and states its mirrors; a connection's has a route alone, is forwarded or
-/// refused, and has no answer of HTTP's.
+/// its route; a connection's has a route alone, is forwarded or refused, and has no answer,
+/// mirrors or rate limits of HTTP's.
 fn for_listener(test: &Test, protocol: Protocol) -> Vec<Problem> {
     let expect = &test.expect;
     let mut problems = Vec::new();
@@ -579,13 +581,6 @@ fn for_listener(test: &Test, protocol: Protocol) -> Vec<Problem> {
                 problems.push(Problem::RouteAndRule);
             } else if routed && expect.route.is_none() {
                 problems.push(Problem::NoRoute);
-            }
-            if expect
-                .forward
-                .as_ref()
-                .is_some_and(|forward| forward.mirrors.is_none())
-            {
-                problems.push(Problem::NoMirrors);
             }
             if expect.refused.is_some() {
                 problems.push(Problem::Unwanted("refused", kind));
@@ -605,6 +600,13 @@ fn for_listener(test: &Test, protocol: Protocol) -> Vec<Problem> {
                         .forward
                         .as_ref()
                         .is_some_and(|forward| forward.mirrors.is_some()),
+                ),
+                (
+                    "rate_limits",
+                    expect
+                        .forward
+                        .as_ref()
+                        .is_some_and(|forward| forward.rate_limits.is_some()),
                 ),
             ];
             problems.extend(
@@ -933,10 +935,11 @@ tls_routes:
             ),
             (
                 "{ listener: db }",
-                "{ route: postgres, rule: 0, forward: { backends: [], mirrors: [] } }",
+                "{ route: postgres, rule: 0, forward: { backends: [], mirrors: [], rate_limits: [] } }",
                 vec![
                     "rule does not apply to a tcp listener",
                     "mirrors does not apply to a tcp listener",
+                    "rate_limits does not apply to a tcp listener",
                 ],
             ),
             (
@@ -969,16 +972,11 @@ tls_routes:
             mistakes(&[test("a", REQUEST, refused)]),
             [(2, "refused does not apply to an http listener".to_owned())]
         );
-        // And a request forwarded states its mirrors.
-        let no_mirrors =
+        // A request forwarded may leave out its mirrors and its rate limits.
+        let neither =
             "{ route: shop, rule: 0, forward: { backends: [{ upstream: cart, weight: 1 }] } }";
-        assert_eq!(
-            mistakes(&[test("a", REQUEST, no_mirrors)]),
-            [(
-                2,
-                "a forwarded request states its mirrors: [] for none".to_owned()
-            )]
-        );
+        let yaml = format!("tests:\n{}", test("a", REQUEST, neither));
+        assert!(read(yaml.as_bytes()).unwrap().prepare(&snapshot()).is_ok());
         // An sni that is neither none nor a name cannot be read.
         let odd = format!(
             "tests:\n{}",
