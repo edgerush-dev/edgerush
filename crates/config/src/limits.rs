@@ -60,6 +60,11 @@ pub struct Limit {
     pub key: String,
     /// How the requests are counted.
     pub model: Model,
+    /// Counted and reported, never refusing: a request it has no room for goes on, counted
+    /// as `dry_run_refused`, and it is not charged, as it would not be had it refused.
+    /// Decided after the limits that refuse, and only when they admit; never waited for.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// The requests a limit applies to: each of what it states holds.
@@ -128,6 +133,8 @@ pub struct CompiledLimit {
     pub window: NonZeroU64,
     /// The whole bucket.
     pub burst: NonZeroU64,
+    /// Whether it only counts and reports, never refusing (06 §2).
+    pub dry_run: bool,
 }
 
 /// The engine's limits, compiled: by name, and those over every request.
@@ -226,6 +233,7 @@ pub(crate) fn compile_limits(
                 rate: bucket.rate.clone(),
                 window,
                 burst,
+                dry_run: limit.dry_run,
             };
             by_name.insert(limit.name.clone(), Arc::new(compiled));
         }

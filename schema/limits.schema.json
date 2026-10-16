@@ -62,6 +62,11 @@
       "description": "A limit: whose requests it counts together, and how many it allows.",
       "type": "object",
       "properties": {
+        "dry_run": {
+          "description": "Counted and reported, never refusing: a request it has no room for goes on, counted\nas `dry_run_refused`, and it is not charged, as it would not be had it refused.\nDecided after the limits that refuse, and only when they admit; never waited for.",
+          "type": "boolean",
+          "default": false
+        },
         "key": {
           "description": "Whose requests are counted together: `client`, the address the data plane sees — the\npeer, or the client a trusted PROXY protocol header names — an IPv6 client by its\n/64, which one client holds whole. Never what a client says.",
           "type": "string"

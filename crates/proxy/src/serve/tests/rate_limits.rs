@@ -119,6 +119,78 @@ async fn http2_requests_are_held_to_their_limit() {
         .await;
 }
 
+/// A dry run never refuses: beside a limit that does, the requests that one admits all go
+/// on, the dry run charged for those it has room for and counting the rest
+/// `dry_run_refused`; the 429s name the limit that refused alone.
+#[tokio::test]
+async fn a_dry_run_counts_what_it_would_refuse_and_refuses_nothing() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let service = service().await;
+            let (upstream, _) = counting_upstream().await;
+            let mut config = limited(everything_config(upstream), &service);
+            config.routes[0].rules[0].rate_limits =
+                vec!["per-client".to_owned(), "trial".to_owned()];
+            config.limits = Some(
+                serde_saphyr::from_str(
+                    "limits:
+  - { name: per-client, key: client, model: { bucket: { rate: 10/h, burst: 10 } } }
+  - { name: trial, key: client, model: { bucket: { rate: 4/h, burst: 4 } }, dry_run: true }
+",
+                )
+                .unwrap(),
+            );
+            let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+            let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let mut statuses = Vec::new();
+            for _ in 0..12 {
+                send = within(send.ready()).await.unwrap();
+                let request = Request::get("http://example.test/")
+                    .version(Version::HTTP_2)
+                    .body(())
+                    .unwrap();
+                let (response, _) = send.send_request(request, true).unwrap();
+                let response = within(response).await.unwrap();
+                if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                    assert_eq!(response.headers()["ratelimit"], r#""per-client";r=0;t=360"#);
+                }
+                statuses.push(response.status().as_u16());
+            }
+            assert_eq!(tally(&statuses), (10, 2), "{statuses:?}");
+            // A dry run asked about a cold key is counted when the answer comes.
+            let line = |limit: &str, outcome: &str, count: u64| {
+                format!("edgerush_rate_limit_decisions_total{{limit=\"{limit}\",outcome=\"{outcome}\"}} {count}\n")
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let scrape = loop {
+                let scrape = worker.proxy().metrics();
+                if scrape.contains(&line("trial", "dry_run_refused", 6)) || Instant::now() > deadline {
+                    break scrape;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            for expected in [
+                line("per-client", "admitted", 10),
+                line("per-client", "refused", 2),
+                line("trial", "admitted", 4),
+                line("trial", "refused", 0),
+                line("trial", "dry_run_refused", 6),
+            ] {
+                assert!(scrape.contains(&expected), "{expected}{scrape}");
+            }
+            assert!(
+                !scrape.contains("limit=\"per-client\",outcome=\"dry_run_refused\""),
+                "{scrape}"
+            );
+        })
+        .await;
+}
+
 /// Each limit counts what it decided: a request admitted under every limit it was under, a
 /// refusal under the limits that were out of room alone, gRPC calls too. A config with no
 /// limit shows none.

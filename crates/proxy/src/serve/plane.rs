@@ -301,12 +301,12 @@ impl Proxy {
                 (upstream.name.as_str(), serving, aside)
             })
             .collect();
-        let limits: Vec<(&str, usize)> = snapshot
+        let limits: Vec<(&str, usize, bool)> = snapshot
             .config
             .limits()
             .iter()
             .zip(snapshot.limit_slots.iter())
-            .map(|(limit, slot)| (limit.name.as_str(), *slot))
+            .map(|(limit, slot)| (limit.name.as_str(), *slot, limit.dry_run))
             .collect();
         let mut scrape = self.metrics.render(&self.listeners, &upstreams, &endpoints);
         // Only a config with limits shows them.

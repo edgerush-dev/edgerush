@@ -696,11 +696,12 @@ impl UpstreamCounters {
 
 /// What is counted per rate limit (06 §2): requests admitted under it, each counted under
 /// every limit it was under, and refused by it, each counted under every limit that was
-/// out of room.
+/// out of room; for a dry run, those it had no room for and let go on.
 #[derive(Debug, Default)]
 pub(crate) struct LimitCounters {
     pub(crate) admitted: Counter,
     pub(crate) refused: Counter,
+    pub(crate) dry_run_refused: Counter,
 }
 
 /// The position of a status in [`CLASSES`]. `http` has no status below 100 or above 999;
@@ -869,27 +870,33 @@ impl Metrics {
     }
 
     /// The scrape's rate limits: those of the current config by their names, each with the
-    /// slot it has.
-    pub(crate) fn render_limits(&self, limits: &[(&str, usize)]) -> String {
+    /// slot it has and whether it is a dry run, which alone shows `dry_run_refused`.
+    pub(crate) fn render_limits(&self, limits: &[(&str, usize, bool)]) -> String {
         let mut scrape = Exposition::new();
         // Limits that share a series are shown once, under a name of its own.
-        let mut shown: Vec<(&str, usize)> = Vec::new();
-        for (limit, slot) in limits {
+        let mut shown: Vec<(&str, usize, bool)> = Vec::new();
+        for (limit, slot, dry_run) in limits {
             let limit = if *slot == OVERFLOW_SLOT {
                 OVERFLOW_NAME
             } else {
                 limit
             };
-            if !shown.contains(&(limit, *slot)) {
-                shown.push((limit, *slot));
+            match shown
+                .iter_mut()
+                .find(|(name, at, _)| (*name, *at) == (limit, *slot))
+            {
+                // Shared, it shows what any of its limits does.
+                Some((_, _, shared)) => *shared |= *dry_run,
+                None => shown.push((limit, *slot, *dry_run)),
             }
         }
         let name = "edgerush_rate_limit_decisions_total";
         let help = "Requests decided under the rate limit, by outcome: admitted, counted under \
                     every limit a request was under; refused, counted under every limit that \
-                    was out of room.";
+                    was out of room; dry_run_refused, those a dry run had no room for and let \
+                    go on.";
         scrape.family(name, Kind::Counter, help);
-        for (limit, slot) in shown {
+        for (limit, slot, dry_run) in shown {
             let Some(series) = self.limits.get(slot).and_then(OnceLock::get) else {
                 continue;
             };
@@ -897,6 +904,14 @@ impl Metrics {
             scrape.sample(name, &labels, series.sum(|shard| shard.admitted.get()));
             let labels = [("limit", limit), ("outcome", "refused")];
             scrape.sample(name, &labels, series.sum(|shard| shard.refused.get()));
+            if dry_run {
+                let labels = [("limit", limit), ("outcome", "dry_run_refused")];
+                scrape.sample(
+                    name,
+                    &labels,
+                    series.sum(|shard| shard.dry_run_refused.get()),
+                );
+            }
         }
         scrape.finish()
     }
@@ -1424,9 +1439,9 @@ mod tests {
 
         metrics.limit(OVERFLOW_SLOT).unwrap().admitted.inc();
         let scrape = metrics.render_limits(&[
-            ("writes", writes),
-            ("late-a", OVERFLOW_SLOT),
-            ("late-b", OVERFLOW_SLOT),
+            ("writes", writes, false),
+            ("late-a", OVERFLOW_SLOT, false),
+            ("late-b", OVERFLOW_SLOT, false),
         ]);
         for line in [
             "edgerush_rate_limit_decisions_total{limit=\"writes\",outcome=\"admitted\"} 1\n",
@@ -1445,7 +1460,7 @@ mod tests {
         let metrics = metrics();
         let writes = metrics.limit_slot("writes");
         let scrape = metrics.render(&["web".to_owned()], &[("cart", 1)], &[("cart", 1, 0)])
-            + &metrics.render_limits(&[("writes", writes)]);
+            + &metrics.render_limits(&[("writes", writes, true)]);
         let broken: Vec<&str> = scrape
             .lines()
             .filter(|line| line.starts_with("# HELP") && line.contains("  "))

@@ -365,8 +365,9 @@ fn text(
             if !forward.rule.limits.is_empty() {
                 let under: Vec<String> = limits_under(forward)
                     .map(|limit| {
+                        let dry_run = if limit.dry_run { ", a dry run" } else { "" };
                         format!(
-                            "{} ({}, a bucket of {})",
+                            "{} ({}, a bucket of {}{dry_run})",
                             limit.name, limit.rate, limit.burst
                         )
                     })
@@ -928,7 +929,7 @@ rate_limit_service: { pods: ["rl-0:7000"] }
 "#;
         let limits = "limits:
   - { name: per-client, key: client, model: { bucket: { rate: 100/s, burst: 100 } } }
-  - { name: writes, key: client, match: { methods: [POST] }, model: { bucket: { rate: 10/min, burst: 5 } } }
+  - { name: writes, key: client, match: { methods: [POST] }, model: { bucket: { rate: 10/min, burst: 5 } }, dry_run: true }
 ";
         let mut config: edgerush_config::Config = serde_saphyr::from_str(config).unwrap();
         config.limits = Some(serde_saphyr::from_str(limits).unwrap());
@@ -947,7 +948,9 @@ rate_limit_service: { pods: ["rl-0:7000"] }
         );
         assert_eq!(
             line("POST", "/api/x").as_deref(),
-            Some("limits    writes (10/min, a bucket of 5), per-client (100/s, a bucket of 100)")
+            Some(
+                "limits    writes (10/min, a bucket of 5, a dry run), per-client (100/s, a bucket of 100)"
+            )
         );
         assert_eq!(
             line("GET", "/admin").as_deref(),

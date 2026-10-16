@@ -38,6 +38,25 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 
+/// Some of a rule's rate limits, as a request is under them: bit `n` of `marked` for the
+/// rule's `n`th, and the config's limits' slots, by position.
+#[derive(Clone, Copy)]
+struct Under<'a> {
+    rule: &'a CompiledRule,
+    marked: u64,
+    slots: &'a [usize],
+}
+
+/// Which of `rule`'s limits are dry runs, bit `n` for the `n`th.
+fn dry_runs(rule: &CompiledRule) -> u64 {
+    rule.limits
+        .iter()
+        .take(64)
+        .enumerate()
+        .filter(|(_, limit)| limit.dry_run)
+        .fold(0, |marked, (at, _)| marked | 1 << at)
+}
+
 impl Worker {
     /// Answers a request that came in on `listener`. `interim` is where the server that
     /// read it wants the upstream's interim answers, if it passes them on
@@ -160,18 +179,58 @@ impl Worker {
         }
     }
 
-    /// The answer to `directed`, a request from `client` the rate limits of `rule` it is
-    /// under refused: 429, with `Retry-After` in whole seconds, rounded up and at least
-    /// one — the longest any of them waits — and `RateLimit` naming the limit that waits
-    /// that long, none left, for as long (06 §2). A gRPC call is answered
-    /// `RESOURCE_EXHAUSTED`, which says no more. Counted under each limit that refused it:
-    /// as `told`, where the service pod that decided it said, by position among its keys;
-    /// otherwise as the copies have them.
+    /// Decides a request from `client` under the dry runs it is `under`, each on its own,
+    /// never holding it up: one with room is charged and counts it admitted; one without
+    /// counts it `dry_run_refused` and lets it go on. A key held no fresh copy of is asked
+    /// about, and counted when the answer comes.
+    fn dry_run(&self, under: Under<'_>, client: &Client) {
+        let Some(limiter) = self.limiter() else {
+            return;
+        };
+        let mut marked = under.marked;
+        while marked != 0 {
+            let at = marked.trailing_zeros() as usize;
+            let one = marked.isolate_lowest_one();
+            marked &= marked - 1;
+            let slot = under
+                .rule
+                .limits
+                .get(at)
+                .and_then(|limit| under.slots.get(limit.position).copied());
+            let count = move |proxy: &Proxy, admitted: bool| {
+                if let Some(counters) = slot.and_then(|slot| proxy.metrics.limit(slot)) {
+                    if admitted {
+                        counters.admitted.inc();
+                    } else {
+                        counters.dry_run_refused.inc();
+                    }
+                }
+            };
+            match limiter.decide_all(&under.rule.limits, one, client) {
+                Limited::Admit => count(&self.proxy, true),
+                Limited::Refuse => count(&self.proxy, false),
+                Limited::Wait(decided) => {
+                    let proxy = Arc::clone(&self.proxy);
+                    let _counted = tokio::task::spawn_local(async move {
+                        if let Ok(decided) = decided.await {
+                            count(&proxy, decided.admitted);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// The answer to a request from `client` that the rate limits it is `under` refused:
+    /// 429, with `Retry-After` in whole seconds, rounded up and at least one — the longest
+    /// any of them waits — and `RateLimit` naming the limit that waits that long, none
+    /// left, for as long (06 §2). A gRPC call is answered `RESOURCE_EXHAUSTED`, which says
+    /// no more. Counted under each limit that refused it: as `told`, where the service pod
+    /// that decided it said, by position among its keys; otherwise as the copies have them.
     fn refused(
         &self,
         listener: usize,
-        directed: &Directed,
-        rule: &CompiledRule,
+        under: Under<'_>,
         client: &Client,
         call: Option<Call>,
         told: &[(usize, u64)],
@@ -180,9 +239,10 @@ impl Worker {
         let Some(limiter) = self.limiter() else {
             return response;
         };
-        let refusal = limiter.refusal(&rule.limits, directed.limited, client, told);
-        let slots = directed.limit_slots.as_deref().unwrap_or_default();
-        self.count_limits(rule, refusal.by, slots, |counters| &counters.refused);
+        let refusal = limiter.refusal(&under.rule.limits, under.marked, client, told);
+        self.count_limits(under.rule, refusal.by, under.slots, |counters| {
+            &counters.refused
+        });
         if call.is_none()
             && let Some((limit, wait)) = refusal.longest
         {
@@ -300,31 +360,41 @@ impl Worker {
         };
         // The rate limits it is under, if any: decided at once from the worker's copies, or,
         // for keys it holds no fresh copy of, by a service pod (06 §4).
+        // Dry runs are decided apart, once the others admit it (06 §2).
         if directed.limited != 0
             && let Some(rule) = &directed.rule
         {
-            let (admitted, told) = match self.rate_limits(rule, directed.limited, client) {
-                Limited::Admit => (true, None),
-                Limited::Refuse => (false, None),
-                Limited::Wait(decided) => match decided.await {
-                    Ok(decided) => (decided.admitted, Some(decided.refused_by)),
-                    Err(_) => (false, None),
-                },
-            };
-            if !admitted {
-                return self
-                    .refused(
-                        listener,
-                        &directed,
-                        rule,
-                        client,
-                        call,
-                        told.as_deref().unwrap_or_default(),
-                    )
-                    .into();
-            }
             let slots = directed.limit_slots.as_deref().unwrap_or_default();
-            self.count_limits(rule, directed.limited, slots, |counters| &counters.admitted);
+            let dry = directed.limited & dry_runs(rule);
+            let enforced = directed.limited & !dry;
+            if enforced != 0 {
+                let (admitted, told) = match self.rate_limits(rule, enforced, client) {
+                    Limited::Admit => (true, None),
+                    Limited::Refuse => (false, None),
+                    Limited::Wait(decided) => match decided.await {
+                        Ok(decided) => (decided.admitted, Some(decided.refused_by)),
+                        Err(_) => (false, None),
+                    },
+                };
+                let under = Under {
+                    rule,
+                    marked: enforced,
+                    slots,
+                };
+                if !admitted {
+                    let told = told.as_deref().unwrap_or_default();
+                    return self.refused(listener, under, client, call, told).into();
+                }
+                self.count_limits(rule, enforced, slots, |counters| &counters.admitted);
+            }
+            if dry != 0 {
+                let under = Under {
+                    rule,
+                    marked: dry,
+                    slots,
+                };
+                self.dry_run(under, client);
+            }
         }
         // A WebSocket that an HTTP/2 or HTTP/3 client asks for holds a backend of its own
         // beside the client's one connection, which may carry a hundred: it counts as one
