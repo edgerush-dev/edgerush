@@ -261,6 +261,7 @@ dependencies = [
  "edgerush-ratelimit",
  "edgerush-ratelimit-service",
  "edgerush-router",
+ "edgerush-rules",
  "edgerush-telemetry",
  "h2",
  "http",
