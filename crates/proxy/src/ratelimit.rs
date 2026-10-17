@@ -19,6 +19,7 @@ use crate::forwarding::Client as Requester;
 use crate::request::NoTables;
 use edgerush_config::{CompiledLimit, CompiledRateLimitService};
 use edgerush_ratelimit::service::layer::{Local, Worker};
+use edgerush_ratelimit::service::shared::Worker as Holder;
 use edgerush_ratelimit::service::{
     Contract, DataPlane, Decided, Decision, Keyed, Ticket, View, longest,
 };
@@ -145,6 +146,15 @@ enum Mode {
         /// The next ask's number.
         next: Cell<u64>,
     },
+    /// From each key's one room, which every worker of its process takes from (12 item 3).
+    Shared {
+        hub: Arc<Hub>,
+        /// Which of the process's workers it is.
+        index: usize,
+        rooms: RefCell<Holder<Keyed>>,
+        /// The next ask's number.
+        next: Cell<u64>,
+    },
 }
 
 impl Limiter {
@@ -232,14 +242,49 @@ impl Limiter {
         limiter
     }
 
+    /// A limiter for worker `index` of the process `hub`, taking from the rooms it hands
+    /// out, its task started (12 item 3).
+    pub(crate) fn shared(
+        service: &CompiledRateLimitService,
+        hub: Arc<Hub>,
+        index: usize,
+    ) -> Rc<Self> {
+        let (answers, answered) = mpsc::unbounded_channel();
+        let _gone = hub.to.send(ToHub::Join {
+            worker: index,
+            answers,
+        });
+        let entropy = RandomState::new();
+        let hasher = Keyed::new([entropy.hash_one(0_u8), entropy.hash_one(1_u8)]);
+        let start = hub.epoch();
+        let limiter = Rc::new(Self {
+            service: service.clone(),
+            mode: Mode::Shared {
+                hub,
+                index,
+                rooms: RefCell::new(Holder::with_hasher(hasher)),
+                next: Cell::new(0),
+            },
+            waiting: RefCell::new(HashMap::new()),
+            keys: RefCell::new(Vec::new()),
+            contracts: RefCell::new(Vec::new()),
+            start,
+            asked: Notify::new(),
+            stopped: Cell::new(false),
+        });
+        tokio::task::spawn_local(Rc::clone(&limiter).run_shared(answered));
+        limiter
+    }
+
     /// Whether it reaches `service` as it is set now: the same pods, the same cycle, the
-    /// same layering and keep. A change of what its keys may hold is taken as it is
+    /// same layering, keep and sharing. A change of what its keys may hold is taken as it is
     /// ([`Self::set_capacity`]).
     pub(crate) fn serves(&self, service: &CompiledRateLimitService) -> bool {
         self.service.pods == service.pods
             && self.service.cycle == service.cycle
             && self.service.layered == service.layered
             && self.service.layered_keep == service.layered_keep
+            && self.service.shared == service.shared
     }
 
     /// The bytes its keys may hold from now on: layered, the process's, which its first
@@ -247,10 +292,10 @@ impl Limiter {
     pub(crate) fn set_capacity(&self, max_key_bytes: u64) {
         match &self.mode {
             Mode::Apart { plane, .. } => plane.borrow_mut().set_capacity(max_key_bytes),
-            Mode::Layered { hub, index: 0, .. } => {
+            Mode::Layered { hub, index: 0, .. } | Mode::Shared { hub, index: 0, .. } => {
                 let _gone = hub.to.send(ToHub::Capacity(max_key_bytes));
             }
-            Mode::Layered { .. } => {}
+            Mode::Layered { .. } | Mode::Shared { .. } => {}
         }
     }
 
@@ -263,8 +308,8 @@ impl Limiter {
                 let plane = plane.borrow();
                 (plane.holding(), plane.key_count(), plane.evicted())
             }
-            Mode::Layered { hub, index: 0, .. } => hub.usage(),
-            Mode::Layered { .. } => (0, 0, 0),
+            Mode::Layered { hub, index: 0, .. } | Mode::Shared { hub, index: 0, .. } => hub.usage(),
+            Mode::Layered { .. } | Mode::Shared { .. } => (0, 0, 0),
         }
     }
 
@@ -289,40 +334,36 @@ impl Limiter {
         client: &Requester,
     ) -> Limited {
         let now = self.now();
-        if let Mode::Layered {
-            hub,
-            index,
-            slices,
-            next,
-        } = &self.mode
-        {
-            return self.with_keys(limits, limited, client, |parts| {
-                if parts.is_empty() {
-                    return Limited::Admit;
-                }
-                match slices.borrow_mut().decide(parts, now) {
-                    Local::Admit => Limited::Admit,
-                    Local::Refuse => Limited::Refuse,
-                    Local::Ask => {
-                        let id = next.get();
-                        next.set(id.wrapping_add(1));
-                        let keys = parts
-                            .iter()
-                            .map(|(key, contract)| ((*key).into(), *contract));
-                        let asked = ToHub::Ask {
-                            worker: *index,
-                            id,
-                            keys: keys.collect(),
-                        };
-                        if hub.to.send(asked).is_err() {
-                            return Limited::Refuse;
-                        }
-                        let (decided, waited) = oneshot::channel();
-                        self.waiting.borrow_mut().insert(id, decided);
-                        Limited::Wait(waited)
+        match &self.mode {
+            Mode::Layered {
+                hub,
+                index,
+                slices,
+                next,
+            } => {
+                return self.with_keys(limits, limited, client, |parts| {
+                    if parts.is_empty() {
+                        return Limited::Admit;
                     }
-                }
-            });
+                    let local = slices.borrow_mut().decide(parts, now);
+                    self.or_ask(local, hub, *index, next, parts)
+                });
+            }
+            Mode::Shared {
+                hub,
+                index,
+                rooms,
+                next,
+            } => {
+                return self.with_keys(limits, limited, client, |parts| {
+                    if parts.is_empty() {
+                        return Limited::Admit;
+                    }
+                    let local = rooms.borrow_mut().decide(parts, now);
+                    self.or_ask(local, hub, *index, next, parts)
+                });
+            }
+            Mode::Apart { .. } => {}
         }
         let Mode::Apart { plane, .. } = &self.mode else {
             return Limited::Admit;
@@ -342,6 +383,40 @@ impl Limiter {
                 let (decided, waited) = oneshot::channel();
                 self.waiting.borrow_mut().insert(ticket, decided);
                 self.asked.notify_one();
+                Limited::Wait(waited)
+            }
+        }
+    }
+
+    /// A worker's own decision of a request under `parts`, layered or shared: as it is, or,
+    /// one it cannot make, asked of its process `hub`, numbered from `next`.
+    fn or_ask(
+        &self,
+        local: Local,
+        hub: &Hub,
+        index: usize,
+        next: &Cell<u64>,
+        parts: &[(&[u8], Contract)],
+    ) -> Limited {
+        match local {
+            Local::Admit => Limited::Admit,
+            Local::Refuse => Limited::Refuse,
+            Local::Ask => {
+                let id = next.get();
+                next.set(id.wrapping_add(1));
+                let keys = parts
+                    .iter()
+                    .map(|(key, contract)| ((*key).into(), *contract));
+                let asked = ToHub::Ask {
+                    worker: index,
+                    id,
+                    keys: keys.collect(),
+                };
+                if hub.to.send(asked).is_err() {
+                    return Limited::Refuse;
+                }
+                let (decided, waited) = oneshot::channel();
+                self.waiting.borrow_mut().insert(id, decided);
                 Limited::Wait(waited)
             }
         }
@@ -374,6 +449,7 @@ impl Limiter {
             let own: Vec<(usize, u64)> = match &self.mode {
                 Mode::Apart { plane, .. } => plane.borrow().waits(parts, now).collect(),
                 Mode::Layered { slices, .. } => slices.borrow().waits(parts, now).collect(),
+                Mode::Shared { rooms, .. } => rooms.borrow().waits(parts, now).collect(),
             };
             let waits = own.into_iter().filter(|_| from_copies);
             let waits = waits.chain(told.iter().copied()).inspect(|(part, _)| {
@@ -534,6 +610,7 @@ impl Limiter {
                 }
                 message = answered.recv() => match message {
                     Some(FromHub::Slices(given)) => slices.borrow_mut().on_slices(given),
+                    Some(FromHub::Rooms { .. }) => {}
                     Some(FromHub::Answer { id, answer }) => {
                         slices.borrow_mut().on_slices(answer.slices);
                         if let Some(waiter) = self.waiting.borrow_mut().remove(&id) {
@@ -544,6 +621,41 @@ impl Limiter {
                             });
                         }
                     }
+                    None => return,
+                },
+                () = self.asked.notified() => {}
+            }
+            if self.stopped.get() {
+                return;
+            }
+        }
+    }
+}
+
+impl Limiter {
+    /// Shared, the worker's side of its process: the answers to its asks, with the rooms of
+    /// their keys, and now and then the rooms its process has closed dropped.
+    async fn run_shared(self: Rc<Self>, mut answered: mpsc::UnboundedReceiver<FromHub>) {
+        let Mode::Shared { rooms, .. } = &self.mode else {
+            return;
+        };
+        let mut sweep = tokio::time::interval(Duration::from_secs(1));
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = sweep.tick() => rooms.borrow_mut().sweep(),
+                message = answered.recv() => match message {
+                    Some(FromHub::Rooms { id, answer }) => {
+                        rooms.borrow_mut().on_rooms(answer.rooms);
+                        if let Some(waiter) = self.waiting.borrow_mut().remove(&id) {
+                            let _gone = waiter.send(Decided {
+                                ticket: id,
+                                admitted: answer.admitted,
+                                refused_by: answer.refused_by,
+                            });
+                        }
+                    }
+                    Some(_) => {}
                     None => return,
                 },
                 () = self.asked.notified() => {}

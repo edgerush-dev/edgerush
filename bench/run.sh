@@ -48,7 +48,8 @@
 #                                             client addresses (1000 unless said), each a
 #                                             quiet key of its own; by how a pod's workers
 #                                             share: VARIANTS ours-rl-apart ours-rl-layered
-#                                             ours-rl-keep, beside ours with no limit
+#                                             ours-rl-keep ours-rl-shared, beside ours
+#                                             with no limit
 #   bench/run.sh summary DIR                  the table of a finished run
 #
 # UPSTREAM_H2=1 has the proxy speak HTTP/2 to the backend, by prior knowledge, many
@@ -518,13 +519,15 @@ CFG
 
 # The config under a per-client limit with room for everything the load sends, so that
 # what is measured is deciding rather than refusing, shared as `$1` says: apart (each
-# worker a data plane), layered, or keep (layered, keeping unused slices RL_KEEP_MS).
+# worker a data plane), layered, keep (layered, keeping unused slices RL_KEEP_MS) or
+# shared (each key's one room, taken by atomics).
 rl_config() { # sharing
     local sharing
     case "$1" in
     apart) sharing= ;;
     layered) sharing=", layered: true" ;;
     keep) sharing=", layered: true, layered_keep_ms: $RL_KEEP_MS" ;;
+    shared) sharing=", shared: true" ;;
     *) echo "no sharing $1" >&2; exit 2 ;;
     esac
     cat >"$run-limits.yaml" <<'LIMITS'
@@ -1111,7 +1114,7 @@ profile-body)
     ;;
 ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3 | h3latency | mixed | passthrough | websocket | ratelimit) ;;
 *)
-    sed -n '2,55p' "$0" >&2
+    sed -n '2,56p' "$0" >&2
     exit 2
     ;;
 esac

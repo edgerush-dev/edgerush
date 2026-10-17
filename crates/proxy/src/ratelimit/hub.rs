@@ -7,6 +7,7 @@
 use super::ASK_TIMEOUT;
 use edgerush_config::CompiledRateLimitService;
 use edgerush_ratelimit::service::layer::{Answer, Process, Slice, Used};
+use edgerush_ratelimit::service::shared::{Answer as RoomAnswer, Process as Rooms};
 use edgerush_ratelimit::service::{Contract, DataPlane, Keyed, View};
 use edgerush_ratelimit_service::grpc::Client;
 use std::cell::RefCell;
@@ -45,6 +46,8 @@ pub(crate) enum FromHub {
     Slices(Vec<Slice>),
     /// The answer to a request it asked about.
     Answer { id: u64, answer: Answer },
+    /// Shared, the answer to a request it asked about, with the rooms of its keys.
+    Rooms { id: u64, answer: RoomAnswer },
 }
 
 /// What the process thread and the workers share: the clock its times are read by, and
@@ -84,19 +87,10 @@ impl Hub {
         });
         let (to, from) = mpsc::unbounded_channel();
         let running = Arc::clone(&shared);
-        let (cycle, keep) = (service.cycle, service.layered_keep);
+        let set = service.clone();
         std::thread::Builder::new()
             .name("edgerush-rate-limits".to_owned())
-            .spawn(move || {
-                run(
-                    clients,
-                    (cycle, keep),
-                    workers,
-                    max_key_bytes,
-                    from,
-                    &running,
-                )
-            })
+            .spawn(move || run(clients, &set, workers, max_key_bytes, from, &running))
             .ok()?;
         Some(Arc::new(Self {
             to,
@@ -106,11 +100,12 @@ impl Hub {
     }
 
     /// Whether it reaches `service` as it is set now: the same pods, the same cycle, the
-    /// same keep.
+    /// same keep and sharing.
     pub(crate) fn serves(&self, service: &CompiledRateLimitService) -> bool {
         self.service.pods == service.pods
             && self.service.cycle == service.cycle
             && self.service.layered_keep == service.layered_keep
+            && self.service.shared == service.shared
     }
 
     /// The clock its times are read by.
@@ -139,11 +134,11 @@ impl std::fmt::Debug for Hub {
 }
 
 /// The process thread: a runtime of its own, the process and its clients, until every
-/// sender is gone; its cycle with the service, and how long its workers keep an unused
-/// slice.
+/// sender is gone, as `service` sets it: its cycle, and whether its workers share by slices
+/// or by rooms.
 fn run(
     clients: Vec<Client>,
-    (cycle, keep): (Duration, Duration),
+    service: &CompiledRateLimitService,
     workers: usize,
     max_key_bytes: u64,
     from: mpsc::UnboundedReceiver<ToHub>,
@@ -172,13 +167,19 @@ fn run(
     // Keys are what clients send: hashed under a key of the process's own, drawn at random.
     let entropy = RandomState::new();
     let hasher = Keyed::new([entropy.hash_one(0_u8), entropy.hash_one(1_u8)]);
+    let cycle = service.cycle;
     let mut plane = DataPlane::with_hasher(id, nanos(cycle), view, hasher);
     plane.set_ask_timeout(ASK_TIMEOUT);
     plane.set_capacity(max_key_bytes);
     let state = Rc::new(State {
-        process: RefCell::new(
-            Process::new(plane, workers, nanos(SYNC), hasher).keeping(nanos(keep)),
-        ),
+        engine: RefCell::new(if service.shared {
+            Engine::Shared(Rooms::new(plane, hasher))
+        } else {
+            Engine::Layered(
+                Process::new(plane, workers, nanos(SYNC), hasher)
+                    .keeping(nanos(service.layered_keep)),
+            )
+        }),
         clients,
         answers: RefCell::new(vec![None; workers]),
         shared: Arc::clone(shared),
@@ -187,9 +188,25 @@ fn run(
     local.block_on(&runtime, serve(state, from, cycle));
 }
 
+/// How the process shares its view among its workers: slices of each key's room, or each
+/// key's one room.
+enum Engine {
+    Layered(Process<Keyed>),
+    Shared(Rooms<Keyed>),
+}
+
+impl Engine {
+    fn plane(&mut self) -> &mut DataPlane<Keyed> {
+        match self {
+            Self::Layered(process) => process.plane(),
+            Self::Shared(rooms) => rooms.plane(),
+        }
+    }
+}
+
 /// The process thread's state.
 struct State {
-    process: RefCell<Process<Keyed>>,
+    engine: RefCell<Engine>,
     clients: Vec<Client>,
     /// By worker: where its answers go, once it has joined.
     answers: RefCell<Vec<Option<mpsc::UnboundedSender<FromHub>>>>,
@@ -217,7 +234,10 @@ impl State {
                 }
             }
             ToHub::Used { worker, used } => {
-                let slices = self.process.borrow_mut().on_used(worker, used, now);
+                let slices = match &mut *self.engine.borrow_mut() {
+                    Engine::Layered(process) => process.on_used(worker, used, now),
+                    Engine::Shared(_) => return,
+                };
                 self.tell(worker, FromHub::Slices(slices));
                 // An ask waiting for this sync may now be decided.
                 self.answer();
@@ -227,28 +247,46 @@ impl State {
                     .iter()
                     .map(|(key, contract)| (&**key, *contract))
                     .collect();
-                let answer = self.process.borrow_mut().on_ask(worker, id, &keys, now);
-                if let Some(answer) = answer {
-                    self.tell(worker, FromHub::Answer { id, answer });
+                let told = match &mut *self.engine.borrow_mut() {
+                    Engine::Layered(process) => process
+                        .on_ask(worker, id, &keys, now)
+                        .map(|answer| FromHub::Answer { id, answer }),
+                    Engine::Shared(rooms) => rooms
+                        .on_ask(worker, id, &keys, now)
+                        .map(|answer| FromHub::Rooms { id, answer }),
+                };
+                if let Some(told) = told {
+                    self.tell(worker, told);
                 }
             }
-            ToHub::Capacity(bytes) => self.process.borrow_mut().plane().set_capacity(bytes),
+            ToHub::Capacity(bytes) => self.engine.borrow_mut().plane().set_capacity(bytes),
         }
     }
 
     /// Hands the requests the service decided their answers.
     fn answer(&self) {
         let now = self.now();
-        let answers = self.process.borrow_mut().take_answers(now);
-        for (worker, id, answer) in answers {
-            self.tell(worker, FromHub::Answer { id, answer });
+        let told: Vec<(usize, FromHub)> = match &mut *self.engine.borrow_mut() {
+            Engine::Layered(process) => process
+                .take_answers(now)
+                .into_iter()
+                .map(|(worker, id, answer)| (worker, FromHub::Answer { id, answer }))
+                .collect(),
+            Engine::Shared(rooms) => rooms
+                .take_answers(now)
+                .into_iter()
+                .map(|(worker, id, answer)| (worker, FromHub::Rooms { id, answer }))
+                .collect(),
+        };
+        for (worker, message) in told {
+            self.tell(worker, message);
         }
     }
 
     /// Says what its keys hold, for the workers' scrape.
     fn report(&self) {
-        let mut process = self.process.borrow_mut();
-        let plane = process.plane();
+        let mut engine = self.engine.borrow_mut();
+        let plane = engine.plane();
         let [bytes, keys, evicted] = &self.shared.usage;
         bytes.store(plane.holding(), Ordering::Relaxed);
         keys.store(plane.key_count() as u64, Ordering::Relaxed);
@@ -258,7 +296,7 @@ impl State {
     /// Sends what the data plane has to send, each batch on a task of its own, and hands it
     /// the answers as they come.
     fn send(self: &Rc<Self>) {
-        let outgoing = self.process.borrow_mut().plane().take_outgoing();
+        let outgoing = self.engine.borrow_mut().plane().take_outgoing();
         for (pod, batch) in outgoing {
             let Some(client) = self.clients.get(pod as usize).cloned() else {
                 continue;
@@ -268,7 +306,7 @@ impl State {
                 // Unanswered, it is sent again or given up as the protocol says.
                 if let Ok(answers) = client.exchange(batch).await {
                     let now = me.now();
-                    me.process.borrow_mut().plane().on_answers(answers, now);
+                    me.engine.borrow_mut().plane().on_answers(answers, now);
                     me.answer();
                     me.send();
                 }
@@ -277,19 +315,29 @@ impl State {
     }
 }
 
-/// The process's loop: the workers' messages as they come, and the cycle.
+/// The process's loop: the workers' messages as they come, the cycle, and, shared, its sync
+/// of the rooms every millisecond.
 async fn serve(state: Rc<State>, mut from: mpsc::UnboundedReceiver<ToHub>, cycle: Duration) {
     let mut tick = tokio::time::interval(cycle);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut sync = tokio::time::interval(SYNC);
+    sync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let shared = matches!(&*state.engine.borrow(), Engine::Shared(_));
     loop {
         tokio::select! {
+            _ = sync.tick(), if shared => {
+                let now = state.now();
+                if let Engine::Shared(rooms) = &mut *state.engine.borrow_mut() {
+                    rooms.on_sync(now);
+                }
+            }
             message = from.recv() => match message {
                 Some(message) => state.on(message),
                 None => return,
             },
             _ = tick.tick() => {
                 let now = state.now();
-                state.process.borrow_mut().plane().on_cycle(now);
+                state.engine.borrow_mut().plane().on_cycle(now);
                 state.answer();
                 state.report();
             }

@@ -1020,6 +1020,14 @@
             "type": "string"
           },
           "minItems": 1
+        },
+        "shared": {
+          "description": "Experimental, for measuring: the process alone a data plane of the service, as with\n`layered`, its workers taking from one room a key that all of them reach, by\natomics, rather than from slices of their own (12 item 3). Not with `layered`. Off\nwhen left out.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,

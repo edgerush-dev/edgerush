@@ -273,9 +273,9 @@ impl Worker {
             return Some(Rc::clone(limiter));
         }
         let service = snapshot.config.rate_limit_service()?;
-        // The data plane's keys, shared evenly among its workers (06 §8); layered, the
-        // process's, held once.
-        let share = if service.layered {
+        // The data plane's keys, shared evenly among its workers (06 §8); layered or
+        // shared, the process's, held once.
+        let share = if service.layered || service.shared {
             service.max_key_bytes
         } else {
             service.max_key_bytes / self.proxy.workers.get() as u64
@@ -291,7 +291,10 @@ impl Worker {
         if let Some((_, old)) = held.take() {
             old.stop();
         }
-        let limiter = if service.layered {
+        let limiter = if service.shared {
+            let hub = self.proxy.hub(service)?;
+            Limiter::shared(service, hub, usize::from(self.position))
+        } else if service.layered {
             let hub = self.proxy.hub(service)?;
             Limiter::layered(service, hub, usize::from(self.position))
         } else {

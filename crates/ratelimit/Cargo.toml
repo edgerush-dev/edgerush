@@ -21,5 +21,9 @@ harness = false
 name = "layer"
 harness = false
 
+[[bench]]
+name = "shared"
+harness = false
+
 [lints]
 workspace = true

@@ -68,6 +68,7 @@ fn limited(mut config: Config, service: &[String]) -> Config {
         max_key_bytes: None,
         layered: None,
         layered_keep_ms: None,
+        shared: None,
     });
     config
 }
@@ -174,6 +175,7 @@ async fn a_layered_keep_reaches_the_process() {
             max_key_bytes: 1 << 20,
             layered: true,
             layered_keep: Duration::from_millis(keep),
+            shared: false,
         };
         let hub = Hub::start(&compiled, 1, 1 << 20).unwrap();
         let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
@@ -234,6 +236,20 @@ async fn a_layered_keep_reaches_the_process() {
 /// say when to come back, and the process's keys are counted once.
 #[tokio::test]
 async fn layered_workers_share_a_clients_bucket() {
+    two_workers_share_a_clients_bucket(|service| service.layered = Some(true)).await;
+}
+
+/// Shared (12 item 3), the same through each key's one room.
+#[tokio::test]
+async fn shared_workers_share_a_clients_bucket() {
+    two_workers_share_a_clients_bucket(|service| service.shared = Some(true)).await;
+}
+
+/// Two workers of one data plane sharing as `sharing` sets the service, a client with a
+/// connection to each.
+async fn two_workers_share_a_clients_bucket(
+    sharing: impl Fn(&mut edgerush_config::RateLimitService),
+) {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -241,7 +257,7 @@ async fn layered_workers_share_a_clients_bucket() {
             let (upstream, _) = counting_upstream().await;
             let mut config = limited(everything_config(upstream), &service);
             if let Some(service) = &mut config.rate_limit_service {
-                service.layered = Some(true);
+                sharing(service);
             }
             let workers = NonZeroUsize::new(2).unwrap();
             let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), workers).unwrap());

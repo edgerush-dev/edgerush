@@ -122,6 +122,9 @@ pub struct CompiledRateLimitService {
     pub layered: bool,
     /// Layered, how long a worker keeps a slice of a key it no longer uses (experimental).
     pub layered_keep: Duration,
+    /// Whether the process alone is a data plane of the service, its workers taking from
+    /// one room a key they all reach (experimental).
+    pub shared: bool,
 }
 
 impl CompiledRateLimitService {
@@ -563,6 +566,9 @@ fn rate_limit_service(
     if service.cycle_ms == Some(0) {
         errors.push(place.problem(Problem::RateLimitServiceCycleNever));
     }
+    if service.layered == Some(true) && service.shared == Some(true) {
+        errors.push(place.problem(Problem::RateLimitServiceLayeredAndShared));
+    }
     Some(CompiledRateLimitService {
         pods: service.pods.clone(),
         cycle: service
@@ -573,6 +579,7 @@ fn rate_limit_service(
             .unwrap_or(CompiledRateLimitService::MAX_KEY_BYTES),
         layered: service.layered.unwrap_or(false),
         layered_keep: Duration::from_millis(service.layered_keep_ms.unwrap_or(0)),
+        shared: service.shared.unwrap_or(false),
     })
 }
 
@@ -2252,6 +2259,9 @@ pub enum Problem {
     /// A rate-limiting service whose cycle never comes.
     #[error("`rate_limit_service`: `cycle_ms` is 0: at least 1")]
     RateLimitServiceCycleNever,
+    /// A rate-limiting service asked to be both layered and shared.
+    #[error("`rate_limit_service`: `layered` and `shared` both: one or the other")]
+    RateLimitServiceLayeredAndShared,
     /// A WebSocket's idle bound of nothing, which would never close one whose peer has gone.
     #[error("`tunnel_idle_ms` is 0: at least 1")]
     TunnelIdleNever,
@@ -4647,7 +4657,8 @@ routes:
         assert!(unknown.is_err());
     }
 
-    /// The rate-limiting service: its pods, and a cycle of at least 1 ms, 10 when left out.
+    /// The rate-limiting service: its pods, a cycle of at least 1 ms, 10 when left out, and
+    /// its workers layered or shared, not both.
     #[test]
     fn the_rate_limit_service_is_checked() {
         let with = |service: &str| {
@@ -4669,6 +4680,15 @@ routes:
         assert_eq!(
             with(r#"rate_limit_service: { pods: ["a:1"], cycle_ms: 0 }"#).unwrap_err(),
             ["the data plane: `rate_limit_service`: `cycle_ms` is 0: at least 1"]
+        );
+        let shared = with(r#"rate_limit_service: { pods: ["a:1"], shared: true }"#)
+            .unwrap()
+            .unwrap();
+        assert!(shared.shared && !shared.layered);
+        assert_eq!(
+            with(r#"rate_limit_service: { pods: ["a:1"], layered: true, shared: true }"#)
+                .unwrap_err(),
+            ["the data plane: `rate_limit_service`: `layered` and `shared` both: one or the other"]
         );
     }
 

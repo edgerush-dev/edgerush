@@ -92,6 +92,12 @@ pub struct RateLimitService {
     /// out: a slice not used is given back at the next sync.
     #[serde(default)]
     pub layered_keep_ms: Option<u64>,
+    /// Experimental, for measuring: the process alone a data plane of the service, as with
+    /// `layered`, its workers taking from one room a key that all of them reach, by
+    /// atomics, rather than from slices of their own (12 item 3). Not with `layered`. Off
+    /// when left out.
+    #[serde(default)]
+    pub shared: Option<bool>,
 }
 
 /// A place where requests come in. Hostnames are to come; until a listener can be told

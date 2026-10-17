@@ -39,6 +39,7 @@
 pub mod keyed;
 pub mod layer;
 pub mod membership;
+pub mod shared;
 
 pub use keyed::Keyed;
 
