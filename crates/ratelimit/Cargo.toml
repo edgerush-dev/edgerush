@@ -17,5 +17,9 @@ proptest.workspace = true
 name = "decide"
 harness = false
 
+[[bench]]
+name = "layer"
+harness = false
+
 [lints]
 workspace = true
