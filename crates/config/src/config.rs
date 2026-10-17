@@ -86,6 +86,12 @@ pub struct RateLimitService {
     /// Off when left out.
     #[serde(default)]
     pub layered: Option<bool>,
+    /// Experimental, with `layered`: milliseconds a worker keeps a slice of a key it no
+    /// longer uses, given another at each sync meanwhile, so that a quiet key's next request
+    /// is decided by the worker on the spot rather than asked of the process. 0 when left
+    /// out: a slice not used is given back at the next sync.
+    #[serde(default)]
+    pub layered_keep_ms: Option<u64>,
 }
 
 /// A place where requests come in. Hostnames are to come; until a listener can be told

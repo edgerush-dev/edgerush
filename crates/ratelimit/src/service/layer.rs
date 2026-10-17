@@ -217,6 +217,8 @@ pub struct Process<S> {
     answers: Vec<(usize, u64, Answer)>,
     /// By worker: when it last synced.
     synced: Vec<Option<u64>>,
+    /// How long after a worker last came to a key its slice is given again unused.
+    keep: u64,
 }
 
 impl<S: BuildHasher + Clone> Process<S> {
@@ -233,7 +235,19 @@ impl<S: BuildHasher + Clone> Process<S> {
             deferred: Vec::new(),
             answers: Vec::new(),
             synced: vec![None; workers.max(1)],
+            keep: 0,
         }
+    }
+
+    /// The same, a slice a worker leaves unused given again at its syncs until `keep`
+    /// nanoseconds after the worker last came to the key (experimental, 12 item 3), rather
+    /// than given back at once: a quiet key's next request is then decided by the worker
+    /// on the spot, and the key is sent at every sync meanwhile. A worker counts as coming
+    /// to a key lately for as long.
+    #[must_use]
+    pub fn keeping(mut self, keep: u64) -> Self {
+        self.keep = keep;
+        self
     }
 
     /// Its data plane, for whatever carries its messages to the service and back.
@@ -275,15 +289,19 @@ impl<S: BuildHasher + Clone> Process<S> {
                     .filter(|given| given.contract == contract);
                 // Asked about since its last sync, the worker came to the key though it
                 // took nothing from its slice: its request was admitted by the process.
-                let asked = given
+                let seen = given
                     .as_ref()
-                    .and_then(|given| given.seen.get(worker).copied().flatten())
-                    .is_some_and(|seen| since.is_none_or(|since| seen > since));
+                    .and_then(|given| given.seen.get(worker).copied().flatten());
+                let asked = seen.is_some_and(|seen| since.is_none_or(|since| seen > since));
                 if !asked {
-                    // A slice left unused, given back: the worker has not come to the key,
-                    // and is given none, so that a key it no longer uses stops being sent.
+                    // A slice left unused, given back: the worker has not come to the key.
+                    // Kept, it is given another as it was; otherwise none, so that a key it
+                    // no longer uses stops being sent.
                     if let Some(slice) = given.and_then(|given| given.slices.get_mut(worker)) {
                         *slice = 0;
+                    }
+                    if seen.is_some_and(|seen| now.saturating_sub(seen) <= self.keep) {
+                        slices.push(self.slice(key, contract, worker, now));
                     }
                     continue;
                 }
@@ -476,7 +494,7 @@ impl<S: BuildHasher + Clone> Process<S> {
             };
         };
         let available = self.available(&key, contract, now).unwrap_or(0);
-        let lately = self.sync.saturating_mul(LATELY_SYNCS);
+        let lately = self.sync.saturating_mul(LATELY_SYNCS).max(self.keep);
         let given = self
             .given
             .entry(key.clone())

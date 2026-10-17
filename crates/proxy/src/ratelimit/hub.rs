@@ -84,10 +84,19 @@ impl Hub {
         });
         let (to, from) = mpsc::unbounded_channel();
         let running = Arc::clone(&shared);
-        let cycle = service.cycle;
+        let (cycle, keep) = (service.cycle, service.layered_keep);
         std::thread::Builder::new()
             .name("edgerush-rate-limits".to_owned())
-            .spawn(move || run(clients, cycle, workers, max_key_bytes, from, &running))
+            .spawn(move || {
+                run(
+                    clients,
+                    (cycle, keep),
+                    workers,
+                    max_key_bytes,
+                    from,
+                    &running,
+                )
+            })
             .ok()?;
         Some(Arc::new(Self {
             to,
@@ -96,9 +105,12 @@ impl Hub {
         }))
     }
 
-    /// Whether it reaches `service` as it is set now: the same pods, the same cycle.
+    /// Whether it reaches `service` as it is set now: the same pods, the same cycle, the
+    /// same keep.
     pub(crate) fn serves(&self, service: &CompiledRateLimitService) -> bool {
-        self.service.pods == service.pods && self.service.cycle == service.cycle
+        self.service.pods == service.pods
+            && self.service.cycle == service.cycle
+            && self.service.layered_keep == service.layered_keep
     }
 
     /// The clock its times are read by.
@@ -127,10 +139,11 @@ impl std::fmt::Debug for Hub {
 }
 
 /// The process thread: a runtime of its own, the process and its clients, until every
-/// sender is gone.
+/// sender is gone; its cycle with the service, and how long its workers keep an unused
+/// slice.
 fn run(
     clients: Vec<Client>,
-    cycle: Duration,
+    (cycle, keep): (Duration, Duration),
     workers: usize,
     max_key_bytes: u64,
     from: mpsc::UnboundedReceiver<ToHub>,
@@ -163,7 +176,9 @@ fn run(
     plane.set_ask_timeout(ASK_TIMEOUT);
     plane.set_capacity(max_key_bytes);
     let state = Rc::new(State {
-        process: RefCell::new(Process::new(plane, workers, nanos(SYNC), hasher)),
+        process: RefCell::new(
+            Process::new(plane, workers, nanos(SYNC), hasher).keeping(nanos(keep)),
+        ),
         clients,
         answers: RefCell::new(vec![None; workers]),
         shared: Arc::clone(shared),

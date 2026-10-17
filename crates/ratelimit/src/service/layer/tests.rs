@@ -321,3 +321,45 @@ fn an_unused_slice_lapses_and_is_not_given_again() {
     let room = process.plane().room(b"k", contract(), 10 * MS).unwrap();
     assert_eq!(answer.slices[0].allowance, room);
 }
+
+/// Kept (`keeping`), a slice a worker leaves unused is given again at each sync until the
+/// worker last came to the key longer ago than the keep: a quiet key's next request is
+/// decided on the spot rather than asked.
+#[test]
+fn a_kept_slice_is_given_again_until_its_keep_runs_out() {
+    let (process, mut pod) = process(2);
+    let mut process = process.keeping(5 * MS);
+    let mut zero = worker();
+    warm(&mut process, &mut pod, 0);
+    let keys = [(&b"k"[..], contract())];
+    let answer = process.on_ask(0, 2, &keys, 0).unwrap();
+    zero.on_slices(answer.slices);
+    // Nothing used: given again, to 5 ms after the sync that carried the ask.
+    for sync in 1..=6 {
+        let used = zero.take_used(sync * MS);
+        let slices = process.on_used(0, used, sync * MS);
+        assert_eq!(slices.len(), 1, "kept at {sync} ms");
+        assert!(slices[0].allowance > 0, "at {sync} ms: {slices:?}");
+        zero.on_slices(slices);
+        // A kept slice counts its worker in the share: another's ask, finding the room all
+        // given out, is answered at the kept worker's next sync.
+        if sync == 3 {
+            assert_eq!(process.on_ask(1, 9, &keys, 3 * MS), None);
+        }
+        if sync == 4 {
+            let answers = process.take_answers(4 * MS);
+            assert_eq!(answers.len(), 1, "answered at the kept worker's sync");
+            assert!(answers[0].2.admitted);
+        }
+    }
+    let used = zero.take_used(7 * MS);
+    assert!(
+        process.on_used(0, used, 7 * MS).is_empty(),
+        "the keep run out"
+    );
+    assert!(zero.take_used(8 * MS).is_empty());
+    // Asked once more, it has a slice again.
+    assert_eq!(zero.decide(&keys, 9 * MS), Local::Ask);
+    zero.on_slices(process.on_ask(0, 3, &keys, 9 * MS).unwrap().slices);
+    assert_eq!(zero.decide(&keys, 9 * MS), Local::Admit);
+}

@@ -67,6 +67,7 @@ fn limited(mut config: Config, service: &[String]) -> Config {
         cycle_ms: Some(10),
         max_key_bytes: None,
         layered: None,
+        layered_keep_ms: None,
     });
     config
 }
@@ -119,6 +120,113 @@ async fn http2_requests_are_held_to_their_limit() {
             assert!(answer.headers().get("ratelimit").is_none());
         })
         .await;
+}
+
+/// A reload that changes how long an unused slice is kept starts the process layer afresh,
+/// with the new keep; one that changes nothing keeps it.
+#[tokio::test]
+async fn a_changed_keep_starts_the_process_layer_afresh() {
+    let mut config = limited(
+        everything_config("127.0.0.1:1".parse().unwrap()),
+        &["127.0.0.1:1".to_owned()],
+    );
+    if let Some(service) = &mut config.rate_limit_service {
+        service.layered = Some(true);
+    }
+    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+    let service = |keep| {
+        let mut config = config.clone();
+        if let Some(service) = &mut config.rate_limit_service {
+            service.layered_keep_ms = keep;
+        }
+        compile(&config)
+            .unwrap()
+            .rate_limit_service()
+            .unwrap()
+            .clone()
+    };
+    let first = proxy.hub(&service(None)).unwrap();
+    let same = proxy.hub(&service(None)).unwrap();
+    assert!(Arc::ptr_eq(&first, &same), "nothing changed");
+    let kept = proxy.hub(&service(Some(50))).unwrap();
+    assert!(!Arc::ptr_eq(&first, &kept), "a new keep");
+}
+
+/// Layered, `layered_keep_ms` reaches the process: a slice its worker leaves unused is
+/// given again at its sync while the keep lasts, and given back at once without one.
+#[tokio::test]
+async fn a_layered_keep_reaches_the_process() {
+    use crate::ratelimit::{FromHub, Hub, ToHub};
+    use edgerush_ratelimit::service::Contract;
+    use edgerush_ratelimit::service::layer::Used;
+    use std::num::NonZeroU64;
+
+    let service = service().await;
+    let contract = Contract {
+        limit: NonZeroU64::new(10).unwrap(),
+        window: NonZeroU64::new(3_600_000_000_000).unwrap(),
+        burst: NonZeroU64::new(10).unwrap(),
+    };
+    for (keep, kept) in [(0, false), (1_000, true)] {
+        let compiled = edgerush_config::CompiledRateLimitService {
+            pods: service.clone(),
+            cycle: Duration::from_millis(10),
+            max_key_bytes: 1 << 20,
+            layered: true,
+            layered_keep: Duration::from_millis(keep),
+        };
+        let hub = Hub::start(&compiled, 1, 1 << 20).unwrap();
+        let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
+        hub.to.send(ToHub::Join { worker: 0, answers }).unwrap();
+        let key: Box<[u8]> = format!("kept-{keep}").into_bytes().into();
+        // Asked until an answer brings a slice: the first waits on the service, and the
+        // copy is fresh once a cycle has bounded it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for id in 0.. {
+            assert!(Instant::now() < deadline, "no slice for keep {keep}");
+            let keys = vec![(key.clone(), contract)];
+            hub.to
+                .send(ToHub::Ask {
+                    worker: 0,
+                    id,
+                    keys,
+                })
+                .unwrap();
+            let answer = loop {
+                match within(answered.recv()).await.unwrap() {
+                    FromHub::Answer {
+                        id: answered,
+                        answer,
+                    } if answered == id => break answer,
+                    _ => {}
+                }
+            };
+            if answer
+                .slices
+                .first()
+                .is_some_and(|slice| slice.allowance > 0)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Two syncs with nothing used: the first still counts the ask as use.
+        let mut given = Vec::new();
+        for _ in 0..2 {
+            let used = vec![Used {
+                key: key.clone(),
+                contract,
+                count: 0,
+            }];
+            hub.to.send(ToHub::Used { worker: 0, used }).unwrap();
+            given = loop {
+                if let FromHub::Slices(slices) = within(answered.recv()).await.unwrap() {
+                    break slices;
+                }
+            };
+        }
+        assert_eq!(!given.is_empty(), kept, "keep {keep}: {given:?}");
+    }
 }
 
 /// Layered (12 item 3), two workers of one data plane share a client's bucket through

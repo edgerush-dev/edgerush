@@ -25,7 +25,8 @@ use edgerush_ratelimit::service::{
 use edgerush_ratelimit_service::grpc::Client;
 use edgerush_rules::{Address, Context, KeyValue, Named, Outcome, Text};
 use http::HeaderName;
-use hub::{FromHub, SYNC, ToHub};
+use hub::SYNC;
+pub(crate) use hub::{FromHub, ToHub};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
@@ -232,12 +233,13 @@ impl Limiter {
     }
 
     /// Whether it reaches `service` as it is set now: the same pods, the same cycle, the
-    /// same layering. A change of what its keys may hold is taken as it is
+    /// same layering and keep. A change of what its keys may hold is taken as it is
     /// ([`Self::set_capacity`]).
     pub(crate) fn serves(&self, service: &CompiledRateLimitService) -> bool {
         self.service.pods == service.pods
             && self.service.cycle == service.cycle
             && self.service.layered == service.layered
+            && self.service.layered_keep == service.layered_keep
     }
 
     /// The bytes its keys may hold from now on: layered, the process's, which its first

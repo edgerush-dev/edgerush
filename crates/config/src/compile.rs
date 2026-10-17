@@ -120,6 +120,8 @@ pub struct CompiledRateLimitService {
     /// Whether the process alone is a data plane of the service, its workers deciding from
     /// slices of its room (experimental).
     pub layered: bool,
+    /// Layered, how long a worker keeps a slice of a key it no longer uses (experimental).
+    pub layered_keep: Duration,
 }
 
 impl CompiledRateLimitService {
@@ -570,6 +572,7 @@ fn rate_limit_service(
             .max_key_bytes
             .unwrap_or(CompiledRateLimitService::MAX_KEY_BYTES),
         layered: service.layered.unwrap_or(false),
+        layered_keep: Duration::from_millis(service.layered_keep_ms.unwrap_or(0)),
     })
 }
 

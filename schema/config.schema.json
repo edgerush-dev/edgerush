@@ -993,6 +993,16 @@
           ],
           "default": null
         },
+        "layered_keep_ms": {
+          "description": "Experimental, with `layered`: milliseconds a worker keeps a slice of a key it no\nlonger uses, given another at each sync meanwhile, so that a quiet key's next request\nis decided by the worker on the spot rather than asked of the process. 0 when left\nout: a slice not used is given back at the next sync.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
         "max_key_bytes": {
           "description": "Bytes the rate limits' keys may hold on this data plane, divided evenly among its\nworkers, as an estimate of their own data: past it, each worker evicts its least\nrecently used keys, which start again full.\n268,435,456 (256 MiB) when left out.",
           "type": [
