@@ -193,6 +193,7 @@ impl Proxy {
             current: ArcSwap::from_pointee(snapshot),
             metrics,
             workers,
+            hub: std::sync::Mutex::new(None),
             keys,
             draining: AtomicBool::new(false),
             quic,
@@ -345,6 +346,25 @@ impl Proxy {
             .map(Arc::clone)
             .collect();
         (aside, snapshot.config.data_plane().set_aside)
+    }
+
+    /// The process layer of a layered limiter reaching `service`: started the first time a
+    /// worker needs it, and again when the service's pods or cycle change; `None` if it
+    /// cannot be started. For a worker making its limiter: it takes a lock.
+    pub(crate) fn hub(
+        &self,
+        service: &edgerush_config::CompiledRateLimitService,
+    ) -> Option<Arc<crate::ratelimit::Hub>> {
+        let mut held = self
+            .hub
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(hub) = held.as_ref().filter(|hub| hub.serves(service)) {
+            return Some(Arc::clone(hub));
+        }
+        let hub = crate::ratelimit::Hub::start(service, self.workers.get(), service.max_key_bytes)?;
+        *held = Some(Arc::clone(&hub));
+        Some(hub)
     }
 
     /// Counts `destination` as set aside, for its upstream. For the health checker, as it

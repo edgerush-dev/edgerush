@@ -98,6 +98,7 @@ fn a_worker_decides_from_its_slice_and_asks_without_one() {
         refuse_until: Some(5 * MS),
     }]);
     assert_eq!(one.decide(&keys, MS), Local::Refuse, "no room until 5 ms");
+    assert_eq!(one.waits(&keys, MS).collect::<Vec<_>>(), [(0, 4 * MS)]);
     assert_eq!(
         one.decide(&keys, 5 * MS),
         Local::Ask,
@@ -137,17 +138,29 @@ fn the_process_gives_equal_slices_and_never_more_than_its_room() {
     };
     // Room nine. Worker 0 alone has come to it: all nine.
     assert_eq!(sync(&mut process, 0, MS), 9);
-    // Worker 1 comes: nothing left until worker 0's slice lapses.
+    // Worker 1 comes: nothing left until worker 0's slice lapses — but no refusal: the
+    // room is there, in worker 0's slice.
     let late = process.on_used(1, vec![k(0)], MS);
     assert_eq!(late[0].allowance, 0);
-    assert!(late[0].refuse_until.is_some(), "all of the room given out");
+    assert_eq!(late[0].refuse_until, None, "room given out is no refusal");
     let keys = [(&b"k"[..], contract())];
-    assert!(
-        !process.on_ask(1, 2, &keys, MS).unwrap().admitted,
-        "the room is worker 0's until its sync"
+    assert_eq!(
+        process.on_ask(1, 2, &keys, MS),
+        None,
+        "it waits for worker 0's sync"
     );
-    // A millisecond on, both sync: half each, rounded down.
+    assert!(process.take_answers(MS).is_empty());
+    // A millisecond on, worker 0 syncs: half of the nine is its, and worker 1's request,
+    // waiting, is admitted from what lapsed, with a slice of its own.
     assert_eq!(sync(&mut process, 0, 2 * MS), 4);
+    let answers = process.take_answers(2 * MS);
+    assert_eq!(answers.len(), 1);
+    let (worker, id, answer) = &answers[0];
+    assert_eq!((*worker, *id, answer.admitted), (1, 2, true));
+    assert_eq!(
+        answer.slices[0].allowance, 4,
+        "eight left, less worker 0's four"
+    );
     assert_eq!(sync(&mut process, 1, 2 * MS), 4);
     // All four come: never more given out than the room, however they arrive.
     let mut out = [0; 4];
@@ -161,7 +174,7 @@ fn the_process_gives_equal_slices_and_never_more_than_its_room() {
             );
         }
     }
-    // Settled, each has a quarter: nine among four, two each.
+    // Settled, each has a quarter: eight among four, two each.
     assert_eq!(out, [2; 4]);
 }
 
@@ -214,5 +227,33 @@ fn what_workers_admit_reaches_the_owner_once() {
         pod.counted(b"k"),
         Some(1 + admitted),
         "the asked one and the worker's"
+    );
+}
+
+/// An ask waiting for a holder's sync is answered at that sync however late it comes: a
+/// worker waiting counts among those come to the key, so the room is shared with it.
+#[test]
+fn a_waiting_ask_is_answered_however_late_the_holders_sync() {
+    let (mut process, mut pod) = process(2);
+    warm(&mut process, &mut pod, 0);
+    let k = Used {
+        key: b"k"[..].into(),
+        contract: contract(),
+        count: 0,
+    };
+    assert_eq!(process.on_used(0, vec![k.clone()], MS)[0].allowance, 9);
+    let keys = [(&b"k"[..], contract())];
+    assert_eq!(
+        process.on_ask(1, 7, &keys, MS),
+        None,
+        "the room is worker 0's"
+    );
+    // Worker 0's next sync, long after two of them would have come.
+    process.on_used(0, vec![k], 50 * MS);
+    let answers = process.take_answers(50 * MS);
+    assert_eq!(answers.len(), 1, "answered at the holder's sync");
+    assert_eq!(
+        (answers[0].0, answers[0].1, answers[0].2.admitted),
+        (1, 7, true)
     );
 }

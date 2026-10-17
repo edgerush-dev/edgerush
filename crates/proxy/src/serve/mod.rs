@@ -382,6 +382,9 @@ pub struct Proxy {
     /// How many workers it runs on: what shares out what the data plane as a whole may
     /// hold.
     workers: NonZeroUsize,
+    /// The process layer of a layered limiter (12 item 3), once a worker needs it; locked
+    /// only when a worker makes its limiter.
+    hub: std::sync::Mutex<Option<Arc<crate::ratelimit::Hub>>>,
     /// Outside it for a different reason: a key must not come round again when a config
     /// does, so what hands them out lives as long as the process.
     keys: Keys,

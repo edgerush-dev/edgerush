@@ -985,6 +985,14 @@
           "default": null,
           "minimum": 1
         },
+        "layered": {
+          "description": "Experimental, for measuring: the process alone a data plane of the service, its\nworkers deciding from slices of its room it gives them every millisecond, rather than\neach worker a data plane of its own.\nOff when left out.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
         "max_key_bytes": {
           "description": "Bytes the rate limits' keys may hold on this data plane, divided evenly among its\nworkers, as an estimate of their own data: past it, each worker evicts its least\nrecently used keys, which start again full.\n268,435,456 (256 MiB) when left out.",
           "type": [

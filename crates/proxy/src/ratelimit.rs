@@ -7,16 +7,25 @@
 //! Nothing here runs unless a rule limits: the worker makes its limiter the first time one
 //! does, and makes it again when the service's settings change, which starts every key
 //! afresh, as any change to a limit does.
+//!
+//! Layered (experimental, 12 item 3), the process alone is a data plane, on a thread of its
+//! own ([`hub`]), and each worker decides from slices of its room, syncing every millisecond.
+
+mod hub;
+
+pub(crate) use hub::Hub;
 
 use crate::forwarding::Client as Requester;
 use crate::request::NoTables;
 use edgerush_config::{CompiledLimit, CompiledRateLimitService};
+use edgerush_ratelimit::service::layer::{Local, Worker};
 use edgerush_ratelimit::service::{
     Contract, DataPlane, Decided, Decision, Keyed, Ticket, View, longest,
 };
 use edgerush_ratelimit_service::grpc::Client;
 use edgerush_rules::{Address, Context, KeyValue, Named, Outcome, Text};
 use http::HeaderName;
+use hub::{FromHub, SYNC, ToHub};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
@@ -25,7 +34,7 @@ use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 /// How long a worker waits for the owner's answer to an ask before deciding what waits from
 /// its copy: long enough for TCP to send a lost segment again (some 200 ms on Linux), as the
@@ -97,22 +106,44 @@ pub(crate) enum Limited {
     Wait(oneshot::Receiver<Decided>),
 }
 
-/// A worker's limiter: its data plane and the clients of the service's pods.
+/// A worker's limiter: as a data plane of its own, or deciding from its process's slices.
 pub(crate) struct Limiter {
     service: CompiledRateLimitService,
-    plane: RefCell<DataPlane<Keyed>>,
-    clients: Vec<Client>,
-    /// The requests waiting for an owner's decision, by ticket: dropped with the limiter,
-    /// which refuses them.
+    mode: Mode,
+    /// The requests waiting for a decision from elsewhere, by ticket or ask: dropped with
+    /// the limiter, which refuses them.
     waiting: RefCell<HashMap<Ticket, oneshot::Sender<Decided>>>,
     /// Where each of a request's keys is put together, one for each limit it can be under,
     /// kept so that no request makes them afresh; and their contracts.
     keys: RefCell<Vec<Vec<u8>>>,
     contracts: RefCell<Vec<Contract>>,
+    /// The clock: the worker's own, or, layered, its process's.
     start: Instant,
     /// Wakes the task to send what a decision asked for at once.
     asked: Notify,
     stopped: Cell<bool>,
+}
+
+/// How a worker's limiter decides.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one limiter a worker, whose size matters not; a box would put a pointer between               every decision and its data plane"
+)]
+enum Mode {
+    /// A data plane of its own, and the clients of the service's pods.
+    Apart {
+        plane: RefCell<DataPlane<Keyed>>,
+        clients: Vec<Client>,
+    },
+    /// From the slices of its process's room (12 item 3).
+    Layered {
+        hub: Arc<Hub>,
+        /// Which of the process's workers it is.
+        index: usize,
+        slices: RefCell<Worker<Keyed>>,
+        /// The next ask's number.
+        next: Cell<u64>,
+    },
 }
 
 impl Limiter {
@@ -151,8 +182,10 @@ impl Limiter {
         plane.set_capacity(max_key_bytes);
         let limiter = Rc::new(Self {
             service: service.clone(),
-            plane: RefCell::new(plane),
-            clients,
+            mode: Mode::Apart {
+                plane: RefCell::new(plane),
+                clients,
+            },
             waiting: RefCell::new(HashMap::new()),
             keys: RefCell::new(Vec::new()),
             contracts: RefCell::new(Vec::new()),
@@ -164,22 +197,73 @@ impl Limiter {
         Some(limiter)
     }
 
-    /// Whether it reaches `service` as it is set now: the same pods, the same cycle. A
-    /// change of what its keys may hold is taken as it is ([`Self::set_capacity`]).
-    pub(crate) fn serves(&self, service: &CompiledRateLimitService) -> bool {
-        self.service.pods == service.pods && self.service.cycle == service.cycle
+    /// A limiter for worker `index` of the process `hub`, deciding from the slices it gives,
+    /// its task started (12 item 3).
+    pub(crate) fn layered(
+        service: &CompiledRateLimitService,
+        hub: Arc<Hub>,
+        index: usize,
+    ) -> Rc<Self> {
+        let (answers, answered) = mpsc::unbounded_channel();
+        let _gone = hub.to.send(ToHub::Join {
+            worker: index,
+            answers,
+        });
+        let entropy = RandomState::new();
+        let hasher = Keyed::new([entropy.hash_one(0_u8), entropy.hash_one(1_u8)]);
+        let start = hub.epoch();
+        let limiter = Rc::new(Self {
+            service: service.clone(),
+            mode: Mode::Layered {
+                hub,
+                index,
+                slices: RefCell::new(Worker::with_hasher(hasher)),
+                next: Cell::new(0),
+            },
+            waiting: RefCell::new(HashMap::new()),
+            keys: RefCell::new(Vec::new()),
+            contracts: RefCell::new(Vec::new()),
+            start,
+            asked: Notify::new(),
+            stopped: Cell::new(false),
+        });
+        tokio::task::spawn_local(Rc::clone(&limiter).run_layered(answered));
+        limiter
     }
 
-    /// The bytes its keys may hold from now on.
+    /// Whether it reaches `service` as it is set now: the same pods, the same cycle, the
+    /// same layering. A change of what its keys may hold is taken as it is
+    /// ([`Self::set_capacity`]).
+    pub(crate) fn serves(&self, service: &CompiledRateLimitService) -> bool {
+        self.service.pods == service.pods
+            && self.service.cycle == service.cycle
+            && self.service.layered == service.layered
+    }
+
+    /// The bytes its keys may hold from now on: layered, the process's, which its first
+    /// worker passes on.
     pub(crate) fn set_capacity(&self, max_key_bytes: u64) {
-        self.plane.borrow_mut().set_capacity(max_key_bytes);
+        match &self.mode {
+            Mode::Apart { plane, .. } => plane.borrow_mut().set_capacity(max_key_bytes),
+            Mode::Layered { hub, index: 0, .. } => {
+                let _gone = hub.to.send(ToHub::Capacity(max_key_bytes));
+            }
+            Mode::Layered { .. } => {}
+        }
     }
 
     /// What its keys hold, in bytes, how many there are, and how many it has evicted, all
-    /// told: for the worker's sweep to say.
+    /// told: for the worker's sweep to say. Layered, the process's, said by its first worker
+    /// alone, so that the workers' sum is the process's.
     pub(crate) fn usage(&self) -> (u64, usize, u64) {
-        let plane = self.plane.borrow();
-        (plane.holding(), plane.key_count(), plane.evicted())
+        match &self.mode {
+            Mode::Apart { plane, .. } => {
+                let plane = plane.borrow();
+                (plane.holding(), plane.key_count(), plane.evicted())
+            }
+            Mode::Layered { hub, index: 0, .. } => hub.usage(),
+            Mode::Layered { .. } => (0, 0, 0),
+        }
     }
 
     /// Stops its task: a limiter for other settings takes its place.
@@ -203,10 +287,51 @@ impl Limiter {
         client: &Requester,
     ) -> Limited {
         let now = self.now();
-        let decision = self.with_keys(limits, limited, client, |plane, parts| match parts {
-            [] => None,
-            [(key, contract)] => Some(plane.decide(key, *contract, now)),
-            parts => Some(plane.decide_all(parts, now)),
+        if let Mode::Layered {
+            hub,
+            index,
+            slices,
+            next,
+        } = &self.mode
+        {
+            return self.with_keys(limits, limited, client, |parts| {
+                if parts.is_empty() {
+                    return Limited::Admit;
+                }
+                match slices.borrow_mut().decide(parts, now) {
+                    Local::Admit => Limited::Admit,
+                    Local::Refuse => Limited::Refuse,
+                    Local::Ask => {
+                        let id = next.get();
+                        next.set(id.wrapping_add(1));
+                        let keys = parts
+                            .iter()
+                            .map(|(key, contract)| ((*key).into(), *contract));
+                        let asked = ToHub::Ask {
+                            worker: *index,
+                            id,
+                            keys: keys.collect(),
+                        };
+                        if hub.to.send(asked).is_err() {
+                            return Limited::Refuse;
+                        }
+                        let (decided, waited) = oneshot::channel();
+                        self.waiting.borrow_mut().insert(id, decided);
+                        Limited::Wait(waited)
+                    }
+                }
+            });
+        }
+        let Mode::Apart { plane, .. } = &self.mode else {
+            return Limited::Admit;
+        };
+        let decision = self.with_keys(limits, limited, client, |parts| {
+            let mut plane = plane.borrow_mut();
+            match parts {
+                [] => None,
+                [(key, contract)] => Some(plane.decide(key, *contract, now)),
+                parts => Some(plane.decide_all(parts, now)),
+            }
         });
         match decision {
             None | Some(Decision::Admit) => Limited::Admit,
@@ -232,7 +357,7 @@ impl Limiter {
         told: &[(usize, u64)],
     ) -> Refusal<'a> {
         let now = self.now();
-        self.with_keys(limits, limited, client, |plane, parts| {
+        self.with_keys(limits, limited, client, |parts| {
             // A key begins with its limit's name and a zero.
             let at = |part: usize| {
                 let (key, _) = parts.get(part)?;
@@ -242,9 +367,13 @@ impl Limiter {
                     .position(|limit| limit.name.as_bytes() == name)
             };
             let mut by = 0;
-            // The copies only where no pod said.
+            // The copies only where no pod said; layered, the worker's slices.
             let from_copies = told.is_empty();
-            let waits = plane.waits(parts, now).filter(|_| from_copies);
+            let own: Vec<(usize, u64)> = match &self.mode {
+                Mode::Apart { plane, .. } => plane.borrow().waits(parts, now).collect(),
+                Mode::Layered { slices, .. } => slices.borrow().waits(parts, now).collect(),
+            };
+            let waits = own.into_iter().filter(|_| from_copies);
             let waits = waits.chain(told.iter().copied()).inspect(|(part, _)| {
                 if let Some(bit) =
                     at(*part).and_then(|at| 1_u64.checked_shl(u32::try_from(at).ok()?))
@@ -260,7 +389,7 @@ impl Limiter {
         })
     }
 
-    /// Calls `then` with the data plane and the keys of a request from `client` under
+    /// Calls `then` with the keys of a request from `client` under
     /// those of `limits` that `limited` marks, bit `n` for the `n`th: each the limit's name,
     /// a zero and the key's value, with its contract, put together in the worker's buffers.
     /// A limit the request has no key for is left out, as one whose number came out below
@@ -270,7 +399,7 @@ impl Limiter {
         limits: &[Arc<CompiledLimit>],
         limited: u64,
         client: &Requester,
-        then: impl FnOnce(&mut DataPlane<Keyed>, &[(&[u8], Contract)]) -> R,
+        then: impl FnOnce(&[(&[u8], Contract)]) -> R,
     ) -> R {
         let mut keys = self.keys.borrow_mut();
         let mut contracts = self.contracts.borrow_mut();
@@ -303,30 +432,30 @@ impl Limiter {
             });
             used += 1;
         }
-        let mut plane = self.plane.borrow_mut();
         // The usual few at once without a list made for them.
         match (&keys[..used], &contracts[..]) {
-            ([], _) => then(&mut plane, &[]),
-            ([a], [ca]) => then(&mut plane, &[(a, *ca)]),
-            ([a, b], [ca, cb]) => then(&mut plane, &[(a, *ca), (b, *cb)]),
-            ([a, b, c], [ca, cb, cc]) => then(&mut plane, &[(a, *ca), (b, *cb), (c, *cc)]),
-            ([a, b, c, d], [ca, cb, cc, cd]) => {
-                then(&mut plane, &[(a, *ca), (b, *cb), (c, *cc), (d, *cd)])
-            }
+            ([], _) => then(&[]),
+            ([a], [ca]) => then(&[(a, *ca)]),
+            ([a, b], [ca, cb]) => then(&[(a, *ca), (b, *cb)]),
+            ([a, b, c], [ca, cb, cc]) => then(&[(a, *ca), (b, *cb), (c, *cc)]),
+            ([a, b, c, d], [ca, cb, cc, cd]) => then(&[(a, *ca), (b, *cb), (c, *cc), (d, *cd)]),
             (many, contracts) => {
                 let parts: Vec<(&[u8], Contract)> = many
                     .iter()
                     .map(Vec::as_slice)
                     .zip(contracts.iter().copied())
                     .collect();
-                then(&mut plane, &parts)
+                then(&parts)
             }
         }
     }
 
     /// Hands the requests the data plane decided their decisions.
     fn settle(&self) {
-        let decided = self.plane.borrow_mut().take_decisions();
+        let Mode::Apart { plane, .. } = &self.mode else {
+            return;
+        };
+        let decided = plane.borrow_mut().take_decisions();
         let mut waiting = self.waiting.borrow_mut();
         for decided in decided {
             if let Some(waiter) = waiting.remove(&decided.ticket) {
@@ -338,16 +467,21 @@ impl Limiter {
     /// Sends what the data plane has to send, each batch on a task of its own, and hands it
     /// the answers as they come.
     fn send(self: &Rc<Self>) {
-        let outgoing = self.plane.borrow_mut().take_outgoing();
+        let Mode::Apart { plane, clients } = &self.mode else {
+            return;
+        };
+        let outgoing = plane.borrow_mut().take_outgoing();
         for (pod, batch) in outgoing {
-            let Some(client) = self.clients.get(pod as usize).cloned() else {
+            let Some(client) = clients.get(pod as usize).cloned() else {
                 continue;
             };
             let me = Rc::clone(self);
             tokio::task::spawn_local(async move {
                 // Unanswered, it is sent again or given up as the protocol says.
-                if let Ok(answers) = client.exchange(batch).await {
-                    me.plane.borrow_mut().on_answers(answers, me.now());
+                if let Ok(answers) = client.exchange(batch).await
+                    && let Mode::Apart { plane, .. } = &me.mode
+                {
+                    plane.borrow_mut().on_answers(answers, me.now());
                     me.settle();
                     me.send();
                 }
@@ -362,7 +496,9 @@ impl Limiter {
             tokio::select! {
                 _ = cycle.tick() => {
                     let now = self.now();
-                    self.plane.borrow_mut().on_cycle(now);
+                    if let Mode::Apart { plane, .. } = &self.mode {
+                        plane.borrow_mut().on_cycle(now);
+                    }
                     self.settle();
                 }
                 () = self.asked.notified() => {}
@@ -371,6 +507,48 @@ impl Limiter {
                 return;
             }
             self.send();
+        }
+    }
+}
+
+impl Limiter {
+    /// A layered worker's loop: its sync every millisecond, and its process's answers.
+    async fn run_layered(self: Rc<Self>, mut answered: mpsc::UnboundedReceiver<FromHub>) {
+        let Mode::Layered {
+            hub, index, slices, ..
+        } = &self.mode
+        else {
+            return;
+        };
+        let mut sync = tokio::time::interval(SYNC);
+        sync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = sync.tick() => {
+                    let used = slices.borrow_mut().take_used(self.now());
+                    if !used.is_empty() {
+                        let _gone = hub.to.send(ToHub::Used { worker: *index, used });
+                    }
+                }
+                message = answered.recv() => match message {
+                    Some(FromHub::Slices(given)) => slices.borrow_mut().on_slices(given),
+                    Some(FromHub::Answer { id, answer }) => {
+                        slices.borrow_mut().on_slices(answer.slices);
+                        if let Some(waiter) = self.waiting.borrow_mut().remove(&id) {
+                            let _gone = waiter.send(Decided {
+                                ticket: id,
+                                admitted: answer.admitted,
+                                refused_by: answer.refused_by,
+                            });
+                        }
+                    }
+                    None => return,
+                },
+                () = self.asked.notified() => {}
+            }
+            if self.stopped.get() {
+                return;
+            }
         }
     }
 }

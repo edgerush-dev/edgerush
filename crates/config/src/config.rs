@@ -80,6 +80,12 @@ pub struct RateLimitService {
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub max_key_bytes: Option<u64>,
+    /// Experimental, for measuring: the process alone a data plane of the service, its
+    /// workers deciding from slices of its room it gives them every millisecond, rather than
+    /// each worker a data plane of its own ([12 item 3](../../../docs/12-open-questions.md)).
+    /// Off when left out.
+    #[serde(default)]
+    pub layered: Option<bool>,
 }
 
 /// A place where requests come in. Hostnames are to come; until a listener can be told

@@ -66,6 +66,7 @@ fn limited(mut config: Config, service: &[String]) -> Config {
         pods: service.to_vec(),
         cycle_ms: Some(10),
         max_key_bytes: None,
+        layered: None,
     });
     config
 }
@@ -116,6 +117,69 @@ async fn http2_requests_are_held_to_their_limit() {
             assert_eq!(answer.headers()["grpc-status"], "8");
             assert!(answer.headers().get("retry-after").is_none());
             assert!(answer.headers().get("ratelimit").is_none());
+        })
+        .await;
+}
+
+/// Layered (12 item 3), two workers of one data plane share a client's bucket through
+/// their process: a client with a connection to each is held to the one bucket, refusals
+/// say when to come back, and the process's keys are counted once.
+#[tokio::test]
+async fn layered_workers_share_a_clients_bucket() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let service = service().await;
+            let (upstream, _) = counting_upstream().await;
+            let mut config = limited(everything_config(upstream), &service);
+            if let Some(service) = &mut config.rate_limit_service {
+                service.layered = Some(true);
+            }
+            let workers = NonZeroUsize::new(2).unwrap();
+            let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), workers).unwrap());
+            let limits = H1Limits {
+                sweep: Duration::from_millis(20),
+                ..H1Limits::default()
+            };
+            let mut sends = Vec::new();
+            for position in 0..2 {
+                let worker = Worker::made(Arc::clone(&proxy), limits, SHORT, position, None);
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let front = socket.local_addr().unwrap();
+                let _maintained = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+                let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+                sends.push(h2_library_client(front, &::h2::client::Builder::new()).await);
+            }
+            let mut statuses = Vec::new();
+            for turn in 0..16 {
+                let send = sends.remove(0);
+                let mut send = within(send.ready()).await.unwrap();
+                let request = Request::get("http://example.test/")
+                    .version(Version::HTTP_2)
+                    .body(())
+                    .unwrap();
+                let (response, _) = send.send_request(request, true).unwrap();
+                let response = within(response).await.unwrap();
+                if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                    assert_eq!(response.headers()["retry-after"], "360", "turn {turn}");
+                    assert_eq!(response.headers()["ratelimit"], r#""per-client";r=0;t=360"#);
+                }
+                statuses.push(response.status().as_u16());
+                sends.push(send);
+                // The workers sync every millisecond: a few between requests, as a client's
+                // come over a network.
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+            assert_eq!(tally(&statuses), (10, 6), "{statuses:?}");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let scrape = loop {
+                let scrape = proxy.metrics();
+                if scrape.contains("edgerush_rate_limit_keys 1\n") || Instant::now() > deadline {
+                    break scrape;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert!(scrape.contains("edgerush_rate_limit_keys 1\n"), "{scrape}");
         })
         .await;
 }

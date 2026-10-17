@@ -117,6 +117,9 @@ pub struct CompiledRateLimitService {
     pub cycle: Duration,
     /// The bytes the keys may hold on the data plane, all its workers together.
     pub max_key_bytes: u64,
+    /// Whether the process alone is a data plane of the service, its workers deciding from
+    /// slices of its room (experimental).
+    pub layered: bool,
 }
 
 impl CompiledRateLimitService {
@@ -566,6 +569,7 @@ fn rate_limit_service(
         max_key_bytes: service
             .max_key_bytes
             .unwrap_or(CompiledRateLimitService::MAX_KEY_BYTES),
+        layered: service.layered.unwrap_or(false),
     })
 }
 

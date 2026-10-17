@@ -9,7 +9,9 @@
 //! on the spot — no message, no shared memory; one it cannot decide goes to the process,
 //! which decides it from its view as a data plane decides a request, waiting on the service
 //! for a key it holds no fresh copy of. A key with no room comes back with until when, and
-//! the worker refuses on its own till then.
+//! the worker refuses on its own till then. An ask that finds a key's room all in other
+//! workers' slices waits for their next sync (Lucas), where what they left unused lapses
+//! and the room is shared again, rather than being refused within the contract.
 //!
 //! No I/O: what carries the messages between worker and process — channels between
 //! threads, or the simulator — is the caller's.
@@ -111,6 +113,25 @@ impl<S: BuildHasher> Worker<S> {
         Local::Admit
     }
 
+    /// Those of `keys` it refuses on its own at `now`, each by its position in `keys` with
+    /// how long it waits: until the time its process said it has room.
+    pub fn waits<'a>(
+        &'a self,
+        keys: &'a [(&[u8], Contract)],
+        now: u64,
+    ) -> impl Iterator<Item = (usize, u64)> + 'a {
+        keys.iter()
+            .enumerate()
+            .filter_map(move |(position, (key, contract))| {
+                let held = self
+                    .keys
+                    .get(*key)
+                    .filter(|held| held.contract == *contract)?;
+                let until = held.refuse_until.filter(|until| *until > now)?;
+                Some((position, until - now))
+            })
+    }
+
     /// What it holds for the next sync: every key it admitted under or held a slice of
     /// since the last, its slices lapsing now, as they do at a sync; keys it did neither for
     /// are forgotten.
@@ -190,6 +211,8 @@ pub struct Process<S> {
     sync: u64,
     given: HashMap<Box<[u8]>, Given, S>,
     asked: BTreeMap<Ticket, Asked>,
+    /// Asks that found a key's room all given out, waiting for the holders' syncs.
+    deferred: Vec<Asked>,
     answers: Vec<(usize, u64, Answer)>,
 }
 
@@ -204,6 +227,7 @@ impl<S: BuildHasher + Clone> Process<S> {
             sync: sync.max(1),
             given: HashMap::with_hasher(hasher),
             asked: BTreeMap::new(),
+            deferred: Vec::new(),
             answers: Vec::new(),
         }
     }
@@ -216,6 +240,19 @@ impl<S: BuildHasher + Clone> Process<S> {
     /// Worker `worker`'s sync at `now`: what it admitted charged, its slices lapsed, and new
     /// ones given for every key it sent.
     pub fn on_used(&mut self, worker: usize, used: Vec<Used>, now: u64) -> Vec<Slice> {
+        // A worker waiting for this sync has come to its keys, however long ago it asked:
+        // the room is shared with it, so that its ask is decided rather than kept waiting.
+        for asked in &self.deferred {
+            for (key, _) in &asked.keys {
+                if let Some(seen) = self
+                    .given
+                    .get_mut(key)
+                    .and_then(|given| given.seen.get_mut(asked.worker))
+                {
+                    *seen = Some(now);
+                }
+            }
+        }
         let mut slices = Vec::with_capacity(used.len());
         for Used {
             key,
@@ -228,6 +265,17 @@ impl<S: BuildHasher + Clone> Process<S> {
             }
             self.lapse(&key, contract, worker, now);
             slices.push(self.slice(key, contract, worker, now));
+        }
+        // What lapsed may be what a deferred ask was waiting for.
+        for asked in std::mem::take(&mut self.deferred) {
+            let keys: Vec<(&[u8], Contract)> = asked
+                .keys
+                .iter()
+                .map(|(key, contract)| (&**key, *contract))
+                .collect();
+            if let Some(answer) = self.decide(asked.worker, asked.id, &keys, now) {
+                self.answers.push((asked.worker, asked.id, answer));
+            }
         }
         slices
     }
@@ -245,19 +293,46 @@ impl<S: BuildHasher + Clone> Process<S> {
         for (key, contract) in keys {
             self.lapse(key, *contract, worker, now);
         }
-        // A key with room, all of it given out: refused here, the room the workers'.
-        let short: Vec<(usize, u64)> = keys
+        self.decide(worker, id, keys, now)
+    }
+
+    /// Decides request `id` of worker `worker` under `keys` at `now`, or keeps it waiting:
+    /// for the holders' syncs while a key's room is all given out, or for the service.
+    fn decide(
+        &mut self,
+        worker: usize,
+        id: u64,
+        keys: &[(&[u8], Contract)],
+        now: u64,
+    ) -> Option<Answer> {
+        // A key with no room at all: refused, as the copy says when it has some.
+        let empty: Vec<(usize, u64)> = keys
             .iter()
             .enumerate()
-            .filter(|(_, (key, contract))| self.available(key, *contract, now) == Some(0))
+            .filter(|(_, (key, contract))| self.plane.room(key, *contract, now) == Some(0))
             .map(|(at, (key, contract))| (at, self.wait(key, *contract, now)))
             .collect();
-        if !short.is_empty() {
+        if !empty.is_empty() {
             return Some(Answer {
                 admitted: false,
-                refused_by: short.into(),
+                refused_by: empty.into(),
                 slices: self.slices(keys, worker, now),
             });
+        }
+        // A key with room, all of it in other workers' slices: it waits for their syncs.
+        if keys
+            .iter()
+            .any(|(key, contract)| self.available(key, *contract, now) == Some(0))
+        {
+            let keys = keys
+                .iter()
+                .map(|(key, contract)| ((*key).into(), *contract));
+            self.deferred.push(Asked {
+                worker,
+                id,
+                keys: keys.collect(),
+            });
+            return None;
         }
         match self.plane.decide_all(keys, now) {
             Decision::Admit => Some(Answer {
@@ -287,8 +362,8 @@ impl<S: BuildHasher + Clone> Process<S> {
         }
     }
 
-    /// The answers to requests that waited on the service, decided since last asked: the
-    /// worker, the request's id, and the answer.
+    /// The answers to requests that waited — on the service, or on the workers' syncs —
+    /// decided since last asked: the worker, the request's id, and the answer.
     pub fn take_answers(&mut self, now: u64) -> Vec<(usize, u64, Answer)> {
         for decided in self.plane.take_decisions() {
             let Some(asked) = self.asked.remove(&decided.ticket) else {
@@ -389,7 +464,9 @@ impl<S: BuildHasher + Clone> Process<S> {
         if let Some(slice) = given.slices.get_mut(worker) {
             *slice = allowance;
         }
-        let refuse_until = (available == 0).then(|| now + self.wait(&key, contract, now));
+        // No room at all: refused by the worker itself until there is. Room all given out
+        // is no refusal: the worker asks, and waits for the holders' syncs.
+        let refuse_until = (room == 0).then(|| now + self.wait(&key, contract, now));
         Slice {
             key,
             contract,
