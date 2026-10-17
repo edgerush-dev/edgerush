@@ -6,6 +6,8 @@
 //!                  [--rate MESSAGES_PER_SECOND] [--threads N]
 //! wsbench churn URL --rate CONNECTIONS_PER_SECOND [--host NAME] [--seconds S]
 //!                   [--size BYTES] [--most N] [--threads N]
+//! wsbench http URL [--host NAME] [--connections N] [--addresses N] [--seconds S]
+//!                  [--threads N]
 //! ```
 //!
 //! `serve` answers a handshake with its 101 and then sends every frame back as it came,
@@ -18,12 +20,15 @@
 //! its echo (what is timed), then a Close each way. URL is `ws://` or `wss://` with an IP
 //! address; `--host` is the name asked for, and the name TLS is asked for by.
 //!
+//! `http` is plain requests from many client addresses, for rate limits ([`http`]).
+//!
 //! A client prints one line of JSON: messages echoed, those that failed, the seconds they
 //! were sent in, their rate, and latency percentiles in milliseconds.
 
 #![forbid(unsafe_code)]
 
 mod frames;
+mod http;
 
 use std::collections::HashMap;
 use std::io;
@@ -59,7 +64,7 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<(), String> {
     let (command, rest) = args
         .split_first()
-        .ok_or("no command: serve, echo or churn")?;
+        .ok_or("no command: serve, echo, churn or http")?;
     let (place, flags) = rest.split_first().ok_or("no address or URL")?;
     let options = Options::read(flags)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -90,6 +95,15 @@ fn run(args: &[String]) -> Result<(), String> {
                 runtime.block_on(churn(target, rate, seconds, size, most))
             };
             println!("{}", tally.report(command, seconds));
+            Ok(())
+        }
+        "http" => {
+            let target = Arc::new(http::Target::new(place, &options)?);
+            let seconds: f64 = options.get("seconds", 10.0)?;
+            let connections = options.get("connections", 64)?;
+            let addresses = options.get("addresses", 1)?;
+            let tally = runtime.block_on(http::run(target, connections, addresses, seconds));
+            println!("{}", tally.report(seconds));
             Ok(())
         }
         other => Err(format!("no command {other}")),

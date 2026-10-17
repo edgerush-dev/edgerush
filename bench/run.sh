@@ -42,6 +42,13 @@
 #                                             a second, large messages, a connection a
 #                                             message at CHURN a second, and what open ones
 #                                             cost held idle (without TLS)
+#   bench/run.sh ratelimit [KEYS]             a per-client limit shared through the
+#                                             rate-limiting service (12 item 3): saturation
+#                                             from one client, one busy key, and from KEYS
+#                                             client addresses (1000 unless said), each a
+#                                             quiet key of its own; by how a pod's workers
+#                                             share: VARIANTS ours-rl-apart ours-rl-layered
+#                                             ours-rl-keep, beside ours with no limit
 #   bench/run.sh summary DIR                  the table of a finished run
 #
 # UPSTREAM_H2=1 has the proxy speak HTTP/2 to the backend, by prior knowledge, many
@@ -127,6 +134,10 @@ repo=$(dirname "$here")
 : "${WEBSOCKET:=0}"
 [ "${1:-}" = websocket ] && WEBSOCKET=1
 : "${WSBENCH:=$here/wsbench/target/release/wsbench}"
+# The `ratelimit` scenario's service pod, on the backend's CPUs, and how long the
+# ours-rl-keep variant keeps a slice its worker no longer uses.
+: "${RL_SERVICE:=$repo/target/release/edgerush-ratelimit-service}"
+: "${RL_KEEP_MS:=50}"
 # ACCESS_LOG=1 has every proxy log each request as EdgeRush's access log does (21 §5): the
 # same fields as a line of JSON each, to a file, each proxy its fastest way. EdgeRush its own
 # (a worker's batches, a logger thread); NGINX through `escape=json`, into a 64 KiB buffer
@@ -484,6 +495,12 @@ CFG
         taskset -c "$PROXY_CPUS" "$EDGERUSH_PGO" proxy --config "$config" \
             --workers "$WORKERS" $idle 2>>"$OUT/proxy.log" &
         ;;
+    ours-rl-*)
+        # EdgeRush under a per-client limit, its workers sharing as the name says.
+        rl_config "${1#ours-rl-}"
+        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config.rl" \
+            --workers "$WORKERS" $idle 2>>"$OUT/proxy.log" &
+        ;;
     ours-ab*)
         # EdgeRush accepting N connections before its other work goes first: ours-ab1.
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config" \
@@ -497,6 +514,57 @@ CFG
     esac
     proxy_pid=${daemon:-$!}
     await "$scheme://$proxy_at/"
+}
+
+# The config under a per-client limit with room for everything the load sends, so that
+# what is measured is deciding rather than refusing, shared as `$1` says: apart (each
+# worker a data plane), layered, or keep (layered, keeping unused slices RL_KEEP_MS).
+rl_config() { # sharing
+    local sharing
+    case "$1" in
+    apart) sharing= ;;
+    layered) sharing=", layered: true" ;;
+    keep) sharing=", layered: true, layered_keep_ms: $RL_KEEP_MS" ;;
+    *) echo "no sharing $1" >&2; exit 2 ;;
+    esac
+    cat >"$run-limits.yaml" <<'LIMITS'
+limits:
+  - { name: per-client, key: client, model: { bucket: { rate: 100000000/s, burst: 100000000 } } }
+LIMITS
+    python3 - "$config" "$config.rl" <<'PY'
+import sys
+s = open(sys.argv[1]).read()
+rule = "          - path: { prefix: / }\n        filters:"
+assert s.count(rule) == 1, "the measured rule moved"
+s = s.replace(rule, "          - path: { prefix: / }\n        rate_limits: [per-client]\n        filters:")
+open(sys.argv[2], "w").write(s)
+PY
+    printf 'rate_limit_service: { pods: ["127.0.0.1:7000"], cycle_ms: 10%s }\nlimits_file: %s\n' \
+        "$sharing" "$run-limits.yaml" >>"$config.rl"
+}
+
+# The service's one pod, for `ratelimit`.
+rl_pid=
+start_rl_service() {
+    [ -x "$RL_SERVICE" ] || { echo "no service at $RL_SERVICE: build it first" >&2; exit 2; }
+    taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --id 0 --listen 127.0.0.1:7000 --cycle-ms 10 \
+        --pod 0=127.0.0.1:7000 2>>"$OUT/rl-service.log" &
+    rl_pid=$!
+    sleep 2
+}
+
+stop_rl_service() {
+    [ -n "$rl_pid" ] || return 0
+    kill "$rl_pid" 2>/dev/null || true
+    wait "$rl_pid" 2>/dev/null || true
+    rl_pid=
+}
+
+ratelimit_runs() {
+    saturation_h1 "$1.saturation-h1" "$proxy" --connect-to="$proxy_at"
+    saturation_h2 "$1.saturation-h2" "$proxy" --connect-to="$proxy_at"
+    measured "$1.keys-h1" "$WSBENCH" http "$scheme://$proxy_at/" --host "$host" \
+        --connections "$rl_keys" --addresses "$rl_keys" --seconds "$DURATION" --threads 2
 }
 
 stop_proxy() {
@@ -1041,9 +1109,9 @@ profile-body)
         exit 2
     }
     ;;
-ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3 | h3latency | mixed | passthrough | websocket) ;;
+ceiling | saturation | latency | carrying | hotpaths | frontend | instructions | idle | soak | h2 | grpc | handshakes | h3 | h3latency | mixed | passthrough | websocket | ratelimit) ;;
 *)
-    sed -n '2,48p' "$0" >&2
+    sed -n '2,55p' "$0" >&2
     exit 2
     ;;
 esac
@@ -1075,7 +1143,7 @@ restore_idle() {
         [ "$(cat "$path")" = "$value" ] || echo "$value" | sudo -n tee "$path" >/dev/null
     done <"$idle_saved"
 }
-trap 'stop_proxy; stop_backend; restore_mtu; restore_idle' EXIT
+trap 'stop_proxy; stop_rl_service; stop_backend; restore_mtu; restore_idle' EXIT
 trap 'exit 1' INT TERM HUP
 for policy in $IDLE; do
     python3 "$here/residency.py" plan "$policy" "$PROXY_CPUS" >/dev/null
@@ -1105,6 +1173,13 @@ ceiling)
     ;;
 saturation)
     each_variant saturation_runs
+    ;;
+ratelimit)
+    rl_keys=${2:-${RL_KEYS:-1000}}
+    [ -x "$WSBENCH" ] || { echo "no wsbench at $WSBENCH: build it first" >&2; exit 2; }
+    start_rl_service
+    each_variant ratelimit_runs
+    stop_rl_service
     ;;
 latency)
     h1_rate=${2:?rate for h1} h2_rate=${3:?rate for h2} churn_rate=${4:?rate for churn}
