@@ -568,6 +568,12 @@ ratelimit_runs() {
     saturation_h2 "$1.saturation-h2" "$proxy" --connect-to="$proxy_at"
     measured "$1.keys-h1" "$WSBENCH" http "$scheme://$proxy_at/" --host "$host" \
         --connections "$rl_keys" --addresses "$rl_keys" --seconds "$DURATION" --threads 2
+    # The CPU each of the proxy's threads spent over the three, in clock ticks: the
+    # process layer's thread apart from the workers'.
+    local task
+    for task in /proc/"$proxy_pid"/task/*; do
+        printf '%s %s\n' "$(cat "$task/comm")" "$(awk '{print $14 + $15}' "$task/stat")"
+    done >"$OUT/$1.threads" 2>/dev/null || true
 }
 
 stop_proxy() {
