@@ -2,10 +2,11 @@
 //! [`DataPlane`] of the protocol, its workers deciding from slices of its room.
 //!
 //! Every sync, about every millisecond, a [`Worker`] tells its [`Process`] what it admitted
-//! under each key since the last, and the process answers with a new slice of each key's
-//! room: the room divided equally among the workers that came to the key lately, never more
-//! than the room less the slices other workers still hold. A slice not used lapses at the
-//! worker's next sync. A request every key of which has slice left is admitted by the worker
+//! under each key since the last, and the process answers with a new slice of each key it
+//! used, from its slice or by asking: the room divided equally among the workers that came
+//! to the key lately, never more than the room less the slices other workers still hold. A
+//! slice not used is given back at the worker's next sync and none given in its place, so
+//! that a key it no longer uses stops being sent: a sync costs the keys in use. A request every key of which has slice left is admitted by the worker
 //! on the spot — no message, no shared memory; one it cannot decide goes to the process,
 //! which decides it from its view as a data plane decides a request, waiting on the service
 //! for a key it holds no fresh copy of. A key with no room comes back with until when, and
@@ -214,6 +215,8 @@ pub struct Process<S> {
     /// Asks that found a key's room all given out, waiting for the holders' syncs.
     deferred: Vec<Asked>,
     answers: Vec<(usize, u64, Answer)>,
+    /// By worker: when it last synced.
+    synced: Vec<Option<u64>>,
 }
 
 impl<S: BuildHasher + Clone> Process<S> {
@@ -229,6 +232,7 @@ impl<S: BuildHasher + Clone> Process<S> {
             asked: BTreeMap::new(),
             deferred: Vec::new(),
             answers: Vec::new(),
+            synced: vec![None; workers.max(1)],
         }
     }
 
@@ -238,8 +242,12 @@ impl<S: BuildHasher + Clone> Process<S> {
     }
 
     /// Worker `worker`'s sync at `now`: what it admitted charged, its slices lapsed, and new
-    /// ones given for every key it sent.
+    /// ones given for every key it used since its last sync, from its slice or by asking.
     pub fn on_used(&mut self, worker: usize, used: Vec<Used>, now: u64) -> Vec<Slice> {
+        let since = self
+            .synced
+            .get_mut(worker)
+            .and_then(|synced| synced.replace(now));
         // A worker waiting for this sync has come to its keys, however long ago it asked:
         // the room is shared with it, so that its ask is decided rather than kept waiting.
         for asked in &self.deferred {
@@ -260,7 +268,26 @@ impl<S: BuildHasher + Clone> Process<S> {
             count,
         } in used
         {
-            if count > 0 {
+            if count == 0 {
+                let given = self
+                    .given
+                    .get_mut(&key)
+                    .filter(|given| given.contract == contract);
+                // Asked about since its last sync, the worker came to the key though it
+                // took nothing from its slice: its request was admitted by the process.
+                let asked = given
+                    .as_ref()
+                    .and_then(|given| given.seen.get(worker).copied().flatten())
+                    .is_some_and(|seen| since.is_none_or(|since| seen > since));
+                if !asked {
+                    // A slice left unused, given back: the worker has not come to the key,
+                    // and is given none, so that a key it no longer uses stops being sent.
+                    if let Some(slice) = given.and_then(|given| given.slices.get_mut(worker)) {
+                        *slice = 0;
+                    }
+                    continue;
+                }
+            } else {
                 self.plane.charge(&key, contract, count, now);
             }
             self.lapse(&key, contract, worker, now);

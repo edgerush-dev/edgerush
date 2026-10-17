@@ -46,12 +46,27 @@ fn settle(process: &mut Process<FixedState>, pod: &mut ServicePod, now: u64) {
 /// The process with `k` warm: one request asked about and answered, and a cycle that
 /// bounds the copy.
 fn warm(process: &mut Process<FixedState>, pod: &mut ServicePod, worker: usize) -> Answer {
-    let keys = [(&b"k"[..], contract())];
-    assert_eq!(process.on_ask(worker, 1, &keys, 0), None, "cold: it waits");
-    settle(process, pod, 0);
-    let answers = process.take_answers(0);
-    process.plane().on_cycle(0);
-    settle(process, pod, 0);
+    warm_key(process, pod, worker, (b"k", contract()), 0)
+}
+
+/// The process with `key` under its contract warm at `now`, as [`warm`] has `k`.
+fn warm_key(
+    process: &mut Process<FixedState>,
+    pod: &mut ServicePod,
+    worker: usize,
+    key: (&[u8], Contract),
+    now: u64,
+) -> Answer {
+    let keys = [key];
+    assert_eq!(
+        process.on_ask(worker, 1, &keys, now),
+        None,
+        "cold: it waits"
+    );
+    settle(process, pod, now);
+    let answers = process.take_answers(now);
+    process.plane().on_cycle(now);
+    settle(process, pod, now);
     let (_, id, answer) = answers.into_iter().next().unwrap();
     assert_eq!(id, 1);
     answer
@@ -126,56 +141,79 @@ fn a_worker_decides_from_its_slice_and_asks_without_one() {
 #[test]
 fn the_process_gives_equal_slices_and_never_more_than_its_room() {
     let (mut process, mut pod) = process(4);
-    let first = warm(&mut process, &mut pod, 0);
-    assert!(first.admitted);
+    warm(&mut process, &mut pod, 0);
+    let keys = [(&b"k"[..], contract())];
     let k = |count| Used {
         key: b"k"[..].into(),
         contract: contract(),
         count,
     };
-    let sync = |process: &mut Process<FixedState>, worker, now| {
-        process.on_used(worker, vec![k(0)], now)[0].allowance
-    };
-    // Room nine. Worker 0 alone has come to it: all nine.
-    assert_eq!(sync(&mut process, 0, MS), 9);
+    // Room nine. Worker 0 alone has come to it: all eight left after its request.
+    let first = process.on_ask(0, 2, &keys, 0).unwrap();
+    assert!(first.admitted);
+    assert_eq!(first.slices[0].allowance, 8);
     // Worker 1 comes: nothing left until worker 0's slice lapses — but no refusal: the
     // room is there, in worker 0's slice.
-    let late = process.on_used(1, vec![k(0)], MS);
-    assert_eq!(late[0].allowance, 0);
-    assert_eq!(late[0].refuse_until, None, "room given out is no refusal");
-    let keys = [(&b"k"[..], contract())];
     assert_eq!(
-        process.on_ask(1, 2, &keys, MS),
+        process.on_ask(1, 3, &keys, MS),
         None,
         "it waits for worker 0's sync"
     );
     assert!(process.take_answers(MS).is_empty());
-    // A millisecond on, worker 0 syncs: half of the nine is its, and worker 1's request,
-    // waiting, is admitted from what lapsed, with a slice of its own.
-    assert_eq!(sync(&mut process, 0, 2 * MS), 4);
+    // A millisecond on, worker 0 syncs, one used: half of the seven left is its, and
+    // worker 1's request, waiting, is admitted from what lapsed, with a slice of its own.
+    assert_eq!(process.on_used(0, vec![k(1)], 2 * MS)[0].allowance, 3);
     let answers = process.take_answers(2 * MS);
     assert_eq!(answers.len(), 1);
-    let (worker, id, answer) = &answers[0];
-    assert_eq!((*worker, *id, answer.admitted), (1, 2, true));
+    let (asker, id, answer) = &answers[0];
+    assert_eq!((*asker, *id, answer.admitted), (1, 3, true));
     assert_eq!(
-        answer.slices[0].allowance, 4,
-        "eight left, less worker 0's four"
+        answer.slices[0].allowance, 3,
+        "six left, less worker 0's three"
     );
-    assert_eq!(sync(&mut process, 1, 2 * MS), 4);
-    // All four come: never more given out than the room, however they arrive.
-    let mut out = [0; 4];
-    for round in 3..8 {
-        for worker in 0..4 {
-            out[worker] = sync(&mut process, worker, round * MS);
-            let room = process.plane().room(b"k", contract(), round * MS).unwrap();
-            assert!(
-                out.iter().sum::<u64>() <= room,
-                "round {round}: {out:?} of {room}"
-            );
+    // Worker 1 syncs, its three spent: what room is left is in worker 0's slice.
+    let late = process.on_used(1, vec![k(3)], 3 * MS);
+    assert_eq!(late[0].allowance, 0);
+    assert_eq!(late[0].refuse_until, None, "room given out is no refusal");
+    // Four workers, a request each a millisecond, under a key with room to spare: never
+    // more given out than the room, however they arrive, and settled, a quarter each.
+    let n = |n| NonZeroU64::new(n).unwrap();
+    let roomy = Contract {
+        limit: n(10_000),
+        window: n(1_000 * MS),
+        burst: n(400),
+    };
+    warm_key(&mut process, &mut pod, 0, (b"r", roomy), 3 * MS);
+    let r = [(&b"r"[..], roomy)];
+    let mut workers: Vec<_> = (0..4).map(|_| worker()).collect();
+    let mut id = 10;
+    for round in 4..12 {
+        let now = round * MS;
+        for (at, one) in workers.iter_mut().enumerate() {
+            if one.decide(&r, now) == Local::Ask {
+                id += 1;
+                if let Some(answer) = process.on_ask(at, id, &r, now) {
+                    one.on_slices(answer.slices);
+                }
+            }
+            let used = one.take_used(now);
+            one.on_slices(process.on_used(at, used, now));
+            // The service answers within the round, as it does within a sync or two.
+            settle(&mut process, &mut pod, now);
+            let room = process.plane().room(b"r", roomy, now).unwrap();
+            let out: u64 = process.given[&b"r"[..]].slices.iter().sum();
+            assert!(out <= room, "round {round}: {out} of {room}");
+        }
+        for (at, _, answer) in process.take_answers(now) {
+            workers[at].on_slices(answer.slices);
         }
     }
-    // Settled, each has a quarter: eight among four, two each.
-    assert_eq!(out, [2; 4]);
+    let held: Vec<u64> = workers
+        .iter()
+        .map(|one| one.keys[&b"r"[..]].allowance)
+        .collect();
+    // A quarter each of the room at a sync: the full 400, less the request just taken.
+    assert_eq!(held, [99; 4]);
 }
 
 /// A key's room spent comes back with until when it has room again; the worker told so
@@ -207,15 +245,11 @@ fn no_room_comes_back_with_until_when() {
 fn what_workers_admit_reaches_the_owner_once() {
     let (mut process, mut pod) = process(2);
     warm(&mut process, &mut pod, 0);
-    let k = |count| Used {
-        key: b"k"[..].into(),
-        contract: contract(),
-        count,
-    };
-    let slices = process.on_used(0, vec![k(0)], MS);
-    let mut zero = worker();
-    zero.on_slices(slices);
     let keys = [(&b"k"[..], contract())];
+    let answer = process.on_ask(0, 2, &keys, MS).unwrap();
+    assert!(answer.admitted);
+    let mut zero = worker();
+    zero.on_slices(answer.slices);
     let admitted = (0..20)
         .filter(|_| zero.decide(&keys, MS) == Local::Admit)
         .count() as u64;
@@ -225,8 +259,8 @@ fn what_workers_admit_reaches_the_owner_once() {
     settle(&mut process, &mut pod, CYCLE);
     assert_eq!(
         pod.counted(b"k"),
-        Some(1 + admitted),
-        "the asked one and the worker's"
+        Some(2 + admitted),
+        "the two asked and the worker's"
     );
 }
 
@@ -236,19 +270,20 @@ fn what_workers_admit_reaches_the_owner_once() {
 fn a_waiting_ask_is_answered_however_late_the_holders_sync() {
     let (mut process, mut pod) = process(2);
     warm(&mut process, &mut pod, 0);
-    let k = Used {
-        key: b"k"[..].into(),
-        contract: contract(),
-        count: 0,
-    };
-    assert_eq!(process.on_used(0, vec![k.clone()], MS)[0].allowance, 9);
     let keys = [(&b"k"[..], contract())];
+    let answer = process.on_ask(0, 2, &keys, MS).unwrap();
+    assert_eq!(answer.slices[0].allowance, 8, "nine, less the one asked");
     assert_eq!(
         process.on_ask(1, 7, &keys, MS),
         None,
         "the room is worker 0's"
     );
-    // Worker 0's next sync, long after two of them would have come.
+    // Worker 0's next sync, one used, long after two of them would have come.
+    let k = Used {
+        key: b"k"[..].into(),
+        contract: contract(),
+        count: 1,
+    };
     process.on_used(0, vec![k], 50 * MS);
     let answers = process.take_answers(50 * MS);
     assert_eq!(answers.len(), 1, "answered at the holder's sync");
@@ -256,4 +291,33 @@ fn a_waiting_ask_is_answered_however_late_the_holders_sync() {
         (answers[0].0, answers[0].1, answers[0].2.admitted),
         (1, 7, true)
     );
+}
+
+/// A slice a worker leaves unused is given back at its next sync and none given in its
+/// place: an idle worker sends nothing after, and the room goes to the workers still coming.
+#[test]
+fn an_unused_slice_lapses_and_is_not_given_again() {
+    let (mut process, mut pod) = process(2);
+    let mut zero = worker();
+    warm(&mut process, &mut pod, 0);
+    // Its next request, the copy fresh: admitted, with a slice.
+    let keys = [(&b"k"[..], contract())];
+    let answer = process.on_ask(0, 2, &keys, 0).unwrap();
+    assert!(answer.admitted);
+    zero.on_slices(answer.slices);
+    assert_eq!(zero.decide(&keys, 0), Local::Admit);
+    // Its first sync: one used, a new slice.
+    let slices = process.on_used(0, zero.take_used(MS), MS);
+    assert!(slices[0].allowance > 0, "{slices:?}");
+    zero.on_slices(slices);
+    // Its next, nothing used: the slice given back, none given.
+    let used = zero.take_used(2 * MS);
+    assert_eq!(used.len(), 1, "given back once");
+    assert!(process.on_used(0, used, 2 * MS).is_empty(), "none given");
+    assert!(zero.take_used(3 * MS).is_empty(), "idle: nothing sent");
+    // Worker 1, coming later, is given the whole room.
+    let answer = process.on_ask(1, 3, &keys, 10 * MS).unwrap();
+    assert!(answer.admitted);
+    let room = process.plane().room(b"k", contract(), 10 * MS).unwrap();
+    assert_eq!(answer.slices[0].allowance, room);
 }
