@@ -517,8 +517,9 @@ CFG
     await "$scheme://$proxy_at/"
 }
 
-# The config under a per-client limit with room for everything the load sends, so that
-# what is measured is deciding rather than refusing, shared as `$1` says: apart (each
+# The config under a per-client limit, RL_RATE with a bucket of RL_BURST — unless set,
+# room for everything the load sends, so that what is measured is deciding rather than
+# refusing — shared as `$1` says: apart (each
 # worker a data plane), layered, keep (layered, keeping unused slices RL_KEEP_MS) or
 # shared (each key's one room, taken by atomics).
 rl_config() { # sharing
@@ -530,9 +531,9 @@ rl_config() { # sharing
     shared) sharing=", shared: true" ;;
     *) echo "no sharing $1" >&2; exit 2 ;;
     esac
-    cat >"$run-limits.yaml" <<'LIMITS'
+    cat >"$run-limits.yaml" <<LIMITS
 limits:
-  - { name: per-client, key: client, model: { bucket: { rate: 100000000/s, burst: 100000000 } } }
+  - { name: per-client, key: client, model: { bucket: { rate: ${RL_RATE:-100000000/s}, burst: ${RL_BURST:-100000000} } } }
 LIMITS
     python3 - "$config" "$config.rl" <<'PY'
 import sys
