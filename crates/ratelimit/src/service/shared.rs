@@ -7,7 +7,10 @@
 //! A sync swaps what is left of a room for nothing, charges its data plane what was taken
 //! since the last, and puts the plane's room for the key back: between the two a worker
 //! finds the room empty and asks, so nothing is taken twice and never more than the room
-//! of one data plane. A worker that finds a room empty asks the process, which folds the
+//! of one data plane. The process finds the rooms taken from without looking at the others:
+//! the first take from a room since its last fold marks it and puts it on the process's
+//! queue, so a sync costs the keys in use, not those held. A worker that finds a room
+//! empty asks the process, which folds the
 //! key at once and decides from its data plane, waiting on the service for a key it holds
 //! no fresh copy of. A key with no room at all comes back with until when, and every worker
 //! refuses on its own till then.
@@ -21,10 +24,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 /// How long a key no worker took from or asked about is kept: then its room is closed, and
 /// a worker still holding it asks.
 const IDLE: u64 = 60_000_000_000;
+
+/// How often idle keys are looked for among all held: once a second, not at every sync.
+const SWEEP: u64 = 1_000_000_000;
 
 /// How many times an ask folds its keys and takes before it is refused, the workers having
 /// emptied a room between the fold and the take each time.
@@ -47,7 +54,7 @@ fn take_all(rooms: &[Handed], now: u64) -> Result<(), (usize, Take)> {
 
 /// A key's room, shared by a process's workers: on a cache line of its own, so that one
 /// key's takes do not slow another's.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 #[repr(align(128))]
 pub struct Room {
     /// What may be taken before the process folds the key again.
@@ -56,6 +63,13 @@ pub struct Room {
     refuse_until: AtomicU64,
     /// The process no longer holds the key: whoever holds the room asks instead.
     closed: AtomicBool,
+    /// Taken from since the process last folded it, and so on its queue.
+    marked: AtomicBool,
+    /// The key it is the room of, and its contract, for the process to fold it by.
+    key: Box<[u8]>,
+    contract: Contract,
+    /// The process's queue of rooms taken from.
+    marks: Sender<Arc<Room>>,
 }
 
 /// What taking from a room came to.
@@ -70,8 +84,21 @@ pub enum Take {
 }
 
 impl Room {
-    /// Takes a request's worth at `now`, if there is any left.
-    pub fn take(&self, now: u64) -> Take {
+    fn new(key: Box<[u8]>, contract: Contract, marks: Sender<Arc<Room>>) -> Self {
+        Self {
+            left: AtomicU64::new(0),
+            refuse_until: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            marked: AtomicBool::new(false),
+            key,
+            contract,
+            marks,
+        }
+    }
+
+    /// Takes a request's worth at `now`, if there is any left; the first since the process
+    /// last folded the room puts it on the process's queue.
+    pub fn take(self: &Arc<Self>, now: u64) -> Take {
         if self.closed.load(Ordering::Acquire) {
             return Take::Ask;
         }
@@ -84,7 +111,15 @@ impl Room {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                 left.checked_sub(1)
             }) {
-            Ok(_) => Take::Taken,
+            Ok(_) => {
+                // Read, not written, by every take but the first: the line is the take's.
+                if !self.marked.load(Ordering::Acquire) && !self.marked.swap(true, Ordering::AcqRel)
+                {
+                    // The process gone, nothing is folded any more: the room is closed too.
+                    let _gone = self.marks.send(Arc::clone(self));
+                }
+                Take::Taken
+            }
             Err(_) => Take::Ask,
         }
     }
@@ -241,6 +276,12 @@ pub struct Process<S> {
     keys: HashMap<Box<[u8]>, Held, S>,
     asked: BTreeMap<Ticket, Asked>,
     answers: Vec<(usize, u64, Answer)>,
+    /// The rooms' queue: those taken from since their last fold.
+    marks: (Sender<Arc<Room>>, Receiver<Arc<Room>>),
+    /// The rooms with no room until a time, to fold when it comes.
+    refusing: Vec<(u64, Arc<Room>)>,
+    /// When idle keys were last looked for.
+    swept: u64,
 }
 
 impl<S: BuildHasher + Clone> Process<S> {
@@ -252,6 +293,9 @@ impl<S: BuildHasher + Clone> Process<S> {
             keys: HashMap::with_hasher(hasher),
             asked: BTreeMap::new(),
             answers: Vec::new(),
+            marks: channel(),
+            refusing: Vec::new(),
+            swept: 0,
         }
     }
 
@@ -261,28 +305,43 @@ impl<S: BuildHasher + Clone> Process<S> {
     }
 
     /// Its sync at `now`: every room taken from since its last fold folded, and one whose
-    /// bucket was empty filled if it has room again; a key idle long closed and forgotten.
+    /// bucket was empty filled if it has room again; now and then, a key idle long closed
+    /// and forgotten.
     pub fn on_sync(&mut self, now: u64) {
-        let due: Vec<(Box<[u8]>, Contract)> = self
-            .keys
-            .iter()
-            .filter(|(_, held)| {
-                held.room.left.load(Ordering::Acquire) != held.given
-                    || held.room.wait(now).is_none()
-                        && held.room.refuse_until.load(Ordering::Acquire) != 0
-            })
-            .map(|(key, held)| (key.clone(), held.contract))
-            .collect();
-        for (key, contract) in due {
-            self.fold(&key, contract, now);
+        let marked: Vec<Arc<Room>> = self.marks.1.try_iter().collect();
+        for room in marked {
+            // Unmarked first: a take after this marks it again, for the next sync.
+            room.marked.store(false, Ordering::Release);
+            self.fold_room(&room, now);
         }
-        self.keys.retain(|_, held| {
-            let idle = now.saturating_sub(held.used) > IDLE;
-            if idle {
-                held.room.closed.store(true, Ordering::Release);
-            }
-            !idle
-        });
+        let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.refusing)
+            .into_iter()
+            .partition(|(until, _)| *until <= now);
+        self.refusing = waiting;
+        for (_, room) in due {
+            self.fold_room(&room, now);
+        }
+        if now.saturating_sub(self.swept) >= SWEEP {
+            self.swept = now;
+            self.keys.retain(|_, held| {
+                let idle = now.saturating_sub(held.used) > IDLE;
+                if idle {
+                    held.room.closed.store(true, Ordering::Release);
+                }
+                !idle
+            });
+        }
+    }
+
+    /// Folds `room` at `now` if it is still its key's: a room closed since is not.
+    fn fold_room(&mut self, room: &Arc<Room>, now: u64) {
+        let current = self
+            .keys
+            .get(&room.key)
+            .is_some_and(|held| Arc::ptr_eq(&held.room, room));
+        if current {
+            self.fold(&room.key, room.contract, now);
+        }
     }
 
     /// Worker `worker` asks about request `id` under `keys` at `now`: each key folded, then
@@ -429,9 +488,11 @@ impl<S: BuildHasher + Clone> Process<S> {
     /// Folds `key`'s room at `now`: what was taken since its last fold charged on the data
     /// plane, and the plane's room put back, or, the bucket empty, until when it has none.
     fn fold(&mut self, key: &[u8], contract: Contract, now: u64) {
+        let marks = &self.marks.0;
+        let room = || Arc::new(Room::new(key.into(), contract, marks.clone()));
         let held = self.keys.entry(key.into()).or_insert_with(|| Held {
             contract,
-            room: Arc::default(),
+            room: room(),
             given: 0,
             used: now,
         });
@@ -441,7 +502,7 @@ impl<S: BuildHasher + Clone> Process<S> {
             held.room.closed.store(true, Ordering::Release);
             *held = Held {
                 contract,
-                room: Arc::default(),
+                room: room(),
                 given: 0,
                 used: now,
             };
@@ -468,7 +529,17 @@ impl<S: BuildHasher + Clone> Process<S> {
             held.given = given;
             held.room.refuse_until.store(until, Ordering::Release);
             held.room.left.store(given, Ordering::Release);
+            if until > 0 {
+                self.refusing.push((until, Arc::clone(&held.room)));
+            }
         }
+    }
+}
+
+impl<S> Drop for Process<S> {
+    fn drop(&mut self) {
+        // A room on the queue holds a sender of it: emptied, the queue goes with the last.
+        while self.marks.1.try_recv().is_ok() {}
     }
 }
 

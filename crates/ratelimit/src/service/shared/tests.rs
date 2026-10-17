@@ -56,6 +56,15 @@ fn warm(process: &mut Process<FixedState>, pod: &mut ServicePod, now: u64) -> An
     answer
 }
 
+/// A room of `key` on a queue no process reads.
+fn room(key: &[u8]) -> Arc<Room> {
+    Arc::new(Room::new(
+        key.into(),
+        contract(),
+        std::sync::mpsc::channel().0,
+    ))
+}
+
 fn worker() -> Worker<FixedState> {
     Worker::with_hasher(FixedState::default())
 }
@@ -120,7 +129,7 @@ fn what_workers_take_reaches_the_owner_once() {
 /// However many threads take from a room at once, no more is taken than was put in it.
 #[test]
 fn threads_taking_at_once_never_take_more_than_the_room() {
-    let room = Room::default();
+    let room = room(b"k");
     room.left.store(10_000, Ordering::Release);
     let taken: u64 = std::thread::scope(|scope| {
         let threads: Vec<_> = (0..4)
@@ -147,9 +156,9 @@ fn threads_taking_at_once_never_take_more_than_the_room() {
 /// back if the second has none.
 #[test]
 fn two_keys_are_taken_all_or_none() {
-    let full = Arc::new(Room::default());
+    let full = room(b"a");
     full.left.store(5, Ordering::Release);
-    let empty = Arc::new(Room::default());
+    let empty = room(b"b");
     let mut one = worker();
     one.on_rooms(vec![
         Handed {
@@ -190,13 +199,14 @@ fn a_closed_room_is_asked_about_and_an_idle_key_closed() {
     one.on_rooms(answer.rooms);
     assert_eq!(process.len(), 1);
     // The ask's take folded at the next sync, and then nothing for longer than IDLE.
+    // Idle keys are looked for once a SWEEP.
     process.on_sync(MS);
     process.on_sync(IDLE + MS);
     assert!(!room.closed(), "not yet");
-    process.on_sync(IDLE + 2 * MS);
+    process.on_sync(IDLE + MS + SWEEP);
     assert!(room.closed());
     assert!(process.is_empty(), "forgotten");
-    assert_eq!(one.decide(&keys, IDLE + 2 * MS), Local::Ask);
+    assert_eq!(one.decide(&keys, IDLE + MS + SWEEP), Local::Ask);
     assert!(one.is_empty(), "dropped");
 }
 
@@ -218,5 +228,31 @@ fn an_ask_never_admits_past_what_the_workers_took() {
         answer.refused_by.len(),
         1,
         "the bucket empty: when to come back"
+    );
+}
+
+/// A room taken from again after a sync folded it is folded again at the next: the first
+/// take since each fold puts it back on the process's queue.
+#[test]
+fn takes_after_a_fold_are_folded_at_the_next_sync() {
+    let (mut process, mut pod) = process();
+    warm(&mut process, &mut pod, 0);
+    let keys = [(&b"k"[..], contract())];
+    let mut one = worker();
+    one.on_rooms(process.on_ask(0, 2, &keys, MS).unwrap().rooms);
+    for _ in 0..2 {
+        assert_eq!(one.decide(&keys, MS), Local::Admit);
+    }
+    process.on_sync(2 * MS);
+    for _ in 0..3 {
+        assert_eq!(one.decide(&keys, 2 * MS), Local::Admit);
+    }
+    process.on_sync(3 * MS);
+    process.plane().on_cycle(CYCLE);
+    settle(&mut process, &mut pod, CYCLE);
+    assert_eq!(
+        pod.counted(b"k"),
+        Some(2 + 2 + 3),
+        "the two asked and the five taken"
     );
 }
