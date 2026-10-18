@@ -110,6 +110,18 @@ pub enum Fault {
         /// When.
         at: u64,
     },
+    /// From `at`, for `length` nanoseconds, the background work of the data plane taking
+    /// pod `pod`'s traffic is held: its cycles do not run and its answers wait, and so do
+    /// asks a pooled process's workers make of it; decisions its workers make themselves
+    /// go on. As a process thread held up while its workers run.
+    Pause {
+        /// When it starts.
+        at: u64,
+        /// For how long.
+        length: u64,
+        /// A pod of the data plane held, as the run numbers them.
+        pod: usize,
+    },
 }
 
 impl Fault {
@@ -149,6 +161,13 @@ pub enum FaultEvent {
     },
     /// The owner restarts.
     OwnerRestarts,
+    /// A pod's background work is held until a time.
+    Pause {
+        /// The pod, as the run numbers them.
+        pod: usize,
+        /// Until when.
+        until: u64,
+    },
 }
 
 /// Every request of a run with the decision it got, in the order they arrived: what a
@@ -227,6 +246,13 @@ fn play_with(run: &Run, mut cluster: Box<dyn Cluster>) -> Played {
         }
         Fault::Restart { at, pod } => queue.push(at, Event::Fault(FaultEvent::Restart { pod })),
         Fault::OwnerRestart { at } => queue.push(at, Event::Fault(FaultEvent::OwnerRestarts)),
+        Fault::Pause { at, length, pod } => queue.push(
+            at,
+            Event::Fault(FaultEvent::Pause {
+                pod,
+                until: at + length,
+            }),
+        ),
         Fault::Rolling { from, every } => {
             for pod in 0..pods {
                 let at = from + every * pod as u64;

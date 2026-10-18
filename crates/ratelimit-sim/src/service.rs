@@ -857,6 +857,8 @@ impl Cluster for Service {
 
     fn on_fault(&mut self, event: FaultEvent, now: u64, outbox: &mut Outbox) {
         match event {
+            // No background apart from deciding, to hold.
+            FaultEvent::Pause { .. } => {}
             // The service pod owning the key goes for good: the key's hash leads to the next,
             // which starts from a full bucket.
             // With a secondary, it takes over from its copy.

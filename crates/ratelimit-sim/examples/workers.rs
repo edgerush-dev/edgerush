@@ -1,7 +1,8 @@
 //! A data-plane pod's workers as data planes of their own, as the prototype runs them;
-//! layered, the pod's process one data plane syncing its workers' allowances every
-//! millisecond; and one data plane a pod, its workers sharing its keys at no cost: the same
-//! traffic on the same pods, over many seeds, printed as Markdown (12 item 3).
+//! pooled, the pod's process one participant whose workers decide from per-key state they
+//! share by compare-and-swap (`service::pooled`, the shared-atomic spike); and one data
+//! plane a pod, the semantic reference for sharing: the same traffic on the same pods,
+//! over many seeds, printed as Markdown (12 item 3).
 //!
 //! `cargo run --release -p edgerush-ratelimit-sim --example workers [seeds] [pods]`
 //!
@@ -134,25 +135,25 @@ fn main() {
     println!(
         "Contract: {limit} a second, a bucket of {burst}. {pods} pods; runs of ten seconds, \
          {seeds} seeds each; messages take 1 ms, give or take 0.5 ms; a 10 ms cycle. \
-         \"apart\": each worker a data plane; \"layered\": the process one, its workers \
-         synced every millisecond; \"shared\": one a pod, at no cost.\n"
+         \"apart\": each worker a data plane; \"pooled\": the process one participant, \
+         its workers deciding from shared entries; \"one\": one data plane a pod, the \
+         reference.\n"
     );
     let mut table: Vec<(String, Vec<[Totals; 3]>)> = Vec::new();
     for (name, conforming, shaped) in cases {
         let mut row = Vec::new();
         for &w in &workers {
             let (shared_shape, apart_shape) = shaped(limit, burst, w);
-            let layered = Approach::Layered {
+            let pooled = Approach::Pooled {
                 cycle: CYCLE,
                 ask_timeout: 0,
                 workers: w,
-                sync: MS,
             };
             let mut cell: [Totals; 3] = Default::default();
-            let [apart, layers, shared] = &mut cell;
+            let [apart, pools, shared] = &mut cell;
             for (totals, shape, planes, approach) in [
                 (apart, apart_shape, pods * w, approach),
-                (layers, apart_shape, pods * w, layered),
+                (pools, apart_shape, pods * w, pooled),
                 (shared, shared_shape, pods, approach),
             ] {
                 for seed in 0..seeds {
@@ -190,7 +191,7 @@ fn main() {
     let header = |what: &str| {
         print!("| {what} |");
         for w in workers {
-            print!(" {w} apart | {w} layered | {w} shared |");
+            print!(" {w} apart | {w} pooled | {w} one |");
         }
         println!();
         println!("|---|{}", "---|---|---|".repeat(workers.len()));
@@ -199,8 +200,8 @@ fn main() {
         header(what);
         for (name, row) in &table {
             print!("| {name} |");
-            for [apart, layered, shared] in row {
-                print!(" {} | {} | {} |", cell(apart), cell(layered), cell(shared));
+            for [apart, pooled, shared] in row {
+                print!(" {} | {} | {} |", cell(apart), cell(pooled), cell(shared));
             }
             println!();
         }

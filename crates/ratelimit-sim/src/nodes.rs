@@ -5,10 +5,14 @@
 //! built. Requests can be under other limits beside the run's ([`Beside`]).
 
 use crate::{Beside, Cluster, Contract, FaultEvent, Message, Order, Outbox};
-use edgerush_ratelimit::service::{
-    self, DataPlane, Decision, PlaneId, PodId, ServicePod, Ticket, View,
+use edgerush_ratelimit::service::pooled::{
+    self, Decision as Pooled, Entry, Local, Participant, Registry,
 };
-use std::collections::BTreeMap;
+use edgerush_ratelimit::service::{
+    self, Answers, Batch, DataPlane, Decision, FixedState, PlaneId, PodId, ServicePod, Ticket, View,
+};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 /// The service's pods.
 const SERVICE_PODS: u32 = 3;
@@ -27,7 +31,7 @@ pub(crate) struct Nodes {
     /// How long a data plane waits for an ask's answer; 0 for four cycles.
     ask_timeout: u64,
     view: View,
-    planes: Vec<DataPlane>,
+    planes: Vec<Plane>,
     /// How many times each data plane has restarted: its id is its index and its life.
     lives: Vec<u64>,
     pods: Vec<ServicePod>,
@@ -41,6 +45,20 @@ pub(crate) struct Nodes {
     admitted: Vec<u64>,
     /// The workers each data plane gives allowances to, if layered (12 item 3).
     layer: Option<Layer>,
+    /// The workers each participant shares its keys with, if pooled (12 item 3).
+    pool: Option<Pool>,
+    /// Data planes to a pod, each one worker of it, as faults that strike a pod see them:
+    /// one unless grouped.
+    group: usize,
+    /// By data plane: until when its background work is held (`Fault::Pause`), 0 if not;
+    /// the answers that reached it meanwhile, and — pooled — what its workers asked.
+    paused: Vec<u64>,
+    held: Vec<Vec<Answers>>,
+    pending: Vec<Vec<Asked>>,
+    /// Pooled, by process: requests deferred (`Local::Defer`) or handed back to decide
+    /// again, with the worker that decides them, retried at the process's next arrival,
+    /// answer or cycle.
+    deferred: Vec<Vec<(usize, usize)>>,
     /// The nodes before the service pods, as the run numbers them: the data planes, or,
     /// layered, their workers.
     front: usize,
@@ -61,6 +79,191 @@ struct Layer {
     active: Vec<bool>,
     /// By process: when it last synced.
     synced: Vec<u64>,
+}
+
+/// Each data plane one participant for its process (`service::pooled`), its workers
+/// deciding warm requests from the shared entries they hold handles to, the participant
+/// (the process's transport) deciding the rest, sending the cycle's batches and taking the
+/// answers. In one process: a worker's decision is a function call on shared state.
+struct Pool {
+    workers: usize,
+    /// By worker: its handles to the entries its participant gave it.
+    handles: Vec<HashMap<Box<[u8]>, Arc<Entry>>>,
+    /// By process: its participant's registry, where a worker finds an entry it holds no
+    /// handle to without asking.
+    registries: Vec<Arc<Registry>>,
+}
+
+/// A data plane of the protocol: one worker's own (`DataPlane`), or a process's shared by
+/// its workers (`pooled::Participant`).
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one a simulated data plane, kept in a list: a box would add a pointer to every               decision the reference makes"
+)]
+enum Plane {
+    Data(DataPlane),
+    Pooled(Box<Participant<FixedState>>),
+}
+
+impl Plane {
+    fn decide_all(&mut self, keys: &[(&[u8], service::Contract)], now: u64) -> Pooled {
+        match self {
+            Self::Data(plane) => match plane.decide_all(keys, now) {
+                Decision::Admit => Pooled::Admit,
+                Decision::Refuse => Pooled::Refuse,
+                Decision::Wait(ticket) => Pooled::Wait(ticket),
+            },
+            Self::Pooled(participant) => participant.decide_all(keys, now),
+        }
+    }
+
+    /// Pooled, the waited requests to decide again.
+    fn take_retries(&mut self) -> Vec<Ticket> {
+        match self {
+            Self::Data(_) => Vec::new(),
+            Self::Pooled(participant) => participant.take_retries(),
+        }
+    }
+
+    fn on_cycle(&mut self, now: u64) {
+        match self {
+            Self::Data(plane) => plane.on_cycle(now),
+            Self::Pooled(participant) => participant.on_cycle(now),
+        }
+    }
+
+    fn on_answers(&mut self, answers: Answers, now: u64) {
+        match self {
+            Self::Data(plane) => plane.on_answers(answers, now),
+            Self::Pooled(participant) => participant.on_answers(answers, now),
+        }
+    }
+
+    fn on_view(&mut self, view: View, now: u64) {
+        match self {
+            Self::Data(plane) => plane.on_view(view, now),
+            Self::Pooled(participant) => participant.on_view(view, now),
+        }
+    }
+
+    fn take_outgoing(&mut self) -> Vec<(PodId, Batch)> {
+        match self {
+            Self::Data(plane) => plane.take_outgoing(),
+            Self::Pooled(participant) => participant.take_outgoing(),
+        }
+    }
+
+    fn take_decided(&mut self) -> Vec<(Ticket, bool)> {
+        match self {
+            Self::Data(plane) => plane.take_decided(),
+            Self::Pooled(participant) => participant
+                .take_decisions()
+                .into_iter()
+                .map(|decided| (decided.ticket, decided.admitted))
+                .collect(),
+        }
+    }
+
+    fn abandon(&mut self, now: u64) -> Vec<Ticket> {
+        match self {
+            Self::Data(plane) => plane.abandon(),
+            Self::Pooled(participant) => participant.abandon(now),
+        }
+    }
+
+    /// The `DataPlane` of a layered process, which shares its room by allowances.
+    fn data(&mut self) -> Option<&mut DataPlane> {
+        match self {
+            Self::Data(plane) => Some(plane),
+            Self::Pooled(_) => None,
+        }
+    }
+}
+
+impl Nodes {
+    /// Pooled, request `request` comes to worker `worker` at `now`: decided now, or later
+    /// (asked about, or deferred).
+    fn pooled_arrival(
+        &mut self,
+        request: usize,
+        worker: usize,
+        now: u64,
+        outbox: &mut Outbox,
+    ) -> Option<bool> {
+        let pool = self.pool.as_ref()?;
+        let process = worker / pool.workers;
+        let limits: Vec<(Box<[u8]>, service::Contract)> = self
+            .kind(request)
+            .iter()
+            .map(|&key| (self.keys[key].0.clone(), self.keys[key].1))
+            .collect();
+        let keys: Vec<(&[u8], service::Contract)> =
+            limits.iter().map(|(key, c)| (&**key, *c)).collect();
+        // A key it holds no handle to is looked for in its process's registry first.
+        let pool = self.pool.as_mut()?;
+        for (key, contract) in &keys {
+            let held = pool.handles[worker]
+                .get(*key)
+                .is_some_and(|entry| entry.contract() == *contract);
+            if !held && let Some(entry) = pool.registries[process].find(key, *contract) {
+                pool.handles[worker].insert((*key).into(), entry);
+            }
+        }
+        let handles = &self.pool.as_ref()?.handles[worker];
+        let held: Option<Vec<&Entry>> = keys
+            .iter()
+            .map(|(key, contract)| {
+                handles
+                    .get(*key)
+                    .filter(|entry| entry.contract() == *contract)
+                    .map(|entry| &**entry)
+            })
+            .collect();
+        if let Some(held) = held {
+            match pooled::decide(&held, now).local {
+                Local::Admit => {
+                    self.count(request);
+                    return Some(true);
+                }
+                Local::Refuse => return Some(false),
+                Local::Defer => return self.defer(process, request, worker),
+                Local::Ask => {}
+            }
+        }
+        self.resume(process, now, outbox);
+        if self.paused[process] > now {
+            // Its process is held: the ask waits in its queue, as on the process
+            // thread's channel.
+            self.pending[process].push((request, worker, limits));
+            return None;
+        }
+        let decision = self.planes[process].decide_all(&keys, now);
+        self.give_entries(process, worker, &keys);
+        let decided = match decision {
+            Pooled::Admit => {
+                self.count(request);
+                Some(true)
+            }
+            Pooled::Refuse => Some(false),
+            Pooled::Wait(ticket) => {
+                self.tickets[process].insert(ticket, request);
+                None
+            }
+            Pooled::Defer => self.defer(process, request, worker),
+        };
+        self.flush_plane(process, outbox);
+        decided
+    }
+
+    /// Pooled, request `request` deferred by `worker` of `process`, to decide again; one
+    /// with no number, which nothing can come back to, refused.
+    fn defer(&mut self, process: usize, request: usize, worker: usize) -> Option<bool> {
+        if request == usize::MAX {
+            return Some(false);
+        }
+        self.deferred[process].push((request, worker));
+        None
+    }
 }
 
 /// The protocol's contract for the simulator's.
@@ -123,7 +326,7 @@ impl Nodes {
             cycle,
             ask_timeout,
             planes: (0..planes)
-                .map(|plane| plane_of(id(plane, 0), cycle, ask_timeout, view.clone()))
+                .map(|plane| Plane::Data(plane_of(id(plane, 0), cycle, ask_timeout, view.clone())))
                 .collect(),
             lives: vec![0; planes],
             pods: (0..SERVICE_PODS)
@@ -134,8 +337,104 @@ impl Nodes {
             decided: Vec::new(),
             view,
             layer: None,
+            pool: None,
+            group: 1,
+            paused: vec![0; planes],
+            held: vec![Vec::new(); planes],
+            pending: vec![Vec::new(); planes],
+            deferred: vec![Vec::new(); planes],
             front: planes,
         }
+    }
+
+    /// The same, its data planes grouped `workers` to a pod for faults that strike a pod.
+    pub(crate) fn grouped(mut self, workers: usize) -> Self {
+        self.group = workers.max(1);
+        self
+    }
+
+    /// The data planes of the pod whose first worker is `pod`, as the run numbers them;
+    /// none for any other worker, so that a fault striking every worker in turn strikes
+    /// each pod once.
+    fn pod_planes(&self, pod: usize) -> std::ops::Range<usize> {
+        let (workers, per_plane) = match &self.pool {
+            Some(pool) => (pool.workers, pool.workers),
+            None => (self.group, 1),
+        };
+        if !pod.is_multiple_of(workers) {
+            return 0..0;
+        }
+        let first = pod / per_plane;
+        let count = workers / per_plane;
+        first.min(self.planes.len())..(first + count).min(self.planes.len())
+    }
+
+    /// Ends a pause of data plane `plane` that is over at `now`: the answers it held taken,
+    /// and, pooled, what its workers asked decided.
+    fn resume(&mut self, plane: usize, now: u64, outbox: &mut Outbox) {
+        if self.paused[plane] == 0 || now < self.paused[plane] {
+            return;
+        }
+        self.paused[plane] = 0;
+        for answers in std::mem::take(&mut self.held[plane]) {
+            self.planes[plane].on_answers(answers, now);
+        }
+        for (request, worker, limits) in std::mem::take(&mut self.pending[plane]) {
+            let keys: Vec<(&[u8], service::Contract)> =
+                limits.iter().map(|(key, c)| (&**key, *c)).collect();
+            let decision = self.planes[plane].decide_all(&keys, now);
+            self.give_entries(plane, worker, &keys);
+            match decision {
+                Pooled::Admit => {
+                    self.count(request);
+                    self.decided.push((request, true));
+                }
+                Pooled::Refuse => self.decided.push((request, false)),
+                Pooled::Wait(ticket) => {
+                    self.tickets[plane].insert(ticket, request);
+                }
+                Pooled::Defer => self.deferred[plane].push((request, worker)),
+            }
+        }
+        self.flush_plane(plane, outbox);
+    }
+
+    /// Pooled, every request process `process` deferred, decided again at `now`.
+    fn again(&mut self, process: usize, now: u64, outbox: &mut Outbox) {
+        for (request, worker) in std::mem::take(&mut self.deferred[process]) {
+            if let Some(admitted) = self.pooled_arrival(request, worker, now, outbox) {
+                self.decided.push((request, admitted));
+            }
+        }
+    }
+
+    /// Pooled, worker `worker` holds the entries participant `plane` has of `keys`.
+    fn give_entries(&mut self, plane: usize, worker: usize, keys: &[(&[u8], service::Contract)]) {
+        if let Plane::Pooled(participant) = &self.planes[plane] {
+            let given = participant.entries(keys);
+            if let Some(pool) = &mut self.pool {
+                for entry in given {
+                    pool.handles[worker].insert(entry.key().into(), entry);
+                }
+            }
+        }
+    }
+
+    /// The same, each data plane a process's one participant, its `workers` deciding from
+    /// shared entries; requests arrive at the workers, `workers` to a process.
+    pub(crate) fn pooled(mut self, workers: usize) -> Self {
+        let workers = workers.max(1);
+        for (at, plane) in self.planes.iter_mut().enumerate() {
+            *plane = pooled_plane(id(at, 0), self.cycle, self.ask_timeout, self.view.clone());
+        }
+        let registries = self.planes.iter().map(registry_of).collect();
+        self.pool = Some(Pool {
+            workers,
+            handles: vec![HashMap::new(); self.planes.len() * workers],
+            registries,
+        });
+        self.front = self.planes.len() * workers;
+        self
     }
 
     /// The same, each data plane a process of `workers` deciding from allowances given every
@@ -163,10 +462,13 @@ impl Nodes {
         let (key, contract) = (&*self.keys[0].0, self.keys[0].1);
         let workers = plane * layer.workers..(plane + 1) * layer.workers;
         let used: u64 = layer.used[workers.clone()].iter().sum();
+        let Some(data) = self.planes[plane].data() else {
+            return;
+        };
         if used > 0 {
-            self.planes[plane].charge(key, contract, used, now);
+            data.charge(key, contract, used, now);
         }
-        let room = self.planes[plane].room(key, contract, now).unwrap_or(0);
+        let room = data.room(key, contract, now).unwrap_or(0);
         let active = layer.active[workers.clone()].iter().filter(|a| **a).count() as u64;
         for worker in workers {
             layer.allowance[worker] = if layer.active[worker] {
@@ -180,6 +482,25 @@ impl Nodes {
         layer.synced[plane] = now;
     }
 
+    /// The node data plane `plane` sends from and is reached at, as the network places
+    /// it: layered or pooled, its process's first worker, so that a partition cuts it where
+    /// its workers are.
+    fn node_of(&self, plane: usize) -> usize {
+        let workers = self
+            .layer
+            .as_ref()
+            .map(|layer| layer.workers)
+            .or(self.pool.as_ref().map(|pool| pool.workers))
+            .unwrap_or(1);
+        plane * workers
+    }
+
+    /// The data plane at node `node`, if one is.
+    fn plane_at(&self, node: usize) -> Option<usize> {
+        let workers = self.node_of(1);
+        (node.is_multiple_of(workers) && node / workers < self.planes.len()).then(|| node / workers)
+    }
+
     /// The node a service pod is reached at: after the data planes.
     fn address(&self, pod: PodId) -> usize {
         self.front + pod as usize
@@ -187,8 +508,9 @@ impl Nodes {
 
     /// Sends what data plane `plane` has to send, and takes its decisions.
     fn flush_plane(&mut self, plane: usize, outbox: &mut Outbox) {
+        let from = self.node_of(plane);
         for (pod, batch) in self.planes[plane].take_outgoing() {
-            outbox.send(self.address(pod), Message::Batch { from: plane, batch });
+            outbox.send(self.address(pod), Message::Batch { from, batch });
         }
         for (ticket, admitted) in self.planes[plane].take_decided() {
             if let Some(request) = self.tickets[plane].remove(&ticket) {
@@ -196,6 +518,16 @@ impl Nodes {
                     self.count(request);
                 }
                 self.decided.push((request, admitted));
+            }
+        }
+        // Handed back to decide again: by the process's first worker.
+        let first = self
+            .pool
+            .as_ref()
+            .map_or(plane, |pool| plane * pool.workers);
+        for ticket in self.planes[plane].take_retries() {
+            if let Some(request) = self.tickets[plane].remove(&ticket) {
+                self.deferred[plane].push((request, first));
             }
         }
     }
@@ -272,6 +604,74 @@ fn plane_of(id: PlaneId, cycle: u64, ask_timeout: u64, view: View) -> DataPlane 
     plane
 }
 
+impl Nodes {
+    /// Data plane `plane` restarts at `now`: a new life, with a new id; what waited on it
+    /// is refused, and, pooled, what its workers held is gone with it.
+    fn restart(&mut self, plane: usize, now: u64) {
+        for ticket in self.planes[plane].abandon(now) {
+            if let Some(request) = self.tickets[plane].remove(&ticket) {
+                self.decided.push((request, false));
+            }
+        }
+        for (request, _, _) in std::mem::take(&mut self.pending[plane]) {
+            self.decided.push((request, false));
+        }
+        for (request, _) in std::mem::take(&mut self.deferred[plane]) {
+            self.decided.push((request, false));
+        }
+        self.held[plane].clear();
+        self.paused[plane] = 0;
+        self.lives[plane] += 1;
+        let id = id(plane, self.lives[plane]);
+        self.planes[plane] = match &mut self.pool {
+            Some(pool) => {
+                let workers = plane * pool.workers..(plane + 1) * pool.workers;
+                for handles in &mut pool.handles[workers] {
+                    handles.clear();
+                }
+                let fresh = pooled_plane(id, self.cycle, self.ask_timeout, self.view.clone());
+                pool.registries[plane] = registry_of(&fresh);
+                fresh
+            }
+            None => Plane::Data(plane_of(
+                id,
+                self.cycle,
+                self.ask_timeout,
+                self.view.clone(),
+            )),
+        };
+    }
+}
+
+/// A plane's registry of entries: a pooled participant's, or an empty one.
+fn registry_of(plane: &Plane) -> Arc<Registry> {
+    match plane {
+        Plane::Pooled(participant) => participant.registry(),
+        Plane::Data(_) => Arc::new(Registry::default()),
+    }
+}
+
+/// An ask a pooled worker made of its process while it was held: the request, the worker,
+/// and the request's keys.
+type Asked = (usize, usize, Vec<(Box<[u8]>, service::Contract)>);
+
+/// A pooled participant `id`, waiting `ask_timeout` for an ask's answer (0: four cycles).
+/// The simulator runs where 128-bit atomics are native; the protocol's `DataPlane` is
+/// what it falls back to only where they are not, so that a run still runs.
+fn pooled_plane(id: PlaneId, cycle: u64, ask_timeout: u64, view: View) -> Plane {
+    match Participant::new(id, cycle, view.clone(), FixedState::default()) {
+        Some(mut participant) => {
+            if ask_timeout > 0 {
+                participant.set_ask_timeout(ask_timeout);
+            }
+            // As the proxy runs it: one exchange in flight to each service pod.
+            participant.set_one_in_flight(true);
+            Plane::Pooled(Box::new(participant))
+        }
+        None => Plane::Data(plane_of(id, cycle, ask_timeout, view)),
+    }
+}
+
 /// A data plane's id: its index and its life.
 fn id(plane: usize, life: u64) -> PlaneId {
     (life << 32) | plane as u64
@@ -289,6 +689,13 @@ impl Cluster for Nodes {
         now: u64,
         outbox: &mut Outbox,
     ) -> Option<bool> {
+        // Pooled: the request comes to a worker, which decides it from the entries it
+        // holds, or asks its participant, and holds the entries it gives.
+        if let Some(pool) = &self.pool {
+            let process = plane / pool.workers;
+            self.again(process, now, outbox);
+            return self.pooled_arrival(request, plane, now, outbox);
+        }
         // Layered: the request comes to a worker, which admits it from its allowance, or
         // asks its process.
         let plane = match &mut self.layer {
@@ -332,12 +739,13 @@ impl Cluster for Nodes {
             .collect();
         let decision = self.planes[plane].decide_all(&limits, now);
         let decided = match decision {
-            Decision::Admit => {
+            Pooled::Admit => {
                 self.count(request);
                 Some(true)
             }
-            Decision::Refuse => Some(false),
-            Decision::Wait(ticket) => {
+            // A data plane never defers.
+            Pooled::Refuse | Pooled::Defer => Some(false),
+            Pooled::Wait(ticket) => {
                 self.tickets[plane].insert(ticket, request);
                 None
             }
@@ -360,16 +768,28 @@ impl Cluster for Nodes {
 
     fn on_timer(&mut self, node: usize, now: u64, outbox: &mut Outbox) {
         if node < self.front {
-            // Layered, a process's cycle comes with its first worker's timer.
-            let node = match &self.layer {
+            // Layered or pooled, a process's cycle comes with its first worker's timer.
+            let workers = self
+                .layer
+                .as_ref()
+                .map(|layer| layer.workers)
+                .or(self.pool.as_ref().map(|pool| pool.workers));
+            let node = match workers {
                 None => node,
-                Some(layer) if node.is_multiple_of(layer.workers) => node / layer.workers,
+                Some(workers) if node.is_multiple_of(workers) => node / workers,
                 Some(_) => return,
             };
+            self.resume(node, now, outbox);
+            if self.paused[node] > now {
+                return;
+            }
             // What the workers admitted goes with the cycle's batch.
             self.sync(node, now);
             self.planes[node].on_cycle(now);
             self.flush_plane(node, outbox);
+            if self.pool.is_some() {
+                self.again(node, now, outbox);
+            }
         } else {
             let pod = node - self.front;
             if !self.gone[pod] {
@@ -395,9 +815,19 @@ impl Cluster for Nodes {
                     self.pods[pod].on_replicas(replicas, now);
                 }
             }
-            Message::Answers { answers, .. } if to < self.planes.len() => {
+            Message::Answers { answers, .. } if to < self.front => {
+                let Some(to) = self.plane_at(to) else {
+                    return;
+                };
+                if self.paused[to] > now {
+                    self.held[to].push(answers);
+                    return;
+                }
                 self.planes[to].on_answers(answers, now);
                 self.flush_plane(to, outbox);
+                if self.pool.is_some() {
+                    self.again(to, now, outbox);
+                }
             }
             _ => {}
         }
@@ -419,19 +849,17 @@ impl Cluster for Nodes {
                 self.change_view(owner as PodId, now, outbox);
             }
             // A data plane restarts: a new life, with a new id; what waited on it is refused.
-            FaultEvent::Restart { pod } if pod < self.planes.len() => {
-                for ticket in self.planes[pod].abandon() {
-                    if let Some(request) = self.tickets[pod].remove(&ticket) {
-                        self.decided.push((request, false));
-                    }
+            FaultEvent::Restart { pod } => {
+                for plane in self.pod_planes(pod) {
+                    self.restart(plane, now);
                 }
-                self.lives[pod] += 1;
-                self.planes[pod] = plane_of(
-                    id(pod, self.lives[pod]),
-                    self.cycle,
-                    self.ask_timeout,
-                    self.view.clone(),
-                );
+            }
+            // A pooled process's background held; one without (apart, or one data plane)
+            // has none apart from its deciding, and goes on.
+            FaultEvent::Pause { pod, until } if self.pool.is_some() => {
+                for plane in self.pod_planes(pod) {
+                    self.paused[plane] = until;
+                }
             }
             _ => {}
         }
@@ -535,6 +963,112 @@ mod tests {
                 });
                 assert_eq!(conforming.refused, 0, "{seed} {shape:?}");
             }
+        }
+    }
+
+    /// Pooled (the shared-atomic spike), a pod's process one participant: what a pod admits
+    /// does not depend on how many workers it has — the same traffic on 1, 4 and 8 workers
+    /// a pod comes out the same — bursts are held to about one bucket, and a conforming
+    /// client moving between a pod's workers is never refused, its process's background
+    /// held for 100 ms across the move or not. Every admission is counted once.
+    #[test]
+    fn a_pooled_pod_decides_alike_whatever_its_workers_and_refuses_nothing_conforming() {
+        let pooled = |workers| Approach::Pooled {
+            cycle: 10_000_000,
+            ask_timeout: 0,
+            workers,
+        };
+        for seed in 0..3 {
+            let spread = |workers: usize| {
+                run(&Run {
+                    pods: 4 * workers,
+                    approach: pooled(workers),
+                    workload: Workload {
+                        shape: Shape::Spread { per_window: 300 },
+                        span: 6 * SECOND,
+                        conforming: false,
+                    },
+                    ..bursts(Fault::None, seed)
+                })
+            };
+            let one = spread(1);
+            for workers in [4, 8] {
+                let many = spread(workers);
+                assert_eq!(
+                    (many.admitted, many.refused, many.messages),
+                    (one.admitted, one.refused, one.messages),
+                    "{seed}: {workers} workers"
+                );
+            }
+            let burst = run(&Run {
+                pods: 32,
+                approach: pooled(8),
+                workload: Workload {
+                    shape: Shape::Bursts { each: 100 / 8 },
+                    span: 6 * SECOND,
+                    conforming: false,
+                },
+                ..bursts(Fault::None, seed)
+            });
+            let central = run(&Run {
+                pods: 32,
+                approach: Approach::Central,
+                workload: burst_workload(),
+                ..bursts(Fault::None, seed)
+            });
+            assert!(
+                burst.admitted <= central.admitted + central.admitted / 20,
+                "{seed}: {} against {}",
+                burst.admitted,
+                central.admitted
+            );
+            assert_eq!(burst.counted_twice, 0);
+            let span = 6 * SECOND;
+            let mut waited = Vec::new();
+            for fault in [
+                Fault::None,
+                Fault::Pause {
+                    at: 2 * span / 3 - 50_000_000,
+                    length: 100_000_000,
+                    pod: 3 * 8,
+                },
+            ] {
+                let moving = run(&Run {
+                    pods: 32,
+                    approach: pooled(8),
+                    workload: Workload {
+                        // Spread over half a pod's workers, then on one, then on one it
+                        // had not reached: an ask of its process, held or not.
+                        shape: Shape::Migrating {
+                            per_window: 100,
+                            last: 4,
+                            to: 8,
+                        },
+                        span,
+                        conforming: true,
+                    },
+                    fault,
+                    ..bursts(Fault::None, seed)
+                });
+                assert_eq!(moving.refused, 0, "{seed} {fault:?}");
+                assert_eq!(
+                    (moving.lost, moving.counted_twice),
+                    (0, 0),
+                    "{seed} {fault:?}"
+                );
+                waited.push((moving.waited, moving.waited_for));
+            }
+            // The worker it moved to finds the pod's entry itself: the process held up
+            // holds up none of its requests.
+            assert_eq!(waited[1], waited[0], "{seed}: waits with the process held");
+        }
+    }
+
+    fn burst_workload() -> Workload {
+        Workload {
+            shape: Shape::Bursts { each: 100 / 8 },
+            span: 6 * SECOND,
+            conforming: false,
         }
     }
 

@@ -60,6 +60,18 @@ pub enum Shape {
         /// How long, in nanoseconds, each burst takes to arrive.
         over: u64,
     },
+    /// One client moving: until a third of the span spread over the last `last` pods
+    /// (some of one data-plane pod's workers), then to two thirds all on the last, then all
+    /// on the pod `to` from the end (1 the last) — traffic concentrating and moving, as connections
+    /// close and open again elsewhere: to a worker it had not reached, or to another pod.
+    Migrating {
+        /// Requests a window, on average.
+        per_window: u64,
+        /// Among how many of the last pods it starts spread.
+        last: usize,
+        /// The pod it ends on, counted from the end.
+        to: usize,
+    },
     /// `Skewed` for the first half of the run, then `Bursts`: the case that sets a bound on
     /// bursts against skewed traffic.
     SkewedThenBursts {
@@ -107,6 +119,20 @@ impl Workload {
             Shape::Within { per_window, last } => {
                 let within = Target::Last(pods, last.clamp(1, pods));
                 spread(&mut arrivals, rng, start, span, window, per_window, within);
+            }
+            Shape::Migrating {
+                per_window,
+                last: among,
+                to,
+            } => {
+                // The moves at fixed times, a third and two thirds of the span, whatever
+                // the start: a fault can be set across one.
+                let (first, second) = (self.span / 3, 2 * self.span / 3);
+                let within = Target::Last(pods, among.clamp(1, pods));
+                let other = Target::Only(pods.saturating_sub(to.clamp(1, pods)));
+                spread(&mut arrivals, rng, start, first, window, per_window, within);
+                spread(&mut arrivals, rng, first, second, window, per_window, last);
+                spread(&mut arrivals, rng, second, span, window, per_window, other);
             }
             Shape::Bursts { each } => {
                 bursts(&mut arrivals, start, span, window, each, pods);

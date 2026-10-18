@@ -443,6 +443,8 @@ impl Cluster for Ownership {
     fn on_fault(&mut self, event: FaultEvent, now: u64, outbox: &mut Outbox) {
         let pods = self.pods.len();
         match event {
+            // No background apart from deciding, to hold.
+            FaultEvent::Pause { .. } => {}
             FaultEvent::OwnerLost => {
                 let old = self.main_owner();
                 self.alive[old] = false;

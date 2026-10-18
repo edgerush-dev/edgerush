@@ -115,6 +115,43 @@ pub enum Approach {
         /// The time between a process's syncs with its workers.
         sync: u64,
     },
+    /// [`Nodes`](Self::Nodes) with its data planes grouped `workers` to a pod, each one
+    /// worker of it, as the prototype runs them: faults that strike a pod — a restart, a
+    /// pause — strike every worker of it. The run's pods are the workers.
+    Apart {
+        /// The time between a data plane's batches.
+        cycle: u64,
+        /// How long an ask may go unanswered before it is given up; 0 for four cycles.
+        ask_timeout: u64,
+        /// The workers of a pod, each a data plane.
+        workers: usize,
+    },
+    /// [`Nodes`](Self::Nodes) pooled (12 item 3, the shared-atomic spike): each data plane
+    /// of the protocol is one process's participant, its `workers` deciding warm requests
+    /// from per-key state they share, by compare-and-swap, the participant the rest. The
+    /// run's pods are the workers, `workers` to a process.
+    Pooled {
+        /// The time between a process's batches to the service.
+        cycle: u64,
+        /// How long an ask may go unanswered before it is given up; 0 for four cycles.
+        ask_timeout: u64,
+        /// The workers of a process.
+        workers: usize,
+    },
+    /// [`Pooled`](Self::Pooled) with every request under another limit beside the run's,
+    /// decided under both, all or none, as [`NodesUnder`](Self::NodesUnder).
+    PooledUnder {
+        /// The time between a process's batches to the service.
+        cycle: u64,
+        /// How long an ask may go unanswered before it is given up; 0 for four cycles.
+        ask_timeout: u64,
+        /// The workers of a process.
+        workers: usize,
+        /// The limits beside the run's.
+        beside: Beside,
+        /// The order a request's limits are decided in.
+        order: Order,
+    },
     /// [`Nodes`](Self::Nodes) with every request under another limit beside the run's,
     /// decided under both, all or none (06 §4). The run's contract is the one measured.
     NodesUnder {
@@ -329,6 +366,39 @@ impl Approach {
                 let processes = pods.div_ceil(workers);
                 let nodes = Nodes::new(contract, processes, *cycle, *ask_timeout, None);
                 Box::new(nodes.layered(workers, *sync))
+            }
+            Self::Apart {
+                cycle,
+                ask_timeout,
+                workers,
+            } => Box::new(Nodes::new(contract, pods, *cycle, *ask_timeout, None).grouped(*workers)),
+            Self::Pooled {
+                cycle,
+                ask_timeout,
+                workers,
+            } => {
+                let workers = (*workers).max(1);
+                let processes = pods.div_ceil(workers);
+                let nodes = Nodes::new(contract, processes, *cycle, *ask_timeout, None);
+                Box::new(nodes.pooled(workers))
+            }
+            Self::PooledUnder {
+                cycle,
+                ask_timeout,
+                workers,
+                beside,
+                order,
+            } => {
+                let workers = (*workers).max(1);
+                let processes = pods.div_ceil(workers);
+                let nodes = Nodes::new(
+                    contract,
+                    processes,
+                    *cycle,
+                    *ask_timeout,
+                    Some((*beside, *order)),
+                );
+                Box::new(nodes.pooled(workers))
             }
             Self::NodesUnder {
                 cycle,

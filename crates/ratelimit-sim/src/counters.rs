@@ -246,6 +246,8 @@ impl Cluster for Counters {
 
     fn on_fault(&mut self, event: FaultEvent, _: u64, _: &mut Outbox) {
         match event {
+            // No background apart from deciding, to hold.
+            FaultEvent::Pause { .. } => {}
             // No owner to lose: the first pod goes, and its traffic goes to the next.
             FaultEvent::OwnerLost => {
                 let first = self.serving(0);
