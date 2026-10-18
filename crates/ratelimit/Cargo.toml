@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+portable-atomic.workspace = true
 
 [dev-dependencies]
 iai-callgrind.workspace = true
