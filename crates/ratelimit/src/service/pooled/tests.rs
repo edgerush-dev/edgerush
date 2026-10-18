@@ -1087,6 +1087,48 @@ fn a_cold_key_decided_locally_asks_nothing() {
     assert_eq!(reported, 3);
 }
 
+/// Cold keys decided locally, a worker makes a key's entry itself, once however many meet
+/// it; the participant adopts it, reports what it admitted, and keeps it as the key's.
+#[test]
+fn a_worker_makes_a_local_key_and_the_participant_adopts_it() {
+    let mut participant = participant();
+    participant.set_levers(Levers {
+        ask_cold: false,
+        ..Levers::default()
+    });
+    let registry = participant.registry();
+    let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
+    let (made, fresh) = registry.find_or_make(key, c, CYCLE, 0).unwrap();
+    assert!(fresh);
+    let (again, fresh) = registry.find_or_make(key, c, CYCLE, 0).unwrap();
+    assert!(!fresh && Arc::ptr_eq(&made, &again), "one entry");
+    assert!(
+        registry
+            .find_or_make(key, contract(100, 11), CYCLE, 0)
+            .is_none(),
+        "another contract"
+    );
+    assert_eq!(decide(&[&made], 0).local, Local::Admit, "decided at once");
+    participant.adopt(Arc::clone(&made));
+    participant.adopt(Arc::clone(&made));
+    assert_eq!(participant.key_count(), 1);
+    assert!(Arc::ptr_eq(&participant.entries(&[(key, c)])[0], &made));
+    // The participant meeting the key itself keeps the worker's entry.
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    assert!(Arc::ptr_eq(&participant.entries(&[(key, c)])[0], &made));
+    participant.on_cycle(CYCLE);
+    let reported: u64 = participant
+        .take_outgoing()
+        .iter()
+        .flat_map(|(_, batch)| &batch.entries)
+        .filter_map(|e| match e.report {
+            Report::Hits { count, .. } => Some(count),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(reported, 2, "the worker's and the participant's");
+}
+
 /// With quiet keys not polled, a key in use with nothing to report sends nothing with the
 /// cycle; with them polled, a poll.
 #[test]

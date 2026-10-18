@@ -437,9 +437,9 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
         .await;
 }
 
-/// Pooled with cold keys not asked about: a new key is decided at once from a full bucket,
-/// no service pod being there to answer, and the next request from the worker's own
-/// handle; with them asked about, the first waits on the ask.
+/// Pooled with cold keys not asked about: a new key is decided at once, by the worker,
+/// from an entry it makes with a full bucket, no service pod being there to answer; with
+/// them asked about, the first waits on the ask.
 #[tokio::test]
 async fn a_cold_key_decided_locally_does_not_wait_for_the_service() {
     use crate::ratelimit::{Hub, Limited, Limiter};
@@ -462,26 +462,32 @@ async fn a_cold_key_decided_locally_does_not_wait_for_the_service() {
                 let rule = Arc::clone(&compiled.rules_of(0)[0]);
                 let client = crate::forwarding::Client::new("203.0.113.9".parse().unwrap());
                 let started = Instant::now();
-                let Limited::Later(first) = limiter.decide_all(&rule.limits, 0b1, &client) else {
-                    panic!("the first goes to the process");
-                };
-                let first = within(first).await.unwrap().unwrap();
-                assert!(first.admitted);
-                let took = started.elapsed();
+                let first = limiter.decide_all(&rule.limits, 0b1, &client);
                 if ask_cold {
+                    let Limited::Later(first) = first else {
+                        panic!("the first goes to the process");
+                    };
+                    assert!(within(first).await.unwrap().unwrap().admitted);
+                    let took = started.elapsed();
                     assert!(
                         took >= Duration::from_millis(200),
                         "waited on the ask: {took:?}"
                     );
                 } else {
                     assert!(
-                        took < Duration::from_millis(100),
-                        "decided at once: {took:?}"
+                        matches!(first, Limited::Admit),
+                        "decided by the worker at once"
                     );
                     assert!(matches!(
                         limiter.decide_all(&rule.limits, 0b1, &client),
                         Limited::Admit
                     ));
+                    // The process keeps the worker's entry, to report what it admitted.
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while limiter.usage().1 != 1 {
+                        assert!(Instant::now() < deadline, "the process never kept the key");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
                 }
                 limiter.stop();
             }

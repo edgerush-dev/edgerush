@@ -200,6 +200,36 @@ impl Registry {
             .cloned()
     }
 
+    /// The live entry of `key` under `contract`, or, if there is none, one made at `now`
+    /// for a participant whose cold keys are decided locally — its bucket full, its cycle
+    /// `cycle` — and kept: with whether it was made here, for whoever made it to have the
+    /// participant adopt it ([`Participant::adopt`]). `None` if a live entry of the key is
+    /// under another contract: the participant replaces it. Taken by a worker meeting a key
+    /// its process has not, once; under the shard's lock, so that two workers meeting it at
+    /// once share one entry.
+    #[must_use]
+    pub fn find_or_make(
+        &self,
+        key: &[u8],
+        contract: Contract,
+        cycle: u64,
+        now: u64,
+    ) -> Option<(Arc<Entry>, bool)> {
+        let mut shard = self
+            .shard(key)
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(held) = shard.get(key).map(Handle::entry)
+            && !held.snapshot().closed
+        {
+            return (held.contract == contract).then(|| (Arc::clone(held), false));
+        }
+        let entry = Arc::new(Entry::new(key.into(), contract, cycle, false, now));
+        entry.set_flag(LOCAL, true);
+        shard.replace(Handle(Arc::clone(&entry)));
+        Some((entry, true))
+    }
+
     fn insert(&self, entry: Arc<Entry>) {
         let mut shard = self
             .shard(&entry.key)
@@ -881,14 +911,51 @@ impl<S: BuildHasher + Clone> Participant<S> {
             self.registry.remove(&old.entry);
             self.holding = self.holding.saturating_sub(key_bytes(key, self.workers));
         }
-        let owner = self.view.owners(key).0;
-        let entry = Arc::new(Entry::new(
-            key.into(),
-            contract,
-            self.cycle,
-            owner.is_some(),
-            now,
-        ));
+        // Decided locally, a worker may have made the key's entry already: that one.
+        let made = if self.levers.ask_cold {
+            None
+        } else {
+            self.registry
+                .find_or_make(key, contract, self.cycle, now)
+                .map(|(entry, _)| entry)
+        };
+        let entry = made.unwrap_or_else(|| {
+            Arc::new(Entry::new(
+                key.into(),
+                contract,
+                self.cycle,
+                self.view.owners(key).0.is_some(),
+                now,
+            ))
+        });
+        self.track(entry);
+    }
+
+    /// A worker made `entry` in the registry ([`Registry::find_or_make`]), cold keys being
+    /// decided locally: kept and reported from now on, as one this participant made — unless
+    /// it is closed, or already kept.
+    pub fn adopt(&mut self, entry: Arc<Entry>) {
+        if entry.snapshot().closed
+            || self
+                .keys
+                .get(&*entry.key)
+                .is_some_and(|tracked| Arc::ptr_eq(&tracked.entry, &entry))
+        {
+            return;
+        }
+        if let Some(old) = self.keys.remove(&*entry.key) {
+            close(&old.entry);
+            self.holding = self
+                .holding
+                .saturating_sub(key_bytes(&entry.key, self.workers));
+        }
+        self.track(entry);
+    }
+
+    /// Keeps `entry`, a live entry of a key not kept, from now on.
+    fn track(&mut self, entry: Arc<Entry>) {
+        let key = entry.key.clone();
+        let owner = self.view.owners(&key).0;
         if !self.levers.ask_cold {
             entry.set_flag(LOCAL, true);
         }
@@ -906,8 +973,8 @@ impl<S: BuildHasher + Clone> Participant<S> {
         };
         tracked.publish();
         self.registry.insert(Arc::clone(&tracked.entry));
-        self.keys.insert(key.into(), tracked);
-        self.holding += key_bytes(key, self.workers);
+        self.holding += key_bytes(&key, self.workers);
+        self.keys.insert(key, tracked);
     }
 
     /// Decides at `now` a request a worker asked about, under `keys`: as

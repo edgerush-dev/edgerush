@@ -201,14 +201,38 @@ impl Nodes {
             .collect();
         let keys: Vec<(&[u8], service::Contract)> =
             limits.iter().map(|(key, c)| (&**key, *c)).collect();
-        // A key it holds no handle to is looked for in its process's registry first.
+        // A key it holds no handle to is looked for in its process's registry first; with
+        // cold keys decided locally, made there if its process has none, and adopted.
+        let cycle = self.cycle;
         let pool = self.pool.as_mut()?;
+        let mut made = Vec::new();
         for (key, contract) in &keys {
             let held = pool.handles[worker]
                 .get(*key)
                 .is_some_and(|entry| entry.contract() == *contract);
-            if !held && let Some(entry) = pool.registries[process].find(key, *contract) {
+            if held {
+                continue;
+            }
+            let registry = &pool.registries[process];
+            let found = if pool.levers.ask_cold {
+                registry.find(key, *contract)
+            } else {
+                registry
+                    .find_or_make(key, *contract, cycle, now)
+                    .map(|(entry, fresh)| {
+                        if fresh {
+                            made.push(Arc::clone(&entry));
+                        }
+                        entry
+                    })
+            };
+            if let Some(entry) = found {
                 pool.handles[worker].insert((*key).into(), entry);
+            }
+        }
+        if let Plane::Pooled(participant) = &mut self.planes[process] {
+            for entry in made {
+                participant.adopt(entry);
             }
         }
         let handles = &self.pool.as_ref()?.handles[worker];

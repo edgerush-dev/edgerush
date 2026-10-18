@@ -46,6 +46,8 @@ pub(crate) enum ToHub {
     Capacity(u64),
     /// Pooled, a key whose unreported count passed half its most: to drain now.
     Drain(Box<[u8]>),
+    /// Pooled, cold keys decided locally: an entry a worker made, for the process to keep.
+    Adopt(Arc<Entry>),
 }
 
 /// What the process sends a worker.
@@ -522,6 +524,11 @@ impl State {
             ToHub::Drain(key) => {
                 if let Engine::Pooled { participant, .. } = &mut *self.engine.borrow_mut() {
                     participant.drain(&key, now);
+                }
+            }
+            ToHub::Adopt(entry) => {
+                if let Engine::Pooled { participant, .. } = &mut *self.engine.borrow_mut() {
+                    participant.adopt(entry);
                 }
             }
         }
