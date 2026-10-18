@@ -461,8 +461,7 @@ fn main() {
     println!(
         "{PODS} pods of {w} workers; runs of ten seconds, {seeds} seeds each; messages take \
          1 ms, give or take 0.5 ms (TCP rows: 10% lost, sent again after 200 ms); a {} ms \
-         cycle. \"apart\": each worker a data plane (`Approach::Apart`); \"pooled\": each pod's \
-         process one participant, its workers deciding from shared entries \
+         cycle. \"pooled\": each pod's process one participant, its workers deciding from shared entries \
          (`Approach::Pooled`, levers {:?}, {}); \"one\": one `DataPlane` a pod, the \
          reference.\n",
         cycle() / MS,
@@ -473,19 +472,14 @@ fn main() {
             "visiting every key every cycle"
         }
     );
-    let mut table: Vec<(String, [Totals; 3])> = Vec::new();
+    let mut table: Vec<(String, [Totals; 2])> = Vec::new();
     for case in &cases {
         let span = 10 * case.contract.window.get();
         let (one_shape, workers_shape) = (case.shapes)(&case.contract, w);
         let (one_fault, workers_fault) = (case.faults)(span, w);
-        let mut cell = [Totals::default(); 3];
-        let (apart, pooled, one) = match case.beside {
+        let mut cell = [Totals::default(); 2];
+        let (pooled, one) = match case.beside {
             None => (
-                Approach::Apart {
-                    cycle: cycle(),
-                    ask_timeout: 0,
-                    workers: w,
-                },
                 Approach::PooledWith {
                     cycle: cycle(),
                     ask_timeout: 0,
@@ -512,11 +506,10 @@ fn main() {
                     beside,
                     order,
                 };
-                (under, pooled, under)
+                (pooled, under)
             }
         };
         let setups = [
-            (apart, PODS * w, workers_shape, workers_fault),
             (pooled, PODS * w, workers_shape, workers_fault),
             (one, PODS, one_shape, one_fault),
         ];
@@ -556,15 +549,10 @@ fn main() {
     }
 
     let print = |what: &str, cell: &dyn Fn(&Totals) -> String| {
-        println!("| {what} | apart | pooled | one |");
-        println!("|---|---|---|---|");
-        for (name, [apart, pooled, one]) in &table {
-            println!(
-                "| {name} | {} | {} | {} |",
-                cell(apart),
-                cell(pooled),
-                cell(one)
-            );
+        println!("| {what} | pooled | one |");
+        println!("|---|---|---|");
+        for (name, [pooled, one]) in &table {
+            println!("| {name} | {} | {} |", cell(pooled), cell(one));
         }
         println!();
     };

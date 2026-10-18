@@ -1451,6 +1451,7 @@ fn the_platform_has_native_128_bit_atomics() {
 /// Runs `schedule` on both sides, printing what each decided and every key's room after
 /// each event: for explaining a failure of the comparison above.
 fn replay(schedule: &[(Event, u64)]) {
+    use crate::reference::Model as _;
     let keys: [(&[u8], Contract); 3] = [
         (b"a", contract(100, 10)),
         (b"b", contract(10, 3)),
@@ -1500,7 +1501,19 @@ fn replay(schedule: &[(Event, u64)]) {
         let rooms: Vec<String> = keys
             .iter()
             .map(|(key, contract)| {
-                let want = reference.plane.room(key, *contract, now);
+                // What the reference's copy would admit: none while cold, otherwise what is
+                // left of its bucket and of its share of the cycle.
+                let want = reference
+                    .plane
+                    .keys
+                    .get(*key)
+                    .filter(|at| at.contract == *contract && !at.cold(now))
+                    .map(|at| {
+                        let left = at.bucket.remaining(now);
+                        at.allowance.map_or(left, |allowance| {
+                            left.min(allowance.saturating_sub(at.spent))
+                        })
+                    });
                 let got = pooled.participant.keys.get(*key).map(|tracked| {
                     let entry = &tracked.entry;
                     let fields =

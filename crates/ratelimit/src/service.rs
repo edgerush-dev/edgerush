@@ -639,37 +639,6 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         self.keys.len()
     }
 
-    /// How many requests under `key` it would admit at `now`, one after another, as its
-    /// copy has them: what is left of the bucket, and no more than what is left of its share
-    /// of the cycle. `None` while the key is cold — held no copy of, or the copy not fresh —
-    /// when a request would wait for its owner. For a process that shares its view among
-    /// its workers (12 item 3).
-    #[must_use]
-    pub fn room(&self, key: &[u8], contract: Contract, now: u64) -> Option<u64> {
-        let at = self.keys.get(key).filter(|at| at.contract == contract)?;
-        if at.cold(now) {
-            return None;
-        }
-        let left = at.bucket.remaining(now);
-        Some(at.allowance.map_or(left, |allowance| {
-            left.min(allowance.saturating_sub(at.spent))
-        }))
-    }
-
-    /// Records `count` requests under `key` admitted elsewhere at `now` — by workers that
-    /// decided them from what [`room`](Self::room) gave them — as if admitted here: charged
-    /// on the copy and sent to the owner with the next batch. A key it holds no copy of
-    /// keeps nothing, as nothing is given from one.
-    pub fn charge(&mut self, key: &[u8], contract: Contract, count: u64, now: u64) {
-        let Some(at) = self.keys.get_mut(key).filter(|at| at.contract == contract) else {
-            return;
-        };
-        at.last_request = Some(now);
-        for _ in 0..count {
-            at.take(now);
-        }
-    }
-
     /// Its id.
     #[must_use]
     pub fn id(&self) -> PlaneId {

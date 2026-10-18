@@ -101,33 +101,8 @@ pub enum Approach {
         /// How long an ask may go unanswered before it is given up; 0 for four cycles.
         ask_timeout: u64,
     },
-    /// [`Nodes`](Self::Nodes) layered (12 item 3): each data plane of the protocol is a
-    /// process whose `workers` decide its requests from allowances it gives them every
-    /// `sync` nanoseconds, a worker with none asking the process, which decides from its
-    /// view and the allowances out. The run's pods are the workers, `workers` to a process.
-    Layered {
-        /// The time between a process's batches to the service.
-        cycle: u64,
-        /// How long an ask may go unanswered before it is given up; 0 for four cycles.
-        ask_timeout: u64,
-        /// The workers of a process.
-        workers: usize,
-        /// The time between a process's syncs with its workers.
-        sync: u64,
-    },
-    /// [`Nodes`](Self::Nodes) with its data planes grouped `workers` to a pod, each one
-    /// worker of it, as the prototype runs them: faults that strike a pod — a restart, a
-    /// pause — strike every worker of it. The run's pods are the workers.
-    Apart {
-        /// The time between a data plane's batches.
-        cycle: u64,
-        /// How long an ask may go unanswered before it is given up; 0 for four cycles.
-        ask_timeout: u64,
-        /// The workers of a pod, each a data plane.
-        workers: usize,
-    },
-    /// [`Nodes`](Self::Nodes) pooled (12 item 3, the shared-atomic spike): each data plane
-    /// of the protocol is one process's participant, its `workers` deciding warm requests
+    /// [`Nodes`](Self::Nodes) pooled, as the proxy runs it (06 §4): each data plane of the
+    /// protocol is one process's participant, its `workers` deciding warm requests
     /// from per-key state they share, by compare-and-swap, the participant the rest. The
     /// run's pods are the workers, `workers` to a process.
     Pooled {
@@ -371,22 +346,6 @@ impl Approach {
             Self::Nodes { cycle, ask_timeout } => {
                 Box::new(Nodes::new(contract, pods, *cycle, *ask_timeout, None))
             }
-            Self::Layered {
-                cycle,
-                ask_timeout,
-                workers,
-                sync,
-            } => {
-                let workers = (*workers).max(1);
-                let processes = pods.div_ceil(workers);
-                let nodes = Nodes::new(contract, processes, *cycle, *ask_timeout, None);
-                Box::new(nodes.layered(workers, *sync))
-            }
-            Self::Apart {
-                cycle,
-                ask_timeout,
-                workers,
-            } => Box::new(Nodes::new(contract, pods, *cycle, *ask_timeout, None).grouped(*workers)),
             Self::Pooled {
                 cycle,
                 ask_timeout,

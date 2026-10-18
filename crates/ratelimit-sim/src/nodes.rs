@@ -43,13 +43,8 @@ pub(crate) struct Nodes {
     decided: Vec<(usize, bool)>,
     /// Requests admitted anywhere, under each key.
     admitted: Vec<u64>,
-    /// The workers each data plane gives allowances to, if layered (12 item 3).
-    layer: Option<Layer>,
-    /// The workers each participant shares its keys with, if pooled (12 item 3).
+    /// The workers each participant shares its keys with, if pooled.
     pool: Option<Pool>,
-    /// Data planes to a pod, each one worker of it, as faults that strike a pod see them:
-    /// one unless grouped.
-    group: usize,
     /// By data plane: until when its background work is held (`Fault::Pause`), 0 if not;
     /// the answers that reached it meanwhile, and — pooled — what its workers asked.
     paused: Vec<u64>,
@@ -60,25 +55,8 @@ pub(crate) struct Nodes {
     /// answer or cycle.
     deferred: Vec<Vec<(usize, usize)>>,
     /// The nodes before the service pods, as the run numbers them: the data planes, or,
-    /// layered, their workers.
+    /// pooled, their workers.
     front: usize,
-}
-
-/// Each data plane a process, its workers deciding the run's key from allowances it gives
-/// them every `sync`: a share each of its room, among the workers that came to it lately.
-/// What they admit is charged to it at the next sync; a worker with nothing left asks the
-/// process, which syncs at once and, if that leaves the worker nothing, decides itself. In
-/// one process, so its messages are not the network's: a sync is a function call.
-struct Layer {
-    workers: usize,
-    sync: u64,
-    /// By worker: what it may admit before the next sync, and what it has.
-    allowance: Vec<u64>,
-    used: Vec<u64>,
-    /// By worker: whether a request came to it since the last sync.
-    active: Vec<bool>,
-    /// By process: when it last synced.
-    synced: Vec<u64>,
 }
 
 /// Each data plane one participant for its process (`service::pooled`), its workers
@@ -172,14 +150,6 @@ impl Plane {
         match self {
             Self::Data(plane) => plane.abandon(),
             Self::Pooled(participant) => participant.abandon(now),
-        }
-    }
-
-    /// The `DataPlane` of a layered process, which shares its room by allowances.
-    fn data(&mut self) -> Option<&mut DataPlane> {
-        match self {
-            Self::Data(plane) => Some(plane),
-            Self::Pooled(_) => None,
         }
     }
 }
@@ -376,9 +346,7 @@ impl Nodes {
             tickets: vec![BTreeMap::new(); planes],
             decided: Vec::new(),
             view,
-            layer: None,
             pool: None,
-            group: 1,
             paused: vec![0; planes],
             held: vec![Vec::new(); planes],
             pending: vec![Vec::new(); planes],
@@ -387,19 +355,13 @@ impl Nodes {
         }
     }
 
-    /// The same, its data planes grouped `workers` to a pod for faults that strike a pod.
-    pub(crate) fn grouped(mut self, workers: usize) -> Self {
-        self.group = workers.max(1);
-        self
-    }
-
     /// The data planes of the pod whose first worker is `pod`, as the run numbers them;
     /// none for any other worker, so that a fault striking every worker in turn strikes
     /// each pod once.
     fn pod_planes(&self, pod: usize) -> std::ops::Range<usize> {
         let (workers, per_plane) = match &self.pool {
             Some(pool) => (pool.workers, pool.workers),
-            None => (self.group, 1),
+            None => (1, 1),
         };
         if !pod.is_multiple_of(workers) {
             return 0..0;
@@ -492,61 +454,11 @@ impl Nodes {
         self
     }
 
-    /// The same, each data plane a process of `workers` deciding from allowances given every
-    /// `sync` nanoseconds; requests arrive at the workers, `workers` to a process.
-    pub(crate) fn layered(mut self, workers: usize, sync: u64) -> Self {
-        let count = self.planes.len() * workers;
-        self.layer = Some(Layer {
-            workers,
-            sync: sync.max(1),
-            allowance: vec![0; count],
-            used: vec![0; count],
-            active: vec![false; count],
-            synced: vec![0; self.planes.len()],
-        });
-        self.front = count;
-        self
-    }
-
-    /// Process `plane` syncs with its workers at `now`: what they admitted charged to it,
-    /// then its room shared out among those that came to it since the last sync.
-    fn sync(&mut self, plane: usize, now: u64) {
-        let Some(layer) = &mut self.layer else {
-            return;
-        };
-        let (key, contract) = (&*self.keys[0].0, self.keys[0].1);
-        let workers = plane * layer.workers..(plane + 1) * layer.workers;
-        let used: u64 = layer.used[workers.clone()].iter().sum();
-        let Some(data) = self.planes[plane].data() else {
-            return;
-        };
-        if used > 0 {
-            data.charge(key, contract, used, now);
-        }
-        let room = data.room(key, contract, now).unwrap_or(0);
-        let active = layer.active[workers.clone()].iter().filter(|a| **a).count() as u64;
-        for worker in workers {
-            layer.allowance[worker] = if layer.active[worker] {
-                room / active.max(1)
-            } else {
-                0
-            };
-            layer.used[worker] = 0;
-            layer.active[worker] = false;
-        }
-        layer.synced[plane] = now;
-    }
-
     /// The node data plane `plane` sends from and is reached at, as the network places
-    /// it: layered or pooled, its process's first worker, so that a partition cuts it where
-    /// its workers are.
+    /// it: pooled, its process's first worker, so that a partition cuts it where its
+    /// workers are.
     fn node_of(&self, plane: usize) -> usize {
-        let workers = self
-            .layer
-            .as_ref()
-            .map(|layer| layer.workers)
-            .or(self.pool.as_ref().map(|pool| pool.workers))
-            .unwrap_or(1);
+        let workers = self.pool.as_ref().map_or(1, |pool| pool.workers);
         plane * workers
     }
 
@@ -767,42 +679,6 @@ impl Cluster for Nodes {
             self.again(process, now, outbox);
             return self.pooled_arrival(request, plane, now, outbox);
         }
-        // Layered: the request comes to a worker, which admits it from its allowance, or
-        // asks its process.
-        let plane = match &mut self.layer {
-            None => plane,
-            Some(layer) => {
-                let worker = plane;
-                let process = worker / layer.workers;
-                if now.saturating_sub(layer.synced[process]) >= layer.sync {
-                    self.sync(process, now);
-                }
-                let Some(layer) = &mut self.layer else {
-                    return None;
-                };
-                layer.active[worker] = true;
-                // A worker with nothing left asks its process, which syncs at once: what the
-                // others hold unused comes back, and its room is shared again, this worker's
-                // part with it.
-                if layer.allowance[worker] == 0 {
-                    self.sync(process, now);
-                }
-                let Some(layer) = &mut self.layer else {
-                    return None;
-                };
-                layer.active[worker] = true;
-                if layer.allowance[worker] > 0 {
-                    layer.allowance[worker] -= 1;
-                    layer.used[worker] += 1;
-                    self.count(request);
-                    return Some(true);
-                }
-                // None left after the sync: the room was less than a request for each
-                // worker that came lately, so none was given out, and the process decides
-                // from its own view, which holds every admission charged.
-                process
-            }
-        };
         let limits: Vec<(&[u8], service::Contract)> = self
             .kind(request)
             .iter()
@@ -839,12 +715,8 @@ impl Cluster for Nodes {
 
     fn on_timer(&mut self, node: usize, now: u64, outbox: &mut Outbox) {
         if node < self.front {
-            // Layered or pooled, a process's cycle comes with its first worker's timer.
-            let workers = self
-                .layer
-                .as_ref()
-                .map(|layer| layer.workers)
-                .or(self.pool.as_ref().map(|pool| pool.workers));
+            // Pooled, a process's cycle comes with its first worker's timer.
+            let workers = self.pool.as_ref().map(|pool| pool.workers);
             let node = match workers {
                 None => node,
                 Some(workers) if node.is_multiple_of(workers) => node / workers,
@@ -854,8 +726,6 @@ impl Cluster for Nodes {
             if self.paused[node] > now {
                 return;
             }
-            // What the workers admitted goes with the cycle's batch.
-            self.sync(node, now);
             self.planes[node].on_cycle(now);
             self.flush_plane(node, outbox);
             if self.pool.is_some() {
@@ -981,64 +851,7 @@ mod tests {
         }
     }
 
-    /// Layered, four processes of eight workers: bursts on every worker are held to about
-    /// one bucket for the fleet, and traffic that keeps the contract, spread over the
-    /// workers or on one process's alone, is never refused; every admission is counted once.
-    #[test]
-    fn layered_workers_hold_bursts_to_one_bucket_and_refuse_nothing_conforming() {
-        let layered = Approach::Layered {
-            cycle: 10_000_000,
-            ask_timeout: 0,
-            workers: 8,
-            sync: 1_000_000,
-        };
-        for seed in 0..3 {
-            let base = Run {
-                pods: 32,
-                approach: layered,
-                ..bursts(Fault::None, seed)
-            };
-            // A bucket on each of the four processes, split among its workers.
-            let burst = Run {
-                workload: Workload {
-                    shape: Shape::Bursts { each: 100 / 8 },
-                    ..base.workload
-                },
-                ..base
-            };
-            let outcome = run(&burst);
-            let central = run(&Run {
-                approach: Approach::Central,
-                ..burst
-            });
-            assert!(
-                outcome.admitted <= central.admitted + central.admitted / 20,
-                "{seed}: {} against {}",
-                outcome.admitted,
-                central.admitted
-            );
-            assert_eq!(outcome.counted_twice, 0);
-            for shape in [
-                Shape::Spread { per_window: 100 },
-                Shape::Within {
-                    per_window: 100,
-                    last: 8,
-                },
-            ] {
-                let conforming = run(&Run {
-                    workload: Workload {
-                        shape,
-                        span: 6 * SECOND,
-                        conforming: true,
-                    },
-                    ..base
-                });
-                assert_eq!(conforming.refused, 0, "{seed} {shape:?}");
-            }
-        }
-    }
-
-    /// Pooled (the shared-atomic spike), a pod's process one participant: what a pod admits
+    /// Pooled, a pod's process one participant: what a pod admits
     /// does not depend on how many workers it has — the same traffic on 1, 4 and 8 workers
     /// a pod comes out the same — bursts are held to about one bucket, and a conforming
     /// client moving between a pod's workers is never refused, its process's background

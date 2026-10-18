@@ -1576,48 +1576,10 @@ fn a_service_pod_past_its_capacity_evicts_the_least_recently_changed() {
     assert_eq!(pod.evicted(), 3);
 }
 
-/// A data plane's room for a key is none while the key is cold, then what its copy has
-/// left; admissions made elsewhere and charged to it take from that room, and go to the
-/// owner with the next cycle's batch.
+/// A data plane's share of the cycle, admitting with others: what its copy has left and the
+/// cycle refills, divided among them.
 #[test]
-fn room_is_what_the_copy_has_left_and_a_charge_takes_from_it() {
-    let mut net = Net::new(1);
-    assert_eq!(net.planes[0].room(b"k", contract(), 0), None, "never seen");
-    let mut asking = Net::new(1);
-    assert!(waits(asking.planes[0].decide(b"k", contract(), 0)));
-    assert_eq!(
-        asking.planes[0].room(b"k", contract(), 0),
-        None,
-        "asked, not yet answered"
-    );
-    warmed(&mut net, 0, b"k", 0);
-    // A bucket of ten, one taken by the request that warmed it.
-    assert_eq!(net.planes[0].room(b"k", contract(), 0), Some(9));
-    net.planes[0].charge(b"k", contract(), 4, 0);
-    assert_eq!(net.planes[0].room(b"k", contract(), 0), Some(5));
-    assert_eq!(net.copy(0, b"k").unsent, 4);
-    let other = Contract {
-        limit: NonZeroU64::new(5).unwrap(),
-        ..contract()
-    };
-    assert_eq!(
-        net.planes[0].room(b"k", other, 0),
-        None,
-        "another contract: another key"
-    );
-    net.planes[0].on_cycle(CYCLE);
-    net.settle(CYCLE);
-    assert_eq!(
-        net.pods[Net::owner(b"k")].counted(b"k"),
-        Some(5),
-        "one asked, four charged"
-    );
-}
-
-/// A data plane bounded to a share of the cycle has no more room than that share, though
-/// its copy of the bucket has more left; what it spends comes off it.
-#[test]
-fn room_is_no_more_than_the_share_of_the_cycle() {
+fn a_share_of_the_cycle_divides_what_the_copy_has_among_those_admitting() {
     let mut net = Net::new(1);
     warmed(&mut net, 0, b"k", 0);
     let at = net.planes[0].keys.get_mut(&b"k"[..]).unwrap();
@@ -1627,7 +1589,4 @@ fn room_is_no_more_than_the_share_of_the_cycle() {
     net.planes[0].on_cycle(0);
     // Nine left, one refilled, among three.
     assert_eq!(net.copy(0, b"k").allowance, Some(3));
-    assert_eq!(net.planes[0].room(b"k", contract(), 0), Some(3));
-    net.admits(0, b"k", 1, 0);
-    assert_eq!(net.planes[0].room(b"k", contract(), 0), Some(2));
 }
