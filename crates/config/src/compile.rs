@@ -132,6 +132,8 @@ pub struct CompiledRateLimitService {
     pub poll_quiet_keys: bool,
     /// Pooled, whether a request for a cold key waits for its owner's word.
     pub ask_cold_keys: bool,
+    /// Pooled, whether each cycle visits only the keys that need it.
+    pub schedule_keys: bool,
 }
 
 impl CompiledRateLimitService {
@@ -580,7 +582,9 @@ fn rate_limit_service(
     if ways > 1 {
         errors.push(place.problem(Problem::RateLimitServiceLayeredAndShared));
     }
-    let levers = service.poll_quiet_keys.is_some() || service.ask_cold_keys.is_some();
+    let levers = service.poll_quiet_keys.is_some()
+        || service.ask_cold_keys.is_some()
+        || service.schedule_keys.is_some();
     if levers && service.pooled != Some(true) {
         errors.push(place.problem(Problem::RateLimitServiceLeverNotPooled));
     }
@@ -598,6 +602,7 @@ fn rate_limit_service(
         pooled: service.pooled.unwrap_or(false),
         poll_quiet_keys: service.poll_quiet_keys.unwrap_or(true),
         ask_cold_keys: service.ask_cold_keys.unwrap_or(true),
+        schedule_keys: service.schedule_keys.unwrap_or(false),
     })
 }
 
@@ -2281,7 +2286,9 @@ pub enum Problem {
     #[error("`rate_limit_service`: more than one of `layered`, `shared` and `pooled`: one at most")]
     RateLimitServiceLayeredAndShared,
     /// A pooled service's lever set on a service that is not pooled.
-    #[error("`rate_limit_service`: `poll_quiet_keys` and `ask_cold_keys` only with `pooled`")]
+    #[error(
+        "`rate_limit_service`: `poll_quiet_keys`, `ask_cold_keys` and `schedule_keys` only with `pooled`"
+    )]
     RateLimitServiceLeverNotPooled,
     /// A WebSocket's idle bound of nothing, which would never close one whose peer has gone.
     #[error("`tunnel_idle_ms` is 0: at least 1")]
@@ -4714,21 +4721,27 @@ routes:
             ]
         );
         let levers = with(
-            r#"rate_limit_service: { pods: ["a:1"], pooled: true, poll_quiet_keys: false, ask_cold_keys: false }"#,
+            r#"rate_limit_service: { pods: ["a:1"], pooled: true, poll_quiet_keys: false, ask_cold_keys: false, schedule_keys: true }"#,
         )
         .unwrap()
         .unwrap();
-        assert!(!levers.poll_quiet_keys && !levers.ask_cold_keys);
+        assert!(!levers.poll_quiet_keys && !levers.ask_cold_keys && levers.schedule_keys);
         assert!(
-            shared.poll_quiet_keys && shared.ask_cold_keys,
-            "on when left out"
+            shared.poll_quiet_keys && shared.ask_cold_keys && !shared.schedule_keys,
+            "as the protocol keeps it when left out"
         );
-        assert_eq!(
-            with(r#"rate_limit_service: { pods: ["a:1"], ask_cold_keys: false }"#).unwrap_err(),
-            [
-                "the data plane: `rate_limit_service`: `poll_quiet_keys` and `ask_cold_keys` only with `pooled`"
-            ]
-        );
+        for lever in ["ask_cold_keys: false", "schedule_keys: true"] {
+            assert_eq!(
+                with(&format!(
+                    r#"rate_limit_service: {{ pods: ["a:1"], {lever} }}"#
+                ))
+                .unwrap_err(),
+                [
+                    "the data plane: `rate_limit_service`: `poll_quiet_keys`, `ask_cold_keys` and `schedule_keys` only with `pooled`"
+                ],
+                "{lever}"
+            );
+        }
     }
 
     const LIMITS: &str = r"

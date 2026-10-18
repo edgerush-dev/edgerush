@@ -112,6 +112,7 @@ fn limited(mut config: Config, service: &[String]) -> Config {
         pooled: None,
         poll_quiet_keys: None,
         ask_cold_keys: None,
+        schedule_keys: None,
     });
     config
 }
@@ -222,6 +223,7 @@ async fn a_layered_keep_reaches_the_process() {
             pooled: false,
             poll_quiet_keys: true,
             ask_cold_keys: true,
+            schedule_keys: false,
         };
         let hub = Hub::start(&compiled, 1, 1 << 20).unwrap();
         let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
@@ -324,6 +326,7 @@ async fn asks_that_come_together_are_sent_together() {
         pooled: true,
         poll_quiet_keys: true,
         ask_cold_keys: true,
+        schedule_keys: false,
     };
     let hub = Hub::start(&compiled, 1, 1 << 20).unwrap();
     let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
@@ -493,6 +496,78 @@ async fn a_cold_key_decided_locally_does_not_wait_for_the_service() {
             }
         })
         .await;
+}
+
+/// Pooled, keys visited only when they need it: a key the process has reported and heard
+/// back about, nothing polled, is left alone; a worker's next admission under it signals
+/// it, and that reaches the process, which reports it.
+#[tokio::test]
+async fn scheduled_a_workers_admission_reaches_the_service() {
+    use crate::ratelimit::{Hub, Limited, Limiter};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let exchanges = Arc::new(AtomicUsize::new(0));
+            let service = counted_service(&exchanges).await;
+            let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
+            if let Some(service) = &mut config.rate_limit_service {
+                service.pooled = Some(true);
+                service.poll_quiet_keys = Some(false);
+                service.ask_cold_keys = Some(false);
+                service.schedule_keys = Some(true);
+            }
+            let compiled = compile(&config).unwrap();
+            let service = compiled.rate_limit_service().unwrap().clone();
+            let hub = Hub::start(&service, 1, 1 << 20).unwrap();
+            let limiter = Limiter::pooled(&service, Arc::clone(&hub), 0).unwrap();
+            let rule = Arc::clone(&compiled.rules_of(0)[0]);
+            let client = crate::forwarding::Client::new("203.0.113.9".parse().unwrap());
+            let settle = || async {
+                // Quiet once a few cycles pass with no exchange.
+                let mut last = exchanges.load(Ordering::Relaxed);
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let now = exchanges.load(Ordering::Relaxed);
+                    if now == last {
+                        return now;
+                    }
+                    last = now;
+                }
+            };
+            assert!(matches!(
+                limiter.decide_all(&rule.limits, 0b1, &client),
+                Limited::Admit
+            ));
+            let quiet = within(settle()).await;
+            assert!(quiet > 0, "the new key reported");
+            assert!(matches!(
+                limiter.decide_all(&rule.limits, 0b1, &client),
+                Limited::Admit
+            ));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while exchanges.load(Ordering::Relaxed) == quiet {
+                assert!(Instant::now() < deadline, "the admission never reported");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let stats = hub.render_stats();
+            assert!(
+                stats.contains("edgerush_rate_limit_hub_visits_total "),
+                "{stats}"
+            );
+            limiter.stop();
+        })
+        .await;
+}
+
+/// Pooled with keys visited only when they need it, two workers share a client's bucket as
+/// when every key is visited.
+#[tokio::test]
+async fn scheduled_pooled_workers_share_a_clients_bucket() {
+    two_workers_share_a_clients_bucket(|service| {
+        service.pooled = Some(true);
+        service.schedule_keys = Some(true);
+    })
+    .await;
 }
 
 /// A config with a pooled service is refused where 128-bit atomics are not native, at start

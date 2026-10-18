@@ -116,6 +116,13 @@ pub struct RateLimitService {
     /// key admitted by every process that meets it. Only with `pooled`; on when left out.
     #[serde(default)]
     pub ask_cold_keys: Option<bool>,
+    /// Pooled, whether each cycle the process visits only the keys that need it — those its
+    /// workers signal, and those with work outstanding — rather than every key it holds,
+    /// so that quiet keys cost nothing between their uses. A key woken after cycles without
+    /// a visit gets one share of its bucket refilled from the time gone by. Only with
+    /// `pooled`; off when left out.
+    #[serde(default)]
+    pub schedule_keys: Option<bool>,
 }
 
 /// A place where requests come in. Hostnames are to come; until a listener can be told

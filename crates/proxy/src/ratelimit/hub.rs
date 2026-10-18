@@ -48,6 +48,9 @@ pub(crate) enum ToHub {
     Drain(Box<[u8]>),
     /// Pooled, cold keys decided locally: an entry a worker made, for the process to keep.
     Adopt(Arc<Entry>),
+    /// Pooled, keys visited only when they need it: those its decisions signalled since its
+    /// last such message, for the next cycle to visit.
+    Signals(Vec<Arc<Entry>>),
 }
 
 /// What the process sends a worker.
@@ -97,6 +100,7 @@ pub(crate) struct Stats {
     cycle_ns_most: AtomicU64,
     answers_ns: AtomicU64,
     busy_ns: AtomicU64,
+    visits: AtomicU64,
 }
 
 impl Stats {
@@ -127,6 +131,7 @@ impl Stats {
             ("cycle_ns_most", "gauge", take(&self.cycle_ns_most)),
             ("answers_ns_total", "counter", read(&self.answers_ns)),
             ("busy_ns_total", "counter", read(&self.busy_ns)),
+            ("visits_total", "counter", read(&self.visits)),
         ];
         let mut out = String::new();
         for (name, kind, value) in lines {
@@ -227,6 +232,7 @@ impl Hub {
             && self.service.pooled == service.pooled
             && self.service.poll_quiet_keys == service.poll_quiet_keys
             && self.service.ask_cold_keys == service.ask_cold_keys
+            && self.service.schedule_keys == service.schedule_keys
     }
 
     /// The clock its times are read by.
@@ -311,6 +317,7 @@ fn run(
             poll_quiet: service.poll_quiet_keys,
             ask_cold: service.ask_cold_keys,
         });
+        participant.set_scheduled(service.schedule_keys);
         if made.send(participant.registry()).is_err() {
             return;
         }
@@ -430,6 +437,14 @@ impl Engine {
         }
     }
 
+    /// Pooled, the keys its cycles visited, all told.
+    fn visits(&self) -> u64 {
+        match self {
+            Self::Pooled { participant, .. } => participant.visits(),
+            _ => 0,
+        }
+    }
+
     fn on_cycle(&mut self, now: u64) {
         match self {
             Self::Pooled { participant, .. } => participant.on_cycle(now),
@@ -529,6 +544,11 @@ impl State {
             ToHub::Adopt(entry) => {
                 if let Engine::Pooled { participant, .. } = &mut *self.engine.borrow_mut() {
                     participant.adopt(entry);
+                }
+            }
+            ToHub::Signals(entries) => {
+                if let Engine::Pooled { participant, .. } = &mut *self.engine.borrow_mut() {
+                    participant.on_signals(entries);
                 }
             }
         }
@@ -769,6 +789,8 @@ async fn serve(state: Rc<State>, mut from: mpsc::UnboundedReceiver<ToHub>, cycle
                 let started = Instant::now();
                 let now = state.now();
                 state.engine.borrow_mut().on_cycle(now);
+                let visits = state.engine.borrow().visits();
+                state.shared.stats.visits.store(visits, Ordering::Relaxed);
                 state.report();
                 let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 state.shared.stats.cycle_ns.fetch_add(took, Ordering::Relaxed);

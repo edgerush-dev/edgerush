@@ -1045,6 +1045,14 @@
           ],
           "default": null
         },
+        "schedule_keys": {
+          "description": "Pooled, whether each cycle the process visits only the keys that need it — those its\nworkers signal, and those with work outstanding — rather than every key it holds,\nso that quiet keys cost nothing between their uses. A key woken after cycles without\na visit gets one share of its bucket refilled from the time gone by. Only with\n`pooled`; off when left out.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
         "shared": {
           "description": "Experimental, for measuring: the process alone a data plane of the service, as with\n`layered`, its workers taking from one room a key that all of them reach, by\natomics, rather than from slices of their own (12 item 3). Not with `layered`. Off\nwhen left out.",
           "type": [

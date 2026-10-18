@@ -111,6 +111,11 @@ pub(crate) const DEFER_WAIT: Duration = Duration::from_millis(400);
 /// request is answered as the gateway's own overload.
 pub(crate) const MOST_DEFERRED: usize = 1_024;
 
+/// The most entries a pooled worker keeps signalled between syncs: a key signals at most
+/// once each time its count starts, so a millisecond's worth for any worker; past it, the
+/// worker asks its process to visit every key at the next cycle rather than keep more.
+const MOST_SIGNALLED: usize = 4_096;
+
 /// How a request fared against the limits it is under.
 pub(crate) enum Limited {
     /// Within it.
@@ -192,6 +197,9 @@ enum Mode {
         settled: Arc<tokio::sync::Notify>,
         deferring: Cell<usize>,
         most_deferred: Cell<usize>,
+        /// With keys visited only when they need it, the entries its decisions signalled
+        /// since it last handed them to its process: every sync, at most `MOST_SIGNALLED`.
+        signalled: RefCell<Vec<Arc<Entry>>>,
     },
 }
 
@@ -343,6 +351,7 @@ impl Limiter {
                 settled,
                 deferring: Cell::new(0),
                 most_deferred: Cell::new(MOST_DEFERRED),
+                signalled: RefCell::new(Vec::new()),
             },
             waiting: RefCell::new(HashMap::new()),
             keys: RefCell::new(Vec::new()),
@@ -367,6 +376,7 @@ impl Limiter {
             && self.service.pooled == service.pooled
             && self.service.poll_quiet_keys == service.poll_quiet_keys
             && self.service.ask_cold_keys == service.ask_cold_keys
+            && self.service.schedule_keys == service.schedule_keys
     }
 
     /// The bytes its keys may hold from now on: layered, the process's, which its first
@@ -790,14 +800,30 @@ impl Limiter {
     /// of their keys, and now and then its handles to entries its process has closed
     /// dropped.
     async fn run_pooled(self: Rc<Self>, mut answered: mpsc::UnboundedReceiver<FromHub>) {
-        let Mode::Pooled { handles, asked, .. } = &self.mode else {
+        let Mode::Pooled {
+            hub,
+            handles,
+            asked,
+            signalled,
+            ..
+        } = &self.mode
+        else {
             return;
         };
         let mut sweep = tokio::time::interval(Duration::from_secs(1));
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut sync = tokio::time::interval(SYNC);
+        sync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = sweep.tick() => handles.borrow_mut().retain(|held| !held.entry().closed()),
+                // What its decisions signalled, handed over in one message a sync.
+                _ = sync.tick(), if self.service.schedule_keys => {
+                    let entries = std::mem::take(&mut *signalled.borrow_mut());
+                    if !entries.is_empty() {
+                        let _gone = hub.to.send(ToHub::Signals(entries));
+                    }
+                }
                 message = answered.recv() => match message {
                     Some(FromHub::Pooled { id, admitted, overloaded, refused_by, entries }) => {
                         let mut handles = handles.borrow_mut();
@@ -907,11 +933,38 @@ impl Limiter {
         (!self.service.ask_cold_keys).then_some((&**hub, cycle))
     }
 
-    /// Pooled, what a decision asks of others: a key's count drained, waiters woken.
+    /// Pooled, what a decision asks of others: a key's count drained, waiters woken, and
+    /// with keys visited only when they need it, the keys it signalled kept to hand over —
+    /// or, with no room left to keep them, every key asked to be visited.
     fn signal(&self, outcome: &Pooled, parts: &[(&[u8], Contract)]) {
-        let Mode::Pooled { hub, settled, .. } = &self.mode else {
+        let Mode::Pooled {
+            hub,
+            settled,
+            handles,
+            registry,
+            signalled,
+            ..
+        } = &self.mode
+        else {
             return;
         };
+        if outcome.signal != 0 && self.service.schedule_keys {
+            let handles = handles.borrow();
+            let mut signalled = signalled.borrow_mut();
+            for (at, (key, _)) in parts.iter().enumerate() {
+                if outcome.signal & (1 << at) == 0 {
+                    continue;
+                }
+                let Some(held) = handles.get(*key) else {
+                    continue;
+                };
+                if signalled.len() < MOST_SIGNALLED {
+                    signalled.push(Arc::clone(held.entry()));
+                } else {
+                    registry.require_scan();
+                }
+            }
+        }
         if outcome.drain {
             for (key, _) in parts {
                 let _gone = hub.to.send(ToHub::Drain((*key).into()));
