@@ -1238,6 +1238,22 @@ fn the_transport_keeps_the_cycle_number_from_wrapping_unseen() {
     }
 }
 
+/// The participant finds a key by a handle to its entry, holding no copy of its bytes; a
+/// key whose contract changed is found by its new entry, not the closed one.
+#[test]
+fn the_participant_keeps_a_key_once() {
+    let mut participant = participant();
+    let key: &[u8] = b"k";
+    participant.ensure(key, contract(100, 10), 0);
+    for c in [contract(100, 10), contract(100, 11)] {
+        participant.ensure(key, c, 0);
+        let (handle, tracked) = participant.keys.get_key_value(key).unwrap();
+        assert!(Arc::ptr_eq(handle.entry(), &tracked.entry));
+        assert_eq!(tracked.entry.terms.contract, c);
+    }
+    assert_eq!(participant.key_count(), 1);
+}
+
 /// What keys under one contract share is made once and pointed to, not copied into each
 /// key's entry: an entry is its key, a pointer, its word and its counts.
 #[test]

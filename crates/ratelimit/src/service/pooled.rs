@@ -798,8 +798,8 @@ struct Group {
 /// bookkeeping, the key twice (the entry's and the bookkeeping's), and a handle to it in its
 /// registry and in each of its `workers`, one byte of a table's control with each slot.
 fn key_bytes(key: &[u8], workers: u64) -> u64 {
-    let entry = 2 * size_of::<usize>() + size_of::<Entry>() + 2 * key.len();
-    let tracked = size_of::<(Box<[u8]>, Tracked)>() + 1;
+    let entry = 2 * size_of::<usize>() + size_of::<Entry>() + key.len();
+    let tracked = size_of::<(Handle, Tracked)>() + 1;
     let handle = (size_of::<Handle>() + 1) as u64;
     (entry + tracked) as u64 + handle * (1 + workers)
 }
@@ -812,7 +812,8 @@ pub struct Participant<S> {
     registry: Arc<Registry>,
     cycle: u64,
     view: View,
-    keys: HashMap<Box<[u8]>, Tracked, S>,
+    /// By a handle to the key's entry, so that the key's bytes are kept once, in it.
+    keys: HashMap<Handle, Tracked, S>,
     groups: HashMap<Box<[u8]>, Group, S>,
     /// The requests waiting with their group's keys not asked about held.
     holds: BTreeSet<Ticket>,
@@ -1009,8 +1010,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
 
     /// Keeps `entry`, a live entry of a key not kept, from now on.
     fn track(&mut self, entry: Arc<Entry>) {
-        let key = entry.key.clone();
-        let owner = self.view.owners(&key).0;
+        let owner = self.view.owners(&entry.key).0;
         if !self.levers.ask_cold {
             entry.set_flag(LOCAL, true);
         }
@@ -1028,8 +1028,9 @@ impl<S: BuildHasher + Clone> Participant<S> {
         };
         tracked.publish();
         self.registry.insert(Arc::clone(&tracked.entry));
-        self.holding += key_bytes(&key, self.workers);
-        self.keys.insert(key, tracked);
+        self.holding += key_bytes(&tracked.entry.key, self.workers);
+        self.keys
+            .insert(Handle::new(Arc::clone(&tracked.entry)), tracked);
     }
 
     /// Decides at `now` a request a worker asked about, under `keys`: as
@@ -1117,14 +1118,14 @@ impl<S: BuildHasher + Clone> Participant<S> {
             .collect();
         let room = held.iter().all(|at| {
             self.keys
-                .get(&group.keys[*at].0)
+                .get(&*group.keys[*at].0)
                 .is_some_and(|tracked| tracked.room(now))
         });
         // No room under a key that holds are outstanding on: they may be given back.
         let contended = !room
             && held.iter().any(|at| {
                 self.keys
-                    .get(&group.keys[*at].0)
+                    .get(&*group.keys[*at].0)
                     .is_some_and(|tracked| !tracked.room(now) && tracked.entry.snapshot().held > 0)
             });
         // Hold the keys not asked about, all or none.
@@ -1138,7 +1139,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             for at in &held {
                 let taken = self
                     .keys
-                    .get(&group.keys[*at].0)
+                    .get(&*group.keys[*at].0)
                     .map_or(Taken::Refused, |tracked| tracked.entry.take(Op::Hold, now));
                 if !taken.done() {
                     failed = taken;
@@ -1149,7 +1150,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
         }
         if holding < held.len() {
             for at in &held[..holding] {
-                if let Some(tracked) = self.keys.get(&group.keys[*at].0) {
+                if let Some(tracked) = self.keys.get(&*group.keys[*at].0) {
                     self.wake |= tracked.entry.settle(false, now);
                 }
             }
@@ -1188,7 +1189,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
         let Some(pod) = group
             .cold
             .first()
-            .and_then(|at| self.keys.get(&group.keys[*at].0))
+            .and_then(|at| self.keys.get(&*group.keys[*at].0))
             .and_then(|tracked| tracked.owner)
         else {
             return;
@@ -1198,7 +1199,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             None => {
                 self.asks_sent += 1;
                 for at in &group.cold {
-                    if let Some(tracked) = self.keys.get_mut(&group.keys[*at].0) {
+                    if let Some(tracked) = self.keys.get_mut(&*group.keys[*at].0) {
                         tracked.asking += 1;
                         tracked.publish();
                     }
@@ -1242,7 +1243,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
         };
         self.in_flight.remove(&flight.id);
         for at in &group.cold {
-            if let Some(tracked) = self.keys.get_mut(&group.keys[*at].0) {
+            if let Some(tracked) = self.keys.get_mut(&*group.keys[*at].0) {
                 tracked.asking = tracked.asking.saturating_sub(1);
                 tracked.publish();
             }
@@ -1260,7 +1261,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             .iter()
             .filter_map(|at| {
                 self.keys
-                    .get(&group.keys[*at].0)
+                    .get(&*group.keys[*at].0)
                     .map(|t| Arc::clone(&t.entry))
             })
             .collect();
@@ -1307,7 +1308,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
         }
         let held = (0..group.keys.len()).filter(|at| !group.cold.contains(at));
         for at in held {
-            if let Some(tracked) = self.keys.get(&group.keys[at].0) {
+            if let Some(tracked) = self.keys.get(&*group.keys[at].0) {
                 self.wake |= tracked.entry.settle_in(admitted, now, cycle);
             }
         }
@@ -1346,7 +1347,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 .chain(std::mem::take(&mut group.waiting))
                 .collect();
             for at in group.cold.clone() {
-                if let Some(tracked) = self.keys.get_mut(&group.keys[at].0) {
+                if let Some(tracked) = self.keys.get_mut(&*group.keys[at].0) {
                     tracked.unreachable = true;
                     tracked.publish();
                 }
@@ -1363,8 +1364,9 @@ impl<S: BuildHasher + Clone> Participant<S> {
             .retain(|_, since| now.saturating_sub(*since) < ask_timeout);
         let sending = &self.sending;
         let poll_quiet = self.levers.poll_quiet;
-        for (key, tracked) in &mut self.keys {
+        for tracked in self.keys.values_mut() {
             let entry = &tracked.entry;
+            let key = &entry.key;
             let hold = entry.terms.hold;
             // The cycle advanced here if no worker has, so that it is set every cycle, and
             // what was admitted drained into the ledger in the same step — every key's,
@@ -1450,11 +1452,11 @@ impl<S: BuildHasher + Clone> Participant<S> {
         }
         let mut freed = 0;
         let (registry, workers) = (&self.registry, self.workers);
-        self.keys.retain(|key, tracked| {
+        self.keys.retain(|_, tracked| {
             let evict = tracked.idle(now) && close_if_quiet(tracked);
             if evict {
                 registry.remove(&tracked.entry);
-                freed += key_bytes(key, workers);
+                freed += key_bytes(&tracked.entry.key, workers);
             }
             !evict
         });
@@ -1464,7 +1466,10 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 .keys
                 .iter()
                 .filter(|(_, t)| t.asking == 0 && t.unacknowledged.is_empty() && t.unsent == 0)
-                .map(|(key, t)| (t.entry.last_request.load(Ordering::Relaxed), key.clone()))
+                .map(|(_, t)| {
+                    let used = t.entry.last_request.load(Ordering::Relaxed);
+                    (used, t.entry.key.clone())
+                })
                 .collect();
             quiet.sort_unstable_by_key(|(used, _)| *used);
             let target = self.capacity - self.capacity / 10;
@@ -1472,11 +1477,11 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 if self.holding <= target {
                     break;
                 }
-                let closed = self.keys.get(&key).is_some_and(close_if_quiet);
-                if let Some(tracked) = self.keys.get(&key).filter(|_| closed) {
+                let closed = self.keys.get(&*key).is_some_and(close_if_quiet);
+                if let Some(tracked) = self.keys.get(&*key).filter(|_| closed) {
                     self.registry.remove(&tracked.entry);
                 }
-                if closed && self.keys.remove(&key).is_some() {
+                if closed && self.keys.remove(&*key).is_some() {
                     self.holding = self.holding.saturating_sub(key_bytes(&key, self.workers));
                     self.evicted += 1;
                 }
@@ -1499,7 +1504,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
         let mut copies = Vec::new();
         let mut untaken: Vec<(Box<[u8]>, u128)> = Vec::new();
         for answer in entries {
-            let Some(tracked) = self.keys.get_mut(&answer.key) else {
+            let Some(tracked) = self.keys.get_mut(&*answer.key) else {
                 continue;
             };
             if answer.owned && tracked.owner != Some(from) {
@@ -1551,7 +1556,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                     .iter()
                     .filter_map(|at| {
                         let key = &group.keys[*at].0;
-                        let tracked = self.keys.get(key)?;
+                        let tracked = self.keys.get(&**key)?;
                         let wait = match untaken.iter().find(|(untaken, _)| untaken == key) {
                             Some((_, behind)) => {
                                 let bucket = &tracked.entry.terms.bucket;
@@ -1576,7 +1581,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 let admitted = (index as u64) < admitted;
                 if admitted {
                     for key in &charged {
-                        if let Some(tracked) = self.keys.get_mut(key) {
+                        if let Some(tracked) = self.keys.get_mut(&**key) {
                             tracked.unsent += 1;
                         }
                     }
@@ -1599,10 +1604,11 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 self.groups.remove(&name);
                 continue;
             }
-            let bounded = group
-                .cold
-                .iter()
-                .all(|at| self.keys.get(&group.keys[*at].0).is_some_and(|t| t.bounded));
+            let bounded = group.cold.iter().all(|at| {
+                self.keys
+                    .get(&*group.keys[*at].0)
+                    .is_some_and(|t| t.bounded)
+            });
             if group.follow_up && bounded {
                 let waiting = std::mem::take(&mut group.waiting);
                 for ticket in waiting {
@@ -1626,7 +1632,8 @@ impl<S: BuildHasher + Clone> Participant<S> {
             return;
         }
         self.view = view;
-        for (key, tracked) in &mut self.keys {
+        for tracked in self.keys.values_mut() {
+            let key = &tracked.entry.key;
             let owner = self.view.owners(key).0;
             if owner == tracked.owner {
                 continue;
@@ -1657,7 +1664,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             .filter_map(|(name, group)| {
                 let flight = group.asking.as_ref()?;
                 let first = group.cold.first()?;
-                let owner = self.keys.get(&group.keys[*first].0)?.owner;
+                let owner = self.keys.get(&*group.keys[*first].0)?.owner;
                 (owner != Some(flight.pod)).then(|| (name.clone(), flight.id))
             })
             .collect();
