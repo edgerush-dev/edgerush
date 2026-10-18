@@ -28,6 +28,12 @@ fn levers() -> edgerush_ratelimit::service::pooled::Levers {
     }
 }
 
+/// Whether each participant visits only the keys that need it each cycle: a fifth argument
+/// `scheduled`; every key unless said.
+fn scheduled() -> bool {
+    std::env::args().nth(5).as_deref() == Some("scheduled")
+}
+
 /// The protocol's cycle: the third argument, in milliseconds, 10 unless said.
 fn cycle() -> u64 {
     std::env::args()
@@ -457,9 +463,15 @@ fn main() {
          1 ms, give or take 0.5 ms (TCP rows: 10% lost, sent again after 200 ms); a {} ms \
          cycle. \"apart\": each worker a data plane (`Approach::Apart`); \"pooled\": each pod's \
          process one participant, its workers deciding from shared entries \
-         (`Approach::Pooled`, levers {:?}); \"one\": one `DataPlane` a pod, the reference.\n",
+         (`Approach::Pooled`, levers {:?}, {}); \"one\": one `DataPlane` a pod, the \
+         reference.\n",
         cycle() / MS,
-        levers()
+        levers(),
+        if scheduled() {
+            "visiting only the keys that need it"
+        } else {
+            "visiting every key every cycle"
+        }
     );
     let mut table: Vec<(String, [Totals; 3])> = Vec::new();
     for case in &cases {
@@ -479,6 +491,7 @@ fn main() {
                     ask_timeout: 0,
                     workers: w,
                     levers: levers(),
+                    scheduled: scheduled(),
                 },
                 Approach::Nodes {
                     cycle: cycle(),

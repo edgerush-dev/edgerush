@@ -149,6 +149,9 @@ pub enum Approach {
         workers: usize,
         /// The levers.
         levers: edgerush_ratelimit::service::pooled::Levers,
+        /// Whether each participant visits only the keys that need it each cycle
+        /// (`Participant::set_scheduled`), rather than every key.
+        scheduled: bool,
     },
     /// [`Pooled`](Self::Pooled) with every request under another limit beside the run's,
     /// decided under both, all or none, as [`NodesUnder`](Self::NodesUnder).
@@ -399,11 +402,12 @@ impl Approach {
                 ask_timeout,
                 workers,
                 levers,
+                scheduled,
             } => {
                 let workers = (*workers).max(1);
                 let processes = pods.div_ceil(workers);
                 let nodes = Nodes::new(contract, processes, *cycle, *ask_timeout, None);
-                Box::new(nodes.pooled_with(workers, *levers))
+                Box::new(nodes.pooled_with(workers, *levers, *scheduled))
             }
             Self::PooledUnder {
                 cycle,

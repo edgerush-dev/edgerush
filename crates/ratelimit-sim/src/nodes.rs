@@ -89,6 +89,8 @@ struct Pool {
     workers: usize,
     /// What its participants give up of accuracy for throughput.
     levers: Levers,
+    /// Whether its participants visit only the keys that need it each cycle.
+    scheduled: bool,
     /// By worker: its handles to the entries its participant gave it.
     handles: Vec<HashMap<Box<[u8]>, Arc<Entry>>>,
     /// By process: its participant's registry, where a worker finds an entry it holds no
@@ -236,17 +238,29 @@ impl Nodes {
             }
         }
         let handles = &self.pool.as_ref()?.handles[worker];
-        let held: Option<Vec<&Entry>> = keys
+        let held: Option<Vec<&Arc<Entry>>> = keys
             .iter()
             .map(|(key, contract)| {
                 handles
                     .get(*key)
                     .filter(|entry| entry.contract() == *contract)
-                    .map(|entry| &**entry)
             })
             .collect();
         if let Some(held) = held {
-            match pooled::decide(&held, now).local {
+            let entries: Vec<&Entry> = held.iter().map(|entry| &***entry).collect();
+            let outcome = pooled::decide(&entries, now);
+            // Signals reach the process at once, as the proxy's do within a tick.
+            if outcome.signal != 0
+                && let Plane::Pooled(participant) = &mut self.planes[process]
+            {
+                let signalled = held
+                    .iter()
+                    .enumerate()
+                    .filter(|(at, _)| outcome.signal & (1 << at) != 0)
+                    .map(|(_, entry)| Arc::clone(entry));
+                participant.on_signals(signalled);
+            }
+            match outcome.local {
                 Local::Admit => {
                     self.count(request);
                     return Some(true);
@@ -449,11 +463,12 @@ impl Nodes {
     /// The same, each data plane a process's one participant, its `workers` deciding from
     /// shared entries; requests arrive at the workers, `workers` to a process.
     pub(crate) fn pooled(self, workers: usize) -> Self {
-        self.pooled_with(workers, Levers::default())
+        self.pooled_with(workers, Levers::default(), false)
     }
 
-    /// The same, its participants' levers set.
-    pub(crate) fn pooled_with(mut self, workers: usize, levers: Levers) -> Self {
+    /// The same, its participants' levers set, each visiting only the keys that need it
+    /// each cycle if `scheduled`.
+    pub(crate) fn pooled_with(mut self, workers: usize, levers: Levers, scheduled: bool) -> Self {
         let workers = workers.max(1);
         for (at, plane) in self.planes.iter_mut().enumerate() {
             *plane = pooled_plane(
@@ -462,12 +477,14 @@ impl Nodes {
                 self.ask_timeout,
                 self.view.clone(),
                 levers,
+                scheduled,
             );
         }
         let registries = self.planes.iter().map(registry_of).collect();
         self.pool = Some(Pool {
             workers,
             levers,
+            scheduled,
             handles: vec![HashMap::new(); self.planes.len() * workers],
             registries,
         });
@@ -673,6 +690,7 @@ impl Nodes {
                     self.ask_timeout,
                     self.view.clone(),
                     pool.levers,
+                    pool.scheduled,
                 );
                 pool.registries[plane] = registry_of(&fresh);
                 fresh
@@ -702,7 +720,14 @@ type Asked = (usize, usize, Vec<(Box<[u8]>, service::Contract)>);
 /// A pooled participant `id`, waiting `ask_timeout` for an ask's answer (0: four cycles).
 /// The simulator runs where 128-bit atomics are native; the protocol's `DataPlane` is
 /// what it falls back to only where they are not, so that a run still runs.
-fn pooled_plane(id: PlaneId, cycle: u64, ask_timeout: u64, view: View, levers: Levers) -> Plane {
+fn pooled_plane(
+    id: PlaneId,
+    cycle: u64,
+    ask_timeout: u64,
+    view: View,
+    levers: Levers,
+    scheduled: bool,
+) -> Plane {
     match Participant::new(id, cycle, view.clone(), FixedState::default()) {
         Some(mut participant) => {
             if ask_timeout > 0 {
@@ -711,6 +736,7 @@ fn pooled_plane(id: PlaneId, cycle: u64, ask_timeout: u64, view: View, levers: L
             // As the proxy runs it: one exchange in flight to each service pod.
             participant.set_one_in_flight(true);
             participant.set_levers(levers);
+            participant.set_scheduled(scheduled);
             Plane::Pooled(Box::new(participant))
         }
         None => Plane::Data(plane_of(id, cycle, ask_timeout, view)),
@@ -926,6 +952,7 @@ impl Cluster for Nodes {
 #[cfg(test)]
 mod tests {
     use crate::{Approach, Beside, Fault, Network, Order, Run, Shape, Workload, run};
+    use edgerush_ratelimit::service::pooled::Levers;
     use std::num::NonZeroU64;
 
     const SECOND: u64 = 1_000_000_000;
@@ -1106,6 +1133,94 @@ mod tests {
             // The worker it moved to finds the pod's entry itself: the process held up
             // holds up none of its requests.
             assert_eq!(waited[1], waited[0], "{seed}: waits with the process held");
+        }
+    }
+
+    /// Pooled visiting only the keys that need it each cycle keeps pooled's guarantees,
+    /// with the protocol's levers and with both off: bursts on every pod held to about one
+    /// bucket, nothing counted twice; a conforming client moving between a pod's workers
+    /// never refused, nothing lost; steady overload admitted as when every key is visited,
+    /// within 2%, with no more messages.
+    #[test]
+    fn a_scheduled_pooled_pod_keeps_pooleds_guarantees() {
+        let both_off = Levers {
+            poll_quiet: false,
+            ask_cold: false,
+        };
+        for levers in [Levers::default(), both_off] {
+            let pooled = |scheduled| Approach::PooledWith {
+                cycle: 10_000_000,
+                ask_timeout: 0,
+                workers: 8,
+                levers,
+                scheduled,
+            };
+            for seed in 0..3 {
+                let burst = run(&Run {
+                    pods: 32,
+                    approach: pooled(true),
+                    workload: burst_workload(),
+                    ..bursts(Fault::None, seed)
+                });
+                let visited = run(&Run {
+                    pods: 32,
+                    approach: pooled(false),
+                    workload: burst_workload(),
+                    ..bursts(Fault::None, seed)
+                });
+                assert!(
+                    burst.admitted <= visited.admitted + visited.admitted / 20,
+                    "{levers:?} {seed}: {} against {}",
+                    burst.admitted,
+                    visited.admitted
+                );
+                assert_eq!(burst.counted_twice, 0, "{levers:?} {seed}");
+                let moving = run(&Run {
+                    pods: 32,
+                    approach: pooled(true),
+                    workload: Workload {
+                        shape: Shape::Migrating {
+                            per_window: 100,
+                            last: 4,
+                            to: 8,
+                        },
+                        span: 6 * SECOND,
+                        conforming: true,
+                    },
+                    ..bursts(Fault::None, seed)
+                });
+                assert_eq!(moving.refused, 0, "{levers:?} {seed}");
+                assert_eq!(
+                    (moving.lost, moving.counted_twice),
+                    (0, 0),
+                    "{levers:?} {seed}"
+                );
+                let overload = |scheduled| {
+                    run(&Run {
+                        pods: 32,
+                        approach: pooled(scheduled),
+                        workload: Workload {
+                            shape: Shape::Spread { per_window: 300 },
+                            span: 6 * SECOND,
+                            conforming: false,
+                        },
+                        ..bursts(Fault::None, seed)
+                    })
+                };
+                let (scheduled, every) = (overload(true), overload(false));
+                assert!(
+                    scheduled.admitted.abs_diff(every.admitted) <= every.admitted / 50,
+                    "{levers:?} {seed}: {} against {}",
+                    scheduled.admitted,
+                    every.admitted
+                );
+                assert!(
+                    scheduled.messages <= every.messages,
+                    "{levers:?} {seed}: {} messages against {}",
+                    scheduled.messages,
+                    every.messages
+                );
+            }
         }
     }
 
