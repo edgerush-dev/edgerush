@@ -31,9 +31,9 @@ use super::{
 use portable_atomic::{AtomicU128, Ordering};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, fence};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, fence};
 use std::sync::{Arc, RwLock};
-use word::{Advance, Bucket, Fields};
+use word::{Advance, Bucket, Fields, Step};
 
 /// A worker's own decision of a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,6 +297,10 @@ pub struct Entry {
     /// What it shares with every key under its contract.
     terms: Arc<Terms>,
     word: AtomicU128,
+    /// The cycle the word was last advanced to, coarsely ([`word::record_of`]): written
+    /// after the compare-and-swap that advanced it, so never ahead of it, and read before
+    /// the word, so that a 16-bit cycle number that wrapped is told from one that did not.
+    record: AtomicU32,
     /// The first time the copy is no longer fresh: `heard + hold + 1`; 0 if never heard.
     warm_until: AtomicU64,
     flags: AtomicU8,
@@ -412,6 +416,7 @@ impl Entry {
             key,
             terms,
             word: AtomicU128::new(fields.pack()),
+            record: AtomicU32::new(word::record_of(now, cycle)),
             warm_until: AtomicU64::new(0),
             flags: AtomicU8::new(if owned { OWNED } else { 0 }),
             others: AtomicU64::new(0),
@@ -488,6 +493,7 @@ impl Entry {
             cycle: self.terms.cycle,
             refill: self.terms.refill,
             others: self.others.load(Ordering::Acquire),
+            record: self.record.load(Ordering::Acquire),
         }
     }
 
@@ -499,13 +505,19 @@ impl Entry {
         cycle: Cycle,
         mut change: impl FnMut(Fields) -> Option<Fields>,
     ) -> Option<Fields> {
+        // The record read before the word, so that it is no later than the word's cycle.
         let advance = self.advance();
         let mut current = self.word.load(Ordering::Acquire);
         loop {
             let before = Fields::unpack(current);
-            let fields = match cycle {
-                Cycle::Advance => word::advanced(&self.terms.bucket, before, advance, now),
-                Cycle::AsItIs => before,
+            // Whether this advances the cycle: by the step, not by the 16-bit number, which
+            // a gap of a multiple of its range leaves as it was.
+            let moved = cycle == Cycle::Advance
+                && word::step(before.cycle, advance.record, now, advance.cycle) != Step::Same;
+            let fields = if moved {
+                word::advanced(&self.terms.bucket, before, advance, now)
+            } else {
+                before
             };
             let changed = change(fields)?;
             match self.word.compare_exchange_weak(
@@ -514,7 +526,14 @@ impl Entry {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(changed),
+                Ok(_) => {
+                    let record = word::record_of(now, advance.cycle);
+                    // Changed once every few hundred cycles: read first, written then.
+                    if moved && self.record.load(Ordering::Relaxed) < record {
+                        self.record.fetch_max(record, Ordering::AcqRel);
+                    }
+                    return Some(changed);
+                }
                 Err(seen) => {
                     if seen != current {
                         self.retries.fetch_add(1, Ordering::Relaxed);

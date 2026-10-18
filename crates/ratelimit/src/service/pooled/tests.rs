@@ -1190,13 +1190,47 @@ fn quiet_keys_are_polled_only_when_asked_to_be() {
     }
 }
 
-/// The cycle number is kept modulo 2^16: a key untouched by any worker for exactly that many
-/// cycles would look as if its cycle had not changed, and keep a spent allowance. The
-/// transport advances every key it holds each cycle, so while it runs — held up for less
-/// than 2^16 cycles, 655 s at 10 ms — the number never wraps unseen. Without it, the hazard
-/// the bound rules out.
+/// A request whose clock read a moment before another's, and whose compare-and-swap comes
+/// after, finds the cycle the other advanced the key to: it does not move it back, and gets
+/// no allowance from doing so, nor does the next request from moving it on again.
 #[test]
-fn the_transport_keeps_the_cycle_number_from_wrapping_unseen() {
+fn an_earlier_clock_does_not_move_a_cycle_back() {
+    // No pods: the key decided here, nothing asked.
+    let view = View {
+        epoch: 1,
+        pods: Vec::new(),
+    };
+    let mut participant = Participant::new(7, CYCLE, view, FixedState::default()).unwrap();
+    let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
+    participant.ensure(key, c, 0);
+    let entry = participant.entries(&[(key, c)]).remove(0);
+    // Nine others: a share of one a cycle.
+    entry.others.store(9, Ordering::Release);
+    let at = 5 * CYCLE;
+    assert_eq!(decide(&[&entry], at).local, Local::Admit);
+    assert_eq!(
+        decide(&[&entry], at).local,
+        Local::Refuse,
+        "the share spent"
+    );
+    assert_eq!(
+        decide(&[&entry], at - 1).local,
+        Local::Refuse,
+        "a clock behind"
+    );
+    assert_eq!(
+        decide(&[&entry], at).local,
+        Local::Refuse,
+        "and the cycle as it was"
+    );
+}
+
+/// The cycle number is kept modulo 2^16: a key untouched for exactly that many cycles has
+/// the number it had. Its record tells the gap, so it gets a new cycle's share, whether the
+/// transport advanced it every cycle or nothing did — the process paused, or the key off
+/// the transport's schedule.
+#[test]
+fn a_key_untouched_for_the_cycle_numbers_range_gets_a_new_share() {
     let wrap = (1u64 << 16) * CYCLE;
     for transport in [true, false] {
         let mut participant = Participant::new(
@@ -1225,16 +1259,16 @@ fn the_transport_keeps_the_cycle_number_from_wrapping_unseen() {
                 participant.on_cycle(cycle * CYCLE);
             }
         }
-        let decided = decide(&[&entry], wrap + CYCLE).local;
-        if transport {
-            assert_eq!(decided, Local::Admit, "a new cycle's share");
-        } else {
-            assert_eq!(
-                decided,
-                Local::Refuse,
-                "the wrapped number looks like the same cycle"
-            );
-        }
+        let admitted = (0..10)
+            .take_while(|_| decide(&[&entry], wrap + CYCLE).local == Local::Admit)
+            .count();
+        // A share of one; advanced every cycle, one more carried from the cycle before,
+        // which left its place unspent.
+        assert_eq!(
+            admitted,
+            if transport { 2 } else { 1 },
+            "transport {transport}"
+        );
     }
 }
 
