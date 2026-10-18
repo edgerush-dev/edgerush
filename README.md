@@ -5,8 +5,9 @@ planes in one binary; Ingress and Gateway API served from the same data plane; c
 rate limiting with no external store.
 
 **Status: the data plane runs; Kubernetes does not yet.** The proxy serves traffic from a
-YAML file, the development harness; the control plane, the operator and the rate limiter
-are still to be built. Not for production. A hobby project with no timelines.
+YAML file, the development harness; rate limiting runs, experimentally; the control plane
+and the operator are still to be built. Not for production. A hobby project with no
+timelines.
 
 ## What it is for
 
@@ -42,10 +43,17 @@ without dropping a request.
   every upstream; a drain on SIGTERM; Prometheus metrics; access logs, a line of JSON for
   each request, WebSocket and passthrough connection, to stdout or a file reopened on
   SIGUSR1.
+- **Rate limiting, experimental:** token-bucket limits on route rules, keyed by the
+  client's address, a request under several decided under all of them at once, and dry
+  runs that count without refusing; shared across pods through the rate-limiting service
+  (`edgerush-ratelimit-service`), whose pods own the keys. Each proxy process is one
+  participant of it: its workers decide from per-key state they share by compare-and-swap,
+  and a thread of its own reports to the service. A refusal is a 429 with `Retry-After` and
+  the `RateLimit` field.
 
 Not yet: anything Kubernetes (the control plane, the operator, translating Ingress and
-Gateway API), rate limiting, authentication. The request path comes first, then rate
-limiting, then the control plane and the operator.
+Gateway API), authentication. The request path comes first, then rate limiting, then the
+control plane and the operator.
 
 ## Trying it
 
@@ -189,7 +197,8 @@ crates/filters     built-in filters (`edgerush-filters`): pure, on plain `http` 
 crates/ratelimit   rate limiting (`edgerush-ratelimit`): pure, no I/O; the admission models as
                    reference implementations behind one interface, an example that runs the same
                    clients through each (`cargo run -p edgerush-ratelimit --example timelines`),
-                   and the rate-limiting service's protocol as two state machines
+                   the rate-limiting service's protocol as two state machines, and a
+                   process's one participant of it, its workers sharing each key's state
 crates/ratelimit-sim
                    the rate-limit simulator (`edgerush-ratelimit-sim`): ways of limiting one key
                    across pods run against the contract, deterministic, no I/O; side by side
