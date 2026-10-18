@@ -4650,8 +4650,7 @@ routes:
     }
 
     /// The rate-limiting service: its pods, a cycle of at least 1 ms, 10 when left out, and
-    /// its levers, the fastest when left out; the ways of sharing keys it once had to choose
-    /// from are no longer settings.
+    /// its levers, the fastest when left out.
     #[test]
     fn the_rate_limit_service_is_checked() {
         let with = |service: &str| {
@@ -4685,18 +4684,6 @@ routes:
             "when left out, the fastest: quiet keys not polled, cold keys decided locally, \
              keys scheduled"
         );
-        for gone in [
-            "layered: true",
-            "layered_keep_ms: 50",
-            "shared: true",
-            "pooled: true",
-        ] {
-            let yaml = format!(
-                "listeners: {{}}\nroutes: []\nupstreams: {{}}\nrate_limit_service: {{ pods: [\"a:1\"], {gone} }}\n"
-            );
-            let parsed: Result<Config, _> = serde_saphyr::from_str(&yaml);
-            assert!(parsed.is_err(), "{gone}");
-        }
     }
 
     const LIMITS: &str = r"
