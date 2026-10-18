@@ -563,6 +563,12 @@ rl_config() { # sharing
     pooled-nopoll) sharing=", pooled: true, poll_quiet_keys: false" ;;
     pooled-local) sharing=", pooled: true, ask_cold_keys: false" ;;
     pooled-both) sharing=", pooled: true, poll_quiet_keys: false, ask_cold_keys: false" ;;
+    # The same, each cycle visiting only the keys that need it.
+    pooled-sched) sharing=", pooled: true, schedule_keys: true" ;;
+    pooled-local-sched) sharing=", pooled: true, ask_cold_keys: false, schedule_keys: true" ;;
+    pooled-both-sched)
+        sharing=", pooled: true, poll_quiet_keys: false, ask_cold_keys: false, schedule_keys: true"
+        ;;
     *) echo "no sharing $1" >&2; exit 2 ;;
     esac
     cat >"$run-limits.yaml" <<LIMITS
