@@ -14,6 +14,9 @@ portable-atomic.workspace = true
 iai-callgrind.workspace = true
 proptest.workspace = true
 
+[target.'cfg(loom)'.dev-dependencies]
+loom.workspace = true
+
 [[bench]]
 name = "decide"
 harness = false

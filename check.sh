@@ -60,6 +60,14 @@ say "vendored quiche's own tests"
 cargo test --manifest-path vendor/quiche/Cargo.toml --no-default-features \
     --features boringssl-boring-crate --lib --target-dir "${CARGO_TARGET_DIR:-target}/vendored"
 
+say "loom"
+# The pooled entries' concurrency under `--cfg loom`, every interleaving of their threads
+# (crates/ratelimit/src/service/pooled/loom_tests.rs): the tests above run them only as the
+# scheduler happens to. Optimised, as loom's search is slow unoptimised, and in a target
+# directory of their own, as the flag rebuilds every crate.
+RUSTFLAGS="${RUSTFLAGS:-} --cfg loom" cargo test --release -p edgerush-ratelimit --lib \
+    --target-dir "${CARGO_TARGET_DIR:-target}/loom" loom
+
 say "docs"
 # Rustdoc's warnings are not failures by default, and a stale link is exactly the kind of
 # thing nobody reads a log to find.

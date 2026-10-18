@@ -1,5 +1,8 @@
 //! Tests of the pooled participant: against `DataPlane` as the semantic reference for one
-//! participant, the races between workers, and between workers and the transport.
+//! participant, the races between workers, and between workers and the transport. Not
+//! under loom, whose atomics work only inside its model (`loom_tests`).
+
+#![cfg(not(loom))]
 
 use super::*;
 use crate::service::{Answer, DataPlane, FixedState, ServicePod};

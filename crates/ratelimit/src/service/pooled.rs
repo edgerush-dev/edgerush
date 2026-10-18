@@ -17,8 +17,11 @@
 //!
 //! No I/O: the time is passed in; the transport's messages are the caller's to carry.
 
+mod sync;
 mod word;
 
+#[cfg(test)]
+mod loom_tests;
 #[cfg(test)]
 mod tests;
 
@@ -28,12 +31,11 @@ use super::{
     Answers, Ask, Batch, Contract, Decided, Entry as BatchEntry, PlaneId, PodId,
     RESEND_AFTER_CYCLES, Report, Ticket, View, group_name, longest,
 };
-use portable_atomic::{AtomicU128, Ordering};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, fence};
 use std::sync::{Arc, RwLock};
+use sync::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicU128, Ordering, fence};
 use word::{Advance, Bucket, Fields, Step};
 
 /// A worker's own decision of a request.
@@ -456,8 +458,7 @@ impl Entry {
     /// [`Participant::take_wake`]). Called before the request is decided again, so that no
     /// wake-up falls between the two.
     pub fn add_waiter(&self) {
-        self.waiters.fetch_add(1, Ordering::SeqCst);
-        fence(Ordering::SeqCst);
+        wait_on(&self.waiters);
     }
 
     /// A deferred request waits on it no longer.
@@ -468,8 +469,7 @@ impl Entry {
     /// Whether a change just made to the word is one deferred requests wait for. The fence
     /// pairs with `add_waiter`'s: either the waiter sees the change, or this sees it.
     fn wanted(&self) -> bool {
-        fence(Ordering::SeqCst);
-        self.waiters.load(Ordering::Relaxed) > 0
+        waited_on(&self.waiters)
     }
 
     /// Its key.
@@ -708,6 +708,22 @@ impl Entry {
             self.flags.fetch_and(!flag, Ordering::AcqRel);
         }
     }
+}
+
+/// One more request waits on what `waiters` counts: the count raised, then a fence, before
+/// the request looks at the word again — so that a change to the word made after the look
+/// sees the count ([`waited_on`]). The word's own accesses are acquire and release, too
+/// weak alone for this: each side writes one location and then reads the other's.
+fn wait_on(waiters: &AtomicU64) {
+    waiters.fetch_add(1, Ordering::SeqCst);
+    fence(Ordering::SeqCst);
+}
+
+/// Whether a change just made to the word is one requests wait on: a fence, then the count
+/// read, pairing with [`wait_on`]'s, so that the waiter sees the change or this sees it.
+fn waited_on(waiters: &AtomicU64) -> bool {
+    fence(Ordering::SeqCst);
+    waiters.load(Ordering::Relaxed) > 0
 }
 
 /// A worker deciding a request under `entries` at `now`, all or none: admitted with one
