@@ -166,6 +166,8 @@ impl Eq for Handle {}
 /// choosing keys to crowd a shard slows only those misses.
 pub struct Registry {
     shards: Vec<Shard>,
+    /// What keys share, by contract: read when an entry is made.
+    terms: RwLock<HashMap<Contract, Arc<Terms>>>,
 }
 
 impl Default for Registry {
@@ -178,6 +180,7 @@ impl Registry {
     fn new() -> Self {
         Self {
             shards: (0..SHARDS).map(|_| RwLock::new(HashSet::new())).collect(),
+            terms: RwLock::new(HashMap::new()),
         }
     }
 
@@ -196,7 +199,7 @@ impl Registry {
         shard
             .get(key)
             .map(Handle::entry)
-            .filter(|entry| entry.contract == contract && !entry.snapshot().closed)
+            .filter(|entry| entry.terms.contract == contract && !entry.snapshot().closed)
             .cloned()
     }
 
@@ -222,12 +225,38 @@ impl Registry {
         if let Some(held) = shard.get(key).map(Handle::entry)
             && !held.snapshot().closed
         {
-            return (held.contract == contract).then(|| (Arc::clone(held), false));
+            return (held.terms.contract == contract).then(|| (Arc::clone(held), false));
         }
-        let entry = Arc::new(Entry::new(key.into(), contract, cycle, false, now));
+        let entry = Arc::new(Entry::with_terms(
+            key.into(),
+            self.terms(contract, cycle),
+            false,
+            now,
+        ));
         entry.set_flag(LOCAL, true);
         shard.replace(Handle(Arc::clone(&entry)));
         Some((entry, true))
+    }
+
+    /// What keys under `contract` share, at `cycle`: made the first time it is asked for.
+    fn terms(&self, contract: Contract, cycle: u64) -> Arc<Terms> {
+        let terms = self
+            .terms
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&contract)
+            .cloned();
+        terms.unwrap_or_else(|| {
+            let mut terms = self
+                .terms
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Arc::clone(
+                terms
+                    .entry(contract)
+                    .or_insert_with(|| Arc::new(Terms::new(contract, cycle))),
+            )
+        })
     }
 
     fn insert(&self, entry: Arc<Entry>) {
@@ -265,13 +294,8 @@ pub fn supported() -> bool {
 /// new entry, made only once the old one is closed.
 pub struct Entry {
     key: Box<[u8]>,
-    contract: Contract,
-    bucket: Bucket,
-    /// The contract's refill time: how long a copy stays fresh after an answer.
-    hold: u64,
-    /// The protocol's cycle, and what the contract refills in one.
-    cycle: u64,
-    refill: u64,
+    /// What it shares with every key under its contract.
+    terms: Arc<Terms>,
     word: AtomicU128,
     /// The first time the copy is no longer fresh: `heard + hold + 1`; 0 if never heard.
     warm_until: AtomicU64,
@@ -288,6 +312,32 @@ pub struct Entry {
     waiters: AtomicU64,
     /// Its count passed half its most and the transport was told to drain it.
     pressed: AtomicBool,
+}
+
+/// What every key under one contract shares, made once a contract and pointed to by each
+/// key's entry rather than copied into it: the contract, its bucket's constants, its refill
+/// time, and the cycle and what the contract refills in one.
+#[derive(Debug)]
+struct Terms {
+    contract: Contract,
+    bucket: Bucket,
+    /// The contract's refill time: how long a copy stays fresh after an answer.
+    hold: u64,
+    /// The protocol's cycle, and what the contract refills in one.
+    cycle: u64,
+    refill: u64,
+}
+
+impl Terms {
+    fn new(contract: Contract, cycle: u64) -> Self {
+        Self {
+            contract,
+            bucket: Bucket::new(contract),
+            hold: contract.refill_time(),
+            cycle,
+            refill: contract.refilled(cycle),
+        }
+    }
 }
 
 impl std::fmt::Debug for Entry {
@@ -338,10 +388,16 @@ enum Cycle {
 }
 
 impl Entry {
+    /// An entry with terms of its own, for tests of one key.
+    #[cfg(test)]
     fn new(key: Box<[u8]>, contract: Contract, cycle: u64, owned: bool, now: u64) -> Self {
-        let bucket = Bucket::new(contract);
+        Self::with_terms(key, Arc::new(Terms::new(contract, cycle)), owned, now)
+    }
+
+    fn with_terms(key: Box<[u8]>, terms: Arc<Terms>, owned: bool, now: u64) -> Self {
+        let cycle = terms.cycle;
         let fields = Fields {
-            arrival: bucket.units(now),
+            arrival: terms.bucket.units(now),
             // No share bound until a cycle sets one, as a new `DataPlane` key has none.
             left: word::MOST_LEFT,
             spent: 0,
@@ -354,11 +410,7 @@ impl Entry {
         };
         Self {
             key,
-            contract,
-            bucket,
-            hold: contract.refill_time(),
-            cycle,
-            refill: contract.refilled(cycle),
+            terms,
             word: AtomicU128::new(fields.pack()),
             warm_until: AtomicU64::new(0),
             flags: AtomicU8::new(if owned { OWNED } else { 0 }),
@@ -401,7 +453,7 @@ impl Entry {
     /// Its contract.
     #[must_use]
     pub fn contract(&self) -> Contract {
-        self.contract
+        self.terms.contract
     }
 
     /// Whether it is closed: evicted or replaced, never to decide again, a worker holding
@@ -433,8 +485,8 @@ impl Entry {
 
     fn advance(&self) -> Advance {
         Advance {
-            cycle: self.cycle,
-            refill: self.refill,
+            cycle: self.terms.cycle,
+            refill: self.terms.refill,
             others: self.others.load(Ordering::Acquire),
         }
     }
@@ -452,7 +504,7 @@ impl Entry {
         loop {
             let before = Fields::unpack(current);
             let fields = match cycle {
-                Cycle::Advance => word::advanced(&self.bucket, before, advance, now),
+                Cycle::Advance => word::advanced(&self.terms.bucket, before, advance, now),
                 Cycle::AsItIs => before,
             };
             let changed = change(fields)?;
@@ -482,7 +534,7 @@ impl Entry {
     /// Taking does not count as the key's use: a request's arrival does, which the
     /// transport's own takes, settling what waited, are not ([`decide`] marks it).
     fn take_in(&self, op: Op, now: u64, cycle: Cycle) -> Taken {
-        let units = self.bucket.units(now);
+        let units = self.terms.bucket.units(now);
         let mut why = Taken::Refused;
         let taken = self.update(now, cycle, |fields| {
             why = if fields.closed {
@@ -492,7 +544,7 @@ impl Entry {
             {
                 // Out of places to count it, which says nothing of the client's room.
                 Taken::Full
-            } else if fields.left == 0 || !self.bucket.admits(fields.arrival, units) {
+            } else if fields.left == 0 || !self.terms.bucket.admits(fields.arrival, units) {
                 if fields.held > 0 {
                     Taken::Contended
                 } else {
@@ -574,15 +626,15 @@ impl Entry {
     #[must_use]
     pub fn wait(&self, now: u64) -> Option<u64> {
         let fields = word::advanced(
-            &self.bucket,
+            &self.terms.bucket,
             Fields::unpack(self.word.load(Ordering::Acquire)),
             self.advance(),
             now,
         );
-        let units = self.bucket.units(now);
-        match self.bucket.wait(fields.arrival, units) {
+        let units = self.terms.bucket.units(now);
+        match self.terms.bucket.wait(fields.arrival, units) {
             Some(wait) => Some(wait),
-            None if fields.left == 0 => Some(self.cycle),
+            None if fields.left == 0 => Some(self.terms.cycle),
             None => None,
         }
     }
@@ -691,7 +743,7 @@ impl Tracked {
         entry.set_flag(UNREACHABLE, self.unreachable);
         entry.set_flag(ASKING, self.asking > 0);
         let until = self.heard.map_or(0, |heard| {
-            heard.saturating_add(entry.hold).saturating_add(1)
+            heard.saturating_add(entry.terms.hold).saturating_add(1)
         });
         entry.warm_until.store(until, Ordering::Release);
     }
@@ -703,8 +755,12 @@ impl Tracked {
     /// What it would admit as one request now, from the word, the cycle advanced if due.
     fn room(&self, now: u64) -> bool {
         let entry = &self.entry;
-        let fields = word::advanced(&entry.bucket, entry.snapshot(), entry.advance(), now);
-        fields.left > 0 && entry.bucket.admits(fields.arrival, entry.bucket.units(now))
+        let fields = word::advanced(&entry.terms.bucket, entry.snapshot(), entry.advance(), now);
+        fields.left > 0
+            && entry
+                .terms
+                .bucket
+                .admits(fields.arrival, entry.terms.bucket.units(now))
     }
 
     fn idle(&self, now: u64) -> bool {
@@ -715,7 +771,7 @@ impl Tracked {
             && fields.held == 0
             && self.asking == 0
             && self.unacknowledged.is_empty()
-            && now.saturating_sub(last) > 2 * self.entry.hold
+            && now.saturating_sub(last) > 2 * self.entry.terms.hold
     }
 }
 
@@ -893,7 +949,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
         keys.iter()
             .filter_map(|(key, contract)| {
                 let tracked = self.keys.get(*key)?;
-                (tracked.entry.contract == *contract).then(|| Arc::clone(&tracked.entry))
+                (tracked.entry.terms.contract == *contract).then(|| Arc::clone(&tracked.entry))
             })
             .collect()
     }
@@ -902,7 +958,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
     /// changed, starts afresh; the old entry, if any, is closed first.
     fn ensure(&mut self, key: &[u8], contract: Contract, now: u64) {
         if self.keys.get(key).is_some_and(|tracked| {
-            tracked.entry.contract == contract && !tracked.entry.snapshot().closed
+            tracked.entry.terms.contract == contract && !tracked.entry.snapshot().closed
         }) {
             return;
         }
@@ -920,10 +976,9 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 .map(|(entry, _)| entry)
         };
         let entry = made.unwrap_or_else(|| {
-            Arc::new(Entry::new(
+            Arc::new(Entry::with_terms(
                 key.into(),
-                contract,
-                self.cycle,
+                self.registry.terms(contract, self.cycle),
                 self.view.owners(key).0.is_some(),
                 now,
             ))
@@ -1310,7 +1365,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
         let poll_quiet = self.levers.poll_quiet;
         for (key, tracked) in &mut self.keys {
             let entry = &tracked.entry;
-            let hold = entry.hold;
+            let hold = entry.terms.hold;
             // The cycle advanced here if no worker has, so that it is set every cycle, and
             // what was admitted drained into the ledger in the same step — every key's,
             // with an owner to send it to or not, so that no count fills.
@@ -1339,7 +1394,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                     *last = now;
                     entries.push(BatchEntry {
                         key: key.clone(),
-                        contract: entry.contract,
+                        contract: entry.terms.contract,
                         report: Report::Hits {
                             sequence: *sequence,
                             count: *count,
@@ -1355,7 +1410,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 tracked.sent += 1;
                 entries.push(BatchEntry {
                     key: key.clone(),
-                    contract: entry.contract,
+                    contract: entry.terms.contract,
                     report: Report::Hits {
                         sequence: tracked.sent,
                         count: unsent,
@@ -1372,7 +1427,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             if !reported && in_use && poll_quiet {
                 entries.push(BatchEntry {
                     key: key.clone(),
-                    contract: entry.contract,
+                    contract: entry.terms.contract,
                     report: Report::Poll,
                 });
             }
@@ -1466,11 +1521,11 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 .sum();
             let unsent = tracked.unsent;
             let entry = &tracked.entry;
-            let units = entry.bucket.units(now);
+            let units = entry.terms.bucket.units(now);
             entry.update(now, Cycle::Advance, |fields| {
                 let extra = unseen + unsent + fields.unreported + fields.held;
                 Some(Fields {
-                    arrival: entry.bucket.rebased(units, answer.behind, extra),
+                    arrival: entry.terms.bucket.rebased(units, answer.behind, extra),
                     ..fields
                 })
             });
@@ -1499,7 +1554,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                         let tracked = self.keys.get(key)?;
                         let wait = match untaken.iter().find(|(untaken, _)| untaken == key) {
                             Some((_, behind)) => {
-                                let bucket = &tracked.entry.bucket;
+                                let bucket = &tracked.entry.terms.bucket;
                                 let units = bucket.units(now);
                                 bucket.wait(bucket.rebased(units, *behind, 0), units)
                             }
@@ -1587,7 +1642,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 *last = now;
                 entries.push(BatchEntry {
                     key: key.clone(),
-                    contract: tracked.entry.contract,
+                    contract: tracked.entry.terms.contract,
                     report: Report::Hits {
                         sequence: *sequence,
                         count: *count,
@@ -1623,7 +1678,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 let tracked = self
                     .keys
                     .get(*key)
-                    .filter(|t| t.entry.contract == *contract)?;
+                    .filter(|t| t.entry.terms.contract == *contract)?;
                 Some((at, tracked.entry.wait(now)?))
             })
     }

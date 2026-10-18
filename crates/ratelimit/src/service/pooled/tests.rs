@@ -618,7 +618,13 @@ fn set_most_reserved(participant: &mut Participant<FixedState>, key: &[u8], most
         None => {
             // Shared with the registry: made again with the most set, and registered.
             let old = &tracked.entry;
-            let mut fresh = Entry::new(old.key.clone(), old.contract, old.cycle, true, 0);
+            let mut fresh = Entry::new(
+                old.key.clone(),
+                old.terms.contract,
+                old.terms.cycle,
+                true,
+                0,
+            );
             fresh.most_reserved = most;
             participant.registry.remove(&tracked.entry);
             tracked.entry = Arc::new(fresh);
@@ -691,7 +697,12 @@ fn a_refused_hold_gives_back_to_a_cycle_only_what_it_spent() {
     assert_eq!((after.left, after.spent), (spent.left + 1, 0));
     // Held in one cycle, refused in the next, which has spent nothing: nothing given to it.
     assert!(entry.take(Op::Hold, 4 * CYCLE).done());
-    let fresh = word::advanced(&entry.bucket, entry.snapshot(), entry.advance(), 5 * CYCLE);
+    let fresh = word::advanced(
+        &entry.terms.bucket,
+        entry.snapshot(),
+        entry.advance(),
+        5 * CYCLE,
+    );
     entry.settle(false, 5 * CYCLE);
     let after = entry.snapshot();
     assert_eq!(
@@ -785,7 +796,7 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
         },
         0,
     );
-    let bucket = entry.bucket;
+    let bucket = entry.terms.bucket;
     assert_eq!(
         bucket.remaining(entry.snapshot().arrival, bucket.units(0)),
         100 - 6,
@@ -876,14 +887,15 @@ fn a_stalled_transport_leaves_workers_advancing_cycles_with_one_refill() {
     // Five cycles later: one advance, sharing out what the bucket refilled (capped at the
     // bucket) and one cycle's refill, among two — not five refills.
     let now = 5 * CYCLE;
-    let fields = word::advanced(&entry.bucket, entry.snapshot(), entry.advance(), now);
+    let fields = word::advanced(&entry.terms.bucket, entry.snapshot(), entry.advance(), now);
     let remaining = entry
+        .terms
         .bucket
-        .remaining(fields.arrival, entry.bucket.units(now));
+        .remaining(fields.arrival, entry.terms.bucket.units(now));
     // No cycle had set an allowance before: nothing is carried.
     assert_eq!(
         fields.left,
-        ((remaining + entry.refill) / 2).max(1),
+        ((remaining + entry.terms.refill) / 2).max(1),
         "one share of what is left, one cycle's refill"
     );
     let admitted = (0..100)
@@ -1226,6 +1238,22 @@ fn the_transport_keeps_the_cycle_number_from_wrapping_unseen() {
     }
 }
 
+/// What keys under one contract share is made once and pointed to, not copied into each
+/// key's entry: an entry is its key, a pointer, its word and its counts.
+#[test]
+fn keys_under_one_contract_share_their_terms() {
+    let registry = Registry::new();
+    let c = contract(100, 10);
+    let (a, _) = registry.find_or_make(b"a", c, CYCLE, 0).unwrap();
+    let (b, _) = registry.find_or_make(b"b", c, CYCLE, 0).unwrap();
+    assert!(Arc::ptr_eq(&a.terms, &b.terms));
+    let (other, _) = registry
+        .find_or_make(b"c", contract(100, 11), CYCLE, 0)
+        .unwrap();
+    assert!(!Arc::ptr_eq(&a.terms, &other.terms));
+    assert!(size_of::<Entry>() <= 128, "{}", size_of::<Entry>());
+}
+
 #[test]
 fn the_platform_has_native_128_bit_atomics() {
     assert!(supported(), "the participant would not start here");
@@ -1287,10 +1315,11 @@ fn replay(schedule: &[(Event, u64)]) {
                 let got = pooled.participant.keys.get(*key).map(|tracked| {
                     let entry = &tracked.entry;
                     let fields =
-                        word::advanced(&entry.bucket, entry.snapshot(), entry.advance(), now);
+                        word::advanced(&entry.terms.bucket, entry.snapshot(), entry.advance(), now);
                     let left = entry
+                        .terms
                         .bucket
-                        .remaining(fields.arrival, entry.bucket.units(now));
+                        .remaining(fields.arrival, entry.terms.bucket.units(now));
                     (
                         fields.left,
                         left,
