@@ -2,7 +2,7 @@
 //! participant, the races between workers, and between workers and the transport.
 
 use super::*;
-use crate::service::{DataPlane, FixedState, ServicePod};
+use crate::service::{Answer, DataPlane, FixedState, ServicePod};
 use proptest::prelude::*;
 use std::num::NonZeroU64;
 
@@ -50,6 +50,14 @@ impl Pooled {
             handles: HashMap::new(),
             pending: Vec::new(),
         }
+    }
+
+    /// Its participant visiting only the keys that need it, its workers' signals handed to
+    /// it as they decide.
+    fn scheduled() -> Self {
+        let mut pooled = Self::new();
+        pooled.participant.set_scheduled(true);
+        pooled
     }
 
     /// What it has to send, answered by the pod and held back.
@@ -102,6 +110,12 @@ impl Pooled {
         if let Some(held) = held {
             let entries: Vec<&Entry> = held.iter().map(|entry| &**entry).collect();
             let outcome = decide(&entries, now);
+            let signalled = held
+                .iter()
+                .enumerate()
+                .filter(|(at, _)| outcome.signal & (1 << at) != 0)
+                .map(|(_, entry)| Arc::clone(entry));
+            self.participant.on_signals(signalled);
             if outcome.drain {
                 for (key, _) in keys {
                     self.participant.drain(key, now);
@@ -282,6 +296,128 @@ proptest! {
         prop_assert!(comparison.aside.is_empty(), "never decided: {:?}", comparison.aside);
         for (key, _) in keys {
             prop_assert_eq!(comparison.pooled.pod.counted(key), comparison.reference.pod.counted(key));
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|n| n.parse().ok()).unwrap_or(2_048)
+    ))]
+
+    /// No admission goes uncounted, whether the participant visits every key each cycle or
+    /// only those that need it, quiet keys polled or not, one exchange in flight or more:
+    /// over a schedule of requests, cycles and answers — late, out
+    /// of order, twice — and then everything delivered and settled, each key's count at its
+    /// owner is what was admitted under it, with cold keys decided locally. With them asked
+    /// about, at least that: the pod counts an ask sent again twice where another ask about
+    /// the key came between (the service pod's one-ask memory; results note), which neither
+    /// mode causes. Buckets refilling over longer than a schedule, so that no key is idle
+    /// long enough to evict: a key evicted and made again starts its reports afresh, which
+    /// a pod that never forgot the key, as this one never does, takes for ones it applied.
+    #[test]
+    fn no_admission_goes_uncounted_scheduled_or_not(
+        events in prop::collection::vec((event(), 0u64..4), 1..300),
+        ask_cold: bool,
+        poll_quiet: bool,
+        one_in_flight: bool,
+    ) {
+        let keys: [(&[u8], Contract); 3] = [
+            (b"a", contract(100, 80)),
+            (b"b", contract(10, 70)),
+            (b"c", contract(1_000, 100)),
+        ];
+        for scheduled in [false, true] {
+            let mut pooled = if scheduled { Pooled::scheduled() } else { Pooled::new() };
+            pooled.participant.set_levers(Levers {
+                ask_cold,
+                poll_quiet,
+            });
+            pooled.participant.set_one_in_flight(one_in_flight);
+            let mut admitted = [0u64; 3];
+            let mut waiting: HashMap<Ticket, Vec<usize>> = HashMap::new();
+            let settle = |settled: Settled,
+                          admitted: &mut [u64; 3],
+                          waiting: &mut HashMap<Ticket, Vec<usize>>| {
+                for (ticket, ok) in settled.decided {
+                    let places = waiting.remove(&ticket).unwrap_or_default();
+                    if ok {
+                        for place in places {
+                            admitted[place] += 1;
+                        }
+                    }
+                }
+                for ticket in settled.retries {
+                    waiting.remove(&ticket);
+                }
+            };
+            let mut now = 0;
+            let mut next_cycle = CYCLE;
+            for (event, step) in &events {
+                now += step * 40_000 * 25;
+                while now >= next_cycle {
+                    pooled.participant.on_cycle(next_cycle);
+                    next_cycle += CYCLE;
+                }
+                let places = match event {
+                    Event::Request(key) => vec![*key],
+                    Event::Pair(first, second) => vec![*first, *second],
+                    Event::Cycle => continue,
+                    Event::Exchange => {
+                        settle(pooled.exchange(now), &mut admitted, &mut waiting);
+                        continue;
+                    }
+                    Event::Send => {
+                        pooled.send(now);
+                        continue;
+                    }
+                    Event::Deliver(index, twice) => {
+                        settle(pooled.deliver(*index, *twice, now), &mut admitted, &mut waiting);
+                        continue;
+                    }
+                };
+                let request: Vec<(&[u8], Contract)> =
+                    places.iter().map(|place| keys[*place]).collect();
+                match pooled.decide(&request, now) {
+                    Decision::Admit => {
+                        for place in &places {
+                            admitted[*place] += 1;
+                        }
+                    }
+                    Decision::Wait(ticket) => {
+                        waiting.insert(ticket, places);
+                    }
+                    Decision::Refuse | Decision::Defer => {}
+                }
+            }
+            for _ in 0..50 {
+                now = next_cycle;
+                pooled.participant.on_cycle(now);
+                next_cycle += CYCLE;
+                while !pooled.pending.is_empty() {
+                    settle(pooled.deliver(0, false, now), &mut admitted, &mut waiting);
+                }
+                settle(pooled.exchange(now), &mut admitted, &mut waiting);
+            }
+            prop_assert!(waiting.is_empty(), "never decided: {:?}", waiting);
+            for (place, (key, _)) in keys.iter().enumerate() {
+                let counted = pooled.pod.counted(key).unwrap_or(0);
+                if ask_cold {
+                    prop_assert!(
+                        counted >= admitted[place],
+                        "scheduled {}, key {}: {} counted of {}",
+                        scheduled, place, counted, admitted[place]
+                    );
+                } else {
+                    prop_assert_eq!(
+                        counted,
+                        admitted[place],
+                        "scheduled {}, key {}",
+                        scheduled,
+                        place
+                    );
+                }
+            }
         }
     }
 }
@@ -565,7 +701,7 @@ fn reports_racing_admissions_count_each_once() {
                     scope.spawn(move || {
                         let (mut admitted, mut full) = (0u64, 0u64);
                         while admitted < 20_000 {
-                            match entry.take(Op::Admit, 1) {
+                            match entry.take(Op::Admit, 1).0 {
                                 Taken::Done | Taken::Pressed => admitted += 1,
                                 Taken::Full => full += 1,
                                 // Time standing still, the bucket runs out: done.
@@ -640,22 +776,22 @@ fn a_full_count_defers_and_holds_still_settle() {
     let mut entry = Entry::new(b"k"[..].into(), contract(100, 100), CYCLE, false, 0);
     entry.most_reserved = 4;
     for _ in 0..2 {
-        assert!(entry.take(Op::Hold, 0).done());
+        assert!(entry.take(Op::Hold, 0).0.done());
     }
     for _ in 0..2 {
-        assert!(entry.take(Op::Admit, 0).done());
+        assert!(entry.take(Op::Admit, 0).0.done());
     }
-    assert_eq!(entry.take(Op::Admit, 0), Taken::Full);
+    assert_eq!(entry.take(Op::Admit, 0).0, Taken::Full);
     assert_eq!(decide(&[&entry], 0).local, Local::Defer);
     entry.settle(true, 0);
     entry.settle(false, 0);
     let fields = entry.snapshot();
     assert_eq!((fields.unreported, fields.held), (3, 0));
     assert!(
-        entry.take(Op::Admit, 0).done(),
+        entry.take(Op::Admit, 0).0.done(),
         "the given-back place free again"
     );
-    assert_eq!(entry.take(Op::Admit, 0), Taken::Full);
+    assert_eq!(entry.take(Op::Admit, 0).0, Taken::Full);
     let (drained, _) = entry.drain(0, Cycle::AsItIs);
     assert_eq!(drained, 4);
     assert_eq!(decide(&[&entry], 0).local, Local::Admit);
@@ -681,22 +817,22 @@ fn a_key_asks_for_a_drain_once_at_half_its_count() {
 fn a_refused_hold_gives_back_to_a_cycle_only_what_it_spent() {
     let entry = Entry::new(b"k"[..].into(), contract(1_000, 1_000), CYCLE, false, 0);
     // Its own cycle: held, refused, all back.
-    assert!(entry.take(Op::Hold, CYCLE).done());
+    assert!(entry.take(Op::Hold, CYCLE).0.done());
     let held = entry.snapshot();
     entry.settle(false, CYCLE);
     let back = entry.snapshot();
     assert_eq!((back.left, back.spent), (held.left + 1, held.spent - 1));
     // Held in one cycle; the next advanced by another worker's admission, which spends one;
     // the hold refused after: the new cycle gets its one back.
-    assert!(entry.take(Op::Hold, 2 * CYCLE).done());
-    assert!(entry.take(Op::Admit, 3 * CYCLE).done());
+    assert!(entry.take(Op::Hold, 2 * CYCLE).0.done());
+    assert!(entry.take(Op::Admit, 3 * CYCLE).0.done());
     let spent = entry.snapshot();
     assert_eq!(spent.spent, 1);
     entry.settle(false, 3 * CYCLE);
     let after = entry.snapshot();
     assert_eq!((after.left, after.spent), (spent.left + 1, 0));
     // Held in one cycle, refused in the next, which has spent nothing: nothing given to it.
-    assert!(entry.take(Op::Hold, 4 * CYCLE).done());
+    assert!(entry.take(Op::Hold, 4 * CYCLE).0.done());
     let fresh = word::advanced(
         &entry.terms.bucket,
         entry.snapshot(),
@@ -718,16 +854,16 @@ fn a_refused_hold_gives_back_to_a_cycle_only_what_it_spent() {
 #[test]
 fn a_request_short_only_by_anothers_hold_waits_for_it() {
     let x = Entry::new(b"x"[..].into(), contract(100, 1), CYCLE, false, 0);
-    assert!(x.take(Op::Hold, 0).done(), "A holds X's last token");
+    assert!(x.take(Op::Hold, 0).0.done(), "A holds X's last token");
     let b = decide(&[&x], 0);
     assert_eq!(b.local, Local::Defer, "B is not refused");
     x.add_waiter();
-    assert!(x.settle(false, 0), "A gives X back, and B is to be woken");
+    assert!(x.settle(false, 0).0, "A gives X back, and B is to be woken");
     assert_eq!(decide(&[&x], 0).local, Local::Admit, "B, again");
     x.remove_waiter();
     // With nothing held, no room is a refusal.
     assert_eq!(decide(&[&x], 0).local, Local::Refuse);
-    assert!(!x.settle(true, 0) || x.snapshot().held == 0);
+    assert!(!x.settle(true, 0).0 || x.snapshot().held == 0);
 }
 
 /// A key's holds at their most defer a request that would hold one more, its earlier holds
@@ -737,7 +873,7 @@ fn holds_at_their_most_defer_a_request_rather_than_refuse_it() {
     let x = Entry::new(b"x"[..].into(), contract(1_000, 1_000), CYCLE, false, 0);
     let y = Entry::new(b"y"[..].into(), contract(1_000, 1_000), CYCLE, false, 0);
     for _ in 0..word::MOST_HELD {
-        assert!(x.take(Op::Hold, 0).done());
+        assert!(x.take(Op::Hold, 0).0.done());
     }
     let before = y.snapshot();
     assert_eq!(decide(&[&y, &x], 0).local, Local::Defer);
@@ -750,13 +886,13 @@ fn holds_at_their_most_defer_a_request_rather_than_refuse_it() {
 #[test]
 fn only_a_key_with_waiters_wants_waking() {
     let x = Entry::new(b"x"[..].into(), contract(100, 10), CYCLE, false, 0);
-    assert!(x.take(Op::Hold, 0).done());
-    assert!(!x.settle(false, 0));
-    assert!(x.take(Op::Admit, 0).done());
+    assert!(x.take(Op::Hold, 0).0.done());
+    assert!(!x.settle(false, 0).0);
+    assert!(x.take(Op::Admit, 0).0.done());
     x.add_waiter();
     assert!(x.drain(0, Cycle::AsItIs).1);
     x.remove_waiter();
-    assert!(x.take(Op::Admit, 0).done());
+    assert!(x.take(Op::Admit, 0).0.done());
     assert!(!x.drain(0, Cycle::AsItIs).1);
 }
 
@@ -772,14 +908,14 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
     let entry = participant.entries(&[(key, c)]).remove(0);
     // Three admitted and reported, two admitted since, one held.
     for _ in 0..3 {
-        assert!(entry.take(Op::Admit, 0).done());
+        assert!(entry.take(Op::Admit, 0).0.done());
     }
     participant.on_cycle(0);
     let _batches = participant.take_outgoing();
     for _ in 0..2 {
-        assert!(entry.take(Op::Admit, 0).done());
+        assert!(entry.take(Op::Admit, 0).0.done());
     }
-    assert!(entry.take(Op::Hold, 0).done());
+    assert!(entry.take(Op::Hold, 0).0.done());
     // The owner has seen none of it, and its own bucket is full.
     participant.on_answers(
         Answers {
@@ -861,7 +997,7 @@ fn an_evicted_entry_sends_its_holders_to_the_new_one() {
     let c = contract(100, 10);
     participant.ensure(key, c, 0);
     let old = participant.entries(&[(key, c)]).remove(0);
-    assert!(old.take(Op::Admit, 0).done());
+    assert!(old.take(Op::Admit, 0).0.done());
     assert!(
         !close_if_quiet(&participant.keys[key]),
         "an admission not drained"
@@ -1045,13 +1181,13 @@ fn one_exchange_in_flight_gathers_what_comes_meanwhile() {
     }
     let entry = participant.entries(&[(key, c)]).remove(0);
     // One admitted, sent with a cycle, and not answered.
-    assert!(entry.take(Op::Admit, CYCLE).done());
+    assert!(entry.take(Op::Admit, CYCLE).0.done());
     participant.on_cycle(CYCLE);
     let first = participant.take_outgoing();
     assert_eq!(first.len(), 1, "the report");
     // Three cycles more, an admission each: nothing goes while the first is out.
     for cycle in 2..5 {
-        assert!(entry.take(Op::Admit, cycle * CYCLE).done());
+        assert!(entry.take(Op::Admit, cycle * CYCLE).0.done());
         participant.on_cycle(cycle * CYCLE);
         assert!(participant.take_outgoing().is_empty(), "cycle {cycle}");
     }
@@ -1071,7 +1207,7 @@ fn one_exchange_in_flight_gathers_what_comes_meanwhile() {
         .collect();
     assert_eq!(hits, [3]);
     // Never answered: after an ask's time, taken as failed, and the next goes.
-    assert!(entry.take(Op::Admit, 6 * CYCLE).done());
+    assert!(entry.take(Op::Admit, 6 * CYCLE).0.done());
     let later = 5 * CYCLE + RESEND_AFTER_CYCLES * CYCLE;
     participant.on_cycle(later);
     assert!(
@@ -1450,4 +1586,224 @@ fn replay_a_failure() {
         (Exchange, 1),
         (r(1), 1),
     ]);
+}
+
+/// A scheduled participant deciding cold keys locally, nothing polled: what each test of
+/// scheduling starts from, with `keys` keys made at 0 and their first cycle's visit done.
+fn scheduled(keys: u64) -> (Participant<FixedState>, Vec<Arc<Entry>>) {
+    let mut participant = participant();
+    participant.set_scheduled(true);
+    participant.set_levers(Levers {
+        poll_quiet: false,
+        ask_cold: false,
+    });
+    let c = contract(100, 10);
+    let names: Vec<Vec<u8>> = (0..keys).map(|n| format!("k{n}").into_bytes()).collect();
+    for name in &names {
+        participant.ensure(name, c, 0);
+    }
+    participant.on_cycle(CYCLE);
+    let _ = participant.take_outgoing();
+    let entries = names
+        .iter()
+        .map(|name| participant.entries(&[(name, c)]).remove(0))
+        .collect();
+    (participant, entries)
+}
+
+/// The hits each key was reported with in `batches`, by key.
+fn hits(batches: &[(PodId, Batch)]) -> HashMap<Box<[u8]>, u64> {
+    let mut hits = HashMap::new();
+    for (_, batch) in batches {
+        for entry in &batch.entries {
+            if let Report::Hits { count, .. } = entry.report {
+                *hits.entry(entry.key.clone()).or_default() += count;
+            }
+        }
+    }
+    hits
+}
+
+/// Scheduled, a cycle visits the keys that need it and no other: none while all are quiet;
+/// a key a worker signalled, once, and its admission reported. A second admission before
+/// the count is drained signals nothing; one after it signals again.
+#[test]
+fn a_scheduled_participant_visits_only_the_keys_that_need_it() {
+    let (mut participant, entries) = scheduled(100);
+    let quiet = participant.visits();
+    participant.on_cycle(2 * CYCLE);
+    assert_eq!(participant.visits(), quiet, "nothing to do");
+    let key = &entries[5];
+    let outcome = decide(&[key], 2 * CYCLE + 1);
+    assert_eq!((outcome.local, outcome.signal), (Local::Admit, 1));
+    assert_eq!(
+        decide(&[key], 2 * CYCLE + 2).signal,
+        0,
+        "the count started already"
+    );
+    participant.on_signals([Arc::clone(key)]);
+    participant.on_cycle(3 * CYCLE);
+    assert_eq!(participant.visits(), quiet + 1, "the one signalled");
+    let sent = hits(&participant.take_outgoing());
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[key.key()], 2);
+    assert_eq!(
+        decide(&[key], 3 * CYCLE + 1).signal,
+        1,
+        "drained, it starts again"
+    );
+}
+
+/// A count no worker could signal, its queue full, is found by the scan it asked for:
+/// the next cycle visits every key, and the one after only those that need it.
+#[test]
+fn a_required_scan_finds_a_count_no_signal_named() {
+    let (mut participant, entries) = scheduled(50);
+    assert_eq!(decide(&[&entries[7]], 2 * CYCLE).signal, 1);
+    participant.on_cycle(2 * CYCLE + 1);
+    assert!(
+        hits(&participant.take_outgoing()).is_empty(),
+        "not signalled"
+    );
+    participant.registry().require_scan();
+    let before = participant.visits();
+    participant.on_cycle(3 * CYCLE);
+    assert_eq!(participant.visits(), before + 50, "every key");
+    assert_eq!(hits(&participant.take_outgoing())[entries[7].key()], 1);
+    let before = participant.visits();
+    participant.on_cycle(4 * CYCLE);
+    assert!(participant.visits() - before <= 1, "the scan taken");
+}
+
+/// With one exchange in flight, a key drained while its owner's exchange is out keeps its
+/// ledger and is visited until the exchange is over, then reported, with no new signal.
+#[test]
+fn a_count_drained_while_its_owner_is_busy_goes_once_the_exchange_is_over() {
+    let (mut participant, entries) = scheduled(2);
+    participant.set_one_in_flight(true);
+    let (a, b) = (&entries[0], &entries[1]);
+    assert_eq!(decide(&[a], 2 * CYCLE).signal, 1);
+    participant.on_signals([Arc::clone(a)]);
+    participant.on_cycle(2 * CYCLE + 1);
+    assert_eq!(
+        hits(&participant.take_outgoing())[a.key()],
+        1,
+        "a's exchange goes"
+    );
+    assert_eq!(decide(&[b], 2 * CYCLE + 2).signal, 1);
+    participant.on_signals([Arc::clone(b)]);
+    for cycle in 3..6 {
+        participant.on_cycle(cycle * CYCLE);
+        assert!(participant.take_outgoing().is_empty(), "the pod is busy");
+    }
+    participant.exchanged(0);
+    participant.on_cycle(6 * CYCLE);
+    assert_eq!(hits(&participant.take_outgoing())[b.key()], 1);
+}
+
+/// Scheduled, idle keys are evicted when their time comes, without a cycle visiting them;
+/// a key used again in the meantime is kept until it is idle in turn. One eviction time a
+/// key at most.
+#[test]
+fn idle_keys_are_evicted_at_their_time_without_a_scan() {
+    let (mut participant, entries) = scheduled(50);
+    // A refill time of some 105 ms: idle after twice that.
+    let used = 200 * MS;
+    assert_eq!(decide(&[&entries[3]], used).local, Local::Admit);
+    participant.on_signals([Arc::clone(&entries[3])]);
+    participant.on_cycle(used + 1);
+    let _ = participant.take_outgoing();
+    let before = participant.visits();
+    participant.on_cycle(300 * MS);
+    assert_eq!(participant.key_count(), 1, "all but the one used");
+    assert!(
+        participant.visits() - before <= 1,
+        "evicted without a visit"
+    );
+    assert!(participant.evictions.len() <= participant.key_count());
+    // Its report acknowledged, the used key is evicted once idle in turn: from 200 ms, some
+    // 210 ms on.
+    participant.on_answers(
+        Answers {
+            from: 0,
+            entries: vec![Answer {
+                key: entries[3].key().into(),
+                behind: 0,
+                applied: 1,
+                others: 0,
+                owned: true,
+            }],
+            decided: Vec::new(),
+            view: None,
+        },
+        300 * MS,
+    );
+    let mut at = 300 * MS;
+    while participant.key_count() > 0 && at < 2_000 * MS {
+        at += CYCLE;
+        participant.on_cycle(at);
+        let _ = participant.take_outgoing();
+    }
+    assert_eq!(participant.key_count(), 0);
+    assert!(
+        (410 * MS..=440 * MS).contains(&at),
+        "idle in turn at {} ms",
+        at / MS
+    );
+}
+
+/// A request refused still brings a key back into use: signalled, so that a scheduled
+/// transport polls it again; a refusal under a key in use signals nothing.
+#[test]
+fn a_refused_request_signals_a_key_it_brings_back_into_use() {
+    let (_participant, entries) = scheduled(2);
+    let (busy, quiet) = (&entries[0], &entries[1]);
+    // The busy key's bucket spent at 300 ms; the quiet key unused since it was made.
+    let at = 300 * MS;
+    while decide(&[busy], at).local == Local::Admit {}
+    let outcome = decide(&[busy, quiet], at);
+    assert_eq!(outcome.local, Local::Refuse);
+    assert_eq!(outcome.signal, 0b10, "the quiet key, back in use");
+    assert_eq!(decide(&[busy, quiet], at + 1).signal, 0);
+}
+
+/// With quiet keys polled, a key in use is visited every cycle while it is, and no longer
+/// once it is not.
+#[test]
+fn a_polled_key_is_visited_while_in_use() {
+    let mut participant = participant();
+    participant.set_scheduled(true);
+    let c = contract(100, 10);
+    participant.ensure(b"k", c, 0);
+    participant.on_cycle(CYCLE);
+    let _ = participant.take_outgoing();
+    let mut visited = Vec::new();
+    for cycle in 2..40 {
+        let before = participant.visits();
+        participant.on_cycle(cycle * CYCLE);
+        let _ = participant.take_outgoing();
+        visited.push(participant.visits() - before);
+    }
+    // In use for its refill time (some 105 ms) from its making: polled every cycle until
+    // then, not after.
+    assert!(visited[..8].iter().all(|v| *v == 1), "{visited:?}");
+    assert!(visited[12..].iter().all(|v| *v == 0), "{visited:?}");
+}
+
+/// Scheduled, a report never acknowledged is sent again, as it is unscheduled: its key is
+/// visited every cycle until it is.
+#[test]
+fn an_unacknowledged_report_is_sent_again_scheduled() {
+    let (mut participant, entries) = scheduled(1);
+    let key = &entries[0];
+    assert_eq!(decide(&[key], 2 * CYCLE).signal, 1);
+    participant.on_signals([Arc::clone(key)]);
+    participant.on_cycle(2 * CYCLE + 1);
+    assert_eq!(hits(&participant.take_outgoing())[key.key()], 1);
+    // Its answer lost: sent again within a few cycles, unasked.
+    let again = (3..20).find(|cycle| {
+        participant.on_cycle(cycle * CYCLE);
+        hits(&participant.take_outgoing()).get(key.key()) == Some(&1)
+    });
+    assert!(again.is_some(), "never sent again");
 }

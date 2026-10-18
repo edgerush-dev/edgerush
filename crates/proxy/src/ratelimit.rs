@@ -839,6 +839,7 @@ fn decide_pooled(
         local: PooledLocal::Ask,
         drain: false,
         wake: false,
+        signal: 0,
     };
     let held = |handles: &Handles, key: &[u8], contract| {
         handles

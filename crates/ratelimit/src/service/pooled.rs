@@ -29,7 +29,8 @@ use super::{
     RESEND_AFTER_CYCLES, Report, Ticket, View, group_name, longest,
 };
 use portable_atomic::{AtomicU128, Ordering};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, fence};
 use std::sync::{Arc, RwLock};
@@ -62,6 +63,12 @@ pub struct Outcome {
     pub drain: bool,
     /// A hold was settled on a key requests wait on: wake them.
     pub wake: bool,
+    /// The keys, by position (bit `n` for the `n`th), that now want the transport's
+    /// attention: their count started, nothing having been admitted since it was last
+    /// drained, or a request brought them back into use after a refill time without one.
+    /// Each to be handed to it ([`Participant::on_signals`]) where it visits only the keys
+    /// that need it ([`Participant::set_scheduled`]).
+    pub signal: u64,
 }
 
 /// The transport's decision of a request a worker asked about.
@@ -166,6 +173,9 @@ impl Eq for Handle {}
 /// choosing keys to crowd a shard slows only those misses.
 pub struct Registry {
     shards: Vec<Shard>,
+    /// A worker could not hand the transport a key that wanted it: the next cycle visits
+    /// every key ([`Self::require_scan`]).
+    scan: AtomicBool,
     /// What keys share, by contract: read when an entry is made.
     terms: RwLock<HashMap<Contract, Arc<Terms>>>,
 }
@@ -180,6 +190,7 @@ impl Registry {
     fn new() -> Self {
         Self {
             shards: (0..SHARDS).map(|_| RwLock::new(HashSet::new())).collect(),
+            scan: AtomicBool::new(false),
             terms: RwLock::new(HashMap::new()),
         }
     }
@@ -257,6 +268,18 @@ impl Registry {
                     .or_insert_with(|| Arc::new(Terms::new(contract, cycle))),
             )
         })
+    }
+
+    /// Asks for every key to be visited at the next cycle: a worker could not hand the
+    /// transport a key its signal named ([`Outcome::signal`]), its queue full. Sticky until
+    /// the transport takes it, which it does before it visits them, so that a signal lost
+    /// during that visit asks for another.
+    pub fn require_scan(&self) {
+        self.scan.store(true, Ordering::Release);
+    }
+
+    fn take_scan(&self) -> bool {
+        self.scan.swap(false, Ordering::AcqRel)
     }
 
     fn insert(&self, entry: Arc<Entry>) {
@@ -546,16 +569,20 @@ impl Entry {
 
     /// Takes one request's worth at `now`: admitted, or held for a request waiting on an
     /// ask about its other keys.
-    fn take(&self, op: Op, now: u64) -> Taken {
+    fn take(&self, op: Op, now: u64) -> (Taken, bool) {
         self.take_in(op, now, Cycle::Advance)
     }
 
     /// Taking does not count as the key's use: a request's arrival does, which the
-    /// transport's own takes, settling what waited, are not ([`decide`] marks it).
-    fn take_in(&self, op: Op, now: u64, cycle: Cycle) -> Taken {
+    /// transport's own takes, settling what waited, are not ([`decide`] marks it). With
+    /// whether it started the key's count: an admission counted where none was, read from
+    /// the compare-and-swap that took it, never from an attempt.
+    fn take_in(&self, op: Op, now: u64, cycle: Cycle) -> (Taken, bool) {
         let units = self.terms.bucket.units(now);
         let mut why = Taken::Refused;
+        let mut was = 0;
         let taken = self.update(now, cycle, |fields| {
+            was = fields.unreported;
             why = if fields.closed {
                 Taken::Closed
             } else if fields.unreported + fields.held >= self.most_reserved
@@ -582,14 +609,15 @@ impl Entry {
             None
         });
         let Some(taken) = taken else {
-            return why;
+            return (why, false);
         };
+        let started = was == 0 && taken.unreported > 0;
         if taken.unreported + taken.held >= self.most_reserved.div_ceil(2)
             && !self.pressed.swap(true, Ordering::AcqRel)
         {
-            Taken::Pressed
+            (Taken::Pressed, started)
         } else {
-            Taken::Done
+            (Taken::Done, started)
         }
     }
 
@@ -597,12 +625,15 @@ impl Entry {
     /// place it reserved kept; refused, its charge is given back, and one of the cycle's
     /// allowance if the cycle under way has spent any, as `DataPlane`'s `spent − 1` does —
     /// all read from the one word. Whether requests wait on it.
-    fn settle(&self, admitted: bool, now: u64) -> bool {
+    fn settle(&self, admitted: bool, now: u64) -> (bool, bool) {
         self.settle_in(admitted, now, Cycle::Advance)
     }
 
-    fn settle_in(&self, admitted: bool, now: u64, cycle: Cycle) -> bool {
-        self.update(now, cycle, |fields| {
+    /// As [`Self::settle`], with whether it started the key's count, as [`Self::take_in`].
+    fn settle_in(&self, admitted: bool, now: u64, cycle: Cycle) -> (bool, bool) {
+        let mut was = 0;
+        let settled = self.update(now, cycle, |fields| {
+            was = fields.unreported;
             Some(if admitted {
                 Fields {
                     held: fields.held.saturating_sub(1),
@@ -620,7 +651,15 @@ impl Entry {
                 }
             })
         });
-        self.wanted()
+        let started = settled.is_some_and(|fields| was == 0 && fields.unreported > 0);
+        (self.wanted(), started)
+    }
+
+    /// Marks a request's arrival at `now`, a request being its use whether it is admitted or
+    /// not: whether it brought the key back into use, a refill time and more after the last.
+    fn arrive(&self, now: u64) -> bool {
+        let last = self.last_request.swap(now, Ordering::Relaxed);
+        now.saturating_sub(last) > self.terms.hold
     }
 
     /// Takes what was admitted and not yet drained, in one compare-and-swap that leaves the
@@ -680,40 +719,57 @@ pub fn decide(entries: &[&Entry], now: u64) -> Outcome {
         local: Local::Admit,
         drain: false,
         wake: false,
+        signal: 0,
     };
     if entries.iter().any(|entry| entry.cold(now)) {
         outcome.local = Local::Ask;
         return outcome;
     }
     if let [entry] = entries {
-        entry.last_request.store(now, Ordering::Relaxed);
-        let taken = entry.take(Op::Admit, now);
+        let back = entry.arrive(now);
+        let (taken, started) = entry.take(Op::Admit, now);
         outcome.drain = taken == Taken::Pressed;
         outcome.local = local(taken);
+        outcome.signal = u64::from(back || started);
         return outcome;
     }
     // Every key counts as used, whichever refuses first, as `DataPlane` has it: a key not
     // marked would not be polled, and its copy would go cold.
-    for entry in entries {
-        entry.last_request.store(now, Ordering::Relaxed);
+    for (at, entry) in entries.iter().enumerate() {
+        if entry.arrive(now) {
+            outcome.signal |= bit(at);
+        }
     }
     // Every key held first, then all settled one way: holds are never reported, so a
     // request given back leaves no trace in what the transport sends.
     for (held, entry) in entries.iter().enumerate() {
-        let taken = entry.take(Op::Hold, now);
+        let (taken, _) = entry.take(Op::Hold, now);
         outcome.drain |= taken == Taken::Pressed;
         if !taken.done() {
             for entry in &entries[..held] {
-                outcome.wake |= entry.settle(false, now);
+                outcome.wake |= entry.settle(false, now).0;
             }
             outcome.local = local(taken);
             return outcome;
         }
     }
-    for entry in entries {
-        outcome.wake |= entry.settle(true, now);
+    for (at, entry) in entries.iter().enumerate() {
+        let (wake, started) = entry.settle(true, now);
+        outcome.wake |= wake;
+        if started {
+            outcome.signal |= bit(at);
+        }
     }
     outcome
+}
+
+/// The signal bit of the `at`th key: none past the 64th, which a request never has (the
+/// proxy's limits are marked by a 64-bit mask).
+fn bit(at: usize) -> u64 {
+    u32::try_from(at)
+        .ok()
+        .and_then(|at| 1u64.checked_shl(at))
+        .unwrap_or(0)
 }
 
 /// What a worker makes of a take that did not hold.
@@ -751,6 +807,8 @@ struct Tracked {
     bounded: bool,
     unreachable: bool,
     asking: u32,
+    /// Scheduled, whether it is to be visited at the next cycle.
+    queued: bool,
 }
 
 impl Tracked {
@@ -816,6 +874,16 @@ struct Group {
 /// What a participant counts a key as holding: its entry and the counts beside it, its
 /// bookkeeping, the key twice (the entry's and the bookkeeping's), and a handle to it in its
 /// registry and in each of its `workers`, one byte of a table's control with each slot.
+/// The first time `entry`'s key may be idle enough to evict ([`Tracked::idle`]), from its
+/// last request.
+fn idle_at(entry: &Entry) -> u64 {
+    entry
+        .last_request
+        .load(Ordering::Relaxed)
+        .saturating_add(2 * entry.terms.hold)
+        .saturating_add(1)
+}
+
 fn key_bytes(key: &[u8], workers: u64) -> u64 {
     let entry = 2 * size_of::<usize>() + size_of::<Entry>() + key.len();
     let tracked = size_of::<(Handle, Tracked)>() + 1;
@@ -857,6 +925,158 @@ pub struct Participant<S> {
     capacity: u64,
     holding: u64,
     evicted: u64,
+    /// Whether each cycle visits only the keys that need it, rather than every key.
+    scheduled: bool,
+    /// Scheduled, the keys to visit at the next cycle, each once ([`Tracked::queued`]).
+    runnable: Vec<Handle>,
+    /// Scheduled, when each key may next be idle enough to evict: one for each key, a later
+    /// one put back in its place when one comes due early.
+    evictions: BinaryHeap<Reverse<Due>>,
+    /// Keys visited, all told.
+    visits: u64,
+}
+
+/// When an entry's key is next to be looked at for eviction.
+struct Due {
+    at: u64,
+    entry: Arc<Entry>,
+}
+
+impl PartialEq for Due {
+    fn eq(&self, other: &Self) -> bool {
+        self.at == other.at
+    }
+}
+
+impl Eq for Due {}
+
+impl PartialOrd for Due {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Due {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.at.cmp(&other.at)
+    }
+}
+
+/// What visiting a key in a cycle reads and writes besides the key.
+struct Visit<'a> {
+    now: u64,
+    resend_after: u64,
+    poll_quiet: bool,
+    sending: &'a BTreeMap<PodId, u64>,
+    outgoing: &'a mut BTreeMap<PodId, Vec<BatchEntry>>,
+    cut_off: bool,
+    wake: bool,
+}
+
+impl Visit<'_> {
+    /// The cycle's work on one key, as `DataPlane::on_cycle` does it on each: its count
+    /// drained into the ledger, its reports sent or sent again, a poll if it is in use with
+    /// nothing to report. Whether it needs visiting at the next cycle too: a ledger it could
+    /// not send, its owner's exchange in flight; reports not yet acknowledged; a poll due
+    /// every cycle; its owner out of reach.
+    fn key(&mut self, tracked: &mut Tracked) -> bool {
+        let now = self.now;
+        let entry = &tracked.entry;
+        let key = &entry.key;
+        let hold = entry.terms.hold;
+        // What was admitted drained into the ledger, every key's, with an owner to send it
+        // to or not, so that no count fills.
+        let (count, woken) = entry.drain(now, Cycle::Advance);
+        tracked.unsent += count;
+        self.wake |= woken;
+        tracked.bounded |= tracked.heard.is_some();
+        tracked.publish();
+        let Some(owner) = tracked.owner else {
+            return false;
+        };
+        // Its owner has an exchange in flight: what is admitted stays in the ledger, and
+        // the exchange's answer refreshes the copy.
+        if self.sending.contains_key(&owner) {
+            return true;
+        }
+        let mut entries = Vec::new();
+        for (_, count, first, _) in &mut tracked.unacknowledged {
+            if now - *first > hold {
+                *count = 0;
+            }
+        }
+        let mut reported = false;
+        for (sequence, count, _, last) in &mut tracked.unacknowledged {
+            if now - *last >= self.resend_after {
+                *last = now;
+                entries.push(BatchEntry {
+                    key: key.clone(),
+                    contract: entry.terms.contract,
+                    report: Report::Hits {
+                        sequence: *sequence,
+                        count: *count,
+                        seen: tracked.seen,
+                    },
+                });
+                reported = true;
+            }
+        }
+        let unsent = tracked.unsent;
+        if unsent > 0 {
+            tracked.unsent = 0;
+            tracked.sent += 1;
+            entries.push(BatchEntry {
+                key: key.clone(),
+                contract: entry.terms.contract,
+                report: Report::Hits {
+                    sequence: tracked.sent,
+                    count: unsent,
+                    seen: tracked.seen,
+                },
+            });
+            tracked
+                .unacknowledged
+                .push_back((tracked.sent, unsent, now, now));
+            reported = true;
+        }
+        let last = entry.last_request.load(Ordering::Relaxed);
+        let in_use = now.saturating_sub(last) <= hold || !tracked.unacknowledged.is_empty();
+        let polled = in_use && self.poll_quiet;
+        if !reported && polled {
+            entries.push(BatchEntry {
+                key: key.clone(),
+                contract: entry.terms.contract,
+                report: Report::Poll,
+            });
+        }
+        self.cut_off |= tracked.unreachable
+            || (in_use
+                && tracked
+                    .heard
+                    .is_none_or(|heard| now - heard >= self.resend_after));
+        if !entries.is_empty() {
+            self.outgoing.entry(owner).or_default().extend(entries);
+        }
+        !tracked.unacknowledged.is_empty() || polled || tracked.unreachable
+    }
+}
+
+/// Queues `key` to be visited at the next cycle, unless it is already.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "a handle hashes and compares by its entry's key, which never changes"
+)]
+fn queue<S: BuildHasher>(
+    keys: &mut HashMap<Handle, Tracked, S>,
+    runnable: &mut Vec<Handle>,
+    key: &[u8],
+) {
+    if let Some(tracked) = keys.get_mut(key)
+        && !tracked.queued
+    {
+        tracked.queued = true;
+        runnable.push(Handle::new(Arc::clone(&tracked.entry)));
+    }
 }
 
 impl<S: BuildHasher + Clone> Participant<S> {
@@ -893,7 +1113,46 @@ impl<S: BuildHasher + Clone> Participant<S> {
             capacity: u64::MAX,
             holding: 0,
             evicted: 0,
+            scheduled: false,
+            runnable: Vec::new(),
+            evictions: BinaryHeap::new(),
+            visits: 0,
         })
+    }
+
+    /// Each cycle visits only the keys that need it — those its workers signalled
+    /// ([`Self::on_signals`]), those with work outstanding, and those whose eviction is due
+    /// — rather than every key, so that quiet keys cost nothing between their uses. A key
+    /// not visited has its cycle advanced when it is next taken from, by the rule for a gap:
+    /// one share of the bucket refilled from the time gone by. Off unless set: the
+    /// comparison with `DataPlane`, which visits every
+    /// key every cycle, is exact only then. Set before it holds any key.
+    pub fn set_scheduled(&mut self, on: bool) {
+        self.scheduled = on;
+    }
+
+    /// Keys its workers' decisions signalled ([`Outcome::signal`]): visited at the next
+    /// cycle.
+    pub fn on_signals(&mut self, entries: impl IntoIterator<Item = Arc<Entry>>) {
+        for entry in entries {
+            if let Some(tracked) = self.keys.get_mut(&*entry.key)
+                && Arc::ptr_eq(&tracked.entry, &entry)
+                && !tracked.queued
+            {
+                tracked.queued = true;
+                self.runnable.push(Handle::new(entry));
+            }
+        }
+    }
+
+    /// Keys visited, all told.
+    #[must_use]
+    pub fn visits(&self) -> u64 {
+        self.visits
+    }
+
+    fn run(&mut self, key: &[u8]) {
+        queue(&mut self.keys, &mut self.runnable, key);
     }
 
     /// Its id.
@@ -1044,12 +1303,22 @@ impl<S: BuildHasher + Clone> Participant<S> {
             bounded: false,
             unreachable: false,
             asking: 0,
+            queued: false,
         };
         tracked.publish();
         self.registry.insert(Arc::clone(&tracked.entry));
         self.holding += key_bytes(&tracked.entry.key, self.workers);
+        if self.scheduled {
+            let at = idle_at(&tracked.entry);
+            self.evictions.push(Reverse(Due {
+                at,
+                entry: Arc::clone(&tracked.entry),
+            }));
+        }
+        let key = tracked.entry.key.clone();
         self.keys
             .insert(Handle::new(Arc::clone(&tracked.entry)), tracked);
+        self.run(&key);
     }
 
     /// Decides at `now` a request a worker asked about, under `keys`: as
@@ -1071,6 +1340,11 @@ impl<S: BuildHasher + Clone> Participant<S> {
             let entries: Vec<&Entry> = entries.iter().map(|entry| &**entry).collect();
             let outcome = decide(&entries, now);
             self.wake |= outcome.wake;
+            for (at, (key, _)) in keys.iter().enumerate() {
+                if outcome.signal & bit(at) != 0 {
+                    self.run(key);
+                }
+            }
             if outcome.drain {
                 for (key, _) in keys {
                     self.drain(key, now);
@@ -1095,6 +1369,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
         let (count, wake) = tracked.entry.drain(now, Cycle::AsItIs);
         tracked.unsent += count;
         self.wake |= wake;
+        self.run(key);
     }
 
     /// Whether, since last asked, a hold was settled or a count drained on a key deferred
@@ -1159,7 +1434,9 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 let taken = self
                     .keys
                     .get(&*group.keys[*at].0)
-                    .map_or(Taken::Refused, |tracked| tracked.entry.take(Op::Hold, now));
+                    .map_or(Taken::Refused, |tracked| {
+                        tracked.entry.take(Op::Hold, now).0
+                    });
                 if !taken.done() {
                     failed = taken;
                     break;
@@ -1170,7 +1447,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
         if holding < held.len() {
             for at in &held[..holding] {
                 if let Some(tracked) = self.keys.get(&*group.keys[*at].0) {
-                    self.wake |= tracked.entry.settle(false, now);
+                    self.wake |= tracked.entry.settle(false, now).0;
                 }
             }
             let idle = self
@@ -1328,7 +1605,13 @@ impl<S: BuildHasher + Clone> Participant<S> {
         let held = (0..group.keys.len()).filter(|at| !group.cold.contains(at));
         for at in held {
             if let Some(tracked) = self.keys.get(&*group.keys[at].0) {
-                self.wake |= tracked.entry.settle_in(admitted, now, cycle);
+                self.wake |= tracked.entry.settle_in(admitted, now, cycle).0;
+            }
+        }
+        if admitted {
+            let keys: Vec<Box<[u8]>> = group.keys.iter().map(|(key, _)| key.clone()).collect();
+            for key in keys {
+                self.run(&key);
             }
         }
     }
@@ -1370,97 +1653,57 @@ impl<S: BuildHasher + Clone> Participant<S> {
                     tracked.unreachable = true;
                     tracked.publish();
                 }
+                let key = group.keys[at].0.clone();
+                queue(&mut self.keys, &mut self.runnable, &key);
             }
             for ticket in waited {
                 self.settle_here(&name, ticket, now, Cycle::AsItIs);
             }
             self.groups.remove(&name);
         }
-        let mut cut_off = false;
-        let mut wake = false;
         // An exchange out for as long as an ask may wait is taken as failed.
         self.sending
             .retain(|_, since| now.saturating_sub(*since) < ask_timeout);
-        let sending = &self.sending;
-        let poll_quiet = self.levers.poll_quiet;
-        for tracked in self.keys.values_mut() {
-            let entry = &tracked.entry;
-            let key = &entry.key;
-            let hold = entry.terms.hold;
-            // The cycle advanced here if no worker has, so that it is set every cycle, and
-            // what was admitted drained into the ledger in the same step — every key's,
-            // with an owner to send it to or not, so that no count fills.
-            let (count, woken) = entry.drain(now, Cycle::Advance);
-            tracked.unsent += count;
-            wake |= woken;
-            tracked.bounded |= tracked.heard.is_some();
-            tracked.publish();
-            let Some(owner) = tracked.owner else {
-                continue;
-            };
-            // Its owner has an exchange in flight: what is admitted stays in the ledger,
-            // and the exchange's answer refreshes the copy.
-            if sending.contains_key(&owner) {
-                continue;
-            }
-            let mut entries = Vec::new();
-            for (_, count, first, _) in &mut tracked.unacknowledged {
-                if now - *first > hold {
-                    *count = 0;
+        let mut visit = Visit {
+            now,
+            resend_after,
+            poll_quiet: self.levers.poll_quiet,
+            sending: &self.sending,
+            outgoing: &mut self.outgoing,
+            cut_off: false,
+            wake: false,
+        };
+        let mut visits = 0;
+        let mut next = Vec::new();
+        // Taken before the visit, so that a signal lost during it asks for another.
+        if !self.scheduled || self.registry.take_scan() {
+            for (handle, tracked) in &mut self.keys {
+                tracked.queued = false;
+                visits += 1;
+                if visit.key(tracked) && self.scheduled {
+                    tracked.queued = true;
+                    next.push(handle.clone());
                 }
             }
-            let mut reported = false;
-            for (sequence, count, _, last) in &mut tracked.unacknowledged {
-                if now - *last >= resend_after {
-                    *last = now;
-                    entries.push(BatchEntry {
-                        key: key.clone(),
-                        contract: entry.terms.contract,
-                        report: Report::Hits {
-                            sequence: *sequence,
-                            count: *count,
-                            seen: tracked.seen,
-                        },
-                    });
-                    reported = true;
+        } else {
+            for handle in std::mem::take(&mut self.runnable) {
+                let Some(tracked) = self.keys.get_mut(&*handle.0.key) else {
+                    continue;
+                };
+                if !Arc::ptr_eq(&tracked.entry, &handle.0) {
+                    continue;
                 }
-            }
-            let unsent = tracked.unsent;
-            if unsent > 0 {
-                tracked.unsent = 0;
-                tracked.sent += 1;
-                entries.push(BatchEntry {
-                    key: key.clone(),
-                    contract: entry.terms.contract,
-                    report: Report::Hits {
-                        sequence: tracked.sent,
-                        count: unsent,
-                        seen: tracked.seen,
-                    },
-                });
-                tracked
-                    .unacknowledged
-                    .push_back((tracked.sent, unsent, now, now));
-                reported = true;
-            }
-            let last = entry.last_request.load(Ordering::Relaxed);
-            let in_use = now.saturating_sub(last) <= hold || !tracked.unacknowledged.is_empty();
-            if !reported && in_use && poll_quiet {
-                entries.push(BatchEntry {
-                    key: key.clone(),
-                    contract: entry.terms.contract,
-                    report: Report::Poll,
-                });
-            }
-            cut_off |= tracked.unreachable
-                || (in_use
-                    && tracked
-                        .heard
-                        .is_none_or(|heard| now - heard >= resend_after));
-            if !entries.is_empty() {
-                self.outgoing.entry(owner).or_default().extend(entries);
+                tracked.queued = false;
+                visits += 1;
+                if visit.key(tracked) {
+                    tracked.queued = true;
+                    next.push(handle);
+                }
             }
         }
+        let (cut_off, wake) = (visit.cut_off, visit.wake);
+        self.visits += visits;
+        self.runnable = next;
         self.wake |= wake;
         if cut_off && !self.view.pods.is_empty() {
             let at = usize::try_from(self.polls).unwrap_or(0) % self.view.pods.len();
@@ -1469,17 +1712,21 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 self.outgoing.entry(self.view.pods[at]).or_default();
             }
         }
-        let mut freed = 0;
-        let (registry, workers) = (&self.registry, self.workers);
-        self.keys.retain(|_, tracked| {
-            let evict = tracked.idle(now) && close_if_quiet(tracked);
-            if evict {
-                registry.remove(&tracked.entry);
-                freed += key_bytes(&tracked.entry.key, workers);
-            }
-            !evict
-        });
-        self.holding = self.holding.saturating_sub(freed);
+        if self.scheduled {
+            self.evict_due(now);
+        } else {
+            let mut freed = 0;
+            let (registry, workers) = (&self.registry, self.workers);
+            self.keys.retain(|_, tracked| {
+                let evict = tracked.idle(now) && close_if_quiet(tracked);
+                if evict {
+                    registry.remove(&tracked.entry);
+                    freed += key_bytes(&tracked.entry.key, workers);
+                }
+                !evict
+            });
+            self.holding = self.holding.saturating_sub(freed);
+        }
         if self.holding > self.capacity {
             let mut quiet: Vec<(u64, Box<[u8]>)> = self
                 .keys
@@ -1504,6 +1751,36 @@ impl<S: BuildHasher + Clone> Participant<S> {
                     self.holding = self.holding.saturating_sub(key_bytes(&key, self.workers));
                     self.evicted += 1;
                 }
+            }
+        }
+    }
+
+    /// Scheduled, the keys whose eviction has come due at `now`: evicted if idle, as an
+    /// unscheduled cycle evicts every idle key; otherwise looked at again when they next
+    /// may be. A due whose key is gone, or has another entry, is dropped.
+    fn evict_due(&mut self, now: u64) {
+        while self.evictions.peek().is_some_and(|due| due.0.at <= now) {
+            let Some(Reverse(due)) = self.evictions.pop() else {
+                break;
+            };
+            let Some(tracked) = self.keys.get(&*due.entry.key) else {
+                continue;
+            };
+            if !Arc::ptr_eq(&tracked.entry, &due.entry) {
+                continue;
+            }
+            if tracked.idle(now) && close_if_quiet(tracked) {
+                self.registry.remove(&tracked.entry);
+                self.holding = self
+                    .holding
+                    .saturating_sub(key_bytes(&due.entry.key, self.workers));
+                self.keys.remove(&*due.entry.key);
+            } else {
+                let at = idle_at(&due.entry).max(now + self.cycle);
+                self.evictions.push(Reverse(Due {
+                    at,
+                    entry: due.entry,
+                }));
             }
         }
     }
@@ -1556,6 +1833,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             tracked.heard = Some(now);
             tracked.unreachable = false;
             tracked.publish();
+            queue(&mut self.keys, &mut self.runnable, &answer.key);
             if !answer.owned {
                 copies.push(answer.key);
             }
@@ -1603,6 +1881,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                         if let Some(tracked) = self.keys.get_mut(&**key) {
                             tracked.unsent += 1;
                         }
+                        queue(&mut self.keys, &mut self.runnable, key);
                     }
                 }
                 self.settle_held(&name, ticket, admitted, now, Cycle::Advance);
@@ -1651,7 +1930,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             return;
         }
         self.view = view;
-        for tracked in self.keys.values_mut() {
+        for (handle, tracked) in &mut self.keys {
             let key = &tracked.entry.key;
             let owner = self.view.owners(key).0;
             if owner == tracked.owner {
@@ -1660,6 +1939,10 @@ impl<S: BuildHasher + Clone> Participant<S> {
             tracked.owner = owner;
             tracked.unreachable = false;
             tracked.publish();
+            if self.scheduled && !tracked.queued {
+                tracked.queued = true;
+                self.runnable.push(handle.clone());
+            }
             let Some(owner) = owner else {
                 continue;
             };
@@ -1808,7 +2091,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
 fn decide_here(entries: &[&Entry], now: u64, cycle: Cycle) -> (Local, bool) {
     if let [entry] = entries {
         return (
-            match local(entry.take_in(Op::Admit, now, cycle)) {
+            match local(entry.take_in(Op::Admit, now, cycle).0) {
                 Local::Ask => Local::Refuse,
                 decided => decided,
             },
@@ -1817,10 +2100,10 @@ fn decide_here(entries: &[&Entry], now: u64, cycle: Cycle) -> (Local, bool) {
     }
     let mut wake = false;
     for (held, entry) in entries.iter().enumerate() {
-        let taken = entry.take_in(Op::Hold, now, cycle);
+        let (taken, _) = entry.take_in(Op::Hold, now, cycle);
         if !taken.done() {
             for entry in &entries[..held] {
-                wake |= entry.settle_in(false, now, cycle);
+                wake |= entry.settle_in(false, now, cycle).0;
             }
             return (
                 match local(taken) {
@@ -1832,7 +2115,7 @@ fn decide_here(entries: &[&Entry], now: u64, cycle: Cycle) -> (Local, bool) {
         }
     }
     for entry in entries {
-        wake |= entry.settle_in(true, now, cycle);
+        wake |= entry.settle_in(true, now, cycle).0;
     }
     (Local::Admit, wake)
 }
