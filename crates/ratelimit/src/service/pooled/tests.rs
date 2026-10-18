@@ -55,7 +55,7 @@ impl Pooled {
     /// What it has to send, answered by the pod and held back.
     fn send(&mut self, now: u64) {
         for (_, batch) in self.participant.take_outgoing() {
-            self.pending.push(self.pod.on_batch(batch, now));
+            self.pending.push(self.pod.on_batch(in_order(batch), now));
         }
     }
 
@@ -128,7 +128,7 @@ impl Pooled {
                 break;
             }
             for (_, batch) in outgoing {
-                let answers = self.pod.on_batch(batch, now);
+                let answers = self.pod.on_batch(in_order(batch), now);
                 self.participant.on_answers(answers, now);
             }
         }
@@ -141,6 +141,16 @@ impl Pooled {
 struct Settled {
     decided: Vec<(Ticket, bool)>,
     retries: Vec<Ticket>,
+}
+
+/// `batch` with its asks in the order of their numbers, as both sides' pods are given them.
+/// A pod remembers only the last ask a data plane made about a key, so two asks about one
+/// key sent again count once more or twice more as their order has it (an inherited defect
+/// of the service pod, apart's alike; results note): the order a side happens to list its
+/// waiting groups in, which is not what this comparison is about.
+fn in_order(mut batch: Batch) -> Batch {
+    batch.asks.sort_by_key(|ask| ask.id);
+    batch
 }
 
 /// The reference: one `DataPlane`, its pod, and the answers not yet delivered.
@@ -161,7 +171,7 @@ impl Reference {
 
     fn send(&mut self, now: u64) {
         for (_, batch) in self.plane.take_outgoing() {
-            self.pending.push(self.pod.on_batch(batch, now));
+            self.pending.push(self.pod.on_batch(in_order(batch), now));
         }
     }
 
@@ -186,7 +196,7 @@ impl Reference {
                 break;
             }
             for (_, batch) in outgoing {
-                let answers = self.pod.on_batch(batch, now);
+                let answers = self.pod.on_batch(in_order(batch), now);
                 self.plane.on_answers(answers, now);
             }
         }
@@ -544,27 +554,32 @@ fn reports_racing_admissions_count_each_once() {
         participant.ensure(key, contract, 0);
         set_most_reserved(&mut participant, key, most);
         let entry = participant.entries(&[(key, contract)]).remove(0);
-        let stop = std::sync::atomic::AtomicBool::new(false);
+        // Drained until every worker is done, however late the threads start: a fixed
+        // number of drains could end before they filled the small count.
+        let done = std::sync::atomic::AtomicUsize::new(0);
         let (admitted, full, sent) = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..4)
                 .map(|_| {
                     let entry = Arc::clone(&entry);
-                    let stop = &stop;
+                    let done = &done;
                     scope.spawn(move || {
                         let (mut admitted, mut full) = (0u64, 0u64);
-                        while !stop.load(Ordering::Relaxed) && admitted < 20_000 {
+                        while admitted < 20_000 {
                             match entry.take(Op::Admit, 1) {
                                 Taken::Done | Taken::Pressed => admitted += 1,
                                 Taken::Full => full += 1,
-                                _ => {}
+                                // Time standing still, the bucket runs out: done.
+                                Taken::Refused | Taken::Closed => break,
+                                Taken::Contended => {}
                             }
                         }
+                        done.fetch_add(1, Ordering::Relaxed);
                         (admitted, full)
                     })
                 })
                 .collect();
             let mut sent = 0u64;
-            for _ in 0..2_000 {
+            while done.load(Ordering::Relaxed) < 4 {
                 participant.on_cycle(1);
                 for (_, batch) in participant.take_outgoing() {
                     for batch_entry in batch.entries {
@@ -574,7 +589,6 @@ fn reports_racing_admissions_count_each_once() {
                     }
                 }
             }
-            stop.store(true, Ordering::Relaxed);
             let (admitted, full) = workers
                 .into_iter()
                 .map(|worker| worker.join().unwrap())
