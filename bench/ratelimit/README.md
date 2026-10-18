@@ -17,6 +17,9 @@ simulator's numbers have real systems beside them.
 | `envoy-wait` | as `envoy`, with a 1 s timeout on the ratelimit service rather than 20 ms | the same |
 | `envoy-local` | Envoy's own token bucket, the limit divided among its instances (`local_cluster_rate_limit`) | 100 a second, bucket of 100 |
 | `edgerush` | EdgeRush's rate-limiting service prototype: each worker decides from its copies, three service pods own the keys | token bucket, 100 a second, burst 100, by the client's address |
+| `edgerush-w2` | the same with two workers an instance, on two CPUs | the same |
+| `edgerush-pooled-w2` | two workers an instance deciding from the process's shared entries (`pooled: true`, the shared-atomic spike), on two CPUs | the same |
+| `edgerush-w2-cpu1`, `edgerush-pooled-w2-cpu1` | the two above held to one CPU: a quota below the worker count | the same |
 
 `edgerush` runs from binaries built on the host (`cargo build --release -p edgerush -p
 edgerush-ratelimit-service`, copied to `$RLH_BIN`, `/home/claude/rlh-bin` by default) in an
@@ -24,7 +27,7 @@ image with the host's glibc; its limit is keyed by the client's address, the onl
 takes before authentication, so every run's load, from the host, is one key; faults on its
 owner strike the service pod that owns that key, found as the protocol finds it.
 
-Every instance gets one CPU. Clients reach instances on a front network; instances reach
+Every instance gets one CPU, the two-worker EdgeRush systems two. Clients reach instances on a front network; instances reach
 Redis, the ratelimit service or each other on a back network, which is what faults touch.
 
 ## Running

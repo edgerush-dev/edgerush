@@ -48,7 +48,9 @@
 #                                             client addresses (1000 unless said), each a
 #                                             quiet key of its own; by how a pod's workers
 #                                             share: VARIANTS ours-rl-apart ours-rl-layered
-#                                             ours-rl-keep ours-rl-shared, beside ours
+#                                             ours-rl-keep ours-rl-shared ours-rl-pooled,
+#                                             envoy-rl (Envoy's global rate limit:
+#                                             envoyproxy/ratelimit on Redis), beside ours
 #                                             with no limit
 #   bench/run.sh summary DIR                  the table of a finished run
 #
@@ -139,6 +141,21 @@ repo=$(dirname "$here")
 # ours-rl-keep variant keeps a slice its worker no longer uses.
 : "${RL_SERVICE:=$repo/target/release/edgerush-ratelimit-service}"
 : "${RL_KEEP_MS:=50}"
+# The rate-limiting service's cycle, in milliseconds: the data planes' and the pod's alike.
+: "${RL_CYCLE_MS:=10}"
+# The envoy-rl variant's service, envoyproxy/ratelimit, and its Redis: in Docker on the
+# backend's CPUs, as EdgeRush's service pod runs there, with host networking. Its knobs:
+# RLS_PIPELINE_WINDOW (the time it gathers commands to Redis for, `150us`; empty for none,
+# its default), RLS_PIPELINE_LIMIT (commands a pipeline, 0 for none), RLS_POOL (Redis
+# connections, its default 10), RLS_PROCS (GOMAXPROCS, the backend's CPUs unless said) and
+# REDIS_IO_THREADS (Redis's I/O threads, 1).
+: "${RLS_IMAGE:=envoyproxy/ratelimit:8fe6ea42}"
+: "${REDIS_IMAGE:=redis:8.6.7}"
+: "${RLS_PIPELINE_WINDOW:=}"
+: "${RLS_PIPELINE_LIMIT:=0}"
+: "${RLS_POOL:=10}"
+: "${RLS_PROCS:=}"
+: "${REDIS_IO_THREADS:=1}"
 # ACCESS_LOG=1 has every proxy log each request as EdgeRush's access log does (21 §5): the
 # same fields as a line of JSON each, to a file, each proxy its fastest way. EdgeRush its own
 # (a worker's batches, a logger thread); NGINX through `escape=json`, into a 64 KiB buffer
@@ -349,6 +366,10 @@ start_proxy() { # variant, or a name made of one: `ours@C1E` is ours under an id
         taskset -c "$PROXY_CPUS" envoy -c "$here/envoy.yaml" --concurrency "$WORKERS" \
             --disable-hot-restart -l warn 2>>"$OUT/proxy.log" &
         ;;
+    envoy-rl)
+        taskset -c "$PROXY_CPUS" envoy -c "$here/envoy-rl.yaml" --concurrency "$WORKERS" \
+            --disable-hot-restart -l warn 2>>"$OUT/proxy.log" &
+        ;;
     kong)
         # Kong goes into the background by itself and leaves the pid of its master.
         (
@@ -500,7 +521,7 @@ CFG
         # EdgeRush under a per-client limit, its workers sharing as the name says.
         rl_config "${1#ours-rl-}"
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config.rl" \
-            --workers "$WORKERS" $idle 2>>"$OUT/proxy.log" &
+            --workers "$WORKERS" $idle ${METRICS:+--metrics "$METRICS"} 2>>"$OUT/proxy.log" &
         ;;
     ours-ab*)
         # EdgeRush accepting N connections before its other work goes first: ours-ab1.
@@ -529,6 +550,7 @@ rl_config() { # sharing
     layered) sharing=", layered: true" ;;
     keep) sharing=", layered: true, layered_keep_ms: $RL_KEEP_MS" ;;
     shared) sharing=", shared: true" ;;
+    pooled) sharing=", pooled: true" ;;
     *) echo "no sharing $1" >&2; exit 2 ;;
     esac
     cat >"$run-limits.yaml" <<LIMITS
@@ -543,15 +565,15 @@ assert s.count(rule) == 1, "the measured rule moved"
 s = s.replace(rule, "          - path: { prefix: / }\n        rate_limits: [per-client]\n        filters:")
 open(sys.argv[2], "w").write(s)
 PY
-    printf 'rate_limit_service: { pods: ["127.0.0.1:7000"], cycle_ms: 10%s }\nlimits_file: %s\n' \
-        "$sharing" "$run-limits.yaml" >>"$config.rl"
+    printf 'rate_limit_service: { pods: ["127.0.0.1:7000"], cycle_ms: %s%s }\nlimits_file: %s\n' \
+        "$RL_CYCLE_MS" "$sharing" "$run-limits.yaml" >>"$config.rl"
 }
 
 # The service's one pod, for `ratelimit`.
 rl_pid=
 start_rl_service() {
     [ -x "$RL_SERVICE" ] || { echo "no service at $RL_SERVICE: build it first" >&2; exit 2; }
-    taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --id 0 --listen 127.0.0.1:7000 --cycle-ms 10 \
+    taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --id 0 --listen 127.0.0.1:7000 --cycle-ms "$RL_CYCLE_MS" \
         --pod 0=127.0.0.1:7000 2>>"$OUT/rl-service.log" &
     rl_pid=$!
     sleep 2
@@ -564,7 +586,53 @@ stop_rl_service() {
     rl_pid=
 }
 
+# The envoy-rl variant's service and its Redis, for `ratelimit`, if it is to run.
+rls_up=
+start_rls() {
+    case " $VARIANTS " in *" envoy-rl "*) ;; *) return 0 ;; esac
+    stop_rls
+    local procs=${RLS_PROCS:-$(echo "$BACKEND_CPUS" | tr ',' '\n' | wc -l)}
+    docker run -d --rm --name bench-redis --network host --cpuset-cpus "$BACKEND_CPUS" \
+        "$REDIS_IMAGE" redis-server --port 6379 --bind 127.0.0.1 --save "" --appendonly no \
+        --io-threads "$REDIS_IO_THREADS" --maxmemory 0 >/dev/null
+    local pipeline=()
+    [ -n "$RLS_PIPELINE_WINDOW" ] && pipeline+=(-e "REDIS_PIPELINE_WINDOW=$RLS_PIPELINE_WINDOW")
+    docker run -d --rm --name bench-rls --network host --cpuset-cpus "$BACKEND_CPUS" \
+        -e USE_STATSD=false -e LOG_LEVEL=warn -e REDIS_SOCKET_TYPE=tcp \
+        -e REDIS_URL=127.0.0.1:6379 -e REDIS_POOL_SIZE="$RLS_POOL" \
+        -e REDIS_PIPELINE_LIMIT="$RLS_PIPELINE_LIMIT" "${pipeline[@]}" \
+        -e GOMAXPROCS="$procs" -e PORT=8082 -e GRPC_PORT=8081 -e DEBUG_PORT=6070 \
+        -e RUNTIME_ROOT=/data -e RUNTIME_SUBDIRECTORY=ratelimit -e RUNTIME_WATCH_ROOT=false \
+        -v "$here/rls-config.yaml:/data/ratelimit/config/config.yaml:ro" \
+        "$RLS_IMAGE" /bin/ratelimit >/dev/null
+    rls_up=1
+    sleep 3
+    {
+        echo "redis $REDIS_IMAGE io-threads $REDIS_IO_THREADS"
+        echo "rls $RLS_IMAGE pool $RLS_POOL pipeline window '${RLS_PIPELINE_WINDOW}' limit $RLS_PIPELINE_LIMIT procs $procs"
+    } >>"$OUT/rls.settings"
+}
+
+stop_rls() {
+    docker rm -f bench-rls bench-redis >/dev/null 2>&1 || true
+    rls_up=
+}
+
+# The CPU, in microseconds, the rate-limiting services have spent so far: EdgeRush's
+# service pod, and envoyproxy/ratelimit and Redis.
+service_cpu() {
+    local ticks=0 container id usage
+    [ -n "$rl_pid" ] && ticks=$(awk '{print $14 + $15}' "/proc/$rl_pid/stat" 2>/dev/null || echo 0)
+    printf 'edgerush-service %s\n' "$((ticks * 1000000 / $(getconf CLK_TCK)))"
+    for container in bench-rls bench-redis; do
+        id=$(docker inspect -f '{{.Id}}' "$container" 2>/dev/null) || continue
+        usage=$(awk '/usage_usec/ {print $2}' "/sys/fs/cgroup/system.slice/docker-$id.scope/cpu.stat" 2>/dev/null || echo 0)
+        printf '%s %s\n' "$container" "$usage"
+    done
+}
+
 ratelimit_runs() {
+    service_cpu >"$OUT/$1.service-cpu-before"
     saturation_h1 "$1.saturation-h1" "$proxy" --connect-to="$proxy_at"
     saturation_h2 "$1.saturation-h2" "$proxy" --connect-to="$proxy_at"
     measured "$1.keys-h1" "$WSBENCH" http "$scheme://$proxy_at/" --host "$host" \
@@ -575,6 +643,13 @@ ratelimit_runs() {
     for task in /proc/"$proxy_pid"/task/*; do
         printf '%s %s\n' "$(cat "$task/comm")" "$(awk '{print $14 + $15}' "$task/stat")"
     done >"$OUT/$1.threads" 2>/dev/null || true
+    service_cpu >"$OUT/$1.service-cpu-after"
+    # Envoy's own count of asks answered, failed and refused, and what Redis holds.
+    if [ -n "$rls_up" ]; then
+        curl -s "http://127.0.0.1:9901/stats?filter=ratelimit" >"$OUT/$1.envoy-stats" || true
+        docker exec bench-redis redis-cli info memory >"$OUT/$1.redis-memory" 2>&1 || true
+        docker exec bench-redis redis-cli dbsize >"$OUT/$1.redis-keys" 2>&1 || true
+    fi
 }
 
 stop_proxy() {
@@ -1153,7 +1228,7 @@ restore_idle() {
         [ "$(cat "$path")" = "$value" ] || echo "$value" | sudo -n tee "$path" >/dev/null
     done <"$idle_saved"
 }
-trap 'stop_proxy; stop_rl_service; stop_backend; restore_mtu; restore_idle' EXIT
+trap 'stop_proxy; stop_rl_service; stop_rls; stop_backend; restore_mtu; restore_idle' EXIT
 trap 'exit 1' INT TERM HUP
 for policy in $IDLE; do
     python3 "$here/residency.py" plan "$policy" "$PROXY_CPUS" >/dev/null
@@ -1188,7 +1263,9 @@ ratelimit)
     rl_keys=${2:-${RL_KEYS:-1000}}
     [ -x "$WSBENCH" ] || { echo "no wsbench at $WSBENCH: build it first" >&2; exit 2; }
     start_rl_service
+    start_rls
     each_variant ratelimit_runs
+    stop_rls
     stop_rl_service
     ;;
 latency)

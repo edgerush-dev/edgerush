@@ -323,7 +323,8 @@ class System:
 
 
 def gateway(i, image, **more):
-    """An instance on both networks, held to one CPU as every system's is."""
+    """An instance on both networks, held to one CPU as every system's is unless `more`
+    says otherwise."""
     service = {
         "image": image,
         "container_name": name(i),
@@ -523,7 +524,7 @@ routes:
         rate_limits: [per-client]
 upstreams:
   up: { load_balancer: p2c, endpoints: ["%(upstream)s:80"] }
-rate_limit_service: { pods: [%(pods)s], cycle_ms: 10 }
+rate_limit_service: { pods: [%(pods)s], cycle_ms: 10%(sharing)s }
 limits_file: limits.yaml
 """
 
@@ -535,9 +536,10 @@ EDGERUSH_LIMITS = """limits:
 """
 
 
-def build_edgerush(n):
-    """EdgeRush with the rate-limiting service: three service pods, and proxies of one
-    worker each, every worker a data plane of the service."""
+def build_edgerush(n, workers=1, sharing="", cpus=None):
+    """EdgeRush with the rate-limiting service: three service pods, and proxies of
+    `workers` workers each on as many CPUs (or `cpus`), every worker a data plane of the
+    service, or, with `sharing` (", pooled: true"), the process one."""
     pods = [f"{pod}={SERVICE_IPS[pod]}:7000" for pod in range(3)]
     services = {}
     for pod in range(3):
@@ -557,7 +559,8 @@ def build_edgerush(n):
             i,
             IMAGES["edgerush"],
             command=["/opt/bin/edgerush", "proxy", "--config", "/etc/edgerush.yaml",
-                     "--workers", "1"],
+                     "--workers", str(workers)],
+            cpus=cpus or workers,
             volumes=[f"{BINARIES}:/opt/bin:ro", "./edgerush.yaml:/etc/edgerush.yaml:ro",
                      "./limits.yaml:/etc/limits.yaml:ro"],
         )
@@ -565,6 +568,7 @@ def build_edgerush(n):
         "edgerush.yaml": EDGERUSH % {
             "upstream": UPSTREAM_IP,
             "pods": ", ".join(f'"{ip}:7000"' for ip in SERVICE_IPS),
+            "sharing": sharing,
         },
         "limits.yaml": EDGERUSH_LIMITS,
     }
@@ -621,6 +625,41 @@ SYSTEMS = {
         System("tyk", 8080, "http", "first", ["redis"], build_tyk),
         System("haproxy", 8080, "http", "first", [], build_haproxy),
         System("edgerush", 8080, "http", "service", ["rl0", "rl1", "rl2"], build_edgerush),
+        # The shared-atomic spike: two workers a proxy, each a data plane (apart) or the
+        # process one participant (pooled).
+        System(
+            "edgerush-w2",
+            8080,
+            "http",
+            "service",
+            ["rl0", "rl1", "rl2"],
+            lambda n: build_edgerush(n, workers=2),
+        ),
+        System(
+            "edgerush-pooled-w2",
+            8080,
+            "http",
+            "service",
+            ["rl0", "rl1", "rl2"],
+            lambda n: build_edgerush(n, workers=2, sharing=", pooled: true"),
+        ),
+        # The same held to one CPU: a quota below the worker count.
+        System(
+            "edgerush-w2-cpu1",
+            8080,
+            "http",
+            "service",
+            ["rl0", "rl1", "rl2"],
+            lambda n: build_edgerush(n, workers=2, cpus=1),
+        ),
+        System(
+            "edgerush-pooled-w2-cpu1",
+            8080,
+            "http",
+            "service",
+            ["rl0", "rl1", "rl2"],
+            lambda n: build_edgerush(n, workers=2, sharing=", pooled: true", cpus=1),
+        ),
     ]
 }
 

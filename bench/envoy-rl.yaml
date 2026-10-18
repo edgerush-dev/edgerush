@@ -1,0 +1,120 @@
+# Envoy as bench/envoy.yaml has it, with its global rate limit: every request forwarded is
+# first asked of envoyproxy/ratelimit over gRPC, which counts in Redis, keyed by the
+# client's address as EdgeRush's per-client limit is (bench/run.sh `ratelimit`, variant
+# envoy-rl). The limit (bench/rls-config.yaml) is one no request reaches, so that every
+# request is decided and none refused, as EdgeRush's is in that scenario.
+#
+# Tuned for its best: the rate limit cluster's circuit breakers raised from their 1024, and
+# a timeout of a second on the ask rather than 20 ms, so that a slow answer is waited for
+# rather than let through unchecked (`failure_mode_deny` off counts it as an error and
+# admits it); the admin interface on 127.0.0.1:9901 for its ratelimit counters.
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+static_resources:
+  listeners:
+    - name: web
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: web
+                codec_type: AUTO
+                generate_request_id: false
+                server_header_transformation: PASS_THROUGH
+                # The peer's address is the client's: the `remote_address` the limit keys by.
+                use_remote_address: true
+                http_filters:
+                  - name: envoy.filters.http.ratelimit
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
+                      domain: edgerush-bench
+                      timeout: 1s
+                      failure_mode_deny: false
+                      rate_limit_service:
+                        transport_api_version: V3
+                        grpc_service:
+                          envoy_grpc: { cluster_name: ratelimit }
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      suppress_envoy_headers: true
+                route_config:
+                  name: routes
+                  virtual_hosts:
+                    - name: bench
+                      domains: ["bench.example.com", "bench.example.com:*"]
+                      routes:
+                        - match: { path: /health }
+                          direct_response: { status: 503 }
+                        - match: { prefix: /static }
+                          direct_response: { status: 503 }
+                        - match:
+                            prefix: /api/v1
+                            headers:
+                              - name: ":method"
+                                string_match: { exact: POST }
+                          direct_response: { status: 503 }
+                        - match: { prefix: / }
+                          route:
+                            cluster: backend
+                            timeout: 0s
+                            rate_limits:
+                              - actions:
+                                  - remote_address: {}
+                          request_headers_to_add:
+                            - header: { key: x-forwarded-proto, value: http }
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                            - header: { key: x-request-source, value: edge }
+                              append_action: APPEND_IF_EXISTS_OR_ADD
+                          request_headers_to_remove: [x-internal-debug]
+                          response_headers_to_add:
+                            - header: { key: x-served-by, value: edgerush }
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                          response_headers_to_remove: [server]
+                    - name: others
+                      domains: ["*.example.org", "*.example.org:*", "www.example.net", "www.example.net:*"]
+                      routes:
+                        - match: { prefix: / }
+                          direct_response: { status: 503 }
+  clusters:
+    - name: backend
+      type: STATIC
+      connect_timeout: 5s
+      # Its defaults stop at 1024 connections and 1024 requests under way.
+      circuit_breakers:
+        thresholds:
+          - max_connections: 100000
+            max_pending_requests: 100000
+            max_requests: 100000
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 9000 }
+    - name: ratelimit
+      type: STATIC
+      connect_timeout: 1s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options:
+              max_concurrent_streams: 100000
+      circuit_breakers:
+        thresholds:
+          - max_connections: 100000
+            max_pending_requests: 100000
+            max_requests: 100000
+      load_assignment:
+        cluster_name: ratelimit
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 8081 }
