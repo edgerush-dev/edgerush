@@ -217,8 +217,32 @@ impl Worker {
                         }
                     });
                 }
+                Limited::Later(decided) => {
+                    let proxy = Arc::clone(&self.proxy);
+                    let _counted = tokio::task::spawn_local(async move {
+                        if let Ok(Some(decided)) = decided.await {
+                            count(&proxy, decided.admitted);
+                        }
+                    });
+                }
+                // Undecided: a dry run counts neither way.
+                Limited::Overloaded => {}
             }
         }
+    }
+
+    /// The answer to a request its rate limits could not decide in time (pooled, deferred):
+    /// the gateway's own overload, 503 with `Retry-After: 1`, counted as
+    /// `rate_limit_deferred`, never a 429.
+    fn undecided(&self, listener: usize, call: Option<Call>) -> Response<Body> {
+        let mut response = self
+            .proxy
+            .answer_to(listener, Answer::RateLimitDeferred, call);
+        response.headers_mut().insert(
+            http::header::RETRY_AFTER,
+            http::HeaderValue::from_static("1"),
+        );
+        response
     }
 
     /// The answer to a request from `client` that the rate limits it is `under` refused:
@@ -273,9 +297,9 @@ impl Worker {
             return Some(Rc::clone(limiter));
         }
         let service = snapshot.config.rate_limit_service()?;
-        // The data plane's keys, shared evenly among its workers (06 §8); layered or
-        // shared, the process's, held once.
-        let share = if service.layered || service.shared {
+        // The data plane's keys, shared evenly among its workers (06 §8); layered, shared
+        // or pooled, the process's, held once.
+        let share = if service.layered || service.shared || service.pooled {
             service.max_key_bytes
         } else {
             service.max_key_bytes / self.proxy.workers.get() as u64
@@ -291,7 +315,10 @@ impl Worker {
         if let Some((_, old)) = held.take() {
             old.stop();
         }
-        let limiter = if service.shared {
+        let limiter = if service.pooled {
+            let hub = self.proxy.hub(service)?;
+            Limiter::pooled(service, hub, usize::from(self.position))?
+        } else if service.shared {
             let hub = self.proxy.hub(service)?;
             Limiter::shared(service, hub, usize::from(self.position))
         } else if service.layered {
@@ -391,6 +418,11 @@ impl Worker {
                         Ok(decided) => (decided.admitted, Some(decided.refused_by)),
                         Err(_) => (false, None),
                     },
+                    Limited::Later(decided) => match decided.await {
+                        Ok(Some(decided)) => (decided.admitted, Some(decided.refused_by)),
+                        Ok(None) | Err(_) => return self.undecided(listener, call).into(),
+                    },
+                    Limited::Overloaded => return self.undecided(listener, call).into(),
                 };
                 let under = Under {
                     rule,

@@ -7,10 +7,16 @@ use edgerush_ratelimit::service::PodId;
 use edgerush_ratelimit_service::grpc::{Client as PodClient, Server};
 use edgerush_ratelimit_service::pod::{Pod, Timing};
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicUsize;
 use tonic::transport::server::TcpIncoming;
 
 /// Three service pods, once they agree all three serve: their addresses.
 async fn service() -> Vec<String> {
+    counted_service(&Arc::new(AtomicUsize::new(0))).await
+}
+
+/// The same, each exchange any of its pods is sent counted in `exchanges`.
+async fn counted_service(exchanges: &Arc<AtomicUsize>) -> Vec<String> {
     let mut listeners = Vec::new();
     let mut addresses = Vec::new();
     for _ in 0..3 {
@@ -31,7 +37,10 @@ async fn service() -> Vec<String> {
             .map(|pod| (pod, PodClient::new(&addresses[pod as usize]).unwrap()))
             .collect();
         let pod = Pod::spawn(id, vec![0, 1, 2], 1, timing, peers);
-        let server = Server::new(pod.clone());
+        let server = Counted {
+            server: Server::new(pod.clone()),
+            exchanges: Arc::clone(exchanges),
+        };
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .serve_with_incoming(server, TcpIncoming::from(listener))
@@ -52,6 +61,37 @@ async fn service() -> Vec<String> {
     addresses
 }
 
+/// A service pod's server that counts the exchanges it is sent.
+#[derive(Clone)]
+struct Counted {
+    server: Server,
+    exchanges: Arc<AtomicUsize>,
+}
+
+impl tonic::server::NamedService for Counted {
+    const NAME: &'static str = <Server as tonic::server::NamedService>::NAME;
+}
+
+impl tower_service::Service<http::Request<tonic::body::Body>> for Counted {
+    type Response = <Server as tower_service::Service<http::Request<tonic::body::Body>>>::Response;
+    type Error = <Server as tower_service::Service<http::Request<tonic::body::Body>>>::Error;
+    type Future = <Server as tower_service::Service<http::Request<tonic::body::Body>>>::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.server.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+        if request.uri().path().ends_with("/Exchange") {
+            self.exchanges.fetch_add(1, Ordering::Relaxed);
+        }
+        self.server.call(request)
+    }
+}
+
 /// `config` with its first route's first rule under ten requests an hour for each client,
 /// a burst of ten, shared through `service`.
 fn limited(mut config: Config, service: &[String]) -> Config {
@@ -69,6 +109,7 @@ fn limited(mut config: Config, service: &[String]) -> Config {
         layered: None,
         layered_keep_ms: None,
         shared: None,
+        pooled: None,
     });
     config
 }
@@ -176,6 +217,7 @@ async fn a_layered_keep_reaches_the_process() {
             layered: true,
             layered_keep: Duration::from_millis(keep),
             shared: false,
+            pooled: false,
         };
         let hub = Hub::start(&compiled, 1, 1 << 20).unwrap();
         let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
@@ -243,6 +285,217 @@ async fn layered_workers_share_a_clients_bucket() {
 #[tokio::test]
 async fn shared_workers_share_a_clients_bucket() {
     two_workers_share_a_clients_bucket(|service| service.shared = Some(true)).await;
+}
+
+/// Pooled (the shared-atomic spike), the same through each key's one shared entry.
+#[tokio::test]
+async fn pooled_workers_share_a_clients_bucket() {
+    two_workers_share_a_clients_bucket(|service| service.pooled = Some(true)).await;
+}
+
+/// Asks that reach the process together go to the service together: a burst of workers'
+/// asks about cold keys is sent in a few exchanges, not one for each ask, which under many
+/// cold keys would hold an exchange in flight for every one.
+#[tokio::test]
+async fn asks_that_come_together_are_sent_together() {
+    use crate::ratelimit::{FromHub, Hub, ToHub};
+    use edgerush_ratelimit::service::Contract;
+    use std::num::NonZeroU64;
+
+    let exchanges = Arc::new(AtomicUsize::new(0));
+    let service = counted_service(&exchanges).await;
+    let contract = Contract {
+        limit: NonZeroU64::new(10).unwrap(),
+        window: NonZeroU64::new(3_600_000_000_000).unwrap(),
+        burst: NonZeroU64::new(10).unwrap(),
+    };
+    let compiled = edgerush_config::CompiledRateLimitService {
+        pods: service,
+        // A cycle longer than the test, so that every exchange is an ask's.
+        cycle: Duration::from_secs(60),
+        max_key_bytes: 1 << 20,
+        layered: false,
+        layered_keep: Duration::ZERO,
+        shared: false,
+        pooled: true,
+    };
+    let hub = Hub::start(&compiled, 1, 1 << 20).unwrap();
+    let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
+    hub.to.send(ToHub::Join { worker: 0, answers }).unwrap();
+    let before = exchanges.load(Ordering::Relaxed);
+    const ASKS: u64 = 500;
+    for id in 0..ASKS {
+        let key: Box<[u8]> = format!("cold-{id}").into_bytes().into();
+        hub.to
+            .send(ToHub::Ask {
+                worker: 0,
+                id,
+                keys: vec![(key, contract)],
+            })
+            .unwrap();
+    }
+    for _ in 0..ASKS {
+        assert!(matches!(
+            within(answered.recv()).await.unwrap(),
+            FromHub::Pooled { admitted: true, .. }
+        ));
+    }
+    let sent = exchanges.load(Ordering::Relaxed) - before;
+    assert!(sent < 50, "{sent} exchanges for {ASKS} asks");
+    // The process thread counts what it took and answered.
+    let stats = hub.render_stats();
+    assert!(
+        stats.contains(
+            "edgerush_rate_limit_hub_asks_total 500
+"
+        ),
+        "{stats}"
+    );
+    assert!(
+        stats.contains(
+            "edgerush_rate_limit_hub_asks_answered_total 500
+"
+        ),
+        "{stats}"
+    );
+}
+
+/// Pooled, a request short only by another request's hold on its key is deferred rather
+/// than refused, and decided once the hold settles; with as many deferred as may be, it is
+/// the overload answer at once. No service pod answers: asks are given up after their time
+/// and keys decided from their copies.
+#[tokio::test]
+async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
+    use crate::ratelimit::{Hub, Limited, Limiter, MOST_DEFERRED};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut config = limited(
+                everything_config("127.0.0.1:9".parse().unwrap()),
+                &["127.0.0.1:9".to_owned()],
+            );
+            config.routes[0].rules[0].rate_limits = vec!["x".to_owned(), "y".to_owned()];
+            config.limits = Some(
+                serde_saphyr::from_str(
+                    "limits:
+  - { name: x, key: client, model: { bucket: { rate: 1/h, burst: 2 } } }
+  - { name: y, key: client, model: { bucket: { rate: 100/h, burst: 100 } } }
+",
+                )
+                .unwrap(),
+            );
+            if let Some(service) = &mut config.rate_limit_service {
+                service.pooled = Some(true);
+            }
+            let compiled = compile(&config).unwrap();
+            let service = compiled.rate_limit_service().unwrap().clone();
+            let hub = Hub::start(&service, 1, 1 << 20).unwrap();
+            let limiter = Limiter::pooled(&service, hub, 0).unwrap();
+            let rule = Arc::clone(&compiled.rules_of(0)[0]);
+            let client = crate::forwarding::Client::new("203.0.113.7".parse().unwrap());
+            let decided = |limited: Limited| async move {
+                match limited {
+                    Limited::Admit => Some(true),
+                    Limited::Refuse => Some(false),
+                    Limited::Later(later) => later.await.ok().flatten().map(|d| d.admitted),
+                    Limited::Wait(_) | Limited::Overloaded => None,
+                }
+            };
+            // X alone, asked about and given up: decided from its copy, one of its two taken.
+            let first = limiter.decide_all(&rule.limits, 0b01, &client);
+            assert_eq!(within(decided(first)).await, Some(true));
+            // X and Y: X's last token held while Y, cold, is asked about.
+            let both = limiter.decide_all(&rule.limits, 0b11, &client);
+            assert!(matches!(both, Limited::Later(_)));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // X alone again, short only by that hold: with none to be deferred, overloaded.
+            limiter.set_most_deferred(0);
+            assert!(matches!(
+                limiter.decide_all(&rule.limits, 0b01, &client),
+                Limited::Overloaded
+            ));
+            limiter.set_most_deferred(MOST_DEFERRED);
+            // Deferred, and decided once the hold settles: X and Y admitted, X is spent.
+            let Limited::Later(alone) = limiter.decide_all(&rule.limits, 0b01, &client) else {
+                panic!("not deferred");
+            };
+            assert_eq!(within(decided(both)).await, Some(true));
+            let alone = within(alone).await.unwrap();
+            assert_eq!(
+                alone.map(|d| d.admitted),
+                Some(false),
+                "decided, not overloaded"
+            );
+            limiter.stop();
+        })
+        .await;
+}
+
+/// A config with a pooled service is refused where 128-bit atomics are not native, at start
+/// and at a reload alike; one that is not pooled runs anywhere.
+#[test]
+fn a_pooled_service_needs_native_128_bit_atomics() {
+    use crate::serve::plane::runs_pooled;
+    let mut config = limited(
+        everything_config("127.0.0.1:1".parse().unwrap()),
+        &["127.0.0.1:1".to_owned()],
+    );
+    let apart = compile(&config).unwrap();
+    assert_eq!(runs_pooled(&apart, false), Ok(()));
+    if let Some(service) = &mut config.rate_limit_service {
+        service.pooled = Some(true);
+    }
+    let pooled = compile(&config).unwrap();
+    assert_eq!(runs_pooled(&pooled, true), Ok(()));
+    assert_eq!(runs_pooled(&pooled, false), Err(ProxyError::Pooled));
+    // A burst that, with two cycles' refill, passes what a pooled key's cycle holds: refused
+    // rather than held to less; one that fits runs.
+    for (burst, fits) in [(65_000, true), (70_000, false)] {
+        config.limits = Some(
+            serde_saphyr::from_str(&format!(
+                "limits:\n  - {{ name: per-client, key: client, model: {{ bucket: {{ rate: 10/h, burst: {burst} }} }} }}\n"
+            ))
+            .unwrap(),
+        );
+        let compiled = compile(&config).unwrap();
+        let want = if fits {
+            Ok(())
+        } else {
+            Err(ProxyError::PooledLimit("per-client".to_owned()))
+        };
+        assert_eq!(runs_pooled(&compiled, true), want, "burst {burst}");
+    }
+}
+
+/// A reload that turns pooling on or off starts the process's limiter afresh; pooled, it
+/// hands its workers the registry of its entries.
+#[tokio::test]
+async fn a_changed_pooling_starts_the_process_afresh() {
+    let config = limited(
+        everything_config("127.0.0.1:1".parse().unwrap()),
+        &["127.0.0.1:1".to_owned()],
+    );
+    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+    let service = |pooled| {
+        let mut config = config.clone();
+        if let Some(service) = &mut config.rate_limit_service {
+            service.pooled = pooled;
+        }
+        compile(&config)
+            .unwrap()
+            .rate_limit_service()
+            .unwrap()
+            .clone()
+    };
+    let not = proxy.hub(&service(None)).unwrap();
+    assert!(not.registry().is_none());
+    let pooled = proxy.hub(&service(Some(true))).unwrap();
+    assert!(!Arc::ptr_eq(&not, &pooled), "pooled now");
+    assert!(pooled.registry().is_some());
+    let same = proxy.hub(&service(Some(true))).unwrap();
+    assert!(Arc::ptr_eq(&pooled, &same), "nothing changed");
+    let again = proxy.hub(&service(Some(false))).unwrap();
+    assert!(!Arc::ptr_eq(&pooled, &again), "no longer pooled");
 }
 
 /// Two workers of one data plane sharing as `sharing` sets the service, a client with a

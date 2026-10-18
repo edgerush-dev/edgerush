@@ -133,6 +133,8 @@ pub struct CompiledLimit {
     pub rule: Rule,
     /// Its rate as it was written, `100/s`: for telling a person.
     pub rate: String,
+    /// Its rate's count: the requests its window holds.
+    pub count: NonZeroU64,
     /// The window its rate is a number of requests in, in nanoseconds.
     pub window: NonZeroU64,
     /// The whole bucket.
@@ -226,7 +228,7 @@ pub(crate) fn compile_limits(
                 }));
             })
             .ok();
-        if let (Some(rule), Some((_, window)), Some(burst)) = (rule, rate, burst)
+        if let (Some(rule), Some((count, window)), Some(burst)) = (rule, rate, burst)
             && errors.len() == before
         {
             let compiled = CompiledLimit {
@@ -236,6 +238,7 @@ pub(crate) fn compile_limits(
                 definition: definition(limit),
                 rule,
                 rate: bucket.rate.clone(),
+                count,
                 window,
                 burst,
                 dry_run: limit.dry_run,

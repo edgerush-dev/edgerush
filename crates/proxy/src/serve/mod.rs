@@ -1173,6 +1173,16 @@ pub enum ProxyError {
     /// BoringSSL could not give the keys the data plane makes at start.
     #[error("no random keys to be had: {0}")]
     Random(String),
+    /// A pooled rate-limiting service on a machine without native 128-bit atomics.
+    #[error("`rate_limit_service.pooled`: this machine has no native 128-bit compare-and-swap")]
+    Pooled,
+    /// A pooled rate-limiting service with a limit whose bucket and two cycles' refill pass
+    /// 65,535, what a pooled key's cycle can hold.
+    #[error(
+        "`rate_limit_service.pooled`: limit `{0}`'s burst and two cycles' refill pass 65,535, \
+         the most a pooled key's cycle holds"
+    )]
+    PooledLimit(String),
     /// A listener's access log that cannot be opened to be written to.
     #[error("listener `{listener}`: its access log cannot be opened: {error}")]
     AccessLog {

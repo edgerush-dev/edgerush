@@ -1021,6 +1021,14 @@
           },
           "minItems": 1
         },
+        "pooled": {
+          "description": "Experimental, for measuring: the process alone a participant of the service, its\nworkers deciding warm requests from per-key state they share by compare-and-swap,\nwith no thread between them (12 item 3; the shared-atomic spike). Not with `layered`\nor `shared`; needs native 128-bit atomics, which the proxy checks. Off when left out.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
         "shared": {
           "description": "Experimental, for measuring: the process alone a data plane of the service, as with\n`layered`, its workers taking from one room a key that all of them reach, by\natomics, rather than from slices of their own (12 item 3). Not with `layered`. Off\nwhen left out.",
           "type": [

@@ -98,6 +98,12 @@ pub struct RateLimitService {
     /// when left out.
     #[serde(default)]
     pub shared: Option<bool>,
+    /// Experimental, for measuring: the process alone a participant of the service, its
+    /// workers deciding warm requests from per-key state they share by compare-and-swap,
+    /// with no thread between them (12 item 3; the shared-atomic spike). Not with `layered`
+    /// or `shared`; needs native 128-bit atomics, which the proxy checks. Off when left out.
+    #[serde(default)]
+    pub pooled: Option<bool>,
 }
 
 /// A place where requests come in. Hostnames are to come; until a listener can be told

@@ -387,10 +387,14 @@ pub(crate) enum Answer {
     MaxForwards,
     /// Over its rule's rate limit (experimental).
     RateLimited,
+    /// Its rate limits could not decide it in the time a deferred request may wait, or
+    /// found as many deferred as may be (pooled, experimental): the gateway's own overload,
+    /// never over a limit.
+    RateLimitDeferred,
 }
 
 impl Answer {
-    const ALL: [Self; 25] = [
+    const ALL: [Self; 26] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -416,6 +420,7 @@ impl Answer {
         Self::UnknownProtocol,
         Self::MaxForwards,
         Self::RateLimited,
+        Self::RateLimitDeferred,
     ];
 
     /// The status that is answered with.
@@ -434,7 +439,8 @@ impl Answer {
             | Self::Exhausted
             | Self::NoRoom
             | Self::QueueFull
-            | Self::QueueTimedOut => StatusCode::SERVICE_UNAVAILABLE,
+            | Self::QueueTimedOut
+            | Self::RateLimitDeferred => StatusCode::SERVICE_UNAVAILABLE,
             Self::ConnectionAuth | Self::UnknownProtocol => StatusCode::NOT_IMPLEMENTED,
             Self::DeadlineExceeded | Self::UpstreamTimedOut => StatusCode::GATEWAY_TIMEOUT,
             Self::Unreachable | Self::UpstreamFailed => StatusCode::BAD_GATEWAY,
@@ -474,6 +480,7 @@ impl Answer {
             Self::UnknownProtocol => "unknown_protocol",
             Self::MaxForwards => "max_forwards",
             Self::RateLimited => "rate_limited",
+            Self::RateLimitDeferred => "rate_limit_deferred",
         }
     }
 
@@ -527,6 +534,10 @@ impl Answer {
             // Not a gRPC call's method; said for completeness.
             Self::MaxForwards => (Code::Unimplemented, "answered here, as the final recipient"),
             Self::RateLimited => (Code::ResourceExhausted, "the call is over its rate limit"),
+            Self::RateLimitDeferred => (
+                Code::Unavailable,
+                "the rate limits could not decide the call in time",
+            ),
         }
     }
 }

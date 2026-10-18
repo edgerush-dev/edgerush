@@ -125,6 +125,9 @@ pub struct CompiledRateLimitService {
     /// Whether the process alone is a data plane of the service, its workers taking from
     /// one room a key they all reach (experimental).
     pub shared: bool,
+    /// Whether the process alone is a participant of the service, its workers deciding
+    /// from per-key state they share by compare-and-swap (experimental).
+    pub pooled: bool,
 }
 
 impl CompiledRateLimitService {
@@ -566,7 +569,11 @@ fn rate_limit_service(
     if service.cycle_ms == Some(0) {
         errors.push(place.problem(Problem::RateLimitServiceCycleNever));
     }
-    if service.layered == Some(true) && service.shared == Some(true) {
+    let ways = [service.layered, service.shared, service.pooled]
+        .iter()
+        .filter(|way| **way == Some(true))
+        .count();
+    if ways > 1 {
         errors.push(place.problem(Problem::RateLimitServiceLayeredAndShared));
     }
     Some(CompiledRateLimitService {
@@ -580,6 +587,7 @@ fn rate_limit_service(
         layered: service.layered.unwrap_or(false),
         layered_keep: Duration::from_millis(service.layered_keep_ms.unwrap_or(0)),
         shared: service.shared.unwrap_or(false),
+        pooled: service.pooled.unwrap_or(false),
     })
 }
 
@@ -2259,8 +2267,8 @@ pub enum Problem {
     /// A rate-limiting service whose cycle never comes.
     #[error("`rate_limit_service`: `cycle_ms` is 0: at least 1")]
     RateLimitServiceCycleNever,
-    /// A rate-limiting service asked to be both layered and shared.
-    #[error("`rate_limit_service`: `layered` and `shared` both: one or the other")]
+    /// A rate-limiting service asked to share its keys more than one way.
+    #[error("`rate_limit_service`: more than one of `layered`, `shared` and `pooled`: one at most")]
     RateLimitServiceLayeredAndShared,
     /// A WebSocket's idle bound of nothing, which would never close one whose peer has gone.
     #[error("`tunnel_idle_ms` is 0: at least 1")]
@@ -4688,7 +4696,9 @@ routes:
         assert_eq!(
             with(r#"rate_limit_service: { pods: ["a:1"], layered: true, shared: true }"#)
                 .unwrap_err(),
-            ["the data plane: `rate_limit_service`: `layered` and `shared` both: one or the other"]
+            [
+                "the data plane: `rate_limit_service`: more than one of `layered`, `shared` and `pooled`: one at most"
+            ]
         );
     }
 

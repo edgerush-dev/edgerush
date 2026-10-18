@@ -18,6 +18,31 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Refuses a config whose rate-limiting service is pooled on a machine without the native
+/// 128-bit compare-and-swap its entries need (`supported` false): a lock in its place would
+/// put one on every request. And one with a limit whose largest allowance a cycle could
+/// pass what a pooled key holds, rather than hold it to less and refuse what it allows.
+pub(super) fn runs_pooled(config: &Compiled, supported: bool) -> Result<(), ProxyError> {
+    let Some(service) = config.rate_limit_service().filter(|service| service.pooled) else {
+        return Ok(());
+    };
+    if !supported {
+        return Err(ProxyError::Pooled);
+    }
+    let cycle = u64::try_from(service.cycle.as_nanos()).unwrap_or(u64::MAX);
+    for limit in config.limits() {
+        let contract = edgerush_ratelimit::service::Contract {
+            limit: limit.count,
+            window: limit.window,
+            burst: limit.burst,
+        };
+        if !edgerush_ratelimit::service::pooled::fits(contract, cycle) {
+            return Err(ProxyError::PooledLimit(limit.name.clone()));
+        }
+    }
+    Ok(())
+}
+
 impl Snapshot {
     pub(super) fn new(
         config: Compiled,
@@ -27,6 +52,7 @@ impl Snapshot {
         keys: &Keys,
         logs: Vec<Option<Sink>>,
     ) -> Result<Self, ProxyError> {
+        runs_pooled(&config, edgerush_ratelimit::service::pooled::supported())?;
         let endpoints = config
             .upstreams()
             .iter()
@@ -316,6 +342,17 @@ impl Proxy {
             && !limits.is_empty()
         {
             scrape.push_str(&self.metrics.render_limits(&limits, service.max_key_bytes));
+            // Pooled (the shared-atomic spike), the process thread's own measures.
+            if service.pooled {
+                let hub = self
+                    .hub
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(hub) = hub {
+                    scrape.push_str(&hub.render_stats());
+                }
+            }
         }
         scrape
     }
