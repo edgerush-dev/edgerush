@@ -7,7 +7,7 @@
 //! wsbench churn URL --rate CONNECTIONS_PER_SECOND [--host NAME] [--seconds S]
 //!                   [--size BYTES] [--most N] [--threads N]
 //! wsbench http URL [--host NAME] [--connections N] [--addresses N] [--seconds S]
-//!                  [--threads N]
+//!                  [--resident N] [--threads N]
 //! ```
 //!
 //! `serve` answers a handshake with its 101 and then sends every frame back as it came,
@@ -102,7 +102,9 @@ fn run(args: &[String]) -> Result<(), String> {
             let seconds: f64 = options.get("seconds", 10.0)?;
             let connections = options.get("connections", 64)?;
             let addresses = options.get("addresses", 1)?;
-            let tally = runtime.block_on(http::run(target, connections, addresses, seconds));
+            let resident = options.get("resident", 0)?;
+            let tally =
+                runtime.block_on(http::run(target, connections, addresses, seconds, resident));
             println!("{}", tally.report(seconds));
             Ok(())
         }

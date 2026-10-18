@@ -146,6 +146,11 @@ repo=$(dirname "$here")
 : "${RL_KEEP_MS:=50}"
 # The rate-limiting service's cycle, in milliseconds: the data planes' and the pod's alike.
 : "${RL_CYCLE_MS:=10}"
+# The `ratelimit` scenario's keys beyond its busy ones: RL_RESIDENT more client addresses
+# met once each before the run (wsbench --resident), quiet keys the limits then hold; and
+# RL_MAX_KEY_BYTES, the bytes their keys may hold, the proxy's and the service pod's alike
+# (256 MiB each when unset). Keys quiet for twice the limit's refill time are dropped, so a
+# run with resident keys wants RL_RATE and RL_BURST refilling slower than it lasts.
 # The envoy-rl variant's service, envoyproxy/ratelimit, and its Redis: in Docker on the
 # backend's CPUs, as EdgeRush's service pod runs there, with host networking. Its knobs:
 # RLS_PIPELINE_WINDOW (the time it gathers commands to Redis for, `150us`; empty for none,
@@ -572,8 +577,9 @@ assert s.count(rule) == 1, "the measured rule moved"
 s = s.replace(rule, "          - path: { prefix: / }\n        rate_limits: [per-client]\n        filters:")
 open(sys.argv[2], "w").write(s)
 PY
-    printf 'rate_limit_service: { pods: ["127.0.0.1:7000"], cycle_ms: %s%s }\nlimits_file: %s\n' \
-        "$RL_CYCLE_MS" "$sharing" "$run-limits.yaml" >>"$config.rl"
+    printf 'rate_limit_service: { pods: ["127.0.0.1:7000"], cycle_ms: %s%s%s }\nlimits_file: %s\n' \
+        "$RL_CYCLE_MS" "$sharing" "${RL_MAX_KEY_BYTES:+, max_key_bytes: $RL_MAX_KEY_BYTES}" \
+        "$run-limits.yaml" >>"$config.rl"
 }
 
 # The service's one pod, for `ratelimit`.
@@ -581,7 +587,8 @@ rl_pid=
 start_rl_service() {
     [ -x "$RL_SERVICE" ] || { echo "no service at $RL_SERVICE: build it first" >&2; exit 2; }
     taskset -c "$BACKEND_CPUS" "$RL_SERVICE" --id 0 --listen 127.0.0.1:7000 --cycle-ms "$RL_CYCLE_MS" \
-        --pod 0=127.0.0.1:7000 2>>"$OUT/rl-service.log" &
+        --pod 0=127.0.0.1:7000 ${RL_MAX_KEY_BYTES:+--max-key-bytes "$RL_MAX_KEY_BYTES"} \
+        2>>"$OUT/rl-service.log" &
     rl_pid=$!
     sleep 2
 }
@@ -643,7 +650,13 @@ ratelimit_runs() {
     saturation_h1 "$1.saturation-h1" "$proxy" --connect-to="$proxy_at"
     saturation_h2 "$1.saturation-h2" "$proxy" --connect-to="$proxy_at"
     measured "$1.keys-h1" "$WSBENCH" http "$scheme://$proxy_at/" --host "$host" \
-        --connections "$rl_keys" --addresses "$rl_keys" --seconds "$DURATION" --threads 2
+        --connections "$rl_keys" --addresses "$rl_keys" --seconds "$DURATION" --threads 2 \
+        ${RL_RESIDENT:+--resident "$RL_RESIDENT"}
+    # The proxy's own counts after it, where it serves them: its answers by kind, its keys
+    # and its background thread's work.
+    if [ -n "$METRICS" ]; then
+        curl -s "http://$METRICS/metrics" >"$OUT/$1.keys-h1.metrics" || true
+    fi
     # The CPU each of the proxy's threads spent over the three, in clock ticks: the
     # process layer's thread apart from the workers'.
     local task
