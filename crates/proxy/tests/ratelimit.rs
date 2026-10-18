@@ -157,6 +157,19 @@ async fn ask(stream: &mut TcpStream, method: &str, path: &str) -> u16 {
 
 /// The status of `method path` through `stream`, its `Retry-After` and its `RateLimit`, if
 /// it has them.
+/// A refusal by `limit` saying to come back in `seconds` — or a second more, a key's wait
+/// being padded so that it is never short and rounded up to whole seconds — with the
+/// `RateLimit` field saying the same.
+fn refused_by(answer: &(u16, Option<u64>, Option<String>), limit: &str, seconds: u64) -> bool {
+    let (status, after, field) = answer;
+    let Some(after) = *after else {
+        return false;
+    };
+    *status == 429
+        && (after == seconds || after == seconds + 1)
+        && field.as_deref() == Some(format!(r#""{limit}";r=0;t={after}"#).as_str())
+}
+
 async fn answer(
     stream: &mut TcpStream,
     method: &str,
@@ -311,10 +324,8 @@ async fn a_refusal_says_when_the_request_would_be_admitted() {
             );
         }
         // Ten an hour: one back every 360 seconds.
-        assert_eq!(
-            answer(&mut stream, "GET", "/by-client").await,
-            (429, Some(360), Some(r#""per-client";r=0;t=360"#.into()))
-        );
+        let refused = answer(&mut stream, "GET", "/by-client").await;
+        assert!(refused_by(&refused, "per-client", 360), "{refused:?}");
         // Three POSTs an hour spent, with three of the twenty an hour over everything; then
         // the rest of the twenty: both refuse, `writes` for 1,200 s, `everything` for 180.
         for _ in 0..3 {
@@ -326,14 +337,11 @@ async fn a_refusal_says_when_the_request_would_be_admitted() {
                 break answer;
             }
         };
-        assert_eq!(
-            refused,
-            (429, Some(180), Some(r#""everything";r=0;t=180"#.into()))
-        );
-        assert_eq!(
-            answer(&mut stream, "POST", "/api/orders").await,
-            (429, Some(1_200), Some(r#""writes";r=0;t=1200"#.into())),
-            "the latest of the two"
+        assert!(refused_by(&refused, "everything", 180), "{refused:?}");
+        let latest = answer(&mut stream, "POST", "/api/orders").await;
+        assert!(
+            refused_by(&latest, "writes", 1_200),
+            "the latest of the two: {latest:?}"
         );
         // Another client spends everything elsewhere: `/by-client`, its own bucket full, is
         // refused by the second of its limits.
@@ -343,10 +351,8 @@ async fn a_refusal_says_when_the_request_would_be_admitted() {
         for _ in 0..20 {
             assert_eq!(answer(&mut stream, "GET", "/elsewhere").await.0, 200);
         }
-        assert_eq!(
-            answer(&mut stream, "GET", "/by-client").await,
-            (429, Some(180), Some(r#""everything";r=0;t=180"#.into()))
-        );
+        let refused = answer(&mut stream, "GET", "/by-client").await;
+        assert!(refused_by(&refused, "everything", 180), "{refused:?}");
     })
     .await;
 }

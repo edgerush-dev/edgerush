@@ -106,15 +106,23 @@ fn limited(mut config: Config, service: &[String]) -> Config {
         pods: service.to_vec(),
         cycle_ms: Some(10),
         max_key_bytes: None,
-        layered: None,
-        layered_keep_ms: None,
-        shared: None,
-        pooled: None,
         poll_quiet_keys: None,
         ask_cold_keys: None,
         schedule_keys: None,
     });
     config
+}
+
+/// A refusal under ten an hour says to come back in six minutes — or a second more, a key's
+/// wait being padded so that it is never short and rounded up to whole seconds — and the
+/// `RateLimit` field says the same.
+fn comes_back(headers: &http::HeaderMap) {
+    let after = headers["retry-after"].to_str().unwrap();
+    assert!(after == "360" || after == "361", "retry-after {after}");
+    assert_eq!(
+        headers["ratelimit"],
+        format!(r#""per-client";r=0;t={after}"#).as_str()
+    );
 }
 
 fn tally(statuses: &[u16]) -> (usize, usize) {
@@ -150,8 +158,7 @@ async fn http2_requests_are_held_to_their_limit() {
                 let (response, _) = send.send_request(request, true).unwrap();
                 let response = within(response).await.unwrap();
                 if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                    assert_eq!(response.headers()["retry-after"], "360");
-                    assert_eq!(response.headers()["ratelimit"], r#""per-client";r=0;t=360"#);
+                    comes_back(response.headers());
                 }
                 statuses.push(response.status().as_u16());
             }
@@ -167,136 +174,19 @@ async fn http2_requests_are_held_to_their_limit() {
         .await;
 }
 
-/// A reload that changes how long an unused slice is kept starts the process layer afresh,
-/// with the new keep; one that changes nothing keeps it.
+/// Two workers of one data plane share a client's bucket through each key's one entry: a
+/// client with a connection to each is held to the one bucket, refusals say when to come
+/// back, and the process's keys are counted once — with the levers left out, and with the
+/// protocol's (quiet keys polled, cold keys asked about, every key visited).
 #[tokio::test]
-async fn a_changed_keep_starts_the_process_layer_afresh() {
-    let mut config = limited(
-        everything_config("127.0.0.1:1".parse().unwrap()),
-        &["127.0.0.1:1".to_owned()],
-    );
-    if let Some(service) = &mut config.rate_limit_service {
-        service.layered = Some(true);
-    }
-    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
-    let service = |keep| {
-        let mut config = config.clone();
-        if let Some(service) = &mut config.rate_limit_service {
-            service.layered_keep_ms = keep;
-        }
-        compile(&config)
-            .unwrap()
-            .rate_limit_service()
-            .unwrap()
-            .clone()
-    };
-    let first = proxy.hub(&service(None)).unwrap();
-    let same = proxy.hub(&service(None)).unwrap();
-    assert!(Arc::ptr_eq(&first, &same), "nothing changed");
-    let kept = proxy.hub(&service(Some(50))).unwrap();
-    assert!(!Arc::ptr_eq(&first, &kept), "a new keep");
-}
-
-/// Layered, `layered_keep_ms` reaches the process: a slice its worker leaves unused is
-/// given again at its sync while the keep lasts, and given back at once without one.
-#[tokio::test]
-async fn a_layered_keep_reaches_the_process() {
-    use crate::ratelimit::{FromHub, Hub, ToHub};
-    use edgerush_ratelimit::service::Contract;
-    use edgerush_ratelimit::service::layer::Used;
-    use std::num::NonZeroU64;
-
-    let service = service().await;
-    let contract = Contract {
-        limit: NonZeroU64::new(10).unwrap(),
-        window: NonZeroU64::new(3_600_000_000_000).unwrap(),
-        burst: NonZeroU64::new(10).unwrap(),
-    };
-    for (keep, kept) in [(0, false), (1_000, true)] {
-        let compiled = edgerush_config::CompiledRateLimitService {
-            pods: service.clone(),
-            cycle: Duration::from_millis(10),
-            max_key_bytes: 1 << 20,
-            layered: true,
-            layered_keep: Duration::from_millis(keep),
-            shared: false,
-            pooled: false,
-            poll_quiet_keys: true,
-            ask_cold_keys: true,
-            schedule_keys: false,
-        };
-        let hub = Hub::start(&compiled, 1, 1 << 20).unwrap();
-        let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
-        hub.to.send(ToHub::Join { worker: 0, answers }).unwrap();
-        let key: Box<[u8]> = format!("kept-{keep}").into_bytes().into();
-        // Asked until an answer brings a slice: the first waits on the service, and the
-        // copy is fresh once a cycle has bounded it.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        for id in 0.. {
-            assert!(Instant::now() < deadline, "no slice for keep {keep}");
-            let keys = vec![(key.clone(), contract)];
-            hub.to
-                .send(ToHub::Ask {
-                    worker: 0,
-                    id,
-                    keys,
-                })
-                .unwrap();
-            let answer = loop {
-                match within(answered.recv()).await.unwrap() {
-                    FromHub::Answer {
-                        id: answered,
-                        answer,
-                    } if answered == id => break answer,
-                    _ => {}
-                }
-            };
-            if answer
-                .slices
-                .first()
-                .is_some_and(|slice| slice.allowance > 0)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        // Two syncs with nothing used: the first still counts the ask as use.
-        let mut given = Vec::new();
-        for _ in 0..2 {
-            let used = vec![Used {
-                key: key.clone(),
-                contract,
-                count: 0,
-            }];
-            hub.to.send(ToHub::Used { worker: 0, used }).unwrap();
-            given = loop {
-                if let FromHub::Slices(slices) = within(answered.recv()).await.unwrap() {
-                    break slices;
-                }
-            };
-        }
-        assert_eq!(!given.is_empty(), kept, "keep {keep}: {given:?}");
-    }
-}
-
-/// Layered (12 item 3), two workers of one data plane share a client's bucket through
-/// their process: a client with a connection to each is held to the one bucket, refusals
-/// say when to come back, and the process's keys are counted once.
-#[tokio::test]
-async fn layered_workers_share_a_clients_bucket() {
-    two_workers_share_a_clients_bucket(|service| service.layered = Some(true)).await;
-}
-
-/// Shared (12 item 3), the same through each key's one room.
-#[tokio::test]
-async fn shared_workers_share_a_clients_bucket() {
-    two_workers_share_a_clients_bucket(|service| service.shared = Some(true)).await;
-}
-
-/// Pooled (the shared-atomic spike), the same through each key's one shared entry.
-#[tokio::test]
-async fn pooled_workers_share_a_clients_bucket() {
-    two_workers_share_a_clients_bucket(|service| service.pooled = Some(true)).await;
+async fn workers_share_a_clients_bucket() {
+    two_workers_share_a_clients_bucket(|_| {}).await;
+    two_workers_share_a_clients_bucket(|service| {
+        service.poll_quiet_keys = Some(true);
+        service.ask_cold_keys = Some(true);
+        service.schedule_keys = Some(false);
+    })
+    .await;
 }
 
 /// Asks that reach the process together go to the service together: a burst of workers'
@@ -320,10 +210,6 @@ async fn asks_that_come_together_are_sent_together() {
         // A cycle longer than the test, so that every exchange is an ask's.
         cycle: Duration::from_secs(60),
         max_key_bytes: 1 << 20,
-        layered: false,
-        layered_keep: Duration::ZERO,
-        shared: false,
-        pooled: true,
         poll_quiet_keys: true,
         ask_cold_keys: true,
         schedule_keys: false,
@@ -346,7 +232,7 @@ async fn asks_that_come_together_are_sent_together() {
     for _ in 0..ASKS {
         assert!(matches!(
             within(answered.recv()).await.unwrap(),
-            FromHub::Pooled { admitted: true, .. }
+            FromHub { admitted: true, .. }
         ));
     }
     let sent = exchanges.load(Ordering::Relaxed) - before;
@@ -394,14 +280,13 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
                 .unwrap(),
             );
             if let Some(service) = &mut config.rate_limit_service {
-                service.pooled = Some(true);
                 // Cold keys asked about: a hold waits on an ask.
                 service.ask_cold_keys = Some(true);
             }
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
             let hub = Hub::start(&service, 1, 1 << 20).unwrap();
-            let limiter = Limiter::pooled(&service, hub, 0).unwrap();
+            let limiter = Limiter::new(&service, hub, 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = crate::forwarding::Client::new("203.0.113.7".parse().unwrap());
             let decided = |limited: Limited| async move {
@@ -409,7 +294,7 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
                     Limited::Admit => Some(true),
                     Limited::Refuse => Some(false),
                     Limited::Later(later) => later.await.ok().flatten().map(|d| d.admitted),
-                    Limited::Wait(_) | Limited::Overloaded => None,
+                    Limited::Overloaded => None,
                 }
             };
             // X alone, asked about and given up: decided from its copy, one of its two taken.
@@ -457,13 +342,12 @@ async fn a_cold_key_decided_locally_does_not_wait_for_the_service() {
                     &["127.0.0.1:9".to_owned()],
                 );
                 if let Some(service) = &mut config.rate_limit_service {
-                    service.pooled = Some(true);
                     service.ask_cold_keys = Some(ask_cold);
                 }
                 let compiled = compile(&config).unwrap();
                 let service = compiled.rate_limit_service().unwrap().clone();
                 let hub = Hub::start(&service, 1, 1 << 20).unwrap();
-                let limiter = Limiter::pooled(&service, hub, 0).unwrap();
+                let limiter = Limiter::new(&service, hub, 0);
                 let rule = Arc::clone(&compiled.rules_of(0)[0]);
                 let client = crate::forwarding::Client::new("203.0.113.9".parse().unwrap());
                 let started = Instant::now();
@@ -513,7 +397,6 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
             let service = counted_service(&exchanges).await;
             let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
             if let Some(service) = &mut config.rate_limit_service {
-                service.pooled = Some(true);
                 service.poll_quiet_keys = Some(false);
                 service.ask_cold_keys = Some(false);
                 service.schedule_keys = Some(true);
@@ -521,7 +404,7 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
             let hub = Hub::start(&service, 1, 1 << 20).unwrap();
-            let limiter = Limiter::pooled(&service, Arc::clone(&hub), 0).unwrap();
+            let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = crate::forwarding::Client::new("203.0.113.9".parse().unwrap());
             let settle = || async {
@@ -561,36 +444,25 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
         .await;
 }
 
-/// Pooled with keys visited only when they need it, two workers share a client's bucket as
-/// when every key is visited.
-#[tokio::test]
-async fn scheduled_pooled_workers_share_a_clients_bucket() {
-    two_workers_share_a_clients_bucket(|service| {
-        service.pooled = Some(true);
-        service.schedule_keys = Some(true);
-    })
-    .await;
-}
-
-/// A config with a pooled service is refused where 128-bit atomics are not native, at start
-/// and at a reload alike; one that is not pooled runs anywhere.
+/// A config with rate limits is refused where 128-bit atomics are not native, at start and
+/// at a reload alike; one without runs anywhere.
 #[test]
-fn a_pooled_service_needs_native_128_bit_atomics() {
-    use crate::serve::plane::runs_pooled;
+fn rate_limits_need_native_128_bit_atomics() {
+    use crate::serve::plane::runs_rate_limits;
+    let unlimited = compile(&everything_config("127.0.0.1:1".parse().unwrap())).unwrap();
+    assert_eq!(runs_rate_limits(&unlimited, false), Ok(()));
     let mut config = limited(
         everything_config("127.0.0.1:1".parse().unwrap()),
         &["127.0.0.1:1".to_owned()],
     );
-    let apart = compile(&config).unwrap();
-    assert_eq!(runs_pooled(&apart, false), Ok(()));
-    if let Some(service) = &mut config.rate_limit_service {
-        service.pooled = Some(true);
-    }
-    let pooled = compile(&config).unwrap();
-    assert_eq!(runs_pooled(&pooled, true), Ok(()));
-    assert_eq!(runs_pooled(&pooled, false), Err(ProxyError::Pooled));
-    // A burst that, with two cycles' refill, passes what a pooled key's cycle holds: refused
-    // rather than held to less; one that fits runs.
+    let limited = compile(&config).unwrap();
+    assert_eq!(runs_rate_limits(&limited, true), Ok(()));
+    assert_eq!(
+        runs_rate_limits(&limited, false),
+        Err(ProxyError::RateLimitsUnsupported)
+    );
+    // A burst that, with two cycles' refill, passes what a key's cycle holds: refused rather
+    // than held to less; one that fits runs.
     for (burst, fits) in [(65_000, true), (70_000, false)] {
         config.limits = Some(
             serde_saphyr::from_str(&format!(
@@ -602,49 +474,52 @@ fn a_pooled_service_needs_native_128_bit_atomics() {
         let want = if fits {
             Ok(())
         } else {
-            Err(ProxyError::PooledLimit("per-client".to_owned()))
+            Err(ProxyError::LimitTooLarge("per-client".to_owned()))
         };
-        assert_eq!(runs_pooled(&compiled, true), want, "burst {burst}");
+        assert_eq!(runs_rate_limits(&compiled, true), want, "burst {burst}");
     }
 }
 
-/// A reload that turns pooling on or off starts the process's limiter afresh; pooled, it
-/// hands its workers the registry of its entries.
+/// A reload that changes a lever, the cycle or the pods starts the process's limiter
+/// afresh; one that changes nothing, or only what its keys may hold, keeps it.
 #[tokio::test]
-async fn a_changed_pooling_starts_the_process_afresh() {
+async fn a_changed_service_starts_the_process_afresh() {
     let config = limited(
         everything_config("127.0.0.1:1".parse().unwrap()),
         &["127.0.0.1:1".to_owned()],
     );
     let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
-    let service = |pooled| {
-        let mut config = config.clone();
-        if let Some(service) = &mut config.rate_limit_service {
-            service.pooled = pooled;
-        }
-        compile(&config)
-            .unwrap()
-            .rate_limit_service()
-            .unwrap()
-            .clone()
-    };
-    let not = proxy.hub(&service(None)).unwrap();
-    assert!(not.registry().is_none());
-    let pooled = proxy.hub(&service(Some(true))).unwrap();
-    assert!(!Arc::ptr_eq(&not, &pooled), "pooled now");
-    assert!(pooled.registry().is_some());
-    let same = proxy.hub(&service(Some(true))).unwrap();
-    assert!(Arc::ptr_eq(&pooled, &same), "nothing changed");
-    let again = proxy.hub(&service(Some(false))).unwrap();
-    assert!(!Arc::ptr_eq(&pooled, &again), "no longer pooled");
-    // A lever changed: the process's limiter afresh too.
-    let mut levered = service(Some(true));
-    levered.ask_cold_keys = !levered.ask_cold_keys;
-    let pooled = proxy.hub(&service(Some(true))).unwrap();
+    let service = compile(&config)
+        .unwrap()
+        .rate_limit_service()
+        .unwrap()
+        .clone();
+    let first = proxy.hub(&service).unwrap();
     assert!(
-        !Arc::ptr_eq(&pooled, &proxy.hub(&levered).unwrap()),
-        "a lever changed"
+        Arc::ptr_eq(&first, &proxy.hub(&service).unwrap()),
+        "nothing changed"
     );
+    let mut bigger = service.clone();
+    bigger.max_key_bytes *= 2;
+    assert!(
+        Arc::ptr_eq(&first, &proxy.hub(&bigger).unwrap()),
+        "only its keys' bytes"
+    );
+    let changes: [fn(&mut edgerush_config::CompiledRateLimitService); 4] = [
+        |service| service.ask_cold_keys = !service.ask_cold_keys,
+        |service| service.poll_quiet_keys = !service.poll_quiet_keys,
+        |service| service.schedule_keys = !service.schedule_keys,
+        |service| service.cycle *= 2,
+    ];
+    for (at, change) in changes.into_iter().enumerate() {
+        let mut changed = service.clone();
+        change(&mut changed);
+        let current = proxy.hub(&service).unwrap();
+        assert!(
+            !Arc::ptr_eq(&current, &proxy.hub(&changed).unwrap()),
+            "change {at}"
+        );
+    }
 }
 
 /// Two workers of one data plane sharing as `sharing` sets the service, a client with a
@@ -677,7 +552,7 @@ async fn two_workers_share_a_clients_bucket(
                 sends.push(h2_library_client(front, &::h2::client::Builder::new()).await);
             }
             let mut statuses = Vec::new();
-            for turn in 0..16 {
+            for _ in 0..16 {
                 let send = sends.remove(0);
                 let mut send = within(send.ready()).await.unwrap();
                 let request = Request::get("http://example.test/")
@@ -687,8 +562,7 @@ async fn two_workers_share_a_clients_bucket(
                 let (response, _) = send.send_request(request, true).unwrap();
                 let response = within(response).await.unwrap();
                 if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                    assert_eq!(response.headers()["retry-after"], "360", "turn {turn}");
-                    assert_eq!(response.headers()["ratelimit"], r#""per-client";r=0;t=360"#);
+                    comes_back(response.headers());
                 }
                 statuses.push(response.status().as_u16());
                 sends.push(send);
@@ -748,7 +622,7 @@ async fn a_dry_run_counts_what_it_would_refuse_and_refuses_nothing() {
                 let (response, _) = send.send_request(request, true).unwrap();
                 let response = within(response).await.unwrap();
                 if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                    assert_eq!(response.headers()["ratelimit"], r#""per-client";r=0;t=360"#);
+                    comes_back(response.headers());
                 }
                 statuses.push(response.status().as_u16());
             }
@@ -782,10 +656,10 @@ async fn a_dry_run_counts_what_it_would_refuse_and_refuses_nothing() {
         .await;
 }
 
-/// The scrape shows what the workers' keys hold against the data plane's bound; a bound
-/// too small to keep any key evicts each once its requests are over; and the bound is the
-/// data plane's, shared among its workers: one and a half keys' worth on two leaves each
-/// room for none.
+/// The scrape shows what the keys hold against the data plane's bound; a bound too small to
+/// keep any key evicts each once its requests are over; and the bound is the process's,
+/// its keys held once for all its workers: one and a half keys' worth on two workers keeps
+/// the one key.
 #[tokio::test]
 async fn the_keys_held_are_shown_and_kept_within_their_bound() {
     let local = tokio::task::LocalSet::new();
@@ -795,7 +669,7 @@ async fn the_keys_held_are_shown_and_kept_within_their_bound() {
             let (upstream, _) = counting_upstream().await;
             // What the one key holds, as the first case's scrape says.
             let mut one_key = 0;
-            for (case, workers, held) in [(0, 1, true), (1, 1, false), (2, 2, false)] {
+            for (case, workers, held) in [(0, 1, true), (1, 1, false), (2, 2, true)] {
                 let max = match case {
                     0 => None,
                     1 => Some(1),
@@ -860,7 +734,7 @@ async fn the_keys_held_are_shown_and_kept_within_their_bound() {
                     max.unwrap_or(256 << 20)
                 );
                 assert!(scrape.contains(&bound), "{bound}{scrape}");
-                if held {
+                if case == 0 {
                     one_key = sample(&scrape, "edgerush_rate_limit_key_bytes");
                     assert!(one_key > 0, "{scrape}");
                 }
@@ -1096,7 +970,8 @@ async fn a_refusal_is_put_down_to_the_limits_the_pod_named() {
             );
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
-            let limiter = crate::ratelimit::Limiter::start(&service, 0, u64::MAX).unwrap();
+            let hub = crate::ratelimit::Hub::start(&service, 1, u64::MAX).unwrap();
+            let limiter = crate::ratelimit::Limiter::new(&service, hub, 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = crate::forwarding::Client::new("203.0.113.7".parse().unwrap());
             let told = [(1, 5_000_000_000)];
@@ -1106,7 +981,7 @@ async fn a_refusal_is_put_down_to_the_limits_the_pod_named() {
             assert_eq!(limit.name, "wide");
             assert_eq!(wait, Duration::from_secs(5));
             let unsaid = limiter.refusal(&rule.limits, 0b11, &client, &[]);
-            assert_eq!(unsaid.by, 0, "the copies know nothing");
+            assert_eq!(unsaid.by, 0, "the entries know nothing");
             limiter.stop();
         })
         .await;

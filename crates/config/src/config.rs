@@ -69,59 +69,34 @@ pub struct RateLimitService {
     /// The address (`host:port`) of each of its pods, the first being pod 0.
     #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
     pub pods: Vec<String>,
-    /// Milliseconds between a worker's messages to the service; 10 when left out.
+    /// Milliseconds between the process's messages to the service; 10 when left out.
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub cycle_ms: Option<u64>,
-    /// Bytes the rate limits' keys may hold on this data plane, divided evenly among its
-    /// workers, as an estimate of their own data: past it, each worker evicts its least
-    /// recently used keys, which start again full ([06 §8](../../../docs/06-rate-limiting.md)).
-    /// 268,435,456 (256 MiB) when left out.
+    /// Bytes the rate limits' keys may hold on this data plane, which its process holds once
+    /// for all its workers, as an estimate of their own data: past it, the process evicts
+    /// its least recently used keys, which start again full
+    /// ([06 §8](../../../docs/06-rate-limiting.md)). 268,435,456 (256 MiB) when left out.
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub max_key_bytes: Option<u64>,
-    /// Experimental, for measuring: the process alone a data plane of the service, its
-    /// workers deciding from slices of its room it gives them every millisecond, rather than
-    /// each worker a data plane of its own ([12 item 3](../../../docs/12-open-questions.md)).
-    /// Off when left out.
-    #[serde(default)]
-    pub layered: Option<bool>,
-    /// Experimental, with `layered`: milliseconds a worker keeps a slice of a key it no
-    /// longer uses, given another at each sync meanwhile, so that a quiet key's next request
-    /// is decided by the worker on the spot rather than asked of the process. 0 when left
-    /// out: a slice not used is given back at the next sync.
-    #[serde(default)]
-    pub layered_keep_ms: Option<u64>,
-    /// Experimental, for measuring: the process alone a data plane of the service, as with
-    /// `layered`, its workers taking from one room a key that all of them reach, by
-    /// atomics, rather than from slices of their own (12 item 3). Not with `layered`. Off
-    /// when left out.
-    #[serde(default)]
-    pub shared: Option<bool>,
-    /// Experimental, for measuring: the process alone a participant of the service, its
-    /// workers deciding warm requests from per-key state they share by compare-and-swap,
-    /// with no thread between them (12 item 3; the shared-atomic spike). Not with `layered`
-    /// or `shared`; needs native 128-bit atomics, which the proxy checks. Off when left out.
-    #[serde(default)]
-    pub pooled: Option<bool>,
-    /// Pooled, whether a key with nothing to report is polled every cycle while in use, to
-    /// keep its copy fresh. Off, a quiet key's copy goes cold after a refill time and its
-    /// next request asks: messages grow with the keys admitting, not with all those in
-    /// use. Only with `pooled`; off when left out, the faster (Lucas).
+    /// Whether a key with nothing to report is polled every cycle while in use, to keep its
+    /// copy fresh. Off, a quiet key's copy goes cold after a refill time and its next
+    /// request asks: messages grow with the keys admitting, not with all those in use. Off
+    /// when left out, the faster (Lucas).
     #[serde(default)]
     pub poll_quiet_keys: Option<bool>,
-    /// Pooled, whether a request for a key whose copy is cold waits for its owner's word.
-    /// Off, it is decided from the copy as it is — a new key's a full bucket — and the copy
-    /// put right after: no request waits on the service, at the price of a burst on a new
-    /// key admitted by every process that meets it. Only with `pooled`; off when left out,
-    /// the faster (Lucas).
+    /// Whether a request for a key whose copy is cold waits for its owner's word. Off, it is
+    /// decided from the copy as it is — a new key's a full bucket — and the copy put right
+    /// after: no request waits on the service, at the price of a burst on a new key
+    /// admitted by every process that meets it. Off when left out, the faster (Lucas).
     #[serde(default)]
     pub ask_cold_keys: Option<bool>,
-    /// Pooled, whether each cycle the process visits only the keys that need it — those its
-    /// workers signal, and those with work outstanding — rather than every key it holds,
-    /// so that quiet keys cost nothing between their uses. A key woken after cycles without
-    /// a visit gets one share of its bucket refilled from the time gone by. Only with
-    /// `pooled`; on when left out, the faster (Lucas).
+    /// Whether each cycle the process visits only the keys that need it — those its workers
+    /// signal, and those with work outstanding — rather than every key it holds, so that
+    /// quiet keys cost nothing between their uses. A key woken after cycles without a visit
+    /// gets one share of its bucket refilled from the time gone by. On when left out, the
+    /// faster (Lucas).
     #[serde(default)]
     pub schedule_keys: Option<bool>,
 }

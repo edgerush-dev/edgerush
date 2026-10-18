@@ -538,8 +538,9 @@ EDGERUSH_LIMITS = """limits:
 
 def build_edgerush(n, workers=1, sharing="", cpus=None):
     """EdgeRush with the rate-limiting service: three service pods, and proxies of
-    `workers` workers each on as many CPUs (or `cpus`), every worker a data plane of the
-    service, or, with `sharing` (", pooled: true"), the process one."""
+    `workers` workers each on as many CPUs (or `cpus`), each proxy one participant of the
+    service, its workers deciding from the entries it keeps; `sharing` is more of the
+    service's settings (", poll_quiet_keys: true", say)."""
     pods = [f"{pod}={SERVICE_IPS[pod]}:7000" for pod in range(3)]
     services = {}
     for pod in range(3):
@@ -625,8 +626,7 @@ SYSTEMS = {
         System("tyk", 8080, "http", "first", ["redis"], build_tyk),
         System("haproxy", 8080, "http", "first", [], build_haproxy),
         System("edgerush", 8080, "http", "service", ["rl0", "rl1", "rl2"], build_edgerush),
-        # The shared-atomic spike: two workers a proxy, each a data plane (apart) or the
-        # process one participant (pooled).
+        # Two workers a proxy, sharing its entries.
         System(
             "edgerush-w2",
             8080,
@@ -634,14 +634,6 @@ SYSTEMS = {
             "service",
             ["rl0", "rl1", "rl2"],
             lambda n: build_edgerush(n, workers=2),
-        ),
-        System(
-            "edgerush-pooled-w2",
-            8080,
-            "http",
-            "service",
-            ["rl0", "rl1", "rl2"],
-            lambda n: build_edgerush(n, workers=2, sharing=", pooled: true"),
         ),
         # The same held to one CPU: a quota below the worker count.
         System(
@@ -651,14 +643,6 @@ SYSTEMS = {
             "service",
             ["rl0", "rl1", "rl2"],
             lambda n: build_edgerush(n, workers=2, cpus=1),
-        ),
-        System(
-            "edgerush-pooled-w2-cpu1",
-            8080,
-            "http",
-            "service",
-            ["rl0", "rl1", "rl2"],
-            lambda n: build_edgerush(n, workers=2, sharing=", pooled: true", cpus=1),
         ),
     ]
 }

@@ -382,8 +382,8 @@ pub struct Proxy {
     /// How many workers it runs on: what shares out what the data plane as a whole may
     /// hold.
     workers: NonZeroUsize,
-    /// The process layer of a layered limiter (12 item 3), once a worker needs it; locked
-    /// only when a worker makes its limiter.
+    /// The process's rate-limiting thread, once a worker needs it; locked only when a worker
+    /// makes its limiter.
     hub: std::sync::Mutex<Option<Arc<crate::ratelimit::Hub>>>,
     /// Outside it for a different reason: a key must not come round again when a config
     /// does, so what hands them out lives as long as the process.
@@ -1173,16 +1173,17 @@ pub enum ProxyError {
     /// BoringSSL could not give the keys the data plane makes at start.
     #[error("no random keys to be had: {0}")]
     Random(String),
-    /// A pooled rate-limiting service on a machine without native 128-bit atomics.
-    #[error("`rate_limit_service.pooled`: this machine has no native 128-bit compare-and-swap")]
-    Pooled,
-    /// A pooled rate-limiting service with a limit whose bucket and two cycles' refill pass
-    /// 65,535, what a pooled key's cycle can hold.
+    /// A rate-limiting service on a machine without native 128-bit atomics.
     #[error(
-        "`rate_limit_service.pooled`: limit `{0}`'s burst and two cycles' refill pass 65,535, \
-         the most a pooled key's cycle holds"
+        "`rate_limit_service`: this machine has no native 128-bit compare-and-swap, which rate \
+         limits need"
     )]
-    PooledLimit(String),
+    RateLimitsUnsupported,
+    /// A limit whose bucket and two cycles' refill pass 65,535, what a key's cycle can hold.
+    #[error(
+        "limit `{0}`: its burst and two cycles' refill pass 65,535, the most a key's cycle holds"
+    )]
+    LimitTooLarge(String),
     /// A listener's access log that cannot be opened to be written to.
     #[error("listener `{listener}`: its access log cannot be opened: {error}")]
     AccessLog {

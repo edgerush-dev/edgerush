@@ -209,14 +209,6 @@ impl Worker {
             match limiter.decide_all(&under.rule.limits, one, client) {
                 Limited::Admit => count(&self.proxy, true),
                 Limited::Refuse => count(&self.proxy, false),
-                Limited::Wait(decided) => {
-                    let proxy = Arc::clone(&self.proxy);
-                    let _counted = tokio::task::spawn_local(async move {
-                        if let Ok(decided) = decided.await {
-                            count(&proxy, decided.admitted);
-                        }
-                    });
-                }
                 Limited::Later(decided) => {
                     let proxy = Arc::clone(&self.proxy);
                     let _counted = tokio::task::spawn_local(async move {
@@ -297,36 +289,20 @@ impl Worker {
             return Some(Rc::clone(limiter));
         }
         let service = snapshot.config.rate_limit_service()?;
-        // The data plane's keys, shared evenly among its workers (06 §8); layered, shared
-        // or pooled, the process's, held once.
-        let share = if service.layered || service.shared || service.pooled {
-            service.max_key_bytes
-        } else {
-            service.max_key_bytes / self.proxy.workers.get() as u64
-        };
         if let Some((_, limiter)) = held.as_ref()
             && limiter.serves(service)
         {
             let limiter = Rc::clone(limiter);
-            limiter.set_capacity(share);
+            // The process's keys, held once (06 §8).
+            limiter.set_capacity(service.max_key_bytes);
             *held = Some((snapshot.generation, Rc::clone(&limiter)));
             return Some(limiter);
         }
         if let Some((_, old)) = held.take() {
             old.stop();
         }
-        let limiter = if service.pooled {
-            let hub = self.proxy.hub(service)?;
-            Limiter::pooled(service, hub, usize::from(self.position))?
-        } else if service.shared {
-            let hub = self.proxy.hub(service)?;
-            Limiter::shared(service, hub, usize::from(self.position))
-        } else if service.layered {
-            let hub = self.proxy.hub(service)?;
-            Limiter::layered(service, hub, usize::from(self.position))
-        } else {
-            Limiter::start(service, self.position, share)?
-        };
+        let hub = self.proxy.hub(service)?;
+        let limiter = Limiter::new(service, hub, usize::from(self.position));
         *held = Some((snapshot.generation, Rc::clone(&limiter)));
         Some(limiter)
     }
@@ -414,10 +390,6 @@ impl Worker {
                 let (admitted, told) = match self.rate_limits(rule, enforced, client) {
                     Limited::Admit => (true, None),
                     Limited::Refuse => (false, None),
-                    Limited::Wait(decided) => match decided.await {
-                        Ok(decided) => (decided.admitted, Some(decided.refused_by)),
-                        Err(_) => (false, None),
-                    },
                     Limited::Later(decided) => match decided.await {
                         Ok(Some(decided)) => (decided.admitted, Some(decided.refused_by)),
                         Ok(None) | Err(_) => return self.undecided(listener, call).into(),

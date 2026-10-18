@@ -18,16 +18,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Refuses a config whose rate-limiting service is pooled on a machine without the native
-/// 128-bit compare-and-swap its entries need (`supported` false): a lock in its place would
+/// Refuses a config with a rate-limiting service on a machine without the native 128-bit
+/// compare-and-swap its keys' entries need (`supported` false): a lock in its place would
 /// put one on every request. And one with a limit whose largest allowance a cycle could
-/// pass what a pooled key holds, rather than hold it to less and refuse what it allows.
-pub(super) fn runs_pooled(config: &Compiled, supported: bool) -> Result<(), ProxyError> {
-    let Some(service) = config.rate_limit_service().filter(|service| service.pooled) else {
+/// pass what a key's entry holds, rather than hold it to less and refuse what it allows.
+pub(super) fn runs_rate_limits(config: &Compiled, supported: bool) -> Result<(), ProxyError> {
+    let Some(service) = config.rate_limit_service() else {
         return Ok(());
     };
     if !supported {
-        return Err(ProxyError::Pooled);
+        return Err(ProxyError::RateLimitsUnsupported);
     }
     let cycle = u64::try_from(service.cycle.as_nanos()).unwrap_or(u64::MAX);
     for limit in config.limits() {
@@ -37,7 +37,7 @@ pub(super) fn runs_pooled(config: &Compiled, supported: bool) -> Result<(), Prox
             burst: limit.burst,
         };
         if !edgerush_ratelimit::service::pooled::fits(contract, cycle) {
-            return Err(ProxyError::PooledLimit(limit.name.clone()));
+            return Err(ProxyError::LimitTooLarge(limit.name.clone()));
         }
     }
     Ok(())
@@ -52,7 +52,7 @@ impl Snapshot {
         keys: &Keys,
         logs: Vec<Option<Sink>>,
     ) -> Result<Self, ProxyError> {
-        runs_pooled(&config, edgerush_ratelimit::service::pooled::supported())?;
+        runs_rate_limits(&config, edgerush_ratelimit::service::pooled::supported())?;
         let endpoints = config
             .upstreams()
             .iter()
@@ -342,16 +342,14 @@ impl Proxy {
             && !limits.is_empty()
         {
             scrape.push_str(&self.metrics.render_limits(&limits, service.max_key_bytes));
-            // Pooled (the shared-atomic spike), the process thread's own measures.
-            if service.pooled {
-                let hub = self
-                    .hub
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                if let Some(hub) = hub {
-                    scrape.push_str(&hub.render_stats());
-                }
+            // The process thread's own measures.
+            let hub = self
+                .hub
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(hub) = hub {
+                scrape.push_str(&hub.render_stats());
             }
         }
         scrape
@@ -385,8 +383,8 @@ impl Proxy {
         (aside, snapshot.config.data_plane().set_aside)
     }
 
-    /// The process layer of a layered limiter reaching `service`: started the first time a
-    /// worker needs it, and again when the service's pods or cycle change; `None` if it
+    /// The process's rate-limiting thread reaching `service`: started the first time a worker
+    /// needs it, and again when the service's pods, cycle or levers change; `None` if it
     /// cannot be started. For a worker making its limiter: it takes a lock.
     pub(crate) fn hub(
         &self,

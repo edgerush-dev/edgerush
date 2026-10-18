@@ -388,7 +388,7 @@ pub(crate) enum Answer {
     /// Over its rule's rate limit (experimental).
     RateLimited,
     /// Its rate limits could not decide it in the time a deferred request may wait, or
-    /// found as many deferred as may be (pooled, experimental): the gateway's own overload,
+    /// found as many deferred as may be (experimental): the gateway's own overload,
     /// never over a limit.
     RateLimitDeferred,
 }
@@ -940,7 +940,7 @@ impl Metrics {
         let bytes = self.limiters.sum(|shard| shard.key_bytes.get());
         scrape.sample(name, &[], bytes.max(0).cast_unsigned());
         let name = "edgerush_rate_limit_max_key_bytes";
-        let help = "Bytes the rate limits' keys may hold, shared evenly among the workers.";
+        let help = "Bytes the rate limits' keys may hold, held once by the process.";
         scrape.family(name, Kind::Gauge, help);
         scrape.sample(name, &[], max_key_bytes);
         let name = "edgerush_rate_limit_keys";

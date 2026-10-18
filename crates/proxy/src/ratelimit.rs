@@ -1,18 +1,12 @@
-//! The rate limits route rules are under (07 §2): each worker is a data plane of the
-//! rate-limiting service's protocol (`edgerush_ratelimit::service`), deciding every request
-//! under all its limits at once from its copies, asking a service pod about keys it holds no
-//! fresh copy of, and sending the service, every cycle, what it admitted — over gRPC, from a
-//! task of the worker's own.
+//! The rate limits route rules are under (07 §2). The process is one participant of the
+//! rate-limiting service's protocol (`edgerush_ratelimit::service::pooled`), on a thread of
+//! its own ([`hub`]); each worker decides a request under all its limits at once from the
+//! entries of its keys that the participant keeps and every worker shares, one
+//! compare-and-swap a key, and asks the process only about what it cannot decide itself.
 //!
 //! Nothing here runs unless a rule limits: the worker makes its limiter the first time one
 //! does, and makes it again when the service's settings change, which starts every key
 //! afresh, as any change to a limit does.
-//!
-//! Layered (experimental, 12 item 3), the process alone is a data plane, on a thread of its
-//! own ([`hub`]), and each worker decides from slices of its room, syncing every millisecond.
-//! Pooled (the shared-atomic spike), the process alone is a participant, and each worker
-//! decides from the shared entries of its keys, one compare-and-swap a key, asking the
-//! process only about keys it holds no warm entry of.
 
 mod hub;
 
@@ -21,15 +15,10 @@ pub(crate) use hub::Hub;
 use crate::forwarding::Client as Requester;
 use crate::request::NoTables;
 use edgerush_config::{CompiledLimit, CompiledRateLimitService};
-use edgerush_ratelimit::service::layer::{Local, Worker};
 use edgerush_ratelimit::service::pooled::{
     self, Entry, Handle, Local as PooledLocal, Outcome as Pooled, Registry,
 };
-use edgerush_ratelimit::service::shared::Worker as Holder;
-use edgerush_ratelimit::service::{
-    Contract, DataPlane, Decided, Decision, Keyed, Ticket, View, longest,
-};
-use edgerush_ratelimit_service::grpc::Client;
+use edgerush_ratelimit::service::{Contract, Decided, Keyed, longest};
 use edgerush_rules::{Address, Context, KeyValue, Named, Outcome, Text};
 use http::HeaderName;
 use hub::SYNC;
@@ -41,19 +30,20 @@ use std::net::IpAddr;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, oneshot};
 
-/// How long a worker waits for the owner's answer to an ask before deciding what waits from
-/// its copy: long enough for TCP to send a lost segment again (some 200 ms on Linux), as the
-/// comparison harness found that the protocol's own four cycles, 40 ms, were not.
+/// How long the process waits for an owner's answer to an ask before deciding what waits
+/// from its entries: long enough for TCP to send a lost segment again (some 200 ms on
+/// Linux), as the comparison harness found that the protocol's own four cycles, 40 ms, were
+/// not.
 const ASK_TIMEOUT: u64 = 300_000_000;
 
-/// Why a request was refused, as the worker's copies have it.
+/// Why a request was refused, as the worker's entries have it.
 pub(crate) struct Refusal<'a> {
     /// The limits that refused it, bit `n` for the rule's `n`th: those out of room. None
-    /// when the copies show room under every one, the service pod having refused it from
-    /// counts the copies have yet to catch up with.
+    /// when the entries show room under every one, the service pod having refused it from
+    /// counts the entries have yet to catch up with.
     pub(crate) by: u64,
     /// The limit that waits longest to admit it, the first of those that wait as long, and
     /// how long: when to come back.
@@ -103,17 +93,17 @@ fn key_into(buffer: &mut Vec<u8>, name: &str, definition: [u8; 8], key: KeyValue
     }
 }
 
-/// How long a pooled request may wait deferred: an ask's own time, which a hold it waits on
-/// may take to settle, and a little more.
+/// How long a request may wait deferred: an ask's own time, which a hold it waits on may
+/// take to settle, and a little more.
 pub(crate) const DEFER_WAIT: Duration = Duration::from_millis(400);
 
-/// The most requests a pooled worker, or its process, holds deferred at once: past it, a
-/// request is answered as the gateway's own overload.
+/// The most requests a worker, or its process, holds deferred at once: past it, a request
+/// is answered as the gateway's own overload.
 pub(crate) const MOST_DEFERRED: usize = 1_024;
 
-/// The most entries a pooled worker keeps signalled between syncs: a key signals at most
-/// once each time its count starts, so a millisecond's worth for any worker; past it, the
-/// worker asks its process to visit every key at the next cycle rather than keep more.
+/// The most entries a worker keeps signalled between syncs: a key signals at most once each
+/// time its count starts, so a millisecond's worth for any worker; past it, the worker asks
+/// its process to visit every key at the next cycle rather than keep more.
 const MOST_SIGNALLED: usize = 4_096;
 
 /// How a request fared against the limits it is under.
@@ -122,214 +112,54 @@ pub(crate) enum Limited {
     Admit,
     /// Over it.
     Refuse,
-    /// Asked about: the owner's decision comes, with which keys refused it if it did. A
-    /// sender dropped (the limiter gone) refuses it.
-    Wait(oneshot::Receiver<Decided>),
-    /// Pooled, asked about or deferred: its decision comes, or none — it could not be
-    /// decided in the time allowed, or the limiter went — and it is answered as the
-    /// gateway's own overload, never as over its limit.
+    /// Asked about or deferred: its decision comes, or none — it could not be decided in
+    /// the time allowed, or the limiter went — and it is answered as the gateway's own
+    /// overload, never as over its limit.
     Later(oneshot::Receiver<Option<Decided>>),
-    /// Pooled, deferred with as many deferred as may be: the gateway's own overload.
+    /// Deferred with as many deferred as may be: the gateway's own overload.
     Overloaded,
 }
 
-/// A worker's limiter: as a data plane of its own, or deciding from its process's slices.
+/// A worker's handles to its process's entries, found by key.
+type Handles = HashSet<Handle, Keyed>;
+
+/// A worker's limiter: deciding from the entries its process's participant keeps.
 pub(crate) struct Limiter {
     service: CompiledRateLimitService,
-    mode: Mode,
-    /// The requests waiting for a decision from elsewhere, by ticket or ask: dropped with
-    /// the limiter, which refuses them.
-    waiting: RefCell<HashMap<Ticket, oneshot::Sender<Decided>>>,
+    hub: Arc<Hub>,
+    /// Which of the process's workers it is.
+    index: usize,
+    /// Where it finds an entry of the process it holds no handle to.
+    registry: Arc<Registry>,
+    /// Its handles to entries, by key: one lookup a key a request.
+    handles: RefCell<Handles>,
+    /// The next ask's number.
+    next: Cell<u64>,
+    /// Its asks waiting on its process, by number.
+    asked: RefCell<HashMap<u64, oneshot::Sender<Option<Decided>>>>,
+    /// What its deferred requests wait on, and how many there are, and may be.
+    settled: Arc<Notify>,
+    deferring: Cell<usize>,
+    most_deferred: Cell<usize>,
+    /// With keys visited only when they need it, the entries its decisions signalled since
+    /// it last handed them to its process: every sync, at most `MOST_SIGNALLED`.
+    signalled: RefCell<Vec<Arc<Entry>>>,
     /// Where each of a request's keys is put together, one for each limit it can be under,
     /// kept so that no request makes them afresh; and their contracts.
     keys: RefCell<Vec<Vec<u8>>>,
     contracts: RefCell<Vec<Contract>>,
-    /// The clock: the worker's own, or, layered, its process's.
+    /// The clock: its process's.
     start: Instant,
-    /// Wakes the task to send what a decision asked for at once.
-    asked: Notify,
+    /// Wakes its task to stop.
+    stopping: Notify,
     stopped: Cell<bool>,
 }
 
-/// A pooled worker's handles to its process's entries, found by key.
-type Handles = HashSet<Handle, Keyed>;
-
-/// How a worker's limiter decides.
-enum Mode {
-    /// A data plane of its own, and the clients of the service's pods.
-    Apart {
-        plane: RefCell<DataPlane<Keyed>>,
-        clients: Vec<Client>,
-    },
-    /// From the slices of its process's room (12 item 3).
-    Layered {
-        hub: Arc<Hub>,
-        /// Which of the process's workers it is.
-        index: usize,
-        slices: RefCell<Worker<Keyed>>,
-        /// The next ask's number.
-        next: Cell<u64>,
-    },
-    /// From each key's one room, which every worker of its process takes from (12 item 3).
-    Shared {
-        hub: Arc<Hub>,
-        /// Which of the process's workers it is.
-        index: usize,
-        rooms: RefCell<Holder<Keyed>>,
-        /// The next ask's number.
-        next: Cell<u64>,
-    },
-    /// From the shared entries of its keys, which every worker of its process decides from
-    /// and its process's participant keeps (the shared-atomic spike).
-    Pooled {
-        hub: Arc<Hub>,
-        /// Which of the process's workers it is.
-        index: usize,
-        /// Where it finds an entry of the process it holds no handle to.
-        registry: Arc<Registry>,
-        /// Its handles to entries, by key: one lookup a key a request.
-        handles: RefCell<Handles>,
-        /// The next ask's number.
-        next: Cell<u64>,
-        /// Its asks waiting on its process, by number.
-        asked: RefCell<HashMap<u64, oneshot::Sender<Option<Decided>>>>,
-        /// What its deferred requests wait on, and how many there are, and may be.
-        settled: Arc<tokio::sync::Notify>,
-        deferring: Cell<usize>,
-        most_deferred: Cell<usize>,
-        /// With keys visited only when they need it, the entries its decisions signalled
-        /// since it last handed them to its process: every sync, at most `MOST_SIGNALLED`.
-        signalled: RefCell<Vec<Arc<Entry>>>,
-    },
-}
-
 impl Limiter {
-    /// A limiter for worker `worker` reaching `service`, its keys holding at most
-    /// `max_key_bytes`, its task started; `None` if an address cannot be made into one to
-    /// connect to.
-    pub(crate) fn start(
-        service: &CompiledRateLimitService,
-        worker: u16,
-        max_key_bytes: u64,
-    ) -> Option<Rc<Self>> {
-        let clients = service
-            .pods
-            .iter()
-            .map(|address| Client::new(address))
-            .collect::<Result<Vec<_>, _>>()
-            .ok()?;
-        // A data plane is one worker in one life: the time it began, and its number.
-        let began = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| {
-                u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
-            });
-        let id = began.wrapping_mul(1_024).wrapping_add(u64::from(worker));
-        let pods = u32::try_from(clients.len()).unwrap_or(u32::MAX);
-        let view = View {
-            epoch: 0,
-            pods: (0..pods).collect(),
-        };
-        let cycle = u64::try_from(service.cycle.as_nanos()).unwrap_or(u64::MAX);
-        // Keys are what clients send: hashed under a key of the worker's own, drawn at random.
-        let entropy = RandomState::new();
-        let hasher = Keyed::new([entropy.hash_one(0_u8), entropy.hash_one(1_u8)]);
-        let mut plane = DataPlane::with_hasher(id, cycle, view, hasher);
-        plane.set_ask_timeout(ASK_TIMEOUT);
-        plane.set_capacity(max_key_bytes);
-        let limiter = Rc::new(Self {
-            service: service.clone(),
-            mode: Mode::Apart {
-                plane: RefCell::new(plane),
-                clients,
-            },
-            waiting: RefCell::new(HashMap::new()),
-            keys: RefCell::new(Vec::new()),
-            contracts: RefCell::new(Vec::new()),
-            start: Instant::now(),
-            asked: Notify::new(),
-            stopped: Cell::new(false),
-        });
-        tokio::task::spawn_local(Rc::clone(&limiter).run());
-        Some(limiter)
-    }
-
-    /// A limiter for worker `index` of the process `hub`, deciding from the slices it gives,
-    /// its task started (12 item 3).
-    pub(crate) fn layered(
-        service: &CompiledRateLimitService,
-        hub: Arc<Hub>,
-        index: usize,
-    ) -> Rc<Self> {
-        let (answers, answered) = mpsc::unbounded_channel();
-        let _gone = hub.to.send(ToHub::Join {
-            worker: index,
-            answers,
-        });
-        let entropy = RandomState::new();
-        let hasher = Keyed::new([entropy.hash_one(0_u8), entropy.hash_one(1_u8)]);
-        let start = hub.epoch();
-        let limiter = Rc::new(Self {
-            service: service.clone(),
-            mode: Mode::Layered {
-                hub,
-                index,
-                slices: RefCell::new(Worker::with_hasher(hasher)),
-                next: Cell::new(0),
-            },
-            waiting: RefCell::new(HashMap::new()),
-            keys: RefCell::new(Vec::new()),
-            contracts: RefCell::new(Vec::new()),
-            start,
-            asked: Notify::new(),
-            stopped: Cell::new(false),
-        });
-        tokio::task::spawn_local(Rc::clone(&limiter).run_layered(answered));
-        limiter
-    }
-
-    /// A limiter for worker `index` of the process `hub`, taking from the rooms it hands
-    /// out, its task started (12 item 3).
-    pub(crate) fn shared(
-        service: &CompiledRateLimitService,
-        hub: Arc<Hub>,
-        index: usize,
-    ) -> Rc<Self> {
-        let (answers, answered) = mpsc::unbounded_channel();
-        let _gone = hub.to.send(ToHub::Join {
-            worker: index,
-            answers,
-        });
-        let entropy = RandomState::new();
-        let hasher = Keyed::new([entropy.hash_one(0_u8), entropy.hash_one(1_u8)]);
-        let start = hub.epoch();
-        let limiter = Rc::new(Self {
-            service: service.clone(),
-            mode: Mode::Shared {
-                hub,
-                index,
-                rooms: RefCell::new(Holder::with_hasher(hasher)),
-                next: Cell::new(0),
-            },
-            waiting: RefCell::new(HashMap::new()),
-            keys: RefCell::new(Vec::new()),
-            contracts: RefCell::new(Vec::new()),
-            start,
-            asked: Notify::new(),
-            stopped: Cell::new(false),
-        });
-        tokio::task::spawn_local(Rc::clone(&limiter).run_shared(answered));
-        limiter
-    }
-
     /// A limiter for worker `index` of the process `hub`, deciding from the shared entries
-    /// its participant keeps, its task started; `None` if the hub is not pooled.
-    pub(crate) fn pooled(
-        service: &CompiledRateLimitService,
-        hub: Arc<Hub>,
-        index: usize,
-    ) -> Option<Rc<Self>> {
-        let registry = hub.registry()?;
+    /// its participant keeps, its task started.
+    pub(crate) fn new(service: &CompiledRateLimitService, hub: Arc<Hub>, index: usize) -> Rc<Self> {
+        let registry = hub.registry();
         let settled = hub.settled();
         let (answers, answered) = mpsc::unbounded_channel();
         let _gone = hub.to.send(ToHub::Join {
@@ -341,78 +171,59 @@ impl Limiter {
         let start = hub.epoch();
         let limiter = Rc::new(Self {
             service: service.clone(),
-            mode: Mode::Pooled {
-                hub,
-                index,
-                registry,
-                handles: RefCell::new(HashSet::with_hasher(hasher)),
-                next: Cell::new(0),
-                asked: RefCell::new(HashMap::new()),
-                settled,
-                deferring: Cell::new(0),
-                most_deferred: Cell::new(MOST_DEFERRED),
-                signalled: RefCell::new(Vec::new()),
-            },
-            waiting: RefCell::new(HashMap::new()),
+            hub,
+            index,
+            registry,
+            handles: RefCell::new(HashSet::with_hasher(hasher)),
+            next: Cell::new(0),
+            asked: RefCell::new(HashMap::new()),
+            settled,
+            deferring: Cell::new(0),
+            most_deferred: Cell::new(MOST_DEFERRED),
+            signalled: RefCell::new(Vec::new()),
             keys: RefCell::new(Vec::new()),
             contracts: RefCell::new(Vec::new()),
             start,
-            asked: Notify::new(),
+            stopping: Notify::new(),
             stopped: Cell::new(false),
         });
-        tokio::task::spawn_local(Rc::clone(&limiter).run_pooled(answered));
-        Some(limiter)
+        tokio::task::spawn_local(Rc::clone(&limiter).run(answered));
+        limiter
     }
 
     /// Whether it reaches `service` as it is set now: the same pods, the same cycle, the
-    /// same layering, keep and sharing. A change of what its keys may hold is taken as it is
+    /// same levers. A change of what its keys may hold is taken as it is
     /// ([`Self::set_capacity`]).
     pub(crate) fn serves(&self, service: &CompiledRateLimitService) -> bool {
         self.service.pods == service.pods
             && self.service.cycle == service.cycle
-            && self.service.layered == service.layered
-            && self.service.layered_keep == service.layered_keep
-            && self.service.shared == service.shared
-            && self.service.pooled == service.pooled
             && self.service.poll_quiet_keys == service.poll_quiet_keys
             && self.service.ask_cold_keys == service.ask_cold_keys
             && self.service.schedule_keys == service.schedule_keys
     }
 
-    /// The bytes its keys may hold from now on: layered, the process's, which its first
-    /// worker passes on.
+    /// The bytes its process's keys may hold from now on, which its first worker passes on.
     pub(crate) fn set_capacity(&self, max_key_bytes: u64) {
-        match &self.mode {
-            Mode::Apart { plane, .. } => plane.borrow_mut().set_capacity(max_key_bytes),
-            Mode::Layered { hub, index: 0, .. }
-            | Mode::Shared { hub, index: 0, .. }
-            | Mode::Pooled { hub, index: 0, .. } => {
-                let _gone = hub.to.send(ToHub::Capacity(max_key_bytes));
-            }
-            Mode::Layered { .. } | Mode::Shared { .. } | Mode::Pooled { .. } => {}
+        if self.index == 0 {
+            let _gone = self.hub.to.send(ToHub::Capacity(max_key_bytes));
         }
     }
 
-    /// What its keys hold, in bytes, how many there are, and how many it has evicted, all
-    /// told: for the worker's sweep to say. Layered, the process's, said by its first worker
-    /// alone, so that the workers' sum is the process's.
+    /// What its process's keys hold, in bytes, how many there are, and how many it has
+    /// evicted, all told: for the worker's sweep to say, by its first worker alone, so that
+    /// the workers' sum is the process's.
     pub(crate) fn usage(&self) -> (u64, usize, u64) {
-        match &self.mode {
-            Mode::Apart { plane, .. } => {
-                let plane = plane.borrow();
-                (plane.holding(), plane.key_count(), plane.evicted())
-            }
-            Mode::Layered { hub, index: 0, .. }
-            | Mode::Shared { hub, index: 0, .. }
-            | Mode::Pooled { hub, index: 0, .. } => hub.usage(),
-            Mode::Layered { .. } | Mode::Shared { .. } | Mode::Pooled { .. } => (0, 0, 0),
+        if self.index == 0 {
+            self.hub.usage()
+        } else {
+            (0, 0, 0)
         }
     }
 
     /// Stops its task: a limiter for other settings takes its place.
     pub(crate) fn stop(&self) {
         self.stopped.set(true);
-        self.asked.notify_one();
+        self.stopping.notify_one();
     }
 
     fn now(&self) -> u64 {
@@ -430,115 +241,25 @@ impl Limiter {
         client: &Requester,
     ) -> Limited {
         let now = self.now();
-        match &self.mode {
-            Mode::Layered {
-                hub,
-                index,
-                slices,
-                next,
-            } => {
-                return self.with_keys(limits, limited, client, |parts| {
-                    if parts.is_empty() {
-                        return Limited::Admit;
-                    }
-                    let local = slices.borrow_mut().decide(parts, now);
-                    self.or_ask(local, hub, *index, next, parts)
-                });
+        self.with_keys(limits, limited, client, |parts| {
+            if parts.is_empty() {
+                return Limited::Admit;
             }
-            Mode::Shared {
-                hub,
-                index,
-                rooms,
-                next,
-            } => {
-                return self.with_keys(limits, limited, client, |parts| {
-                    if parts.is_empty() {
-                        return Limited::Admit;
-                    }
-                    let local = rooms.borrow_mut().decide(parts, now);
-                    self.or_ask(local, hub, *index, next, parts)
-                });
+            let outcome = decide(&self.handles, &self.registry, self.making(), parts, now);
+            self.signal(&outcome, parts);
+            match outcome.local {
+                PooledLocal::Admit => Limited::Admit,
+                PooledLocal::Refuse => Limited::Refuse,
+                PooledLocal::Ask => self.ask(parts),
+                PooledLocal::Defer => self.defer(parts),
             }
-            Mode::Pooled {
-                handles, registry, ..
-            } => {
-                return self.with_keys(limits, limited, client, |parts| {
-                    if parts.is_empty() {
-                        return Limited::Admit;
-                    }
-                    let outcome = decide_pooled(handles, registry, self.making(), parts, now);
-                    self.signal(&outcome, parts);
-                    match outcome.local {
-                        PooledLocal::Admit => Limited::Admit,
-                        PooledLocal::Refuse => Limited::Refuse,
-                        PooledLocal::Ask => self.ask_pooled(parts),
-                        PooledLocal::Defer => self.defer(parts),
-                    }
-                });
-            }
-            Mode::Apart { .. } => {}
-        }
-        let Mode::Apart { plane, .. } = &self.mode else {
-            return Limited::Admit;
-        };
-        let decision = self.with_keys(limits, limited, client, |parts| {
-            let mut plane = plane.borrow_mut();
-            match parts {
-                [] => None,
-                [(key, contract)] => Some(plane.decide(key, *contract, now)),
-                parts => Some(plane.decide_all(parts, now)),
-            }
-        });
-        match decision {
-            None | Some(Decision::Admit) => Limited::Admit,
-            Some(Decision::Refuse) => Limited::Refuse,
-            Some(Decision::Wait(ticket)) => {
-                let (decided, waited) = oneshot::channel();
-                self.waiting.borrow_mut().insert(ticket, decided);
-                self.asked.notify_one();
-                Limited::Wait(waited)
-            }
-        }
-    }
-
-    /// A worker's own decision of a request under `parts`, layered or shared: as it is, or,
-    /// one it cannot make, asked of its process `hub`, numbered from `next`.
-    fn or_ask(
-        &self,
-        local: Local,
-        hub: &Hub,
-        index: usize,
-        next: &Cell<u64>,
-        parts: &[(&[u8], Contract)],
-    ) -> Limited {
-        match local {
-            Local::Admit => Limited::Admit,
-            Local::Refuse => Limited::Refuse,
-            Local::Ask => {
-                let id = next.get();
-                next.set(id.wrapping_add(1));
-                let keys = parts
-                    .iter()
-                    .map(|(key, contract)| ((*key).into(), *contract));
-                let asked = ToHub::Ask {
-                    worker: index,
-                    id,
-                    keys: keys.collect(),
-                };
-                if hub.to.send(asked).is_err() {
-                    return Limited::Refuse;
-                }
-                let (decided, waited) = oneshot::channel();
-                self.waiting.borrow_mut().insert(id, decided);
-                Limited::Wait(waited)
-            }
-        }
+        })
     }
 
     /// Which of `limits` refused a request from `client` that was under those `limited`
     /// marks, and how long it should wait to be admitted under all of them (06 §2): as
     /// `told` says, by position among the request's keys, where a service pod decided it
-    /// and said; otherwise as the worker's copies have them.
+    /// and said; otherwise as the worker's entries have them.
     pub(crate) fn refusal<'a>(
         &self,
         limits: &'a [Arc<CompiledLimit>],
@@ -557,36 +278,34 @@ impl Limiter {
                     .position(|limit| limit.name.as_bytes() == name)
             };
             let mut by = 0;
-            // The copies only where no pod said; layered, the worker's slices.
-            let from_copies = told.is_empty();
-            let own: Vec<(usize, u64)> = match &self.mode {
-                Mode::Apart { plane, .. } => plane.borrow().waits(parts, now).collect(),
-                Mode::Layered { slices, .. } => slices.borrow().waits(parts, now).collect(),
-                Mode::Shared { rooms, .. } => rooms.borrow().waits(parts, now).collect(),
-                Mode::Pooled { handles, .. } => {
-                    // The keys it holds entries of, each where it is among the request's.
-                    let handles = handles.borrow();
-                    let (at, held): (Vec<usize>, Vec<&Entry>) = parts
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(at, (key, contract))| {
-                            let entry = handles.get(*key)?.entry();
-                            (entry.contract() == *contract).then_some((at, &**entry))
-                        })
-                        .unzip();
-                    pooled::waits(&held, now)
-                        .filter_map(|(part, wait)| Some((*at.get(part)?, wait)))
-                        .collect()
-                }
+            // The entries only where no pod said.
+            let own: Vec<(usize, u64)> = if told.is_empty() {
+                // The keys it holds entries of, each where it is among the request's.
+                let handles = self.handles.borrow();
+                let (at, held): (Vec<usize>, Vec<&Entry>) = parts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(at, (key, contract))| {
+                        let entry = handles.get(*key)?.entry();
+                        (entry.contract() == *contract).then_some((at, &**entry))
+                    })
+                    .unzip();
+                pooled::waits(&held, now)
+                    .filter_map(|(part, wait)| Some((*at.get(part)?, wait)))
+                    .collect()
+            } else {
+                Vec::new()
             };
-            let waits = own.into_iter().filter(|_| from_copies);
-            let waits = waits.chain(told.iter().copied()).inspect(|(part, _)| {
-                if let Some(bit) =
-                    at(*part).and_then(|at| 1_u64.checked_shl(u32::try_from(at).ok()?))
-                {
-                    by |= bit;
-                }
-            });
+            let waits = own
+                .into_iter()
+                .chain(told.iter().copied())
+                .inspect(|(part, _)| {
+                    if let Some(bit) =
+                        at(*part).and_then(|at| 1_u64.checked_shl(u32::try_from(at).ok()?))
+                    {
+                        by |= bit;
+                    }
+                });
             let longest = longest(waits).and_then(|(part, wait)| {
                 let limit = limits.get(at(part)?)?;
                 Some((&**limit, Duration::from_nanos(wait)))
@@ -656,182 +375,34 @@ impl Limiter {
         }
     }
 
-    /// Hands the requests the data plane decided their decisions.
-    fn settle(&self) {
-        let Mode::Apart { plane, .. } = &self.mode else {
-            return;
-        };
-        let decided = plane.borrow_mut().take_decisions();
-        let mut waiting = self.waiting.borrow_mut();
-        for decided in decided {
-            if let Some(waiter) = waiting.remove(&decided.ticket) {
-                let _gone = waiter.send(decided);
-            }
-        }
-    }
-
-    /// Sends what the data plane has to send, each batch on a task of its own, and hands it
-    /// the answers as they come.
-    fn send(self: &Rc<Self>) {
-        let Mode::Apart { plane, clients } = &self.mode else {
-            return;
-        };
-        let outgoing = plane.borrow_mut().take_outgoing();
-        for (pod, batch) in outgoing {
-            let Some(client) = clients.get(pod as usize).cloned() else {
-                continue;
-            };
-            let me = Rc::clone(self);
-            tokio::task::spawn_local(async move {
-                // Unanswered, it is sent again or given up as the protocol says.
-                if let Ok(answers) = client.exchange(batch).await
-                    && let Mode::Apart { plane, .. } = &me.mode
-                {
-                    plane.borrow_mut().on_answers(answers, me.now());
-                    me.settle();
-                    me.send();
-                }
-            });
-        }
-    }
-
-    async fn run(self: Rc<Self>) {
-        let mut cycle = tokio::time::interval(self.service.cycle);
-        cycle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = cycle.tick() => {
-                    let now = self.now();
-                    if let Mode::Apart { plane, .. } = &self.mode {
-                        plane.borrow_mut().on_cycle(now);
-                    }
-                    self.settle();
-                }
-                () = self.asked.notified() => {}
-            }
-            if self.stopped.get() {
-                return;
-            }
-            self.send();
-        }
-    }
-}
-
-impl Limiter {
-    /// A layered worker's loop: its sync every millisecond, and its process's answers.
-    async fn run_layered(self: Rc<Self>, mut answered: mpsc::UnboundedReceiver<FromHub>) {
-        let Mode::Layered {
-            hub, index, slices, ..
-        } = &self.mode
-        else {
-            return;
-        };
-        let mut sync = tokio::time::interval(SYNC);
-        sync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = sync.tick() => {
-                    let used = slices.borrow_mut().take_used(self.now());
-                    if !used.is_empty() {
-                        let _gone = hub.to.send(ToHub::Used { worker: *index, used });
-                    }
-                }
-                message = answered.recv() => match message {
-                    Some(FromHub::Slices(given)) => slices.borrow_mut().on_slices(given),
-                    Some(FromHub::Rooms { .. } | FromHub::Pooled { .. }) => {}
-                    Some(FromHub::Answer { id, answer }) => {
-                        slices.borrow_mut().on_slices(answer.slices);
-                        if let Some(waiter) = self.waiting.borrow_mut().remove(&id) {
-                            let _gone = waiter.send(Decided {
-                                ticket: id,
-                                admitted: answer.admitted,
-                                refused_by: answer.refused_by,
-                            });
-                        }
-                    }
-                    None => return,
-                },
-                () = self.asked.notified() => {}
-            }
-            if self.stopped.get() {
-                return;
-            }
-        }
-    }
-}
-
-impl Limiter {
-    /// Shared, the worker's side of its process: the answers to its asks, with the rooms of
-    /// their keys, and now and then the rooms its process has closed dropped.
-    async fn run_shared(self: Rc<Self>, mut answered: mpsc::UnboundedReceiver<FromHub>) {
-        let Mode::Shared { rooms, .. } = &self.mode else {
-            return;
-        };
-        let mut sweep = tokio::time::interval(Duration::from_secs(1));
-        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = sweep.tick() => rooms.borrow_mut().sweep(),
-                message = answered.recv() => match message {
-                    Some(FromHub::Rooms { id, answer }) => {
-                        rooms.borrow_mut().on_rooms(answer.rooms);
-                        if let Some(waiter) = self.waiting.borrow_mut().remove(&id) {
-                            let _gone = waiter.send(Decided {
-                                ticket: id,
-                                admitted: answer.admitted,
-                                refused_by: answer.refused_by,
-                            });
-                        }
-                    }
-                    Some(_) => {}
-                    None => return,
-                },
-                () = self.asked.notified() => {}
-            }
-            if self.stopped.get() {
-                return;
-            }
-        }
-    }
-}
-
-impl Limiter {
-    /// Pooled, the worker's side of its process: the answers to its asks, with the entries
-    /// of their keys, and now and then its handles to entries its process has closed
-    /// dropped.
-    async fn run_pooled(self: Rc<Self>, mut answered: mpsc::UnboundedReceiver<FromHub>) {
-        let Mode::Pooled {
-            hub,
-            handles,
-            asked,
-            signalled,
-            ..
-        } = &self.mode
-        else {
-            return;
-        };
+    /// The worker's side of its process: the answers to its asks, with the entries of their
+    /// keys; its signals handed over every sync; and now and then its handles to entries
+    /// its process has closed dropped.
+    async fn run(self: Rc<Self>, mut answered: mpsc::UnboundedReceiver<FromHub>) {
         let mut sweep = tokio::time::interval(Duration::from_secs(1));
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut sync = tokio::time::interval(SYNC);
         sync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                _ = sweep.tick() => handles.borrow_mut().retain(|held| !held.entry().closed()),
+                _ = sweep.tick() => {
+                    self.handles.borrow_mut().retain(|held| !held.entry().closed());
+                }
                 // What its decisions signalled, handed over in one message a sync.
                 _ = sync.tick(), if self.service.schedule_keys => {
-                    let entries = std::mem::take(&mut *signalled.borrow_mut());
+                    let entries = std::mem::take(&mut *self.signalled.borrow_mut());
                     if !entries.is_empty() {
-                        let _gone = hub.to.send(ToHub::Signals(entries));
+                        let _gone = self.hub.to.send(ToHub::Signals(entries));
                     }
                 }
                 message = answered.recv() => match message {
-                    Some(FromHub::Pooled { id, admitted, overloaded, refused_by, entries }) => {
-                        let mut handles = handles.borrow_mut();
+                    Some(FromHub { id, admitted, overloaded, refused_by, entries }) => {
+                        let mut handles = self.handles.borrow_mut();
                         for entry in entries {
                             handles.replace(Handle::new(entry));
                         }
                         drop(handles);
-                        if let Some(waiter) = asked.borrow_mut().remove(&id) {
+                        if let Some(waiter) = self.asked.borrow_mut().remove(&id) {
                             let _gone = waiter.send((!overloaded).then_some(Decided {
                                 ticket: id,
                                 admitted,
@@ -839,10 +410,9 @@ impl Limiter {
                             }));
                         }
                     }
-                    Some(_) => {}
                     None => return,
                 },
-                () = self.asked.notified() => {}
+                () = self.stopping.notified() => {}
             }
             if self.stopped.get() {
                 return;
@@ -851,10 +421,11 @@ impl Limiter {
     }
 }
 
-/// A pooled worker's own decision of a request under `parts` at `now`, from its handles to
-/// the entries of its keys: those it holds none of under their contracts looked for in its
-/// process's `registry` first, and asked about if not there.
-fn decide_pooled(
+/// A worker's own decision of a request under `parts` at `now`, from its handles to the
+/// entries of its keys: those it holds none of under their contracts looked for in its
+/// process's `registry` first — or, with cold keys decided locally, made there — and asked
+/// about if not there.
+fn decide(
     handles: &RefCell<Handles>,
     registry: &Registry,
     making: Option<(&Hub, u64)>,
@@ -923,34 +494,20 @@ fn decide_pooled(
 }
 
 impl Limiter {
-    /// Pooled with cold keys decided locally, where a worker makes a key's entry: its
-    /// process, and the cycle, in nanoseconds.
+    /// With cold keys decided locally, where a worker makes a key's entry: its process, and
+    /// the cycle, in nanoseconds.
     fn making(&self) -> Option<(&Hub, u64)> {
-        let Mode::Pooled { hub, .. } = &self.mode else {
-            return None;
-        };
         let cycle = u64::try_from(self.service.cycle.as_nanos()).unwrap_or(u64::MAX);
-        (!self.service.ask_cold_keys).then_some((&**hub, cycle))
+        (!self.service.ask_cold_keys).then_some((&*self.hub, cycle))
     }
 
-    /// Pooled, what a decision asks of others: a key's count drained, waiters woken, and
-    /// with keys visited only when they need it, the keys it signalled kept to hand over —
-    /// or, with no room left to keep them, every key asked to be visited.
+    /// What a decision asks of others: a key's count drained, waiters woken, and with keys
+    /// visited only when they need it, the keys it signalled kept to hand over — or, with no
+    /// room left to keep them, every key asked to be visited.
     fn signal(&self, outcome: &Pooled, parts: &[(&[u8], Contract)]) {
-        let Mode::Pooled {
-            hub,
-            settled,
-            handles,
-            registry,
-            signalled,
-            ..
-        } = &self.mode
-        else {
-            return;
-        };
         if outcome.signal != 0 && self.service.schedule_keys {
-            let handles = handles.borrow();
-            let mut signalled = signalled.borrow_mut();
+            let handles = self.handles.borrow();
+            let mut signalled = self.signalled.borrow_mut();
             for (at, (key, _)) in parts.iter().enumerate() {
                 if outcome.signal & (1 << at) == 0 {
                     continue;
@@ -961,22 +518,22 @@ impl Limiter {
                 if signalled.len() < MOST_SIGNALLED {
                     signalled.push(Arc::clone(held.entry()));
                 } else {
-                    registry.require_scan();
+                    self.registry.require_scan();
                 }
             }
         }
         if outcome.drain {
             for (key, _) in parts {
-                let _gone = hub.to.send(ToHub::Drain((*key).into()));
+                let _gone = self.hub.to.send(ToHub::Drain((*key).into()));
             }
         }
         if outcome.wake {
-            settled.notify_waiters();
+            self.settled.notify_waiters();
         }
     }
 
-    /// Pooled, a request under `parts` asked of the process; refused if it is gone.
-    fn ask_pooled(&self, parts: &[(&[u8], Contract)]) -> Limited {
+    /// A request under `parts` asked of the process; refused if it is gone.
+    fn ask(&self, parts: &[(&[u8], Contract)]) -> Limited {
         match self.ask_process(parts) {
             Some(later) => Limited::Later(later),
             None => Limited::Refuse,
@@ -987,49 +544,31 @@ impl Limiter {
         &self,
         parts: &[(&[u8], Contract)],
     ) -> Option<oneshot::Receiver<Option<Decided>>> {
-        let Mode::Pooled {
-            hub,
-            index,
-            next,
-            asked,
-            ..
-        } = &self.mode
-        else {
-            return None;
-        };
-        let id = next.get();
-        next.set(id.wrapping_add(1));
+        let id = self.next.get();
+        self.next.set(id.wrapping_add(1));
         let keys = parts
             .iter()
             .map(|(key, contract)| ((*key).into(), *contract))
             .collect();
         let message = ToHub::Ask {
-            worker: *index,
+            worker: self.index,
             id,
             keys,
         };
-        hub.to.send(message).ok()?;
+        self.hub.to.send(message).ok()?;
         let (decided, later) = oneshot::channel();
-        asked.borrow_mut().insert(id, decided);
+        self.asked.borrow_mut().insert(id, decided);
         Some(later)
     }
 
-    /// Pooled, a request under `parts` deferred: decided again on a task of its own as its
-    /// keys' holds settle and counts drain, until its time is up; or, with as many deferred
-    /// as may be, the overload answer at once.
+    /// A request under `parts` deferred: decided again on a task of its own as its keys'
+    /// holds settle and counts drain, until its time is up; or, with as many deferred as
+    /// may be, the overload answer at once.
     fn defer(self: &Rc<Self>, parts: &[(&[u8], Contract)]) -> Limited {
-        let Mode::Pooled {
-            deferring,
-            most_deferred,
-            ..
-        } = &self.mode
-        else {
-            return Limited::Refuse;
-        };
-        if deferring.get() >= most_deferred.get() {
+        if self.deferring.get() >= self.most_deferred.get() {
             return Limited::Overloaded;
         }
-        deferring.set(deferring.get() + 1);
+        self.deferring.set(self.deferring.get() + 1);
         let keys: Vec<(Box<[u8]>, Contract)> = parts
             .iter()
             .map(|(key, contract)| ((*key).into(), *contract))
@@ -1047,16 +586,6 @@ impl Limiter {
         keys: Vec<(Box<[u8]>, Contract)>,
         mut decided: oneshot::Sender<Option<Decided>>,
     ) {
-        let Mode::Pooled {
-            handles,
-            registry,
-            settled,
-            deferring,
-            ..
-        } = &self.mode
-        else {
-            return;
-        };
         let parts: Vec<(&[u8], Contract)> = keys
             .iter()
             .map(|(key, contract)| (&**key, *contract))
@@ -1072,11 +601,17 @@ impl Limiter {
         let result = loop {
             // Waiting on its keys before it decides, and listening before it decides, so
             // that a hold settled between the two is not missed.
-            let _waiting = Waiting::on(handles, registry, &parts);
-            let woken = settled.notified();
+            let _waiting = Waiting::on(&self.handles, &self.registry, &parts);
+            let woken = self.settled.notified();
             tokio::pin!(woken);
             woken.as_mut().enable();
-            let outcome = decide_pooled(handles, registry, self.making(), &parts, self.now());
+            let outcome = decide(
+                &self.handles,
+                &self.registry,
+                self.making(),
+                &parts,
+                self.now(),
+            );
             self.signal(&outcome, &parts);
             match outcome.local {
                 PooledLocal::Admit => break decision(true),
@@ -1093,21 +628,19 @@ impl Limiter {
                 () = &mut woken => {}
                 () = tokio::time::sleep_until(deadline) => break None,
                 () = decided.closed() => {
-                    deferring.set(deferring.get().saturating_sub(1));
+                    self.deferring.set(self.deferring.get().saturating_sub(1));
                     return;
                 }
             }
         };
-        deferring.set(deferring.get().saturating_sub(1));
+        self.deferring.set(self.deferring.get().saturating_sub(1));
         let _gone = decided.send(result);
     }
 
-    /// Pooled, the most requests it holds deferred, for a test to fill.
+    /// The most requests it holds deferred, for a test to fill.
     #[cfg(test)]
     pub(crate) fn set_most_deferred(&self, most: usize) {
-        if let Mode::Pooled { most_deferred, .. } = &self.mode {
-            most_deferred.set(most);
-        }
+        self.most_deferred.set(most);
     }
 }
 
@@ -1151,7 +684,7 @@ impl std::fmt::Debug for Limiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Limiter")
             .field("service", &self.service)
-            .field("waiting", &self.waiting.borrow().len())
+            .field("asked", &self.asked.borrow().len())
             .finish_non_exhaustive()
     }
 }

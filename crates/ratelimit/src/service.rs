@@ -37,10 +37,8 @@
 //! takes it over, so a pod leaving moves only the keys it held.
 
 pub mod keyed;
-pub mod layer;
 pub mod membership;
 pub mod pooled;
-pub mod shared;
 
 pub use keyed::Keyed;
 

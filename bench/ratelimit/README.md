@@ -16,10 +16,9 @@ simulator's numbers have real systems beside them.
 | `haproxy` | stick tables copied between instances by `peers` (not added up) | `http_req_rate(1s)` over 100 refused |
 | `envoy-wait` | as `envoy`, with a 1 s timeout on the ratelimit service rather than 20 ms | the same |
 | `envoy-local` | Envoy's own token bucket, the limit divided among its instances (`local_cluster_rate_limit`) | 100 a second, bucket of 100 |
-| `edgerush` | EdgeRush's rate-limiting service prototype: each worker decides from its copies, three service pods own the keys | token bucket, 100 a second, burst 100, by the client's address |
+| `edgerush` | EdgeRush's rate-limiting service: each proxy one participant, its workers deciding from the entries it keeps, three service pods owning the keys | token bucket, 100 a second, burst 100, by the client's address |
 | `edgerush-w2` | the same with two workers an instance, on two CPUs | the same |
-| `edgerush-pooled-w2` | two workers an instance deciding from the process's shared entries (`pooled: true`, the shared-atomic spike), on two CPUs | the same |
-| `edgerush-w2-cpu1`, `edgerush-pooled-w2-cpu1` | the two above held to one CPU: a quota below the worker count | the same |
+| `edgerush-w2-cpu1` | the above held to one CPU: a quota below the worker count | the same |
 
 `edgerush` runs from binaries built on the host (`cargo build --release -p edgerush -p
 edgerush-ratelimit-service`, copied to `$RLH_BIN`, `/home/claude/rlh-bin` by default) in an

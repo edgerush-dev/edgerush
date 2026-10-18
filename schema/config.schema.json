@@ -976,7 +976,7 @@
       "type": "object",
       "properties": {
         "ask_cold_keys": {
-          "description": "Pooled, whether a request for a key whose copy is cold waits for its owner's word.\nOff, it is decided from the copy as it is — a new key's a full bucket — and the copy\nput right after: no request waits on the service, at the price of a burst on a new\nkey admitted by every process that meets it. Only with `pooled`; off when left out,\nthe faster (Lucas).",
+          "description": "Whether a request for a key whose copy is cold waits for its owner's word. Off, it is\ndecided from the copy as it is — a new key's a full bucket — and the copy put right\nafter: no request waits on the service, at the price of a burst on a new key\nadmitted by every process that meets it. Off when left out, the faster (Lucas).",
           "type": [
             "boolean",
             "null"
@@ -984,7 +984,7 @@
           "default": null
         },
         "cycle_ms": {
-          "description": "Milliseconds between a worker's messages to the service; 10 when left out.",
+          "description": "Milliseconds between the process's messages to the service; 10 when left out.",
           "type": [
             "integer",
             "null"
@@ -993,26 +993,8 @@
           "default": null,
           "minimum": 1
         },
-        "layered": {
-          "description": "Experimental, for measuring: the process alone a data plane of the service, its\nworkers deciding from slices of its room it gives them every millisecond, rather than\neach worker a data plane of its own.\nOff when left out.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
-        },
-        "layered_keep_ms": {
-          "description": "Experimental, with `layered`: milliseconds a worker keeps a slice of a key it no\nlonger uses, given another at each sync meanwhile, so that a quiet key's next request\nis decided by the worker on the spot rather than asked of the process. 0 when left\nout: a slice not used is given back at the next sync.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "default": null,
-          "minimum": 0
-        },
         "max_key_bytes": {
-          "description": "Bytes the rate limits' keys may hold on this data plane, divided evenly among its\nworkers, as an estimate of their own data: past it, each worker evicts its least\nrecently used keys, which start again full.\n268,435,456 (256 MiB) when left out.",
+          "description": "Bytes the rate limits' keys may hold on this data plane, which its process holds once\nfor all its workers, as an estimate of their own data: past it, the process evicts\nits least recently used keys, which start again full. 268,435,456 (256 MiB) when left out.",
           "type": [
             "integer",
             "null"
@@ -1030,15 +1012,7 @@
           "minItems": 1
         },
         "poll_quiet_keys": {
-          "description": "Pooled, whether a key with nothing to report is polled every cycle while in use, to\nkeep its copy fresh. Off, a quiet key's copy goes cold after a refill time and its\nnext request asks: messages grow with the keys admitting, not with all those in\nuse. Only with `pooled`; off when left out, the faster (Lucas).",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
-        },
-        "pooled": {
-          "description": "Experimental, for measuring: the process alone a participant of the service, its\nworkers deciding warm requests from per-key state they share by compare-and-swap,\nwith no thread between them (12 item 3; the shared-atomic spike). Not with `layered`\nor `shared`; needs native 128-bit atomics, which the proxy checks. Off when left out.",
+          "description": "Whether a key with nothing to report is polled every cycle while in use, to keep its\ncopy fresh. Off, a quiet key's copy goes cold after a refill time and its next\nrequest asks: messages grow with the keys admitting, not with all those in use. Off\nwhen left out, the faster (Lucas).",
           "type": [
             "boolean",
             "null"
@@ -1046,15 +1020,7 @@
           "default": null
         },
         "schedule_keys": {
-          "description": "Pooled, whether each cycle the process visits only the keys that need it — those its\nworkers signal, and those with work outstanding — rather than every key it holds,\nso that quiet keys cost nothing between their uses. A key woken after cycles without\na visit gets one share of its bucket refilled from the time gone by. Only with\n`pooled`; on when left out, the faster (Lucas).",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
-        },
-        "shared": {
-          "description": "Experimental, for measuring: the process alone a data plane of the service, as with\n`layered`, its workers taking from one room a key that all of them reach, by\natomics, rather than from slices of their own (12 item 3). Not with `layered`. Off\nwhen left out.",
+          "description": "Whether each cycle the process visits only the keys that need it — those its workers\nsignal, and those with work outstanding — rather than every key it holds, so that\nquiet keys cost nothing between their uses. A key woken after cycles without a visit\ngets one share of its bucket refilled from the time gone by. On when left out, the\nfaster (Lucas).",
           "type": [
             "boolean",
             "null"

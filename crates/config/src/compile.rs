@@ -113,26 +113,15 @@ pub struct Compiled {
 pub struct CompiledRateLimitService {
     /// The address of each pod, the first being pod 0.
     pub pods: Vec<String>,
-    /// The time between a worker's messages to the service.
+    /// The time between the process's messages to the service.
     pub cycle: Duration,
-    /// The bytes the keys may hold on the data plane, all its workers together.
+    /// The bytes the keys may hold on the data plane, held once by its process.
     pub max_key_bytes: u64,
-    /// Whether the process alone is a data plane of the service, its workers deciding from
-    /// slices of its room (experimental).
-    pub layered: bool,
-    /// Layered, how long a worker keeps a slice of a key it no longer uses (experimental).
-    pub layered_keep: Duration,
-    /// Whether the process alone is a data plane of the service, its workers taking from
-    /// one room a key they all reach (experimental).
-    pub shared: bool,
-    /// Whether the process alone is a participant of the service, its workers deciding
-    /// from per-key state they share by compare-and-swap (experimental).
-    pub pooled: bool,
-    /// Pooled, whether quiet keys are polled every cycle while in use.
+    /// Whether quiet keys are polled every cycle while in use.
     pub poll_quiet_keys: bool,
-    /// Pooled, whether a request for a cold key waits for its owner's word.
+    /// Whether a request for a cold key waits for its owner's word.
     pub ask_cold_keys: bool,
-    /// Pooled, whether each cycle visits only the keys that need it.
+    /// Whether each cycle visits only the keys that need it.
     pub schedule_keys: bool,
 }
 
@@ -575,19 +564,6 @@ fn rate_limit_service(
     if service.cycle_ms == Some(0) {
         errors.push(place.problem(Problem::RateLimitServiceCycleNever));
     }
-    let ways = [service.layered, service.shared, service.pooled]
-        .iter()
-        .filter(|way| **way == Some(true))
-        .count();
-    if ways > 1 {
-        errors.push(place.problem(Problem::RateLimitServiceLayeredAndShared));
-    }
-    let levers = service.poll_quiet_keys.is_some()
-        || service.ask_cold_keys.is_some()
-        || service.schedule_keys.is_some();
-    if levers && service.pooled != Some(true) {
-        errors.push(place.problem(Problem::RateLimitServiceLeverNotPooled));
-    }
     Some(CompiledRateLimitService {
         pods: service.pods.clone(),
         cycle: service
@@ -596,10 +572,6 @@ fn rate_limit_service(
         max_key_bytes: service
             .max_key_bytes
             .unwrap_or(CompiledRateLimitService::MAX_KEY_BYTES),
-        layered: service.layered.unwrap_or(false),
-        layered_keep: Duration::from_millis(service.layered_keep_ms.unwrap_or(0)),
-        shared: service.shared.unwrap_or(false),
-        pooled: service.pooled.unwrap_or(false),
         poll_quiet_keys: service.poll_quiet_keys.unwrap_or(false),
         ask_cold_keys: service.ask_cold_keys.unwrap_or(false),
         schedule_keys: service.schedule_keys.unwrap_or(true),
@@ -2282,14 +2254,6 @@ pub enum Problem {
     /// A rate-limiting service whose cycle never comes.
     #[error("`rate_limit_service`: `cycle_ms` is 0: at least 1")]
     RateLimitServiceCycleNever,
-    /// A rate-limiting service asked to share its keys more than one way.
-    #[error("`rate_limit_service`: more than one of `layered`, `shared` and `pooled`: one at most")]
-    RateLimitServiceLayeredAndShared,
-    /// A pooled service's lever set on a service that is not pooled.
-    #[error(
-        "`rate_limit_service`: `poll_quiet_keys`, `ask_cold_keys` and `schedule_keys` only with `pooled`"
-    )]
-    RateLimitServiceLeverNotPooled,
     /// A WebSocket's idle bound of nothing, which would never close one whose peer has gone.
     #[error("`tunnel_idle_ms` is 0: at least 1")]
     TunnelIdleNever,
@@ -4686,7 +4650,8 @@ routes:
     }
 
     /// The rate-limiting service: its pods, a cycle of at least 1 ms, 10 when left out, and
-    /// its workers layered or shared, not both.
+    /// its levers, the fastest when left out; the ways of sharing keys it once had to choose
+    /// from are no longer settings.
     #[test]
     fn the_rate_limit_service_is_checked() {
         let with = |service: &str| {
@@ -4709,39 +4674,28 @@ routes:
             with(r#"rate_limit_service: { pods: ["a:1"], cycle_ms: 0 }"#).unwrap_err(),
             ["the data plane: `rate_limit_service`: `cycle_ms` is 0: at least 1"]
         );
-        let shared = with(r#"rate_limit_service: { pods: ["a:1"], shared: true }"#)
-            .unwrap()
-            .unwrap();
-        assert!(shared.shared && !shared.layered);
-        assert_eq!(
-            with(r#"rate_limit_service: { pods: ["a:1"], layered: true, shared: true }"#)
-                .unwrap_err(),
-            [
-                "the data plane: `rate_limit_service`: more than one of `layered`, `shared` and `pooled`: one at most"
-            ]
-        );
         let levers = with(
-            r#"rate_limit_service: { pods: ["a:1"], pooled: true, poll_quiet_keys: true, ask_cold_keys: true, schedule_keys: false }"#,
+            r#"rate_limit_service: { pods: ["a:1"], poll_quiet_keys: true, ask_cold_keys: true, schedule_keys: false }"#,
         )
         .unwrap()
         .unwrap();
         assert!(levers.poll_quiet_keys && levers.ask_cold_keys && !levers.schedule_keys);
         assert!(
-            !shared.poll_quiet_keys && !shared.ask_cold_keys && shared.schedule_keys,
+            !service.poll_quiet_keys && !service.ask_cold_keys && service.schedule_keys,
             "when left out, the fastest: quiet keys not polled, cold keys decided locally, \
              keys scheduled"
         );
-        for lever in ["ask_cold_keys: false", "schedule_keys: true"] {
-            assert_eq!(
-                with(&format!(
-                    r#"rate_limit_service: {{ pods: ["a:1"], {lever} }}"#
-                ))
-                .unwrap_err(),
-                [
-                    "the data plane: `rate_limit_service`: `poll_quiet_keys`, `ask_cold_keys` and `schedule_keys` only with `pooled`"
-                ],
-                "{lever}"
+        for gone in [
+            "layered: true",
+            "layered_keep_ms: 50",
+            "shared: true",
+            "pooled: true",
+        ] {
+            let yaml = format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{}}\nrate_limit_service: {{ pods: [\"a:1\"], {gone} }}\n"
             );
+            let parsed: Result<Config, _> = serde_saphyr::from_str(&yaml);
+            assert!(parsed.is_err(), "{gone}");
         }
     }
 

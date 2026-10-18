@@ -1,6 +1,5 @@
 //! One rate-limit participant per process, its workers deciding warm requests from shared
-//! per-key state by compare-and-swap (12 item 3; a spike, workspace
-//! `rate-limiting-shared-atomic-spike.md`, results `rate-limiting-shared-atomic-results.md`).
+//! per-key state by compare-and-swap (06 §4).
 //!
 //! The process is one data plane of the protocol (one [`PlaneId`] for its life). A key's
 //! admission state — its bucket, the cycle's allowance and carry, what was admitted for the
@@ -13,7 +12,7 @@
 //! sends what was admitted every cycle, rebases each key's bucket on the owner's answers,
 //! asks the owners about cold keys, coalescing requests under the same list of keys, and
 //! evicts idle keys. It is `DataPlane`'s protocol with the per-key state moved into the
-//! entries; `DataPlane` itself is left as it is, each worker's data plane in the default.
+//! entries; `DataPlane` itself is kept as the reference it is tested against.
 //!
 //! No I/O: the time is passed in; the transport's messages are the caller's to carry.
 

@@ -21,13 +21,5 @@ loom.workspace = true
 name = "decide"
 harness = false
 
-[[bench]]
-name = "layer"
-harness = false
-
-[[bench]]
-name = "shared"
-harness = false
-
 [lints]
 workspace = true

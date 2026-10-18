@@ -1,19 +1,16 @@
-//! The process layer of a layered limiter (12 item 3): a thread of its own, as Lucas chose,
-//! holding the pod's one data plane of the rate-limiting service, the clients of its pods,
-//! and the slices of its room it gives the workers. Its inputs are the workers' messages,
-//! the service's answers and its cycle; nothing of it is shared with a worker but a channel
-//! and the clock they read its times by.
+//! The process's rate-limiting thread (06 §4): one thread of its own holding the process's
+//! one participant of the rate-limiting service and the clients of its pods. Its workers decide warm requests themselves from the entries the
+//! participant keeps; the thread reports what they admitted, rebases the entries on the
+//! owners' answers, decides what they ask about, and evicts idle keys. Its inputs are the
+//! workers' messages, the service's answers and its cycle; nothing of it is shared with a
+//! worker but the entries, a channel, and the clock they read its times by.
 
 use super::{ASK_TIMEOUT, DEFER_WAIT, MOST_DEFERRED};
 use edgerush_config::CompiledRateLimitService;
-use edgerush_ratelimit::service::layer::{Answer, Process, Slice, Used};
 use edgerush_ratelimit::service::pooled::{
     Decision as Pooled, Entry, Levers, Participant, Registry,
 };
-use edgerush_ratelimit::service::shared::{Answer as RoomAnswer, Process as Rooms};
-use edgerush_ratelimit::service::{
-    Answers, Batch, Contract, DataPlane, Keyed, PodId, Ticket, View,
-};
+use edgerush_ratelimit::service::{Contract, Keyed, Ticket, View};
 use edgerush_ratelimit_service::grpc::Client;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -24,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, mpsc};
 
-/// The time between a worker's syncs with its process (Lucas: every millisecond).
+/// The time between a worker's handing its signals to its process.
 pub(crate) const SYNC: Duration = Duration::from_millis(1);
 
 /// What a worker sends its process.
@@ -34,8 +31,6 @@ pub(crate) enum ToHub {
         worker: usize,
         answers: mpsc::UnboundedSender<FromHub>,
     },
-    /// Its sync: what it admitted since the last, by key.
-    Used { worker: usize, used: Vec<Used> },
     /// A request it cannot decide itself, for the process to.
     Ask {
         worker: usize,
@@ -44,34 +39,25 @@ pub(crate) enum ToHub {
     },
     /// The bytes the keys may hold from now on.
     Capacity(u64),
-    /// Pooled, a key whose unreported count passed half its most: to drain now.
+    /// A key whose unreported count passed half its most: to drain now.
     Drain(Box<[u8]>),
-    /// Pooled, cold keys decided locally: an entry a worker made, for the process to keep.
+    /// Cold keys decided locally: an entry a worker made, for the process to keep.
     Adopt(Arc<Entry>),
-    /// Pooled, keys visited only when they need it: those its decisions signalled since its
-    /// last such message, for the next cycle to visit.
+    /// Keys visited only when they need it: those its decisions signalled since its last
+    /// such message, for the next cycle to visit.
     Signals(Vec<Arc<Entry>>),
 }
 
-/// What the process sends a worker.
-pub(crate) enum FromHub {
-    /// New slices, for its sync.
-    Slices(Vec<Slice>),
-    /// The answer to a request it asked about.
-    Answer { id: u64, answer: Answer },
-    /// Shared, the answer to a request it asked about, with the rooms of its keys.
-    Rooms { id: u64, answer: RoomAnswer },
-    /// Pooled, the decision on a request it asked about — refused, which of its keys
-    /// refused and how long each waits — with the entries of its keys, to hold; or, if
-    /// `overloaded`, none: it could not be decided in the time allowed a deferred request,
-    /// or too many were deferred.
-    Pooled {
-        id: u64,
-        admitted: bool,
-        overloaded: bool,
-        refused_by: Box<[(usize, u64)]>,
-        entries: Vec<Arc<Entry>>,
-    },
+/// What the process sends a worker: the decision on a request it asked about — refused,
+/// which of its keys refused and how long each waits — with the entries of its keys, to
+/// hold; or, if `overloaded`, none: it could not be decided in the time allowed a deferred
+/// request, or too many were deferred.
+pub(crate) struct FromHub {
+    pub(crate) id: u64,
+    pub(crate) admitted: bool,
+    pub(crate) overloaded: bool,
+    pub(crate) refused_by: Box<[(usize, u64)]>,
+    pub(crate) entries: Vec<Arc<Entry>>,
 }
 
 /// What the process thread and the workers share: the clock its times are read by, and
@@ -83,9 +69,9 @@ struct Shared {
     stats: Stats,
 }
 
-/// Pooled, what the process thread says of its own work, for the scrape: the asks it
-/// takes and how long they wait, its queue, its exchanges, and the time its work takes.
-/// The most-of figures are since the last scrape, which takes them.
+/// What the process thread says of its own work, for the scrape: the asks it takes and how
+/// long they wait, its queue, its exchanges, the time its work takes, and the keys its
+/// cycles visit. The most-of figures are since the last scrape, which takes them.
 #[derive(Default)]
 pub(crate) struct Stats {
     asks: AtomicU64,
@@ -143,23 +129,24 @@ impl Stats {
     }
 }
 
-/// A handle on a running process layer. It stops once every handle and every worker's
+/// A handle on a running process thread. It stops once every handle and every worker's
 /// sender is gone.
 pub(crate) struct Hub {
     pub(crate) to: mpsc::UnboundedSender<ToHub>,
     shared: Arc<Shared>,
     service: CompiledRateLimitService,
-    /// Pooled, its participant's registry of live entries, for workers meeting a key.
-    registry: Option<Arc<Registry>>,
-    /// Pooled, woken when a hold settles or a count drains on a key requests are deferred
-    /// on, by whichever thread did it: the workers' deferred requests wait on it.
+    /// Its participant's registry of live entries, for workers meeting a key.
+    registry: Arc<Registry>,
+    /// Woken when a hold settles or a count drains on a key requests are deferred on, by
+    /// whichever thread did it: the workers' deferred requests wait on it.
     settled: Arc<Notify>,
 }
 
 impl Hub {
-    /// The process layer of `workers` reaching `service`, its keys holding at most
-    /// `max_key_bytes`, its thread started; `None` if an address cannot be made into one to
-    /// connect to, or no thread could be had.
+    /// The process thread of `workers` reaching `service`, its keys holding at most
+    /// `max_key_bytes`, started; `None` if an address cannot be made into one to connect
+    /// to, no thread could be had, or the machine has no native 128-bit compare-and-swap
+    /// for the participant's entries (which the proxy refuses at start).
     pub(crate) fn start(
         service: &CompiledRateLimitService,
         workers: usize,
@@ -181,7 +168,7 @@ impl Hub {
         let set = service.clone();
         let settled = Arc::new(Notify::new());
         let waking = Arc::clone(&settled);
-        // Pooled, the participant is made on the thread and its registry handed back.
+        // The participant is made on the thread and its registry handed back.
         let (made, registry) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("edgerush-rate-limits".to_owned())
@@ -193,11 +180,7 @@ impl Hub {
                 run(clients, &set, workers, max_key_bytes, from, &running, &made);
             })
             .ok()?;
-        let registry = if service.pooled {
-            Some(registry.recv().ok()?)
-        } else {
-            None
-        };
+        let registry = registry.recv().ok()?;
         Some(Arc::new(Self {
             to,
             shared,
@@ -207,29 +190,26 @@ impl Hub {
         }))
     }
 
-    /// Pooled, its participant's registry.
-    pub(crate) fn registry(&self) -> Option<Arc<Registry>> {
-        self.registry.clone()
+    /// Its participant's registry.
+    pub(crate) fn registry(&self) -> Arc<Registry> {
+        Arc::clone(&self.registry)
     }
 
-    /// Pooled, the process thread's own measures, as scrape lines.
+    /// The process thread's own measures, as scrape lines.
     pub(crate) fn render_stats(&self) -> String {
         self.shared.stats.render()
     }
 
-    /// Pooled, what deferred requests wait on.
+    /// What deferred requests wait on.
     pub(crate) fn settled(&self) -> Arc<Notify> {
         Arc::clone(&self.settled)
     }
 
     /// Whether it reaches `service` as it is set now: the same pods, the same cycle, the
-    /// same keep and sharing.
+    /// same levers.
     pub(crate) fn serves(&self, service: &CompiledRateLimitService) -> bool {
         self.service.pods == service.pods
             && self.service.cycle == service.cycle
-            && self.service.layered_keep == service.layered_keep
-            && self.service.shared == service.shared
-            && self.service.pooled == service.pooled
             && self.service.poll_quiet_keys == service.poll_quiet_keys
             && self.service.ask_cold_keys == service.ask_cold_keys
             && self.service.schedule_keys == service.schedule_keys
@@ -266,9 +246,8 @@ struct Running {
     settled: Arc<Notify>,
 }
 
-/// The process thread: a runtime of its own, the process and its clients, until every
-/// sender is gone, as `service` sets it: its cycle, and whether its workers share by slices
-/// or by rooms.
+/// The process thread: a runtime of its own, the participant and its clients, until every
+/// sender is gone, as `service` sets it: its cycle and its levers.
 fn run(
     clients: Vec<Client>,
     service: &CompiledRateLimitService,
@@ -301,46 +280,29 @@ fn run(
     let entropy = RandomState::new();
     let hasher = Keyed::new([entropy.hash_one(0_u8), entropy.hash_one(1_u8)]);
     let cycle = service.cycle;
-    let engine = if service.pooled {
-        // The proxy refuses a pooled service where 128-bit atomics are not native, so the
-        // participant is made; if not, the thread ends, and the hub with it.
-        let Some(mut participant) = Participant::new(id, nanos(cycle), view, hasher) else {
-            return;
-        };
-        participant.set_ask_timeout(ASK_TIMEOUT);
-        participant.set_capacity(max_key_bytes);
-        participant.set_workers(workers as u64);
-        // One exchange in flight to each service pod, what comes meanwhile gathered for
-        // the next (Lucas).
-        participant.set_one_in_flight(true);
-        participant.set_levers(Levers {
-            poll_quiet: service.poll_quiet_keys,
-            ask_cold: service.ask_cold_keys,
-        });
-        participant.set_scheduled(service.schedule_keys);
-        if made.send(participant.registry()).is_err() {
-            return;
-        }
-        Engine::Pooled {
-            participant: Box::new(participant),
-            waiting: HashMap::new(),
-            deferred: Vec::new(),
-        }
-    } else {
-        let mut plane = DataPlane::with_hasher(id, nanos(cycle), view, hasher);
-        plane.set_ask_timeout(ASK_TIMEOUT);
-        plane.set_capacity(max_key_bytes);
-        if service.shared {
-            Engine::Shared(Rooms::new(plane, hasher))
-        } else {
-            Engine::Layered(
-                Process::new(plane, workers, nanos(SYNC), hasher)
-                    .keeping(nanos(service.layered_keep)),
-            )
-        }
+    // The proxy refuses rate limits where 128-bit atomics are not native, so the
+    // participant is made; if not, the thread ends, and the hub with it.
+    let Some(mut participant) = Participant::new(id, nanos(cycle), view, hasher) else {
+        return;
     };
+    participant.set_ask_timeout(ASK_TIMEOUT);
+    participant.set_capacity(max_key_bytes);
+    participant.set_workers(workers as u64);
+    // One exchange in flight to each service pod, what comes meanwhile gathered for the
+    // next (Lucas).
+    participant.set_one_in_flight(true);
+    participant.set_levers(Levers {
+        poll_quiet: service.poll_quiet_keys,
+        ask_cold: service.ask_cold_keys,
+    });
+    participant.set_scheduled(service.schedule_keys);
+    if made.send(participant.registry()).is_err() {
+        return;
+    }
     let state = Rc::new(State {
-        engine: RefCell::new(engine),
+        participant: RefCell::new(participant),
+        waiting: RefCell::new(HashMap::new()),
+        deferred: RefCell::new(Vec::new()),
         clients,
         answers: RefCell::new(vec![None; workers]),
         shared: Arc::clone(&running.shared),
@@ -350,116 +312,24 @@ fn run(
     local.block_on(&runtime, serve(state, from, cycle));
 }
 
-/// Pooled, a request waiting on the service: the worker that asked, its number for it,
-/// the request's keys, and when the process took it.
+/// A request waiting on the service: the worker that asked, its number for it, the
+/// request's keys, and when the process took it.
 type Waiting = (usize, u64, Vec<(Box<[u8]>, Contract)>, u64);
 
-/// Pooled, a request deferred here: as it waited, and until when it may.
+/// A request deferred here: as it waited, and until when it may.
 struct Deferred {
     asked: Waiting,
     until: u64,
 }
 
-/// How the process shares its view among its workers: slices of each key's room, each
-/// key's one room, or, pooled, the shared entries its participant keeps.
-enum Engine {
-    Layered(Process<Keyed>),
-    Shared(Rooms<Keyed>),
-    Pooled {
-        participant: Box<Participant<Keyed>>,
-        /// Requests that wait on the service, by ticket: the worker, its id, the keys.
-        waiting: HashMap<Ticket, Waiting>,
-        /// Requests deferred here, decided again at every turn of the loop until their
-        /// time is up: as many as a worker may defer, at most.
-        deferred: Vec<Deferred>,
-    },
-}
-
-impl Engine {
-    fn plane(&mut self) -> Option<&mut DataPlane<Keyed>> {
-        match self {
-            Self::Layered(process) => Some(process.plane()),
-            Self::Shared(rooms) => Some(rooms.plane()),
-            Self::Pooled { .. } => None,
-        }
-    }
-
-    fn set_capacity(&mut self, bytes: u64) {
-        match self {
-            Self::Pooled { participant, .. } => participant.set_capacity(bytes),
-            other => {
-                if let Some(plane) = other.plane() {
-                    plane.set_capacity(bytes);
-                }
-            }
-        }
-    }
-
-    /// What its keys hold, in bytes, how many there are, and how many it has evicted.
-    fn usage(&mut self) -> (u64, u64, u64) {
-        match self {
-            Self::Pooled { participant, .. } => (
-                participant.holding(),
-                participant.key_count() as u64,
-                participant.evicted(),
-            ),
-            other => other.plane().map_or((0, 0, 0), |plane| {
-                (plane.holding(), plane.key_count() as u64, plane.evicted())
-            }),
-        }
-    }
-
-    fn take_outgoing(&mut self) -> Vec<(PodId, Batch)> {
-        match self {
-            Self::Pooled { participant, .. } => participant.take_outgoing(),
-            other => other
-                .plane()
-                .map(DataPlane::take_outgoing)
-                .unwrap_or_default(),
-        }
-    }
-
-    /// Pooled, the exchange in flight to `pod` failed: the next may go.
-    fn exchanged(&mut self, pod: PodId) {
-        if let Self::Pooled { participant, .. } = self {
-            participant.exchanged(pod);
-        }
-    }
-
-    fn on_answers(&mut self, answers: Answers, now: u64) {
-        match self {
-            Self::Pooled { participant, .. } => participant.on_answers(answers, now),
-            other => {
-                if let Some(plane) = other.plane() {
-                    plane.on_answers(answers, now);
-                }
-            }
-        }
-    }
-
-    /// Pooled, the keys its cycles visited, all told.
-    fn visits(&self) -> u64 {
-        match self {
-            Self::Pooled { participant, .. } => participant.visits(),
-            _ => 0,
-        }
-    }
-
-    fn on_cycle(&mut self, now: u64) {
-        match self {
-            Self::Pooled { participant, .. } => participant.on_cycle(now),
-            other => {
-                if let Some(plane) = other.plane() {
-                    plane.on_cycle(now);
-                }
-            }
-        }
-    }
-}
-
 /// The process thread's state.
 struct State {
-    engine: RefCell<Engine>,
+    participant: RefCell<Participant<Keyed>>,
+    /// Requests that wait on the service, by ticket: the worker, its id, the keys.
+    waiting: RefCell<HashMap<Ticket, Waiting>>,
+    /// Requests deferred here, decided again at every turn of the loop until their time is
+    /// up: as many as a worker may defer, at most.
+    deferred: RefCell<Vec<Deferred>>,
     clients: Vec<Client>,
     /// By worker: where its answers go, once it has joined.
     answers: RefCell<Vec<Option<mpsc::UnboundedSender<FromHub>>>>,
@@ -487,147 +357,85 @@ impl State {
                     *slot = Some(answers);
                 }
             }
-            ToHub::Used { worker, used } => {
-                let slices = match &mut *self.engine.borrow_mut() {
-                    Engine::Layered(process) => process.on_used(worker, used, now),
-                    Engine::Shared(_) | Engine::Pooled { .. } => return,
-                };
-                self.tell(worker, FromHub::Slices(slices));
-                // An ask waiting for this sync may now be decided.
-                self.answer();
-            }
             ToHub::Ask { worker, id, keys } => {
+                self.shared.stats.asks.fetch_add(1, Ordering::Relaxed);
+                let told = decided(
+                    &mut self.participant.borrow_mut(),
+                    &mut self.waiting.borrow_mut(),
+                    &mut self.deferred.borrow_mut(),
+                    (worker, id, keys, now),
+                    now,
+                );
+                if let Some(told) = told {
+                    self.shared.stats.answered(0);
+                    self.tell(worker, told);
+                }
+            }
+            ToHub::Capacity(bytes) => self.participant.borrow_mut().set_capacity(bytes),
+            ToHub::Drain(key) => self.participant.borrow_mut().drain(&key, now),
+            ToHub::Adopt(entry) => self.participant.borrow_mut().adopt(entry),
+            ToHub::Signals(entries) => self.participant.borrow_mut().on_signals(entries),
+        }
+    }
+
+    /// Hands the requests the service decided their answers, decides again what is
+    /// deferred here, and wakes what waits on a settled hold or a drained count.
+    fn answer(&self) {
+        let now = self.now();
+        let mut participant = self.participant.borrow_mut();
+        let mut waiting = self.waiting.borrow_mut();
+        let mut deferred = self.deferred.borrow_mut();
+        let mut told: Vec<(usize, FromHub)> = participant
+            .take_decisions()
+            .into_iter()
+            .filter_map(|decided| {
+                let (worker, id, keys, since) = waiting.remove(&decided.ticket)?;
+                self.shared.stats.answered(now.saturating_sub(since));
                 let keys: Vec<(&[u8], Contract)> = keys
                     .iter()
                     .map(|(key, contract)| (&**key, *contract))
                     .collect();
-                let told = match &mut *self.engine.borrow_mut() {
-                    Engine::Layered(process) => process
-                        .on_ask(worker, id, &keys, now)
-                        .map(|answer| FromHub::Answer { id, answer }),
-                    Engine::Shared(rooms) => rooms
-                        .on_ask(worker, id, &keys, now)
-                        .map(|answer| FromHub::Rooms { id, answer }),
-                    Engine::Pooled {
-                        participant,
-                        waiting,
-                        deferred,
-                    } => {
-                        let owned = keys
-                            .iter()
-                            .map(|(key, contract)| ((*key).into(), *contract))
-                            .collect();
-                        self.shared.stats.asks.fetch_add(1, Ordering::Relaxed);
-                        let told = pooled_decided(
-                            participant,
-                            waiting,
-                            deferred,
-                            (worker, id, owned, now),
-                            now,
-                        );
-                        if told.is_some() {
-                            self.shared.stats.answered(0);
-                        }
-                        told
-                    }
-                };
-                if let Some(told) = told {
-                    self.tell(worker, told);
-                }
-            }
-            ToHub::Capacity(bytes) => self.engine.borrow_mut().set_capacity(bytes),
-            ToHub::Drain(key) => {
-                if let Engine::Pooled { participant, .. } = &mut *self.engine.borrow_mut() {
-                    participant.drain(&key, now);
-                }
-            }
-            ToHub::Adopt(entry) => {
-                if let Engine::Pooled { participant, .. } = &mut *self.engine.borrow_mut() {
-                    participant.adopt(entry);
-                }
-            }
-            ToHub::Signals(entries) => {
-                if let Engine::Pooled { participant, .. } = &mut *self.engine.borrow_mut() {
-                    participant.on_signals(entries);
-                }
+                Some((
+                    worker,
+                    FromHub {
+                        id,
+                        admitted: decided.admitted,
+                        overloaded: false,
+                        refused_by: decided.refused_by,
+                        entries: participant.entries(&keys),
+                    },
+                ))
+            })
+            .collect();
+        // Handed back at their settling: deferred here, as one deferred when asked.
+        for ticket in participant.take_retries() {
+            if let Some(asked) = waiting.remove(&ticket) {
+                deferred.push(Deferred {
+                    asked,
+                    until: now.saturating_add(nanos(DEFER_WAIT)),
+                });
             }
         }
-    }
-
-    /// Hands the requests the service decided their answers.
-    fn answer(&self) {
-        let now = self.now();
-        let told: Vec<(usize, FromHub)> = match &mut *self.engine.borrow_mut() {
-            Engine::Layered(process) => process
-                .take_answers(now)
-                .into_iter()
-                .map(|(worker, id, answer)| (worker, FromHub::Answer { id, answer }))
-                .collect(),
-            Engine::Shared(rooms) => rooms
-                .take_answers(now)
-                .into_iter()
-                .map(|(worker, id, answer)| (worker, FromHub::Rooms { id, answer }))
-                .collect(),
-            Engine::Pooled {
-                participant,
-                waiting,
-                deferred,
-            } => {
-                let mut told: Vec<(usize, FromHub)> = participant
-                    .take_decisions()
-                    .into_iter()
-                    .filter_map(|decided| {
-                        let (worker, id, keys, since) = waiting.remove(&decided.ticket)?;
-                        self.shared.stats.answered(now.saturating_sub(since));
-                        let keys: Vec<(&[u8], Contract)> = keys
-                            .iter()
-                            .map(|(key, contract)| (&**key, *contract))
-                            .collect();
-                        Some((
-                            worker,
-                            FromHub::Pooled {
-                                id,
-                                admitted: decided.admitted,
-                                overloaded: false,
-                                refused_by: decided.refused_by,
-                                entries: participant.entries(&keys),
-                            },
-                        ))
-                    })
-                    .collect();
-                // Handed back at their settling: deferred here, as one deferred when asked.
-                for ticket in participant.take_retries() {
-                    if let Some(asked) = waiting.remove(&ticket) {
-                        deferred.push(Deferred {
-                            asked,
-                            until: now.saturating_add(nanos(DEFER_WAIT)),
-                        });
-                    }
-                }
-                // Every request deferred here, decided again.
-                for Deferred { asked, until } in std::mem::take(deferred) {
-                    let worker = asked.0;
-                    let since = asked.3;
-                    if now >= until {
-                        self.shared.stats.answered(now.saturating_sub(since));
-                        told.push((worker, overloaded(asked.1)));
-                        continue;
-                    }
-                    let mut again = Vec::new();
-                    if let Some(answer) =
-                        pooled_decided(participant, waiting, &mut again, asked, now)
-                    {
-                        self.shared.stats.answered(now.saturating_sub(since));
-                        told.push((worker, answer));
-                    }
-                    deferred.extend(again.into_iter().map(|again| Deferred { until, ..again }));
-                }
-                if participant.take_wake() {
-                    self.settled.notify_waiters();
-                }
-                told
+        // Every request deferred here, decided again.
+        for Deferred { asked, until } in std::mem::take(&mut *deferred) {
+            let worker = asked.0;
+            let since = asked.3;
+            if now >= until {
+                self.shared.stats.answered(now.saturating_sub(since));
+                told.push((worker, overloaded(asked.1)));
+                continue;
             }
-        };
+            let mut again = Vec::new();
+            if let Some(answer) = decided(&mut participant, &mut waiting, &mut again, asked, now) {
+                self.shared.stats.answered(now.saturating_sub(since));
+                told.push((worker, answer));
+            }
+            deferred.extend(again.into_iter().map(|again| Deferred { until, ..again }));
+        }
+        if participant.take_wake() {
+            self.settled.notify_waiters();
+        }
+        drop((participant, waiting, deferred));
         for (worker, message) in told {
             self.tell(worker, message);
         }
@@ -635,17 +443,17 @@ impl State {
 
     /// Says what its keys hold, for the workers' scrape.
     fn report(&self) {
-        let (holding, count, gone) = self.engine.borrow_mut().usage();
+        let participant = self.participant.borrow();
         let [bytes, keys, evicted] = &self.shared.usage;
-        bytes.store(holding, Ordering::Relaxed);
-        keys.store(count, Ordering::Relaxed);
-        evicted.store(gone, Ordering::Relaxed);
+        bytes.store(participant.holding(), Ordering::Relaxed);
+        keys.store(participant.key_count() as u64, Ordering::Relaxed);
+        evicted.store(participant.evicted(), Ordering::Relaxed);
     }
 
-    /// Sends what the data plane has to send, each batch on a task of its own, and hands it
-    /// the answers as they come.
+    /// Sends what the participant has to send, each batch on a task of its own, and hands
+    /// it the answers as they come.
     fn send(self: &Rc<Self>) {
-        let outgoing = self.engine.borrow_mut().take_outgoing();
+        let outgoing = self.participant.borrow_mut().take_outgoing();
         for (pod, batch) in outgoing {
             let Some(client) = self.clients.get(pod as usize).cloned() else {
                 continue;
@@ -666,31 +474,33 @@ impl State {
                 stats
                     .entries_in_flight
                     .fetch_sub(entries, Ordering::Relaxed);
-                if answered.is_err() {
-                    me.engine.borrow_mut().exchanged(pod);
-                    me.send();
-                }
-                if let Ok(answers) = answered {
-                    let started = Instant::now();
-                    let now = me.now();
-                    me.engine.borrow_mut().on_answers(answers, now);
-                    me.answer();
-                    me.send();
-                    let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    me.shared
-                        .stats
-                        .answers_ns
-                        .fetch_add(took, Ordering::Relaxed);
+                match answered {
+                    Err(_) => {
+                        me.participant.borrow_mut().exchanged(pod);
+                        me.send();
+                    }
+                    Ok(answers) => {
+                        let started = Instant::now();
+                        let now = me.now();
+                        me.participant.borrow_mut().on_answers(answers, now);
+                        me.answer();
+                        me.send();
+                        let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                        me.shared
+                            .stats
+                            .answers_ns
+                            .fetch_add(took, Ordering::Relaxed);
+                    }
                 }
             });
         }
     }
 }
 
-/// Pooled, what comes of request `asked` at `now`: told its decision now; kept waiting on
-/// the service, by ticket; or deferred, to be decided again while its time lasts — or,
-/// past as many deferred as a worker may hold, told it is overloaded.
-fn pooled_decided(
+/// What comes of request `asked` at `now`: told its decision now; kept waiting on the
+/// service, by ticket; or deferred, to be decided again while its time lasts — or, past as
+/// many deferred as a worker may hold, told it is overloaded.
+fn decided(
     participant: &mut Participant<Keyed>,
     waiting: &mut HashMap<Ticket, Waiting>,
     deferred: &mut Vec<Deferred>,
@@ -723,7 +533,7 @@ fn pooled_decided(
             } else {
                 participant.waits(&keys, now).collect()
             };
-            Some(FromHub::Pooled {
+            Some(FromHub {
                 id,
                 admitted,
                 overloaded: false,
@@ -734,9 +544,9 @@ fn pooled_decided(
     }
 }
 
-/// Pooled, the answer to ask `id` that could not be decided in time.
+/// The answer to ask `id` that could not be decided in time.
 fn overloaded(id: u64) -> FromHub {
-    FromHub::Pooled {
+    FromHub {
         id,
         admitted: false,
         overloaded: true,
@@ -752,22 +562,12 @@ fn nanos(duration: Duration) -> u64 {
 /// The most of the workers' messages the process takes at once before it sends.
 const READY: usize = 1_024;
 
-/// The process's loop: the workers' messages as they come, the cycle, and, shared, its sync
-/// of the rooms every millisecond.
+/// The process's loop: the workers' messages as they come, and the cycle.
 async fn serve(state: Rc<State>, mut from: mpsc::UnboundedReceiver<ToHub>, cycle: Duration) {
     let mut tick = tokio::time::interval(cycle);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut sync = tokio::time::interval(SYNC);
-    sync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let shared = matches!(&*state.engine.borrow(), Engine::Shared(_));
     loop {
         tokio::select! {
-            _ = sync.tick(), if shared => {
-                let now = state.now();
-                if let Engine::Shared(rooms) = &mut *state.engine.borrow_mut() {
-                    rooms.on_sync(now);
-                }
-            }
             message = from.recv() => match message {
                 Some(message) => {
                     let queued = from.len() as u64 + 1;
@@ -788,8 +588,11 @@ async fn serve(state: Rc<State>, mut from: mpsc::UnboundedReceiver<ToHub>, cycle
             _ = tick.tick() => {
                 let started = Instant::now();
                 let now = state.now();
-                state.engine.borrow_mut().on_cycle(now);
-                let visits = state.engine.borrow().visits();
+                let visits = {
+                    let mut participant = state.participant.borrow_mut();
+                    participant.on_cycle(now);
+                    participant.visits()
+                };
                 state.shared.stats.visits.store(visits, Ordering::Relaxed);
                 state.report();
                 let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -797,7 +600,7 @@ async fn serve(state: Rc<State>, mut from: mpsc::UnboundedReceiver<ToHub>, cycle
                 state.shared.stats.cycle_ns_most.fetch_max(took, Ordering::Relaxed);
             }
         }
-        // Pooled, what was deferred decided again, and what settled woken, every turn.
+        // What was deferred decided again, and what settled woken, every turn.
         let started = Instant::now();
         state.answer();
         state.send();

@@ -46,12 +46,12 @@
 #                                             rate-limiting service (12 item 3): saturation
 #                                             from one client, one busy key, and from KEYS
 #                                             client addresses (1000 unless said), each a
-#                                             quiet key of its own; by how a pod's workers
-#                                             share: VARIANTS ours-rl-apart ours-rl-layered
-#                                             ours-rl-keep ours-rl-shared ours-rl-pooled,
-#                                             ours-rl-pooled-nopoll, -local and -both (its
-#                                             levers: quiet keys not polled, cold keys
-#                                             decided locally, or both),
+#                                             quiet key of its own; by the levers:
+#                                             VARIANTS ours-rl-default (left out),
+#                                             ours-rl-protocol (quiet keys polled, cold keys
+#                                             asked about, every key visited), -nopoll,
+#                                             -local, -both, -sched, -local-sched and
+#                                             -both-sched,
 #                                             envoy-rl (Envoy's global rate limit:
 #                                             envoyproxy/ratelimit on Redis), beside ours
 #                                             with no limit
@@ -140,10 +140,8 @@ repo=$(dirname "$here")
 : "${WEBSOCKET:=0}"
 [ "${1:-}" = websocket ] && WEBSOCKET=1
 : "${WSBENCH:=$here/wsbench/target/release/wsbench}"
-# The `ratelimit` scenario's service pod, on the backend's CPUs, and how long the
-# ours-rl-keep variant keeps a slice its worker no longer uses.
+# The `ratelimit` scenario's service pod, on the backend's CPUs.
 : "${RL_SERVICE:=$repo/target/release/edgerush-ratelimit-service}"
-: "${RL_KEEP_MS:=50}"
 # The rate-limiting service's cycle, in milliseconds: the data planes' and the pod's alike.
 : "${RL_CYCLE_MS:=10}"
 # The `ratelimit` scenario's keys beyond its busy ones: RL_RESIDENT more client addresses
@@ -526,7 +524,7 @@ CFG
             --workers "$WORKERS" $idle 2>>"$OUT/proxy.log" &
         ;;
     ours-rl-*)
-        # EdgeRush under a per-client limit, its workers sharing as the name says.
+        # EdgeRush under a per-client limit, its levers as the name says.
         rl_config "${1#ours-rl-}"
         taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config.rl" \
             --workers "$WORKERS" $idle ${METRICS:+--metrics "$METRICS"} 2>>"$OUT/proxy.log" &
@@ -548,33 +546,27 @@ CFG
 
 # The config under a per-client limit, RL_RATE with a bucket of RL_BURST — unless set,
 # room for everything the load sends, so that what is measured is deciding rather than
-# refusing — shared as `$1` says: apart (each
-# worker a data plane), layered, keep (layered, keeping unused slices RL_KEEP_MS) or
-# shared (each key's one room, taken by atomics).
-rl_config() { # sharing
+# refusing — its levers as `$1` says.
+rl_config() { # levers
     local sharing
     levers() { # poll_quiet_keys ask_cold_keys schedule_keys
         printf ', poll_quiet_keys: %s, ask_cold_keys: %s, schedule_keys: %s' "$1" "$2" "$3"
     }
     case "$1" in
-    apart) sharing= ;;
-    layered) sharing=", layered: true" ;;
-    keep) sharing=", layered: true, layered_keep_ms: $RL_KEEP_MS" ;;
-    shared) sharing=", shared: true" ;;
-    # Pooled as it is when its levers are left out: the fastest.
-    pooled-default) sharing=", pooled: true" ;;
-    # Pooled with every lever said, so that a name keeps its meaning whatever the defaults:
-    # the protocol's (quiet keys polled, cold keys asked about, every key visited); quiet keys
+    # As configured with its levers left out: the fastest.
+    default) sharing= ;;
+    # Every lever said, so that a name keeps its meaning whatever the defaults: the
+    # protocol's (quiet keys polled, cold keys asked about, every key visited); quiet keys
     # not polled; cold keys decided locally; both; and each visiting only the keys that need
     # it.
-    pooled) sharing=", pooled: true$(levers true true false)" ;;
-    pooled-nopoll) sharing=", pooled: true$(levers false true false)" ;;
-    pooled-local) sharing=", pooled: true$(levers true false false)" ;;
-    pooled-both) sharing=", pooled: true$(levers false false false)" ;;
-    pooled-sched) sharing=", pooled: true$(levers true true true)" ;;
-    pooled-local-sched) sharing=", pooled: true$(levers true false true)" ;;
-    pooled-both-sched) sharing=", pooled: true$(levers false false true)" ;;
-    *) echo "no sharing $1" >&2; exit 2 ;;
+    protocol) sharing=$(levers true true false) ;;
+    nopoll) sharing=$(levers false true false) ;;
+    local) sharing=$(levers true false false) ;;
+    both) sharing=$(levers false false false) ;;
+    sched) sharing=$(levers true true true) ;;
+    local-sched) sharing=$(levers true false true) ;;
+    both-sched) sharing=$(levers false false true) ;;
+    *) echo "no levers $1" >&2; exit 2 ;;
     esac
     cat >"$run-limits.yaml" <<LIMITS
 limits:
