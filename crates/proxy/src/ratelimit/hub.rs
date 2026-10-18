@@ -7,7 +7,9 @@
 use super::{ASK_TIMEOUT, DEFER_WAIT, MOST_DEFERRED};
 use edgerush_config::CompiledRateLimitService;
 use edgerush_ratelimit::service::layer::{Answer, Process, Slice, Used};
-use edgerush_ratelimit::service::pooled::{Decision as Pooled, Entry, Participant, Registry};
+use edgerush_ratelimit::service::pooled::{
+    Decision as Pooled, Entry, Levers, Participant, Registry,
+};
 use edgerush_ratelimit::service::shared::{Answer as RoomAnswer, Process as Rooms};
 use edgerush_ratelimit::service::{
     Answers, Batch, Contract, DataPlane, Keyed, PodId, Ticket, View,
@@ -221,6 +223,8 @@ impl Hub {
             && self.service.layered_keep == service.layered_keep
             && self.service.shared == service.shared
             && self.service.pooled == service.pooled
+            && self.service.poll_quiet_keys == service.poll_quiet_keys
+            && self.service.ask_cold_keys == service.ask_cold_keys
     }
 
     /// The clock its times are read by.
@@ -301,6 +305,10 @@ fn run(
         // One exchange in flight to each service pod, what comes meanwhile gathered for
         // the next (Lucas).
         participant.set_one_in_flight(true);
+        participant.set_levers(Levers {
+            poll_quiet: service.poll_quiet_keys,
+            ask_cold: service.ask_cold_keys,
+        });
         if made.send(participant.registry()).is_err() {
             return;
         }

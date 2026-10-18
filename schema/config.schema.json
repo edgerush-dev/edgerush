@@ -975,6 +975,14 @@
       "description": "The rate-limiting service (experimental): its pods, and how often each worker sends\nthem what it admitted.",
       "type": "object",
       "properties": {
+        "ask_cold_keys": {
+          "description": "Pooled, whether a request for a key whose copy is cold waits for its owner's word.\nOff, it is decided from the copy as it is — a new key's a full bucket — and the copy\nput right after: no request waits on the service, at the price of a burst on a new\nkey admitted by every process that meets it. Only with `pooled`; on when left out.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
         "cycle_ms": {
           "description": "Milliseconds between a worker's messages to the service; 10 when left out.",
           "type": [
@@ -1020,6 +1028,14 @@
             "type": "string"
           },
           "minItems": 1
+        },
+        "poll_quiet_keys": {
+          "description": "Pooled, whether a key with nothing to report is polled every cycle while in use, to\nkeep its copy fresh. Off, a quiet key's copy goes cold after a refill time and its\nnext request asks: messages grow with the keys admitting, not with all those in\nuse. Only with `pooled`; on when left out.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
         },
         "pooled": {
           "description": "Experimental, for measuring: the process alone a participant of the service, its\nworkers deciding warm requests from per-key state they share by compare-and-swap,\nwith no thread between them (12 item 3; the shared-atomic spike). Not with `layered`\nor `shared`; needs native 128-bit atomics, which the proxy checks. Off when left out.",

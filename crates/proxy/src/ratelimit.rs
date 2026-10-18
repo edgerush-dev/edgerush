@@ -365,6 +365,8 @@ impl Limiter {
             && self.service.layered_keep == service.layered_keep
             && self.service.shared == service.shared
             && self.service.pooled == service.pooled
+            && self.service.poll_quiet_keys == service.poll_quiet_keys
+            && self.service.ask_cold_keys == service.ask_cold_keys
     }
 
     /// The bytes its keys may hold from now on: layered, the process's, which its first

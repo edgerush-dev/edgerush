@@ -138,6 +138,18 @@ pub enum Approach {
         /// The workers of a process.
         workers: usize,
     },
+    /// [`Pooled`](Self::Pooled) with its participants' levers set: what they give up of
+    /// accuracy for throughput.
+    PooledWith {
+        /// The time between a process's batches to the service.
+        cycle: u64,
+        /// How long an ask may go unanswered before it is given up; 0 for four cycles.
+        ask_timeout: u64,
+        /// The workers of a process.
+        workers: usize,
+        /// The levers.
+        levers: edgerush_ratelimit::service::pooled::Levers,
+    },
     /// [`Pooled`](Self::Pooled) with every request under another limit beside the run's,
     /// decided under both, all or none, as [`NodesUnder`](Self::NodesUnder).
     PooledUnder {
@@ -381,6 +393,17 @@ impl Approach {
                 let processes = pods.div_ceil(workers);
                 let nodes = Nodes::new(contract, processes, *cycle, *ask_timeout, None);
                 Box::new(nodes.pooled(workers))
+            }
+            Self::PooledWith {
+                cycle,
+                ask_timeout,
+                workers,
+                levers,
+            } => {
+                let workers = (*workers).max(1);
+                let processes = pods.div_ceil(workers);
+                let nodes = Nodes::new(contract, processes, *cycle, *ask_timeout, None);
+                Box::new(nodes.pooled_with(workers, *levers))
             }
             Self::PooledUnder {
                 cycle,

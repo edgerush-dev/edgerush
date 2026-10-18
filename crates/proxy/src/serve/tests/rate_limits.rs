@@ -110,6 +110,8 @@ fn limited(mut config: Config, service: &[String]) -> Config {
         layered_keep_ms: None,
         shared: None,
         pooled: None,
+        poll_quiet_keys: None,
+        ask_cold_keys: None,
     });
     config
 }
@@ -218,6 +220,8 @@ async fn a_layered_keep_reaches_the_process() {
             layered_keep: Duration::from_millis(keep),
             shared: false,
             pooled: false,
+            poll_quiet_keys: true,
+            ask_cold_keys: true,
         };
         let hub = Hub::start(&compiled, 1, 1 << 20).unwrap();
         let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
@@ -318,6 +322,8 @@ async fn asks_that_come_together_are_sent_together() {
         layered_keep: Duration::ZERO,
         shared: false,
         pooled: true,
+        poll_quiet_keys: true,
+        ask_cold_keys: true,
     };
     let hub = Hub::start(&compiled, 1, 1 << 20).unwrap();
     let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
@@ -431,6 +437,58 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
         .await;
 }
 
+/// Pooled with cold keys not asked about: a new key is decided at once from a full bucket,
+/// no service pod being there to answer, and the next request from the worker's own
+/// handle; with them asked about, the first waits on the ask.
+#[tokio::test]
+async fn a_cold_key_decided_locally_does_not_wait_for_the_service() {
+    use crate::ratelimit::{Hub, Limited, Limiter};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for ask_cold in [false, true] {
+                let mut config = limited(
+                    everything_config("127.0.0.1:9".parse().unwrap()),
+                    &["127.0.0.1:9".to_owned()],
+                );
+                if let Some(service) = &mut config.rate_limit_service {
+                    service.pooled = Some(true);
+                    service.ask_cold_keys = Some(ask_cold);
+                }
+                let compiled = compile(&config).unwrap();
+                let service = compiled.rate_limit_service().unwrap().clone();
+                let hub = Hub::start(&service, 1, 1 << 20).unwrap();
+                let limiter = Limiter::pooled(&service, hub, 0).unwrap();
+                let rule = Arc::clone(&compiled.rules_of(0)[0]);
+                let client = crate::forwarding::Client::new("203.0.113.9".parse().unwrap());
+                let started = Instant::now();
+                let Limited::Later(first) = limiter.decide_all(&rule.limits, 0b1, &client) else {
+                    panic!("the first goes to the process");
+                };
+                let first = within(first).await.unwrap().unwrap();
+                assert!(first.admitted);
+                let took = started.elapsed();
+                if ask_cold {
+                    assert!(
+                        took >= Duration::from_millis(200),
+                        "waited on the ask: {took:?}"
+                    );
+                } else {
+                    assert!(
+                        took < Duration::from_millis(100),
+                        "decided at once: {took:?}"
+                    );
+                    assert!(matches!(
+                        limiter.decide_all(&rule.limits, 0b1, &client),
+                        Limited::Admit
+                    ));
+                }
+                limiter.stop();
+            }
+        })
+        .await;
+}
+
 /// A config with a pooled service is refused where 128-bit atomics are not native, at start
 /// and at a reload alike; one that is not pooled runs anywhere.
 #[test]
@@ -496,6 +554,14 @@ async fn a_changed_pooling_starts_the_process_afresh() {
     assert!(Arc::ptr_eq(&pooled, &same), "nothing changed");
     let again = proxy.hub(&service(Some(false))).unwrap();
     assert!(!Arc::ptr_eq(&pooled, &again), "no longer pooled");
+    // A lever changed: the process's limiter afresh too.
+    let mut levered = service(Some(true));
+    levered.ask_cold_keys = false;
+    let pooled = proxy.hub(&service(Some(true))).unwrap();
+    assert!(
+        !Arc::ptr_eq(&pooled, &proxy.hub(&levered).unwrap()),
+        "a lever changed"
+    );
 }
 
 /// Two workers of one data plane sharing as `sharing` sets the service, a client with a

@@ -49,6 +49,9 @@
 #                                             quiet key of its own; by how a pod's workers
 #                                             share: VARIANTS ours-rl-apart ours-rl-layered
 #                                             ours-rl-keep ours-rl-shared ours-rl-pooled,
+#                                             ours-rl-pooled-nopoll, -local and -both (its
+#                                             levers: quiet keys not polled, cold keys
+#                                             decided locally, or both),
 #                                             envoy-rl (Envoy's global rate limit:
 #                                             envoyproxy/ratelimit on Redis), beside ours
 #                                             with no limit
@@ -551,6 +554,10 @@ rl_config() { # sharing
     keep) sharing=", layered: true, layered_keep_ms: $RL_KEEP_MS" ;;
     shared) sharing=", shared: true" ;;
     pooled) sharing=", pooled: true" ;;
+    # Pooled with its levers: quiet keys not polled, cold keys decided locally, or both.
+    pooled-nopoll) sharing=", pooled: true, poll_quiet_keys: false" ;;
+    pooled-local) sharing=", pooled: true, ask_cold_keys: false" ;;
+    pooled-both) sharing=", pooled: true, poll_quiet_keys: false, ask_cold_keys: false" ;;
     *) echo "no sharing $1" >&2; exit 2 ;;
     esac
     cat >"$run-limits.yaml" <<LIMITS

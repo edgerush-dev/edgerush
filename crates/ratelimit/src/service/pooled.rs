@@ -83,6 +83,34 @@ const OWNED: u8 = 1;
 const BOUNDED: u8 = 2;
 const UNREACHABLE: u8 = 4;
 const ASKING: u8 = 8;
+/// The participant decides cold keys from their copies ([`Levers::ask_cold`] off).
+const LOCAL: u8 = 16;
+
+/// What a participant may give up of accuracy for throughput, each the user's to choose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Levers {
+    /// Whether a key with nothing to report is polled every cycle while it is in use, to
+    /// keep its copy fresh. Off, a quiet key's copy goes cold after a refill time and its
+    /// next request asks: messages no longer grow with the keys in use, only with those
+    /// admitting.
+    pub poll_quiet: bool,
+    /// Whether a request for a key whose copy is cold — new, stale, or being asked about —
+    /// waits for its owner's word. Off, it is decided from the copy as it is, a new key's a
+    /// full bucket, and the copy put right by the reports' answers after: no request waits
+    /// on the service, at the price of a burst on a new key admitted by every process that
+    /// meets it, and copies of keys used on several pods only as fresh as their last answer.
+    pub ask_cold: bool,
+}
+
+impl Default for Levers {
+    /// The protocol as `DataPlane` keeps it: both on.
+    fn default() -> Self {
+        Self {
+            poll_quiet: true,
+            ask_cold: true,
+        }
+    }
+}
 
 /// Shards of a [`Registry`]: a few for each core, so that the transport writing one key's
 /// shard does not hold up a worker reading another's.
@@ -365,7 +393,8 @@ impl Entry {
     #[must_use]
     pub fn cold(&self, now: u64) -> bool {
         let flags = self.flags.load(Ordering::Acquire);
-        flags & OWNED != 0
+        flags & LOCAL == 0
+            && flags & OWNED != 0
             && flags & UNREACHABLE == 0
             && (flags & ASKING != 0
                 || flags & BOUNDED == 0
@@ -714,6 +743,7 @@ pub struct Participant<S> {
     /// With one exchange in flight to a pod at a time: the pods that have one, since when.
     one_in_flight: bool,
     sending: BTreeMap<PodId, u64>,
+    levers: Levers,
     /// The latest time it was given: an exchange's start.
     last_now: u64,
     polls: u64,
@@ -750,6 +780,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             asks: BTreeMap::new(),
             one_in_flight: false,
             sending: BTreeMap::new(),
+            levers: Levers::default(),
             last_now: 0,
             polls: 0,
             ask_timeout: RESEND_AFTER_CYCLES * cycle.max(1),
@@ -774,6 +805,12 @@ impl<S: BuildHasher + Clone> Participant<S> {
     /// As `DataPlane::set_ask_timeout`.
     pub fn set_ask_timeout(&mut self, timeout: u64) {
         self.ask_timeout = timeout.max(1);
+    }
+
+    /// What it gives up of accuracy for throughput ([`Levers`]): the defaults unless set.
+    /// Set before it holds any key.
+    pub fn set_levers(&mut self, levers: Levers) {
+        self.levers = levers;
     }
 
     /// One exchange in flight to a service pod at a time: while a pod has one, nothing new
@@ -852,6 +889,9 @@ impl<S: BuildHasher + Clone> Participant<S> {
             owner.is_some(),
             now,
         ));
+        if !self.levers.ask_cold {
+            entry.set_flag(LOCAL, true);
+        }
         let tracked = Tracked {
             entry,
             owner,
@@ -1200,6 +1240,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
         self.sending
             .retain(|_, since| now.saturating_sub(*since) < ask_timeout);
         let sending = &self.sending;
+        let poll_quiet = self.levers.poll_quiet;
         for (key, tracked) in &mut self.keys {
             let entry = &tracked.entry;
             let hold = entry.hold;
@@ -1261,7 +1302,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             }
             let last = entry.last_request.load(Ordering::Relaxed);
             let in_use = now.saturating_sub(last) <= hold || !tracked.unacknowledged.is_empty();
-            if !reported && in_use {
+            if !reported && in_use && poll_quiet {
                 entries.push(BatchEntry {
                     key: key.clone(),
                     contract: entry.contract,

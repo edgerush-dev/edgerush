@@ -6,7 +6,7 @@
 
 use crate::{Beside, Cluster, Contract, FaultEvent, Message, Order, Outbox};
 use edgerush_ratelimit::service::pooled::{
-    self, Decision as Pooled, Entry, Local, Participant, Registry,
+    self, Decision as Pooled, Entry, Levers, Local, Participant, Registry,
 };
 use edgerush_ratelimit::service::{
     self, Answers, Batch, DataPlane, Decision, FixedState, PlaneId, PodId, ServicePod, Ticket, View,
@@ -87,6 +87,8 @@ struct Layer {
 /// answers. In one process: a worker's decision is a function call on shared state.
 struct Pool {
     workers: usize,
+    /// What its participants give up of accuracy for throughput.
+    levers: Levers,
     /// By worker: its handles to the entries its participant gave it.
     handles: Vec<HashMap<Box<[u8]>, Arc<Entry>>>,
     /// By process: its participant's registry, where a worker finds an entry it holds no
@@ -422,14 +424,26 @@ impl Nodes {
 
     /// The same, each data plane a process's one participant, its `workers` deciding from
     /// shared entries; requests arrive at the workers, `workers` to a process.
-    pub(crate) fn pooled(mut self, workers: usize) -> Self {
+    pub(crate) fn pooled(self, workers: usize) -> Self {
+        self.pooled_with(workers, Levers::default())
+    }
+
+    /// The same, its participants' levers set.
+    pub(crate) fn pooled_with(mut self, workers: usize, levers: Levers) -> Self {
         let workers = workers.max(1);
         for (at, plane) in self.planes.iter_mut().enumerate() {
-            *plane = pooled_plane(id(at, 0), self.cycle, self.ask_timeout, self.view.clone());
+            *plane = pooled_plane(
+                id(at, 0),
+                self.cycle,
+                self.ask_timeout,
+                self.view.clone(),
+                levers,
+            );
         }
         let registries = self.planes.iter().map(registry_of).collect();
         self.pool = Some(Pool {
             workers,
+            levers,
             handles: vec![HashMap::new(); self.planes.len() * workers],
             registries,
         });
@@ -629,7 +643,13 @@ impl Nodes {
                 for handles in &mut pool.handles[workers] {
                     handles.clear();
                 }
-                let fresh = pooled_plane(id, self.cycle, self.ask_timeout, self.view.clone());
+                let fresh = pooled_plane(
+                    id,
+                    self.cycle,
+                    self.ask_timeout,
+                    self.view.clone(),
+                    pool.levers,
+                );
                 pool.registries[plane] = registry_of(&fresh);
                 fresh
             }
@@ -658,7 +678,7 @@ type Asked = (usize, usize, Vec<(Box<[u8]>, service::Contract)>);
 /// A pooled participant `id`, waiting `ask_timeout` for an ask's answer (0: four cycles).
 /// The simulator runs where 128-bit atomics are native; the protocol's `DataPlane` is
 /// what it falls back to only where they are not, so that a run still runs.
-fn pooled_plane(id: PlaneId, cycle: u64, ask_timeout: u64, view: View) -> Plane {
+fn pooled_plane(id: PlaneId, cycle: u64, ask_timeout: u64, view: View, levers: Levers) -> Plane {
     match Participant::new(id, cycle, view.clone(), FixedState::default()) {
         Some(mut participant) => {
             if ask_timeout > 0 {
@@ -666,6 +686,7 @@ fn pooled_plane(id: PlaneId, cycle: u64, ask_timeout: u64, view: View) -> Plane 
             }
             // As the proxy runs it: one exchange in flight to each service pod.
             participant.set_one_in_flight(true);
+            participant.set_levers(levers);
             Plane::Pooled(Box::new(participant))
         }
         None => Plane::Data(plane_of(id, cycle, ask_timeout, view)),

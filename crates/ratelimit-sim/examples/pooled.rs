@@ -18,6 +18,16 @@ use std::num::NonZeroU64;
 
 const MS: u64 = 1_000_000;
 const SECOND: u64 = 1_000 * MS;
+/// Pooled's levers: the fourth argument, `no-poll`, `local` or `both`; the protocol's own
+/// unless said. (Rows with a limit beside the run's keep the protocol's.)
+fn levers() -> edgerush_ratelimit::service::pooled::Levers {
+    let chosen = std::env::args().nth(4).unwrap_or_default();
+    edgerush_ratelimit::service::pooled::Levers {
+        poll_quiet: !matches!(chosen.as_str(), "no-poll" | "both"),
+        ask_cold: !matches!(chosen.as_str(), "local" | "both"),
+    }
+}
+
 /// The protocol's cycle: the third argument, in milliseconds, 10 unless said.
 fn cycle() -> u64 {
     std::env::args()
@@ -447,8 +457,9 @@ fn main() {
          1 ms, give or take 0.5 ms (TCP rows: 10% lost, sent again after 200 ms); a {} ms \
          cycle. \"apart\": each worker a data plane (`Approach::Apart`); \"pooled\": each pod's \
          process one participant, its workers deciding from shared entries \
-         (`Approach::Pooled`); \"one\": one `DataPlane` a pod, the reference.\n",
-        cycle() / MS
+         (`Approach::Pooled`, levers {:?}); \"one\": one `DataPlane` a pod, the reference.\n",
+        cycle() / MS,
+        levers()
     );
     let mut table: Vec<(String, [Totals; 3])> = Vec::new();
     for case in &cases {
@@ -463,10 +474,11 @@ fn main() {
                     ask_timeout: 0,
                     workers: w,
                 },
-                Approach::Pooled {
+                Approach::PooledWith {
                     cycle: cycle(),
                     ask_timeout: 0,
                     workers: w,
+                    levers: levers(),
                 },
                 Approach::Nodes {
                     cycle: cycle(),

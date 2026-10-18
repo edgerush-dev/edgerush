@@ -1054,6 +1054,74 @@ fn one_exchange_in_flight_gathers_what_comes_meanwhile() {
     );
 }
 
+/// With cold keys not asked about, a new key's request is decided at once from a full
+/// bucket and nothing is asked; its admissions are reported with the cycle, as any key's.
+#[test]
+fn a_cold_key_decided_locally_asks_nothing() {
+    let mut participant = participant();
+    participant.set_levers(Levers {
+        ask_cold: false,
+        ..Levers::default()
+    });
+    let (key, c): (&[u8], Contract) = (b"k", contract(100, 3));
+    for _ in 0..3 {
+        assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    }
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Refuse);
+    let asked: usize = participant
+        .take_outgoing()
+        .iter()
+        .map(|(_, batch)| batch.asks.len())
+        .sum();
+    assert_eq!(asked, 0);
+    participant.on_cycle(CYCLE);
+    let reported: u64 = participant
+        .take_outgoing()
+        .iter()
+        .flat_map(|(_, batch)| &batch.entries)
+        .filter_map(|e| match e.report {
+            Report::Hits { count, .. } => Some(count),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(reported, 3);
+}
+
+/// With quiet keys not polled, a key in use with nothing to report sends nothing with the
+/// cycle; with them polled, a poll.
+#[test]
+fn quiet_keys_are_polled_only_when_asked_to_be() {
+    for poll_quiet in [true, false] {
+        let mut participant = participant();
+        participant.set_levers(Levers {
+            poll_quiet,
+            ..Levers::default()
+        });
+        let mut pod: ServicePod = ServicePod::new(0, CYCLE, view());
+        let (key, c): (&[u8], Contract) = (b"k", contract(100, 100));
+        assert!(matches!(
+            participant.decide_all(&[(key, c)], 0),
+            Decision::Wait(_)
+        ));
+        for (_, batch) in participant.take_outgoing() {
+            participant.on_answers(pod.on_batch(batch, 0), 0);
+        }
+        // Its admission reported and answered; then a cycle with nothing to report.
+        participant.on_cycle(CYCLE);
+        for (_, batch) in participant.take_outgoing() {
+            participant.on_answers(pod.on_batch(batch, CYCLE), CYCLE);
+        }
+        participant.on_cycle(2 * CYCLE);
+        let polls = participant
+            .take_outgoing()
+            .iter()
+            .flat_map(|(_, batch)| &batch.entries)
+            .filter(|e| matches!(e.report, Report::Poll))
+            .count();
+        assert_eq!(polls, usize::from(poll_quiet), "poll_quiet {poll_quiet}");
+    }
+}
+
 /// The cycle number is kept modulo 2^16: a key untouched by any worker for exactly that many
 /// cycles would look as if its cycle had not changed, and keep a spent allowance. The
 /// transport advances every key it holds each cycle, so while it runs — held up for less

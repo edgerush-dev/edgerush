@@ -104,6 +104,18 @@ pub struct RateLimitService {
     /// or `shared`; needs native 128-bit atomics, which the proxy checks. Off when left out.
     #[serde(default)]
     pub pooled: Option<bool>,
+    /// Pooled, whether a key with nothing to report is polled every cycle while in use, to
+    /// keep its copy fresh. Off, a quiet key's copy goes cold after a refill time and its
+    /// next request asks: messages grow with the keys admitting, not with all those in
+    /// use. Only with `pooled`; on when left out.
+    #[serde(default)]
+    pub poll_quiet_keys: Option<bool>,
+    /// Pooled, whether a request for a key whose copy is cold waits for its owner's word.
+    /// Off, it is decided from the copy as it is — a new key's a full bucket — and the copy
+    /// put right after: no request waits on the service, at the price of a burst on a new
+    /// key admitted by every process that meets it. Only with `pooled`; on when left out.
+    #[serde(default)]
+    pub ask_cold_keys: Option<bool>,
 }
 
 /// A place where requests come in. Hostnames are to come; until a listener can be told
