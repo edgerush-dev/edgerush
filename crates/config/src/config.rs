@@ -107,20 +107,21 @@ pub struct RateLimitService {
     /// Pooled, whether a key with nothing to report is polled every cycle while in use, to
     /// keep its copy fresh. Off, a quiet key's copy goes cold after a refill time and its
     /// next request asks: messages grow with the keys admitting, not with all those in
-    /// use. Only with `pooled`; on when left out.
+    /// use. Only with `pooled`; off when left out, the faster (Lucas).
     #[serde(default)]
     pub poll_quiet_keys: Option<bool>,
     /// Pooled, whether a request for a key whose copy is cold waits for its owner's word.
     /// Off, it is decided from the copy as it is — a new key's a full bucket — and the copy
     /// put right after: no request waits on the service, at the price of a burst on a new
-    /// key admitted by every process that meets it. Only with `pooled`; on when left out.
+    /// key admitted by every process that meets it. Only with `pooled`; off when left out,
+    /// the faster (Lucas).
     #[serde(default)]
     pub ask_cold_keys: Option<bool>,
     /// Pooled, whether each cycle the process visits only the keys that need it — those its
     /// workers signal, and those with work outstanding — rather than every key it holds,
     /// so that quiet keys cost nothing between their uses. A key woken after cycles without
     /// a visit gets one share of its bucket refilled from the time gone by. Only with
-    /// `pooled`; off when left out.
+    /// `pooled`; on when left out, the faster (Lucas).
     #[serde(default)]
     pub schedule_keys: Option<bool>,
 }

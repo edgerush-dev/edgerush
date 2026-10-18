@@ -553,22 +553,27 @@ CFG
 # shared (each key's one room, taken by atomics).
 rl_config() { # sharing
     local sharing
+    levers() { # poll_quiet_keys ask_cold_keys schedule_keys
+        printf ', poll_quiet_keys: %s, ask_cold_keys: %s, schedule_keys: %s' "$1" "$2" "$3"
+    }
     case "$1" in
     apart) sharing= ;;
     layered) sharing=", layered: true" ;;
     keep) sharing=", layered: true, layered_keep_ms: $RL_KEEP_MS" ;;
     shared) sharing=", shared: true" ;;
-    pooled) sharing=", pooled: true" ;;
-    # Pooled with its levers: quiet keys not polled, cold keys decided locally, or both.
-    pooled-nopoll) sharing=", pooled: true, poll_quiet_keys: false" ;;
-    pooled-local) sharing=", pooled: true, ask_cold_keys: false" ;;
-    pooled-both) sharing=", pooled: true, poll_quiet_keys: false, ask_cold_keys: false" ;;
-    # The same, each cycle visiting only the keys that need it.
-    pooled-sched) sharing=", pooled: true, schedule_keys: true" ;;
-    pooled-local-sched) sharing=", pooled: true, ask_cold_keys: false, schedule_keys: true" ;;
-    pooled-both-sched)
-        sharing=", pooled: true, poll_quiet_keys: false, ask_cold_keys: false, schedule_keys: true"
-        ;;
+    # Pooled as it is when its levers are left out: the fastest.
+    pooled-default) sharing=", pooled: true" ;;
+    # Pooled with every lever said, so that a name keeps its meaning whatever the defaults:
+    # the protocol's (quiet keys polled, cold keys asked about, every key visited); quiet keys
+    # not polled; cold keys decided locally; both; and each visiting only the keys that need
+    # it.
+    pooled) sharing=", pooled: true$(levers true true false)" ;;
+    pooled-nopoll) sharing=", pooled: true$(levers false true false)" ;;
+    pooled-local) sharing=", pooled: true$(levers true false false)" ;;
+    pooled-both) sharing=", pooled: true$(levers false false false)" ;;
+    pooled-sched) sharing=", pooled: true$(levers true true true)" ;;
+    pooled-local-sched) sharing=", pooled: true$(levers true false true)" ;;
+    pooled-both-sched) sharing=", pooled: true$(levers false false true)" ;;
     *) echo "no sharing $1" >&2; exit 2 ;;
     esac
     cat >"$run-limits.yaml" <<LIMITS

@@ -976,7 +976,7 @@
       "type": "object",
       "properties": {
         "ask_cold_keys": {
-          "description": "Pooled, whether a request for a key whose copy is cold waits for its owner's word.\nOff, it is decided from the copy as it is — a new key's a full bucket — and the copy\nput right after: no request waits on the service, at the price of a burst on a new\nkey admitted by every process that meets it. Only with `pooled`; on when left out.",
+          "description": "Pooled, whether a request for a key whose copy is cold waits for its owner's word.\nOff, it is decided from the copy as it is — a new key's a full bucket — and the copy\nput right after: no request waits on the service, at the price of a burst on a new\nkey admitted by every process that meets it. Only with `pooled`; off when left out,\nthe faster (Lucas).",
           "type": [
             "boolean",
             "null"
@@ -1030,7 +1030,7 @@
           "minItems": 1
         },
         "poll_quiet_keys": {
-          "description": "Pooled, whether a key with nothing to report is polled every cycle while in use, to\nkeep its copy fresh. Off, a quiet key's copy goes cold after a refill time and its\nnext request asks: messages grow with the keys admitting, not with all those in\nuse. Only with `pooled`; on when left out.",
+          "description": "Pooled, whether a key with nothing to report is polled every cycle while in use, to\nkeep its copy fresh. Off, a quiet key's copy goes cold after a refill time and its\nnext request asks: messages grow with the keys admitting, not with all those in\nuse. Only with `pooled`; off when left out, the faster (Lucas).",
           "type": [
             "boolean",
             "null"
@@ -1046,7 +1046,7 @@
           "default": null
         },
         "schedule_keys": {
-          "description": "Pooled, whether each cycle the process visits only the keys that need it — those its\nworkers signal, and those with work outstanding — rather than every key it holds,\nso that quiet keys cost nothing between their uses. A key woken after cycles without\na visit gets one share of its bucket refilled from the time gone by. Only with\n`pooled`; off when left out.",
+          "description": "Pooled, whether each cycle the process visits only the keys that need it — those its\nworkers signal, and those with work outstanding — rather than every key it holds,\nso that quiet keys cost nothing between their uses. A key woken after cycles without\na visit gets one share of its bucket refilled from the time gone by. Only with\n`pooled`; on when left out, the faster (Lucas).",
           "type": [
             "boolean",
             "null"

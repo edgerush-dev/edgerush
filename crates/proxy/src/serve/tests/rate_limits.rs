@@ -395,6 +395,8 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
             );
             if let Some(service) = &mut config.rate_limit_service {
                 service.pooled = Some(true);
+                // Cold keys asked about: a hold waits on an ask.
+                service.ask_cold_keys = Some(true);
             }
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
@@ -637,7 +639,7 @@ async fn a_changed_pooling_starts_the_process_afresh() {
     assert!(!Arc::ptr_eq(&pooled, &again), "no longer pooled");
     // A lever changed: the process's limiter afresh too.
     let mut levered = service(Some(true));
-    levered.ask_cold_keys = false;
+    levered.ask_cold_keys = !levered.ask_cold_keys;
     let pooled = proxy.hub(&service(Some(true))).unwrap();
     assert!(
         !Arc::ptr_eq(&pooled, &proxy.hub(&levered).unwrap()),

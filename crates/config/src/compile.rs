@@ -600,9 +600,9 @@ fn rate_limit_service(
         layered_keep: Duration::from_millis(service.layered_keep_ms.unwrap_or(0)),
         shared: service.shared.unwrap_or(false),
         pooled: service.pooled.unwrap_or(false),
-        poll_quiet_keys: service.poll_quiet_keys.unwrap_or(true),
-        ask_cold_keys: service.ask_cold_keys.unwrap_or(true),
-        schedule_keys: service.schedule_keys.unwrap_or(false),
+        poll_quiet_keys: service.poll_quiet_keys.unwrap_or(false),
+        ask_cold_keys: service.ask_cold_keys.unwrap_or(false),
+        schedule_keys: service.schedule_keys.unwrap_or(true),
     })
 }
 
@@ -4721,14 +4721,15 @@ routes:
             ]
         );
         let levers = with(
-            r#"rate_limit_service: { pods: ["a:1"], pooled: true, poll_quiet_keys: false, ask_cold_keys: false, schedule_keys: true }"#,
+            r#"rate_limit_service: { pods: ["a:1"], pooled: true, poll_quiet_keys: true, ask_cold_keys: true, schedule_keys: false }"#,
         )
         .unwrap()
         .unwrap();
-        assert!(!levers.poll_quiet_keys && !levers.ask_cold_keys && levers.schedule_keys);
+        assert!(levers.poll_quiet_keys && levers.ask_cold_keys && !levers.schedule_keys);
         assert!(
-            shared.poll_quiet_keys && shared.ask_cold_keys && !shared.schedule_keys,
-            "as the protocol keeps it when left out"
+            !shared.poll_quiet_keys && !shared.ask_cold_keys && shared.schedule_keys,
+            "when left out, the fastest: quiet keys not polled, cold keys decided locally, \
+             keys scheduled"
         );
         for lever in ["ask_cold_keys: false", "schedule_keys: true"] {
             assert_eq!(
