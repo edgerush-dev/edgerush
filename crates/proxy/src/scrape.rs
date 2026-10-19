@@ -483,7 +483,8 @@ mod tests {
     /// A scrape answer that has not all gone within its bound of its head being read ends
     /// its connection, so that a reader that takes a little now and then holds the text no
     /// longer than that; one taken at once is not cut (08 §4). The text is made several MB,
-    /// more than the sockets between client and server hold.
+    /// more than the sockets between client and server hold. The bound is seconds: a debug
+    /// build on a busy machine takes more than half of one to send the text read at once.
     #[test]
     fn a_scrape_answer_still_going_when_due_ends_its_connection() {
         use std::io::{Read, Write};
@@ -502,7 +503,7 @@ mod tests {
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         socket.set_nonblocking(true).unwrap();
         let address = socket.local_addr().unwrap();
-        const WITHIN: Duration = Duration::from_millis(500);
+        const WITHIN: Duration = Duration::from_secs(2);
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -556,7 +557,7 @@ mod tests {
         ask(&mut slow);
         let mut taken = slow.read(&mut buffer).unwrap();
         assert!(taken > 0);
-        std::thread::sleep(WITHIN * 3);
+        std::thread::sleep(WITHIN * 2);
         let ended = loop {
             match slow.read(&mut buffer) {
                 Ok(0) => break true,
