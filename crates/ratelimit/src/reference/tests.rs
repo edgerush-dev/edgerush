@@ -458,3 +458,64 @@ fn a_released_charge_leaves_its_first_request_window_open() {
         "the window opened at 900 runs to 1,900"
     );
 }
+
+/// Something done to a token bucket, `gap` nanoseconds after the last, or before it: a
+/// bucket takes an earlier time as the latest it was given.
+#[derive(Clone, Debug)]
+enum Use {
+    Charge,
+    Release,
+    SetBehind(u128),
+}
+
+fn uses() -> impl Strategy<Value = Vec<(i64, Use)>> {
+    let gap = prop_oneof![2 => Just(0i64), 2 => 1i64..50, 1 => 50i64..3000, 1 => -200i64..0];
+    let what = prop_oneof![
+        6 => Just(Use::Charge),
+        1 => Just(Use::Release),
+        1 => (0u128..20_000).prop_map(Use::SetBehind),
+    ];
+    prop::collection::vec((gap, what), 0..80)
+}
+
+proptest! {
+    /// A bucket kept as its state, and made again from it under its terms for every use,
+    /// answers every question as one kept whole.
+    #[test]
+    fn a_bucket_kept_as_its_state_is_the_bucket(
+        uses in uses(), limit in 1u64..8, window in 1u64..2000, capacity in 1u64..8
+    ) {
+        let (limit, window, capacity) = (nz(limit), nz(window), nz(capacity));
+        let mut whole = TokenBucket::new(limit, window, capacity);
+        let mut state = whole.state();
+        let mut now: u64 = 0;
+        for (gap, what) in uses {
+            now = now.saturating_add_signed(gap);
+            let mut kept = TokenBucket::from_state(limit, window, capacity, state);
+            match what {
+                Use::Charge => {
+                    whole.charge(now);
+                    kept.charge(now);
+                }
+                Use::Release => {
+                    let at = Charge { at: now };
+                    whole.release(at);
+                    kept.release(at);
+                }
+                Use::SetBehind(behind) => {
+                    whole.set_behind(now, behind);
+                    kept.set_behind(now, behind);
+                }
+            }
+            state = kept.state();
+            let kept = TokenBucket::from_state(limit, window, capacity, state);
+            for at in [now, now + 1, now + 500, now + 5000] {
+                prop_assert_eq!(kept.admits(at), whole.admits(at));
+                prop_assert_eq!(kept.remaining(at), whole.remaining(at));
+                prop_assert_eq!(kept.retry_at(at), whole.retry_at(at));
+                prop_assert_eq!(kept.behind(at), whole.behind(at));
+            }
+            prop_assert_eq!(kept.forgettable_at(), whole.forgettable_at());
+        }
+    }
+}

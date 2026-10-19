@@ -441,6 +441,41 @@ impl TokenBucket {
         self.last = at;
         self.arrival = (behind > 0).then(|| scaled + behind);
     }
+
+    /// What the bucket holds besides its terms, in less room: for holding many buckets
+    /// whose terms are kept elsewhere, each made again with [`from_state`](Self::from_state)
+    /// to be used.
+    #[must_use]
+    pub fn state(&self) -> BucketState {
+        BucketState {
+            arrival: self.arrival.unwrap_or(0),
+            last: self.last,
+        }
+    }
+
+    /// The bucket refilling `limit` requests per `window` nanoseconds and holding at most
+    /// `capacity`, as [`state`](Self::state) left it.
+    #[must_use]
+    pub fn from_state(
+        limit: NonZeroU64,
+        window: NonZeroU64,
+        capacity: NonZeroU64,
+        state: BucketState,
+    ) -> Self {
+        Self {
+            arrival: (state.arrival > 0).then_some(state.arrival),
+            last: state.last,
+            ..Self::new(limit, window, capacity)
+        }
+    }
+}
+
+/// A [`TokenBucket`]'s state without its terms. An arrival time of zero stands for none:
+/// a bucket arriving at zero is behind every time, as one with none is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BucketState {
+    arrival: u128,
+    last: u64,
 }
 
 impl Model for TokenBucket {
