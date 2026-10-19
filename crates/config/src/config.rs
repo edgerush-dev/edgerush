@@ -86,13 +86,13 @@ pub struct RateLimitService {
     /// a key counts as in use for its refill time after its last request, so under a limit
     /// refilling over an hour or a day every key of every client seen in that time is polled
     /// every cycle: each cycle's messages and work grow with them, millions of keys every
-    /// 10 ms. Off when left out, the faster (Lucas).
+    /// 10 ms. Off when left out, the faster.
     #[serde(default)]
     pub poll_quiet_keys: Option<bool>,
     /// Whether a request for a key whose copy is cold waits for its owner's word. Off, it is
     /// decided from the copy as it is — a new key's a full bucket — and the copy put right
     /// after: no request waits on the service, at the price of a burst on a new key
-    /// admitted by every process that meets it. Off when left out, the faster (Lucas).
+    /// admitted by every process that meets it. Off when left out, the faster.
     #[serde(default)]
     pub ask_cold_keys: Option<bool>,
     /// Whether each cycle the process visits only the keys that need it — those its workers
@@ -101,7 +101,7 @@ pub struct RateLimitService {
     /// gets one share of its bucket refilled from the time gone by. Off, every cycle visits
     /// every key held, and a key is held for twice its refill time after its last request:
     /// under a limit refilling over an hour or a day, each cycle's work grows with every
-    /// client seen in that time. On when left out, the faster (Lucas).
+    /// client seen in that time. On when left out, the faster.
     #[serde(default)]
     pub schedule_keys: Option<bool>,
 }
