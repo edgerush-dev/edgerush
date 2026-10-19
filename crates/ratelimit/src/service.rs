@@ -177,8 +177,9 @@ pub enum Report {
         sequence: u64,
         /// How many hits.
         count: u64,
-        /// The highest of its batches it has seen applied: an owner taking over from a copy
-        /// older than that skips to it rather than wait for batches that will not come.
+        /// The highest of its batches it has seen applied, always below `sequence`: an owner
+        /// taking over from a copy older than that skips to it rather than wait for batches
+        /// that will not come.
         seen: u64,
     },
     /// Nothing to report, but the key is in use: a fresh copy, please.
