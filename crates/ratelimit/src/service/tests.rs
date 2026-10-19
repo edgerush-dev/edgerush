@@ -289,7 +289,7 @@ fn the_owner_owes_excess_up_to_a_refill_time() {
     let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 1));
     pod.on_batch(batch(1, hits(1, 25, 0)), 0);
     assert_eq!(pod.counted(b"k"), Some(25));
-    assert_eq!(pod.keys[&b"k"[..]].bucket.retry_at(0), Some(110 * MS));
+    assert_eq!(pod.keys[&b"k"[..]].bucket().retry_at(0), Some(110 * MS));
 }
 
 #[test]
@@ -840,7 +840,32 @@ fn a_batch_applied_arriving_again_is_not_kept() {
     let answer = pod.on_batch(batch(1, hits(1, 2, 0)), CYCLE);
     assert_eq!(answer.entries[0].applied, 1);
     assert_eq!(pod.counted(b"k"), Some(2));
-    assert!(pod.keys[&b"k"[..]].planes[&1].waiting.is_empty());
+    assert!(pod.keys[&b"k"[..]].planes.get(1).unwrap().waiting.is_none());
+}
+
+/// Batches arriving in order hold no room for batches kept waiting; one arriving ahead of
+/// a batch still missing is kept, and the room given back once the missing one comes.
+#[test]
+fn only_batches_ahead_of_a_missing_one_hold_room() {
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    let room = |pod: &ServicePod| {
+        pod.keys[&b"k"[..]]
+            .planes
+            .get(1)
+            .unwrap()
+            .waiting
+            .as_ref()
+            .map_or(0, |waiting| waiting.capacity())
+    };
+    pod.on_batch(batch(1, hits(1, 1, 0)), 0);
+    pod.on_batch(batch(1, hits(2, 1, 1)), CYCLE);
+    assert_eq!(room(&pod), 0, "in order");
+    pod.on_batch(batch(1, hits(4, 1, 2)), 2 * CYCLE);
+    assert_eq!(pod.counted(b"k"), Some(2), "the fourth waits for the third");
+    assert!(room(&pod) > 0);
+    pod.on_batch(batch(1, hits(3, 1, 2)), 3 * CYCLE);
+    assert_eq!(pod.counted(b"k"), Some(4));
+    assert_eq!(room(&pod), 0, "given back");
 }
 
 /// A pod that leaves and comes back owns its keys again: the pod that held them meanwhile
@@ -901,11 +926,11 @@ fn a_handover_arriving_late_keeps_what_the_new_owner_applied() {
     );
     assert_eq!(pod.counted(b"k"), Some(7));
     assert_eq!(
-        pod.keys[&b"k"[..]].bucket.remaining(0),
+        pod.keys[&b"k"[..]].bucket().remaining(0),
         3,
         "ten less five less two"
     );
-    assert_eq!(pod.keys[&b"k"[..]].planes[&9].applied, 1);
+    assert_eq!(pod.keys[&b"k"[..]].planes.get(9).unwrap().applied, 1);
 }
 
 /// A handover reaching a pod that does not own the key is ignored.
@@ -1254,7 +1279,7 @@ fn a_pod_decides_an_ask_whole_and_its_copies_see_each_ask() {
     let answers = pod.on_batch(ask(3, 1, 3, &[&a, &b]), 0);
     assert_eq!(answers.decided, vec![(1, 0)], "b's copy empty");
     assert_eq!(
-        pod.keys[&a[..]].bucket.remaining(0),
+        pod.keys[&a[..]].bucket().remaining(0),
         4,
         "a charged six only"
     );
@@ -1574,6 +1599,71 @@ fn a_service_pod_past_its_capacity_evicts_the_least_recently_changed() {
     assert_eq!(kept, [false, false, false, true, true]);
     assert_eq!(pod.holding(), bytes[3] + bytes[4]);
     assert_eq!(pod.evicted(), 3);
+}
+
+/// A service pod counts room for as many records as a key's data planes need, not a
+/// B-tree node's eleven: one for the usual key, admitted by one data plane, and growing
+/// one at a time, then doubling.
+#[test]
+fn a_service_pod_counts_room_for_the_records_a_key_has() {
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    let entry = size_of::<(Box<[u8]>, Owned)>() + 1 + b"k".len();
+    let record = size_of::<(PlaneId, Record)>();
+    for (plane, room) in [(7, 1), (3, 2), (9, 4), (5, 4), (1, 8)] {
+        pod.on_batch(batch(plane, hits(1, 1, 0)), 0);
+        let bytes = pod_key_bytes(b"k", &pod.keys[&b"k"[..]]);
+        assert_eq!(bytes, (entry + room * record) as u64, "plane {plane}");
+    }
+}
+
+/// A service pod's key takes 112 bytes in its table, which holds up to twice the room its
+/// keys take, and its record of a data plane 56: its bucket kept as the bucket's state, its
+/// terms the key's contract, and batches waiting, which rarely do, kept apart.
+#[test]
+fn a_service_pods_key_is_small() {
+    assert_eq!(size_of::<(Box<[u8]>, Owned)>(), 112);
+    assert_eq!(size_of::<(PlaneId, Record)>(), 56);
+}
+
+proptest::proptest! {
+    /// A key's records behave as a map from data plane to record: each data plane's found,
+    /// made when first wanted, and gone through in order of data plane.
+    #[test]
+    fn records_are_a_map_of_data_planes(
+        uses in proptest::collection::vec((0u64..24, 1u64..100), 0..64)
+    ) {
+        let mut records = Records::default();
+        let mut model: BTreeMap<PlaneId, u64> = BTreeMap::new();
+        for (plane, applied) in uses {
+            records.entry(plane).applied += applied;
+            *model.entry(plane).or_default() += applied;
+        }
+        for plane in 0..25 {
+            proptest::prop_assert_eq!(
+                records.get(plane).map(|record| record.applied),
+                model.get(&plane).copied()
+            );
+        }
+        let seen: Vec<(PlaneId, u64)> =
+            records.iter().map(|(plane, record)| (plane, record.applied)).collect();
+        proptest::prop_assert_eq!(seen, model.into_iter().collect::<Vec<_>>());
+    }
+
+    /// Records made from a copy's list, in any order, are kept in order of data plane, the
+    /// last of a data plane's taken.
+    #[test]
+    fn records_from_a_list_are_a_map_of_its_last(
+        list in proptest::collection::vec((0u64..24, 1u64..100), 0..64)
+    ) {
+        let records: Records = list
+            .iter()
+            .map(|&(plane, applied)| (plane, Record { applied, ..Record::default() }))
+            .collect();
+        let model: BTreeMap<PlaneId, u64> = list.into_iter().collect();
+        let seen: Vec<(PlaneId, u64)> =
+            records.iter().map(|(plane, record)| (plane, record.applied)).collect();
+        proptest::prop_assert_eq!(seen, model.into_iter().collect::<Vec<_>>());
+    }
 }
 
 /// A data plane's share of the cycle, admitting with others: what its copy has left and the

@@ -42,7 +42,7 @@ pub mod pooled;
 
 pub use keyed::Keyed;
 
-use crate::reference::{Charge, Model, TokenBucket};
+use crate::reference::{BucketState, Charge, Model, TokenBucket};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::num::NonZeroU64;
@@ -545,10 +545,10 @@ fn plane_key_bytes(key: &[u8]) -> u64 {
     (size_of::<(Box<[u8]>, PlaneKey)>() + 1 + key.len()) as u64
 }
 
-/// What a service pod counts a key as holding: as a data plane does, and its records of
-/// the data planes admitting it, kept in a B-tree whose nodes have room for eleven.
+/// What a service pod counts a key as holding: as a data plane does, and the room for its
+/// records of the data planes admitting it.
 fn pod_key_bytes(key: &[u8], owned: &Owned) -> u64 {
-    let records = owned.planes.len().div_ceil(11) * 11 * size_of::<(PlaneId, Record)>();
+    let records = owned.planes.room() * size_of::<(PlaneId, Record)>();
     (size_of::<(Box<[u8]>, Owned)>() + 1 + key.len() + records) as u64
 }
 
@@ -1375,18 +1375,136 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
 #[derive(Clone, Debug, Default)]
 struct Record {
     applied: u64,
-    /// Batches that came ahead of one still missing.
-    waiting: BTreeMap<u64, u64>,
+    /// Batches that came ahead of one still missing, `(sequence, count)` in order: none,
+    /// and no room for any, while batches come in order, as they almost always do.
+    #[allow(
+        clippy::box_collection,
+        reason = "a pointer in every record, rather than a list's three words, for what is rarely there"
+    )]
+    waiting: Option<Box<Vec<(u64, u64)>>>,
     last_admitted: Option<u64>,
     last_ask: (u64, u64),
+}
+
+impl Record {
+    /// Batch `sequence` of `count` hits arrives: the hits now ready to apply, of it and of
+    /// the batches kept waiting for it, each batch once.
+    fn take(&mut self, sequence: u64, count: u64) -> u64 {
+        if sequence <= self.applied {
+            return 0;
+        }
+        if sequence > self.applied + 1 {
+            let waiting = self.waiting.get_or_insert_default();
+            match waiting.binary_search_by_key(&sequence, |(at, _)| *at) {
+                Ok(at) => waiting[at] = (sequence, count),
+                Err(at) => waiting.insert(at, (sequence, count)),
+            }
+            return 0;
+        }
+        self.applied = sequence;
+        let mut ready = count;
+        if let Some(waiting) = &mut self.waiting {
+            // All ahead of it: the first of them follow on from it.
+            let mut caught_up = 0;
+            for &(at, waited) in waiting.iter() {
+                if at != self.applied + 1 {
+                    break;
+                }
+                self.applied = at;
+                ready += waited;
+                caught_up += 1;
+            }
+            waiting.drain(..caught_up);
+            if waiting.is_empty() {
+                self.waiting = None;
+            }
+        }
+        ready
+    }
+
+    /// The data plane has seen batches up to `seen` applied, and will not send them again.
+    fn skip_to(&mut self, seen: u64) {
+        self.applied = seen;
+        if let Some(waiting) = &mut self.waiting {
+            waiting.retain(|(sequence, _)| *sequence > seen);
+            if waiting.is_empty() {
+                self.waiting = None;
+            }
+        }
+    }
+}
+
+/// What a service pod keeps of the data planes admitting a key, one record each, in order
+/// of data plane and each found by halving the list: most keys are admitted by one data
+/// plane, and a list has room for no more than it needs where a B-tree's first node has
+/// room for eleven. A record is never removed.
+#[derive(Debug, Default)]
+struct Records(Vec<(PlaneId, Record)>);
+
+impl Records {
+    fn find(&self, plane: PlaneId) -> Result<usize, usize> {
+        self.0.binary_search_by_key(&plane, |(id, _)| *id)
+    }
+
+    fn get(&self, plane: PlaneId) -> Option<&Record> {
+        let at = self.find(plane).ok()?;
+        self.0.get(at).map(|(_, record)| record)
+    }
+
+    /// The record of `plane`, made if there is none.
+    fn entry(&mut self, plane: PlaneId) -> &mut Record {
+        let at = match self.find(plane) {
+            Ok(at) => at,
+            Err(at) => {
+                // Room for one at first, as most keys stay at one; then twice the room.
+                if self.0.len() == self.0.capacity() {
+                    self.0.reserve_exact(self.0.len().max(1));
+                }
+                self.0.insert(at, (plane, Record::default()));
+                at
+            }
+        };
+        // `at` is in the list: found there, or just put there.
+        &mut self.0[at].1
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (PlaneId, &Record)> {
+        self.0.iter().map(|(plane, record)| (*plane, record))
+    }
+
+    /// How many records there is room for.
+    fn room(&self) -> usize {
+        self.0.capacity()
+    }
+}
+
+impl FromIterator<(PlaneId, Record)> for Records {
+    fn from_iter<I: IntoIterator<Item = (PlaneId, Record)>>(list: I) -> Self {
+        let list = list.into_iter();
+        let mut records = Self(Vec::with_capacity(list.size_hint().0));
+        for (plane, record) in list {
+            *records.entry(plane) = record;
+        }
+        records
+    }
+}
+
+impl IntoIterator for Records {
+    type Item = (PlaneId, Record);
+    type IntoIter = std::vec::IntoIter<(PlaneId, Record)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
 }
 
 /// What a service pod holds of a key, as its owner or as a copy.
 struct Owned {
     contract: Contract,
-    bucket: TokenBucket,
+    /// Its bucket's state, the contract its terms: the bucket is made from them to be used.
+    bucket: BucketState,
     counted: u64,
-    planes: BTreeMap<PlaneId, Record>,
+    planes: Records,
     /// When anything last changed.
     touched: u64,
 }
@@ -1395,9 +1513,9 @@ impl Owned {
     fn new(contract: Contract, now: u64) -> Self {
         Self {
             contract,
-            bucket: contract.bucket(),
+            bucket: BucketState::default(),
             counted: 0,
-            planes: BTreeMap::new(),
+            planes: Records::default(),
             touched: now,
         }
     }
@@ -1407,15 +1525,29 @@ impl Owned {
     fn apply(&mut self, count: u64, now: u64) {
         let most = self.contract.refill_time();
         self.counted += count;
+        let mut bucket = self.bucket();
         for _ in 0..count {
-            let owe = self
-                .bucket
-                .retry_at(now)
-                .is_none_or(|retry| retry - now <= most);
+            let owe = bucket.retry_at(now).is_none_or(|retry| retry - now <= most);
             if owe {
-                self.bucket.charge(now);
+                bucket.charge(now);
             }
         }
+        self.bucket = bucket.state();
+    }
+
+    fn bucket(&self) -> TokenBucket {
+        let Contract {
+            limit,
+            window,
+            burst,
+        } = self.contract;
+        TokenBucket::from_state(limit, window, burst, self.bucket)
+    }
+
+    fn charge(&mut self, now: u64) {
+        let mut bucket = self.bucket();
+        bucket.charge(now);
+        self.bucket = bucket.state();
     }
 
     /// How many data planes besides `plane` it has seen admit the key within a few cycles
@@ -1423,11 +1555,15 @@ impl Owned {
     /// now, so that data planes that burst together and fall quiet are bounded together
     /// when they burst again.
     fn others(&self, plane: PlaneId, lately: u64) -> u64 {
-        let latest = self.planes.values().filter_map(|r| r.last_admitted).max();
+        let latest = self
+            .planes
+            .iter()
+            .filter_map(|(_, r)| r.last_admitted)
+            .max();
         self.planes
             .iter()
             .filter(|(id, record)| {
-                **id != plane
+                *id != plane
                     && matches!((record.last_admitted, latest), (Some(at), Some(latest)) if latest - at <= lately)
             })
             .count() as u64
@@ -1438,7 +1574,7 @@ impl Owned {
     fn merge(&mut self, mine: Owned, now: u64) {
         self.apply(mine.counted, now);
         for (plane, record) in mine.planes {
-            let ours = self.planes.entry(plane).or_default();
+            let ours = self.planes.entry(plane);
             ours.applied = ours.applied.max(record.applied);
             ours.last_admitted = ours.last_admitted.max(record.last_admitted);
             if record.last_ask.0 > ours.last_ask.0 {
@@ -1451,13 +1587,13 @@ impl Owned {
         Replica {
             key: key.into(),
             contract: self.contract,
-            behind: self.bucket.behind(now),
+            behind: self.bucket().behind(now),
             counted: self.counted,
             planes: self
                 .planes
                 .iter()
                 .map(|(plane, record)| PlaneRecord {
-                    plane: *plane,
+                    plane,
                     applied: record.applied,
                     admitted_ago: record.last_admitted.map(|at| now.saturating_sub(at)),
                     last_ask: record.last_ask,
@@ -1589,7 +1725,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 continue;
             };
             owned.touched = now;
-            let record = owned.planes.entry(from).or_default();
+            let record = owned.planes.entry(from);
             let mut changed = false;
             if let Report::Hits {
                 sequence,
@@ -1602,23 +1738,15 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 // Taken over from a copy that had not caught up: batches the data plane saw
                 // applied, and will not send again, are skipped.
                 if seen > record.applied {
-                    record.applied = seen;
-                    record.waiting.retain(|sequence, _| *sequence > seen);
+                    record.skip_to(seen);
                 }
-                if sequence > record.applied {
-                    record.waiting.insert(sequence, count);
-                }
-                let mut ready = 0;
-                while let Some(count) = record.waiting.remove(&(record.applied + 1)) {
-                    record.applied += 1;
-                    ready += count;
-                }
+                let ready = record.take(sequence, count);
                 owned.apply(ready, now);
             }
-            let applied = owned.planes.get(&from).map_or(0, |record| record.applied);
+            let applied = owned.planes.get(from).map_or(0, |record| record.applied);
             answers.push(Answer {
                 key: entry.key.clone(),
-                behind: owned.bucket.behind(now),
+                behind: owned.bucket().behind(now),
                 applied,
                 others: owned.others(from, lately),
                 owned: true,
@@ -1637,8 +1765,8 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                     };
                     answers.push(Answer {
                         key: key.clone(),
-                        behind: held.bucket.behind(now),
-                        applied: held.planes.get(&from).map_or(0, |record| record.applied),
+                        behind: held.bucket().behind(now),
+                        applied: held.planes.get(from).map_or(0, |record| record.applied),
                         others: held.others(from, lately),
                         owned: self.view.owners(key).0 == Some(self.me),
                     });
@@ -1670,7 +1798,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             }
         }
         let before = ask.keys.iter().find_map(|(key, _)| {
-            let record = self.keys.get(key)?.planes.get(&from)?;
+            let record = self.keys.get(key)?.planes.get(from)?;
             (record.last_ask.0 == ask.id).then_some(record.last_ask.1)
         });
         if let Some(admitted) = before {
@@ -1681,14 +1809,14 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             let room = ask.keys.iter().all(|(key, _)| {
                 self.keys
                     .get(key)
-                    .is_some_and(|held| held.bucket.admits(now))
+                    .is_some_and(|held| held.bucket().admits(now))
             });
             if !room {
                 break;
             }
             for (key, _) in &ask.keys {
                 if let Some(held) = self.keys.get_mut(key) {
-                    held.bucket.charge(now);
+                    held.charge(now);
                 }
             }
             admitted += 1;
@@ -1699,7 +1827,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 continue;
             };
             held.touched = now;
-            let record = held.planes.entry(from).or_default();
+            let record = held.planes.entry(from);
             record.last_ask = (ask.id, admitted);
             if owned {
                 record.last_admitted = Some(now);
@@ -1755,7 +1883,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                         record.plane,
                         Record {
                             applied: record.applied,
-                            waiting: BTreeMap::new(),
+                            waiting: None,
                             last_admitted: record.admitted_ago.map(|ago| now.saturating_sub(ago)),
                             last_ask: record.last_ask,
                         },
@@ -1764,7 +1892,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 .collect();
             let mut copy = Owned {
                 contract: replica.contract,
-                bucket,
+                bucket: bucket.state(),
                 counted: replica.counted,
                 planes,
                 touched: now,
@@ -1836,7 +1964,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         let mut holding = 0;
         self.keys.retain(|key, owned| {
             let keep = now.saturating_sub(owned.touched) <= owned.contract.refill_time()
-                || owned.bucket.forgettable_at() > now;
+                || owned.bucket().forgettable_at() > now;
             if keep {
                 holding += pod_key_bytes(key, owned);
             }
