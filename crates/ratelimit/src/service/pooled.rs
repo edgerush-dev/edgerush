@@ -900,10 +900,15 @@ fn idle_at(entry: &Entry) -> u64 {
 }
 
 fn key_bytes(key: &[u8], workers: u64) -> u64 {
-    let entry = 2 * size_of::<usize>() + size_of::<Entry>() + key.len();
     let tracked = size_of::<(Handle, Tracked)>() + 1;
     let handle = (size_of::<Handle>() + 1) as u64;
-    (entry + tracked) as u64 + handle * (1 + workers)
+    entry_bytes(key) + tracked as u64 + handle * (1 + workers)
+}
+
+/// What an entry of `key` holds, counts and key, with its eviction time: all that is left of
+/// a key no longer kept while that time keeps its entry, scheduled.
+fn entry_bytes(key: &[u8]) -> u64 {
+    (2 * size_of::<usize>() + size_of::<Entry>() + key.len() + size_of::<Reverse<Due>>()) as u64
 }
 
 /// The process's side of the protocol: one participant, its keys shared with its workers.
@@ -938,14 +943,19 @@ pub struct Participant<S> {
     polls: u64,
     ask_timeout: u64,
     capacity: u64,
+    /// The bytes of the keys it keeps.
     holding: u64,
+    /// Scheduled, the bytes of entries replaced or evicted that their eviction time, in
+    /// `evictions`, keeps until it comes or is dropped ([`Self::drop_stale`]).
+    stale: u64,
     evicted: u64,
     /// Whether each cycle visits only the keys that need it, rather than every key.
     scheduled: bool,
     /// Scheduled, the keys to visit at the next cycle, each once ([`Tracked::queued`]).
     runnable: Vec<Handle>,
     /// Scheduled, when each key may next be idle enough to evict: one for each key, a later
-    /// one put back in its place when one comes due early.
+    /// one put back in its place when one comes due early; and one for each entry replaced
+    /// or evicted, until it comes or is dropped ([`Self::stale`]).
     evictions: BinaryHeap<Reverse<Due>>,
     /// Keys visited, all told.
     visits: u64,
@@ -1127,6 +1137,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             ask_timeout: RESEND_AFTER_CYCLES * cycle.max(1),
             capacity: u64::MAX,
             holding: 0,
+            stale: 0,
             evicted: 0,
             scheduled: false,
             runnable: Vec::new(),
@@ -1219,10 +1230,11 @@ impl<S: BuildHasher + Clone> Participant<S> {
         self.workers = workers.max(1);
     }
 
-    /// The bytes its keys hold.
+    /// The bytes its keys hold, with those of entries no longer kept that their eviction
+    /// times keep until they come.
     #[must_use]
     pub fn holding(&self) -> u64 {
-        self.holding
+        self.holding + self.stale
     }
 
     /// Keys evicted to stay within its capacity, all told.
@@ -1259,7 +1271,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
         if let Some(old) = self.keys.remove(key) {
             close(&old.entry);
             self.registry.remove(&old.entry);
-            self.holding = self.holding.saturating_sub(key_bytes(key, self.workers));
+            self.forget(key);
         }
         // Decided locally, a worker may have made the key's entry already: that one.
         let made = if self.levers.ask_cold {
@@ -1294,11 +1306,41 @@ impl<S: BuildHasher + Clone> Participant<S> {
         }
         if let Some(old) = self.keys.remove(&*entry.key) {
             close(&old.entry);
-            self.holding = self
-                .holding
-                .saturating_sub(key_bytes(&entry.key, self.workers));
+            self.forget(&entry.key);
         }
         self.track(entry);
+    }
+
+    /// Takes `key`, no longer kept, off what it holds — but for its entry while scheduled,
+    /// which its eviction time keeps until it comes or is dropped, and which counts as stale
+    /// meanwhile.
+    fn forget(&mut self, key: &[u8]) {
+        self.holding = self.holding.saturating_sub(key_bytes(key, self.workers));
+        if self.scheduled {
+            self.stale += entry_bytes(key);
+        }
+    }
+
+    /// Drops the eviction times of entries no longer kept, freeing the entries: a pass over
+    /// every key's, made only past the cap, as eviction's own is.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a handle hashes and compares by its entry's key, which never changes"
+    )]
+    fn drop_stale(&mut self) {
+        let keys = &self.keys;
+        let mut freed = 0;
+        self.evictions.retain(|Reverse(due)| {
+            let kept = keys
+                .get(&*due.entry.key)
+                .is_some_and(|tracked| Arc::ptr_eq(&tracked.entry, &due.entry));
+            if !kept {
+                freed += entry_bytes(&due.entry.key);
+            }
+            kept
+        });
+        debug_assert_eq!(freed, self.stale, "one eviction time an entry");
+        self.stale = 0;
     }
 
     /// Keeps `entry`, a live entry of a key not kept, from now on.
@@ -1742,7 +1784,15 @@ impl<S: BuildHasher + Clone> Participant<S> {
             });
             self.holding = self.holding.saturating_sub(freed);
         }
-        if self.holding > self.capacity {
+        if self.holding() <= self.capacity {
+            return;
+        }
+        // Entries no longer kept go first, before any key that is.
+        if self.stale > 0 {
+            self.drop_stale();
+        }
+        let target = self.capacity - self.capacity / 10;
+        if self.holding > target {
             let mut quiet: Vec<(u64, Box<[u8]>)> = self
                 .keys
                 .iter()
@@ -1753,7 +1803,6 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 })
                 .collect();
             quiet.sort_unstable_by_key(|(used, _)| *used);
-            let target = self.capacity - self.capacity / 10;
             for (_, key) in quiet {
                 if self.holding <= target {
                     break;
@@ -1763,27 +1812,34 @@ impl<S: BuildHasher + Clone> Participant<S> {
                     self.registry.remove(&tracked.entry);
                 }
                 if closed && self.keys.remove(&*key).is_some() {
-                    self.holding = self.holding.saturating_sub(key_bytes(&key, self.workers));
+                    self.forget(&key);
                     self.evicted += 1;
                 }
+            }
+            // Freed now, not when the keys would have gone idle: what was evicted is gone.
+            if self.stale > 0 {
+                self.drop_stale();
             }
         }
     }
 
     /// Scheduled, the keys whose eviction has come due at `now`: evicted if idle, as an
     /// unscheduled cycle evicts every idle key; otherwise looked at again when they next
-    /// may be. A due whose key is gone, or has another entry, is dropped.
+    /// may be. A due whose key is gone, or has another entry, is dropped, and its entry with
+    /// it.
     fn evict_due(&mut self, now: u64) {
         while self.evictions.peek().is_some_and(|due| due.0.at <= now) {
             let Some(Reverse(due)) = self.evictions.pop() else {
                 break;
             };
-            let Some(tracked) = self.keys.get(&*due.entry.key) else {
+            let kept = self
+                .keys
+                .get(&*due.entry.key)
+                .filter(|tracked| Arc::ptr_eq(&tracked.entry, &due.entry));
+            let Some(tracked) = kept else {
+                self.stale = self.stale.saturating_sub(entry_bytes(&due.entry.key));
                 continue;
             };
-            if !Arc::ptr_eq(&tracked.entry, &due.entry) {
-                continue;
-            }
             if tracked.idle(now) && close_if_quiet(tracked) {
                 self.registry.remove(&tracked.entry);
                 self.holding = self
