@@ -976,7 +976,7 @@
       "type": "object",
       "properties": {
         "ask_cold_keys": {
-          "description": "Whether a request for a key whose copy is cold waits for its owner's word. Off, it is\ndecided from the copy as it is — a new key's a full bucket — and the copy put right\nafter: no request waits on the service, at the price of a burst on a new key\nadmitted by every process that meets it. Off when left out, the faster (Lucas).",
+          "description": "Whether a request for a key whose copy is cold waits for its owner's word. Off, it is\ndecided from the copy as it is — a new key's a full bucket — and the copy put right\nafter: no request waits on the service, at the price of a burst on a new key\nadmitted by every process that meets it. Off when left out, the faster.",
           "type": [
             "boolean",
             "null"
@@ -1012,7 +1012,7 @@
           "minItems": 1
         },
         "poll_quiet_keys": {
-          "description": "Whether a key with nothing to report is polled every cycle while in use, to keep its\ncopy fresh. Off, a quiet key's copy goes cold after a refill time and its next\nrequest asks: messages grow with the keys admitting, not with all those in use. On,\na key counts as in use for its refill time after its last request, so under a limit\nrefilling over an hour or a day every key of every client seen in that time is polled\nevery cycle: each cycle's messages and work grow with them, millions of keys every\n10 ms. Off when left out, the faster (Lucas).",
+          "description": "Whether a key with nothing to report is polled every cycle while in use, to keep its\ncopy fresh. Off, a quiet key's copy goes cold after a refill time and its next\nrequest asks: messages grow with the keys admitting, not with all those in use. On,\na key counts as in use for its refill time after its last request, so under a limit\nrefilling over an hour or a day every key of every client seen in that time is polled\nevery cycle: each cycle's messages and work grow with them, millions of keys every\n10 ms. Off when left out, the faster.",
           "type": [
             "boolean",
             "null"
@@ -1020,7 +1020,7 @@
           "default": null
         },
         "schedule_keys": {
-          "description": "Whether each cycle the process visits only the keys that need it — those its workers\nsignal, and those with work outstanding — rather than every key it holds, so that\nquiet keys cost nothing between their uses. A key woken after cycles without a visit\ngets one share of its bucket refilled from the time gone by. Off, every cycle visits\nevery key held, and a key is held for twice its refill time after its last request:\nunder a limit refilling over an hour or a day, each cycle's work grows with every\nclient seen in that time. On when left out, the faster (Lucas).",
+          "description": "Whether each cycle the process visits only the keys that need it — those its workers\nsignal, and those with work outstanding — rather than every key it holds, so that\nquiet keys cost nothing between their uses. A key woken after cycles without a visit\ngets one share of its bucket refilled from the time gone by. Off, every cycle visits\nevery key held, and a key is held for twice its refill time after its last request:\nunder a limit refilling over an hour or a day, each cycle's work grows with every\nclient seen in that time. On when left out, the faster.",
           "type": [
             "boolean",
             "null"

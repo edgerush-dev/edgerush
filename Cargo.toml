@@ -113,8 +113,7 @@ tokio = { version = "1.53", features = ["net", "rt", "time"] }
 iai-callgrind = "=0.16.1"
 # Test-only. Forking and timeouts are left out: they pull in extra crates we do not need.
 proptest = { version = "1.11", default-features = false, features = ["std"] }
-# Test-only, under `--cfg loom`: every interleaving of the pooled entries' atomics checked
-# (Lucas approved, 2026-10-18).
+# Test-only, under `--cfg loom`: every interleaving of the pooled entries' atomics checked.
 loom = "0.7.2"
 serde_json = "1.0"
 
