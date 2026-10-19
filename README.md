@@ -2,7 +2,7 @@
 
 A Kubernetes-native API gateway written in Rust: an operator, control planes and data
 planes in one binary; Ingress and Gateway API served from the same data plane; cluster-wide
-rate limiting with no external store.
+rate limiting with no external store to run.
 
 **Status: the data plane runs; Kubernetes does not yet.** The proxy serves traffic from a
 YAML file, the development harness; rate limiting runs, experimentally; the control plane
@@ -15,9 +15,10 @@ timelines.
   objects. Ingress stays a first-class API.
 - **Operator-driven.** `ControlPlane` and `DataPlane` resources become Deployments and
   Services; one control plane can drive many data planes, each its own failure domain.
-- **Cluster-wide rate limiting with no external store.** Counters live in the data plane's
-  memory and are shared between its pods peer to peer, off the request path, and limits
-  keep working when the control plane is down.
+- **Cluster-wide rate limiting with no external store to run.** Counts live in memory in
+  EdgeRush's own rate-limiting service, packaged with it; each data-plane pod decides from
+  its own copy, off the request path, and limits keep working when the control plane is
+  down.
 - **Low added latency, measured.** Thread-per-core on Tokio, our own HTTP/1 server and
   client, compiled filter chains. `bench/` compares EdgeRush with NGINX, HAProxy, Envoy and
   Kong doing the same work on the same machine.
