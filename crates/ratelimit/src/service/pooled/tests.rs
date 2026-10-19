@@ -1607,13 +1607,17 @@ fn replay_a_failure() {
 /// A scheduled participant deciding cold keys locally, nothing polled: what each test of
 /// scheduling starts from, with `keys` keys made at 0 and their first cycle's visit done.
 fn scheduled(keys: u64) -> (Participant<FixedState>, Vec<Arc<Entry>>) {
+    scheduled_under(keys, contract(100, 10))
+}
+
+/// As [`scheduled`], the keys under `c`.
+fn scheduled_under(keys: u64, c: Contract) -> (Participant<FixedState>, Vec<Arc<Entry>>) {
     let mut participant = participant();
     participant.set_scheduled(true);
     participant.set_levers(Levers {
         poll_quiet: false,
         ask_cold: false,
     });
-    let c = contract(100, 10);
     let names: Vec<Vec<u8>> = (0..keys).map(|n| format!("k{n}").into_bytes()).collect();
     for name in &names {
         participant.ensure(name, c, 0);
@@ -1766,6 +1770,71 @@ fn idle_keys_are_evicted_at_their_time_without_a_scan() {
         "idle in turn at {} ms",
         at / MS
     );
+}
+
+/// Ten an hour: a key idle only two hours after its last request.
+fn hourly() -> Contract {
+    let n = |n| NonZeroU64::new(n).unwrap();
+    Contract {
+        limit: n(10),
+        window: n(3_600_000 * MS),
+        burst: n(10),
+    }
+}
+
+/// Scheduled, a key evicted for capacity frees its entry then, not when its eviction time
+/// comes: under an hourly limit that is hours of memory the cap would not see.
+#[test]
+fn a_key_evicted_for_capacity_is_freed_at_once() {
+    let (mut participant, entries) = scheduled_under(2, hourly());
+    let held: Vec<_> = entries.iter().map(Arc::downgrade).collect();
+    drop(entries);
+    participant.set_capacity(1);
+    participant.on_cycle(2 * CYCLE);
+    assert_eq!(participant.key_count(), 0);
+    assert_eq!(participant.holding(), 0);
+    assert!(held.iter().all(|entry| entry.upgrade().is_none()), "freed");
+    assert!(participant.evictions.is_empty());
+}
+
+/// Scheduled, an entry replaced by a changed contract is kept by its eviction time until
+/// that comes: counted against the cap meanwhile, and freed first when the cap is reached,
+/// before any key in use is evicted.
+#[test]
+fn a_replaced_entry_counts_until_it_is_freed_and_is_freed_first() {
+    let (mut participant, entries) = scheduled_under(1, hourly());
+    let one = participant.holding();
+    let old = Arc::downgrade(&entries[0]);
+    drop(entries);
+    participant.ensure(b"k0", contract(100, 10), 2 * CYCLE);
+    assert!(old.upgrade().is_some(), "kept by its eviction time");
+    let stale = participant.holding() - one;
+    assert!(stale > 0, "and counted");
+    // Past the cap by a byte, and within nine tenths of it once the old entry is gone.
+    participant.set_capacity(one + stale - 1);
+    assert!(one <= (one + stale - 1) / 10 * 9);
+    participant.on_cycle(3 * CYCLE);
+    assert!(old.upgrade().is_none(), "freed under the cap");
+    assert_eq!(participant.key_count(), 1, "the key in use kept");
+    assert_eq!(participant.holding(), one);
+    assert_eq!(participant.evictions.len(), 1);
+}
+
+/// Scheduled, an entry replaced is freed, and stops counting, when its eviction time comes,
+/// with no cap reached.
+#[test]
+fn a_replaced_entry_stops_counting_when_its_time_comes() {
+    let (mut participant, entries) = scheduled_under(1, hourly());
+    let old = Arc::downgrade(&entries[0]);
+    drop(entries);
+    participant.ensure(b"k0", contract(100, 10), 2 * CYCLE);
+    participant.on_cycle(3 * CYCLE);
+    assert!(old.upgrade().is_some(), "not yet due");
+    participant.on_cycle(3 * 3_600_000 * MS);
+    assert!(old.upgrade().is_none());
+    assert_eq!(participant.key_count(), 0, "the new one idle too");
+    assert_eq!(participant.holding(), 0);
+    assert!(participant.evictions.is_empty());
 }
 
 /// A request refused still brings a key back into use: signalled, so that a scheduled
