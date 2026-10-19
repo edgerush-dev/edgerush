@@ -82,8 +82,11 @@ pub struct RateLimitService {
     pub max_key_bytes: Option<u64>,
     /// Whether a key with nothing to report is polled every cycle while in use, to keep its
     /// copy fresh. Off, a quiet key's copy goes cold after a refill time and its next
-    /// request asks: messages grow with the keys admitting, not with all those in use. Off
-    /// when left out, the faster (Lucas).
+    /// request asks: messages grow with the keys admitting, not with all those in use. On,
+    /// a key counts as in use for its refill time after its last request, so under a limit
+    /// refilling over an hour or a day every key of every client seen in that time is polled
+    /// every cycle: each cycle's messages and work grow with them, millions of keys every
+    /// 10 ms. Off when left out, the faster (Lucas).
     #[serde(default)]
     pub poll_quiet_keys: Option<bool>,
     /// Whether a request for a key whose copy is cold waits for its owner's word. Off, it is
@@ -95,8 +98,10 @@ pub struct RateLimitService {
     /// Whether each cycle the process visits only the keys that need it — those its workers
     /// signal, and those with work outstanding — rather than every key it holds, so that
     /// quiet keys cost nothing between their uses. A key woken after cycles without a visit
-    /// gets one share of its bucket refilled from the time gone by. On when left out, the
-    /// faster (Lucas).
+    /// gets one share of its bucket refilled from the time gone by. Off, every cycle visits
+    /// every key held, and a key is held for twice its refill time after its last request:
+    /// under a limit refilling over an hour or a day, each cycle's work grows with every
+    /// client seen in that time. On when left out, the faster (Lucas).
     #[serde(default)]
     pub schedule_keys: Option<bool>,
 }
