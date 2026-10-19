@@ -21,5 +21,9 @@ loom.workspace = true
 name = "decide"
 harness = false
 
+[[bench]]
+name = "batch"
+harness = false
+
 [lints]
 workspace = true
