@@ -292,6 +292,106 @@ fn the_owner_owes_excess_up_to_a_refill_time() {
     assert_eq!(pod.keys[&b"k"[..]].bucket().retry_at(0), Some(110 * MS));
 }
 
+/// A report of any number of hits is charged in one step, owed and forgiven as twenty-five
+/// are: what a batch costs a pod grows with its size, not with the counts in it.
+#[test]
+fn a_report_of_any_number_of_hits_is_charged_at_once() {
+    let (owner, _, _) = roles(b"k");
+    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 1));
+    pod.on_batch(batch(1, hits(1, u64::MAX, 0)), 0);
+    assert_eq!(pod.counted(b"k"), Some(u64::MAX));
+    assert_eq!(pod.keys[&b"k"[..]].bucket().retry_at(0), Some(110 * MS));
+    pod.on_batch(batch(1, hits(2, u64::MAX, 0)), 0);
+    assert_eq!(
+        pod.counted(b"k"),
+        Some(u64::MAX),
+        "counted as many as it can hold"
+    );
+}
+
+/// Reports kept waiting are added to the one they waited for without overflowing, however
+/// many hits each carries: counted as many as the count can hold, not wrapped round to none.
+#[test]
+fn reports_that_waited_are_taken_in_with_no_overflow() {
+    let (owner, _, _) = roles(b"k");
+    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 1));
+    let mut both = batch(1, hits(2, u64::MAX, 0));
+    both.entries.extend(batch(1, hits(1, 1, 0)).entries);
+    pod.on_batch(both, 0);
+    assert_eq!(pod.counted(b"k"), Some(u64::MAX));
+    assert_eq!(pod.keys[&b"k"[..]].planes.get(1).unwrap().applied, 2);
+    assert_eq!(pod.keys[&b"k"[..]].bucket().retry_at(0), Some(110 * MS));
+}
+
+/// An ask about any number of requests is decided in one step: as many admitted as every
+/// key has room for.
+#[test]
+fn an_ask_about_any_number_of_requests_is_decided_at_once() {
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    let answers = pod.on_batch(ask(1, 1, u64::MAX, &[b"a", b"b"]), 0);
+    assert_eq!(answers.decided, [(1, 10)]);
+    assert_eq!(pod.counted(b"a"), Some(10));
+    assert_eq!(pod.keys[&b"b"[..]].bucket().remaining(0), 0);
+}
+
+proptest::proptest! {
+    /// Hits charged at once are charged as one by one: each owed while the bucket would
+    /// admit again within a refill time, the rest forgiven.
+    #[test]
+    fn hits_charged_at_once_are_charged_as_one_by_one(
+        reports in proptest::collection::vec((0u64..300, 0u64..40), 1..20),
+        limit in 1u64..8,
+        window in 1u64..2_000,
+        burst in 1u64..12,
+    ) {
+        let n = |n| NonZeroU64::new(n).unwrap();
+        let contract = Contract { limit: n(limit), window: n(window), burst: n(burst) };
+        let most = contract.refill_time();
+        let mut owned = Owned::new(contract, 0);
+        let mut one_by_one = contract.bucket();
+        let mut now = 0;
+        for (gap, count) in reports {
+            now += gap;
+            owned.apply(count, now);
+            for _ in 0..count {
+                if one_by_one.retry_at(now).is_none_or(|retry| retry - now <= most) {
+                    one_by_one.charge(now);
+                }
+            }
+            proptest::prop_assert_eq!(owned.bucket, one_by_one.state());
+        }
+    }
+
+    /// Requests asked about are decided at once as one by one: each admitted while every
+    /// one of its keys has room, and charged to all of them.
+    #[test]
+    fn asks_decided_at_once_are_decided_as_one_by_one(
+        asks in proptest::collection::vec((0u64..50, 0u64..30, 1usize..8), 1..20),
+    ) {
+        const KEYS: [&[u8]; 3] = [b"a", b"b", b"c"];
+        let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+        let mut one_by_one: Vec<TokenBucket> = KEYS.iter().map(|_| contract().bucket()).collect();
+        let mut now = 0;
+        for (id, (gap, count, which)) in (1..).zip(asks) {
+            now += gap * MS;
+            let under: Vec<usize> = (0..KEYS.len()).filter(|at| which & (1 << at) != 0).collect();
+            let keys: Vec<&[u8]> = under.iter().map(|&at| KEYS[at]).collect();
+            let mut admitted = 0;
+            while admitted < count && under.iter().all(|&at| one_by_one[at].admits(now)) {
+                for &at in &under {
+                    one_by_one[at].charge(now);
+                }
+                admitted += 1;
+            }
+            let answers = pod.on_batch(ask(1, id, count, &keys), now);
+            proptest::prop_assert_eq!(answers.decided, vec![(id, admitted)]);
+            for &at in &under {
+                proptest::prop_assert_eq!(pod.keys[KEYS[at]].bucket, one_by_one[at].state());
+            }
+        }
+    }
+}
+
 #[test]
 fn a_batch_unseen_for_a_refill_time_is_emptied_and_holds_nothing_back() {
     let mut net = Net::new(1);

@@ -206,7 +206,8 @@ pub struct Ask {
     pub id: u64,
     /// How many requests wait.
     pub count: u64,
-    /// The keys, with their contracts, in the order the requests' limits are in.
+    /// The keys, with their contracts, in the order the requests' limits are in: at least
+    /// one, and each once, as a request is under each of its limits once.
     pub keys: Vec<(Box<[u8]>, Contract)>,
 }
 
@@ -1411,7 +1412,8 @@ impl Record {
                     break;
                 }
                 self.applied = at;
-                ready += waited;
+                // Counts come from the wire: as many as a count holds, never wrapped round.
+                ready = ready.saturating_add(waited);
                 caught_up += 1;
             }
             waiting.drain(..caught_up);
@@ -1521,17 +1523,13 @@ impl Owned {
     }
 
     /// `count` reported hits, each charged if there is room, or as debt while it would be
-    /// paid back within a refill time; the rest forgiven.
+    /// paid back within a refill time; the rest forgiven. In one step, whatever the count:
+    /// it comes from the wire.
     fn apply(&mut self, count: u64, now: u64) {
-        let most = self.contract.refill_time();
-        self.counted += count;
+        self.counted = self.counted.saturating_add(count);
         let mut bucket = self.bucket();
-        for _ in 0..count {
-            let owe = bucket.retry_at(now).is_none_or(|retry| retry - now <= most);
-            if owe {
-                bucket.charge(now);
-            }
-        }
+        let owed = bucket.remaining_within(now, self.contract.refill_time(), count);
+        bucket.charge_many(now, owed);
         self.bucket = bucket.state();
     }
 
@@ -1544,9 +1542,9 @@ impl Owned {
         TokenBucket::from_state(limit, window, burst, self.bucket)
     }
 
-    fn charge(&mut self, now: u64) {
+    fn charge(&mut self, now: u64, count: u64) {
         let mut bucket = self.bucket();
-        bucket.charge(now);
+        bucket.charge_many(now, count);
         self.bucket = bucket.state();
     }
 
@@ -1804,34 +1802,29 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         if let Some(admitted) = before {
             return Some(admitted);
         }
-        let mut admitted = 0;
-        for _ in 0..ask.count {
-            let room = ask.keys.iter().all(|(key, _)| {
+        // As many as every key has room for, each charged to all of them: worked out in one
+        // step, whatever the count, as it comes from the wire.
+        let admitted = ask
+            .keys
+            .iter()
+            .map(|(key, _)| {
                 self.keys
                     .get(key)
-                    .is_some_and(|held| held.bucket().admits(now))
-            });
-            if !room {
-                break;
-            }
-            for (key, _) in &ask.keys {
-                if let Some(held) = self.keys.get_mut(key) {
-                    held.charge(now);
-                }
-            }
-            admitted += 1;
-        }
+                    .map_or(0, |held| held.bucket().remaining_within(now, 0, ask.count))
+            })
+            .fold(ask.count, u64::min);
         for (key, _) in &ask.keys {
             let owned = self.view.owners(key).0 == Some(self.me);
             let Some(held) = self.keys.get_mut(key) else {
                 continue;
             };
+            held.charge(now, admitted);
             held.touched = now;
             let record = held.planes.entry(from);
             record.last_ask = (ask.id, admitted);
             if owned {
                 record.last_admitted = Some(now);
-                held.counted += admitted;
+                held.counted = held.counted.saturating_add(admitted);
                 self.copy_out(key, now);
             }
         }

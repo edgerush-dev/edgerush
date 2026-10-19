@@ -302,6 +302,70 @@ fn released(model: Any, before: &[u64], gap: u64, between: Vec<u64>) -> (Option<
     (Some(with), without, *between.last().unwrap())
 }
 
+/// A token bucket with a history behind it, owing up to `owed` more charged at its end,
+/// and the last time in that history.
+fn owing() -> impl Strategy<Value = (TokenBucket, u64)> {
+    (1u64..8, 1u64..2000, 1u64..12, arrivals(), 0u64..20).prop_map(
+        |(limit, window, capacity, times, owed)| {
+            let mut bucket = TokenBucket::new(nz(limit), nz(window), nz(capacity));
+            run(&mut bucket, &times);
+            let last = *times.last().unwrap();
+            for _ in 0..owed {
+                bucket.charge(last);
+            }
+            (bucket, last)
+        },
+    )
+}
+
+proptest! {
+    /// What remains within a wait is how many charged one after another each find the
+    /// bucket admitting again within that wait, and of at most so many, no more than them.
+    #[test]
+    fn remaining_within_a_wait_is_how_many_owe_no_longer(
+        (mut bucket, last) in owing(), later in 0u64..5000, wait in 0u64..20_000, most in 0u64..30
+    ) {
+        let now = last + later;
+        let within = |bucket: &TokenBucket| bucket.retry_at(now).is_none_or(|at| at - now <= wait);
+        let remaining = bucket.remaining_within(now, wait, u64::MAX);
+        prop_assert_eq!(bucket.remaining_within(now, wait, most), remaining.min(most));
+        for i in 0..remaining {
+            prop_assert!(within(&bucket), "charge {} of {} not within the wait", i + 1, remaining);
+            bucket.charge(now);
+        }
+        prop_assert!(!within(&bucket), "one more than the {} within the wait", remaining);
+    }
+
+    /// Charging so many at once is charging them one by one.
+    #[test]
+    fn charging_many_at_once_is_charging_them_one_by_one(
+        (bucket, last) in owing(), later in 0u64..5000, count in 0u64..30
+    ) {
+        let now = last + later;
+        let (mut at_once, mut one_by_one) = (bucket.clone(), bucket);
+        at_once.charge_many(now, count);
+        for _ in 0..count {
+            one_by_one.charge(now);
+        }
+        prop_assert_eq!(at_once, one_by_one);
+    }
+}
+
+/// Counts of any size are taken in one step, and terms of any size without overflowing.
+#[test]
+fn a_bucket_takes_any_count_at_once() {
+    let mut bucket = TokenBucket::new(nz(1), nz(1), nz(1));
+    assert_eq!(bucket.remaining_within(0, u64::MAX, u64::MAX), u64::MAX);
+    bucket.charge_many(0, u64::MAX);
+    assert_eq!(bucket.retry_at(0), Some(u64::MAX));
+    let most = nz(u64::MAX);
+    let mut bucket = TokenBucket::new(most, most, most);
+    let _ = bucket.remaining_within(u64::MAX, u64::MAX, u64::MAX);
+    bucket.charge_many(0, u64::MAX);
+    bucket.charge_many(u64::MAX, u64::MAX);
+    let _ = bucket.remaining_within(u64::MAX, u64::MAX, u64::MAX);
+}
+
 proptest! {
     /// Asking a model anything changes nothing in it.
     #[test]

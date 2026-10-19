@@ -85,7 +85,7 @@ pub struct Ask {
     /// How many requests wait.
     #[prost(uint64, tag = "2")]
     pub count: u64,
-    /// The keys, in their limits' order.
+    /// The keys, in their limits' order: at least one, each once.
     #[prost(message, repeated, tag = "3")]
     pub keys: Vec<AskKey>,
 }
@@ -280,6 +280,12 @@ pub enum Invalid {
     /// A heartbeat without a view.
     #[error("a heartbeat without a view")]
     NoView,
+    /// An ask under no keys.
+    #[error("an ask under no keys")]
+    AskWithoutKeys,
+    /// An ask under one key more than once.
+    #[error("an ask under one key more than once")]
+    KeyTwice,
 }
 
 impl From<service::View> for View {
@@ -442,11 +448,23 @@ impl TryFrom<Batch> for service::Batch {
             .asks
             .into_iter()
             .map(|ask| {
-                let keys = ask
+                let keys: Vec<(Box<[u8]>, service::Contract)> = ask
                     .keys
                     .into_iter()
                     .map(|at| Ok((at.key.into_boxed_slice(), contract(at.contract)?)))
                     .collect::<Result<_, Invalid>>()?;
+                if keys.is_empty() {
+                    return Err(Invalid::AskWithoutKeys);
+                }
+                // Sorted rather than compared pair by pair, so that an ask under many keys
+                // costs no more than sorting them; most asks are under one.
+                if keys.len() > 1 {
+                    let mut sorted: Vec<&[u8]> = keys.iter().map(|(key, _)| &**key).collect();
+                    sorted.sort_unstable();
+                    if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+                        return Err(Invalid::KeyTwice);
+                    }
+                }
                 Ok(service::Ask {
                     id: ask.id,
                     count: ask.count,
@@ -622,9 +640,13 @@ mod tests {
         let ask = (
             any::<u64>(),
             any::<u64>(),
-            prop::collection::vec((key(), contract()), 0..4),
+            prop::collection::btree_map(key(), contract(), 1..4),
         )
-            .prop_map(|(id, count, keys)| service::Ask { id, count, keys });
+            .prop_map(|(id, count, keys)| service::Ask {
+                id,
+                count,
+                keys: keys.into_iter().collect(),
+            });
         (
             any::<u64>(),
             prop::collection::vec(entry, 0..8),
@@ -827,6 +849,39 @@ mod tests {
             service::Batch::try_from(batch(nothing)),
             Err(Invalid::NoReport)
         );
+    }
+
+    /// An ask under no keys, or under one key twice, is refused: the first would admit every
+    /// request it is about, the second charge a key twice for each.
+    #[test]
+    fn an_ask_under_no_keys_or_a_key_twice_is_refused() {
+        let contract = Some(Contract {
+            limit: 1,
+            window_ns: 1,
+            burst: 1,
+        });
+        let at = |key: &[u8]| AskKey {
+            key: key.to_vec(),
+            contract,
+        };
+        let ask = |keys| Batch {
+            from: 1,
+            entries: Vec::new(),
+            asks: vec![Ask {
+                id: 1,
+                count: u64::MAX,
+                keys,
+            }],
+        };
+        assert_eq!(
+            service::Batch::try_from(ask(Vec::new())),
+            Err(Invalid::AskWithoutKeys)
+        );
+        assert_eq!(
+            service::Batch::try_from(ask(vec![at(b"a"), at(b"b"), at(b"a")])),
+            Err(Invalid::KeyTwice)
+        );
+        assert!(service::Batch::try_from(ask(vec![at(b"a"), at(b"b")])).is_ok());
     }
 
     #[test]

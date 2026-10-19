@@ -442,6 +442,45 @@ impl TokenBucket {
         self.arrival = (behind > 0).then(|| scaled + behind);
     }
 
+    /// Of at most `most` requests charged one after another at `now`, how many would each
+    /// find the bucket admitting again within `wait` nanoseconds: [`remaining`](Model::remaining),
+    /// owing up to `wait`. Worked out, not tried one by one, so that any count costs the
+    /// same; and with no division when all of them would, as one most often does.
+    #[must_use]
+    pub fn remaining_within(&self, now: u64, wait: u64, most: u64) -> u64 {
+        let Some(before_last) = most.checked_sub(1) else {
+            return 0;
+        };
+        let (_, now) = self.scaled(now);
+        let ahead = self.ahead(now);
+        // How far ahead the bucket is when the last of them comes: all of them fit if that is
+        // within what is allowed, most often without owing anything.
+        let last = ahead.saturating_add(u128::from(before_last) * self.window);
+        if last <= self.tolerance {
+            return most;
+        }
+        let allowed = self.tolerance.saturating_add(u128::from(wait) * self.limit);
+        if ahead > allowed {
+            return 0;
+        }
+        if last <= allowed {
+            return most;
+        }
+        u64::try_from((allowed - ahead) / self.window + 1).map_or(most, |all| all.min(most))
+    }
+
+    /// Charges `count` requests arriving at `now`, whether or not there was room for them:
+    /// as many [`charge`](Model::charge)s, in one step.
+    pub fn charge_many(&mut self, now: u64, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let (at, scaled) = self.scaled(now);
+        self.last = at;
+        let from = scaled + self.ahead(scaled);
+        self.arrival = Some(from.saturating_add(u128::from(count) * self.window));
+    }
+
     /// What the bucket holds besides its terms, in less room: for holding many buckets
     /// whose terms are kept elsewhere, each made again with [`from_state`](Self::from_state)
     /// to be used.
@@ -487,12 +526,7 @@ impl Model for TokenBucket {
     }
 
     fn remaining(&self, now: u64) -> u64 {
-        let (_, now) = self.scaled(now);
-        let ahead = self.ahead(now);
-        if ahead > self.tolerance {
-            return 0;
-        }
-        u64::try_from((self.tolerance - ahead) / self.window + 1).unwrap_or(u64::MAX)
+        self.remaining_within(now, 0, u64::MAX)
     }
 
     fn charge(&mut self, now: u64) -> Charge {
