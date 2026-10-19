@@ -23,6 +23,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tonic::transport::server::TcpIncoming;
 
@@ -110,8 +111,13 @@ limits:
   - { name: everything, key: client, model: { bucket: { rate: 20/h, burst: 20 } } }
 ";
 
-/// A data plane of one worker under [`LIMITS`], and where it listens.
-async fn proxy(upstream: SocketAddr, service: &[String]) -> SocketAddr {
+/// The lever that has a data plane ask the owner about a key it has not heard of, rather
+/// than decide it from a full bucket.
+const ASKING: &str = ", ask_cold_keys: true";
+
+/// A data plane of one worker under [`LIMITS`], reaching the service pods at `service` with
+/// `levers` besides the defaults (`, name: value` each), and where it listens.
+async fn proxy(upstream: SocketAddr, service: &[String], levers: &str) -> SocketAddr {
     let pods = service
         .iter()
         .map(|address| format!("\"{address}\""))
@@ -136,7 +142,7 @@ routes:
         forward: {{ backends: [{{ upstream: web, weight: 1 }}] }}
 upstreams:
   web: {{ load_balancer: p2c, endpoints: ["{upstream}"] }}
-rate_limit_service: {{ pods: [{pods}], cycle_ms: 10 }}
+rate_limit_service: {{ pods: [{pods}], cycle_ms: 10{levers} }}
 "#
     );
     let mut config: Config = serde_saphyr::from_str(&yaml).unwrap();
@@ -234,7 +240,7 @@ async fn with_proxy<F: Future<Output = ()>>(test: impl FnOnce(SocketAddr) -> F) 
     local
         .run_until(async {
             let service = service().await;
-            let front = proxy(upstream().await, &service).await;
+            let front = proxy(upstream().await, &service, "").await;
             tokio::time::timeout(Duration::from_secs(20), test(front))
                 .await
                 .expect("answered in time");
@@ -286,7 +292,9 @@ async fn a_request_is_charged_to_all_its_limits_or_none() {
 }
 
 /// Two data planes share a client's bucket through the service: what one admitted counts
-/// against the other.
+/// against the other, exactly, when the other asks the owner about a key it has not heard of
+/// and the first no longer counts as admitting it, so that neither is held to a share of
+/// what is left.
 #[tokio::test]
 async fn two_data_planes_share_a_key_through_the_service() {
     let local = tokio::task::LocalSet::new();
@@ -294,17 +302,95 @@ async fn two_data_planes_share_a_key_through_the_service() {
         .run_until(async {
             let service = service().await;
             let upstream = upstream().await;
-            let first = proxy(upstream, &service).await;
-            let second = proxy(upstream, &service).await;
+            let first = proxy(upstream, &service, ASKING).await;
+            let second = proxy(upstream, &service, ASKING).await;
             let client = [127, 0, 0, 5];
+            let one = statuses(first, client, "GET", "/by-client", 6).await;
+            // Longer than a data plane counts as admitting a key after its last admission,
+            // 300 ms (`ACTIVE_CYCLES`): the first's reports have reached the owner, and it
+            // no longer shares the bucket with the second.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let other = statuses(second, client, "GET", "/by-client", 8).await;
+            assert_eq!(one, [200; 6]);
+            assert_eq!(other, [200, 200, 200, 200, 429, 429, 429, 429]);
+        })
+        .await;
+}
+
+/// By default a data plane decides a key it has not heard of from a full bucket until the
+/// owner's word reaches it, and then owes what it admitted meanwhile: on a network slow
+/// enough that the second data plane hears nothing while its client is answered, it admits
+/// all eight on top of the first's six, and once it has heard, refuses.
+#[tokio::test]
+async fn a_data_plane_decides_a_key_it_has_not_heard_of_from_a_full_bucket() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let service = service().await;
+            let upstream = upstream().await;
+            let first = proxy(upstream, &service, "").await;
+            let mut slowly = Vec::new();
+            for pod in &service {
+                slowly.push(slow(pod.clone(), Duration::from_millis(80)).await);
+            }
+            let second = proxy(upstream, &slowly, "").await;
+            let client = [127, 0, 0, 7];
             let one = statuses(first, client, "GET", "/by-client", 6).await;
             // The first's admissions reach the owner within a cycle or two.
             tokio::time::sleep(Duration::from_millis(100)).await;
             let other = statuses(second, client, "GET", "/by-client", 8).await;
-            let admitted = tally(&one).0 + tally(&other).0;
-            assert_eq!(admitted, 10, "{one:?} {other:?}");
+            assert_eq!(one, [200; 6]);
+            assert_eq!(other, [200; 8], "decided before any word could arrive");
+            // An exchange both ways through the slow network, with time to spare.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let after = statuses(second, client, "GET", "/by-client", 1).await;
+            assert_eq!(after, [429], "fourteen admitted against ten: owed");
         })
         .await;
+}
+
+/// A relay to `to` that holds back what it carries, either way, for `delay`: a network slow
+/// enough that a data plane answers its client before it hears from the service. Its
+/// address.
+async fn slow(to: String, delay: Duration) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = listener.accept().await {
+            let Ok(outbound) = TcpStream::connect(&to).await else {
+                continue;
+            };
+            let (from_plane, to_plane) = inbound.into_split();
+            let (from_pod, to_pod) = outbound.into_split();
+            tokio::spawn(late(from_plane, to_pod, delay));
+            tokio::spawn(late(from_pod, to_plane, delay));
+        }
+    });
+    address
+}
+
+/// What `from` reads, written to `to` `delay` after it was read: a constant delay, however
+/// the bytes come.
+async fn late(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, delay: Duration) {
+    let (pieces, mut held) = tokio::sync::mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+    tokio::spawn(async move {
+        while let Some((read, piece)) = held.recv().await {
+            tokio::time::sleep_until((read + delay).into()).await;
+            if to.write_all(&piece).await.is_err() {
+                return;
+            }
+        }
+    });
+    let mut chunk = [0; 16_384];
+    while let Ok(read) = from.read(&mut chunk).await {
+        if read == 0
+            || pieces
+                .send((Instant::now(), chunk[..read].to_vec()))
+                .is_err()
+        {
+            return;
+        }
+    }
 }
 
 /// A refusal says when to come back: `Retry-After`, in seconds, when the refusing limit
