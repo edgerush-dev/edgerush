@@ -31,7 +31,7 @@ pub struct Hits {
     /// How many hits.
     #[prost(uint64, tag = "2")]
     pub count: u64,
-    /// The highest of its batches the data plane has seen applied.
+    /// The highest of its batches the data plane has seen applied, below `sequence`.
     #[prost(uint64, tag = "3")]
     pub seen: u64,
 }
@@ -286,6 +286,9 @@ pub enum Invalid {
     /// An ask under one key more than once.
     #[error("an ask under one key more than once")]
     KeyTwice,
+    /// A report of hits numbered 0, or saying it or a later one was applied already.
+    #[error("a report of hits numbered 0, or seen applied already")]
+    ReportNumbers,
 }
 
 impl From<service::View> for View {
@@ -430,6 +433,11 @@ impl TryFrom<Batch> for service::Batch {
             .into_iter()
             .map(|entry| {
                 let report = match entry.report.ok_or(Invalid::NoReport)? {
+                    // Numbered from 1, and only earlier ones seen applied: a report saying
+                    // it or a later one was would have the pod skip every report to come.
+                    Report::Hits(hits) if hits.seen >= hits.sequence => {
+                        return Err(Invalid::ReportNumbers);
+                    }
                     Report::Hits(hits) => service::Report::Hits {
                         sequence: hits.sequence,
                         count: hits.count,
@@ -615,11 +623,11 @@ mod tests {
 
     fn report() -> impl Strategy<Value = service::Report> {
         prop_oneof![
-            (any::<u64>(), any::<u64>(), any::<u64>()).prop_map(|(sequence, count, seen)| {
+            (1..=u64::MAX, any::<u64>(), any::<u64>()).prop_map(|(sequence, count, seen)| {
                 service::Report::Hits {
                     sequence,
                     count,
-                    seen,
+                    seen: seen % sequence,
                 }
             }),
             Just(service::Report::Poll),
@@ -853,6 +861,43 @@ mod tests {
 
     /// An ask under no keys, or under one key twice, is refused: the first would admit every
     /// request it is about, the second charge a key twice for each.
+    /// A report of hits numbered 0, or saying it or a later one was applied already, is
+    /// refused: a data plane numbers its reports from 1 and has seen only earlier ones
+    /// applied, and a pod taking such a report would skip past every report still to come.
+    #[test]
+    fn a_report_numbered_zero_or_seen_applied_is_refused() {
+        let hits = |sequence, seen| Batch {
+            from: 1,
+            entries: vec![Entry {
+                key: b"k".to_vec(),
+                contract: Some(Contract {
+                    limit: 1,
+                    window_ns: 1,
+                    burst: 1,
+                }),
+                report: Some(Report::Hits(Hits {
+                    sequence,
+                    count: 1,
+                    seen,
+                })),
+            }],
+            asks: Vec::new(),
+        };
+        for (sequence, seen) in [(0, 0), (1, 1), (5, 5), (5, 6), (5, u64::MAX)] {
+            assert_eq!(
+                service::Batch::try_from(hits(sequence, seen)),
+                Err(Invalid::ReportNumbers),
+                "{sequence} seeing {seen}"
+            );
+        }
+        for (sequence, seen) in [(1, 0), (5, 4), (5, 0), (u64::MAX, u64::MAX - 1)] {
+            assert!(
+                service::Batch::try_from(hits(sequence, seen)).is_ok(),
+                "{sequence} seeing {seen}"
+            );
+        }
+    }
+
     #[test]
     fn an_ask_under_no_keys_or_a_key_twice_is_refused() {
         let contract = Some(Contract {

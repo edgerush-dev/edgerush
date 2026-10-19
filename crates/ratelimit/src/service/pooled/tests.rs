@@ -165,7 +165,15 @@ struct Settled {
 /// key sent again count once more or twice more as their order has it (an inherited defect
 /// of the service pod, apart's alike; results note): the order a side happens to list its
 /// waiting groups in, which is not what this comparison is about.
+///
+/// Every report in it is numbered as the wire takes it: from 1, and seeing only earlier
+/// reports applied, whatever was resent, answered late or answered twice before it.
 fn in_order(mut batch: Batch) -> Batch {
+    for entry in &batch.entries {
+        if let Report::Hits { sequence, seen, .. } = entry.report {
+            assert!(seen < sequence, "report {sequence} seeing {seen} applied");
+        }
+    }
     batch.asks.sort_by_key(|ask| ask.id);
     batch
 }
