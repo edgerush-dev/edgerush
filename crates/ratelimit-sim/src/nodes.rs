@@ -35,6 +35,8 @@ pub(crate) struct Nodes {
     /// How many times each data plane has restarted: its id is its index and its life.
     lives: Vec<u64>,
     pods: Vec<ServicePod>,
+    /// The service pods' lives begun, all told: each pod's answers carry its own.
+    pod_lives: u64,
     /// Service pods gone for good.
     gone: Vec<bool>,
     /// For each data plane, the request each of its tickets stands for.
@@ -48,7 +50,7 @@ pub(crate) struct Nodes {
     /// By data plane: until when its background work is held (`Fault::Pause`), 0 if not;
     /// the answers that reached it meanwhile, and — pooled — what its workers asked.
     paused: Vec<u64>,
-    held: Vec<Vec<Answers>>,
+    held: Vec<Vec<(u64, Answers)>>,
     pending: Vec<Vec<Asked>>,
     /// Pooled, by process: requests deferred (`Local::Defer`) or handed back to decide
     /// again, with the worker that decides them, retried at the process's next arrival,
@@ -114,10 +116,11 @@ impl Plane {
         }
     }
 
-    fn on_answers(&mut self, answers: Answers, now: u64) {
+    /// Answers to `exchange`, as [`Self::take_exchanges`] numbered it.
+    fn on_answers(&mut self, exchange: u64, answers: Answers, now: u64) {
         match self {
             Self::Data(plane) => plane.on_answers(answers, now),
-            Self::Pooled(participant) => participant.on_answers(answers, now),
+            Self::Pooled(participant) => participant.on_answers_to(exchange, answers, now),
         }
     }
 
@@ -128,10 +131,16 @@ impl Plane {
         }
     }
 
-    fn take_outgoing(&mut self) -> Vec<(PodId, Batch)> {
+    /// Messages to send, each with the exchange it starts: pooled, numbered by the
+    /// participant; a `DataPlane`, which takes every answer, 0.
+    fn take_exchanges(&mut self) -> Vec<(PodId, u64, Batch)> {
         match self {
-            Self::Data(plane) => plane.take_outgoing(),
-            Self::Pooled(participant) => participant.take_outgoing(),
+            Self::Data(plane) => plane
+                .take_outgoing()
+                .into_iter()
+                .map(|(pod, batch)| (pod, 0, batch))
+                .collect(),
+            Self::Pooled(participant) => participant.take_exchanges(),
         }
     }
 
@@ -340,8 +349,13 @@ impl Nodes {
                 .collect(),
             lives: vec![0; planes],
             pods: (0..SERVICE_PODS)
-                .map(|pod| ServicePod::new(pod, cycle, view.clone()))
+                .map(|pod| {
+                    let mut node = ServicePod::new(pod, cycle, view.clone());
+                    node.set_life(u64::from(pod) + 1);
+                    node
+                })
                 .collect(),
+            pod_lives: u64::from(SERVICE_PODS),
             gone: vec![false; SERVICE_PODS as usize],
             tickets: vec![BTreeMap::new(); planes],
             decided: Vec::new(),
@@ -378,8 +392,8 @@ impl Nodes {
             return;
         }
         self.paused[plane] = 0;
-        for answers in std::mem::take(&mut self.held[plane]) {
-            self.planes[plane].on_answers(answers, now);
+        for (exchange, answers) in std::mem::take(&mut self.held[plane]) {
+            self.planes[plane].on_answers(exchange, answers, now);
         }
         for (request, worker, limits) in std::mem::take(&mut self.pending[plane]) {
             let keys: Vec<(&[u8], service::Contract)> =
@@ -476,8 +490,15 @@ impl Nodes {
     /// Sends what data plane `plane` has to send, and takes its decisions.
     fn flush_plane(&mut self, plane: usize, outbox: &mut Outbox) {
         let from = self.node_of(plane);
-        for (pod, batch) in self.planes[plane].take_outgoing() {
-            outbox.send(self.address(pod), Message::Batch { from, batch });
+        for (pod, exchange, batch) in self.planes[plane].take_exchanges() {
+            outbox.send(
+                self.address(pod),
+                Message::Batch {
+                    from,
+                    exchange,
+                    batch,
+                },
+            );
         }
         for (ticket, admitted) in self.planes[plane].take_decided() {
             if let Some(request) = self.tickets[plane].remove(&ticket) {
@@ -741,13 +762,26 @@ impl Cluster for Nodes {
 
     fn on_message(&mut self, to: usize, message: Message, now: u64, outbox: &mut Outbox) {
         match message {
-            Message::Batch { from, batch } if to >= self.front => {
+            Message::Batch {
+                from,
+                exchange,
+                batch,
+            } if to >= self.front => {
                 let pod = to - self.front;
                 if self.gone[pod] {
                     return;
                 }
+                let plane = batch.from;
                 let answers = self.pods[pod].on_batch(batch, now);
-                outbox.send(from, Message::Answers { from: to, answers });
+                outbox.send(
+                    from,
+                    Message::Answers {
+                        from: to,
+                        plane,
+                        exchange,
+                        answers,
+                    },
+                );
                 self.flush_pod(pod, outbox);
             }
             Message::Replicas { replicas, .. } if to >= self.front => {
@@ -756,15 +790,25 @@ impl Cluster for Nodes {
                     self.pods[pod].on_replicas(replicas, now);
                 }
             }
-            Message::Answers { answers, .. } if to < self.front => {
+            Message::Answers {
+                plane,
+                exchange,
+                answers,
+                ..
+            } if to < self.front => {
                 let Some(to) = self.plane_at(to) else {
                     return;
                 };
-                if self.paused[to] > now {
-                    self.held[to].push(answers);
+                // Answers to a life of the data plane before this one went with the task
+                // that made the call.
+                if plane != id(to, self.lives[to]) {
                     return;
                 }
-                self.planes[to].on_answers(answers, now);
+                if self.paused[to] > now {
+                    self.held[to].push((exchange, answers));
+                    return;
+                }
+                self.planes[to].on_answers(exchange, answers, now);
                 self.flush_plane(to, outbox);
                 if self.pool.is_some() {
                     self.again(to, now, outbox);
@@ -786,6 +830,8 @@ impl Cluster for Nodes {
                 if event == FaultEvent::OwnerRestarts {
                     self.pods[owner] =
                         ServicePod::new(owner as PodId, self.cycle, self.view.clone());
+                    self.pod_lives += 1;
+                    self.pods[owner].set_life(self.pod_lives);
                 }
                 self.change_view(owner as PodId, now, outbox);
             }

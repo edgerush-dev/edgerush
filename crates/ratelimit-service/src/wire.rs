@@ -163,6 +163,12 @@ pub struct Answers {
     /// To each ask decided, its decision.
     #[prost(message, repeated, tag = "4")]
     pub decided: Vec<Decided>,
+    /// The pod's life; 0 leaves the answers unnumbered.
+    #[prost(uint64, tag = "5")]
+    pub life: u64,
+    /// Counted up with each answer the pod gives in its life.
+    #[prost(uint64, tag = "6")]
+    pub number: u64,
 }
 
 /// What an owner knows of one data plane.
@@ -509,6 +515,8 @@ impl From<service::Answers> for Answers {
                 .into_iter()
                 .map(|(id, admitted)| Decided { id, admitted })
                 .collect(),
+            life: answers.life,
+            number: answers.number,
         }
     }
 }
@@ -534,6 +542,8 @@ impl From<Answers> for service::Answers {
                 .map(|decided| (decided.id, decided.admitted))
                 .collect(),
             view: answers.view.map(service::View::from),
+            life: answers.life,
+            number: answers.number,
         }
     }
 }
@@ -691,13 +701,18 @@ mod tests {
             prop::collection::vec(answer, 0..8),
             prop::collection::vec(any::<(u64, u64)>(), 0..3),
             view,
+            any::<(u64, u64)>(),
         )
-            .prop_map(|(from, entries, decided, view)| service::Answers {
-                from,
-                entries,
-                decided,
-                view,
-            })
+            .prop_map(
+                |(from, entries, decided, view, (life, number))| service::Answers {
+                    from,
+                    entries,
+                    decided,
+                    view,
+                    life,
+                    number,
+                },
+            )
     }
 
     fn replicas() -> impl Strategy<Value = service::Replicas> {

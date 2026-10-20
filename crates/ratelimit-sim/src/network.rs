@@ -155,6 +155,9 @@ pub enum Message {
     Batch {
         /// The data plane.
         from: usize,
+        /// The exchange it starts, as the data plane numbers them: what the transport
+        /// carries back with the answer, a call's own, never on the wire.
+        exchange: u64,
         /// What it says.
         batch: service::Batch,
     },
@@ -162,6 +165,11 @@ pub enum Message {
     Answers {
         /// The service pod.
         from: usize,
+        /// The data plane, in the life whose batch it answers: what the transport carries
+        /// back, as a call's answer goes back to the task that made it.
+        plane: service::PlaneId,
+        /// The exchange it answers.
+        exchange: u64,
         /// What it says.
         answers: service::Answers,
     },

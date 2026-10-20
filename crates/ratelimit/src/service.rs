@@ -253,6 +253,12 @@ pub struct Answers {
     pub decided: Vec<(u64, u64)>,
     /// The view it holds: a data plane holding an earlier one takes it over.
     pub view: Option<View>,
+    /// The pod's life: drawn at random when it starts, never 0. 0 is a pod that does not
+    /// number its answers.
+    pub life: u64,
+    /// Counted up, wrapping, with each answer the pod gives in this life: the order in
+    /// which it handled their batches.
+    pub number: u64,
 }
 
 /// What the owner knows of one data plane, for one key.
@@ -1115,6 +1121,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             entries,
             decided,
             view,
+            ..
         } = answers;
         // Keys the pod decided asks under without owning them: the requests it admitted
         // are charged on its copy, and still to be sent to their owners.
@@ -1625,6 +1632,9 @@ pub struct ServicePod<S = FixedState> {
     capacity: u64,
     holding: u64,
     evicted: u64,
+    /// Its life, and the answers it has given in it ([`Answers::number`]).
+    life: u64,
+    answered: u64,
 }
 
 impl<S: BuildHasher + Default> ServicePod<S> {
@@ -1646,7 +1656,17 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             capacity: u64::MAX,
             holding: 0,
             evicted: 0,
+            life: 0,
+            answered: 0,
         }
+    }
+
+    /// Its life, drawn at random when it starts and never 0, which its answers carry: a
+    /// data plane takes an answer's buckets only if it is the pod's latest, and a restart
+    /// starts the numbering again. 0, the default, leaves its answers unnumbered, each
+    /// taken as it comes.
+    pub fn set_life(&mut self, life: u64) {
+        self.life = life;
     }
 
     /// How long after joining a view it makes no key afresh, but answers nothing for a key
@@ -1772,11 +1792,14 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 }
             }
         }
+        self.answered = self.answered.wrapping_add(1);
         Answers {
             from: self.me,
             entries: answers,
             decided,
             view: Some(self.view.clone()),
+            life: self.life,
+            number: self.answered,
         }
     }
 

@@ -823,6 +823,8 @@ fn an_answer_from_a_pod_that_is_not_the_owner_is_ignored() {
             }],
             decided: Vec::new(),
             view: None,
+            life: 0,
+            number: 0,
         },
         CYCLE,
     );
@@ -1464,6 +1466,8 @@ fn a_copy_answering_an_ask_does_not_say_which_batches_were_applied() {
             entries: vec![copy],
             decided: Vec::new(),
             view: None,
+            life: 0,
+            number: 0,
         },
         CYCLE,
     );
