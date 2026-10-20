@@ -110,6 +110,12 @@ impl Storage {
         self.limit.saturating_sub(self.used.get())
     }
 
+    /// How far it holds past the limit: what was charged past it, and the worker's own
+    /// answers drawing on the provision.
+    pub fn over(&self) -> usize {
+        self.used.get().saturating_sub(self.limit)
+    }
+
     /// Whether a byte more would fit under the limit, memory freed since the last sweep
     /// included. Asking charges nothing.
     pub fn has_room(&self) -> bool {
@@ -378,15 +384,15 @@ mod tests {
     fn memory_already_held_is_counted_past_the_limit() {
         let storage = Storage::with_provision(100, 0);
         let mut held = storage.reserve_past(60);
-        assert_eq!(storage.used(), 60);
+        assert_eq!((storage.used(), storage.over()), (60, 0));
         held.grow_past(90);
         assert_eq!(
-            (storage.used(), storage.room(), held.bytes()),
-            (150, 0, 150)
+            (storage.used(), storage.room(), storage.over(), held.bytes()),
+            (150, 0, 50, 150)
         );
         assert!(storage.reserve(1).is_err());
         held.shrink(100);
-        assert_eq!(storage.used(), 50);
+        assert_eq!((storage.used(), storage.over()), (50, 0));
         drop(held);
         assert_eq!(storage.used(), 0);
     }

@@ -9,6 +9,7 @@
 
 use crate::connections::Held;
 use crate::downstream::h3::head::Refused;
+use crate::downstream::h3::listener::Common;
 use crate::drain::Drain;
 use crate::forwarding::{Client, Cut};
 use crate::storage::{Charge, Storage};
@@ -42,6 +43,9 @@ pub(crate) struct Conn {
     /// Closed to make room for the rest: still charged what quiche holds for it, until it
     /// goes.
     shed: Cell<bool>,
+    /// Closed to make room, its driver has ended: its charge counted as room to come until
+    /// it goes with the charge.
+    leaving: Cell<Option<Leaving>>,
     /// Requests the connection has had.
     requests: Cell<u64>,
     /// Of those, the ones the client gave up before their answer's head was sent.
@@ -152,6 +156,7 @@ impl Conn {
             charged: Cell::new(0),
             in_hand: Cell::new(0),
             shed: Cell::new(false),
+            leaving: Cell::new(None),
             requests: Cell::new(0),
             given_up: Cell::new(0),
             provoked: Cell::new(0),
@@ -277,6 +282,20 @@ impl Conn {
         self.stir();
     }
 
+    /// The connection, closed to make room, has had its driver end, so that nothing charges
+    /// it again: what it is charged is counted in `common` as room to come, until the last
+    /// thing holding it lets go of it and the charge goes (16 §6).
+    pub(crate) fn leave(&self, common: &Rc<Common>) {
+        let bytes = self.charged.get();
+        common
+            .leaving
+            .set(common.leaving.get().saturating_add(bytes));
+        self.leaving.set(Some(Leaving {
+            common: Rc::clone(common),
+            bytes,
+        }));
+    }
+
     /// Does `work` with the connection. Never called across an await, and never from
     /// inside another call of its own.
     pub(crate) fn with<T>(&self, work: impl FnOnce(&mut State) -> T) -> T {
@@ -307,6 +326,20 @@ impl Conn {
         if !driver.as_ref().is_some_and(|kept| kept.will_wake(waker)) {
             *driver = Some(waker.clone());
         }
+    }
+}
+
+/// What a connection closed to make room is charged once its driver has ended, counted as
+/// room to come until the connection goes, when its charge goes too.
+struct Leaving {
+    common: Rc<Common>,
+    bytes: usize,
+}
+
+impl Drop for Leaving {
+    fn drop(&mut self) {
+        let leaving = &self.common.leaving;
+        leaving.set(leaving.get().saturating_sub(self.bytes));
     }
 }
 
