@@ -246,7 +246,7 @@ async fn asks_that_come_together_are_sent_together() {
         ask_cold_keys: true,
         schedule_keys: false,
     };
-    let hub = Hub::start(&compiled, 1, 1 << 20).unwrap();
+    let hub = Hub::start(&compiled, 1, 1 << 20, None).unwrap();
     let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
     hub.to.send(ToHub::Join { worker: 0, answers }).unwrap();
     let before = exchanges.load(Ordering::Relaxed);
@@ -317,7 +317,7 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
             }
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
-            let hub = Hub::start(&service, 1, 1 << 20).unwrap();
+            let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
             let limiter = Limiter::new(&service, hub, 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = crate::forwarding::Client::new("203.0.113.7".parse().unwrap());
@@ -378,7 +378,7 @@ async fn a_cold_key_decided_locally_does_not_wait_for_the_service() {
                 }
                 let compiled = compile(&config).unwrap();
                 let service = compiled.rate_limit_service().unwrap().clone();
-                let hub = Hub::start(&service, 1, 1 << 20).unwrap();
+                let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
                 let limiter = Limiter::new(&service, hub, 0);
                 let rule = Arc::clone(&compiled.rules_of(0)[0]);
                 let client = crate::forwarding::Client::new("203.0.113.9".parse().unwrap());
@@ -435,7 +435,7 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
             }
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
-            let hub = Hub::start(&service, 1, 1 << 20).unwrap();
+            let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
             let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = crate::forwarding::Client::new("203.0.113.9".parse().unwrap());
@@ -491,7 +491,7 @@ async fn a_late_answer_does_not_give_back_a_spent_bucket() {
             let config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
-            let hub = Hub::start(&service, 1, 1 << 20).unwrap();
+            let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
             let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = crate::forwarding::Client::new("203.0.113.9".parse().unwrap());
@@ -598,6 +598,140 @@ async fn a_changed_service_starts_the_process_afresh() {
             !Arc::ptr_eq(&current, &proxy.hub(&changed).unwrap()),
             "change {at}"
         );
+    }
+}
+
+/// What a rate-limiting thread tells if it fails, counted.
+fn told_failures() -> (
+    impl Fn() + Send + Sync + 'static,
+    impl Fn() -> usize + 'static,
+) {
+    let failures = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&failures);
+    (
+        move || {
+            counting.fetch_add(1, Ordering::Relaxed);
+        },
+        move || failures.load(Ordering::Relaxed),
+    )
+}
+
+/// Until `done`, looking every few milliseconds.
+async fn until(done: impl Fn() -> bool) {
+    within(async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+}
+
+/// The data plane's rate-limiting thread is watched (03 §2): one that panics tells what the
+/// data plane was given to call; one that a reload replaced ends without telling it, though
+/// an exchange of its is still in flight.
+#[tokio::test]
+async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
+    use crate::ratelimit::ToHub;
+    use edgerush_ratelimit::service::Contract;
+    use std::num::NonZeroU64;
+
+    let exchanges = Arc::new(AtomicUsize::new(0));
+    // Every answer held back past the replacing.
+    let hold = Arc::new(Mutex::new(Some(Instant::now() + Duration::from_secs(60))));
+    let pods = held_service(&exchanges, &hold).await;
+    let mut config = limited(everything_config("127.0.0.1:1".parse().unwrap()), &pods);
+    if let Some(service) = &mut config.rate_limit_service {
+        // A new key is asked about: an exchange.
+        service.ask_cold_keys = Some(true);
+    }
+    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+    let (failed, failures) = told_failures();
+    proxy.watch_rate_limits(failed);
+    let service = compile(&config)
+        .unwrap()
+        .rate_limit_service()
+        .unwrap()
+        .clone();
+    let first = proxy.hub(&service).unwrap();
+    let ended = first.ended();
+    let (answers, _answered) = tokio::sync::mpsc::unbounded_channel();
+    first.to.send(ToHub::Join { worker: 0, answers }).unwrap();
+    let before = exchanges.load(Ordering::Relaxed);
+    first
+        .to
+        .send(ToHub::Ask {
+            worker: 0,
+            id: 0,
+            keys: vec![(
+                b"cold".as_slice().into(),
+                Contract {
+                    limit: NonZeroU64::new(10).unwrap(),
+                    window: NonZeroU64::new(3_600_000_000_000).unwrap(),
+                    burst: NonZeroU64::new(10).unwrap(),
+                },
+            )],
+        })
+        .unwrap();
+    until(|| exchanges.load(Ordering::Relaxed) > before).await;
+    let mut changed = service.clone();
+    changed.cycle *= 2;
+    let second = proxy.hub(&changed).unwrap();
+    drop(first);
+    until(ended).await;
+    assert_eq!(failures(), 0, "the replaced thread told");
+
+    second.to.send(ToHub::Panic { in_exchange: false }).unwrap();
+    until(|| failures() > 0).await;
+    assert_eq!(failures(), 1);
+}
+
+/// A thread whose exchanges are answered tells nothing; one that panicked, or whose
+/// exchange's task did, tells once: once it has ended, its handles let go of, it has told
+/// nothing more.
+#[tokio::test]
+async fn a_failed_rate_limiting_thread_tells_once() {
+    use crate::ratelimit::{Hub, ToHub};
+    use edgerush_ratelimit::service::Contract;
+    use std::num::NonZeroU64;
+
+    let pods = service().await;
+    for in_exchange in [false, true] {
+        let compiled = edgerush_config::CompiledRateLimitService {
+            pods: pods.clone(),
+            cycle: Duration::from_millis(10),
+            max_key_bytes: 1 << 20,
+            poll_quiet_keys: true,
+            // A new key is asked about: an exchange.
+            ask_cold_keys: true,
+            schedule_keys: false,
+        };
+        let (failed, failures) = told_failures();
+        let failed = crate::ratelimit::Failed(Arc::new(failed));
+        let hub = Hub::start(&compiled, 1, 1 << 20, Some(failed)).unwrap();
+        let ended = hub.ended();
+        let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
+        hub.to.send(ToHub::Join { worker: 0, answers }).unwrap();
+        let contract = Contract {
+            limit: NonZeroU64::new(10).unwrap(),
+            window: NonZeroU64::new(3_600_000_000_000).unwrap(),
+            burst: NonZeroU64::new(10).unwrap(),
+        };
+        let ask = |id: u64| ToHub::Ask {
+            worker: 0,
+            id,
+            keys: vec![(format!("cold-{id}").into_bytes().into(), contract)],
+        };
+        hub.to.send(ask(0)).unwrap();
+        assert!(within(answered.recv()).await.unwrap().admitted);
+        assert_eq!(failures(), 0, "an exchange answered");
+
+        hub.to.send(ToHub::Panic { in_exchange }).unwrap();
+        // Not taken once the thread itself has panicked.
+        let _gone = hub.to.send(ask(1));
+        until(|| failures() > 0).await;
+        drop(hub);
+        until(ended).await;
+        assert_eq!(failures(), 1, "in an exchange: {in_exchange}");
     }
 }
 
@@ -1049,7 +1183,7 @@ async fn a_refusal_is_put_down_to_the_limits_the_pod_named() {
             );
             let compiled = compile(&config).unwrap();
             let service = compiled.rate_limit_service().unwrap().clone();
-            let hub = crate::ratelimit::Hub::start(&service, 1, u64::MAX).unwrap();
+            let hub = crate::ratelimit::Hub::start(&service, 1, u64::MAX, None).unwrap();
             let limiter = crate::ratelimit::Limiter::new(&service, hub, 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
             let client = crate::forwarding::Client::new("203.0.113.7".parse().unwrap());

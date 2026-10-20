@@ -12,7 +12,7 @@ use edgerush_ratelimit::service::pooled::{
 };
 use edgerush_ratelimit::service::{Contract, Keyed, Ticket, View};
 use edgerush_ratelimit_service::grpc::Client;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::rc::Rc;
@@ -23,6 +23,17 @@ use tokio::sync::{Notify, mpsc};
 
 /// The time between a worker's handing its signals to its process.
 pub(crate) const SYNC: Duration = Duration::from_millis(1);
+
+/// What the process thread calls if it fails (03 §2), for whoever runs the data plane to
+/// fail the process: once, from the thread.
+#[derive(Clone)]
+pub(crate) struct Failed(pub(crate) Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Failed")
+    }
+}
 
 /// What a worker sends its process.
 pub(crate) enum ToHub {
@@ -46,6 +57,9 @@ pub(crate) enum ToHub {
     /// Keys visited only when they need it: those its decisions signalled since its last
     /// such message, for the next cycle to visit.
     Signals(Vec<Arc<Entry>>),
+    /// For a test: to panic, on the thread itself or in the next exchange's task.
+    #[cfg(test)]
+    Panic { in_exchange: bool },
 }
 
 /// What the process sends a worker: the decision on a request it asked about — refused,
@@ -147,13 +161,15 @@ pub(crate) struct Hub {
 
 impl Hub {
     /// The process thread of `workers` reaching `service`, its keys holding at most
-    /// `max_key_bytes`, started; `None` if an address cannot be made into one to connect
-    /// to, no thread could be had, or the machine has no native 128-bit compare-and-swap
-    /// for the participant's entries (which the proxy refuses at start).
+    /// `max_key_bytes`, started, calling `failed` if it fails once started; `None` if an
+    /// address cannot be made into one to connect to, no thread could be had, or the
+    /// machine has no native 128-bit compare-and-swap for the participant's entries (which
+    /// the proxy refuses at start).
     pub(crate) fn start(
         service: &CompiledRateLimitService,
         workers: usize,
         max_key_bytes: u64,
+        failed: Option<Failed>,
     ) -> Option<Arc<Self>> {
         let clients = service
             .pods
@@ -179,6 +195,7 @@ impl Hub {
                 let running = Running {
                     shared: running,
                     settled: waking,
+                    failed,
                 };
                 run(clients, &set, workers, max_key_bytes, from, &running, &made);
             })
@@ -223,6 +240,14 @@ impl Hub {
         self.shared.epoch
     }
 
+    /// For a test that lets go of every handle: whether its thread has ended since, told
+    /// by what the thread holds of it until it does.
+    #[cfg(test)]
+    pub(crate) fn ended(&self) -> impl Fn() -> bool + use<> {
+        let shared = Arc::downgrade(&self.shared);
+        move || shared.strong_count() == 0
+    }
+
     /// What its keys hold, in bytes, how many there are, and how many it has evicted, all
     /// told, as of its last cycle.
     pub(crate) fn usage(&self) -> (u64, usize, u64) {
@@ -243,10 +268,61 @@ impl std::fmt::Debug for Hub {
     }
 }
 
-/// What the process thread shares with its handles.
+/// What the process thread shares with its handles, and what it calls if it fails.
 struct Running {
     shared: Arc<Shared>,
     settled: Arc<Notify>,
+    failed: Option<Failed>,
+}
+
+/// The process thread's watch (03 §2): it tells once that the thread failed, if the thread
+/// unwinds or a task of its is thrown away after a panic — an exchange's, whose pod would
+/// otherwise wait on it for ever. It tells nothing once the thread's loop has ended, as it
+/// does when the last handle goes: a reload replaced it, or the data plane went.
+struct Watch {
+    failed: Option<Failed>,
+    /// The loop has ended, or the watch has told.
+    over: Cell<bool>,
+}
+
+impl Watch {
+    fn fail(&self) {
+        if !self.over.replace(true)
+            && let Some(Failed(failed)) = &self.failed
+        {
+            failed();
+        }
+    }
+}
+
+/// Carried by the thread and by each exchange's task: tells the watch if dropped before it
+/// has finished.
+struct Guard {
+    watch: Rc<Watch>,
+    finished: bool,
+}
+
+impl Guard {
+    fn new(watch: &Rc<Watch>) -> Self {
+        Self {
+            watch: Rc::clone(watch),
+            finished: false,
+        }
+    }
+
+    /// What it guards has finished. A method, so that a task carrying it captures all of it
+    /// rather than the one field.
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.watch.fail();
+        }
+    }
 }
 
 /// The process thread: a runtime of its own, the participant and its clients, until every
@@ -302,6 +378,12 @@ fn run(
     if made.send(participant.registry()).is_err() {
         return;
     }
+    // Started: from here on, an end other than the loop's is a failure.
+    let watch = Rc::new(Watch {
+        failed: running.failed.clone(),
+        over: Cell::new(false),
+    });
+    let mut thread = Guard::new(&watch);
     let state = Rc::new(State {
         participant: RefCell::new(participant),
         waiting: RefCell::new(HashMap::new()),
@@ -310,9 +392,15 @@ fn run(
         answers: RefCell::new(vec![None; workers]),
         shared: Arc::clone(&running.shared),
         settled: Arc::clone(&running.settled),
+        watch: Rc::clone(&watch),
+        #[cfg(test)]
+        panic_in_exchange: Cell::new(false),
     });
     let local = tokio::task::LocalSet::new();
     local.block_on(&runtime, serve(state, from, cycle));
+    // Every handle gone: the exchanges still in flight go with the `LocalSet`, unfailed.
+    watch.over.set(true);
+    thread.finish();
 }
 
 /// A request waiting on the service: the worker that asked, its number for it, the
@@ -338,6 +426,10 @@ struct State {
     answers: RefCell<Vec<Option<mpsc::UnboundedSender<FromHub>>>>,
     shared: Arc<Shared>,
     settled: Arc<Notify>,
+    watch: Rc<Watch>,
+    /// For a test: the next exchange's task panics.
+    #[cfg(test)]
+    panic_in_exchange: Cell<bool>,
 }
 
 impl State {
@@ -378,6 +470,10 @@ impl State {
             ToHub::Drain(key) => self.participant.borrow_mut().drain(&key, now),
             ToHub::Adopt(entry) => self.participant.borrow_mut().adopt(entry),
             ToHub::Signals(entries) => self.participant.borrow_mut().on_signals(entries),
+            #[cfg(test)]
+            ToHub::Panic { in_exchange: false } => panic!("a panic the test makes"),
+            #[cfg(test)]
+            ToHub::Panic { in_exchange: true } => self.panic_in_exchange.set(true),
         }
     }
 
@@ -473,9 +569,14 @@ impl State {
             stats
                 .entries_in_flight
                 .fetch_add(entries, Ordering::Relaxed);
+            let mut guard = Guard::new(&self.watch);
             tokio::task::spawn_local(async move {
                 // Unanswered, it is sent again or given up as the protocol says.
                 let answered = client.exchange(batch).await;
+                #[cfg(test)]
+                if me.panic_in_exchange.get() {
+                    panic!("a panic the test makes");
+                }
                 let stats = &me.shared.stats;
                 stats.in_flight.fetch_sub(1, Ordering::Relaxed);
                 stats
@@ -501,6 +602,7 @@ impl State {
                             .fetch_add(took, Ordering::Relaxed);
                     }
                 }
+                guard.finish();
             });
         }
     }

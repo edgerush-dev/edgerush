@@ -10,7 +10,7 @@
 
 mod hub;
 
-pub(crate) use hub::Hub;
+pub(crate) use hub::{Failed, Hub};
 
 use crate::forwarding::Client as Requester;
 use crate::request::NoTables;

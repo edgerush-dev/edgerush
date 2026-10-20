@@ -385,6 +385,9 @@ pub struct Proxy {
     /// The process's rate-limiting thread, once a worker needs it; locked only when a worker
     /// makes its limiter.
     hub: std::sync::Mutex<Option<Arc<crate::ratelimit::Hub>>>,
+    /// What every rate-limiting thread started from now on calls if it fails, once one is
+    /// given ([`Proxy::watch_rate_limits`]).
+    hub_failed: std::sync::OnceLock<crate::ratelimit::Failed>,
     /// Outside it for a different reason: a key must not come round again when a config
     /// does, so what hands them out lives as long as the process.
     keys: Keys,
