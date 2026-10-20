@@ -7,6 +7,7 @@ use edgerush_ratelimit::service::PodId;
 use edgerush_ratelimit_service::grpc::{Client as PodClient, Server};
 use edgerush_ratelimit_service::pod::{Pod, Timing};
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use tonic::transport::server::TcpIncoming;
 
@@ -17,6 +18,15 @@ async fn service() -> Vec<String> {
 
 /// The same, each exchange any of its pods is sent counted in `exchanges`.
 async fn counted_service(exchanges: &Arc<AtomicUsize>) -> Vec<String> {
+    held_service(exchanges, &Arc::new(Mutex::new(None))).await
+}
+
+/// The same, the answer to every exchange that reaches a pod before `hold` held back for
+/// [`HELD`].
+async fn held_service(
+    exchanges: &Arc<AtomicUsize>,
+    hold: &Arc<Mutex<Option<Instant>>>,
+) -> Vec<String> {
     let mut listeners = Vec::new();
     let mut addresses = Vec::new();
     for _ in 0..3 {
@@ -40,6 +50,7 @@ async fn counted_service(exchanges: &Arc<AtomicUsize>) -> Vec<String> {
         let server = Counted {
             server: Server::new(pod.clone()),
             exchanges: Arc::clone(exchanges),
+            hold: Arc::clone(hold),
         };
         tokio::spawn(async move {
             tonic::transport::Server::builder()
@@ -61,11 +72,16 @@ async fn counted_service(exchanges: &Arc<AtomicUsize>) -> Vec<String> {
     addresses
 }
 
-/// A service pod's server that counts the exchanges it is sent.
+/// How long an exchange's answer is held back.
+const HELD: Duration = Duration::from_millis(600);
+
+/// A service pod's server that counts the exchanges it is sent, and holds back the answers
+/// to those that reach it before its `hold`.
 #[derive(Clone)]
 struct Counted {
     server: Server,
     exchanges: Arc<AtomicUsize>,
+    hold: Arc<Mutex<Option<Instant>>>,
 }
 
 impl tonic::server::NamedService for Counted {
@@ -75,7 +91,9 @@ impl tonic::server::NamedService for Counted {
 impl tower_service::Service<http::Request<tonic::body::Body>> for Counted {
     type Response = <Server as tower_service::Service<http::Request<tonic::body::Body>>>::Response;
     type Error = <Server as tower_service::Service<http::Request<tonic::body::Body>>>::Error;
-    type Future = <Server as tower_service::Service<http::Request<tonic::body::Body>>>::Future;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
 
     fn poll_ready(
         &mut self,
@@ -85,10 +103,24 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for Counted {
     }
 
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
-        if request.uri().path().ends_with("/Exchange") {
+        let exchange = request.uri().path().ends_with("/Exchange");
+        if exchange {
             self.exchanges.fetch_add(1, Ordering::Relaxed);
         }
-        self.server.call(request)
+        let held = exchange
+            && self
+                .hold
+                .lock()
+                .unwrap()
+                .is_some_and(|until| Instant::now() < until);
+        let answer = self.server.call(request);
+        Box::pin(async move {
+            let answer = answer.await;
+            if held {
+                tokio::time::sleep(HELD).await;
+            }
+            answer
+        })
     }
 }
 
@@ -439,6 +471,53 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
                 stats.contains("edgerush_rate_limit_hub_visits_total "),
                 "{stats}"
             );
+            limiter.stop();
+        })
+        .await;
+}
+
+/// An exchange answered after the one that replaced it: its pod handled it first, so its
+/// bucket is the older, and it is not taken over the newer one's. A client that spent its
+/// bucket while the first exchange's answer was held back stays refused once that answer
+/// comes, and the late answer is counted.
+#[tokio::test]
+async fn a_late_answer_does_not_give_back_a_spent_bucket() {
+    use crate::ratelimit::{Hub, Limited, Limiter};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let hold = Arc::new(Mutex::new(None));
+            let service = held_service(&Arc::new(AtomicUsize::new(0)), &hold).await;
+            let config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
+            let compiled = compile(&config).unwrap();
+            let service = compiled.rate_limit_service().unwrap().clone();
+            let hub = Hub::start(&service, 1, 1 << 20).unwrap();
+            let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
+            let rule = Arc::clone(&compiled.rules_of(0)[0]);
+            let client = crate::forwarding::Client::new("203.0.113.9".parse().unwrap());
+            let admitted = || {
+                (0..5)
+                    .map(|_| limiter.decide_all(&rule.limits, 0b1, &client))
+                    .filter(|limited| matches!(limited, Limited::Admit))
+                    .count()
+            };
+            // The exchange reporting the first five is answered late.
+            let started = Instant::now();
+            *hold.lock().unwrap() = Some(started + Duration::from_millis(100));
+            assert_eq!(admitted(), 5);
+            // Five more from the copy while it is out, the bucket spent. Given up after
+            // 300 ms, the next exchange carries all ten, and its answer says so.
+            tokio::time::sleep_until(started + Duration::from_millis(150)).await;
+            assert_eq!(admitted(), 5);
+            // The held answer, a bucket with five left, has come.
+            tokio::time::sleep_until(started + HELD + Duration::from_millis(300)).await;
+            assert_eq!(admitted(), 0, "the late answer's bucket taken");
+            let stats = hub.render_stats();
+            let late = stats
+                .lines()
+                .find_map(|line| line.strip_prefix("edgerush_rate_limit_hub_answers_late_total "))
+                .and_then(|n| n.parse::<u64>().ok());
+            assert!(late.is_some_and(|late| late > 0), "{stats}");
             limiter.stop();
         })
         .await;

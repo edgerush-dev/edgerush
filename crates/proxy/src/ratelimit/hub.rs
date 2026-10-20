@@ -70,8 +70,9 @@ struct Shared {
 }
 
 /// What the process thread says of its own work, for the scrape: the asks it takes and how
-/// long they wait, its queue, its exchanges, the time its work takes, and the keys its
-/// cycles visit. The most-of figures are since the last scrape, which takes them.
+/// long they wait, its queue, its exchanges and the answers whose buckets were passed over,
+/// a later one from their pod taken first, the time its work takes, and the keys its cycles visit. The most-of
+/// figures are since the last scrape, which takes them.
 #[derive(Default)]
 pub(crate) struct Stats {
     asks: AtomicU64,
@@ -87,6 +88,7 @@ pub(crate) struct Stats {
     answers_ns: AtomicU64,
     busy_ns: AtomicU64,
     visits: AtomicU64,
+    answers_late: AtomicU64,
 }
 
 impl Stats {
@@ -118,6 +120,7 @@ impl Stats {
             ("answers_ns_total", "counter", read(&self.answers_ns)),
             ("busy_ns_total", "counter", read(&self.busy_ns)),
             ("visits_total", "counter", read(&self.visits)),
+            ("answers_late_total", "counter", read(&self.answers_late)),
         ];
         let mut out = String::new();
         for (name, kind, value) in lines {
@@ -441,20 +444,24 @@ impl State {
         }
     }
 
-    /// Says what its keys hold, for the workers' scrape.
+    /// Says what its keys hold, and how many answers came late, for the workers' scrape.
     fn report(&self) {
         let participant = self.participant.borrow();
         let [bytes, keys, evicted] = &self.shared.usage;
         bytes.store(participant.holding(), Ordering::Relaxed);
         keys.store(participant.key_count() as u64, Ordering::Relaxed);
         evicted.store(participant.evicted(), Ordering::Relaxed);
+        self.shared
+            .stats
+            .answers_late
+            .store(participant.late_answers(), Ordering::Relaxed);
     }
 
     /// Sends what the participant has to send, each batch on a task of its own, and hands
     /// it the answers as they come.
     fn send(self: &Rc<Self>) {
-        let outgoing = self.participant.borrow_mut().take_outgoing();
-        for (pod, batch) in outgoing {
+        let outgoing = self.participant.borrow_mut().take_exchanges();
+        for (pod, exchange, batch) in outgoing {
             let Some(client) = self.clients.get(pod as usize).cloned() else {
                 continue;
             };
@@ -476,13 +483,15 @@ impl State {
                     .fetch_sub(entries, Ordering::Relaxed);
                 match answered {
                     Err(_) => {
-                        me.participant.borrow_mut().exchanged(pod);
+                        me.participant.borrow_mut().exchanged(pod, exchange);
                         me.send();
                     }
                     Ok(answers) => {
                         let started = Instant::now();
                         let now = me.now();
-                        me.participant.borrow_mut().on_answers(answers, now);
+                        me.participant
+                            .borrow_mut()
+                            .on_answers_to(exchange, answers, now);
                         me.answer();
                         me.send();
                         let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);

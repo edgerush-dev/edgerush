@@ -875,6 +875,22 @@ struct InFlight {
     resent: bool,
 }
 
+/// The answer whose buckets were last taken from a pod.
+struct LastTaken {
+    /// Its pod's life and number ([`Answers::life`]).
+    life: u64,
+    number: u64,
+    /// The latest exchange started with the pod when the first answer of that life was
+    /// taken: any up to it may have reached an earlier life, none after it can.
+    fence: u64,
+}
+
+/// Whether `a` comes after `b`, both counted up and wrapping: true while they are less than
+/// half the range apart, which `u64` counts never come near.
+fn later(a: u64, b: u64) -> bool {
+    a.wrapping_sub(b).cast_signed() > 0
+}
+
 /// Requests under one list of keys waiting for a service pod's decision, as `DataPlane`
 /// groups them.
 struct Group {
@@ -937,6 +953,15 @@ pub struct Participant<S> {
     /// With one exchange in flight to a pod at a time: the pods that have one, since when.
     one_in_flight: bool,
     sending: BTreeMap<PodId, u64>,
+    /// The number of the latest exchange started with each pod: with one in flight, the
+    /// one whose answer or failure ends it.
+    latest: BTreeMap<PodId, u64>,
+    exchanges: u64,
+    /// The answer whose buckets were last taken from each pod: an answer's are taken only
+    /// if it is later.
+    taken: BTreeMap<PodId, LastTaken>,
+    /// Answers whose buckets were not taken, a later one from the pod taken already.
+    late: u64,
     levers: Levers,
     /// The latest time it was given: an exchange's start.
     last_now: u64,
@@ -1131,6 +1156,10 @@ impl<S: BuildHasher + Clone> Participant<S> {
             asks: BTreeMap::new(),
             one_in_flight: false,
             sending: BTreeMap::new(),
+            latest: BTreeMap::new(),
+            exchanges: 0,
+            taken: BTreeMap::new(),
+            late: 0,
             levers: Levers::default(),
             last_now: 0,
             polls: 0,
@@ -1214,9 +1243,19 @@ impl<S: BuildHasher + Clone> Participant<S> {
         self.one_in_flight = on;
     }
 
-    /// The exchange in flight to `pod` is over, answered or not.
-    pub fn exchanged(&mut self, pod: PodId) {
-        self.sending.remove(&pod);
+    /// Exchange `exchange` with `pod` failed. Over if it is the one in flight; one given up
+    /// already leaves the one that followed it in flight.
+    pub fn exchanged(&mut self, pod: PodId, exchange: u64) {
+        if self.latest.get(&pod) == Some(&exchange) {
+            self.sending.remove(&pod);
+        }
+    }
+
+    /// Answers that came after a later one from their pod, their buckets not taken, all
+    /// told.
+    #[must_use]
+    pub fn late_answers(&self) -> u64 {
+        self.late
     }
 
     /// As `DataPlane::set_capacity`: the bytes its keys may hold, entries included.
@@ -1856,18 +1895,71 @@ impl<S: BuildHasher + Clone> Participant<S> {
         }
     }
 
-    /// A service pod's answers reach it at `now`, as `DataPlane::on_answers`: each copy
-    /// rebased on the owner's bucket and charged with what the owner has not seen, in one
-    /// compare-and-swap with the admissions it races.
+    /// A service pod's answers to the latest exchange started with it reach it at `now`,
+    /// as `DataPlane::on_answers`: each copy rebased on the owner's bucket and charged with
+    /// what the owner has not seen, in one compare-and-swap with the admissions it races.
     pub fn on_answers(&mut self, answers: Answers, now: u64) {
+        let exchange = self.latest.get(&answers.from).copied().unwrap_or(0);
+        self.on_answers_to(exchange, answers, now);
+    }
+
+    /// A service pod's answers to exchange `exchange` ([`Self::take_exchanges`]) reach it
+    /// at `now`. Their buckets rebase the copies only if the pod handled their batch after
+    /// that of the answers last taken from it, so the copies never go back to an older
+    /// bucket: in one life of the pod, if their number is higher; from another life, if
+    /// their exchange started after every exchange started by the time the life last taken
+    /// was first heard from, since lives of a pod never serve at once. Answers from
+    /// the same life not taken still acknowledge reports, which stays true; another life's
+    /// do not, so that the reports go to the life serving, which ignores those its copy
+    /// holds already. The asks they decided were given up already: an answer is late only
+    /// after a later one has come, and an exchange starts no earlier than the asks it
+    /// carries.
+    pub fn on_answers_to(&mut self, exchange: u64, answers: Answers, now: u64) {
+        if self.latest.get(&answers.from) == Some(&exchange) {
+            self.sending.remove(&answers.from);
+        }
+        let last = self.taken.get(&answers.from);
+        let same_life = last.is_some_and(|last| last.life == answers.life);
+        let current = match last {
+            // Unnumbered: taken as it comes.
+            _ if answers.life == 0 => true,
+            None => true,
+            Some(last) if same_life => later(answers.number, last.number),
+            Some(last) => later(exchange, last.fence),
+        };
+        let acknowledges = current || same_life;
+        if current {
+            if answers.life != 0 {
+                let fence = match last {
+                    Some(last) if same_life => last.fence,
+                    _ => self.latest.get(&answers.from).copied().unwrap_or(exchange),
+                };
+                self.taken.insert(
+                    answers.from,
+                    LastTaken {
+                        life: answers.life,
+                        number: answers.number,
+                        fence,
+                    },
+                );
+            }
+        } else {
+            self.late += 1;
+        }
+        self.take_answers(answers, current, acknowledges, now);
+    }
+
+    /// `answers` taken, their buckets too if `current`, their acknowledgements if
+    /// `acknowledges`.
+    fn take_answers(&mut self, answers: Answers, current: bool, acknowledges: bool, now: u64) {
         let Answers {
             from,
             entries,
             decided,
             view,
+            ..
         } = answers;
         self.last_now = now;
-        self.sending.remove(&from);
         let mut copies = Vec::new();
         let mut untaken: Vec<(Box<[u8]>, u128)> = Vec::new();
         for answer in entries {
@@ -1878,14 +1970,23 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 untaken.push((answer.key, answer.behind));
                 continue;
             }
-            tracked.entry.others.store(answer.others, Ordering::Release);
-            if answer.owned {
+            if answer.owned && acknowledges {
                 let seen = answer.applied.min(tracked.sent);
                 tracked.seen = tracked.seen.max(seen);
                 tracked
                     .unacknowledged
                     .retain(|(sequence, _, _, _)| *sequence > seen);
             }
+            if !current {
+                // A key the pod decided an ask under from its copy is charged to the key's
+                // owner, whether or not the copy is taken.
+                if !answer.owned {
+                    copies.push(answer.key.clone());
+                }
+                untaken.push((answer.key, answer.behind));
+                continue;
+            }
+            tracked.entry.others.store(answer.others, Ordering::Release);
             let unseen: u64 = tracked
                 .unacknowledged
                 .iter()
@@ -2071,9 +2172,32 @@ impl<S: BuildHasher + Clone> Participant<S> {
 
     /// Messages to send, as `DataPlane::take_outgoing`.
     pub fn take_outgoing(&mut self) -> Vec<(PodId, Batch)> {
-        if self.one_in_flight {
-            return self.take_outgoing_to_idle();
-        }
+        self.take_exchanges()
+            .into_iter()
+            .map(|(pod, _, batch)| (pod, batch))
+            .collect()
+    }
+
+    /// Messages to send, each starting an exchange with its pod, numbered: its answers are
+    /// taken under that number ([`Self::on_answers_to`]), and its failure said under it
+    /// ([`Self::exchanged`]).
+    pub fn take_exchanges(&mut self) -> Vec<(PodId, u64, Batch)> {
+        let batches = if self.one_in_flight {
+            self.take_outgoing_to_idle()
+        } else {
+            self.take_outgoing_to_all()
+        };
+        batches
+            .into_iter()
+            .map(|(pod, batch)| {
+                self.exchanges = self.exchanges.wrapping_add(1);
+                self.latest.insert(pod, self.exchanges);
+                (pod, self.exchanges, batch)
+            })
+            .collect()
+    }
+
+    fn take_outgoing_to_all(&mut self) -> Vec<(PodId, Batch)> {
         let mut asks = std::mem::take(&mut self.asks);
         let mut batches: Vec<(PodId, Batch)> = std::mem::take(&mut self.outgoing)
             .into_iter()

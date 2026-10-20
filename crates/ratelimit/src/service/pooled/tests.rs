@@ -37,36 +37,69 @@ fn participant() -> Participant<FixedState> {
 }
 
 /// The participant and its pod, a worker's handles to the entries it was given, and the
-/// pod's answers not yet delivered.
+/// pod's answers not yet delivered: each with its exchange and its place among the answers
+/// the pod gave.
 struct Pooled {
     participant: Participant<FixedState>,
     pod: ServicePod,
     handles: HashMap<Box<[u8]>, Arc<Entry>>,
-    pending: Vec<Answers>,
+    pending: Vec<(u64, u64, Answers)>,
+    /// The answers the pod has given.
+    given: u64,
+    /// The place of the latest answer whose buckets the participant took.
+    taken: u64,
 }
 
 impl Pooled {
+    /// Its pod's answers unnumbered, each taken as it comes, as `DataPlane` takes them.
     fn new() -> Self {
         Self {
             participant: participant(),
             pod: ServicePod::new(0, CYCLE, view()),
             handles: HashMap::new(),
             pending: Vec::new(),
+            given: 0,
+            taken: 0,
         }
     }
 
-    /// Its participant visiting only the keys that need it, its workers' signals handed to
-    /// it as they decide.
-    fn scheduled() -> Self {
+    /// `batch` answered by the pod: the answers and their place among those it gave.
+    fn answer(&mut self, batch: Batch, now: u64) -> (u64, Answers) {
+        self.given += 1;
+        (self.given, self.pod.on_batch(in_order(batch), now))
+    }
+
+    /// The pod's `place`th answers, to `exchange`, reach the participant. Numbered, no
+    /// answer's buckets are taken over a later one's: a copy never goes back to an older
+    /// bucket.
+    fn take(&mut self, exchange: u64, place: u64, answers: Answers, now: u64) {
+        let late = self.participant.late_answers();
+        let numbered = answers.life != 0;
+        self.participant.on_answers_to(exchange, answers, now);
+        if numbered && self.participant.late_answers() == late {
+            assert!(
+                place > self.taken,
+                "answer {place} taken after answer {}",
+                self.taken
+            );
+            self.taken = place;
+        }
+    }
+
+    /// Its pod numbering its answers, and its participant visiting only the keys that need
+    /// it if `scheduled`, its workers' signals handed to it as they decide.
+    fn numbered(scheduled: bool) -> Self {
         let mut pooled = Self::new();
-        pooled.participant.set_scheduled(true);
+        pooled.pod.set_life(1);
+        pooled.participant.set_scheduled(scheduled);
         pooled
     }
 
     /// What it has to send, answered by the pod and held back.
     fn send(&mut self, now: u64) {
-        for (_, batch) in self.participant.take_outgoing() {
-            self.pending.push(self.pod.on_batch(in_order(batch), now));
+        for (_, exchange, batch) in self.participant.take_exchanges() {
+            let (place, answers) = self.answer(batch, now);
+            self.pending.push((exchange, place, answers));
         }
     }
 
@@ -77,12 +110,12 @@ impl Pooled {
             return Settled::default();
         }
         let at = at % self.pending.len();
-        let answers = if twice {
+        let (exchange, place, answers) = if twice {
             self.pending[at].clone()
         } else {
             self.pending.remove(at)
         };
-        self.participant.on_answers(answers, now);
+        self.take(exchange, place, answers, now);
         self.settled()
     }
 
@@ -140,13 +173,13 @@ impl Pooled {
 
     fn exchange(&mut self, now: u64) -> Settled {
         for _ in 0..10 {
-            let outgoing = self.participant.take_outgoing();
+            let outgoing = self.participant.take_exchanges();
             if outgoing.is_empty() {
                 break;
             }
-            for (_, batch) in outgoing {
-                let answers = self.pod.on_batch(in_order(batch), now);
-                self.participant.on_answers(answers, now);
+            for (_, exchange, batch) in outgoing {
+                let (place, answers) = self.answer(batch, now);
+                self.take(exchange, place, answers, now);
             }
         }
         self.settled()
@@ -316,8 +349,10 @@ proptest! {
         std::env::var("PROPTEST_CASES").ok().and_then(|n| n.parse().ok()).unwrap_or(2_048)
     ))]
 
-    /// No admission goes uncounted, whether the participant visits every key each cycle or
-    /// only those that need it, quiet keys polled or not, one exchange in flight or more:
+    /// No admission goes uncounted, and no answer's buckets are taken over a later
+    /// answer's ([`Pooled::take`]), whether the participant visits every
+    /// key each cycle or only those that need it, quiet keys polled or not, one exchange in
+    /// flight or more:
     /// over a schedule of requests, cycles and answers — late, out
     /// of order, twice — and then everything delivered and settled, each key's count at its
     /// owner is what was admitted under it, with cold keys decided locally. With them asked
@@ -339,7 +374,7 @@ proptest! {
             (b"c", contract(1_000, 100)),
         ];
         for scheduled in [false, true] {
-            let mut pooled = if scheduled { Pooled::scheduled() } else { Pooled::new() };
+            let mut pooled = Pooled::numbered(scheduled);
             pooled.participant.set_levers(Levers {
                 ask_cold,
                 poll_quiet,
@@ -940,6 +975,8 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
             }],
             decided: Vec::new(),
             view: None,
+            life: 0,
+            number: 0,
         },
         0,
     );
@@ -962,6 +999,8 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
             }],
             decided: Vec::new(),
             view: None,
+            life: 0,
+            number: 0,
         },
         0,
     );
@@ -1225,6 +1264,363 @@ fn one_exchange_in_flight_gathers_what_comes_meanwhile() {
         !participant.take_outgoing().is_empty(),
         "after the exchange's time"
     );
+}
+
+/// One request every 10 s, a bucket of 10: nothing refills within a test.
+fn slow() -> Contract {
+    Contract {
+        limit: NonZeroU64::new(1).unwrap(),
+        window: NonZeroU64::new(10_000 * MS).unwrap(),
+        burst: NonZeroU64::new(10).unwrap(),
+    }
+}
+
+/// A participant with one exchange in flight, cold keys decided locally.
+fn one_in_flight() -> Participant<FixedState> {
+    let mut participant = participant();
+    participant.set_one_in_flight(true);
+    participant.set_levers(Levers {
+        ask_cold: false,
+        poll_quiet: false,
+    });
+    participant
+}
+
+/// Another data plane's `count` hits on `key`, its first report.
+fn others_hits(key: &[u8], c: Contract, count: u64) -> Batch {
+    Batch {
+        from: 8,
+        entries: vec![BatchEntry {
+            key: key.into(),
+            contract: c,
+            report: Report::Hits {
+                sequence: 1,
+                count,
+                seen: 0,
+            },
+        }],
+        asks: Vec::new(),
+    }
+}
+
+/// Service pod 0 in its life `life`.
+fn pod(life: u64) -> ServicePod {
+    let mut pod = ServicePod::new(0, CYCLE, view());
+    pod.set_life(life);
+    pod
+}
+
+/// The one exchange `participant` starts: its number and batch.
+fn only_exchange(participant: &mut Participant<FixedState>) -> (u64, Batch) {
+    let mut started = participant.take_exchanges();
+    assert_eq!(started.len(), 1, "one exchange");
+    let (_, exchange, batch) = started.remove(0);
+    (exchange, batch)
+}
+
+/// An exchange given up and its pod's answer to it arriving after the next one's: the
+/// pod handled the next one later, so its bucket, numbered higher, is the newer, and the
+/// late answer's is not taken over it. Here the late one would have the bucket nearly full
+/// where another data plane has emptied it since.
+#[test]
+fn a_late_answer_does_not_put_back_an_older_bucket() {
+    let mut participant = one_in_flight();
+    let mut pod = pod(1);
+    let (key, c): (&[u8], Contract) = (b"k", slow());
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    participant.on_cycle(CYCLE);
+    let (first, batch) = only_exchange(&mut participant);
+    let older = pod.on_batch(batch, CYCLE);
+    // Unanswered for an ask's time: given up, its report sent again in the next.
+    participant.on_cycle(5 * CYCLE);
+    let (next, batch) = only_exchange(&mut participant);
+    assert!(next > first);
+    let _ = pod.on_batch(others_hits(key, c, 9), 5 * CYCLE);
+    let newer = pod.on_batch(batch, 5 * CYCLE);
+    participant.on_answers_to(next, newer, 6 * CYCLE);
+    assert_eq!(
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
+        Decision::Refuse
+    );
+    participant.on_answers_to(first, older, 6 * CYCLE);
+    assert_eq!(
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
+        Decision::Refuse,
+        "the older bucket put back"
+    );
+    assert_eq!(participant.late_answers(), 1);
+}
+
+/// A late answer, or a late failure, of an exchange given up does not end the one that
+/// followed it: that one is still in flight, and nothing more goes to the pod until it is
+/// over.
+#[test]
+fn a_late_answer_leaves_the_next_exchange_in_flight() {
+    let mut participant = one_in_flight();
+    let mut pod = pod(1);
+    let (key, c): (&[u8], Contract) = (b"k", slow());
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    participant.on_cycle(CYCLE);
+    let (first, batch) = only_exchange(&mut participant);
+    let late = pod.on_batch(batch, CYCLE);
+    participant.on_cycle(5 * CYCLE);
+    let (next, _) = only_exchange(&mut participant);
+    participant.on_answers_to(first, late, 6 * CYCLE);
+    participant.exchanged(0, first);
+    assert_eq!(
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
+        Decision::Admit
+    );
+    participant.on_cycle(7 * CYCLE);
+    assert!(
+        participant.take_exchanges().is_empty(),
+        "the next is still in flight"
+    );
+    participant.exchanged(0, next);
+    participant.on_cycle(8 * CYCLE);
+    assert_eq!(only_exchange(&mut participant).0, next + 1);
+}
+
+/// A late answer's buckets are not taken, but its acknowledgements are: the reports it
+/// says the pod applied are not sent again, though the later answer taken carried none of
+/// the key's.
+#[test]
+fn a_late_answer_still_acknowledges() {
+    let mut participant = one_in_flight();
+    let mut pod = pod(1);
+    let (key, c): (&[u8], Contract) = (b"k", slow());
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    participant.on_cycle(CYCLE);
+    let (first, batch) = only_exchange(&mut participant);
+    let late = pod.on_batch(batch, CYCLE);
+    participant.on_cycle(5 * CYCLE);
+    let (next, batch) = only_exchange(&mut participant);
+    assert_eq!(batch.entries.len(), 1, "the report sent again");
+    participant.on_answers_to(
+        next,
+        Answers {
+            from: 0,
+            entries: Vec::new(),
+            decided: Vec::new(),
+            view: None,
+            life: 1,
+            number: late.number + 1,
+        },
+        6 * CYCLE,
+    );
+    participant.on_answers_to(first, late, 6 * CYCLE);
+    assert_eq!(participant.late_answers(), 1);
+    participant.on_cycle(10 * CYCLE);
+    let again: Vec<Batch> = participant
+        .take_outgoing()
+        .into_iter()
+        .map(|(_, batch)| batch)
+        .collect();
+    assert!(
+        again.iter().all(|batch| batch.entries.is_empty()),
+        "the acknowledged report sent again: {again:?}"
+    );
+}
+
+/// An exchange given up with nothing started after it: its answer is still the latest
+/// the pod gave, and its buckets are taken.
+#[test]
+fn the_answer_to_the_latest_exchange_is_taken_though_given_up() {
+    let mut participant = one_in_flight();
+    let mut pod = pod(1);
+    let (key, c): (&[u8], Contract) = (b"k", slow());
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    participant.on_cycle(CYCLE);
+    let (first, batch) = only_exchange(&mut participant);
+    let _ = pod.on_batch(others_hits(key, c, 9), CYCLE);
+    let answer = pod.on_batch(batch, CYCLE);
+    participant.on_cycle(5 * CYCLE);
+    participant.exchanged(0, first);
+    participant.on_answers_to(first, answer, 6 * CYCLE);
+    assert_eq!(participant.late_answers(), 0);
+    assert_eq!(
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
+        Decision::Refuse
+    );
+}
+
+/// An exchange given up whose batch the pod handled after the next one's: its answer,
+/// though late, is the newer, and its buckets are taken.
+#[test]
+fn a_late_answer_the_pod_handled_later_is_taken() {
+    let mut participant = one_in_flight();
+    let mut pod = pod(1);
+    let (key, c): (&[u8], Contract) = (b"k", slow());
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    participant.on_cycle(CYCLE);
+    let (first, first_batch) = only_exchange(&mut participant);
+    participant.on_cycle(5 * CYCLE);
+    let (next, batch) = only_exchange(&mut participant);
+    let earlier = pod.on_batch(batch, 5 * CYCLE);
+    let _ = pod.on_batch(others_hits(key, c, 9), 5 * CYCLE);
+    let later = pod.on_batch(first_batch, 5 * CYCLE);
+    participant.on_answers_to(next, earlier, 6 * CYCLE);
+    assert_eq!(
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
+        Decision::Admit
+    );
+    participant.on_answers_to(first, later, 6 * CYCLE);
+    assert_eq!(participant.late_answers(), 0);
+    assert_eq!(
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
+        Decision::Refuse,
+        "the newer bucket not taken"
+    );
+}
+
+/// A restarted pod numbers its answers from the start again: its first, in a new life and
+/// to a later exchange, is taken though numbered lower than the last taken.
+#[test]
+fn a_restarted_pods_answers_are_taken() {
+    let mut participant = one_in_flight();
+    let mut before = pod(1);
+    let (key, c): (&[u8], Contract) = (b"k", slow());
+    for _ in 0..3 {
+        let _ = before.on_batch(others_hits(b"other", c, 1), 0);
+    }
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    participant.on_cycle(CYCLE);
+    let (first, batch) = only_exchange(&mut participant);
+    let answer = before.on_batch(batch, CYCLE);
+    assert!(answer.number > 1);
+    participant.on_answers_to(first, answer, CYCLE);
+    // Restarted, it has met another data plane emptying the bucket.
+    let mut after = pod(2);
+    let _ = after.on_batch(others_hits(key, c, 10), 2 * CYCLE);
+    assert_eq!(
+        participant.decide_all(&[(key, c)], 2 * CYCLE),
+        Decision::Admit
+    );
+    participant.on_cycle(3 * CYCLE);
+    let (next, batch) = only_exchange(&mut participant);
+    let answer = after.on_batch(batch, 3 * CYCLE);
+    assert!(answer.number <= 2);
+    participant.on_answers_to(next, answer, 3 * CYCLE);
+    assert_eq!(participant.late_answers(), 0);
+    assert_eq!(
+        participant.decide_all(&[(key, c)], 3 * CYCLE),
+        Decision::Refuse,
+        "the restarted pod's bucket not taken"
+    );
+}
+
+/// After a restart, an answer from the life before arriving late is not taken as another
+/// restart: it answers an exchange started before the one the new life answered.
+#[test]
+fn an_earlier_lifes_late_answer_is_not_taken() {
+    let mut participant = one_in_flight();
+    let mut before = pod(1);
+    let (key, c): (&[u8], Contract) = (b"k", slow());
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    participant.on_cycle(CYCLE);
+    let (first, batch) = only_exchange(&mut participant);
+    let old = before.on_batch(batch, CYCLE);
+    // Unanswered for an ask's time: given up, and the next goes to the pod restarted, which
+    // has met another data plane emptying the bucket.
+    participant.on_cycle(5 * CYCLE);
+    let (next, batch) = only_exchange(&mut participant);
+    let mut after = pod(2);
+    let _ = after.on_batch(others_hits(key, c, 9), 5 * CYCLE);
+    let new = after.on_batch(batch, 5 * CYCLE);
+    participant.on_answers_to(next, new, 6 * CYCLE);
+    assert_eq!(
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
+        Decision::Refuse
+    );
+    participant.on_answers_to(first, old, 6 * CYCLE);
+    assert_eq!(participant.late_answers(), 1);
+    assert_eq!(
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
+        Decision::Refuse,
+        "the earlier life's bucket put back"
+    );
+}
+
+/// After a restart, an earlier life's answer to an exchange started later than the one the
+/// new life answered is not taken either: the two may reach the pod in either order, and
+/// every exchange started before the new life was first heard from is fenced off.
+#[test]
+fn an_earlier_lifes_answer_to_a_later_exchange_is_not_taken() {
+    let mut participant = one_in_flight();
+    let mut before = pod(1);
+    let mut after = pod(2);
+    let (key, c): (&[u8], Contract) = (b"k", slow());
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    participant.on_cycle(CYCLE);
+    let (first, delayed) = only_exchange(&mut participant);
+    participant.on_cycle(5 * CYCLE);
+    let (next, batch) = only_exchange(&mut participant);
+    // The later exchange reaches the life before; the earlier one, held up, the life after,
+    // which has met another data plane emptying the bucket.
+    let old = before.on_batch(batch, 5 * CYCLE);
+    let _ = after.on_batch(others_hits(key, c, 9), 6 * CYCLE);
+    let new = after.on_batch(delayed, 6 * CYCLE);
+    participant.on_answers_to(first, new, 6 * CYCLE);
+    assert_eq!(
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
+        Decision::Refuse
+    );
+    participant.on_answers_to(next, old, 6 * CYCLE);
+    assert_eq!(participant.late_answers(), 1);
+    assert_eq!(
+        participant.decide_all(&[(key, c)], 6 * CYCLE),
+        Decision::Refuse,
+        "the earlier life's bucket put back"
+    );
+}
+
+/// An earlier life's answer passed over acknowledges nothing: the reports it applied go
+/// again to the life serving, which may not hold them. Its own copy holding them, it would
+/// ignore them.
+#[test]
+fn an_earlier_lifes_late_answer_acknowledges_nothing() {
+    let mut participant = one_in_flight();
+    participant.set_levers(Levers {
+        ask_cold: false,
+        poll_quiet: true,
+    });
+    let mut before = pod(1);
+    let mut after = pod(2);
+    let (key, c): (&[u8], Contract) = (b"k", slow());
+    for _ in 0..10 {
+        assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    }
+    participant.on_cycle(CYCLE);
+    let (first, batch) = only_exchange(&mut participant);
+    let old = before.on_batch(batch, CYCLE);
+    // Given up; the next reaches the life after while it joins, answering nothing.
+    participant.on_cycle(5 * CYCLE);
+    let (next, batch) = only_exchange(&mut participant);
+    after.set_serving(false);
+    let joining = after.on_batch(batch, 5 * CYCLE);
+    assert!(joining.entries.is_empty());
+    participant.on_answers_to(next, joining, 5 * CYCLE);
+    participant.on_answers_to(first, old, 6 * CYCLE);
+    assert_eq!(participant.late_answers(), 1);
+    after.set_serving(true);
+    participant.on_cycle(10 * CYCLE);
+    let (third, batch) = only_exchange(&mut participant);
+    let new = after.on_batch(batch, 10 * CYCLE);
+    participant.on_answers_to(third, new, 10 * CYCLE);
+    assert_eq!(after.counted(key), Some(10), "the reports not sent again");
+    assert_eq!(
+        participant.decide_all(&[(key, c)], 10 * CYCLE),
+        Decision::Refuse
+    );
+}
+
+/// Answer and exchange numbers wrap: one counted past the top is still the later.
+#[test]
+fn later_holds_across_the_wrap() {
+    assert!(later(0, u64::MAX));
+    assert!(later(u64::MAX, u64::MAX - 1));
+    assert!(!later(u64::MAX, 0));
+    assert!(!later(5, 5));
 }
 
 /// With cold keys not asked about, a new key's request is decided at once from a full
@@ -1713,18 +2109,17 @@ fn a_count_drained_while_its_owner_is_busy_goes_once_the_exchange_is_over() {
     assert_eq!(decide(&[a], 2 * CYCLE).signal, 1);
     participant.on_signals([Arc::clone(a)]);
     participant.on_cycle(2 * CYCLE + 1);
-    assert_eq!(
-        hits(&participant.take_outgoing())[a.key()],
-        1,
-        "a's exchange goes"
-    );
+    let first = participant.take_exchanges();
+    let exchange = first[0].1;
+    let first: Vec<(PodId, Batch)> = first.into_iter().map(|(pod, _, b)| (pod, b)).collect();
+    assert_eq!(hits(&first)[a.key()], 1, "a's exchange goes");
     assert_eq!(decide(&[b], 2 * CYCLE + 2).signal, 1);
     participant.on_signals([Arc::clone(b)]);
     for cycle in 3..6 {
         participant.on_cycle(cycle * CYCLE);
         assert!(participant.take_outgoing().is_empty(), "the pod is busy");
     }
-    participant.exchanged(0);
+    participant.exchanged(0, exchange);
     participant.on_cycle(6 * CYCLE);
     assert_eq!(hits(&participant.take_outgoing())[b.key()], 1);
 }
@@ -1763,6 +2158,8 @@ fn idle_keys_are_evicted_at_their_time_without_a_scan() {
             }],
             decided: Vec::new(),
             view: None,
+            life: 0,
+            number: 0,
         },
         300 * MS,
     );

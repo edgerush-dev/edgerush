@@ -192,6 +192,8 @@ fn fresh(
     );
     let mut node = ServicePod::new(me, nanos(timing.cycle), membership.view().clone());
     node.set_serving(false);
+    // Its answers carry the life, which differs from every earlier one's.
+    node.set_life(incarnation);
     // A view reaches every pod within a heartbeat or so, and the handovers it starts soon
     // after.
     node.set_join_grace(nanos(timing.heartbeat).saturating_mul(3));
