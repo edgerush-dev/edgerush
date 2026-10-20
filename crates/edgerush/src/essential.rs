@@ -1,6 +1,8 @@
 //! The tasks and threads a data plane cannot do without, watched: a worker's sweep and
 //! timers, its accepting, its HTTP/3 and the connections handed to it, the worker itself,
-//! and the health checker and the scrape. One that ends other than in a drain, or panics,
+//! and the health checker and the scrape; and the rate-limiting thread, which the proxy
+//! starts and watches itself, telling the main loop as a guard does if it fails, but not
+//! when a reload replaces it. One that ends other than in a drain, or panics,
 //! fails the process at once with an error status, so that whatever runs it starts it
 //! afresh rather than leave it half working ([03 §2] in the docs): a worker whose sweep is
 //! gone accepts on while none of its deadlines comes. That is HAProxy's default, whose

@@ -220,6 +220,7 @@ impl Proxy {
             metrics,
             workers,
             hub: std::sync::Mutex::new(None),
+            hub_failed: std::sync::OnceLock::new(),
             keys,
             draining: AtomicBool::new(false),
             quic,
@@ -397,9 +398,28 @@ impl Proxy {
         if let Some(hub) = held.as_ref().filter(|hub| hub.serves(service)) {
             return Some(Arc::clone(hub));
         }
-        let hub = crate::ratelimit::Hub::start(service, self.workers.get(), service.max_key_bytes)?;
+        let hub = crate::ratelimit::Hub::start(
+            service,
+            self.workers.get(),
+            service.max_key_bytes,
+            self.hub_failed.get().cloned(),
+        )?;
         *held = Some(Arc::clone(&hub));
         Some(hub)
+    }
+
+    /// Has `failed` called if the process's rate-limiting thread fails: it panics, or a task
+    /// of its does ([03 §2](../../docs/03-data-plane.md)). Whoever runs the data plane fails
+    /// the process then, as when a worker's thread fails: without the thread every request
+    /// that asks it is refused and nothing more is reported to the service. A thread that
+    /// ends because a reload replaced it, or the data plane went, has not failed.
+    ///
+    /// Given before a request is served, as a thread started before it is not watched;
+    /// only the first one given is kept.
+    pub fn watch_rate_limits(&self, failed: impl Fn() + Send + Sync + 'static) {
+        let _kept = self
+            .hub_failed
+            .set(crate::ratelimit::Failed(Arc::new(failed)));
     }
 
     /// Counts `destination` as set aside, for its upstream. For the health checker, as it

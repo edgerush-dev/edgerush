@@ -334,6 +334,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     let (stopping, stop) = mpsc::channel();
     let logs = Arc::clone(&proxy);
     signals(stopping.clone(), move || logs.reopen_logs()).map_err(Failure::Runtime)?;
+    proxy.watch_rate_limits(rate_limits_failed(&stopping));
     // Every worker runs on a thread of its own, which stays for as long as the process.
     let loads = per_core::start(&proxy, sockets, accept, limits, connections, &stopping)?;
     health_checks(Arc::clone(&proxy), &stopping).map_err(Failure::Runtime)?;
@@ -652,6 +653,20 @@ fn health_checks(proxy: Arc<Proxy>, tell: &Sender<Told>) -> io::Result<()> {
             essential.finished();
         })?;
     Ok(())
+}
+
+/// What the proxy calls if its rate-limiting thread fails, a thread it starts itself when a
+/// rule first limits: the main loop told, as a guard tells it ([`crate::essential`]).
+fn rate_limits_failed(tell: &Sender<Told>) -> impl Fn() + Send + Sync + 'static {
+    let tell = tell.clone();
+    move || {
+        let ended = Ended {
+            what: "the rate-limiting thread".to_owned(),
+            finished: false,
+        };
+        // With nobody left to tell, the process is ending anyway.
+        let _told = tell.send(Told::Ended(ended));
+    }
 }
 
 /// A listener that has a socket.
@@ -1170,6 +1185,21 @@ mod tests {
         assert_eq!(
             Failure::Ended(sweep).to_string(),
             "worker 0's sweep and timers panicked: the data plane stops, to be started afresh"
+        );
+    }
+
+    /// The rate-limiting thread failing, as the proxy tells it, fails the main loop as a
+    /// worker's sweep does.
+    #[test]
+    fn the_rate_limiting_thread_failing_fails_the_main_loop() {
+        let (tell, told) = mpsc::channel();
+        rate_limits_failed(&tell)();
+        let Next::Failed(ended) = next(&told, Duration::from_secs(5)) else {
+            panic!("the main loop goes on");
+        };
+        assert_eq!(
+            Failure::Ended(ended).to_string(),
+            "the rate-limiting thread panicked: the data plane stops, to be started afresh"
         );
     }
 }
