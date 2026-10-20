@@ -248,6 +248,10 @@ pub(crate) struct Common {
     /// A connection was closed to make room, and its driver has not yet ended: until it
     /// has, nobody else is closed, and no Initial and no request is taken (16 §6).
     pub(crate) closing: Cell<bool>,
+    /// What connections closed to make room are still charged once their drivers have
+    /// ended, until the last thing holding each lets go of it: room to come, which a
+    /// shortage it covers waits for rather than closing anyone (16 §6).
+    pub(crate) leaving: Cell<usize>,
 }
 
 /// What a worker's listener and its connections share.

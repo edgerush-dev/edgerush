@@ -376,9 +376,11 @@ pub(crate) async fn drive<R, F, B, D, G>(
     .await;
     // Closed: every stream's task learns it, and the connection's IDs find nothing more.
     // Its charge goes when the last thing holding it lets go of it, with quiche's memory;
-    // one closed to make room lets the next be closed, for a shortage seen from now on.
+    // one closed to make room lets the next be closed, for a shortage seen from now on that
+    // its charge, meanwhile room to come, does not cover.
     if conn.is_shed() {
         shared.common.closing.set(false);
+        conn.leave(&shared.common);
     }
     conn.with(|state| {
         state.closed = true;
@@ -409,10 +411,17 @@ pub(crate) async fn drive<R, F, B, D, G>(
 }
 
 /// Charges the worker what quiche holds for `conn` (16 §6), past the limit if need be, since
-/// quiche holds it already; a worker then short is short by what did not fit.
+/// quiche holds it already; a worker then short is short by what did not fit, less what
+/// connections closed to make room will free once they go.
 fn account(conn: &Rc<Conn>, shared: &Shared) {
     if let Some(short) = conn.charge(&shared.storage) {
-        short_by(shared, short);
+        let uncovered = shared
+            .storage
+            .over()
+            .saturating_sub(shared.common.leaving.get());
+        if uncovered > 0 {
+            short_by(shared, short.min(uncovered));
+        }
     }
 }
 

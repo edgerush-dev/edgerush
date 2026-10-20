@@ -908,6 +908,98 @@ fn a_worker_that_runs_out_closes_its_heaviest_connection() {
     });
 }
 
+/// A worker of 1 MiB whose heaviest connection, holding 700 KiB, was closed for a light one
+/// asking 400 KiB more, and whose driver has ended while the test still holds it: the light
+/// client, its request stream still open, and the closed one.
+async fn closed_and_still_held(storage: &Rc<Storage>, server: &Server) -> (Client, u64, Rc<Conn>) {
+    let mut heavy = Client::connect(server.address, "a.test").await;
+    let mut light = Client::connect(server.address, "a.test").await;
+    let id = heavy.request(&post("/heavy"), false);
+    heavy.body(id, &vec![1; 700 << 10], false).await;
+    heavy.until(|_| storage.used() >= 700 << 10).await;
+    let heavier = server
+        .conns()
+        .into_iter()
+        .max_by_key(|conn| conn.charged())
+        .unwrap();
+    let id = light.request(&post("/light"), false);
+    light.body(id, &vec![1; 400 << 10], false).await;
+    let started = tokio::time::Instant::now();
+    while heavy.closed_by_server().is_none() {
+        assert!(started.elapsed() < PATIENCE, "the heaviest was not closed");
+        light.for_a_while(Duration::from_millis(20)).await;
+        heavy.for_a_while(Duration::from_millis(20)).await;
+    }
+    assert!(heavier.is_shed());
+    // Out of the table once its driver has ended.
+    let started = tokio::time::Instant::now();
+    while server.conns().iter().any(|conn| Rc::ptr_eq(conn, &heavier)) {
+        assert!(
+            started.elapsed() < PATIENCE,
+            "the closed one's driver did not end"
+        );
+        light.for_a_while(Duration::from_millis(20)).await;
+    }
+    assert!(!server.shared.common.closing.get());
+    assert!(heavier.charged() >= 700 << 10);
+    (light, id, heavier)
+}
+
+/// What a connection closed to make room still holds once its driver has ended goes when
+/// the last thing holding it lets go of it: a shortage that will cover closes nobody else
+/// meanwhile (16 §6).
+#[test]
+fn a_shortage_the_closed_one_will_cover_closes_nobody() {
+    locally(async {
+        let limit = 1 << 20;
+        let storage = Storage::new(limit);
+        let server = serving_in(short(), Rc::clone(&storage), Exchanges::default().core()).await;
+        let (mut light, id, heavier) = closed_and_still_held(&storage, &server).await;
+
+        let before = storage.used();
+        light.body(id, &vec![1; 64 << 10], false).await;
+        light
+            .until(|light| {
+                light.closed_by_server().is_some() || storage.used() >= before + (64 << 10)
+            })
+            .await;
+        light.for_a_while(Duration::from_millis(100)).await;
+        assert_eq!(light.closed_by_server(), None);
+        assert_eq!(*server.closed.borrow(), [Cut::Exhausted]);
+
+        drop(heavier);
+        assert!(storage.used() <= limit);
+    });
+}
+
+/// A shortage past what a connection closed to make room still holds is one its going
+/// will not cover: the next is closed for it (16 §6).
+#[test]
+fn a_shortage_past_what_the_closed_one_holds_closes_the_next() {
+    locally(async {
+        let storage = Storage::new(1 << 20);
+        let server = serving_in(short(), Rc::clone(&storage), Exchanges::default().core()).await;
+        let (mut light, id, heavier) = closed_and_still_held(&storage, &server).await;
+
+        // Sent as far as quiche takes it until the server closes the connection, which it
+        // does before all of it has come.
+        let more = vec![1; 1 << 20];
+        let mut sent = 0;
+        let started = tokio::time::Instant::now();
+        while light.closed_by_server().is_none() {
+            assert!(started.elapsed() < PATIENCE, "nobody was closed");
+            let h3 = light.h3.as_mut().unwrap();
+            if let Ok(written) = h3.send_body(&mut light.quic, id, &more[sent..], false) {
+                sent += written;
+            }
+            light.for_a_while(Duration::from_millis(20)).await;
+        }
+        assert_eq!(light.closed_by_server(), Some((true, code::EXCESSIVE_LOAD)));
+        assert_eq!(*server.closed.borrow(), [Cut::Exhausted, Cut::Exhausted]);
+        drop(heavier);
+    });
+}
+
 /// Two connections, each with an upload of its size held in quiche, and what the server
 /// holds of each, the heavier first.
 async fn two_holding(
