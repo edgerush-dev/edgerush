@@ -273,6 +273,21 @@ impl ReuseIdentity {
     }
 }
 
+/// The destinations of a config on its way out that the config coming in does not have,
+/// once it has been taken in: [`Retiring::retire`].
+#[must_use = "they are retired only by `retire`"]
+#[derive(Debug)]
+pub(crate) struct Retiring(Vec<Arc<ReuseIdentity>>);
+
+impl Retiring {
+    /// Retires them: their connections are let go as they are put back or taken out.
+    pub(crate) fn retire(self) {
+        for gone in self.0 {
+            gone.retire();
+        }
+    }
+}
+
 /// Every destination of one compiled config, by the position of the upstream and then of
 /// the endpoint — the same order a request finds them in.
 #[derive(Debug, Default)]
@@ -298,12 +313,30 @@ impl Destinations {
     /// upstream lists twice.
     /// A destination that goes and comes back is a new one, because nothing here can tell
     /// whether what answers at that address is still what answered before.
+    ///
+    /// For the tests and benchmarks; a reload retires only once it is taken in
+    /// ([`Destinations::prepare`]).
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn reconcile(
         config: &Compiled,
         previous: &Self,
         keys: &Keys,
         secure: &[Option<Arc<Secure>>],
     ) -> Self {
+        let (destinations, retiring) = Self::prepare(config, previous, keys, secure);
+        retiring.retire();
+        destinations
+    }
+
+    /// [`Destinations::reconcile`] with those of `previous` that `config` does not have
+    /// handed back to be retired, not retired yet: for a config that may still be refused,
+    /// which must leave the running one's connections as they are.
+    pub(crate) fn prepare(
+        config: &Compiled,
+        previous: &Self,
+        keys: &Keys,
+        secure: &[Option<Arc<Secure>>],
+    ) -> (Self, Retiring) {
         type Same<'a> = (
             &'a str,
             SocketAddr,
@@ -392,10 +425,8 @@ impl Destinations {
             })
             .collect();
 
-        for gone in known.into_values() {
-            gone.retire();
-        }
-        Self(destinations)
+        let gone = known.into_values().map(Arc::clone).collect();
+        (Self(destinations), Retiring(gone))
     }
 
     /// The destination of the endpoint at `endpoint` of the upstream at `upstream`.

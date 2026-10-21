@@ -561,6 +561,11 @@ fn rate_limit_service(
     if service.pods.is_empty() {
         errors.push(place.problem(Problem::RateLimitServiceNoPods));
     }
+    for pod in &service.pods {
+        if !is_host_and_port(pod) {
+            errors.push(place.problem(Problem::RateLimitServicePod(pod.clone())));
+        }
+    }
     if service.cycle_ms == Some(0) {
         errors.push(place.problem(Problem::RateLimitServiceCycleNever));
     }
@@ -1468,6 +1473,16 @@ fn is_host_name(name: &str) -> bool {
         && name.parse::<std::net::IpAddr>().is_err()
 }
 
+/// Whether `address` is a host and a port as a URI's authority writes them, which is what
+/// a rate-limiting service pod is connected to by: no user, and a port always.
+fn is_host_and_port(address: &str) -> bool {
+    address
+        .parse::<http::uri::Authority>()
+        .is_ok_and(|authority| {
+            !address.contains('@') && !authority.host().is_empty() && authority.port_u16().is_some()
+        })
+}
+
 /// The listeners a route is for, each once, as far as they exist.
 fn listeners_of<'a>(
     route: &'a Route,
@@ -2251,6 +2266,9 @@ pub enum Problem {
     /// A rate-limiting service with no pods.
     #[error("`rate_limit_service` names no pods")]
     RateLimitServiceNoPods,
+    /// A rate-limiting service pod whose address is not one to connect to.
+    #[error("`rate_limit_service`: pod `{0}` is no `host:port`")]
+    RateLimitServicePod(String),
     /// A rate-limiting service whose cycle never comes.
     #[error("`rate_limit_service`: `cycle_ms` is 0: at least 1")]
     RateLimitServiceCycleNever,
@@ -4673,6 +4691,29 @@ routes:
             with(r#"rate_limit_service: { pods: ["a:1"], cycle_ms: 0 }"#).unwrap_err(),
             ["the data plane: `rate_limit_service`: `cycle_ms` is 0: at least 1"]
         );
+        // A pod is a host and a port, as the process connects to it; anything else would
+        // leave the data plane unable to start its rate limits.
+        for pod in [
+            "rl-0",
+            "rl-0 :7000",
+            "rl-0:http",
+            "rl-0:7000/x",
+            "u@rl-0:7000",
+            ":7000",
+        ] {
+            assert_eq!(
+                with(&format!(
+                    r#"rate_limit_service: {{ pods: ["a:1", "{pod}"] }}"#
+                ))
+                .unwrap_err(),
+                [format!(
+                    "the data plane: `rate_limit_service`: pod `{pod}` is no `host:port`"
+                )],
+                "{pod}"
+            );
+        }
+        let addresses = with(r#"rate_limit_service: { pods: ["10.0.0.1:7000", "[::1]:7000"] }"#);
+        assert_eq!(addresses.unwrap().unwrap().pods.len(), 2);
         let levers = with(
             r#"rate_limit_service: { pods: ["a:1"], poll_quiet_keys: true, ask_cold_keys: true, schedule_keys: false }"#,
         )

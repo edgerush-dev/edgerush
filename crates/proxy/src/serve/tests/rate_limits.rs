@@ -157,6 +157,14 @@ fn comes_back(headers: &http::HeaderMap) {
     );
 }
 
+/// A data plane for `config` on `workers`, its rate limits started as the binary starts
+/// them.
+fn started(config: &Config, workers: NonZeroUsize) -> Proxy {
+    let proxy = Proxy::new(compile(config).unwrap(), workers).unwrap();
+    proxy.start_rate_limits(|| {}).unwrap();
+    proxy
+}
+
 fn tally(statuses: &[u16]) -> (usize, usize) {
     (
         statuses.iter().filter(|s| **s == 200).count(),
@@ -174,7 +182,7 @@ async fn http2_requests_are_held_to_their_limit() {
             let service = service().await;
             let (upstream, _) = counting_upstream().await;
             let config = limited(everything_config(upstream), &service);
-            let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+            let proxy = started(&config, NonZeroUsize::MIN);
             let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
             let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let front = socket.local_addr().unwrap();
@@ -559,46 +567,207 @@ fn rate_limits_need_native_128_bit_atomics() {
     }
 }
 
-/// A reload that changes a lever, the cycle or the pods starts the process's limiter
-/// afresh; one that changes nothing, or only what its keys may hold, keeps it.
+/// The process's rate-limiting thread the running config's limits are decided with.
+fn hub_of(proxy: &Proxy) -> Arc<crate::ratelimit::Hub> {
+    proxy.hub().1.expect("a thread")
+}
+
+/// `config` without its limits or its rate-limiting service.
+fn unlimited(mut config: Config) -> Config {
+    config.routes[0].rules[0].rate_limits.clear();
+    config.limits = None;
+    config.rate_limit_service = None;
+    config
+}
+
+/// A reload that changes a lever, the cycle or the pods starts the process's thread
+/// afresh; one that changes nothing, or only what its keys may hold, keeps it; one with no
+/// rate-limiting service lets it go, and one with a service again starts one.
 #[tokio::test]
 async fn a_changed_service_starts_the_process_afresh() {
     let config = limited(
         everything_config("127.0.0.1:1".parse().unwrap()),
         &["127.0.0.1:1".to_owned()],
     );
-    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
-    let service = compile(&config)
-        .unwrap()
-        .rate_limit_service()
-        .unwrap()
-        .clone();
-    let first = proxy.hub(&service).unwrap();
-    assert!(
-        Arc::ptr_eq(&first, &proxy.hub(&service).unwrap()),
-        "nothing changed"
-    );
-    let mut bigger = service.clone();
-    bigger.max_key_bytes *= 2;
-    assert!(
-        Arc::ptr_eq(&first, &proxy.hub(&bigger).unwrap()),
-        "only its keys' bytes"
-    );
-    let changes: [fn(&mut edgerush_config::CompiledRateLimitService); 4] = [
-        |service| service.ask_cold_keys = !service.ask_cold_keys,
-        |service| service.poll_quiet_keys = !service.poll_quiet_keys,
-        |service| service.schedule_keys = !service.schedule_keys,
-        |service| service.cycle *= 2,
+    let proxy = started(&config, NonZeroUsize::MIN);
+    let first = hub_of(&proxy);
+    proxy.reload(compile(&config).unwrap()).unwrap();
+    assert!(Arc::ptr_eq(&first, &hub_of(&proxy)), "nothing changed");
+    let mut bigger = config.clone();
+    if let Some(service) = &mut bigger.rate_limit_service {
+        service.max_key_bytes = Some(1 << 30);
+    }
+    proxy.reload(compile(&bigger).unwrap()).unwrap();
+    assert!(Arc::ptr_eq(&first, &hub_of(&proxy)), "only its keys' bytes");
+    let changes: [fn(&mut edgerush_config::RateLimitService); 5] = [
+        |service| service.ask_cold_keys = Some(true),
+        |service| service.poll_quiet_keys = Some(true),
+        |service| service.schedule_keys = Some(false),
+        |service| service.cycle_ms = Some(20),
+        |service| service.pods.push("127.0.0.1:2".to_owned()),
     ];
     for (at, change) in changes.into_iter().enumerate() {
-        let mut changed = service.clone();
-        change(&mut changed);
-        let current = proxy.hub(&service).unwrap();
-        assert!(
-            !Arc::ptr_eq(&current, &proxy.hub(&changed).unwrap()),
-            "change {at}"
-        );
+        let current = hub_of(&proxy);
+        let mut changed = config.clone();
+        if let Some(service) = &mut changed.rate_limit_service {
+            change(service);
+        }
+        proxy.reload(compile(&changed).unwrap()).unwrap();
+        assert!(!Arc::ptr_eq(&current, &hub_of(&proxy)), "change {at}");
     }
+    proxy
+        .reload(compile(&unlimited(config.clone())).unwrap())
+        .unwrap();
+    assert!(proxy.hub().1.is_none(), "no service, no thread");
+    proxy.reload(compile(&config).unwrap()).unwrap();
+    assert!(proxy.hub().1.is_some(), "a service again");
+}
+
+/// Rate limits whose thread cannot be started refuse the config: at start, which the data
+/// plane then cannot run, and on a reload, after which it runs on as it was, the thread
+/// it had deciding its limits still, and the destinations it has kept. A reload before they
+/// are started starts none; starting them starts the thread of the config running then,
+/// once.
+#[tokio::test]
+async fn rate_limits_that_cannot_start_refuse_the_config() {
+    use crate::ratelimit::REFUSE_START;
+
+    let config = limited(
+        everything_config("127.0.0.1:1".parse().unwrap()),
+        &["127.0.0.1:1".to_owned()],
+    );
+    let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+    let mut changed = config.clone();
+    if let Some(service) = &mut changed.rate_limit_service {
+        service.cycle_ms = Some(20);
+    }
+    proxy.reload(compile(&changed).unwrap()).unwrap();
+    assert!(proxy.hub().1.is_none(), "not started");
+
+    REFUSE_START.with(|refuse| refuse.set(true));
+    assert!(matches!(
+        proxy.start_rate_limits(|| {}),
+        Err(ProxyError::RateLimitThread(_))
+    ));
+    assert!(proxy.hub().1.is_none(), "refused");
+    proxy.start_rate_limits(|| {}).unwrap();
+    let running = hub_of(&proxy);
+    let service = proxy.current.load().config.rate_limit_service().cloned();
+    assert_eq!(
+        service.map(|service| service.cycle),
+        Some(Duration::from_millis(20))
+    );
+    let generation = proxy.current.load().generation;
+    let destination = proxy.current.load().destinations.at(0, 0).cloned().unwrap();
+
+    // Its upstream elsewhere too: a config taken in would retire where it is now.
+    let moved = limited(
+        everything_config("127.0.0.1:2".parse().unwrap()),
+        &["127.0.0.1:1".to_owned()],
+    );
+    REFUSE_START.with(|refuse| refuse.set(true));
+    assert!(matches!(
+        proxy.reload(compile(&moved).unwrap()),
+        Err(ProxyError::RateLimitThread(_))
+    ));
+    assert_eq!(
+        proxy.current.load().generation,
+        generation,
+        "runs on as it was"
+    );
+    assert!(Arc::ptr_eq(&running, &hub_of(&proxy)), "its thread kept");
+    assert!(!destination.is_retired(), "its destination kept");
+
+    // Started already: nothing more is started, though it would be refused.
+    REFUSE_START.with(|refuse| refuse.set(true));
+    proxy.start_rate_limits(|| {}).unwrap();
+    assert!(Arc::ptr_eq(&running, &hub_of(&proxy)));
+    REFUSE_START.with(|refuse| refuse.set(false));
+
+    proxy.reload(compile(&moved).unwrap()).unwrap();
+    assert!(destination.is_retired(), "taken in, it retires");
+}
+
+/// A worker follows the thread a reload starts: its limiter is made afresh on the new one,
+/// and the thread replaced, held by nothing then, ends.
+#[tokio::test]
+async fn a_worker_moves_to_the_thread_a_reload_starts() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let service = service().await;
+            let (upstream, _) = counting_upstream().await;
+            let mut config = limited(everything_config(upstream), &service);
+            let proxy = Arc::new(started(&config, NonZeroUsize::MIN));
+            let worker = Worker::with_deadlines(Arc::clone(&proxy), H1Limits::default(), SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let first = hub_of(&proxy);
+            let ended = first.ended();
+            drop(first);
+            for at in 0..2 {
+                if at == 1 {
+                    if let Some(service) = &mut config.rate_limit_service {
+                        service.cycle_ms = Some(20);
+                    }
+                    proxy.reload(compile(&config).unwrap()).unwrap();
+                }
+                send = within(send.ready()).await.unwrap();
+                let request = Request::get("http://example.test/")
+                    .version(Version::HTTP_2)
+                    .body(())
+                    .unwrap();
+                let (response, _) = send.send_request(request, true).unwrap();
+                let response = within(response).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "request {at}");
+            }
+            until(ended).await;
+        })
+        .await;
+}
+
+/// A request under a limit that comes before the data plane's rate limits are started is
+/// refused as one they cannot decide, 503, never let through unlimited; once they are
+/// started, the limit holds it.
+#[tokio::test]
+async fn a_limit_not_started_refuses_rather_than_admits() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let service = service().await;
+            let (upstream, _) = counting_upstream().await;
+            let config = limited(everything_config(upstream), &service);
+            let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+            let worker = Worker::with_deadlines(Arc::clone(&proxy), H1Limits::default(), SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let mut statuses = Vec::new();
+            for at in 0..15 {
+                if at == 3 {
+                    proxy.start_rate_limits(|| {}).unwrap();
+                }
+                send = within(send.ready()).await.unwrap();
+                let request = Request::get("http://example.test/")
+                    .version(Version::HTTP_2)
+                    .body(())
+                    .unwrap();
+                let (response, _) = send.send_request(request, true).unwrap();
+                let response = within(response).await.unwrap();
+                statuses.push(response.status().as_u16());
+            }
+            assert_eq!(statuses[..3], [503; 3], "{statuses:?}");
+            assert_eq!(tally(&statuses[3..]), (10, 2), "{statuses:?}");
+            let scrape = worker.proxy().metrics();
+            assert!(
+                scrape.contains(r#"reason="rate_limit_deferred"} 3"#),
+                "{scrape}"
+            );
+        })
+        .await;
 }
 
 /// What a rate-limiting thread tells if it fails, counted.
@@ -646,13 +815,8 @@ async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
     }
     let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
     let (failed, failures) = told_failures();
-    proxy.watch_rate_limits(failed);
-    let service = compile(&config)
-        .unwrap()
-        .rate_limit_service()
-        .unwrap()
-        .clone();
-    let first = proxy.hub(&service).unwrap();
+    proxy.start_rate_limits(failed).unwrap();
+    let first = hub_of(&proxy);
     let ended = first.ended();
     let (answers, _answered) = tokio::sync::mpsc::unbounded_channel();
     first.to.send(ToHub::Join { worker: 0, answers }).unwrap();
@@ -673,9 +837,11 @@ async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
         })
         .unwrap();
     until(|| exchanges.load(Ordering::Relaxed) > before).await;
-    let mut changed = service.clone();
-    changed.cycle *= 2;
-    let second = proxy.hub(&changed).unwrap();
+    if let Some(service) = &mut config.rate_limit_service {
+        service.cycle_ms = Some(20);
+    }
+    proxy.reload(compile(&config).unwrap()).unwrap();
+    let second = hub_of(&proxy);
     drop(first);
     until(ended).await;
     assert_eq!(failures(), 0, "the replaced thread told");
@@ -750,7 +916,7 @@ async fn two_workers_share_a_clients_bucket(
                 sharing(service);
             }
             let workers = NonZeroUsize::new(2).unwrap();
-            let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), workers).unwrap());
+            let proxy = Arc::new(started(&config, workers));
             let limits = H1Limits {
                 sweep: Duration::from_millis(20),
                 ..H1Limits::default()
@@ -819,7 +985,7 @@ async fn a_dry_run_counts_what_it_would_refuse_and_refuses_nothing() {
                 )
                 .unwrap(),
             );
-            let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+            let proxy = started(&config, NonZeroUsize::MIN);
             let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
             let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let front = socket.local_addr().unwrap();
@@ -872,7 +1038,7 @@ async fn a_dry_run_counts_what_it_would_refuse_and_refuses_nothing() {
 /// The scrape shows what the keys hold against the data plane's bound; a bound too small to
 /// keep any key evicts each once its requests are over; and the bound is the process's,
 /// its keys held once for all its workers: one and a half keys' worth on two workers keeps
-/// the one key.
+/// the one key. A bound a reload sets before any request is held to as one set at start.
 #[tokio::test]
 async fn the_keys_held_are_shown_and_kept_within_their_bound() {
     let local = tokio::task::LocalSet::new();
@@ -882,18 +1048,28 @@ async fn the_keys_held_are_shown_and_kept_within_their_bound() {
             let (upstream, _) = counting_upstream().await;
             // What the one key holds, as the first case's scrape says.
             let mut one_key = 0;
-            for (case, workers, held) in [(0, 1, true), (1, 1, false), (2, 2, true)] {
+            for (case, workers, held) in [(0, 1, true), (1, 1, false), (2, 2, true), (3, 1, false)]
+            {
                 let max = match case {
                     0 => None,
-                    1 => Some(1),
+                    1 | 3 => Some(1),
                     _ => Some(one_key * 3 / 2),
                 };
                 let mut config = limited(everything_config(upstream), &service);
-                if let Some(service) = &mut config.rate_limit_service {
-                    service.max_key_bytes = max;
-                }
                 let workers = NonZeroUsize::new(workers).unwrap();
-                let proxy = Proxy::new(compile(&config).unwrap(), workers).unwrap();
+                let proxy = if case == 3 {
+                    let proxy = started(&config, workers);
+                    if let Some(service) = &mut config.rate_limit_service {
+                        service.max_key_bytes = max;
+                    }
+                    proxy.reload(compile(&config).unwrap()).unwrap();
+                    proxy
+                } else {
+                    if let Some(service) = &mut config.rate_limit_service {
+                        service.max_key_bytes = max;
+                    }
+                    started(&config, workers)
+                };
                 // Swept often: the sweep is what says what the keys hold.
                 let limits = H1Limits {
                     sweep: Duration::from_millis(20),
@@ -1028,7 +1204,7 @@ async fn a_reload_keeps_a_limit_as_it_was_and_starts_a_changed_one_afresh() {
                 let service = service().await;
                 let mut config = limited(everything_config(upstream), &service);
                 config.limits = Some(limits(PER_CLIENT));
-                let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+                let proxy = started(&config, NonZeroUsize::MIN);
                 let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
                 let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let front = socket.local_addr().unwrap();
@@ -1078,7 +1254,7 @@ async fn each_limit_counts_what_it_admitted_and_refused() {
             let service = service().await;
             let (upstream, _) = counting_upstream().await;
             let quiet = everything_config(upstream);
-            let proxy = Proxy::new(compile(&quiet).unwrap(), NonZeroUsize::MIN).unwrap();
+            let proxy = started(&quiet, NonZeroUsize::MIN);
             assert!(!proxy.metrics().contains("edgerush_rate_limit"));
             let mut config = limited(everything_config(upstream), &service);
             config.routes[0].rules[0].rate_limits =
@@ -1093,7 +1269,7 @@ async fn each_limit_counts_what_it_admitted_and_refused() {
                 )
                 .unwrap(),
             );
-            let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
+            let proxy = started(&config, NonZeroUsize::MIN);
             let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
             let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let front = socket.local_addr().unwrap();

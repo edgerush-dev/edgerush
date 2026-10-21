@@ -10,6 +10,8 @@
 
 mod hub;
 
+#[cfg(test)]
+pub(crate) use hub::REFUSE_START;
 pub(crate) use hub::{Failed, Hub};
 
 use crate::forwarding::Client as Requester;
@@ -191,22 +193,11 @@ impl Limiter {
         limiter
     }
 
-    /// Whether it reaches `service` as it is set now: the same pods, the same cycle, the
-    /// same levers. A change of what its keys may hold is taken as it is
-    /// ([`Self::set_capacity`]).
-    pub(crate) fn serves(&self, service: &CompiledRateLimitService) -> bool {
-        self.service.pods == service.pods
-            && self.service.cycle == service.cycle
-            && self.service.poll_quiet_keys == service.poll_quiet_keys
-            && self.service.ask_cold_keys == service.ask_cold_keys
-            && self.service.schedule_keys == service.schedule_keys
-    }
-
-    /// The bytes its process's keys may hold from now on, which its first worker passes on.
-    pub(crate) fn set_capacity(&self, max_key_bytes: u64) {
-        if self.index == 0 {
-            let _gone = self.hub.to.send(ToHub::Capacity(max_key_bytes));
-        }
+    /// Whether it is a limiter of the process thread `hub`. The thread is kept while the
+    /// service's pods, cycle and levers are; a change of what its keys may hold is taken as
+    /// it is ([`Hub::set_capacity`]).
+    pub(crate) fn is_on(&self, hub: &Arc<Hub>) -> bool {
+        Arc::ptr_eq(&self.hub, hub)
     }
 
     /// What its process's keys hold, in bytes, how many there are, and how many it has

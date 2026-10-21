@@ -149,11 +149,12 @@ impl Worker {
     }
 
     /// How a request from `client` fares against the rate limits of `rule` it is under,
-    /// `limited` marking them.
+    /// `limited` marking them: undecided, never admitted unlimited, with no thread to
+    /// decide them with.
     fn rate_limits(&self, rule: &CompiledRule, limited: u64, client: &Client) -> Limited {
         match self.limiter() {
             Some(limiter) => limiter.decide_all(&rule.limits, limited, client),
-            None => Limited::Admit,
+            None => Limited::Overloaded,
         }
     }
 
@@ -278,30 +279,34 @@ impl Worker {
         response
     }
 
-    /// The worker's limiter, made when first needed and again when the service's settings
-    /// change; `None` with no service to reach, which a config that limits always names.
+    /// The worker's limiter, made when first needed and again when the process's thread is
+    /// replaced; `None` with no thread to decide with: no service, which a config that
+    /// limits always names, or rate limits not started.
     fn limiter(&self) -> Option<Rc<Limiter>> {
-        let snapshot = self.proxy.current.load();
+        let generation = self.proxy.current.load().generation;
         let mut held = self.limiter.borrow_mut();
-        if let Some((generation, limiter)) = held.as_ref()
-            && *generation == snapshot.generation
+        if let Some((made_for, limiter)) = held.as_ref()
+            && *made_for == generation
         {
             return Some(Rc::clone(limiter));
         }
-        let service = snapshot.config.rate_limit_service()?;
+        let (snapshot, hub) = self.proxy.hub();
+        let (Some(service), Some(hub)) = (snapshot.config.rate_limit_service(), hub) else {
+            if let Some((_, old)) = held.take() {
+                old.stop();
+            }
+            return None;
+        };
         if let Some((_, limiter)) = held.as_ref()
-            && limiter.serves(service)
+            && limiter.is_on(&hub)
         {
             let limiter = Rc::clone(limiter);
-            // The process's keys, held once (06 §8).
-            limiter.set_capacity(service.max_key_bytes);
             *held = Some((snapshot.generation, Rc::clone(&limiter)));
             return Some(limiter);
         }
         if let Some((_, old)) = held.take() {
             old.stop();
         }
-        let hub = self.proxy.hub(service)?;
         let limiter = Limiter::new(service, hub, usize::from(self.position));
         *held = Some((snapshot.generation, Rc::clone(&limiter)));
         Some(limiter)

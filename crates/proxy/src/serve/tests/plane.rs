@@ -148,6 +148,7 @@ fn a_snapshot_knows_where_it_has_the_listeners_that_have_sockets() {
             vec![None; sockets.len()],
         )
         .unwrap()
+        .0
         .listeners
     };
 
