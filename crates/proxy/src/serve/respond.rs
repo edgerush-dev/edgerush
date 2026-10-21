@@ -213,7 +213,7 @@ impl Worker {
                 Limited::Later(decided) => {
                     let proxy = Arc::clone(&self.proxy);
                     let _counted = tokio::task::spawn_local(async move {
-                        if let Ok(Ok(decided)) = decided.await {
+                        if let Ok(decided) = decided.decided().await {
                             count(&proxy, decided.admitted);
                         }
                     });
@@ -402,15 +402,9 @@ impl Worker {
                 let (admitted, told) = match self.rate_limits(rule, enforced, requester) {
                     Limited::Admit => (true, None),
                     Limited::Refuse => (false, None),
-                    Limited::Later(decided) => match decided.await {
-                        Ok(Ok(decided)) => (decided.admitted, Some(decided.refused_by)),
-                        Ok(Err(why)) => return self.undecided(listener, why, call).into(),
-                        // The limiter went with the request still waiting.
-                        Err(_) => {
-                            return self
-                                .undecided(listener, Undecided::Unavailable, call)
-                                .into();
-                        }
+                    Limited::Later(decided) => match decided.decided().await {
+                        Ok(decided) => (decided.admitted, Some(decided.refused_by)),
+                        Err(why) => return self.undecided(listener, why, call).into(),
                     },
                     Limited::Undecided(why) => return self.undecided(listener, why, call).into(),
                 };

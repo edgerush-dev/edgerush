@@ -95,13 +95,18 @@ fn key_into(buffer: &mut Vec<u8>, name: &str, definition: [u8; 8], key: KeyValue
     }
 }
 
-/// How long a request may wait deferred: an ask's own time, which a hold it waits on may
-/// take to settle, and a little more.
-pub(crate) const DEFER_WAIT: Duration = Duration::from_millis(400);
+/// How long a request may wait on its rate limits in all, from when its worker's limiter
+/// first meets it, wherever it waits — deferred, queued for the process, asked about, handed
+/// back: an ask's own time, which a hold it waits on may take to settle, and a little more.
+/// Fixed, until measuring shows that setting it would be worth what it costs.
+pub(crate) const WAIT: Duration = Duration::from_millis(400);
 
-/// The most requests a worker, or its process, holds deferred at once: past it, a request
-/// is answered as the gateway's own overload.
-pub(crate) const MOST_DEFERRED: usize = 1_024;
+/// The most requests a worker has waiting on its rate limits at once — asked about,
+/// deferred, or dry runs whose answer is to come — past which a request is answered
+/// [`Undecided::Full`]. A place is held until nothing is left of the request's wait: an
+/// ask's until the process answers it, even once the request has gone, so that what its
+/// process holds of a worker's, queued or asking, is within it too.
+pub(crate) const MOST_WAITING: usize = 1_024;
 
 /// The most entries a worker keeps signalled between syncs: a key signals at most once each
 /// time its count starts, so a millisecond's worth for any worker; past it, the worker asks
@@ -114,12 +119,43 @@ pub(crate) enum Limited {
     Admit,
     /// Over it.
     Refuse,
-    /// Asked about or deferred: its decision comes, or why there is none. A sender dropped
-    /// unanswered is the limiter gone: [`Undecided::Unavailable`].
-    Later(oneshot::Receiver<Result<Decided, Undecided>>),
+    /// Asked about or deferred: its decision comes, or why there is none.
+    Later(Later),
     /// Not decided, and not to be: why.
     Undecided(Undecided),
 }
+
+/// A request's decision to come, and how long it may be waited for.
+pub(crate) struct Later {
+    decided: oneshot::Receiver<Result<Decided, Undecided>>,
+    until: tokio::time::Instant,
+}
+
+impl Later {
+    /// The decision; or, once its time is up, [`Undecided::Timeout`], wherever the request
+    /// waits — the place it holds is kept until what it waits on is done; or, with its
+    /// sender dropped unanswered, the limiter gone: [`Undecided::Unavailable`].
+    pub(crate) async fn decided(self) -> Result<Decided, Undecided> {
+        match tokio::time::timeout_at(self.until, self.decided).await {
+            Ok(Ok(decided)) => decided,
+            Ok(Err(_)) => Err(Undecided::Unavailable),
+            Err(_) => Err(Undecided::Timeout),
+        }
+    }
+}
+
+/// A place held among those a worker has for requests waiting on its rate limits: given
+/// back when dropped.
+struct Reservation(Rc<Cell<usize>>);
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
+/// Where an asked-about request's decision goes, and the place it holds until then.
+type Asked = (oneshot::Sender<Result<Decided, Undecided>>, Reservation);
 
 /// Why a request's rate limits did not decide it: each the gateway's own trouble, answered
 /// 503, never as over a limit (06 §4).
@@ -149,11 +185,14 @@ pub(crate) struct Limiter {
     /// The next ask's number.
     next: Cell<u64>,
     /// Its asks waiting on its process, by number.
-    asked: RefCell<HashMap<u64, oneshot::Sender<Result<Decided, Undecided>>>>,
-    /// What its deferred requests wait on, and how many there are, and may be.
+    asked: RefCell<HashMap<u64, Asked>>,
+    /// What its deferred requests wait on.
     settled: Arc<Notify>,
-    deferring: Cell<usize>,
-    most_deferred: Cell<usize>,
+    /// How many requests wait on its rate limits, and how many may.
+    waiting: Rc<Cell<usize>>,
+    most_waiting: Cell<usize>,
+    /// How long each may wait in all: [`WAIT`], but for a test.
+    wait: Cell<Duration>,
     /// With keys visited only when they need it, the entries its decisions signalled since
     /// it last handed them to its process: every sync, at most `MOST_SIGNALLED`.
     signalled: RefCell<Vec<Arc<Entry>>>,
@@ -191,8 +230,9 @@ impl Limiter {
             next: Cell::new(0),
             asked: RefCell::new(HashMap::new()),
             settled,
-            deferring: Cell::new(0),
-            most_deferred: Cell::new(MOST_DEFERRED),
+            waiting: Rc::new(Cell::new(0)),
+            most_waiting: Cell::new(MOST_WAITING),
+            wait: Cell::new(WAIT),
             signalled: RefCell::new(Vec::new()),
             keys: RefCell::new(Vec::new()),
             contracts: RefCell::new(Vec::new()),
@@ -232,6 +272,24 @@ impl Limiter {
         u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
+    /// A place for a request to wait in, if one is left.
+    fn reserve(&self) -> Option<Reservation> {
+        let waiting = self.waiting.get();
+        (waiting < self.most_waiting.get()).then(|| {
+            self.waiting.set(waiting + 1);
+            Reservation(Rc::clone(&self.waiting))
+        })
+    }
+
+    /// When a request the limiter meets at `now` must be decided by: in the process's clock,
+    /// which every worker and the process read, and as an instant to wait until.
+    fn deadline(&self, now: u64) -> (u64, tokio::time::Instant) {
+        let wait = self.wait.get();
+        let at = now.saturating_add(u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX));
+        let until = self.start + Duration::from_nanos(at);
+        (at, tokio::time::Instant::from_std(until))
+    }
+
     /// Decides a request from `client` under those of `limits` that `limited` marks, bit `n`
     /// for the `n`th: each counted by its key — the limit's name, a zero, the key's value —
     /// and all decided at once, admitted under all of them or none (06 §2). A limit the
@@ -252,8 +310,8 @@ impl Limiter {
             match outcome.local {
                 PooledLocal::Admit => Limited::Admit,
                 PooledLocal::Refuse => Limited::Refuse,
-                PooledLocal::Ask => self.ask(parts),
-                PooledLocal::Defer => self.defer(parts),
+                PooledLocal::Ask => self.ask(parts, now),
+                PooledLocal::Defer => self.defer(parts, now),
             }
         })
     }
@@ -404,7 +462,9 @@ impl Limiter {
                             handles.replace(Handle::new(entry));
                         }
                         drop(handles);
-                        if let Some(waiter) = self.asked.borrow_mut().remove(&id) {
+                        // Its place given back with it, the request there or gone.
+                        let asked = self.asked.borrow_mut().remove(&id);
+                        if let Some((waiter, _place)) = asked {
                             let decided = match undecided {
                                 Some(why) => Err(why),
                                 None => Ok(Decided {
@@ -419,7 +479,8 @@ impl Limiter {
                     // The process is gone: what still waits on it is told so, rather than
                     // left waiting for an answer that cannot come.
                     None => {
-                        for (_, waiter) in self.asked.borrow_mut().drain() {
+                        let asked = std::mem::take(&mut *self.asked.borrow_mut());
+                        for (_, (waiter, _place)) in asked {
                             let _gone = waiter.send(Err(Undecided::Unavailable));
                         }
                         return;
@@ -545,18 +606,27 @@ impl Limiter {
         }
     }
 
-    /// A request under `parts` asked of the process; undecided if it is gone.
-    fn ask(&self, parts: &[(&[u8], Contract)]) -> Limited {
-        match self.ask_process(parts) {
-            Some(later) => Limited::Later(later),
-            None => Limited::Undecided(Undecided::Unavailable),
+    /// A request under `parts`, met at `now`, asked of the process; undecided if it has no
+    /// place to wait in, or the process is gone.
+    fn ask(&self, parts: &[(&[u8], Contract)], now: u64) -> Limited {
+        let Some(place) = self.reserve() else {
+            return Limited::Undecided(Undecided::Full);
+        };
+        let (at, until) = self.deadline(now);
+        let (decided, later) = oneshot::channel();
+        match self.send_ask(parts, at, (decided, place)) {
+            Ok(()) => Limited::Later(Later {
+                decided: later,
+                until,
+            }),
+            Err(_) => Limited::Undecided(Undecided::Unavailable),
         }
     }
 
-    fn ask_process(
-        &self,
-        parts: &[(&[u8], Contract)],
-    ) -> Option<oneshot::Receiver<Result<Decided, Undecided>>> {
+    /// Asks the process about a request under `parts`, to be decided by `at`: its decision
+    /// to go where `asked` says, its place kept until the process answers. Handed back if
+    /// the process is gone.
+    fn send_ask(&self, parts: &[(&[u8], Contract)], at: u64, asked: Asked) -> Result<(), Asked> {
         let id = self.next.get();
         self.next.set(id.wrapping_add(1));
         let keys = parts
@@ -567,43 +637,49 @@ impl Limiter {
             worker: self.index,
             id,
             keys,
+            until: at,
         };
-        self.hub.to.send(message).ok()?;
-        let (decided, later) = oneshot::channel();
-        self.asked.borrow_mut().insert(id, decided);
-        Some(later)
+        if self.hub.to.send(message).is_err() {
+            return Err(asked);
+        }
+        self.asked.borrow_mut().insert(id, asked);
+        Ok(())
     }
 
-    /// A request under `parts` deferred: decided again on a task of its own as its keys'
-    /// holds settle and counts drain, until its time is up; or, with as many deferred as
-    /// may be, undecided at once.
-    fn defer(self: &Rc<Self>, parts: &[(&[u8], Contract)]) -> Limited {
-        if self.deferring.get() >= self.most_deferred.get() {
+    /// A request under `parts`, met at `now`, deferred: decided again on a task of its own
+    /// as its keys' holds settle and counts drain, until its time is up; or, with no place
+    /// to wait in, undecided at once.
+    fn defer(self: &Rc<Self>, parts: &[(&[u8], Contract)], now: u64) -> Limited {
+        let Some(place) = self.reserve() else {
             return Limited::Undecided(Undecided::Full);
-        }
-        self.deferring.set(self.deferring.get() + 1);
+        };
+        let (at, until) = self.deadline(now);
         let keys: Vec<(Box<[u8]>, Contract)> = parts
             .iter()
             .map(|(key, contract)| ((*key).into(), *contract))
             .collect();
         let (decided, later) = oneshot::channel();
-        tokio::task::spawn_local(Rc::clone(self).deferred(keys, decided));
-        Limited::Later(later)
+        tokio::task::spawn_local(Rc::clone(self).deferred(keys, (decided, place), (at, until)));
+        Limited::Later(Later {
+            decided: later,
+            until,
+        })
     }
 
     /// A deferred request under `keys`, decided again whenever a hold settles or a count
-    /// drains anywhere in the process, until it is decided, its time is up, or nobody waits
-    /// for it any more.
+    /// drains anywhere in the process, until it is decided, asked about — its decision and
+    /// place handed to the ask — its time is up, or nobody waits for it any more.
     async fn deferred(
         self: Rc<Self>,
         keys: Vec<(Box<[u8]>, Contract)>,
-        mut decided: oneshot::Sender<Result<Decided, Undecided>>,
+        asked: Asked,
+        (at, deadline): (u64, tokio::time::Instant),
     ) {
+        let (mut decided, place) = asked;
         let parts: Vec<(&[u8], Contract)> = keys
             .iter()
             .map(|(key, contract)| (&**key, *contract))
             .collect();
-        let deadline = tokio::time::Instant::now() + DEFER_WAIT;
         let decision = |admitted| {
             Ok(Decided {
                 ticket: 0,
@@ -630,30 +706,35 @@ impl Limiter {
                 PooledLocal::Admit => break decision(true),
                 PooledLocal::Refuse => break decision(false),
                 PooledLocal::Ask => {
-                    break match self.ask_process(&parts) {
-                        Some(later) => later.await.unwrap_or(Err(Undecided::Unavailable)),
-                        None => Err(Undecided::Unavailable),
-                    };
+                    // The ask answers the request itself, and keeps its place till then.
+                    drop(_waiting);
+                    if let Err((decided, _place)) = self.send_ask(&parts, at, (decided, place)) {
+                        let _gone = decided.send(Err(Undecided::Unavailable));
+                    }
+                    return;
                 }
                 PooledLocal::Defer => {}
             }
             tokio::select! {
                 () = &mut woken => {}
                 () = tokio::time::sleep_until(deadline) => break Err(Undecided::Timeout),
-                () = decided.closed() => {
-                    self.deferring.set(self.deferring.get().saturating_sub(1));
-                    return;
-                }
+                () = decided.closed() => return,
             }
         };
-        self.deferring.set(self.deferring.get().saturating_sub(1));
+        drop(place);
         let _gone = decided.send(result);
     }
 
-    /// The most requests it holds deferred, for a test to fill.
+    /// The most requests it may have waiting, for a test to fill.
     #[cfg(test)]
-    pub(crate) fn set_most_deferred(&self, most: usize) {
-        self.most_deferred.set(most);
+    pub(crate) fn set_most_waiting(&self, most: usize) {
+        self.most_waiting.set(most);
+    }
+
+    /// How long each request may wait in all, for a test to run out.
+    #[cfg(test)]
+    pub(crate) fn set_wait(&self, wait: Duration) {
+        self.wait.set(wait);
     }
 }
 
