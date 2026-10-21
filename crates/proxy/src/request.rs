@@ -16,7 +16,7 @@
 //! the upstream is told of the client — `X-Forwarded-*` and `Via` — is made before routing,
 //! so that a rule reads what the upstream will ([`crate::forwarding`]).
 
-use crate::forwarding::{Client, forward};
+use crate::forwarding::{Client, Requester, forward};
 use crate::head::Head;
 use crate::hop_by_hop::ConnectionError;
 use crate::host::{HostError, bare_host};
@@ -83,6 +83,10 @@ pub struct Forward<'a> {
     /// was routed — the method, the host, the normalised path — before any rewrite
     /// ([07 §2](../../../docs/07-config-and-dsl.md)).
     pub limited: u64,
+    /// The client's address as forwarding worked it out for this request: whom a trusted
+    /// proxy names, or else the connection's client. A rate limit's key reads it
+    /// ([03 §11](../../../docs/03-data-plane.md)).
+    pub client: IpAddr,
 }
 
 /// What a limit's match reads of a request while it is routed (07 §2): no headers, which a
@@ -91,7 +95,7 @@ struct Routed<'a> {
     method: &'a str,
     host: &'a str,
     path: &'a str,
-    client: &'a Client,
+    client: Requester,
 }
 
 impl Context for Routed<'_> {
@@ -106,8 +110,8 @@ impl Context for Routed<'_> {
 
     fn address(&self, field: Address) -> Option<IpAddr> {
         match field {
-            Address::Client => Some(self.client.address()),
-            Address::Peer => self.client.peer().map(|peer| peer.ip()),
+            Address::Client => Some(self.client.address),
+            Address::Peer => self.client.peer,
         }
     }
 
@@ -371,7 +375,7 @@ pub fn decide_routed<'a, H: Head>(
     }
     // Before routing, so that a rule's predicates read what the upstream will be told, and
     // before the host is borrowed from the head for routing.
-    forward(head, listener, client, id)?;
+    let address = forward(head, listener, client, id)?;
     let host = match (named, head.uri().authority()) {
         (Some(length), Some(authority)) => {
             authority.as_str().get(..length).ok_or(HostError::Invalid)?
@@ -462,7 +466,10 @@ pub fn decide_routed<'a, H: Head>(
             },
             host,
             path: &path,
-            client,
+            client: Requester {
+                address,
+                peer: client.peer().map(|peer| peer.ip()),
+            },
         };
         limited(rule, &routed)
     };
@@ -569,6 +576,7 @@ pub fn decide_routed<'a, H: Head>(
         mirrors,
         websocket,
         limited,
+        client: address,
     }))
 }
 

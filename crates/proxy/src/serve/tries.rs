@@ -245,6 +245,7 @@ impl Worker {
                     rule: None,
                     limited: 0,
                     limit_slots: None,
+                    client: None,
                     upstream: Rc::clone(&mirror.upstream),
                     alone,
                     endpoint: Arc::clone(&mirror.endpoint),

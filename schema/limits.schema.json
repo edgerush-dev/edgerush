@@ -68,7 +68,7 @@
           "default": false
         },
         "key": {
-          "description": "Whose requests are counted together: `client`, the address the data plane sees — the\npeer, or the client a trusted PROXY protocol header names — an IPv6 client by its\n/64, which one client holds whole. Never what a client says.",
+          "description": "Whose requests are counted together: `client`, the client's address as forwarding\nworks it out for each request — the peer, or the client a trusted PROXY protocol\nheader names, or the client a trusted proxy's `X-Forwarded-For` names — an IPv6\nclient by its /64, which one client holds whole. Never what an untrusted client says.",
           "type": "string"
         },
         "match": {

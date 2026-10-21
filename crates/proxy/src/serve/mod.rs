@@ -75,7 +75,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
@@ -794,6 +794,9 @@ struct Directed {
     limited: u64,
     /// The slots of the config's rate limits, by position, for a request under any.
     limit_slots: Option<Arc<[usize]>>,
+    /// For a request under any rate limit, its client's address as forwarding worked it
+    /// out ([`crate::request::Forward::client`]): what its limits' keys read.
+    client: Option<IpAddr>,
     /// The worker's state for its upstream: where it is counted, the places it holds, its
     /// retry budget and its balancer.
     upstream: Rc<balancing::Upstream>,

@@ -8,7 +8,7 @@ use super::{
 };
 use crate::balance::Tried;
 use crate::downstream::h1::connection::{self as h1, Answered};
-use crate::forwarding::Client;
+use crate::forwarding::{Client, Requester};
 use crate::grpc::answer::{Answered as GrpcAnswered, is_grpc_answer};
 use crate::grpc::call::Call;
 use crate::head::Forwarded;
@@ -151,7 +151,7 @@ impl Worker {
     /// How a request from `client` fares against the rate limits of `rule` it is under,
     /// `limited` marking them: undecided, never admitted unlimited, with no thread to
     /// decide them with.
-    fn rate_limits(&self, rule: &CompiledRule, limited: u64, client: &Client) -> Limited {
+    fn rate_limits(&self, rule: &CompiledRule, limited: u64, client: Requester) -> Limited {
         match self.limiter() {
             Some(limiter) => limiter.decide_all(&rule.limits, limited, client),
             None => Limited::Overloaded,
@@ -184,7 +184,7 @@ impl Worker {
     /// never holding it up: one with room is charged and counts it admitted; one without
     /// counts it `dry_run_refused` and lets it go on. A key held no fresh copy of is asked
     /// about, and counted when the answer comes.
-    fn dry_run(&self, under: Under<'_>, client: &Client) {
+    fn dry_run(&self, under: Under<'_>, client: Requester) {
         let Some(limiter) = self.limiter() else {
             return;
         };
@@ -248,7 +248,7 @@ impl Worker {
         &self,
         listener: usize,
         under: Under<'_>,
-        client: &Client,
+        client: Requester,
         call: Option<Call>,
         told: &[(usize, u64)],
     ) -> Response<Body> {
@@ -387,12 +387,17 @@ impl Worker {
         // Dry runs are decided apart, once the others admit it (06 §2).
         if directed.limited != 0
             && let Some(rule) = &directed.rule
+            && let Some(address) = directed.client
         {
+            let requester = Requester {
+                address,
+                peer: client.peer().map(|peer| peer.ip()),
+            };
             let slots = directed.limit_slots.as_deref().unwrap_or_default();
             let dry = directed.limited & dry_runs(rule);
             let enforced = directed.limited & !dry;
             if enforced != 0 {
-                let (admitted, told) = match self.rate_limits(rule, enforced, client) {
+                let (admitted, told) = match self.rate_limits(rule, enforced, requester) {
                     Limited::Admit => (true, None),
                     Limited::Refuse => (false, None),
                     Limited::Later(decided) => match decided.await {
@@ -408,7 +413,7 @@ impl Worker {
                 };
                 if !admitted {
                     let told = told.as_deref().unwrap_or_default();
-                    return self.refused(listener, under, client, call, told).into();
+                    return self.refused(listener, under, requester, call, told).into();
                 }
                 self.count_limits(rule, enforced, slots, |counters| &counters.admitted);
             }
@@ -418,7 +423,7 @@ impl Worker {
                     marked: dry,
                     slots,
                 };
-                self.dry_run(under, client);
+                self.dry_run(under, requester);
             }
         }
         // A WebSocket that an HTTP/2 or HTTP/3 client asks for holds a backend of its own
@@ -812,6 +817,7 @@ impl Proxy {
         Ok(Directing::Upstream(Directed {
             rule: kept.then(|| Arc::clone(forward.rule)),
             limited: forward.limited,
+            client: (forward.limited != 0).then_some(forward.client),
             limit_slots: (forward.limited != 0).then(|| Arc::clone(&snapshot.limit_slots)),
             upstream: balance,
             endpoint: Arc::clone(identity),

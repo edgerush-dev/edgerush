@@ -165,6 +165,14 @@ fn started(config: &Config, workers: NonZeroUsize) -> Proxy {
     proxy
 }
 
+/// A request's client at `address`, no trusted proxy's.
+fn requester(address: &str) -> crate::forwarding::Requester {
+    crate::forwarding::Requester {
+        address: address.parse().unwrap(),
+        peer: None,
+    }
+}
+
 fn tally(statuses: &[u16]) -> (usize, usize) {
     (
         statuses.iter().filter(|s| **s == 200).count(),
@@ -212,6 +220,89 @@ async fn http2_requests_are_held_to_their_limit() {
             assert!(answer.headers().get("ratelimit").is_none());
         })
         .await;
+}
+
+/// Behind a trusted proxy each of its clients is held to a bucket of its own, the client
+/// being whom its `X-Forwarded-For` names, as forwarding works it out (03 §11, 06 §2): the
+/// eleventh request of each is refused. From a peer that is no trusted proxy the field is
+/// not believed, and every request counts as the peer's. Over HTTP/1.1 and HTTP/2, the
+/// clients' requests coming on one connection.
+#[tokio::test]
+async fn a_trusted_proxys_clients_are_each_held_to_their_own_limit() {
+    let mut forwarded_for = vec!["198.51.100.1"; 11];
+    forwarded_for.extend(["2001:db8::1"; 11]);
+    let mut each_their_own = vec![200; 22];
+    each_their_own[10] = 429;
+    each_their_own[21] = 429;
+    let mut all_the_peers = vec![429; 22];
+    all_the_peers[..10].fill(200);
+    for version in [Version::HTTP_11, Version::HTTP_2] {
+        assert_eq!(
+            statuses_from(version, &["127.0.0.0/8"], &forwarded_for).await,
+            each_their_own,
+            "trusted, {version:?}"
+        );
+        assert_eq!(
+            statuses_from(version, &[], &forwarded_for).await,
+            all_the_peers,
+            "not trusted, {version:?}"
+        );
+    }
+}
+
+/// The statuses of requests from 127.0.0.1, one for each of `forwarded_for`, which each
+/// says as its `X-Forwarded-For`, all on one connection of `version`, to a listener trusting
+/// `trusted` under ten requests an hour for each client.
+async fn statuses_from(version: Version, trusted: &[&str], forwarded_for: &[&str]) -> Vec<u16> {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let service = service().await;
+            let (upstream, _) = counting_upstream().await;
+            let config = limited(forwarding_config(upstream, trusted), &service);
+            let proxy = started(&config, NonZeroUsize::MIN);
+            let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+            let mut statuses = Vec::new();
+            if version == Version::HTTP_2 {
+                let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+                for client in forwarded_for {
+                    send = within(send.ready()).await.unwrap();
+                    let request = Request::get("http://example.test/")
+                        .version(Version::HTTP_2)
+                        .header("x-forwarded-for", *client)
+                        .body(())
+                        .unwrap();
+                    let (response, _) = send.send_request(request, true).unwrap();
+                    statuses.push(within(response).await.unwrap().status().as_u16());
+                }
+            } else {
+                let stream = TcpStream::connect(front).await.unwrap();
+                let (mut sender, connection) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                        .await
+                        .unwrap();
+                let _driving = tokio::task::spawn_local(async move {
+                    let _closed = connection.await;
+                });
+                for client in forwarded_for {
+                    within(sender.ready()).await.unwrap();
+                    let request = Request::get("/")
+                        .header("host", "example.test")
+                        .header("x-forwarded-for", *client)
+                        .body(Empty::<Bytes>::new())
+                        .unwrap();
+                    let response = within(sender.send_request(request)).await.unwrap();
+                    statuses.push(response.status().as_u16());
+                    // Read to its end, so that the connection is free for the next.
+                    let _body = within(response.into_body().collect()).await.unwrap();
+                }
+            }
+            statuses
+        })
+        .await
 }
 
 /// Two workers of one data plane share a client's bucket through each key's one entry: a
@@ -328,7 +419,7 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
             let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
             let limiter = Limiter::new(&service, hub, 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
-            let client = crate::forwarding::Client::new("203.0.113.7".parse().unwrap());
+            let client = requester("203.0.113.7");
             let decided = |limited: Limited| async move {
                 match limited {
                     Limited::Admit => Some(true),
@@ -338,21 +429,21 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
                 }
             };
             // X alone, asked about and given up: decided from its copy, one of its two taken.
-            let first = limiter.decide_all(&rule.limits, 0b01, &client);
+            let first = limiter.decide_all(&rule.limits, 0b01, client);
             assert_eq!(within(decided(first)).await, Some(true));
             // X and Y: X's last token held while Y, cold, is asked about.
-            let both = limiter.decide_all(&rule.limits, 0b11, &client);
+            let both = limiter.decide_all(&rule.limits, 0b11, client);
             assert!(matches!(both, Limited::Later(_)));
             tokio::time::sleep(Duration::from_millis(50)).await;
             // X alone again, short only by that hold: with none to be deferred, overloaded.
             limiter.set_most_deferred(0);
             assert!(matches!(
-                limiter.decide_all(&rule.limits, 0b01, &client),
+                limiter.decide_all(&rule.limits, 0b01, client),
                 Limited::Overloaded
             ));
             limiter.set_most_deferred(MOST_DEFERRED);
             // Deferred, and decided once the hold settles: X and Y admitted, X is spent.
-            let Limited::Later(alone) = limiter.decide_all(&rule.limits, 0b01, &client) else {
+            let Limited::Later(alone) = limiter.decide_all(&rule.limits, 0b01, client) else {
                 panic!("not deferred");
             };
             assert_eq!(within(decided(both)).await, Some(true));
@@ -389,9 +480,9 @@ async fn a_cold_key_decided_locally_does_not_wait_for_the_service() {
                 let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
                 let limiter = Limiter::new(&service, hub, 0);
                 let rule = Arc::clone(&compiled.rules_of(0)[0]);
-                let client = crate::forwarding::Client::new("203.0.113.9".parse().unwrap());
+                let client = requester("203.0.113.9");
                 let started = Instant::now();
-                let first = limiter.decide_all(&rule.limits, 0b1, &client);
+                let first = limiter.decide_all(&rule.limits, 0b1, client);
                 if ask_cold {
                     let Limited::Later(first) = first else {
                         panic!("the first goes to the process");
@@ -408,7 +499,7 @@ async fn a_cold_key_decided_locally_does_not_wait_for_the_service() {
                         "decided by the worker at once"
                     );
                     assert!(matches!(
-                        limiter.decide_all(&rule.limits, 0b1, &client),
+                        limiter.decide_all(&rule.limits, 0b1, client),
                         Limited::Admit
                     ));
                     // The process keeps the worker's entry, to report what it admitted.
@@ -446,7 +537,7 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
             let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
             let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
-            let client = crate::forwarding::Client::new("203.0.113.9".parse().unwrap());
+            let client = requester("203.0.113.9");
             let settle = || async {
                 // Quiet once a few cycles pass with no exchange.
                 let mut last = exchanges.load(Ordering::Relaxed);
@@ -460,13 +551,13 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
                 }
             };
             assert!(matches!(
-                limiter.decide_all(&rule.limits, 0b1, &client),
+                limiter.decide_all(&rule.limits, 0b1, client),
                 Limited::Admit
             ));
             let quiet = within(settle()).await;
             assert!(quiet > 0, "the new key reported");
             assert!(matches!(
-                limiter.decide_all(&rule.limits, 0b1, &client),
+                limiter.decide_all(&rule.limits, 0b1, client),
                 Limited::Admit
             ));
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -502,10 +593,10 @@ async fn a_late_answer_does_not_give_back_a_spent_bucket() {
             let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
             let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
-            let client = crate::forwarding::Client::new("203.0.113.9".parse().unwrap());
+            let client = requester("203.0.113.9");
             let admitted = || {
                 (0..5)
-                    .map(|_| limiter.decide_all(&rule.limits, 0b1, &client))
+                    .map(|_| limiter.decide_all(&rule.limits, 0b1, client))
                     .filter(|limited| matches!(limited, Limited::Admit))
                     .count()
             };
@@ -1362,14 +1453,14 @@ async fn a_refusal_is_put_down_to_the_limits_the_pod_named() {
             let hub = crate::ratelimit::Hub::start(&service, 1, u64::MAX, None).unwrap();
             let limiter = crate::ratelimit::Limiter::new(&service, hub, 0);
             let rule = Arc::clone(&compiled.rules_of(0)[0]);
-            let client = crate::forwarding::Client::new("203.0.113.7".parse().unwrap());
+            let client = requester("203.0.113.7");
             let told = [(1, 5_000_000_000)];
-            let refusal = limiter.refusal(&rule.limits, 0b11, &client, &told);
+            let refusal = limiter.refusal(&rule.limits, 0b11, client, &told);
             assert_eq!(refusal.by, 0b10, "wide, the second");
             let (limit, wait) = refusal.longest.unwrap();
             assert_eq!(limit.name, "wide");
             assert_eq!(wait, Duration::from_secs(5));
-            let unsaid = limiter.refusal(&rule.limits, 0b11, &client, &[]);
+            let unsaid = limiter.refusal(&rule.limits, 0b11, client, &[]);
             assert_eq!(unsaid.by, 0, "the entries know nothing");
             limiter.stop();
         })
