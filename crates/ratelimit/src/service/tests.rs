@@ -437,6 +437,36 @@ fn the_owner_counts_those_admitting_as_of_its_latest_traffic() {
     );
 }
 
+/// A report sent again, its batch applied already, keeps its data plane counted with those
+/// admitting as of the latest admission, and no later: arriving long after a burst, it
+/// leaves the data planes that admitted together counted together. One that brings a batch
+/// not applied yet is an admission then, however late it comes.
+#[test]
+fn a_report_sent_again_admits_no_later_than_the_latest() {
+    let (owner, _, _) = roles(b"k");
+    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 1));
+    for plane in 1..=3 {
+        pod.on_batch(batch(plane, hits(1, 1, 0)), 0);
+    }
+    // Its answer lost, the first data plane's batch is sent again, and comes late.
+    let answer = pod.on_batch(batch(1, hits(1, 1, 0)), 400 * MS);
+    assert_eq!(answer.entries[0].others, 2, "the three still together");
+    let answer = pod.on_batch(batch(1, hits(2, 1, 1)), 400 * MS);
+    assert_eq!(
+        answer.entries[0].others, 0,
+        "a new batch, the others long before"
+    );
+
+    // While another admits, one whose batch comes again is counted with it.
+    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 1));
+    pod.on_batch(batch(1, hits(1, 1, 0)), 0);
+    pod.on_batch(batch(2, hits(1, 1, 0)), 0);
+    pod.on_batch(batch(2, hits(2, 1, 1)), 250 * MS);
+    pod.on_batch(batch(1, hits(1, 1, 0)), 250 * MS);
+    let answer = pod.on_batch(batch(2, hits(3, 1, 2)), 500 * MS);
+    assert_eq!(answer.entries[0].others, 1, "the first, sent again lately");
+}
+
 /// A data plane may admit a cycle its share of what its copy has left and the cycle
 /// refills, divided among it and the others admitting; one request more if it left one
 /// unspent the cycle before.
