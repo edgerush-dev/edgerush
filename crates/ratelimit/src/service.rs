@@ -1744,6 +1744,11 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 continue;
             };
             owned.touched = now;
+            let latest = owned
+                .planes
+                .iter()
+                .filter_map(|(_, record)| record.last_admitted)
+                .max();
             let record = owned.planes.entry(from);
             let mut changed = false;
             if let Report::Hits {
@@ -1752,12 +1757,21 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 seen,
             } = entry.report
             {
-                record.last_admitted = Some(now);
                 changed = true;
                 // Taken over from a copy that had not caught up: batches the data plane saw
                 // applied, and will not send again, are skipped.
                 if seen > record.applied {
                     record.skip_to(seen);
+                }
+                // A batch not applied yet is an admission now. One sent again, its answer
+                // lost, keeps its data plane counted with those admitting, as of the latest
+                // admission and no later: made the latest itself, long after a burst, it
+                // would leave the others that admitted with it uncounted, and each would take
+                // too large a share of the next burst.
+                if sequence > record.applied {
+                    record.last_admitted = Some(now);
+                } else {
+                    record.last_admitted = record.last_admitted.max(latest);
                 }
                 let ready = record.take(sequence, count);
                 owned.apply(ready, now);
