@@ -114,12 +114,23 @@ pub(crate) enum Limited {
     Admit,
     /// Over it.
     Refuse,
-    /// Asked about or deferred: its decision comes, or none — it could not be decided in
-    /// the time allowed, or the limiter went — and it is answered as the gateway's own
-    /// overload, never as over its limit.
-    Later(oneshot::Receiver<Option<Decided>>),
-    /// Deferred with as many deferred as may be: the gateway's own overload.
-    Overloaded,
+    /// Asked about or deferred: its decision comes, or why there is none. A sender dropped
+    /// unanswered is the limiter gone: [`Undecided::Unavailable`].
+    Later(oneshot::Receiver<Result<Decided, Undecided>>),
+    /// Not decided, and not to be: why.
+    Undecided(Undecided),
+}
+
+/// Why a request's rate limits did not decide it: each the gateway's own trouble, answered
+/// 503, never as over a limit (06 §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Undecided {
+    /// It could not take a place to wait in.
+    Full,
+    /// Its time to wait ran out, wherever it was waiting.
+    Timeout,
+    /// There is no thread to decide it: never started, or gone.
+    Unavailable,
 }
 
 /// A worker's handles to its process's entries, found by key.
@@ -138,7 +149,7 @@ pub(crate) struct Limiter {
     /// The next ask's number.
     next: Cell<u64>,
     /// Its asks waiting on its process, by number.
-    asked: RefCell<HashMap<u64, oneshot::Sender<Option<Decided>>>>,
+    asked: RefCell<HashMap<u64, oneshot::Sender<Result<Decided, Undecided>>>>,
     /// What its deferred requests wait on, and how many there are, and may be.
     settled: Arc<Notify>,
     deferring: Cell<usize>,
@@ -387,21 +398,32 @@ impl Limiter {
                     }
                 }
                 message = answered.recv() => match message {
-                    Some(FromHub { id, admitted, overloaded, refused_by, entries }) => {
+                    Some(FromHub { id, admitted, undecided, refused_by, entries }) => {
                         let mut handles = self.handles.borrow_mut();
                         for entry in entries {
                             handles.replace(Handle::new(entry));
                         }
                         drop(handles);
                         if let Some(waiter) = self.asked.borrow_mut().remove(&id) {
-                            let _gone = waiter.send((!overloaded).then_some(Decided {
-                                ticket: id,
-                                admitted,
-                                refused_by,
-                            }));
+                            let decided = match undecided {
+                                Some(why) => Err(why),
+                                None => Ok(Decided {
+                                    ticket: id,
+                                    admitted,
+                                    refused_by,
+                                }),
+                            };
+                            let _gone = waiter.send(decided);
                         }
                     }
-                    None => return,
+                    // The process is gone: what still waits on it is told so, rather than
+                    // left waiting for an answer that cannot come.
+                    None => {
+                        for (_, waiter) in self.asked.borrow_mut().drain() {
+                            let _gone = waiter.send(Err(Undecided::Unavailable));
+                        }
+                        return;
+                    }
                 },
                 () = self.stopping.notified() => {}
             }
@@ -523,18 +545,18 @@ impl Limiter {
         }
     }
 
-    /// A request under `parts` asked of the process; refused if it is gone.
+    /// A request under `parts` asked of the process; undecided if it is gone.
     fn ask(&self, parts: &[(&[u8], Contract)]) -> Limited {
         match self.ask_process(parts) {
             Some(later) => Limited::Later(later),
-            None => Limited::Refuse,
+            None => Limited::Undecided(Undecided::Unavailable),
         }
     }
 
     fn ask_process(
         &self,
         parts: &[(&[u8], Contract)],
-    ) -> Option<oneshot::Receiver<Option<Decided>>> {
+    ) -> Option<oneshot::Receiver<Result<Decided, Undecided>>> {
         let id = self.next.get();
         self.next.set(id.wrapping_add(1));
         let keys = parts
@@ -554,10 +576,10 @@ impl Limiter {
 
     /// A request under `parts` deferred: decided again on a task of its own as its keys'
     /// holds settle and counts drain, until its time is up; or, with as many deferred as
-    /// may be, the overload answer at once.
+    /// may be, undecided at once.
     fn defer(self: &Rc<Self>, parts: &[(&[u8], Contract)]) -> Limited {
         if self.deferring.get() >= self.most_deferred.get() {
-            return Limited::Overloaded;
+            return Limited::Undecided(Undecided::Full);
         }
         self.deferring.set(self.deferring.get() + 1);
         let keys: Vec<(Box<[u8]>, Contract)> = parts
@@ -575,7 +597,7 @@ impl Limiter {
     async fn deferred(
         self: Rc<Self>,
         keys: Vec<(Box<[u8]>, Contract)>,
-        mut decided: oneshot::Sender<Option<Decided>>,
+        mut decided: oneshot::Sender<Result<Decided, Undecided>>,
     ) {
         let parts: Vec<(&[u8], Contract)> = keys
             .iter()
@@ -583,7 +605,7 @@ impl Limiter {
             .collect();
         let deadline = tokio::time::Instant::now() + DEFER_WAIT;
         let decision = |admitted| {
-            Some(Decided {
+            Ok(Decided {
                 ticket: 0,
                 admitted,
                 refused_by: Box::default(),
@@ -609,15 +631,15 @@ impl Limiter {
                 PooledLocal::Refuse => break decision(false),
                 PooledLocal::Ask => {
                     break match self.ask_process(&parts) {
-                        Some(later) => later.await.unwrap_or(None),
-                        None => decision(false),
+                        Some(later) => later.await.unwrap_or(Err(Undecided::Unavailable)),
+                        None => Err(Undecided::Unavailable),
                     };
                 }
                 PooledLocal::Defer => {}
             }
             tokio::select! {
                 () = &mut woken => {}
-                () = tokio::time::sleep_until(deadline) => break None,
+                () = tokio::time::sleep_until(deadline) => break Err(Undecided::Timeout),
                 () = decided.closed() => {
                     self.deferring.set(self.deferring.get().saturating_sub(1));
                     return;

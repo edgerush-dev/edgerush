@@ -392,7 +392,7 @@ async fn asks_that_come_together_are_sent_together() {
 /// and keys decided from their copies.
 #[tokio::test]
 async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
-    use crate::ratelimit::{Hub, Limited, Limiter, MOST_DEFERRED};
+    use crate::ratelimit::{Hub, Limited, Limiter, MOST_DEFERRED, Undecided};
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -424,8 +424,8 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
                 match limited {
                     Limited::Admit => Some(true),
                     Limited::Refuse => Some(false),
-                    Limited::Later(later) => later.await.ok().flatten().map(|d| d.admitted),
-                    Limited::Overloaded => None,
+                    Limited::Later(later) => later.await.unwrap().ok().map(|d| d.admitted),
+                    Limited::Undecided(_) => None,
                 }
             };
             // X alone, asked about and given up: decided from its copy, one of its two taken.
@@ -435,11 +435,11 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
             let both = limiter.decide_all(&rule.limits, 0b11, client);
             assert!(matches!(both, Limited::Later(_)));
             tokio::time::sleep(Duration::from_millis(50)).await;
-            // X alone again, short only by that hold: with none to be deferred, overloaded.
+            // X alone again, short only by that hold: with no place to be deferred in, full.
             limiter.set_most_deferred(0);
             assert!(matches!(
                 limiter.decide_all(&rule.limits, 0b01, client),
-                Limited::Overloaded
+                Limited::Undecided(Undecided::Full)
             ));
             limiter.set_most_deferred(MOST_DEFERRED);
             // Deferred, and decided once the hold settles: X and Y admitted, X is spent.
@@ -450,8 +450,8 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
             let alone = within(alone).await.unwrap();
             assert_eq!(
                 alone.map(|d| d.admitted),
-                Some(false),
-                "decided, not overloaded"
+                Ok(false),
+                "decided, not undecided"
             );
             limiter.stop();
         })
@@ -854,9 +854,101 @@ async fn a_limit_not_started_refuses_rather_than_admits() {
             assert_eq!(tally(&statuses[3..]), (10, 2), "{statuses:?}");
             let scrape = worker.proxy().metrics();
             assert!(
-                scrape.contains(r#"reason="rate_limit_deferred"} 3"#),
+                scrape.contains(r#"reason="rate_limit_unavailable"} 3"#),
                 "{scrape}"
             );
+        })
+        .await;
+}
+
+/// A request that would ask once the rate-limiting thread is gone — its channel closed —
+/// is answered 503 `rate_limit_unavailable`, the gateway's own trouble, never 429 as if
+/// over its limit.
+#[tokio::test]
+async fn a_rate_limiting_thread_gone_is_unavailable_not_a_refusal() {
+    use crate::ratelimit::ToHub;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let mut config = limited(everything_config(upstream), &["127.0.0.1:9".to_owned()]);
+            if let Some(service) = &mut config.rate_limit_service {
+                // Every new client asked about.
+                service.ask_cold_keys = Some(true);
+            }
+            let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+            let (failed, failures) = told_failures();
+            proxy.start_rate_limits(failed).unwrap();
+            hub_of(&proxy)
+                .to
+                .send(ToHub::Panic { in_exchange: false })
+                .unwrap();
+            until(|| failures() > 0).await;
+            let worker = Worker::with_deadlines(Arc::clone(&proxy), H1Limits::default(), SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let mut statuses = Vec::new();
+            for _ in 0..3 {
+                send = within(send.ready()).await.unwrap();
+                let request = Request::get("http://example.test/")
+                    .version(Version::HTTP_2)
+                    .body(())
+                    .unwrap();
+                let (response, _) = send.send_request(request, true).unwrap();
+                let response = within(response).await.unwrap();
+                statuses.push(response.status().as_u16());
+            }
+            assert_eq!(statuses, [503; 3]);
+            let scrape = worker.proxy().metrics();
+            assert!(
+                scrape.contains(r#"reason="rate_limit_unavailable"} 3"#),
+                "{scrape}"
+            );
+        })
+        .await;
+}
+
+/// An ask still waiting when the rate-limiting thread goes is told it is unavailable, at
+/// once, rather than left waiting for an answer that cannot come; one made after is too.
+#[tokio::test]
+async fn an_ask_waiting_when_the_thread_goes_is_told_it_is_unavailable() {
+    use crate::ratelimit::{Hub, Limited, Limiter, ToHub, Undecided};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let exchanges = Arc::new(AtomicUsize::new(0));
+            // Every answer held back past the end of the test.
+            let hold = Arc::new(Mutex::new(Some(Instant::now() + Duration::from_secs(60))));
+            let pods = held_service(&exchanges, &hold).await;
+            let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &pods);
+            if let Some(service) = &mut config.rate_limit_service {
+                service.ask_cold_keys = Some(true);
+            }
+            let compiled = compile(&config).unwrap();
+            let service = compiled.rate_limit_service().unwrap().clone();
+            let (failed, failures) = told_failures();
+            let failed = crate::ratelimit::Failed(Arc::new(failed));
+            let hub = Hub::start(&service, 1, 1 << 20, Some(failed)).unwrap();
+            let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
+            let rule = Arc::clone(&compiled.rules_of(0)[0]);
+            let Limited::Later(waiting) =
+                limiter.decide_all(&rule.limits, 0b1, requester("203.0.113.7"))
+            else {
+                panic!("not asked about");
+            };
+            until(|| exchanges.load(Ordering::Relaxed) > 0).await;
+            hub.to.send(ToHub::Panic { in_exchange: false }).unwrap();
+            until(|| failures() > 0).await;
+            assert_eq!(within(waiting).await, Ok(Err(Undecided::Unavailable)));
+            assert!(matches!(
+                limiter.decide_all(&rule.limits, 0b1, requester("203.0.113.8")),
+                Limited::Undecided(Undecided::Unavailable)
+            ));
+            limiter.stop();
         })
         .await;
 }

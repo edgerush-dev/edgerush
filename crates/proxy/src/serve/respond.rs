@@ -16,7 +16,7 @@ use crate::interim::Interim;
 use crate::map_head::MapHead;
 use crate::metrics::{Answer, LimitCounters};
 use crate::random::{random, unguessable};
-use crate::ratelimit::{Limited, Limiter, RATELIMIT};
+use crate::ratelimit::{Limited, Limiter, RATELIMIT, Undecided};
 use crate::request::{Decision, Opening, Rejection, decide};
 use crate::request_body::{Counts, RequestBody};
 use crate::routed::Through;
@@ -154,7 +154,7 @@ impl Worker {
     fn rate_limits(&self, rule: &CompiledRule, limited: u64, client: Requester) -> Limited {
         match self.limiter() {
             Some(limiter) => limiter.decide_all(&rule.limits, limited, client),
-            None => Limited::Overloaded,
+            None => Limited::Undecided(Undecided::Unavailable),
         }
     }
 
@@ -213,24 +213,26 @@ impl Worker {
                 Limited::Later(decided) => {
                     let proxy = Arc::clone(&self.proxy);
                     let _counted = tokio::task::spawn_local(async move {
-                        if let Ok(Some(decided)) = decided.await {
+                        if let Ok(Ok(decided)) = decided.await {
                             count(&proxy, decided.admitted);
                         }
                     });
                 }
                 // Undecided: a dry run counts neither way.
-                Limited::Overloaded => {}
+                Limited::Undecided(_) => {}
             }
         }
     }
 
-    /// The answer to a request its rate limits could not decide in time (pooled, deferred):
-    /// the gateway's own overload, 503 with `Retry-After: 1`, counted as
-    /// `rate_limit_deferred`, never a 429.
-    fn undecided(&self, listener: usize, call: Option<Call>) -> Response<Body> {
-        let mut response = self
-            .proxy
-            .answer_to(listener, Answer::RateLimitDeferred, call);
+    /// The answer to a request its rate limits did not decide, for `why`: the gateway's own
+    /// trouble, 503 with `Retry-After: 1`, counted by why, never a 429.
+    fn undecided(&self, listener: usize, why: Undecided, call: Option<Call>) -> Response<Body> {
+        let answer = match why {
+            Undecided::Full => Answer::RateLimitFull,
+            Undecided::Timeout => Answer::RateLimitTimeout,
+            Undecided::Unavailable => Answer::RateLimitUnavailable,
+        };
+        let mut response = self.proxy.answer_to(listener, answer, call);
         response.headers_mut().insert(
             http::header::RETRY_AFTER,
             http::HeaderValue::from_static("1"),
@@ -401,10 +403,16 @@ impl Worker {
                     Limited::Admit => (true, None),
                     Limited::Refuse => (false, None),
                     Limited::Later(decided) => match decided.await {
-                        Ok(Some(decided)) => (decided.admitted, Some(decided.refused_by)),
-                        Ok(None) | Err(_) => return self.undecided(listener, call).into(),
+                        Ok(Ok(decided)) => (decided.admitted, Some(decided.refused_by)),
+                        Ok(Err(why)) => return self.undecided(listener, why, call).into(),
+                        // The limiter went with the request still waiting.
+                        Err(_) => {
+                            return self
+                                .undecided(listener, Undecided::Unavailable, call)
+                                .into();
+                        }
                     },
-                    Limited::Overloaded => return self.undecided(listener, call).into(),
+                    Limited::Undecided(why) => return self.undecided(listener, why, call).into(),
                 };
                 let under = Under {
                     rule,

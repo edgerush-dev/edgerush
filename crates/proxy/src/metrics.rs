@@ -387,14 +387,17 @@ pub(crate) enum Answer {
     MaxForwards,
     /// Over its rule's rate limit (experimental).
     RateLimited,
-    /// Its rate limits could not decide it in the time a deferred request may wait, or
-    /// found as many deferred as may be (experimental): the gateway's own overload,
-    /// never over a limit.
-    RateLimitDeferred,
+    /// Its rate limits had no place for it to wait in (experimental): the gateway's own
+    /// trouble, never over a limit, as are the two after it.
+    RateLimitFull,
+    /// Its time to wait on its rate limits ran out, wherever it was waiting (experimental).
+    RateLimitTimeout,
+    /// No rate-limiting thread to decide it: never started, or gone (experimental).
+    RateLimitUnavailable,
 }
 
 impl Answer {
-    const ALL: [Self; 26] = [
+    const ALL: [Self; 28] = [
         Self::BadHost,
         Self::BadPath,
         Self::BadConnection,
@@ -420,7 +423,9 @@ impl Answer {
         Self::UnknownProtocol,
         Self::MaxForwards,
         Self::RateLimited,
-        Self::RateLimitDeferred,
+        Self::RateLimitFull,
+        Self::RateLimitTimeout,
+        Self::RateLimitUnavailable,
     ];
 
     /// The status that is answered with.
@@ -440,7 +445,9 @@ impl Answer {
             | Self::NoRoom
             | Self::QueueFull
             | Self::QueueTimedOut
-            | Self::RateLimitDeferred => StatusCode::SERVICE_UNAVAILABLE,
+            | Self::RateLimitFull
+            | Self::RateLimitTimeout
+            | Self::RateLimitUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::ConnectionAuth | Self::UnknownProtocol => StatusCode::NOT_IMPLEMENTED,
             Self::DeadlineExceeded | Self::UpstreamTimedOut => StatusCode::GATEWAY_TIMEOUT,
             Self::Unreachable | Self::UpstreamFailed => StatusCode::BAD_GATEWAY,
@@ -480,7 +487,9 @@ impl Answer {
             Self::UnknownProtocol => "unknown_protocol",
             Self::MaxForwards => "max_forwards",
             Self::RateLimited => "rate_limited",
-            Self::RateLimitDeferred => "rate_limit_deferred",
+            Self::RateLimitFull => "rate_limit_full",
+            Self::RateLimitTimeout => "rate_limit_timeout",
+            Self::RateLimitUnavailable => "rate_limit_unavailable",
         }
     }
 
@@ -534,9 +543,17 @@ impl Answer {
             // Not a gRPC call's method; said for completeness.
             Self::MaxForwards => (Code::Unimplemented, "answered here, as the final recipient"),
             Self::RateLimited => (Code::ResourceExhausted, "the call is over its rate limit"),
-            Self::RateLimitDeferred => (
+            Self::RateLimitFull => (
+                Code::Unavailable,
+                "the rate limits had no room to decide the call",
+            ),
+            Self::RateLimitTimeout => (
                 Code::Unavailable,
                 "the rate limits could not decide the call in time",
+            ),
+            Self::RateLimitUnavailable => (
+                Code::Unavailable,
+                "the rate limits are not running to decide the call",
             ),
         }
     }

@@ -5,7 +5,7 @@
 //! workers' messages, the service's answers and its cycle; nothing of it is shared with a
 //! worker but the entries, a channel, and the clock they read its times by.
 
-use super::{ASK_TIMEOUT, DEFER_WAIT, MOST_DEFERRED};
+use super::{ASK_TIMEOUT, DEFER_WAIT, MOST_DEFERRED, Undecided};
 use crate::ProxyError;
 use edgerush_config::CompiledRateLimitService;
 use edgerush_ratelimit::service::pooled::{
@@ -72,12 +72,12 @@ pub(crate) enum ToHub {
 
 /// What the process sends a worker: the decision on a request it asked about — refused,
 /// which of its keys refused and how long each waits — with the entries of its keys, to
-/// hold; or, if `overloaded`, none: it could not be decided in the time allowed a deferred
-/// request, or too many were deferred.
+/// hold; or, if `undecided`, none, and why: it could not be decided in the time allowed a
+/// deferred request, or too many were deferred.
 pub(crate) struct FromHub {
     pub(crate) id: u64,
     pub(crate) admitted: bool,
-    pub(crate) overloaded: bool,
+    pub(crate) undecided: Option<Undecided>,
     pub(crate) refused_by: Box<[(usize, u64)]>,
     pub(crate) entries: Vec<Arc<Entry>>,
 }
@@ -540,7 +540,7 @@ impl State {
                     FromHub {
                         id,
                         admitted: decided.admitted,
-                        overloaded: false,
+                        undecided: None,
                         refused_by: decided.refused_by,
                         entries: participant.entries(&keys),
                     },
@@ -562,7 +562,7 @@ impl State {
             let since = asked.3;
             if now >= until {
                 self.shared.stats.answered(now.saturating_sub(since));
-                told.push((worker, overloaded(asked.1)));
+                told.push((worker, undecided(asked.1, Undecided::Timeout)));
                 continue;
             }
             let mut again = Vec::new();
@@ -651,7 +651,7 @@ impl State {
 
 /// What comes of request `asked` at `now`: told its decision now; kept waiting on the
 /// service, by ticket; or deferred, to be decided again while its time lasts — or, past as
-/// many deferred as a worker may hold, told it is overloaded.
+/// many deferred as a worker may hold, told it has no place to wait.
 fn decided(
     participant: &mut Participant<Keyed>,
     waiting: &mut HashMap<Ticket, Waiting>,
@@ -670,7 +670,7 @@ fn decided(
             waiting.insert(ticket, asked);
             None
         }
-        Pooled::Defer if deferred.len() >= MOST_DEFERRED => Some(overloaded(id)),
+        Pooled::Defer if deferred.len() >= MOST_DEFERRED => Some(undecided(id, Undecided::Full)),
         Pooled::Defer => {
             deferred.push(Deferred {
                 asked,
@@ -688,7 +688,7 @@ fn decided(
             Some(FromHub {
                 id,
                 admitted,
-                overloaded: false,
+                undecided: None,
                 refused_by,
                 entries: participant.entries(&keys),
             })
@@ -696,12 +696,12 @@ fn decided(
     }
 }
 
-/// The answer to ask `id` that could not be decided in time.
-fn overloaded(id: u64) -> FromHub {
+/// The answer to ask `id` that was not decided, for `why`.
+fn undecided(id: u64, why: Undecided) -> FromHub {
     FromHub {
         id,
         admitted: false,
-        overloaded: true,
+        undecided: Some(why),
         refused_by: Box::default(),
         entries: Vec::new(),
     }
