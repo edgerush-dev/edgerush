@@ -14,7 +14,7 @@ mod hub;
 pub(crate) use hub::REFUSE_START;
 pub(crate) use hub::{Failed, Hub};
 
-use crate::forwarding::Client as Requester;
+use crate::forwarding::Requester;
 use crate::request::NoTables;
 use edgerush_config::{CompiledLimit, CompiledRateLimitService};
 use edgerush_ratelimit::service::pooled::{
@@ -56,21 +56,21 @@ pub(crate) struct Refusal<'a> {
 /// limit that refused, none of it left, and for how long.
 pub(crate) const RATELIMIT: HeaderName = HeaderName::from_static("ratelimit");
 
-/// What a limit's key reads of a request: the client's address, until authentication
-/// gives the rest (stage 9).
-struct ByKey<'a> {
-    client: &'a Requester,
+/// What a limit's key reads of a request: the client's address as forwarding worked it
+/// out, until authentication gives the rest (stage 9).
+struct ByKey {
+    client: Requester,
 }
 
-impl Context for ByKey<'_> {
+impl Context for ByKey {
     fn text(&self, _: Text) -> Option<&str> {
         None
     }
 
     fn address(&self, field: Address) -> Option<IpAddr> {
         match field {
-            Address::Client => Some(self.client.address()),
-            Address::Peer => self.client.peer().map(|peer| peer.ip()),
+            Address::Client => Some(self.client.address),
+            Address::Peer => self.client.peer,
         }
     }
 
@@ -229,7 +229,7 @@ impl Limiter {
         self: &Rc<Self>,
         limits: &[Arc<CompiledLimit>],
         limited: u64,
-        client: &Requester,
+        client: Requester,
     ) -> Limited {
         let now = self.now();
         self.with_keys(limits, limited, client, |parts| {
@@ -255,7 +255,7 @@ impl Limiter {
         &self,
         limits: &'a [Arc<CompiledLimit>],
         limited: u64,
-        client: &Requester,
+        client: Requester,
         told: &[(usize, u64)],
     ) -> Refusal<'a> {
         let now = self.now();
@@ -314,7 +314,7 @@ impl Limiter {
         &self,
         limits: &[Arc<CompiledLimit>],
         limited: u64,
-        client: &Requester,
+        client: Requester,
         then: impl FnOnce(&[(&[u8], Contract)]) -> R,
     ) -> R {
         let mut keys = self.keys.borrow_mut();

@@ -91,6 +91,17 @@ impl Client {
     }
 }
 
+/// Who a request is from, as forwarding works it out for that request (03 §11): what a
+/// rate limit's key and match read of its addresses. One connection from a trusted proxy
+/// carries many clients' requests, so this is the request's, not the connection's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Requester {
+    /// The client: whom a trusted proxy names, or else the connection's client.
+    pub(crate) address: IpAddr,
+    /// The address that connected, where the connection knows it.
+    pub(crate) peer: Option<IpAddr>,
+}
+
 /// Why the gateway closed a connection with requests under way: what their records say in
 /// place of a client that left ([21 §3](../../docs/21-access-logs.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +141,8 @@ impl Cut {
 }
 
 /// Makes `head`, of a request from `client` that came in on `listener`, say what the
-/// upstream is to be told of the client, and carry `id` if the request was given one.
+/// upstream is to be told of the client, and carry `id` if the request was given one; the
+/// client's address, as worked out: whom a trusted proxy names, or else `client`'s.
 ///
 /// # Errors
 ///
@@ -141,15 +153,16 @@ pub(crate) fn forward<H: Head>(
     listener: &CompiledListener,
     client: &Client,
     id: Option<&HeaderValue>,
-) -> Result<(), Rejection> {
+) -> Result<IpAddr, Rejection> {
     let forwarding = &listener.forwarding;
     // QUIC is always over TLS, and only an `https` listener serves it.
     let proto = proto_value(listener.protocol == Protocol::Https);
-    if forwarding.trusted_proxies.trusts(client.address) {
-        from_trusted_proxy(head, listener, client, proto)?;
+    let address = if forwarding.trusted_proxies.trusts(client.address) {
+        let found = from_trusted_proxy(head, listener, client, proto)?;
         if let Some(id) = id {
             head.set_field(request_id::HEADER, id.clone())?;
         }
+        found
     } else {
         // One pass over the names takes off what the client said of forwarding, its ID if
         // the gateway gives one, and what only a trusted proxy may send; what the gateway
@@ -168,18 +181,20 @@ pub(crate) fn forward<H: Head>(
         if let Some(host) = head.host_value() {
             head.append_field(FORWARDED_HOST, host)?;
         }
-    }
-    head.append_field(VIA, via_value(head.version()))
+        client.address
+    };
+    head.append_field(VIA, via_value(head.version()))?;
+    Ok(address)
 }
 
 /// The same for a request from a trusted proxy: the client its chain names, and its scheme
-/// and host as it said them, or the gateway's where it said none.
+/// and host as it said them, or the gateway's where it said none; that client's address.
 fn from_trusted_proxy<H: Head>(
     head: &mut H,
     listener: &CompiledListener,
     client: &Client,
     proto: HeaderValue,
-) -> Result<(), Rejection> {
+) -> Result<IpAddr, Rejection> {
     let found = client_address(
         client.address,
         head.fields().values(&FORWARDED_FOR),
@@ -199,7 +214,7 @@ fn from_trusted_proxy<H: Head>(
     {
         head.append_field(FORWARDED_HOST, host)?;
     }
-    Ok(())
+    Ok(found)
 }
 
 /// Whether `name`, in whatever case, is one of the three the gateway says itself.

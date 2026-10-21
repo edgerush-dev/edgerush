@@ -216,8 +216,12 @@ pub enum AccessLog {
 #[serde(deny_unknown_fields)]
 pub struct Forwarding {
     /// The proxies whose `X-Forwarded-For` is believed, as ranges of their addresses:
-    /// `10.0.0.0/8`, `192.0.2.1/32` for one. Empty, no one's is. Each is written one
-    /// way: no bits set past its prefix, and an IPv4 range not as IPv6.
+    /// `10.0.4.0/24`, `192.0.2.1/32` for one. Empty, no one's is. Each is written one
+    /// way: no bits set past its prefix, and an IPv4 range not as IPv6. List the proxies
+    /// alone: whatever connects from a range listed can name any client, and the client it
+    /// names is what upstreams are told, what logs record and what per-client rate limits
+    /// count, so a range wider than the proxies lets anything inside it take a fresh limit
+    /// with each request.
     #[cfg_attr(feature = "schema", schemars(length(max = edgerush_filters::forwarding::MOST_ENTRIES)))]
     pub trusted_proxies: Vec<String>,
     /// Headers taken off a request that did not come from a trusted proxy: names, or the

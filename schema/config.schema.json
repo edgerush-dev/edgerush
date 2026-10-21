@@ -383,7 +383,7 @@
           "maxItems": 64
         },
         "trusted_proxies": {
-          "description": "The proxies whose `X-Forwarded-For` is believed, as ranges of their addresses:\n`10.0.0.0/8`, `192.0.2.1/32` for one. Empty, no one's is. Each is written one\nway: no bits set past its prefix, and an IPv4 range not as IPv6.",
+          "description": "The proxies whose `X-Forwarded-For` is believed, as ranges of their addresses:\n`10.0.4.0/24`, `192.0.2.1/32` for one. Empty, no one's is. Each is written one\nway: no bits set past its prefix, and an IPv4 range not as IPv6. List the proxies\nalone: whatever connects from a range listed can name any client, and the client it\nnames is what upstreams are told, what logs record and what per-client rate limits\ncount, so a range wider than the proxies lets anything inside it take a fresh limit\nwith each request.",
           "type": "array",
           "items": {
             "type": "string"
