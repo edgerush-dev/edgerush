@@ -43,6 +43,8 @@ pub(super) async fn serving_worker(upstream: SocketAddr) -> SocketAddr {
 /// and the proxy, for a test to give a new config.
 pub(super) async fn serving_h3(config: &edgerush_config::Config) -> (SocketAddr, Arc<Proxy>) {
     let proxy = Arc::new(Proxy::new(compile(config).unwrap(), NonZeroUsize::MIN).unwrap());
+    // As the binary starts them: nothing without a rate-limiting service.
+    proxy.start_rate_limits(|| {}).unwrap();
     let worker = Worker::with_deadlines(Arc::clone(&proxy), H1Limits::default(), SHORT);
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let front = socket.local_addr().unwrap();

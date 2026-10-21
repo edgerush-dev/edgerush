@@ -8,7 +8,7 @@ use crate::metrics::{AcceptPause, Metrics};
 use crate::routed::Routed;
 use crate::tls::Tls;
 use crate::upstream::balancing::Carry;
-use crate::upstream::destination::{Aside, Destinations, Keys, ReuseIdentity};
+use crate::upstream::destination::{Aside, Destinations, Keys, Retiring, ReuseIdentity};
 use crate::upstream::secure::Secure;
 use arc_swap::ArcSwap;
 use edgerush_config::Compiled;
@@ -44,6 +44,8 @@ pub(super) fn runs_rate_limits(config: &Compiled, supported: bool) -> Result<(),
 }
 
 impl Snapshot {
+    /// The snapshot of `config`, after `previous` if there is one, and the destinations of
+    /// `previous` it does not have, retired only once it is taken in.
     pub(super) fn new(
         config: Compiled,
         listeners: &[String],
@@ -51,7 +53,7 @@ impl Snapshot {
         previous: Option<&Snapshot>,
         keys: &Keys,
         logs: Vec<Option<Sink>>,
-    ) -> Result<Self, ProxyError> {
+    ) -> Result<(Self, Retiring), ProxyError> {
         runs_rate_limits(&config, edgerush_ratelimit::service::pooled::supported())?;
         let endpoints = config
             .upstreams()
@@ -147,7 +149,8 @@ impl Snapshot {
         let nothing_yet = Destinations::default();
         let previous_destinations =
             previous.map_or(&nothing_yet, |previous| &previous.destinations);
-        let destinations = Destinations::reconcile(&config, previous_destinations, keys, &secure);
+        let (destinations, retiring) =
+            Destinations::prepare(&config, previous_destinations, keys, &secure);
         let carried = previous.map_or_else(
             || vec![Carry::New; config.upstreams().len()],
             |previous| {
@@ -159,7 +162,7 @@ impl Snapshot {
                 )
             },
         );
-        Ok(Self {
+        let snapshot = Self {
             config,
             generation: previous.map_or(0, |previous| previous.generation + 1),
             listeners,
@@ -174,7 +177,8 @@ impl Snapshot {
             secure,
             routed,
             logs,
-        })
+        };
+        Ok((snapshot, retiring))
     }
 }
 
@@ -203,7 +207,8 @@ impl Proxy {
         let keys = Keys::default();
         let logs = Logs::new(workers.get(), Arc::clone(&metrics.logs_dropped));
         let prepared = logs.prepare(&config, &listeners)?;
-        let snapshot = Snapshot::new(
+        // After none, nothing to retire.
+        let (snapshot, _none) = Snapshot::new(
             config,
             &listeners,
             &metrics,
@@ -219,8 +224,7 @@ impl Proxy {
             current: ArcSwap::from_pointee(snapshot),
             metrics,
             workers,
-            hub: std::sync::Mutex::new(None),
-            hub_failed: std::sync::OnceLock::new(),
+            rate_limits: std::sync::Mutex::default(),
             keys,
             draining: AtomicBool::new(false),
             quic,
@@ -259,7 +263,7 @@ impl Proxy {
         // keeps what its connections are filed under and one that has gone is retired.
         let previous = self.current.load();
         let prepared = self.logs.prepare(&config, &self.listeners)?;
-        let snapshot = Snapshot::new(
+        let (snapshot, retiring) = Snapshot::new(
             config,
             &self.listeners,
             &self.metrics,
@@ -268,14 +272,33 @@ impl Proxy {
             prepared.by_listener(),
         )?;
         drop(previous);
+        // Held until the config is in, so that no worker pairs either config with the
+        // other's thread.
+        let mut rate_limits = self
+            .rate_limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Not started yet, starting them starts it for whichever config runs then.
+        let hub = match &rate_limits.failed {
+            Some(failed) => self.hub_for(&snapshot.config, rate_limits.hub.as_ref(), failed)?,
+            None => None,
+        };
         // Only now that all of it is accepted: a config refused for one listener must not
-        // have changed the certificates of another, nor opened a file it logs to.
+        // have changed the certificates of another, nor opened a file it logs to, nor let
+        // go of the running config's connections.
         for tls in snapshot.tls.iter().flatten() {
             tls.install();
+        }
+        retiring.retire();
+        // A thread kept keeps the keys it holds, now within this config's bound (06 §8).
+        if let (Some(hub), Some(service)) = (&hub, snapshot.config.rate_limit_service()) {
+            hub.set_capacity(service.max_key_bytes);
         }
         // Before any request of it can make a record.
         self.logs.commit(prepared);
         self.current.store(Arc::new(snapshot));
+        rate_limits.hub = hub;
+        drop(rate_limits);
         self.metrics.reloads.inc();
         let now = SystemTime::now().duration_since(UNIX_EPOCH);
         let now = now.map_or(0, |since_epoch| since_epoch.as_secs());
@@ -344,11 +367,7 @@ impl Proxy {
         {
             scrape.push_str(&self.metrics.render_limits(&limits, service.max_key_bytes));
             // The process thread's own measures.
-            let hub = self
-                .hub
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
+            let (_, hub) = self.hub();
             if let Some(hub) = hub {
                 scrape.push_str(&hub.render_stats());
             }
@@ -384,42 +403,76 @@ impl Proxy {
         (aside, snapshot.config.data_plane().set_aside)
     }
 
-    /// The process's rate-limiting thread reaching `service`: started the first time a worker
-    /// needs it, and again when the service's pods, cycle or levers change; `None` if it
-    /// cannot be started. For a worker making its limiter: it takes a lock.
-    pub(crate) fn hub(
+    /// The rate-limiting thread `config` decides its limits with: none without a service,
+    /// `running` if it reaches the service as it is set, else one started, calling `failed`
+    /// if it fails.
+    fn hub_for(
         &self,
-        service: &edgerush_config::CompiledRateLimitService,
-    ) -> Option<Arc<crate::ratelimit::Hub>> {
-        let mut held = self
-            .hub
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(hub) = held.as_ref().filter(|hub| hub.serves(service)) {
-            return Some(Arc::clone(hub));
+        config: &Compiled,
+        running: Option<&Arc<crate::ratelimit::Hub>>,
+        failed: &crate::ratelimit::Failed,
+    ) -> Result<Option<Arc<crate::ratelimit::Hub>>, ProxyError> {
+        let Some(service) = config.rate_limit_service() else {
+            return Ok(None);
+        };
+        if let Some(running) = running.filter(|running| running.serves(service)) {
+            return Ok(Some(Arc::clone(running)));
         }
-        let hub = crate::ratelimit::Hub::start(
+        crate::ratelimit::Hub::start(
             service,
             self.workers.get(),
             service.max_key_bytes,
-            self.hub_failed.get().cloned(),
-        )?;
-        *held = Some(Arc::clone(&hub));
-        Some(hub)
+            Some(failed.clone()),
+        )
+        .map(Some)
     }
 
-    /// Has `failed` called if the process's rate-limiting thread fails: it panics, or a task
-    /// of its does ([03 §2](../../docs/03-data-plane.md)). Whoever runs the data plane fails
-    /// the process then, as when a worker's thread fails: without the thread every request
-    /// that asks it is refused and nothing more is reported to the service. A thread that
-    /// ends because a reload replaced it, or the data plane went, has not failed.
+    /// The running config and the rate-limiting thread its limits are decided with, which
+    /// are always taken in together; no thread for a config with limits if they were not
+    /// started ([`Proxy::start_rate_limits`]). For a worker making its limiter: it takes a
+    /// lock.
+    pub(super) fn hub(&self) -> (Arc<Snapshot>, Option<Arc<crate::ratelimit::Hub>>) {
+        let rate_limits = self
+            .rate_limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (self.current.load_full(), rate_limits.hub.clone())
+    }
+
+    /// Starts the data plane's rate limits: the process's rate-limiting thread for the
+    /// running config, if it has a rate-limiting service, and from now on for every config
+    /// taken in whose service is set otherwise, a reload refused if its thread cannot be
+    /// started ([06 §4](../../docs/06-rate-limiting.md)). Called before a request is
+    /// served: until then a request under a limit is refused, as one its limits cannot
+    /// decide (503).
     ///
-    /// Given before a request is served, as a thread started before it is not watched;
-    /// only the first one given is kept.
-    pub fn watch_rate_limits(&self, failed: impl Fn() + Send + Sync + 'static) {
-        let _kept = self
-            .hub_failed
-            .set(crate::ratelimit::Failed(Arc::new(failed)));
+    /// `failed` is called if a thread fails: it panics, or a task of its does
+    /// ([03 §2](../../docs/03-data-plane.md)). Whoever runs the data plane fails the process
+    /// then, as when a worker's thread fails: without the thread every request that asks it
+    /// is refused and nothing more is reported to the service. A thread that ends because a
+    /// reload replaced it, or the data plane went, has not failed.
+    ///
+    /// Once started, a later call does nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ProxyError::RateLimitThread`] if the thread cannot be started: the data plane
+    /// cannot run its config.
+    pub fn start_rate_limits(
+        &self,
+        failed: impl Fn() + Send + Sync + 'static,
+    ) -> Result<(), ProxyError> {
+        let mut rate_limits = self
+            .rate_limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if rate_limits.failed.is_some() {
+            return Ok(());
+        }
+        let failed = crate::ratelimit::Failed(Arc::new(failed));
+        rate_limits.hub = self.hub_for(&self.current.load().config, None, &failed)?;
+        rate_limits.failed = Some(failed);
+        Ok(())
     }
 
     /// Counts `destination` as set aside, for its upstream. For the health checker, as it

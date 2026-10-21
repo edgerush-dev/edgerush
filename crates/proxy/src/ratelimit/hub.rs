@@ -6,6 +6,7 @@
 //! worker but the entries, a channel, and the clock they read its times by.
 
 use super::{ASK_TIMEOUT, DEFER_WAIT, MOST_DEFERRED};
+use crate::ProxyError;
 use edgerush_config::CompiledRateLimitService;
 use edgerush_ratelimit::service::pooled::{
     Decision as Pooled, Entry, Levers, Participant, Registry,
@@ -33,6 +34,13 @@ impl std::fmt::Debug for Failed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Failed")
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set, the next start on this thread is refused as one that could have no thread: for
+    /// tests of a data plane whose rate limits cannot be started.
+    pub(crate) static REFUSE_START: Cell<bool> = const { Cell::new(false) };
 }
 
 /// What a worker sends its process.
@@ -161,22 +169,24 @@ pub(crate) struct Hub {
 
 impl Hub {
     /// The process thread of `workers` reaching `service`, its keys holding at most
-    /// `max_key_bytes`, started, calling `failed` if it fails once started; `None` if an
-    /// address cannot be made into one to connect to, no thread could be had, or the
-    /// machine has no native 128-bit compare-and-swap for the participant's entries (which
-    /// the proxy refuses at start).
+    /// `max_key_bytes`, started, calling `failed` if it fails once started.
+    ///
+    /// # Errors
+    ///
+    /// [`ProxyError::RateLimitThread`] if an address cannot be made into one to connect to
+    /// (which the config refuses before), no thread or runtime could be had, or the machine
+    /// has no native 128-bit compare-and-swap for the participant's entries (which the
+    /// proxy refuses before).
     pub(crate) fn start(
         service: &CompiledRateLimitService,
         workers: usize,
         max_key_bytes: u64,
         failed: Option<Failed>,
-    ) -> Option<Arc<Self>> {
-        let clients = service
-            .pods
-            .iter()
-            .map(|address| Client::new(address))
-            .collect::<Result<Vec<_>, _>>()
-            .ok()?;
+    ) -> Result<Arc<Self>, ProxyError> {
+        #[cfg(test)]
+        if REFUSE_START.with(Cell::take) {
+            return Err(ProxyError::RateLimitThread("refused for a test".to_owned()));
+        }
         let shared = Arc::new(Shared {
             epoch: Instant::now(),
             usage: Default::default(),
@@ -187,7 +197,7 @@ impl Hub {
         let set = service.clone();
         let settled = Arc::new(Notify::new());
         let waking = Arc::clone(&settled);
-        // The participant is made on the thread and its registry handed back.
+        // The participant is made on the thread and its registry handed back, or why not.
         let (made, registry) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("edgerush-rate-limits".to_owned())
@@ -197,17 +207,26 @@ impl Hub {
                     settled: waking,
                     failed,
                 };
-                run(clients, &set, workers, max_key_bytes, from, &running, &made);
+                run(&set, workers, max_key_bytes, from, &running, &made);
             })
-            .ok()?;
-        let registry = registry.recv().ok()?;
-        Some(Arc::new(Self {
+            .map_err(|error| ProxyError::RateLimitThread(format!("no thread: {error}")))?;
+        let registry = registry
+            .recv()
+            .unwrap_or_else(|_| Err("it ended before it began".to_owned()))
+            .map_err(ProxyError::RateLimitThread)?;
+        Ok(Arc::new(Self {
             to,
             shared,
             service: service.clone(),
             registry,
             settled,
         }))
+    }
+
+    /// The bytes its keys may hold from now on, the process's for all its workers: for a
+    /// reload that keeps it.
+    pub(crate) fn set_capacity(&self, max_key_bytes: u64) {
+        let _gone = self.to.send(ToHub::Capacity(max_key_bytes));
     }
 
     /// Its participant's registry.
@@ -326,21 +345,42 @@ impl Drop for Guard {
 }
 
 /// The process thread: a runtime of its own, the participant and its clients, until every
-/// sender is gone, as `service` sets it: its cycle and its levers.
+/// sender is gone, as `service` sets it: its pods, its cycle and its levers.
 fn run(
-    clients: Vec<Client>,
     service: &CompiledRateLimitService,
     workers: usize,
     max_key_bytes: u64,
     from: mpsc::UnboundedReceiver<ToHub>,
     running: &Running,
-    made: &std::sync::mpsc::SyncSender<Arc<Registry>>,
+    made: &std::sync::mpsc::SyncSender<Result<Arc<Registry>, String>>,
 ) {
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+    let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-    else {
-        return;
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _gone = made.send(Err(format!("no runtime: {error}")));
+            return;
+        }
+    };
+    // Made in the runtime, which a client's connection runs on, whoever starts the thread.
+    let clients = {
+        let _in = runtime.enter();
+        service
+            .pods
+            .iter()
+            .map(|address| {
+                Client::new(address).map_err(|error| format!("pod `{address}`: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let clients = match clients {
+        Ok(clients) => clients,
+        Err(error) => {
+            let _gone = made.send(Err(error));
+            return;
+        }
     };
     // The process is one data plane in one life: the time it began, numbered past any
     // worker's.
@@ -362,6 +402,7 @@ fn run(
     // The proxy refuses rate limits where 128-bit atomics are not native, so the
     // participant is made; if not, the thread ends, and the hub with it.
     let Some(mut participant) = Participant::new(id, nanos(cycle), view, hasher) else {
+        let _gone = made.send(Err("no native 128-bit compare-and-swap".to_owned()));
         return;
     };
     participant.set_ask_timeout(ASK_TIMEOUT);
@@ -375,7 +416,7 @@ fn run(
         ask_cold: service.ask_cold_keys,
     });
     participant.set_scheduled(service.schedule_keys);
-    if made.send(participant.registry()).is_err() {
+    if made.send(Ok(participant.registry())).is_err() {
         return;
     }
     // Started: from here on, an end other than the loop's is a failure.

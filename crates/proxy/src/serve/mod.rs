@@ -382,12 +382,10 @@ pub struct Proxy {
     /// How many workers it runs on: what shares out what the data plane as a whole may
     /// hold.
     workers: NonZeroUsize,
-    /// The process's rate-limiting thread, once a worker needs it; locked only when a worker
-    /// makes its limiter.
-    hub: std::sync::Mutex<Option<Arc<crate::ratelimit::Hub>>>,
-    /// What every rate-limiting thread started from now on calls if it fails, once one is
-    /// given ([`Proxy::watch_rate_limits`]).
-    hub_failed: std::sync::OnceLock<crate::ratelimit::Failed>,
+    /// The process's rate-limiting thread for the running config, and what it calls if it
+    /// fails ([`Proxy::start_rate_limits`]). Locked when a config is taken in and when a
+    /// worker makes its limiter, so that a worker never pairs a config with another's thread.
+    rate_limits: std::sync::Mutex<RateLimits>,
     /// Outside it for a different reason: a key must not come round again when a config
     /// does, so what hands them out lives as long as the process.
     keys: Keys,
@@ -398,6 +396,16 @@ pub struct Proxy {
     /// What the listeners' access logs are written to, and the thread that writes them
     /// ([21 §4](../../docs/21-access-logs.md)).
     logs: Logs,
+}
+
+/// The data plane's rate limits: whether they were started, and the thread the running
+/// config's limits are decided with.
+#[derive(Debug, Default)]
+struct RateLimits {
+    /// What every thread calls if it fails: given when they are started, and none before.
+    failed: Option<crate::ratelimit::Failed>,
+    /// The thread, for a running config with a rate-limiting service, once started.
+    hub: Option<Arc<crate::ratelimit::Hub>>,
 }
 
 /// One worker's share of the data plane: the connections it holds to the upstreams, which
@@ -1182,6 +1190,10 @@ pub enum ProxyError {
          limits need"
     )]
     RateLimitsUnsupported,
+    /// A rate-limiting thread that could not be started: its pods' addresses, a thread or
+    /// its runtime could not be had.
+    #[error("`rate_limit_service`: its thread cannot be started: {0}")]
+    RateLimitThread(String),
     /// A limit whose bucket and two cycles' refill pass 65,535, what a key's cycle can hold.
     #[error(
         "limit `{0}`: its burst and two cycles' refill pass 65,535, the most a key's cycle holds"

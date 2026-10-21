@@ -72,6 +72,35 @@ fn proxy_does_not_start_on_a_config_that_cannot_be_run() -> io::Result<()> {
     Ok(())
 }
 
+/// Rate limits are started before a request is served: a request under a limit is decided
+/// by them, though no service pod answers (a key new to the data plane is decided by it
+/// alone), and one over the limit is refused.
+#[test]
+fn proxy_starts_its_rate_limits_before_it_serves() -> io::Result<()> {
+    let one = upstream("one")?;
+    let limits = scratch("started-limits.yaml");
+    std::fs::write(
+        &limits,
+        "limits:\n  - { name: per-client, key: client, model: { bucket: { rate: 10/h, burst: 2 } } }\n",
+    )?;
+    let file = scratch("started.yaml");
+    let limited = config("127.0.0.1:0", "up", Some(one)).replace(
+        "        forward:",
+        "        rate_limits: [per-client]\n        forward:",
+    ) + &format!(
+        "rate_limit_service: {{ pods: [\"127.0.0.1:1\"] }}\nlimits_file: '{limits}'\n"
+    );
+    std::fs::write(&file, limited)?;
+    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
+    let web = harness.address_after("listener \"web\" is on ");
+    harness.wait_for("1 worker, thread-per-core");
+    assert!(get(web, "/")?.contains("x-upstream: one"));
+    assert!(get(web, "/")?.contains("x-upstream: one"));
+    let refused = get(web, "/")?;
+    assert!(refused.starts_with("HTTP/1.1 429 "), "{refused}");
+    Ok(())
+}
+
 #[test]
 fn proxy_does_not_start_when_a_port_is_taken() -> io::Result<()> {
     let taken = TcpListener::bind("127.0.0.1:0")?;

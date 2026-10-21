@@ -148,6 +148,7 @@ rate_limit_service: {{ pods: [{pods}], cycle_ms: 10{levers} }}
     let mut config: Config = serde_saphyr::from_str(&yaml).unwrap();
     config.limits = Some(serde_saphyr::from_str(LIMITS).unwrap());
     let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+    proxy.start_rate_limits(|| {}).unwrap();
     let worker = Worker::with_limits(proxy, H1Limits::default());
     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let front = socket.local_addr().unwrap();

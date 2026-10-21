@@ -286,7 +286,10 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     let mut bound: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
     let proxy = Proxy::new(config, workers)
         .map(Arc::new)
-        .map_err(|error| Failure::Proxy { path, error })?;
+        .map_err(|error| Failure::Proxy {
+            path: path.clone(),
+            error,
+        })?;
 
     // Every socket is open before a request is served on any, so that a port that is
     // taken stops a harness that has done nothing yet.
@@ -334,7 +337,9 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     let (stopping, stop) = mpsc::channel();
     let logs = Arc::clone(&proxy);
     signals(stopping.clone(), move || logs.reopen_logs()).map_err(Failure::Runtime)?;
-    proxy.watch_rate_limits(rate_limits_failed(&stopping));
+    proxy
+        .start_rate_limits(rate_limits_failed(&stopping))
+        .map_err(|error| Failure::Proxy { path, error })?;
     // Every worker runs on a thread of its own, which stays for as long as the process.
     let loads = per_core::start(&proxy, sockets, accept, limits, connections, &stopping)?;
     health_checks(Arc::clone(&proxy), &stopping).map_err(Failure::Runtime)?;
