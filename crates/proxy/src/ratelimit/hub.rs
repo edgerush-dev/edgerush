@@ -5,7 +5,7 @@
 //! workers' messages, the service's answers and its cycle; nothing of it is shared with a
 //! worker but the entries, a channel, and the clock they read its times by.
 
-use super::{ASK_TIMEOUT, DEFER_WAIT, MOST_DEFERRED, Undecided};
+use super::{ASK_TIMEOUT, Undecided};
 use crate::ProxyError;
 use edgerush_config::CompiledRateLimitService;
 use edgerush_ratelimit::service::pooled::{
@@ -50,11 +50,13 @@ pub(crate) enum ToHub {
         worker: usize,
         answers: mpsc::UnboundedSender<FromHub>,
     },
-    /// A request it cannot decide itself, for the process to.
+    /// A request it cannot decide itself, for the process to, by `until` in the process's
+    /// clock: its deadline, from when the worker first met it.
     Ask {
         worker: usize,
         id: u64,
         keys: Vec<(Box<[u8]>, Contract)>,
+        until: u64,
     },
     /// The bytes the keys may hold from now on.
     Capacity(u64),
@@ -72,8 +74,8 @@ pub(crate) enum ToHub {
 
 /// What the process sends a worker: the decision on a request it asked about — refused,
 /// which of its keys refused and how long each waits — with the entries of its keys, to
-/// hold; or, if `undecided`, none, and why: it could not be decided in the time allowed a
-/// deferred request, or too many were deferred.
+/// hold; or, if `undecided`, none, and why: its time ran out. Every ask is answered once,
+/// which gives its worker back the place it holds.
 pub(crate) struct FromHub {
     pub(crate) id: u64,
     pub(crate) admitted: bool,
@@ -444,24 +446,26 @@ fn run(
     thread.finish();
 }
 
-/// A request waiting on the service: the worker that asked, its number for it, the
-/// request's keys, and when the process took it.
-type Waiting = (usize, u64, Vec<(Box<[u8]>, Contract)>, u64);
-
-/// A request deferred here: as it waited, and until when it may.
-struct Deferred {
-    asked: Waiting,
+/// A request a worker asked about.
+struct Asked {
+    /// The worker, and its number for the request.
+    worker: usize,
+    id: u64,
+    keys: Vec<(Box<[u8]>, Contract)>,
+    /// When the process took it, and by when it must be decided: its deadline, set by its
+    /// worker when it first met the request, whatever has become of it since.
+    since: u64,
     until: u64,
 }
 
 /// The process thread's state.
 struct State {
     participant: RefCell<Participant<Keyed>>,
-    /// Requests that wait on the service, by ticket: the worker, its id, the keys.
-    waiting: RefCell<HashMap<Ticket, Waiting>>,
+    /// Requests that wait on the service, by ticket.
+    waiting: RefCell<HashMap<Ticket, Asked>>,
     /// Requests deferred here, decided again at every turn of the loop until their time is
-    /// up: as many as a worker may defer, at most.
-    deferred: RefCell<Vec<Deferred>>,
+    /// up: no more than their workers have places for.
+    deferred: RefCell<Vec<Asked>>,
     clients: Vec<Client>,
     /// By worker: where its answers go, once it has joined.
     answers: RefCell<Vec<Option<mpsc::UnboundedSender<FromHub>>>>,
@@ -493,15 +497,33 @@ impl State {
                     *slot = Some(answers);
                 }
             }
-            ToHub::Ask { worker, id, keys } => {
+            ToHub::Ask {
+                worker,
+                id,
+                keys,
+                until,
+            } => {
                 self.shared.stats.asks.fetch_add(1, Ordering::Relaxed);
-                let told = decided(
-                    &mut self.participant.borrow_mut(),
-                    &mut self.waiting.borrow_mut(),
-                    &mut self.deferred.borrow_mut(),
-                    (worker, id, keys, now),
-                    now,
-                );
+                let asked = Asked {
+                    worker,
+                    id,
+                    keys,
+                    since: now,
+                    until,
+                };
+                // Out of time while queued: answered so, undecided — never decided, or
+                // charged, for a request no longer waiting for it.
+                let told = if now >= until {
+                    Some(undecided(id, Undecided::Timeout))
+                } else {
+                    decided(
+                        &mut self.participant.borrow_mut(),
+                        &mut self.waiting.borrow_mut(),
+                        &mut self.deferred.borrow_mut(),
+                        asked,
+                        now,
+                    )
+                };
                 if let Some(told) = told {
                     self.shared.stats.answered(0);
                     self.tell(worker, told);
@@ -529,7 +551,13 @@ impl State {
             .take_decisions()
             .into_iter()
             .filter_map(|decided| {
-                let (worker, id, keys, since) = waiting.remove(&decided.ticket)?;
+                let Asked {
+                    worker,
+                    id,
+                    keys,
+                    since,
+                    ..
+                } = waiting.remove(&decided.ticket)?;
                 self.shared.stats.answered(now.saturating_sub(since));
                 let keys: Vec<(&[u8], Contract)> = keys
                     .iter()
@@ -547,30 +575,26 @@ impl State {
                 ))
             })
             .collect();
-        // Handed back at their settling: deferred here, as one deferred when asked.
+        // Handed back at their settling: deferred here, as one deferred when asked, within
+        // the time it had from the first.
         for ticket in participant.take_retries() {
             if let Some(asked) = waiting.remove(&ticket) {
-                deferred.push(Deferred {
-                    asked,
-                    until: now.saturating_add(nanos(DEFER_WAIT)),
-                });
+                deferred.push(asked);
             }
         }
-        // Every request deferred here, decided again.
-        for Deferred { asked, until } in std::mem::take(&mut *deferred) {
-            let worker = asked.0;
-            let since = asked.3;
-            if now >= until {
+        // Every request deferred here, decided again while its time lasts.
+        for asked in std::mem::take(&mut *deferred) {
+            let (worker, since) = (asked.worker, asked.since);
+            if now >= asked.until {
                 self.shared.stats.answered(now.saturating_sub(since));
-                told.push((worker, undecided(asked.1, Undecided::Timeout)));
+                told.push((worker, undecided(asked.id, Undecided::Timeout)));
                 continue;
             }
-            let mut again = Vec::new();
-            if let Some(answer) = decided(&mut participant, &mut waiting, &mut again, asked, now) {
+            if let Some(answer) = decided(&mut participant, &mut waiting, &mut deferred, asked, now)
+            {
                 self.shared.stats.answered(now.saturating_sub(since));
                 told.push((worker, answer));
             }
-            deferred.extend(again.into_iter().map(|again| Deferred { until, ..again }));
         }
         if participant.take_wake() {
             self.settled.notify_waiters();
@@ -650,32 +674,28 @@ impl State {
 }
 
 /// What comes of request `asked` at `now`: told its decision now; kept waiting on the
-/// service, by ticket; or deferred, to be decided again while its time lasts — or, past as
-/// many deferred as a worker may hold, told it has no place to wait.
+/// service, by ticket; or deferred, to be decided again while its time lasts. What is kept
+/// needs no bound of its own: each holds one of its worker's places until it is answered.
 fn decided(
     participant: &mut Participant<Keyed>,
-    waiting: &mut HashMap<Ticket, Waiting>,
-    deferred: &mut Vec<Deferred>,
-    asked: Waiting,
+    waiting: &mut HashMap<Ticket, Asked>,
+    deferred: &mut Vec<Asked>,
+    asked: Asked,
     now: u64,
 ) -> Option<FromHub> {
     let keys: Vec<(&[u8], Contract)> = asked
-        .2
+        .keys
         .iter()
         .map(|(key, contract)| (&**key, *contract))
         .collect();
-    let id = asked.1;
+    let id = asked.id;
     match participant.decide_all(&keys, now) {
         Pooled::Wait(ticket) => {
             waiting.insert(ticket, asked);
             None
         }
-        Pooled::Defer if deferred.len() >= MOST_DEFERRED => Some(undecided(id, Undecided::Full)),
         Pooled::Defer => {
-            deferred.push(Deferred {
-                asked,
-                until: now.saturating_add(nanos(DEFER_WAIT)),
-            });
+            deferred.push(asked);
             None
         }
         decision => {

@@ -357,6 +357,7 @@ async fn asks_that_come_together_are_sent_together() {
                 worker: 0,
                 id,
                 keys: vec![(key, contract)],
+                until: u64::MAX,
             })
             .unwrap();
     }
@@ -387,12 +388,12 @@ async fn asks_that_come_together_are_sent_together() {
 }
 
 /// Pooled, a request short only by another request's hold on its key is deferred rather
-/// than refused, and decided once the hold settles; with as many deferred as may be, it is
-/// the overload answer at once. No service pod answers: asks are given up after their time
+/// than refused, and decided once the hold settles; with no place left to wait in, it is
+/// answered full at once. No service pod answers: asks are given up after their time
 /// and keys decided from their copies.
 #[tokio::test]
 async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
-    use crate::ratelimit::{Hub, Limited, Limiter, MOST_DEFERRED, Undecided};
+    use crate::ratelimit::{Hub, Limited, Limiter, MOST_WAITING, Undecided};
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -424,7 +425,7 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
                 match limited {
                     Limited::Admit => Some(true),
                     Limited::Refuse => Some(false),
-                    Limited::Later(later) => later.await.unwrap().ok().map(|d| d.admitted),
+                    Limited::Later(later) => later.decided().await.ok().map(|d| d.admitted),
                     Limited::Undecided(_) => None,
                 }
             };
@@ -435,19 +436,20 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
             let both = limiter.decide_all(&rule.limits, 0b11, client);
             assert!(matches!(both, Limited::Later(_)));
             tokio::time::sleep(Duration::from_millis(50)).await;
-            // X alone again, short only by that hold: with no place to be deferred in, full.
-            limiter.set_most_deferred(0);
+            // X alone again, short only by that hold: with one place, which the waiting ask
+            // holds, none to be deferred in: full.
+            limiter.set_most_waiting(1);
             assert!(matches!(
                 limiter.decide_all(&rule.limits, 0b01, client),
                 Limited::Undecided(Undecided::Full)
             ));
-            limiter.set_most_deferred(MOST_DEFERRED);
+            limiter.set_most_waiting(MOST_WAITING);
             // Deferred, and decided once the hold settles: X and Y admitted, X is spent.
             let Limited::Later(alone) = limiter.decide_all(&rule.limits, 0b01, client) else {
                 panic!("not deferred");
             };
             assert_eq!(within(decided(both)).await, Some(true));
-            let alone = within(alone).await.unwrap();
+            let alone = within(alone.decided()).await;
             assert_eq!(
                 alone.map(|d| d.admitted),
                 Ok(false),
@@ -487,7 +489,7 @@ async fn a_cold_key_decided_locally_does_not_wait_for_the_service() {
                     let Limited::Later(first) = first else {
                         panic!("the first goes to the process");
                     };
-                    assert!(within(first).await.unwrap().unwrap().admitted);
+                    assert!(within(first.decided()).await.unwrap().admitted);
                     let took = started.elapsed();
                     assert!(
                         took >= Duration::from_millis(200),
@@ -943,7 +945,7 @@ async fn an_ask_waiting_when_the_thread_goes_is_told_it_is_unavailable() {
             until(|| exchanges.load(Ordering::Relaxed) > 0).await;
             hub.to.send(ToHub::Panic { in_exchange: false }).unwrap();
             until(|| failures() > 0).await;
-            assert_eq!(within(waiting).await, Ok(Err(Undecided::Unavailable)));
+            assert_eq!(within(waiting.decided()).await, Err(Undecided::Unavailable));
             assert!(matches!(
                 limiter.decide_all(&rule.limits, 0b1, requester("203.0.113.8")),
                 Limited::Undecided(Undecided::Unavailable)
@@ -951,6 +953,158 @@ async fn an_ask_waiting_when_the_thread_goes_is_told_it_is_unavailable() {
             limiter.stop();
         })
         .await;
+}
+
+/// A limiter of one worker whose every new client is asked about, of three service pods
+/// that hold back every answer for longer than an ask may wait — so that each ask is given
+/// up after its 300 ms and decided from the copy — with the rule it limits, and the
+/// exchanges the pods were sent.
+async fn asking_limiter() -> (
+    Rc<crate::ratelimit::Limiter>,
+    Arc<edgerush_config::CompiledRule>,
+    Arc<AtomicUsize>,
+) {
+    let exchanges = Arc::new(AtomicUsize::new(0));
+    let hold = Arc::new(Mutex::new(Some(Instant::now() + Duration::from_secs(60))));
+    let pods = held_service(&exchanges, &hold).await;
+    let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &pods);
+    if let Some(service) = &mut config.rate_limit_service {
+        service.ask_cold_keys = Some(true);
+    }
+    let compiled = compile(&config).unwrap();
+    let service = compiled.rate_limit_service().unwrap().clone();
+    let hub = crate::ratelimit::Hub::start(&service, 1, 1 << 20, None).unwrap();
+    let limiter = crate::ratelimit::Limiter::new(&service, hub, 0);
+    (limiter, Arc::clone(&compiled.rules_of(0)[0]), exchanges)
+}
+
+/// A worker has so many places for requests waiting on its rate limits, asks and deferred
+/// alike: past them a request is answered full at once, never queued; a place is given back
+/// once its ask is answered.
+#[tokio::test]
+async fn a_worker_holds_no_more_requests_waiting_than_it_has_places() {
+    use crate::ratelimit::{Limited, Undecided};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (limiter, rule, _) = asking_limiter().await;
+            limiter.set_most_waiting(2);
+            let ask = |client: &str| limiter.decide_all(&rule.limits, 0b1, requester(client));
+            let Limited::Later(first) = ask("203.0.113.1") else {
+                panic!("not asked about");
+            };
+            let Limited::Later(second) = ask("203.0.113.2") else {
+                panic!("not asked about");
+            };
+            assert!(matches!(
+                ask("203.0.113.3"),
+                Limited::Undecided(Undecided::Full)
+            ));
+            // Given up after their time, and decided from their copies: admitted, and their
+            // places given back.
+            assert!(within(first.decided()).await.unwrap().admitted);
+            assert!(within(second.decided()).await.unwrap().admitted);
+            assert!(matches!(ask("203.0.113.4"), Limited::Later(_)));
+            limiter.stop();
+        })
+        .await;
+}
+
+/// A request waits on its rate limits no longer than its time, wherever it waits — here on
+/// an ask its process has out — and is then answered as out of time; its place is kept until
+/// the ask is answered, though nothing waits for it any more, so that what is still queued
+/// or asking is within the places too.
+#[tokio::test]
+async fn a_request_out_of_time_is_answered_and_its_place_kept_until_its_ask_is() {
+    use crate::ratelimit::{Limited, Undecided};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (limiter, rule, _) = asking_limiter().await;
+            limiter.set_most_waiting(1);
+            limiter.set_wait(Duration::from_millis(50));
+            let ask = |client: &str| limiter.decide_all(&rule.limits, 0b1, requester(client));
+            let Limited::Later(first) = ask("203.0.113.1") else {
+                panic!("not asked about");
+            };
+            let started = Instant::now();
+            assert_eq!(within(first.decided()).await, Err(Undecided::Timeout));
+            let waited = started.elapsed();
+            assert!(
+                waited < Duration::from_millis(250),
+                "waited {waited:?}, as long as its ask"
+            );
+            // Its ask still out: no place for another.
+            assert!(matches!(
+                ask("203.0.113.2"),
+                Limited::Undecided(Undecided::Full)
+            ));
+            // Its ask given up and answered: its place given back.
+            within(async {
+                while matches!(ask("203.0.113.3"), Limited::Undecided(Undecided::Full)) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            limiter.stop();
+        })
+        .await;
+}
+
+/// An ask its process takes once its time is up is answered as out of time, undecided:
+/// never asked of a service pod, never charged.
+#[tokio::test]
+async fn an_ask_out_of_time_when_taken_is_not_asked_of_the_service() {
+    use crate::ratelimit::{FromHub, Hub, ToHub, Undecided};
+    use edgerush_ratelimit::service::Contract;
+    use std::num::NonZeroU64;
+
+    let exchanges = Arc::new(AtomicUsize::new(0));
+    let service = counted_service(&exchanges).await;
+    let compiled = edgerush_config::CompiledRateLimitService {
+        pods: service,
+        // A cycle longer than the test, so that every exchange is an ask's.
+        cycle: Duration::from_secs(60),
+        max_key_bytes: 1 << 20,
+        poll_quiet_keys: true,
+        ask_cold_keys: true,
+        schedule_keys: false,
+    };
+    let hub = Hub::start(&compiled, 1, 1 << 20, None).unwrap();
+    let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
+    hub.to.send(ToHub::Join { worker: 0, answers }).unwrap();
+    let before = exchanges.load(Ordering::Relaxed);
+    hub.to
+        .send(ToHub::Ask {
+            worker: 0,
+            id: 7,
+            keys: vec![(
+                b"cold".as_slice().into(),
+                Contract {
+                    limit: NonZeroU64::new(10).unwrap(),
+                    window: NonZeroU64::new(3_600_000_000_000).unwrap(),
+                    burst: NonZeroU64::new(10).unwrap(),
+                },
+            )],
+            until: 0,
+        })
+        .unwrap();
+    assert!(matches!(
+        within(answered.recv()).await.unwrap(),
+        FromHub {
+            id: 7,
+            undecided: Some(Undecided::Timeout),
+            ..
+        }
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        exchanges.load(Ordering::Relaxed),
+        before,
+        "asked all the same"
+    );
 }
 
 /// What a rate-limiting thread tells if it fails, counted.
@@ -1017,6 +1171,7 @@ async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
                     burst: NonZeroU64::new(10).unwrap(),
                 },
             )],
+            until: u64::MAX,
         })
         .unwrap();
     until(|| exchanges.load(Ordering::Relaxed) > before).await;
@@ -1069,6 +1224,7 @@ async fn a_failed_rate_limiting_thread_tells_once() {
             worker: 0,
             id,
             keys: vec![(format!("cold-{id}").into_bytes().into(), contract)],
+            until: u64::MAX,
         };
         hub.to.send(ask(0)).unwrap();
         assert!(within(answered.recv()).await.unwrap().admitted);
