@@ -25,7 +25,7 @@ pub struct Contract {
 /// Hits a data plane admitted.
 #[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
 pub struct Hits {
-    /// The batch's number for the key, from 1.
+    /// The batch's number for the key, one past the last, and never 0.
     #[prost(uint64, tag = "1")]
     pub sequence: u64,
     /// How many hits.

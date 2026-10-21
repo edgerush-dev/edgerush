@@ -1706,6 +1706,30 @@ fn a_data_plane_past_its_capacity_evicts_the_least_recently_used() {
     assert_eq!(net.planes[0].holding(), 0);
 }
 
+/// A key evicted and made again numbers its reports past those its earlier life sent: its
+/// owner, which still holds that life's numbers, counts them rather than taking them for
+/// reports it has applied.
+#[test]
+fn a_key_made_again_is_counted_from_its_first_report() {
+    let mut net = Net::new(1);
+    let owner = Net::owner(b"k");
+    warmed(&mut net, 0, b"k", 0);
+    assert_eq!(net.admits(0, b"k", 2, MS), 2);
+    net.planes[0].on_cycle(MS);
+    net.settle(MS);
+    assert_eq!(net.pods[owner].counted(b"k"), Some(3));
+    net.planes[0].set_capacity(1);
+    net.planes[0].on_cycle(2 * MS);
+    assert!(net.planes[0].keys.is_empty(), "evicted");
+    net.planes[0].set_capacity(u64::MAX);
+    warmed(&mut net, 0, b"k", 3 * MS);
+    assert_eq!(net.pods[owner].counted(b"k"), Some(4), "asked about");
+    assert_eq!(net.admits(0, b"k", 2, 4 * MS), 2);
+    net.planes[0].on_cycle(4 * MS);
+    net.settle(4 * MS);
+    assert_eq!(net.pods[owner].counted(b"k"), Some(6), "reported");
+}
+
 /// Past its capacity, a service pod evicts the keys that changed least recently down to
 /// nine tenths of it.
 #[test]

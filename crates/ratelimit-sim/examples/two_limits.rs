@@ -174,8 +174,7 @@ fn main() {
          share of requests refused / admitted against one bucket holding it, over the whole \
          run (how many more a run, on average) / the most over it \
          in any span, worst seed / (two routes: the most over a route's own limit) / share of \
-         admissions some owner never counted — a key forgotten once full and quiet takes its \
-         count with it — / share counted twice, over every limit.\n"
+         admissions some owner never counted / share counted twice, over every limit.\n"
     );
     for (title, limit, beside) in scenarios {
         let routes = matches!(beside, Beside::Routes(_));

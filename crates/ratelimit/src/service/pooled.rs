@@ -964,6 +964,9 @@ pub struct Participant<S> {
     in_flight: BTreeMap<u64, Box<[u8]>>,
     next_ticket: Ticket,
     asks_sent: u64,
+    /// Batches numbered, over every key: a key made again numbers its own from here, past
+    /// every number an earlier life of it used.
+    numbered: u64,
     decided: Vec<Decided>,
     /// Requests that waited and are to be decided again, whole, by their workers.
     retries: Vec<Ticket>,
@@ -1040,6 +1043,7 @@ struct Visit<'a> {
     poll_quiet: bool,
     sending: &'a BTreeMap<PodId, u64>,
     outgoing: &'a mut BTreeMap<PodId, Vec<BatchEntry>>,
+    numbered: &'a mut u64,
     cut_off: bool,
     wake: bool,
 }
@@ -1096,6 +1100,7 @@ impl Visit<'_> {
         if unsent > 0 {
             tracked.unsent = 0;
             tracked.sent += 1;
+            *self.numbered += 1;
             entries.push(BatchEntry {
                 key: key.clone(),
                 contract: entry.terms.contract,
@@ -1170,6 +1175,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             in_flight: BTreeMap::new(),
             next_ticket: 0,
             asks_sent: 0,
+            numbered: 0,
             decided: Vec::new(),
             retries: Vec::new(),
             wake: false,
@@ -1415,8 +1421,8 @@ impl<S: BuildHasher + Clone> Participant<S> {
         let tracked = Tracked {
             entry,
             owner,
-            sent: 0,
-            seen: 0,
+            sent: self.numbered,
+            seen: self.numbered,
             unacknowledged: VecDeque::new(),
             unsent: 0,
             heard: None,
@@ -1790,6 +1796,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             poll_quiet: self.levers.poll_quiet,
             sending: &self.sending,
             outgoing: &mut self.outgoing,
+            numbered: &mut self.numbered,
             cut_off: false,
             wake: false,
         };
