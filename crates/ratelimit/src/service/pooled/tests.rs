@@ -358,12 +358,12 @@ proptest! {
     /// owner is what was admitted under it, with cold keys decided locally. With them asked
     /// about, at least that: the pod counts an ask sent again twice where another ask about
     /// the key came between (the service pod's one-ask memory; results note), which neither
-    /// mode causes. Buckets refilling over longer than a schedule, so that no key is idle
-    /// long enough to evict: a key evicted and made again starts its reports afresh, which
-    /// a pod that never forgot the key, as this one never does, takes for ones it applied.
+    /// mode causes. Now and then the next cycle runs with no room for any key, evicting every
+    /// key it may, to be made again by its next request: its reports then number on past
+    /// those of its earlier life, which the pod, never forgetting the key, still holds.
     #[test]
     fn no_admission_goes_uncounted_scheduled_or_not(
-        events in prop::collection::vec((event(), 0u64..4), 1..300),
+        events in prop::collection::vec((event(), 0u64..4, prop::bool::weighted(0.1)), 1..300),
         ask_cold: bool,
         poll_quiet: bool,
         one_in_flight: bool,
@@ -399,11 +399,20 @@ proptest! {
             };
             let mut now = 0;
             let mut next_cycle = CYCLE;
-            for (event, step) in &events {
+            let mut evicting = false;
+            for (event, step, evict) in &events {
                 now += step * 40_000 * 25;
+                if *evict {
+                    pooled.participant.set_capacity(1);
+                    evicting = true;
+                }
                 while now >= next_cycle {
                     pooled.participant.on_cycle(next_cycle);
                     next_cycle += CYCLE;
+                    if evicting {
+                        pooled.participant.set_capacity(u64::MAX);
+                        evicting = false;
+                    }
                 }
                 let places = match event {
                     Event::Request(key) => vec![*key],
@@ -2200,6 +2209,38 @@ fn a_key_evicted_for_capacity_is_freed_at_once() {
     assert_eq!(participant.holding(), 0);
     assert!(held.iter().all(|entry| entry.upgrade().is_none()), "freed");
     assert!(participant.evictions.is_empty());
+}
+
+/// A key evicted and made again numbers its reports past those its earlier life sent,
+/// scheduled or not: its owner, which still holds that life's numbers, counts them rather
+/// than taking them for reports it has applied.
+#[test]
+fn a_key_made_again_is_counted_from_its_first_report() {
+    for scheduled in [false, true] {
+        let mut participant = one_in_flight();
+        participant.set_scheduled(scheduled);
+        let mut pod = pod(1);
+        let keys: [(&[u8], Contract); 1] = [(b"k", contract(100, 10))];
+        let mut exchange = |participant: &mut Participant<FixedState>, now: u64| {
+            participant.on_cycle(now);
+            for (_, exchange, batch) in participant.take_exchanges() {
+                participant.on_answers_to(exchange, pod.on_batch(batch, now), now);
+            }
+            pod.counted(b"k")
+        };
+        assert_eq!(participant.decide_all(&keys, 0), Decision::Admit);
+        assert_eq!(exchange(&mut participant, CYCLE), Some(1));
+        participant.set_capacity(1);
+        participant.on_cycle(2 * CYCLE);
+        assert_eq!(participant.key_count(), 0, "evicted");
+        participant.set_capacity(u64::MAX);
+        assert_eq!(participant.decide_all(&keys, 2 * CYCLE), Decision::Admit);
+        assert_eq!(
+            exchange(&mut participant, 3 * CYCLE),
+            Some(2),
+            "scheduled: {scheduled}"
+        );
+    }
 }
 
 /// Scheduled, an entry replaced by a changed contract is kept by its eviction time until

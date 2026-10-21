@@ -173,7 +173,8 @@ pub type FixedState = BuildHasherDefault<Fnv>;
 pub enum Report {
     /// Hits it admitted, for the owner to apply.
     Hits {
-        /// The batch's number among this data plane's batches for the key, from 1.
+        /// The batch's number among this data plane's batches for the key, one past the
+        /// last; a key evicted and made again numbers on past every number it had before.
         sequence: u64,
         /// How many hits.
         count: u64,
@@ -372,15 +373,15 @@ struct PlaneKey {
 }
 
 impl PlaneKey {
-    fn new(contract: Contract, owner: Option<PodId>) -> Self {
+    fn new(contract: Contract, owner: Option<PodId>, numbered: u64) -> Self {
         Self {
             contract,
             hold: contract.refill_time(),
             owner,
             bucket: contract.bucket(),
             unsent: 0,
-            sent: 0,
-            seen: 0,
+            sent: numbered,
+            seen: numbered,
             unacknowledged: VecDeque::new(),
             spent: 0,
             allowance: None,
@@ -532,6 +533,9 @@ pub struct DataPlane<S = FixedState> {
     in_flight: BTreeMap<u64, Box<[u8]>>,
     next_ticket: Ticket,
     asks_sent: u64,
+    /// Batches numbered, over every key: a key made again numbers its own from here, past
+    /// every number an earlier life of it used.
+    numbered: u64,
     decided: Vec<Decided>,
     outgoing: BTreeMap<PodId, Vec<Entry>>,
     asks: BTreeMap<PodId, Vec<Ask>>,
@@ -604,6 +608,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             in_flight: BTreeMap::new(),
             next_ticket: 0,
             asks_sent: 0,
+            numbered: 0,
             decided: Vec::new(),
             outgoing: BTreeMap::new(),
             asks: BTreeMap::new(),
@@ -742,7 +747,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 let owner = self.view.owners(key).0;
                 if self
                     .keys
-                    .insert(key.into(), PlaneKey::new(contract, owner))
+                    .insert(key.into(), PlaneKey::new(contract, owner, self.numbered))
                     .is_none()
                 {
                     self.holding += plane_key_bytes(key);
@@ -1046,6 +1051,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             }
             if at.unsent > 0 {
                 at.sent += 1;
+                self.numbered += 1;
                 entries.push(Entry {
                     key: key.clone(),
                     contract: at.contract,
