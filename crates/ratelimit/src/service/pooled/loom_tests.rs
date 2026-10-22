@@ -100,6 +100,58 @@ fn loom_admissions_racing_a_drain_are_counted_once_and_a_count_left_is_signalled
     });
 }
 
+/// Two workers starting a key's count, each claiming its signal for the queue to the
+/// transport, while the transport takes what is queued — the signal first, then a visit
+/// that drains the key: every admission is drained once or left in the count; a count left
+/// has a signal queued for it, never one carried by a signal already taken; the key is
+/// queued once at most; and it is claimed just while it is queued. It checks the order of
+/// the steps, not the claim's orderings: what those keep out — a worker's change to the
+/// word ordered after a drain it found the claim taken before — needs read-modify-writes
+/// to take effect out of turn, which loom never tries, so it passes them relaxed too, as
+/// it does with a loom atomic in the word's place ([`Entry::claim_signal`] says why they
+/// are as they are).
+#[test]
+fn loom_a_signal_carried_by_one_on_its_way_reaches_the_transport() {
+    loom::model(|| {
+        let entry = Arc::new(Entry::new(
+            b"k"[..].into(),
+            contract(1_000, 1_000),
+            CYCLE,
+            false,
+            0,
+        ));
+        let queue = Arc::new(loom::sync::Mutex::new(Vec::<Arc<Entry>>::new()));
+        let admit = |entry: &Arc<Entry>, queue: &Arc<loom::sync::Mutex<Vec<Arc<Entry>>>>| {
+            let (entry, queue) = (Arc::clone(entry), Arc::clone(queue));
+            loom::thread::spawn(move || {
+                let (taken, started) = entry.take(Op::Admit, 0);
+                if started && entry.claim_signal() {
+                    queue.lock().unwrap().push(Arc::clone(&entry));
+                }
+                u64::from(taken.done())
+            })
+        };
+        let (a, b) = (admit(&entry, &queue), admit(&entry, &queue));
+        let taken = std::mem::take(&mut *queue.lock().unwrap());
+        let mut drained = 0;
+        for signalled in &taken {
+            signalled.unclaim_signal();
+            drained += signalled.drain(0, Cycle::AsItIs).0;
+        }
+        let admitted = a.join().unwrap() + b.join().unwrap();
+        let left = entry.snapshot().unreported;
+        let queued = queue.lock().unwrap().len();
+        assert_eq!(drained + left, admitted, "each admission counted once");
+        assert!(left == 0 || queued == 1, "{left} left, no signal queued");
+        assert!(queued <= 1, "queued {queued} times");
+        assert_eq!(
+            entry.signalled.load(Ordering::Acquire),
+            queued == 1,
+            "claimed while not queued, or queued unclaimed"
+        );
+    });
+}
+
 /// Two requests whose clocks read either side of a cycle boundary, at once, the later in a
 /// new 256-cycle step of the record: the word ends in the later cycle, never moved back by
 /// the earlier, and the record matches the cycle the word holds — never ahead of it.

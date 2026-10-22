@@ -2099,6 +2099,45 @@ fn a_required_scan_finds_a_count_no_signal_named() {
     assert!(participant.visits() - before <= 1, "the scan taken");
 }
 
+/// A key's signal on its way to the transport carries any other worker's for it: a second
+/// claim finds it taken, until the transport takes it — before it visits the key, and even
+/// with the key queued already or the entry stale — after which the key's next signal is
+/// claimed afresh.
+#[test]
+fn a_signal_on_its_way_carries_the_others_until_the_transport_takes_it() {
+    let (mut participant, entries) = scheduled(2);
+    let key = &entries[0];
+    assert!(key.claim_signal(), "the first");
+    assert!(!key.claim_signal(), "a second, carried by the first");
+    participant.on_signals([Arc::clone(key)]);
+    assert!(key.claim_signal(), "taken, claimed afresh");
+    participant.on_signals([Arc::clone(key)]);
+    assert!(key.claim_signal(), "taken with the key queued already");
+    let stale = Arc::new(Entry::new(
+        b"gone"[..].into(),
+        contract(100, 10),
+        CYCLE,
+        false,
+        0,
+    ));
+    assert!(stale.claim_signal());
+    participant.on_signals([Arc::clone(&stale)]);
+    assert!(stale.claim_signal(), "taken, though no longer kept");
+}
+
+/// A scan visits every key but takes no signal still on its way: the key stays claimed
+/// until the transport takes that signal, so no other worker sends it again meanwhile.
+#[test]
+fn a_scan_leaves_a_signal_on_its_way_claimed() {
+    let (mut participant, entries) = scheduled(3);
+    assert!(entries[1].claim_signal());
+    participant.registry().require_scan();
+    participant.on_cycle(2 * CYCLE);
+    assert!(!entries[1].claim_signal(), "the scan took it");
+    participant.on_signals([Arc::clone(&entries[1])]);
+    assert!(entries[1].claim_signal());
+}
+
 /// With one exchange in flight, a key drained while its owner's exchange is out keeps its
 /// ledger and is visited until the exchange is over, then reported, with no new signal.
 #[test]
