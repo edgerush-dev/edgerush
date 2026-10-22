@@ -970,22 +970,26 @@ fn sample(scrape: &str, series: &str) -> u64 {
     line.rsplit(' ').next().unwrap().parse().unwrap()
 }
 
-/// `proxy`'s scrape once each of `settled` reads its value: an answer is counted as it
-/// goes, which a client that has read all of it can come before.
-async fn scrape_when(proxy: &Proxy, settled: &[(&str, u64)]) -> String {
-    within(async {
-        loop {
-            let scrape = proxy.metrics();
-            if settled
-                .iter()
-                .all(|(series, value)| sample(&scrape, series) == *value)
-            {
-                return scrape;
+/// `proxy`'s scrape once each of `expected` reads its value, or, after a while, the series
+/// that do not, failed. An answer is counted as it goes, which a client that has read all
+/// of it can come before; and a scrape reads one series after another, so one that has its
+/// value says nothing of another. Every series a test reads from the scrape goes in
+/// `expected`.
+async fn scrape_when(proxy: &Proxy, expected: &[(&str, u64)]) -> String {
+    let began = Instant::now();
+    loop {
+        let scrape = proxy.metrics();
+        let settled = expected
+            .iter()
+            .all(|(series, value)| sample(&scrape, series) == *value);
+        if settled || began.elapsed() > Duration::from_secs(10) {
+            for (series, value) in expected {
+                assert_eq!(sample(&scrape, series), *value, "{series}");
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            return scrape;
         }
-    })
-    .await
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1003,75 +1007,42 @@ async fn what_happens_is_counted_and_a_reload_resets_nothing() {
 
     let head_time = "edgerush_listener_time_to_response_head_seconds";
     let web_counted = format!("{head_time}_count{{listener=\"web\"}}");
-    let dead_counted = format!("{head_time}_count{{listener=\"dead\"}}");
-    let scrape = scrape_when(&proxy, &[(&web_counted, 4), (&dead_counted, 1)]).await;
     let web_responses = "edgerush_listener_responses_total{listener=\"web\",class=";
-    assert_eq!(sample(&scrape, &format!("{web_responses}\"2xx\"}}")), 3);
-    assert_eq!(sample(&scrape, &format!("{web_responses}\"4xx\"}}")), 1);
-    assert_eq!(sample(&scrape, &format!("{web_responses}\"5xx\"}}")), 0);
     let answers = "edgerush_listener_local_answers_total{listener=";
-    assert_eq!(
-        sample(&scrape, &format!("{answers}\"web\",reason=\"bad_path\"}}")),
-        1
-    );
-    assert_eq!(
-        sample(
-            &scrape,
-            &format!("{answers}\"dead\",reason=\"upstream_failed\"}}")
-        ),
-        1
-    );
-    assert_eq!(sample(&scrape, &web_counted), 4);
-    assert_eq!(
-        sample(
-            &scrape,
-            &format!("{head_time}_bucket{{listener=\"web\",le=\"+Inf\"}}")
-        ),
-        4
-    );
-    assert_eq!(
-        sample(
-            &scrape,
-            "edgerush_upstream_requests_total{upstream=\"web\"}"
-        ),
-        3
-    );
-    assert_eq!(
-        sample(
-            &scrape,
-            "edgerush_upstream_responses_total{upstream=\"web\",class=\"2xx\"}"
-        ),
-        3
-    );
-    assert_eq!(
-        sample(
-            &scrape,
-            "edgerush_upstream_failures_total{upstream=\"web\"}"
-        ),
-        0
-    );
-    assert_eq!(
-        sample(
-            &scrape,
-            "edgerush_upstream_requests_total{upstream=\"dead\"}"
-        ),
-        1
-    );
-    assert_eq!(
-        sample(
-            &scrape,
-            "edgerush_upstream_failures_total{upstream=\"dead\"}"
-        ),
-        1
-    );
-    // Every request came on a connection of its own, and the clients are gone again.
-    assert_eq!(
-        sample(
-            &scrape,
-            "edgerush_listener_connections_accepted_total{listener=\"web\"}"
-        ),
-        4
-    );
+    scrape_when(
+        &proxy,
+        &[
+            (&format!("{web_responses}\"2xx\"}}"), 3),
+            (&format!("{web_responses}\"4xx\"}}"), 1),
+            (&format!("{web_responses}\"5xx\"}}"), 0),
+            (&format!("{answers}\"web\",reason=\"bad_path\"}}"), 1),
+            (
+                &format!("{answers}\"dead\",reason=\"upstream_failed\"}}"),
+                1,
+            ),
+            (&web_counted, 4),
+            (
+                &format!("{head_time}_bucket{{listener=\"web\",le=\"+Inf\"}}"),
+                4,
+            ),
+            (&format!("{head_time}_count{{listener=\"dead\"}}"), 1),
+            ("edgerush_upstream_requests_total{upstream=\"web\"}", 3),
+            (
+                "edgerush_upstream_responses_total{upstream=\"web\",class=\"2xx\"}",
+                3,
+            ),
+            ("edgerush_upstream_failures_total{upstream=\"web\"}", 0),
+            ("edgerush_upstream_requests_total{upstream=\"dead\"}", 1),
+            ("edgerush_upstream_failures_total{upstream=\"dead\"}", 1),
+            // Every request came on a connection of its own.
+            (
+                "edgerush_listener_connections_accepted_total{listener=\"web\"}",
+                4,
+            ),
+        ],
+    )
+    .await;
+    // And the clients are gone again.
     let active = "edgerush_listener_connections_active{listener=\"web\"}";
     within(async {
         while sample(&proxy.metrics(), active) != 0 {
@@ -1084,16 +1055,16 @@ async fn what_happens_is_counted_and_a_reload_resets_nothing() {
     let reloaded = everything_to(&[("dead", nowhere), ("web", up)], "1");
     proxy.reload(compiled(&reloaded)).unwrap();
     assert_eq!(send(get(web, "/")).await.0, 200);
-    let scrape = scrape_when(&proxy, &[(&web_counted, 5)]).await;
-    assert_eq!(sample(&scrape, &format!("{web_responses}\"2xx\"}}")), 4);
-    assert_eq!(
-        sample(
-            &scrape,
-            "edgerush_upstream_requests_total{upstream=\"web\"}"
-        ),
-        4
-    );
-    assert_eq!(sample(&scrape, "edgerush_config_reloads_total"), 1);
+    let scrape = scrape_when(
+        &proxy,
+        &[
+            (&web_counted, 5),
+            (&format!("{web_responses}\"2xx\"}}"), 4),
+            ("edgerush_upstream_requests_total{upstream=\"web\"}", 4),
+            ("edgerush_config_reloads_total", 1),
+        ],
+    )
+    .await;
     assert!(sample(&scrape, "edgerush_config_last_reload_timestamp_seconds") > 1_700_000_000);
 }
 
