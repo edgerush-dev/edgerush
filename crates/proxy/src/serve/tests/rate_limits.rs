@@ -1016,6 +1016,46 @@ async fn a_worker_holds_no_more_requests_waiting_than_it_has_places() {
         .await;
 }
 
+/// Dry runs wait in places of their own: however many they fill, the limits that refuse
+/// keep every one of theirs, and the other way about.
+#[tokio::test]
+async fn dry_runs_wait_in_places_of_their_own() {
+    use crate::ratelimit::{Limited, Undecided};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (limiter, rule, _) = asking_limiter().await;
+            limiter.set_most_waiting(1);
+            limiter.set_most_dry_runs_waiting(1);
+            let ask = |client: &str| limiter.decide_all(&rule.limits, 0b1, requester(client));
+            let dry_run =
+                |client: &str| limiter.decide_dry_run(&rule.limits, 0b1, requester(client));
+            let Limited::Later(dry) = dry_run("203.0.113.1") else {
+                panic!("not asked about");
+            };
+            assert!(matches!(
+                dry_run("203.0.113.2"),
+                Limited::Undecided(Undecided::Full)
+            ));
+            let Limited::Later(enforced) = ask("203.0.113.3") else {
+                panic!("a dry run took an enforced limit's place");
+            };
+            assert!(matches!(
+                ask("203.0.113.4"),
+                Limited::Undecided(Undecided::Full)
+            ));
+            assert!(matches!(
+                dry_run("203.0.113.5"),
+                Limited::Undecided(Undecided::Full)
+            ));
+            assert!(within(dry.decided()).await.unwrap().admitted);
+            assert!(within(enforced.decided()).await.unwrap().admitted);
+            limiter.stop();
+        })
+        .await;
+}
+
 /// A request waits on its rate limits no longer than its time, wherever it waits — here on
 /// an ask its process has out — and is then answered as out of time; its place is kept until
 /// the ask is answered, though nothing waits for it any more, so that what is still queued
@@ -1429,10 +1469,65 @@ async fn a_dry_run_counts_what_it_would_refuse_and_refuses_nothing() {
             ] {
                 assert!(scrape.contains(&expected), "{expected}{scrape}");
             }
-            assert!(
-                !scrape.contains("limit=\"per-client\",outcome=\"dry_run_refused\""),
-                "{scrape}"
+            assert!(scrape.contains(&line("trial", "dry_run_uncounted", 0)), "{scrape}");
+            for outcome in ["dry_run_refused", "dry_run_uncounted"] {
+                assert!(
+                    !scrape.contains(&format!("limit=\"per-client\",outcome=\"{outcome}\"")),
+                    "{scrape}"
+                );
+            }
+        })
+        .await;
+}
+
+/// A dry run its rate limits cannot decide — here, before they are started — lets the
+/// request go on as ever, and counts it `dry_run_uncounted`, neither admitted nor refused.
+#[tokio::test]
+async fn a_dry_run_not_decided_lets_the_request_go_on_and_says_so() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let service = service().await;
+            let (upstream, _) = counting_upstream().await;
+            let mut config = limited(everything_config(upstream), &service);
+            config.routes[0].rules[0].rate_limits = vec!["trial".to_owned()];
+            config.limits = Some(
+                serde_saphyr::from_str(
+                    "limits:
+  - { name: trial, key: client, model: { bucket: { rate: 4/h, burst: 4 } }, dry_run: true }
+",
+                )
+                .unwrap(),
             );
+            let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
+            let worker = Worker::with_deadlines(Arc::clone(&proxy), H1Limits::default(), SHORT);
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front = socket.local_addr().unwrap();
+            let _serving = serving(&worker, socket);
+            let mut send = h2_library_client(front, &::h2::client::Builder::new()).await;
+            let mut statuses = Vec::new();
+            for _ in 0..3 {
+                send = within(send.ready()).await.unwrap();
+                let request = Request::get("http://example.test/")
+                    .version(Version::HTTP_2)
+                    .body(())
+                    .unwrap();
+                let (response, _) = send.send_request(request, true).unwrap();
+                let response = within(response).await.unwrap();
+                statuses.push(response.status().as_u16());
+            }
+            assert_eq!(statuses, [200; 3]);
+            let line = |outcome: &str, count: u64| {
+                format!("edgerush_rate_limit_decisions_total{{limit=\"trial\",outcome=\"{outcome}\"}} {count}\n")
+            };
+            let scrape = worker.proxy().metrics();
+            for expected in [
+                line("admitted", 0),
+                line("dry_run_refused", 0),
+                line("dry_run_uncounted", 3),
+            ] {
+                assert!(scrape.contains(&expected), "{expected}{scrape}");
+            }
         })
         .await;
 }

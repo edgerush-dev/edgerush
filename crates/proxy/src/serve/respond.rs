@@ -183,11 +183,10 @@ impl Worker {
     /// Decides a request from `client` under the dry runs it is `under`, each on its own,
     /// never holding it up: one with room is charged and counts it admitted; one without
     /// counts it `dry_run_refused` and lets it go on. A key held no fresh copy of is asked
-    /// about, and counted when the answer comes.
+    /// about, in places dry runs have of their own, and counted when the answer comes; one
+    /// not decided — no place, no time, no thread to decide it — counts `dry_run_uncounted`.
     fn dry_run(&self, under: Under<'_>, client: Requester) {
-        let Some(limiter) = self.limiter() else {
-            return;
-        };
+        let limiter = self.limiter();
         let mut marked = under.marked;
         while marked != 0 {
             let at = marked.trailing_zeros() as usize;
@@ -198,28 +197,32 @@ impl Worker {
                 .limits
                 .get(at)
                 .and_then(|limit| under.slots.get(limit.position).copied());
-            let count = move |proxy: &Proxy, admitted: bool| {
+            // Admitted, refused, or neither.
+            let count = move |proxy: &Proxy, admitted: Option<bool>| {
                 if let Some(counters) = slot.and_then(|slot| proxy.metrics.limit(slot)) {
-                    if admitted {
-                        counters.admitted.inc();
-                    } else {
-                        counters.dry_run_refused.inc();
+                    match admitted {
+                        Some(true) => counters.admitted.inc(),
+                        Some(false) => counters.dry_run_refused.inc(),
+                        None => counters.dry_run_uncounted.inc(),
                     }
                 }
             };
-            match limiter.decide_all(&under.rule.limits, one, client) {
-                Limited::Admit => count(&self.proxy, true),
-                Limited::Refuse => count(&self.proxy, false),
+            let limited = limiter
+                .as_ref()
+                .map_or(Limited::Undecided(Undecided::Unavailable), |limiter| {
+                    limiter.decide_dry_run(&under.rule.limits, one, client)
+                });
+            match limited {
+                Limited::Admit => count(&self.proxy, Some(true)),
+                Limited::Refuse => count(&self.proxy, Some(false)),
                 Limited::Later(decided) => {
                     let proxy = Arc::clone(&self.proxy);
                     let _counted = tokio::task::spawn_local(async move {
-                        if let Ok(decided) = decided.decided().await {
-                            count(&proxy, decided.admitted);
-                        }
+                        let decided = decided.decided().await;
+                        count(&proxy, decided.ok().map(|decided| decided.admitted));
                     });
                 }
-                // Undecided: a dry run counts neither way.
-                Limited::Undecided(_) => {}
+                Limited::Undecided(_) => count(&self.proxy, None),
             }
         }
     }

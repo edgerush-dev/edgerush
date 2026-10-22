@@ -724,12 +724,14 @@ impl UpstreamCounters {
 
 /// What is counted per rate limit (06 §2): requests admitted under it, each counted under
 /// every limit it was under, and refused by it, each counted under every limit that was
-/// out of room; for a dry run, those it had no room for and let go on.
+/// out of room; for a dry run, those it had no room for and let go on, and those it could
+/// not decide and let go on uncounted.
 #[derive(Debug, Default)]
 pub(crate) struct LimitCounters {
     pub(crate) admitted: Counter,
     pub(crate) refused: Counter,
     pub(crate) dry_run_refused: Counter,
+    pub(crate) dry_run_uncounted: Counter,
 }
 
 /// The position of a status in [`CLASSES`]. `http` has no status below 100 or above 999;
@@ -942,7 +944,8 @@ impl Metrics {
     }
 
     /// The scrape's rate limits: those of the current config by their names, each with the
-    /// slot it has and whether it is a dry run, which alone shows `dry_run_refused`; and
+    /// slot it has and whether it is a dry run, which alone shows `dry_run_refused` and
+    /// `dry_run_uncounted`; and
     /// what the workers' keys hold against `max_key_bytes`, the data plane's.
     pub(crate) fn render_limits(
         &self,
@@ -994,7 +997,8 @@ impl Metrics {
         let help = "Requests decided under the rate limit, by outcome: admitted, counted under \
                     every limit a request was under; refused, counted under every limit that \
                     was out of room; dry_run_refused, those a dry run had no room for and let \
-                    go on.";
+                    go on; dry_run_uncounted, those a dry run could not decide in time and let \
+                    go on uncounted.";
         scrape.family(name, Kind::Counter, help);
         for (limit, slot, dry_run) in shown {
             let Some(series) = self.limits.get(slot).and_then(OnceLock::get) else {
@@ -1010,6 +1014,12 @@ impl Metrics {
                     name,
                     &labels,
                     series.sum(|shard| shard.dry_run_refused.get()),
+                );
+                let labels = [("limit", limit), ("outcome", "dry_run_uncounted")];
+                scrape.sample(
+                    name,
+                    &labels,
+                    series.sum(|shard| shard.dry_run_uncounted.get()),
                 );
             }
         }
