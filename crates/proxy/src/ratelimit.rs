@@ -140,10 +140,14 @@ pub(crate) struct Later {
 
 impl Later {
     /// The decision; or, once its time is up, [`Undecided::Timeout`], wherever the request
-    /// waits — the place it holds is kept until what it waits on is done; or, with its
-    /// sender dropped unanswered, the limiter gone: [`Undecided::Unavailable`].
+    /// waits — the place it holds is kept until what it waits on is done — and however
+    /// ready its decision: one taken up after its time, its worker held up meanwhile, is out
+    /// of time too, though it may have been charged; or, with its sender dropped unanswered,
+    /// the limiter gone: [`Undecided::Unavailable`].
     pub(crate) async fn decided(self) -> Result<Decided, Undecided> {
-        match tokio::time::timeout_at(self.until, self.decided).await {
+        let until = self.until;
+        match tokio::time::timeout_at(until, self.decided).await {
+            Ok(_) if tokio::time::Instant::now() >= until => Err(Undecided::Timeout),
             Ok(Ok(decided)) => decided,
             Ok(Err(_)) => Err(Undecided::Unavailable),
             Err(_) => Err(Undecided::Timeout),
@@ -749,6 +753,14 @@ impl Limiter {
             })
         };
         let result = loop {
+            // Let go before it is decided again, never charged for: nobody waits for it, or
+            // its time is up — however it was woken, or before its task first ran.
+            if decided.is_closed() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break Err(Undecided::Timeout);
+            }
             // Waiting on its keys before it decides, and listening before it decides, so
             // that a hold settled between the two is not missed.
             let _waiting = Waiting::on(&self.handles, &self.registry, &parts);
@@ -794,6 +806,21 @@ impl Limiter {
     #[cfg(test)]
     pub(crate) fn set_most_dry_runs_waiting(&self, most: usize) {
         self.dry_runs.most.set(most);
+    }
+
+    /// Defers a request from `client` under those of `limits` that `limited` marks,
+    /// whatever its keys say, for a test of what a deferred request does.
+    #[cfg(test)]
+    pub(crate) fn defer_regardless(
+        self: &Rc<Self>,
+        limits: &[Arc<CompiledLimit>],
+        limited: u64,
+        client: Requester,
+    ) -> Limited {
+        let now = self.now();
+        self.with_keys(limits, limited, client, |parts| {
+            self.defer(parts, now, &self.waiting)
+        })
     }
 
     /// The most entries it keeps signalled between syncs, for a test to fill.
