@@ -1018,6 +1018,97 @@ async fn an_ask_waiting_when_the_thread_goes_is_told_it_is_unavailable() {
         .await;
 }
 
+/// A limiter of one worker that decides new clients itself, no service pod answering or
+/// asked, with a rule under one limit of a single token.
+async fn one_token_limiter() -> (
+    Rc<crate::ratelimit::Limiter>,
+    Arc<edgerush_config::CompiledRule>,
+) {
+    let mut config = limited(
+        everything_config("127.0.0.1:9".parse().unwrap()),
+        &["127.0.0.1:9".to_owned()],
+    );
+    config.routes[0].rules[0].rate_limits = vec!["one".to_owned()];
+    config.limits = Some(
+        serde_saphyr::from_str(
+            "limits:
+  - { name: one, key: client, model: { bucket: { rate: 1/h, burst: 1 } } }
+",
+        )
+        .unwrap(),
+    );
+    if let Some(service) = &mut config.rate_limit_service {
+        service.ask_cold_keys = Some(false);
+    }
+    let compiled = compile(&config).unwrap();
+    let service = compiled.rate_limit_service().unwrap().clone();
+    let hub = crate::ratelimit::Hub::start(&service, 1, 1 << 20, None).unwrap();
+    let limiter = crate::ratelimit::Limiter::new(&service, hub, 0);
+    (limiter, Arc::clone(&compiled.rules_of(0)[0]))
+}
+
+/// A deferred request is let go before it is decided again once nothing waits for it, or
+/// once its time is up, never charged for: here gone before its task first ran, and out of
+/// time before it did. The key's one token is left for the next request.
+#[tokio::test]
+async fn a_deferred_request_gone_or_out_of_time_is_not_decided_again() {
+    use crate::ratelimit::{Limited, Undecided, WAIT};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (limiter, rule) = one_token_limiter().await;
+            let client = requester("203.0.113.1");
+            drop(limiter.defer_regardless(&rule.limits, 0b1, client));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            limiter.set_wait(Duration::ZERO);
+            let Limited::Later(late) = limiter.defer_regardless(&rule.limits, 0b1, client) else {
+                panic!("not deferred");
+            };
+            assert_eq!(
+                within(late.decided()).await.map(|d| d.admitted),
+                Err(Undecided::Timeout)
+            );
+            limiter.set_wait(WAIT);
+            assert!(
+                matches!(
+                    limiter.decide_all(&rule.limits, 0b1, client),
+                    Limited::Admit
+                ),
+                "the token taken for a request no longer waiting"
+            );
+            limiter.stop();
+        })
+        .await;
+}
+
+/// A decision made in time but taken up once the request's time is up — its worker held up
+/// meanwhile — is answered out of time: nothing goes on past its time to wait.
+#[tokio::test]
+async fn a_decision_taken_up_after_its_time_is_out_of_time() {
+    use crate::ratelimit::{Limited, Undecided};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (limiter, rule) = one_token_limiter().await;
+            limiter.set_wait(Duration::from_millis(100));
+            let client = requester("203.0.113.1");
+            let Limited::Later(later) = limiter.defer_regardless(&rule.limits, 0b1, client) else {
+                panic!("not deferred");
+            };
+            // Its task decides it at once; its answer is there well before its time is up.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            std::thread::sleep(Duration::from_millis(150));
+            assert_eq!(
+                later.decided().await.map(|d| d.admitted),
+                Err(Undecided::Timeout)
+            );
+            limiter.stop();
+        })
+        .await;
+}
+
 /// A limiter of one worker whose every new client is asked about, of three service pods
 /// that hold back every answer for longer than an ask may wait — so that each ask is given
 /// up after its 300 ms and decided from the copy — with the rule it limits, and the
