@@ -1991,8 +1991,23 @@ impl<S: BuildHasher + Clone> Participant<S> {
             ..
         } = answers;
         self.last_now = now;
-        let mut copies = Vec::new();
         let mut untaken: Vec<(Box<[u8]>, u128)> = Vec::new();
+        // What the asks decided admitted under each of their keys: still to be sent, as
+        // hits, and left out of the owner's bucket, which holds them for those hits.
+        let mut admitting: Vec<(Box<[u8]>, u64)> = Vec::new();
+        for (id, admitted) in &decided {
+            let Some(group) = self
+                .in_flight
+                .get(id)
+                .and_then(|name| self.groups.get(name))
+            else {
+                continue;
+            };
+            let admitted = (*admitted).min(group.asked.len() as u64);
+            for at in &group.cold {
+                admitting.push((group.keys[*at].0.clone(), admitted));
+            }
+        }
         for answer in entries {
             let Some(tracked) = self.keys.get_mut(&*answer.key) else {
                 continue;
@@ -2009,11 +2024,6 @@ impl<S: BuildHasher + Clone> Participant<S> {
                     .retain(|(sequence, _, _, _)| *sequence > seen);
             }
             if !current {
-                // A key the pod decided an ask under from its copy is charged to the key's
-                // owner, whether or not the copy is taken.
-                if !answer.owned {
-                    copies.push(answer.key.clone());
-                }
                 untaken.push((answer.key, answer.behind));
                 continue;
             }
@@ -2024,10 +2034,19 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 .map(|(_, count, _, _)| count)
                 .sum();
             let unsent = tracked.unsent;
+            let asked: u64 = if answer.owned {
+                admitting
+                    .iter()
+                    .filter(|(key, _)| *key == answer.key)
+                    .map(|(_, admitted)| admitted)
+                    .sum()
+            } else {
+                0
+            };
             let entry = &tracked.entry;
             let units = entry.terms.bucket.units(now);
             entry.update(now, Cycle::Advance, |fields| {
-                let extra = unseen + unsent + fields.unreported + fields.held;
+                let extra = unseen + unsent + asked + fields.unreported + fields.held;
                 Some(Fields {
                     arrival: entry.terms.bucket.rebased(units, answer.behind, extra),
                     ..fields
@@ -2037,9 +2056,6 @@ impl<S: BuildHasher + Clone> Participant<S> {
             tracked.unreachable = false;
             tracked.publish();
             queue(&mut self.keys, &mut self.runnable, &answer.key);
-            if !answer.owned {
-                copies.push(answer.key);
-            }
         }
         for (id, admitted) in decided {
             let Some(name) = self.in_flight.get(&id).cloned() else {
@@ -2071,11 +2087,13 @@ impl<S: BuildHasher + Clone> Participant<S> {
             } else {
                 Box::default()
             };
+            // Every request admitted is reported as a hit under each key asked about: its
+            // owner, deciding the ask, holds what it admitted for those hits; a pod deciding
+            // from its copy leaves them to the owner to count.
             let charged: Vec<Box<[u8]>> = group
                 .cold
                 .iter()
                 .map(|at| group.keys[*at].0.clone())
-                .filter(|key| copies.contains(key))
                 .collect();
             for (index, ticket) in asked.into_iter().enumerate() {
                 let admitted = (index as u64) < admitted;
