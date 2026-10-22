@@ -1019,10 +1019,11 @@ async fn an_ask_waiting_when_the_thread_goes_is_told_it_is_unavailable() {
 }
 
 /// A limiter of one worker that decides new clients itself, no service pod answering or
-/// asked, with a rule under one limit of a single token.
+/// asked, with a rule under one limit of a single token, and its process's thread.
 async fn one_token_limiter() -> (
     Rc<crate::ratelimit::Limiter>,
     Arc<edgerush_config::CompiledRule>,
+    Arc<crate::ratelimit::Hub>,
 ) {
     let mut config = limited(
         everything_config("127.0.0.1:9".parse().unwrap()),
@@ -1043,8 +1044,51 @@ async fn one_token_limiter() -> (
     let compiled = compile(&config).unwrap();
     let service = compiled.rate_limit_service().unwrap().clone();
     let hub = crate::ratelimit::Hub::start(&service, 1, 1 << 20, None).unwrap();
-    let limiter = crate::ratelimit::Limiter::new(&service, hub, 0);
-    (limiter, Arc::clone(&compiled.rules_of(0)[0]))
+    let limiter = crate::ratelimit::Limiter::new(&service, Arc::clone(&hub), 0);
+    (limiter, Arc::clone(&compiled.rules_of(0)[0]), hub)
+}
+
+/// A worker makes a new client's key only with room for it — so many keys, and so many
+/// bytes of what they hold, made and not yet taken in by its process — and asks its
+/// process about the client without: here while its process is held up, the one key it
+/// made still queued. The room comes back once the process takes the key in.
+#[tokio::test]
+async fn a_worker_makes_new_keys_only_with_room_and_asks_without() {
+    use crate::ratelimit::{Limited, MOST_MADE, MOST_MADE_BYTES, ToHub};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (limiter, rule, hub) = one_token_limiter().await;
+            let decide = |client: &str| limiter.decide_all(&rule.limits, 0b1, requester(client));
+            let (release, stalled) = std::sync::mpsc::channel();
+            hub.to.send(ToHub::Stall(stalled)).unwrap();
+            limiter.set_most_made(1, MOST_MADE_BYTES);
+            assert!(matches!(decide("203.0.113.1"), Limited::Admit), "made");
+            let Limited::Later(asked) = decide("203.0.113.2") else {
+                panic!("made with no room");
+            };
+            release.send(()).unwrap();
+            // Its ask given up, the process makes the key itself, from a full bucket.
+            assert!(within(asked.decided()).await.unwrap().admitted);
+            // The first key taken in: room again.
+            within(async {
+                let mut client = 3;
+                while !matches!(decide(&format!("203.0.113.{client}")), Limited::Admit) {
+                    client += 1;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            // Room for keys, none for their bytes.
+            limiter.set_most_made(MOST_MADE, 1);
+            assert!(
+                matches!(decide("203.0.113.200"), Limited::Later(_)),
+                "made with no room for its bytes"
+            );
+            limiter.stop();
+        })
+        .await;
 }
 
 /// A deferred request is let go before it is decided again once nothing waits for it, or
@@ -1057,7 +1101,7 @@ async fn a_deferred_request_gone_or_out_of_time_is_not_decided_again() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (limiter, rule) = one_token_limiter().await;
+            let (limiter, rule, _) = one_token_limiter().await;
             let client = requester("203.0.113.1");
             drop(limiter.defer_regardless(&rule.limits, 0b1, client));
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1091,7 +1135,7 @@ async fn a_decision_taken_up_after_its_time_is_out_of_time() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (limiter, rule) = one_token_limiter().await;
+            let (limiter, rule, _) = one_token_limiter().await;
             limiter.set_wait(Duration::from_millis(100));
             let client = requester("203.0.113.1");
             let Limited::Later(later) = limiter.defer_regardless(&rule.limits, 0b1, client) else {
@@ -1160,6 +1204,41 @@ async fn a_worker_holds_no_more_requests_waiting_than_it_has_places() {
             assert!(within(first.decided()).await.unwrap().admitted);
             assert!(within(second.decided()).await.unwrap().admitted);
             assert!(matches!(ask("203.0.113.4"), Limited::Later(_)));
+            limiter.stop();
+        })
+        .await;
+}
+
+/// A place holds the bytes its request carries — its keys and its message — as well as a
+/// place: a request whose bytes do not fit is answered full at once, however many places
+/// are free, and the bytes come back with the place. Dry runs' bytes are their own too.
+#[tokio::test]
+async fn a_place_holds_its_requests_bytes_too() {
+    use crate::ratelimit::{Limited, MOST_WAITING_BYTES, Undecided};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (limiter, rule, _) = asking_limiter().await;
+            let ask = |client: &str| limiter.decide_all(&rule.limits, 0b1, requester(client));
+            let Limited::Later(first) = ask("203.0.113.1") else {
+                panic!("not asked about");
+            };
+            // Room for the bytes of one such request alone.
+            limiter.set_most_waiting_bytes(limiter.waiting_bytes());
+            assert!(matches!(
+                ask("203.0.113.2"),
+                Limited::Undecided(Undecided::Full)
+            ));
+            limiter.set_most_dry_runs_waiting_bytes(1);
+            assert!(matches!(
+                limiter.decide_dry_run(&rule.limits, 0b1, requester("203.0.113.3")),
+                Limited::Undecided(Undecided::Full)
+            ));
+            // Its ask given up and answered: its bytes given back.
+            assert!(within(first.decided()).await.unwrap().admitted);
+            assert!(matches!(ask("203.0.113.4"), Limited::Later(_)));
+            limiter.set_most_waiting_bytes(MOST_WAITING_BYTES);
             limiter.stop();
         })
         .await;

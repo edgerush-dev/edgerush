@@ -5,7 +5,7 @@
 //! workers' messages, the service's answers and its cycle; nothing of it is shared with a
 //! worker but the entries, a channel, and the clock they read its times by.
 
-use super::{ASK_TIMEOUT, Decision, Undecided};
+use super::{ASK_TIMEOUT, Decision, Made, Undecided};
 use crate::ProxyError;
 use edgerush_config::CompiledRateLimitService;
 use edgerush_ratelimit::service::pooled::{
@@ -64,14 +64,18 @@ pub(crate) enum ToHub {
     Capacity(u64),
     /// A key whose unreported count passed half its most: to drain now.
     Drain(Box<[u8]>),
-    /// Cold keys decided locally: an entry a worker made, for the process to keep.
-    Adopt(Arc<Entry>),
+    /// Cold keys decided locally: an entry a worker made, for the process to keep, with
+    /// the room it holds among its worker's until the process takes it in.
+    Adopt(Arc<Entry>, Made),
     /// Keys visited only when they need it: those its decisions signalled since its last
     /// such message, for the next cycle to visit.
     Signals(Vec<Arc<Entry>>),
     /// For a test: to panic, on the thread itself or in the next exchange's task.
     #[cfg(test)]
     Panic { in_exchange: bool },
+    /// For a test: to stand still, as a thread held up does, until told to go on.
+    #[cfg(test)]
+    Stall(std::sync::mpsc::Receiver<()>),
 }
 
 /// What the process sends a worker: the decision on a request it asked about — refused,
@@ -563,12 +567,17 @@ impl State {
             }
             ToHub::Capacity(bytes) => self.participant.borrow_mut().set_capacity(bytes),
             ToHub::Drain(key) => self.participant.borrow_mut().drain(&key, now),
-            ToHub::Adopt(entry) => self.participant.borrow_mut().adopt(entry),
+            // Its room given back once it is taken in.
+            ToHub::Adopt(entry, _made) => self.participant.borrow_mut().adopt(entry),
             ToHub::Signals(entries) => self.participant.borrow_mut().on_signals(entries),
             #[cfg(test)]
             ToHub::Panic { in_exchange: false } => panic!("a panic the test makes"),
             #[cfg(test)]
             ToHub::Panic { in_exchange: true } => self.panic_in_exchange.set(true),
+            #[cfg(test)]
+            ToHub::Stall(until) => {
+                let _told = until.recv();
+            }
         }
     }
 

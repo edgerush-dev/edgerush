@@ -32,6 +32,7 @@ use std::net::IpAddr;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -108,10 +109,81 @@ pub(crate) const WAIT: Duration = Duration::from_millis(400);
 /// within it too.
 pub(crate) const MOST_WAITING: usize = 1_024;
 
+/// The most bytes the requests in a worker's [`MOST_WAITING`] places carry at once — their
+/// keys and the message each is asked in — past which a request is answered
+/// [`Undecided::Full`] as one with no place is: a limit's name may be long, and its key with
+/// it. Held as a place is.
+pub(crate) const MOST_WAITING_BYTES: u64 = 1 << 20;
+
 /// The most dry runs a worker has waiting on its rate limits at once, in places of their
 /// own, held as [`MOST_WAITING`]'s are: however many wait, the limits that refuse keep all
 /// of theirs. Past it, a dry run is not counted.
 pub(crate) const MOST_DRY_RUNS_WAITING: usize = 256;
+
+/// The most bytes the dry runs in a worker's [`MOST_DRY_RUNS_WAITING`] places carry at
+/// once, as [`MOST_WAITING_BYTES`] for theirs.
+const MOST_DRY_RUNS_WAITING_BYTES: u64 = 256 << 10;
+
+/// The most keys a worker has made and handed its process, not yet taken in, and the most
+/// bytes they hold, entries and messages: past either, a new client's key is not made but
+/// its request asked of the process, which makes the key itself, within the places
+/// ([`MOST_WAITING`]) and where its capacity holds. So a process held up has only so much of
+/// a worker's new keys queued. Fixed, until measuring shows that setting them would be
+/// worth what it costs.
+pub(crate) const MOST_MADE: usize = 1_024;
+pub(crate) const MOST_MADE_BYTES: u64 = 1 << 20;
+
+/// The room a worker has for keys it made and handed its process, not yet taken in.
+struct Room {
+    keys: AtomicUsize,
+    bytes: AtomicU64,
+    most_keys: AtomicUsize,
+    most_bytes: AtomicU64,
+}
+
+impl Room {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            keys: AtomicUsize::new(0),
+            bytes: AtomicU64::new(0),
+            most_keys: AtomicUsize::new(MOST_MADE),
+            most_bytes: AtomicU64::new(MOST_MADE_BYTES),
+        })
+    }
+
+    /// Room for an entry of `key`, if there is any. Taken by its worker alone and given back
+    /// by its process, so what the worker reads is never less than is held: relaxed.
+    fn take(self: &Arc<Self>, key: &[u8]) -> Option<Made> {
+        let bytes = pooled::entry_bytes(key) + size_of::<ToHub>() as u64;
+        let keys = self.keys.load(Ordering::Relaxed);
+        let held = self.bytes.load(Ordering::Relaxed);
+        if keys >= self.most_keys.load(Ordering::Relaxed)
+            || held.saturating_add(bytes) > self.most_bytes.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        self.keys.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        Some(Made {
+            room: Arc::clone(self),
+            bytes,
+        })
+    }
+}
+
+/// The room a key its worker made holds until its process takes it in: given back when
+/// dropped, there or wherever the message goes.
+pub(crate) struct Made {
+    room: Arc<Room>,
+    bytes: u64,
+}
+
+impl Drop for Made {
+    fn drop(&mut self) {
+        self.room.keys.fetch_sub(1, Ordering::Relaxed);
+        self.room.bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
 
 /// The most entries a worker keeps signalled between syncs: a key signals at most once each
 /// time its count starts, so a millisecond's worth for any worker; past it, the worker asks
@@ -155,37 +227,61 @@ impl Later {
     }
 }
 
-/// So many places for requests to wait on a worker's rate limits in, and how many are held.
+/// So many places for requests to wait on a worker's rate limits in, and so many bytes for
+/// what they carry; how many of each are held.
 struct Places {
     held: Rc<Cell<usize>>,
     most: Cell<usize>,
+    bytes: Rc<Cell<u64>>,
+    most_bytes: Cell<u64>,
 }
 
 impl Places {
-    fn new(most: usize) -> Self {
+    fn new(most: usize, most_bytes: u64) -> Self {
         Self {
             held: Rc::new(Cell::new(0)),
             most: Cell::new(most),
+            bytes: Rc::new(Cell::new(0)),
+            most_bytes: Cell::new(most_bytes),
         }
     }
 
-    /// A place for a request to wait in, if one is left.
-    fn take(&self) -> Option<Reservation> {
-        let held = self.held.get();
-        (held < self.most.get()).then(|| {
-            self.held.set(held + 1);
-            Reservation(Rc::clone(&self.held))
-        })
+    /// A place for a request under `parts` to wait in, with room for what it carries, if
+    /// both are left.
+    fn take(&self, parts: &[(&[u8], Contract)]) -> Option<Reservation> {
+        let bytes = parts
+            .iter()
+            .map(|(key, _)| (key.len() + size_of::<(Box<[u8]>, Contract)>()) as u64)
+            .sum::<u64>()
+            + size_of::<ToHub>() as u64;
+        let (held, carried) = (self.held.get(), self.bytes.get());
+        (held < self.most.get() && carried.saturating_add(bytes) <= self.most_bytes.get()).then(
+            || {
+                self.held.set(held + 1);
+                self.bytes.set(carried + bytes);
+                Reservation {
+                    held: Rc::clone(&self.held),
+                    carried: Rc::clone(&self.bytes),
+                    bytes,
+                }
+            },
+        )
     }
 }
 
-/// A place held among those a worker has for requests waiting on its rate limits: given
-/// back when dropped.
-struct Reservation(Rc<Cell<usize>>);
+/// A place held among those a worker has for requests waiting on its rate limits, and the
+/// bytes its request carries: given back when dropped.
+struct Reservation {
+    held: Rc<Cell<usize>>,
+    carried: Rc<Cell<u64>>,
+    bytes: u64,
+}
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.0.set(self.0.get().saturating_sub(1));
+        self.held.set(self.held.get().saturating_sub(1));
+        self.carried
+            .set(self.carried.get().saturating_sub(self.bytes));
     }
 }
 
@@ -230,6 +326,8 @@ pub(crate) struct Limiter {
     /// The places its requests wait on its rate limits in, and its dry runs, apart.
     waiting: Places,
     dry_runs: Places,
+    /// Its room for keys it made, not yet taken in by its process.
+    room: Arc<Room>,
     /// How long each may wait in all: [`WAIT`], but for a test.
     wait: Cell<Duration>,
     /// With keys visited only when they need it, the entries its decisions signalled since
@@ -272,8 +370,9 @@ impl Limiter {
             next: Cell::new(0),
             asked: RefCell::new(HashMap::new()),
             settled,
-            waiting: Places::new(MOST_WAITING),
-            dry_runs: Places::new(MOST_DRY_RUNS_WAITING),
+            waiting: Places::new(MOST_WAITING, MOST_WAITING_BYTES),
+            dry_runs: Places::new(MOST_DRY_RUNS_WAITING, MOST_DRY_RUNS_WAITING_BYTES),
+            room: Room::new(),
             wait: Cell::new(WAIT),
             signalled: RefCell::new(Vec::new()),
             most_signalled: Cell::new(MOST_SIGNALLED),
@@ -552,12 +651,12 @@ impl Limiter {
 
 /// A worker's own decision of a request under `parts` at `now`, from its handles to the
 /// entries of its keys: those it holds none of under their contracts looked for in its
-/// process's `registry` first — or, with cold keys decided locally, made there — and asked
-/// about if not there.
+/// process's `registry` first — or, with cold keys decided locally, made there while there
+/// is room for it — and asked about if not there.
 fn decide(
     handles: &RefCell<Handles>,
     registry: &Registry,
-    making: Option<(&Hub, u64)>,
+    making: Option<(&Hub, u64, &Arc<Room>)>,
     parts: &[(&[u8], Contract)],
     now: u64,
 ) -> Pooled {
@@ -579,20 +678,21 @@ fn decide(
                 continue;
             }
             // Cold keys decided locally, a key the process has not met is made here, at
-            // once, and handed to the process to keep.
-            let found = match making {
-                None => registry.find(key, *contract),
-                Some((hub, cycle)) => {
-                    registry
+            // once, and handed to the process to keep, holding room until it is taken in;
+            // with no room, only one there already is found, and the request is asked
+            // about otherwise.
+            let found =
+                match making.and_then(|(hub, cycle, room)| Some((hub, cycle, room.take(key)?))) {
+                    None => registry.find(key, *contract),
+                    Some((hub, cycle, room)) => registry
                         .find_or_make(key, *contract, cycle, now)
                         .map(|(entry, made)| {
                             if made {
-                                let _gone = hub.to.send(ToHub::Adopt(Arc::clone(&entry)));
+                                let _gone = hub.to.send(ToHub::Adopt(Arc::clone(&entry), room));
                             }
                             entry
-                        })
-                }
-            };
+                        }),
+                };
             let Some(entry) = found else {
                 return ask;
             };
@@ -623,11 +723,11 @@ fn decide(
 }
 
 impl Limiter {
-    /// With cold keys decided locally, where a worker makes a key's entry: its process, and
-    /// the cycle, in nanoseconds.
-    fn making(&self) -> Option<(&Hub, u64)> {
+    /// With cold keys decided locally, where a worker makes a key's entry: its process, the
+    /// cycle, in nanoseconds, and its room for keys made.
+    fn making(&self) -> Option<(&Hub, u64, &Arc<Room>)> {
         let cycle = u64::try_from(self.service.cycle.as_nanos()).unwrap_or(u64::MAX);
-        (!self.service.ask_cold_keys).then_some((&*self.hub, cycle))
+        (!self.service.ask_cold_keys).then_some((&*self.hub, cycle, &self.room))
     }
 
     /// What a decision asks of others: a key's count drained, waiters woken, and with keys
@@ -671,7 +771,7 @@ impl Limiter {
     /// A request under `parts`, met at `now`, asked of the process; undecided if it has no
     /// place to wait in among `places`, or the process is gone.
     fn ask(&self, parts: &[(&[u8], Contract)], now: u64, places: &Places) -> Limited {
-        let Some(place) = places.take() else {
+        let Some(place) = places.take(parts) else {
             return Limited::Undecided(Undecided::Full);
         };
         let (at, until) = self.deadline(now);
@@ -715,7 +815,7 @@ impl Limiter {
     /// as its keys' holds settle and counts drain, until its time is up; or, with no place
     /// to wait in among `places`, undecided at once.
     fn defer(self: &Rc<Self>, parts: &[(&[u8], Contract)], now: u64, places: &Places) -> Limited {
-        let Some(place) = places.take() else {
+        let Some(place) = places.take(parts) else {
             return Limited::Undecided(Undecided::Full);
         };
         let (at, until) = self.deadline(now);
@@ -808,6 +908,24 @@ impl Limiter {
         self.dry_runs.most.set(most);
     }
 
+    /// The most bytes the requests it has waiting may carry, for a test to fill.
+    #[cfg(test)]
+    pub(crate) fn set_most_waiting_bytes(&self, most: u64) {
+        self.waiting.most_bytes.set(most);
+    }
+
+    /// The most bytes the dry runs it has waiting may carry, for a test to fill.
+    #[cfg(test)]
+    pub(crate) fn set_most_dry_runs_waiting_bytes(&self, most: u64) {
+        self.dry_runs.most_bytes.set(most);
+    }
+
+    /// The bytes the requests it has waiting carry, for a test to fill its room with.
+    #[cfg(test)]
+    pub(crate) fn waiting_bytes(&self) -> u64 {
+        self.waiting.bytes.get()
+    }
+
     /// Defers a request from `client` under those of `limits` that `limited` marks,
     /// whatever its keys say, for a test of what a deferred request does.
     #[cfg(test)]
@@ -821,6 +939,14 @@ impl Limiter {
         self.with_keys(limits, limited, client, |parts| {
             self.defer(parts, now, &self.waiting)
         })
+    }
+
+    /// The most keys it may have made and not yet taken in, and the most bytes they may
+    /// hold, for a test to fill.
+    #[cfg(test)]
+    pub(crate) fn set_most_made(&self, keys: usize, bytes: u64) {
+        self.room.most_keys.store(keys, Ordering::Relaxed);
+        self.room.most_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// The most entries it keeps signalled between syncs, for a test to fill.
