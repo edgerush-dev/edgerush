@@ -154,8 +154,12 @@ impl Drop for Reservation {
     }
 }
 
-/// Where an asked-about request's decision goes, and the place it holds until then.
-type Asked = (oneshot::Sender<Result<Decided, Undecided>>, Reservation);
+/// Where a waiting request's decision goes: closed once nothing waits for it, which is how
+/// its process tells a request gone.
+pub(crate) type Decision = oneshot::Sender<Result<Decided, Undecided>>;
+
+/// Where a waiting request's decision goes, and the place it holds until then.
+type Asked = (Decision, Reservation);
 
 /// Why a request's rate limits did not decide it: each the gateway's own trouble, answered
 /// 503, never as over a limit (06 §4).
@@ -184,8 +188,8 @@ pub(crate) struct Limiter {
     handles: RefCell<Handles>,
     /// The next ask's number.
     next: Cell<u64>,
-    /// Its asks waiting on its process, by number.
-    asked: RefCell<HashMap<u64, Asked>>,
+    /// The places its asks hold until its process answers them, by number.
+    asked: RefCell<HashMap<u64, Reservation>>,
     /// What its deferred requests wait on.
     settled: Arc<Notify>,
     /// How many requests wait on its rate limits, and how many may.
@@ -456,15 +460,15 @@ impl Limiter {
                     }
                 }
                 message = answered.recv() => match message {
-                    Some(FromHub { id, admitted, undecided, refused_by, entries }) => {
+                    Some(FromHub { id, to, admitted, undecided, refused_by, entries }) => {
                         let mut handles = self.handles.borrow_mut();
                         for entry in entries {
                             handles.replace(Handle::new(entry));
                         }
                         drop(handles);
-                        // Its place given back with it, the request there or gone.
-                        let asked = self.asked.borrow_mut().remove(&id);
-                        if let Some((waiter, _place)) = asked {
+                        // Its place given back, the request there or gone.
+                        drop(self.asked.borrow_mut().remove(&id));
+                        if let Some(to) = to {
                             let decided = match undecided {
                                 Some(why) => Err(why),
                                 None => Ok(Decided {
@@ -473,16 +477,13 @@ impl Limiter {
                                     refused_by,
                                 }),
                             };
-                            let _gone = waiter.send(decided);
+                            let _gone = to.send(decided);
                         }
                     }
-                    // The process is gone: what still waits on it is told so, rather than
-                    // left waiting for an answer that cannot come.
+                    // The process is gone, and with it where its asks' decisions were to go:
+                    // what waits on them is told it is unavailable, and their places freed.
                     None => {
-                        let asked = std::mem::take(&mut *self.asked.borrow_mut());
-                        for (_, (waiter, _place)) in asked {
-                            let _gone = waiter.send(Err(Undecided::Unavailable));
-                        }
+                        self.asked.borrow_mut().clear();
                         return;
                     }
                 },
@@ -614,19 +615,21 @@ impl Limiter {
         };
         let (at, until) = self.deadline(now);
         let (decided, later) = oneshot::channel();
-        match self.send_ask(parts, at, (decided, place)) {
-            Ok(()) => Limited::Later(Later {
+        if self.send_ask(parts, at, (decided, place)) {
+            Limited::Later(Later {
                 decided: later,
                 until,
-            }),
-            Err(_) => Limited::Undecided(Undecided::Unavailable),
+            })
+        } else {
+            Limited::Undecided(Undecided::Unavailable)
         }
     }
 
     /// Asks the process about a request under `parts`, to be decided by `at`: its decision
-    /// to go where `asked` says, its place kept until the process answers. Handed back if
-    /// the process is gone.
-    fn send_ask(&self, parts: &[(&[u8], Contract)], at: u64, asked: Asked) -> Result<(), Asked> {
+    /// sent with it, for the process to answer and to see the request gone by; its place kept
+    /// until the process answers. False if the process is gone, its decision dropped with
+    /// the message: what waits for it is told it is unavailable.
+    fn send_ask(&self, parts: &[(&[u8], Contract)], at: u64, (decided, place): Asked) -> bool {
         let id = self.next.get();
         self.next.set(id.wrapping_add(1));
         let keys = parts
@@ -638,12 +641,13 @@ impl Limiter {
             id,
             keys,
             until: at,
+            decided,
         };
         if self.hub.to.send(message).is_err() {
-            return Err(asked);
+            return false;
         }
-        self.asked.borrow_mut().insert(id, asked);
-        Ok(())
+        self.asked.borrow_mut().insert(id, place);
+        true
     }
 
     /// A request under `parts`, met at `now`, deferred: decided again on a task of its own
@@ -708,9 +712,7 @@ impl Limiter {
                 PooledLocal::Ask => {
                     // The ask answers the request itself, and keeps its place till then.
                     drop(_waiting);
-                    if let Err((decided, _place)) = self.send_ask(&parts, at, (decided, place)) {
-                        let _gone = decided.send(Err(Undecided::Unavailable));
-                    }
+                    let _asked = self.send_ask(&parts, at, (decided, place));
                     return;
                 }
                 PooledLocal::Defer => {}

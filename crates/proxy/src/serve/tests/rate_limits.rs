@@ -350,14 +350,19 @@ async fn asks_that_come_together_are_sent_together() {
     hub.to.send(ToHub::Join { worker: 0, answers }).unwrap();
     let before = exchanges.load(Ordering::Relaxed);
     const ASKS: u64 = 500;
+    // Each decision waited for, as a request there still waits for its own.
+    let mut waiting = Vec::new();
     for id in 0..ASKS {
         let key: Box<[u8]> = format!("cold-{id}").into_bytes().into();
+        let (decided, waits) = tokio::sync::oneshot::channel();
+        waiting.push(waits);
         hub.to
             .send(ToHub::Ask {
                 worker: 0,
                 id,
                 keys: vec![(key, contract)],
                 until: u64::MAX,
+                decided,
             })
             .unwrap();
     }
@@ -1053,10 +1058,46 @@ async fn a_request_out_of_time_is_answered_and_its_place_kept_until_its_ask_is()
         .await;
 }
 
-/// An ask its process takes once its time is up is answered as out of time, undecided:
-/// never asked of a service pod, never charged.
+/// A request that goes while its process's participant has its ask out is left to settle,
+/// not taken back: its place is held until the ask is answered, though nothing waits for
+/// it any more, so that work the participant still has is within the places too.
 #[tokio::test]
-async fn an_ask_out_of_time_when_taken_is_not_asked_of_the_service() {
+async fn a_request_gone_keeps_its_place_while_its_ask_is_out() {
+    use crate::ratelimit::{Limited, Undecided};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (limiter, rule, exchanges) = asking_limiter().await;
+            limiter.set_most_waiting(1);
+            let ask = |client: &str| limiter.decide_all(&rule.limits, 0b1, requester(client));
+            let Limited::Later(first) = ask("203.0.113.1") else {
+                panic!("not asked about");
+            };
+            until(|| exchanges.load(Ordering::Relaxed) > 0).await;
+            // The request goes; its ask is out.
+            drop(first);
+            assert!(matches!(
+                ask("203.0.113.2"),
+                Limited::Undecided(Undecided::Full)
+            ));
+            // Its ask given up and answered: its place given back.
+            within(async {
+                while matches!(ask("203.0.113.3"), Limited::Undecided(Undecided::Full)) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            limiter.stop();
+        })
+        .await;
+}
+
+/// An ask its process takes once its time is up is answered as out of time, undecided; one
+/// whose request has gone is let go, its place given back and nothing told, and counted:
+/// neither is asked of a service pod, or charged.
+#[tokio::test]
+async fn an_ask_gone_or_out_of_time_when_taken_is_not_asked_of_the_service() {
     use crate::ratelimit::{FromHub, Hub, ToHub, Undecided};
     use edgerush_ratelimit::service::Contract;
     use std::num::NonZeroU64;
@@ -1076,29 +1117,42 @@ async fn an_ask_out_of_time_when_taken_is_not_asked_of_the_service() {
     let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
     hub.to.send(ToHub::Join { worker: 0, answers }).unwrap();
     let before = exchanges.load(Ordering::Relaxed);
-    hub.to
-        .send(ToHub::Ask {
-            worker: 0,
-            id: 7,
-            keys: vec![(
-                b"cold".as_slice().into(),
-                Contract {
-                    limit: NonZeroU64::new(10).unwrap(),
-                    window: NonZeroU64::new(3_600_000_000_000).unwrap(),
-                    burst: NonZeroU64::new(10).unwrap(),
-                },
-            )],
-            until: 0,
-        })
-        .unwrap();
-    assert!(matches!(
-        within(answered.recv()).await.unwrap(),
-        FromHub {
-            id: 7,
-            undecided: Some(Undecided::Timeout),
-            ..
-        }
-    ));
+    let ask = |id: u64, until: u64, decided| ToHub::Ask {
+        worker: 0,
+        id,
+        keys: vec![(
+            format!("cold-{id}").into_bytes().into(),
+            Contract {
+                limit: NonZeroU64::new(10).unwrap(),
+                window: NonZeroU64::new(3_600_000_000_000).unwrap(),
+                burst: NonZeroU64::new(10).unwrap(),
+            },
+        )],
+        until,
+        decided,
+    };
+    // Out of time, its request still waiting for it: told so.
+    let (decided, waits) = tokio::sync::oneshot::channel();
+    hub.to.send(ask(7, 0, decided)).unwrap();
+    let FromHub {
+        id, to, undecided, ..
+    } = within(answered.recv()).await.unwrap();
+    assert_eq!((id, undecided), (7, Some(Undecided::Timeout)));
+    assert!(to.is_some(), "not told where to go");
+    drop(waits);
+    // Its request gone, with time left: let go, nowhere to go.
+    let (decided, waits) = tokio::sync::oneshot::channel();
+    drop(waits);
+    hub.to.send(ask(8, u64::MAX, decided)).unwrap();
+    let FromHub { id, to, .. } = within(answered.recv()).await.unwrap();
+    assert_eq!(id, 8);
+    assert!(to.is_none(), "a request gone was decided");
+    assert!(
+        hub.render_stats()
+            .contains("edgerush_rate_limit_hub_asks_abandoned_total 1\n"),
+        "{}",
+        hub.render_stats()
+    );
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         exchanges.load(Ordering::Relaxed),
@@ -1158,6 +1212,7 @@ async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
     let (answers, _answered) = tokio::sync::mpsc::unbounded_channel();
     first.to.send(ToHub::Join { worker: 0, answers }).unwrap();
     let before = exchanges.load(Ordering::Relaxed);
+    let (decided, _waits) = tokio::sync::oneshot::channel();
     first
         .to
         .send(ToHub::Ask {
@@ -1172,6 +1227,7 @@ async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
                 },
             )],
             until: u64::MAX,
+            decided,
         })
         .unwrap();
     until(|| exchanges.load(Ordering::Relaxed) > before).await;
@@ -1220,11 +1276,18 @@ async fn a_failed_rate_limiting_thread_tells_once() {
             window: NonZeroU64::new(3_600_000_000_000).unwrap(),
             burst: NonZeroU64::new(10).unwrap(),
         };
-        let ask = |id: u64| ToHub::Ask {
-            worker: 0,
-            id,
-            keys: vec![(format!("cold-{id}").into_bytes().into(), contract)],
-            until: u64::MAX,
+        // Each decision waited for, as a request there still waits for its own.
+        let waiting = RefCell::new(Vec::new());
+        let ask = |id: u64| {
+            let (decided, waits) = tokio::sync::oneshot::channel();
+            waiting.borrow_mut().push(waits);
+            ToHub::Ask {
+                worker: 0,
+                id,
+                keys: vec![(format!("cold-{id}").into_bytes().into(), contract)],
+                until: u64::MAX,
+                decided,
+            }
         };
         hub.to.send(ask(0)).unwrap();
         assert!(within(answered.recv()).await.unwrap().admitted);

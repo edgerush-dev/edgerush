@@ -5,7 +5,7 @@
 //! workers' messages, the service's answers and its cycle; nothing of it is shared with a
 //! worker but the entries, a channel, and the clock they read its times by.
 
-use super::{ASK_TIMEOUT, Undecided};
+use super::{ASK_TIMEOUT, Decision, Undecided};
 use crate::ProxyError;
 use edgerush_config::CompiledRateLimitService;
 use edgerush_ratelimit::service::pooled::{
@@ -51,12 +51,14 @@ pub(crate) enum ToHub {
         answers: mpsc::UnboundedSender<FromHub>,
     },
     /// A request it cannot decide itself, for the process to, by `until` in the process's
-    /// clock: its deadline, from when the worker first met it.
+    /// clock: its deadline, from when the worker first met it; its decision to go back in
+    /// the answer, closed once the request has gone.
     Ask {
         worker: usize,
         id: u64,
         keys: Vec<(Box<[u8]>, Contract)>,
         until: u64,
+        decided: Decision,
     },
     /// The bytes the keys may hold from now on.
     Capacity(u64),
@@ -75,9 +77,11 @@ pub(crate) enum ToHub {
 /// What the process sends a worker: the decision on a request it asked about — refused,
 /// which of its keys refused and how long each waits — with the entries of its keys, to
 /// hold; or, if `undecided`, none, and why: its time ran out. Every ask is answered once,
-/// which gives its worker back the place it holds.
+/// which gives its worker back the place it holds; where the decision goes, `to`, is none
+/// for a request gone, which only gives its place back.
 pub(crate) struct FromHub {
     pub(crate) id: u64,
+    pub(crate) to: Option<Decision>,
     pub(crate) admitted: bool,
     pub(crate) undecided: Option<Undecided>,
     pub(crate) refused_by: Box<[(usize, u64)]>,
@@ -94,13 +98,14 @@ struct Shared {
 }
 
 /// What the process thread says of its own work, for the scrape: the asks it takes and how
-/// long they wait, its queue, its exchanges and the answers whose buckets were passed over,
+/// long they wait, those it let go undecided as their requests had gone, its queue, its exchanges and the answers whose buckets were passed over,
 /// a later one from their pod taken first, the time its work takes, and the keys its cycles visit. The most-of
 /// figures are since the last scrape, which takes them.
 #[derive(Default)]
 pub(crate) struct Stats {
     asks: AtomicU64,
     answered: AtomicU64,
+    abandoned: AtomicU64,
     ask_ns: AtomicU64,
     ask_ns_most: AtomicU64,
     queued_most: AtomicU64,
@@ -129,6 +134,7 @@ impl Stats {
         let lines = [
             ("asks_total", "counter", read(&self.asks)),
             ("asks_answered_total", "counter", read(&self.answered)),
+            ("asks_abandoned_total", "counter", read(&self.abandoned)),
             ("ask_ns_total", "counter", read(&self.ask_ns)),
             ("ask_ns_most", "gauge", take(&self.ask_ns_most)),
             ("queued_most", "gauge", take(&self.queued_most)),
@@ -456,6 +462,31 @@ struct Asked {
     /// worker when it first met the request, whatever has become of it since.
     since: u64,
     until: u64,
+    /// Where its decision goes: closed once the request has gone.
+    decided: Decision,
+}
+
+impl Asked {
+    /// What it is answered at `now` without being decided: nothing, if it may still be;
+    /// let go, if its request has gone — counted as such, its place given back; or told it
+    /// is out of time. Only before a decision starts or a retry: one its process's
+    /// participant has taken on is left to settle, its place held till then.
+    fn over(self, now: u64, stats: &Stats) -> Result<FromHub, Self> {
+        if self.decided.is_closed() {
+            stats.abandoned.fetch_add(1, Ordering::Relaxed);
+            Ok(FromHub {
+                to: None,
+                ..undecided(self.id, Undecided::Timeout)
+            })
+        } else if now >= self.until {
+            Ok(FromHub {
+                to: Some(self.decided),
+                ..undecided(self.id, Undecided::Timeout)
+            })
+        } else {
+            Err(self)
+        }
+    }
 }
 
 /// The process thread's state.
@@ -502,6 +533,7 @@ impl State {
                 id,
                 keys,
                 until,
+                decided: to,
             } => {
                 self.shared.stats.asks.fetch_add(1, Ordering::Relaxed);
                 let asked = Asked {
@@ -510,19 +542,19 @@ impl State {
                     keys,
                     since: now,
                     until,
+                    decided: to,
                 };
-                // Out of time while queued: answered so, undecided — never decided, or
+                // Gone or out of time while queued: answered undecided — never decided, or
                 // charged, for a request no longer waiting for it.
-                let told = if now >= until {
-                    Some(undecided(id, Undecided::Timeout))
-                } else {
-                    decided(
+                let told = match asked.over(now, &self.shared.stats) {
+                    Ok(over) => Some(over),
+                    Err(asked) => decided(
                         &mut self.participant.borrow_mut(),
                         &mut self.waiting.borrow_mut(),
                         &mut self.deferred.borrow_mut(),
                         asked,
                         now,
-                    )
+                    ),
                 };
                 if let Some(told) = told {
                     self.shared.stats.answered(0);
@@ -551,11 +583,13 @@ impl State {
             .take_decisions()
             .into_iter()
             .filter_map(|decided| {
+                // Gone or not, settled as the participant had it, its place given back.
                 let Asked {
                     worker,
                     id,
                     keys,
                     since,
+                    decided: to,
                     ..
                 } = waiting.remove(&decided.ticket)?;
                 self.shared.stats.answered(now.saturating_sub(since));
@@ -567,6 +601,7 @@ impl State {
                     worker,
                     FromHub {
                         id,
+                        to: Some(to),
                         admitted: decided.admitted,
                         undecided: None,
                         refused_by: decided.refused_by,
@@ -576,20 +611,24 @@ impl State {
             })
             .collect();
         // Handed back at their settling: deferred here, as one deferred when asked, within
-        // the time it had from the first.
+        // the time it had from the first — or, its request gone, let go rather than tried
+        // again.
         for ticket in participant.take_retries() {
             if let Some(asked) = waiting.remove(&ticket) {
                 deferred.push(asked);
             }
         }
-        // Every request deferred here, decided again while its time lasts.
+        // Every request deferred here, decided again while its time lasts and it is there.
         for asked in std::mem::take(&mut *deferred) {
             let (worker, since) = (asked.worker, asked.since);
-            if now >= asked.until {
-                self.shared.stats.answered(now.saturating_sub(since));
-                told.push((worker, undecided(asked.id, Undecided::Timeout)));
-                continue;
-            }
+            let asked = match asked.over(now, &self.shared.stats) {
+                Ok(over) => {
+                    self.shared.stats.answered(now.saturating_sub(since));
+                    told.push((worker, over));
+                    continue;
+                }
+                Err(asked) => asked,
+            };
             if let Some(answer) = decided(&mut participant, &mut waiting, &mut deferred, asked, now)
             {
                 self.shared.stats.answered(now.saturating_sub(since));
@@ -707,6 +746,7 @@ fn decided(
             };
             Some(FromHub {
                 id,
+                to: Some(asked.decided),
                 admitted,
                 undecided: None,
                 refused_by,
@@ -716,10 +756,12 @@ fn decided(
     }
 }
 
-/// The answer to ask `id` that was not decided, for `why`.
+/// The answer to ask `id` that was not decided, for `why`, going nowhere until it is told
+/// where.
 fn undecided(id: u64, why: Undecided) -> FromHub {
     FromHub {
         id,
+        to: None,
         admitted: false,
         undecided: Some(why),
         refused_by: Box::default(),
