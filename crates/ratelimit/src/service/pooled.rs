@@ -28,7 +28,7 @@ pub use word::fits;
 
 use super::{
     Answers, Ask, Batch, Contract, Decided, Entry as BatchEntry, PlaneId, PodId,
-    RESEND_AFTER_CYCLES, Report, Ticket, View, group_name, longest,
+    RESEND_AFTER_CYCLES, Report, Ticket, Unseen, View, group_name, longest,
 };
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
@@ -813,11 +813,16 @@ struct Tracked {
     owner: Option<PodId>,
     sent: u64,
     seen: u64,
-    /// Batches sent and not yet seen applied: `(sequence, count, first sent, last sent)`.
-    unacknowledged: VecDeque<(u64, u64, u64, u64)>,
+    /// Batches sent and not yet seen applied.
+    unacknowledged: VecDeque<Unseen>,
     /// The ledger: admitted and not yet sent — drained from the entry's count, or decided by
     /// a service pod for a key it holds a copy of — still to go to the owner.
     unsent: u64,
+    /// Of what is admitted, requests an ask decided, its answer heard or not: those of an
+    /// ask given up reach the ledger through the entry's count, at the next drain.
+    unsent_asked: u64,
+    /// Requests of asks given up refused here, not yet sent.
+    unsent_refused: u64,
     heard: Option<u64>,
     bounded: bool,
     unreachable: bool,
@@ -860,6 +865,7 @@ impl Tracked {
         let last = self.entry.last_request.load(Ordering::Relaxed);
         fields.unreported == 0
             && self.unsent == 0
+            && self.unsent_refused == 0
             && fields.held == 0
             && self.asking == 0
             && self.unacknowledged.is_empty()
@@ -1054,44 +1060,43 @@ impl Visit<'_> {
             return true;
         }
         let mut entries = Vec::new();
-        for (_, count, first, _) in &mut tracked.unacknowledged {
-            if now - *first > hold {
-                *count = 0;
-            }
+        for unseen in &mut tracked.unacknowledged {
+            unseen.empty_if_stale(hold, now);
         }
         let mut reported = false;
-        for (sequence, count, _, last) in &mut tracked.unacknowledged {
-            if now - *last >= self.resend_after {
-                *last = now;
+        for unseen in &mut tracked.unacknowledged {
+            if now - unseen.last >= self.resend_after {
+                unseen.last = now;
                 entries.push(BatchEntry {
                     key: key.clone(),
                     contract: entry.terms.contract,
-                    report: Report::Hits {
-                        sequence: *sequence,
-                        count: *count,
-                        seen: tracked.seen,
-                    },
+                    report: unseen.report(tracked.seen),
                 });
                 reported = true;
             }
         }
         let unsent = tracked.unsent;
-        if unsent > 0 {
+        if unsent > 0 || tracked.unsent_refused > 0 {
+            let asked = tracked.unsent_asked.min(unsent);
+            tracked.unsent_asked -= asked;
+            let refused = std::mem::take(&mut tracked.unsent_refused);
             tracked.unsent = 0;
             tracked.sent += 1;
             *self.numbered += 1;
+            let unseen = Unseen {
+                sequence: tracked.sent,
+                count: unsent,
+                asked,
+                refused,
+                first: now,
+                last: now,
+            };
             entries.push(BatchEntry {
                 key: key.clone(),
                 contract: entry.terms.contract,
-                report: Report::Hits {
-                    sequence: tracked.sent,
-                    count: unsent,
-                    seen: tracked.seen,
-                },
+                report: unseen.report(tracked.seen),
             });
-            tracked
-                .unacknowledged
-                .push_back((tracked.sent, unsent, now, now));
+            tracked.unacknowledged.push_back(unseen);
             reported = true;
         }
         let last = entry.last_request.load(Ordering::Relaxed);
@@ -1401,6 +1406,8 @@ impl<S: BuildHasher + Clone> Participant<S> {
             seen: self.numbered,
             unacknowledged: VecDeque::new(),
             unsent: 0,
+            unsent_asked: 0,
+            unsent_refused: 0,
             heard: None,
             bounded: false,
             unreachable: false,
@@ -1624,6 +1631,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
         self.asks.entry(pod).or_default().push(Ask {
             id,
             count: group.asked.len() as u64,
+            timeout: self.ask_timeout,
             keys: group
                 .cold
                 .iter()
@@ -1650,7 +1658,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
 
     /// Decides here a request of the group `name` that waited: its asked-about keys from
     /// the entries, its held ones settled with them.
-    fn settle_here(&mut self, name: &[u8], ticket: Ticket, now: u64, cycle: Cycle) {
+    fn settle_here(&mut self, name: &[u8], ticket: Ticket, of_ask: bool, now: u64, cycle: Cycle) {
         let Some(group) = self.groups.get(name) else {
             return;
         };
@@ -1673,12 +1681,31 @@ impl<S: BuildHasher + Clone> Participant<S> {
             Local::Refuse
         };
         if decided == Local::Defer {
-            // Its holds given back; its worker decides it again.
+            // Its holds given back; its worker decides it again, as a request of its own:
+            // the owner told the ask's is refused, and counts it if it is admitted then.
+            if of_ask {
+                for at in &group.cold {
+                    if let Some(tracked) = self.keys.get_mut(&*group.keys[*at].0) {
+                        tracked.unsent_refused += 1;
+                    }
+                }
+            }
             self.settle_held(name, ticket, false, now, cycle);
             self.retries.push(ticket);
             return;
         }
         let admitted = decided == Local::Admit;
+        if of_ask {
+            for at in &group.cold {
+                if let Some(tracked) = self.keys.get_mut(&*group.keys[*at].0) {
+                    if admitted {
+                        tracked.unsent_asked += 1;
+                    } else {
+                        tracked.unsent_refused += 1;
+                    }
+                }
+            }
+        }
         let refused_by = if admitted {
             Box::default()
         } else {
@@ -1746,9 +1773,15 @@ impl<S: BuildHasher + Clone> Participant<S> {
             let Some(group) = self.groups.get_mut(&name) else {
                 continue;
             };
-            let waited: Vec<Ticket> = std::mem::take(&mut group.asked)
+            let asked = std::mem::take(&mut group.asked);
+            let waited: Vec<(Ticket, bool)> = asked
                 .into_iter()
-                .chain(std::mem::take(&mut group.waiting))
+                .map(|ticket| (ticket, true))
+                .chain(
+                    std::mem::take(&mut group.waiting)
+                        .into_iter()
+                        .map(|ticket| (ticket, false)),
+                )
                 .collect();
             for at in group.cold.clone() {
                 if let Some(tracked) = self.keys.get_mut(&*group.keys[at].0) {
@@ -1758,8 +1791,8 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 let key = group.keys[at].0.clone();
                 queue(&mut self.keys, &mut self.runnable, &key);
             }
-            for ticket in waited {
-                self.settle_here(&name, ticket, now, Cycle::AsItIs);
+            for (ticket, asked) in waited {
+                self.settle_here(&name, ticket, asked, now, Cycle::AsItIs);
             }
             self.groups.remove(&name);
         }
@@ -1842,7 +1875,12 @@ impl<S: BuildHasher + Clone> Participant<S> {
             let mut quiet: Vec<(u64, Box<[u8]>)> = self
                 .keys
                 .iter()
-                .filter(|(_, t)| t.asking == 0 && t.unacknowledged.is_empty() && t.unsent == 0)
+                .filter(|(_, t)| {
+                    t.asking == 0
+                        && t.unacknowledged.is_empty()
+                        && t.unsent == 0
+                        && t.unsent_refused == 0
+                })
                 .map(|(_, t)| {
                     let used = t.entry.last_request.load(Ordering::Relaxed);
                     (used, t.entry.key.clone())
@@ -1997,7 +2035,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 tracked.seen = tracked.seen.max(seen);
                 tracked
                     .unacknowledged
-                    .retain(|(sequence, _, _, _)| *sequence > seen);
+                    .retain(|unseen| unseen.sequence > seen);
             }
             if !current {
                 untaken.push((answer.key, answer.behind));
@@ -2007,7 +2045,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             let unseen: u64 = tracked
                 .unacknowledged
                 .iter()
-                .map(|(_, count, _, _)| count)
+                .map(|unseen| unseen.count)
                 .sum();
             let unsent = tracked.unsent;
             let asked: u64 = if answer.owned {
@@ -2077,6 +2115,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                     for key in &charged {
                         if let Some(tracked) = self.keys.get_mut(&**key) {
                             tracked.unsent += 1;
+                            tracked.unsent_asked += 1;
                         }
                         queue(&mut self.keys, &mut self.runnable, key);
                     }
@@ -2107,7 +2146,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             if group.follow_up && bounded {
                 let waiting = std::mem::take(&mut group.waiting);
                 for ticket in waiting {
-                    self.settle_here(&name, ticket, now, Cycle::Advance);
+                    self.settle_here(&name, ticket, false, now, Cycle::Advance);
                 }
                 self.groups.remove(&name);
             } else {
@@ -2144,16 +2183,12 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 continue;
             };
             let entries = self.outgoing.entry(owner).or_default();
-            for (sequence, count, _, last) in &mut tracked.unacknowledged {
-                *last = now;
+            for unseen in &mut tracked.unacknowledged {
+                unseen.last = now;
                 entries.push(BatchEntry {
                     key: key.clone(),
                     contract: tracked.entry.terms.contract,
-                    report: Report::Hits {
-                        sequence: *sequence,
-                        count: *count,
-                        seen: tracked.seen,
-                    },
+                    report: unseen.report(tracked.seen),
                 });
             }
         }
@@ -2222,7 +2257,17 @@ impl<S: BuildHasher + Clone> Participant<S> {
             .collect()
     }
 
+    /// As `DataPlane::oldest_ask`.
+    fn oldest_ask(&self) -> u64 {
+        self.in_flight
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(self.asks_sent + 1)
+    }
+
     fn take_outgoing_to_all(&mut self) -> Vec<(PodId, Batch)> {
+        let oldest_ask = self.oldest_ask();
         let mut asks = std::mem::take(&mut self.asks);
         let mut batches: Vec<(PodId, Batch)> = std::mem::take(&mut self.outgoing)
             .into_iter()
@@ -2233,6 +2278,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                         from: self.id,
                         entries,
                         asks: asks.remove(&pod).unwrap_or_default(),
+                        oldest_ask,
                     },
                 )
             })
@@ -2244,6 +2290,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                     from: self.id,
                     entries: Vec::new(),
                     asks,
+                    oldest_ask,
                 },
             )
         }));
@@ -2262,6 +2309,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             .filter(|pod| !self.sending.contains_key(pod))
             .copied()
             .collect();
+        let oldest_ask = self.oldest_ask();
         let mut batches = Vec::new();
         for pod in pods {
             let entries = self.outgoing.remove(&pod).unwrap_or_default();
@@ -2273,6 +2321,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                     from: self.id,
                     entries,
                     asks,
+                    oldest_ask,
                 },
             ));
         }
