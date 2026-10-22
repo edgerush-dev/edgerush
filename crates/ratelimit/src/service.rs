@@ -58,14 +58,18 @@ pub const RESEND_AFTER_CYCLES: u64 = 4;
 /// through at 1.44 times the contract with one packet in ten lost (simulator, TCP-like loss).
 pub const ACTIVE_CYCLES: u64 = 30;
 
-/// For how many cycles at least, after a data plane last admitted the key, its owner holds
-/// what the data plane's asks admitted, for the hits they are reported as, unless set
+/// For how many cycles at least, beside the time data planes wait for an ask's answer, the
+/// owner holds what an ask admitted for the hits it is reported as, unless set
 /// ([`ServicePod::set_least_hold`]): the key's refill time if that is longer, as a data plane
-/// sends its hits for as long, and 400 ms at a 10 ms cycle at least, past the 300 ms the
-/// proxy waits for an ask's answer before giving it up and deciding its requests itself,
-/// whose hits then still find the hold. What no hits settle by then — the data plane gone,
-/// or an ask that arrived again decided twice — lapses, staying charged and counted.
-pub const HOLD_CYCLES: u64 = 40;
+/// sends its hits for as long. 3 s at a 10 ms cycle: a report held up by TCP sending a lost
+/// segment again, and again, still finds its hold (simulator: 22 requests in 200 runs counted
+/// twice at 2 s, none at 3 s). What no hits settle by then — the data plane gone, or an ask
+/// that arrived again decided twice — lapses, staying charged and counted.
+pub const HOLD_CYCLES: u64 = 300;
+
+/// For how many cycles a service pod keeps what it knows of a data plane's asks after its
+/// last ask: a minute at a 10 ms cycle, far past any ask's copy still on its way.
+pub const ASKS_KEPT_CYCLES: u64 = 6_000;
 
 /// A data plane: one worker of one EdgeRush pod, in one life of it. A restarted worker is a
 /// new data plane, with a new id.
@@ -187,6 +191,12 @@ pub enum Report {
         sequence: u64,
         /// How many hits.
         count: u64,
+        /// How many of them are requests an ask decided, its answer heard or not: only
+        /// these settle what the owner holds for the data plane.
+        asked: u64,
+        /// Requests of asks given up that the data plane then refused itself: what the
+        /// owner holds for them is dropped from its count, left charged.
+        refused: u64,
         /// The highest of its batches it has seen applied, always below `sequence`: an owner
         /// taking over from a copy older than that skips to it rather than wait for batches
         /// that will not come.
@@ -217,6 +227,9 @@ pub struct Ask {
     pub id: u64,
     /// How many requests wait.
     pub count: u64,
+    /// How long the data plane waits for the answer before giving the ask up and deciding
+    /// its requests itself: what the owner admits is held as much longer, for their hits.
+    pub timeout: u64,
     /// The keys, with their contracts, in the order the requests' limits are in: at least
     /// one, and each once, as a request is under each of its limits once.
     pub keys: Vec<(Box<[u8]>, Contract)>,
@@ -232,6 +245,11 @@ pub struct Batch {
     pub entries: Vec<Entry>,
     /// Requests waiting for a decision.
     pub asks: Vec<Ask>,
+    /// The oldest of the data plane's asks still in flight as it sent the batch, or one past
+    /// its last if none is: every ask before it is over, answered or given up, and a copy of
+    /// one, however late — queued behind an exchange, or in this very batch — is not decided
+    /// again.
+    pub oldest_ask: u64,
 }
 
 /// A service pod's answer about one key.
@@ -285,6 +303,8 @@ pub struct PlaneRecord {
     /// What the owner's answers to its asks admitted that its hits have not yet settled:
     /// charged on the bucket, held for those hits ([`HOLD_CYCLES`]).
     pub held: u64,
+    /// How long after the copy was made that lapses.
+    pub held_for: u64,
 }
 
 /// The owner's copy of one key, for the other service pods.
@@ -350,6 +370,43 @@ fn admitted_under(admitting: &[(Box<[u8]>, u64)], key: &[u8]) -> u64 {
         .sum()
 }
 
+/// A batch a data plane sent and has not yet seen applied.
+#[derive(Clone, Copy, Debug)]
+struct Unseen {
+    sequence: u64,
+    /// Its hits, how many of them are requests an ask decided, and the requests of asks
+    /// given up it refused ([`Report::Hits`]).
+    count: u64,
+    asked: u64,
+    refused: u64,
+    /// When it was first sent, and last.
+    first: u64,
+    last: u64,
+}
+
+impl Unseen {
+    /// Its report, the data plane having seen its batches up to `seen` applied.
+    fn report(&self, seen: u64) -> Report {
+        Report::Hits {
+            sequence: self.sequence,
+            count: self.count,
+            asked: self.asked,
+            refused: self.refused,
+            seen,
+        }
+    }
+
+    /// Emptied of its hits if it is not seen applied within `hold` of first being sent, at
+    /// `now`, and still sent, as the owner applies in order. What it says of requests
+    /// refused stays: it charges nothing, and frees what is held for them.
+    fn empty_if_stale(&mut self, hold: u64, now: u64) {
+        if now - self.first > hold {
+            self.count = 0;
+            self.asked = 0;
+        }
+    }
+}
+
 /// What a data plane holds of one key.
 struct PlaneKey {
     contract: Contract,
@@ -362,12 +419,16 @@ struct PlaneKey {
     bucket: TokenBucket,
     /// Hits admitted and not yet sent.
     unsent: u64,
+    /// Of them, requests an ask decided.
+    unsent_asked: u64,
+    /// Requests of asks given up refused here, not yet sent.
+    unsent_refused: u64,
     /// Batches sent to the present owner so far.
     sent: u64,
     /// The highest of them the owner has been seen to apply.
     seen: u64,
-    /// Batches sent and not yet seen applied: `(sequence, count, first sent, last sent)`.
-    unacknowledged: VecDeque<(u64, u64, u64, u64)>,
+    /// Batches sent and not yet seen applied.
+    unacknowledged: VecDeque<Unseen>,
     /// Admitted in the cycle under way.
     spent: u64,
     /// The most it may admit in the cycle under way, once a cycle has set it.
@@ -401,6 +462,8 @@ impl PlaneKey {
             owner,
             bucket: contract.bucket(),
             unsent: 0,
+            unsent_asked: 0,
+            unsent_refused: 0,
             sent: numbered,
             seen: numbered,
             unacknowledged: VecDeque::new(),
@@ -492,6 +555,7 @@ impl PlaneKey {
     /// Whether nothing is left to do for the key and its copy would be cold anyway.
     fn idle(&self, now: u64) -> bool {
         self.unsent == 0
+            && self.unsent_refused == 0
             && self.held == 0
             && self.asking == 0
             && self.unacknowledged.is_empty()
@@ -899,6 +963,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         self.asks.entry(pod).or_default().push(Ask {
             id,
             count: group.asked.len() as u64,
+            timeout: self.ask_timeout,
             keys: group
                 .cold
                 .iter()
@@ -923,7 +988,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
 
     /// Decides here a request of the group `name` that waited: its asked-about keys from
     /// their copies, its held ones admitted or given back with them.
-    fn settle_here(&mut self, name: &[u8], ticket: Ticket, now: u64) {
+    fn settle_here(&mut self, name: &[u8], ticket: Ticket, asked: bool, now: u64) {
         let Some(group) = self.groups.get(name) else {
             return;
         };
@@ -936,6 +1001,15 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             for at in &group.cold {
                 if let Some(key) = self.keys.get_mut(&group.keys[*at].0) {
                     key.take(now);
+                    if asked {
+                        key.unsent_asked += 1;
+                    }
+                }
+            }
+        } else if asked {
+            for at in &group.cold {
+                if let Some(key) = self.keys.get_mut(&group.keys[*at].0) {
+                    key.unsent_refused += 1;
                 }
             }
         }
@@ -1004,17 +1078,23 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             let Some(group) = self.groups.get_mut(&name) else {
                 continue;
             };
-            let waited: Vec<Ticket> = std::mem::take(&mut group.asked)
+            let asked = std::mem::take(&mut group.asked);
+            let waited: Vec<(Ticket, bool)> = asked
                 .into_iter()
-                .chain(std::mem::take(&mut group.waiting))
+                .map(|ticket| (ticket, true))
+                .chain(
+                    std::mem::take(&mut group.waiting)
+                        .into_iter()
+                        .map(|ticket| (ticket, false)),
+                )
                 .collect();
             for at in group.cold.clone() {
                 if let Some(key) = self.keys.get_mut(&group.keys[at].0) {
                     key.unreachable = true;
                 }
             }
-            for ticket in waited {
-                self.settle_here(&name, ticket, now);
+            for (ticket, asked) in waited {
+                self.settle_here(&name, ticket, asked, now);
             }
             self.groups.remove(&name);
         }
@@ -1047,43 +1127,41 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 continue;
             };
             let mut entries = Vec::new();
-            // A batch not seen applied within a refill time is emptied, and still sent, as
-            // the owner applies in order.
-            for (_, count, first, _) in &mut at.unacknowledged {
-                if now - *first > hold {
-                    *count = 0;
-                }
+            for unseen in &mut at.unacknowledged {
+                unseen.empty_if_stale(hold, now);
             }
             let mut reported = false;
-            for (sequence, count, _, last) in &mut at.unacknowledged {
-                if now - *last >= resend_after {
-                    *last = now;
+            for unseen in &mut at.unacknowledged {
+                if now - unseen.last >= resend_after {
+                    unseen.last = now;
                     entries.push(Entry {
                         key: key.clone(),
                         contract: at.contract,
-                        report: Report::Hits {
-                            sequence: *sequence,
-                            count: *count,
-                            seen: at.seen,
-                        },
+                        report: unseen.report(at.seen),
                     });
                     reported = true;
                 }
             }
-            if at.unsent > 0 {
+            if at.unsent > 0 || at.unsent_refused > 0 {
                 at.sent += 1;
                 self.numbered += 1;
+                let unseen = Unseen {
+                    sequence: at.sent,
+                    count: at.unsent,
+                    asked: at.unsent_asked,
+                    refused: at.unsent_refused,
+                    first: now,
+                    last: now,
+                };
                 entries.push(Entry {
                     key: key.clone(),
                     contract: at.contract,
-                    report: Report::Hits {
-                        sequence: at.sent,
-                        count: at.unsent,
-                        seen: at.seen,
-                    },
+                    report: unseen.report(at.seen),
                 });
-                at.unacknowledged.push_back((at.sent, at.unsent, now, now));
+                at.unacknowledged.push_back(unseen);
                 at.unsent = 0;
+                at.unsent_asked = 0;
+                at.unsent_refused = 0;
                 reported = true;
             }
             let in_use = at.last_request.is_some_and(|last| now - last <= hold)
@@ -1124,7 +1202,11 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 .keys
                 .iter()
                 .filter(|(_, at)| {
-                    at.unsent == 0 && at.held == 0 && at.asking == 0 && at.unacknowledged.is_empty()
+                    at.unsent == 0
+                        && at.unsent_refused == 0
+                        && at.held == 0
+                        && at.asking == 0
+                        && at.unacknowledged.is_empty()
                 })
                 .map(|(key, at)| {
                     let used = at.last_request.unwrap_or(0);
@@ -1195,10 +1277,9 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 // No more of this data plane's batches can have been applied than it has sent.
                 let seen = answer.applied.min(at.sent);
                 at.seen = at.seen.max(seen);
-                at.unacknowledged
-                    .retain(|(sequence, _, _, _)| *sequence > seen);
+                at.unacknowledged.retain(|unseen| unseen.sequence > seen);
             }
-            let unseen: u64 = at.unacknowledged.iter().map(|(_, count, _, _)| count).sum();
+            let unseen: u64 = at.unacknowledged.iter().map(|unseen| unseen.count).sum();
             let asked = if answer.owned {
                 admitted_under(&admitting, &answer.key)
             } else {
@@ -1256,6 +1337,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                     for key in &charged {
                         if let Some(at) = self.keys.get_mut(key) {
                             at.unsent += 1;
+                            at.unsent_asked += 1;
                         }
                     }
                 }
@@ -1289,7 +1371,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             if group.follow_up && bounded {
                 let waiting = std::mem::take(&mut group.waiting);
                 for ticket in waiting {
-                    self.settle_here(&name, ticket, now);
+                    self.settle_here(&name, ticket, false, now);
                 }
                 self.groups.remove(&name);
             } else {
@@ -1323,16 +1405,12 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 continue;
             };
             let entries = self.outgoing.entry(owner).or_default();
-            for (sequence, count, _, last) in &mut at.unacknowledged {
-                *last = now;
+            for unseen in &mut at.unacknowledged {
+                unseen.last = now;
                 entries.push(Entry {
                     key: key.clone(),
                     contract: at.contract,
-                    report: Report::Hits {
-                        sequence: *sequence,
-                        count: *count,
-                        seen: at.seen,
-                    },
+                    report: unseen.report(at.seen),
                 });
             }
         }
@@ -1378,8 +1456,18 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         longest(self.waits(keys, now))
     }
 
+    /// The oldest of its asks still in flight, or one past its last ([`Batch::oldest_ask`]).
+    fn oldest_ask(&self) -> u64 {
+        self.in_flight
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(self.asks_sent + 1)
+    }
+
     /// Messages to send: one batch per service pod; an empty one asks only for the view.
     pub fn take_outgoing(&mut self) -> Vec<(PodId, Batch)> {
+        let oldest_ask = self.oldest_ask();
         let mut asks = std::mem::take(&mut self.asks);
         let mut batches: Vec<(PodId, Batch)> = std::mem::take(&mut self.outgoing)
             .into_iter()
@@ -1390,6 +1478,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                         from: self.id,
                         entries,
                         asks: asks.remove(&pod).unwrap_or_default(),
+                        oldest_ask,
                     },
                 )
             })
@@ -1401,6 +1490,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                     from: self.id,
                     entries: Vec::new(),
                     asks,
+                    oldest_ask,
                 },
             )
         }));
@@ -1442,13 +1532,43 @@ struct Record {
         clippy::box_collection,
         reason = "a pointer in every record, rather than a list's three words, for what is rarely there"
     )]
-    waiting: Option<Box<Vec<(u64, u64)>>>,
+    waiting: Option<Box<Vec<(u64, Tally)>>>,
     last_admitted: Admitted,
-    last_ask: (u64, u64),
+    /// Its last ask decided under the key, and how many were admitted.
+    last_ask: u64,
+    last_ask_admitted: u32,
     /// What its asks were admitted, charged and counted, that its hits have not yet
     /// settled: its next hits settle it rather than being charged, until it lapses
-    /// ([`Owned::lapse`]).
-    held: u64,
+    /// ([`Owned::lapse`]). In four bytes, as `last_ask_admitted`, so that `held_until` fits
+    /// in the record's 56: past four billion, the rest is counted and charged but not held.
+    held: u32,
+    /// When it lapses: the latest of its asks' holds.
+    held_until: u64,
+}
+
+/// A batch's hits as its owner applies them: how many, how many of them are requests an ask
+/// decided, and the requests of asks given up its data plane refused ([`Report::Hits`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Tally {
+    count: u64,
+    asked: u64,
+    refused: u64,
+}
+
+impl Tally {
+    /// Counts come from the wire: as many as a count holds, never wrapped round.
+    fn add(self, other: Self) -> Self {
+        Self {
+            count: self.count.saturating_add(other.count),
+            asked: self.asked.saturating_add(other.asked),
+            refused: self.refused.saturating_add(other.refused),
+        }
+    }
+}
+
+/// `count` in four bytes, the most they hold if it is more.
+fn saturated(count: u64) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 /// When a data plane last admitted a key, if it has, in eight bytes rather than an option's
@@ -1476,22 +1596,29 @@ impl From<Option<u64>> for Admitted {
 }
 
 impl Record {
+    /// Takes up to `most` from what is held, and says how much it took.
+    fn take_held(&mut self, most: u64) -> u64 {
+        let taken = saturated(most).min(self.held);
+        self.held -= taken;
+        u64::from(taken)
+    }
+
     /// Batch `sequence` of `count` hits arrives: the hits now ready to apply, of it and of
     /// the batches kept waiting for it, each batch once.
-    fn take(&mut self, sequence: u64, count: u64) -> u64 {
+    fn take(&mut self, sequence: u64, tally: Tally) -> Tally {
         if sequence <= self.applied {
-            return 0;
+            return Tally::default();
         }
         if sequence > self.applied + 1 {
             let waiting = self.waiting.get_or_insert_default();
             match waiting.binary_search_by_key(&sequence, |(at, _)| *at) {
-                Ok(at) => waiting[at] = (sequence, count),
-                Err(at) => waiting.insert(at, (sequence, count)),
+                Ok(at) => waiting[at] = (sequence, tally),
+                Err(at) => waiting.insert(at, (sequence, tally)),
             }
-            return 0;
+            return Tally::default();
         }
         self.applied = sequence;
-        let mut ready = count;
+        let mut ready = tally;
         if let Some(waiting) = &mut self.waiting {
             // All ahead of it: the first of them follow on from it.
             let mut caught_up = 0;
@@ -1500,8 +1627,7 @@ impl Record {
                     break;
                 }
                 self.applied = at;
-                // Counts come from the wire: as many as a count holds, never wrapped round.
-                ready = ready.saturating_add(waited);
+                ready = ready.add(waited);
                 caught_up += 1;
             }
             waiting.drain(..caught_up);
@@ -1625,20 +1751,13 @@ impl Owned {
         self.bucket = bucket.state();
     }
 
-    /// Ends what is held for data planes that have admitted nothing for the key's refill
-    /// time, or `least_hold` if longer, at `now`: it stays charged and counted, and hits
-    /// arriving after are charged as any other — a request counted twice if they were its
-    /// own. Not given back: taken off a bucket that had since refilled to full, it would free
-    /// room later charges took; and a data plane gives up sending hits it has not seen applied
-    /// within a refill time, whose requests would then go uncounted.
-    fn lapse(&mut self, least_hold: u64, now: u64) {
-        let hold_for = self.contract.refill_time().max(least_hold);
+    /// Ends what is held for data planes whose holds are over at `now`: it stays charged
+    /// and counted, and hits arriving after are charged as any other — a request counted
+    /// twice if they were its own. Not given back: taken off a bucket that had since refilled
+    /// to full, it would free room later charges took.
+    fn lapse(&mut self, now: u64) {
         for record in self.planes.iter_mut() {
-            let due = record
-                .last_admitted
-                .get()
-                .is_none_or(|at| now.saturating_sub(at) >= hold_for);
-            if due {
+            if now >= record.held_until {
                 record.held = 0;
             }
         }
@@ -1696,11 +1815,13 @@ impl Owned {
             let ours = self.planes.entry(plane);
             ours.applied = ours.applied.max(record.applied);
             ours.last_admitted = ours.last_admitted.max(record.last_admitted);
-            if record.last_ask.0 > ours.last_ask.0 {
+            if record.last_ask > ours.last_ask {
                 ours.last_ask = record.last_ask;
+                ours.last_ask_admitted = record.last_ask_admitted;
             }
             // Charged and counted with the rest of its count, above.
             ours.held = ours.held.saturating_add(record.held);
+            ours.held_until = ours.held_until.max(record.held_until);
         }
     }
 
@@ -1717,8 +1838,9 @@ impl Owned {
                     plane,
                     applied: record.applied,
                     admitted_ago: record.last_admitted.get().map(|at| now.saturating_sub(at)),
-                    last_ask: record.last_ask,
-                    held: record.held,
+                    last_ask: (record.last_ask, u64::from(record.last_ask_admitted)),
+                    held: u64::from(record.held),
+                    held_for: record.held_until.saturating_sub(now),
                 })
                 .collect(),
         }
@@ -1753,6 +1875,19 @@ pub struct ServicePod<S = FixedState> {
     answered: u64,
     /// The least a key's asked requests are held for their data plane's hits.
     least_hold: u64,
+    /// What it knows of each data plane's asks ([`PlaneAsks`]).
+    asks: BTreeMap<PlaneId, PlaneAsks>,
+}
+
+/// What a service pod knows of one data plane's asks: the oldest it last said were still in
+/// flight — every ask before it is over, answered or given up, and a copy of one is
+/// answered without being decided — and what it decided of those after, so that a copy of
+/// one, sent again, is answered as it was. When it last asked, to forget it a while after.
+#[derive(Debug)]
+struct PlaneAsks {
+    oldest: u64,
+    decided: BTreeMap<u64, u64>,
+    heard: u64,
 }
 
 impl<S: BuildHasher + Default> ServicePod<S> {
@@ -1777,6 +1912,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             life: 0,
             answered: 0,
             least_hold: HOLD_CYCLES * cycle.max(1),
+            asks: BTreeMap::new(),
         }
     }
 
@@ -1848,6 +1984,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         let lately = ACTIVE_CYCLES * self.cycle;
         let mut answers = Vec::new();
         let from = batch.from;
+        let oldest_ask = batch.oldest_ask;
         let (entries, asks) = if self.serving {
             (batch.entries, batch.asks)
         } else {
@@ -1871,7 +2008,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 continue;
             };
             owned.touched = now;
-            owned.lapse(self.least_hold, now);
+            owned.lapse(now);
             let latest = owned
                 .planes
                 .iter()
@@ -1883,6 +2020,8 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             if let Report::Hits {
                 sequence,
                 count,
+                asked,
+                refused,
                 seen,
             } = entry.report
             {
@@ -1902,14 +2041,26 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 } else {
                     record.last_admitted = record.last_admitted.max(latest);
                 }
-                let ready = record.take(sequence, count);
+                // No more of its hits asked than there are.
+                let asked = asked.min(count);
+                let ready = record.take(
+                    sequence,
+                    Tally {
+                        count,
+                        asked,
+                        refused,
+                    },
+                );
                 // What is held for the data plane settles first: counted and charged when
                 // its ask was decided. Any hit settles it, not only those of the requests
                 // its ask admitted — a hold is a charge like any other — and the bucket ends
                 // charged once for every hit either way.
-                let settled = ready.min(record.held);
-                record.held -= settled;
-                owned.apply(ready - settled, now);
+                let settled = record.take_held(ready.asked);
+                // Held for requests the data plane refused, its ask given up: never
+                // admitted, so not counted; the bucket left charged.
+                let dropped = record.take_held(ready.refused);
+                owned.counted = owned.counted.saturating_sub(dropped);
+                owned.apply(ready.count - settled, now);
             }
             let applied = owned.planes.get(from).map_or(0, |record| record.applied);
             answers.push(Answer {
@@ -1924,8 +2075,32 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             }
         }
         let mut decided = Vec::new();
+        let known = self.asks.entry(from).or_insert(PlaneAsks {
+            oldest: 0,
+            decided: BTreeMap::new(),
+            heard: now,
+        });
+        if oldest_ask > known.oldest {
+            known.oldest = oldest_ask;
+            known.decided = known.decided.split_off(&oldest_ask);
+        }
+        known.heard = now;
         for ask in asks {
-            if let Some(admitted) = self.decide_ask(from, &ask, now) {
+            let known = self.asks.get(&from);
+            // Its data plane is done with it: deciding it again would count requests it
+            // admitted once, or refused, a second time.
+            if known.is_some_and(|known| ask.id < known.oldest) {
+                continue;
+            }
+            let before = known.and_then(|known| known.decided.get(&ask.id).copied());
+            let admitted = before.or_else(|| {
+                let admitted = self.decide_ask(from, &ask, now)?;
+                if let Some(known) = self.asks.get_mut(&from) {
+                    known.decided.insert(ask.id, admitted);
+                }
+                Some(admitted)
+            });
+            if let Some(admitted) = admitted {
                 decided.push((ask.id, admitted));
                 for (key, _) in &ask.keys {
                     let Some(held) = self.keys.get(key) else {
@@ -1975,12 +2150,12 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 self.keys.insert(key.clone(), Owned::new(*contract, now));
             }
             if let Some(held) = self.keys.get_mut(key) {
-                held.lapse(least_hold, now);
+                held.lapse(now);
             }
         }
         let before = ask.keys.iter().find_map(|(key, _)| {
             let record = self.keys.get(key)?.planes.get(from)?;
-            (record.last_ask.0 == ask.id).then_some(record.last_ask.1)
+            (record.last_ask == ask.id).then_some(u64::from(record.last_ask_admitted))
         });
         if let Some(admitted) = before {
             return Some(admitted);
@@ -2004,10 +2179,19 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             held.charge(now, admitted);
             held.touched = now;
             let record = held.planes.entry(from);
-            record.last_ask = (ask.id, admitted);
+            record.last_ask = ask.id;
+            record.last_ask_admitted = saturated(admitted);
             if owned {
                 record.last_admitted = Admitted::at(now);
-                record.held = record.held.saturating_add(admitted);
+                record.held = record.held.saturating_add(saturated(admitted));
+                // Its hits come within the data plane's wait for the answer and a refill
+                // time after, as long as it sends them.
+                let hold_for = held
+                    .contract
+                    .refill_time()
+                    .max(least_hold)
+                    .saturating_add(ask.timeout);
+                record.held_until = record.held_until.max(now.saturating_add(hold_for));
                 held.counted = held.counted.saturating_add(admitted);
                 self.copy_out(key, now);
             }
@@ -2065,8 +2249,10 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                                 .admitted_ago
                                 .map(|ago| now.saturating_sub(ago))
                                 .into(),
-                            last_ask: record.last_ask,
-                            held: record.held,
+                            last_ask: record.last_ask.0,
+                            last_ask_admitted: saturated(record.last_ask.1),
+                            held: saturated(record.held),
+                            held_until: now.saturating_add(record.held_for),
                         },
                     )
                 })
@@ -2142,6 +2328,9 @@ impl<S: BuildHasher + Default> ServicePod<S> {
     /// The pod's timer at `now`: keys full again and quiet for a refill time are dropped,
     /// owned or copies.
     pub fn on_timer(&mut self, now: u64) {
+        let kept = ASKS_KEPT_CYCLES * self.cycle;
+        self.asks
+            .retain(|_, known| now.saturating_sub(known.heard) <= kept);
         let mut holding = 0;
         self.keys.retain(|key, owned| {
             let keep = now.saturating_sub(owned.touched) <= owned.contract.refill_time()

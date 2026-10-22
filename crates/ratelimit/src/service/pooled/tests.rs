@@ -355,12 +355,10 @@ proptest! {
     /// flight or more:
     /// over a schedule of requests, cycles and answers — late, out
     /// of order, twice — and then everything delivered and settled, each key's count at its
-    /// owner is what was admitted under it, with cold keys decided locally. With them asked
-    /// about, at least that: what an ask admits the owner holds for the hits it is reported
-    /// as, so that an ask given up and decided here is counted once; but an ask sent again
-    /// and decided twice — its first sending arriving after another ask under the key, the
-    /// pod remembering only the last — is counted twice unless the data plane's hits settle
-    /// what it held before it lapses (results note), which neither mode causes. Now
+    /// owner is what was admitted under it, cold keys decided locally or asked about: what an
+    /// ask admits the owner holds for the hits it is reported as, an ask given up and decided
+    /// here is counted once whether admitted or refused, and an ask sent again, or arriving
+    /// after its data plane is done with it, is not decided twice. Now
     /// and then the next cycle runs with no room for any key, evicting every
     /// key it may, to be made again by its next request: its reports then number on past
     /// those of its earlier life, which the pod, never forgetting the key, still holds.
@@ -460,21 +458,14 @@ proptest! {
             prop_assert!(waiting.is_empty(), "never decided: {:?}", waiting);
             for (place, (key, _)) in keys.iter().enumerate() {
                 let counted = pooled.pod.counted(key).unwrap_or(0);
-                if ask_cold {
-                    prop_assert!(
-                        counted >= admitted[place],
-                        "scheduled {}, key {}: {} counted of {}",
-                        scheduled, place, counted, admitted[place]
-                    );
-                } else {
-                    prop_assert_eq!(
-                        counted,
-                        admitted[place],
-                        "scheduled {}, key {}",
-                        scheduled,
-                        place
-                    );
-                }
+                prop_assert_eq!(
+                    counted,
+                    admitted[place],
+                    "scheduled {}, asked {}, key {}",
+                    scheduled,
+                    ask_cold,
+                    place
+                );
             }
         }
     }
@@ -1302,12 +1293,15 @@ fn one_in_flight() -> Participant<FixedState> {
 fn others_hits(key: &[u8], c: Contract, count: u64) -> Batch {
     Batch {
         from: 8,
+        oldest_ask: 0,
         entries: vec![BatchEntry {
             key: key.into(),
             contract: c,
             report: Report::Hits {
                 sequence: 1,
                 count,
+                asked: 0,
+                refused: 0,
                 seen: 0,
             },
         }],
@@ -2273,6 +2267,60 @@ fn hourly() -> Contract {
         window: n(3_600_000 * MS),
         burst: n(10),
     }
+}
+
+/// A key with refused requests of an ask given up still to report is neither evicted for
+/// room nor idle, as a data plane's is not.
+#[test]
+fn a_key_with_refusals_to_report_is_kept() {
+    let mut participant = one_in_flight();
+    participant.ensure(b"k", contract(100, 10), 0);
+    // Its owner gone, nothing is sent.
+    participant.on_view(
+        View {
+            epoch: 2,
+            pods: Vec::new(),
+        },
+        0,
+    );
+    participant.keys.get_mut(&b"k"[..]).unwrap().unsent_refused = 1;
+    participant.set_capacity(1);
+    participant.on_cycle(CYCLE);
+    assert_eq!(participant.key_count(), 1, "not evicted");
+    participant.set_capacity(u64::MAX);
+    participant.on_cycle(1_000 * MS);
+    assert_eq!(participant.key_count(), 1, "not idle");
+}
+
+/// An ask says how long its participant waits for the answer, and its batch the oldest of
+/// its asks still in flight, as a data plane's do.
+#[test]
+fn a_batch_says_which_asks_are_over_and_an_ask_how_long_it_waits() {
+    let mut participant = participant();
+    participant.set_ask_timeout(300 * MS);
+    let c = contract(100, 10);
+    assert!(matches!(
+        participant.decide_all(&[(b"k", c)], 0),
+        Decision::Wait(_)
+    ));
+    assert!(matches!(
+        participant.decide_all(&[(b"j", c)], 0),
+        Decision::Wait(_)
+    ));
+    participant.on_cycle(CYCLE);
+    let batches: Vec<Batch> = participant
+        .take_exchanges()
+        .into_iter()
+        .map(|(_, _, batch)| batch)
+        .collect();
+    let mut asks: Vec<(u64, u64)> = batches
+        .iter()
+        .flat_map(|batch| &batch.asks)
+        .map(|ask| (ask.id, ask.timeout))
+        .collect();
+    asks.sort_unstable();
+    assert_eq!(asks, [(1, 300 * MS), (2, 300 * MS)]);
+    assert!(batches.iter().all(|batch| batch.oldest_ask == 1));
 }
 
 /// Scheduled, a key evicted for capacity frees its entry then, not when its eviction time

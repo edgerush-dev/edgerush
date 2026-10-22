@@ -34,6 +34,12 @@ pub struct Hits {
     /// The highest of its batches the data plane has seen applied, below `sequence`.
     #[prost(uint64, tag = "3")]
     pub seen: u64,
+    /// How many of the hits are requests an ask decided.
+    #[prost(uint64, tag = "4")]
+    pub asked: u64,
+    /// Requests of asks given up that the data plane refused itself.
+    #[prost(uint64, tag = "5")]
+    pub refused: u64,
 }
 
 /// Nothing to report; a fresh copy, please.
@@ -88,6 +94,9 @@ pub struct Ask {
     /// The keys, in their limits' order: at least one, each once.
     #[prost(message, repeated, tag = "3")]
     pub keys: Vec<AskKey>,
+    /// How long the data plane waits for the answer, in nanoseconds.
+    #[prost(uint64, tag = "4")]
+    pub timeout_ns: u64,
 }
 
 /// A data plane's batch.
@@ -102,6 +111,9 @@ pub struct Batch {
     /// Requests waiting for a decision.
     #[prost(message, repeated, tag = "3")]
     pub asks: Vec<Ask>,
+    /// The oldest of the data plane's asks still in flight, or one past its last.
+    #[prost(uint64, tag = "4")]
+    pub oldest_ask: u64,
 }
 
 /// An ask's decision.
@@ -192,6 +204,9 @@ pub struct PlaneRecord {
     /// What its asks were admitted that its hits have not yet settled.
     #[prost(uint64, tag = "6")]
     pub held: u64,
+    /// How long after the copy was made that lapses, in nanoseconds.
+    #[prost(uint64, tag = "7")]
+    pub held_for_ns: u64,
 }
 
 /// An owner's copy of one key.
@@ -403,11 +418,15 @@ impl From<service::Batch> for Batch {
                         service::Report::Hits {
                             sequence,
                             count,
+                            asked,
+                            refused,
                             seen,
                         } => Report::Hits(Hits {
                             sequence,
                             count,
                             seen,
+                            asked,
+                            refused,
                         }),
                         service::Report::Poll => Report::Poll(Poll {}),
                     }),
@@ -419,6 +438,7 @@ impl From<service::Batch> for Batch {
                 .map(|ask| Ask {
                     id: ask.id,
                     count: ask.count,
+                    timeout_ns: ask.timeout,
                     keys: ask
                         .keys
                         .into_iter()
@@ -429,6 +449,7 @@ impl From<service::Batch> for Batch {
                         .collect(),
                 })
                 .collect(),
+            oldest_ask: batch.oldest_ask,
         }
     }
 }
@@ -450,6 +471,8 @@ impl TryFrom<Batch> for service::Batch {
                     Report::Hits(hits) => service::Report::Hits {
                         sequence: hits.sequence,
                         count: hits.count,
+                        asked: hits.asked,
+                        refused: hits.refused,
                         seen: hits.seen,
                     },
                     Report::Poll(_) => service::Report::Poll,
@@ -485,6 +508,7 @@ impl TryFrom<Batch> for service::Batch {
                 Ok(service::Ask {
                     id: ask.id,
                     count: ask.count,
+                    timeout: ask.timeout_ns,
                     keys,
                 })
             })
@@ -493,6 +517,7 @@ impl TryFrom<Batch> for service::Batch {
             from: batch.from,
             entries,
             asks,
+            oldest_ask: batch.oldest_ask,
         })
     }
 }
@@ -573,6 +598,7 @@ impl From<service::Replicas> for Replicas {
                             last_ask: record.last_ask.0,
                             last_ask_admitted: record.last_ask.1,
                             held: record.held,
+                            held_for_ns: record.held_for,
                         })
                         .collect(),
                 })
@@ -605,6 +631,7 @@ impl TryFrom<Replicas> for service::Replicas {
                             admitted_ago: record.admitted_ago,
                             last_ask: (record.last_ask, record.last_ask_admitted),
                             held: record.held,
+                            held_for: record.held_for_ns,
                         })
                         .collect(),
                 })
@@ -638,13 +665,22 @@ mod tests {
 
     fn report() -> impl Strategy<Value = service::Report> {
         prop_oneof![
-            (1..=u64::MAX, any::<u64>(), any::<u64>()).prop_map(|(sequence, count, seen)| {
-                service::Report::Hits {
-                    sequence,
-                    count,
-                    seen: seen % sequence,
-                }
-            }),
+            (
+                1..=u64::MAX,
+                any::<u64>(),
+                any::<u64>(),
+                any::<u64>(),
+                any::<u64>()
+            )
+                .prop_map(|(sequence, count, asked, refused, seen)| {
+                    service::Report::Hits {
+                        sequence,
+                        count,
+                        asked,
+                        refused,
+                        seen: seen % sequence,
+                    }
+                }),
             Just(service::Report::Poll),
         ]
     }
@@ -663,22 +699,26 @@ mod tests {
         let ask = (
             any::<u64>(),
             any::<u64>(),
+            any::<u64>(),
             prop::collection::btree_map(key(), contract(), 1..4),
         )
-            .prop_map(|(id, count, keys)| service::Ask {
+            .prop_map(|(id, count, timeout, keys)| service::Ask {
                 id,
                 count,
+                timeout,
                 keys: keys.into_iter().collect(),
             });
         (
             any::<u64>(),
             prop::collection::vec(entry, 0..8),
             prop::collection::vec(ask, 0..3),
+            any::<u64>(),
         )
-            .prop_map(|(from, entries, asks)| service::Batch {
+            .prop_map(|(from, entries, asks, oldest_ask)| service::Batch {
                 from,
                 entries,
                 asks,
+                oldest_ask,
             })
     }
 
@@ -726,17 +766,18 @@ mod tests {
             any::<u64>(),
             prop::option::of(any::<u64>()),
             any::<(u64, u64)>(),
-            any::<u64>(),
+            any::<(u64, u64)>(),
         )
-            .prop_map(|(plane, applied, admitted_ago, last_ask, held)| {
-                service::PlaneRecord {
+            .prop_map(
+                |(plane, applied, admitted_ago, last_ask, (held, held_for))| service::PlaneRecord {
                     plane,
                     applied,
                     admitted_ago,
                     last_ask,
                     held,
-                }
-            });
+                    held_for,
+                },
+            );
         let replica = (
             key(),
             contract(),
@@ -840,6 +881,7 @@ mod tests {
         };
         let batch = |entry| Batch {
             from: 1,
+            oldest_ask: 0,
             entries: vec![entry],
             asks: Vec::new(),
         };
@@ -890,6 +932,7 @@ mod tests {
     fn a_report_numbered_zero_or_seen_applied_is_refused() {
         let hits = |sequence, seen| Batch {
             from: 1,
+            oldest_ask: 0,
             entries: vec![Entry {
                 key: b"k".to_vec(),
                 contract: Some(Contract {
@@ -901,6 +944,8 @@ mod tests {
                     sequence,
                     count: 1,
                     seen,
+                    asked: 0,
+                    refused: 0,
                 })),
             }],
             asks: Vec::new(),
@@ -933,11 +978,13 @@ mod tests {
         };
         let ask = |keys| Batch {
             from: 1,
+            oldest_ask: 0,
             entries: Vec::new(),
             asks: vec![Ask {
                 id: 1,
                 count: u64::MAX,
                 keys,
+                timeout_ns: 0,
             }],
         };
         assert_eq!(
