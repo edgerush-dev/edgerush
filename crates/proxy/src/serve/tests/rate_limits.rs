@@ -582,6 +582,64 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
         .await;
 }
 
+/// Pooled, keys visited only when they need it: a signal a worker has no room to keep
+/// asks for every key to be visited instead, and gives its key back, so that the key's
+/// next signal is sent — not taken as carried by the one that never went.
+#[tokio::test]
+async fn scheduled_a_signal_with_no_room_leaves_the_next_free_to_go() {
+    use crate::ratelimit::{Hub, Limited, Limiter, MOST_SIGNALLED};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let exchanges = Arc::new(AtomicUsize::new(0));
+            let service = counted_service(&exchanges).await;
+            let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
+            if let Some(service) = &mut config.rate_limit_service {
+                service.poll_quiet_keys = Some(false);
+                service.ask_cold_keys = Some(false);
+                service.schedule_keys = Some(true);
+            }
+            let compiled = compile(&config).unwrap();
+            let service = compiled.rate_limit_service().unwrap().clone();
+            let hub = Hub::start(&service, 1, 1 << 20, None).unwrap();
+            let limiter = Limiter::new(&service, Arc::clone(&hub), 0);
+            let rule = Arc::clone(&compiled.rules_of(0)[0]);
+            let client = requester("203.0.113.9");
+            let settle = || async {
+                // Quiet once a few cycles pass with no exchange.
+                let mut last = exchanges.load(Ordering::Relaxed);
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let now = exchanges.load(Ordering::Relaxed);
+                    if now == last {
+                        return now;
+                    }
+                    last = now;
+                }
+            };
+            // The new key's signal finds no room: every key visited, the key reported.
+            limiter.set_most_signalled(0);
+            assert!(matches!(
+                limiter.decide_all(&rule.limits, 0b1, client),
+                Limited::Admit
+            ));
+            let quiet = within(settle()).await;
+            assert!(quiet > 0, "the new key reported");
+            limiter.set_most_signalled(MOST_SIGNALLED);
+            assert!(matches!(
+                limiter.decide_all(&rule.limits, 0b1, client),
+                Limited::Admit
+            ));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while exchanges.load(Ordering::Relaxed) == quiet {
+                assert!(Instant::now() < deadline, "the next signal never went");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            limiter.stop();
+        })
+        .await;
+}
+
 /// An exchange answered after the one that replaced it: its pod handled it first, so its
 /// bucket is the older, and it is not taken over the newer one's. A client that spent its
 /// bucket while the first exchange's answer was held back stays refused once that answer

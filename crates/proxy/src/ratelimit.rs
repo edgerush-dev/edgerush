@@ -115,8 +115,10 @@ pub(crate) const MOST_DRY_RUNS_WAITING: usize = 256;
 
 /// The most entries a worker keeps signalled between syncs: a key signals at most once each
 /// time its count starts, so a millisecond's worth for any worker; past it, the worker asks
-/// its process to visit every key at the next cycle rather than keep more.
-const MOST_SIGNALLED: usize = 4_096;
+/// its process to visit every key at the next cycle rather than keep more. A key's signal
+/// on its way, from any worker, carries the rest until its process takes it, so what is
+/// on its way is one signal a key at most, however long its process takes.
+pub(crate) const MOST_SIGNALLED: usize = 4_096;
 
 /// How a request fared against the limits it is under.
 pub(crate) enum Limited {
@@ -227,8 +229,11 @@ pub(crate) struct Limiter {
     /// How long each may wait in all: [`WAIT`], but for a test.
     wait: Cell<Duration>,
     /// With keys visited only when they need it, the entries its decisions signalled since
-    /// it last handed them to its process: every sync, at most `MOST_SIGNALLED`.
+    /// it last handed them to its process, each claimed: every sync, at most
+    /// `most_signalled`, [`MOST_SIGNALLED`] but for a test. Those left when it stops go
+    /// with its process, which only a new process replaces.
     signalled: RefCell<Vec<Arc<Entry>>>,
+    most_signalled: Cell<usize>,
     /// Where each of a request's keys is put together, one for each limit it can be under,
     /// kept so that no request makes them afresh; and their contracts.
     keys: RefCell<Vec<Vec<u8>>>,
@@ -267,6 +272,7 @@ impl Limiter {
             dry_runs: Places::new(MOST_DRY_RUNS_WAITING),
             wait: Cell::new(WAIT),
             signalled: RefCell::new(Vec::new()),
+            most_signalled: Cell::new(MOST_SIGNALLED),
             keys: RefCell::new(Vec::new()),
             contracts: RefCell::new(Vec::new()),
             start,
@@ -634,9 +640,16 @@ impl Limiter {
                 let Some(held) = handles.get(*key) else {
                     continue;
                 };
-                if signalled.len() < MOST_SIGNALLED {
-                    signalled.push(Arc::clone(held.entry()));
+                let entry = held.entry();
+                // One on its way already carries it.
+                if !entry.claim_signal() {
+                    continue;
+                }
+                if signalled.len() < self.most_signalled.get() {
+                    signalled.push(Arc::clone(entry));
                 } else {
+                    // Given back before the scan is asked for: nothing carries it.
+                    entry.unclaim_signal();
                     self.registry.require_scan();
                 }
             }
@@ -781,6 +794,12 @@ impl Limiter {
     #[cfg(test)]
     pub(crate) fn set_most_dry_runs_waiting(&self, most: usize) {
         self.dry_runs.most.set(most);
+    }
+
+    /// The most entries it keeps signalled between syncs, for a test to fill.
+    #[cfg(test)]
+    pub(crate) fn set_most_signalled(&self, most: usize) {
+        self.most_signalled.set(most);
     }
 
     /// How long each request may wait in all, for a test to run out.

@@ -68,7 +68,8 @@ pub struct Outcome {
     /// attention: their count started, nothing having been admitted since it was last
     /// drained, or a request brought them back into use after a refill time without one.
     /// Each to be handed to it ([`Participant::on_signals`]) where it visits only the keys
-    /// that need it ([`Participant::set_scheduled`]).
+    /// that need it ([`Participant::set_scheduled`]), once claimed
+    /// ([`Entry::claim_signal`]): a key's signal already on its way carries the rest.
     pub signal: u64,
 }
 
@@ -340,6 +341,9 @@ pub struct Entry {
     waiters: AtomicU64,
     /// Its count passed half its most and the transport was told to drain it.
     pressed: AtomicBool,
+    /// A signal of it is on its way to the transport: held in a worker's batch, or queued
+    /// ([`Self::claim_signal`]).
+    signalled: AtomicBool,
 }
 
 /// What every key under one contract shares, made once a contract and pointed to by each
@@ -449,7 +453,23 @@ impl Entry {
             most_reserved: word::MOST_RESERVED,
             waiters: AtomicU64::new(0),
             pressed: AtomicBool::new(false),
+            signalled: AtomicBool::new(false),
         }
+    }
+
+    /// Claims its signal ([`Outcome::signal`]) for a worker to hand the transport: false if
+    /// one is on its way already, which carries this one too — the transport takes the
+    /// claim ([`Participant::on_signals`]) before it visits the key, and the swap's acquire
+    /// there sees whatever a worker did before it found the claim taken. A worker that
+    /// cannot hand its claim over gives it back ([`Self::unclaim_signal`]) before asking for
+    /// a scan instead, so that no key stays claimed with nothing on its way.
+    pub fn claim_signal(&self) -> bool {
+        !self.signalled.swap(true, Ordering::AcqRel)
+    }
+
+    /// Gives back a claim on its signal: its signal is no longer on its way.
+    pub fn unclaim_signal(&self) {
+        self.signalled.swap(false, Ordering::AcqRel);
     }
 
     /// A request deferred on it waits from now: a hold settled or the count drained after
@@ -1187,9 +1207,12 @@ impl<S: BuildHasher + Clone> Participant<S> {
     }
 
     /// Keys its workers' decisions signalled ([`Outcome::signal`]): visited at the next
-    /// cycle.
+    /// cycle, each claim taken first ([`Entry::claim_signal`]) — the key queued already, or
+    /// no longer kept, alike — so that a signal after it is sent anew. A scan leaves claims
+    /// as they are: their signals are still on their way.
     pub fn on_signals(&mut self, entries: impl IntoIterator<Item = Arc<Entry>>) {
         for entry in entries {
+            entry.unclaim_signal();
             if let Some(tracked) = self.keys.get_mut(&*entry.key)
                 && Arc::ptr_eq(&tracked.entry, &entry)
                 && !tracked.queued
