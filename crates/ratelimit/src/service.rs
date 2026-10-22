@@ -58,6 +58,15 @@ pub const RESEND_AFTER_CYCLES: u64 = 4;
 /// through at 1.44 times the contract with one packet in ten lost (simulator, TCP-like loss).
 pub const ACTIVE_CYCLES: u64 = 30;
 
+/// For how many cycles at least, after a data plane last admitted the key, its owner holds
+/// what the data plane's asks admitted, for the hits they are reported as, unless set
+/// ([`ServicePod::set_least_hold`]): the key's refill time if that is longer, as a data plane
+/// sends its hits for as long, and 400 ms at a 10 ms cycle at least, past the 300 ms the
+/// proxy waits for an ask's answer before giving it up and deciding its requests itself,
+/// whose hits then still find the hold. What no hits settle by then — the data plane gone,
+/// or an ask that arrived again decided twice — lapses, staying charged and counted.
+pub const HOLD_CYCLES: u64 = 40;
+
 /// A data plane: one worker of one EdgeRush pod, in one life of it. A restarted worker is a
 /// new data plane, with a new id.
 pub type PlaneId = u64;
@@ -273,6 +282,9 @@ pub struct PlaneRecord {
     pub admitted_ago: Option<u64>,
     /// Its last ask decided under the key, and how many were admitted.
     pub last_ask: (u64, u64),
+    /// What the owner's answers to its asks admitted that its hits have not yet settled:
+    /// charged on the bucket, held for those hits ([`HOLD_CYCLES`]).
+    pub held: u64,
 }
 
 /// The owner's copy of one key, for the other service pods.
@@ -327,6 +339,15 @@ pub enum Decision {
     Refuse,
     /// Waiting for a service pod: its decision comes from [`DataPlane::take_decided`].
     Wait(Ticket),
+}
+
+/// What `admitting` says the asks decided admitted under `key`.
+fn admitted_under(admitting: &[(Box<[u8]>, u64)], key: &[u8]) -> u64 {
+    admitting
+        .iter()
+        .filter(|(asked, _)| **asked == *key)
+        .map(|(_, admitted)| admitted)
+        .sum()
 }
 
 /// What a data plane holds of one key.
@@ -1120,6 +1141,25 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         }
     }
 
+    /// Of the asks `decided`, what each admitted under each of its keys asked about.
+    fn admitting(&self, decided: &[(u64, u64)]) -> Vec<(Box<[u8]>, u64)> {
+        let mut admitting = Vec::new();
+        for (id, admitted) in decided {
+            let Some(group) = self
+                .in_flight
+                .get(id)
+                .and_then(|name| self.groups.get(name))
+            else {
+                continue;
+            };
+            let admitted = (*admitted).min(group.asked.len() as u64);
+            for at in &group.cold {
+                admitting.push((group.keys[*at].0.clone(), admitted));
+            }
+        }
+        admitting
+    }
+
     /// A service pod's answers reach it at `now`.
     pub fn on_answers(&mut self, answers: Answers, now: u64) {
         let Answers {
@@ -1131,10 +1171,12 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         } = answers;
         // Keys the pod decided asks under without owning them: the requests it admitted
         // are charged on its copy, and still to be sent to their owners.
-        let mut copies = Vec::new();
         // Keys whose state the pod sent but the copies did not take, for saying which of
         // them refused the asks it decided.
         let mut untaken: Vec<(Box<[u8]>, u128)> = Vec::new();
+        // What the asks decided admitted under each of their keys: still to be sent, as
+        // hits, and left out of the owner's bucket, which holds them for those hits.
+        let admitting = self.admitting(&decided);
         for answer in entries {
             let Some(at) = self.keys.get_mut(&answer.key) else {
                 continue;
@@ -1157,14 +1199,16 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                     .retain(|(sequence, _, _, _)| *sequence > seen);
             }
             let unseen: u64 = at.unacknowledged.iter().map(|(_, count, _, _)| count).sum();
-            for _ in 0..unseen + at.unsent + at.held {
+            let asked = if answer.owned {
+                admitted_under(&admitting, &answer.key)
+            } else {
+                0
+            };
+            for _ in 0..unseen + at.unsent + at.held + asked {
                 at.bucket.charge(now);
             }
             at.heard = Some(now);
             at.unreachable = false;
-            if !answer.owned {
-                copies.push(answer.key);
-            }
         }
         for (id, admitted) in decided {
             let Some(name) = self.in_flight.get(&id).cloned() else {
@@ -1198,11 +1242,13 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             } else {
                 Box::default()
             };
+            // Every request admitted is reported as a hit under each key asked about: its
+            // owner, deciding the ask, holds what it admitted for those hits; a pod deciding
+            // from its copy leaves them to the owner to count.
             let charged: Vec<Box<[u8]>> = group
                 .cold
                 .iter()
                 .map(|at| group.keys[*at].0.clone())
-                .filter(|key| copies.contains(key))
                 .collect();
             for (index, ticket) in asked.into_iter().enumerate() {
                 let admitted = (index as u64) < admitted;
@@ -1397,8 +1443,36 @@ struct Record {
         reason = "a pointer in every record, rather than a list's three words, for what is rarely there"
     )]
     waiting: Option<Box<Vec<(u64, u64)>>>,
-    last_admitted: Option<u64>,
+    last_admitted: Admitted,
     last_ask: (u64, u64),
+    /// What its asks were admitted, charged and counted, that its hits have not yet
+    /// settled: its next hits settle it rather than being charged, until it lapses
+    /// ([`Owned::lapse`]).
+    held: u64,
+}
+
+/// When a data plane last admitted a key, if it has, in eight bytes rather than an option's
+/// sixteen: a record's room, kept for every data plane admitting every key, holds what is
+/// held for it beside. One past the time, 0 if never; ordered as the option is, never first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Admitted(u64);
+
+impl Admitted {
+    /// Admitted at `at`.
+    fn at(at: u64) -> Self {
+        Self(at.saturating_add(1))
+    }
+
+    /// When, if ever.
+    fn get(self) -> Option<u64> {
+        self.0.checked_sub(1)
+    }
+}
+
+impl From<Option<u64>> for Admitted {
+    fn from(at: Option<u64>) -> Self {
+        at.map_or(Self(0), Self::at)
+    }
 }
 
 impl Record {
@@ -1488,6 +1562,10 @@ impl Records {
         self.0.iter().map(|(plane, record)| (*plane, record))
     }
 
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Record> {
+        self.0.iter_mut().map(|(_, record)| record)
+    }
+
     /// How many records there is room for.
     fn room(&self) -> usize {
         self.0.capacity()
@@ -1547,6 +1625,34 @@ impl Owned {
         self.bucket = bucket.state();
     }
 
+    /// Ends what is held for data planes that have admitted nothing for the key's refill
+    /// time, or `least_hold` if longer, at `now`: it stays charged and counted, and hits
+    /// arriving after are charged as any other — a request counted twice if they were its
+    /// own. Not given back: taken off a bucket that had since refilled to full, it would free
+    /// room later charges took; and a data plane gives up sending hits it has not seen applied
+    /// within a refill time, whose requests would then go uncounted.
+    fn lapse(&mut self, least_hold: u64, now: u64) {
+        let hold_for = self.contract.refill_time().max(least_hold);
+        for record in self.planes.iter_mut() {
+            let due = record
+                .last_admitted
+                .get()
+                .is_none_or(|at| now.saturating_sub(at) >= hold_for);
+            if due {
+                record.held = 0;
+            }
+        }
+    }
+
+    /// The bucket as `plane` is to take it: without what is held for it, which its own
+    /// ledger carries as hits still to report.
+    fn behind_for(&self, plane: PlaneId, now: u64) -> u128 {
+        let held = self.planes.get(plane).map_or(0, |record| record.held);
+        self.bucket()
+            .behind(now)
+            .saturating_sub(u128::from(held) * u128::from(self.contract.window.get()))
+    }
+
     fn bucket(&self) -> TokenBucket {
         let Contract {
             limit,
@@ -1570,19 +1676,20 @@ impl Owned {
         let latest = self
             .planes
             .iter()
-            .filter_map(|(_, r)| r.last_admitted)
+            .filter_map(|(_, r)| r.last_admitted.get())
             .max();
         self.planes
             .iter()
             .filter(|(id, record)| {
                 *id != plane
-                    && matches!((record.last_admitted, latest), (Some(at), Some(latest)) if latest - at <= lately)
+                    && matches!((record.last_admitted.get(), latest), (Some(at), Some(latest)) if latest - at <= lately)
             })
             .count() as u64
     }
 
-    /// Takes in what `mine` applied of the key while this copy was on its way: its hits
-    /// charged on top, and the furthest of each data plane's marks.
+    /// Takes in what `mine` applied of the key while this copy was on its way: its count —
+    /// hits, and what it holds for the asks it decided — charged on top, what it holds kept
+    /// for the hits to come, and the furthest of each data plane's marks.
     fn merge(&mut self, mine: Owned, now: u64) {
         self.apply(mine.counted, now);
         for (plane, record) in mine.planes {
@@ -1592,6 +1699,8 @@ impl Owned {
             if record.last_ask.0 > ours.last_ask.0 {
                 ours.last_ask = record.last_ask;
             }
+            // Charged and counted with the rest of its count, above.
+            ours.held = ours.held.saturating_add(record.held);
         }
     }
 
@@ -1607,8 +1716,9 @@ impl Owned {
                 .map(|(plane, record)| PlaneRecord {
                     plane,
                     applied: record.applied,
-                    admitted_ago: record.last_admitted.map(|at| now.saturating_sub(at)),
+                    admitted_ago: record.last_admitted.get().map(|at| now.saturating_sub(at)),
                     last_ask: record.last_ask,
+                    held: record.held,
                 })
                 .collect(),
         }
@@ -1641,6 +1751,8 @@ pub struct ServicePod<S = FixedState> {
     /// Its life, and the answers it has given in it ([`Answers::number`]).
     life: u64,
     answered: u64,
+    /// The least a key's asked requests are held for their data plane's hits.
+    least_hold: u64,
 }
 
 impl<S: BuildHasher + Default> ServicePod<S> {
@@ -1664,7 +1776,15 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             evicted: 0,
             life: 0,
             answered: 0,
+            least_hold: HOLD_CYCLES * cycle.max(1),
         }
+    }
+
+    /// The least time after a data plane last admitted a key that what its asks were
+    /// admitted is held, charged and counted, for its hits to settle rather than be charged
+    /// again; the key's refill time if that is longer ([`HOLD_CYCLES`]).
+    pub fn set_least_hold(&mut self, least_hold: u64) {
+        self.least_hold = least_hold;
     }
 
     /// Its life, drawn at random when it starts and never 0, which its answers carry: a
@@ -1714,7 +1834,8 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         self.serving = serving;
     }
 
-    /// Hits the count of `key` holds, each once, if it holds the key.
+    /// Requests the count of `key` holds, each once, if it holds the key: hits reported, and
+    /// what asks were admitted that their data planes have not yet reported, held for it.
     #[must_use]
     pub fn counted(&self, key: &[u8]) -> Option<u64> {
         self.keys.get(key).map(|owned| owned.counted)
@@ -1750,11 +1871,13 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 continue;
             };
             owned.touched = now;
+            owned.lapse(self.least_hold, now);
             let latest = owned
                 .planes
                 .iter()
-                .filter_map(|(_, record)| record.last_admitted)
-                .max();
+                .map(|(_, record)| record.last_admitted)
+                .max()
+                .unwrap_or_default();
             let record = owned.planes.entry(from);
             let mut changed = false;
             if let Report::Hits {
@@ -1775,17 +1898,23 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 // would leave the others that admitted with it uncounted, and each would take
                 // too large a share of the next burst.
                 if sequence > record.applied {
-                    record.last_admitted = Some(now);
+                    record.last_admitted = Admitted::at(now);
                 } else {
                     record.last_admitted = record.last_admitted.max(latest);
                 }
                 let ready = record.take(sequence, count);
-                owned.apply(ready, now);
+                // What is held for the data plane settles first: counted and charged when
+                // its ask was decided. Any hit settles it, not only those of the requests
+                // its ask admitted — a hold is a charge like any other — and the bucket ends
+                // charged once for every hit either way.
+                let settled = ready.min(record.held);
+                record.held -= settled;
+                owned.apply(ready - settled, now);
             }
             let applied = owned.planes.get(from).map_or(0, |record| record.applied);
             answers.push(Answer {
                 key: entry.key.clone(),
-                behind: owned.bucket().behind(now),
+                behind: owned.behind_for(from, now),
                 applied,
                 others: owned.others(from, lately),
                 owned: true,
@@ -1802,12 +1931,17 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                     let Some(held) = self.keys.get(key) else {
                         continue;
                     };
+                    let owned = self.view.owners(key).0 == Some(self.me);
                     answers.push(Answer {
                         key: key.clone(),
-                        behind: held.bucket().behind(now),
+                        behind: if owned {
+                            held.behind_for(from, now)
+                        } else {
+                            held.bucket().behind(now)
+                        },
                         applied: held.planes.get(from).map_or(0, |record| record.applied),
                         others: held.others(from, lately),
-                        owned: self.view.owners(key).0 == Some(self.me),
+                        owned,
                     });
                 }
             }
@@ -1824,19 +1958,24 @@ impl<S: BuildHasher + Default> ServicePod<S> {
     }
 
     /// Decides the requests of `ask`, from data plane `from`, each under all its keys or
-    /// none: the keys it owns exactly, counted and copied to the other pods; the others from
-    /// its copies, charged on them so that the asks it decides one after another see each
-    /// other, and counted by their owners when the data plane's hits reach them. A key it
-    /// holds nothing of is new to the service: a full bucket. An ask decided already is
-    /// answered as it was. `None` if it cannot decide: it has just joined, and a key it owns
-    /// may still be on its way, handed over.
+    /// none: the keys it owns exactly, counted, held for the hits the data plane will report
+    /// them as, and copied to the other pods; the others from its copies, charged on them so
+    /// that the asks it decides one after another see each other, and counted by their
+    /// owners when the data plane's hits reach them. A key it holds nothing of is new to the
+    /// service: a full bucket. An ask decided already is answered as it was. `None` if it
+    /// cannot decide: it has just joined, and a key it owns may still be on its way, handed
+    /// over.
     fn decide_ask(&mut self, from: PlaneId, ask: &Ask, now: u64) -> Option<u64> {
+        let least_hold = self.least_hold;
         for (key, contract) in &ask.keys {
             if !matches!(self.keys.get(key), Some(held) if held.contract == *contract) {
                 if now < self.fresh_from && self.view.owners(key).0 == Some(self.me) {
                     return None;
                 }
                 self.keys.insert(key.clone(), Owned::new(*contract, now));
+            }
+            if let Some(held) = self.keys.get_mut(key) {
+                held.lapse(least_hold, now);
             }
         }
         let before = ask.keys.iter().find_map(|(key, _)| {
@@ -1867,7 +2006,8 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             let record = held.planes.entry(from);
             record.last_ask = (ask.id, admitted);
             if owned {
-                record.last_admitted = Some(now);
+                record.last_admitted = Admitted::at(now);
+                record.held = record.held.saturating_add(admitted);
                 held.counted = held.counted.saturating_add(admitted);
                 self.copy_out(key, now);
             }
@@ -1921,8 +2061,12 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                         Record {
                             applied: record.applied,
                             waiting: None,
-                            last_admitted: record.admitted_ago.map(|ago| now.saturating_sub(ago)),
+                            last_admitted: record
+                                .admitted_ago
+                                .map(|ago| now.saturating_sub(ago))
+                                .into(),
                             last_ask: record.last_ask,
+                            held: record.held,
                         },
                     )
                 })

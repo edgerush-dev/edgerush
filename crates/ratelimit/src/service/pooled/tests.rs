@@ -356,9 +356,12 @@ proptest! {
     /// over a schedule of requests, cycles and answers — late, out
     /// of order, twice — and then everything delivered and settled, each key's count at its
     /// owner is what was admitted under it, with cold keys decided locally. With them asked
-    /// about, at least that: the pod counts an ask sent again twice where another ask about
-    /// the key came between (the service pod's one-ask memory; results note), which neither
-    /// mode causes. Now and then the next cycle runs with no room for any key, evicting every
+    /// about, at least that: what an ask admits the owner holds for the hits it is reported
+    /// as, so that an ask given up and decided here is counted once; but an ask sent again
+    /// and decided twice — its first sending arriving after another ask under the key, the
+    /// pod remembering only the last — is counted twice unless the data plane's hits settle
+    /// what it held before it lapses (results note), which neither mode causes. Now
+    /// and then the next cycle runs with no room for any key, evicting every
     /// key it may, to be made again by its next request: its reports then number on past
     /// those of its earlier life, which the pod, never forgetting the key, still holds.
     #[test]
@@ -1325,6 +1328,43 @@ fn only_exchange(participant: &mut Participant<FixedState>) -> (u64, Batch) {
     assert_eq!(started.len(), 1, "one exchange");
     let (_, exchange, batch) = started.remove(0);
     (exchange, batch)
+}
+
+/// An ask its owner decided, whose exchange then failed, and failed again when sent again,
+/// is given up and its request decided here: the hit it is sent as settles what the owner
+/// held for it, and the request is counted once.
+#[test]
+fn an_ask_given_up_after_its_owner_decided_it_is_counted_once() {
+    let mut participant = participant();
+    participant.set_one_in_flight(true);
+    let mut pod = pod(1);
+    let (key, c): (&[u8], Contract) = (b"k", contract(100, 10));
+    let Decision::Wait(ticket) = participant.decide_all(&[(key, c)], 0) else {
+        panic!("a new key is asked about");
+    };
+    participant.on_cycle(CYCLE);
+    let (first, batch) = only_exchange(&mut participant);
+    assert_eq!(batch.asks.len(), 1);
+    let _lost = pod.on_batch(batch, CYCLE);
+    participant.exchanged(0, first);
+    // Out of reach until the ask is given up, its sending again failing too.
+    let mut decided = Vec::new();
+    for cycle in 2..20 {
+        let now = cycle * CYCLE;
+        participant.on_cycle(now);
+        decided.extend(participant.take_decisions());
+        for (to, exchange, batch) in participant.take_exchanges() {
+            if decided.is_empty() {
+                participant.exchanged(to, exchange);
+            } else {
+                let answers = pod.on_batch(batch, now);
+                participant.on_answers_to(exchange, answers, now);
+            }
+        }
+    }
+    let decided: Vec<(Ticket, bool)> = decided.iter().map(|d| (d.ticket, d.admitted)).collect();
+    assert_eq!(decided, [(ticket, true)], "given up, decided here");
+    assert_eq!(pod.counted(key), Some(1));
 }
 
 /// An exchange given up and its pod's answer to it arriving after the next one's: the

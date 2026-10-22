@@ -157,13 +157,14 @@ impl Net {
 }
 
 /// A data plane asks about its first request and hears back, and a cycle bounds the copy:
-/// warm, it decides at once. What the cycle has to send is left unsent.
+/// warm, it decides at once. What the cycle sends — the request's hit, settling what the
+/// owner held for it — is delivered and answered.
 fn warmed(net: &mut Net, plane: usize, key: &[u8], now: u64) {
     net.planes[plane].decide(key, contract(), now);
     net.settle(now);
     net.planes[plane].take_decided();
     net.planes[plane].on_cycle(now);
-    net.planes[plane].take_outgoing();
+    net.settle(now);
 }
 
 fn waits(decision: Decision) -> bool {
@@ -697,6 +698,183 @@ fn an_ask_is_sent_again_once_and_decided_once() {
     assert_eq!(asks(&net.planes[0].take_outgoing()), 0, "only once");
 }
 
+/// An ask its owner decided, whose answer is lost and whose sending again is lost too, is
+/// given up and its request decided here: the hit it is sent as settles what the owner held
+/// for it, and the request is counted once.
+#[test]
+fn an_ask_given_up_after_its_owner_decided_it_is_counted_once() {
+    let mut net = Net::new(1);
+    let owner = Net::owner(b"k");
+    net.planes[0].decide(b"k", contract(), 0);
+    for (_, batch) in net.planes[0].take_outgoing() {
+        net.pods[owner].on_batch(batch, 0); // its answer lost
+    }
+    net.planes[0].on_cycle(2 * CYCLE);
+    net.planes[0].take_outgoing(); // sent again, lost
+    net.planes[0].on_cycle(4 * CYCLE);
+    assert_eq!(
+        net.planes[0].take_decided(),
+        vec![(0, true)],
+        "given up, decided here"
+    );
+    net.settle(4 * CYCLE);
+    assert_eq!(net.pods[owner].counted(b"k"), Some(1));
+}
+
+/// An ask whose first sending arrives after a later ask under its key was decided is
+/// decided again, the owner remembering only the last: what it admits is held, and the
+/// data plane's next hits settle it, so that each request is counted once.
+#[test]
+fn an_ask_arriving_after_a_later_one_is_settled_by_the_next_hits() {
+    let mut net = Net::new(1);
+    let owner = Net::owner(b"k");
+    net.planes[0].decide(b"k", contract(), 0);
+    let late = net.planes[0].take_outgoing(); // held up on the way
+    net.planes[0].on_cycle(2 * CYCLE);
+    net.settle(2 * CYCLE); // sent again, and answered
+    assert_eq!(net.planes[0].take_decided(), vec![(0, true)]);
+    net.planes[0].on_cycle(3 * CYCLE);
+    net.settle(3 * CYCLE);
+    // Quiet for two refill times: forgotten here, made again, and asked about anew.
+    net.planes[0].on_cycle(300 * MS);
+    assert!(net.planes[0].keys.is_empty());
+    net.planes[0].decide(b"k", contract(), 300 * MS);
+    net.settle(300 * MS);
+    assert_eq!(net.planes[0].take_decided(), vec![(1, true)]);
+    net.planes[0].on_cycle(310 * MS);
+    net.settle(310 * MS);
+    assert_eq!(net.pods[owner].counted(b"k"), Some(2));
+    // The first sending arrives, its answer to an ask long over.
+    net.to_pods = late;
+    net.settle(310 * MS);
+    assert_eq!(
+        net.pods[owner].counted(b"k"),
+        Some(3),
+        "decided again, held"
+    );
+    assert_eq!(net.admits(0, b"k", 1, 320 * MS), 1);
+    net.planes[0].on_cycle(320 * MS);
+    net.settle(320 * MS);
+    assert_eq!(
+        net.pods[owner].counted(b"k"),
+        Some(3),
+        "three admitted, the next hit settling the hold"
+    );
+}
+
+/// What an ask admits is held for its data plane's hits, which settle it rather than being
+/// charged again, until that data plane has admitted nothing for the key's refill time, or
+/// the pod's least hold if that is longer: then it lapses, still charged and counted, and
+/// neither the hits after it nor those of a later ask settle what is left of it.
+#[test]
+fn a_hold_lapses_charged_once_its_hits_stop() {
+    let n = |n| NonZeroU64::new(n).unwrap();
+    // Counted after each step, for a key under `contract`, the pod holding at least
+    // `least_hold`.
+    let steps = |contract: Contract, least_hold: u64| -> Vec<u64> {
+        let hits = |sequence, count| Batch {
+            from: 100,
+            entries: vec![Entry {
+                key: b"k"[..].into(),
+                contract,
+                report: hits(sequence, count, sequence - 1),
+            }],
+            asks: Vec::new(),
+        };
+        let ask = |id, count| Batch {
+            from: 100,
+            entries: Vec::new(),
+            asks: vec![Ask {
+                id,
+                count,
+                keys: vec![(b"k"[..].into(), contract)],
+            }],
+        };
+        let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+        pod.set_least_hold(least_hold);
+        let mut counted = Vec::new();
+        let mut step = |pod: &ServicePod| counted.push(pod.counted(b"k").unwrap_or(0));
+        assert_eq!(pod.on_batch(ask(1, 3), 0).decided, [(1, 3)]);
+        step(&pod);
+        pod.on_batch(hits(1, 1), 4 * CYCLE);
+        step(&pod);
+        // Nothing admitted for the hold's time: what is left of it lapses, still charged.
+        pod.on_batch(hits(2, 1), 9 * CYCLE);
+        step(&pod);
+        assert_eq!(pod.on_batch(ask(2, 2), 9 * CYCLE).decided, [(2, 2)]);
+        pod.on_batch(hits(3, 1), 10 * CYCLE);
+        step(&pod);
+        // Lapsed again when the next ask comes: its hits settle its own hold only.
+        assert_eq!(pod.on_batch(ask(3, 1), 15 * CYCLE).decided, [(3, 1)]);
+        pod.on_batch(hits(4, 2), 15 * CYCLE);
+        step(&pod);
+        counted
+    };
+    let want = [3, 3, 4, 6, 8];
+    // Refilling in 50 ms, longer than the least hold: held as long as that.
+    let refilling_in = |time: u64| Contract {
+        limit: n(10),
+        window: n(time),
+        burst: n(10),
+    };
+    assert_eq!(
+        steps(refilling_in(5 * CYCLE), CYCLE),
+        want,
+        "its refill time"
+    );
+    // Refilling in 10 ms, shorter than the least hold of 50 ms: held as long as that.
+    assert_eq!(
+        steps(refilling_in(CYCLE), 5 * CYCLE),
+        want,
+        "the least hold"
+    );
+}
+
+/// What the owner holds for a data plane's hits is copied with the key: the secondary
+/// taking over settles it with those hits, charging each request once.
+#[test]
+fn a_hold_is_settled_by_the_secondary_taking_over() {
+    let (owner, secondary, _) = roles(b"k");
+    let mut net = Net::new(1);
+    net.planes[0].decide(b"k", contract(), 0);
+    net.settle(0);
+    assert_eq!(net.planes[0].take_decided(), vec![(0, true)]);
+    let secondary = secondary as usize;
+    assert_eq!(net.pods[secondary].counted(b"k"), Some(1), "copied, held");
+    net.set_view(&without(owner), 0);
+    net.planes[0].on_cycle(0);
+    net.settle(0);
+    assert_eq!(net.pods[secondary].counted(b"k"), Some(1), "settled");
+    let bucket = net.pods[secondary].keys[&b"k"[..]].bucket();
+    assert_eq!(bucket.remaining(0), 9, "charged once");
+}
+
+/// What the owner holds for an asked request is left out of the bucket it sends the
+/// asking data plane, which carries the request itself until it sees its hit applied: its
+/// copy has the request once, from the ask's answer and from any answer after it.
+#[test]
+fn the_asking_data_plane_has_its_asked_request_once() {
+    let mut net = Net::new(1);
+    net.planes[0].decide(b"k", contract(), 0);
+    net.settle(0);
+    assert_eq!(net.planes[0].take_decided(), vec![(0, true)]);
+    assert_eq!(
+        net.copy(0, b"k").bucket.remaining(0),
+        9,
+        "from the ask's answer"
+    );
+    net.planes[0].on_cycle(0);
+    net.planes[0].take_outgoing(); // the asked request's hit, lost
+    assert_eq!(net.admits(0, b"k", 2, 0), 2);
+    net.planes[0].on_cycle(0);
+    net.settle(0); // the next batch, kept waiting for the lost one, answered
+    assert_eq!(
+        net.copy(0, b"k").bucket.remaining(0),
+        7,
+        "from the next batch's answer"
+    );
+}
+
 /// The owner copies every change to the key's secondary, which takes over from that copy
 /// when the owner leaves: data planes send it again the batches not seen applied, numbered
 /// as before, and it applies only those its copy lacks.
@@ -1045,6 +1223,7 @@ fn a_handover_arriving_late_keeps_what_the_new_owner_applied() {
             applied: 0,
             admitted_ago: Some(0),
             last_ask: (0, 0),
+            held: 0,
         }],
     };
     pod.on_replicas(
@@ -1063,6 +1242,40 @@ fn a_handover_arriving_late_keeps_what_the_new_owner_applied() {
         "ten less five less two"
     );
     assert_eq!(pod.keys[&b"k"[..]].planes.get(9).unwrap().applied, 1);
+}
+
+/// What the new owner holds for asks it decided before the handover reached it stays held,
+/// on top of what it is handed: the hits that come after settle it, each request counted
+/// and charged once.
+#[test]
+fn a_handover_arriving_late_keeps_what_the_new_owner_held() {
+    let (owner, secondary, _) = roles(b"k");
+    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 3));
+    assert_eq!(pod.on_batch(ask(9, 1, 2, &[b"k"]), 0).decided, [(1, 2)]);
+    let handed = Replica {
+        key: b"k"[..].into(),
+        contract: contract(),
+        behind: contract().bucket().behind(0) + 5 * u128::from(1_000 * MS),
+        counted: 5,
+        planes: Vec::new(),
+    };
+    pod.on_replicas(
+        Replicas {
+            from: secondary,
+            entries: vec![handed],
+            handover: true,
+            epoch: 0,
+        },
+        0,
+    );
+    assert_eq!(pod.counted(b"k"), Some(7));
+    pod.on_batch(batch(9, hits(1, 2, 0)), 0);
+    assert_eq!(pod.counted(b"k"), Some(7), "settled, not counted again");
+    assert_eq!(
+        pod.keys[&b"k"[..]].bucket().remaining(0),
+        3,
+        "ten less five less two"
+    );
 }
 
 /// A handover reaching a pod that does not own the key is ignored.
@@ -1436,8 +1649,10 @@ fn an_ask_given_up_decides_its_requests_here_under_every_limit() {
         .flat_map(|(_, batch)| batch.entries)
         .map(|entry| (entry.key.to_vec(), entry.report))
         .collect();
+    // Each after the first batch the data plane numbered, the warm limit's asked request
+    // reported, and seen applied.
     assert!(
-        sent.contains(&(a.clone(), hits(1, 1, 0))) && sent.contains(&(b.clone(), hits(1, 1, 0))),
+        sent.contains(&(a.clone(), hits(2, 1, 1))) && sent.contains(&(b.clone(), hits(2, 1, 1))),
         "both sent their owners in the same cycle: {sent:?}"
     );
 }
@@ -1481,10 +1696,13 @@ fn a_copy_answering_an_ask_does_not_say_which_batches_were_applied() {
     net.planes[0].on_cycle(CYCLE);
     net.planes[0].take_outgoing(); // the batch's answer never comes
     assert_eq!(net.copy(0, &b).unacknowledged.len(), 1);
+    // The first batch, the asked request's hit, the owner said it applied; the second's
+    // answer never came.
+    assert_eq!(net.copy(0, &b).seen, 1);
     let copy = Answer {
         key: b.clone().into_boxed_slice(),
         behind: 0,
-        applied: 1,
+        applied: 2,
         others: 0,
         owned: false,
     };
@@ -1506,7 +1724,7 @@ fn a_copy_answering_an_ask_does_not_say_which_batches_were_applied() {
         1,
         "still waiting for the owner to say it applied it"
     );
-    assert_eq!(net.copy(0, &b).seen, 0);
+    assert_eq!(net.copy(0, &b).seen, 1);
 }
 
 /// A refused request waits as long as the longest of its keys: its bucket's refill to one,
@@ -1776,11 +1994,24 @@ fn a_service_pod_counts_room_for_the_records_a_key_has() {
 
 /// A service pod's key takes 112 bytes in its table, which holds up to twice the room its
 /// keys take, and its record of a data plane 56: its bucket kept as the bucket's state, its
-/// terms the key's contract, and batches waiting, which rarely do, kept apart.
+/// terms the key's contract, batches waiting, which rarely do, kept apart, and the data
+/// plane's last admission in eight bytes, room for what is held for it.
 #[test]
 fn a_service_pods_key_is_small() {
     assert_eq!(size_of::<(Box<[u8]>, Owned)>(), 112);
     assert_eq!(size_of::<(PlaneId, Record)>(), 56);
+}
+
+/// A data plane's last admission, kept in eight bytes, reads back as it was set and orders
+/// as an option of it does: never before any time, time 0 among them.
+#[test]
+fn a_last_admission_reads_back_and_orders_as_an_option() {
+    for at in [None, Some(0), Some(1), Some(5 * MS)] {
+        assert_eq!(Admitted::from(at).get(), at);
+    }
+    assert!(Admitted::from(None) < Admitted::at(0));
+    assert!(Admitted::at(0) < Admitted::at(1));
+    assert_eq!(Admitted::default(), Admitted::from(None));
 }
 
 proptest::proptest! {

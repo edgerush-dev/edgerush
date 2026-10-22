@@ -189,6 +189,9 @@ pub struct PlaneRecord {
     /// How many that ask admitted.
     #[prost(uint64, tag = "5")]
     pub last_ask_admitted: u64,
+    /// What its asks were admitted that its hits have not yet settled.
+    #[prost(uint64, tag = "6")]
+    pub held: u64,
 }
 
 /// An owner's copy of one key.
@@ -569,6 +572,7 @@ impl From<service::Replicas> for Replicas {
                             admitted_ago: record.admitted_ago,
                             last_ask: record.last_ask.0,
                             last_ask_admitted: record.last_ask.1,
+                            held: record.held,
                         })
                         .collect(),
                 })
@@ -600,6 +604,7 @@ impl TryFrom<Replicas> for service::Replicas {
                             applied: record.applied,
                             admitted_ago: record.admitted_ago,
                             last_ask: (record.last_ask, record.last_ask_admitted),
+                            held: record.held,
                         })
                         .collect(),
                 })
@@ -721,15 +726,17 @@ mod tests {
             any::<u64>(),
             prop::option::of(any::<u64>()),
             any::<(u64, u64)>(),
+            any::<u64>(),
         )
-            .prop_map(
-                |(plane, applied, admitted_ago, last_ask)| service::PlaneRecord {
+            .prop_map(|(plane, applied, admitted_ago, last_ask, held)| {
+                service::PlaneRecord {
                     plane,
                     applied,
                     admitted_ago,
                     last_ask,
-                },
-            );
+                    held,
+                }
+            });
         let replica = (
             key(),
             contract(),
