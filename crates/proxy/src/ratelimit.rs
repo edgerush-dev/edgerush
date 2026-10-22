@@ -101,12 +101,17 @@ fn key_into(buffer: &mut Vec<u8>, name: &str, definition: [u8; 8], key: KeyValue
 /// Fixed, until measuring shows that setting it would be worth what it costs.
 pub(crate) const WAIT: Duration = Duration::from_millis(400);
 
-/// The most requests a worker has waiting on its rate limits at once — asked about,
-/// deferred, or dry runs whose answer is to come — past which a request is answered
-/// [`Undecided::Full`]. A place is held until nothing is left of the request's wait: an
-/// ask's until the process answers it, even once the request has gone, so that what its
-/// process holds of a worker's, queued or asking, is within it too.
+/// The most requests a worker has waiting on its rate limits at once — asked about or
+/// deferred — past which a request is answered [`Undecided::Full`]. A place is held until
+/// nothing is left of the request's wait: an ask's until the process answers it, even once
+/// the request has gone, so that what its process holds of a worker's, queued or asking, is
+/// within it too.
 pub(crate) const MOST_WAITING: usize = 1_024;
+
+/// The most dry runs a worker has waiting on its rate limits at once, in places of their
+/// own, held as [`MOST_WAITING`]'s are: however many wait, the limits that refuse keep all
+/// of theirs. Past it, a dry run is not counted.
+pub(crate) const MOST_DRY_RUNS_WAITING: usize = 256;
 
 /// The most entries a worker keeps signalled between syncs: a key signals at most once each
 /// time its count starts, so a millisecond's worth for any worker; past it, the worker asks
@@ -141,6 +146,30 @@ impl Later {
             Ok(Err(_)) => Err(Undecided::Unavailable),
             Err(_) => Err(Undecided::Timeout),
         }
+    }
+}
+
+/// So many places for requests to wait on a worker's rate limits in, and how many are held.
+struct Places {
+    held: Rc<Cell<usize>>,
+    most: Cell<usize>,
+}
+
+impl Places {
+    fn new(most: usize) -> Self {
+        Self {
+            held: Rc::new(Cell::new(0)),
+            most: Cell::new(most),
+        }
+    }
+
+    /// A place for a request to wait in, if one is left.
+    fn take(&self) -> Option<Reservation> {
+        let held = self.held.get();
+        (held < self.most.get()).then(|| {
+            self.held.set(held + 1);
+            Reservation(Rc::clone(&self.held))
+        })
     }
 }
 
@@ -192,9 +221,9 @@ pub(crate) struct Limiter {
     asked: RefCell<HashMap<u64, Reservation>>,
     /// What its deferred requests wait on.
     settled: Arc<Notify>,
-    /// How many requests wait on its rate limits, and how many may.
-    waiting: Rc<Cell<usize>>,
-    most_waiting: Cell<usize>,
+    /// The places its requests wait on its rate limits in, and its dry runs, apart.
+    waiting: Places,
+    dry_runs: Places,
     /// How long each may wait in all: [`WAIT`], but for a test.
     wait: Cell<Duration>,
     /// With keys visited only when they need it, the entries its decisions signalled since
@@ -234,8 +263,8 @@ impl Limiter {
             next: Cell::new(0),
             asked: RefCell::new(HashMap::new()),
             settled,
-            waiting: Rc::new(Cell::new(0)),
-            most_waiting: Cell::new(MOST_WAITING),
+            waiting: Places::new(MOST_WAITING),
+            dry_runs: Places::new(MOST_DRY_RUNS_WAITING),
             wait: Cell::new(WAIT),
             signalled: RefCell::new(Vec::new()),
             keys: RefCell::new(Vec::new()),
@@ -276,15 +305,6 @@ impl Limiter {
         u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
-    /// A place for a request to wait in, if one is left.
-    fn reserve(&self) -> Option<Reservation> {
-        let waiting = self.waiting.get();
-        (waiting < self.most_waiting.get()).then(|| {
-            self.waiting.set(waiting + 1);
-            Reservation(Rc::clone(&self.waiting))
-        })
-    }
-
     /// When a request the limiter meets at `now` must be decided by: in the process's clock,
     /// which every worker and the process read, and as an instant to wait until.
     fn deadline(&self, now: u64) -> (u64, tokio::time::Instant) {
@@ -304,6 +324,30 @@ impl Limiter {
         limited: u64,
         client: Requester,
     ) -> Limited {
+        self.decide_in(limits, limited, client, &self.waiting)
+    }
+
+    /// Decides a request from `client` under the dry runs of `limits` that `limited` marks,
+    /// as [`decide_all`](Self::decide_all) does, waiting, if it must, in the places dry runs
+    /// have of their own.
+    pub(crate) fn decide_dry_run(
+        self: &Rc<Self>,
+        limits: &[Arc<CompiledLimit>],
+        limited: u64,
+        client: Requester,
+    ) -> Limited {
+        self.decide_in(limits, limited, client, &self.dry_runs)
+    }
+
+    /// Decides a request as [`decide_all`](Self::decide_all) does, waiting, if it must, in
+    /// one of `places`.
+    fn decide_in(
+        self: &Rc<Self>,
+        limits: &[Arc<CompiledLimit>],
+        limited: u64,
+        client: Requester,
+        places: &Places,
+    ) -> Limited {
         let now = self.now();
         self.with_keys(limits, limited, client, |parts| {
             if parts.is_empty() {
@@ -314,8 +358,8 @@ impl Limiter {
             match outcome.local {
                 PooledLocal::Admit => Limited::Admit,
                 PooledLocal::Refuse => Limited::Refuse,
-                PooledLocal::Ask => self.ask(parts, now),
-                PooledLocal::Defer => self.defer(parts, now),
+                PooledLocal::Ask => self.ask(parts, now, places),
+                PooledLocal::Defer => self.defer(parts, now, places),
             }
         })
     }
@@ -608,9 +652,9 @@ impl Limiter {
     }
 
     /// A request under `parts`, met at `now`, asked of the process; undecided if it has no
-    /// place to wait in, or the process is gone.
-    fn ask(&self, parts: &[(&[u8], Contract)], now: u64) -> Limited {
-        let Some(place) = self.reserve() else {
+    /// place to wait in among `places`, or the process is gone.
+    fn ask(&self, parts: &[(&[u8], Contract)], now: u64, places: &Places) -> Limited {
+        let Some(place) = places.take() else {
             return Limited::Undecided(Undecided::Full);
         };
         let (at, until) = self.deadline(now);
@@ -652,9 +696,9 @@ impl Limiter {
 
     /// A request under `parts`, met at `now`, deferred: decided again on a task of its own
     /// as its keys' holds settle and counts drain, until its time is up; or, with no place
-    /// to wait in, undecided at once.
-    fn defer(self: &Rc<Self>, parts: &[(&[u8], Contract)], now: u64) -> Limited {
-        let Some(place) = self.reserve() else {
+    /// to wait in among `places`, undecided at once.
+    fn defer(self: &Rc<Self>, parts: &[(&[u8], Contract)], now: u64, places: &Places) -> Limited {
+        let Some(place) = places.take() else {
             return Limited::Undecided(Undecided::Full);
         };
         let (at, until) = self.deadline(now);
@@ -730,7 +774,13 @@ impl Limiter {
     /// The most requests it may have waiting, for a test to fill.
     #[cfg(test)]
     pub(crate) fn set_most_waiting(&self, most: usize) {
-        self.most_waiting.set(most);
+        self.waiting.most.set(most);
+    }
+
+    /// The most dry runs it may have waiting, for a test to fill.
+    #[cfg(test)]
+    pub(crate) fn set_most_dry_runs_waiting(&self, most: usize) {
+        self.dry_runs.most.set(most);
     }
 
     /// How long each request may wait in all, for a test to run out.
