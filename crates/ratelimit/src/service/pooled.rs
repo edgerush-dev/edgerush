@@ -943,7 +943,8 @@ fn key_bytes(key: &[u8], workers: u64) -> u64 {
 
 /// What an entry of `key` holds, counts and key, with its eviction time: all that is left of
 /// a key no longer kept while that time keeps its entry, scheduled.
-fn entry_bytes(key: &[u8]) -> u64 {
+#[must_use]
+pub fn entry_bytes(key: &[u8]) -> u64 {
     (2 * size_of::<usize>() + size_of::<Entry>() + key.len() + size_of::<Reverse<Due>>()) as u64
 }
 
