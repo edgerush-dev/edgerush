@@ -173,7 +173,7 @@ pub(crate) struct Hub {
     shared: Arc<Shared>,
     service: CompiledRateLimitService,
     /// Its participant's registry of live entries, for workers meeting a key.
-    registry: Arc<Registry>,
+    registry: Arc<Registry<Keyed>>,
     /// Woken when a hold settles or a count drains on a key requests are deferred on, by
     /// whichever thread did it: the workers' deferred requests wait on it.
     settled: Arc<Notify>,
@@ -242,7 +242,7 @@ impl Hub {
     }
 
     /// Its participant's registry.
-    pub(crate) fn registry(&self) -> Arc<Registry> {
+    pub(crate) fn registry(&self) -> Arc<Registry<Keyed>> {
         Arc::clone(&self.registry)
     }
 
@@ -364,7 +364,7 @@ fn run(
     max_key_bytes: u64,
     from: mpsc::UnboundedReceiver<ToHub>,
     running: &Running,
-    made: &std::sync::mpsc::SyncSender<Result<Arc<Registry>, String>>,
+    made: &std::sync::mpsc::SyncSender<Result<Arc<Registry<Keyed>>, String>>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()

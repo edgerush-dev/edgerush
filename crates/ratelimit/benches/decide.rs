@@ -2,20 +2,27 @@
 //! 150 ns for an existing key): a warm key, its copy bounded by a cycle, admitted; and
 //! refused, its cycle's share spent and its bucket empty; and a request under two and three
 //! limits, all warm, admitted. A thousand other keys held, so that the lookup is not a map
-//! of one.
+//! of one. And a worker meeting a key it holds no handle to, in its process's registry of a
+//! hundred thousand: found, made by another worker; and made, cold keys decided locally.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-ratelimit --bench decide`, see the
 //! repository README.
 
 #![allow(
+    clippy::expect_used,
+    reason = "benchmark set-up over fixed inputs, not production code"
+)]
+#![allow(
     missing_docs,
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
+use edgerush_ratelimit::service::pooled::{Entry, Participant, Registry};
 use edgerush_ratelimit::service::{Contract, DataPlane, Decision, Keyed, ServicePod, View};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 const MS: u64 = 1_000_000;
 /// A key as the proxy makes it: the rule's name, a zero, and an API key's value.
@@ -90,5 +97,44 @@ fn decide_all(setup: (Plane, Contract), limits: usize) -> (Decision, Plane) {
     (decision, plane)
 }
 
+/// A process's registry of entries, its keys hashed as the proxy's are.
+type Shared = Arc<Registry<Keyed>>;
+
+/// An entry found or made in a registry, with whether it was made.
+type Made = Option<(Arc<Entry>, bool)>;
+
+/// A process's registry of a hundred thousand keys, `KEY` among them.
+fn registry() -> Shared {
+    let view = View {
+        epoch: 1,
+        pods: vec![0],
+    };
+    let hasher = Keyed::new([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
+    let participant =
+        Participant::new(1, 10 * MS, view, hasher).expect("native 128-bit atomics on Linux");
+    let registry = participant.registry();
+    let contract = contract(100);
+    let keys = (0..100_000).map(|k| format!("api/0\0key-{k}").into_bytes());
+    for key in keys.chain([KEY.to_vec()]) {
+        let _made = registry.find_or_make(&key, contract, 0, 0);
+    }
+    registry
+}
+
+#[library_benchmark]
+#[bench::found(registry())]
+fn find(registry: Shared) -> (Option<Arc<Entry>>, Shared) {
+    let found = registry.find(black_box(KEY), black_box(contract(100)));
+    (found, registry)
+}
+
+#[library_benchmark]
+#[bench::made(registry())]
+fn find_or_make(registry: Shared) -> (Made, Shared) {
+    let made = registry.find_or_make(black_box(ROUTE), black_box(contract(100)), 0, MS);
+    (made, registry)
+}
+
 library_benchmark_group!(name = data_plane; benchmarks = decide, decide_all);
-main!(library_benchmark_groups = data_plane);
+library_benchmark_group!(name = registry_of_keys; benchmarks = find, find_or_make);
+main!(library_benchmark_groups = data_plane, registry_of_keys);

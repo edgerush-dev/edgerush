@@ -5,7 +5,7 @@
 #![cfg(not(loom))]
 
 use super::*;
-use crate::service::{Answer, DataPlane, FixedState, ServicePod};
+use crate::service::{Answer, DataPlane, FixedState, Keyed, ServicePod};
 use proptest::prelude::*;
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
@@ -1879,7 +1879,7 @@ fn the_participant_keeps_a_key_once() {
 /// key's entry: an entry is its key, a pointer, its word and its counts.
 #[test]
 fn keys_under_one_contract_share_their_terms() {
-    let registry = Registry::new();
+    let registry = Registry::new(FixedState::default());
     let c = contract(100, 10);
     let (a, _) = registry.find_or_make(b"a", c, CYCLE, 0).unwrap();
     let (b, _) = registry.find_or_make(b"b", c, CYCLE, 0).unwrap();
@@ -1889,6 +1889,24 @@ fn keys_under_one_contract_share_their_terms() {
         .unwrap();
     assert!(!Arc::ptr_eq(&a.terms, &other.terms));
     assert!(size_of::<Entry>() <= 128, "{}", size_of::<Entry>());
+}
+
+/// A client choosing its keys cannot crowd one of the registry's shards: keys found to share
+/// a shard under one process's hash are spread over the shards under another's, as keys
+/// would be by chance. A shard's table grows by rehashing all of it under its lock, so one
+/// holding all the process's keys would hold a worker up for as long as they take.
+#[test]
+fn keys_chosen_to_share_a_shard_spread_under_another_processs_hash() {
+    let known = Registry::new(Keyed::new([1, 2]));
+    let unknown = Registry::new(Keyed::new([3, 4]));
+    let crowded: Vec<Vec<u8>> = (0_u64..)
+        .map(|k| format!("api/0\0client-{k}").into_bytes())
+        .filter(|key| known.index(key) == 0)
+        .take(200)
+        .collect();
+    let shards: HashSet<usize> = crowded.iter().map(|key| unknown.index(key)).collect();
+    // 200 keys over 4,096 shards land on some 195 by chance.
+    assert!(shards.len() > 180, "{} shards", shards.len());
 }
 
 /// A key's slot in the participant's table takes 88 bytes, the table holding up to twice

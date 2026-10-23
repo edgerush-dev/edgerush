@@ -75,7 +75,7 @@ struct Pool {
     handles: Vec<HashMap<Box<[u8]>, Arc<Entry>>>,
     /// By process: its participant's registry, where a worker finds an entry it holds no
     /// handle to without asking.
-    registries: Vec<Arc<Registry>>,
+    registries: Vec<Arc<Registry<FixedState>>>,
 }
 
 /// A data plane of the protocol: one worker's own (`DataPlane`), or a process's shared by
@@ -639,7 +639,7 @@ impl Nodes {
 }
 
 /// A plane's registry of entries: a pooled participant's, or an empty one.
-fn registry_of(plane: &Plane) -> Arc<Registry> {
+fn registry_of(plane: &Plane) -> Arc<Registry<FixedState>> {
     match plane {
         Plane::Pooled(participant) => participant.registry(),
         Plane::Data(_) => Arc::new(Registry::default()),

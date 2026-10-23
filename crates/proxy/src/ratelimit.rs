@@ -314,7 +314,7 @@ pub(crate) struct Limiter {
     /// Which of the process's workers it is.
     index: usize,
     /// Where it finds an entry of the process it holds no handle to.
-    registry: Arc<Registry>,
+    registry: Arc<Registry<Keyed>>,
     /// Its handles to entries, by key: one lookup a key a request.
     handles: RefCell<Handles>,
     /// The next ask's number.
@@ -655,7 +655,7 @@ impl Limiter {
 /// is room for it — and asked about if not there.
 fn decide(
     handles: &RefCell<Handles>,
-    registry: &Registry,
+    registry: &Registry<Keyed>,
     making: Option<(&Hub, u64, &Arc<Room>)>,
     parts: &[(&[u8], Contract)],
     now: u64,
@@ -967,7 +967,11 @@ impl Limiter {
 struct Waiting(Vec<Arc<Entry>>);
 
 impl Waiting {
-    fn on(handles: &RefCell<Handles>, registry: &Registry, parts: &[(&[u8], Contract)]) -> Self {
+    fn on(
+        handles: &RefCell<Handles>,
+        registry: &Registry<Keyed>,
+        parts: &[(&[u8], Contract)],
+    ) -> Self {
         let mut handles = handles.borrow_mut();
         let entries: Vec<Arc<Entry>> = parts
             .iter()
