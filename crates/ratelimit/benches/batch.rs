@@ -52,6 +52,7 @@ fn batch(from: PlaneId, sequence: u64, keys: impl Iterator<Item = u32>) -> Batch
                 asked: 0,
                 refused: 0,
                 seen: sequence - 1,
+                age: 0,
             },
         })
         .collect();
@@ -60,6 +61,7 @@ fn batch(from: PlaneId, sequence: u64, keys: impl Iterator<Item = u32>) -> Batch
         entries,
         asks: Vec::new(),
         oldest_ask: 0,
+        made: 0,
     }
 }
 

@@ -44,6 +44,7 @@ fn hits(sequence: u64, count: u64, seen: u64) -> Report {
         asked: 0,
         refused: 0,
         seen,
+        age: 0,
     }
 }
 
@@ -55,6 +56,7 @@ fn asked_hits(sequence: u64, count: u64, seen: u64) -> Report {
         asked: count,
         refused: 0,
         seen,
+        age: 0,
     }
 }
 
@@ -68,6 +70,7 @@ fn batch(from: PlaneId, report: Report) -> Batch {
         }],
         asks: Vec::new(),
         oldest_ask: 0,
+        made: 0,
     }
 }
 
@@ -84,6 +87,7 @@ fn ask(from: PlaneId, id: u64, count: u64, keys: &[&[u8]]) -> Batch {
             keys: keys.iter().map(|key| ((*key).into(), contract())).collect(),
         }],
         oldest_ask: id,
+        made: 0,
     }
 }
 
@@ -370,7 +374,7 @@ proptest::proptest! {
         let mut now = 0;
         for (gap, count) in reports {
             now += gap;
-            owned.apply(count, now);
+            owned.apply(count, now, now);
             for _ in 0..count {
                 if one_by_one.retry_at(now).is_none_or(|retry| retry - now <= most) {
                     one_by_one.charge(now);
@@ -445,8 +449,9 @@ fn an_emptied_batch_still_says_what_was_refused() {
         refused: 1,
         first: 0,
         last: 0,
+        admitted: 0,
     };
-    let said = |unseen: &Unseen| unseen.report(0);
+    let said = |unseen: &Unseen| unseen.report(0, 0);
     unseen.empty_if_stale(100 * MS, 100 * MS);
     assert_eq!(
         said(&unseen),
@@ -456,6 +461,7 @@ fn an_emptied_batch_still_says_what_was_refused() {
             asked: 2,
             refused: 1,
             seen: 0,
+            age: 0,
         },
         "not yet"
     );
@@ -468,6 +474,7 @@ fn an_emptied_batch_still_says_what_was_refused() {
             asked: 0,
             refused: 1,
             seen: 0,
+            age: 0,
         }
     );
 }
@@ -919,8 +926,9 @@ fn a_later_ask_holds_what_is_held_as_long_as_its_own() {
 fn an_admission_after_an_asked_hit_emptied_is_counted() {
     let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
     assert_eq!(pod.on_batch(ask(100, 1, 1, &[b"k"]), 0).decided, [(1, 1)]);
-    // The asked request's batch lost; one admitted after it reported, kept waiting.
-    pod.on_batch(batch(100, hits(2, 1, 0)), 50 * MS);
+    // The asked request's batch lost; one admitted after it reported, kept waiting. Charged
+    // as of when it was admitted, under an interval before the check below, where it shows.
+    pod.on_batch(batch(100, hits(2, 1, 0)), 105 * MS);
     pod.on_batch(batch(100, asked_hits(1, 0, 0)), 110 * MS);
     assert_eq!(pod.counted(b"k"), Some(2), "two admitted");
     assert_eq!(pod.keys[&b"k"[..]].bucket().remaining(110 * MS), 9);
@@ -967,6 +975,7 @@ fn the_hits_of_an_ask_given_up_find_its_hold() {
             timeout: 300 * MS,
             keys: vec![(b"k"[..].into(), slow)],
         }],
+        made: 0,
     };
     let hits = |sequence| Batch {
         from: 100,
@@ -977,6 +986,7 @@ fn the_hits_of_an_ask_given_up_find_its_hold() {
             report: asked_hits(sequence, 1, sequence - 1),
         }],
         asks: Vec::new(),
+        made: 0,
     };
     let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
     pod.set_least_hold(0);
@@ -999,6 +1009,7 @@ fn a_request_of_an_ask_given_up_and_refused_is_not_counted() {
         asked: 0,
         refused: 1,
         seen: sequence - 1,
+        age: 0,
     };
     let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
     assert_eq!(pod.on_batch(ask(100, 1, 1, &[b"k"]), 0).decided, [(1, 1)]);
@@ -1035,9 +1046,11 @@ fn a_hold_lapses_charged_once_its_time_is_over() {
                     asked,
                     refused: 0,
                     seen: sequence - 1,
+                    age: 0,
                 },
             }],
             asks: Vec::new(),
+            made: 0,
         };
         let ask = |id, count| Batch {
             from: 100,
@@ -1049,6 +1062,7 @@ fn a_hold_lapses_charged_once_its_time_is_over() {
                 timeout: 4 * CYCLE,
                 keys: vec![(b"k"[..].into(), contract)],
             }],
+            made: 0,
         };
         let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
         pod.set_least_hold(least_hold);
@@ -1288,6 +1302,7 @@ fn an_answer_from_a_pod_that_is_not_the_owner_is_ignored() {
             entries: vec![Answer {
                 key: b"k"[..].into(),
                 behind: 0,
+                held: 0,
                 applied: 0,
                 others: 5,
                 owned: true,
@@ -1296,6 +1311,7 @@ fn an_answer_from_a_pod_that_is_not_the_owner_is_ignored() {
             view: None,
             life: 0,
             number: 0,
+            made: CYCLE,
         },
         CYCLE,
     );
@@ -2021,6 +2037,7 @@ fn a_copy_answering_an_ask_does_not_say_which_batches_were_applied() {
     let copy = Answer {
         key: b.clone().into_boxed_slice(),
         behind: 0,
+        held: 0,
         applied: 2,
         others: 0,
         owned: false,
@@ -2035,6 +2052,7 @@ fn a_copy_answering_an_ask_does_not_say_which_batches_were_applied() {
             view: None,
             life: 0,
             number: 0,
+            made: CYCLE,
         },
         CYCLE,
     );
@@ -2389,6 +2407,180 @@ fn a_share_of_the_cycle_divides_what_the_copy_has_among_those_admitting() {
     assert_eq!(net.copy(0, b"k").allowance, Some(3));
 }
 
+/// A hit is charged as of when it was admitted, its age counted back from the batch's
+/// arrival: one admitted 30 ms before, at 100 a second, has refilled by the time it arrives.
+#[test]
+fn a_hit_is_charged_as_of_when_it_was_admitted() {
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    let mut late = batch(100, hits(1, 1, 0));
+    late.made = 7;
+    if let Report::Hits { age, .. } = &mut late.entries[0].report {
+        *age = 30 * MS;
+    }
+    let answers = pod.on_batch(late, 1_000 * MS);
+    assert_eq!(answers.made, 7, "said back");
+    let bucket = pod.keys[&b"k"[..]].bucket();
+    assert_eq!(bucket.remaining(1_000 * MS), 10, "refilled since");
+    assert_eq!(answers.entries[0].behind, 0);
+}
+
+/// The owner charges back to the earliest hit however long ago, past the key's refill time
+/// too: 15 hits said to be 150 ms old, at 100 a second with a bucket of 10, are charged
+/// from then and have all refilled as they arrive.
+#[test]
+fn hits_are_charged_back_to_the_earliest_past_a_refill_time() {
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    let mut old = batch(100, hits(1, 15, 0));
+    if let Report::Hits { age, .. } = &mut old.entries[0].report {
+        *age = 150 * MS;
+    }
+    pod.on_batch(old, 1_000 * MS);
+    assert_eq!(pod.keys[&b"k"[..]].bucket().remaining(1_000 * MS), 10);
+}
+
+/// A batch's ages count back from when it was made, the latest anything joined it: entries
+/// that joined earlier age with it.
+#[test]
+fn a_batch_ages_what_joined_it_earlier() {
+    let mut queued = Queued::default();
+    queued.at(10 * MS).entries.push(Entry {
+        key: b"k"[..].into(),
+        contract: contract(),
+        report: Unseen {
+            sequence: 1,
+            count: 1,
+            asked: 0,
+            refused: 0,
+            admitted: 4 * MS,
+            first: 10 * MS,
+            last: 10 * MS,
+        }
+        .report(0, 10 * MS),
+    });
+    queued.at(25 * MS);
+    queued.at(20 * MS);
+    let batch = queued.batch(100, 1);
+    assert_eq!(batch.made, 25 * MS);
+    assert!(matches!(batch.entries[0].report, Report::Hits { age, .. } if age == 21 * MS));
+}
+
+/// One data plane and its pod, batches taking `there` to reach the pod and answers `back`
+/// to return, a cycle every `CYCLE`, and asks sent as they are made, as the proxy's hub
+/// sends them: requests at `times`. Whether each was admitted, `None` if never decided.
+fn decided_over_round_trips(
+    c: Contract,
+    times: &[u64],
+    there: u64,
+    back: u64,
+) -> Vec<Option<bool>> {
+    let mut plane: DataPlane = DataPlane::new(100, CYCLE, view(&[0], 1));
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    let mut decided = vec![None; times.len()];
+    let mut waiting: BTreeMap<Ticket, usize> = BTreeMap::new();
+    // In order of arrival: answers, and when. Each takes as long, so sent in order, they
+    // arrive in order.
+    let mut answers: VecDeque<(u64, Answers)> = VecDeque::new();
+    let mut next_cycle = CYCLE;
+    let last = times.last().copied().unwrap_or(0);
+    let mut at = 0;
+    loop {
+        let request = times.get(at).copied();
+        let answer = answers.front().map(|(when, _)| *when);
+        // Requests first at the same instant, as the harder order.
+        let now = [request, Some(next_cycle), answer]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap();
+        if request == Some(now) {
+            match plane.decide(b"k", c, now) {
+                Decision::Wait(ticket) => {
+                    waiting.insert(ticket, at);
+                }
+                decision => decided[at] = Some(decision == Decision::Admit),
+            }
+            at += 1;
+        } else if answer == Some(now) {
+            let (_, answer) = answers.pop_front().unwrap();
+            plane.on_answers(answer, now);
+        } else {
+            if next_cycle > last + 4 * CYCLE && at == times.len() && answers.is_empty() {
+                return decided;
+            }
+            plane.on_cycle(now);
+            next_cycle += CYCLE;
+        }
+        for (ticket, admitted) in plane.take_decided() {
+            decided[waiting.remove(&ticket).unwrap()] = Some(admitted);
+        }
+        for (_, batch) in plane.take_outgoing() {
+            let answer = pod.on_batch(batch, now + there);
+            answers.push_back((now + there + back, answer));
+        }
+    }
+}
+
+proptest::proptest! {
+    /// Traffic a plain token bucket admits all of, over many rates and bursts, is admitted
+    /// all by one data plane however long its messages take: its hits are charged as of
+    /// when it admitted them, and its copy taken as of when it sent them. The key is kept
+    /// warm throughout, so that nothing is asked about: an ask's requests are still decided
+    /// at one instant (issue #49). One request warms it a refill time and a round trip
+    /// before the traffic; the bucket holds at least a round trip and two cycles of refill,
+    /// so the copy stays warm between answers; and no gap is longer than a refill time,
+    /// after which a bucket is full however long the gap.
+    #[test]
+    fn what_a_plain_bucket_admits_a_data_plane_admits_over_round_trips(
+        limit in 1u64..200, interval in 1u64..50, burst in 1u64..12,
+        gaps in proptest::collection::vec(
+            proptest::prop_oneof![2 => proptest::strategy::Just(1u64), 1 => 0u64..3, 1 => 0u64..40],
+            1..80,
+        ),
+        jitter in proptest::collection::vec(0u64..1_000_000, 80),
+        there in 0u64..5_000_000, back in 0u64..5_000_000,
+    ) {
+        let interval = interval * MS + 1;
+        let burst = burst.max((there + back + 2 * CYCLE).div_ceil(interval));
+        let n = |n| NonZeroU64::new(n).unwrap();
+        let c = Contract { limit: n(limit), window: n(limit * interval), burst: n(burst) };
+        // Gaps of whole intervals, exactly at the edge, some a little more.
+        let refill = burst * interval;
+        let mut plain = c.bucket();
+        proptest::prop_assert!(plain.decide(0));
+        let mut times = vec![0];
+        let mut now = refill + there + back;
+        for (gap, jitter) in gaps.iter().zip(&jitter) {
+            now += (gap * interval + if *gap > 2 { *jitter } else { 0 }).min(refill);
+            if plain.decide(now) {
+                times.push(now);
+            }
+        }
+        let decided = decided_over_round_trips(c, &times, there, back);
+        let refused: Vec<(u64, Option<bool>)> = times
+            .iter()
+            .zip(&decided)
+            .filter(|(_, admitted)| **admitted != Some(true))
+            .map(|(at, admitted)| (*at, *admitted))
+            .collect();
+        proptest::prop_assert!(refused.is_empty(), "refused {:?} of {:?}", refused, times);
+    }
+}
+
+/// The issue's case: a client at exactly one a second, a bucket of one, its hits reaching
+/// the owner a cycle and a millisecond on, the answers a millisecond after.
+#[test]
+fn a_client_at_exactly_its_rate_is_admitted_after_a_round_trip() {
+    let n = |n| NonZeroU64::new(n).unwrap();
+    let c = Contract {
+        limit: n(1),
+        window: n(1_000 * MS),
+        burst: n(1),
+    };
+    let times: Vec<u64> = (0..5).map(|k| k * 1_000 * MS).collect();
+    let decided = decided_over_round_trips(c, &times, MS, MS);
+    assert_eq!(decided, [Some(true); 5]);
+}
+
 /// What the copy has left and what the cycle refills are counted together and rounded once:
 /// half a request left and 6.67 refilled, one request every 1.5 ms, is a share of 7 — not
 /// 0 and 6, which would refuse a client at exactly its rate.
@@ -2410,4 +2602,95 @@ fn a_share_rounds_what_is_left_and_the_refill_together() {
     at.shared = None;
     net.planes[0].on_cycle(3 * MS / 4);
     assert_eq!(net.copy(0, b"k").allowance, Some(7));
+}
+
+/// Exchanges overlapping, a bucket of one that refills faster than a round trip: requests
+/// at exactly the rate ask, and the owner holds what it admits for their hits. Its answers
+/// say what it holds rather than taking it off the bucket, which a partial refill since
+/// would leave short, so the copy is not left further behind than the owner.
+#[test]
+fn a_client_at_exactly_its_rate_is_admitted_with_exchanges_overlapping() {
+    let n = |n| NonZeroU64::new(n).unwrap();
+    let interval = 11 * MS + 1;
+    let c = Contract {
+        limit: n(1),
+        window: n(interval),
+        burst: n(1),
+    };
+    let times = [
+        interval,
+        2 * interval,
+        3 * interval,
+        4 * interval,
+        176_494_783,
+        309_000_000,
+        309_000_000 + interval,
+    ];
+    let decided = decided_over_round_trips(c, &times, 4_773_750, 266_466);
+    assert_eq!(decided, [Some(true); 7]);
+}
+
+/// Answers from a pod that does not say back when their batch was made — `made` 0 — come
+/// from one that charges hits as they arrive: their buckets are taken as of when the
+/// answers came, not as of time 0 and refilled since.
+#[test]
+fn answers_that_do_not_say_when_are_taken_as_they_come() {
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, b"k", 0);
+    let (owner, _, _) = roles(b"k");
+    let seen = net.copy(0, b"k").seen;
+    net.planes[0].on_answers(
+        Answers {
+            from: owner,
+            entries: vec![Answer {
+                key: b"k"[..].into(),
+                behind: 5 * u128::from(1_000 * MS),
+                held: 0,
+                applied: seen,
+                others: 0,
+                owned: true,
+            }],
+            decided: Vec::new(),
+            view: None,
+            life: 0,
+            number: 0,
+            made: 0,
+        },
+        500 * MS,
+    );
+    assert_eq!(net.copy(0, b"k").bucket.remaining(500 * MS), 5);
+}
+
+/// Answers whose batch was made long before they came — a lost packet waiting for TCP to
+/// send it again — are taken as of a cycle before they came, not as of then: the trip's
+/// refill counted no further than a cycle.
+#[test]
+fn answers_held_up_are_taken_as_of_no_more_than_a_cycle_before() {
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, b"k", 0);
+    let (owner, _, _) = roles(b"k");
+    let seen = net.copy(0, b"k").seen;
+    let behind = 5 * u128::from(1_000 * MS);
+    net.planes[0].on_answers(
+        Answers {
+            from: owner,
+            entries: vec![Answer {
+                key: b"k"[..].into(),
+                behind,
+                held: 0,
+                applied: seen,
+                others: 0,
+                owned: true,
+            }],
+            decided: Vec::new(),
+            view: None,
+            life: 0,
+            number: 0,
+            made: 200 * MS,
+        },
+        500 * MS,
+    );
+    // A cycle's refill at 100 a second, in the bucket's units.
+    let refill = u128::from(CYCLE) * 100;
+    assert_eq!(net.copy(0, b"k").bucket.behind(500 * MS), behind - refill);
 }

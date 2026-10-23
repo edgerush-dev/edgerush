@@ -28,7 +28,7 @@ mod tests;
 pub use word::fits;
 
 use super::{
-    Answers, Ask, Batch, Contract, Decided, Entry as BatchEntry, PlaneId, PodId,
+    Answers, Ask, Batch, Contract, Decided, Entry as BatchEntry, PlaneId, PodId, Queued,
     RESEND_AFTER_CYCLES, Report, Ticket, Unseen, View, group_name, longest,
 };
 use chunked::MinHeap;
@@ -344,6 +344,11 @@ pub struct Entry {
     /// Other participants the owner last said admit the key.
     others: AtomicU64,
     last_request: AtomicU64,
+    /// When a worker last started the key's count, from none: the earliest of the hits the
+    /// transport drains, which they are charged as of. Written before the compare-and-swap
+    /// that starts the count, so that the drain taking the count sees it; one taking a count
+    /// started after it may see a later one, which errs towards charging late.
+    started: AtomicU64,
     /// Compare-and-swap attempts that lost to another and went round again.
     retries: AtomicU64,
     /// The most admitted and not yet drained, holds included: `word::MOST_RESERVED`, or
@@ -463,6 +468,7 @@ impl Entry {
             flags: AtomicU8::new(if owned { OWNED } else { 0 }),
             others: AtomicU64::new(0),
             last_request: AtomicU64::new(now),
+            started: AtomicU64::new(now),
             retries: AtomicU64::new(0),
             most_reserved: word::MOST_RESERVED,
             waiters: AtomicU64::new(0),
@@ -631,6 +637,9 @@ impl Entry {
                     Taken::Refused
                 }
             } else {
+                if op == Op::Admit && fields.unreported == 0 {
+                    self.started.store(now, Ordering::Relaxed);
+                }
                 return Some(Fields {
                     arrival: Bucket::charge(fields.arrival, units, 1),
                     left: fields.left - 1,
@@ -669,6 +678,9 @@ impl Entry {
         let settled = self.update(now, cycle, |fields| {
             was = fields.unreported;
             Some(if admitted {
+                if fields.unreported == 0 {
+                    self.started.store(now, Ordering::Relaxed);
+                }
                 Fields {
                     held: fields.held.saturating_sub(1),
                     unreported: fields.unreported + 1,
@@ -698,9 +710,9 @@ impl Entry {
 
     /// Takes what was admitted and not yet drained, in one compare-and-swap that leaves the
     /// rest — holds, the bucket, the allowance — as they are, its cycle advanced first if
-    /// `cycle` says so: the count, for the transport's ledger, and whether requests wait on
-    /// it.
-    fn drain(&self, now: u64, cycle: Cycle) -> (u64, bool) {
+    /// `cycle` says so: the count, for the transport's ledger, when the earliest of it was
+    /// admitted, and whether requests wait on it.
+    fn drain(&self, now: u64, cycle: Cycle) -> (u64, u64, bool) {
         let mut count = 0;
         self.update(now, cycle, |fields| {
             count = fields.unreported;
@@ -709,8 +721,11 @@ impl Entry {
                 ..fields
             })
         });
+        // After the compare-and-swap, whose acquire sees the time written before the one
+        // that started the count.
+        let started = self.started.load(Ordering::Relaxed);
         self.pressed.store(false, Ordering::Release);
-        (count, count > 0 && self.wanted())
+        (count, started, count > 0 && self.wanted())
     }
 
     /// How long from `now` it waits to admit a request, if it would refuse one: its
@@ -853,11 +868,13 @@ struct Tracked {
     /// The ledger: admitted and not yet sent — drained from the entry's count, or decided by
     /// a service pod for a key it holds a copy of — still to go to the owner.
     unsent: u64,
+    /// When the earliest of it was admitted.
+    unsent_since: u64,
     /// Of what is admitted, requests an ask decided, its answer heard or not: those of an
     /// ask given up reach the ledger through the entry's count, at the next drain.
-    unsent_asked: u64,
+    unsent_asked: u32,
     /// Requests of asks given up refused here, not yet sent.
-    unsent_refused: u64,
+    unsent_refused: u32,
     heard: Heard,
     bounded: bool,
     unreachable: bool,
@@ -882,6 +899,19 @@ impl Tracked {
 
     fn cold(&self, now: u64) -> bool {
         self.entry.cold(now)
+    }
+
+    /// `count` more in the ledger, the earliest of them admitted at `since`.
+    fn unsent_more(&mut self, count: u64, since: u64) {
+        if count == 0 {
+            return;
+        }
+        self.unsent_since = if self.unsent == 0 {
+            since
+        } else {
+            self.unsent_since.min(since)
+        };
+        self.unsent += count;
     }
 
     /// What it would admit as one request now, from the word, the cycle advanced if due.
@@ -1081,8 +1111,8 @@ pub struct Participant<S> {
     retries: Vec<Ticket>,
     /// A hold settled or a count drained on a key requests wait on.
     wake: bool,
-    outgoing: BTreeMap<PodId, Vec<BatchEntry>>,
-    asks: BTreeMap<PodId, Vec<Ask>>,
+    /// What is to go to each pod.
+    queued: BTreeMap<PodId, Queued>,
     /// With one exchange in flight to a pod at a time: the pods that have one, since when.
     one_in_flight: bool,
     sending: BTreeMap<PodId, u64>,
@@ -1157,7 +1187,7 @@ struct Visit<'a> {
     resend_after: u64,
     poll_quiet: bool,
     sending: &'a BTreeMap<PodId, u64>,
-    outgoing: &'a mut BTreeMap<PodId, Vec<BatchEntry>>,
+    queued: &'a mut BTreeMap<PodId, Queued>,
     numbered: &'a mut u64,
     spare: &'a mut Spare,
     cut_off: bool,
@@ -1172,14 +1202,14 @@ impl Visit<'_> {
     /// every cycle; its owner out of reach.
     fn key(&mut self, tracked: &mut Tracked) -> bool {
         let now = self.now;
+        // What was admitted drained into the ledger, every key's, with an owner to send it
+        // to or not, so that no count fills.
+        let (count, started, woken) = tracked.entry.drain(now, Cycle::Advance);
+        tracked.unsent_more(count, started);
+        self.wake |= woken;
         let entry = &tracked.entry;
         let key = &entry.key;
         let hold = entry.terms.hold;
-        // What was admitted drained into the ledger, every key's, with an owner to send it
-        // to or not, so that no count fills.
-        let (count, woken) = entry.drain(now, Cycle::Advance);
-        tracked.unsent += count;
-        self.wake |= woken;
         tracked.bounded |= tracked.heard.get().is_some();
         tracked.publish();
         let Some(owner) = tracked.owner else {
@@ -1190,6 +1220,8 @@ impl Visit<'_> {
         if self.sending.contains_key(&owner) {
             return true;
         }
+        // Ages count back from now, as the batch its entries join is made: every batch waiting
+        // was made at a time this data plane was given, and time does not go back.
         let mut entries = Vec::new();
         for unseen in tracked.unacknowledged.as_mut_slice() {
             unseen.empty_if_stale(hold, now);
@@ -1201,16 +1233,17 @@ impl Visit<'_> {
                 entries.push(BatchEntry {
                     key: key.clone(),
                     contract: entry.terms.contract,
-                    report: unseen.report(tracked.seen),
+                    report: unseen.report(tracked.seen, now),
                 });
                 reported = true;
             }
         }
         let unsent = tracked.unsent;
         if unsent > 0 || tracked.unsent_refused > 0 {
-            let asked = tracked.unsent_asked.min(unsent);
-            tracked.unsent_asked -= asked;
-            let refused = std::mem::take(&mut tracked.unsent_refused);
+            let asked = u64::from(tracked.unsent_asked).min(unsent);
+            // No more than the u32 it was taken from.
+            tracked.unsent_asked -= u32::try_from(asked).unwrap_or(u32::MAX);
+            let refused = u64::from(std::mem::take(&mut tracked.unsent_refused));
             tracked.unsent = 0;
             tracked.sent += 1;
             *self.numbered += 1;
@@ -1219,13 +1252,14 @@ impl Visit<'_> {
                 count: unsent,
                 asked,
                 refused,
+                admitted: tracked.unsent_since,
                 first: now,
                 last: now,
             };
             entries.push(BatchEntry {
                 key: key.clone(),
                 contract: entry.terms.contract,
-                report: unseen.report(tracked.seen),
+                report: unseen.report(tracked.seen, now),
             });
             tracked.unacknowledged.push(unseen, self.spare);
             reported = true;
@@ -1247,7 +1281,8 @@ impl Visit<'_> {
                     .get()
                     .is_none_or(|heard| now - heard >= self.resend_after));
         if !entries.is_empty() {
-            self.outgoing.entry(owner).or_default().extend(entries);
+            let queued = self.queued.entry(owner).or_default().at(now);
+            queued.entries.extend(entries);
         }
         !tracked.unacknowledged.is_empty() || polled || tracked.unreachable
     }
@@ -1295,8 +1330,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             decided: Vec::new(),
             retries: Vec::new(),
             wake: false,
-            outgoing: BTreeMap::new(),
-            asks: BTreeMap::new(),
+            queued: BTreeMap::new(),
             one_in_flight: false,
             sending: BTreeMap::new(),
             latest: BTreeMap::new(),
@@ -1543,6 +1577,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             seen: self.numbered,
             unacknowledged: Unacknowledged::default(),
             unsent: 0,
+            unsent_since: 0,
             unsent_asked: 0,
             unsent_refused: 0,
             heard: Heard::default(),
@@ -1612,8 +1647,8 @@ impl<S: BuildHasher + Clone> Participant<S> {
         let Some(tracked) = self.keys.get_mut(key) else {
             return;
         };
-        let (count, wake) = tracked.entry.drain(now, Cycle::AsItIs);
-        tracked.unsent += count;
+        let (count, started, wake) = tracked.entry.drain(now, Cycle::AsItIs);
+        tracked.unsent_more(count, started);
         self.wake |= wake;
         self.run(key);
     }
@@ -1765,7 +1800,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             sent,
             resent,
         });
-        self.asks.entry(pod).or_default().push(Ask {
+        self.queued.entry(pod).or_default().at(now).asks.push(Ask {
             id,
             count: group.asked.len() as u64,
             timeout: self.ask_timeout,
@@ -1823,7 +1858,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             if of_ask {
                 for at in &group.cold {
                     if let Some(tracked) = self.keys.get_mut(&*group.keys[*at].0) {
-                        tracked.unsent_refused += 1;
+                        tracked.unsent_refused = tracked.unsent_refused.saturating_add(1);
                     }
                 }
             }
@@ -1836,9 +1871,9 @@ impl<S: BuildHasher + Clone> Participant<S> {
             for at in &group.cold {
                 if let Some(tracked) = self.keys.get_mut(&*group.keys[*at].0) {
                     if admitted {
-                        tracked.unsent_asked += 1;
+                        tracked.unsent_asked = tracked.unsent_asked.saturating_add(1);
                     } else {
-                        tracked.unsent_refused += 1;
+                        tracked.unsent_refused = tracked.unsent_refused.saturating_add(1);
                     }
                 }
             }
@@ -1941,7 +1976,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             resend_after,
             poll_quiet: self.levers.poll_quiet,
             sending: &self.sending,
-            outgoing: &mut self.outgoing,
+            queued: &mut self.queued,
             numbered: &mut self.numbered,
             spare: &mut self.spare,
             cut_off: false,
@@ -1984,7 +2019,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             let at = usize::try_from(self.polls).unwrap_or(0) % self.view.pods.len();
             self.polls += 1;
             if !self.sending.contains_key(&self.view.pods[at]) {
-                self.outgoing.entry(self.view.pods[at]).or_default();
+                self.queued.entry(self.view.pods[at]).or_default().at(now);
             }
         }
         if self.scheduled {
@@ -2141,9 +2176,11 @@ impl<S: BuildHasher + Clone> Participant<S> {
             entries,
             decided,
             view,
+            made,
             ..
         } = answers;
         self.last_now = now;
+        let made = super::taken_as_of(made, self.cycle, now);
         let mut untaken: Vec<(Box<[u8]>, u128)> = Vec::new();
         // What the asks decided admitted under each of their keys: still to be sent, as
         // hits, and left out of the owner's bucket, which holds them for those hits.
@@ -2195,10 +2232,21 @@ impl<S: BuildHasher + Clone> Participant<S> {
             } else {
                 0
             };
+            // The hits the owner has yet to apply, but for the asked ones it holds charged — no
+            // more than this participant knows of, its answer to an ask maybe lost.
+            let known: u64 = tracked
+                .unacknowledged
+                .as_slice()
+                .iter()
+                .map(|unseen| unseen.asked)
+                .sum::<u64>()
+                + u64::from(tracked.unsent_asked)
+                + asked;
+            let unapplied = (unseen + unsent + asked).saturating_sub(answer.held.min(known));
             let entry = &tracked.entry;
-            let units = entry.terms.bucket.units(now);
+            let units = entry.terms.bucket.units(made);
             entry.update(now, Cycle::Advance, |fields| {
-                let extra = unseen + unsent + asked + fields.unreported + fields.held;
+                let extra = unapplied + fields.unreported + fields.held;
                 Some(Fields {
                     arrival: entry.terms.bucket.rebased(units, answer.behind, extra),
                     ..fields
@@ -2228,8 +2276,8 @@ impl<S: BuildHasher + Clone> Participant<S> {
                         let wait = match untaken.iter().find(|(untaken, _)| untaken == key) {
                             Some((_, behind)) => {
                                 let bucket = &tracked.entry.terms.bucket;
-                                let units = bucket.units(now);
-                                bucket.wait(bucket.rebased(units, *behind, 0), units)
+                                let (then, units) = (bucket.units(made), bucket.units(now));
+                                bucket.wait(bucket.rebased(then, *behind, 0), units)
                             }
                             None => tracked.entry.wait(now),
                         }?;
@@ -2252,8 +2300,8 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 if admitted {
                     for key in &charged {
                         if let Some(tracked) = self.keys.get_mut(&**key) {
-                            tracked.unsent += 1;
-                            tracked.unsent_asked += 1;
+                            tracked.unsent_more(1, now);
+                            tracked.unsent_asked = tracked.unsent_asked.saturating_add(1);
                         }
                         queue(&mut self.keys, &mut self.runnable, key);
                     }
@@ -2320,13 +2368,13 @@ impl<S: BuildHasher + Clone> Participant<S> {
             let Some(owner) = owner else {
                 continue;
             };
-            let entries = self.outgoing.entry(owner).or_default();
+            let queued = self.queued.entry(owner).or_default().at(now);
             for unseen in tracked.unacknowledged.as_mut_slice() {
                 unseen.last = now;
-                entries.push(BatchEntry {
+                queued.entries.push(BatchEntry {
                     key: key.clone(),
                     contract: tracked.entry.terms.contract,
-                    report: unseen.report(tracked.seen),
+                    report: unseen.report(tracked.seen, queued.made),
                 });
             }
         }
@@ -2406,62 +2454,30 @@ impl<S: BuildHasher + Clone> Participant<S> {
 
     fn take_outgoing_to_all(&mut self) -> Vec<(PodId, Batch)> {
         let oldest_ask = self.oldest_ask();
-        let mut asks = std::mem::take(&mut self.asks);
-        let mut batches: Vec<(PodId, Batch)> = std::mem::take(&mut self.outgoing)
+        std::mem::take(&mut self.queued)
             .into_iter()
-            .map(|(pod, entries)| {
-                (
-                    pod,
-                    Batch {
-                        from: self.id,
-                        entries,
-                        asks: asks.remove(&pod).unwrap_or_default(),
-                        oldest_ask,
-                    },
-                )
-            })
-            .collect();
-        batches.extend(asks.into_iter().map(|(pod, asks)| {
-            (
-                pod,
-                Batch {
-                    from: self.id,
-                    entries: Vec::new(),
-                    asks,
-                    oldest_ask,
-                },
-            )
-        }));
-        batches.sort_by_key(|(pod, _)| *pod);
-        batches
+            .map(|(pod, queued)| (pod, queued.batch(self.id, oldest_ask)))
+            .collect()
     }
 
     /// With one exchange in flight, what is to go to the pods with none, each now with one;
     /// the rest kept until theirs is over. Called with `now` given by the last cycle's time
     /// that `on_cycle` saw, as the start of each exchange.
     fn take_outgoing_to_idle(&mut self) -> Vec<(PodId, Batch)> {
-        let pods: BTreeSet<PodId> = self
-            .outgoing
+        let pods: Vec<PodId> = self
+            .queued
             .keys()
-            .chain(self.asks.keys())
             .filter(|pod| !self.sending.contains_key(pod))
             .copied()
             .collect();
         let oldest_ask = self.oldest_ask();
         let mut batches = Vec::new();
         for pod in pods {
-            let entries = self.outgoing.remove(&pod).unwrap_or_default();
-            let asks = self.asks.remove(&pod).unwrap_or_default();
+            let Some(queued) = self.queued.remove(&pod) else {
+                continue;
+            };
             self.sending.insert(pod, self.last_now);
-            batches.push((
-                pod,
-                Batch {
-                    from: self.id,
-                    entries,
-                    asks,
-                    oldest_ask,
-                },
-            ));
+            batches.push((pod, queued.batch(self.id, oldest_ask)));
         }
         batches
     }

@@ -1115,7 +1115,9 @@ mod tests {
 
     /// A request under a limit over the whole data plane too is decided under both: the
     /// tighter binds, whichever of the two is the run's, and every admission is counted once
-    /// under each.
+    /// under each. Messages take a fixed delay: a second key, owned elsewhere, sends twice
+    /// as many, and with jitter drawn from one stream for all of them the runs compared
+    /// would not see the same network.
     #[test]
     fn a_request_under_a_limit_over_the_data_plane_too_is_held_to_the_tighter() {
         let n = |n| NonZeroU64::new(n).unwrap();
@@ -1132,6 +1134,7 @@ mod tests {
                     span: 6 * SECOND,
                     conforming: false,
                 },
+                network: Network::reliable(1_000_000, 0),
                 ..bursts(Fault::None, seed)
             };
             let alone = run(&base);
