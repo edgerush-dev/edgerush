@@ -16,9 +16,11 @@
 //!   while the others' hits under it are still on their way, gets its share of the refill
 //!   only, and keeps what it left unspent.
 //! - Every cycle it sends each owner, in one batch over all the keys that owner holds, the
-//!   hits it admitted, numbered; or, with none to send while the key is in use, a poll. Each
-//!   is answered with the bucket as it stands. A batch not seen applied is sent again after
-//!   four cycles; one older than a bucket's refill time is sent emptied.
+//!   hits it admitted, numbered, with how long ago the earliest of them was; or, with none to
+//!   send while the key is in use, a poll. Each is answered with the bucket as it stands,
+//!   which the copy takes as of when the batch was made: the batch's trip cancels out the
+//!   lateness of the owner's charge, with no clock shared. A batch not seen applied is sent
+//!   again after four cycles; one older than a bucket's refill time is sent emptied.
 //! - A request under several limits is admitted under all of them or none, and charged
 //!   to all or none. Its limits whose keys the data plane holds fresh copies of are decided
 //!   there first, and held; the rest wait while the data plane asks one service pod — the
@@ -27,9 +29,9 @@
 //!   others. An ask unanswered for two cycles is sent again once; one unanswered for four
 //!   is given up, and requests are decided from the copies until a pod is heard from
 //!   again.
-//! - The owner applies hits in order, once each, charging what does not fit as debt while
-//!   it would be paid back within one bucket's refill time, and copies every change it makes
-//!   to every other service pod: the next to own the key takes over from its copy should
+//! - The owner applies hits in order, once each, as of when the earliest of them was
+//!   admitted, charging what does not fit as debt while it would be paid back within one
+//!   bucket's refill time, and copies every change it makes to every other service pod: the next to own the key takes over from its copy should
 //!   the owner go, with nothing to send anyone.
 //!
 //! Which pods own which keys follows from the [`View`] the service pods agree on: the owner
@@ -201,6 +203,10 @@ pub enum Report {
         /// taking over from a copy older than that skips to it rather than wait for batches
         /// that will not come.
         seen: u64,
+        /// How long before the batch was made ([`Batch::made`]) the earliest of the hits was
+        /// admitted: the owner charges them as of the batch's arrival less this, so that a
+        /// hit takes the room it took when admitted, not what has refilled since.
+        age: u64,
     },
     /// Nothing to report, but the key is in use: a fresh copy, please.
     Poll,
@@ -250,6 +256,9 @@ pub struct Batch {
     /// one, however late — queued behind an exchange, or in this very batch — is not decided
     /// again.
     pub oldest_ask: u64,
+    /// When the data plane made it, on its own clock: what its hits' ages count back from,
+    /// said back in the answers ([`Answers::made`]).
+    pub made: u64,
 }
 
 /// A service pod's answer about one key.
@@ -259,6 +268,10 @@ pub struct Answer {
     pub key: Box<[u8]>,
     /// The bucket as the pod holds it: how far from full, as [`TokenBucket::behind`] says.
     pub behind: u128,
+    /// Of the receiver's hits still to reach the pod, how many the bucket already holds
+    /// charged, for asks the pod admitted: the data plane charges the rest on top. Said
+    /// rather than taken off `behind`, which a partial refill would leave short of them.
+    pub held: u64,
     /// The highest of the receiver's batches applied, every one before it too, as far as
     /// the pod knows: a copy is never ahead of its owner.
     pub applied: u64,
@@ -287,6 +300,14 @@ pub struct Answers {
     /// Counted up, wrapping, with each answer the pod gives in this life: the order in
     /// which it handled their batches.
     pub number: u64,
+    /// The batch's [`Batch::made`], said back: the data plane takes the buckets as of then.
+    /// The pod charged the batch's hits as late as the batch took to reach it, and the
+    /// buckets read later by as much: taken as of when the batch was made, the two cancel,
+    /// with no clock shared; but no further back than a cycle before the answers came, as a
+    /// trip held up longer — a lost packet waiting for TCP to send it again — would be
+    /// counted as refill the copy never had. 0 is a pod that does not say it back, charging
+    /// hits as they arrive: its buckets are taken as of when the answers came.
+    pub made: u64,
 }
 
 /// What the owner knows of one data plane, for one key.
@@ -370,6 +391,17 @@ fn admitted_under(admitting: &[(Box<[u8]>, u64)], key: &[u8]) -> u64 {
         .sum()
 }
 
+/// When answers that came at `now` are taken as of, their batch [`made`](Answers::made) at
+/// `made`: then, so that the batch's trip there cancels out, but no further back than a
+/// `cycle` — a trip held up longer, a lost packet waiting for TCP to send it again, would
+/// be refill the copy never had — and as of `now` from a pod that does not say when.
+fn taken_as_of(made: u64, cycle: u64, now: u64) -> u64 {
+    if made == 0 {
+        return now;
+    }
+    made.min(now).max(now.saturating_sub(cycle))
+}
+
 /// A batch a data plane sent and has not yet seen applied.
 #[derive(Clone, Copy, Debug)]
 struct Unseen {
@@ -379,20 +411,24 @@ struct Unseen {
     count: u64,
     asked: u64,
     refused: u64,
+    /// When the earliest of its hits was admitted.
+    admitted: u64,
     /// When it was first sent, and last.
     first: u64,
     last: u64,
 }
 
 impl Unseen {
-    /// Its report, the data plane having seen its batches up to `seen` applied.
-    fn report(&self, seen: u64) -> Report {
+    /// Its report in a batch made at `made`, the data plane having seen its batches up to
+    /// `seen` applied.
+    fn report(&self, seen: u64, made: u64) -> Report {
         Report::Hits {
             sequence: self.sequence,
             count: self.count,
             asked: self.asked,
             refused: self.refused,
             seen,
+            age: made.saturating_sub(self.admitted),
         }
     }
 
@@ -403,6 +439,44 @@ impl Unseen {
         if now - self.first > hold {
             self.count = 0;
             self.asked = 0;
+        }
+    }
+}
+
+/// What a data plane has to send one service pod: entries, their hits' ages counting back
+/// from `made`, and asks.
+#[derive(Debug, Default)]
+pub(crate) struct Queued {
+    pub(crate) made: u64,
+    pub(crate) entries: Vec<Entry>,
+    pub(crate) asks: Vec<Ask>,
+}
+
+impl Queued {
+    /// Made at `now` from here on, if that is later: the ages of the hits it holds count
+    /// back from it, so that every age in a batch counts back from one time, the latest
+    /// anything was added at.
+    pub(crate) fn at(&mut self, now: u64) -> &mut Self {
+        if now > self.made {
+            let later = now - self.made;
+            for entry in &mut self.entries {
+                if let Report::Hits { age, .. } = &mut entry.report {
+                    *age = age.saturating_add(later);
+                }
+            }
+            self.made = now;
+        }
+        self
+    }
+
+    /// Its batch, from data plane `from`.
+    pub(crate) fn batch(self, from: PlaneId, oldest_ask: u64) -> Batch {
+        Batch {
+            from,
+            entries: self.entries,
+            asks: self.asks,
+            oldest_ask,
+            made: self.made,
         }
     }
 }
@@ -419,6 +493,8 @@ struct PlaneKey {
     bucket: TokenBucket,
     /// Hits admitted and not yet sent.
     unsent: u64,
+    /// When the earliest of them was admitted.
+    unsent_since: u64,
     /// Of them, requests an ask decided.
     unsent_asked: u64,
     /// Requests of asks given up refused here, not yet sent.
@@ -462,6 +538,7 @@ impl PlaneKey {
             owner,
             bucket: contract.bucket(),
             unsent: 0,
+            unsent_since: 0,
             unsent_asked: 0,
             unsent_refused: 0,
             sent: numbered,
@@ -521,6 +598,14 @@ impl PlaneKey {
     fn take(&mut self, now: u64) {
         self.bucket.charge(now);
         self.spent += 1;
+        self.unsent_one(now);
+    }
+
+    /// One more hit to send, admitted at `now`.
+    fn unsent_one(&mut self, now: u64) {
+        if self.unsent == 0 {
+            self.unsent_since = now;
+        }
         self.unsent += 1;
     }
 
@@ -541,11 +626,12 @@ impl PlaneKey {
         self.bucket.charge(now)
     }
 
-    /// A request held: admitted, it goes to the owner; refused, its charge is given back.
-    fn release(&mut self, charge: Charge, admitted: bool) {
+    /// A request held, decided at `now`: admitted, it goes to the owner; refused, its charge
+    /// is given back.
+    fn release(&mut self, charge: Charge, admitted: bool, now: u64) {
         self.held = self.held.saturating_sub(1);
         if admitted {
-            self.unsent += 1;
+            self.unsent_one(now);
         } else {
             self.spent = self.spent.saturating_sub(1);
             self.bucket.release(charge);
@@ -622,8 +708,8 @@ pub struct DataPlane<S = FixedState> {
     /// every number an earlier life of it used.
     numbered: u64,
     decided: Vec<Decided>,
-    outgoing: BTreeMap<PodId, Vec<Entry>>,
-    asks: BTreeMap<PodId, Vec<Ask>>,
+    /// What is to go to each pod.
+    queued: BTreeMap<PodId, Queued>,
     /// Views asked for so far, to ask the pods in turn.
     polls: u64,
     /// How long an ask may go unanswered before it is given up and what waits is decided
@@ -695,8 +781,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             asks_sent: 0,
             numbered: 0,
             decided: Vec::new(),
-            outgoing: BTreeMap::new(),
-            asks: BTreeMap::new(),
+            queued: BTreeMap::new(),
             polls: 0,
             ask_timeout: RESEND_AFTER_CYCLES * cycle.max(1),
             capacity: u64::MAX,
@@ -960,7 +1045,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             sent,
             resent,
         });
-        self.asks.entry(pod).or_default().push(Ask {
+        self.queued.entry(pod).or_default().at(now).asks.push(Ask {
             id,
             count: group.asked.len() as u64,
             timeout: self.ask_timeout,
@@ -1025,7 +1110,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 })
                 .collect()
         };
-        self.settle_held(name, ticket, admitted);
+        self.settle_held(name, ticket, admitted, now);
         self.decided.push(Decided {
             ticket,
             admitted,
@@ -1033,8 +1118,8 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         });
     }
 
-    /// The charges held for `ticket`, of the group `name`, as its decision says.
-    fn settle_held(&mut self, name: &[u8], ticket: Ticket, admitted: bool) {
+    /// The charges held for `ticket`, of the group `name`, as its decision at `now` says.
+    fn settle_held(&mut self, name: &[u8], ticket: Ticket, admitted: bool, now: u64) {
         let Some(group) = self.groups.get(name) else {
             return;
         };
@@ -1042,7 +1127,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         let held = (0..group.keys.len()).filter(|at| !group.cold.contains(at));
         for (at, charge) in held.zip(charges) {
             if let Some(key) = self.keys.get_mut(&group.keys[at].0) {
-                key.release(charge, admitted);
+                key.release(charge, admitted, now);
             }
         }
     }
@@ -1128,6 +1213,8 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             let Some(owner) = at.owner else {
                 continue;
             };
+            // Ages count back from now, as the batch its entries join is made: every batch waiting
+            // was made at a time this data plane was given, and time does not go back.
             let mut entries = Vec::new();
             for unseen in &mut at.unacknowledged {
                 unseen.empty_if_stale(hold, now);
@@ -1139,7 +1226,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                     entries.push(Entry {
                         key: key.clone(),
                         contract: at.contract,
-                        report: unseen.report(at.seen),
+                        report: unseen.report(at.seen, now),
                     });
                     reported = true;
                 }
@@ -1152,13 +1239,14 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                     count: at.unsent,
                     asked: at.unsent_asked,
                     refused: at.unsent_refused,
+                    admitted: at.unsent_since,
                     first: now,
                     last: now,
                 };
                 entries.push(Entry {
                     key: key.clone(),
                     contract: at.contract,
-                    report: unseen.report(at.seen),
+                    report: unseen.report(at.seen, now),
                 });
                 at.unacknowledged.push_back(unseen);
                 at.unsent = 0;
@@ -1180,7 +1268,8 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             cut_off |= at.unreachable
                 || (in_use && at.heard.is_none_or(|heard| now - heard >= resend_after));
             if !entries.is_empty() {
-                self.outgoing.entry(owner).or_default().extend(entries);
+                let queued = self.queued.entry(owner).or_default().at(now);
+                queued.entries.extend(entries);
             }
         }
         // An owner out of reach may have gone: the pods are asked for their view in turn,
@@ -1188,7 +1277,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         if cut_off && !self.view.pods.is_empty() {
             let at = usize::try_from(self.polls).unwrap_or(0) % self.view.pods.len();
             self.polls += 1;
-            self.outgoing.entry(self.view.pods[at]).or_default();
+            self.queued.entry(self.view.pods[at]).or_default().at(now);
         }
         let mut freed = 0;
         self.keys.retain(|key, at| {
@@ -1244,22 +1333,25 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
         admitting
     }
 
-    /// A service pod's answers reach it at `now`.
+    /// A service pod's answers reach it at `now`: each copy set to the pod's bucket as of
+    /// when the batch was made, and charged with what the pod has not seen.
     pub fn on_answers(&mut self, answers: Answers, now: u64) {
         let Answers {
             from,
             entries,
             decided,
             view,
+            made,
             ..
         } = answers;
+        let made = taken_as_of(made, self.cycle, now);
         // Keys the pod decided asks under without owning them: the requests it admitted
         // are charged on its copy, and still to be sent to their owners.
         // Keys whose state the pod sent but the copies did not take, for saying which of
         // them refused the asks it decided.
         let mut untaken: Vec<(Box<[u8]>, u128)> = Vec::new();
         // What the asks decided admitted under each of their keys: still to be sent, as
-        // hits, and left out of the owner's bucket, which holds them for those hits.
+        // hits, and already charged in the owner's bucket, which holds them for those hits.
         let admitting = self.admitting(&decided);
         for answer in entries {
             let Some(at) = self.keys.get_mut(&answer.key) else {
@@ -1271,7 +1363,6 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 untaken.push((answer.key, answer.behind));
                 continue;
             }
-            at.bucket.set_behind(now, answer.behind);
             at.others = answer.others;
             // Only the owner says which batches it applied: another pod's copy may be fresher
             // than the owner's own state, which after a failover went on from an older one.
@@ -1287,9 +1378,18 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             } else {
                 0
             };
-            for _ in 0..unseen + at.unsent + at.held + asked {
-                at.bucket.charge(now);
-            }
+            // Charged on top: the hits the owner has yet to apply, but for the asked ones it
+            // holds — no more than this data plane knows of, its answer to an ask maybe lost —
+            // and what waits on this data plane's own asks.
+            let known: u64 = at
+                .unacknowledged
+                .iter()
+                .map(|unseen| unseen.asked)
+                .sum::<u64>()
+                + at.unsent_asked
+                + asked;
+            let unapplied = (unseen + at.unsent + asked).saturating_sub(answer.held.min(known));
+            at.bucket.rebase(made, answer.behind, unapplied + at.held);
             at.heard = Some(now);
             at.unreachable = false;
         }
@@ -1314,7 +1414,7 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                         let wait = match untaken.iter().find(|(untaken, _)| untaken == key) {
                             Some((_, behind)) => {
                                 let mut held = copy.bucket.clone();
-                                held.set_behind(now, *behind);
+                                held.rebase(made, *behind, 0);
                                 held.retry_at(now).map(|retry| retry.saturating_sub(now))
                             }
                             None => copy.wait(self.cycle, now),
@@ -1338,12 +1438,12 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 if admitted {
                     for key in &charged {
                         if let Some(at) = self.keys.get_mut(key) {
-                            at.unsent += 1;
+                            at.unsent_one(now);
                             at.unsent_asked += 1;
                         }
                     }
                 }
-                self.settle_held(&name, ticket, admitted);
+                self.settle_held(&name, ticket, admitted, now);
                 self.decided.push(Decided {
                     ticket,
                     admitted,
@@ -1406,13 +1506,13 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             let Some(owner) = owner else {
                 continue;
             };
-            let entries = self.outgoing.entry(owner).or_default();
+            let queued = self.queued.entry(owner).or_default().at(now);
             for unseen in &mut at.unacknowledged {
                 unseen.last = now;
-                entries.push(Entry {
+                queued.entries.push(Entry {
                     key: key.clone(),
                     contract: at.contract,
-                    report: unseen.report(at.seen),
+                    report: unseen.report(at.seen, queued.made),
                 });
             }
         }
@@ -1470,34 +1570,10 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
     /// Messages to send: one batch per service pod; an empty one asks only for the view.
     pub fn take_outgoing(&mut self) -> Vec<(PodId, Batch)> {
         let oldest_ask = self.oldest_ask();
-        let mut asks = std::mem::take(&mut self.asks);
-        let mut batches: Vec<(PodId, Batch)> = std::mem::take(&mut self.outgoing)
+        std::mem::take(&mut self.queued)
             .into_iter()
-            .map(|(pod, entries)| {
-                (
-                    pod,
-                    Batch {
-                        from: self.id,
-                        entries,
-                        asks: asks.remove(&pod).unwrap_or_default(),
-                        oldest_ask,
-                    },
-                )
-            })
-            .collect();
-        batches.extend(asks.into_iter().map(|(pod, asks)| {
-            (
-                pod,
-                Batch {
-                    from: self.id,
-                    entries: Vec::new(),
-                    asks,
-                    oldest_ask,
-                },
-            )
-        }));
-        batches.sort_by_key(|(pod, _)| *pod);
-        batches
+            .map(|(pod, queued)| (pod, queued.batch(self.id, oldest_ask)))
+            .collect()
     }
 
     /// Requests that waited, decided since last asked: `(ticket, admitted)`.
@@ -1549,21 +1625,25 @@ struct Record {
 }
 
 /// A batch's hits as its owner applies them: how many, how many of them are requests an ask
-/// decided, and the requests of asks given up its data plane refused ([`Report::Hits`]).
+/// decided, and the requests of asks given up its data plane refused ([`Report::Hits`]); and
+/// as of when they are charged, on the owner's clock.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Tally {
     count: u64,
     asked: u64,
     refused: u64,
+    at: u64,
 }
 
 impl Tally {
-    /// Counts come from the wire: as many as a count holds, never wrapped round.
+    /// Counts come from the wire: as many as a count holds, never wrapped round. Charged
+    /// as of the earlier, as one entry's hits are as of its earliest.
     fn add(self, other: Self) -> Self {
         Self {
             count: self.count.saturating_add(other.count),
             asked: self.asked.saturating_add(other.asked),
             refused: self.refused.saturating_add(other.refused),
+            at: self.at.min(other.at),
         }
     }
 }
@@ -1742,14 +1822,13 @@ impl Owned {
         }
     }
 
-    /// `count` reported hits, each charged if there is room, or as debt while it would be
-    /// paid back within a refill time; the rest forgiven. In one step, whatever the count:
-    /// it comes from the wire.
-    fn apply(&mut self, count: u64, now: u64) {
+    /// `count` reported hits, admitted at `at`, applied at `now`: charged as of `at`, each
+    /// if there is room, or as debt while it would be paid back within a refill time of
+    /// `now`; the rest forgiven. In one step, whatever the count: it comes from the wire.
+    fn apply(&mut self, count: u64, at: u64, now: u64) {
         self.counted = self.counted.saturating_add(count);
         let mut bucket = self.bucket();
-        let owed = bucket.remaining_within(now, self.contract.refill_time(), count);
-        bucket.charge_many(now, owed);
+        bucket.charge_within(at, now, self.contract.refill_time(), count);
         self.bucket = bucket.state();
     }
 
@@ -1765,13 +1844,11 @@ impl Owned {
         }
     }
 
-    /// The bucket as `plane` is to take it: without what is held for it, which its own
-    /// ledger carries as hits still to report.
-    fn behind_for(&self, plane: PlaneId, now: u64) -> u128 {
-        let held = self.planes.get(plane).map_or(0, |record| record.held);
-        self.bucket()
-            .behind(now)
-            .saturating_sub(u128::from(held) * u128::from(self.contract.window.get()))
+    /// What is held for `plane`: hits its own ledger carries as still to report.
+    fn held_for(&self, plane: PlaneId) -> u64 {
+        self.planes
+            .get(plane)
+            .map_or(0, |record| u64::from(record.held))
     }
 
     fn bucket(&self) -> TokenBucket {
@@ -1812,7 +1889,7 @@ impl Owned {
     /// hits, and what it holds for the asks it decided — charged on top, what it holds kept
     /// for the hits to come, and the furthest of each data plane's marks.
     fn merge(&mut self, mine: Owned, now: u64) {
-        self.apply(mine.counted, now);
+        self.apply(mine.counted, now, now);
         for (plane, record) in mine.planes {
             let ours = self.planes.entry(plane);
             ours.applied = ours.applied.max(record.applied);
@@ -1987,6 +2064,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
         let mut answers = Vec::new();
         let from = batch.from;
         let oldest_ask = batch.oldest_ask;
+        let batch_made = batch.made;
         let (entries, asks) = if self.serving {
             (batch.entries, batch.asks)
         } else {
@@ -2025,6 +2103,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 asked,
                 refused,
                 seen,
+                age,
             } = entry.report
             {
                 changed = true;
@@ -2045,12 +2124,16 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 }
                 // No more of its hits asked than there are.
                 let asked = asked.min(count);
+                // Charged as of when the earliest was admitted, the batch's trip here counted
+                // in with its age, however long ago: charged any later, a batch of more hits than
+                // a bucket holds would be charged late, refusing a client within its rate.
                 let ready = record.take(
                     sequence,
                     Tally {
                         count,
                         asked,
                         refused,
+                        at: now.saturating_sub(age),
                     },
                 );
                 // What is held for the data plane settles first: counted and charged when
@@ -2062,12 +2145,13 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 // admitted, so not counted; the bucket left charged.
                 let dropped = record.take_held(ready.refused);
                 owned.counted = owned.counted.saturating_sub(dropped);
-                owned.apply(ready.count - settled, now);
+                owned.apply(ready.count - settled, ready.at, now);
             }
             let applied = owned.planes.get(from).map_or(0, |record| record.applied);
             answers.push(Answer {
                 key: entry.key.clone(),
-                behind: owned.behind_for(from, now),
+                behind: owned.bucket().behind(now),
+                held: owned.held_for(from),
                 applied,
                 others: owned.others(from, lately),
                 owned: true,
@@ -2111,11 +2195,9 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                     let owned = self.view.owners(key).0 == Some(self.me);
                     answers.push(Answer {
                         key: key.clone(),
-                        behind: if owned {
-                            held.behind_for(from, now)
-                        } else {
-                            held.bucket().behind(now)
-                        },
+                        behind: held.bucket().behind(now),
+                        // A pod deciding from its copy holds nothing: the owner counts.
+                        held: if owned { held.held_for(from) } else { 0 },
                         applied: held.planes.get(from).map_or(0, |record| record.applied),
                         others: held.others(from, lately),
                         owned,
@@ -2131,6 +2213,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             view: Some(self.view.clone()),
             life: self.life,
             number: self.answered,
+            made: batch_made,
         }
     }
 

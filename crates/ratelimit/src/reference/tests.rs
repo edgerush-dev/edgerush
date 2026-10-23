@@ -349,6 +349,121 @@ proptest! {
         }
         prop_assert_eq!(at_once, one_by_one);
     }
+
+    /// Charged within a wait as of now, a bucket charges what remains within it.
+    #[test]
+    fn charging_within_a_wait_now_charges_what_remains_within_it(
+        (bucket, last) in owing(), later in 0u64..5000, wait in 0u64..20_000, most in 0u64..30
+    ) {
+        let now = last + later;
+        let (mut within, mut apart) = (bucket.clone(), bucket);
+        let remaining = apart.remaining_within(now, wait, most);
+        apart.charge_many(now, remaining);
+        prop_assert_eq!(within.charge_within(now, now, wait, most), remaining);
+        prop_assert_eq!(within, apart);
+    }
+
+    /// Charged as of a time no earlier than its last, with room to owe all of them, a bucket
+    /// is charged as it would have been then.
+    #[test]
+    fn charging_within_as_of_an_earlier_time_is_charging_then(
+        (bucket, last) in owing(), then in 0u64..5000, later in 0u64..5000, count in 0u64..30
+    ) {
+        let (at, now) = (last + then, last + then + later);
+        let (mut within, mut then) = (bucket.clone(), bucket);
+        then.charge_many(at, count);
+        prop_assert_eq!(within.charge_within(at, now, u64::MAX / 4, count), count);
+        prop_assert_eq!(within.behind(now), then.behind(now));
+    }
+
+    /// Charging as of any earlier time, before what the bucket was last charged at too,
+    /// never frees room; and, all of it owed, never takes more than charging now would.
+    /// (With a wait, what is forgiven past it is rounded to a request from each time, and
+    /// either can leave the bucket under an interval further behind.)
+    #[test]
+    fn charging_in_the_past_frees_nothing_and_takes_no_more_than_now(
+        (bucket, last) in owing(), back in 0u64..5000, later in 0u64..5000,
+        wait in 0u64..20_000, most in 0u64..30
+    ) {
+        let now = last + later;
+        let at = now.saturating_sub(back);
+        let mut waited = bucket.clone();
+        waited.charge_within(at, now, wait, most);
+        let ample = u64::MAX / 4;
+        let (mut past, mut present) = (bucket.clone(), bucket.clone());
+        past.charge_within(at, now, ample, most);
+        present.charge_within(now, now, ample, most);
+        for t in [now, now + 1, now + 500, now + 5000] {
+            prop_assert!(waited.behind(t) >= bucket.behind(t), "freed room at {}", t);
+            prop_assert!(past.behind(t) <= present.behind(t), "took more than now at {}", t);
+        }
+    }
+
+    /// Charges taken out of order leave a bucket at least as far behind as in order.
+    #[test]
+    fn charges_out_of_order_leave_a_bucket_no_emptier(
+        (bucket, last) in owing(), first in 0u64..5000, gap in 0u64..5000, later in 0u64..5000,
+        (a, b) in (0u64..10, 0u64..10)
+    ) {
+        let (early, late) = (last + first, last + first + gap);
+        let now = late + later;
+        let ample = u64::MAX / 4;
+        let (mut in_order, mut out_of_order) = (bucket.clone(), bucket);
+        in_order.charge_within(early, now, ample, a);
+        in_order.charge_within(late, now, ample, b);
+        out_of_order.charge_within(late, now, ample, b);
+        out_of_order.charge_within(early, now, ample, a);
+        prop_assert!(out_of_order.behind(now) >= in_order.behind(now));
+    }
+
+    /// Charged within a wait in one step is charged one at a time.
+    #[test]
+    fn charging_within_at_once_is_charging_one_at_a_time(
+        (bucket, last) in owing(), back in 0u64..5000, later in 0u64..5000,
+        wait in 0u64..20_000, most in 0u64..30
+    ) {
+        let now = last + later;
+        let at = now.saturating_sub(back);
+        let (mut at_once, mut one_at_a_time) = (bucket.clone(), bucket);
+        let charged = at_once.charge_within(at, now, wait, most);
+        let mut counted = 0;
+        while counted < most && one_at_a_time.charge_within(at, now, wait, 1) == 1 {
+            counted += 1;
+        }
+        prop_assert_eq!(charged, counted);
+        prop_assert_eq!(at_once, one_at_a_time);
+    }
+
+    /// Rebased as of now, a bucket is set behind and charged on top, as now.
+    #[test]
+    fn rebasing_now_is_setting_behind_and_charging_on_top(
+        (bucket, last) in owing(), later in 0u64..5000, behind in 0u128..100_000,
+        extra in 0u64..30
+    ) {
+        let now = last + later;
+        let (mut rebased, mut apart) = (bucket.clone(), bucket);
+        rebased.rebase(now, behind, extra);
+        apart.set_behind(now, behind);
+        apart.charge_many(now, extra);
+        prop_assert_eq!(rebased, apart);
+    }
+
+    /// Rebased as of an earlier time, a bucket is as far behind then as it is set, its
+    /// extra charged on top, and refills from then.
+    #[test]
+    fn rebasing_as_of_an_earlier_time_refills_from_then(
+        (mut bucket, last) in owing(), back in 0u64..5000, later in 0u64..5000,
+        behind in 0u128..100_000, extra in 0u64..30
+    ) {
+        let now = last + later;
+        let at = now.saturating_sub(back);
+        bucket.rebase(at, behind, extra);
+        let set = behind + u128::from(extra) * bucket.window;
+        for t in [now, now + 1, now + 500, now + 5000] {
+            let refilled = u128::from(t - at) * bucket.limit;
+            prop_assert_eq!(bucket.behind(t), set.saturating_sub(refilled));
+        }
+    }
 }
 
 /// Counts of any size are taken in one step, and terms of any size without overflowing.

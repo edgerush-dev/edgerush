@@ -481,6 +481,42 @@ impl TokenBucket {
         self.arrival = Some(from.saturating_add(u128::from(count) * self.window));
     }
 
+    /// Charges up to `most` requests admitted at `at`, one after another as of then: each
+    /// that finds the bucket admitting again within `wait` of `now`, the rest forgiven; how
+    /// many it charged. `at` may be earlier than times the bucket was given before: a charge
+    /// moves the arrival time on from the later of it and `at`, so a charge taken late never
+    /// frees room, and charges taken out of their order leave the bucket at least as far
+    /// behind as in order. `at` after `now` is taken as `now`. In one step, whatever the
+    /// count.
+    pub fn charge_within(&mut self, at: u64, now: u64, wait: u64, most: u64) -> u64 {
+        let (now, scaled) = self.scaled(now);
+        let at = u128::from(at.min(now)) * self.limit;
+        let from = self.arrival.map_or(at, |arrival| arrival.max(at));
+        // The furthest the arrival time may be when a request is charged: what the bucket
+        // admits at `now`, and `wait` more.
+        let furthest = scaled
+            .saturating_add(self.tolerance)
+            .saturating_add(u128::from(wait) * self.limit);
+        if most == 0 || from > furthest {
+            return 0;
+        }
+        let charged =
+            u64::try_from((furthest - from) / self.window + 1).map_or(most, |all| all.min(most));
+        self.last = now;
+        self.arrival = Some(from.saturating_add(u128::from(charged) * self.window));
+        charged
+    }
+
+    /// Sets the bucket to be `behind` from full as of `at`, as [`behind`](Self::behind) says
+    /// it, with `extra` requests charged on top: a copy of a bucket read at `at`, charged with
+    /// what its holder admitted that the bucket read does not hold. `at` may be earlier than
+    /// times the bucket was given before: it refills from `at`.
+    pub fn rebase(&mut self, at: u64, behind: u128, extra: u64) {
+        let ahead = behind.saturating_add(u128::from(extra) * self.window);
+        self.last = self.last.max(at);
+        self.arrival = (ahead > 0).then(|| (u128::from(at) * self.limit).saturating_add(ahead));
+    }
+
     /// What the bucket holds besides its terms, in less room: for holding many buckets
     /// whose terms are kept elsewhere, each made again with [`from_state`](Self::from_state)
     /// to be used.

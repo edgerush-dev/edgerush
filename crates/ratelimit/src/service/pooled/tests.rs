@@ -842,7 +842,7 @@ fn a_full_count_defers_and_holds_still_settle() {
         "the given-back place free again"
     );
     assert_eq!(entry.take(Op::Admit, 0).0, Taken::Full);
-    let (drained, _) = entry.drain(0, Cycle::AsItIs);
+    let (drained, _, _) = entry.drain(0, Cycle::AsItIs);
     assert_eq!(drained, 4);
     assert_eq!(decide(&[&entry], 0).local, Local::Admit);
 }
@@ -940,10 +940,10 @@ fn only_a_key_with_waiters_wants_waking() {
     assert!(!x.settle(false, 0).0);
     assert!(x.take(Op::Admit, 0).0.done());
     x.add_waiter();
-    assert!(x.drain(0, Cycle::AsItIs).1);
+    assert!(x.drain(0, Cycle::AsItIs).2);
     x.remove_waiter();
     assert!(x.take(Op::Admit, 0).0.done());
-    assert!(!x.drain(0, Cycle::AsItIs).1);
+    assert!(!x.drain(0, Cycle::AsItIs).2);
 }
 
 /// An answer racing admissions rebases the bucket on the owner's view and charges every
@@ -973,6 +973,7 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
             entries: vec![crate::service::Answer {
                 key: key.into(),
                 behind: 0,
+                held: 0,
                 applied: 0,
                 others: 0,
                 owned: true,
@@ -981,6 +982,7 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
             view: None,
             life: 0,
             number: 0,
+            made: 0,
         },
         0,
     );
@@ -997,6 +999,7 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
             entries: vec![crate::service::Answer {
                 key: key.into(),
                 behind: 3 * u128::from(c.window.get()),
+                held: 0,
                 applied: 1,
                 others: 0,
                 owned: true,
@@ -1005,6 +1008,7 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
             view: None,
             life: 0,
             number: 0,
+            made: 0,
         },
         0,
     );
@@ -1013,6 +1017,195 @@ fn a_rebase_charges_what_the_owner_has_not_seen_once() {
         100 - 6,
         "the owner's three, and the three it has not seen"
     );
+}
+
+/// Answers from a pod that does not say back when their batch was made — `made` 0 — come
+/// from one that charges hits as they arrive: their buckets are taken as of when the
+/// answers came, not as of time 0 and refilled since.
+#[test]
+fn answers_that_do_not_say_when_are_taken_as_they_come() {
+    let mut participant = participant();
+    let key: &[u8] = b"k";
+    let c = contract(100, 10);
+    participant.ensure(key, c, 0);
+    let entry = participant.entries(&[(key, c)]).remove(0);
+    let now = 50 * INTERVAL;
+    participant.on_answers(
+        Answers {
+            from: 0,
+            entries: vec![crate::service::Answer {
+                key: key.into(),
+                behind: 5 * u128::from(c.window.get()),
+                held: 0,
+                applied: 0,
+                others: 0,
+                owned: true,
+            }],
+            decided: Vec::new(),
+            view: None,
+            life: 0,
+            number: 0,
+            made: 0,
+        },
+        now,
+    );
+    let bucket = entry.terms.bucket;
+    assert_eq!(
+        bucket.remaining(entry.snapshot().arrival, bucket.units(now)),
+        5
+    );
+}
+
+/// Answers whose batch was made long before they came — a lost packet waiting for TCP to
+/// send it again — are taken as of a cycle before they came, not as of then: the trip's
+/// refill counted no further than a cycle.
+#[test]
+fn answers_held_up_are_taken_as_of_no_more_than_a_cycle_before() {
+    let mut participant = participant();
+    let key: &[u8] = b"k";
+    let c = contract(100, 10);
+    participant.ensure(key, c, 0);
+    let entry = participant.entries(&[(key, c)]).remove(0);
+    let now = 50 * INTERVAL;
+    participant.on_answers(
+        Answers {
+            from: 0,
+            entries: vec![crate::service::Answer {
+                key: key.into(),
+                behind: 5 * u128::from(c.window.get()),
+                held: 0,
+                applied: 0,
+                others: 0,
+                owned: true,
+            }],
+            decided: Vec::new(),
+            view: None,
+            life: 0,
+            number: 0,
+            made: 20 * INTERVAL,
+        },
+        now,
+    );
+    let bucket = entry.terms.bucket;
+    assert_eq!(
+        entry.snapshot().arrival,
+        bucket.units(now - CYCLE) + 5 * 65_536
+    );
+}
+
+/// A client at exactly its rate is admitted, however long its hits take to reach the owner
+/// and its answer to come back: the owner charges a hit as of when it was admitted, not as
+/// of when the batch arrives, and the copy taken from the answer loses no time either.
+#[test]
+fn a_client_at_exactly_its_rate_is_admitted_after_a_round_trip() {
+    use crate::reference::Model as _;
+    let mut participant = one_in_flight();
+    let mut pod = pod(1);
+    let (key, c): (&[u8], Contract) = (b"k", contract(1, 1));
+    let interval = c.window.get();
+    let mut exact = c.bucket();
+    assert!(exact.decide(0));
+    assert_eq!(participant.decide_all(&[(key, c)], 0), Decision::Admit);
+    participant.on_cycle(CYCLE);
+    let (exchange, batch) = only_exchange(&mut participant);
+    let answers = pod.on_batch(batch, CYCLE + MS);
+    participant.on_answers_to(exchange, answers, CYCLE + 2 * MS);
+    assert!(exact.decide(interval));
+    assert_eq!(
+        participant.decide_all(&[(key, c)], interval),
+        Decision::Admit,
+        "one interval after the last, as a plain bucket admits it"
+    );
+}
+
+/// A participant as the proxy runs it — one exchange in flight to a pod, cold keys decided
+/// from their copies, what it has to send sent every turn — and its pod, batches taking
+/// `there` to reach the pod and answers `back` to return, a cycle every `CYCLE`: requests at
+/// `times`. Whether each was admitted, `None` if never decided.
+fn decided_over_round_trips(
+    c: Contract,
+    times: &[u64],
+    there: u64,
+    back: u64,
+) -> Vec<Option<bool>> {
+    let mut participant = one_in_flight();
+    let mut pod = pod(1);
+    let key: &[u8] = b"k";
+    let mut decided = vec![None; times.len()];
+    // In order of arrival, each taking as long: exchange, answers, and when.
+    let mut answers: VecDeque<(u64, u64, Answers)> = VecDeque::new();
+    let mut next_cycle = CYCLE;
+    let last = times.last().copied().unwrap_or(0);
+    let mut at = 0;
+    loop {
+        let request = times.get(at).copied();
+        let answer = answers.front().map(|(when, _, _)| *when);
+        // Requests first at the same instant, as the harder order.
+        let now = [request, Some(next_cycle), answer]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap();
+        if request == Some(now) {
+            decided[at] = match participant.decide_all(&[(key, c)], now) {
+                Decision::Admit => Some(true),
+                Decision::Refuse => Some(false),
+                waits => panic!("decided from the copy, not {waits:?}"),
+            };
+            at += 1;
+        } else if answer == Some(now) {
+            let (_, exchange, answer) = answers.pop_front().unwrap();
+            participant.on_answers_to(exchange, answer, now);
+        } else {
+            if next_cycle > last + 4 * CYCLE && at == times.len() && answers.is_empty() {
+                return decided;
+            }
+            participant.on_cycle(now);
+            next_cycle += CYCLE;
+        }
+        for (_, exchange, batch) in participant.take_exchanges() {
+            let answer = pod.on_batch(batch, now + there);
+            answers.push_back((now + there + back, exchange, answer));
+        }
+    }
+}
+
+proptest! {
+    /// Traffic a plain token bucket admits all of, over many rates and bursts, is admitted
+    /// all by a participant however long its messages take: its hits are charged as of when
+    /// it admitted them, and its copies taken as of when it sent them.
+    #[test]
+    fn what_a_plain_bucket_admits_a_participant_admits_over_round_trips(
+        limit in 1u64..200, units in 16u64..800, burst in 1u64..12,
+        gaps in prop::collection::vec(prop_oneof![2 => Just(1u64), 1 => 0u64..3, 1 => 0u64..40], 1..80),
+        jitter in prop::collection::vec(0u64..1_000_000, 80),
+        there in 0u64..5_000_000, back in 0u64..5_000_000,
+    ) {
+        use crate::reference::Model as _;
+        // A whole number of nanoseconds a unit, so that a request at the edge is at it in
+        // units too.
+        let interval = units * 65_536;
+        let n = |n| NonZeroU64::new(n).unwrap();
+        let c = Contract { limit: n(limit), window: n(limit * interval), burst: n(burst) };
+        // Gaps of whole intervals, exactly at the edge, some a little more.
+        let mut plain = c.bucket();
+        let mut times = Vec::new();
+        let mut now = 0;
+        for (gap, jitter) in gaps.iter().zip(&jitter) {
+            now += gap * interval + if *gap > 2 { *jitter } else { 0 };
+            if plain.decide(now) {
+                times.push(now);
+            }
+        }
+        let decided = decided_over_round_trips(c, &times, there, back);
+        let refused: Vec<(u64, Option<bool>)> = times
+            .iter()
+            .zip(&decided)
+            .filter(|(_, admitted)| **admitted != Some(true))
+            .map(|(at, admitted)| (*at, *admitted))
+            .collect();
+        prop_assert!(refused.is_empty(), "refused {:?} of {:?}", refused, times);
+    }
 }
 
 /// A request under two keys is held on both or neither: the second without room gives
@@ -1309,9 +1502,11 @@ fn others_hits(key: &[u8], c: Contract, count: u64) -> Batch {
                 asked: 0,
                 refused: 0,
                 seen: 0,
+                age: 0,
             },
         }],
         asks: Vec::new(),
+        made: 0,
     }
 }
 
@@ -1454,6 +1649,7 @@ fn a_late_answer_still_acknowledges() {
             view: None,
             life: 1,
             number: late.number + 1,
+            made: 5 * CYCLE,
         },
         6 * CYCLE,
     );
@@ -1940,6 +2136,7 @@ fn unseen(sequence: u64) -> Unseen {
         count: sequence,
         asked: 0,
         refused: 0,
+        admitted: sequence,
         first: sequence,
         last: sequence,
     }
@@ -2366,6 +2563,7 @@ fn idle_keys_are_evicted_at_their_time_without_a_scan() {
             entries: vec![Answer {
                 key: entries[3].key().into(),
                 behind: 0,
+                held: 0,
                 applied: 1,
                 others: 0,
                 owned: true,
@@ -2374,6 +2572,7 @@ fn idle_keys_are_evicted_at_their_time_without_a_scan() {
             view: None,
             life: 0,
             number: 0,
+            made: 300 * MS,
         },
         300 * MS,
     );

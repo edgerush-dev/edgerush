@@ -3,7 +3,9 @@
 //! refused, its cycle's share spent and its bucket empty; and a request under two and three
 //! limits, all warm, admitted. A thousand other keys held, so that the lookup is not a map
 //! of one. And a worker meeting a key it holds no handle to, in its process's registry of a
-//! hundred thousand: found, made by another worker; and made, cold keys decided locally.
+//! hundred thousand: found, made by another worker; and made, cold keys decided locally. And
+//! a worker deciding on a key it holds, as the proxy's do: the first request of a cycle, which
+//! starts the key's count and notes when, one after it, and one refused, the bucket empty.
 //!
 //! Linux only (valgrind): `cargo bench -p edgerush-ratelimit --bench decide`, see the
 //! repository README.
@@ -17,7 +19,7 @@
     reason = "the iai-callgrind macros generate public items without docs"
 )]
 
-use edgerush_ratelimit::service::pooled::{Entry, Participant, Registry};
+use edgerush_ratelimit::service::pooled::{self, Entry, Levers, Outcome, Participant, Registry};
 use edgerush_ratelimit::service::{Contract, DataPlane, Decision, Keyed, ServicePod, View};
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use std::hint::black_box;
@@ -135,6 +137,51 @@ fn find_or_make(registry: Shared) -> (Made, Shared) {
     (made, registry)
 }
 
+/// A worker's handle to `KEY`'s entry under a bucket of `burst`, warm: admitted, reported,
+/// answered and visited at the next cycle, which leaves its count at none; and `admitted`
+/// requests decided on it since, at 21 ms.
+fn held(burst: u64, admitted: usize) -> Arc<Entry> {
+    let view = View {
+        epoch: 1,
+        pods: vec![0],
+    };
+    let mut pod: ServicePod = ServicePod::new(0, 10 * MS, view.clone());
+    let hasher = Keyed::new([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
+    let mut participant =
+        Participant::new(1, 10 * MS, view, hasher).expect("native 128-bit atomics on Linux");
+    participant.set_levers(Levers {
+        poll_quiet: false,
+        ask_cold: false,
+    });
+    let contract = contract(burst);
+    participant.decide_all(&[(KEY, contract)], 0);
+    participant.on_cycle(10 * MS);
+    for (_, batch) in participant.take_outgoing() {
+        let answers = pod.on_batch(batch, 10 * MS);
+        participant.on_answers(answers, 10 * MS);
+    }
+    participant.on_cycle(20 * MS);
+    let entry = participant.entries(&[(KEY, contract)]).remove(0);
+    for _ in 0..admitted {
+        let _decided = pooled::decide(&[&entry], 21 * MS);
+    }
+    entry
+}
+
+#[library_benchmark]
+#[bench::first_of_a_cycle(held(100, 0))]
+#[bench::admitted(held(100, 1))]
+#[bench::refused_empty(held(1, 1))]
+fn worker(entry: Arc<Entry>) -> (Outcome, Arc<Entry>) {
+    let outcome = pooled::decide(&[black_box(&*entry)], black_box(22 * MS));
+    (outcome, entry)
+}
+
 library_benchmark_group!(name = data_plane; benchmarks = decide, decide_all);
 library_benchmark_group!(name = registry_of_keys; benchmarks = find, find_or_make);
-main!(library_benchmark_groups = data_plane, registry_of_keys);
+library_benchmark_group!(name = participant; benchmarks = worker);
+main!(
+    library_benchmark_groups = data_plane,
+    registry_of_keys,
+    participant
+);

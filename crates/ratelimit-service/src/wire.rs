@@ -40,6 +40,10 @@ pub struct Hits {
     /// Requests of asks given up that the data plane refused itself.
     #[prost(uint64, tag = "5")]
     pub refused: u64,
+    /// How long before the batch was made the earliest of them was admitted, in
+    /// nanoseconds; 0, from a data plane that does not say, charges them as they arrive.
+    #[prost(uint64, tag = "6")]
+    pub age_ns: u64,
 }
 
 /// Nothing to report; a fresh copy, please.
@@ -114,6 +118,10 @@ pub struct Batch {
     /// The oldest of the data plane's asks still in flight, or one past its last.
     #[prost(uint64, tag = "4")]
     pub oldest_ask: u64,
+    /// When the data plane made it, on its own clock, in nanoseconds: said back with the
+    /// answers.
+    #[prost(uint64, tag = "5")]
+    pub made_ns: u64,
 }
 
 /// An ask's decision.
@@ -147,6 +155,9 @@ pub struct Answer {
     /// Whether the pod owns the key, rather than answering an ask from its copy.
     #[prost(bool, tag = "6")]
     pub owned: bool,
+    /// Of the receiver's hits still to reach the pod, how many `behind` holds charged.
+    #[prost(uint64, tag = "7")]
+    pub held: u64,
 }
 
 /// Which service pods serve, as they agree.
@@ -181,6 +192,9 @@ pub struct Answers {
     /// Counted up with each answer the pod gives in its life.
     #[prost(uint64, tag = "6")]
     pub number: u64,
+    /// The batch's `made_ns`, said back; 0 from a pod that does not.
+    #[prost(uint64, tag = "7")]
+    pub made_ns: u64,
 }
 
 /// What an owner knows of one data plane.
@@ -421,12 +435,14 @@ impl From<service::Batch> for Batch {
                             asked,
                             refused,
                             seen,
+                            age,
                         } => Report::Hits(Hits {
                             sequence,
                             count,
                             seen,
                             asked,
                             refused,
+                            age_ns: age,
                         }),
                         service::Report::Poll => Report::Poll(Poll {}),
                     }),
@@ -450,6 +466,7 @@ impl From<service::Batch> for Batch {
                 })
                 .collect(),
             oldest_ask: batch.oldest_ask,
+            made_ns: batch.made,
         }
     }
 }
@@ -474,6 +491,7 @@ impl TryFrom<Batch> for service::Batch {
                         asked: hits.asked,
                         refused: hits.refused,
                         seen: hits.seen,
+                        age: hits.age_ns,
                     },
                     Report::Poll(_) => service::Report::Poll,
                 };
@@ -518,6 +536,7 @@ impl TryFrom<Batch> for service::Batch {
             entries,
             asks,
             oldest_ask: batch.oldest_ask,
+            made: batch.made_ns,
         })
     }
 }
@@ -535,6 +554,7 @@ impl From<service::Answers> for Answers {
                     applied: answer.applied,
                     others: answer.others,
                     owned: answer.owned,
+                    held: answer.held,
                 })
                 .collect(),
             view: answers.view.map(View::from),
@@ -545,6 +565,7 @@ impl From<service::Answers> for Answers {
                 .collect(),
             life: answers.life,
             number: answers.number,
+            made_ns: answers.made,
         }
     }
 }
@@ -562,6 +583,7 @@ impl From<Answers> for service::Answers {
                     applied: answer.applied,
                     others: answer.others,
                     owned: answer.owned,
+                    held: answer.held,
                 })
                 .collect(),
             decided: answers
@@ -572,6 +594,7 @@ impl From<Answers> for service::Answers {
             view: answers.view.map(service::View::from),
             life: answers.life,
             number: answers.number,
+            made: answers.made_ns,
         }
     }
 }
@@ -670,15 +693,17 @@ mod tests {
                 any::<u64>(),
                 any::<u64>(),
                 any::<u64>(),
+                any::<u64>(),
                 any::<u64>()
             )
-                .prop_map(|(sequence, count, asked, refused, seen)| {
+                .prop_map(|(sequence, count, asked, refused, seen, age)| {
                     service::Report::Hits {
                         sequence,
                         count,
                         asked,
                         refused,
                         seen: seen % sequence,
+                        age,
                     }
                 }),
             Just(service::Report::Poll),
@@ -712,13 +737,14 @@ mod tests {
             any::<u64>(),
             prop::collection::vec(entry, 0..8),
             prop::collection::vec(ask, 0..3),
-            any::<u64>(),
+            any::<(u64, u64)>(),
         )
-            .prop_map(|(from, entries, asks, oldest_ask)| service::Batch {
+            .prop_map(|(from, entries, asks, (oldest_ask, made))| service::Batch {
                 from,
                 entries,
                 asks,
                 oldest_ask,
+                made,
             })
     }
 
@@ -727,16 +753,19 @@ mod tests {
             key(),
             any::<u64>(),
             any::<u64>(),
+            any::<(u64, bool)>(),
             any::<u64>(),
-            any::<bool>(),
         )
-            .prop_map(|(key, behind, applied, others, owned)| service::Answer {
-                key,
-                behind: u128::from(behind),
-                applied,
-                others,
-                owned,
-            });
+            .prop_map(
+                |(key, behind, applied, (others, owned), held)| service::Answer {
+                    key,
+                    behind: u128::from(behind),
+                    applied,
+                    others,
+                    owned,
+                    held,
+                },
+            );
         let view = prop::option::of(
             (any::<u64>(), prop::collection::vec(any::<u32>(), 0..4))
                 .prop_map(|(epoch, pods)| service::View { epoch, pods }),
@@ -746,18 +775,19 @@ mod tests {
             prop::collection::vec(answer, 0..8),
             prop::collection::vec(any::<(u64, u64)>(), 0..3),
             view,
-            any::<(u64, u64)>(),
+            any::<(u64, u64, u64)>(),
         )
-            .prop_map(
-                |(from, entries, decided, view, (life, number))| service::Answers {
+            .prop_map(|(from, entries, decided, view, (life, number, made))| {
+                service::Answers {
                     from,
                     entries,
                     decided,
                     view,
                     life,
                     number,
-                },
-            )
+                    made,
+                }
+            })
     }
 
     fn replicas() -> impl Strategy<Value = service::Replicas> {
@@ -882,6 +912,7 @@ mod tests {
         let batch = |entry| Batch {
             from: 1,
             oldest_ask: 0,
+            made_ns: 0,
             entries: vec![entry],
             asks: Vec::new(),
         };
@@ -933,6 +964,7 @@ mod tests {
         let hits = |sequence, seen| Batch {
             from: 1,
             oldest_ask: 0,
+            made_ns: 0,
             entries: vec![Entry {
                 key: b"k".to_vec(),
                 contract: Some(Contract {
@@ -946,6 +978,7 @@ mod tests {
                     seen,
                     asked: 0,
                     refused: 0,
+                    age_ns: 0,
                 })),
             }],
             asks: Vec::new(),
@@ -979,6 +1012,7 @@ mod tests {
         let ask = |keys| Batch {
             from: 1,
             oldest_ask: 0,
+            made_ns: 0,
             entries: Vec::new(),
             asks: vec![Ask {
                 id: 1,

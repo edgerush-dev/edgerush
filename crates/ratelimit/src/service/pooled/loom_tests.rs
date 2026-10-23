@@ -92,7 +92,7 @@ fn loom_admissions_racing_a_drain_are_counted_once_and_a_count_left_is_signalled
             })
         };
         let (a, b) = (admit(&entry), admit(&entry));
-        let (drained, _) = entry.drain(0, Cycle::AsItIs);
+        let (drained, _, _) = entry.drain(0, Cycle::AsItIs);
         let (a, b) = (a.join().unwrap(), b.join().unwrap());
         let left = entry.snapshot().unreported;
         assert_eq!(drained + left, a.0 + b.0, "each admission counted once");
