@@ -2465,6 +2465,46 @@ fn a_key_evicted_for_capacity_is_freed_at_once() {
     assert!(participant.evictions.is_empty());
 }
 
+/// Scheduled, the two lists of keys to visit keep their room from cycle to cycle, however
+/// few keys later cycles visit: a list made for each cycle grows from nothing and is freed,
+/// which, for a large one, holds up the workers (06 §4).
+#[test]
+fn the_lists_of_keys_to_visit_keep_their_room() {
+    const KEYS: usize = 1_000;
+    let mut participant = one_in_flight();
+    participant.set_scheduled(true);
+    let mut pod = pod(1);
+    let c = contract(100, 10);
+    for n in 0..KEYS {
+        let name = format!("k{n}").into_bytes();
+        assert_eq!(participant.decide_all(&[(&name, c)], 0), Decision::Admit);
+    }
+    let lists = |participant: &Participant<FixedState>| {
+        let (one, other) = (&participant.runnable, &participant.next_runnable);
+        let mut blocks = [one.as_ptr() as usize, other.as_ptr() as usize];
+        blocks.sort_unstable();
+        (blocks, one.capacity().min(other.capacity()), one.len())
+    };
+    let mut first = None;
+    for cycle in 1..8 {
+        let now = cycle * CYCLE;
+        participant.on_cycle(now);
+        for (_, exchange, batch) in participant.take_exchanges() {
+            participant.on_answers_to(exchange, pod.on_batch(batch, now), now);
+        }
+        let (blocks, room, _) = lists(&participant);
+        match first {
+            None => first = Some(blocks),
+            Some(first) => assert_eq!(blocks, first, "cycle {cycle}: the same two lists"),
+        }
+        assert!(room >= KEYS, "cycle {cycle}: room for {room} keys");
+    }
+    assert!(
+        lists(&participant).2 < KEYS / 10,
+        "later cycles visit few keys"
+    );
+}
+
 /// A key evicted and made again numbers its reports past those its earlier life sent,
 /// scheduled or not: its owner, which still holds that life's numbers, counts them rather
 /// than taking them for reports it has applied.

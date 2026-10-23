@@ -16,6 +16,7 @@
 //!
 //! No I/O: the time is passed in; the transport's messages are the caller's to carry.
 
+mod chunked;
 mod sync;
 mod word;
 
@@ -30,8 +31,8 @@ use super::{
     Answers, Ask, Batch, Contract, Decided, Entry as BatchEntry, PlaneId, PodId,
     RESEND_AFTER_CYCLES, Report, Ticket, Unseen, View, group_name, longest,
 };
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use chunked::MinHeap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::sync::{Arc, RwLock};
 use sync::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicU128, Ordering, fence};
@@ -1050,7 +1051,7 @@ fn key_bytes(key: &[u8], workers: u64) -> u64 {
 /// a key no longer kept while that time keeps its entry, scheduled.
 #[must_use]
 pub fn entry_bytes(key: &[u8]) -> u64 {
-    (2 * size_of::<usize>() + size_of::<Entry>() + key.len() + size_of::<Reverse<Due>>()) as u64
+    (2 * size_of::<usize>() + size_of::<Entry>() + key.len() + size_of::<Due>()) as u64
 }
 
 /// The process's side of the protocol: one participant, its keys shared with its workers.
@@ -1109,10 +1110,14 @@ pub struct Participant<S> {
     scheduled: bool,
     /// Scheduled, the keys to visit at the next cycle, each once ([`Tracked::queued`]).
     runnable: Vec<Handle>,
+    /// Empty, the list `runnable` is swapped with each cycle: two kept, with their room,
+    /// rather than one made for every cycle, so that neither is grown from nothing or freed
+    /// again, a large block's growth and freeing holding up the workers (06 §4).
+    next_runnable: Vec<Handle>,
     /// Scheduled, when each key may next be idle enough to evict: one for each key, a later
     /// one put back in its place when one comes due early; and one for each entry replaced
     /// or evicted, until it comes or is dropped ([`Self::stale`]).
-    evictions: BinaryHeap<Reverse<Due>>,
+    evictions: MinHeap<Due>,
     /// Keys visited, all told.
     visits: u64,
 }
@@ -1306,7 +1311,8 @@ impl<S: BuildHasher + Clone> Participant<S> {
             spare: Spare::default(),
             scheduled: false,
             runnable: Vec::new(),
-            evictions: BinaryHeap::new(),
+            next_runnable: Vec::new(),
+            evictions: MinHeap::new(),
             visits: 0,
         })
     }
@@ -1508,7 +1514,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
     fn drop_stale(&mut self) {
         let keys = &self.keys;
         let mut freed = 0;
-        self.evictions.retain(|Reverse(due)| {
+        self.evictions.retain(|due| {
             let kept = keys
                 .get(&*due.entry.key)
                 .is_some_and(|tracked| Arc::ptr_eq(&tracked.entry, &due.entry));
@@ -1547,10 +1553,10 @@ impl<S: BuildHasher + Clone> Participant<S> {
         self.holding += key_bytes(&tracked.entry.key, self.workers);
         if self.scheduled {
             let at = idle_at(&tracked.entry);
-            self.evictions.push(Reverse(Due {
+            self.evictions.push(Due {
                 at,
                 entry: Arc::clone(&tracked.entry),
-            }));
+            });
         }
         let key = tracked.entry.key.clone();
         self.keys
@@ -1939,7 +1945,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             wake: false,
         };
         let mut visits = 0;
-        let mut next = Vec::new();
+        let mut next = std::mem::take(&mut self.next_runnable);
         // Taken before the visit, so that a signal lost during it asks for another.
         if !self.scheduled || self.registry.take_scan() {
             for (handle, tracked) in &mut self.keys {
@@ -1951,7 +1957,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 }
             }
         } else {
-            for handle in std::mem::take(&mut self.runnable) {
+            for handle in self.runnable.drain(..) {
                 let Some(tracked) = self.keys.get_mut(&*handle.0.key) else {
                     continue;
                 };
@@ -1968,7 +1974,8 @@ impl<S: BuildHasher + Clone> Participant<S> {
         }
         let (cut_off, wake) = (visit.cut_off, visit.wake);
         self.visits += visits;
-        self.runnable = next;
+        self.next_runnable = std::mem::replace(&mut self.runnable, next);
+        self.next_runnable.clear();
         self.wake |= wake;
         if cut_off && !self.view.pods.is_empty() {
             let at = usize::try_from(self.polls).unwrap_or(0) % self.view.pods.len();
@@ -2041,8 +2048,8 @@ impl<S: BuildHasher + Clone> Participant<S> {
     /// may be. A due whose key is gone, or has another entry, is dropped, and its entry with
     /// it.
     fn evict_due(&mut self, now: u64) {
-        while self.evictions.peek().is_some_and(|due| due.0.at <= now) {
-            let Some(Reverse(due)) = self.evictions.pop() else {
+        while self.evictions.peek().is_some_and(|due| due.at <= now) {
+            let Some(due) = self.evictions.pop() else {
                 break;
             };
             let kept = self
@@ -2061,10 +2068,10 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 self.keys.remove(&*due.entry.key);
             } else {
                 let at = idle_at(&due.entry).max(now + self.cycle);
-                self.evictions.push(Reverse(Due {
+                self.evictions.push(Due {
                     at,
                     entry: due.entry,
-                }));
+                });
             }
         }
     }
