@@ -403,10 +403,13 @@ async fn http3_connections_are_held_to_their_workers_connection_cap() {
             let proxy = Arc::new(Proxy::new(config, NonZeroUsize::MIN).unwrap());
             // Room for one HTTP/3 connection.
             let connections = Loads::new(1, 3, QUIC_MOST, 1);
+            // The first client asks for nothing, and must stay until it goes: under `SHORT`
+            // it would be closed for that within the second's wait, and the second let in
+            // or not as its next Initial happened to fall.
             let worker = Worker::made(
                 Arc::clone(&proxy),
                 H1Limits::default(),
-                SHORT,
+                Deadlines::default(),
                 0,
                 Some(Arc::clone(&connections)),
             );
