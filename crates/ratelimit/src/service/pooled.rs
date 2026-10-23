@@ -31,7 +31,7 @@ use super::{
     RESEND_AFTER_CYCLES, Report, Ticket, Unseen, View, group_name, longest,
 };
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::sync::{Arc, RwLock};
 use sync::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicU128, Ordering, fence};
@@ -834,7 +834,7 @@ struct Tracked {
     sent: u64,
     seen: u64,
     /// Batches sent and not yet seen applied.
-    unacknowledged: VecDeque<Unseen>,
+    unacknowledged: Unacknowledged,
     /// The ledger: admitted and not yet sent — drained from the entry's count, or decided by
     /// a service pod for a key it holds a copy of — still to go to the owner.
     unsent: u64,
@@ -843,7 +843,7 @@ struct Tracked {
     unsent_asked: u64,
     /// Requests of asks given up refused here, not yet sent.
     unsent_refused: u64,
-    heard: Option<u64>,
+    heard: Heard,
     bounded: bool,
     unreachable: bool,
     asking: u32,
@@ -859,7 +859,7 @@ impl Tracked {
         entry.set_flag(BOUNDED, self.bounded);
         entry.set_flag(UNREACHABLE, self.unreachable);
         entry.set_flag(ASKING, self.asking > 0);
-        let until = self.heard.map_or(0, |heard| {
+        let until = self.heard.get().map_or(0, |heard| {
             heard.saturating_add(entry.terms.hold).saturating_add(1)
         });
         entry.warm_until.store(until, Ordering::Release);
@@ -890,6 +890,94 @@ impl Tracked {
             && self.asking == 0
             && self.unacknowledged.is_empty()
             && now.saturating_sub(last) > 2 * self.entry.terms.hold
+    }
+}
+
+/// A list of a key's unacknowledged batches, behind a pointer.
+#[allow(
+    clippy::box_collection,
+    reason = "a pointer in every key's slot, rather than a list's three words, for what is rarely there"
+)]
+type List = Box<Vec<Unseen>>;
+
+/// A key's batches sent and not yet seen applied, in the order sent. Between cycles there
+/// are almost never any, so a key holds no room for them then: a pointer in its slot, the
+/// list taken when a batch is sent and given back once every batch is seen applied, rather
+/// than a list's room kept for the key's life.
+#[derive(Default)]
+struct Unacknowledged(Option<List>);
+
+impl Unacknowledged {
+    fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    fn as_slice(&self) -> &[Unseen] {
+        self.0.as_deref().map_or(&[], Vec::as_slice)
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [Unseen] {
+        self.0.as_deref_mut().map_or(&mut [], Vec::as_mut_slice)
+    }
+
+    /// Adds `unseen`, last, a list taken from `spare` if it has to be made.
+    fn push(&mut self, unseen: Unseen, spare: &mut Spare) {
+        self.0.get_or_insert_with(|| spare.take()).push(unseen);
+    }
+
+    /// Lets go of the batches seen applied, those numbered up to `seen`; of the list too,
+    /// to `spare`, if that was all of them.
+    fn acknowledge(&mut self, seen: u64, spare: &mut Spare) {
+        if let Some(list) = &mut self.0 {
+            list.retain(|unseen| unseen.sequence > seen);
+            if list.is_empty()
+                && let Some(list) = self.0.take()
+            {
+                spare.give(list);
+            }
+        }
+    }
+}
+
+/// Lists of unacknowledged batches given back, for keys to take rather than the allocator
+/// making and freeing one for nearly every batch a key sends: at most `SPARE_LISTS`, each
+/// with room for one batch, which is almost always all a list holds.
+#[derive(Default)]
+struct Spare(Vec<List>);
+
+/// The most lists [`Spare`] keeps.
+const SPARE_LISTS: usize = 1_024;
+
+impl Spare {
+    fn take(&mut self) -> List {
+        self.0
+            .pop()
+            .unwrap_or_else(|| Box::new(Vec::with_capacity(1)))
+    }
+
+    /// Keeps `list`, empty, unless it has more room than one batch's or enough are kept.
+    fn give(&mut self, list: List) {
+        if list.capacity() == 1 && self.0.len() < SPARE_LISTS {
+            self.0.push(list);
+        }
+    }
+}
+
+/// When a key's copy was last heard of from its owner, if it has been, in eight bytes rather
+/// than an option's sixteen, as the service pod keeps a data plane's last admission: one
+/// past the time, 0 if never.
+#[derive(Clone, Copy, Debug, Default)]
+struct Heard(u64);
+
+impl Heard {
+    /// Heard of at `at`.
+    fn at(at: u64) -> Self {
+        Self(at.saturating_add(1))
+    }
+
+    /// When, if ever.
+    fn get(self) -> Option<u64> {
+        self.0.checked_sub(1)
     }
 }
 
@@ -1004,6 +1092,8 @@ pub struct Participant<S> {
     /// `evictions`, keeps until it comes or is dropped ([`Self::drop_stale`]).
     stale: u64,
     evicted: u64,
+    /// Lists of unacknowledged batches given back, for keys to take.
+    spare: Spare,
     /// Whether each cycle visits only the keys that need it, rather than every key.
     scheduled: bool,
     /// Scheduled, the keys to visit at the next cycle, each once ([`Tracked::queued`]).
@@ -1050,6 +1140,7 @@ struct Visit<'a> {
     sending: &'a BTreeMap<PodId, u64>,
     outgoing: &'a mut BTreeMap<PodId, Vec<BatchEntry>>,
     numbered: &'a mut u64,
+    spare: &'a mut Spare,
     cut_off: bool,
     wake: bool,
 }
@@ -1070,7 +1161,7 @@ impl Visit<'_> {
         let (count, woken) = entry.drain(now, Cycle::Advance);
         tracked.unsent += count;
         self.wake |= woken;
-        tracked.bounded |= tracked.heard.is_some();
+        tracked.bounded |= tracked.heard.get().is_some();
         tracked.publish();
         let Some(owner) = tracked.owner else {
             return false;
@@ -1081,11 +1172,11 @@ impl Visit<'_> {
             return true;
         }
         let mut entries = Vec::new();
-        for unseen in &mut tracked.unacknowledged {
+        for unseen in tracked.unacknowledged.as_mut_slice() {
             unseen.empty_if_stale(hold, now);
         }
         let mut reported = false;
-        for unseen in &mut tracked.unacknowledged {
+        for unseen in tracked.unacknowledged.as_mut_slice() {
             if now - unseen.last >= self.resend_after {
                 unseen.last = now;
                 entries.push(BatchEntry {
@@ -1117,7 +1208,7 @@ impl Visit<'_> {
                 contract: entry.terms.contract,
                 report: unseen.report(tracked.seen),
             });
-            tracked.unacknowledged.push_back(unseen);
+            tracked.unacknowledged.push(unseen, self.spare);
             reported = true;
         }
         let last = entry.last_request.load(Ordering::Relaxed);
@@ -1134,6 +1225,7 @@ impl Visit<'_> {
             || (in_use
                 && tracked
                     .heard
+                    .get()
                     .is_none_or(|heard| now - heard >= self.resend_after));
         if !entries.is_empty() {
             self.outgoing.entry(owner).or_default().extend(entries);
@@ -1200,6 +1292,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             holding: 0,
             stale: 0,
             evicted: 0,
+            spare: Spare::default(),
             scheduled: false,
             runnable: Vec::new(),
             evictions: BinaryHeap::new(),
@@ -1428,11 +1521,11 @@ impl<S: BuildHasher + Clone> Participant<S> {
             owner,
             sent: self.numbered,
             seen: self.numbered,
-            unacknowledged: VecDeque::new(),
+            unacknowledged: Unacknowledged::default(),
             unsent: 0,
             unsent_asked: 0,
             unsent_refused: 0,
-            heard: None,
+            heard: Heard::default(),
             bounded: false,
             unreachable: false,
             asking: 0,
@@ -1830,6 +1923,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             sending: &self.sending,
             outgoing: &mut self.outgoing,
             numbered: &mut self.numbered,
+            spare: &mut self.spare,
             cut_off: false,
             wake: false,
         };
@@ -2057,9 +2151,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             if answer.owned && acknowledges {
                 let seen = answer.applied.min(tracked.sent);
                 tracked.seen = tracked.seen.max(seen);
-                tracked
-                    .unacknowledged
-                    .retain(|unseen| unseen.sequence > seen);
+                tracked.unacknowledged.acknowledge(seen, &mut self.spare);
             }
             if !current {
                 untaken.push((answer.key, answer.behind));
@@ -2068,6 +2160,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             tracked.entry.others.store(answer.others, Ordering::Release);
             let unseen: u64 = tracked
                 .unacknowledged
+                .as_slice()
                 .iter()
                 .map(|unseen| unseen.count)
                 .sum();
@@ -2090,7 +2183,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                     ..fields
                 })
             });
-            tracked.heard = Some(now);
+            tracked.heard = Heard::at(now);
             tracked.unreachable = false;
             tracked.publish();
             queue(&mut self.keys, &mut self.runnable, &answer.key);
@@ -2207,7 +2300,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 continue;
             };
             let entries = self.outgoing.entry(owner).or_default();
-            for unseen in &mut tracked.unacknowledged {
+            for unseen in tracked.unacknowledged.as_mut_slice() {
                 unseen.last = now;
                 entries.push(BatchEntry {
                     key: key.clone(),
