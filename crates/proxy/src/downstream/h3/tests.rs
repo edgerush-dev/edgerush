@@ -850,13 +850,7 @@ fn a_worker_that_runs_out_closes_its_heaviest_connection() {
         let mut light = Client::connect(server.address, "a.test").await;
         let id = heavy.request(&post("/heavy"), false);
         heavy.body(id, &vec![1; 700 << 10], false).await;
-        heavy.until(|_| storage.used() >= 700 << 10).await;
-        // Held here as well as by the server, so that it cannot go while it is looked at.
-        let heavier = server
-            .conns()
-            .into_iter()
-            .max_by_key(|conn| conn.charged())
-            .unwrap();
+        let heavier = charged_its_upload(&mut heavy, &server).await;
 
         // Both driven, so that what the server's socket had no room for is sent again.
         let id = light.request(&post("/light"), false);
@@ -908,20 +902,35 @@ fn a_worker_that_runs_out_closes_its_heaviest_connection() {
     });
 }
 
+/// The connection of `heavy`, its 700 KiB upload under way, once it is charged 700 KiB:
+/// held here as well as by the server, so that it cannot go while it is looked at. Its own
+/// charge is waited on, not the worker's, which holds the request's task too: a connection
+/// short of it has the rest of its upload still to come, which closing it would cut off.
+async fn charged_its_upload(heavy: &mut Client, server: &Server) -> Rc<Conn> {
+    heavy
+        .until(|_| {
+            server
+                .conns()
+                .iter()
+                .any(|conn| conn.charged() >= 700 << 10)
+        })
+        .await;
+    server
+        .conns()
+        .into_iter()
+        .max_by_key(|conn| conn.charged())
+        .unwrap()
+}
+
 /// A worker of 1 MiB whose heaviest connection, holding 700 KiB, was closed for a light one
 /// asking 400 KiB more, and whose driver has ended while the test still holds it: the light
 /// client, its request stream still open, and the closed one.
-async fn closed_and_still_held(storage: &Rc<Storage>, server: &Server) -> (Client, u64, Rc<Conn>) {
+async fn closed_and_still_held(server: &Server) -> (Client, u64, Rc<Conn>) {
     let mut heavy = Client::connect(server.address, "a.test").await;
     let mut light = Client::connect(server.address, "a.test").await;
     let id = heavy.request(&post("/heavy"), false);
     heavy.body(id, &vec![1; 700 << 10], false).await;
-    heavy.until(|_| storage.used() >= 700 << 10).await;
-    let heavier = server
-        .conns()
-        .into_iter()
-        .max_by_key(|conn| conn.charged())
-        .unwrap();
+    let heavier = charged_its_upload(&mut heavy, server).await;
     let id = light.request(&post("/light"), false);
     light.body(id, &vec![1; 400 << 10], false).await;
     let started = tokio::time::Instant::now();
@@ -954,7 +963,7 @@ fn a_shortage_the_closed_one_will_cover_closes_nobody() {
         let limit = 1 << 20;
         let storage = Storage::new(limit);
         let server = serving_in(short(), Rc::clone(&storage), Exchanges::default().core()).await;
-        let (mut light, id, heavier) = closed_and_still_held(&storage, &server).await;
+        let (mut light, id, heavier) = closed_and_still_held(&server).await;
 
         let before = storage.used();
         light.body(id, &vec![1; 64 << 10], false).await;
@@ -979,7 +988,7 @@ fn a_shortage_past_what_the_closed_one_holds_closes_the_next() {
     locally(async {
         let storage = Storage::new(1 << 20);
         let server = serving_in(short(), Rc::clone(&storage), Exchanges::default().core()).await;
-        let (mut light, id, heavier) = closed_and_still_held(&storage, &server).await;
+        let (mut light, id, heavier) = closed_and_still_held(&server).await;
 
         // Sent as far as quiche takes it until the server closes the connection, which it
         // does before all of it has come.
