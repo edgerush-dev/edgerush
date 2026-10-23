@@ -7,6 +7,7 @@
 use super::*;
 use crate::service::{Answer, DataPlane, FixedState, ServicePod};
 use proptest::prelude::*;
+use std::collections::VecDeque;
 use std::num::NonZeroU64;
 
 const MS: u64 = 1_000_000;
@@ -1890,6 +1891,114 @@ fn keys_under_one_contract_share_their_terms() {
     assert!(size_of::<Entry>() <= 128, "{}", size_of::<Entry>());
 }
 
+/// A key's slot in the participant's table takes 88 bytes, the table holding up to twice
+/// the room its keys take: the batches it has not seen acknowledged, which between cycles
+/// it almost never has, kept apart behind a pointer, and when its copy was last heard of
+/// in eight bytes.
+#[test]
+fn a_keys_slot_is_small() {
+    assert_eq!(size_of::<(Handle, Tracked)>(), 88);
+}
+
+/// When a key's copy was last heard of, kept in eight bytes, reads back as it was set:
+/// never, time 0 among the times.
+#[test]
+fn when_a_copy_was_heard_of_reads_back() {
+    assert_eq!(Heard::default().get(), None);
+    for at in [0, 1, 5 * MS] {
+        assert_eq!(Heard::at(at).get(), Some(at));
+    }
+}
+
+/// A batch numbered `sequence`, its count telling it apart.
+fn unseen(sequence: u64) -> Unseen {
+    Unseen {
+        sequence,
+        count: sequence,
+        asked: 0,
+        refused: 0,
+        first: sequence,
+        last: sequence,
+    }
+}
+
+proptest! {
+    /// Keys' unacknowledged batches behave as lists of them, sent in order and let go of as
+    /// they are seen applied; a key holds no list once there are none, and the lists given
+    /// back are kept empty, with room for one batch, for keys to take.
+    #[test]
+    fn unacknowledged_batches_are_lists_given_back_when_empty(
+        steps in proptest::collection::vec((0usize..3, proptest::option::of(0u64..4)), 0..96)
+    ) {
+        let mut spare = Spare::default();
+        let mut lists: [Unacknowledged; 3] = Default::default();
+        let mut models: [VecDeque<Unseen>; 3] = Default::default();
+        let (mut sent, mut seen) = ([0; 3], [0; 3]);
+        for (key, step) in steps {
+            let (list, model) = (&mut lists[key], &mut models[key]);
+            match step {
+                None => {
+                    sent[key] += 1;
+                    list.push(unseen(sent[key]), &mut spare);
+                    model.push_back(unseen(sent[key]));
+                }
+                Some(more) => {
+                    seen[key] = (seen[key] + more).min(sent[key]);
+                    list.acknowledge(seen[key], &mut spare);
+                    model.retain(|unseen| unseen.sequence > seen[key]);
+                }
+            }
+            let held: Vec<(u64, u64)> = list
+                .as_slice()
+                .iter()
+                .map(|unseen| (unseen.sequence, unseen.count))
+                .collect();
+            let want: Vec<(u64, u64)> = model
+                .iter()
+                .map(|unseen| (unseen.sequence, unseen.count))
+                .collect();
+            prop_assert_eq!(held, want);
+            prop_assert_eq!(list.is_empty(), model.is_empty());
+            prop_assert_eq!(list.0.is_none(), model.is_empty(), "no list kept for none");
+            prop_assert!(
+                spare.0.iter().all(|list| list.is_empty() && list.capacity() == 1),
+                "kept empty, room for one"
+            );
+        }
+    }
+}
+
+/// Lists given back are kept up to `SPARE_LISTS`, and only those with room for one batch:
+/// one grown while a key's batches went unacknowledged goes back to the allocator.
+#[test]
+fn spare_lists_are_kept_up_to_a_bound_with_room_for_one() {
+    let mut spare = Spare::default();
+    let mut grown = Unacknowledged::default();
+    for sequence in 1..=3 {
+        grown.push(unseen(sequence), &mut spare);
+    }
+    grown.acknowledge(3, &mut spare);
+    assert!(grown.is_empty());
+    assert_eq!(spare.0.len(), 0, "room for more than one: not kept");
+    for _ in 0..SPARE_LISTS + 5 {
+        let mut list = Unacknowledged::default();
+        list.push(unseen(1), &mut spare);
+        list.acknowledge(1, &mut spare);
+    }
+    assert_eq!(spare.0.len(), 1, "the one list taken back each time");
+    let mut lists: Vec<Unacknowledged> = (0..SPARE_LISTS + 5)
+        .map(|_| Unacknowledged::default())
+        .collect();
+    for list in &mut lists {
+        list.push(unseen(1), &mut spare);
+    }
+    assert_eq!(spare.0.len(), 0, "taken before any is made");
+    for list in &mut lists {
+        list.acknowledge(1, &mut spare);
+    }
+    assert_eq!(spare.0.len(), SPARE_LISTS, "no more kept");
+}
+
 #[test]
 fn the_platform_has_native_128_bit_atomics() {
     assert!(supported(), "the participant would not start here");
@@ -1976,7 +2085,7 @@ fn replay(schedule: &[(Event, u64)]) {
                         entry.cold(now),
                         tracked.asking,
                         tracked.bounded,
-                        tracked.heard,
+                        tracked.heard.get(),
                     )
                 });
                 format!("{want:?}/{got:?}")
@@ -1997,8 +2106,8 @@ fn replay(schedule: &[(Event, u64)]) {
             let got = pooled.participant.keys.get(key).map(|t| {
                 (
                     t.entry.last_request.load(Ordering::Relaxed),
-                    t.heard,
-                    t.unacknowledged.len(),
+                    t.heard.get(),
+                    t.unacknowledged.as_slice().len(),
                     t.entry.snapshot().unreported + t.unsent,
                     t.sent,
                 )
