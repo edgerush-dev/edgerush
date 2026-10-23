@@ -367,9 +367,10 @@ struct Terms {
     bucket: Bucket,
     /// The contract's refill time: how long a copy stays fresh after an answer.
     hold: u64,
-    /// The protocol's cycle, and what the contract refills in one.
+    /// The protocol's cycle, and what the contract refills in one, in requests and in units.
     cycle: u64,
     refill: u64,
+    refill_units: u64,
 }
 
 impl Terms {
@@ -380,6 +381,7 @@ impl Terms {
             hold: contract.refill_time(),
             cycle,
             refill: contract.refilled(cycle),
+            refill_units: Bucket::new(contract).units(cycle),
         }
     }
 }
@@ -546,6 +548,7 @@ impl Entry {
         Advance {
             cycle: self.terms.cycle,
             refill: self.terms.refill,
+            refill_units: self.terms.refill_units,
             others: self.others.load(Ordering::Acquire),
             record: self.record.load(Ordering::Acquire),
         }

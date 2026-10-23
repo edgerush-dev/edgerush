@@ -2388,3 +2388,26 @@ fn a_share_of_the_cycle_divides_what_the_copy_has_among_those_admitting() {
     // Nine left, one refilled, among three.
     assert_eq!(net.copy(0, b"k").allowance, Some(3));
 }
+
+/// What the copy has left and what the cycle refills are counted together and rounded once:
+/// half a request left and 6.67 refilled, one request every 1.5 ms, is a share of 7 — not
+/// 0 and 6, which would refuse a client at exactly its rate.
+#[test]
+fn a_share_rounds_what_is_left_and_the_refill_together() {
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, b"k", 0);
+    let at = net.planes[0].keys.get_mut(&b"k"[..]).unwrap();
+    let n = |n| NonZeroU64::new(n).unwrap();
+    at.contract = Contract {
+        limit: n(2),
+        window: n(3 * MS),
+        burst: n(1),
+    };
+    at.bucket = at.contract.bucket();
+    at.bucket.charge_many(0, 1);
+    at.others = 0;
+    at.allowance = None;
+    at.shared = None;
+    net.planes[0].on_cycle(3 * MS / 4);
+    assert_eq!(net.copy(0, b"k").allowance, Some(7));
+}

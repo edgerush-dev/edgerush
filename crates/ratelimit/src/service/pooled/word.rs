@@ -215,12 +215,24 @@ impl Bucket {
     }
 
     /// Requests the bucket has room for at `now`.
+    #[cfg(test)]
     pub(super) fn remaining(&self, arrival: u64, now: u64) -> u64 {
         let ahead = Self::ahead(arrival, now);
         if ahead > self.tolerance {
             return 0;
         }
         (self.tolerance - ahead) / UNITS + 1
+    }
+
+    /// Requests the bucket has room for at `now` and in `more` units refilled after,
+    /// counted together and rounded down once: no fraction of the refill is lost.
+    pub(super) fn remaining_within(&self, arrival: u64, now: u64, more: u64) -> u64 {
+        let allowed = self.tolerance.saturating_add(more);
+        let ahead = Self::ahead(arrival, now);
+        if ahead > allowed {
+            return 0;
+        }
+        (allowed - ahead) / UNITS + 1
     }
 
     /// The arrival after charging `count` at `now`.
@@ -264,12 +276,14 @@ impl Bucket {
     }
 }
 
-/// What a cycle advance needs besides the word: the contract's refill a cycle, how many
-/// other participants the owner said admit the key, and the entry's cycle record.
+/// What a cycle advance needs besides the word: the contract's refill a cycle, in requests
+/// and in units, how many other participants the owner said admit the key, and the entry's
+/// cycle record.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Advance {
     pub(super) cycle: u64,
     pub(super) refill: u64,
+    pub(super) refill_units: u64,
     pub(super) others: u64,
     pub(super) record: u32,
 }
@@ -295,9 +309,7 @@ pub(super) fn advanced(bucket: &Bucket, fields: Fields, advance: Advance, now: u
     let allowance = if after_share {
         (advance.refill / (advance.others + 1)).max(1) + left
     } else {
-        let sees = bucket
-            .remaining(fields.arrival, bucket.units(now))
-            .saturating_add(advance.refill);
+        let sees = bucket.remaining_within(fields.arrival, bucket.units(now), advance.refill_units);
         (sees / (advance.others + 1)).max(1) + left.min(1)
     };
     Fields {
@@ -471,6 +483,7 @@ mod tests {
         let advance = Advance {
             cycle,
             refill: 10,
+            refill_units: bucket.units(cycle),
             others: 1,
             record: 0,
         };
@@ -495,7 +508,8 @@ mod tests {
         assert!(skipped.shared, "after a skipped cycle, the copy again");
         assert_eq!(
             skipped.left,
-            (bucket.remaining(first.arrival, bucket.units(4 * cycle)) + 10) / 2
+            bucket.remaining_within(first.arrival, bucket.units(4 * cycle), bucket.units(cycle))
+                / 2
         );
     }
 
@@ -593,14 +607,13 @@ mod tests {
             let advance = Advance {
                 cycle: LENGTH,
                 refill,
+                refill_units: bucket.units(LENGTH),
                 others,
                 record: record_of(start, LENGTH),
             };
             let now = (last + gap) * LENGTH;
             let woken = advanced(&bucket, fields, advance, now);
-            let share = (bucket
-                .remaining(arrival, bucket.units(now))
-                .saturating_add(refill)
+            let share = (bucket.remaining_within(arrival, bucket.units(now), bucket.units(LENGTH))
                 / (others + 1))
                 .max(1);
             prop_assert!(woken.left >= 1);

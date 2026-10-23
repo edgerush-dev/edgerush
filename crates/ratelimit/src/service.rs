@@ -1118,7 +1118,9 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 (refill / (at.others + 1)).max(1) + left
             } else {
                 at.shared = Some(now);
-                let sees = at.bucket.remaining(now).saturating_add(refill);
+                // Rounded once, the room and the refill together: rounded apart, a refill of
+                // 6.6 a cycle shares out 6, and a client at exactly its rate is refused.
+                let sees = at.bucket.remaining_within(now, cycle, u64::MAX);
                 (sees / (at.others + 1)).max(1) + left.min(1)
             });
             at.bounded |= at.heard.is_some();

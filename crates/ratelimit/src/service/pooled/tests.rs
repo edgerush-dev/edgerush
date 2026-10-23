@@ -1078,19 +1078,24 @@ fn a_stalled_transport_leaves_workers_advancing_cycles_with_one_refill() {
     // bucket) and one cycle's refill, among two — not five refills.
     let now = 5 * CYCLE;
     let fields = word::advanced(&entry.terms.bucket, entry.snapshot(), entry.advance(), now);
-    let remaining = entry
-        .terms
-        .bucket
-        .remaining(fields.arrival, entry.terms.bucket.units(now));
+    let sees = entry.terms.bucket.remaining_within(
+        fields.arrival,
+        entry.terms.bucket.units(now),
+        entry.terms.refill_units,
+    );
     // No cycle had set an allowance before: nothing is carried.
     assert_eq!(
         fields.left,
-        ((remaining + entry.terms.refill) / 2).max(1),
+        (sees / 2).max(1),
         "one share of what is left, one cycle's refill"
     );
     let admitted = (0..100)
         .filter(|_| decide(&[&entry], now).local == Local::Admit)
         .count() as u64;
+    let remaining = entry
+        .terms
+        .bucket
+        .remaining(fields.arrival, entry.terms.bucket.units(now));
     assert_eq!(admitted, fields.left.min(remaining));
 }
 
