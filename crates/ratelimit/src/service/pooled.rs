@@ -121,9 +121,11 @@ impl Default for Levers {
     }
 }
 
-/// Shards of a [`Registry`]: a few for each core, so that the transport writing one key's
-/// shard does not hold up a worker reading another's.
-const SHARDS: usize = 64;
+/// Shards of a [`Registry`]: so many that each holds few of the process's keys. A shard's
+/// table grows by rehashing all of it under the shard's lock, some 70 ns a key it holds,
+/// which the worker making the key waits for, and any other wanting the shard: at 4,096,
+/// some 16 µs for a million keys, half a millisecond for 30 million.
+const SHARDS: usize = 4_096;
 
 /// One shard of a [`Registry`]: its entries by key.
 type Shard = RwLock<HashSet<Handle>>;
@@ -171,9 +173,11 @@ impl Eq for Handle {}
 /// Every live entry of a participant, for a worker meeting a key it holds no handle to:
 /// it finds the pod's entry here rather than asking the transport, which may be held up.
 /// Read only then — once per key per worker — and written by the transport when it makes
-/// or evicts an entry: no lock on the request path. Sharded by the key's FNV-1a; a client
-/// choosing keys to crowd a shard slows only those misses.
-pub struct Registry {
+/// or evicts an entry: no lock on the request path. Sharded by the participant's keyed
+/// hash, so that a client cannot choose keys that crowd one shard and so make its table,
+/// and the stall of its growth, as large as all the process's.
+pub struct Registry<S> {
+    hasher: S,
     shards: Vec<Shard>,
     /// A worker could not hand the transport a key that wanted it: the next cycle visits
     /// every key ([`Self::require_scan`]).
@@ -182,24 +186,31 @@ pub struct Registry {
     terms: RwLock<HashMap<Contract, Arc<Terms>>>,
 }
 
-impl Default for Registry {
+impl<S: BuildHasher + Default> Default for Registry<S> {
     fn default() -> Self {
-        Self::new()
+        Self::new(S::default())
     }
 }
 
-impl Registry {
-    fn new() -> Self {
+impl<S: BuildHasher> Registry<S> {
+    fn new(hasher: S) -> Self {
         Self {
+            hasher,
             shards: (0..SHARDS).map(|_| RwLock::new(HashSet::new())).collect(),
             scan: AtomicBool::new(false),
             terms: RwLock::new(HashMap::new()),
         }
     }
 
+    /// The shard of `key`, by number.
+    fn index(&self, key: &[u8]) -> usize {
+        // Less than the shard count, which fits in a `usize`.
+        (self.hasher.hash_one(key) % SHARDS as u64) as usize
+    }
+
     fn shard(&self, key: &[u8]) -> &Shard {
-        // The shard count divides the hash's range, so the index is always in it.
-        &self.shards[(super::fnv1a(key) % SHARDS as u64) as usize]
+        // `index` is always less than the shard count.
+        &self.shards[self.index(key)]
     }
 
     /// The live entry of `key` under `contract`, if the participant has made one.
@@ -1047,7 +1058,7 @@ pub struct Participant<S> {
     id: PlaneId,
     /// The workers that may hold a handle to each entry, which its bytes count.
     workers: u64,
-    registry: Arc<Registry>,
+    registry: Arc<Registry<S>>,
     cycle: u64,
     view: View,
     /// By a handle to the key's entry, so that the key's bytes are kept once, in it.
@@ -1263,7 +1274,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
         Some(Self {
             id,
             workers: 1,
-            registry: Arc::new(Registry::new()),
+            registry: Arc::new(Registry::new(hasher.clone())),
             cycle: cycle.max(1),
             view,
             keys: HashMap::with_hasher(hasher.clone()),
@@ -1346,7 +1357,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
 
     /// Its registry of live entries, for its workers.
     #[must_use]
-    pub fn registry(&self) -> Arc<Registry> {
+    pub fn registry(&self) -> Arc<Registry<S>> {
         Arc::clone(&self.registry)
     }
 
