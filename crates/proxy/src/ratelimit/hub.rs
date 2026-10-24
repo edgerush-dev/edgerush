@@ -12,7 +12,7 @@ use edgerush_ratelimit::service::pooled::{
     Decision as Pooled, Entry, Levers, Participant, Registry,
 };
 use edgerush_ratelimit::service::{Contract, Keyed, Ticket, View};
-use edgerush_ratelimit_service::grpc::Client;
+use edgerush_ratelimit_service::grpc::{Client, Error};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
@@ -103,8 +103,9 @@ struct Shared {
 
 /// What the process thread says of its own work, for the scrape: the asks it takes and how
 /// long they wait, those it let go undecided as their requests had gone, its queue, its exchanges and the answers whose buckets were passed over,
-/// a later one from their pod taken first, the time its work takes, and the keys its cycles visit. The most-of
-/// figures are since the last scrape, which takes them.
+/// a later one from their pod taken first, the time its work takes, the keys its cycles visit and
+/// those they left out of a full batch, and batches too long to send. The most-of figures are
+/// since the last scrape, which takes them.
 #[derive(Default)]
 pub(crate) struct Stats {
     asks: AtomicU64,
@@ -122,6 +123,8 @@ pub(crate) struct Stats {
     busy_ns: AtomicU64,
     visits: AtomicU64,
     answers_late: AtomicU64,
+    keys_left_out: AtomicU64,
+    batches_too_long: AtomicU64,
 }
 
 impl Stats {
@@ -155,6 +158,12 @@ impl Stats {
             ("busy_ns_total", "counter", read(&self.busy_ns)),
             ("visits_total", "counter", read(&self.visits)),
             ("answers_late_total", "counter", read(&self.answers_late)),
+            ("keys_left_out_total", "counter", read(&self.keys_left_out)),
+            (
+                "batches_too_long_total",
+                "counter",
+                read(&self.batches_too_long),
+            ),
         ];
         let mut out = String::new();
         for (name, kind, value) in lines {
@@ -653,17 +662,21 @@ impl State {
         }
     }
 
-    /// Says what its keys hold, and how many answers came late, for the workers' scrape.
+    /// Says what its keys hold, how many answers came late and keys were left out of full
+    /// batches, for the workers' scrape.
     fn report(&self) {
         let participant = self.participant.borrow();
         let [bytes, keys, evicted] = &self.shared.usage;
         bytes.store(participant.holding(), Ordering::Relaxed);
         keys.store(participant.key_count() as u64, Ordering::Relaxed);
         evicted.store(participant.evicted(), Ordering::Relaxed);
-        self.shared
-            .stats
+        let stats = &self.shared.stats;
+        stats
             .answers_late
             .store(participant.late_answers(), Ordering::Relaxed);
+        stats
+            .keys_left_out
+            .store(participant.keys_left_out(), Ordering::Relaxed);
     }
 
     /// Sends what the participant has to send, each batch on a task of its own, and hands
@@ -696,7 +709,10 @@ impl State {
                     .entries_in_flight
                     .fetch_sub(entries, Ordering::Relaxed);
                 match answered {
-                    Err(_) => {
+                    Err(error) => {
+                        if let Error::TooLong(_) = error {
+                            stats.batches_too_long.fetch_add(1, Ordering::Relaxed);
+                        }
                         me.participant.borrow_mut().exchanged(pod, exchange);
                         me.send();
                     }

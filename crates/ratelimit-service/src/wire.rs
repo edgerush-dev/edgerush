@@ -875,6 +875,19 @@ mod tests {
     }
 
     proptest! {
+        /// What a batch is cut by holds: it never takes more than [`service::Batch::bytes`]
+        /// says, nor does any part of it.
+        #[test]
+        fn a_batch_takes_no_more_than_its_bound(batch in batch()) {
+            prop_assert!(within_bounds(&batch));
+        }
+
+        /// As for a batch, for copies.
+        #[test]
+        fn copies_take_no_more_than_their_bound(replicas in replicas()) {
+            prop_assert!(copies_within_bounds(&replicas));
+        }
+
         #[test]
         fn a_heartbeat_comes_through_the_wire_as_it_was_sent(beat in heartbeat()) {
             let bytes = Heartbeat::from(beat.clone()).encode_to_vec();
@@ -912,6 +925,204 @@ mod tests {
             if let Ok(replicas) = Replicas::decode(bytes.as_slice()) {
                 let _ = service::Replicas::try_from(replicas);
             }
+        }
+    }
+
+    /// Every number at its longest and keys long enough for their lengths to take three
+    /// bytes, an ask with a hundred of them: still within the bound.
+    #[test]
+    fn a_batch_at_its_longest_takes_no_more_than_its_bound() {
+        let most = NonZeroU64::MAX;
+        let contract = service::Contract {
+            limit: most,
+            window: most,
+            burst: most,
+        };
+        let key: Box<[u8]> = vec![b'k'; 100_000].into();
+        let batch = service::Batch {
+            from: u64::MAX,
+            entries: vec![service::Entry {
+                key,
+                contract,
+                report: service::Report::Hits {
+                    sequence: u64::MAX,
+                    count: u64::MAX,
+                    asked: u64::MAX,
+                    refused: u64::MAX,
+                    seen: u64::MAX - 1,
+                    age: u64::MAX,
+                },
+            }],
+            asks: vec![service::Ask {
+                id: u64::MAX,
+                count: u64::MAX,
+                age: u64::MAX,
+                span: u64::MAX,
+                timeout: u64::MAX,
+                keys: (0..100_u8)
+                    .map(|n| {
+                        let mut key = vec![b'k'; 20_000];
+                        key[0] = n;
+                        (key.into(), contract)
+                    })
+                    .collect(),
+            }],
+            oldest_ask: u64::MAX,
+            made: u64::MAX,
+        };
+        assert!(within_bounds(&batch));
+    }
+
+    /// Whether `batch` takes no more than its bound, and each entry and ask no more than
+    /// its own: what each adds to the batch without it, its fields' framing included.
+    fn within_bounds(batch: &service::Batch) -> bool {
+        let encoded = |batch: &service::Batch| Batch::from(batch.clone()).encoded_len();
+        let empty = service::Batch {
+            entries: Vec::new(),
+            asks: Vec::new(),
+            ..batch.clone()
+        };
+        let alone = encoded(&empty);
+        let entries = batch.entries.iter().all(|entry| {
+            let with = service::Batch {
+                entries: vec![entry.clone()],
+                ..empty.clone()
+            };
+            encoded(&with) - alone <= entry.bytes()
+        });
+        let asks = batch.asks.iter().all(|ask| {
+            let with = service::Batch {
+                asks: vec![ask.clone()],
+                ..empty.clone()
+            };
+            encoded(&with) - alone <= ask.bytes()
+        });
+        entries && asks && alone <= empty.bytes() && encoded(batch) <= batch.bytes()
+    }
+
+    /// Every number at its longest, keys long enough for their lengths to take three bytes,
+    /// one copy with a hundred records and one with none: still within the bound.
+    #[test]
+    fn copies_at_their_longest_take_no_more_than_their_bound() {
+        let most = NonZeroU64::MAX;
+        let record = service::PlaneRecord {
+            plane: u64::MAX,
+            applied: u64::MAX,
+            admitted_ago: Some(u64::MAX),
+            last_ask: (u64::MAX, u64::MAX),
+            held: u64::MAX,
+            held_for: u64::MAX,
+        };
+        let replica = |planes| service::Replica {
+            key: vec![b'k'; 100_000].into(),
+            contract: service::Contract {
+                limit: most,
+                window: most,
+                burst: most,
+            },
+            behind: u128::from(u64::MAX),
+            counted: u64::MAX,
+            planes,
+        };
+        let replicas = service::Replicas {
+            from: u32::MAX,
+            entries: vec![replica(vec![record; 100]), replica(Vec::new())],
+            handover: true,
+            epoch: u64::MAX,
+        };
+        assert!(copies_within_bounds(&replicas));
+    }
+
+    /// Whether `replicas` take no more than their bound, and each copy no more than its
+    /// own, as [`within_bounds`] for a batch.
+    fn copies_within_bounds(replicas: &service::Replicas) -> bool {
+        let encoded = |replicas: &service::Replicas| Replicas::from(replicas.clone()).encoded_len();
+        let empty = service::Replicas {
+            entries: Vec::new(),
+            ..replicas.clone()
+        };
+        let alone = encoded(&empty);
+        let each = replicas.entries.iter().all(|replica| {
+            let with = service::Replicas {
+                entries: vec![replica.clone()],
+                ..empty.clone()
+            };
+            encoded(&with) - alone <= replica.bytes()
+        });
+        each && alone <= empty.bytes() && encoded(replicas) <= replicas.bytes()
+    }
+
+    /// The answers to a full piece are no bigger than it: a piece of asks, each about one
+    /// short key, as answers say most for what a batch holds; and a piece of hits.
+    #[test]
+    fn the_answers_to_a_piece_are_no_bigger_than_it() {
+        let one = NonZeroU64::MIN;
+        let contract = service::Contract {
+            limit: one,
+            window: NonZeroU64::new(1_000_000_000).unwrap(),
+            burst: one,
+        };
+        let key = |n: u64| -> Box<[u8]> { n.to_be_bytes().into() };
+        let full =
+            |batch: &service::Batch, more: usize| batch.bytes() + more <= service::PIECE_BYTES;
+        let mut asks = service::Batch {
+            from: 7,
+            entries: Vec::new(),
+            asks: Vec::new(),
+            oldest_ask: 1,
+            made: 0,
+        };
+        let mut hits = asks.clone();
+        let mut n = 0;
+        loop {
+            let ask = service::Ask {
+                id: n + 1,
+                count: 3,
+                age: 0,
+                span: 0,
+                timeout: 300_000_000,
+                keys: vec![(key(n), contract)],
+            };
+            if !full(&asks, ask.bytes()) {
+                break;
+            }
+            asks.asks.push(ask);
+            n += 1;
+        }
+        loop {
+            let entry = service::Entry {
+                key: key(n),
+                contract,
+                report: service::Report::Hits {
+                    sequence: 1,
+                    count: 1,
+                    asked: 0,
+                    refused: 0,
+                    seen: 0,
+                    age: 0,
+                },
+            };
+            if !full(&hits, entry.bytes()) {
+                break;
+            }
+            hits.entries.push(entry);
+            n += 1;
+        }
+        let view = service::View {
+            epoch: 1,
+            pods: vec![0],
+        };
+        let mut pod: service::ServicePod = service::ServicePod::new(0, 10_000_000, view);
+        pod.set_life(u64::MAX);
+        for piece in [asks, hits] {
+            let bound = piece.bytes();
+            let answers = Answers::from(pod.on_batch(piece, 1_000_000_000));
+            assert!(!answers.entries.is_empty());
+            assert!(
+                answers.encoded_len() <= bound,
+                "{} {bound}",
+                answers.encoded_len()
+            );
         }
     }
 

@@ -65,10 +65,11 @@ fn exchange(plane: &mut Plane, pod: &mut ServicePod, now: u64) -> Vec<Answers> {
         .collect()
 }
 
-/// A data plane holding `HELD` keys, each admitted, reported and answered once, then
-/// visited at a quiet cycle, which leaves none of them queued; the only pod of its service
-/// owning them all; and a request for each of the first `ADMITTING` admitted since.
-fn admitted() -> (Plane, ServicePod) {
+/// A data plane holding `HELD` keys, each admitted, reported and answered once — more than a
+/// piece takes, so over a few cycles — then visited at a quiet cycle, which leaves none of
+/// them queued; the only pod of its service owning them all; and a request for each of the
+/// first `ADMITTING` admitted since, at the time it returns.
+fn admitted() -> (Plane, ServicePod, u64) {
     let view = View {
         epoch: 1,
         pods: vec![0],
@@ -84,48 +85,54 @@ fn admitted() -> (Plane, ServicePod) {
     });
     plane.set_scheduled(true);
     admit(&mut plane, 0..HELD, 0);
-    plane.on_cycle(CYCLE);
-    for answers in exchange(&mut plane, &mut pod, CYCLE) {
-        plane.on_answers(answers, CYCLE);
+    let mut now = CYCLE;
+    loop {
+        plane.on_cycle(now);
+        let answers = exchange(&mut plane, &mut pod, now);
+        now += CYCLE;
+        if answers.is_empty() {
+            break;
+        }
+        for answers in answers {
+            plane.on_answers(answers, now - CYCLE);
+        }
     }
-    plane.on_cycle(2 * CYCLE);
-    assert!(plane.take_outgoing().is_empty(), "nothing to report");
-    admit(&mut plane, 0..ADMITTING, 3 * CYCLE);
-    (plane, pod)
+    admit(&mut plane, 0..ADMITTING, now);
+    (plane, pod, now)
 }
 
-/// The cycle after `admitted`'s requests, its batch taken in by the pod: the data plane
-/// and the answers it has yet to take in.
-fn answered() -> (Plane, Vec<Answers>) {
-    let (mut plane, mut pod) = admitted();
+/// The cycle after `admitted`'s requests, its batch taken in by the pod: the data plane,
+/// the answers it has yet to take in, and when.
+fn answered() -> (Plane, Vec<Answers>, u64) {
+    let (mut plane, mut pod, now) = admitted();
     let visits = plane.visits();
-    plane.on_cycle(3 * CYCLE);
+    plane.on_cycle(now);
     assert_eq!(
         plane.visits() - visits,
         u64::from(ADMITTING),
         "only the keys admitting"
     );
-    let answers = exchange(&mut plane, &mut pod, 3 * CYCLE);
+    let answers = exchange(&mut plane, &mut pod, now);
     let reported: usize = answers.iter().map(|answers| answers.entries.len()).sum();
     assert_eq!(reported, ADMITTING as usize, "each key admitting reported");
-    (plane, answers)
+    (plane, answers, now)
 }
 
 #[library_benchmark]
 #[bench::hundred_keys(admitted())]
-fn on_cycle(setup: (Plane, ServicePod)) -> (Plane, ServicePod) {
-    let (mut plane, pod) = setup;
-    plane.on_cycle(black_box(3 * CYCLE));
+fn on_cycle(setup: (Plane, ServicePod, u64)) -> (Plane, ServicePod) {
+    let (mut plane, pod, now) = setup;
+    plane.on_cycle(black_box(now));
     // Handed back, so that its keys are freed outside what is measured.
     (plane, pod)
 }
 
 #[library_benchmark]
 #[bench::hundred_keys(answered())]
-fn on_answers(setup: (Plane, Vec<Answers>)) -> Plane {
-    let (mut plane, answers) = setup;
+fn on_answers(setup: (Plane, Vec<Answers>, u64)) -> Plane {
+    let (mut plane, answers, now) = setup;
     for answers in answers {
-        plane.on_answers(black_box(answers), black_box(3 * CYCLE));
+        plane.on_answers(black_box(answers), black_box(now));
     }
     plane
 }

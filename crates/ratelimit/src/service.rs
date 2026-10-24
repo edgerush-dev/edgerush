@@ -267,6 +267,59 @@ pub struct Batch {
     pub made: u64,
 }
 
+/// The most a data plane's batch to a pod takes, by [`Batch::bytes`]: 1 MiB, a quarter of
+/// the longest message the transport takes, so that a batch cut by a bound on its size,
+/// and the answers to it, always fit. What does not fit waits for the next exchange (06
+/// §4).
+pub const PIECE_BYTES: usize = 1 << 20;
+
+/// What a batch or copies take encoded beyond their entries, at most: their own few
+/// numbers. This and the bounds below take each number at its longest, ten bytes, with
+/// its field's tag and length; that they hold is tested where messages are encoded.
+const MESSAGE_BYTES: usize = 64;
+/// What an entry takes beyond its key's bytes: its contract, a report's six numbers, and
+/// the lengths framing them.
+const ENTRY_BYTES: usize = 128;
+/// What an ask takes beyond its keys: its five numbers.
+const ASK_BYTES: usize = 64;
+/// What each key of an ask takes beyond its bytes: its contract.
+const ASK_KEY_BYTES: usize = 64;
+
+impl Entry {
+    /// At most what it takes encoded.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        encoded_entry_bytes(self.key.len())
+    }
+}
+
+/// At most what an entry for a key of `key` bytes takes encoded.
+pub(crate) const fn encoded_entry_bytes(key: usize) -> usize {
+    key.saturating_add(ENTRY_BYTES)
+}
+
+impl Ask {
+    /// At most what it takes encoded.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.keys.iter().fold(ASK_BYTES, |bytes, (key, _)| {
+            bytes.saturating_add(key.len().saturating_add(ASK_KEY_BYTES))
+        })
+    }
+}
+
+impl Batch {
+    /// At most what it takes encoded.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        let entries = self.entries.iter().map(Entry::bytes);
+        let asks = self.asks.iter().map(Ask::bytes);
+        entries
+            .chain(asks)
+            .fold(MESSAGE_BYTES, usize::saturating_add)
+    }
+}
+
 /// A service pod's answer about one key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Answer {
@@ -364,6 +417,62 @@ pub struct Replicas {
     pub epoch: u64,
 }
 
+/// What a copy takes beyond its key's bytes and its records.
+const REPLICA_BYTES: usize = 128;
+/// What each of a copy's records takes.
+const PLANE_RECORD_BYTES: usize = 96;
+
+impl Replica {
+    /// At most what it takes encoded.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        let records = self.planes.len().saturating_mul(PLANE_RECORD_BYTES);
+        self.key
+            .len()
+            .saturating_add(REPLICA_BYTES)
+            .saturating_add(records)
+    }
+}
+
+impl Replicas {
+    /// At most what they take encoded.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .map(Replica::bytes)
+            .fold(MESSAGE_BYTES, usize::saturating_add)
+    }
+
+    /// Cut into pieces of at most [`PIECE_BYTES`], in order, to be sent one after the
+    /// other; a copy bigger than a piece goes alone. Copies apply key by key, and keys
+    /// handed over too, so that a piece needs none of the others.
+    #[must_use]
+    pub fn into_pieces(self) -> Vec<Self> {
+        let piece = |entries| Self {
+            from: self.from,
+            entries,
+            handover: self.handover,
+            epoch: self.epoch,
+        };
+        let mut pieces = Vec::new();
+        let mut entries = Vec::new();
+        let mut room = Room::new();
+        for replica in self.entries {
+            if !room.take(replica.bytes()) {
+                pieces.push(piece(std::mem::take(&mut entries)));
+                room = Room::new();
+                room.take(replica.bytes());
+            }
+            entries.push(replica);
+        }
+        if !entries.is_empty() {
+            pieces.push(piece(entries));
+        }
+        pieces
+    }
+}
+
 /// The decision on a request that waited.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decided {
@@ -450,15 +559,101 @@ impl Unseen {
 }
 
 /// What a data plane has to send one service pod: entries, their hits' ages counting back
-/// from `made`, and asks.
+/// from `made`, and asks; and what they take, by [`Entry::bytes`] and [`Ask::bytes`].
 #[derive(Debug, Default)]
 pub(crate) struct Queued {
     pub(crate) made: u64,
     pub(crate) entries: Vec<Entry>,
     pub(crate) asks: Vec<Ask>,
+    bytes: usize,
+}
+
+/// The room left in a piece being filled, which takes its first entry or ask however big.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Room {
+    left: usize,
+    empty: bool,
+}
+
+impl Room {
+    /// A piece with nothing in it.
+    pub(crate) const fn new() -> Self {
+        Self {
+            left: PIECE_BYTES - MESSAGE_BYTES,
+            empty: true,
+        }
+    }
+
+    /// Whether `bytes` more fit, taken from the room if they do.
+    pub(crate) const fn take(&mut self, bytes: usize) -> bool {
+        if !self.empty && bytes > self.left {
+            return false;
+        }
+        self.left = self.left.saturating_sub(bytes);
+        self.empty = false;
+        true
+    }
 }
 
 impl Queued {
+    /// The room left in its next piece.
+    pub(crate) fn room(&self) -> Room {
+        let mut room = Room::new();
+        if !self.is_empty() {
+            room.take(self.bytes);
+        }
+        room
+    }
+
+    /// Whether it holds nothing to send.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.asks.is_empty()
+    }
+
+    /// `entry` queued last.
+    pub(crate) fn push_entry(&mut self, entry: Entry) {
+        self.bytes = self.bytes.saturating_add(entry.bytes());
+        self.entries.push(entry);
+    }
+
+    /// `ask` queued last.
+    pub(crate) fn push_ask(&mut self, ask: Ask) {
+        self.bytes = self.bytes.saturating_add(ask.bytes());
+        self.asks.push(ask);
+    }
+
+    /// Its next piece, from data plane `from`: the asks first, then the entries, each in
+    /// the order queued, as many as fit in [`PIECE_BYTES`]; the rest kept for the next.
+    /// Asks go first because requests wait on them. Neither ask nor entry depends on
+    /// another in the same batch: an ask kept back is in flight already, so that
+    /// `oldest_ask` leaves it to be decided, and a key's reports kept back follow those
+    /// sent, as its owner applies them.
+    pub(crate) fn take_piece(&mut self, from: PlaneId, oldest_ask: u64) -> Batch {
+        let mut room = Room::new();
+        let asks = self
+            .asks
+            .iter()
+            .take_while(|ask| room.take(ask.bytes()))
+            .count();
+        let entries = if asks == self.asks.len() {
+            self.entries
+                .iter()
+                .take_while(|entry| room.take(entry.bytes()))
+                .count()
+        } else {
+            0
+        };
+        let batch = Batch {
+            from,
+            entries: self.entries.drain(..entries).collect(),
+            asks: self.asks.drain(..asks).collect(),
+            oldest_ask,
+            made: self.made,
+        };
+        self.bytes = self.bytes.saturating_sub(batch.bytes() - MESSAGE_BYTES);
+        batch
+    }
+
     /// Made at `now` from here on, if that is later: the ages of the hits and asks it holds
     /// count back from it, so that every age in a batch counts back from one time, the
     /// latest anything was added at.
@@ -1172,11 +1367,10 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 .entry(owner)
                 .or_default()
                 .at(now)
-                .entries
-                .push(entry);
+                .push_entry(entry);
         }
         let queued = self.queued.entry(pod).or_default().at(now);
-        queued.asks.push(
+        queued.push_ask(
             group.asked_arrived.ask(
                 queued.made,
                 id,
@@ -1395,7 +1589,9 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
                 || (in_use && at.heard.is_none_or(|heard| now - heard >= resend_after));
             if !entries.is_empty() {
                 let queued = self.queued.entry(owner).or_default().at(now);
-                queued.entries.extend(entries);
+                for entry in entries {
+                    queued.push_entry(entry);
+                }
             }
         }
         // An owner out of reach may have gone: the pods are asked for their view in turn,
@@ -1638,10 +1834,11 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
             let queued = self.queued.entry(owner).or_default().at(now);
             for unseen in &mut at.unacknowledged {
                 unseen.last = now;
-                queued.entries.push(Entry {
+                let report = unseen.report(at.seen, queued.made);
+                queued.push_entry(Entry {
                     key: key.clone(),
                     contract: at.contract,
-                    report: unseen.report(at.seen, queued.made),
+                    report,
                 });
             }
         }
@@ -1697,6 +1894,8 @@ impl<S: BuildHasher + Clone> DataPlane<S> {
     }
 
     /// Messages to send: one batch per service pod; an empty one asks only for the view.
+    /// Whole, not cut to [`PIECE_BYTES`] as the pooled participant's are: as the reference,
+    /// it is compared with that over batches that fit.
     pub fn take_outgoing(&mut self) -> Vec<(PodId, Batch)> {
         let oldest_ask = self.oldest_ask();
         std::mem::take(&mut self.queued)

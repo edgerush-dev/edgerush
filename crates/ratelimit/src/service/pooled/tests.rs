@@ -5,7 +5,7 @@
 #![cfg(not(loom))]
 
 use super::*;
-use crate::service::{Answer, DataPlane, FixedState, Keyed, ServicePod};
+use crate::service::{Answer, DataPlane, ENTRY_BYTES, FixedState, Keyed, PIECE_BYTES, ServicePod};
 use proptest::prelude::*;
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
@@ -2891,4 +2891,109 @@ fn an_unacknowledged_report_is_sent_again_scheduled() {
         hits(&participant.take_outgoing()).get(key.key()) == Some(&1)
     });
     assert!(again.is_some(), "never sent again");
+}
+
+/// Keys too many for one piece, each admitting a request every cycle, one exchange in
+/// flight: every exchange carries a piece no bigger than [`PIECE_BYTES`]; a key left out
+/// goes ahead of the rest at the next cycle, so that none waits more cycles than it takes
+/// to send them all; and every hit reaches the pod once.
+fn a_backlog_goes_a_piece_an_exchange_and_none_starves(scheduled: bool) {
+    const KEYS: usize = 6_000;
+    let c = contract(100, 1_000);
+    let mut participant = one_in_flight();
+    participant.set_scheduled(scheduled);
+    participant.set_levers(Levers {
+        poll_quiet: false,
+        ask_cold: false,
+    });
+    let mut pod = pod(1);
+    // 300 bytes a key: some 2,400 to a piece, two and a half pieces for every key.
+    let names: Vec<Vec<u8>> = (0..KEYS)
+        .map(|n| {
+            let mut name = format!("k{n}").into_bytes();
+            name.resize(300, b'.');
+            name
+        })
+        .collect();
+    for name in &names {
+        participant.ensure(name, c, 0);
+    }
+    let entries: Vec<Arc<Entry>> = names
+        .iter()
+        .map(|name| participant.entries(&[(name, c)]).remove(0))
+        .collect();
+    let piece = PIECE_BYTES / (300 + ENTRY_BYTES);
+    let rounds = KEYS.div_ceil(piece);
+    assert_eq!(rounds, 3);
+    let mut admitted = vec![0_u64; KEYS];
+    let mut reported_at = vec![0_u64; KEYS];
+    let at: HashMap<&[u8], usize> = names
+        .iter()
+        .enumerate()
+        .map(|(n, name)| (name.as_slice(), n))
+        .collect();
+    let mut exchange = |participant: &mut Participant<FixedState>,
+                        reported_at: &mut [u64],
+                        cycle: u64,
+                        now: u64| {
+        let started = participant.take_exchanges();
+        assert!(started.len() <= 1, "one pod, one exchange");
+        for (_, number, batch) in started {
+            assert!(batch.bytes() <= PIECE_BYTES, "{}", batch.bytes());
+            for entry in &batch.entries {
+                reported_at[at[&*entry.key]] = cycle;
+            }
+            let answers = pod.on_batch(in_order(batch), now);
+            participant.on_answers_to(number, answers, now);
+        }
+    };
+    for cycle in 1..=12 {
+        let now = cycle * CYCLE;
+        let mut signalled = Vec::new();
+        for (n, entry) in entries.iter().enumerate() {
+            let outcome = decide(&[entry], now + 1);
+            assert_eq!(outcome.local, Local::Admit, "key {n}, cycle {cycle}");
+            admitted[n] += 1;
+            if outcome.signal != 0 {
+                signalled.push(Arc::clone(entry));
+            }
+        }
+        participant.on_signals(signalled);
+        let visits = participant.visits();
+        participant.on_cycle(now + 2);
+        assert_eq!(
+            participant.visits() - visits,
+            KEYS as u64,
+            "each key once, cycle {cycle}"
+        );
+        exchange(&mut participant, &mut reported_at, cycle, now + 3);
+        if cycle > rounds as u64 {
+            for (n, reported) in reported_at.iter().enumerate() {
+                assert!(
+                    cycle - reported < rounds as u64,
+                    "key {n} last reported at cycle {reported}, now {cycle}"
+                );
+            }
+        }
+    }
+    assert!(participant.keys_left_out() > 0);
+    // What is left drains, with nothing more admitted.
+    for cycle in 13..=13 + rounds as u64 {
+        let now = cycle * CYCLE;
+        participant.on_cycle(now + 2);
+        exchange(&mut participant, &mut reported_at, cycle, now + 3);
+    }
+    for (n, name) in names.iter().enumerate() {
+        assert_eq!(pod.counted(name), Some(admitted[n]), "key {n}");
+    }
+}
+
+#[test]
+fn a_scheduled_backlog_goes_a_piece_an_exchange_and_none_starves() {
+    a_backlog_goes_a_piece_an_exchange_and_none_starves(true);
+}
+
+#[test]
+fn a_scanned_backlog_goes_a_piece_an_exchange_and_none_starves() {
+    a_backlog_goes_a_piece_an_exchange_and_none_starves(false);
 }
