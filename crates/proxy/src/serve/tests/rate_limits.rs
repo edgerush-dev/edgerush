@@ -573,10 +573,13 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             let stats = hub.render_stats();
-            assert!(
-                stats.contains("edgerush_rate_limit_hub_visits_total "),
-                "{stats}"
-            );
+            for line in [
+                "edgerush_rate_limit_hub_visits_total ",
+                "edgerush_rate_limit_hub_keys_left_out_total 0\n",
+                "edgerush_rate_limit_hub_batches_too_long_total 0\n",
+            ] {
+                assert!(stats.contains(line), "{line}{stats}");
+            }
             limiter.stop();
         })
         .await;

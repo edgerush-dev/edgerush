@@ -2952,3 +2952,128 @@ fn answers_held_up_are_taken_as_of_no_more_than_a_cycle_before() {
     let refill = u128::from(CYCLE) * 100;
     assert_eq!(net.copy(0, b"k").bucket.behind(500 * MS), behind - refill);
 }
+
+/// What is queued for a pod goes a piece at a time: asks first, then entries, in the order
+/// they were queued, each piece no bigger than [`PIECE_BYTES`], and everything once.
+#[test]
+fn a_piece_takes_asks_first_and_no_more_than_fits() {
+    let key = |n: usize| -> Box<[u8]> {
+        let mut key = vec![b'k'; 1_000];
+        key[..8].copy_from_slice(&(n as u64).to_be_bytes());
+        key.into()
+    };
+    let mut queued = Queued::default();
+    let entries: Vec<Entry> = (0..3_000)
+        .map(|n| Entry {
+            key: key(n),
+            contract: contract(),
+            report: hits(1, 1, 0),
+        })
+        .collect();
+    for entry in entries.iter().cloned() {
+        queued.at(10 * MS).push_entry(entry);
+    }
+    let asks: Vec<Ask> = (1..=3)
+        .map(|id| Ask {
+            id,
+            count: 1,
+            age: 0,
+            span: 0,
+            timeout: 300 * MS,
+            keys: vec![(key(10_000 + id as usize), contract())],
+        })
+        .collect();
+    for ask in asks.iter().cloned() {
+        queued.push_ask(ask);
+    }
+    let whole: usize = entries.iter().map(Entry::bytes).sum();
+    assert!(whole > 3 * PIECE_BYTES, "{whole}: more than three pieces");
+    let mut pieces = Vec::new();
+    while !queued.is_empty() {
+        let piece = queued.take_piece(100, 1);
+        assert!(piece.bytes() <= PIECE_BYTES, "{}", piece.bytes());
+        assert_eq!(
+            (piece.from, piece.oldest_ask, piece.made),
+            (100, 1, 10 * MS)
+        );
+        pieces.push(piece);
+    }
+    assert_eq!(pieces.len(), 4);
+    assert_eq!(pieces[0].asks, asks, "asks first");
+    let sent: Vec<Entry> = pieces.into_iter().flat_map(|piece| piece.entries).collect();
+    assert_eq!(sent, entries, "every entry once, in order");
+}
+
+/// A piece takes at least one thing, however big: an entry bigger than a piece goes alone,
+/// not never.
+#[test]
+fn a_piece_takes_an_entry_bigger_than_itself_alone() {
+    let mut queued = Queued::default();
+    for key in [vec![b'a'; 2 * PIECE_BYTES], vec![b'b'; 10]] {
+        queued.push_entry(Entry {
+            key: key.into(),
+            contract: contract(),
+            report: Report::Poll,
+        });
+    }
+    let first = queued.take_piece(100, 1);
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(first.entries[0].key.len(), 2 * PIECE_BYTES);
+    let second = queued.take_piece(100, 1);
+    assert_eq!(&*second.entries[0].key, b"bbbbbbbbbb");
+    assert!(queued.is_empty());
+}
+
+/// Copies go a piece at a time: in order, every copy once, each piece no bigger than
+/// [`PIECE_BYTES`] but for a copy bigger than a piece, which goes alone; each piece from
+/// the same pod, under the same view, copies or handed over as the whole was.
+#[test]
+fn copies_go_a_piece_at_a_time() {
+    let replica = |n: u64, key_bytes: usize, planes: u64| Replica {
+        key: {
+            let mut key = vec![b'k'; key_bytes];
+            key[..8].copy_from_slice(&n.to_be_bytes());
+            key.into()
+        },
+        contract: contract(),
+        behind: u128::from(n),
+        counted: n,
+        planes: (0..planes)
+            .map(|plane| PlaneRecord {
+                plane,
+                applied: 1,
+                admitted_ago: Some(0),
+                last_ask: (0, 0),
+                held: 0,
+                held_for: 0,
+            })
+            .collect(),
+    };
+    let mut entries: Vec<Replica> = (0..3_000).map(|n| replica(n, 1_000, 2)).collect();
+    entries.insert(1_500, replica(3_000, 2 * PIECE_BYTES, 0));
+    let whole = Replicas {
+        from: 2,
+        entries: entries.clone(),
+        handover: true,
+        epoch: 9,
+    };
+    let pieces = whole.into_pieces();
+    assert_eq!(pieces.len(), 5, "two either side of the one alone");
+    for piece in &pieces {
+        assert_eq!((piece.from, piece.handover, piece.epoch), (2, true, 9));
+        assert!(
+            piece.bytes() <= PIECE_BYTES || piece.entries.len() == 1,
+            "{}",
+            piece.bytes()
+        );
+    }
+    let sent: Vec<Replica> = pieces.into_iter().flat_map(|piece| piece.entries).collect();
+    assert_eq!(sent, entries);
+    let empty = Replicas {
+        from: 2,
+        entries: Vec::new(),
+        handover: false,
+        epoch: 9,
+    };
+    assert!(empty.into_pieces().is_empty(), "nothing to send");
+}

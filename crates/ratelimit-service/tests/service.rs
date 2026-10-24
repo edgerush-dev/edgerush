@@ -8,7 +8,7 @@
 )]
 
 use edgerush_ratelimit::service::{Contract, DataPlane, Decision, PodId, View};
-use edgerush_ratelimit_service::grpc::{Client, Server};
+use edgerush_ratelimit_service::grpc::{Client, Error, Server};
 use edgerush_ratelimit_service::pod::{Pod, Timing};
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
@@ -414,4 +414,129 @@ async fn a_pod_shows_what_its_keys_hold_and_keeps_them_within_their_bound() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
     assert!(scrape.contains(evicted), "{scrape}");
+}
+
+/// Messages of up to 4 MiB go through; a longer one is refused by the client that would
+/// send it, before it is sent, not by the pod after it has been.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn messages_are_held_to_4_mib_by_whoever_sends_them() {
+    use edgerush_ratelimit::service::{Replica, Replicas};
+    let service = start().await;
+    let replicas = |key_bytes: usize| Replicas {
+        from: 1,
+        entries: vec![Replica {
+            key: vec![b'k'; key_bytes].into(),
+            contract: contract(),
+            behind: 0,
+            counted: 0,
+            planes: Vec::new(),
+        }],
+        handover: false,
+        epoch: 1,
+    };
+    let limit = edgerush_ratelimit_service::grpc::MAX_MESSAGE;
+    assert_eq!(limit, 4 << 20);
+    service.clients[&0]
+        .replicate(replicas(limit - 1024))
+        .await
+        .unwrap();
+    let refused = service.clients[&0].replicate(replicas(limit)).await;
+    assert!(
+        matches!(refused, Err(Error::TooLong(length)) if length > limit),
+        "{refused:?}"
+    );
+}
+
+/// A restarted owner rejoins and is handed back more of its keys than one message takes:
+/// they go in pieces, and it counts every one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keys_handed_back_past_a_message_go_in_pieces() {
+    const KEYS: u32 = 30_000;
+    let service = start().await;
+    let start = Instant::now();
+    let cycle = u64::try_from(CYCLE.as_nanos()).unwrap();
+    let mut plane: DataPlane = DataPlane::new(17, cycle, view());
+    let key = |n: u32| {
+        let mut key = vec![b'k'; 1_000];
+        key[..4].copy_from_slice(&n.to_be_bytes());
+        key
+    };
+    // A thousand at a time: the reference sends each pod one batch, uncut.
+    for group in 0..KEYS / 1_000 {
+        for n in group * 1_000..(group + 1) * 1_000 {
+            plane.decide(&key(n), contract(), now(start));
+        }
+        exchange(&mut plane, &service, start).await;
+    }
+    let mine: Vec<Vec<u8>> = (0..KEYS)
+        .map(key)
+        .filter(|key| view().owners(key).0 == Some(0))
+        .collect();
+    // Handed back by the pods that own them meanwhile, each more than a message's worth.
+    let meanwhile = View {
+        epoch: 2,
+        pods: vec![1, 2],
+    };
+    for pod in [1, 2] {
+        let handed: usize = mine
+            .iter()
+            .filter(|key| meanwhile.owners(key).0 == Some(pod))
+            .map(|key| key.len())
+            .sum();
+        assert!(
+            handed > edgerush_ratelimit_service::grpc::MAX_MESSAGE,
+            "pod {pod} hands back {handed} bytes of keys: no more than a message"
+        );
+    }
+    for key in &mine {
+        assert_eq!(counted(&service.pods[0], key, 1).await, Some(1));
+    }
+
+    service.pods[0].restart(2).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let first = &mine[0];
+    loop {
+        let serving = service.pods[0]
+            .view()
+            .await
+            .is_some_and(|(_, serving)| serving);
+        if serving && service.pods[0].counted(first).await == Some(1) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never handed back");
+        tokio::time::sleep(CYCLE).await;
+    }
+    for key in &mine {
+        assert_eq!(
+            counted(&service.pods[0], key, 1).await,
+            Some(1),
+            "handed back"
+        );
+    }
+}
+
+/// A copy longer than a message on its own — a key as long as a message takes, admitted
+/// by enough data planes that their records push it past — is not sent, and is counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_too_long_to_send_is_counted() {
+    let service = start().await;
+    let start = Instant::now();
+    let cycle = u64::try_from(CYCLE.as_nanos()).unwrap();
+    // Room for a batch about it, some 40 bytes more, and not for a dozen records.
+    let key = vec![b'k'; edgerush_ratelimit_service::grpc::MAX_MESSAGE - 120];
+    let owner = view().owners(&key).0.unwrap() as usize;
+    for plane in 0..12 {
+        let mut plane: DataPlane = DataPlane::new(100 + plane, cycle, view());
+        plane.decide(&key, contract(), now(start));
+        exchange(&mut plane, &service, start).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let usage = service.pods[owner].usage().await.unwrap();
+        if usage.copies_too_long > 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never counted: {usage:?}");
+        tokio::time::sleep(CYCLE).await;
+    }
 }
