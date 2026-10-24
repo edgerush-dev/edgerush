@@ -45,7 +45,7 @@ pub mod pooled;
 pub use keyed::Keyed;
 
 use crate::reference::{BucketState, Charge, Model, TokenBucket};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::num::NonZeroU64;
 
@@ -622,31 +622,84 @@ impl Queued {
         self.asks.push(ask);
     }
 
-    /// Its next piece, from data plane `from`: the asks first, then the entries, each in
-    /// the order queued, as many as fit in [`PIECE_BYTES`]; the rest kept for the next.
-    /// Asks go first because requests wait on them. Neither ask nor entry depends on
-    /// another in the same batch: an ask kept back is in flight already, so that
-    /// `oldest_ask` leaves it to be decided, and a key's reports kept back follow those
-    /// sent, as its owner applies them.
+    /// Its next piece, from data plane `from`: the asks first, then the reports queued for
+    /// their keys, then the other entries, each in the order queued, as many as fit in
+    /// [`PIECE_BYTES`]; the rest kept for the next. Asks go first because requests wait on
+    /// them, and their keys' reports with them because their owner charges a batch's
+    /// entries before its asks, as an ask's requests came after the hits queued with them:
+    /// an ask whose keys' reports do not all fit beside it waits for them. A key's reports
+    /// stay in order, and keys depend on no other. An ask kept back is in flight already,
+    /// so that `oldest_ask` leaves it to be decided, and a key's reports kept back follow
+    /// those sent, as its owner applies them.
     pub(crate) fn take_piece(&mut self, from: PlaneId, oldest_ask: u64) -> Batch {
+        if self.bytes <= Room::new().left {
+            // All of it, as most often.
+            let batch = Batch {
+                from,
+                entries: std::mem::take(&mut self.entries),
+                asks: std::mem::take(&mut self.asks),
+                oldest_ask,
+                made: self.made,
+            };
+            self.bytes = 0;
+            return batch;
+        }
         let mut room = Room::new();
-        let asks = self
+        let fit = self
             .asks
             .iter()
             .take_while(|ask| room.take(ask.bytes()))
             .count();
-        let entries = if asks == self.asks.len() {
-            self.entries
-                .iter()
-                .take_while(|entry| room.take(entry.bytes()))
-                .count()
-        } else {
-            0
-        };
+        let asked: HashSet<&[u8]> = self.asks[..fit]
+            .iter()
+            .flat_map(|ask| ask.keys.iter().map(|(key, _)| &**key))
+            .collect();
+        let mut taken = vec![false; self.entries.len()];
+        // Keys asked about whose reports do not all fit: none after the first left out.
+        let mut short = HashSet::new();
+        for (at, entry) in self.entries.iter().enumerate() {
+            let key = &*entry.key;
+            if asked.contains(key) && !short.contains(key) {
+                if room.take(entry.bytes()) {
+                    taken[at] = true;
+                } else {
+                    short.insert(key);
+                }
+            }
+        }
+        for (at, entry) in self.entries.iter().enumerate() {
+            if taken[at] || asked.contains(&*entry.key) {
+                continue;
+            }
+            if !room.take(entry.bytes()) {
+                break;
+            }
+            taken[at] = true;
+        }
+        let mut at = 0;
+        let asks: Vec<Ask> = self
+            .asks
+            .extract_if(.., |ask| {
+                at += 1;
+                at <= fit && !ask.keys.iter().any(|(key, _)| short.contains(&**key))
+            })
+            .collect();
+        if asks.is_empty() && !taken.contains(&true) {
+            // Every ask that fitted waits for a report too big to go beside it: that goes
+            // first, as a piece takes its first entry however big.
+            if let Some(first) = taken.first_mut() {
+                *first = true;
+            }
+        }
+        let mut taken = taken.into_iter();
+        let entries = self
+            .entries
+            .extract_if(.., |_| taken.next().unwrap_or(false))
+            .collect();
         let batch = Batch {
             from,
-            entries: self.entries.drain(..entries).collect(),
-            asks: self.asks.drain(..asks).collect(),
+            entries,
+            asks,
             oldest_ask,
             made: self.made,
         };

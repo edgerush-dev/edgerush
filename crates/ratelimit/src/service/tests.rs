@@ -3004,6 +3004,106 @@ fn a_piece_takes_asks_first_and_no_more_than_fits() {
     assert_eq!(sent, entries, "every entry once, in order");
 }
 
+/// An ask takes its keys' reports into its piece: its owner charges a batch's entries
+/// before its asks, as the ask's requests came after the hits queued with them (#49), so a
+/// piece cut keeps that order, and the ask does not wait behind the reports queued ahead.
+/// Each key's reports stay in order.
+#[test]
+fn an_ask_takes_its_keys_reports_into_its_piece() {
+    let key = |n: usize| -> Box<[u8]> {
+        let mut key = vec![b'k'; 1_000];
+        key[..8].copy_from_slice(&(n as u64).to_be_bytes());
+        key.into()
+    };
+    let ask = |id: u64, n: usize| Ask {
+        id,
+        count: 1,
+        age: 0,
+        span: 0,
+        timeout: 300 * MS,
+        keys: vec![(key(n), contract())],
+    };
+    let entry = |n: usize, report: Report| Entry {
+        key: key(n),
+        contract: contract(),
+        report,
+    };
+    let mut queued = Queued::default();
+    for n in 0..3_000 {
+        queued.at(10 * MS).push_entry(entry(n, hits(1, 1, 0)));
+    }
+    // Key 2,000 has a second report, queued with the ask about it, last.
+    queued.push_entry(entry(2_000, hits(2, 1, 1)));
+    queued.push_ask(ask(1, 2_000));
+    queued.push_ask(ask(2, 10_000));
+    let mut pieces = Vec::new();
+    while !queued.is_empty() {
+        let piece = queued.take_piece(100, 1);
+        assert!(piece.bytes() <= PIECE_BYTES, "{}", piece.bytes());
+        pieces.push(piece);
+    }
+    assert_eq!(pieces.len(), 4);
+    let ids: Vec<u64> = pieces[0].asks.iter().map(|ask| ask.id).collect();
+    assert_eq!(ids, [1, 2], "the asks first");
+    let reports: Vec<&Report> = pieces[0]
+        .entries
+        .iter()
+        .filter(|entry| entry.key == key(2_000))
+        .map(|entry| &entry.report)
+        .collect();
+    assert_eq!(
+        reports,
+        [&hits(1, 1, 0), &hits(2, 1, 1)],
+        "with them, in order"
+    );
+    let rest: Vec<Box<[u8]>> = pieces
+        .iter()
+        .flat_map(|piece| &piece.entries)
+        .map(|entry| entry.key.clone())
+        .filter(|sent| *sent != key(2_000))
+        .collect();
+    let expected: Vec<Box<[u8]>> = (0..3_000).filter(|n| *n != 2_000).map(key).collect();
+    assert_eq!(rest, expected, "the others once, in order");
+}
+
+/// An ask held back for its key's reports, too big to go beside it, does not leave a piece
+/// empty: the reports go first, each alone and in order, and the ask after them.
+#[test]
+fn an_ask_held_back_leaves_its_piece_to_its_keys_report() {
+    let key: Box<[u8]> = vec![b'a'; 2 * PIECE_BYTES].into();
+    let mut queued = Queued::default();
+    for report in [hits(1, 1, 0), hits(2, 1, 1)] {
+        queued.push_entry(Entry {
+            key: key.clone(),
+            contract: contract(),
+            report,
+        });
+    }
+    queued.push_ask(Ask {
+        id: 1,
+        count: 1,
+        age: 0,
+        span: 0,
+        timeout: 300 * MS,
+        keys: vec![(key.clone(), contract())],
+    });
+    let first = queued.take_piece(100, 1);
+    let reports =
+        |piece: &Batch| -> Vec<Report> { piece.entries.iter().map(|entry| entry.report).collect() };
+    assert_eq!(
+        (reports(&first), first.asks.len()),
+        (vec![hits(1, 1, 0)], 0)
+    );
+    let second = queued.take_piece(100, 1);
+    assert_eq!(
+        (reports(&second), second.asks.len()),
+        (vec![hits(2, 1, 1)], 0)
+    );
+    let third = queued.take_piece(100, 1);
+    assert_eq!((reports(&third), third.asks.len()), (vec![], 1));
+    assert!(queued.is_empty());
+}
+
 /// A piece takes at least one thing, however big: an entry bigger than a piece goes alone,
 /// not never.
 #[test]
