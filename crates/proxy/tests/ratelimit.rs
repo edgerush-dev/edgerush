@@ -141,7 +141,7 @@ routes:
       - matches: [{{ path: {{ prefix: / }} }}]
         forward: {{ backends: [{{ upstream: web, weight: 1 }}] }}
 upstreams:
-  web: {{ load_balancer: p2c, endpoints: ["{upstream}"] }}
+  web: {{ load_balancer: p2c, endpoints: {{ listed: ["{upstream}"] }} }}
 rate_limiting: {{ mode: asynchronous, service: {{ pods: [{pods}], cycle_ms: 10{levers} }} }}
 "#
     );

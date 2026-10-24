@@ -317,8 +317,7 @@ mod tests {
     use super::*;
 
     const NOTHING: &str = "listeners: {}\nroutes: []\nupstreams: {}\n";
-    const ONE_UPSTREAM: &str =
-        "listeners: {}\nroutes: []\nupstreams: { web: { load_balancer: p2c, endpoints: [] } }\n";
+    const ONE_UPSTREAM: &str = "listeners: {}\nroutes: []\nupstreams: { web: { load_balancer: p2c, endpoints: { listed: [] } } }\n";
 
     /// A file of the test's own in the system's temporary directory, gone with the test.
     struct Scratch(PathBuf);
@@ -551,7 +550,7 @@ routes:
     listeners: [web]
     hostnames: [{{ name: "*", falls_through: true }}]
     rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}] }}, rate_limits: [per-client] }}]
-upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
+upstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
 rate_limiting: {{ mode: asynchronous, service: {{ pods: ["rl-0:7000"] }} }}
 limits_file: '{limits_file}'
 "#

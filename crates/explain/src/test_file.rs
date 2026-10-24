@@ -704,7 +704,7 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: cart, weight: 1 }] }
 upstreams:
-  cart: { load_balancer: p2c, endpoints: [] }
+  cart: { load_balancer: p2c, endpoints: { listed: [] } }
 tcp_routes:
   - { name: postgres, listeners: [db], backends: [{ upstream: cart, weight: 1 }] }
 tls_routes:

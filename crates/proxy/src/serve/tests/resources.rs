@@ -283,8 +283,8 @@ routes:
           - path: {{ prefix: / }}
         forward: {{ backends: [{{ upstream: healthy, weight: 1 }}] }}
 upstreams:
-  slow: {{ load_balancer: p2c, endpoints: ["{slow}"] }}
-  healthy: {{ load_balancer: p2c, endpoints: ["{healthy}"] }}
+  slow: {{ load_balancer: p2c, endpoints: {{ listed: ["{slow}"] }} }}
+  healthy: {{ load_balancer: p2c, endpoints: {{ listed: ["{healthy}"] }} }}
 "#
     );
     serde_saphyr::from_str(&yaml).unwrap()
@@ -1239,7 +1239,7 @@ async fn requests_refused_before_they_are_sent_are_not_counted_as_sent() {
             let (shadow, _) = counting_upstream().await;
             let mut config = everything_config(upstream);
             let mut copy = config.upstreams["up"].clone();
-            copy.endpoints = vec![shadow];
+            copy.endpoints = edgerush_config::Endpoints::Listed(vec![shadow]);
             config.upstreams.insert("shadow".to_owned(), copy);
             config.routes[0].rules[0].filters.push(
                 serde_saphyr::from_str(

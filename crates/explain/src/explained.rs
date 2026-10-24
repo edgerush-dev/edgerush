@@ -698,12 +698,12 @@ routes:
       - matches: [{ path: { prefix: /static } }]
         forward: { backends: [{ upstream: fallback, weight: 0 }] }
 upstreams:
-  api: { load_balancer: p2c, endpoints: [] }
-  cart: { load_balancer: p2c, endpoints: [] }
-  cart-canary: { load_balancer: p2c, endpoints: [] }
-  chat: { load_balancer: p2c, endpoints: [] }
-  fallback: { load_balancer: p2c, endpoints: [] }
-  shadow: { load_balancer: p2c, endpoints: [] }
+  api: { load_balancer: p2c, endpoints: { listed: [] } }
+  cart: { load_balancer: p2c, endpoints: { listed: [] } }
+  cart-canary: { load_balancer: p2c, endpoints: { listed: [] } }
+  chat: { load_balancer: p2c, endpoints: { listed: [] } }
+  fallback: { load_balancer: p2c, endpoints: { listed: [] } }
+  shadow: { load_balancer: p2c, endpoints: { listed: [] } }
 tcp_routes:
   - { name: postgres, listeners: [db], backends: [{ upstream: fallback, weight: 1 }] }
 "#;
@@ -888,7 +888,7 @@ routes:
         forward: { backends: [{ upstream: u, weight: 1 }] }
       - matches: [{ grpc: { service: pkg.Svc, method: Do } }]
         forward: { backends: [{ upstream: u, weight: 1 }] }
-upstreams: { u: { load_balancer: p2c, endpoints: [] } }
+upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
 "#;
         let snapshot = Snapshot::new(serde_saphyr::from_str(config).unwrap()).unwrap();
         let listener = snapshot.listener("web").unwrap();
@@ -930,7 +930,7 @@ routes:
       - matches: [{ path: { prefix: /admin } }]
         forward: { backends: [{ upstream: u, weight: 1 }] }
         rate_limits: [writes]
-upstreams: { u: { load_balancer: p2c, endpoints: [] } }
+upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
 rate_limiting: { mode: asynchronous, service: { pods: ["rl-0:7000"] } }
 "#;
         let limits = "limits:

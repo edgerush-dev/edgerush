@@ -18,6 +18,7 @@ mod backends;
 mod compile;
 mod config;
 mod harness_file;
+mod kubernetes;
 mod limits;
 mod route;
 
@@ -30,12 +31,13 @@ pub use compile::{
     compile_with_matches,
 };
 pub use config::{
-    AccessLog, Certificate, ClientValidation, Config, DataPlane, Forwarding, HealthCheck, Http3,
-    Keepalive, Listener, ListenerProxyProtocol, LoadBalancer, Probe, Protocol,
+    AccessLog, Certificate, ClientValidation, Config, DataPlane, Endpoints, Forwarding,
+    HealthCheck, Http3, Keepalive, Listener, ListenerProxyProtocol, LoadBalancer, Probe, Protocol,
     ProxyProtocolVersion, RateLimitMode, RateLimitService, RateLimiting, RequestId, SlowStart, Tls,
     Upstream, UpstreamProtocol, UpstreamTls,
 };
 pub use harness_file::{CertificateFiles, HarnessFile};
+pub use kubernetes::{KubernetesService, ServiceNameError, ServicePort};
 pub use limits::{Bucket, CompiledLimit, Global, Limit, LimitMatch, Limits, Model};
 pub use route::{
     Backend, EncodedSlash, Filter, Forward, Fraction, GrpcMethod, Header, HeaderChanges, Hostname,

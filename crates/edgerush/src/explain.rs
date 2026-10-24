@@ -295,12 +295,12 @@ routes:
       - matches: [{ path: { prefix: /static } }]
         forward: { backends: [{ upstream: fallback, weight: 0 }] }
 upstreams:
-  api: { load_balancer: p2c, endpoints: [] }
-  cart: { load_balancer: p2c, endpoints: [] }
-  cart-canary: { load_balancer: p2c, endpoints: [] }
-  chat: { load_balancer: p2c, endpoints: [] }
-  fallback: { load_balancer: p2c, endpoints: [] }
-  shadow: { load_balancer: p2c, endpoints: [] }
+  api: { load_balancer: p2c, endpoints: { listed: [] } }
+  cart: { load_balancer: p2c, endpoints: { listed: [] } }
+  cart-canary: { load_balancer: p2c, endpoints: { listed: [] } }
+  chat: { load_balancer: p2c, endpoints: { listed: [] } }
+  fallback: { load_balancer: p2c, endpoints: { listed: [] } }
+  shadow: { load_balancer: p2c, endpoints: { listed: [] } }
 tcp_routes:
   - { name: postgres, listeners: [db], backends: [{ upstream: fallback, weight: 1 }] }
 "#;

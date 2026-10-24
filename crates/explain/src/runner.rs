@@ -408,9 +408,9 @@ routes:
           - { type: response_header_modifier, set: [{ name: Cache-Control, value: no-store }] }
         redirect: { status: 301, path: { replace_full: /open }, query: keep }
 upstreams:
-  cart: { load_balancer: p2c, endpoints: [] }
-  canary: { load_balancer: p2c, endpoints: [] }
-  shadow: { load_balancer: p2c, endpoints: [] }
+  cart: { load_balancer: p2c, endpoints: { listed: [] } }
+  canary: { load_balancer: p2c, endpoints: { listed: [] } }
+  shadow: { load_balancer: p2c, endpoints: { listed: [] } }
 "#;
 
     /// Runs one test of this request and expectation; what differed.
@@ -450,9 +450,9 @@ tls_routes:
   - { name: api, listeners: [sni], hostnames: [{ name: api.example.com, falls_through: true }], backends: [{ upstream: api, weight: 3 }, { upstream: canary, weight: 1 }] }
   - { name: idle, listeners: [sni], hostnames: [{ name: idle.example.com, falls_through: true }], backends: [{ upstream: api, weight: 0 }] }
 upstreams:
-  api: { load_balancer: p2c, endpoints: [] }
-  canary: { load_balancer: p2c, endpoints: [] }
-  pg: { load_balancer: p2c, endpoints: [] }
+  api: { load_balancer: p2c, endpoints: { listed: [] } }
+  canary: { load_balancer: p2c, endpoints: { listed: [] } }
+  pg: { load_balancer: p2c, endpoints: { listed: [] } }
 "#;
 
     /// Runs one test of a connection; what differed.
@@ -772,7 +772,7 @@ routes:
       - matches: [{ path: { prefix: /admin } }]
         forward: { backends: [{ upstream: u, weight: 1 }] }
         rate_limits: [writes]
-upstreams: { u: { load_balancer: p2c, endpoints: [] } }
+upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
 rate_limiting: { mode: asynchronous, service: { pods: ["rl-0:7000"] } }
 "#;
         let limits = "limits:

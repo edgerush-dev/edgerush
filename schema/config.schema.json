@@ -190,6 +190,41 @@
         }
       ]
     },
+    "Endpoints": {
+      "description": "Where an upstream's endpoints come from, one way and stated.",
+      "oneOf": [
+        {
+          "description": "Addresses, not names, each once. None is allowed, and means there is nothing to\nsend a request to — a state a running system passes through, not a mistake.",
+          "type": "object",
+          "properties": {
+            "listed": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "listed"
+          ]
+        },
+        {
+          "description": "A Kubernetes Service's endpoints, followed through its EndpointSlices:\n`<service>.<namespace>.svc.<cluster domain>:<port>`, the port named, or a number for\nthe Service's only, unnamed port. Not served yet: a data plane refuses it until it\nwatches EndpointSlices.",
+          "type": "object",
+          "properties": {
+            "kubernetes": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kubernetes"
+          ]
+        }
+      ]
+    },
     "Filter": {
       "description": "Something done to a request or its response.",
       "oneOf": [
@@ -1535,12 +1570,8 @@
       "type": "object",
       "properties": {
         "endpoints": {
-          "description": "Where to connect: addresses, not names, each once. None is allowed, and means there\nis nothing to send a request to — a state a running system passes through, not a\nmistake.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "uniqueItems": true
+          "description": "Where its endpoints come from.",
+          "$ref": "#/$defs/Endpoints"
         },
         "health_check": {
           "description": "Probes of each endpoint, which keep one that fails them out of load balancing;\nnone is every endpoint taken as healthy.",

@@ -49,8 +49,8 @@ async fn an_open_tunnel_counts_against_its_backend() {
             let a = naming_backend("a").await;
             let b = naming_backend("b").await;
             let yaml = tcp_to(a, "").replace(
-                &format!("endpoints: [\"{a}\"]"),
-                &format!("endpoints: [\"{a}\", \"{b}\"]"),
+                &format!("endpoints: {{ listed: [\"{a}\"] }}"),
+                &format!("endpoints: {{ listed: [\"{a}\", \"{b}\"] }}"),
             );
             let (front, _worker) = passing(&yaml).await;
             let mut held = Vec::new();
@@ -217,7 +217,7 @@ async fn a_tls_tunnel_goes_where_the_name_asked_for_routes_it() {
                      tls_routes:\n\
                      \x20 - {{ name: exact, listeners: [sni], hostnames: [{{ name: api.example.test, falls_through: true }}], backends: [{{ upstream: exact, weight: 1 }}] }}\n\
                      \x20 - {{ name: rest, listeners: [sni], hostnames: [{{ name: \"*.example.test\", wildcard: any_labels, falls_through: true }}], backends: [{{ upstream: wildcard, weight: 1 }}] }}\n\
-                     upstreams: {{ exact: {{ load_balancer: p2c, endpoints: [\"{exact}\"] }}, wildcard: {{ load_balancer: p2c, endpoints: [\"{wildcard}\"] }} }}\n"
+                     upstreams: {{ exact: {{ load_balancer: p2c, endpoints: {{ listed: [\"{exact}\"] }} }}, wildcard: {{ load_balancer: p2c, endpoints: {{ listed: [\"{wildcard}\"] }} }} }}\n"
             );
             let (front, worker) = passing(&yaml).await;
             assert_eq!(
@@ -251,7 +251,7 @@ async fn a_client_hello_that_never_comes_is_given_up_on() {
                 "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls, proxy_protocol: off }} }}\n\
                      routes: []\n\
                      tls_routes: [{{ name: a, listeners: [sni], hostnames: [{{ name: a.test, falls_through: true }}], backends: [{{ upstream: up, weight: 1 }}] }}]\n\
-                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: [\"{backend}\"] }} }}\n"
+                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [\"{backend}\"] }} }} }}\n"
             );
             let (front, worker) = passing(&yaml).await;
             let mut client = TcpStream::connect(front).await.unwrap();
@@ -328,7 +328,7 @@ async fn a_tunnel_is_drained_once_a_reload_takes_its_route_away() {
                 .replace(
                     "upstreams: {",
                     &format!(
-                        "upstreams: {{ spare: {{ load_balancer: p2c, endpoints: [\"{other}\"] }}, "
+                        "upstreams: {{ spare: {{ load_balancer: p2c, endpoints: {{ listed: [\"{other}\"] }} }}, "
                     ),
                 );
             let reweighted: Config = serde_saphyr::from_str(&reweighted).unwrap();
@@ -348,7 +348,7 @@ async fn a_tunnel_is_drained_once_a_reload_takes_its_route_away() {
                      proxy_protocol: off, forwarding: {{ trusted_proxies: [], \
                      trusted_only_headers: [] }}, request_id: generate }} }}\n\
                      routes: []\n\
-                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: [\"{backend}\"] }} }}\n"
+                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [\"{backend}\"] }} }} }}\n"
             ))
             .unwrap();
             worker.proxy().reload(compile(&without).unwrap()).unwrap();
@@ -381,7 +381,7 @@ async fn a_tls_tunnel_is_drained_once_a_reload_takes_its_route_away() {
                     "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls, proxy_protocol: off }} }}\n\
                      routes: []\n\
                      tls_routes:\n{routes}\
-                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: [\"{backend}\"] }} }}\n"
+                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [\"{backend}\"] }} }} }}\n"
                 )
             };
             let route = |name: &str| {
@@ -441,7 +441,7 @@ async fn a_tunnel_is_drained_once_a_reload_takes_its_upstream_from_its_route() {
                 .replace(
                     "upstreams: {",
                     &format!(
-                        "upstreams: {{ elsewhere: {{ load_balancer: p2c, endpoints: [\"{other}\"] }}, "
+                        "upstreams: {{ elsewhere: {{ load_balancer: p2c, endpoints: {{ listed: [\"{other}\"] }} }}, "
                     ),
                 );
             let repointed: Config = serde_saphyr::from_str(&repointed).unwrap();

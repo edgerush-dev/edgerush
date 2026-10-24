@@ -50,7 +50,7 @@ async fn serving_checked_worker(
 ) -> (SocketAddr, Rc<Worker>) {
     let mut config = everything_config(endpoints[0]);
     let up = config.upstreams.get_mut("up").unwrap();
-    up.endpoints = endpoints;
+    up.endpoints = edgerush_config::Endpoints::Listed(endpoints);
     up.protocol = protocol;
     up.health_check = Some(check);
     let proxy = Arc::new(Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap());
@@ -134,7 +134,7 @@ async fn an_endpoint_that_cannot_be_connected_to_is_set_aside_until_a_probe_gets
             let (answering, _) = statuses_upstream(vec![200]).await;
             let mut config = everything_config(nowhere);
             let up = config.upstreams.get_mut("up").unwrap();
-            up.endpoints = vec![nowhere, answering];
+            up.endpoints = edgerush_config::Endpoints::Listed(vec![nowhere, answering]);
             up.slow_start = Some(edgerush_config::SlowStart { window_ms: 60_000 });
             config.data_plane.set_aside_ms = Some(200);
             let proxy =
@@ -1125,7 +1125,8 @@ async fn a_retry_takes_a_place_of_its_own_beside_a_connect_carried_on() {
             let (answering, _) = counting_upstream().await;
             hold_connects(hanging, Some(Duration::from_secs(60)));
             let mut config = trying(hanging, 100);
-            config.upstreams.get_mut("up").unwrap().endpoints = vec![hanging, answering];
+            config.upstreams.get_mut("up").unwrap().endpoints =
+                edgerush_config::Endpoints::Listed(vec![hanging, answering]);
             let mut retry = retrying(1, &[], &[], 10);
             retry.on_timeout = true;
             config.routes[0].rules[0]
@@ -1169,7 +1170,7 @@ async fn a_mirror_given_up_on_mid_connect_leaves_only_the_connect() {
             hold_connects(shadow, Some(Duration::from_secs(60)));
             let mut config = everything_config(primary);
             let mut copy = config.upstreams["up"].clone();
-            copy.endpoints = vec![shadow];
+            copy.endpoints = edgerush_config::Endpoints::Listed(vec![shadow]);
             config.upstreams.insert("shadow".to_owned(), copy);
             config.routes[0].rules[0].filters.push(
                 serde_saphyr::from_str(
@@ -1364,7 +1365,8 @@ async fn a_connect_carried_on_does_not_wait_for_another() {
             hold_connects(hanging, Some(Duration::from_secs(60)));
             hold_connects(refusing, Some(Duration::from_millis(300)));
             let mut config = trying(hanging, 100);
-            config.upstreams.get_mut("up").unwrap().endpoints = vec![hanging, refusing];
+            config.upstreams.get_mut("up").unwrap().endpoints =
+                edgerush_config::Endpoints::Listed(vec![hanging, refusing]);
             let (front, worker) = serving_connecting_within(&config, Duration::from_secs(3)).await;
             let began = Instant::now();
             // Until a try to each has been let go of: each draws either.
@@ -1510,7 +1512,7 @@ async fn an_upstream_socket_past_the_workers_files_closes_an_idle_one_first() {
             let (second, opened_second) = counting_upstream().await;
             let mut config = everything_config(first);
             let up = config.upstreams.get_mut("up").unwrap();
-            up.endpoints = vec![first, second];
+            up.endpoints = edgerush_config::Endpoints::Listed(vec![first, second]);
             up.load_balancer = edgerush_config::LoadBalancer::RoundRobin;
             // Room for a client connection and one upstream socket.
             let (front, worker) = serving_within_files(&config, 2).await;

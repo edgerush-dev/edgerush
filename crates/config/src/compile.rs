@@ -10,9 +10,10 @@ use crate::route::{
     ValuePredicate, Wildcard,
 };
 use crate::{
-    AccessLog, Backend, Certificate, ClientValidation, Config, Forwarding, HealthCheck, Http3,
-    Keepalive, ListenerProxyProtocol, LoadBalancer, Probe, Protocol, ProxyProtocolVersion,
-    RateLimitMode, RequestId, Rule, SlowStart, UpstreamProtocol,
+    AccessLog, Backend, Certificate, ClientValidation, Config, Endpoints, Forwarding, HealthCheck,
+    Http3, Keepalive, KubernetesService, ListenerProxyProtocol, LoadBalancer, Probe, Protocol,
+    ProxyProtocolVersion, RateLimitMode, RequestId, Rule, ServiceNameError, SlowStart,
+    UpstreamProtocol,
 };
 use edgerush_filters::forwarding::{ForwardingError, HeaderNames, TrustedProxies};
 use edgerush_filters::{
@@ -768,8 +769,12 @@ fn retry(forward: &Forward, place: &Place, errors: &mut Vec<ConfigError>) -> Opt
 pub struct CompiledUpstream {
     /// Its name in the config.
     pub name: String,
-    /// Where to connect.
+    /// Where to connect, as the config lists them; none for an upstream whose endpoints
+    /// are discovered.
     pub endpoints: Vec<SocketAddr>,
+    /// The Kubernetes Service whose EndpointSlices its endpoints come from, if they are
+    /// discovered rather than listed.
+    pub discovery: Option<KubernetesService>,
     /// What to speak there.
     pub protocol: UpstreamProtocol,
     /// TLS to its endpoints, if any.
@@ -869,7 +874,15 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
         .iter()
         .map(|(name, upstream)| CompiledUpstream {
             name: name.clone(),
-            endpoints: upstream.endpoints.clone(),
+            endpoints: match &upstream.endpoints {
+                Endpoints::Listed(endpoints) => endpoints.clone(),
+                Endpoints::Kubernetes(_) => Vec::new(),
+            },
+            // A name that is not a Service's is refused below, and nothing is compiled.
+            discovery: match &upstream.endpoints {
+                Endpoints::Listed(_) => None,
+                Endpoints::Kubernetes(service) => KubernetesService::parse(service).ok(),
+            },
             protocol: upstream.protocol,
             // A certificate not found is refused below, and nothing is compiled.
             tls: upstream.tls.as_ref().map(|tls| CompiledUpstreamTls {
@@ -898,12 +911,23 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
     }
     let rate_limiting = rate_limiting(config, &mut errors);
     for (name, upstream) in &config.upstreams {
-        // Once each: a destination is known across a reload by its upstream and address.
-        let mut listed = BTreeSet::new();
-        for endpoint in &upstream.endpoints {
-            if !listed.insert(endpoint) {
-                let problem = Problem::EndpointTwice(*endpoint);
-                errors.push(Place::upstream(name).problem(problem));
+        match &upstream.endpoints {
+            Endpoints::Listed(endpoints) => {
+                // Once each: a destination is known across a reload by its upstream and
+                // address.
+                let mut listed = BTreeSet::new();
+                for endpoint in endpoints {
+                    if !listed.insert(endpoint) {
+                        let problem = Problem::EndpointTwice(*endpoint);
+                        errors.push(Place::upstream(name).problem(problem));
+                    }
+                }
+            }
+            Endpoints::Kubernetes(service) => {
+                if let Err(error) = KubernetesService::parse(service) {
+                    let problem = Problem::KubernetesService(error);
+                    errors.push(Place::upstream(name).problem(problem));
+                }
             }
         }
         if upstream
@@ -2296,6 +2320,9 @@ pub enum Problem {
     /// repeated address would be a hidden one.
     #[error("endpoint {0} is listed twice")]
     EndpointTwice(SocketAddr),
+    /// Endpoints from Kubernetes, named by something that is not a Service's name and port.
+    #[error("`endpoints.kubernetes`: {0}")]
+    KubernetesService(ServiceNameError),
     /// A slow start over no time at all, which is none: left out is how none is said.
     #[error("`slow_start.window_ms` is 0: at least 1, or no `slow_start`")]
     SlowStartNever,
@@ -2629,9 +2656,9 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: web, weight: 1 }] }
 upstreams:
-  web: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }
-  checkout: { load_balancer: p2c, endpoints: ["127.0.0.1:9001", "[::1]:9001"] }
-  checkout-canary: { load_balancer: p2c, endpoints: [] }
+  web: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000"] } }
+  checkout: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9001", "[::1]:9001"] } }
+  checkout-canary: { load_balancer: p2c, endpoints: { listed: [] } }
 "#;
 
     #[test]
@@ -2908,7 +2935,7 @@ routes:
     listeners: [web]
     hostnames: [{ name: a.example.com, falls_through: true }]
     rules: [{ matches: [{ path: { prefix: /api } }], forward: { backends: [{ upstream: u, weight: 1 }] } }]
-upstreams: { u: { load_balancer: p2c, endpoints: [] } }
+upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
 "#;
         let compiled = compile(&config(twins)).unwrap();
         assert_eq!(route(&compiled, "a.example.com", "/api/x"), Some((0, 0)));
@@ -2927,7 +2954,7 @@ routes:
     listeners: [web]
     hostnames: [{ name: a.example.com, wildcard: any_labels, falls_through: false }]
     rules: [{ matches: [{ path: { prefix: /own } }], forward: { backends: [{ upstream: u, weight: 1 }] } }]
-upstreams: { u: { load_balancer: p2c, endpoints: [] } }
+upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
 "#;
         let compiled = compile(&config(ingress_style)).unwrap();
         assert_eq!(route(&compiled, "b.example.com", "/shared"), Some((0, 0)));
@@ -2977,7 +3004,7 @@ routes:
             - { upstream: web, weight: 1 }
             - { upstream: wbe, weight: 1 }
 upstreams:
-  web: { load_balancer: p2c, endpoints: [] }
+  web: { load_balancer: p2c, endpoints: { listed: [] } }
 "#;
         let errors: Vec<String> = compile(&config(broken))
             .err()
@@ -3032,7 +3059,7 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: u, weight: 1 }] }
 upstreams:
-  u: { load_balancer: p2c, endpoints: [] }
+  u: { load_balancer: p2c, endpoints: { listed: [] } }
 "#,
         ))
         .unwrap();
@@ -3108,7 +3135,7 @@ routes:
         filters: [{}]
         forward: {{ backends: [{{ upstream: u, weight: 1 }}] }}
 upstreams:
-  u: {{ load_balancer: p2c, endpoints: [] }}
+  u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }}
 "#,
                 filters.join(", ")
             );
@@ -3154,7 +3181,7 @@ routes:
     rules:
 {rules}
 upstreams:
-  u: {{ load_balancer: p2c, endpoints: [] }}
+  u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }}
 "#
         );
         compile(&config(&yaml))
@@ -3189,7 +3216,7 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: u, weight: 1 }] }
 upstreams:
-  u: { load_balancer: p2c, endpoints: [] }
+  u: { load_balancer: p2c, endpoints: { listed: [] } }
 "#,
         ))
         .unwrap();
@@ -3455,7 +3482,7 @@ upstreams: {}
         // An endpoint is an address, not a name.
         let upstream = |endpoint: &str| {
             let yaml = format!(
-                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: [\"{endpoint}\"] }} }}\n"
+                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [\"{endpoint}\"] }} }} }}\n"
             );
             serde_saphyr::from_str::<Config>(&yaml).map(|_| ())
         };
@@ -3467,18 +3494,20 @@ upstreams: {}
             serde_saphyr::from_str::<Config>(&yaml).map(|config| config.upstreams["u"].protocol)
         };
         assert_eq!(
-            spoken("{ load_balancer: p2c, endpoints: [] }").unwrap(),
+            spoken("{ load_balancer: p2c, endpoints: { listed: [] } }").unwrap(),
             UpstreamProtocol::Http1
         );
         assert_eq!(
-            spoken("{ load_balancer: p2c, endpoints: [], protocol: http1 }").unwrap(),
+            spoken("{ load_balancer: p2c, endpoints: { listed: [] }, protocol: http1 }").unwrap(),
             UpstreamProtocol::Http1
         );
         assert_eq!(
-            spoken("{ load_balancer: p2c, endpoints: [], protocol: http2 }").unwrap(),
+            spoken("{ load_balancer: p2c, endpoints: { listed: [] }, protocol: http2 }").unwrap(),
             UpstreamProtocol::Http2
         );
-        assert!(spoken("{ load_balancer: p2c, endpoints: [], protocol: h2c }").is_err());
+        assert!(
+            spoken("{ load_balancer: p2c, endpoints: { listed: [] }, protocol: h2c }").is_err()
+        );
         assert!(upstream("localhost:80").is_err());
         assert!(upstream("10.0.0.1").is_err());
 
@@ -3590,7 +3619,7 @@ listeners:
   l: { address: "[::]:443", protocol: https, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate, tls: { certificates: [b, a], without_sni: b } }
 routes: []
 upstreams:
-  u: { load_balancer: p2c, endpoints: [], tls: { server_name: backend.internal, authorities: ["CA"], client_certificate: c } }
+  u: { load_balancer: p2c, endpoints: { listed: [] }, tls: { server_name: backend.internal, authorities: ["CA"], client_certificate: c } }
 "#;
         let compiled =
             compile(&with_certificates(config(yaml), &["a", "b", "c", "unused"])).unwrap();
@@ -3675,7 +3704,7 @@ upstreams: {{}}
         assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
         let yaml = r#"listeners: {}
 routes: []
-upstreams: { u: { load_balancer: p2c, endpoints: [], tls: { server_name: a.b, authorities: ["CA"], client_certificate: { chain: C, key: K } } } }
+upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] }, tls: { server_name: a.b, authorities: ["CA"], client_certificate: { chain: C, key: K } } } }
 "#;
         assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
     }
@@ -3774,8 +3803,8 @@ tls_routes:
     hostnames: [{ name: api.example.com, falls_through: true }]
     backends: [{ upstream: postgres, weight: 1 }]
 upstreams:
-  api: { load_balancer: p2c, endpoints: ["10.0.0.2:443"] }
-  postgres: { load_balancer: p2c, endpoints: ["10.0.0.1:5432"] }
+  api: { load_balancer: p2c, endpoints: { listed: ["10.0.0.2:443"] } }
+  postgres: { load_balancer: p2c, endpoints: { listed: ["10.0.0.1:5432"] } }
 "#,
         ))
         .unwrap();
@@ -3854,7 +3883,7 @@ tls_routes:
   - { name: kept, listeners: [sni], hostnames: [{ name: "*.example.org", wildcard: one_label, falls_through: false }], backends: [{ upstream: up, weight: 1 }] }
   - { name: also-api, listeners: [sni], hostnames: [{ name: api.example.com, falls_through: true }], backends: [{ upstream: up, weight: 1 }] }
 upstreams:
-  up: { load_balancer: p2c, endpoints: [] }
+  up: { load_balancer: p2c, endpoints: { listed: [] } }
 "#,
         ))
         .unwrap();
@@ -3926,8 +3955,8 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: two, weight: 1 }] }
 upstreams:
-  one: { load_balancer: p2c, endpoints: ["10.0.0.1:80"] }
-  two: { load_balancer: p2c, endpoints: ["10.0.0.2:80"] }
+  one: { load_balancer: p2c, endpoints: { listed: ["10.0.0.1:80"] } }
+  two: { load_balancer: p2c, endpoints: { listed: ["10.0.0.2:80"] } }
 "#,
         ))
         .unwrap();
@@ -3953,7 +3982,7 @@ upstreams:
     fn passthrough_routes_are_held_to_their_listeners_and_backends() {
         let refused = |listeners: &str, routes: &str| -> Vec<String> {
             let yaml = format!(
-                "listeners: {{ {listeners} }}\n{routes}\nupstreams: {{ up: {{ load_balancer: p2c, endpoints: [] }}, h2: {{ load_balancer: p2c, endpoints: [], protocol: http2 }} }}\n"
+                "listeners: {{ {listeners} }}\n{routes}\nupstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }}, h2: {{ load_balancer: p2c, endpoints: {{ listed: [] }}, protocol: http2 }} }}\n"
             );
             compile(&config(&yaml))
                 .err()
@@ -4217,7 +4246,7 @@ upstreams: {}
   off: {{ address: "[::]:81", protocol: tcp, proxy_protocol: off }}
 routes: []
 tcp_routes: [{{ name: db, listeners: [off], backends: [{{ upstream: up, weight: 1 }}] }}]
-upstreams: {{ up: {{ load_balancer: p2c, endpoints: [] }} }}
+upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
 "#
         )))
         .unwrap();
@@ -4241,9 +4270,9 @@ upstreams: {{ up: {{ load_balancer: p2c, endpoints: [] }} }}
 {routes}
 tcp_routes: [{{ name: db, listeners: [t], backends: [{{ upstream: one, weight: 1 }}] }}]
 upstreams:
-  one: {{ load_balancer: p2c, endpoints: [], proxy_protocol: v1 }}
-  two: {{ load_balancer: p2c, endpoints: [], proxy_protocol: v2 }}
-  plain: {{ load_balancer: p2c, endpoints: [] }}
+  one: {{ load_balancer: p2c, endpoints: {{ listed: [] }}, proxy_protocol: v1 }}
+  two: {{ load_balancer: p2c, endpoints: {{ listed: [] }}, proxy_protocol: v2 }}
+  plain: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }}
 "#
             );
             compile(&config(&yaml))
@@ -4282,7 +4311,7 @@ upstreams:
                 "route `web`, rules[0], filters[0]: upstream `two` is sent a PROXY protocol header, which only TCP and TLS routes send",
             ]
         );
-        let yaml = "listeners: {}\nroutes: []\nupstreams: { u: { load_balancer: p2c, endpoints: [], proxy_protocol: v3 } }\n";
+        let yaml = "listeners: {}\nroutes: []\nupstreams: { u: { load_balancer: p2c, endpoints: { listed: [] }, proxy_protocol: v3 } }\n";
         assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
     }
 
@@ -4299,8 +4328,8 @@ routes: []
 tcp_routes: [{{ name: db, listeners: [t], backends: [{{ upstream: http, weight: 1 }}] }}]
 tls_routes: [{{ name: api, listeners: [s], hostnames: [{{ name: a.test, falls_through: true }}], backends: [{route}] }}]
 upstreams:
-  http: {{ load_balancer: p2c, endpoints: [], health_check: {{ interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 1, unhealthy_threshold: 1, probe: {{ http: {{ path: / }} }} }} }}
-  quiet: {{ load_balancer: p2c, endpoints: [] }}
+  http: {{ load_balancer: p2c, endpoints: {{ listed: [] }}, health_check: {{ interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 1, unhealthy_threshold: 1, probe: {{ http: {{ path: / }} }} }} }}
+  quiet: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }}
 "#
             );
             compile(&config(&yaml))
@@ -4311,7 +4340,7 @@ upstreams:
             r#"listeners: {}
 routes: []
 upstreams:
-  db: { load_balancer: p2c, endpoints: [], health_check: { interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 1, unhealthy_threshold: 1, probe: tcp } }
+  db: { load_balancer: p2c, endpoints: { listed: [] }, health_check: { interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 1, unhealthy_threshold: 1, probe: tcp } }
 "#,
         ))
         .unwrap();
@@ -4399,7 +4428,7 @@ routes: []
 tcp_routes:
   - {{ name: db, listeners: [db], backends: [{{ upstream: postgres, weight: 1 }}] }}
 upstreams:
-  postgres: {{ load_balancer: p2c, endpoints: ["10.0.0.1:5432"] }}
+  postgres: {{ load_balancer: p2c, endpoints: {{ listed: ["10.0.0.1:5432"] }} }}
 "#
             )))
         };
@@ -4456,7 +4485,7 @@ upstreams:
     fn tls_to_an_upstream_names_its_server_and_whom_to_trust() {
         let with = |tls: &str| {
             config(&format!(
-                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: [], tls: {tls} }} }}\n"
+                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }}, tls: {tls} }} }}\n"
             ))
         };
         let compiled = compile(&with(
@@ -4495,7 +4524,7 @@ upstreams:
             );
         }
         // Both are said.
-        let yaml = "listeners: {}\nroutes: []\nupstreams: { u: { load_balancer: p2c, endpoints: [], tls: { server_name: a.b } } }\n";
+        let yaml = "listeners: {}\nroutes: []\nupstreams: { u: { load_balancer: p2c, endpoints: { listed: [] }, tls: { server_name: a.b } } }\n";
         assert!(serde_saphyr::from_str::<Config>(yaml).is_err());
     }
 
@@ -4511,7 +4540,7 @@ routes:
     listeners: [web]
     hostnames: [{{ name: "*", falls_through: true }}]
     rules: [{{ matches: [{matching}], forward: {{ backends: [{{ upstream: u, weight: 1 }}] }} }}]
-upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
+upstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
 "#
             );
             compile(&config(&yaml))
@@ -4563,7 +4592,7 @@ routes:
         forward: { backends: [{ upstream: u, weight: 1 }] }
       - matches: [{ grpc: { service: pkg.Svc, method: Do } }]
         forward: { backends: [{ upstream: u, weight: 1 }] }
-upstreams: { u: { load_balancer: p2c, endpoints: [] } }
+upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
 "#,
         ))
         .unwrap();
@@ -4593,7 +4622,7 @@ routes:
     listeners: [web]
     hostnames: [{{ name: "*", falls_through: true }}]
     rules:
-{}{}upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
+{}{}upstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
 "#,
                 rules[0], rules[1]
             );
@@ -4619,17 +4648,17 @@ routes:
         assert_eq!(most, 359_996_400);
         let tunnel = |seconds: u64| {
             format!(
-                "listeners: {{ db: {{ address: \"[::]:5432\", protocol: tcp, proxy_protocol: off, tunnel_idle_seconds: {seconds} }} }}\nroutes: []\ntcp_routes: [{{ name: pg, listeners: [db], backends: [{{ upstream: u, weight: 1 }}] }}]\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}\n"
+                "listeners: {{ db: {{ address: \"[::]:5432\", protocol: tcp, proxy_protocol: off, tunnel_idle_seconds: {seconds} }} }}\nroutes: []\ntcp_routes: [{{ name: pg, listeners: [db], backends: [{{ upstream: u, weight: 1 }}] }}]\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}\n"
             )
         };
         let health = |interval: u64, timeout: u64| {
             format!(
-                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: [], health_check: {{ interval_seconds: {interval}, timeout_seconds: {timeout}, healthy_threshold: 1, unhealthy_threshold: 1, probe: tcp }} }} }}\n"
+                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }}, health_check: {{ interval_seconds: {interval}, timeout_seconds: {timeout}, healthy_threshold: 1, unhealthy_threshold: 1, probe: tcp }} }} }}\n"
             )
         };
         let keepalive = |interval: u64, timeout: u64| {
             format!(
-                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: [], protocol: http2, keepalive: {{ interval_seconds: {interval}, timeout_seconds: {timeout}, without_calls: false }} }} }}\n"
+                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }}, protocol: http2, keepalive: {{ interval_seconds: {interval}, timeout_seconds: {timeout}, without_calls: false }} }} }}\n"
             )
         };
         let refused = |yaml: &str| {
@@ -4670,17 +4699,17 @@ routes:
                 .map(|compiled| compiled.upstreams[0].keepalive)
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
-        let ok = with("{ load_balancer: p2c, endpoints: [], protocol: http2, keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false } }")
+        let ok = with("{ load_balancer: p2c, endpoints: { listed: [] }, protocol: http2, keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false } }")
             .unwrap()
             .unwrap();
         assert_eq!(ok.interval_seconds, 300);
-        assert!(with("{ load_balancer: p2c, endpoints: [], protocol: http2, keepalive: { interval_seconds: 10, timeout_seconds: 5, without_calls: true, backend_allows_short_intervals: true } }").is_ok());
+        assert!(with("{ load_balancer: p2c, endpoints: { listed: [] }, protocol: http2, keepalive: { interval_seconds: 10, timeout_seconds: 5, without_calls: true, backend_allows_short_intervals: true } }").is_ok());
         let problem = |upstream: &str| with(upstream).unwrap_err()[0].clone();
-        assert!(problem("{ load_balancer: p2c, endpoints: [], keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false } }")
+        assert!(problem("{ load_balancer: p2c, endpoints: { listed: [] }, keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false } }")
             .ends_with("`keepalive` is for an upstream spoken to in HTTP/2"));
-        assert!(problem("{ load_balancer: p2c, endpoints: [], protocol: http2, keepalive: { interval_seconds: 60, timeout_seconds: 20, without_calls: false } }")
+        assert!(problem("{ load_balancer: p2c, endpoints: { listed: [] }, protocol: http2, keepalive: { interval_seconds: 60, timeout_seconds: 20, without_calls: false } }")
             .contains("more often than the 300 s gRPC servers take"));
-        assert!(problem("{ load_balancer: p2c, endpoints: [], protocol: http2, keepalive: { interval_seconds: 0, timeout_seconds: 20, without_calls: false, backend_allows_short_intervals: true } }")
+        assert!(problem("{ load_balancer: p2c, endpoints: { listed: [] }, protocol: http2, keepalive: { interval_seconds: 0, timeout_seconds: 20, without_calls: false, backend_allows_short_intervals: true } }")
             .ends_with("needs an interval and a timeout of at least a second"));
     }
 
@@ -4695,18 +4724,18 @@ routes:
             compile(&parsed(upstream).unwrap()).unwrap().upstreams[0].load_balancer
         };
         assert_eq!(
-            balancer("{ load_balancer: p2c, endpoints: [] }"),
+            balancer("{ load_balancer: p2c, endpoints: { listed: [] } }"),
             LoadBalancer::P2c
         );
         assert_eq!(
-            balancer("{ load_balancer: round_robin, endpoints: [] }"),
+            balancer("{ load_balancer: round_robin, endpoints: { listed: [] } }"),
             LoadBalancer::RoundRobin
         );
         // None is not "whatever the data plane likes": the control plane says which.
-        assert!(parsed("{ endpoints: [] }").is_err());
+        assert!(parsed("{ endpoints: { listed: [] } }").is_err());
         // Random is no longer a choice, and least-request is spelled `p2c`.
-        assert!(parsed("{ load_balancer: random, endpoints: [] }").is_err());
-        assert!(parsed("{ load_balancer: least_request, endpoints: [] }").is_err());
+        assert!(parsed("{ load_balancer: random, endpoints: { listed: [] } }").is_err());
+        assert!(parsed("{ load_balancer: least_request, endpoints: { listed: [] } }").is_err());
     }
 
     /// An upstream lists each endpoint once: a repeated address would be a second, hidden
@@ -4722,7 +4751,7 @@ routes:
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
         let refused = with(
-            r#"{ u: { load_balancer: p2c, endpoints: ["127.0.0.1:9000", "127.0.0.1:9001", "127.0.0.1:9000"] } }"#,
+            r#"{ u: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000", "127.0.0.1:9001", "127.0.0.1:9000"] } } }"#,
         )
         .unwrap_err();
         assert_eq!(refused.len(), 1, "{refused:?}");
@@ -4732,9 +4761,69 @@ routes:
         );
         assert_eq!(
             with(
-                r#"{ u: { load_balancer: p2c, endpoints: ["127.0.0.1:9000", "127.0.0.1:9001"] }, v: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] } }"#
+                r#"{ u: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000", "127.0.0.1:9001"] } }, v: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000"] } } }"#
             ),
             Ok(2)
+        );
+    }
+
+    /// An upstream says where its endpoints come from, and a bare list says nothing of
+    /// that: it is refused rather than read as listed.
+    #[test]
+    fn an_upstream_says_where_its_endpoints_come_from() {
+        let parsed = |upstream: &str| {
+            let yaml = format!(
+                "listeners: {{}}
+routes: []
+upstreams: {{ u: {upstream} }}
+"
+            );
+            serde_saphyr::from_str::<Config>(&yaml)
+        };
+        assert!(parsed(r#"{ load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }"#).is_err());
+        assert!(
+            parsed(r#"{ load_balancer: p2c, endpoints: { listed: [], kubernetes: "web.shop.svc.cluster.local:http" } }"#)
+                .is_err()
+        );
+        assert!(parsed("{ load_balancer: p2c, endpoints: {} }").is_err());
+    }
+
+    /// Endpoints from Kubernetes compile to the Service and port they are followed
+    /// through, with none listed; a name that is not a Service's is refused, saying why.
+    #[test]
+    fn endpoints_from_kubernetes_name_a_service_and_its_port() {
+        let with = |endpoints: &str| {
+            let yaml = format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{ u: {{ load_balancer: p2c, endpoints: {endpoints} }} }}\n"
+            );
+            compile(&config(&yaml))
+                .map(|compiled| {
+                    let upstream = &compiled.upstreams[0];
+                    (upstream.endpoints.clone(), upstream.discovery.clone())
+                })
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            with(r#"{ kubernetes: "web.shop.svc.cluster.local:http" }"#),
+            Ok((
+                Vec::new(),
+                Some(KubernetesService {
+                    service: "web".to_owned(),
+                    namespace: "shop".to_owned(),
+                    cluster_domain: "cluster.local".to_owned(),
+                    port: crate::ServicePort::Named("http".to_owned()),
+                })
+            ))
+        );
+        assert_eq!(
+            with(r#"{ listed: ["127.0.0.1:9000"] }"#),
+            Ok((vec!["127.0.0.1:9000".parse().unwrap()], None))
+        );
+        let refused = with(r#"{ kubernetes: "web.shop:http" }"#).unwrap_err();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].contains("`endpoints.kubernetes`: not a Service's name"),
+            "{refused:?}"
         );
     }
 
@@ -4747,13 +4836,19 @@ routes:
                 .map(|compiled| compiled.upstreams[0].slow_start)
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
-        assert_eq!(with("{ load_balancer: p2c, endpoints: [] }"), Ok(None));
         assert_eq!(
-            with("{ load_balancer: p2c, endpoints: [], slow_start: { window_ms: 30000 } }"),
+            with("{ load_balancer: p2c, endpoints: { listed: [] } }"),
+            Ok(None)
+        );
+        assert_eq!(
+            with(
+                "{ load_balancer: p2c, endpoints: { listed: [] }, slow_start: { window_ms: 30000 } }"
+            ),
             Ok(Some(SlowStart { window_ms: 30_000 }))
         );
-        let refused = with("{ load_balancer: p2c, endpoints: [], slow_start: { window_ms: 0 } }")
-            .unwrap_err();
+        let refused =
+            with("{ load_balancer: p2c, endpoints: { listed: [] }, slow_start: { window_ms: 0 } }")
+                .unwrap_err();
         assert!(
             refused[0].ends_with("`slow_start.window_ms` is 0: at least 1, or no `slow_start`")
         );
@@ -5009,7 +5104,7 @@ routes:
     rules:
       - {{ matches: [{{ path: {{ prefix: /api }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}] }}, rate_limits: [{rule}] }}
       - {{ matches: [{{ path: {{ prefix: /old }} }}], redirect: {{ status: 301, query: keep }}, rate_limits: [{redirect}] }}
-upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
+upstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
 {service}"#
         );
         let mut config = config(&yaml);
@@ -5188,7 +5283,7 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
         };
         let check = |fields: &str| {
             format!(
-                "{{ load_balancer: p2c, endpoints: [], protocol: http1, health_check: {{ interval_seconds: 5, timeout_seconds: 2, healthy_threshold: 2, unhealthy_threshold: 3, {fields} }} }}"
+                "{{ load_balancer: p2c, endpoints: {{ listed: [] }}, protocol: http1, health_check: {{ interval_seconds: 5, timeout_seconds: 2, healthy_threshold: 2, unhealthy_threshold: 3, {fields} }} }}"
             )
         };
         let http = with(&check("probe: { http: { path: /healthz } }"))
@@ -5227,7 +5322,7 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
             .ends_with("thresholds of at least one")
         );
         // Nothing is left to a default.
-        let missing = "{ load_balancer: p2c, endpoints: [], health_check: { interval_seconds: 5, timeout_seconds: 2, probe: { http: { path: / } } } }";
+        let missing = "{ load_balancer: p2c, endpoints: { listed: [] }, health_check: { interval_seconds: 5, timeout_seconds: 2, probe: { http: { path: / } } } }";
         let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{ u: {missing} }}\n");
         assert!(serde_saphyr::from_str::<Config>(&yaml).is_err());
     }
@@ -5244,7 +5339,7 @@ routes:
     listeners: [web]
     hostnames: [{{ name: "*", falls_through: true }}]
     rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}] }}, filters: [{mirror}] }}]
-upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }}, shadow: {{ load_balancer: p2c, endpoints: [] }} }}
+upstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }}, shadow: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
 "#
             );
             compile(&config(&yaml))
@@ -5308,7 +5403,7 @@ routes:
     listeners: [web]
     hostnames: [{{ name: "*", falls_through: true }}]
     rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}], retry: {retry} }} }}]
-upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
+upstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
 "#
             );
             compile(&config(&yaml))
@@ -5392,7 +5487,7 @@ routes:
     listeners: [web]
     hostnames: [{{ name: "*", falls_through: true }}]
     rules: [{{ matches: [{{ path: {{ prefix: / }} }}], forward: {{ backends: [{{ upstream: u, weight: 1 }}]{forward} }} }}]
-upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
+upstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
 "#
             );
             compile(&config(&yaml))
@@ -5526,7 +5621,7 @@ routes:
     listeners: [internal, public]
     hostnames: [{ name: metrics.internal, falls_through: true }]
     rules: [{ matches: [{ path: { prefix: / } }], forward: { backends: [{ upstream: u, weight: 1 }] } }]
-upstreams: { u: { load_balancer: p2c, endpoints: [] } }
+upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
 "#;
         let compiled = compile(&config(two)).unwrap();
         let names: Vec<&str> = compiled.listeners.iter().map(|l| l.name.as_str()).collect();

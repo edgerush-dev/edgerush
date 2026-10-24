@@ -72,7 +72,7 @@ routes:
           - path: {{ prefix: / }}
 {extra}
 upstreams:
-  up: {{ load_balancer: p2c, endpoints: ["{upstream}"] }}
+  up: {{ load_balancer: p2c, endpoints: {{ listed: ["{upstream}"] }} }}
 {upstreams}
 "#
     );
@@ -726,7 +726,7 @@ async fn a_handshake_is_not_mirrored() {
     let (address, proxy) = gateway(
         upstream,
         rule,
-        &format!("  copy: {{ load_balancer: p2c, endpoints: [\"{mirror}\"] }}"),
+        &format!("  copy: {{ load_balancer: p2c, endpoints: {{ listed: [\"{mirror}\"] }} }}"),
     );
     let mut client = Wire::to(address).await;
     client.write(&handshake()).await;
@@ -1044,7 +1044,9 @@ fn h2_backend_answering(
 
 /// The config's upstreams line for `up` spoken to in HTTP/2 at `address`.
 fn h2_upstream(address: SocketAddr) -> String {
-    format!("  up2: {{ load_balancer: p2c, endpoints: [\"{address}\"], protocol: http2 }}")
+    format!(
+        "  up2: {{ load_balancer: p2c, endpoints: {{ listed: [\"{address}\"] }}, protocol: http2 }}"
+    )
 }
 
 const FORWARD_H2: &str = "        forward: { backends: [{ upstream: up2, weight: 1 }] }";
@@ -1364,7 +1366,8 @@ async fn an_open_websocket_counts_against_its_backend() {
     let (a, at_a) = echoing(saw.clone());
     let (b, at_b) = echoing(saw);
     let (unused, _) = backend(|_| async {});
-    let pair = format!("  pair: {{ load_balancer: p2c, endpoints: [\"{a}\", \"{b}\"] }}");
+    let pair =
+        format!("  pair: {{ load_balancer: p2c, endpoints: {{ listed: [\"{a}\", \"{b}\"] }} }}");
     let (address, _proxy) = gateway(unused, FORWARD_PAIR, &pair);
     let mut held = Vec::new();
     for opened in 1..=20 {
@@ -1390,8 +1393,9 @@ async fn an_open_http2_websocket_counts_against_its_backend() {
     let (a, _) = h2_backend(true, saw_a);
     let (b, _) = h2_backend(true, saw_b);
     let (unused, _) = backend(|_| async {});
-    let pair =
-        format!("  pair: {{ load_balancer: p2c, endpoints: [\"{a}\", \"{b}\"], protocol: http2 }}");
+    let pair = format!(
+        "  pair: {{ load_balancer: p2c, endpoints: {{ listed: [\"{a}\", \"{b}\"] }}, protocol: http2 }}"
+    );
     let (address, _proxy) = gateway(unused, FORWARD_PAIR, &pair);
     let (mut asked_a, mut asked_b) = (0, 0);
     let mut held = Vec::new();

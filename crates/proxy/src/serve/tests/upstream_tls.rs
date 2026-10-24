@@ -333,7 +333,7 @@ async fn a_request_waiting_for_a_retired_destination_gets_a_secured_connection()
             let secured = |endpoints: &[SocketAddr]| {
                 let mut config = everything_config(kept);
                 let up = config.upstreams.get_mut("up").unwrap();
-                up.endpoints = endpoints.to_vec();
+                up.endpoints = edgerush_config::Endpoints::Listed(endpoints.to_vec());
                 up.protocol = UpstreamProtocol::Http2;
                 up.tls = Some(trusting("backend.test", &certificate));
                 compile(&config).unwrap()

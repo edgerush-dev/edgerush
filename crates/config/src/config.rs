@@ -365,11 +365,8 @@ impl fmt::Debug for Certificate {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
-    /// Where to connect: addresses, not names, each once. None is allowed, and means there
-    /// is nothing to send a request to — a state a running system passes through, not a
-    /// mistake.
-    #[cfg_attr(feature = "schema", schemars(extend("uniqueItems" = true)))]
-    pub endpoints: Vec<SocketAddr>,
+    /// Where its endpoints come from.
+    pub endpoints: Endpoints,
     /// What its endpoints are spoken to in, whatever the client spoke. An upstream of TCP
     /// and TLS routes is sent their bytes as they come: neither `http2` nor `tls`.
     #[serde(default)]
@@ -396,6 +393,22 @@ pub struct Upstream {
     /// route's connections carry many clients' requests.
     #[serde(default)]
     pub proxy_protocol: Option<ProxyProtocolVersion>,
+}
+
+/// Where an upstream's endpoints come from, one way and stated
+/// ([03 §6](../../../docs/03-data-plane.md)).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Endpoints {
+    /// Addresses, not names, each once. None is allowed, and means there is nothing to
+    /// send a request to — a state a running system passes through, not a mistake.
+    Listed(#[cfg_attr(feature = "schema", schemars(extend("uniqueItems" = true)))] Vec<SocketAddr>),
+    /// A Kubernetes Service's endpoints, followed through its EndpointSlices:
+    /// `<service>.<namespace>.svc.<cluster domain>:<port>`, the port named, or a number for
+    /// the Service's only, unnamed port. Not served yet: a data plane refuses it until it
+    /// watches EndpointSlices.
+    Kubernetes(String),
 }
 
 /// How an upstream's endpoint is chosen for an exchange ([03 §6](../../../docs/03-data-plane.md)).

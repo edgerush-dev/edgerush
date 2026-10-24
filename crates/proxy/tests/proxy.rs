@@ -217,7 +217,9 @@ fn everything_to(listeners: &[(&str, SocketAddr)], config: &str) -> String {
     }
     yaml += "upstreams:\n";
     for (listener, upstream) in listeners {
-        yaml += &format!("  {listener}: {{ load_balancer: p2c, endpoints: [\"{upstream}\"] }}\n");
+        yaml += &format!(
+            "  {listener}: {{ load_balancer: p2c, endpoints: {{ listed: [\"{upstream}\"] }} }}\n"
+        );
     }
     yaml
 }
@@ -270,10 +272,10 @@ routes:
           backends:
             - {{ upstream: pages, weight: 1 }}
 upstreams:
-  cart: {{ load_balancer: p2c, endpoints: ["{cart}"] }}
-  dead: {{ load_balancer: p2c, endpoints: ["{dead}"] }}
-  empty: {{ load_balancer: p2c, endpoints: [] }}
-  pages: {{ load_balancer: p2c, endpoints: ["{pages}"] }}
+  cart: {{ load_balancer: p2c, endpoints: {{ listed: ["{cart}"] }} }}
+  dead: {{ load_balancer: p2c, endpoints: {{ listed: ["{dead}"] }} }}
+  empty: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }}
+  pages: {{ load_balancer: p2c, endpoints: {{ listed: ["{pages}"] }} }}
 "#
     );
     proxy(&yaml).await["web"]
@@ -495,7 +497,7 @@ routes:
           - path: {{ prefix: / }}
         forward: {{ backends: [{{ upstream: pages, weight: 1 }}] }}
 upstreams:
-  pages: {{ load_balancer: p2c, endpoints: ["{pages}"] }}
+  pages: {{ load_balancer: p2c, endpoints: {{ listed: ["{pages}"] }} }}
 "#
     );
     let (proxy, addresses) = reloadable_proxy(&yaml).await;
@@ -623,8 +625,8 @@ routes:
           backends:
             - {{ upstream: rest, weight: 1 }}
 upstreams:
-  evil: {{ load_balancer: p2c, endpoints: ["{evil}"] }}
-  rest: {{ load_balancer: p2c, endpoints: ["{rest}"] }}
+  evil: {{ load_balancer: p2c, endpoints: {{ listed: ["{evil}"] }} }}
+  rest: {{ load_balancer: p2c, endpoints: {{ listed: ["{rest}"] }} }}
 "#
     );
     let proxy = proxy(&yaml).await["web"];
@@ -732,7 +734,7 @@ routes:
           backends:
             - {{ upstream: any, weight: 1 }}
 upstreams:
-  any: {{ load_balancer: p2c, endpoints: ["{any_host}"] }}
+  any: {{ load_balancer: p2c, endpoints: {{ listed: ["{any_host}"] }} }}
 "#
     );
     let proxy = self::proxy(&yaml).await["web"];
@@ -786,8 +788,8 @@ routes:
           backends:
             - {{ upstream: admin, weight: 1 }}
 upstreams:
-  admin: {{ load_balancer: p2c, endpoints: ["{admin}"] }}
-  web: {{ load_balancer: p2c, endpoints: ["{one}", "{two}"] }}
+  admin: {{ load_balancer: p2c, endpoints: {{ listed: ["{admin}"] }} }}
+  web: {{ load_balancer: p2c, endpoints: {{ listed: ["{one}", "{two}"] }} }}
 "#
     );
     let listeners = proxy(&yaml).await;
@@ -1342,7 +1344,9 @@ fn routed_to(upstreams: &[(&str, SocketAddr)]) -> String {
     }
     yaml += "upstreams:\n";
     for (name, address) in upstreams {
-        yaml += &format!("  {name}: {{ load_balancer: p2c, endpoints: [\"{address}\"] }}\n");
+        yaml += &format!(
+            "  {name}: {{ load_balancer: p2c, endpoints: {{ listed: [\"{address}\"] }} }}\n"
+        );
     }
     yaml
 }
@@ -1731,7 +1735,7 @@ fn balanced(endpoints: &[SocketAddr], balancer: &str, retry: bool) -> String {
         "listeners:\n  web: {{ address: \"127.0.0.1:0\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n\
          routes:\n  - name: everything\n    listeners: [web]\n    hostnames:\n      - {{ name: \"*\", falls_through: true }}\n    rules:\n      \
          - matches:\n          - path: {{ prefix: / }}\n        forward: {{ backends: [{{ upstream: web, weight: 1 }}]{retry} }}\n\
-         upstreams:\n  web: {{ load_balancer: {balancer}, endpoints: [{}] }}\n",
+         upstreams:\n  web: {{ load_balancer: {balancer}, endpoints: {{ listed: [{}] }} }}\n",
         listed.join(", ")
     )
 }
@@ -1828,7 +1832,7 @@ async fn a_mirrors_copy_counts_against_the_mirrors_backend() {
             "        filters: [{ type: request_mirror, upstream: shadow, fraction: { numerator: 1, denominator: 1 } }]\n        forward:",
         )
         + &format!(
-            "  shadow: {{ load_balancer: p2c, endpoints: [\"{}\", \"{}\"] }}\n",
+            "  shadow: {{ load_balancer: p2c, endpoints: {{ listed: [\"{}\", \"{}\"] }} }}\n",
             one.address, two.address
         );
     let listeners = proxy(&yaml).await;

@@ -31,5 +31,5 @@ routes:
         forward: { backends: [{ upstream: web, weight: 1 }] }
 
 upstreams:
-  api: { load_balancer: p2c, endpoints: ["127.0.0.1:9001", "127.0.0.1:9002"], slow_start: { window_ms: 30000 } }
-  web: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }
+  api: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9001", "127.0.0.1:9002"] }, slow_start: { window_ms: 30000 } }
+  web: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000"] } }

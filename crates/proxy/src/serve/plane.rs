@@ -43,6 +43,21 @@ pub(super) fn runs_rate_limits(config: &Compiled, supported: bool) -> Result<(),
     Ok(())
 }
 
+/// Refuses a config with an upstream whose endpoints come from Kubernetes: the data plane
+/// does not watch EndpointSlices yet, and such an upstream would never have an endpoint.
+pub(super) fn discovers_nothing(config: &Compiled) -> Result<(), ProxyError> {
+    match config
+        .upstreams()
+        .iter()
+        .find(|upstream| upstream.discovery.is_some())
+    {
+        Some(upstream) => Err(ProxyError::KubernetesDiscoveryNotBuilt(
+            upstream.name.clone(),
+        )),
+        None => Ok(()),
+    }
+}
+
 impl Snapshot {
     /// The snapshot of `config`, after `previous` if there is one, and the destinations of
     /// `previous` it does not have, retired only once it is taken in.
@@ -55,6 +70,7 @@ impl Snapshot {
         logs: Vec<Option<Sink>>,
     ) -> Result<(Self, Retiring), ProxyError> {
         runs_rate_limits(&config, edgerush_ratelimit::service::pooled::supported())?;
+        discovers_nothing(&config)?;
         let endpoints = config
             .upstreams()
             .iter()

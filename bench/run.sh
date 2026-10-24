@@ -242,7 +242,7 @@ start_backend() {
         grep -q 'access_log: { file:' "$config"
     fi
     if [ "$UPSTREAM_H2" = 1 ]; then
-        sed -i 's#backend: { load_balancer: p2c, endpoints: \["127.0.0.1:9000"\] }#backend: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"], protocol: http2 }#' "$config"
+        sed -i 's#backend: { load_balancer: p2c, endpoints: { listed: \["127.0.0.1:9000"\] } }#backend: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000"] }, protocol: http2 }#' "$config"
         grep -q 'protocol: http2' "$config"
     fi
     local backend_conf=$here/nginx.conf
@@ -264,7 +264,7 @@ start_backend() {
             [ "$(grep -c 'backlog=4096 proxy_protocol;' "$backend_conf")" = 2 ]
             sed -i 's#protocol: tcp, proxy_protocol: off#protocol: tcp, proxy_protocol: { senders: ["127.0.0.0/8"] }#;
                 s#protocol: tls, proxy_protocol: off#protocol: tls, proxy_protocol: { senders: ["127.0.0.0/8"] }#;
-                s#{ load_balancer: p2c, endpoints: \[#{ proxy_protocol: v2, load_balancer: p2c, endpoints: [#' "$config"
+                s#{ load_balancer: p2c, endpoints: { listed: \[#{ proxy_protocol: v2, load_balancer: p2c, endpoints: { listed: [#' "$config"
             [ "$(grep -c 'senders' "$config")" = 2 ]
             [ "$(grep -c 'proxy_protocol: v2' "$config")" = 2 ]
         fi

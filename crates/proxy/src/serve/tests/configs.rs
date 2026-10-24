@@ -24,7 +24,7 @@ pub(super) fn tcp_to(backend: SocketAddr, extra: &str) -> String {
         "listeners: {{ db: {{ address: \"127.0.0.1:0\", protocol: tcp, proxy_protocol: off{extra} }} }}\n\
              routes: []\n\
              tcp_routes: [{{ name: db, listeners: [db], backends: [{{ upstream: up, weight: 1 }}] }}]\n\
-             upstreams: {{ up: {{ load_balancer: p2c, endpoints: [\"{backend}\"] }} }}\n"
+             upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [\"{backend}\"] }} }} }}\n"
     )
 }
 
@@ -138,7 +138,7 @@ routes:
           - path: {{ prefix: / }}
         forward: {{ backends: [{{ upstream: up, weight: 1 }}] }}
 upstreams:
-  up: {{ load_balancer: p2c, endpoints: ["{upstream}"] }}
+  up: {{ load_balancer: p2c, endpoints: {{ listed: ["{upstream}"] }} }}
 "#
     );
     serde_saphyr::from_str(&yaml).unwrap()

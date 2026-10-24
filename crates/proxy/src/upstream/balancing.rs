@@ -344,7 +344,7 @@ mod tests {
         for (name, balancer, addresses) in upstreams {
             let listed: Vec<String> = addresses.iter().map(|a| format!("\"{a}\"")).collect();
             yaml += &format!(
-                "  {name}: {{ load_balancer: {balancer}, endpoints: [{}] }}\n",
+                "  {name}: {{ load_balancer: {balancer}, endpoints: {{ listed: [{}] }} }}\n",
                 listed.join(", ")
             );
         }
@@ -534,7 +534,7 @@ mod tests {
                 format!(", slow_start: {{ window_ms: {ms} }}")
             });
             yaml += &format!(
-                "  {name}: {{ load_balancer: {balancer}, endpoints: [{}]{slow} }}\n",
+                "  {name}: {{ load_balancer: {balancer}, endpoints: {{ listed: [{}] }}{slow} }}\n",
                 listed.join(", ")
             );
         }

@@ -227,7 +227,7 @@ mod tests {
     /// that merely goes on passing does not (03 §6).
     #[test]
     fn passing_again_after_failing_starts_a_ramp() {
-        let yaml = "listeners: {}\nroutes: []\nupstreams:\n  web: { load_balancer: p2c, endpoints: [\"127.0.0.1:1\"], health_check: { interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 2, unhealthy_threshold: 2, probe: { http: { path: / } } } }\n";
+        let yaml = "listeners: {}\nroutes: []\nupstreams:\n  web: { load_balancer: p2c, endpoints: { listed: [\"127.0.0.1:1\"] }, health_check: { interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 2, unhealthy_threshold: 2, probe: { http: { path: / } } } }\n";
         let config: Config = serde_saphyr::from_str(yaml).unwrap();
         let compiled = compile(&config).unwrap();
         let destinations =

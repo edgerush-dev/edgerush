@@ -436,7 +436,7 @@ async fn a_tls_tunnel_routes_by_the_client_hello_after_the_header() {
                 "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls, proxy_protocol: {{ senders: [\"127.0.0.0/8\"] }} }} }}\n\
                      routes: []\n\
                      tls_routes: [{{ name: a, listeners: [sni], hostnames: [{{ name: a.test, falls_through: true }}], backends: [{{ upstream: up, weight: 1 }}] }}]\n\
-                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: [\"{backend}\"] }} }}\n"
+                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [\"{backend}\"] }} }} }}\n"
             );
             let (front, worker) = passing(&yaml).await;
             let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
@@ -594,7 +594,7 @@ async fn a_tls_backend_that_asks_is_sent_the_header_then_the_client_hello() {
                 "listeners: {{ sni: {{ address: \"127.0.0.1:0\", protocol: tls, proxy_protocol: off }} }}\n\
                      routes: []\n\
                      tls_routes: [{{ name: a, listeners: [sni], hostnames: [{{ name: a.test, falls_through: true }}], backends: [{{ upstream: up, weight: 1 }}] }}]\n\
-                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: [\"{backend}\"] }} }}\n"
+                     upstreams: {{ up: {{ load_balancer: p2c, endpoints: {{ listed: [\"{backend}\"] }} }} }}\n"
             );
             let (front, _worker) = passing(&sending(&yaml, "v1")).await;
             // The handshake goes nowhere: the backend only listens. The client gives up.

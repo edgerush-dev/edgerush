@@ -210,7 +210,7 @@ routes:
       - matches: [{ path: { prefix: /cart } }]
         forward: { backends: [{ upstream: cart, weight: 1 }] }
 upstreams:
-  cart: { load_balancer: p2c, endpoints: [] }
+  cart: { load_balancer: p2c, endpoints: { listed: [] } }
 "#;
 
     const PASSES: &str = r#"tests:

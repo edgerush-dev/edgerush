@@ -59,8 +59,8 @@ tls_routes:
 {routes}  - {{ name: api, listeners: [sni], hostnames: [{{ name: api.example.com, falls_through: true }}], backends: [{{ upstream: api, weight: 1 }}] }}
   - {{ name: rest, listeners: [sni], hostnames: [{{ name: "*.example.com", wildcard: any_labels, falls_through: true }}], backends: [{{ upstream: api, weight: 1 }}] }}
 upstreams:
-  api: {{ load_balancer: p2c, endpoints: ["10.0.0.2:443"] }}
-  postgres: {{ load_balancer: p2c, endpoints: ["10.0.0.1:5432"] }}
+  api: {{ load_balancer: p2c, endpoints: {{ listed: ["10.0.0.2:443"] }} }}
+  postgres: {{ load_balancer: p2c, endpoints: {{ listed: ["10.0.0.1:5432"] }} }}
 "#
     );
     let config: Config = serde_saphyr::from_str(&yaml).expect("valid YAML");
