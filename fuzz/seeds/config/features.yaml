@@ -24,10 +24,11 @@ routes:
 tcp_routes:
   - { name: db, listeners: [db], backends: [{ upstream: db, weight: 1 }] }
 upstreams:
-  orders: { load_balancer: p2c, endpoints: ["10.0.1.1:8080"], slow_start: { window_ms: 30000 }, health_check: { interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 1, unhealthy_threshold: 1, probe: { http: { path: /healthz } } } }
-  shadow: { load_balancer: round_robin, endpoints: ["10.0.1.2:8080"] }
-  grpc: { load_balancer: p2c, endpoints: ["10.0.1.3:9000"], protocol: http2, keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false }, tls: { server_name: grpc.internal, authorities: ["CA"], client_certificate: gateway } }
-  db: { load_balancer: p2c, endpoints: ["10.0.1.4:5432"], proxy_protocol: v2, health_check: { interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 1, unhealthy_threshold: 1, probe: tcp } }
+  orders: { load_balancer: p2c, endpoints: { listed: ["10.0.1.1:8080"] }, slow_start: { window_ms: 30000 }, health_check: { interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 1, unhealthy_threshold: 1, probe: { http: { path: /healthz } } } }
+  shadow: { load_balancer: round_robin, endpoints: { listed: ["10.0.1.2:8080"] } }
+  grpc: { load_balancer: p2c, endpoints: { listed: ["10.0.1.3:9000"] }, protocol: http2, keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false }, tls: { server_name: grpc.internal, authorities: ["CA"], client_certificate: gateway } }
+  db: { load_balancer: p2c, endpoints: { listed: ["10.0.1.4:5432"] }, proxy_protocol: v2, health_check: { interval_seconds: 5, timeout_seconds: 1, healthy_threshold: 1, unhealthy_threshold: 1, probe: tcp } }
+  catalog: { load_balancer: p2c, endpoints: { kubernetes: "catalog.shop.svc.cluster.local:http" } }
 data_plane: { set_aside_ms: 2000 }
 certificates:
   site: { chain_file: site.crt, key_file: site.key }

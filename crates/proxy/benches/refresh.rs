@@ -37,7 +37,7 @@ fn config(upstreams: usize, moved: Option<usize>) -> Compiled {
             .collect();
         let _written = writeln!(
             yaml,
-            "  u{upstream}: {{ load_balancer: p2c, endpoints: [{}] }}",
+            "  u{upstream}: {{ load_balancer: p2c, endpoints: {{ listed: [{}] }} }}",
             endpoints.join(", ")
         );
     }

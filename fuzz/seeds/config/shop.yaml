@@ -84,10 +84,10 @@ routes:
           backends:
             - { upstream: admin, weight: 1 }
 upstreams:
-  admin: { load_balancer: p2c, endpoints: ["127.0.0.1:9001"] }
-  cart: { load_balancer: p2c, endpoints: ["127.0.0.1:9002"] }
-  cart-canary: { load_balancer: p2c, endpoints: ["127.0.0.1:9003"] }
-  fallback: { load_balancer: p2c, endpoints: [] }
-  search: { load_balancer: p2c, endpoints: ["127.0.0.1:9004"] }
+  admin: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9001"] } }
+  cart: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9002"] } }
+  cart-canary: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9003"] } }
+  fallback: { load_balancer: p2c, endpoints: { listed: [] } }
+  search: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9004"] } }
 certificates:
   secure: { chain_file: secure.crt, key_file: secure.key }

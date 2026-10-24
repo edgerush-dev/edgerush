@@ -15,9 +15,9 @@ async fn a_mirror_is_sent_the_request_as_it_stands_at_its_place() {
             let (after, copied_after) = recording_upstream("200 OK");
             let mut config = everything_config(primary);
             let mut copy = config.upstreams["up"].clone();
-            copy.endpoints = vec![before];
+            copy.endpoints = edgerush_config::Endpoints::Listed(vec![before]);
             config.upstreams.insert("before".to_owned(), copy.clone());
-            copy.endpoints = vec![after];
+            copy.endpoints = edgerush_config::Endpoints::Listed(vec![after]);
             config.upstreams.insert("after".to_owned(), copy);
             let filters = [
                 "{ type: request_mirror, upstream: before, fraction: { numerator: 1, denominator: 1 } }",
@@ -67,7 +67,7 @@ async fn serving_mirroring_worker(
     config.upstreams.get_mut("up").unwrap().protocol = speaking;
     for &(name, at, protocol) in mirrors {
         let mut upstream = config.upstreams["up"].clone();
-        upstream.endpoints = at.into_iter().collect();
+        upstream.endpoints = edgerush_config::Endpoints::Listed(at.into_iter().collect());
         upstream.protocol = protocol;
         config.upstreams.insert(name.to_owned(), upstream);
         config.routes[0].rules[0]

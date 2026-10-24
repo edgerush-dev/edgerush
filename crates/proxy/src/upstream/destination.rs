@@ -475,7 +475,7 @@ mod tests {
         for (name, addresses) in upstreams {
             let listed: Vec<String> = addresses.iter().map(|a| format!("\"{a}\"")).collect();
             yaml += &format!(
-                "  {name}: {{ load_balancer: p2c, endpoints: [{}] }}\n",
+                "  {name}: {{ load_balancer: p2c, endpoints: {{ listed: [{}] }} }}\n",
                 listed.join(", ")
             );
         }

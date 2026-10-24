@@ -208,9 +208,9 @@ tls_routes:
   - { name: kept, listeners: [sni], hostnames: [{ name: "*.example.org", wildcard: one_label, falls_through: false }], backends: [{ upstream: api, weight: 0 }] }
   - { name: org, listeners: [sni], hostnames: [{ name: www.example.org, falls_through: true }], backends: [{ upstream: api, weight: 1 }] }
 upstreams:
-  api: { load_balancer: p2c, endpoints: [] }
-  api-canary: { load_balancer: p2c, endpoints: [] }
-  pg: { load_balancer: p2c, endpoints: [] }
+  api: { load_balancer: p2c, endpoints: { listed: [] } }
+  api-canary: { load_balancer: p2c, endpoints: { listed: [] } }
+  pg: { load_balancer: p2c, endpoints: { listed: [] } }
 "#;
 
     fn snapshot() -> Snapshot {

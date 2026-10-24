@@ -741,11 +741,11 @@ routes:
           backends:
             - { upstream: admin, weight: 1 }
 upstreams:
-  admin: { load_balancer: p2c, endpoints: ["127.0.0.1:9001"] }
-  cart: { load_balancer: p2c, endpoints: ["127.0.0.1:9002"] }
-  cart-canary: { load_balancer: p2c, endpoints: ["127.0.0.1:9003"] }
-  fallback: { load_balancer: p2c, endpoints: [] }
-  search: { load_balancer: p2c, endpoints: ["127.0.0.1:9004"] }
+  admin: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9001"] } }
+  cart: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9002"] } }
+  cart-canary: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9003"] } }
+  fallback: { load_balancer: p2c, endpoints: { listed: [] } }
+  search: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9004"] } }
 "#;
 
     fn shop() -> Compiled {
@@ -891,9 +891,9 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: other, weight: 1 }] }
 upstreams:
-  connect: { load_balancer: p2c, endpoints: ["127.0.0.1:9001"] }
-  get: { load_balancer: p2c, endpoints: ["127.0.0.1:9002"] }
-  other: { load_balancer: p2c, endpoints: ["127.0.0.1:9003"] }
+  connect: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9001"] } }
+  get: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9002"] } }
+  other: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9003"] } }
 "#;
         let config: Config = serde_saphyr::from_str(BY_METHOD).unwrap();
         let compiled = compile(&config).unwrap();
@@ -1152,7 +1152,7 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: cart, weight: 1 }] }
 upstreams:
-  cart: { load_balancer: p2c, endpoints: ["10.0.0.1:80"] }
+  cart: { load_balancer: p2c, endpoints: { listed: ["10.0.0.1:80"] } }
 "#,
             )
             .unwrap(),
@@ -1426,7 +1426,7 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: pages, weight: 1 }] }
 upstreams:
-  pages: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }
+  pages: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000"] } }
 "#;
 
     /// What a request to `web` of [`MOVED`] is redirected with: status and `Location`.
@@ -1499,7 +1499,7 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: up, weight: 1 }] }
 upstreams:
-  up: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }
+  up: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000"] } }
 "#;
 
     /// Decides on `web` of [`REWRITTEN`], and gives the head as it goes upstream.
@@ -1569,10 +1569,10 @@ routes:
           - { type: request_mirror, upstream: third, fraction: { numerator: 1, denominator: 1 } }
         forward: { backends: [{ upstream: up, weight: 1 }] }
 upstreams:
-  up: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }
-  first: { load_balancer: p2c, endpoints: ["127.0.0.1:9001"] }
-  second: { load_balancer: p2c, endpoints: ["127.0.0.1:9002"] }
-  third: { load_balancer: p2c, endpoints: ["127.0.0.1:9003"] }
+  up: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000"] } }
+  first: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9001"] } }
+  second: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9002"] } }
+  third: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9003"] } }
 "#;
 
     /// What a copy says: its target, its `Host`, and whether it has `x-changed`.
@@ -1877,9 +1877,9 @@ routes:
       - matches: [{ path: { prefix: / } }]
         forward: { backends: [{ upstream: open, weight: 1 }] }
 upstreams:
-  gitlab: { load_balancer: p2c, endpoints: ["127.0.0.1:9001"] }
-  guarded: { load_balancer: p2c, endpoints: ["127.0.0.1:9002"] }
-  open: { load_balancer: p2c, endpoints: ["127.0.0.1:9003"] }
+  gitlab: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9001"] } }
+  guarded: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9002"] } }
+  open: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9003"] } }
 "#;
         let config: Config = serde_saphyr::from_str(GIT).unwrap();
         let compiled = compile(&config).unwrap();
@@ -2054,9 +2054,9 @@ routes:
           backends:
             - { upstream: other, weight: 1 }
 upstreams:
-  one-spelling: { load_balancer: p2c, endpoints: ["127.0.0.1:9001"] }
-  both-spellings: { load_balancer: p2c, endpoints: ["127.0.0.1:9002"] }
-  other: { load_balancer: p2c, endpoints: ["127.0.0.1:9003"] }
+  one-spelling: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9001"] } }
+  both-spellings: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9002"] } }
+  other: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9003"] } }
 "#;
         let config: Config = serde_saphyr::from_str(SPELLINGS).unwrap();
         let spellings = compile(&config).unwrap();
@@ -2156,7 +2156,7 @@ routes:
             add: [{ name: Cookie, value: "flag=on" }, { name: X-Note, value: "n" }]
         forward: { backends: [{ upstream: app, weight: 1 }] }
 upstreams:
-  app: { load_balancer: p2c, endpoints: ["127.0.0.1:9001"] }
+  app: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9001"] } }
 "#;
         let compiled = compile(&shop_config(ADDS)).unwrap();
         let web = compiled

@@ -80,7 +80,7 @@ routes:
           backends:
             - { upstream: app, weight: 1 }
 upstreams:
-  app: { load_balancer: p2c, endpoints: ["127.0.0.1:9000"] }
+  app: { load_balancer: p2c, endpoints: { listed: ["127.0.0.1:9000"] } }
 ```
 
 ```sh

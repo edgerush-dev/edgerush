@@ -21,7 +21,7 @@ routes:
     listeners: [web]
     hostnames: [{ name: "*", falls_through: true }]
     rules: [{ matches: [{ path: { prefix: / } }], forward: { backends: [{ upstream: u, weight: 1 }] } }]
-upstreams: { u: { load_balancer: p2c, endpoints: [] } }
+upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
 rate_limiting: { mode: asynchronous, service: { pods: ["rl-0:7000"] } }
 "#;
 

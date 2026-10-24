@@ -6,7 +6,9 @@ use super::*;
 fn upstreams(named: &[(&str, &str)]) -> Compiled {
     let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
     for (name, address) in named {
-        yaml += &format!("  {name}: {{ load_balancer: p2c, endpoints: [\"{address}\"] }}\n");
+        yaml += &format!(
+            "  {name}: {{ load_balancer: p2c, endpoints: {{ listed: [\"{address}\"] }} }}\n"
+        );
     }
     let config: Config = serde_saphyr::from_str(&yaml).unwrap();
     compile(&config).unwrap()
@@ -43,6 +45,40 @@ fn a_reload_keeps_what_has_not_changed_and_retires_what_has() {
     assert_eq!(filed_under(&proxy, 1), web, "web changed hands on a reload");
     assert_ne!(filed_under(&proxy, 0), web, "the newcomer took web's place");
     assert!(zed.is_retired(), "an upstream that is gone was left live");
+}
+
+/// An upstream whose endpoints come from Kubernetes would never have one while the data
+/// plane does not watch EndpointSlices: such a config is refused at start, and on a reload,
+/// which leaves the running config as it was.
+#[test]
+fn endpoints_from_kubernetes_are_refused_until_they_can_be_followed() {
+    let discovered = |name: &str| {
+        let yaml = format!(
+            "listeners: {{}}
+routes: []
+upstreams:
+  {name}: {{ load_balancer: p2c, endpoints: {{ kubernetes: \"web.shop.svc.cluster.local:http\" }} }}
+"
+        );
+        let config: Config = serde_saphyr::from_str(&yaml).unwrap();
+        compile(&config).unwrap()
+    };
+    assert!(matches!(
+        Proxy::new(discovered("shop"), NonZeroUsize::MIN),
+        Err(ProxyError::KubernetesDiscoveryNotBuilt(name)) if name == "shop"
+    ));
+
+    let proxy = Proxy::new(upstreams(&[("web", "127.0.0.1:1")]), NonZeroUsize::MIN).unwrap();
+    let web = filed_under(&proxy, 0);
+    assert_eq!(
+        proxy.reload(discovered("web")).unwrap_err().to_string(),
+        "upstream `web`: endpoints from Kubernetes are not served yet"
+    );
+    assert_eq!(
+        filed_under(&proxy, 0),
+        web,
+        "a refused reload changed the config"
+    );
 }
 
 /// Reads a body to its end and says whether its connection went back.

@@ -12,7 +12,7 @@ async fn a_grpc_call_the_gateway_answers_itself_is_told_a_grpc_status() {
         .run_until(async {
             let mut config = everything_config("127.0.0.1:9".parse().unwrap());
             let up = config.upstreams.get_mut("up").unwrap();
-            up.endpoints.clear();
+            up.endpoints = edgerush_config::Endpoints::Listed(Vec::new());
             up.protocol = UpstreamProtocol::Http2;
             let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
             let worker = Worker::with_deadlines(Arc::new(proxy), H1Limits::default(), SHORT);

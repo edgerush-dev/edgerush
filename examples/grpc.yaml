@@ -45,7 +45,7 @@ routes:
 
 upstreams:
   greeter:
-    endpoints: ["127.0.0.1:50051", "127.0.0.1:50052"]
+    endpoints: { listed: ["127.0.0.1:50051", "127.0.0.1:50052"] }
     load_balancer: p2c
     protocol: http2
     keepalive: { interval_seconds: 300, timeout_seconds: 20, without_calls: false }
@@ -56,6 +56,6 @@ upstreams:
       unhealthy_threshold: 3
       probe: { grpc: { service: helloworld.Greeter } }
   greeter-canary:
-    endpoints: ["127.0.0.1:50061"]
+    endpoints: { listed: ["127.0.0.1:50061"] }
     load_balancer: p2c
     protocol: http2

@@ -491,7 +491,7 @@ mod tests {
         let mut yaml = String::from("listeners: {}\nroutes: []\nupstreams:\n");
         for at in 0..4_000 {
             yaml.push_str(&format!(
-                "  upstream-{at}: {{ load_balancer: p2c, endpoints: [\"127.0.0.1:{}\"] }}\n",
+                "  upstream-{at}: {{ load_balancer: p2c, endpoints: {{ listed: [\"127.0.0.1:{}\"] }} }}\n",
                 1_000 + at
             ));
         }

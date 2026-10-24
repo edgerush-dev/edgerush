@@ -204,7 +204,7 @@ tls_routes:
 
 upstreams:
   web_backend:
-    endpoints: ["127.0.0.1:9000", "127.0.0.1:9001"]
+    endpoints: { listed: ["127.0.0.1:9000", "127.0.0.1:9001"] }
     protocol: http1
     load_balancer: p2c
     slow_start: { window_ms: 30000 }
@@ -226,12 +226,12 @@ upstreams:
     #   client_certificate: client
 
   canary:
-    endpoints: ["127.0.0.1:9002"]
+    endpoints: { listed: ["127.0.0.1:9002"] }
     load_balancer: round_robin
 
   grpc_backend:
     # HTTP/2 without TLS: spoken by prior knowledge (h2c).
-    endpoints: ["127.0.0.1:50051"]
+    endpoints: { listed: ["127.0.0.1:50051"] }
     protocol: http2
     load_balancer: p2c
     keepalive:
@@ -248,7 +248,7 @@ upstreams:
 
   raw_backend:
     # The backend must accept a PROXY v2 header before the client's bytes.
-    endpoints: ["127.0.0.1:10001"]
+    endpoints: { listed: ["127.0.0.1:10001"] }
     load_balancer: round_robin
     proxy_protocol: v2
     health_check:
@@ -261,7 +261,7 @@ upstreams:
   tls_backend:
     # Carries the client's TLS unchanged, so it has no tls of its own; an HTTP probe could
     # never pass behind it, and a health check here would be a tcp one.
-    endpoints: ["127.0.0.1:9443"]
+    endpoints: { listed: ["127.0.0.1:9443"] }
     load_balancer: p2c
 
 data_plane:

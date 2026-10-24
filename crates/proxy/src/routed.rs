@@ -147,8 +147,8 @@ listeners:
 
     const UPSTREAMS: &str = r#"
 upstreams:
-  one: { load_balancer: p2c, endpoints: ["10.0.0.1:80"] }
-  two: { load_balancer: p2c, endpoints: ["10.0.0.2:80"] }
+  one: { load_balancer: p2c, endpoints: { listed: ["10.0.0.1:80"] } }
+  two: { load_balancer: p2c, endpoints: { listed: ["10.0.0.2:80"] } }
 "#;
 
     /// A config of the three listeners above with `routes`, `tcp_routes` and `tls_routes`

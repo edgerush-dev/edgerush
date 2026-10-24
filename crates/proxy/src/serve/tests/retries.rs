@@ -86,7 +86,7 @@ fn in_turn_retrying_503(
     let mut config = everything_config(endpoints[0]);
     let up = config.upstreams.get_mut("up").unwrap();
     up.protocol = protocol;
-    up.endpoints = endpoints;
+    up.endpoints = edgerush_config::Endpoints::Listed(endpoints);
     up.load_balancer = edgerush_config::LoadBalancer::RoundRobin;
     config.routes[0].rules[0]
         .forward

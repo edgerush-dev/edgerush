@@ -104,7 +104,7 @@ listeners:
 routes: []
 tcp_routes: []
 tls_routes: []
-upstreams: { u: { load_balancer: p2c, endpoints: [] } }
+upstreams: { u: { load_balancer: p2c, endpoints: { listed: [] } } }
 data_plane: { set_aside_ms: 7 }
 "#;
 

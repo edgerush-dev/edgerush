@@ -1191,6 +1191,10 @@ pub enum ProxyError {
     /// BoringSSL could not give the keys the data plane makes at start.
     #[error("no random keys to be had: {0}")]
     Random(String),
+    /// An upstream whose endpoints come from Kubernetes, which the data plane cannot
+    /// follow yet: it does not watch EndpointSlices.
+    #[error("upstream `{0}`: endpoints from Kubernetes are not served yet")]
+    KubernetesDiscoveryNotBuilt(String),
     /// A rate-limiting service on a machine without native 128-bit atomics.
     #[error(
         "`rate_limiting`: this machine has no native 128-bit compare-and-swap, which rate \

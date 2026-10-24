@@ -197,7 +197,8 @@ async fn the_gateways_own_answer_says_why() {
     local
         .run_until(async {
             let mut config = everything_config("127.0.0.1:9".parse().unwrap());
-            config.upstreams.get_mut("up").unwrap().endpoints.clear();
+            config.upstreams.get_mut("up").unwrap().endpoints =
+                edgerush_config::Endpoints::Listed(Vec::new());
             let logged = recording("own", config).await;
             let answer = h1_answer(logged.front, CLOSING_GET).await;
             assert!(answer.starts_with("HTTP/1.1 503"), "{answer}");
@@ -677,7 +678,8 @@ async fn a_grpc_call_the_gateway_answers_has_its_status() {
     local
         .run_until(async {
             let mut config = everything_config("127.0.0.1:9".parse().unwrap());
-            config.upstreams.get_mut("up").unwrap().endpoints.clear();
+            config.upstreams.get_mut("up").unwrap().endpoints =
+                edgerush_config::Endpoints::Listed(Vec::new());
             let logged = recording("grpc-own", config).await;
             let mut send = h2_library_client(logged.front, &::h2::client::Builder::new()).await;
             let (answer, _) = send
@@ -1186,7 +1188,7 @@ async fn a_tls_connection_is_logged_with_the_name_it_asked_for() {
                          routes: []\n\
                          tls_routes:\n\
                          \x20 - {{ name: exact, listeners: [sni], hostnames: [{{ name: api.example.test, falls_through: true }}], backends: [{{ upstream: exact, weight: 1 }}] }}\n\
-                         upstreams: {{ exact: {{ load_balancer: p2c, endpoints: [\"{exact}\"] }} }}\n"
+                         upstreams: {{ exact: {{ load_balancer: p2c, endpoints: {{ listed: [\"{exact}\"] }} }} }}\n"
                 )
             })
             .await;
