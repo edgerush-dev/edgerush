@@ -1935,6 +1935,10 @@ struct Owned {
     /// Its bucket's state, the contract its terms: the bucket is made from them to be used.
     bucket: BucketState,
     counted: u64,
+    /// What it had counted when its pod last took up a view, or was handed it: a pod left
+    /// out and taken back in, still holding the key, is handed it back holding all that,
+    /// so only what came after is charged on top ([`merge`](Self::merge)).
+    since: u64,
     planes: Records,
     /// When anything last changed.
     touched: u64,
@@ -1946,6 +1950,7 @@ impl Owned {
             contract,
             bucket: BucketState::default(),
             counted: 0,
+            since: 0,
             planes: Records::default(),
             touched: now,
         }
@@ -2024,11 +2029,12 @@ impl Owned {
             .count() as u64
     }
 
-    /// Takes in what `mine` applied of the key while this copy was on its way: its count —
-    /// hits, and what it holds for the asks it decided — charged on top, what it holds kept
-    /// for the hits to come, and the furthest of each data plane's marks.
+    /// Takes in what `mine` applied of the key while this copy was on its way: its count
+    /// since its pod took up the view — hits, and what it holds for the asks it decided —
+    /// charged on top, what it holds kept for the hits to come, and the furthest of each
+    /// data plane's marks.
     fn merge(&mut self, mine: Owned, now: u64) {
-        self.apply(mine.counted, now, now);
+        self.apply(mine.counted.saturating_sub(mine.since), now, now);
         for (plane, record) in mine.planes {
             let ours = self.planes.entry(plane);
             ours.applied = ours.applied.max(record.applied);
@@ -2497,6 +2503,7 @@ impl<S: BuildHasher + Default> ServicePod<S> {
                 // own clock, which this pod cannot tell apart.
                 bucket: bucket.state().with_as_of(now),
                 counted: replica.counted,
+                since: replica.counted,
                 planes,
                 touched: now,
             };
@@ -2525,7 +2532,10 @@ impl<S: BuildHasher + Default> ServicePod<S> {
             .copied()
             .filter(|pod| *pod != self.me && !before.pods.contains(pod))
             .collect();
-        for (key, owned) in &self.keys {
+        for (key, owned) in &mut self.keys {
+            // Whoever hands it a key from now holds what it had counted until now: it may
+            // have been left out of a view it never saw.
+            owned.since = owned.counted;
             let (owner, _) = self.view.owners(key);
             // Owned until now, and from now a pod's that was not serving, so holds no copy
             // of it: handed over.
