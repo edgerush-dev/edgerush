@@ -29,7 +29,8 @@ pub use word::fits;
 
 use super::{
     Answers, Ask, Batch, Contract, Decided, Entry as BatchEntry, PlaneId, PodId, Queued,
-    RESEND_AFTER_CYCLES, Report, Ticket, Unseen, View, group_name, longest,
+    RESEND_AFTER_CYCLES, Report, Room, Ticket, Unseen, View, encoded_entry_bytes, group_name,
+    longest,
 };
 use chunked::MinHeap;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -881,6 +882,9 @@ struct Tracked {
     asking: u32,
     /// Scheduled, whether it is to be visited at the next cycle.
     queued: bool,
+    /// Whether it is among the keys left out of their owners' pieces, to be visited first
+    /// at the next cycle.
+    left_out: bool,
 }
 
 impl Tracked {
@@ -1153,6 +1157,13 @@ pub struct Participant<S> {
     evictions: MinHeap<Due>,
     /// Keys visited, all told.
     visits: u64,
+    /// The keys the last cycle left out of their owners' pieces, to be visited first at the
+    /// next ([`PIECE_BYTES`](super::PIECE_BYTES)).
+    left_out: Vec<Handle>,
+    /// Empty, the list `left_out` is swapped with each cycle, as `next_runnable` is.
+    spare_left_out: Vec<Handle>,
+    /// Keys left out of their owners' pieces, all told: a visit each.
+    keys_left_out: u64,
 }
 
 /// When an entry's key is next to be looked at for eviction.
@@ -1192,14 +1203,20 @@ struct Visit<'a> {
     spare: &'a mut Spare,
     cut_off: bool,
     wake: bool,
+    /// Whether the key last visited was left out of its owner's piece, wholly or in part.
+    left_out: bool,
+    /// Keys left out so, all told.
+    keys_left_out: u64,
 }
 
 impl Visit<'_> {
     /// The cycle's work on one key, as `DataPlane::on_cycle` does it on each: its count
     /// drained into the ledger, its reports sent or sent again, a poll if it is in use with
     /// nothing to report. Whether it needs visiting at the next cycle too: a ledger it could
-    /// not send, its owner's exchange in flight; reports not yet acknowledged; a poll due
-    /// every cycle; its owner out of reach.
+    /// not send, its owner's exchange in flight or its piece full; reports not yet
+    /// acknowledged; a poll due every cycle; its owner out of reach. A key its owner's piece
+    /// has no room for is treated as one whose owner is busy: what it has not sent stays in
+    /// its ledger, unnumbered, and reports due to go again stay due.
     fn key(&mut self, tracked: &mut Tracked) -> bool {
         let now = self.now;
         // What was admitted drained into the ledger, every key's, with an owner to send it
@@ -1223,12 +1240,19 @@ impl Visit<'_> {
         // Ages count back from now, as the batch its entries join is made: every batch waiting
         // was made at a time this data plane was given, and time does not go back.
         let mut entries = Vec::new();
+        let mut room = self.queued.get(&owner).map_or_else(Room::new, Queued::room);
+        let bytes = encoded_entry_bytes(key.len());
+        let mut left_out = false;
         for unseen in tracked.unacknowledged.as_mut_slice() {
             unseen.empty_if_stale(hold, now);
         }
         let mut reported = false;
         for unseen in tracked.unacknowledged.as_mut_slice() {
             if now - unseen.last >= self.resend_after {
+                if !room.take(bytes) {
+                    left_out = true;
+                    break;
+                }
                 unseen.last = now;
                 entries.push(BatchEntry {
                     key: key.clone(),
@@ -1239,7 +1263,11 @@ impl Visit<'_> {
             }
         }
         let unsent = tracked.unsent;
-        if unsent > 0 || tracked.unsent_refused > 0 {
+        let pending = unsent > 0 || tracked.unsent_refused > 0;
+        // Not ahead of its own reports left out.
+        if pending && (left_out || !room.take(bytes)) {
+            left_out = true;
+        } else if pending {
             let asked = u64::from(tracked.unsent_asked).min(unsent);
             // No more than the u32 it was taken from.
             tracked.unsent_asked -= u32::try_from(asked).unwrap_or(u32::MAX);
@@ -1268,11 +1296,15 @@ impl Visit<'_> {
         let in_use = now.saturating_sub(last) <= hold || !tracked.unacknowledged.is_empty();
         let polled = in_use && self.poll_quiet;
         if !reported && polled {
-            entries.push(BatchEntry {
-                key: key.clone(),
-                contract: entry.terms.contract,
-                report: Report::Poll,
-            });
+            if room.take(bytes) {
+                entries.push(BatchEntry {
+                    key: key.clone(),
+                    contract: entry.terms.contract,
+                    report: Report::Poll,
+                });
+            } else {
+                left_out = true;
+            }
         }
         self.cut_off |= tracked.unreachable
             || (in_use
@@ -1282,10 +1314,47 @@ impl Visit<'_> {
                     .is_none_or(|heard| now - heard >= self.resend_after));
         if !entries.is_empty() {
             let queued = self.queued.entry(owner).or_default().at(now);
-            queued.entries.extend(entries);
+            for entry in entries {
+                queued.push_entry(entry);
+            }
         }
-        !tracked.unacknowledged.is_empty() || polled || tracked.unreachable
+        self.left_out = left_out;
+        self.keys_left_out += u64::from(left_out);
+        !tracked.unacknowledged.is_empty() || polled || tracked.unreachable || left_out
     }
+
+    /// Visits `tracked`, `handle`'s, and lists it to go first at the next cycle if it was
+    /// left out of its owner's piece; or else, `scheduled`, to visit then if it needs it.
+    fn listed(
+        &mut self,
+        handle: Handle,
+        tracked: &mut Tracked,
+        scheduled: bool,
+        left_out: &mut Vec<Handle>,
+        next: &mut Vec<Handle>,
+    ) {
+        let again = self.key(tracked);
+        tracked.left_out = self.left_out;
+        tracked.queued = scheduled && again;
+        if self.left_out {
+            left_out.push(handle);
+        } else if tracked.queued {
+            next.push(handle);
+        }
+    }
+}
+
+/// `handle`'s key, if it is still the one the handle was made for.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "a handle hashes and compares by its entry's key, which never changes"
+)]
+fn listed<'a, S: BuildHasher>(
+    keys: &'a mut HashMap<Handle, Tracked, S>,
+    handle: &Handle,
+) -> Option<&'a mut Tracked> {
+    keys.get_mut(&*handle.0.key)
+        .filter(|tracked| Arc::ptr_eq(&tracked.entry, &handle.0))
 }
 
 /// Queues `key` to be visited at the next cycle, unless it is already.
@@ -1351,6 +1420,9 @@ impl<S: BuildHasher + Clone> Participant<S> {
             next_runnable: Vec::new(),
             evictions: MinHeap::new(),
             visits: 0,
+            left_out: Vec::new(),
+            spare_left_out: Vec::new(),
+            keys_left_out: 0,
         })
     }
 
@@ -1386,6 +1458,14 @@ impl<S: BuildHasher + Clone> Participant<S> {
     #[must_use]
     pub fn visits(&self) -> u64 {
         self.visits
+    }
+
+    /// Keys left out of their owners' pieces, all told: a visit each that found no room
+    /// for what the key had to send ([`PIECE_BYTES`](super::PIECE_BYTES)), which waited
+    /// for the next.
+    #[must_use]
+    pub fn keys_left_out(&self) -> u64 {
+        self.keys_left_out
     }
 
     fn run(&mut self, key: &[u8]) {
@@ -1585,6 +1665,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             unreachable: false,
             asking: 0,
             queued: false,
+            left_out: false,
         };
         tracked.publish();
         self.registry.insert(Arc::clone(&tracked.entry));
@@ -1800,7 +1881,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             sent,
             resent,
         });
-        self.queued.entry(pod).or_default().at(now).asks.push(Ask {
+        self.queued.entry(pod).or_default().at(now).push_ask(Ask {
             id,
             count: group.asked.len() as u64,
             timeout: self.ask_timeout,
@@ -1981,36 +2062,51 @@ impl<S: BuildHasher + Clone> Participant<S> {
             spare: &mut self.spare,
             cut_off: false,
             wake: false,
+            left_out: false,
+            keys_left_out: 0,
         };
         let mut visits = 0;
         let mut next = std::mem::take(&mut self.next_runnable);
+        // The keys the last cycle left out of their owners' pieces go first: visited in the
+        // order they otherwise are, the same keys would be left out every cycle.
+        let mut previous = std::mem::take(&mut self.left_out);
+        let mut left_out = std::mem::take(&mut self.spare_left_out);
+        let scheduled = self.scheduled;
         // Taken before the visit, so that a signal lost during it asks for another.
         if !self.scheduled || self.registry.take_scan() {
+            for handle in previous.drain(..) {
+                if let Some(tracked) = listed(&mut self.keys, &handle) {
+                    visits += 1;
+                    visit.listed(handle, tracked, scheduled, &mut left_out, &mut next);
+                    // Marked visited for the walk below, left out again or not; those
+                    // that were are marked so again after it.
+                    tracked.left_out = true;
+                }
+            }
             for (handle, tracked) in &mut self.keys {
-                tracked.queued = false;
+                if std::mem::take(&mut tracked.left_out) {
+                    continue;
+                }
                 visits += 1;
-                if visit.key(tracked) && self.scheduled {
-                    tracked.queued = true;
-                    next.push(handle.clone());
+                visit.listed(handle.clone(), tracked, scheduled, &mut left_out, &mut next);
+            }
+            for handle in &left_out {
+                if let Some(tracked) = listed(&mut self.keys, handle) {
+                    tracked.left_out = true;
                 }
             }
         } else {
-            for handle in self.runnable.drain(..) {
-                let Some(tracked) = self.keys.get_mut(&*handle.0.key) else {
-                    continue;
-                };
-                if !Arc::ptr_eq(&tracked.entry, &handle.0) {
-                    continue;
-                }
-                tracked.queued = false;
-                visits += 1;
-                if visit.key(tracked) {
-                    tracked.queued = true;
-                    next.push(handle);
+            for handle in previous.drain(..).chain(self.runnable.drain(..)) {
+                if let Some(tracked) = listed(&mut self.keys, &handle) {
+                    visits += 1;
+                    visit.listed(handle, tracked, scheduled, &mut left_out, &mut next);
                 }
             }
         }
+        self.spare_left_out = previous;
+        self.left_out = left_out;
         let (cut_off, wake) = (visit.cut_off, visit.wake);
+        self.keys_left_out += visit.keys_left_out;
         self.visits += visits;
         self.next_runnable = std::mem::replace(&mut self.runnable, next);
         self.next_runnable.clear();
@@ -2371,10 +2467,11 @@ impl<S: BuildHasher + Clone> Participant<S> {
             let queued = self.queued.entry(owner).or_default().at(now);
             for unseen in tracked.unacknowledged.as_mut_slice() {
                 unseen.last = now;
-                queued.entries.push(BatchEntry {
+                let report = unseen.report(tracked.seen, queued.made);
+                queued.push_entry(BatchEntry {
                     key: key.clone(),
                     contract: tracked.entry.terms.contract,
-                    report: unseen.report(tracked.seen, queued.made),
+                    report,
                 });
             }
         }
@@ -2452,16 +2549,20 @@ impl<S: BuildHasher + Clone> Participant<S> {
             .unwrap_or(self.asks_sent + 1)
     }
 
+    /// A piece of what is to go to each pod; the rest kept for the next.
     fn take_outgoing_to_all(&mut self) -> Vec<(PodId, Batch)> {
-        let oldest_ask = self.oldest_ask();
-        std::mem::take(&mut self.queued)
-            .into_iter()
-            .map(|(pod, queued)| (pod, queued.batch(self.id, oldest_ask)))
-            .collect()
+        let (id, oldest_ask) = (self.id, self.oldest_ask());
+        let batches = self
+            .queued
+            .iter_mut()
+            .map(|(pod, queued)| (*pod, queued.take_piece(id, oldest_ask)))
+            .collect();
+        self.queued.retain(|_, queued| !queued.is_empty());
+        batches
     }
 
-    /// With one exchange in flight, what is to go to the pods with none, each now with one;
-    /// the rest kept until theirs is over. Called with `now` given by the last cycle's time
+    /// With one exchange in flight, a piece of what is to go to each pod with none, each now
+    /// with one; the rest kept until theirs is over. Called with `now` given by the last cycle's time
     /// that `on_cycle` saw, as the start of each exchange.
     fn take_outgoing_to_idle(&mut self) -> Vec<(PodId, Batch)> {
         let pods: Vec<PodId> = self
@@ -2473,11 +2574,14 @@ impl<S: BuildHasher + Clone> Participant<S> {
         let oldest_ask = self.oldest_ask();
         let mut batches = Vec::new();
         for pod in pods {
-            let Some(queued) = self.queued.remove(&pod) else {
+            let Some(mut queued) = self.queued.remove(&pod) else {
                 continue;
             };
             self.sending.insert(pod, self.last_now);
-            batches.push((pod, queued.batch(self.id, oldest_ask)));
+            batches.push((pod, queued.take_piece(self.id, oldest_ask)));
+            if !queued.is_empty() {
+                self.queued.insert(pod, queued);
+            }
         }
         batches
     }

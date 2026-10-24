@@ -30,6 +30,12 @@ const HEARTBEAT: &str = "/edgerush.ratelimit.v1.RateLimit/Heartbeat";
 /// How long a call may take before it is given up: the protocol sends again what matters.
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// The longest message either side sends or takes, set rather than left to tonic's
+/// defaults: 4 MiB. What the protocol sends is cut to a quarter of it (06 §4), so that
+/// a piece made by an estimate of its size, or an answer to it, always fits; a message
+/// longer than this is refused before it is sent rather than after.
+pub const MAX_MESSAGE: usize = 4 << 20;
+
 /// Encodes `E` and decodes `D` as protobuf.
 struct Prost<E, D>(PhantomData<fn(E) -> D>);
 
@@ -155,6 +161,13 @@ impl tonic::server::UnaryService<wire::Heartbeat> for Beat {
     }
 }
 
+/// A server's side of a call, held to [`MAX_MESSAGE`] both ways.
+fn limited<C: Codec>(codec: C) -> tonic::server::Grpc<C> {
+    tonic::server::Grpc::new(codec)
+        .max_decoding_message_size(MAX_MESSAGE)
+        .max_encoding_message_size(MAX_MESSAGE)
+}
+
 impl tower_service::Service<http::Request<tonic::body::Body>> for Server {
     type Response = http::Response<tonic::body::Body>;
     type Error = Infallible;
@@ -169,18 +182,15 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for Server {
         Box::pin(async move {
             Ok(match request.uri().path() {
                 EXCHANGE => {
-                    let mut grpc =
-                        tonic::server::Grpc::new(Prost::<wire::Answers, wire::Batch>::default());
+                    let mut grpc = limited(Prost::<wire::Answers, wire::Batch>::default());
                     grpc.unary(Exchange(pod), request).await
                 }
                 HEARTBEAT => {
-                    let mut grpc =
-                        tonic::server::Grpc::new(Prost::<wire::Empty, wire::Heartbeat>::default());
+                    let mut grpc = limited(Prost::<wire::Empty, wire::Heartbeat>::default());
                     grpc.unary(Beat(pod), request).await
                 }
                 REPLICATE => {
-                    let mut grpc =
-                        tonic::server::Grpc::new(Prost::<wire::Empty, wire::Replicas>::default());
+                    let mut grpc = limited(Prost::<wire::Empty, wire::Replicas>::default());
                     grpc.unary(Replicate(pod), request).await
                 }
                 _ => Status::unimplemented("no such method").into_http(),
@@ -201,6 +211,9 @@ pub enum Error {
     /// The answer cannot be used.
     #[error("an answer that cannot be used: {0}")]
     Invalid(#[from] wire::Invalid),
+    /// The message is longer than [`MAX_MESSAGE`]: not sent.
+    #[error("a message of {0} bytes, longer than the {MAX_MESSAGE} a call takes")]
+    TooLong(usize),
 }
 
 /// A client of one service pod. Cheap to clone: clones share the connection, made when
@@ -230,7 +243,15 @@ impl Client {
         E: prost::Message + Send + 'static,
         D: prost::Message + Default + Send + 'static,
     {
-        let mut grpc = tonic::client::Grpc::new(self.channel.clone());
+        // Said here, rather than left to tonic, whose refusal on the way out resets the
+        // stream and says only that.
+        let length = message.encoded_len();
+        if length > MAX_MESSAGE {
+            return Err(Error::TooLong(length));
+        }
+        let mut grpc = tonic::client::Grpc::new(self.channel.clone())
+            .max_decoding_message_size(MAX_MESSAGE)
+            .max_encoding_message_size(MAX_MESSAGE);
         grpc.ready()
             .await
             .map_err(|error| Status::unavailable(error.to_string()))?;

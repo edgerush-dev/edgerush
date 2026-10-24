@@ -8,11 +8,13 @@
 //! pod never takes an older copy over a newer; what piles up while one is on its way goes
 //! as one message, the latest copy of each key.
 
-use crate::grpc::Client;
+use crate::grpc::{Client, Error};
 use edgerush_ratelimit::service::membership::{Heartbeat, Membership};
 use edgerush_ratelimit::service::{self, PodId, ServicePod, View};
 use std::collections::BTreeMap;
 use std::hash::RandomState;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
@@ -76,6 +78,8 @@ pub struct Usage {
     pub keys: usize,
     /// How many it has evicted to stay within what they may hold, all told, in this life.
     pub evicted: u64,
+    /// Copies not sent to another pod, each alone longer than a message takes, all told.
+    pub copies_too_long: u64,
 }
 
 /// A handle on a running service pod. Cheap to clone.
@@ -98,9 +102,10 @@ impl Pod {
         let (commands, received) = mpsc::channel(QUEUE);
         let start = Instant::now();
         let (node, membership) = fresh(me, &members, incarnation, timing, 0);
+        let copies_too_long = Arc::new(AtomicU64::new(0));
         let senders = peers
             .into_iter()
-            .map(|(pod, client)| (pod, Sender::spawn(client)))
+            .map(|(pod, client)| (pod, Sender::spawn(client, Arc::clone(&copies_too_long))))
             .collect();
         let running = Running {
             me,
@@ -111,6 +116,7 @@ impl Pod {
             senders,
             start,
             capacity: u64::MAX,
+            copies_too_long,
         };
         tokio::spawn(running.run(received));
         Self { commands }
@@ -210,6 +216,8 @@ struct Running {
     start: Instant,
     /// The bytes its keys may hold, kept for a life after a restart.
     capacity: u64,
+    /// Copies its senders found too long to send.
+    copies_too_long: Arc<AtomicU64>,
 }
 
 impl Running {
@@ -275,6 +283,7 @@ impl Running {
                             key_bytes: self.node.holding(),
                             keys: self.node.key_count(),
                             evicted: self.node.evicted(),
+                            copies_too_long: self.copies_too_long.load(Ordering::Relaxed),
                         });
                     }
                 },
@@ -301,15 +310,17 @@ impl Running {
     }
 }
 
-/// Sends one pod its copies, in order, coalescing what waits; and its heartbeats, which
-/// need no order and are not worth waiting for.
+/// Sends one pod its copies, in order, coalescing what waits and cutting it into pieces
+/// ([`service::Replicas::into_pieces`]); and its heartbeats, which need no order and are
+/// not worth waiting for.
 struct Sender {
     queue: mpsc::Sender<service::Replicas>,
     client: Client,
 }
 
 impl Sender {
-    fn spawn(client: Client) -> Self {
+    /// Counting in `too_long` the copies too long to send.
+    fn spawn(client: Client, too_long: Arc<AtomicU64>) -> Self {
         let (queue, mut waiting) = mpsc::channel::<service::Replicas>(COPIES_WAITING);
         let sending = client.clone();
         tokio::spawn(async move {
@@ -343,10 +354,15 @@ impl Sender {
                         handover,
                         epoch,
                     };
-                    // Lost if the call fails: the next change sends the key again, and a
-                    // pod taking over from a copy that missed some is what the data planes'
-                    // `seen` marks are for.
-                    let _lost = sending.replicate(replicas).await;
+                    // A piece at a time, in order, as a message takes so much. Lost if the
+                    // call fails: the next change sends the key again, and a pod taking
+                    // over from a copy that missed some is what the data planes' `seen`
+                    // marks are for.
+                    for piece in replicas.into_pieces() {
+                        if let Err(Error::TooLong(_)) = sending.replicate(piece).await {
+                            too_long.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
             }
         });

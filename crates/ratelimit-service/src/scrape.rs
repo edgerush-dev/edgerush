@@ -45,6 +45,11 @@ pub fn render(usage: Usage, max_key_bytes: u64) -> String {
                 may hold; each starts again full.";
     scrape.family(name, Kind::Counter, help);
     scrape.sample(name, &[], usage.evicted);
+    let name = "edgerush_rate_limit_copies_too_long_total";
+    let help = "Copies of keys not sent to another pod, one alone longer than a message \
+                takes: its records of data planes too many.";
+    scrape.family(name, Kind::Counter, help);
+    scrape.sample(name, &[], usage.copies_too_long);
     scrape.finish()
 }
 
@@ -116,6 +121,7 @@ mod tests {
             key_bytes: 9_710,
             keys: 10,
             evicted: 4,
+            copies_too_long: 2,
         };
         let scrape = render(usage, 1 << 20);
         for line in [
@@ -123,6 +129,7 @@ mod tests {
             "edgerush_rate_limit_max_key_bytes 1048576\n",
             "edgerush_rate_limit_keys 10\n",
             "edgerush_rate_limit_keys_evicted_total 4\n",
+            "edgerush_rate_limit_copies_too_long_total 2\n",
         ] {
             assert!(scrape.contains(line), "{line}{scrape}");
         }
