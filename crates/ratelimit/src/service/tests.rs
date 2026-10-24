@@ -2552,9 +2552,11 @@ proptest::proptest! {
     /// wait — the copy cold between answers — decided as of when they came. One request
     /// warms the key a refill time and a round trip before the traffic, and no gap is
     /// longer than a refill time, after which a bucket is full however long the gap. The
-    /// bucket refills in two round trips or more: in less, a copy answered full charges
-    /// hits that waited from the answer's batch rather than from when they came, and
-    /// refuses a client within its rate (issue #54).
+    /// bucket holds two cycles of its rate or more, as config insists, and a round trip
+    /// fits in a cycle. A bucket that refills faster refuses a client within its rate: a
+    /// copy answered full charges hits that waited from the answer's batch rather than from
+    /// when they came (issue #54); so does a cycle shorter than the round trip, whose
+    /// answers are taken as of a cycle before they come (issue #56).
     #[test]
     fn what_a_plain_bucket_admits_a_data_plane_admits_over_round_trips(
         limit in 1u64..200, interval in 1u64..50, burst in 1u64..12,
@@ -2566,7 +2568,7 @@ proptest::proptest! {
         there in 0u64..5_000_000, back in 0u64..5_000_000,
     ) {
         let interval = interval * MS + 1;
-        let burst = burst.max((2 * (there + back)).div_ceil(interval));
+        let burst = burst.max((2 * CYCLE).div_ceil(interval));
         let n = |n| NonZeroU64::new(n).unwrap();
         let c = Contract { limit: n(limit), window: n(limit * interval), burst: n(burst) };
         // Gaps of whole intervals, exactly at the edge, some a little more.

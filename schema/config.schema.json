@@ -984,7 +984,7 @@
           "default": null
         },
         "cycle_ms": {
-          "description": "Milliseconds between the process's messages to the service; 10 when left out.",
+          "description": "Milliseconds between the process's messages to the service; 10 when left out. Every\nlimit's bucket holds at least two cycles of its rate, so a longer cycle asks for\nlarger buckets: at 20 ms, a burst of 40 at `1000/s`.",
           "type": [
             "integer",
             "null"
