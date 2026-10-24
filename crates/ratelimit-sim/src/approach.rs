@@ -128,8 +128,8 @@ pub enum Approach {
         /// (`Participant::set_scheduled`), rather than every key.
         scheduled: bool,
     },
-    /// [`Pooled`](Self::Pooled) with every request under another limit beside the run's,
-    /// decided under both, all or none, as [`NodesUnder`](Self::NodesUnder).
+    /// [`PooledWith`](Self::PooledWith) with every request under another limit beside the
+    /// run's, decided under both, all or none, as [`NodesUnder`](Self::NodesUnder).
     PooledUnder {
         /// The time between a process's batches to the service.
         cycle: u64,
@@ -141,6 +141,10 @@ pub enum Approach {
         beside: Beside,
         /// The order a request's limits are decided in.
         order: Order,
+        /// The levers.
+        levers: edgerush_ratelimit::service::pooled::Levers,
+        /// Whether each participant visits only the keys that need it each cycle.
+        scheduled: bool,
     },
     /// [`Nodes`](Self::Nodes) with every request under another limit beside the run's,
     /// decided under both, all or none (06 §4). The run's contract is the one measured.
@@ -374,6 +378,8 @@ impl Approach {
                 workers,
                 beside,
                 order,
+                levers,
+                scheduled,
             } => {
                 let workers = (*workers).max(1);
                 let processes = pods.div_ceil(workers);
@@ -384,7 +390,7 @@ impl Approach {
                     *ask_timeout,
                     Some((*beside, *order)),
                 );
-                Box::new(nodes.pooled(workers))
+                Box::new(nodes.pooled_with(workers, *levers, *scheduled))
             }
             Self::NodesUnder {
                 cycle,

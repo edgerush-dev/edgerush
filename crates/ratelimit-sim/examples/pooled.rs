@@ -19,7 +19,7 @@ use std::num::NonZeroU64;
 const MS: u64 = 1_000_000;
 const SECOND: u64 = 1_000 * MS;
 /// Pooled's levers: the fourth argument, `no-poll`, `local` or `both`; the protocol's own
-/// unless said. (Rows with a limit beside the run's keep the protocol's.)
+/// unless said.
 fn levers() -> edgerush_ratelimit::service::pooled::Levers {
     let chosen = std::env::args().nth(4).unwrap_or_default();
     edgerush_ratelimit::service::pooled::Levers {
@@ -505,6 +505,8 @@ fn main() {
                     workers: w,
                     beside,
                     order,
+                    levers: levers(),
+                    scheduled: scheduled(),
                 };
                 (pooled, under)
             }
