@@ -28,11 +28,11 @@ mod tests;
 pub use word::fits;
 
 use super::{
-    Answers, Ask, Batch, Contract, Decided, Entry as BatchEntry, PlaneId, PodId, Queued,
+    Answers, Arrived, Batch, Contract, Decided, Entry as BatchEntry, PlaneId, PodId, Queued,
     RESEND_AFTER_CYCLES, Report, Ticket, Unseen, View, group_name, longest,
 };
 use chunked::MinHeap;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::sync::{Arc, RwLock};
 use sync::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicU128, Ordering, fence};
@@ -448,7 +448,7 @@ impl Entry {
     fn with_terms(key: Box<[u8]>, terms: Arc<Terms>, owned: bool, now: u64) -> Self {
         let cycle = terms.cycle;
         let fields = Fields {
-            arrival: terms.bucket.units(now),
+            arrival: Bucket::full(terms.bucket.units(now)),
             // No share bound until a cycle sets one, as a new `DataPlane` key has none.
             left: word::MOST_LEFT,
             spent: 0,
@@ -610,15 +610,16 @@ impl Entry {
     /// Takes one request's worth at `now`: admitted, or held for a request waiting on an
     /// ask about its other keys.
     fn take(&self, op: Op, now: u64) -> (Taken, bool) {
-        self.take_in(op, now, Cycle::Advance)
+        self.take_in(op, now, now, Cycle::Advance)
     }
 
     /// Taking does not count as the key's use: a request's arrival does, which the
     /// transport's own takes, settling what waited, are not ([`decide`] marks it). With
     /// whether it started the key's count: an admission counted where none was, read from
-    /// the compare-and-swap that took it, never from an attempt.
-    fn take_in(&self, op: Op, now: u64, cycle: Cycle) -> (Taken, bool) {
-        let units = self.terms.bucket.units(now);
+    /// the compare-and-swap that took it, never from an attempt. Taken at `now` for a
+    /// request that arrived at `at`: the bucket as of then, the cycle as of now.
+    fn take_in(&self, op: Op, at: u64, now: u64, cycle: Cycle) -> (Taken, bool) {
+        let units = self.terms.bucket.units(at);
         let mut why = Taken::Refused;
         let mut was = 0;
         let taken = self.update(now, cycle, |fields| {
@@ -638,7 +639,7 @@ impl Entry {
                 }
             } else {
                 if op == Op::Admit && fields.unreported == 0 {
-                    self.started.store(now, Ordering::Relaxed);
+                    self.started.store(at, Ordering::Relaxed);
                 }
                 return Some(Fields {
                     arrival: Bucket::charge(fields.arrival, units, 1),
@@ -669,17 +670,28 @@ impl Entry {
     /// allowance if the cycle under way has spent any, as `DataPlane`'s `spent − 1` does —
     /// all read from the one word. Whether requests wait on it.
     fn settle(&self, admitted: bool, now: u64) -> (bool, bool) {
-        self.settle_in(admitted, now, Cycle::Advance)
+        self.settle_in(admitted, now, now, Cycle::Advance)
     }
 
-    /// As [`Self::settle`], with whether it started the key's count, as [`Self::take_in`].
-    fn settle_in(&self, admitted: bool, now: u64, cycle: Cycle) -> (bool, bool) {
+    /// An admission counted at `now` for a request that arrived at `at` and waited: the
+    /// count's earliest no later than it. Only the transport's thread settles what waited,
+    /// and drains the count; a worker writes the time only as the count starts. Called by
+    /// the thread, after the compare-and-swap, so that a worker's take pays nothing for it.
+    fn admitted_at(&self, at: u64, now: u64) {
+        if at < now {
+            self.started.fetch_min(at, Ordering::Relaxed);
+        }
+    }
+
+    /// As [`Self::settle`], with whether it started the key's count, as [`Self::take_in`],
+    /// for a request that arrived at `at`.
+    fn settle_in(&self, admitted: bool, at: u64, now: u64, cycle: Cycle) -> (bool, bool) {
         let mut was = 0;
         let settled = self.update(now, cycle, |fields| {
             was = fields.unreported;
             Some(if admitted {
                 if fields.unreported == 0 {
-                    self.started.store(now, Ordering::Relaxed);
+                    self.started.store(at, Ordering::Relaxed);
                 }
                 Fields {
                     held: fields.held.saturating_sub(1),
@@ -744,6 +756,17 @@ impl Entry {
             None if fields.left == 0 => Some(self.terms.cycle),
             None => None,
         }
+    }
+
+    /// Whether it would admit, at `now`, one request that arrived at `at`: the bucket as of
+    /// then, the cycle advanced if due.
+    fn room_as_of(&self, at: u64, now: u64) -> bool {
+        let fields = word::advanced(&self.terms.bucket, self.snapshot(), self.advance(), now);
+        fields.left > 0
+            && self
+                .terms
+                .bucket
+                .admits(fields.arrival, self.terms.bucket.units(at))
     }
 
     fn snapshot(&self) -> Fields {
@@ -901,6 +924,36 @@ impl Tracked {
         self.entry.cold(now)
     }
 
+    /// Its ledger's hits, and requests of asks given up it refused, as a report numbered
+    /// after the last, sent at `now`: `None` if there are none.
+    fn report_unsent(&mut self, now: u64, spare: &mut Spare) -> Option<BatchEntry> {
+        let unsent = self.unsent;
+        if unsent == 0 && self.unsent_refused == 0 {
+            return None;
+        }
+        let asked = u64::from(self.unsent_asked).min(unsent);
+        // No more than the u32 it was taken from.
+        self.unsent_asked -= u32::try_from(asked).unwrap_or(u32::MAX);
+        let refused = u64::from(std::mem::take(&mut self.unsent_refused));
+        self.unsent = 0;
+        self.sent += 1;
+        let unseen = Unseen {
+            sequence: self.sent,
+            count: unsent,
+            asked,
+            refused,
+            admitted: self.unsent_since,
+            first: now,
+            last: now,
+        };
+        self.unacknowledged.push(unseen, spare);
+        Some(BatchEntry {
+            key: self.entry.key.clone(),
+            contract: self.entry.terms.contract,
+            report: unseen.report(self.seen, now),
+        })
+    }
+
     /// `count` more in the ledger, the earliest of them admitted at `since`.
     fn unsent_more(&mut self, count: u64, since: u64) {
         if count == 0 {
@@ -916,13 +969,7 @@ impl Tracked {
 
     /// What it would admit as one request now, from the word, the cycle advanced if due.
     fn room(&self, now: u64) -> bool {
-        let entry = &self.entry;
-        let fields = word::advanced(&entry.terms.bucket, entry.snapshot(), entry.advance(), now);
-        fields.left > 0
-            && entry
-                .terms
-                .bucket
-                .admits(fields.arrival, entry.terms.bucket.units(now))
+        self.entry.room_as_of(now, now)
     }
 
     fn idle(&self, now: u64) -> bool {
@@ -1057,7 +1104,9 @@ struct Group {
     cold: Vec<usize>,
     asking: Option<InFlight>,
     asked: Vec<Ticket>,
+    asked_arrived: Arrived,
     waiting: Vec<Ticket>,
+    waiting_arrived: Option<Arrived>,
     follow_up: bool,
 }
 
@@ -1098,8 +1147,9 @@ pub struct Participant<S> {
     /// By a handle to the key's entry, so that the key's bytes are kept once, in it.
     keys: HashMap<Handle, Tracked, S>,
     groups: HashMap<Box<[u8]>, Group, S>,
-    /// The requests waiting with their group's keys not asked about held.
-    holds: BTreeSet<Ticket>,
+    /// The requests waiting with their group's keys not asked about held, and when each
+    /// arrived.
+    holds: BTreeMap<Ticket, u64>,
     in_flight: BTreeMap<u64, Box<[u8]>>,
     next_ticket: Ticket,
     asks_sent: u64,
@@ -1238,32 +1288,13 @@ impl Visit<'_> {
                 reported = true;
             }
         }
-        let unsent = tracked.unsent;
-        if unsent > 0 || tracked.unsent_refused > 0 {
-            let asked = u64::from(tracked.unsent_asked).min(unsent);
-            // No more than the u32 it was taken from.
-            tracked.unsent_asked -= u32::try_from(asked).unwrap_or(u32::MAX);
-            let refused = u64::from(std::mem::take(&mut tracked.unsent_refused));
-            tracked.unsent = 0;
-            tracked.sent += 1;
+        if let Some(report) = tracked.report_unsent(now, self.spare) {
             *self.numbered += 1;
-            let unseen = Unseen {
-                sequence: tracked.sent,
-                count: unsent,
-                asked,
-                refused,
-                admitted: tracked.unsent_since,
-                first: now,
-                last: now,
-            };
-            entries.push(BatchEntry {
-                key: key.clone(),
-                contract: entry.terms.contract,
-                report: unseen.report(tracked.seen, now),
-            });
-            tracked.unacknowledged.push(unseen, self.spare);
+            entries.push(report);
             reported = true;
         }
+        let entry = &tracked.entry;
+        let key = &entry.key;
         let last = entry.last_request.load(Ordering::Relaxed);
         let in_use = now.saturating_sub(last) <= hold || !tracked.unacknowledged.is_empty();
         let polled = in_use && self.poll_quiet;
@@ -1322,7 +1353,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
             view,
             keys: HashMap::with_hasher(hasher.clone()),
             groups: HashMap::with_hasher(hasher),
-            holds: BTreeSet::new(),
+            holds: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             next_ticket: 0,
             asks_sent: 0,
@@ -1680,7 +1711,9 @@ impl<S: BuildHasher + Clone> Participant<S> {
                 cold,
                 asking: None,
                 asked: Vec::new(),
+                asked_arrived: Arrived::at(now),
                 waiting: Vec::new(),
+                waiting_arrived: None,
                 follow_up: false,
             };
             self.groups.insert(name.clone(), group);
@@ -1745,15 +1778,17 @@ impl<S: BuildHasher + Clone> Participant<S> {
         }
         let ticket = self.next_ticket;
         self.next_ticket += 1;
-        self.holds.insert(ticket);
+        self.holds.insert(ticket, now);
         let Some(group) = self.groups.get_mut(&name) else {
             return Decision::Refuse;
         };
         if group.asking.is_some() {
             group.waiting.push(ticket);
+            group.waiting_arrived = Some(Arrived::and(group.waiting_arrived, now));
         } else {
             group.follow_up = false;
             group.asked.push(ticket);
+            group.asked_arrived = Arrived::at(now);
             self.ask(&name, None, now);
         }
         Decision::Wait(ticket)
@@ -1800,16 +1835,47 @@ impl<S: BuildHasher + Clone> Participant<S> {
             sent,
             resent,
         });
-        self.queued.entry(pod).or_default().at(now).asks.push(Ask {
-            id,
-            count: group.asked.len() as u64,
-            timeout: self.ask_timeout,
-            keys: group
-                .cold
-                .iter()
-                .map(|at| group.keys[*at].clone())
-                .collect(),
-        });
+        // What it admitted of the keys and has not yet sent goes first, drained from the
+        // workers' counts, ahead of the ask in its pod's batch: decided after them, the
+        // ask's requests are charged after them, as they came after them, not before —
+        // which charges leave a bucket further behind than in order, refusing a client
+        // within its rate.
+        for at in &group.cold {
+            let Some(tracked) = self.keys.get_mut(&*group.keys[*at].0) else {
+                continue;
+            };
+            let (count, started, wake) = tracked.entry.drain(now, Cycle::AsItIs);
+            tracked.unsent_more(count, started);
+            self.wake |= wake;
+            let Some(owner) = tracked.owner else {
+                continue;
+            };
+            let Some(report) = tracked.report_unsent(now, &mut self.spare) else {
+                continue;
+            };
+            self.numbered += 1;
+            self.queued
+                .entry(owner)
+                .or_default()
+                .at(now)
+                .entries
+                .push(report);
+            queue(&mut self.keys, &mut self.runnable, &group.keys[*at].0);
+        }
+        let queued = self.queued.entry(pod).or_default().at(now);
+        queued.asks.push(
+            group.asked_arrived.ask(
+                queued.made,
+                id,
+                group.asked.len() as u64,
+                self.ask_timeout,
+                group
+                    .cold
+                    .iter()
+                    .map(|at| group.keys[*at].clone())
+                    .collect(),
+            ),
+        );
     }
 
     fn ask_over(&mut self, name: &[u8]) {
@@ -1828,9 +1894,11 @@ impl<S: BuildHasher + Clone> Participant<S> {
         }
     }
 
-    /// Decides here a request of the group `name` that waited: its asked-about keys from
-    /// the entries, its held ones settled with them.
+    /// Decides here, at `now`, a request of the group `name` that waited: its asked-about
+    /// keys from the entries as of when it arrived — requests that waited together are as
+    /// far apart as they came — its held ones settled with them.
     fn settle_here(&mut self, name: &[u8], ticket: Ticket, of_ask: bool, now: u64, cycle: Cycle) {
+        let arrived = self.arrived(ticket, now);
         let Some(group) = self.groups.get(name) else {
             return;
         };
@@ -1846,7 +1914,7 @@ impl<S: BuildHasher + Clone> Participant<S> {
         let entries: Vec<&Entry> = asked.iter().map(|entry| &**entry).collect();
         // Decided as a worker would, the copies now warm or unreachable.
         let decided = if entries.len() == group.cold.len() {
-            let (decided, wake) = decide_here(&entries, now, cycle);
+            let (decided, wake) = decide_here(&entries, arrived, now, cycle);
             self.wake |= wake;
             decided
         } else {
@@ -1881,11 +1949,14 @@ impl<S: BuildHasher + Clone> Participant<S> {
         let refused_by = if admitted {
             Box::default()
         } else {
+            // Those that had no room for it when it came, each with how long from now it
+            // waits: none if it has room again by now, refilled while the request waited.
             group
                 .cold
                 .iter()
                 .zip(&entries)
-                .filter_map(|(at, entry)| Some((*at, entry.wait(now)?)))
+                .filter(|(_, entry)| !entry.room_as_of(arrived, now))
+                .map(|(at, entry)| (*at, entry.wait(now).unwrap_or(0)))
                 .collect()
         };
         self.settle_held(name, ticket, admitted, now, cycle);
@@ -1896,17 +1967,25 @@ impl<S: BuildHasher + Clone> Participant<S> {
         });
     }
 
+    /// When the request `ticket`, waiting, arrived; `now` if it is not waiting.
+    fn arrived(&self, ticket: Ticket, now: u64) -> u64 {
+        self.holds.get(&ticket).copied().unwrap_or(now)
+    }
+
     fn settle_held(&mut self, name: &[u8], ticket: Ticket, admitted: bool, now: u64, cycle: Cycle) {
         let Some(group) = self.groups.get(name) else {
             return;
         };
-        if !self.holds.remove(&ticket) {
+        let Some(arrived) = self.holds.remove(&ticket) else {
             return;
-        }
+        };
         let held = (0..group.keys.len()).filter(|at| !group.cold.contains(at));
         for at in held {
             if let Some(tracked) = self.keys.get(&*group.keys[at].0) {
-                self.wake |= tracked.entry.settle_in(admitted, now, cycle).0;
+                self.wake |= tracked.entry.settle_in(admitted, arrived, now, cycle).0;
+                if admitted {
+                    tracked.entry.admitted_at(arrived, now);
+                }
             }
         }
         if admitted {
@@ -2298,9 +2377,10 @@ impl<S: BuildHasher + Clone> Participant<S> {
             for (index, ticket) in asked.into_iter().enumerate() {
                 let admitted = (index as u64) < admitted;
                 if admitted {
+                    let arrived = self.arrived(ticket, now);
                     for key in &charged {
                         if let Some(tracked) = self.keys.get_mut(&**key) {
-                            tracked.unsent_more(1, now);
+                            tracked.unsent_more(1, arrived);
                             tracked.unsent_asked = tracked.unsent_asked.saturating_add(1);
                         }
                         queue(&mut self.keys, &mut self.runnable, key);
@@ -2338,6 +2418,8 @@ impl<S: BuildHasher + Clone> Participant<S> {
             } else {
                 group.follow_up = true;
                 group.asked = std::mem::take(&mut group.waiting);
+                // Never `None` with requests waiting: they set it as they came.
+                group.asked_arrived = group.waiting_arrived.take().unwrap_or(Arrived::at(now));
                 self.ask(&name, None, now);
             }
         }
@@ -2511,22 +2593,23 @@ impl<S: BuildHasher + Clone> Participant<S> {
 /// Decided by the transport for a request that waited and is now settled here: as a
 /// worker would, the keys' copies taken as they are, cold or not; and whether a settle
 /// wants waiters woken.
-fn decide_here(entries: &[&Entry], now: u64, cycle: Cycle) -> (Local, bool) {
+fn decide_here(entries: &[&Entry], at: u64, now: u64, cycle: Cycle) -> (Local, bool) {
     if let [entry] = entries {
-        return (
-            match local(entry.take_in(Op::Admit, now, cycle).0) {
-                Local::Ask => Local::Refuse,
-                decided => decided,
-            },
-            false,
-        );
+        let decided = match local(entry.take_in(Op::Admit, at, now, cycle).0) {
+            Local::Ask => Local::Refuse,
+            decided => decided,
+        };
+        if decided == Local::Admit {
+            entry.admitted_at(at, now);
+        }
+        return (decided, false);
     }
     let mut wake = false;
     for (held, entry) in entries.iter().enumerate() {
-        let (taken, _) = entry.take_in(Op::Hold, now, cycle);
+        let (taken, _) = entry.take_in(Op::Hold, at, now, cycle);
         if !taken.done() {
             for entry in &entries[..held] {
-                wake |= entry.settle_in(false, now, cycle).0;
+                wake |= entry.settle_in(false, at, now, cycle).0;
             }
             return (
                 match local(taken) {
@@ -2538,7 +2621,8 @@ fn decide_here(entries: &[&Entry], now: u64, cycle: Cycle) -> (Local, bool) {
         }
     }
     for entry in entries {
-        wake |= entry.settle_in(true, now, cycle).0;
+        wake |= entry.settle_in(true, at, now, cycle).0;
+        entry.admitted_at(at, now);
     }
     (Local::Admit, wake)
 }

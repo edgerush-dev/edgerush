@@ -927,7 +927,7 @@ fn holds_at_their_most_defer_a_request_rather_than_refuse_it() {
     }
     let before = y.snapshot();
     assert_eq!(decide(&[&y, &x], 0).local, Local::Defer);
-    assert_eq!(y.snapshot(), before, "its hold on Y given back as it was");
+    given_back_as_it_was(&y, before);
     x.settle(true, 0);
     assert_eq!(decide(&[&y, &x], 0).local, Local::Admit);
 }
@@ -1208,6 +1208,26 @@ proptest! {
     }
 }
 
+/// `entry` as it was `before` a hold taken and given back at 0: its bucket as full at 0, but
+/// full from then rather than from long before, as the reference's is left.
+fn given_back_as_it_was(entry: &Entry, before: Fields) {
+    let after = entry.snapshot();
+    assert_eq!(
+        Fields {
+            arrival: before.arrival,
+            ..after
+        },
+        before,
+        "given back as it was"
+    );
+    let bucket = &entry.terms.bucket;
+    assert_eq!(
+        bucket.remaining(after.arrival, bucket.units(0)),
+        bucket.remaining(before.arrival, bucket.units(0)),
+        "as much room"
+    );
+}
+
 /// A request under two keys is held on both or neither: the second without room gives
 /// the first back as it was.
 #[test]
@@ -1217,7 +1237,7 @@ fn a_two_key_request_is_charged_on_both_or_neither() {
     assert_eq!(decide(&[&empty], 0).local, Local::Admit);
     let before = roomy.snapshot();
     assert_eq!(decide(&[&roomy, &empty], 0).local, Local::Refuse);
-    assert_eq!(roomy.snapshot(), before, "given back as it was");
+    given_back_as_it_was(&roomy, before);
     let fresh = Entry::new(b"c"[..].into(), contract(100, 1), CYCLE, false, 0);
     assert_eq!(decide(&[&roomy, &fresh], 0).local, Local::Admit);
     let after = roomy.snapshot();
@@ -1515,6 +1535,42 @@ fn pod(life: u64) -> ServicePod {
     let mut pod = ServicePod::new(0, CYCLE, view());
     pod.set_life(life);
     pod
+}
+
+/// An ask's batch carries first what workers admitted of its keys and the participant had
+/// not yet drained or sent: the owner charges those before it decides the ask, as they came
+/// before it.
+#[test]
+fn an_asks_batch_carries_its_keys_unsent_hits_ahead_of_it() {
+    let mut pooled = Pooled::new();
+    let a: (&[u8], Contract) = (b"a", contract(100, 10));
+    assert!(matches!(pooled.decide(&[a], 0), Decision::Wait(_)));
+    pooled.exchange(0);
+    pooled.participant.on_cycle(CYCLE);
+    pooled.exchange(CYCLE);
+    assert_eq!(
+        pooled.decide(&[a], CYCLE + 1),
+        Decision::Admit,
+        "from the warm copy"
+    );
+    // A refill time on, unheard from since, the copy is cold: the next request asks.
+    let cold = CYCLE + 11 * INTERVAL;
+    assert!(matches!(pooled.decide(&[a], cold), Decision::Wait(_)));
+    let (_, batch) = only_exchange(&mut pooled.participant);
+    assert_eq!(batch.asks.len(), 1);
+    let hits: Vec<u64> = batch
+        .entries
+        .iter()
+        .filter_map(|entry| match entry.report {
+            Report::Hits { count, .. } if &*entry.key == b"a" => Some(count),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        hits,
+        [1],
+        "the worker's admission, drained and sent with the ask"
+    );
 }
 
 /// The one exchange `participant` starts: its number and batch.

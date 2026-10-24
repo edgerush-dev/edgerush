@@ -31,6 +31,10 @@ const AHEAD_BELOW: u64 = 1 << (ARRIVAL_BITS - 1);
 /// (two bursts' intervals) after which the transport evicts it. A larger burst is held to
 /// this, 137 billion requests, rather than wrapping into no bound at all.
 pub(super) const MOST_BURST: u64 = 1 << 37;
+/// How far behind `now` a full bucket's arrival is set ([`Bucket::full`]): `MOST_BURST`
+/// intervals, so that with the two refill times a key may be left untouched it stays inside
+/// the behind half of the arrival's range.
+const FULL_FOR: u64 = MOST_BURST * UNITS;
 /// Units added to a wait so that it is never short: the arrival and `now` are each
 /// rounded by under a unit when converted, so the wait in units is off by under two.
 const WAIT_SLACK: u64 = 2;
@@ -245,16 +249,28 @@ impl Bucket {
         from.wrapping_add(count.saturating_mul(UNITS)) & ARRIVAL_MASK
     }
 
+    /// The arrival of a bucket full at `now` (units) and at any earlier time a request that
+    /// waited is decided as of, as the reference's bucket with no arrival time is: charged
+    /// as of then, from then.
+    pub(super) fn full(now: u64) -> u64 {
+        now.wrapping_sub(FULL_FOR) & ARRIVAL_MASK
+    }
+
     /// The arrival after giving one charge back.
     pub(super) fn release(arrival: u64) -> u64 {
         arrival.wrapping_sub(UNITS) & ARRIVAL_MASK
     }
 
     /// The arrival `behind` from full at `now`, as [`TokenBucket::behind`] says it
-    /// (time multiplied by the limit, an interval being the window), plus `extra` charges.
+    /// (time multiplied by the limit, an interval being the window), plus `extra` charges:
+    /// [`full`](Self::full) if both are none, as [`TokenBucket::rebase`] leaves no arrival.
     ///
     /// [`TokenBucket::behind`]: crate::reference::TokenBucket::behind
+    /// [`TokenBucket::rebase`]: crate::reference::TokenBucket::rebase
     pub(super) fn rebased(&self, now: u64, behind: u128, extra: u64) -> u64 {
+        if behind == 0 && extra == 0 {
+            return Self::full(now);
+        }
         let behind = u64::try_from(behind * u128::from(UNITS) / self.window).unwrap_or(u64::MAX);
         let behind = behind.min(AHEAD_BELOW - 1);
         now.wrapping_add(behind)
