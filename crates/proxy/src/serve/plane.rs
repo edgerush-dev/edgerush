@@ -11,7 +11,7 @@ use crate::upstream::balancing::Carry;
 use crate::upstream::destination::{Aside, Destinations, Keys, Retiring, ReuseIdentity};
 use crate::upstream::secure::Secure;
 use arc_swap::ArcSwap;
-use edgerush_config::Compiled;
+use edgerush_config::{Compiled, CompiledRateLimiting};
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -283,6 +283,10 @@ impl Proxy {
             Some(failed) => self.hub_for(&snapshot.config, rate_limits.hub.as_ref(), failed)?,
             None => None,
         };
+        let local = match &rate_limits.failed {
+            Some(failed) => self.local_for(&snapshot.config, rate_limits.local.as_ref(), failed)?,
+            None => None,
+        };
         // Only now that all of it is accepted: a config refused for one listener must not
         // have changed the certificates of another, nor opened a file it logs to, nor let
         // go of the running config's connections.
@@ -298,6 +302,7 @@ impl Proxy {
         self.logs.commit(prepared);
         self.current.store(Arc::new(snapshot));
         rate_limits.hub = hub;
+        rate_limits.local = local;
         drop(rate_limits);
         self.metrics.reloads.inc();
         let now = SystemTime::now().duration_since(UNIX_EPOCH);
@@ -361,11 +366,16 @@ impl Proxy {
             .map(|(limit, slot)| (limit.name.as_str(), *slot, limit.dry_run))
             .collect();
         let mut scrape = self.metrics.render(&self.listeners, &upstreams, &endpoints);
-        // Only a config with limits shows them.
-        if let Some(service) = snapshot.config.rate_limit_service()
+        // Only a config that enforces limits shows them.
+        let max_key_bytes = match snapshot.config.rate_limiting() {
+            CompiledRateLimiting::Local { max_key_bytes } => Some(*max_key_bytes),
+            CompiledRateLimiting::Asynchronous(service) => Some(service.max_key_bytes),
+            CompiledRateLimiting::Off => None,
+        };
+        if let Some(max_key_bytes) = max_key_bytes
             && !limits.is_empty()
         {
-            scrape.push_str(&self.metrics.render_limits(&limits, service.max_key_bytes));
+            scrape.push_str(&self.metrics.render_limits(&limits, max_key_bytes));
             // The process thread's own measures.
             let (_, hub) = self.hub();
             if let Some(hub) = hub {
@@ -427,6 +437,43 @@ impl Proxy {
         .map(Some)
     }
 
+    /// The keys `config` decides its limits with in local mode: none in another mode;
+    /// `running`, within the new cap, if there are some, so that a reload keeps them; else
+    /// new ones, their sweep calling `failed` if it fails.
+    fn local_for(
+        &self,
+        config: &Compiled,
+        running: Option<&Arc<crate::ratelimit::local::Process>>,
+        failed: &crate::ratelimit::Failed,
+    ) -> Result<Option<Arc<crate::ratelimit::local::Process>>, ProxyError> {
+        let CompiledRateLimiting::Local { max_key_bytes } = *config.rate_limiting() else {
+            return Ok(None);
+        };
+        if let Some(running) = running {
+            running.set_capacity(max_key_bytes);
+            return Ok(Some(Arc::clone(running)));
+        }
+        crate::ratelimit::local::Process::start(
+            self.workers.get(),
+            max_key_bytes,
+            Some(failed.clone()),
+        )
+        .map(Some)
+        .map_err(|error| ProxyError::RateLimitThread(format!("no thread: {error}")))
+    }
+
+    /// The running config and the keys its limits are decided with in local mode, taken in
+    /// together, as [`hub`](Self::hub) takes the thread.
+    pub(super) fn local_limits(
+        &self,
+    ) -> (Arc<Snapshot>, Option<Arc<crate::ratelimit::local::Process>>) {
+        let rate_limits = self
+            .rate_limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (self.current.load_full(), rate_limits.local.clone())
+    }
+
     /// The running config and the rate-limiting thread its limits are decided with, which
     /// are always taken in together; no thread for a config with limits if they were not
     /// started ([`Proxy::start_rate_limits`]). For a worker making its limiter: it takes a
@@ -471,6 +518,7 @@ impl Proxy {
         }
         let failed = crate::ratelimit::Failed(Arc::new(failed));
         rate_limits.hub = self.hub_for(&self.current.load().config, None, &failed)?;
+        rate_limits.local = self.local_for(&self.current.load().config, None, &failed)?;
         rate_limits.failed = Some(failed);
         Ok(())
     }

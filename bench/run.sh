@@ -51,7 +51,8 @@
 #                                             ours-rl-protocol (quiet keys polled, cold keys
 #                                             asked about, every key visited), -nopoll,
 #                                             -local, -both, -sched, -local-sched and
-#                                             -both-sched,
+#                                             -both-sched, ours-local (local mode: the
+#                                             process alone, no service),
 #                                             envoy-rl (Envoy's global rate limit:
 #                                             envoyproxy/ratelimit on Redis), beside ours
 #                                             with no limit
@@ -523,6 +524,12 @@ CFG
         taskset -c "$PROXY_CPUS" "$EDGERUSH_PGO" proxy --config "$config" \
             --workers "$WORKERS" $idle 2>>"$OUT/proxy.log" &
         ;;
+    ours-local)
+        # EdgeRush under a per-client limit in local mode: the process alone, no service.
+        rl_config local-mode
+        taskset -c "$PROXY_CPUS" "$edgerush" proxy --config "$config.rl" \
+            --workers "$WORKERS" $idle ${METRICS:+--metrics "$METRICS"} 2>>"$OUT/proxy.log" &
+        ;;
     ours-rl-*)
         # EdgeRush under a per-client limit, its levers as the name says.
         rl_config "${1#ours-rl-}"
@@ -566,6 +573,8 @@ rl_config() { # levers
     sched) sharing=$(levers true true true) ;;
     local-sched) sharing=$(levers true false true) ;;
     both-sched) sharing=$(levers false false true) ;;
+    # Local mode: no service, no levers.
+    local-mode) sharing= ;;
     *) echo "no levers $1" >&2; exit 2 ;;
     esac
     cat >"$run-limits.yaml" <<LIMITS
@@ -580,8 +589,13 @@ assert s.count(rule) == 1, "the measured rule moved"
 s = s.replace(rule, "          - path: { prefix: / }\n        rate_limits: [per-client]\n        filters:")
 open(sys.argv[2], "w").write(s)
 PY
-    printf 'rate_limit_service: { pods: ["127.0.0.1:7000"], cycle_ms: %s%s%s }\nlimits_file: %s\n' \
-        "$RL_CYCLE_MS" "$sharing" "${RL_MAX_KEY_BYTES:+, max_key_bytes: $RL_MAX_KEY_BYTES}" \
+    if [ "$1" = local-mode ]; then
+        printf 'rate_limiting: { mode: local%s }\nlimits_file: %s\n' \
+            "${RL_MAX_KEY_BYTES:+, max_key_bytes: $RL_MAX_KEY_BYTES}" "$run-limits.yaml" >>"$config.rl"
+        return
+    fi
+    printf 'rate_limiting: { mode: asynchronous%s, service: { pods: ["127.0.0.1:7000"], cycle_ms: %s%s } }\nlimits_file: %s\n' \
+        "${RL_MAX_KEY_BYTES:+, max_key_bytes: $RL_MAX_KEY_BYTES}" "$RL_CYCLE_MS" "$sharing" \
         "$run-limits.yaml" >>"$config.rl"
 }
 

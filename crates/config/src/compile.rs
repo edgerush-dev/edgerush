@@ -12,7 +12,7 @@ use crate::route::{
 use crate::{
     AccessLog, Backend, Certificate, ClientValidation, Config, Forwarding, HealthCheck, Http3,
     Keepalive, ListenerProxyProtocol, LoadBalancer, Probe, Protocol, ProxyProtocolVersion,
-    RequestId, Rule, SlowStart, UpstreamProtocol,
+    RateLimitMode, RequestId, Rule, SlowStart, UpstreamProtocol,
 };
 use edgerush_filters::forwarding::{ForwardingError, HeaderNames, TrustedProxies};
 use edgerush_filters::{
@@ -102,10 +102,34 @@ pub struct Compiled {
     route_names: Vec<String>,
     /// The data plane's own settings.
     data_plane: CompiledDataPlane,
-    /// The rate-limiting service, if rules limit requests.
-    rate_limit_service: Option<CompiledRateLimitService>,
+    /// How its rate limits are enforced.
+    rate_limiting: CompiledRateLimiting,
     /// The engine's limits, each at its position.
     limits: Vec<Arc<CompiledLimit>>,
+}
+
+/// How a data plane enforces its rate limits, checked: its mode, with what the mode needs
+/// ([06 §4](../../../docs/06-rate-limiting.md)).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CompiledRateLimiting {
+    /// None enforced: the limits are checked, and no request is marked as under them.
+    #[default]
+    Off,
+    /// Each process on what it sees alone.
+    Local {
+        /// The bytes the keys may hold on the data plane, held once by its process.
+        max_key_bytes: u64,
+    },
+    /// Each process from its copies, sharing through the service (experimental).
+    Asynchronous(CompiledRateLimitService),
+}
+
+impl CompiledRateLimiting {
+    /// Whether any limit is enforced.
+    #[must_use]
+    pub fn enforces(&self) -> bool {
+        !matches!(self, Self::Off)
+    }
 }
 
 /// The rate-limiting service, checked (experimental).
@@ -163,10 +187,19 @@ impl Compiled {
         self.data_plane
     }
 
-    /// The rate-limiting service, if rules limit requests.
+    /// How its rate limits are enforced.
+    #[must_use]
+    pub fn rate_limiting(&self) -> &CompiledRateLimiting {
+        &self.rate_limiting
+    }
+
+    /// The rate-limiting service, in the asynchronous mode.
     #[must_use]
     pub fn rate_limit_service(&self) -> Option<&CompiledRateLimitService> {
-        self.rate_limit_service.as_ref()
+        match &self.rate_limiting {
+            CompiledRateLimiting::Asynchronous(service) => Some(service),
+            CompiledRateLimiting::Off | CompiledRateLimiting::Local { .. } => None,
+        }
     }
 
     /// The engine's limits, each at its [position](CompiledLimit::position).
@@ -514,10 +547,9 @@ fn too_long(field: &'static str, seconds: u64) -> Option<Problem> {
 }
 
 /// The limits a rule's requests are under ([`crate::limits`]): only a rule that forwards
-/// has any, a limit named on a rule that does not being a problem, and they need a service to
-/// share their counts through.
+/// has any, a limit named on a rule that does not being a problem. Compiled and checked in
+/// every mode, `off` included, which marks no request as under them.
 fn rule_limits(
-    config: &Config,
     engine: &crate::limits::CompiledLimits,
     route: &Route,
     rule: &Rule,
@@ -538,9 +570,6 @@ fn rule_limits(
         place,
         errors,
     );
-    if !limits.is_empty() && config.rate_limit_service.is_none() {
-        errors.push(place.problem(Problem::LimitsWithoutService));
-    }
     if limits.len() > MOST_LIMITS {
         errors.push(place.problem(Problem::LimitsTooMany(limits.len())));
     }
@@ -568,36 +597,80 @@ fn bucket_under_two_cycles(limit: &CompiledLimit, cycle: Duration) -> Option<Pro
 /// told in 64 bits.
 pub(crate) const MOST_LIMITS: usize = 64;
 
-/// The rate-limiting service, checked: a pod at least, and a cycle of at least 1 ms.
-fn rate_limit_service(
-    config: &Config,
-    errors: &mut Vec<ConfigError>,
-) -> Option<CompiledRateLimitService> {
-    let service = config.rate_limit_service.as_ref()?;
+/// How the data plane enforces its rate limits, checked: each mode with what it needs and
+/// nothing it does not; the service, where there is one, with a pod at least and a cycle of
+/// at least 1 ms.
+fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRateLimiting {
+    let Some(limiting) = config.rate_limiting.as_ref() else {
+        return CompiledRateLimiting::Off;
+    };
     let place = Place::of(Object::DataPlane);
-    if service.pods.is_empty() {
-        errors.push(place.problem(Problem::RateLimitServiceNoPods));
+    let mode = limiting.mode;
+    let max_key_bytes = limiting
+        .max_key_bytes
+        .unwrap_or(CompiledRateLimitService::MAX_KEY_BYTES);
+    let uses_service = matches!(
+        mode,
+        RateLimitMode::Synchronous | RateLimitMode::Asynchronous
+    );
+    if mode == RateLimitMode::Off && limiting.max_key_bytes.is_some() {
+        errors.push(place.problem(Problem::RateLimitingKeyBytesOff));
     }
-    for pod in &service.pods {
-        if !is_host_and_port(pod) {
-            errors.push(place.problem(Problem::RateLimitServicePod(pod.clone())));
+    if !uses_service && limiting.service.is_some() {
+        errors.push(place.problem(Problem::RateLimitingServiceUnused(mode_name(mode))));
+    }
+    let service = match (&limiting.service, uses_service) {
+        (Some(service), true) => Some(service),
+        (None, true) => {
+            errors.push(place.problem(Problem::RateLimitingServiceMissing(mode_name(mode))));
+            None
+        }
+        (_, false) => None,
+    };
+    if let Some(service) = service {
+        if service.pods.is_empty() {
+            errors.push(place.problem(Problem::RateLimitServiceNoPods));
+        }
+        for pod in &service.pods {
+            if !is_host_and_port(pod) {
+                errors.push(place.problem(Problem::RateLimitServicePod(pod.clone())));
+            }
+        }
+        if service.cycle_ms == Some(0) {
+            errors.push(place.problem(Problem::RateLimitServiceCycleNever));
         }
     }
-    if service.cycle_ms == Some(0) {
-        errors.push(place.problem(Problem::RateLimitServiceCycleNever));
+    match mode {
+        RateLimitMode::Off => CompiledRateLimiting::Off,
+        RateLimitMode::Local => CompiledRateLimiting::Local { max_key_bytes },
+        RateLimitMode::Synchronous => {
+            errors.push(place.problem(Problem::RateLimitingSynchronousNotBuilt));
+            CompiledRateLimiting::Off
+        }
+        RateLimitMode::Asynchronous => match service {
+            Some(service) => CompiledRateLimiting::Asynchronous(CompiledRateLimitService {
+                pods: service.pods.clone(),
+                cycle: service
+                    .cycle_ms
+                    .map_or(CompiledRateLimitService::CYCLE, Duration::from_millis),
+                max_key_bytes,
+                poll_quiet_keys: service.poll_quiet_keys.unwrap_or(false),
+                ask_cold_keys: service.ask_cold_keys.unwrap_or(false),
+                schedule_keys: service.schedule_keys.unwrap_or(true),
+            }),
+            None => CompiledRateLimiting::Off,
+        },
     }
-    Some(CompiledRateLimitService {
-        pods: service.pods.clone(),
-        cycle: service
-            .cycle_ms
-            .map_or(CompiledRateLimitService::CYCLE, Duration::from_millis),
-        max_key_bytes: service
-            .max_key_bytes
-            .unwrap_or(CompiledRateLimitService::MAX_KEY_BYTES),
-        poll_quiet_keys: service.poll_quiet_keys.unwrap_or(false),
-        ask_cold_keys: service.ask_cold_keys.unwrap_or(false),
-        schedule_keys: service.schedule_keys.unwrap_or(true),
-    })
+}
+
+/// A mode as it is written.
+fn mode_name(mode: RateLimitMode) -> &'static str {
+    match mode {
+        RateLimitMode::Off => "off",
+        RateLimitMode::Local => "local",
+        RateLimitMode::Synchronous => "synchronous",
+        RateLimitMode::Asynchronous => "asynchronous",
+    }
 }
 
 fn timeouts(
@@ -823,7 +896,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
     if config.data_plane.set_aside_ms == Some(0) {
         errors.push(Place::of(Object::DataPlane).problem(Problem::SetAsideNever));
     }
-    let rate_limit_service = rate_limit_service(config, &mut errors);
+    let rate_limiting = rate_limiting(config, &mut errors);
     for (name, upstream) in &config.upstreams {
         // Once each: a destination is known across a reload by its upstream and address.
         let mut listed = BTreeSet::new();
@@ -1018,7 +1091,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
         .map(|name| (name.as_str(), Vec::new()))
         .collect();
     let engine = compile_limits(config.limits.as_ref(), &mut errors);
-    if let Some(service) = &rate_limit_service {
+    if let CompiledRateLimiting::Asynchronous(service) = &rate_limiting {
         for limit in engine.all() {
             if let Some(problem) = bucket_under_two_cycles(&limit, service.cycle) {
                 errors.push(Place::of(Object::Limit(limit.name.clone())).problem(problem));
@@ -1100,7 +1173,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                 outcome: outcome(rule, &upstream_ids, &place, &mut errors),
                 mirrors,
                 keeps_encoded_slash: encoded_slash(rule) == edgerush_router::EncodedSlash::Keep,
-                limits: rule_limits(config, &engine, route, rule, &place, &mut errors),
+                limits: rule_limits(&engine, route, rule, &place, &mut errors),
             }));
         }
         rules.push(compiled_rules);
@@ -1176,7 +1249,7 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
                 .map(|route| route.name.clone())
                 .collect(),
             data_plane,
-            rate_limit_service,
+            rate_limiting,
             limits: engine.all(),
         };
         let sni = if keep {
@@ -2256,9 +2329,6 @@ pub enum Problem {
     /// A limit named by a rule that does not forward.
     #[error("`rate_limits` is for a rule that forwards")]
     LimitsWithoutForward,
-    /// Limits with no service to share their counts through.
-    #[error("`rate_limits` needs `rate_limit_service`")]
-    LimitsWithoutService,
     /// A name that no limit has.
     #[error("`rate_limits`: no limit is named `{0}`")]
     LimitUnknown(String),
@@ -2281,7 +2351,7 @@ pub enum Problem {
     LimitBurstZero,
     /// A bucket that refills in under two of the rate-limiting service's cycles.
     #[error(
-        "`model.bucket.burst` is {burst}: at `{rate}` it refills in under two of `rate_limit_service`'s {cycle_ms} ms cycles: at least {least}"
+        "`model.bucket.burst` is {burst}: at `{rate}` it refills in under two of `rate_limiting.service`'s {cycle_ms} ms cycles: at least {least}"
     )]
     LimitBurstUnderTwoCycles {
         /// The burst.
@@ -2302,14 +2372,26 @@ pub enum Problem {
         message: String,
     },
     /// A rate-limiting service with no pods.
-    #[error("`rate_limit_service` names no pods")]
+    #[error("`rate_limiting.service` names no pods")]
     RateLimitServiceNoPods,
     /// A rate-limiting service pod whose address is not one to connect to.
-    #[error("`rate_limit_service`: pod `{0}` is no `host:port`")]
+    #[error("`rate_limiting.service`: pod `{0}` is no `host:port`")]
     RateLimitServicePod(String),
     /// A rate-limiting service whose cycle never comes.
-    #[error("`rate_limit_service`: `cycle_ms` is 0: at least 1")]
+    #[error("`rate_limiting.service`: `cycle_ms` is 0: at least 1")]
     RateLimitServiceCycleNever,
+    /// A mode that needs the service, with none.
+    #[error("`rate_limiting`: mode `{0}` needs `service`")]
+    RateLimitingServiceMissing(&'static str),
+    /// A service for a mode that has none.
+    #[error("`rate_limiting.service` is for the modes that share counts, not `{0}`")]
+    RateLimitingServiceUnused(&'static str),
+    /// A cap on keys where none are kept.
+    #[error("`rate_limiting.max_key_bytes` is for a mode that keeps keys, not `off`")]
+    RateLimitingKeyBytesOff,
+    /// The synchronous mode, which is not built.
+    #[error("`rate_limiting`: mode `synchronous` is not built yet")]
+    RateLimitingSynchronousNotBuilt,
     /// A WebSocket's idle bound of nothing, which would never close one whose peer has gone.
     #[error("`tunnel_idle_ms` is 0: at least 1")]
     TunnelIdleNever,
@@ -4705,29 +4787,91 @@ routes:
         assert!(unknown.is_err());
     }
 
+    /// The section left out, or its mode `off`, enforces nothing; `local` keeps keys within
+    /// a cap, 256 MiB when left out, and takes no service; the modes that share counts need
+    /// one, and `synchronous` is not built yet.
+    #[test]
+    fn the_mode_takes_what_it_needs_and_nothing_else() {
+        let with = |section: &str| {
+            let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{}}\n{section}\n");
+            compile(&config(&yaml))
+                .map(|compiled| compiled.rate_limiting().clone())
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        assert_eq!(with(""), Ok(CompiledRateLimiting::Off));
+        assert_eq!(
+            with("rate_limiting: { mode: off }"),
+            Ok(CompiledRateLimiting::Off)
+        );
+        assert_eq!(
+            with("rate_limiting: { mode: local }"),
+            Ok(CompiledRateLimiting::Local {
+                max_key_bytes: 256 << 20
+            })
+        );
+        assert_eq!(
+            with("rate_limiting: { mode: local, max_key_bytes: 1000 }"),
+            Ok(CompiledRateLimiting::Local {
+                max_key_bytes: 1000
+            })
+        );
+        assert_eq!(
+            with("rate_limiting: { mode: off, max_key_bytes: 1000 }").unwrap_err(),
+            [
+                "the data plane: `rate_limiting.max_key_bytes` is for a mode that keeps keys, not `off`"
+            ]
+        );
+        for mode in ["off", "local"] {
+            assert_eq!(
+                with(&format!(
+                    r#"rate_limiting: {{ mode: {mode}, service: {{ pods: ["rl-0:7000"] }} }}"#
+                ))
+                .unwrap_err(),
+                [format!(
+                    "the data plane: `rate_limiting.service` is for the modes that share counts, not `{mode}`"
+                )]
+            );
+        }
+        assert_eq!(
+            with("rate_limiting: { mode: asynchronous }").unwrap_err(),
+            ["the data plane: `rate_limiting`: mode `asynchronous` needs `service`"]
+        );
+        assert_eq!(
+            with(r#"rate_limiting: { mode: synchronous, service: { pods: ["rl-0:7000"] } }"#)
+                .unwrap_err(),
+            ["the data plane: `rate_limiting`: mode `synchronous` is not built yet"]
+        );
+        // The mode is always written: a section saying nothing would leave it implied.
+        let unsaid: Result<Config, _> =
+            serde_saphyr::from_str("listeners: {}\nroutes: []\nupstreams: {}\nrate_limiting: {}\n");
+        assert!(unsaid.is_err());
+    }
+
     /// The rate-limiting service: its pods, a cycle of at least 1 ms, 10 when left out, and
     /// its levers, the fastest when left out.
     #[test]
     fn the_rate_limit_service_is_checked() {
         let with = |service: &str| {
-            let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{}}\n{service}\n");
+            let yaml = format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{}}\nrate_limiting: {{ mode: asynchronous, service: {service} }}\n"
+            );
             compile(&config(&yaml))
                 .map(|compiled| compiled.rate_limit_service().cloned())
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
-        let service = with(r#"rate_limit_service: { pods: ["rl-0:7000", "rl-1:7000"] }"#)
+        let service = with(r#"{ pods: ["rl-0:7000", "rl-1:7000"] }"#)
             .unwrap()
             .unwrap();
         assert_eq!(service.pods, ["rl-0:7000", "rl-1:7000"]);
         assert_eq!(service.cycle, Duration::from_millis(10));
-        assert_eq!(with("").unwrap(), None);
+        assert_eq!(service.max_key_bytes, 256 << 20);
         assert_eq!(
-            with("rate_limit_service: { pods: [] }").unwrap_err(),
-            ["the data plane: `rate_limit_service` names no pods"]
+            with("{ pods: [] }").unwrap_err(),
+            ["the data plane: `rate_limiting.service` names no pods"]
         );
         assert_eq!(
-            with(r#"rate_limit_service: { pods: ["a:1"], cycle_ms: 0 }"#).unwrap_err(),
-            ["the data plane: `rate_limit_service`: `cycle_ms` is 0: at least 1"]
+            with(r#"{ pods: ["a:1"], cycle_ms: 0 }"#).unwrap_err(),
+            ["the data plane: `rate_limiting.service`: `cycle_ms` is 0: at least 1"]
         );
         // A pod is a host and a port, as the process connects to it; anything else would
         // leave the data plane unable to start its rate limits.
@@ -4740,20 +4884,17 @@ routes:
             ":7000",
         ] {
             assert_eq!(
-                with(&format!(
-                    r#"rate_limit_service: {{ pods: ["a:1", "{pod}"] }}"#
-                ))
-                .unwrap_err(),
+                with(&format!(r#"{{ pods: ["a:1", "{pod}"] }}"#)).unwrap_err(),
                 [format!(
-                    "the data plane: `rate_limit_service`: pod `{pod}` is no `host:port`"
+                    "the data plane: `rate_limiting.service`: pod `{pod}` is no `host:port`"
                 )],
                 "{pod}"
             );
         }
-        let addresses = with(r#"rate_limit_service: { pods: ["10.0.0.1:7000", "[::1]:7000"] }"#);
+        let addresses = with(r#"{ pods: ["10.0.0.1:7000", "[::1]:7000"] }"#);
         assert_eq!(addresses.unwrap().unwrap().pods.len(), 2);
         let levers = with(
-            r#"rate_limit_service: { pods: ["a:1"], poll_quiet_keys: true, ask_cold_keys: true, schedule_keys: false }"#,
+            r#"{ pods: ["a:1"], poll_quiet_keys: true, ask_cold_keys: true, schedule_keys: false }"#,
         )
         .unwrap()
         .unwrap();
@@ -4763,17 +4904,20 @@ routes:
             "when left out, the fastest: quiet keys not polled, cold keys decided locally, \
              keys scheduled"
         );
+        let capped = compile(&config(
+            "listeners: {}\nroutes: []\nupstreams: {}\nrate_limiting: { mode: asynchronous, max_key_bytes: 1000, service: { pods: [\"a:1\"] } }\n",
+        ))
+        .unwrap();
+        assert_eq!(capped.rate_limit_service().unwrap().max_key_bytes, 1000);
     }
 
     /// A limit's bucket holds at least two of the service's cycles of its rate, every limit
     /// whether a rule names it or not: one that refills faster is refused, naming the
-    /// smallest burst that would do.
+    /// smallest burst that would do. Local mode, which has no cycle, asks nothing of it.
     #[test]
     fn a_bucket_holds_two_cycles_of_its_rate() {
-        let with = |service: &str, bucket: &str| {
-            let yaml = format!(
-                "listeners: {{}}\nroutes: []\nupstreams: {{}}\nrate_limit_service: {{ pods: [\"rl-0:7000\"]{service} }}\n"
-            );
+        let with_section = |section: &str, bucket: &str| {
+            let yaml = format!("listeners: {{}}\nroutes: []\nupstreams: {{}}\n{section}\n");
             let mut config = config(&yaml);
             let limits = format!(
                 "limits:\n  - {{ name: k, key: client, model: {{ bucket: {{ {bucket} }} }} }}\n"
@@ -4783,11 +4927,24 @@ routes:
                 .map(|_| ())
                 .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
+        let with = |service: &str, bucket: &str| {
+            with_section(
+                &format!(
+                    "rate_limiting: {{ mode: asynchronous, service: {{ pods: [\"rl-0:7000\"]{service} }} }}"
+                ),
+                bucket,
+            )
+        };
         let refused = |cycle: u64, rate: &str, burst: u64, least: u64| {
             [format!(
-                "limit `k`: `model.bucket.burst` is {burst}: at `{rate}` it refills in under two of `rate_limit_service`'s {cycle} ms cycles: at least {least}"
+                "limit `k`: `model.bucket.burst` is {burst}: at `{rate}` it refills in under two of `rate_limiting.service`'s {cycle} ms cycles: at least {least}"
             )]
         };
+        assert_eq!(
+            with_section("rate_limiting: { mode: local }", "rate: 51/s, burst: 1"),
+            Ok(()),
+            "no cycle in local mode"
+        );
         // The cycle when left out, 10 ms: a bucket of at least 20 ms of its rate.
         assert_eq!(
             with("", "rate: 50/s, burst: 1"),
@@ -4837,7 +4994,7 @@ limits:
         service: bool,
     ) -> Result<(Vec<String>, Vec<String>, Compiled), Vec<String>> {
         let service = if service {
-            "rate_limit_service: { pods: [\"rl-0:7000\"] }"
+            "rate_limiting: { mode: asynchronous, service: { pods: [\"rl-0:7000\"] } }"
         } else {
             ""
         };
@@ -4887,8 +5044,22 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
         assert!(none.is_empty(), "no limits, no service needed");
     }
 
+    /// With rate limiting off — its section left out — the limits are compiled and checked
+    /// as in any mode, so that turning it on cannot fail on one left unchecked, and enforce
+    /// nothing.
     #[test]
-    fn a_limit_named_must_be_one_and_needs_a_service_and_a_rule_that_forwards() {
+    fn with_rate_limiting_off_the_limits_are_still_checked() {
+        let (forwarding, _, compiled) = limited("per-route", "writes", "", LIMITS, false).unwrap();
+        assert_eq!(forwarding, ["writes", "per-route", "wide"]);
+        assert!(!compiled.rate_limiting().enforces());
+        assert_eq!(
+            limited("nope", "", "", LIMITS, false).unwrap_err(),
+            ["route `api`: `rate_limits`: no limit is named `nope`"]
+        );
+    }
+
+    #[test]
+    fn a_limit_named_must_be_one_on_a_rule_that_forwards() {
         let refused = |route, rule, redirect, limits, service| {
             limited(route, rule, redirect, limits, service).unwrap_err()
         };
@@ -4908,10 +5079,6 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: [] }} }}
                 true
             ),
             ["the rate limits: `rate_limits`: no limit is named `gone`"]
-        );
-        assert_eq!(
-            refused("", "", "", LIMITS, false),
-            ["route `api`, rules[0]: `rate_limits` needs `rate_limit_service`"]
         );
         assert_eq!(
             refused("", "", "small", LIMITS, true),

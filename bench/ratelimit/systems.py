@@ -524,7 +524,7 @@ routes:
         rate_limits: [per-client]
 upstreams:
   up: { load_balancer: p2c, endpoints: ["%(upstream)s:80"] }
-rate_limit_service: { pods: [%(pods)s], cycle_ms: 10%(sharing)s }
+rate_limiting: { mode: asynchronous, service: { pods: [%(pods)s], cycle_ms: 10%(sharing)s } }
 limits_file: limits.yaml
 """
 

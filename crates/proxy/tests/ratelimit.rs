@@ -142,7 +142,7 @@ routes:
         forward: {{ backends: [{{ upstream: web, weight: 1 }}] }}
 upstreams:
   web: {{ load_balancer: p2c, endpoints: ["{upstream}"] }}
-rate_limit_service: {{ pods: [{pods}], cycle_ms: 10{levers} }}
+rate_limiting: {{ mode: asynchronous, service: {{ pods: [{pods}], cycle_ms: 10{levers} }} }}
 "#
     );
     let mut config: Config = serde_saphyr::from_str(&yaml).unwrap();

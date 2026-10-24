@@ -134,15 +134,26 @@ fn limited(mut config: Config, service: &[String]) -> Config {
         )
         .unwrap(),
     );
-    config.rate_limit_service = Some(edgerush_config::RateLimitService {
-        pods: service.to_vec(),
-        cycle_ms: Some(10),
+    config.rate_limiting = Some(edgerush_config::RateLimiting {
+        mode: edgerush_config::RateLimitMode::Asynchronous,
         max_key_bytes: None,
-        poll_quiet_keys: None,
-        ask_cold_keys: None,
-        schedule_keys: None,
+        service: Some(edgerush_config::RateLimitService {
+            pods: service.to_vec(),
+            cycle_ms: Some(10),
+            poll_quiet_keys: None,
+            ask_cold_keys: None,
+            schedule_keys: None,
+        }),
     });
     config
+}
+
+/// The rate-limiting service `config` names, if it names one.
+fn service_of(config: &mut Config) -> Option<&mut edgerush_config::RateLimitService> {
+    config
+        .rate_limiting
+        .as_mut()
+        .and_then(|limiting| limiting.service.as_mut())
 }
 
 /// A refusal under ten an hour says to come back in six minutes — or a second more, a key's
@@ -416,7 +427,7 @@ async fn a_pooled_request_short_only_by_a_hold_waits_for_it() {
                 )
                 .unwrap(),
             );
-            if let Some(service) = &mut config.rate_limit_service {
+            if let Some(service) = service_of(&mut config) {
                 // Cold keys asked about: a hold waits on an ask.
                 service.ask_cold_keys = Some(true);
             }
@@ -479,7 +490,7 @@ async fn a_cold_key_decided_locally_does_not_wait_for_the_service() {
                     everything_config("127.0.0.1:9".parse().unwrap()),
                     &["127.0.0.1:9".to_owned()],
                 );
-                if let Some(service) = &mut config.rate_limit_service {
+                if let Some(service) = service_of(&mut config) {
                     service.ask_cold_keys = Some(ask_cold);
                 }
                 let compiled = compile(&config).unwrap();
@@ -534,7 +545,7 @@ async fn scheduled_a_workers_admission_reaches_the_service() {
             let exchanges = Arc::new(AtomicUsize::new(0));
             let service = counted_service(&exchanges).await;
             let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
-            if let Some(service) = &mut config.rate_limit_service {
+            if let Some(service) = service_of(&mut config) {
                 service.poll_quiet_keys = Some(false);
                 service.ask_cold_keys = Some(false);
                 service.schedule_keys = Some(true);
@@ -597,7 +608,7 @@ async fn scheduled_a_signal_with_no_room_leaves_the_next_free_to_go() {
             let exchanges = Arc::new(AtomicUsize::new(0));
             let service = counted_service(&exchanges).await;
             let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &service);
-            if let Some(service) = &mut config.rate_limit_service {
+            if let Some(service) = service_of(&mut config) {
                 service.poll_quiet_keys = Some(false);
                 service.ask_cold_keys = Some(false);
                 service.schedule_keys = Some(true);
@@ -735,7 +746,7 @@ fn hub_of(proxy: &Proxy) -> Arc<crate::ratelimit::Hub> {
 fn unlimited(mut config: Config) -> Config {
     config.routes[0].rules[0].rate_limits.clear();
     config.limits = None;
-    config.rate_limit_service = None;
+    config.rate_limiting = None;
     config
 }
 
@@ -753,8 +764,8 @@ async fn a_changed_service_starts_the_process_afresh() {
     proxy.reload(compile(&config).unwrap()).unwrap();
     assert!(Arc::ptr_eq(&first, &hub_of(&proxy)), "nothing changed");
     let mut bigger = config.clone();
-    if let Some(service) = &mut bigger.rate_limit_service {
-        service.max_key_bytes = Some(1 << 30);
+    if let Some(limiting) = &mut bigger.rate_limiting {
+        limiting.max_key_bytes = Some(1 << 30);
     }
     proxy.reload(compile(&bigger).unwrap()).unwrap();
     assert!(Arc::ptr_eq(&first, &hub_of(&proxy)), "only its keys' bytes");
@@ -768,7 +779,7 @@ async fn a_changed_service_starts_the_process_afresh() {
     for (at, change) in changes.into_iter().enumerate() {
         let current = hub_of(&proxy);
         let mut changed = config.clone();
-        if let Some(service) = &mut changed.rate_limit_service {
+        if let Some(service) = service_of(&mut changed) {
             change(service);
         }
         proxy.reload(compile(&changed).unwrap()).unwrap();
@@ -797,7 +808,7 @@ async fn rate_limits_that_cannot_start_refuse_the_config() {
     );
     let proxy = Proxy::new(compile(&config).unwrap(), NonZeroUsize::MIN).unwrap();
     let mut changed = config.clone();
-    if let Some(service) = &mut changed.rate_limit_service {
+    if let Some(service) = service_of(&mut changed) {
         service.cycle_ms = Some(20);
     }
     proxy.reload(compile(&changed).unwrap()).unwrap();
@@ -868,7 +879,7 @@ async fn a_worker_moves_to_the_thread_a_reload_starts() {
             drop(first);
             for at in 0..2 {
                 if at == 1 {
-                    if let Some(service) = &mut config.rate_limit_service {
+                    if let Some(service) = service_of(&mut config) {
                         service.cycle_ms = Some(20);
                     }
                     proxy.reload(compile(&config).unwrap()).unwrap();
@@ -941,7 +952,7 @@ async fn a_rate_limiting_thread_gone_is_unavailable_not_a_refusal() {
         .run_until(async {
             let (upstream, _) = counting_upstream().await;
             let mut config = limited(everything_config(upstream), &["127.0.0.1:9".to_owned()]);
-            if let Some(service) = &mut config.rate_limit_service {
+            if let Some(service) = service_of(&mut config) {
                 // Every new client asked about.
                 service.ask_cold_keys = Some(true);
             }
@@ -993,7 +1004,7 @@ async fn an_ask_waiting_when_the_thread_goes_is_told_it_is_unavailable() {
             let hold = Arc::new(Mutex::new(Some(Instant::now() + Duration::from_secs(60))));
             let pods = held_service(&exchanges, &hold).await;
             let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &pods);
-            if let Some(service) = &mut config.rate_limit_service {
+            if let Some(service) = service_of(&mut config) {
                 service.ask_cold_keys = Some(true);
             }
             let compiled = compile(&config).unwrap();
@@ -1041,7 +1052,7 @@ async fn one_token_limiter() -> (
         )
         .unwrap(),
     );
-    if let Some(service) = &mut config.rate_limit_service {
+    if let Some(service) = service_of(&mut config) {
         service.ask_cold_keys = Some(false);
     }
     let compiled = compile(&config).unwrap();
@@ -1169,7 +1180,7 @@ async fn asking_limiter() -> (
     let hold = Arc::new(Mutex::new(Some(Instant::now() + Duration::from_secs(60))));
     let pods = held_service(&exchanges, &hold).await;
     let mut config = limited(everything_config("127.0.0.1:9".parse().unwrap()), &pods);
-    if let Some(service) = &mut config.rate_limit_service {
+    if let Some(service) = service_of(&mut config) {
         service.ask_cold_keys = Some(true);
     }
     let compiled = compile(&config).unwrap();
@@ -1471,7 +1482,7 @@ async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
     let hold = Arc::new(Mutex::new(Some(Instant::now() + Duration::from_secs(60))));
     let pods = held_service(&exchanges, &hold).await;
     let mut config = limited(everything_config("127.0.0.1:1".parse().unwrap()), &pods);
-    if let Some(service) = &mut config.rate_limit_service {
+    if let Some(service) = service_of(&mut config) {
         // A new key is asked about: an exchange.
         service.ask_cold_keys = Some(true);
     }
@@ -1502,7 +1513,7 @@ async fn a_rate_limiting_thread_that_panics_is_told_and_one_replaced_is_not() {
         })
         .unwrap();
     until(|| exchanges.load(Ordering::Relaxed) > before).await;
-    if let Some(service) = &mut config.rate_limit_service {
+    if let Some(service) = service_of(&mut config) {
         service.cycle_ms = Some(20);
     }
     proxy.reload(compile(&config).unwrap()).unwrap();
@@ -1585,7 +1596,7 @@ async fn two_workers_share_a_clients_bucket(
             let service = service().await;
             let (upstream, _) = counting_upstream().await;
             let mut config = limited(everything_config(upstream), &service);
-            if let Some(service) = &mut config.rate_limit_service {
+            if let Some(service) = service_of(&mut config) {
                 sharing(service);
             }
             let workers = NonZeroUsize::new(2).unwrap();
@@ -1787,14 +1798,14 @@ async fn the_keys_held_are_shown_and_kept_within_their_bound() {
                 let workers = NonZeroUsize::new(workers).unwrap();
                 let proxy = if case == 3 {
                     let proxy = started(&config, workers);
-                    if let Some(service) = &mut config.rate_limit_service {
-                        service.max_key_bytes = max;
+                    if let Some(limiting) = &mut config.rate_limiting {
+                        limiting.max_key_bytes = max;
                     }
                     proxy.reload(compile(&config).unwrap()).unwrap();
                     proxy
                 } else {
-                    if let Some(service) = &mut config.rate_limit_service {
-                        service.max_key_bytes = max;
+                    if let Some(limiting) = &mut config.rate_limiting {
+                        limiting.max_key_bytes = max;
                     }
                     started(&config, workers)
                 };
@@ -1884,8 +1895,8 @@ async fn a_reload_keeps_a_limit_as_it_was_and_starts_a_changed_one_afresh() {
         (
             "what the keys may hold",
             |config| {
-                if let Some(service) = &mut config.rate_limit_service {
-                    service.max_key_bytes = Some(128 << 20);
+                if let Some(limiting) = &mut config.rate_limiting {
+                    limiting.max_key_bytes = Some(128 << 20);
                 }
             },
             429,
