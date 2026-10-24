@@ -101,6 +101,13 @@ pub struct Ask {
     /// How long the data plane waits for the answer, in nanoseconds.
     #[prost(uint64, tag = "4")]
     pub timeout_ns: u64,
+    /// How long before the batch was made the earliest of the requests arrived, in
+    /// nanoseconds; 0, from a data plane that does not say, decides them as the ask arrives.
+    #[prost(uint64, tag = "5")]
+    pub age_ns: u64,
+    /// How long after the earliest the latest of them arrived, in nanoseconds.
+    #[prost(uint64, tag = "6")]
+    pub span_ns: u64,
 }
 
 /// A data plane's batch.
@@ -455,6 +462,8 @@ impl From<service::Batch> for Batch {
                     id: ask.id,
                     count: ask.count,
                     timeout_ns: ask.timeout,
+                    age_ns: ask.age,
+                    span_ns: ask.span,
                     keys: ask
                         .keys
                         .into_iter()
@@ -526,6 +535,8 @@ impl TryFrom<Batch> for service::Batch {
                 Ok(service::Ask {
                     id: ask.id,
                     count: ask.count,
+                    age: ask.age_ns,
+                    span: ask.span_ns,
                     timeout: ask.timeout_ns,
                     keys,
                 })
@@ -722,14 +733,16 @@ mod tests {
                 report,
             });
         let ask = (
-            any::<u64>(),
-            any::<u64>(),
+            any::<(u64, u64)>(),
+            any::<(u64, u64)>(),
             any::<u64>(),
             prop::collection::btree_map(key(), contract(), 1..4),
         )
-            .prop_map(|(id, count, timeout, keys)| service::Ask {
+            .prop_map(|((id, count), (age, span), timeout, keys)| service::Ask {
                 id,
                 count,
+                age,
+                span,
                 timeout,
                 keys: keys.into_iter().collect(),
             });
@@ -1019,6 +1032,8 @@ mod tests {
                 count: u64::MAX,
                 keys,
                 timeout_ns: 0,
+                age_ns: 0,
+                span_ns: 0,
             }],
         };
         assert_eq!(

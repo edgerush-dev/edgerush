@@ -83,6 +83,8 @@ fn ask(from: PlaneId, id: u64, count: u64, keys: &[&[u8]]) -> Batch {
         asks: vec![Ask {
             id,
             count,
+            age: 0,
+            span: 0,
             timeout: 4 * CYCLE,
             keys: keys.iter().map(|key| ((*key).into(), contract())).collect(),
         }],
@@ -380,7 +382,7 @@ proptest::proptest! {
                     one_by_one.charge(now);
                 }
             }
-            proptest::prop_assert_eq!(owned.bucket, one_by_one.state());
+            proptest::prop_assert_eq!(owned.bucket(), one_by_one.clone());
         }
     }
 
@@ -408,7 +410,7 @@ proptest::proptest! {
             let answers = pod.on_batch(ask(1, id, count, &keys), now);
             proptest::prop_assert_eq!(answers.decided, vec![(id, admitted)]);
             for &at in &under {
-                proptest::prop_assert_eq!(pod.keys[KEYS[at]].bucket, one_by_one[at].state());
+                proptest::prop_assert_eq!(pod.keys[KEYS[at]].bucket(), one_by_one[at].clone());
             }
         }
     }
@@ -972,6 +974,8 @@ fn the_hits_of_an_ask_given_up_find_its_hold() {
         asks: vec![Ask {
             id,
             count: 1,
+            age: 0,
+            span: 0,
             timeout: 300 * MS,
             keys: vec![(b"k"[..].into(), slow)],
         }],
@@ -1059,6 +1063,8 @@ fn a_hold_lapses_charged_once_its_time_is_over() {
             asks: vec![Ask {
                 id,
                 count,
+                age: 0,
+                span: 0,
                 timeout: 4 * CYCLE,
                 keys: vec![(b"k"[..].into(), contract)],
             }],
@@ -1984,10 +1990,29 @@ fn an_ask_given_up_decides_its_requests_here_under_every_limit() {
         .map(|entry| (entry.key.to_vec(), entry.report))
         .collect();
     // Each after the first batch the data plane numbered, and seen applied: the cold
-    // limit's a request of the ask, which its owner may have decided and holds for it.
+    // limit's a request of the ask, which its owner may have decided and holds for it. Both
+    // admitted as the request came, four cycles before.
+    let aged = |report| match report {
+        Report::Hits {
+            sequence,
+            count,
+            asked,
+            refused,
+            seen,
+            ..
+        } => Report::Hits {
+            sequence,
+            count,
+            asked,
+            refused,
+            seen,
+            age: 4 * CYCLE,
+        },
+        report => report,
+    };
     assert!(
-        sent.contains(&(a.clone(), hits(2, 1, 1)))
-            && sent.contains(&(b.clone(), asked_hits(2, 1, 1))),
+        sent.contains(&(a.clone(), aged(hits(2, 1, 1))))
+            && sent.contains(&(b.clone(), aged(asked_hits(2, 1, 1)))),
         "both sent their owners in the same cycle: {sent:?}"
     );
 }
@@ -2183,8 +2208,9 @@ fn a_refusal_names_its_key_as_the_deciding_pod_held_it() {
     );
 }
 
-/// Requests whose ask goes unanswered are decided here, from the copy, and those refused
-/// name the key that refused them, as the copy has it.
+/// Requests whose ask goes unanswered are decided here, from the copy as of when they came,
+/// and those refused name the key that refused them, with its wait as the copy has it now:
+/// none, as it refilled while they waited.
 #[test]
 fn a_refusal_decided_here_names_its_key_as_the_copy_has_it() {
     let mut net = Net::new(1);
@@ -2200,8 +2226,7 @@ fn a_refusal_decided_here_names_its_key_as_the_copy_has_it() {
     let refused: Vec<&Decided> = decided.iter().filter(|d| !d.admitted).collect();
     assert!(!refused.is_empty(), "{decided:?}");
     for decided in refused {
-        // A hundred a second: one back in 10 ms.
-        assert_eq!(&*decided.refused_by, [(0, 10 * MS)], "{decided:?}");
+        assert_eq!(&*decided.refused_by, [(0, 0)], "{decided:?}");
     }
     assert!(
         decided
@@ -2523,12 +2548,13 @@ fn decided_over_round_trips(
 proptest::proptest! {
     /// Traffic a plain token bucket admits all of, over many rates and bursts, is admitted
     /// all by one data plane however long its messages take: its hits are charged as of
-    /// when it admitted them, and its copy taken as of when it sent them. The key is kept
-    /// warm throughout, so that nothing is asked about: an ask's requests are still decided
-    /// at one instant (issue #49). One request warms it a refill time and a round trip
-    /// before the traffic; the bucket holds at least a round trip and two cycles of refill,
-    /// so the copy stays warm between answers; and no gap is longer than a refill time,
-    /// after which a bucket is full however long the gap.
+    /// when it admitted them, its copy taken as of when it sent them, and requests that
+    /// wait — the copy cold between answers — decided as of when they came. One request
+    /// warms the key a refill time and a round trip before the traffic, and no gap is
+    /// longer than a refill time, after which a bucket is full however long the gap. The
+    /// bucket refills in two round trips or more: in less, a copy answered full charges
+    /// hits that waited from the answer's batch rather than from when they came, and
+    /// refuses a client within its rate (issue #54).
     #[test]
     fn what_a_plain_bucket_admits_a_data_plane_admits_over_round_trips(
         limit in 1u64..200, interval in 1u64..50, burst in 1u64..12,
@@ -2540,7 +2566,7 @@ proptest::proptest! {
         there in 0u64..5_000_000, back in 0u64..5_000_000,
     ) {
         let interval = interval * MS + 1;
-        let burst = burst.max((there + back + 2 * CYCLE).div_ceil(interval));
+        let burst = burst.max((2 * (there + back)).div_ceil(interval));
         let n = |n| NonZeroU64::new(n).unwrap();
         let c = Contract { limit: n(limit), window: n(limit * interval), burst: n(burst) };
         // Gaps of whole intervals, exactly at the edge, some a little more.
@@ -2628,6 +2654,150 @@ fn a_client_at_exactly_its_rate_is_admitted_with_exchanges_overlapping() {
     ];
     let decided = decided_over_round_trips(c, &times, 4_773_750, 266_466);
     assert_eq!(decided, [Some(true); 7]);
+}
+
+/// An owner decides an ask's requests as of when they came, by the ask's ages: two that came
+/// an interval apart fit a bucket of one; two at one instant do not; and an ask that does
+/// not say when is decided as it arrives.
+#[test]
+fn an_ask_is_decided_between_its_requests_arrivals() {
+    let n = |n| NonZeroU64::new(n).unwrap();
+    let interval = 10 * MS;
+    let c = Contract {
+        limit: n(1),
+        window: n(interval),
+        burst: n(1),
+    };
+    let decided = |age, span| {
+        let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+        let batch = Batch {
+            from: 100,
+            entries: Vec::new(),
+            asks: vec![Ask {
+                id: 1,
+                count: 2,
+                age,
+                span,
+                timeout: 4 * CYCLE,
+                keys: vec![(b"k"[..].into(), c)],
+            }],
+            oldest_ask: 1,
+            made: 50 * MS,
+        };
+        pod.on_batch(batch, 100 * MS).decided
+    };
+    assert_eq!(
+        decided(3 * interval, interval),
+        [(1, 2)],
+        "an interval apart"
+    );
+    assert_eq!(decided(3 * interval, 0), [(1, 1)], "at one instant");
+    assert_eq!(decided(0, 0), [(1, 1)], "as it arrives");
+}
+
+/// An ask that, by its ages, came before requests its owner has already charged is decided
+/// as if it came no earlier than them: two data planes' batches arrive offset differently —
+/// a batch waiting to be sent counts its wait as trip — and decided as of before them, it
+/// would find their charges ahead of it, as if out of order, and lose room. A bucket of ten
+/// refilling ten an hour admits ten of twelve, in any order.
+#[test]
+fn an_ask_is_decided_no_earlier_than_what_its_owner_charged() {
+    let n = |n| NonZeroU64::new(n).unwrap();
+    let c = Contract {
+        limit: n(10),
+        window: n(3_600_000 * MS),
+        burst: n(10),
+    };
+    let ask = |from, count, age| Batch {
+        from,
+        entries: Vec::new(),
+        asks: vec![Ask {
+            id: 1,
+            count,
+            age,
+            span: 0,
+            timeout: 4 * CYCLE,
+            keys: vec![(b"k"[..].into(), c)],
+        }],
+        oldest_ask: 1,
+        made: 50 * MS,
+    };
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    assert_eq!(pod.on_batch(ask(100, 6, 0), 50 * MS).decided, [(1, 6)]);
+    assert_eq!(
+        pod.on_batch(ask(101, 6, 10 * MS), 51 * MS).decided,
+        [(1, 4)],
+        "as of 41 ms, before the six charged as of 50"
+    );
+    // So too after another data plane's hits, charged as of when they were admitted.
+    let mut pod: ServicePod = ServicePod::new(0, CYCLE, view(&[0], 1));
+    let mut hits = batch(102, hits(1, 6, 0));
+    hits.entries[0].contract = c;
+    hits.made = 50 * MS;
+    pod.on_batch(hits, 50 * MS);
+    assert_eq!(
+        pod.on_batch(ask(101, 6, 10 * MS), 51 * MS).decided,
+        [(1, 4)],
+        "as of 41 ms, before the six hits admitted at 50"
+    );
+}
+
+/// An ask's ages count back from when its batch was made, as its hits' do.
+#[test]
+fn a_batch_ages_its_asks_with_its_hits() {
+    let mut queued = Queued::default();
+    let arrived = Arrived::and(Some(Arrived::at(4 * MS)), 6 * MS);
+    let made = queued.at(10 * MS).made;
+    queued
+        .asks
+        .push(arrived.ask(made, 1, 2, 4 * CYCLE, vec![(b"k"[..].into(), contract())]));
+    queued.at(25 * MS);
+    let batch = queued.batch(100, 1);
+    assert_eq!((batch.asks[0].age, batch.asks[0].span), (21 * MS, 2 * MS));
+}
+
+/// An ask's batch carries first what the data plane admitted of its keys and has not yet
+/// sent: the owner charges those before it decides the ask, as they came before it.
+#[test]
+fn an_asks_batch_carries_its_keys_unsent_hits_ahead_of_it() {
+    let mut net = Net::new(1);
+    warmed(&mut net, 0, b"k", 0);
+    assert_eq!(
+        net.planes[0].decide(b"k", contract(), 10 * MS),
+        Decision::Admit
+    );
+    // A refill time on, unheard from since, the copy is cold: the next request asks.
+    assert!(waits(net.planes[0].decide(b"k", contract(), 150 * MS)));
+    let owner = Net::owner(b"k") as PodId;
+    let sent = net.planes[0].take_outgoing();
+    let (_, batch) = sent.iter().find(|(pod, _)| *pod == owner).unwrap();
+    assert_eq!(batch.asks.len(), 1);
+    assert!(
+        batch.entries.iter().any(|entry| matches!(
+            entry.report,
+            Report::Hits { count: 1, age, .. } if age == 140 * MS
+        )),
+        "the hit admitted at 10 ms, sent with the ask: {:?}",
+        batch.entries
+    );
+}
+
+/// The issue's case (#49): a bucket of one refilling faster than a round trip, so the copy
+/// is cold for every request and each asks. The requests that come while the first ask is
+/// out go in one ask after it; the owner decides them at one instant, against a bucket of
+/// one, though they came an interval apart.
+#[test]
+fn a_client_at_exactly_its_rate_is_admitted_when_every_request_asks() {
+    let n = |n| NonZeroU64::new(n).unwrap();
+    let interval = MS + 1;
+    let c = Contract {
+        limit: n(1),
+        window: n(interval),
+        burst: n(1),
+    };
+    let times = [interval, 2 * interval, 3 * interval];
+    let decided = decided_over_round_trips(c, &times, 3_270_000, 1_620_000);
+    assert_eq!(decided, [Some(true); 3]);
 }
 
 /// Answers from a pod that does not say back when their batch was made — `made` 0 — come
