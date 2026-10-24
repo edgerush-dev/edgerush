@@ -1641,6 +1641,92 @@ fn a_handover_to_a_pod_that_does_not_own_the_key_is_ignored() {
     assert_eq!(pod.counted(b"k"), None);
 }
 
+/// What a pod owning `k` would hold of it after `batches` from data plane 9, as a copy.
+fn held_after(batches: &[Report]) -> Replica {
+    let mut pod: ServicePod = ServicePod::new(roles(b"k").0, CYCLE, view(&[0, 1, 2], 3));
+    for report in batches {
+        pod.on_batch(batch(9, *report), 0);
+    }
+    pod.keys[&b"k"[..]].replica(b"k", 0)
+}
+
+/// The owner of `k`, having applied one hit, is left out of the view and taken back in —
+/// seeing the view without it or not — and is handed `k` back by the pod that held it
+/// meanwhile, which applied one more: then, before the handback, it applies `fresh`.
+fn retaken(saw_itself_left_out: bool, fresh: Option<Report>) -> ServicePod {
+    let (owner, secondary, _) = roles(b"k");
+    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 3));
+    pod.on_batch(batch(9, hits(1, 1, 0)), 0);
+    if saw_itself_left_out {
+        let pods: Vec<PodId> = (0..3).filter(|p| *p != owner).collect();
+        pod.on_view(view(&pods, 4), 0);
+    }
+    pod.on_view(view(&[0, 1, 2], 5), 0);
+    if let Some(report) = fresh {
+        pod.on_batch(batch(9, report), 0);
+    }
+    pod.on_replicas(
+        Replicas {
+            from: secondary,
+            entries: vec![held_after(&[hits(1, 1, 0), hits(2, 1, 1)])],
+            handover: true,
+            epoch: 5,
+        },
+        0,
+    );
+    pod
+}
+
+/// A pod taken back into the view still holding a key is handed it back holding all it
+/// held before, and more: what it held is not charged again on top.
+#[test]
+fn a_key_handed_back_to_a_pod_that_still_holds_it_is_counted_once() {
+    for saw_itself_left_out in [true, false] {
+        let pod = retaken(saw_itself_left_out, None);
+        assert_eq!(pod.counted(b"k"), Some(2), "{saw_itself_left_out}");
+        assert_eq!(
+            pod.keys[&b"k"[..]].bucket().remaining(0),
+            8,
+            "{saw_itself_left_out}: ten less two"
+        );
+    }
+}
+
+/// Hits it applies once taken back in, before the handback, are charged on top of it.
+#[test]
+fn a_key_handed_back_keeps_what_its_pod_applied_since_it_was_taken_back() {
+    for saw_itself_left_out in [true, false] {
+        let pod = retaken(saw_itself_left_out, Some(hits(3, 1, 2)));
+        assert_eq!(pod.counted(b"k"), Some(3), "{saw_itself_left_out}");
+        assert_eq!(
+            pod.keys[&b"k"[..]].bucket().remaining(0),
+            7,
+            "{saw_itself_left_out}: ten less three"
+        );
+        assert_eq!(pod.keys[&b"k"[..]].planes.get(9).unwrap().applied, 3);
+    }
+}
+
+/// A key handed over twice, the same, is counted as it was handed, once.
+#[test]
+fn a_key_handed_over_twice_is_counted_once() {
+    let (owner, secondary, _) = roles(b"k");
+    let mut pod: ServicePod = ServicePod::new(owner, CYCLE, view(&[0, 1, 2], 3));
+    for _ in 0..2 {
+        pod.on_replicas(
+            Replicas {
+                from: secondary,
+                entries: vec![held_after(&[hits(1, 1, 0), hits(2, 1, 1)])],
+                handover: true,
+                epoch: 3,
+            },
+            0,
+        );
+    }
+    assert_eq!(pod.counted(b"k"), Some(2));
+    assert_eq!(pod.keys[&b"k"[..]].bucket().remaining(0), 8);
+}
+
 /// A pod not yet taken into the view answers with its view and decides nothing.
 #[test]
 fn a_pod_not_serving_answers_with_its_view_alone() {
@@ -2354,13 +2440,13 @@ fn a_service_pod_counts_room_for_the_records_a_key_has() {
     }
 }
 
-/// A service pod's key takes 112 bytes in its table, which holds up to twice the room its
+/// A service pod's key takes 128 bytes in its table, which holds up to twice the room its
 /// keys take, and its record of a data plane 56: its bucket kept as the bucket's state, its
 /// terms the key's contract, batches waiting, which rarely do, kept apart, and the data
 /// plane's last admission in eight bytes, room for what is held for it.
 #[test]
 fn a_service_pods_key_is_small() {
-    assert_eq!(size_of::<(Box<[u8]>, Owned)>(), 112);
+    assert_eq!(size_of::<(Box<[u8]>, Owned)>(), 128);
     assert_eq!(size_of::<(PlaneId, Record)>(), 56);
 }
 
