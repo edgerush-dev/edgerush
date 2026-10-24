@@ -295,9 +295,26 @@ pub fn decide<'a, H: Head>(
     random: &mut impl FnMut() -> u64,
     id: Option<&HeaderValue>,
 ) -> Result<Decision<'a>, Rejection> {
-    decide_routed(snapshot, listener, head, client, random, id, |request| {
-        listener.router.route(request).copied()
-    })
+    decide_with(
+        snapshot,
+        listener,
+        head,
+        client,
+        random,
+        id,
+        |request| listener.router.route(request).copied(),
+        Marking::Enforced,
+    )
+}
+
+/// Which of a rule's limits a request is marked as under.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Marking {
+    /// Those its data plane enforces: none with rate limiting off, so that a rule's limits
+    /// cost a request nothing then.
+    Enforced,
+    /// Every one whose match takes it, enforced or not: what `explain` shows.
+    All,
 }
 
 /// [`decide`], with the rule found by `route` from what routing reads of the request, in
@@ -316,6 +333,32 @@ pub fn decide_routed<'a, H: Head>(
     random: &mut impl FnMut() -> u64,
     id: Option<&HeaderValue>,
     route: impl FnOnce(&RequestParts<'_, H::Fields<'_>>) -> Option<RuleId>,
+) -> Result<Decision<'a>, Rejection> {
+    decide_with(
+        snapshot,
+        listener,
+        head,
+        client,
+        random,
+        id,
+        route,
+        Marking::All,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "decide's and decide_routed's arguments, and which limits to mark"
+)]
+fn decide_with<'a, H: Head>(
+    snapshot: &'a Compiled,
+    listener: &CompiledListener,
+    head: &mut H,
+    client: &Client,
+    random: &mut impl FnMut() -> u64,
+    id: Option<&HeaderValue>,
+    route: impl FnOnce(&RequestParts<'_, H::Fields<'_>>) -> Option<RuleId>,
+    marking: Marking,
 ) -> Result<Decision<'a>, Rejection> {
     let found = head.survey();
     // An extended CONNECT is for WebSocket or for nothing the gateway carries: it cannot be
@@ -454,7 +497,9 @@ pub fn decide_routed<'a, H: Head>(
         }
     };
     let upstream = backends.pick(random()).ok_or(Rejection::NoBackend)?;
-    let limited = if rule.limits.is_empty() {
+    let limited = if rule.limits.is_empty()
+        || (marking == Marking::Enforced && !snapshot.rate_limiting().enforces())
+    {
         0
     } else {
         let routed = Routed {

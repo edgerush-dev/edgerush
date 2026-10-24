@@ -9,6 +9,7 @@
 //! afresh, as any change to a limit does.
 
 mod hub;
+pub(crate) mod local;
 
 #[cfg(test)]
 pub(crate) use hub::REFUSE_START;
@@ -543,11 +544,8 @@ impl Limiter {
         })
     }
 
-    /// Calls `then` with the keys of a request from `client` under
-    /// those of `limits` that `limited` marks, bit `n` for the `n`th: each the limit's name,
-    /// a zero and the key's value, with its contract, put together in the worker's buffers.
-    /// A limit the request has no key for is left out, as one whose number came out below
-    /// one: it lets the request through.
+    /// Calls `then` with the keys of a request from `client` under those of `limits` that
+    /// `limited` marks, put together in the worker's buffers ([`with_keys`]).
     fn with_keys<R>(
         &self,
         limits: &[Arc<CompiledLimit>],
@@ -555,53 +553,7 @@ impl Limiter {
         client: Requester,
         then: impl FnOnce(&[(&[u8], Contract)]) -> R,
     ) -> R {
-        let mut keys = self.keys.borrow_mut();
-        let mut contracts = self.contracts.borrow_mut();
-        contracts.clear();
-        let context = ByKey { client };
-        let mut used = 0;
-        for (at, limit) in limits.iter().enumerate() {
-            let bit = 1_u64.checked_shl(u32::try_from(at).unwrap_or(u32::MAX));
-            if bit.is_none_or(|bit| limited & bit == 0) {
-                continue;
-            }
-            let Outcome::Applies { key, limit: count } = limit.rule.counted(&context, &NoTables)
-            else {
-                continue;
-            };
-            let Some(count) = NonZeroU64::new(count) else {
-                continue;
-            };
-            if keys.len() <= used {
-                keys.push(Vec::new());
-            }
-            let Some(buffer) = keys.get_mut(used) else {
-                continue;
-            };
-            key_into(buffer, &limit.name, limit.definition, key);
-            contracts.push(Contract {
-                limit: count,
-                window: limit.window,
-                burst: limit.burst,
-            });
-            used += 1;
-        }
-        // The usual few at once without a list made for them.
-        match (&keys[..used], &contracts[..]) {
-            ([], _) => then(&[]),
-            ([a], [ca]) => then(&[(a, *ca)]),
-            ([a, b], [ca, cb]) => then(&[(a, *ca), (b, *cb)]),
-            ([a, b, c], [ca, cb, cc]) => then(&[(a, *ca), (b, *cb), (c, *cc)]),
-            ([a, b, c, d], [ca, cb, cc, cd]) => then(&[(a, *ca), (b, *cb), (c, *cc), (d, *cd)]),
-            (many, contracts) => {
-                let parts: Vec<(&[u8], Contract)> = many
-                    .iter()
-                    .map(Vec::as_slice)
-                    .zip(contracts.iter().copied())
-                    .collect();
-                then(&parts)
-            }
-        }
+        with_keys(&self.keys, &self.contracts, limits, limited, client, then)
     }
 
     /// The worker's side of its process: the answers to its asks, with the entries of their
@@ -1020,6 +972,67 @@ impl std::fmt::Debug for Limiter {
             .field("service", &self.service)
             .field("asked", &self.asked.borrow().len())
             .finish_non_exhaustive()
+    }
+}
+
+/// Calls `then` with the keys of a request from `client` under
+/// those of `limits` that `limited` marks, bit `n` for the `n`th: each the limit's name,
+/// a zero and the key's value, with its contract, put together in a worker's buffers,
+/// `keys` and `contracts`, whichever mode decides them. A limit the request has no key for
+/// is left out, as one whose number came out below one: it lets the request through.
+pub(crate) fn with_keys<R>(
+    keys: &RefCell<Vec<Vec<u8>>>,
+    contracts: &RefCell<Vec<Contract>>,
+    limits: &[Arc<CompiledLimit>],
+    limited: u64,
+    client: Requester,
+    then: impl FnOnce(&[(&[u8], Contract)]) -> R,
+) -> R {
+    let mut keys = keys.borrow_mut();
+    let mut contracts = contracts.borrow_mut();
+    contracts.clear();
+    let context = ByKey { client };
+    let mut used = 0;
+    for (at, limit) in limits.iter().enumerate() {
+        let bit = 1_u64.checked_shl(u32::try_from(at).unwrap_or(u32::MAX));
+        if bit.is_none_or(|bit| limited & bit == 0) {
+            continue;
+        }
+        let Outcome::Applies { key, limit: count } = limit.rule.counted(&context, &NoTables) else {
+            continue;
+        };
+        let Some(count) = NonZeroU64::new(count) else {
+            continue;
+        };
+        if keys.len() <= used {
+            keys.push(Vec::new());
+        }
+        let Some(buffer) = keys.get_mut(used) else {
+            continue;
+        };
+        key_into(buffer, &limit.name, limit.definition, key);
+        contracts.push(Contract {
+            limit: count,
+            window: limit.window,
+            burst: limit.burst,
+        });
+        used += 1;
+    }
+    // The usual few at once without a list made for them.
+    match (&keys[..used], &contracts[..]) {
+        ([], _) => then(&[]),
+        ([a], [ca]) => then(&[(a, *ca)]),
+        ([a, b], [ca, cb]) => then(&[(a, *ca), (b, *cb)]),
+        ([a, b, c], [ca, cb, cc]) => then(&[(a, *ca), (b, *cb), (c, *cc)]),
+        ([a, b, c, d], [ca, cb, cc, cd]) => then(&[(a, *ca), (b, *cb), (c, *cc), (d, *cd)]),
+        (many, contracts) => {
+            let parts: Vec<(&[u8], Contract)> = many
+                .iter()
+                .map(Vec::as_slice)
+                .zip(contracts.iter().copied())
+                .collect();
+            then(&parts)
+        }
     }
 }
 

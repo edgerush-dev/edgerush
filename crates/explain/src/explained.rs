@@ -377,6 +377,12 @@ fn text(
                 } else {
                     under.join(", ")
                 };
+                // Checked, and named as in any mode, but enforced in none (07 §1).
+                let under = if compiled.rate_limiting().enforces() {
+                    under
+                } else {
+                    format!("{under}; rate limiting is off, none enforced")
+                };
                 field(&mut lines, "limits", vec![under]);
             }
         }
@@ -911,7 +917,7 @@ upstreams: { u: { load_balancer: p2c, endpoints: [] } }
     /// which applies says so.
     #[test]
     fn a_request_under_limits_says_which() {
-        let config = r#"
+        let yaml = r#"
 listeners: { web: { address: "[::]:80", protocol: http, proxy_protocol: off, forwarding: { trusted_proxies: [], trusted_only_headers: [] }, request_id: generate } }
 routes:
   - name: api
@@ -925,13 +931,13 @@ routes:
         forward: { backends: [{ upstream: u, weight: 1 }] }
         rate_limits: [writes]
 upstreams: { u: { load_balancer: p2c, endpoints: [] } }
-rate_limit_service: { pods: ["rl-0:7000"] }
+rate_limiting: { mode: asynchronous, service: { pods: ["rl-0:7000"] } }
 "#;
         let limits = "limits:
   - { name: per-client, key: client, model: { bucket: { rate: 100/s, burst: 100 } } }
   - { name: writes, key: client, match: { methods: [POST] }, model: { bucket: { rate: 10/min, burst: 5 } }, dry_run: true }
 ";
-        let mut config: edgerush_config::Config = serde_saphyr::from_str(config).unwrap();
+        let mut config: edgerush_config::Config = serde_saphyr::from_str(yaml).unwrap();
         config.limits = Some(serde_saphyr::from_str(limits).unwrap());
         let snapshot = Snapshot::new(config).unwrap();
         let listener = snapshot.listener("web").unwrap();
@@ -955,6 +961,23 @@ rate_limit_service: { pods: ["rl-0:7000"] }
         assert_eq!(
             line("GET", "/admin").as_deref(),
             Some("limits    none of the rule's applies")
+        );
+        // Rate limiting off: the same limits named, and said to be enforced in none.
+        let mut off: edgerush_config::Config = serde_saphyr::from_str(&yaml.replace(
+            r#"rate_limiting: { mode: asynchronous, service: { pods: ["rl-0:7000"] } }"#,
+            "",
+        ))
+        .unwrap();
+        off.limits = Some(serde_saphyr::from_str(limits).unwrap());
+        let snapshot = Snapshot::new(off).unwrap();
+        let listener = snapshot.listener("web").unwrap();
+        let asked = asked("1.1", "GET", "http://a.test/api/x", &[]);
+        let text = snapshot.explain(listener, &asked).unwrap().text();
+        assert!(
+            text.contains(
+                "limits    per-client (100/s, a bucket of 100); rate limiting is off, none enforced"
+            ),
+            "{text}"
         );
     }
 

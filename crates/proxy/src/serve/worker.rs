@@ -139,6 +139,7 @@ impl Worker {
             ),
             balancing: RefCell::default(),
             limiter: RefCell::new(None),
+            local_limiter: RefCell::new(None),
             accepted: Cell::new(0),
             body_limits,
             me: Weak::clone(me),
@@ -362,11 +363,11 @@ impl Worker {
                 storage,
             );
             // And its rate limiter's keys, none when it has none (06 §8).
-            let usage = self
-                .limiter
-                .borrow()
-                .as_ref()
-                .map_or((0, 0, 0), |(_, limiter)| limiter.usage());
+            let usage = match (&*self.limiter.borrow(), &*self.local_limiter.borrow()) {
+                (Some((_, limiter)), _) => limiter.usage(),
+                (None, Some((_, local))) => local.usage(),
+                (None, None) => (0, 0, 0),
+            };
             metrics.limiter().holding(&self.limiter_said, usage);
             // What its listeners logged since the last sweep goes to be written, so that a
             // quiet worker holds no record for longer than a sweep (21 §4).

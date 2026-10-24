@@ -28,10 +28,11 @@ pub struct Config {
     /// The data plane's own settings; left out, each has its value.
     #[serde(default)]
     pub data_plane: DataPlane,
-    /// Experimental: the rate-limiting service the rate limits rules are under share their
-    /// counts through. Needed by any rule under one.
+    /// How the data plane enforces the rate limits its rules are under
+    /// ([06 §4](../../../docs/06-rate-limiting.md)); left out, it enforces none, though it
+    /// checks them.
     #[serde(default)]
-    pub rate_limit_service: Option<RateLimitService>,
+    pub rate_limiting: Option<RateLimiting>,
     /// The certificates listeners and upstreams name, by name: a resource of their own
     /// ([07 §1](../../../docs/07-config-and-dsl.md)), which reaches a data plane apart from
     /// the rest of its config and is never read with it, so that no file a config is read
@@ -60,8 +61,46 @@ pub struct DataPlane {
     pub set_aside_ms: Option<u64>,
 }
 
-/// The rate-limiting service (experimental): its pods, and how often each worker sends
-/// them what it admitted.
+/// How the data plane enforces its rate limits: the mode, and what that mode needs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RateLimiting {
+    /// Which mode.
+    pub mode: RateLimitMode,
+    /// Bytes the rate limits' keys may hold on this data plane, which its process holds once
+    /// for all its workers, as an estimate of their own data: past it, keys are evicted, and
+    /// start again full ([06 §8](../../../docs/06-rate-limiting.md)). 268,435,456 (256 MiB)
+    /// when left out. Not for `off`, which keeps no keys.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    pub max_key_bytes: Option<u64>,
+    /// The rate-limiting service, which `synchronous` and `asynchronous` need and no other
+    /// mode takes.
+    #[serde(default)]
+    pub service: Option<RateLimitService>,
+}
+
+/// How a data plane enforces its rate limits ([06 §4](../../../docs/06-rate-limiting.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitMode {
+    /// None enforced: the limits are checked as in any mode, and requests go on as if under
+    /// none. What a data plane does with no `rate_limiting`.
+    Off,
+    /// Each process on what it sees alone, with no service: a client spread over several
+    /// processes gets each one's limit.
+    Local,
+    /// The key's owner in the rate-limiting service decides every request. Not built yet.
+    Synchronous,
+    /// Each process decides from its copies of the keys and shares what it admitted through
+    /// the rate-limiting service every cycle (experimental).
+    Asynchronous,
+}
+
+/// The rate-limiting service: its pods, and how often each process sends them what it
+/// admitted.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -75,13 +114,6 @@ pub struct RateLimitService {
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub cycle_ms: Option<u64>,
-    /// Bytes the rate limits' keys may hold on this data plane, which its process holds once
-    /// for all its workers, as an estimate of their own data: past it, the process evicts
-    /// its least recently used keys, which start again full
-    /// ([06 §8](../../../docs/06-rate-limiting.md)). 268,435,456 (256 MiB) when left out.
-    #[serde(default)]
-    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
-    pub max_key_bytes: Option<u64>,
     /// Whether a key with nothing to report is polled every cycle while in use, to keep its
     /// copy fresh. Off, a quiet key's copy goes cold after a refill time and its next
     /// request asks: messages grow with the keys admitting, not with all those in use. On,

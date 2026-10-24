@@ -24,16 +24,16 @@ mod route;
 pub use backends::{UpstreamId, WeightedBackends};
 pub use compile::{
     Compiled, CompiledDataPlane, CompiledForwarding, CompiledListener, CompiledMirror,
-    CompiledRateLimitService, CompiledRetry, CompiledRule, CompiledTimeouts, CompiledTls,
-    CompiledUpstream, CompiledUpstreamTls, ConfigError, L4, L4Route, MatchId, Matches,
+    CompiledRateLimitService, CompiledRateLimiting, CompiledRetry, CompiledRule, CompiledTimeouts,
+    CompiledTls, CompiledUpstream, CompiledUpstreamTls, ConfigError, L4, L4Route, MatchId, Matches,
     NamedCertificate, Object, Outcome, Place, Problem, RuleId, SniRouter, Step, Timeout, compile,
     compile_with_matches,
 };
 pub use config::{
     AccessLog, Certificate, ClientValidation, Config, DataPlane, Forwarding, HealthCheck, Http3,
     Keepalive, Listener, ListenerProxyProtocol, LoadBalancer, Probe, Protocol,
-    ProxyProtocolVersion, RateLimitService, RequestId, SlowStart, Tls, Upstream, UpstreamProtocol,
-    UpstreamTls,
+    ProxyProtocolVersion, RateLimitMode, RateLimitService, RateLimiting, RequestId, SlowStart, Tls,
+    Upstream, UpstreamProtocol, UpstreamTls,
 };
 pub use harness_file::{CertificateFiles, HarnessFile};
 pub use limits::{Bucket, CompiledLimit, Global, Limit, LimitMatch, Limits, Model};

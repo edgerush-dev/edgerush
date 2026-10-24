@@ -406,6 +406,8 @@ struct RateLimits {
     failed: Option<crate::ratelimit::Failed>,
     /// The thread, for a running config with a rate-limiting service, once started.
     hub: Option<Arc<crate::ratelimit::Hub>>,
+    /// The keys, for a running config in local mode, once started.
+    local: Option<Arc<crate::ratelimit::local::Process>>,
 }
 
 /// One worker's share of the data plane: the connections it holds to the upstreams, which
@@ -444,6 +446,8 @@ pub struct Worker {
     /// Its rules' rate limits (experimental), made when a rule first limits, with the
     /// generation of the config it was last checked against.
     limiter: RefCell<Option<(u64, Rc<crate::ratelimit::Limiter>)>>,
+    /// Its limiter in local mode, as `limiter` is in the asynchronous one.
+    local_limiter: RefCell<Option<(u64, Rc<crate::ratelimit::local::LocalLimiter>)>>,
     /// Connections accepted since everything else last had a turn.
     accepted: Cell<usize>,
     /// Its limits again, for the bodies of answers to share rather than copy.
@@ -1189,13 +1193,13 @@ pub enum ProxyError {
     Random(String),
     /// A rate-limiting service on a machine without native 128-bit atomics.
     #[error(
-        "`rate_limit_service`: this machine has no native 128-bit compare-and-swap, which rate \
+        "`rate_limiting`: this machine has no native 128-bit compare-and-swap, which rate \
          limits need"
     )]
     RateLimitsUnsupported,
     /// A rate-limiting thread that could not be started: its pods' addresses, a thread or
     /// its runtime could not be had.
-    #[error("`rate_limit_service`: its thread cannot be started: {0}")]
+    #[error("`rate_limiting`: its thread cannot be started: {0}")]
     RateLimitThread(String),
     /// A limit whose bucket and two cycles' refill pass 65,535, what a key's cycle can hold.
     #[error(

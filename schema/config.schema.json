@@ -30,11 +30,11 @@
         "$ref": "#/$defs/Listener"
       }
     },
-    "rate_limit_service": {
-      "description": "Experimental: the rate-limiting service the rate limits rules are under share their\ncounts through. Needed by any rule under one.",
+    "rate_limiting": {
+      "description": "How the data plane enforces the rate limits its rules are under; left out, it\nenforces none, though it checks them.",
       "anyOf": [
         {
-          "$ref": "#/$defs/RateLimitService"
+          "$ref": "#/$defs/RateLimiting"
         },
         {
           "type": "null"
@@ -971,8 +971,33 @@
         }
       ]
     },
+    "RateLimitMode": {
+      "description": "How a data plane enforces its rate limits.",
+      "oneOf": [
+        {
+          "description": "None enforced: the limits are checked as in any mode, and requests go on as if under\nnone. What a data plane does with no `rate_limiting`.",
+          "type": "string",
+          "const": "off"
+        },
+        {
+          "description": "Each process on what it sees alone, with no service: a client spread over several\nprocesses gets each one's limit.",
+          "type": "string",
+          "const": "local"
+        },
+        {
+          "description": "The key's owner in the rate-limiting service decides every request. Not built yet.",
+          "type": "string",
+          "const": "synchronous"
+        },
+        {
+          "description": "Each process decides from its copies of the keys and shares what it admitted through\nthe rate-limiting service every cycle (experimental).",
+          "type": "string",
+          "const": "asynchronous"
+        }
+      ]
+    },
     "RateLimitService": {
-      "description": "The rate-limiting service (experimental): its pods, and how often each worker sends\nthem what it admitted.",
+      "description": "The rate-limiting service: its pods, and how often each process sends them what it\nadmitted.",
       "type": "object",
       "properties": {
         "ask_cold_keys": {
@@ -985,16 +1010,6 @@
         },
         "cycle_ms": {
           "description": "Milliseconds between the process's messages to the service; 10 when left out. Every\nlimit's bucket holds at least two cycles of its rate, so a longer cycle asks for\nlarger buckets: at 20 ms, a burst of 40 at `1000/s`.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "default": null,
-          "minimum": 1
-        },
-        "max_key_bytes": {
-          "description": "Bytes the rate limits' keys may hold on this data plane, which its process holds once\nfor all its workers, as an estimate of their own data: past it, the process evicts\nits least recently used keys, which start again full. 268,435,456 (256 MiB) when left out.",
           "type": [
             "integer",
             "null"
@@ -1031,6 +1046,41 @@
       "additionalProperties": false,
       "required": [
         "pods"
+      ]
+    },
+    "RateLimiting": {
+      "description": "How the data plane enforces its rate limits: the mode, and what that mode needs.",
+      "type": "object",
+      "properties": {
+        "max_key_bytes": {
+          "description": "Bytes the rate limits' keys may hold on this data plane, which its process holds once\nfor all its workers, as an estimate of their own data: past it, keys are evicted, and\nstart again full. 268,435,456 (256 MiB)\nwhen left out. Not for `off`, which keeps no keys.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        },
+        "mode": {
+          "description": "Which mode.",
+          "$ref": "#/$defs/RateLimitMode"
+        },
+        "service": {
+          "description": "The rate-limiting service, which `synchronous` and `asynchronous` need and no other\nmode takes.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateLimitService"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "mode"
       ]
     },
     "Redirect": {

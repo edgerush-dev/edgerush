@@ -8,7 +8,7 @@
 //! limits are a resource of their own too, read from the file named here.
 
 use crate::{
-    Certificate, Config, DataPlane, Limits, Listener, RateLimitService, Route, TcpRoute, TlsRoute,
+    Certificate, Config, DataPlane, Limits, Listener, RateLimiting, Route, TcpRoute, TlsRoute,
     Upstream,
 };
 use serde::Deserialize;
@@ -43,10 +43,10 @@ pub struct HarnessFile {
     /// The data plane's own settings; left out, each has its value.
     #[serde(default)]
     pub data_plane: DataPlane,
-    /// Experimental: the rate-limiting service the rate limits rules are under share their
-    /// counts through. Needed by any rule under one.
+    /// How the data plane enforces the rate limits its rules are under; left out, it
+    /// enforces none, though it checks them.
     #[serde(default)]
-    pub rate_limit_service: Option<RateLimitService>,
+    pub rate_limiting: Option<RateLimiting>,
     /// The files of each certificate that listeners and upstreams name, by its name. A key
     /// is never written into the config file itself.
     #[serde(default)]
@@ -87,7 +87,7 @@ impl HarnessFile {
             tls_routes: self.tls_routes,
             upstreams: self.upstreams,
             data_plane: self.data_plane,
-            rate_limit_service: self.rate_limit_service,
+            rate_limiting: self.rate_limiting,
             certificates: read,
             limits,
         }

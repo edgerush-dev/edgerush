@@ -16,6 +16,7 @@ use crate::interim::Interim;
 use crate::map_head::MapHead;
 use crate::metrics::{Answer, LimitCounters};
 use crate::random::{random, unguessable};
+use crate::ratelimit::local::LocalLimiter;
 use crate::ratelimit::{Limited, Limiter, RATELIMIT, Undecided};
 use crate::request::{Decision, Opening, Rejection, decide};
 use crate::request_body::{Counts, RequestBody};
@@ -26,7 +27,7 @@ use crate::upstream::h1::codec::Sending;
 use crate::way_back;
 use crate::websocket::{self, Key};
 use arc_swap::Guard;
-use edgerush_config::{CompiledRule, RequestId, UpstreamProtocol};
+use edgerush_config::{CompiledRateLimiting, CompiledRule, RequestId, UpstreamProtocol};
 use edgerush_filters::request_id;
 use edgerush_router::Fields;
 use http::{HeaderValue, Method, Request, Response, Version};
@@ -55,6 +56,14 @@ fn dry_runs(rule: &CompiledRule) -> u64 {
         .enumerate()
         .filter(|(_, limit)| limit.dry_run)
         .fold(0, |marked, (at, _)| marked | 1 << at)
+}
+
+/// A worker's limiter, in the mode its config enforces limits in.
+enum Limiting {
+    /// Shared through the rate-limiting service (experimental).
+    Asynchronous(Rc<Limiter>),
+    /// The process's own.
+    Local(Rc<LocalLimiter>),
 }
 
 impl Worker {
@@ -152,8 +161,11 @@ impl Worker {
     /// `limited` marking them: undecided, never admitted unlimited, with no thread to
     /// decide them with.
     fn rate_limits(&self, rule: &CompiledRule, limited: u64, client: Requester) -> Limited {
-        match self.limiter() {
-            Some(limiter) => limiter.decide_all(&rule.limits, limited, client),
+        match self.limiting() {
+            Some(Limiting::Asynchronous(limiter)) => {
+                limiter.decide_all(&rule.limits, limited, client)
+            }
+            Some(Limiting::Local(limiter)) => limiter.decide_all(&rule.limits, limited, client),
             None => Limited::Undecided(Undecided::Unavailable),
         }
     }
@@ -186,7 +198,7 @@ impl Worker {
     /// about, in places dry runs have of their own, and counted when the answer comes; one
     /// not decided — no place, no time, no thread to decide it — counts `dry_run_uncounted`.
     fn dry_run(&self, under: Under<'_>, client: Requester) {
-        let limiter = self.limiter();
+        let limiting = self.limiting();
         let mut marked = under.marked;
         while marked != 0 {
             let at = marked.trailing_zeros() as usize;
@@ -207,11 +219,16 @@ impl Worker {
                     }
                 }
             };
-            let limited = limiter
-                .as_ref()
-                .map_or(Limited::Undecided(Undecided::Unavailable), |limiter| {
+            let limited = match &limiting {
+                Some(Limiting::Asynchronous(limiter)) => {
                     limiter.decide_dry_run(&under.rule.limits, one, client)
-                });
+                }
+                // Decided alone, and charged only if there is room: what a dry run is.
+                Some(Limiting::Local(limiter)) => {
+                    limiter.decide_all(&under.rule.limits, one, client)
+                }
+                None => Limited::Undecided(Undecided::Unavailable),
+            };
             match limited {
                 Limited::Admit => count(&self.proxy, Some(true)),
                 Limited::Refuse => count(&self.proxy, Some(false)),
@@ -258,10 +275,15 @@ impl Worker {
         told: &[(usize, u64)],
     ) -> Response<Body> {
         let mut response = self.proxy.answer_to(listener, Answer::RateLimited, call);
-        let Some(limiter) = self.limiter() else {
-            return response;
+        let refusal = match self.limiting() {
+            Some(Limiting::Asynchronous(limiter)) => {
+                limiter.refusal(&under.rule.limits, under.marked, client, told)
+            }
+            Some(Limiting::Local(limiter)) => {
+                limiter.refusal(&under.rule.limits, under.marked, client)
+            }
+            None => return response,
         };
-        let refusal = limiter.refusal(&under.rule.limits, under.marked, client, told);
         self.count_limits(under.rule, refusal.by, under.slots, |counters| {
             &counters.refused
         });
@@ -282,6 +304,43 @@ impl Worker {
             headers.insert(http::header::RETRY_AFTER, seconds);
         }
         response
+    }
+
+    /// The worker's limiter for its config's mode, if the mode enforces limits and they were
+    /// started.
+    fn limiting(&self) -> Option<Limiting> {
+        match self.proxy.current.load().config.rate_limiting() {
+            CompiledRateLimiting::Asynchronous(_) => self.limiter().map(Limiting::Asynchronous),
+            CompiledRateLimiting::Local { .. } => self.local_limiter().map(Limiting::Local),
+            CompiledRateLimiting::Off => None,
+        }
+    }
+
+    /// The worker's limiter in local mode, made when first needed and again when the
+    /// process's keys are replaced; `None` before rate limits are started.
+    fn local_limiter(&self) -> Option<Rc<LocalLimiter>> {
+        let generation = self.proxy.current.load().generation;
+        let mut held = self.local_limiter.borrow_mut();
+        if let Some((made_for, limiter)) = held.as_ref()
+            && *made_for == generation
+        {
+            return Some(Rc::clone(limiter));
+        }
+        let (snapshot, process) = self.proxy.local_limits();
+        let Some(process) = process else {
+            *held = None;
+            return None;
+        };
+        if let Some((_, limiter)) = held.as_ref()
+            && limiter.is_on(&process)
+        {
+            let limiter = Rc::clone(limiter);
+            *held = Some((snapshot.generation, Rc::clone(&limiter)));
+            return Some(limiter);
+        }
+        let limiter = LocalLimiter::new(process, usize::from(self.position));
+        *held = Some((snapshot.generation, Rc::clone(&limiter)));
+        Some(limiter)
     }
 
     /// The worker's limiter, made when first needed and again when the process's thread is

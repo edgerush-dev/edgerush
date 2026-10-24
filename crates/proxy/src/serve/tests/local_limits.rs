@@ -1,0 +1,175 @@
+//! The rate limits route rules are under, in local mode (06 §4): each process on what it
+//! sees, no service; and with rate limiting off, none enforced.
+
+use super::*;
+
+/// `config` with its first route's first rule under ten requests an hour for each client,
+/// a burst of ten, enforced as `section` says, or not at all if there is none.
+fn limited_in(mut config: Config, section: Option<edgerush_config::RateLimiting>) -> Config {
+    config.routes[0].rules[0].rate_limits = vec!["per-client".to_owned()];
+    config.limits = Some(
+        serde_saphyr::from_str(
+            "limits:\n  - { name: per-client, key: client, model: { bucket: { rate: 10/h, burst: 10 } } }\n",
+        )
+        .unwrap(),
+    );
+    config.rate_limiting = section;
+    config
+}
+
+fn local_mode() -> Option<edgerush_config::RateLimiting> {
+    Some(edgerush_config::RateLimiting {
+        mode: edgerush_config::RateLimitMode::Local,
+        max_key_bytes: None,
+        service: None,
+    })
+}
+
+/// A data plane for `config` on `workers`, its rate limits started as the binary starts
+/// them.
+fn started(config: &Config, workers: NonZeroUsize) -> Proxy {
+    let proxy = Proxy::new(compile(config).unwrap(), workers).unwrap();
+    proxy.start_rate_limits(|| {}).unwrap();
+    proxy
+}
+
+/// `count` requests over HTTP/2, alternating between the workers that `sends` reach: each
+/// one's status, and the headers of every refusal.
+async fn send_round(
+    sends: &mut Vec<::h2::client::SendRequest<Bytes>>,
+    count: usize,
+) -> (Vec<u16>, Vec<http::HeaderMap>) {
+    let mut statuses = Vec::new();
+    let mut refusals = Vec::new();
+    for _ in 0..count {
+        let send = sends.remove(0);
+        let mut send = within(send.ready()).await.unwrap();
+        let request = Request::get("http://example.test/")
+            .version(Version::HTTP_2)
+            .body(())
+            .unwrap();
+        let (response, _) = send.send_request(request, true).unwrap();
+        let response = within(response).await.unwrap();
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            refusals.push(response.headers().clone());
+        }
+        statuses.push(response.status().as_u16());
+        sends.push(send);
+    }
+    (statuses, refusals)
+}
+
+/// `workers` workers of a data plane for `config`, each serving a connection of its own:
+/// the data plane, and a client's connection to each.
+async fn serving_workers(
+    config: &Config,
+    workers: usize,
+) -> (Arc<Proxy>, Vec<::h2::client::SendRequest<Bytes>>) {
+    let proxy = Arc::new(started(config, NonZeroUsize::new(workers).unwrap()));
+    let limits = H1Limits {
+        sweep: Duration::from_millis(20),
+        ..H1Limits::default()
+    };
+    let mut sends = Vec::new();
+    for position in 0..u16::try_from(workers).unwrap() {
+        let worker = Worker::made(Arc::clone(&proxy), limits, SHORT, position, None);
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socket.local_addr().unwrap();
+        let _maintained = tokio::task::spawn_local(Rc::clone(&worker).maintain());
+        let _serving = tokio::task::spawn_local(Rc::clone(&worker).serve(0, socket));
+        sends.push(h2_library_client(front, &::h2::client::Builder::new()).await);
+    }
+    (proxy, sends)
+}
+
+/// Under ten an hour, a client is told to come back in six minutes, or a second more, and
+/// the `RateLimit` field says the same.
+fn comes_back(headers: &http::HeaderMap) {
+    let after = headers["retry-after"].to_str().unwrap();
+    assert!(after == "360" || after == "361", "retry-after {after}");
+    assert_eq!(
+        headers["ratelimit"],
+        format!(r#""per-client";r=0;t={after}"#).as_str()
+    );
+}
+
+/// Two workers of one process share a client's bucket in local mode: a client with a
+/// connection to each is held to the one bucket of ten, refusals say when to come back,
+/// and the process's one key is counted once.
+#[tokio::test]
+async fn local_mode_holds_a_client_to_one_bucket_across_workers() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let config = limited_in(everything_config(upstream), local_mode());
+            let (proxy, mut sends) = serving_workers(&config, 2).await;
+            let (statuses, refusals) = send_round(&mut sends, 16).await;
+            let admitted = statuses.iter().filter(|s| **s == 200).count();
+            assert_eq!((admitted, refusals.len()), (10, 6), "{statuses:?}");
+            refusals.iter().for_each(comes_back);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let scrape = loop {
+                let scrape = proxy.metrics();
+                if scrape.contains("edgerush_rate_limit_keys 1\n") || Instant::now() > deadline {
+                    break scrape;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert!(scrape.contains("edgerush_rate_limit_keys 1\n"), "{scrape}");
+            assert!(
+                scrape.contains(
+                    r#"edgerush_rate_limit_decisions_total{limit="per-client",outcome="refused"} 6"#
+                ),
+                "{scrape}"
+            );
+        })
+        .await;
+}
+
+/// With rate limiting off — its section left out, or its mode `off` — a rule's limits are
+/// checked but none is enforced: every request goes on, and no limit is counted.
+#[tokio::test]
+async fn with_rate_limiting_off_every_request_goes_on() {
+    let off = Some(edgerush_config::RateLimiting {
+        mode: edgerush_config::RateLimitMode::Off,
+        max_key_bytes: None,
+        service: None,
+    });
+    for section in [None, off] {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (upstream, _) = counting_upstream().await;
+                let config = limited_in(everything_config(upstream), section.clone());
+                let (proxy, mut sends) = serving_workers(&config, 1).await;
+                let (statuses, _) = send_round(&mut sends, 15).await;
+                assert!(statuses.iter().all(|s| *s == 200), "{statuses:?}");
+                assert!(!proxy.metrics().contains("edgerush_rate_limit"));
+            })
+            .await;
+    }
+}
+
+/// A reload that stays in local mode keeps the keys, its cap changed or not: a client that
+/// spent its bucket is still refused after it.
+#[tokio::test]
+async fn a_reload_in_local_mode_keeps_the_keys() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (upstream, _) = counting_upstream().await;
+            let config = limited_in(everything_config(upstream), local_mode());
+            let (proxy, mut sends) = serving_workers(&config, 1).await;
+            let (statuses, _) = send_round(&mut sends, 10).await;
+            assert!(statuses.iter().all(|s| *s == 200), "{statuses:?}");
+            let mut bigger = config.clone();
+            if let Some(limiting) = &mut bigger.rate_limiting {
+                limiting.max_key_bytes = Some(1 << 30);
+            }
+            proxy.reload(compile(&bigger).unwrap()).unwrap();
+            let (statuses, _) = send_round(&mut sends, 1).await;
+            assert_eq!(statuses, [429]);
+        })
+        .await;
+}

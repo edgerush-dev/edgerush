@@ -88,7 +88,7 @@ fn proxy_starts_its_rate_limits_before_it_serves() -> io::Result<()> {
         "        forward:",
         "        rate_limits: [per-client]\n        forward:",
     ) + &format!(
-        "rate_limit_service: {{ pods: [\"127.0.0.1:1\"] }}\nlimits_file: '{limits}'\n"
+        "rate_limiting: {{ mode: asynchronous, service: {{ pods: [\"127.0.0.1:1\"] }} }}\nlimits_file: '{limits}'\n"
     );
     std::fs::write(&file, limited)?;
     let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
@@ -98,6 +98,45 @@ fn proxy_starts_its_rate_limits_before_it_serves() -> io::Result<()> {
     assert!(get(web, "/")?.contains("x-upstream: one"));
     let refused = get(web, "/")?;
     assert!(refused.starts_with("HTTP/1.1 429 "), "{refused}");
+    Ok(())
+}
+
+/// In local mode the process limits on its own, with no service; with rate limiting left
+/// out, the same limits are checked, said at start to be off, and every request goes on.
+#[test]
+fn proxy_limits_locally_and_says_when_limits_are_off() -> io::Result<()> {
+    let one = upstream("one")?;
+    let limits = scratch("local-limits.yaml");
+    std::fs::write(
+        &limits,
+        "limits:\n  - { name: per-client, key: client, model: { bucket: { rate: 10/h, burst: 2 } } }\n",
+    )?;
+    let limited = |section: &str| {
+        config("127.0.0.1:0", "up", Some(one)).replace(
+            "        forward:",
+            "        rate_limits: [per-client]\n        forward:",
+        ) + &format!("{section}limits_file: '{limits}'\n")
+    };
+    let file = scratch("local.yaml");
+    std::fs::write(&file, limited("rate_limiting: { mode: local }\n"))?;
+    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
+    let web = harness.address_after("listener \"web\" is on ");
+    harness.wait_for("1 worker, thread-per-core");
+    assert!(get(web, "/")?.contains("x-upstream: one"));
+    assert!(get(web, "/")?.contains("x-upstream: one"));
+    let refused = get(web, "/")?;
+    assert!(refused.starts_with("HTTP/1.1 429 "), "{refused}");
+    drop(harness);
+
+    let file = scratch("off.yaml");
+    std::fs::write(&file, limited(""))?;
+    let mut harness = Harness::start(&["--config", &file, "--workers", "1"])?;
+    let web = harness.address_after("listener \"web\" is on ");
+    harness.wait_for("rate limiting is off: 1 limit checked, none enforced");
+    harness.wait_for("1 worker, thread-per-core");
+    for _ in 0..4 {
+        assert!(get(web, "/")?.contains("x-upstream: one"));
+    }
     Ok(())
 }
 

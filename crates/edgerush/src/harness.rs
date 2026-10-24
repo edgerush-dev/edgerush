@@ -284,6 +284,8 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         Err(rejected) => return Err(Failure::Config { path, rejected }),
     };
     let mut bound: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
+    // Limits checked but enforced in none is said once, so that a mode left out is seen.
+    let unenforced = (!config.rate_limiting().enforces()).then_some(config.limits().len());
     let proxy = Proxy::new(config, workers)
         .map(Arc::new)
         .map_err(|error| Failure::Proxy {
@@ -329,6 +331,15 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
             format_args!(
                 "listener \"{}\" is on {}{also}",
                 listener.name, listener.listens_on
+            ),
+        );
+    }
+    if let Some(limits @ 1..) = unenforced {
+        say(
+            stderr,
+            format_args!(
+                "rate limiting is off: {limits} limit{} checked, none enforced",
+                if limits == 1 { "" } else { "s" }
             ),
         );
     }
