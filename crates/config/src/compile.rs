@@ -547,6 +547,23 @@ fn rule_limits(
     limits
 }
 
+/// `limit`'s bucket, if it refills in under two of the service's cycles: the copies the data
+/// planes decide from run up to a cycle and a message behind the owner's bucket, and one
+/// that refills within about that refuses clients within their rate (06 §4).
+fn bucket_under_two_cycles(limit: &CompiledLimit, cycle: Duration) -> Option<Problem> {
+    let burst = u128::from(limit.burst.get());
+    let window = u128::from(limit.window.get());
+    // Two cycles' worth of the rate, in requests times the window: the burst times the window
+    // is to be no less.
+    let needed = 2 * cycle.as_nanos() * u128::from(limit.count.get());
+    (burst * window < needed).then(|| Problem::LimitBurstUnderTwoCycles {
+        burst: limit.burst.get(),
+        rate: limit.rate.clone(),
+        cycle_ms: cycle.as_millis(),
+        least: needed.div_ceil(window),
+    })
+}
+
 /// The most limits a rule's requests can be under: which of them a request is under is
 /// told in 64 bits.
 pub(crate) const MOST_LIMITS: usize = 64;
@@ -1001,6 +1018,13 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
         .map(|name| (name.as_str(), Vec::new()))
         .collect();
     let engine = compile_limits(config.limits.as_ref(), &mut errors);
+    if let Some(service) = &rate_limit_service {
+        for limit in engine.all() {
+            if let Some(problem) = bucket_under_two_cycles(&limit, service.cycle) {
+                errors.push(Place::of(Object::Limit(limit.name.clone())).problem(problem));
+            }
+        }
+    }
     let mut rules = Vec::new();
     let mut names = HashSet::new();
     // The routes of every listener, by the listener's name.
@@ -2255,6 +2279,20 @@ pub enum Problem {
     /// A bucket of nothing.
     #[error("`model.bucket.burst` is 0: at least 1")]
     LimitBurstZero,
+    /// A bucket that refills in under two of the rate-limiting service's cycles.
+    #[error(
+        "`model.bucket.burst` is {burst}: at `{rate}` it refills in under two of `rate_limit_service`'s {cycle_ms} ms cycles: at least {least}"
+    )]
+    LimitBurstUnderTwoCycles {
+        /// The burst.
+        burst: u64,
+        /// The rate as it was written.
+        rate: String,
+        /// The service's cycle, in milliseconds.
+        cycle_ms: u128,
+        /// The smallest burst that holds two cycles of the rate.
+        least: u128,
+    },
     /// A limit whose match does not compile.
     #[error("`match`, {field}: {message}")]
     LimitRule {
@@ -4725,6 +4763,58 @@ routes:
             "when left out, the fastest: quiet keys not polled, cold keys decided locally, \
              keys scheduled"
         );
+    }
+
+    /// A limit's bucket holds at least two of the service's cycles of its rate, every limit
+    /// whether a rule names it or not: one that refills faster is refused, naming the
+    /// smallest burst that would do.
+    #[test]
+    fn a_bucket_holds_two_cycles_of_its_rate() {
+        let with = |service: &str, bucket: &str| {
+            let yaml = format!(
+                "listeners: {{}}\nroutes: []\nupstreams: {{}}\nrate_limit_service: {{ pods: [\"rl-0:7000\"]{service} }}\n"
+            );
+            let mut config = config(&yaml);
+            let limits = format!(
+                "limits:\n  - {{ name: k, key: client, model: {{ bucket: {{ {bucket} }} }} }}\n"
+            );
+            config.limits = Some(serde_saphyr::from_str(&limits).unwrap());
+            compile(&config)
+                .map(|_| ())
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let refused = |cycle: u64, rate: &str, burst: u64, least: u64| {
+            [format!(
+                "limit `k`: `model.bucket.burst` is {burst}: at `{rate}` it refills in under two of `rate_limit_service`'s {cycle} ms cycles: at least {least}"
+            )]
+        };
+        // The cycle when left out, 10 ms: a bucket of at least 20 ms of its rate.
+        assert_eq!(
+            with("", "rate: 50/s, burst: 1"),
+            Ok(()),
+            "exactly two cycles"
+        );
+        assert_eq!(
+            with("", "rate: 51/s, burst: 1").unwrap_err(),
+            refused(10, "51/s", 1, 2)
+        );
+        assert_eq!(with("", "rate: 1000/s, burst: 20"), Ok(()));
+        assert_eq!(
+            with("", "rate: 1000/s, burst: 19").unwrap_err(),
+            refused(10, "1000/s", 19, 20)
+        );
+        assert_eq!(with("", "rate: 100/min, burst: 1"), Ok(()));
+        // A longer cycle asks for a larger bucket.
+        assert_eq!(
+            with(", cycle_ms: 20", "rate: 50/s, burst: 1").unwrap_err(),
+            refused(20, "50/s", 1, 2)
+        );
+        assert_eq!(with(", cycle_ms: 20", "rate: 25/s, burst: 1"), Ok(()));
+        assert_eq!(
+            with(", cycle_ms: 1000", "rate: 1/s, burst: 1").unwrap_err(),
+            refused(1000, "1/s", 1, 2)
+        );
+        assert_eq!(with(", cycle_ms: 1000", "rate: 1/s, burst: 2"), Ok(()));
     }
 
     const LIMITS: &str = r"

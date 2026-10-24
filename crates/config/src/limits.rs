@@ -101,7 +101,9 @@ pub struct Bucket {
     #[cfg_attr(feature = "schema", schemars(regex(pattern = RATE_PATTERN)))]
     pub rate: String,
     /// How many requests a client can send at once, from idle, before its traffic is
-    /// spread out at the rate: the whole bucket.
+    /// spread out at the rate: the whole bucket. At least two of the rate-limiting service's
+    /// cycles of the rate — 20 ms of it at the 10 ms cycle, 20 at `1000/s` — since a bucket
+    /// that refills faster than its counts are shared refuses clients within their rate.
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub burst: u64,
 }

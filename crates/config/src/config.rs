@@ -69,7 +69,9 @@ pub struct RateLimitService {
     /// The address (`host:port`) of each of its pods, the first being pod 0.
     #[cfg_attr(feature = "schema", schemars(length(min = 1)))]
     pub pods: Vec<String>,
-    /// Milliseconds between the process's messages to the service; 10 when left out.
+    /// Milliseconds between the process's messages to the service; 10 when left out. Every
+    /// limit's bucket holds at least two cycles of its rate, so a longer cycle asks for
+    /// larger buckets: at 20 ms, a burst of 40 at `1000/s`.
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub cycle_ms: Option<u64>,
