@@ -60,11 +60,50 @@ pub(crate) const RATELIMIT: HeaderName = HeaderName::from_static("ratelimit");
 
 /// What a limit's key reads of a request: the client's address as forwarding worked it
 /// out, until authentication gives the rest (stage 9).
-struct ByKey {
+struct ByKey<'f> {
     client: Requester,
+    fields: Option<&'f dyn HeaderLookup>,
 }
 
-impl Context for ByKey {
+/// What a request's keys are read from: its client, and, where a limit may be keyed by a
+/// header (07 §2), its fields.
+#[derive(Clone, Copy)]
+pub(crate) struct KeyedBy<'f> {
+    /// The client, as forwarding worked it out.
+    pub(crate) client: Requester,
+    /// Its fields as they go upstream, if a key may read them.
+    pub(crate) fields: Option<&'f dyn HeaderLookup>,
+}
+
+impl From<Requester> for KeyedBy<'_> {
+    fn from(client: Requester) -> Self {
+        Self {
+            client,
+            fields: None,
+        }
+    }
+}
+
+/// A request's fields, read by name, for a limit keyed by a header.
+pub(crate) trait HeaderLookup {
+    /// The first value of the field `name`, if it is text.
+    fn header(&self, name: &str) -> Option<&str>;
+}
+
+/// Fields, as [`HeaderLookup`] reads them.
+pub(crate) struct LookUp<'f, F: ?Sized>(pub(crate) &'f F);
+
+impl<F: edgerush_router::Fields + ?Sized> HeaderLookup for LookUp<'_, F> {
+    fn header(&self, name: &str) -> Option<&str> {
+        // A header's name made for each request that reads one: only a limit keyed by a
+        // header, which is experimental, does.
+        let name = http::HeaderName::from_bytes(name.as_bytes()).ok()?;
+        let value = self.0.values(&name).next()?;
+        std::str::from_utf8(value).ok()
+    }
+}
+
+impl Context for ByKey<'_> {
     fn text(&self, _: Text) -> Option<&str> {
         None
     }
@@ -76,8 +115,11 @@ impl Context for ByKey {
         }
     }
 
-    fn named(&self, _: Named, _: &str) -> Option<&str> {
-        None
+    fn named(&self, field: Named, name: &str) -> Option<&str> {
+        match field {
+            Named::Header => self.fields?.header(name),
+            Named::Query | Named::Cookie | Named::Claim => None,
+        }
     }
 }
 
@@ -440,25 +482,25 @@ impl Limiter {
     /// for the `n`th: each counted by its key — the limit's name, a zero, the key's value —
     /// and all decided at once, admitted under all of them or none (06 §2). A limit the
     /// request has no key for lets it through, as one whose number came out below one.
-    pub(crate) fn decide_all(
+    pub(crate) fn decide_all<'f>(
         self: &Rc<Self>,
         limits: &[Arc<CompiledLimit>],
         limited: u64,
-        client: Requester,
+        client: impl Into<KeyedBy<'f>>,
     ) -> Limited {
-        self.decide_in(limits, limited, client, &self.waiting)
+        self.decide_in(limits, limited, client.into(), &self.waiting)
     }
 
     /// Decides a request from `client` under the dry runs of `limits` that `limited` marks,
     /// as [`decide_all`](Self::decide_all) does, waiting, if it must, in the places dry runs
     /// have of their own.
-    pub(crate) fn decide_dry_run(
+    pub(crate) fn decide_dry_run<'f>(
         self: &Rc<Self>,
         limits: &[Arc<CompiledLimit>],
         limited: u64,
-        client: Requester,
+        client: impl Into<KeyedBy<'f>>,
     ) -> Limited {
-        self.decide_in(limits, limited, client, &self.dry_runs)
+        self.decide_in(limits, limited, client.into(), &self.dry_runs)
     }
 
     /// Decides a request as [`decide_all`](Self::decide_all) does, waiting, if it must, in
@@ -467,7 +509,7 @@ impl Limiter {
         self: &Rc<Self>,
         limits: &[Arc<CompiledLimit>],
         limited: u64,
-        client: Requester,
+        client: KeyedBy<'_>,
         places: &Places,
     ) -> Limited {
         let now = self.now();
@@ -490,15 +532,15 @@ impl Limiter {
     /// marks, and how long it should wait to be admitted under all of them (06 §2): as
     /// `told` says, by position among the request's keys, where a service pod decided it
     /// and said; otherwise as the worker's entries have them.
-    pub(crate) fn refusal<'a>(
+    pub(crate) fn refusal<'a, 'f>(
         &self,
         limits: &'a [Arc<CompiledLimit>],
         limited: u64,
-        client: Requester,
+        client: impl Into<KeyedBy<'f>>,
         told: &[(usize, u64)],
     ) -> Refusal<'a> {
         let now = self.now();
-        self.with_keys(limits, limited, client, |parts| {
+        self.with_keys(limits, limited, client.into(), |parts| {
             // A key begins with its limit's name and a zero.
             let at = |part: usize| {
                 let (key, _) = parts.get(part)?;
@@ -550,7 +592,7 @@ impl Limiter {
         &self,
         limits: &[Arc<CompiledLimit>],
         limited: u64,
-        client: Requester,
+        client: KeyedBy<'_>,
         then: impl FnOnce(&[(&[u8], Contract)]) -> R,
     ) -> R {
         with_keys(&self.keys, &self.contracts, limits, limited, client, then)
@@ -900,7 +942,7 @@ impl Limiter {
         client: Requester,
     ) -> Limited {
         let now = self.now();
-        self.with_keys(limits, limited, client, |parts| {
+        self.with_keys(limits, limited, client.into(), |parts| {
             self.defer(parts, now, &self.waiting)
         })
     }
@@ -985,13 +1027,16 @@ pub(crate) fn with_keys<R>(
     contracts: &RefCell<Vec<Contract>>,
     limits: &[Arc<CompiledLimit>],
     limited: u64,
-    client: Requester,
+    client: KeyedBy<'_>,
     then: impl FnOnce(&[(&[u8], Contract)]) -> R,
 ) -> R {
     let mut keys = keys.borrow_mut();
     let mut contracts = contracts.borrow_mut();
     contracts.clear();
-    let context = ByKey { client };
+    let context = ByKey {
+        client: client.client,
+        fields: client.fields,
+    };
     let mut used = 0;
     for (at, limit) in limits.iter().enumerate() {
         let bit = 1_u64.checked_shl(u32::try_from(at).unwrap_or(u32::MAX));

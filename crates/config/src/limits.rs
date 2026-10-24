@@ -187,6 +187,7 @@ fn rate(text: &str) -> Option<(NonZeroU64, NonZeroU64)> {
 /// Compiles the engine's limits, if there are any, the problems found pushed to `errors`.
 pub(crate) fn compile_limits(
     limits: Option<&Limits>,
+    header_keys: bool,
     errors: &mut Vec<ConfigError>,
 ) -> CompiledLimits {
     let Some(limits) = limits else {
@@ -202,8 +203,18 @@ pub(crate) fn compile_limits(
         if by_name.contains_key(&limit.name) {
             errors.push(place.problem(Problem::LimitTwice));
         }
-        if limit.key != "client" {
-            errors.push(place.problem(Problem::LimitKey(limit.key.clone())));
+        let header = limit.key.starts_with("headers[");
+        let key_refused = if header && !header_keys {
+            Some(Problem::LimitHeaderKeyOff(limit.key.clone()))
+        } else if !header && limit.key != "client" {
+            Some(Problem::LimitKey(limit.key.clone()))
+        } else {
+            None
+        };
+        // A key refused here is said once: the rule is not compiled to say it again.
+        let key_ok = key_refused.is_none();
+        if let Some(problem) = key_refused {
+            errors.push(place.problem(problem));
         }
         let Model::Bucket(bucket) = &limit.model;
         let rate = rate(&bucket.rate);
@@ -222,15 +233,22 @@ pub(crate) fn compile_limits(
             key: Key::Field(limit.key.clone()),
             limit: Count::Count(rate.map_or(1, |(count, _)| count.get())),
         };
-        let rule = plain
-            .compile(&Schema::default())
-            .map_err(|error| {
-                errors.push(place.problem(Problem::LimitRule {
-                    field: error.field,
-                    message: error.message,
-                }));
-            })
-            .ok();
+        let rule = if key_ok {
+            plain
+                .compile(&Schema {
+                    said_keys: header_keys,
+                    ..Schema::default()
+                })
+                .map_err(|error| {
+                    errors.push(place.problem(Problem::LimitRule {
+                        field: error.field,
+                        message: error.message,
+                    }));
+                })
+                .ok()
+        } else {
+            None
+        };
         if let (Some(rule), Some((count, window)), Some(burst)) = (rule, rate, burst)
             && errors.len() == before
         {

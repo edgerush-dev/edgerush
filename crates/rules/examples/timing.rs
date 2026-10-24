@@ -202,6 +202,7 @@ fn key_of(buffer: &mut Vec<u8>, name: &str, key: KeyValue<'_>) {
 fn main() {
     let schema = Schema {
         tables: vec![("accounts".to_owned(), vec!["rps".to_owned()])],
+        said_keys: false,
     };
     let mut rows: HashMap<String, i64> = (0..1_000).map(|n| (format!("acct-{n}"), 100)).collect();
     rows.insert("acme".to_owned(), 500);

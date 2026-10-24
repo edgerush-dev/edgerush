@@ -72,6 +72,9 @@ pub trait Context {
 pub struct Schema {
     /// Each table, with the names of its numeric columns.
     pub tables: Vec<(String, Vec<String>)>,
+    /// Whether a key may be what the client said — a header — rather than only what the
+    /// gateway established: an experiment, behind the data plane's switch (07 §2).
+    pub said_keys: bool,
 }
 
 /// The tables' current data, by the positions [`Schema`] gives.

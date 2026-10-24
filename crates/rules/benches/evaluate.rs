@@ -91,6 +91,7 @@ fn request() -> Request {
 fn schema() -> Schema {
     Schema {
         tables: vec![("accounts".to_owned(), vec!["rps".to_owned()])],
+        said_keys: false,
     }
 }
 

@@ -1114,7 +1114,12 @@ fn compiled(config: &Config, keep: bool) -> Result<(Compiled, Matches), Vec<Conf
         .keys()
         .map(|name| (name.as_str(), Vec::new()))
         .collect();
-    let engine = compile_limits(config.limits.as_ref(), &mut errors);
+    let header_keys = config
+        .rate_limiting
+        .as_ref()
+        .and_then(|limiting| limiting.experimental_header_keys)
+        .unwrap_or(false);
+    let engine = compile_limits(config.limits.as_ref(), header_keys, &mut errors);
     if let CompiledRateLimiting::Asynchronous(service) = &rate_limiting {
         for limit in engine.all() {
             if let Some(problem) = bucket_under_two_cycles(&limit, service.cycle) {
@@ -2368,6 +2373,9 @@ pub enum Problem {
     /// A key other than the client's address, the only one before authentication.
     #[error("`key`: `{0}` is not a key: `client`, until authentication comes")]
     LimitKey(String),
+    /// A header as a key, without the switch that allows it.
+    #[error("`key`: `{0}` is a header, which needs `rate_limiting.experimental_header_keys`")]
+    LimitHeaderKeyOff(String),
     /// A rate that is not one.
     #[error(
         "`model.bucket.rate`: `{0}` is not a rate: a number of at least 1, `/`, and `s`, `min`, `h` or `d`"
@@ -5216,6 +5224,64 @@ upstreams: {{ u: {{ load_balancer: p2c, endpoints: {{ listed: [] }} }} }}
             .collect();
         assert_eq!(kept, [("zeta", 0), ("alpha", 1), ("mid", 2)]);
         assert_eq!(compiled.rules[0][0].limits[0].position, 1);
+    }
+
+    #[test]
+    fn a_header_is_a_key_only_behind_its_switch() {
+        let with = |switch: &str, key: &str| {
+            let yaml = format!(
+                "listeners: {{}}
+routes: []
+upstreams: {{}}
+rate_limiting: {{ mode: local{switch} }}
+"
+            );
+            let mut config = config(&yaml);
+            let limits = format!(
+                "limits:
+  - {{ name: k, key: '{key}', model: {{ bucket: {{ rate: 10/s, burst: 10 }} }} }}
+"
+            );
+            config.limits = Some(serde_saphyr::from_str(&limits).unwrap());
+            compile(&config)
+                .map(|_| ())
+                .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())
+        };
+        let on = ", experimental_header_keys: true";
+        assert_eq!(with(on, r#"headers["x-api-key"]"#), Ok(()));
+        assert_eq!(
+            with("", r#"headers["x-api-key"]"#).unwrap_err(),
+            [
+                r#"limit `k`: `key`: `headers["x-api-key"]` is a header, which needs `rate_limiting.experimental_header_keys`"#
+            ]
+        );
+        assert_eq!(
+            with(
+                ", experimental_header_keys: false",
+                r#"headers["x-api-key"]"#
+            )
+            .unwrap_err(),
+            [
+                r#"limit `k`: `key`: `headers["x-api-key"]` is a header, which needs `rate_limiting.experimental_header_keys`"#
+            ]
+        );
+        // A header's name as the language writes it: lower case, quoted.
+        for bad in [
+            r#"headers["X-Api-Key"]"#,
+            "headers[x-api-key]",
+            r#"headers[""]"#,
+        ] {
+            let refused = with(on, bad).unwrap_err();
+            assert!(
+                refused.len() == 1 && refused[0].contains("not a field's name"),
+                "{bad}: {refused:?}"
+            );
+        }
+        // The switch allows a header, nothing else the client says.
+        assert_eq!(
+            with(on, "path").unwrap_err(),
+            ["limit `k`: `key`: `path` is not a key: `client`, until authentication comes"]
+        );
     }
 
     #[test]

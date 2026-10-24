@@ -105,7 +105,7 @@ impl PlainRule {
                     && name
                         .bytes()
                         .all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'.');
-                if !plain_name {
+                if !plain_name && !is_header(name) {
                     return Err(fail("key", format!("`{name}` is not a field's name")));
                 }
                 name.clone()
@@ -139,4 +139,18 @@ impl PlainRule {
             },
         )
     }
+}
+
+/// Whether `field` is a request header written as the language writes one,
+/// `headers["x-api-key"]`: a header's name, lower case, of letters, digits and hyphens.
+fn is_header(field: &str) -> bool {
+    field
+        .strip_prefix("headers[\"")
+        .and_then(|rest| rest.strip_suffix("\"]"))
+        .is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
